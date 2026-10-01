@@ -97,11 +97,35 @@ pub use host_event_ingest::{
 mod task_controller;
 pub use task_controller::{
     TASK_CONTROLLER_ATTEMPT_WIRE_ID, TASK_CONTROLLER_ATTEMPT_WIRE_VERSION,
+    TASK_CONTROLLER_COORDINATE_INTENT_WIRE_ID, TASK_CONTROLLER_COORDINATE_INTENT_WIRE_VERSION,
     TASK_CONTROLLER_INVOCATION_WIRE_ID, TASK_CONTROLLER_INVOCATION_WIRE_VERSION,
     TASK_CONTROLLER_RESULT_BODY_WIRE_ID, TASK_CONTROLLER_RESULT_BODY_WIRE_VERSION,
     TaskControllerAction, TaskControllerAttempt, TaskControllerCampaignOwnerMaterials,
-    TaskControllerInvocation, TaskControllerResultBody,
+    TaskControllerCoordinateIntentV1, TaskControllerInvocation, TaskControllerResultBody,
 };
+
+mod native_worker_material;
+pub use native_worker_material::{
+    NATIVE_WORKER_PROVIDER_PROCESS_READ_OPERATION,
+    NATIVE_WORKER_RETAINED_PROVIDER_MATERIAL_READ_OPERATION,
+    NATIVE_WORKER_RETAINED_PROVIDER_MATERIAL_RESOLVE_OPERATION,
+    MAX_NATIVE_WORKER_RETAINED_PROVIDER_MATERIAL_BYTES,
+    MAX_NATIVE_WORKER_PROVIDER_PROCESS_ADMISSION_BYTES,
+    NativeWorkerProviderProcessGrantV1,
+    NativeWorkerProviderProcessIdentityV1,
+    NativeWorkerProviderProcessReadRequestV1,
+    NativeWorkerProviderProcessReadResponseV1,
+    NativeWorkerProviderProcessReadbackV1,
+    NativeWorkerRetainedProviderMaterialReadRequestV1,
+    NativeWorkerRetainedProviderMaterialReadbackV1,
+    NativeWorkerRetainedProviderMaterialReadResponseV1,
+    NativeWorkerRetainedProviderMaterialResolveRequestV1,
+    NativeWorkerRetainedProviderMaterialResolveResponseV1,
+    NativeWorkerRetainedProviderMaterialRefV1,
+};
+
+mod work_admission;
+pub use work_admission::WorkAdmissionSemanticRevision;
 
 mod finish_attempt;
 pub use finish_attempt::{

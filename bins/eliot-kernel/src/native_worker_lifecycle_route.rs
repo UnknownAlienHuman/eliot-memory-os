@@ -52,24 +52,26 @@ use eliot_contracts::{
     CapabilityCellId, EpochId, RequestId, StateFence, canonical_json_bytes, sha256_hex,
 };
 use eliot_ipc::{Session, TransportError};
+use eliot_security_contracts::PrivacyClass;
 use eliot_kernel_service::{
     KernelServiceError, NATIVE_WORKER_CLAIM_WIRE_ID, NATIVE_WORKER_CLAIM_WIRE_VERSION,
     NATIVE_WORKER_CLAIM_WIRE_VERSION_V1, NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION,
     NATIVE_WORKER_EXECUTION_UNIT_SCHEMA_VERSION, NATIVE_WORKER_PROTOCOL_VERSION,
     NativeWorkerClaimBudget, NativeWorkerClaimRequest, NativeWorkerClaimResponse,
-    NativeWorkerExecutableBinding, NativeWorkerExecutableExpectation,
+    NativeWorkerExecutableBinding, NativeWorkerExecutableBindingPublication,
+    NativeWorkerExecutableExpectation,
 };
 use eliot_ors::{
     AdmissionReservationClaimRef, AdmissionReservationClaims, AdmissionReservationIdentityInput,
     AdmissionReservationLaunchPrerequisite, AdmissionReservationStageRequest,
-    CanonicalAdmissionResolution, CanonicalAdmissionUnknownReason, NativeWorkerClaimRecord,
+    CanonicalAdmissionUnknownReason, NativeWorkerClaimRecord,
     NativeWorkerClaimState, OpaqueLabel, OperationIdentity, OrsError, StateFenceSnapshot,
-    admission_reservation_identity, epoch_lineage_for, reconcile_canonical_admission,
-    reload_staged_admission_reservation, stage_admission_reservation_inactive,
+    admission_reservation_identity, epoch_lineage_for, stage_admission_reservation_inactive,
     stage_operation_identity,
 };
 use eliot_process::OperationId;
 use eliot_protocol::{Frame, FrameKind, MessageType, ProtocolPayload};
+use eliot_security_contracts::PrivacyClass;
 use serde::Serialize;
 
 // ---------------------------------------------------------------------------
@@ -90,6 +92,12 @@ pub(crate) const NATIVE_WORKER_CHECKPOINT_OPERATION: &str = "native_worker.check
 pub(crate) const NATIVE_WORKER_RESULT_SUBMIT_OPERATION: &str = "native_worker.result_submit";
 /// Observes cancellation for one exact attempt and fences it.
 pub(crate) const NATIVE_WORKER_CANCEL_OBSERVE_OPERATION: &str = "native_worker.cancel_observe";
+/// Attaches the original Governor binding to an existing requested claim row.
+pub(crate) const NATIVE_WORKER_EXECUTABLE_BINDING_PUBLISH_OPERATION: &str =
+    "native_worker.executable_binding.publish";
+/// Reads the exact claim row and retained original Governor binding.
+pub(crate) const NATIVE_WORKER_EXECUTABLE_BINDING_READ_OPERATION: &str =
+    "native_worker.executable_binding.read";
 
 /// Returns true for the eight native-worker operations (seven lifecycle
 /// operations owned here plus reconciliation owned by the sibling
@@ -108,6 +116,8 @@ pub(crate) fn is_native_worker_operation(operation: &str) -> bool {
             | NATIVE_WORKER_CHECKPOINT_OPERATION
             | NATIVE_WORKER_RESULT_SUBMIT_OPERATION
             | NATIVE_WORKER_CANCEL_OBSERVE_OPERATION
+            | NATIVE_WORKER_EXECUTABLE_BINDING_PUBLISH_OPERATION
+            | NATIVE_WORKER_EXECUTABLE_BINDING_READ_OPERATION
             | NATIVE_WORKER_RECONCILE_OPERATION
     )
 }
@@ -784,6 +794,42 @@ fn single_shape_wire_and_executable(
     Ok((wire_id, wire_version, executable_binding))
 }
 
+/// Reads one harness/privacy-owner/swarm leg from presented claim JSON:
+/// absent or null decodes as `None` (the owner has not published the leg);
+/// a present leg must be shape-valid text, never invented here.
+fn optional_claim_text(
+    claim: &serde_json::Value,
+    field: &'static str,
+) -> Result<Option<String>, NativeWorkerRouteError> {
+    match claim.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(_) => Ok(Some(native_worker_json_str(
+            claim,
+            field,
+            MAX_CLAIM_TEXT_LEN,
+        )?)),
+    }
+}
+
+/// Reads the canonical privacy-class leg from presented claim JSON: absent
+/// or null decodes as `None`; a present leg must parse as the canonical
+/// owner enum, so an unknown spelling fails closed here, never downstream.
+fn optional_claim_privacy_class(
+    claim: &serde_json::Value,
+) -> Result<Option<PrivacyClass>, NativeWorkerRouteError> {
+    match claim.get("privacy_class") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => {
+            let class: PrivacyClass = serde_json::from_value(value.clone()).map_err(|_| {
+                NativeWorkerRouteError::Shape {
+                    field: "privacy_class",
+                }
+            })?;
+            Ok(Some(class))
+        }
+    }
+}
+
 fn single_shape_resources(
     claim: &serde_json::Value,
     registration: &serde_json::Value,
@@ -1067,6 +1113,27 @@ impl KernelComposition {
         frame: &Frame,
     ) -> Result<KernelFrameAction, TransportError> {
         let context = self.native_worker_frame_context(session, frame)?;
+        if matches!(
+            context.operation.as_str(),
+            NATIVE_WORKER_EXECUTABLE_BINDING_PUBLISH_OPERATION
+                | NATIVE_WORKER_EXECUTABLE_BINDING_READ_OPERATION
+        ) {
+            self.require_executable_binding_owner_session(
+                session,
+                &context.identity_value,
+                &context.presented_fence,
+                &context.payload,
+            )
+            .map_err(NativeWorkerRouteError::into_transport)?;
+            let receipt = self
+                .dispatch_executable_binding_owner_operation(&context)
+                .map_err(NativeWorkerRouteError::into_transport)?;
+            let mut frame =
+                status_frame(session, FrameKind::Response, MessageType::Result, receipt)?;
+            frame.request_id = Some(context.request_id);
+            frame.validate().map_err(|_| TransportError::SessionFenced)?;
+            return Ok(KernelFrameAction::Reply(frame));
+        }
         let current_proof = self
             .native_worker_cell_current_proof(
                 session,
@@ -1203,6 +1270,287 @@ impl KernelComposition {
             }
             _ => Err(NativeWorkerRouteError::Shape { field: "operation" }),
         }
+    }
+
+    fn dispatch_executable_binding_owner_operation(
+        &self,
+        context: &NativeWorkerFrameContext,
+    ) -> Result<serde_json::Value, NativeWorkerRouteError> {
+        match context.operation.as_str() {
+            NATIVE_WORKER_EXECUTABLE_BINDING_PUBLISH_OPERATION => self
+                .handle_executable_binding_publish(
+                    &context.identity_value,
+                    &context.presented_fence,
+                    &context.payload,
+                ),
+            NATIVE_WORKER_EXECUTABLE_BINDING_READ_OPERATION => self
+                .handle_executable_binding_read(
+                    &context.identity_value,
+                    &context.presented_fence,
+                    &context.payload,
+                ),
+            _ => Err(NativeWorkerRouteError::Shape { field: "operation" }),
+        }
+    }
+
+    fn require_executable_binding_owner_session(
+        &self,
+        session: &Session,
+        identity: &serde_json::Value,
+        presented_fence: &StateFence,
+        payload: &serde_json::Value,
+    ) -> Result<(), NativeWorkerRouteError> {
+        if session.module_generation.module_id.as_str() != super::ACTIVE_DAEMON_CALLER {
+            return Err(NativeWorkerRouteError::Fence {
+                field: "executable_binding_owner_caller",
+            });
+        }
+        session
+            .peer
+            .validate()
+            .map_err(|_| NativeWorkerRouteError::Fence {
+                field: "authenticated_process_binding",
+            })?;
+        let request = identity
+            .get("request")
+            .filter(|value| value.is_object())
+            .ok_or(NativeWorkerRouteError::Shape {
+                field: "request_identity",
+            })?;
+        let metadata = request
+            .get("metadata")
+            .filter(|value| value.is_object())
+            .ok_or(NativeWorkerRouteError::Shape {
+                field: "request_metadata",
+            })?;
+        if metadata
+            .get("product_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(super::ACTIVE_DAEMON_CALLER)
+            || metadata
+                .get("source_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(super::ACTIVE_DAEMON_CALLER)
+            || !session
+                .module_generation
+                .state_fence
+                .is_compatible_with(presented_fence)
+        {
+            return Err(NativeWorkerRouteError::Fence {
+                field: "executable_binding_owner_identity",
+            });
+        }
+        let operation_id = require_claim_text(payload, "operation_id")?;
+        Self::require_message_identity(identity, &operation_id)?;
+        let (owner, _) = caller_binding(session).map_err(|_| NativeWorkerRouteError::Fence {
+            field: "executable_binding_owner_binding",
+        })?;
+        if owner.module_id() != super::ACTIVE_DAEMON_CALLER
+            || owner.generation().get() != session.module_generation.generation.value()
+            || !owner.authority_epoch().is_same_authority(&session.authority_epoch)
+        {
+            return Err(NativeWorkerRouteError::Fence {
+                field: "executable_binding_owner_binding",
+            });
+        }
+        #[cfg(windows)]
+        self.require_current_daemon_session(session)
+            .map_err(|_| NativeWorkerRouteError::Fence {
+                field: "executable_binding_owner_session",
+            })?;
+        Ok(())
+    }
+
+    fn handle_executable_binding_publish(
+        &self,
+        identity: &serde_json::Value,
+        presented_fence: &StateFence,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, NativeWorkerRouteError> {
+        let binding_value = payload
+            .get("binding")
+            .filter(|value| value.is_object())
+            .ok_or(NativeWorkerRouteError::Shape { field: "binding" })?;
+        let binding: NativeWorkerExecutableBindingPublication =
+            serde_json::from_value(binding_value.clone()).map_err(|_| {
+                NativeWorkerRouteError::Shape {
+                    field: "binding",
+                }
+            })?;
+        binding
+            .validate_original_binding()
+            .map_err(|_| NativeWorkerRouteError::Shape {
+                field: "binding",
+            })?;
+        let attempt_id = require_claim_text(payload, "attempt_id")?;
+        if !binding.state_fence.is_compatible_with(presented_fence) {
+            return Err(NativeWorkerRouteError::Fence {
+                field: "binding.state_fence",
+            });
+        }
+        let claim_id = OperationIdentity::new(binding.claim_id.as_str())
+            .map_err(|_| NativeWorkerRouteError::Shape { field: "claim_id" })?;
+        let Some(existing) = self
+            .generation_gateway
+            .ors
+            .load_native_worker_claim(&claim_id)
+            .map_err(|_| NativeWorkerRouteError::Fence { field: "ors_load" })?
+        else {
+            return Ok(serde_json::json!({
+                "kind": "native_worker_executable_binding",
+                "status": "Pending",
+                "claim_id": binding.claim_id,
+                "attempt_id": attempt_id,
+                "observed_at_unix_ms": unix_ms(),
+            }));
+        };
+        Self::require_owner_binding_matches_claim_row(&binding, &existing, &attempt_id)?;
+        let record_json = binding
+            .canonical_record_json()
+            .map_err(|_| NativeWorkerRouteError::Shape { field: "binding" })?;
+        let capability_cell = OpaqueLabel::new(binding.capability_cell.as_str())
+            .map_err(|_| NativeWorkerRouteError::Shape {
+                field: "binding.capability_cell",
+            })?;
+        let durable = self
+            .generation_gateway
+            .ors
+            .bind_native_worker_claim_executable_binding(
+                &claim_id,
+                &binding.binding_digest,
+                &record_json,
+                &capability_cell,
+                &binding.capability_cell_registry_digest,
+            )
+            .map_err(|_| NativeWorkerRouteError::Fence {
+                field: "ors_bind_executable_binding",
+            })?
+            .ok_or_else(|| NativeWorkerRouteError::Unknown {
+                identity: binding.claim_id.clone(),
+            })?;
+        Self::require_owner_binding_matches_claim_row(&binding, &durable, &attempt_id)?;
+        Ok(serde_json::json!({
+            "kind": "native_worker_executable_binding",
+            "status": "Found",
+            "claim_record": durable,
+            "observed_at_unix_ms": unix_ms(),
+        }))
+    }
+
+    fn handle_executable_binding_read(
+        &self,
+        _identity: &serde_json::Value,
+        presented_fence: &StateFence,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, NativeWorkerRouteError> {
+        let claim_id = require_op_id(payload, "claim_id")?;
+        let attempt_id = require_claim_text(payload, "attempt_id")?;
+        let operation_id = require_claim_text(payload, "operation_id")?;
+        let task_id = require_claim_text(payload, "task_id")?;
+        let claim_identity = OperationIdentity::new(claim_id.as_str())
+            .map_err(|_| NativeWorkerRouteError::Shape { field: "claim_id" })?;
+        let Some(record) = self
+            .generation_gateway
+            .ors
+            .load_native_worker_claim(&claim_identity)
+            .map_err(|_| NativeWorkerRouteError::Fence { field: "ors_load" })?
+        else {
+            return Ok(serde_json::json!({
+                "kind": "native_worker_executable_binding",
+                "status": "Pending",
+                "claim_id": claim_id,
+                "attempt_id": attempt_id,
+                "observed_at_unix_ms": unix_ms(),
+            }));
+        };
+        if record.attempt_id.as_str() != attempt_id
+            || record.operation_id.as_str() != operation_id
+            || record.task_id.as_str() != task_id
+            || Self::presenting_fence_digest(presented_fence)? != record.fence_digest
+        {
+            return Err(NativeWorkerRouteError::Fence {
+                field: "executable_binding_claim_readback_tuple",
+            });
+        }
+        let Some(record_json) = record.executable_binding_record_json.as_deref() else {
+            return Ok(serde_json::json!({
+                "kind": "native_worker_executable_binding",
+                "status": "Pending",
+                "claim_id": claim_id,
+                "attempt_id": attempt_id,
+                "observed_at_unix_ms": unix_ms(),
+            }));
+        };
+        let binding: NativeWorkerExecutableBindingPublication =
+            serde_json::from_str(record_json).map_err(|_| NativeWorkerRouteError::Fence {
+                field: "executable_binding_record",
+            })?;
+        binding
+            .validate_original_binding()
+            .map_err(|_| NativeWorkerRouteError::Fence {
+                field: "executable_binding_record",
+            })?;
+        Self::require_owner_binding_matches_claim_row(&binding, &record, &attempt_id)?;
+        Ok(serde_json::json!({
+            "kind": "native_worker_executable_binding",
+            "status": "Found",
+            "claim_record": record,
+            "observed_at_unix_ms": unix_ms(),
+        }))
+    }
+
+    pub(crate) fn require_owner_binding_matches_claim_row(
+        binding: &NativeWorkerExecutableBindingPublication,
+        record: &NativeWorkerClaimRecord,
+        attempt_id: &str,
+    ) -> Result<(), NativeWorkerRouteError> {
+        if binding.claim_id != record.claim_id.as_str()
+            || binding.registration_id != record.registration_id.as_str()
+            || binding.task_id != record.task_id.as_str()
+            || binding.work_scope_id != record.work_scope_id.as_str()
+            || binding.operation_id != record.operation_id.as_str()
+            || record.attempt_id.as_str() != attempt_id
+            || binding.worker_generation != record.worker_generation
+            || binding.authority_epoch.sequence.get() != record.authority_epoch
+            || binding.state_fence.resource_generation.value() != record.worker_generation
+            || binding.deadline_unix_ms != record.deadline_unix_ms
+            || Self::presenting_fence_digest(&binding.state_fence)? != record.fence_digest
+        {
+            return Err(NativeWorkerRouteError::Fence {
+                field: "executable_binding_claim_row",
+            });
+        }
+        match record.executable_binding_record_json.as_deref() {
+            Some(stored_json) => {
+                let expected_json = binding
+                    .canonical_record_json()
+                    .map_err(|_| NativeWorkerRouteError::Fence {
+                        field: "executable_binding_record",
+                    })?;
+                if record.executable_binding_digest != binding.binding_digest
+                    || record.capability_cell.as_ref().map(OpaqueLabel::as_str)
+                        != Some(binding.capability_cell.as_str())
+                    || record.capability_cell_registry_digest.as_deref()
+                        != Some(binding.capability_cell_registry_digest.as_str())
+                    || stored_json != expected_json
+                {
+                    return Err(NativeWorkerRouteError::Fence {
+                        field: "executable_binding_claim_row",
+                    });
+                }
+            }
+            None
+                if !record.executable_binding_digest.is_empty()
+                    || record.capability_cell.is_some()
+                    || record.capability_cell_registry_digest.is_some() =>
+            {
+                return Err(NativeWorkerRouteError::Fence {
+                    field: "executable_binding_claim_row",
+                });
+            }
+            None => {}
+        }
+        Ok(())
     }
 
     /// Joins a worker lifecycle presentation to its exact admitted claim,
@@ -1903,6 +2251,12 @@ impl KernelComposition {
             authority_epoch,
             state_fence: fence,
             executable_binding,
+            // Owner-published legs project verbatim from the presented claim
+            // (or `None` when the owner has not published them); never
+            // invented, and with no registration counterpart to compare.
+            visibility: optional_claim_text(claim, "visibility")?,
+            privacy_class: optional_claim_privacy_class(claim)?,
+            swarm_id: optional_claim_text(claim, "swarm_id")?,
             binding_digest: require_digest(claim, "binding_digest")?,
             request_digest: String::new(),
         };
@@ -1925,104 +2279,47 @@ impl KernelComposition {
         Ok(request)
     }
 
-    /// Builds the current owner-record expectation for the executable gate.
-    ///
-    /// The cell and original registry digest are resolved independently from
-    /// the generated #13 source and compared to the v2 join. The worker
-    /// configuration, generation/fence, and epoch come from the validated
-    /// registration and live service. The other W1 lifecycle dimensions are
-    /// still projected from the presented join until their owner records are
-    /// available to this route. `revoked` stays false: no revocation feed
-    /// exists in these paths, so withdrawal is not independently observed.
-    ///
-    /// Wire v1 carries no owner record: the anchors below still come from the
-    /// same live records while the owner-produced strings stay empty by
-    /// construction. Those placeholders are never inspected — the real gate
-    /// refuses old wire first with typed
-    /// `u1_old_wire_without_executable_binding` — and exist only so the
-    /// refusal is the service owner's typed disposition instead of a local
-    /// invention.
+    /// Builds the executable gate expectation from the full Governor record
+    /// retained on the ORS claim row. No field is copied from the worker join.
+    /// Fresh grant, manifest, route, and module currentness is checked by the
+    /// Governor observer on the daemon use path; Kernel independently binds
+    /// this retained record to its live registration and terminal claim state.
     pub(crate) fn build_executable_expectation(
-        presented: Option<&NativeWorkerExecutableBinding>,
+        owner_binding: &NativeWorkerExecutableBindingPublication,
+        durable: &NativeWorkerClaimRecord,
         registration: &serde_json::Value,
         registration_fence: &StateFence,
         live_epoch: &EpochId,
     ) -> Result<NativeWorkerExecutableExpectation, NativeWorkerRouteError> {
+        owner_binding
+            .validate_original_binding()
+            .map_err(|_| NativeWorkerRouteError::Fence {
+                field: "native_worker_executable_binding_owner_record",
+            })?;
+        Self::require_owner_binding_matches_claim_row(
+            owner_binding,
+            durable,
+            durable.attempt_id.as_str(),
+        )?;
         let config_digest = require_digest(registration, "worker_config_digest")?;
         let (capability_cell, module_catalog_revision) =
             native_worker_catalog_binding(registration)?;
         let registry_digest = native_worker_registry_digest(&capability_cell)?;
-        let current = match presented {
-            Some(join) => {
-                if join.capability_cell != capability_cell
-                    || join.module_catalog_revision != module_catalog_revision
-                    || join.capability_cell_registry_digest != registry_digest
-                {
-                    return Err(NativeWorkerRouteError::Fence {
-                        field: "native_worker_executable_binding",
-                    });
-                }
-                NativeWorkerExecutableBinding {
-                    route_ref: join.route_ref.clone(),
-                    adapter_id: join.adapter_id.clone(),
-                    adapter_revision: join.adapter_revision,
-                    config_digest,
-                    facet_manifest_ref: join.facet_manifest_ref.clone(),
-                    capability_cell: join.capability_cell.clone(),
-                    capability_cell_registry_digest: registry_digest,
-                    grant_graph_revision: join.grant_graph_revision,
-                    module_catalog_revision: join.module_catalog_revision,
-                    kernel_execution_manifest_digest: join.kernel_execution_manifest_digest.clone(),
-                    job_object_lineage_ref: join.job_object_lineage_ref.clone(),
-                    resource_limits_digest: join.resource_limits_digest.clone(),
-                    cancellation_policy_ref: join.cancellation_policy_ref.clone(),
-                    checkpoint_policy_digest: join.checkpoint_policy_digest.clone(),
-                    drain_policy_ref: join.drain_policy_ref.clone(),
-                    restart_policy_digest: join.restart_policy_digest.clone(),
-                    replay_stream_id: join.replay_stream_id.clone(),
-                    launch_nonce: join.launch_nonce.clone(),
-                    process_invocation_digest: join.process_invocation_digest.clone(),
-                    authority_epoch: live_epoch.clone(),
-                    generation: registration_fence.resource_generation,
-                    state_fence: registration_fence.clone(),
-                    deadline_unix_ms: join.deadline_unix_ms,
-                    expires_at_unix_ms: join.expires_at_unix_ms,
-                    executable_wire_version: join.executable_wire_version,
-                    executable_binding_digest: join.executable_binding_digest.clone(),
-                }
-            }
-            None => NativeWorkerExecutableBinding {
-                route_ref: String::new(),
-                adapter_id: String::new(),
-                adapter_revision: 0,
-                config_digest,
-                facet_manifest_ref: String::new(),
-                capability_cell,
-                capability_cell_registry_digest: String::new(),
-                grant_graph_revision: 0,
-                module_catalog_revision,
-                kernel_execution_manifest_digest: String::new(),
-                job_object_lineage_ref: String::new(),
-                resource_limits_digest: String::new(),
-                cancellation_policy_ref: String::new(),
-                checkpoint_policy_digest: String::new(),
-                drain_policy_ref: String::new(),
-                restart_policy_digest: String::new(),
-                replay_stream_id: String::new(),
-                launch_nonce: String::new(),
-                process_invocation_digest: String::new(),
-                authority_epoch: live_epoch.clone(),
-                generation: registration_fence.resource_generation,
-                state_fence: registration_fence.clone(),
-                deadline_unix_ms: 0,
-                expires_at_unix_ms: 0,
-                executable_wire_version: NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION,
-                executable_binding_digest: String::new(),
-            },
-        };
+        if owner_binding.capability_cell != capability_cell
+            || owner_binding.module_catalog_revision != module_catalog_revision
+            || owner_binding.capability_cell_registry_digest != registry_digest
+            || owner_binding.config_digest != config_digest
+            || !owner_binding.authority_epoch.is_same_authority(live_epoch)
+            || owner_binding.state_fence != *registration_fence
+            || owner_binding.generation != registration_fence.resource_generation
+        {
+            return Err(NativeWorkerRouteError::Fence {
+                field: "native_worker_executable_binding_currentness",
+            });
+        }
         Ok(NativeWorkerExecutableExpectation {
-            current,
-            revoked: false,
+            current: owner_binding.to_kernel_binding(),
+            revoked: durable.state.is_terminal(),
         })
     }
 
@@ -2362,71 +2659,11 @@ impl KernelComposition {
         Ok(reservation_id)
     }
 
-    /// Drives the residual halves of the normative admission reservation saga
-    /// for one admitted claim: reconcile the canonical admission operation, and
-    /// read the launch prerequisite back through the single owner verifier
-    /// (#1678 W4, W5, W6, A4, A7, A8).
-    ///
-    /// The stage half already ran in `stage_claim_admission_reservation` before
-    /// `admit_native_worker_claim`, so the durable `StagedInactive` row exists
-    /// and the owner has returned its admission verdict. What remains between
-    /// that verdict and a launch is the canonical join, and this method is
-    /// where it lives.
-    ///
-    /// The canonical operation identity is DERIVED, never minted: it is the
-    /// stage operation identity of this exact reservation
-    /// ([`stage_operation_identity`]), so a retry, a replay or a restart after
-    /// a lost response re-resolves the SAME canonical operation and can never
-    /// mint a second admission (I5.27, A3). The ORS reconcile half
-    /// ([`reconcile_canonical_admission`]) is asked for the owner's readback of
-    /// exactly that identity, and it — not this function — decides the I14.21
-    /// disposition. An absent receipt reaches it as `None` and is `Unknown`,
-    /// never `ProvenNonCommit` (I5.19: an unknown commit is never assumed to be
-    /// a non-commit).
-    ///
-    /// Every non-committed disposition keeps the reservation inactive and blocks
-    /// launch; this method never falls through to an activation on an unknown
-    /// (I14.20). A committed resolution proceeds to the launch-prerequisite
-    /// readback, which is the single owner-verifiable artefact #1701 consumes.
-    /// That readback is a pure read: it provisions nothing, launches nothing and
-    /// changes no lifecycle position, and a staged/reconciling/released/expired
-    /// reservation comes back as its own inert variant rather than as active
-    /// authority.
-    ///
-    /// # Why this method does not activate
-    ///
-    /// The activation half ([`eliot_ors::activate_admission_reservation_from_owner_evidence`])
-    /// requires an owner-issued `eliot_store_api::WriteReceipt` for the
-    /// canonical admission operation, and I14.6 forbids fabricating that receipt
-    /// in Kernel or inferring it from a successful transport response. This
-    /// route has no such receipt and cannot obtain one:
-    ///
-    /// - `service.admit_native_worker_claim` returns a
-    ///   `NativeWorkerClaimResponse`, whose `Admitted` arm carries an ORS-level
-    ///   `NativeWorkerClaimReceipt` (crates/kernel/eliot-kernel-service/src/protocol/native_worker_claim.rs:984).
-    ///   That receipt is a `Serialize`/`Deserialize` ORS claim-table receipt
-    ///   with a `receipt_digest`; it carries no canonical `commit_id`, no
-    ///   `idempotency_key` and no `outbox_refs`, so it cannot stand in for a
-    ///   `WriteReceipt`, and turning it into one would be exactly the
-    ///   fabrication the spec forbids.
-    /// - The only owner port that returns a real `WriteReceipt` for an exact
-    ///   operation is `KernelStoreGateway::receipt`
-    ///   (crates/kernel/eliot-kernel-service/src/store_gateway.rs:2182). It is
-    ///   `async` — it performs live `CanonicalStoreClient` IO — and this route
-    ///   is synchronously reachable only through `KernelComposition::dispatch_frame`
-    ///   (bins/eliot-kernel/src/frame_dispatch.rs:744 -> :984), so no receipt for
-    ///   the reservation's canonical operation can be read back from here, and
-    ///   no canonical `ADMITTED` write is ever submitted for it by this claim
-    ///   path.
-    ///
-    /// So the activation leg is left as a truthful typed refusal rather than a
-    /// made-up receipt. The missing owner port is a canonical admission write
-    /// (`admit`/named-write) plus receipt readback reached through an ASYNC
-    /// Kernel surface; the orchestrator for those does not exist yet. #1701
-    /// consumes the `verify_admission_reservation_launch_prerequisite` result
-    /// this method returns, and the activate half is unreachable for it until
-    /// that port lands — which is the correct fail-closed posture while it
-    /// does.
+    /// Consumes the owner-issued active reservation evidence for one admitted
+    /// native-worker claim. Canonical work admission and its receipt readback
+    /// run on the asynchronous `admission_reservation.admit` daemon route;
+    /// this synchronous frame never substitutes a claim receipt for a Store
+    /// receipt and never treats a staged reservation as launch authority.
     fn coordinate_admission_reservation_saga(
         &self,
         request: &NativeWorkerClaimRequest,
@@ -2460,147 +2697,21 @@ impl KernelComposition {
                 field: "attempt_id",
             }
         })?;
-        // One canonical operation identity for the whole saga, derived from the
-        // reservation alone. It is stable across replay and restart, so a lost
-        // response re-resolves this exact operation instead of admitting again.
-        let canonical_operation_id = stage_operation_identity(reservation_id).map_err(|_| {
-            NativeWorkerRouteError::Fence {
-                field: "admission_reservation.canonical_operation",
-            }
-        })?;
-        // Durably read the staged reservation back. This is the A2/A7 recovery
-        // read: a restart lands on the identical row, and a missing reservation
-        // is `Unknown` rather than silently created here. It is a pure read plus
-        // the owner's own `validate()` and
-        // `verify_staged_claim_completeness()`: it provisions nothing, launches
-        // nothing, allocates no environment and mints no second reservation.
-        //
-        // The launch disposition below is read from this row through the shared
-        // gate, so this load is the SAME row the gate reads: it is kept as the
-        // explicit recovery proof that the reservation is durable and still
-        // inactive before anything else in this saga is attempted, and it is
-        // what turns a reservation that is not durably staged into a typed
-        // `Unknown` rather than a silent pass.
-        reload_staged_admission_reservation(
+        // Canonical admission submission and receipt readback run on the
+        // asynchronous daemon channel. This synchronous frame is only the
+        // launch-consumption edge: the ORS owner issues an active typestate
+        // after the async saga has committed and validated the exact receipt.
+        let active = super::admission_reservation_saga::require_active_admission_reservation(
             self.generation_gateway.ors.as_ref(),
             reservation_id,
+            &work_item_id,
+            &proposed_attempt_id,
+            &authority_epoch,
+            &state_fence,
             now_unix_ms,
         )
-        .map_err(|error| match error {
-            OrsError::ReservationNotFound => NativeWorkerRouteError::Unknown {
-                identity: reservation_id.as_str().to_owned(),
-            },
-            _ => NativeWorkerRouteError::Fence {
-                field: "admission_reservation.reload",
-            },
-        })?;
-        // Ask the ORS owner for the disposition of the ORIGINAL canonical
-        // operation. There is no owner port that can read a `WriteReceipt` for
-        // it from this synchronous route (see this method's docs), so the
-        // readback is absent and the owner classifies it exactly as it must:
-        // `Unknown`, never a presumed non-commit.
-        let readback: Option<&eliot_store_api::WriteReceipt> = None;
-        let resolution = reconcile_canonical_admission(readback, canonical_operation_id.as_str())
-            .map_err(|_| NativeWorkerRouteError::Fence {
-            field: "admission_reservation.reconcile",
-        })?;
-        // Read the launch prerequisite back through the SINGLE shared read
-        // (`admission_reservation_saga::read_admission_reservation_launch_prerequisite`),
-        // so this route and every path that is about to start a child apply the
-        // SAME owner verifier to the SAME durable row instead of a route-local
-        // load plus a route-local verify. It is a pure read: it provisions
-        // nothing, launches nothing and changes no lifecycle position. The nine
-        // states are NOT re-derived here — `MISSING`, `STAGED`, `RELEASED`,
-        // `EXPIRED`, `RECONCILING`, `STALE_FENCE`, `FOREIGN_OWNER` and
-        // `IDENTITY_CONFLICT` are the owner's own variants, and only its sealed
-        // `Active` typestate carries launch authority (#1701's single issuance
-        // point). This runs on EVERY path, so the refusal below carries the same
-        // sealed evidence a consumer would have read.
-        let disposition =
-            super::admission_reservation_saga::read_admission_reservation_launch_prerequisite(
-                self.generation_gateway.ors.as_ref(),
-                reservation_id,
-                &work_item_id,
-                &proposed_attempt_id,
-                &authority_epoch,
-                &state_fence,
-                now_unix_ms,
-            )
-            .map_err(|_| NativeWorkerRouteError::Fence {
-                field: "admission_reservation.launch_prerequisite",
-            })?;
-        match resolution {
-            CanonicalAdmissionResolution::Committed => {
-                // #1678 W8: the launch gate. A committed `ADMITTED` decision is
-                // NOT launch authority. I14.6 requires the Kernel to activate
-                // the exact reservation afterwards, and I14.20 forbids a
-                // reservation that is not `Active` from provisioning or
-                // launching. So the claim is admitted for launch only when the
-                // owner verifier returns its sealed `Active` typestate for this
-                // exact reservation, under this caller's current Authority Epoch
-                // lineage, State Fence, work item and attempt.
-                //
-                // `require_admission_reservation_launch` is the ONE gate: it
-                // returns the sealed value or refuses with the owner's own
-                // discriminant — `STAGED`, `RELEASED`, `EXPIRED`, `RECONCILING`,
-                // `STALE_FENCE`, `FOREIGN_OWNER`, `IDENTITY_CONFLICT`, `MISSING`
-                // or `UNREADABLE:<tag>` — as a TYPED refusal that says which
-                // state blocked the launch. A reservation still `STAGED` behind
-                // an unrun activation is therefore refused by name rather than
-                // admitted for launch.
-                match super::admission_reservation_saga::require_active_admission_reservation(
-                    self.generation_gateway.ors.as_ref(),
-                    reservation_id,
-                    &work_item_id,
-                    &proposed_attempt_id,
-                    &authority_epoch,
-                    &state_fence,
-                    now_unix_ms,
-                ) {
-                    Ok(prerequisite) => Ok(prerequisite),
-                    Err(refusal) => Err(NativeWorkerRouteError::LaunchRefused(refusal)),
-                }
-            }
-            CanonicalAdmissionResolution::ProvenNonCommit => {
-                // A proven terminal non-commit may be retried only under this
-                // same operation identity and only under the existing write
-                // policy. The claim route does not re-admit from here, so the
-                // reservation stays inactive and launch stays blocked; the
-                // readback above is the evidence of that.
-                Ok(disposition)
-            }
-            CanonicalAdmissionResolution::TerminalFailure { error_code } => {
-                // Terminal rejection/rollback/dead-letter: the same identity is
-                // dead, the reservation is dispositioned without launch, and the
-                // exact terminal evidence is retained by the ORS owner. Nothing
-                // here retries or re-admits.
-                //
-                // This is reported as its OWN typed disposition, NOT as
-                // `UnknownCommit{ReceiptAbsent}`: a terminal failure is proven
-                // and permanent for this operation identity, whereas a receipt
-                // that is merely absent is unresolved and reconcileable under the
-                // same identity. Reporting the terminal case as an absent
-                // receipt would tell the caller to keep reconciling an operation
-                // that can never commit, which is precisely the blind duplicate
-                // effect I14.21 forbids.
-                Err(NativeWorkerRouteError::TerminalCanonicalAdmission {
-                    reservation_id: reservation_id.as_str().to_owned(),
-                    operation_id: canonical_operation_id.as_str().to_owned(),
-                    error_code,
-                })
-            }
-            CanonicalAdmissionResolution::Unknown { reason } => {
-                // Missing, unavailable, inconclusive or conflicting: keep the
-                // reservation inactive/reconciling and BLOCK LAUNCH. A later
-                // reconcile under the same operation identity resolves it; no
-                // fresh admission is minted (I14.21, I5.19).
-                Err(NativeWorkerRouteError::UnknownCommit {
-                    reservation_id: reservation_id.as_str().to_owned(),
-                    operation_id: canonical_operation_id.as_str().to_owned(),
-                    reason,
-                })
-            }
-        }
+        .map_err(NativeWorkerRouteError::LaunchRefused)?;
+        Ok(active)
     }
 
     /// Projects the complete W2 claim set for one claim from the existing
@@ -2783,10 +2894,58 @@ impl KernelComposition {
             i64::try_from(now).map_err(|_| NativeWorkerRouteError::Fence { field: "now" })?;
         let reservation_id =
             self.stage_claim_admission_reservation(&request, claim, registration, stage_now_ms)?;
+        let claim_identity = OperationIdentity::new(request.claim_id.as_str())
+            .map_err(|_| NativeWorkerRouteError::Shape { field: "claim_id" })?;
+        let durable_claim = self
+            .generation_gateway
+            .ors
+            .load_native_worker_claim(&claim_identity)
+            .map_err(|_| NativeWorkerRouteError::Fence { field: "ors_load" })?;
+        let owner_binding = durable_claim
+            .as_ref()
+            .and_then(|record| record.executable_binding_record_json.as_deref())
+            .map(|record_json| {
+                serde_json::from_str::<NativeWorkerExecutableBindingPublication>(record_json)
+                    .map_err(|_| NativeWorkerRouteError::Fence {
+                        field: "executable_binding_owner_record",
+                    })
+            })
+            .transpose()?;
+        if let (Some(binding), Some(record)) = (owner_binding.as_ref(), durable_claim.as_ref()) {
+            binding
+                .validate_original_binding()
+                .map_err(|_| NativeWorkerRouteError::Fence {
+                    field: "executable_binding_owner_record",
+                })?;
+            Self::require_owner_binding_matches_claim_row(
+                binding,
+                record,
+                request.attempt_id.as_str(),
+            )?;
+        }
         let service = self.service_guard()?;
         let live_epoch = service.authority_epoch();
+        let expectation = owner_binding
+            .as_ref()
+            .zip(durable_claim.as_ref())
+            .map(|(binding, record)| {
+                Self::build_executable_expectation(
+                    binding,
+                    record,
+                    registration,
+                    &registration_fence,
+                    &live_epoch,
+                )
+            })
+            .transpose()?;
         let decision = service
-            .admit_native_worker_claim(self.generation_gateway.ors.as_ref(), &request, now)
+            .admit_native_worker_claim_with_expectation(
+                self.generation_gateway.ors.as_ref(),
+                &request,
+                owner_binding.as_ref(),
+                expectation.as_ref(),
+                now,
+            )
             .map_err(|_| NativeWorkerRouteError::Fence {
                 field: "service_state",
             })?;
@@ -2798,13 +2957,10 @@ impl KernelComposition {
         // never emitted — while `Rejected`/`Conflict` decisions seal
         // unchanged below.
         if matches!(decision, NativeWorkerClaimResponse::Admitted(_)) {
-            let expectation = Self::build_executable_expectation(
-                request.executable_binding.as_ref(),
-                registration,
-                &registration_fence,
-                &live_epoch,
-            )?;
-            Self::enforce_claim_executable_binding(&request, &expectation, now)?;
+            let expectation = expectation.as_ref().ok_or(NativeWorkerRouteError::Fence {
+                field: "executable_binding_owner_record",
+            })?;
+            Self::enforce_claim_executable_binding(&request, expectation, now)?;
         }
         // #1678 W4/W5/W6/A4/A7: drive the residual saga halves for an ADMITTED
         // claim only. A `Rejected`/`Conflict` verdict admits no canonical work,
@@ -3524,9 +3680,10 @@ mod single_shape_proof {
             "executable_wire_version": NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION,
             "executable_binding_digest": owner_digest,
         });
-        // Binding digest over the shared 18-field set (same procedure both
-        // sides use; envelope-only fields are excluded, so stripping them
-        // keeps the digest).
+        // Binding digest over the shared bound-work key set (the exact key
+        // set both `compute_binding_digest` implementations cover, so the
+        // presented digest binds; envelope-only fields are excluded, so
+        // stripping them keeps the digest).
         let draft = serde_json::json!({
             "attempt_id": attempt_id,
             "authority_epoch": epoch_value,
@@ -3541,10 +3698,13 @@ mod single_shape_proof {
             "operation_id": operation_id,
             "parent_job_id": "parent-job-1",
             "predecessor_revision": "rev-1",
+            "privacy_class": null,
             "registration_id": registration_id,
             "route_class": "test-route",
             "state_fence": fence_value,
+            "swarm_id": null,
             "task_id": "task-1",
+            "visibility": null,
             "work_scope_id": "scope-1",
             "worker_generation": 1,
         });
@@ -3569,8 +3729,11 @@ mod single_shape_proof {
             "expected_result_schema": "result-schema",
             "expected_result_schema_version": 1,
             "predecessor_revision": "rev-1",
+            "privacy_class": null,
             "authority_epoch": epoch_value,
             "state_fence": fence_value,
+            "swarm_id": null,
+            "visibility": null,
             "wire_version": NATIVE_WORKER_CLAIM_WIRE_VERSION,
             "executable_binding": draft.get("executable_binding").cloned().unwrap(),
             "binding_digest": binding_digest,
@@ -3717,10 +3880,12 @@ mod single_shape_proof {
         );
     }
 
-    /// Builds one R1 gate fixture: the typed request plus the live
-    /// registration anchors the expectation is built from.
+    /// Builds one R1 gate fixture whose expectation comes from an independently
+    /// retained full owner record and the exact staged ORS row.
     fn r1_gate_fixture() -> (
         NativeWorkerClaimRequest,
+        NativeWorkerExecutableBindingPublication,
+        NativeWorkerClaimRecord,
         serde_json::Value,
         StateFence,
         EpochId,
@@ -3732,7 +3897,7 @@ mod single_shape_proof {
             "op-r1-gate-1",
             "stream-r1-gate-1/gen-1",
         );
-        let request = KernelComposition::build_single_shape_request(&claim, &registration)
+        let mut request = KernelComposition::build_single_shape_request(&claim, &registration)
             .expect("R1 claim builds single-shape");
         request.validate().expect("R1 request validates");
         let fence_value: StateFence = serde_json::from_value(
@@ -3749,7 +3914,142 @@ mod single_shape_proof {
                 .expect("registration epoch"),
         )
         .expect("registration epoch parses");
-        (request, registration, fence_value, live_epoch)
+        let mut owner_binding = r1_owner_binding(&request);
+        owner_binding.binding_digest = owner_binding
+            .compute_original_binding_digest()
+            .expect("original Governor binding digest");
+        request
+            .executable_binding
+            .as_mut()
+            .expect("R1 join")
+            .executable_binding_digest = owner_binding.binding_digest.clone();
+        r1_rebind(&mut request);
+        let record = r1_owner_claim_record(&request, &owner_binding);
+        (
+            request,
+            owner_binding,
+            record,
+            registration,
+            fence_value,
+            live_epoch,
+        )
+    }
+
+    fn r1_owner_binding(
+        request: &NativeWorkerClaimRequest,
+    ) -> NativeWorkerExecutableBindingPublication {
+        let join = request.executable_binding.as_ref().expect("R1 join");
+        NativeWorkerExecutableBindingPublication {
+            claim_id: request.claim_id.clone(),
+            registration_id: request.registration_id.clone(),
+            task_id: request.task_id.clone(),
+            work_unit_id: "work-unit-r1-gate".to_owned(),
+            work_scope_id: request.work_scope_id.clone(),
+            attempt: 1,
+            lease_id: "lease-r1-gate".to_owned(),
+            operation_id: request.operation_id.clone(),
+            canonical_request_hash: test_owner_digest_for(b"original request commitment r1 gate"),
+            installation_id: request.installation_id.clone(),
+            principal_id: "principal-r1-gate".to_owned(),
+            session_id: "session-r1-gate".to_owned(),
+            worker_generation: request.worker_generation,
+            process_tree_id: request.parent_job_id.clone(),
+            job_object_lineage_ref: join.job_object_lineage_ref.clone(),
+            process_generation: request.worker_generation,
+            process_fence: "process-fence-r1-gate".to_owned(),
+            route_ref: join.route_ref.clone(),
+            adapter_id: join.adapter_id.clone(),
+            adapter_revision: join.adapter_revision,
+            artifact_digest: request.worker_artifact_digest.clone(),
+            config_digest: request.worker_config_digest.clone(),
+            protocol_digest: test_owner_digest_for(b"native-worker-protocol-r1-gate"),
+            command_ref: "command-r1-gate".to_owned(),
+            facet_manifest_ref: join.facet_manifest_ref.clone(),
+            capability_cell: join.capability_cell.clone(),
+            introduction_refs: vec!["grant-introduction-r1-gate".to_owned()],
+            supporting_grant_refs: vec!["grant-support-r1-gate".to_owned()],
+            grant_graph_revision: join.grant_graph_revision,
+            module_catalog_revision: join.module_catalog_revision,
+            capability_cell_registry_digest: join.capability_cell_registry_digest.clone(),
+            kernel_execution_manifest_digest: join.kernel_execution_manifest_digest.clone(),
+            resource_limits_digest: join.resource_limits_digest.clone(),
+            cancellation_policy_ref: join.cancellation_policy_ref.clone(),
+            checkpoint_policy_digest: join.checkpoint_policy_digest.clone(),
+            drain_policy_ref: join.drain_policy_ref.clone(),
+            restart_policy_digest: join.restart_policy_digest.clone(),
+            effective_ceiling: eliot_store_api::EffectClass::Candidate,
+            credential_refs: Vec::new(),
+            resource_refs: Vec::new(),
+            replay_stream_id: join.replay_stream_id.clone(),
+            launch_nonce: join.launch_nonce.clone(),
+            process_invocation_digest: join.process_invocation_digest.clone(),
+            state_fence: request.state_fence.clone(),
+            authority_epoch: request.authority_epoch.clone(),
+            generation: request.state_fence.resource_generation,
+            deadline_unix_ms: join.deadline_unix_ms,
+            expires_at_unix_ms: join.expires_at_unix_ms,
+            plan_id: "plan-r1-gate".to_owned(),
+            plan_revision: "plan-revision-r1-gate".to_owned(),
+            task_revision: 1,
+            config_snapshot_digest: request.worker_config_digest.clone(),
+            admission_revision_ref: "admission-revision-r1-gate".to_owned(),
+            wire_id: NativeWorkerExecutableBindingPublication::WIRE_ID.to_owned(),
+            wire_version: NativeWorkerExecutableBindingPublication::WIRE_VERSION,
+            binding_digest: String::new(),
+        }
+    }
+
+    fn r1_owner_claim_record(
+        request: &NativeWorkerClaimRequest,
+        owner_binding: &NativeWorkerExecutableBindingPublication,
+    ) -> NativeWorkerClaimRecord {
+        let owner_json = owner_binding
+            .canonical_record_json()
+            .expect("canonical owner binding");
+        let budget_digest = sha256_json(&request.budget).expect("budget digest");
+        let fence_digest = KernelComposition::presenting_fence_digest(&request.state_fence)
+            .expect("fence digest");
+        let resource_envelope = serde_json::json!({
+            "installation_id": request.installation_id,
+            "worker_artifact_digest": request.worker_artifact_digest,
+            "worker_config_digest": request.worker_config_digest,
+        });
+        let resource_envelope_digest = sha256_json(&resource_envelope).expect("resource digest");
+        NativeWorkerClaimRecord {
+            contract_version: eliot_ors::CONTRACT_VERSION,
+            claim_id: OperationIdentity::new(request.claim_id.as_str()).expect("claim id"),
+            registration_id: OpaqueLabel::new(request.registration_id.as_str()).expect("reg id"),
+            worker_generation: request.worker_generation,
+            parent_job_id: OpaqueLabel::new(request.parent_job_id.as_str()).expect("parent job"),
+            task_id: OpaqueLabel::new(request.task_id.as_str()).expect("task"),
+            work_scope_id: OpaqueLabel::new(request.work_scope_id.as_str()).expect("scope"),
+            decision_id: OpaqueLabel::new(request.decision_id.as_str()).expect("decision"),
+            attempt_id: OpaqueLabel::new(request.attempt_id.as_str()).expect("attempt"),
+            operation_id: OpaqueLabel::new(request.operation_id.as_str()).expect("operation"),
+            route_class: OpaqueLabel::new(request.route_class.as_str()).expect("route"),
+            budget_digest,
+            deadline_unix_ms: request.deadline_unix_ms,
+            fence_digest,
+            authority_epoch: request.authority_epoch.sequence.get(),
+            binding_digest: request.binding_digest.clone(),
+            request_digest: request.request_digest.clone(),
+            executable_binding_digest: owner_binding.binding_digest.clone(),
+            executable_binding_record_json: Some(owner_json),
+            execution_unit_schema_version: request.execution_unit_schema_version,
+            predecessor_revision: OpaqueLabel::new(request.predecessor_revision.as_str())
+                .expect("predecessor"),
+            resource_envelope_digest,
+            capability_cell: Some(
+                OpaqueLabel::new(owner_binding.capability_cell.as_str()).expect("capability cell"),
+            ),
+            capability_cell_registry_digest: Some(
+                owner_binding.capability_cell_registry_digest.clone(),
+            ),
+            state: NativeWorkerClaimState::Requested,
+            receipt_digest: None,
+            admitted_at_unix_ms: None,
+            commit_order: 0,
+        }
     }
 
     /// Recomputes both claim digests after a presented-field mutation so the
@@ -3765,7 +4065,8 @@ mod single_shape_proof {
     /// exact invocation bytes, and the gate admits the matching digest.
     #[test]
     fn r1_gate_admits_matching_invocation_digest() {
-        let (request, registration, fence_value, live_epoch) = r1_gate_fixture();
+        let (request, owner_binding, record, registration, fence_value, live_epoch) =
+            r1_gate_fixture();
         let presented = request
             .executable_binding
             .as_ref()
@@ -3779,7 +4080,8 @@ mod single_shape_proof {
             "join must carry the derived invocation digest"
         );
         let expectation = KernelComposition::build_executable_expectation(
-            request.executable_binding.as_ref(),
+            &owner_binding,
+            &record,
             &registration,
             &fence_value,
             &live_epoch,
@@ -3802,10 +4104,12 @@ mod single_shape_proof {
     /// `u1_old_wire_without_executable_binding`.
     #[test]
     fn r1_gate_refuses_mutated_and_missing_digest() {
-        let (request, registration, fence_value, live_epoch) = r1_gate_fixture();
+        let (request, owner_binding, record, registration, fence_value, live_epoch) =
+            r1_gate_fixture();
         let now = 9_000_000_050_000u64;
         let expectation = KernelComposition::build_executable_expectation(
-            request.executable_binding.as_ref(),
+            &owner_binding,
+            &record,
             &registration,
             &fence_value,
             &live_epoch,
@@ -3861,36 +4165,18 @@ mod single_shape_proof {
             }
             other => panic!("expected Conflict, got {other:?}"),
         }
-        // Missing join (wire v1): the `None`-branch placeholders stay empty
-        // by construction and the gate refuses typed, never silent.
-        let none_expectation = KernelComposition::build_executable_expectation(
-            None,
-            &registration,
-            &fence_value,
-            &live_epoch,
-        )
-        .expect("None expectation builds by construction");
-        assert!(
-            none_expectation
-                .current
-                .process_invocation_digest
-                .is_empty(),
-            "wire-v1 placeholders stay empty by construction"
-        );
-        assert!(
-            none_expectation
-                .current
-                .executable_binding_digest
-                .is_empty(),
-            "wire-v1 owner placeholder stays empty by construction"
-        );
+        // Missing join (wire v1) is refused against the same independent
+        // retained owner record; no placeholder owner fields are synthesized.
         let mut old_wire = request.clone();
         old_wire.wire_version = NATIVE_WORKER_CLAIM_WIRE_VERSION_V1;
         old_wire.executable_binding = None;
         r1_rebind(&mut old_wire);
-        let old_error =
-            KernelComposition::enforce_claim_executable_binding(&old_wire, &none_expectation, now)
-                .expect_err("old wire must not dispatch");
+        let old_error = KernelComposition::enforce_claim_executable_binding(
+            &old_wire,
+            &expectation,
+            now,
+        )
+        .expect_err("old wire must not dispatch");
         assert!(
             matches!(
                 old_error,

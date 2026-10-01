@@ -74,6 +74,7 @@ use eliot_backup::{
 };
 use eliot_contracts::{EpochRelation, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_ors::RedbRecoveryStore;
+use eliot_platform_windows::fresh_activation_nonce_material;
 use eliot_security_contracts::PurgeLedgerEntry;
 use eliot_store_api::WriteReceipt;
 
@@ -87,6 +88,19 @@ use super::backup_capture_ports::{
 /// Owner order for per-owner budget accounting: canonical, blob, purge, ORS,
 /// watchdog, host.
 const OWNER_COUNT: usize = 6;
+
+/// Owner-chosen lifetime of one backup-verify succession grant, in
+/// milliseconds (#2883 instruction 4).
+///
+/// It bounds how long a single reconciliation stays authorized after its
+/// operation was committed. It is deliberately short relative to the durable
+/// answer's own retention: the grant authorizes reading an ALREADY-committed
+/// result, so it only has to survive a lost response and the reconnect that
+/// follows it, and an open-ended grant would be a permanent second key onto the
+/// row. It is a ceiling, not a promise - the grant is additionally one-shot, so
+/// a reconciliation that happens inside this window spends it and there is no
+/// second one to be late for.
+const SUCCESSION_GRANT_HORIZON_MS: u64 = 300_000;
 
 /// One capture request: the admitted caller, the frozen plan, and owned clones
 /// of the already-accepted owner evidence.
@@ -1018,6 +1032,101 @@ impl KernelBackupCapture {
         relation: &SnapshotRelation,
     ) -> Result<(), KernelCaptureError> {
         relation.validate_relation()
+    }
+
+    /// Issues the owner succession grant that authorizes exactly one later
+    /// reconciliation of one `backup.verify` operation (#2883 instruction 4).
+    ///
+    /// This is the ISSUER, and it is this owner rather than the route because
+    /// this owner is the one that re-decides the archive: the grant is a
+    /// statement about the archive's content and about who may read the stored
+    /// answer for it, and both facts are decided here and nowhere else on the
+    /// verify path. The route only compares what this function produced.
+    ///
+    /// What makes it OWNER-ISSUED rather than a caller-presented value:
+    ///
+    /// - `grant_id` is drawn from the Kernel's OS entropy seam
+    ///   ([`fresh_activation_nonce_material`], the existing one-shot nonce
+    ///   source this crate already depends on, not a second scheme) and is
+    ///   returned ONLY to the caller that is staging the row. It is never
+    ///   projected onto the wire, never derived from the archive, and never
+    ///   derivable from any pair the predecessor's `ok` reply carried. So the
+    ///   predecessor's own reply - which does carry `request_digest` and
+    ///   `operation_namespace` - cannot be replayed into a second grant: there
+    ///   is no value on that reply that completes a grant comparison.
+    /// - `not_before_unix_ms` and `expires_at_unix_ms` are this owner's own
+    ///   clock readings around the grant, so the authorization has a bounded
+    ///   lifetime that no caller can widen or move.
+    /// - `principal` is the BARE authenticated principal the row identity and
+    ///   the per-principal key use, threaded in from the live session rather
+    ///   than read off `CaptureCallerAuth` (which carries a composite
+    ///   `user@session`). A grant is therefore bound to exactly the identity the
+    ///   successor path compares it against.
+    /// - `scope_id` is the live verifying scope. It is threaded in rather than
+    ///   read off `CaptureCallerAuth` because that struct carries the
+    ///   authenticated principal and the admitted capability and deliberately
+    ///   carries no scope: scope is a `WorkScope` owner value that this module
+    ///   does not own, and inventing one on the auth struct would give a second
+    ///   spelling of it. The caller is the only party that can supply it, and
+    ///   the grant is bound to whatever it supplied - which is why the successor
+    ///   path compares the grant's scope against the live session's own scope
+    ///   rather than trusting the grant alone.
+    /// - `authority_lineage_id` is the live session fence's authority LINEAGE.
+    ///   The sequence is deliberately excluded: a rotation is the same authority
+    ///   observed later, exactly as on the observation join, so a grant must
+    ///   survive a rotation and must not survive a lineage change.
+    ///
+    /// The one-shot property is NOT enforced here. It cannot be: two callers
+    /// can hold the same grant concurrently, so "already spent" is only
+    /// decidable inside the single transaction that writes the marker, which is
+    /// `RedbRecoveryStore::consume_backup_verification_succession_grant`. This
+    /// function's job is to produce the grant DATA; that method spends it
+    /// atomically. Splitting them is what keeps the claim "a replay cannot mint
+    /// a fresh grant" true: this function is called exactly once per staged
+    /// operation, on the stage path, and the successor path never calls it.
+    ///
+    /// `Err` is returned when the OS entropy seam is unavailable, which is the
+    /// fail-closed direction: the row is then staged with no grant at all and
+    /// every reconciliation of it is refused, rather than one being authorized
+    /// by a value this owner could not actually draw.
+    pub fn issue_succession_grant(
+        &self,
+        principal: &str,
+        scope_id: &str,
+        kernel_fence: &StateFence,
+    ) -> Result<eliot_ors::BackupVerifySuccessionGrant, KernelCaptureError> {
+        // The grant is issued BY this owner, so the owner's own work root is
+        // bound into the grant identifier. That is what makes the grant
+        // owner-issued rather than a value the caller could have presented: a
+        // caller replaying the same bundle under the same key on another
+        // installation cannot reproduce this owner's material.
+        let owner_work_root = self.work_root.to_string_lossy();
+        let Ok(nonce) = fresh_activation_nonce_material() else {
+            return Err(KernelCaptureError::Unsupported {
+                reason: "the owner succession-grant entropy seam is unavailable",
+            });
+        };
+        let grant_id = eliot_contracts::sha256_hex(
+            format!("{owner_work_root}\u{1f}{}", nonce.as_str()).as_bytes(),
+        );
+        let issued_at_unix_ms = crate::unix_ms();
+        // The window is opened at the NEXT millisecond so the route's own
+        // `now >= not_before` comparison can never reject the grant on the very
+        // call that issued it, and it is closed a fixed owner-chosen horizon
+        // later. Both ends are strictly ordered, which is what the grant's own
+        // `validate` requires and what makes a zero-length window impossible.
+        let not_before_unix_ms = issued_at_unix_ms.saturating_add(1);
+        let expires_at_unix_ms = not_before_unix_ms.saturating_add(SUCCESSION_GRANT_HORIZON_MS);
+        Ok(eliot_ors::BackupVerifySuccessionGrant {
+            grant_id,
+            principal: principal.to_owned(),
+            scope_id: scope_id.to_owned(),
+            authority_lineage_id: kernel_fence.authority_epoch.lineage_id.to_string(),
+            issued_at_unix_ms,
+            not_before_unix_ms,
+            expires_at_unix_ms,
+            consumed_at_unix_ms: None,
+        })
     }
 }
 

@@ -3218,12 +3218,18 @@ impl KernelComposition {
     /// (daemon-leg memory only — the durable ORS record is untouched). A full
     /// queue of claimed/in-flight attempts returns backpressure rather than
     /// silently stealing a live attempt.
+    ///
+    /// Returns the carrier form actually retained, as
+    /// [`Self::enqueue_local_read_pair_under_transition`] does: the enqueue
+    /// resolves the form ONCE from the two closed admission owners, so a
+    /// caller that routes or audits from this answer is reading the same
+    /// disposition the carrier was tagged with (issue #2564).
     #[cfg(test)]
     pub(crate) fn enqueue_local_read_pair(
         &self,
         envelope: &HostRequestEnvelope,
         tool: &serde_json::Value,
-    ) -> Result<(), TransportError> {
+    ) -> Result<LocalReadPairKind, TransportError> {
         let _transition = self.agent_bridge_transition_read()?;
         self.enqueue_local_read_pair_under_transition(envelope, tool)
     }
@@ -10945,6 +10951,12 @@ mod invoke_read_tool_tests {
             local_read_tool: None,
             local_read_held_bytes: 0,
             local_read_attempt: LocalReadAttemptState::default(),
+            // An unoccupied placeholder owns no bounded read at all, so it
+            // carries no carrier form. `None` on an unoccupied slot is never
+            // served: the claim gate reads the tag only behind a present
+            // `local_read_envelope`, and a tagged-but-empty row is not a shape
+            // the enqueue gate can produce.
+            local_read_pair_kind: None,
             observe_envelope: None,
             observe_tool: None,
             observe_reservation: None,
@@ -10979,7 +10991,16 @@ mod invoke_read_tool_tests {
             &envelope,
             &tool,
             bytes,
+            // The fixture stages an `eliot.query` tool, so the carrier form is
+            // `Query` by the same admission-derived rule the enqueue gate
+            // uses (`of_admission` maps the query/Skill form to `Query`).
+            LocalReadPairKind::Query,
             LocalReadAttemptState::default(),
+        );
+        assert_eq!(
+            row.local_read_pair_kind,
+            Some(LocalReadPairKind::Query),
+            "a staged bounded read carries the form it was admitted as"
         );
         row
     }
@@ -11147,7 +11168,16 @@ mod invoke_read_tool_tests {
             &envelope,
             &tool,
             13,
+            // Same `eliot.query` form as the fixture that charged this row: the
+            // replacement must re-tag the carrier form, not leave the row
+            // claiming a bounded read under no form at all.
+            LocalReadPairKind::Query,
             LocalReadAttemptState::default(),
+        );
+        assert_eq!(
+            row.local_read_pair_kind,
+            Some(LocalReadPairKind::Query),
+            "a replaced bounded read re-stages under its admitted form"
         );
         assert_eq!(
             kernel.hot_spine.held_local_read_capacity().expect("ledger"),

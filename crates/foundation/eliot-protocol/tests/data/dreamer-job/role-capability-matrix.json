@@ -1,7 +1,7 @@
 {
   "contract": "eliot.foundation.protocol.durable-job",
   "roles": {
-    "REQUESTER": ["SUBMIT", "STATUS", "REQUEST_CANCEL", "RECONCILE"],
+    "REQUESTER": ["SUBMIT", "STATUS", "REQUEST_CANCEL", "RECONCILE", "RECORD_APPLICABILITY", "RECORD_ADMISSION"],
     "WORKER": [
       "LEASE",
       "RENEW",
