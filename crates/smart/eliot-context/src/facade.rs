@@ -486,12 +486,7 @@ where
     >,
 {
     let result = eliot_context_assembly::assemble_active_view(
-        admitted,
-        recipe,
-        approved,
-        quality,
-        policy,
-        measure,
+        admitted, recipe, approved, quality, policy, measure,
     )?;
     if result.admitted != *admitted {
         return Err(FacadeError::ResponseIdentityMismatch {
