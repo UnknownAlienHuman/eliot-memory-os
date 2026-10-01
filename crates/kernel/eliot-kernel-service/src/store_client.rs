@@ -1144,7 +1144,8 @@ mod tests {
         NamedMutationRequest, OperationIdentity, OperationManifestDigest, ReservedScopeBinding,
         Resubmission, StoreFailure, StoreFailureIdentityContext, TransitionClass,
         WriteAdmissionParams, WriteAdmissionProjection, WriteReceiptStatus, WriterEpochBinding,
-        canonical_request_hash,
+        canonical_request_hash, generated_operation_manifests, operation_manifest_set_digest,
+        supported_admission_contract_set_digest,
     };
     use serde_json::json;
     use std::num::NonZeroU64;
@@ -1157,6 +1158,14 @@ mod tests {
             NonZeroU64::new(sequence).expect("nonzero test sequence"),
         )
         .expect("valid test epoch")
+    }
+
+    fn test_manifest_bindings() -> (String, OperationManifestDigest) {
+        let manifests = generated_operation_manifests().expect("operation catalogue");
+        (
+            supported_admission_contract_set_digest().expect("admission contract set"),
+            operation_manifest_set_digest(&manifests).expect("operation manifest set"),
+        )
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -1675,6 +1684,7 @@ mod tests {
         Vec<RevisionHeadExpectation>,
         Vec<OrderingHeadExpectation>,
     ) {
+        let (admission_contract_set_digest, operation_manifest_digest) = test_manifest_bindings();
         let context = context_for(fence, "apply-request-1", "source");
         let revision_heads = vec![RevisionHeadExpectation {
             key: RevisionKey::new("scope:one").expect("key"),
@@ -1699,9 +1709,8 @@ mod tests {
             ordering_scopes: vec![OrderingScopeId::new("scope-authority").expect("ordering")],
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "b".repeat(64),
-            operation_manifest_digest: OperationManifestDigest::new("manifest-authority")
-                .expect("manifest digest"),
+            admission_contract_set_digest,
+            operation_manifest_digest,
             // Issue-#18 digests are derived below via `bind_issue18_digests`,
             // never defaulted; the admitted expected heads render here via
             // `render_semantic_source_revisions`, mirroring the Governor
@@ -2327,6 +2336,7 @@ mod tests {
     }
 
     fn reserved_request(fence: &StateFence) -> ReservedWriteRequest {
+        let (admission_contract_set_digest, operation_manifest_digest) = test_manifest_bindings();
         let context = context_for(fence, "reserved-request-1", "source-991-k");
         let expected_revision_heads = vec![RevisionHeadExpectation {
             key: RevisionKey::new("rev-991-k1").expect("key"),
@@ -2351,9 +2361,8 @@ mod tests {
             ordering_scopes: vec![OrderingScopeId::new("scope-991-k1").expect("ordering")],
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "b".repeat(64),
-            operation_manifest_digest: OperationManifestDigest::new("manifest-991-k1")
-                .expect("manifest digest"),
+            admission_contract_set_digest,
+            operation_manifest_digest,
             // Issue-#18 digests are derived below via `bind_issue18_digests`,
             // never defaulted; the admitted expected heads render here via
             // `render_semantic_source_revisions`, mirroring the Governor
