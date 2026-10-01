@@ -85,6 +85,7 @@ pub use module::control_reserve_front_door::{
     FRONT_DOOR_BOTTLENECK, FrontDoor, IdempotencyDisposition, IdempotencyLedger, NormalWorkClass,
     PermitOperation,
 };
+pub use module::control_reserve_ors_evidence::join_ors_owner_evidence;
 pub use module::control_reserve_profile_compiler::{
     BottleneckOwnerEvidence, ControlReserveProfileIdentity, ControlReserveStatusRow,
     ControlReserveStatusSnapshot, compile_control_reserve_profile, project_control_reserve_status,
