@@ -272,11 +272,23 @@ fn strip_json_string_quotes(error: &str) -> &str {
 /// equality ([`is_abort_fallout`]). [`AdapterError::AllocationContention`] is
 /// the only outcome that re-enters the transaction loop, and it requires
 /// positive fence evidence.
-fn classify_transaction_errors(errors: &[String], operation_id: &str) -> AdapterError {
+pub(super) fn classify_transaction_errors(errors: &[String], operation_id: &str) -> AdapterError {
     debug_assert!(
         !errors.is_empty(),
         "classification runs only on a non-empty statement-error set"
     );
+    if errors
+        .iter()
+        .any(|error| has_marker_token(error, "work_scope_owner_fence_conflict"))
+    {
+        return AdapterError::Store(StoreError::FenceMismatch);
+    }
+    if errors
+        .iter()
+        .any(|error| has_marker_token(error, "work_scope_owner_revision_conflict"))
+    {
+        return AdapterError::Store(StoreError::IdentityConflict);
+    }
     if errors.iter().any(|error| is_semantic_conflict(error)) {
         return AdapterError::ProviderConflict;
     }

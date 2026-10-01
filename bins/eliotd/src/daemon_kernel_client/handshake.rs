@@ -19,6 +19,7 @@ use eliot_protocol::{
 use eliot_runtime_contracts::{
     ModuleContract, ModuleGeneration, ModuleGenerationState, compare_published_projection,
 };
+use eliot_store_api::StoreFailure;
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -43,9 +44,13 @@ pub(crate) enum KernelClientError {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum WireOutcome {
     Known {
+        value: serde_json::Value,
+        recovery: Option<serde_json::Value>,
+    },
+    AcceptedPending {
         value: serde_json::Value,
         recovery: Option<serde_json::Value>,
     },
@@ -59,6 +64,14 @@ pub(crate) enum WireOutcome {
     Error {
         code: String,
         reason: String,
+        /// Operation-specific empty/error payload carried by the existing
+        /// Kernel response envelope. Absent for legacy/non-Store failures.
+        #[serde(default)]
+        value: Option<serde_json::Value>,
+        /// Typed Store refusal when the operation preserves the existing
+        /// `StoreFailure` contract. Absent for all legacy/non-Store failures.
+        #[serde(default)]
+        failure: Option<Box<StoreFailure>>,
     },
 }
 

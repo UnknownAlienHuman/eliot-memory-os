@@ -153,6 +153,7 @@ fn valid_request() -> ReservedWriteRequest {
             expected_sequence: 6,
             state_fence: fence(),
         }],
+        original_write_submission: None,
     }
 }
 

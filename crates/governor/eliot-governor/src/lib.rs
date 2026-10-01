@@ -234,8 +234,12 @@ pub use migration_inventory::{
     impact_entry_node, impact_node, lookup_by_package, migration_inventory_guard, resolve,
 };
 pub use observation_reconciliation::{
-    GovernorObservationReconciliation, NegativeMemoryGateObservation, NegativeMemoryGateOutcome,
-    WatchdogAdmittedEntry, WatchdogEntryAdmission, WatchdogEntryKind,
+    GovernorObservationReconciliation, McpObservationCaptureInput, McpObservationCompletion,
+    NegativeMemoryGateObservation, NegativeMemoryGateOutcome, ObservationCaptureAccess,
+    ObservationCaptureHostOriginDomain, ObservationCaptureOwnerBinding,
+    ObservationCaptureOwnerOrigin, ObservationCapturePolicyAccess, ObservationCaptureVisibility,
+    ObservationIngressPolicyBinding, PreparedMcpObservation, WatchdogAdmittedEntry,
+    WatchdogEntryAdmission, WatchdogEntryKind,
 };
 pub use opencode_action_gate::{
     GovernorActionGateRefusal, GovernorActionGateRequest, GovernorActionGateVerdict,
@@ -322,6 +326,7 @@ pub use swarm_plan_attachment_service::{
 };
 pub use task_lifecycle::{
     GovernorTaskLifecycle, GuardedTaskCommand, PreparedTaskTransition, TaskLifecycleError,
+    TaskSelectionTransitionInput,
 };
 pub use wasm_resolution::{
     CONFORMANCE_COMPONENT, CONFORMANCE_INPUT, CONFORMANCE_SEED, ContourAdmission,

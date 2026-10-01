@@ -21,12 +21,14 @@ use crate::{
     CanonicalValidationSnapshot, ErasureIntentRecord, ErasureSurfaceKind, ExactJsonBytes,
     IsolatedDestination, IsolatedDestinationReceipt, MAX_STORE_FAILURE_DETAIL_LEN,
     NamedReadRequest, NamedReadResponse, OperationId, OperationIdentity, OrderingHead,
-    OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta,
-    ReservedWriteRequest, RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation,
-    RevisionKey, ScopeId, SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle,
-    SnapshotPage, StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreRecoveryRequest,
-    StoreRecoverySnapshot, WriteReceipt, canonical_json_bytes, dreamer_job::map_durable_error,
-    json_shape_name, reconcile_same_operation, sha256_hex, verify_canonical_request_hash,
+    OrderingHeadExpectation, OrderingHeadReadback, OrderingScopeId, PreparedTransition,
+    RequestMeta, ReservedWriteRequest, RestoreValidationReceipt, RevisionHead,
+    RevisionHeadExpectation, RevisionKey, ScopeId, SnapshotBeginRequest, SnapshotCursor,
+    SnapshotEndReceipt, SnapshotHandle, SnapshotPage, StateFence, StoreError, StoreGenesisRequest,
+    StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, StoreWorkScopeOwnerRequest,
+    StoreWorkScopeOwnerResponse, WriteReceipt, canonical_json_bytes,
+    dreamer_job::map_durable_error, json_shape_name, reconcile_same_operation, sha256_hex,
+    verify_canonical_request_hash,
 };
 use schemars::JsonSchema;
 
@@ -60,6 +62,8 @@ pub const CAPABILITY_ORDERING_HEADS: &str = "store.ordering_heads";
 pub const CAPABILITY_VALIDATION_SNAPSHOT: &str = "store.validation_snapshot";
 pub const CAPABILITY_RECOVERY: &str = "store.recovery";
 pub const CAPABILITY_INITIALIZE_GENESIS: &str = "store.initialize_genesis";
+/// Capability for the authenticated post-genesis `WorkScope` owner CAS.
+pub const CAPABILITY_WORK_SCOPE_OWNER_WRITE: &str = "store.work_scope_owner.write";
 /// Intent capability gate for neutral erasure dispatch (issue #688).
 ///
 /// A store that cannot durably record intent must not advertise this
@@ -94,6 +98,7 @@ pub const CAPABILITIES: &[&str] = &[
     CAPABILITY_VALIDATION_SNAPSHOT,
     CAPABILITY_RECOVERY,
     CAPABILITY_INITIALIZE_GENESIS,
+    CAPABILITY_WORK_SCOPE_OWNER_WRITE,
     CAPABILITY_DREAMER_JOB_SUBMIT,
     CAPABILITY_DREAMER_JOB_LEASE_NEXT,
     CAPABILITY_DREAMER_JOB_LEASE_EXACT,
@@ -332,6 +337,10 @@ pub enum StoreRequest {
         context: RequestMeta,
         request: StoreGenesisRequest,
     },
+    WriteWorkScopeOwner {
+        context: RequestMeta,
+        request: StoreWorkScopeOwnerRequest,
+    },
     Receipt {
         operation_id: OperationId,
     },
@@ -339,6 +348,9 @@ pub enum StoreRequest {
         keys: Vec<RevisionKey>,
     },
     OrderingHeads {
+        scopes: Vec<OrderingScopeId>,
+    },
+    OrderingHeadReadbacks {
         scopes: Vec<OrderingScopeId>,
     },
     ValidationSnapshot,
@@ -365,6 +377,7 @@ impl StoreRequest {
                 }
                 Ok(())
             }
+            Self::WriteWorkScopeOwner { context, request } => request.validate_for_context(context),
             Self::Apply {
                 context,
                 transition,
@@ -399,7 +412,7 @@ impl StoreRequest {
             Self::ReservedWrite { request } => request.validate(),
             Self::Backup { request } => request.validate(),
             Self::RevisionHeads { keys } => bounded_unique(keys, "revision_keys", Clone::clone),
-            Self::OrderingHeads { scopes } => {
+            Self::OrderingHeads { scopes } | Self::OrderingHeadReadbacks { scopes } => {
                 bounded_unique(scopes, "ordering_scopes", Clone::clone)
             }
             Self::DreamerJob { context, request } => {
@@ -424,10 +437,13 @@ impl StoreRequest {
             Self::Backup { .. } => CAPABILITY_STORE_BACKUP,
             Self::Receipt { .. } => CAPABILITY_RECEIPT,
             Self::RevisionHeads { .. } => CAPABILITY_REVISION_HEADS,
-            Self::OrderingHeads { .. } => CAPABILITY_ORDERING_HEADS,
+            Self::OrderingHeads { .. } | Self::OrderingHeadReadbacks { .. } => {
+                CAPABILITY_ORDERING_HEADS
+            }
             Self::ValidationSnapshot => CAPABILITY_VALIDATION_SNAPSHOT,
             Self::Recovery { .. } => CAPABILITY_RECOVERY,
             Self::InitializeGenesis { .. } => CAPABILITY_INITIALIZE_GENESIS,
+            Self::WriteWorkScopeOwner { .. } => CAPABILITY_WORK_SCOPE_OWNER_WRITE,
             Self::DreamerJob { request, .. } => dreamer_job_capability(&request.operation),
         }
     }
@@ -521,44 +537,38 @@ impl StoreRequest {
                 }
                 Ok(())
             }
+            Self::WriteWorkScopeOwner { context, request } => {
+                if context != &identity.request.metadata {
+                    return Err(StoreWireError::Identity(
+                        "WorkScope owner context does not match request identity metadata"
+                            .to_owned(),
+                    ));
+                }
+                if request.idempotency_key != identity.idempotency_key {
+                    return Err(StoreWireError::Identity(
+                        "WorkScope owner idempotency key does not match request identity"
+                            .to_owned(),
+                    ));
+                }
+                if request.state_fence != identity.request.state_fence {
+                    return Err(StoreWireError::Identity(
+                        "WorkScope owner fence does not match request identity".to_owned(),
+                    ));
+                }
+                Ok(())
+            }
             Self::Apply {
                 context,
                 transition,
                 expected_revision_heads,
                 expected_ordering_heads,
-            } => {
-                if context != &identity.request.metadata {
-                    return Err(StoreWireError::Identity(
-                        "apply context does not match request identity metadata".to_owned(),
-                    ));
-                }
-                if transition.identity.idempotency_key != identity.idempotency_key {
-                    return Err(StoreWireError::Identity(
-                        "prepared transition idempotency key does not match request identity"
-                            .to_owned(),
-                    ));
-                }
-                if transition.state_fence != identity.request.state_fence {
-                    return Err(StoreWireError::Identity(
-                        "prepared transition fence does not match request identity".to_owned(),
-                    ));
-                }
-                for head in expected_revision_heads {
-                    if head.state_fence != identity.request.state_fence {
-                        return Err(StoreWireError::Identity(
-                            "revision expectation fence does not match request identity".to_owned(),
-                        ));
-                    }
-                }
-                for head in expected_ordering_heads {
-                    if head.state_fence != identity.request.state_fence {
-                        return Err(StoreWireError::Identity(
-                            "ordering expectation fence does not match request identity".to_owned(),
-                        ));
-                    }
-                }
-                Ok(())
-            }
+            } => validate_apply_identity(
+                context,
+                transition,
+                expected_revision_heads,
+                expected_ordering_heads,
+                identity,
+            ),
             Self::DreamerJob { context, request } => {
                 validate_dreamer_identity(context, request, identity)
             }
@@ -573,6 +583,45 @@ impl StoreRequest {
             _ => Ok(()),
         }
     }
+}
+
+fn validate_apply_identity(
+    context: &RequestMeta,
+    transition: &PreparedTransition,
+    expected_revision_heads: &[RevisionHeadExpectation],
+    expected_ordering_heads: &[OrderingHeadExpectation],
+    identity: &RequestIdentity,
+) -> Result<(), StoreWireError> {
+    if context != &identity.request.metadata {
+        return Err(StoreWireError::Identity(
+            "apply context does not match request identity metadata".to_owned(),
+        ));
+    }
+    if transition.identity.idempotency_key != identity.idempotency_key {
+        return Err(StoreWireError::Identity(
+            "prepared transition idempotency key does not match request identity".to_owned(),
+        ));
+    }
+    if transition.state_fence != identity.request.state_fence {
+        return Err(StoreWireError::Identity(
+            "prepared transition fence does not match request identity".to_owned(),
+        ));
+    }
+    for head in expected_revision_heads {
+        if head.state_fence != identity.request.state_fence {
+            return Err(StoreWireError::Identity(
+                "revision expectation fence does not match request identity".to_owned(),
+            ));
+        }
+    }
+    for head in expected_ordering_heads {
+        if head.state_fence != identity.request.state_fence {
+            return Err(StoreWireError::Identity(
+                "ordering expectation fence does not match request identity".to_owned(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Binds one decoded reserved-write request to the authenticated EBP
@@ -1168,6 +1217,9 @@ pub enum StoreResponse {
     OrderingHeads {
         heads: Vec<OrderingHead>,
     },
+    OrderingHeadReadbacks {
+        heads: Vec<OrderingHeadReadback>,
+    },
     ValidationSnapshot {
         snapshot: CanonicalValidationSnapshot,
     },
@@ -1176,6 +1228,9 @@ pub enum StoreResponse {
     },
     Genesis {
         receipt: WriteReceipt,
+    },
+    WorkScopeOwner {
+        response: StoreWorkScopeOwnerResponse,
     },
     DreamerJob {
         response: DurableJobResponse,
@@ -1292,6 +1347,15 @@ impl StoreResponse {
                 }
                 Ok(())
             }
+            Self::OrderingHeadReadbacks { heads } => {
+                bounded_unique(heads, "ordering_head_readbacks", |readback| {
+                    readback.head.scope.clone()
+                })?;
+                for readback in heads {
+                    readback.validate().map_err(StoreWireError::Store)?;
+                }
+                Ok(())
+            }
             Self::ValidationSnapshot { snapshot } => {
                 snapshot.validate().map_err(StoreWireError::Store)
             }
@@ -1312,6 +1376,9 @@ impl StoreResponse {
                     .require_reconciliation_envelope()
                     .map(|_| ())
                     .map_err(StoreWireError::Store)
+            }
+            Self::WorkScopeOwner { response } => {
+                response.record.validate().map_err(StoreWireError::Store)
             }
             Self::Failure { failure } => failure
                 .validate()

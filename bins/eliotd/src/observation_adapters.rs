@@ -61,6 +61,16 @@ impl<'a, P: ?Sized> ForwardingObservationReconciliation<'a, P> {
 }
 
 impl<P: KernelTransitionPort + ?Sized> ForwardingObservationReconciliation<'_, P> {
+    /// Prepares one original MCP `ObservationContent` capture through the
+    /// Governor owner. This remains a preparation step only; callers exchange
+    /// the returned immutable write after releasing their composition lock.
+    pub fn prepare_mcp_observation(
+        &self,
+        input: eliot_governor::McpObservationCaptureInput,
+    ) -> Result<eliot_governor::PreparedMcpObservation, CompositionError> {
+        self.inner.prepare_mcp_observation(input)
+    }
+
     /// Forwards one independently verified Doctor result to the Governor
     /// canonical path and returns only the exact issued receipt.
     pub async fn admit_doctor_verification(

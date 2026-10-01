@@ -28,8 +28,8 @@ use eliot_store_api::{
     OperationId, OrderingHead, OrderingHeadExpectation, OrderingScopeId, RecoveryRecord,
     RequestMeta, ReservedWriteRequest, RevisionHead, RevisionHeadExpectation, RevisionKey,
     StateFence, StoreError, StoreGenesisRequest, StoreRecoveryRequest, StoreRecoverySnapshot,
-    TransitionClass, WriteReceipt, decode_erasure_surfaces, generated_operation_manifests,
-    operation_manifest_set_digest,
+    StoreWorkScopeOwnerRequest, StoreWorkScopeOwnerResponse, TransitionClass, WriteReceipt,
+    decode_erasure_surfaces, generated_operation_manifests, operation_manifest_set_digest,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -90,6 +90,144 @@ pub(crate) async fn initialize_genesis(
     Ok(receipt)
 }
 
+/// Replaces the retained `WorkScope` owner row only when its current revision
+/// and full Store fence still equal the authenticated admission observation.
+/// The result is acknowledged only after a same-fence provider read returns
+/// the exact canonical record requested by Governor.
+pub(crate) async fn write_work_scope_owner(
+    adapter: &SurrealStoreAdapter,
+    context: &RequestMeta,
+    request: StoreWorkScopeOwnerRequest,
+) -> Result<StoreWorkScopeOwnerResponse, AdapterError> {
+    request
+        .validate_for_context(context)
+        .map_err(AdapterError::Store)?;
+    let _admission = adapter.exclusive_admission.exclusive_operation().await;
+    let Some(execution) = adapter.execution_handle() else {
+        return write_work_scope_owner_direct(adapter, context, request).await;
+    };
+    let transport = ProviderReservedTransport { adapter };
+    let (_, response) = execution
+        .drain_for_migration(
+            ExclusiveOpKind::WorkScopeOwner,
+            current_time_ms(),
+            &transport,
+            || write_work_scope_owner_direct(adapter, context, request),
+        )
+        .await?;
+    Ok(response)
+}
+
+async fn write_work_scope_owner_direct(
+    adapter: &SurrealStoreAdapter,
+    context: &RequestMeta,
+    request: StoreWorkScopeOwnerRequest,
+) -> Result<StoreWorkScopeOwnerResponse, AdapterError> {
+    request
+        .validate_for_context(context)
+        .map_err(AdapterError::Store)?;
+    let db = client(adapter).await?;
+    ensure_ready(adapter, db).await?;
+
+    let key = request.owner_record.record_key();
+    let read_request = StoreRecoveryRequest {
+        contract_version: request.contract_version,
+        state_fence: request.state_fence.clone(),
+        records: vec![key.clone()],
+        include_receipts: false,
+        include_jobs: false,
+    };
+    let current = recovery(adapter, read_request.clone())
+        .await?
+        .owner_records
+        .into_iter()
+        .next()
+        .ok_or(AdapterError::PartialOutcome)?;
+    if current == request.owner_record {
+        let response = StoreWorkScopeOwnerResponse { record: current };
+        response
+            .validate_for_request(&request)
+            .map_err(AdapterError::Store)?;
+        return Ok(response);
+    }
+    current.validate().map_err(AdapterError::Store)?;
+    if current.state_fence != request.state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    if current.namespace != request.owner_record.namespace
+        || current.key != request.owner_record.key
+        || current.schema != request.owner_record.schema
+        || current.revision != request.expected_owner_revision
+    {
+        return Err(AdapterError::Store(StoreError::IdentityConflict));
+    }
+
+    let owner_id = work_scope_owner_record_id(&key)?;
+    let statement = "BEGIN TRANSACTION; LET $work_scope_schema = (SELECT * FROM ONLY schema_meta:current); LET $work_scope_fence = (SELECT VALUE { state_fence: state_fence } FROM ONLY canonical_fence:current); IF !type::is_object($work_scope_schema) OR $work_scope_schema.generation != $expected_generation OR $work_scope_schema.migration_state != 'APPLIED' OR $work_scope_fence.state_fence != $expected_state_fence { THROW 'work_scope_owner_fence_conflict'; }; LET $work_scope_current = (SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision, schema: schema, payload: payload, value_digest: value_digest } FROM ONLY type::record($owner_table, $owner_id)); IF NOT type::is_object($work_scope_current) OR $work_scope_current.namespace != $expected_namespace OR $work_scope_current.key != $expected_key OR $work_scope_current.state_fence != $expected_state_fence OR $work_scope_current.revision != $expected_owner_revision OR $work_scope_current.schema != $expected_schema { THROW 'work_scope_owner_revision_conflict'; }; LET $work_scope_updated = (UPDATE type::record($owner_table, $owner_id) CONTENT { namespace: $owner.namespace, key: $owner.key, state_fence: $owner.state_fence, revision: $owner.revision, schema: $owner.schema, payload: <bytes>$owner.payload, value_digest: $owner.value_digest } WHERE revision = $expected_owner_revision AND state_fence = $expected_state_fence RETURN AFTER); IF array::len($work_scope_updated ?? []) != 1 { THROW 'work_scope_owner_revision_conflict'; }; COMMIT TRANSACTION;";
+    let bindings = json!({
+        "expected_generation": adapter.config.expected_schema_generation.as_str(),
+        "expected_state_fence": request.state_fence,
+        "expected_namespace": request.owner_record.namespace,
+        "expected_key": request.owner_record.key,
+        "expected_owner_revision": request.expected_owner_revision,
+        "expected_schema": request.owner_record.schema,
+        "owner_table": schema::table::RECOVERY_OWNER,
+        "owner_id": owner_id,
+        "owner": request.owner_record,
+    })
+    .as_object()
+    .cloned()
+    .ok_or_else(|| {
+        AdapterError::Serialization("WorkScope owner bindings are not an object".to_owned())
+    })?;
+    let write_result = client::query(
+        db,
+        &adapter.config,
+        "work_scope.owner.cas",
+        statement,
+        bindings,
+    )
+    .await
+    .and_then(|mut response| {
+        let errors = response.take_errors();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(atomic_write::classify_transaction_errors(
+                &errors,
+                "work_scope.owner.cas",
+            ))
+        }
+    });
+
+    // A lost provider reply is not proof of failure. Reconcile from the same
+    // owner row at the same fence and accept only byte-for-byte equality.
+    let readback = recovery(adapter, read_request).await;
+    if let Ok(snapshot) = &readback
+        && let Some(record) = snapshot.owner_records.first()
+        && record == &request.owner_record
+    {
+        let response = StoreWorkScopeOwnerResponse {
+            record: record.clone(),
+        };
+        response
+            .validate_for_request(&request)
+            .map_err(AdapterError::Store)?;
+        return Ok(response);
+    }
+    write_result?;
+    readback?;
+    Err(AdapterError::Store(StoreError::IdentityConflict))
+}
+
+fn work_scope_owner_record_id(
+    key: &eliot_store_api::RecoveryRecordKey,
+) -> Result<String, AdapterError> {
+    let bytes = eliot_store_api::canonical_json_bytes(key)
+        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+    Ok(eliot_store_api::sha256_hex(&bytes))
+}
+
 #[cfg(test)]
 use genesis::{
     GenesisState, build_genesis_bindings, build_genesis_sql, genesis_receipt,
@@ -99,8 +237,8 @@ pub(crate) use health_probe::{adapter_health, health};
 #[cfg(test)]
 use read_boundary::{READ_VALIDATION_SNAPSHOT, build_validation_snapshot};
 pub(crate) use read_boundary::{
-    execute_named, read_ordering_heads, read_revision_heads, read_scope_view,
-    read_validation_snapshot,
+    execute_named, read_ordering_head_readbacks, read_ordering_heads, read_revision_heads,
+    read_scope_view, read_validation_snapshot,
 };
 pub(crate) use receipt_reconciliation::read_receipt;
 use receipt_reconciliation::{

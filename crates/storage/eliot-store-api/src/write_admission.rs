@@ -279,6 +279,7 @@ use super::{
     RequestMeta, RevisionHeadExpectation, StoreError, WriteReceipt, WriteReceiptStatus,
     canonical_json_bytes, generated_operation_manifests, named_mutation_operation_name, sha256_hex,
 };
+use crate::{NamedMutationOperation, TransitionClass};
 use eliot_contracts::{ErrorCode, StateFence};
 
 /// Closed contract version of the write-admission projection (I5.22).
@@ -720,6 +721,56 @@ pub struct ReservedWriteRequest {
     pub expected_revision_heads: Vec<RevisionHeadExpectation>,
     /// Preserved ordering-head expectations covering the reserved scopes.
     pub expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    /// Original public write-submission values for a versioned Observe
+    /// capture. This is kept beside the prepared transition: it is source
+    /// metadata, not part of Governor semantic planning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_write_submission: Option<OriginalWriteSubmission>,
+}
+
+/// Exact user-supplied write identity metadata retained from the original
+/// public Observe capture request. Operation and idempotency identities remain
+/// owned by the authenticated request and prepared transition.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OriginalWriteSubmission {
+    /// Public write-envelope protocol version.
+    pub protocol_version: u32,
+    /// Stable user/agent intent carried across typed correction attempts.
+    pub write_intent_id: String,
+    /// Original agent response preference as an exact closed protocol token.
+    pub response_mode: String,
+}
+
+impl OriginalWriteSubmission {
+    /// Validates the public source values without deriving or aliasing any
+    /// other request identity.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        if self.protocol_version != 1 {
+            return Err(StoreError::InvalidField {
+                field: "original_write_submission.protocol_version",
+                reason: "unsupported write envelope version",
+            });
+        }
+        if self.write_intent_id.trim().is_empty()
+            || self.write_intent_id.chars().any(char::is_control)
+        {
+            return Err(StoreError::InvalidField {
+                field: "original_write_submission.write_intent_id",
+                reason: "must be non-blank and contain no control characters",
+            });
+        }
+        if !matches!(
+            self.response_mode.as_str(),
+            "wait_for_commit" | "accept_after_stage"
+        ) {
+            return Err(StoreError::InvalidField {
+                field: "original_write_submission.response_mode",
+                reason: "must be wait_for_commit or accept_after_stage",
+            });
+        }
+        Ok(())
+    }
 }
 
 impl ReservedWriteRequest {
@@ -738,6 +789,19 @@ impl ReservedWriteRequest {
         self.context.validate().map_err(StoreError::Foundation)?;
         self.transition.validate()?;
         self.admission.validate_shape()?;
+        if let Some(source) = &self.original_write_submission {
+            source.validate()?;
+            if self.transition.transition_class != TransitionClass::CaptureCandidate
+                || self.transition.named_operations.len() != 1
+                || self.transition.named_operations[0].operation
+                    != NamedMutationOperation::CaptureObservation
+            {
+                return Err(StoreError::InvalidField {
+                    field: "original_write_submission",
+                    reason: "is only valid for a single CaptureObservation transition",
+                });
+            }
+        }
         if self.admission.state_fence != self.context.state_fence
             || self.transition.state_fence != self.context.state_fence
         {
@@ -1468,6 +1532,34 @@ impl WriteSubmission {
         Ok(submission)
     }
 
+    /// Reports a durable ORS stage using its Store-owned reservation projection.
+    ///
+    /// The Kernel producer must call this only after ORS has durably staged and
+    /// read back the reservation, and after checking that the returned token
+    /// matches `admission`. The operation and request identities are copied
+    /// from that exact projection, and `ors_stage_ref` is its owner-mapped
+    /// reservation identity; no operation label or derived digest can stand in
+    /// for an ORS stage identity here.
+    pub fn staged(admission: &WriteAdmissionProjection) -> Result<Self, StoreError> {
+        admission.validate_shape()?;
+        let submission = Self {
+            submission_id: derive_submission_id(
+                &admission.operation_id,
+                &admission.canonical_request_hash,
+            )?,
+            operation_id: admission.operation_id.clone(),
+            request_hash: admission.canonical_request_hash.clone(),
+            state: WriteSubmissionState::Staged,
+            reason_codes: Vec::new(),
+            ors_stage_ref: Some(admission.reservation_id.clone()),
+            canonical_receipt_ref: None,
+            retry_identity_rule: STAGED_RETRY_IDENTITY_RULE.to_owned(),
+            next_allowed_action: STAGED_NEXT_ALLOWED_ACTION.to_owned(),
+        };
+        submission.validate()?;
+        Ok(submission)
+    }
+
     /// Renders the carried reason codes as one bounded comma-separated list.
     ///
     /// An accepted decision has no reason code, so this renders as the empty
@@ -1620,6 +1712,40 @@ impl fmt::Display for WriteSubmission {
             self.reason_codes_text(),
             self.next_allowed_action,
         )
+    }
+}
+
+/// One observed outcome of a prepared canonical write.
+///
+/// `Staged` reports only the durable ORS acceptance result. `Receipt` reports
+/// the terminal canonical store result; neither arm is inferred from the
+/// caller's wait mode or deadline.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreparedWriteOutcome {
+    /// ORS durably accepted the exact operation; the caller may poll and must
+    /// not submit a duplicate.
+    Staged(Box<WriteSubmission>),
+    /// The canonical store returned the terminal receipt for this operation.
+    Receipt(Box<WriteReceipt>),
+}
+
+impl PreparedWriteOutcome {
+    /// Validates that each arm carries the evidence its outcome claims.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        match self {
+            Self::Staged(submission) => {
+                submission.validate()?;
+                if submission.state != WriteSubmissionState::Staged {
+                    return Err(StoreError::InvalidField {
+                        field: "prepared_write_outcome.staged",
+                        reason: "the staged outcome must contain a staged submission",
+                    });
+                }
+            }
+            Self::Receipt(receipt) => receipt.validate()?,
+        }
+        Ok(())
     }
 }
 

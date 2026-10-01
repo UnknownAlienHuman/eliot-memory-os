@@ -3617,6 +3617,12 @@ fn current_unix_ms_u64() -> Result<u64, OrsError> {
 /// Composition-injected canonical/readback authenticator. `Ok(())` is trusted only because
 /// composition owns this provider; caller-created receipts never bypass it.
 pub trait CanonicalEvidenceProvider: Send + Sync {
+    /// Verifies Store owner observations against the complete original
+    /// reservation request before sequence allocation.
+    fn verify_reservation(&self, request: &crate::ReservationRequest) -> Result<(), OrsError> {
+        self.verify_ordering_heads(&request.scopes)
+    }
+
     fn verify_ordering_heads(
         &self,
         scopes: &[crate::ScopeReservationRequest],
@@ -4018,6 +4024,11 @@ pub trait OperationalRecoveryStore: Send + Sync {
         token: &WriterReservationToken,
         writer_epoch: &EpochIdentity,
     ) -> Result<ReservationRecord, OrsError>;
+    fn claim_execute(
+        &self,
+        token: &WriterReservationToken,
+        writer_epoch: &EpochIdentity,
+    ) -> Result<ReservationRecord, OrsError>;
     fn mark_unknown(
         &self,
         token: &WriterReservationToken,
@@ -4082,6 +4093,18 @@ pub trait OperationalRecoveryStore: Send + Sync {
         &self,
         operation_id: &crate::OperationIdentity,
     ) -> Result<Option<RecoveryPayloadEnvelope>, OrsError>;
+    /// Loads the exact original reservation through the durable operation
+    /// index. Unsupported stores fail closed instead of scanning or rebuilding
+    /// reservation identity.
+    fn load_write_reservation_by_operation(
+        &self,
+        _operation_id: &crate::OperationIdentity,
+    ) -> Result<Option<ReservationRecord>, OrsError> {
+        Err(OrsError::InvalidField {
+            field: "write_reservation_operation_readback",
+            reason: "the store does not expose the exact operation reservation owner",
+        })
+    }
     /// Durably stages one complete opaque operation and reserves every
     /// declared Ordering Scope in one atomic ORS transaction, then proves the
     /// staging before returning `ACCEPTED_PENDING` (issue #1925, I5.5/I5.6).
@@ -4205,6 +4228,16 @@ pub trait OperationalRecoveryStore: Send + Sync {
         request_digest: &str,
         attempt: &crate::HostRequestAttempt,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
+    /// Marks an exact protected Observe claim as submitted before returning
+    /// its executable pair to the daemon. This v0 local handoff has no
+    /// outbound Host transport channel, so it records the existing possible-
+    /// effect state without fabricating a v1 transport observation.
+    fn begin_host_request_observe_pair(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
     /// Expires an active v1 claim under its exact retained identity. Expiry
     /// moves possible-effect work to `Unknown`; it never grants another send.
     fn reconcile_expired_host_request_claim(
@@ -4281,6 +4314,12 @@ pub trait OperationalRecoveryStore: Send + Sync {
         result_evidence: Option<&crate::HostRequestEffectEvidence>,
         result_lineage: Option<&crate::HostRequestRetainedLineage>,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
+    /// Persists an Observe completion only under the exact current durable
+    /// pair attempt and its protected executable-input commitment.
+    fn persist_host_request_observe_result(
+        &self,
+        result: crate::HostRequestObserveResult<'_>,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
     /// Atomically stores an exact owner result and terminalizes the same
     /// claimed attempt that durably recorded `ResponseReceived`.
     fn persist_claimed_host_request_result(
@@ -4298,6 +4337,14 @@ pub trait OperationalRecoveryStore: Send + Sync {
         operation_id: &crate::OperationIdentity,
         request_digest: &str,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
+    /// Reads the unique durable row for an exact operation. Implementations
+    /// without this source refuse rather than report authoritative absence.
+    fn load_host_request_by_operation(
+        &self,
+        _operation_id: &crate::OperationIdentity,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        Err(OrsError::InvalidTransition)
+    }
     /// Atomically claims one logical host-request key or returns its winner
     /// (issue #2571: cross-restart replay without double execution).
     ///
@@ -4562,10 +4609,230 @@ pub trait OperationalRecoveryStore: Send + Sync {
     ) -> Result<Option<WorkerReplayRequestRecord>, OrsError>;
 }
 
+#[derive(Clone, Copy)]
+struct HostRequestResultPersistence<'a> {
+    operation_id: &'a crate::OperationIdentity,
+    request_digest: &'a str,
+    observe_attempt: Option<&'a crate::HostRequestAttempt>,
+    prepared_transition_sha256: Option<&'a str>,
+    result_digest: &'a str,
+    result_response: &'a serde_json::Value,
+    result_evidence: Option<&'a crate::HostRequestEffectEvidence>,
+    result_lineage: Option<&'a crate::HostRequestRetainedLineage>,
+}
+
+#[derive(Clone, Copy)]
+struct OriginalWriteResultEvidence<'a> {
+    prepared_transition_sha256: &'a str,
+    reservation: &'a crate::ReservationRecord,
+    envelope: &'a crate::RecoveryPayloadEnvelope,
+}
+
+/// Exact owner-supplied Observe completion retained under its durable claim.
+#[derive(Clone, Copy, Debug)]
+pub struct HostRequestObserveResult<'a> {
+    /// Durable host-request operation identity.
+    pub operation_id: &'a crate::OperationIdentity,
+    /// Exact retained host-request digest.
+    pub request_digest: &'a str,
+    /// Whole current durable attempt returned with the claimed pair.
+    pub attempt: &'a crate::HostRequestAttempt,
+    /// Digest of the exact original staged `PreparedTransition`, validated
+    /// by Kernel after recovery decryption and supplied as a proof for the
+    /// retained write binding. ORS never interprets the transition payload.
+    pub prepared_transition_sha256: &'a str,
+    /// Canonical digest of the exact result response.
+    pub result_digest: &'a str,
+    /// Exact bounded owner response body containing the canonical receipt.
+    pub result_response: &'a serde_json::Value,
+    /// Executor-observed effect evidence, when supplied by the owner.
+    pub result_evidence: Option<&'a crate::HostRequestEffectEvidence>,
+    /// Owner-submitted result lineage, including the original receipt reference.
+    pub result_lineage: Option<&'a crate::HostRequestRetainedLineage>,
+}
+
+fn validate_host_request_result_scope(
+    record: &crate::HostRequestRecord,
+    observe_attempt: Option<&crate::HostRequestAttempt>,
+    prepared_transition_sha256: Option<&str>,
+    original_reservation: Option<&crate::ReservationRecord>,
+    original_envelope: Option<&crate::RecoveryPayloadEnvelope>,
+    response: &serde_json::Value,
+    lineage: Option<&crate::HostRequestRetainedLineage>,
+) -> Result<(), OrsError> {
+    let invalid = || OrsError::InvalidField {
+        field: "host_request_result_observe_binding",
+        reason: "protected Observe results require the exact durable attempt and canonical receipt",
+    };
+    let Some(attempt) = observe_attempt else {
+        if record.executable_input.is_some()
+            || prepared_transition_sha256.is_some()
+            || original_reservation.is_some()
+            || original_envelope.is_some()
+        {
+            return Err(invalid());
+        }
+        return Ok(());
+    };
+    let input = record.executable_input.as_ref().ok_or_else(invalid)?;
+    let prepared_transition_sha256 = prepared_transition_sha256.ok_or_else(invalid)?;
+    crate::model::validate_digest(
+        prepared_transition_sha256,
+        "host_request_prepared_transition_sha256",
+    )?;
+    let original_reservation = original_reservation.ok_or_else(invalid)?;
+    let original_envelope = original_envelope.ok_or_else(invalid)?;
+    validate_observe_attempt_binding(record, attempt, input)?;
+    let lineage = lineage.ok_or_else(invalid)?;
+    if lineage.result_class != crate::HostRequestRetainedResultClass::CanonicalWriteReceipt {
+        return Err(invalid());
+    }
+    let receipt_value = response.get("receipt").cloned().ok_or_else(invalid)?;
+    let receipt: eliot_store_api::WriteReceipt =
+        serde_json::from_value(receipt_value).map_err(|_| invalid())?;
+    receipt.validate().map_err(|_| invalid())?;
+    let envelope = receipt
+        .require_reconciliation_envelope()
+        .map_err(|_| invalid())?;
+    let original_write = OriginalWriteResultEvidence {
+        prepared_transition_sha256,
+        reservation: original_reservation,
+        envelope: original_envelope,
+    };
+    validate_observe_receipt_binding(record, input, &original_write, &receipt, envelope, lineage)
+}
+
+fn validate_observe_attempt_binding(
+    record: &crate::HostRequestRecord,
+    attempt: &crate::HostRequestAttempt,
+    input: &crate::HostRequestExecutableInput,
+) -> Result<(), OrsError> {
+    if record.send_claim_protocol_version != 0
+        || record.kind != crate::HostRequestKind::Invocation
+        || record.capability_ref.as_str() != "eliot.observe"
+        || !matches!(
+            record.state,
+            crate::HostRequestState::Submitted
+                | crate::HostRequestState::Unknown
+                | crate::HostRequestState::Reconciling
+                | crate::HostRequestState::ResultReceived
+                | crate::HostRequestState::Terminal
+        )
+        || record.attempt.as_ref() != Some(attempt)
+        || attempt.phase != crate::HostRequestAttemptPhase::Claimed
+        || !attempt.transport_observations.is_empty()
+        || attempt.owner_readback.is_some()
+        || attempt.input_commitment_sha256.as_deref() != Some(input.commitment_sha256.as_str())
+    {
+        return Err(OrsError::InvalidField {
+            field: "host_request_result_observe_binding",
+            reason: "protected Observe results require the exact durable attempt and input commitment",
+        });
+    }
+    Ok(())
+}
+
+fn validate_observe_receipt_binding(
+    record: &crate::HostRequestRecord,
+    input: &crate::HostRequestExecutableInput,
+    original_write: &OriginalWriteResultEvidence<'_>,
+    receipt: &eliot_store_api::WriteReceipt,
+    envelope: &eliot_receipts::ReceiptEnvelope,
+    lineage: &crate::HostRequestRetainedLineage,
+) -> Result<(), OrsError> {
+    let invalid = || OrsError::InvalidField {
+        field: "host_request_result_observe_binding",
+        reason: "canonical receipt must join the original staged write and source request",
+    };
+    let prepared_transition_sha256 = original_write.prepared_transition_sha256;
+    let original_reservation = original_write.reservation;
+    let original_envelope = original_write.envelope;
+    let source_request = input
+        .application_binding
+        .source_request_identity
+        .get("request")
+        .ok_or_else(invalid)?;
+    let source_metadata = source_request.get("metadata").ok_or_else(invalid)?;
+    let source_request_id = source_metadata
+        .get("request_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(invalid)?;
+    let source_product_id = source_metadata
+        .get("product_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(invalid)?;
+    let source_id = source_metadata
+        .get("source_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(invalid)?;
+    let scope_ref = input
+        .application_binding
+        .scope_ref
+        .as_ref()
+        .ok_or_else(invalid)?;
+    let Some(work_scope) = record.scope_ref.as_ref() else {
+        return Err(invalid());
+    };
+    let write_binding = original_reservation
+        .token
+        .write_binding
+        .as_ref()
+        .ok_or_else(invalid)?;
+    write_binding.validate()?;
+    let binding_matches_original =
+        write_binding_matches_token(write_binding, &original_reservation.token)
+            && write_binding.operation_id == record.operation_id
+            && write_binding.idempotency_key.as_str() == record.idempotency_key.as_str()
+            && write_binding.canonical_request_sha256 == receipt.canonical_request_hash
+            && write_binding.prepared_transition_sha256 == prepared_transition_sha256
+            && write_binding.operation_manifest_digest.as_str()
+                == receipt.operation_manifest_digest.as_str();
+    if receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+        || receipt.operation_id.as_str() != record.operation_id.as_str()
+        || receipt.idempotency_key != record.idempotency_key.as_str()
+        || original_reservation.token.operation_id != record.operation_id
+        || original_reservation.token.prepared_transition_sha256 != prepared_transition_sha256
+        || original_reservation.token.write_binding.as_ref() != Some(write_binding)
+        || !binding_matches_original
+        || original_reservation.token.state_fence.validate().is_err()
+        || original_envelope.operation_or_checkpoint_id != record.operation_id
+        || original_envelope.authority_epoch != original_reservation.token.writer_epoch
+        || original_envelope.state_fence != original_reservation.token.state_fence
+        || original_envelope.write_binding.as_ref() != Some(write_binding)
+        || original_envelope.privacy_and_visibility_class
+            != input.protected_envelope.privacy_and_visibility_class
+        || !matches!(
+            &original_envelope.payload,
+            crate::RecoveryPayload::Encrypted { .. }
+        )
+        || serde_json::from_str::<eliot_contracts::StateFence>(
+            &original_reservation.token.state_fence.canonical_json,
+        )
+        .map_or(true, |fence| {
+            fence != input.application_binding.state_fence || fence != receipt.state_fence
+        })
+        || envelope.core.request.metadata.request_id.as_str() != source_request_id
+        || envelope.core.request.metadata.product_id.as_str() != source_product_id
+        || envelope.core.request.metadata.source_id.as_str() != source_id
+        || envelope.core.request.state_fence != input.application_binding.state_fence
+        || envelope.core.work_scope.scope_id.as_str() != work_scope.as_str()
+        || envelope.core.work_scope.state_fence != input.application_binding.state_fence
+        || envelope.core.operation.operation_id.as_str() != record.operation_id.as_str()
+        || envelope.core.operation.idempotency_key != record.idempotency_key.as_str()
+        || envelope.core.operation.state_fence != input.application_binding.state_fence
+        || scope_ref != work_scope
+        || lineage.semantic_receipt_ref.as_deref() != Some(envelope.identity.receipt_id.as_str())
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 /// redb-backed ORS implementation. Every mutating method commits one short transaction.
 pub struct RedbRecoveryStore {
     database: Database,
     evidence: Arc<dyn CanonicalEvidenceProvider>,
+    reservation_lifecycle_changed: tokio::sync::Notify,
     #[cfg(feature = "test-support")]
     authority_handoff_failpoint:
         std::sync::Mutex<Option<Arc<crate::test_support::AuthorityHandoffPersistenceFailpoint>>>,
@@ -7670,6 +7937,52 @@ impl RedbRecoveryStore {
             .transpose()
     }
 
+    /// Reads the original request identity from the existing durable table.
+    /// The operation is compared as an opaque identity; no request digest is
+    /// derived from it, and multiple matching identities are a conflict.
+    pub fn load_host_request_by_operation(
+        &self,
+        operation_id: &crate::OperationIdentity,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(HOST_REQUESTS).map_err(storage)?;
+        let prefix = format!("{}::", operation_id.as_str());
+        let end = format!("{prefix}~");
+        let mut found: Option<crate::HostRequestRecord> = None;
+        for item in table
+            .range(prefix.as_str()..=end.as_str())
+            .map_err(storage)?
+        {
+            let (key, value) = item.map_err(storage)?;
+            let record: crate::HostRequestRecord = decode(value.value())?;
+            record.validate()?;
+            if key.value()
+                != format!(
+                    "{}::{}",
+                    record.operation_id.as_str(),
+                    record.request_digest
+                )
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "host_request",
+                    reason: "durable key differs from its original operation/request identity"
+                        .to_owned(),
+                });
+            }
+            if record.operation_id != *operation_id {
+                continue;
+            }
+            if found.is_some() {
+                return Err(OrsError::HostRequestIdentityConflict {
+                    operation_id: operation_id.as_str().to_owned(),
+                    request_digest: record.request_digest,
+                });
+            }
+            found = Some(record);
+        }
+        Ok(found)
+    }
+
     /// Derives the canonical logical key for one host-request record
     /// (issue #2571: the admitted correlation namespace).
     ///
@@ -10069,6 +10382,7 @@ impl RedbRecoveryStore {
                 .map_err(storage)?;
         }
         write.commit().map_err(storage)?;
+        self.reservation_lifecycle_changed.notify_waiters();
         Ok(Some(next))
     }
 
@@ -10257,6 +10571,7 @@ impl RedbRecoveryStore {
                 .map_err(storage)?;
         }
         write.commit().map_err(storage)?;
+        self.reservation_lifecycle_changed.notify_waiters();
         Ok(Some(next))
     }
 
@@ -10362,6 +10677,7 @@ impl RedbRecoveryStore {
                     .map_err(storage)?;
             }
             write.commit().map_err(storage)?;
+            self.reservation_lifecycle_changed.notify_waiters();
             return Ok(Some(fenced));
         }
         let next = if existing.send_claim_protocol_version == 0 {
@@ -10475,6 +10791,7 @@ impl RedbRecoveryStore {
                             .map_err(storage)?;
                     }
                     write.commit().map_err(storage)?;
+                    self.reservation_lifecycle_changed.notify_waiters();
                     return Err(OrsError::HostRequestAttemptLimitExceeded);
                 }
                 Some(current)
@@ -10503,7 +10820,82 @@ impl RedbRecoveryStore {
                 .map_err(storage)?;
         }
         write.commit().map_err(storage)?;
+        if next.state != existing.state {
+            self.reservation_lifecycle_changed.notify_waiters();
+        }
         Ok(Some(next))
+    }
+
+    /// Durably fences one protected Observe pair before exposing it to the
+    /// daemon. This is a local pair handoff, not an outbound Host transport,
+    /// so the v0 row advances its existing operation state without acquiring
+    /// synthetic v1 channel custody evidence.
+    pub fn begin_host_request_observe_pair(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        crate::model::validate_digest(request_digest, "host_request_request_digest")?;
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing: Option<crate::HostRequestRecord> = {
+            let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let Some(mut record) = existing else {
+            return Ok(None);
+        };
+        record.validate()?;
+        if record.operation_id != *operation_id || record.request_digest != request_digest {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        if record.send_claim_protocol_version != 0
+            || record.kind != crate::HostRequestKind::Invocation
+            || record.capability_ref.as_str() != "eliot.observe"
+            || record.state != crate::HostRequestState::Routed
+            || record.result_digest.is_some()
+            || record.result_response.is_some()
+        {
+            return Err(OrsError::InvalidTransition);
+        }
+        let Some(current) = record.attempt.as_ref() else {
+            return Err(OrsError::InvalidTransition);
+        };
+        attempt.validate(&record.fence_digest)?;
+        let input = record
+            .executable_input
+            .as_ref()
+            .ok_or(OrsError::InvalidTransition)?;
+        if current != attempt
+            || current.phase != crate::HostRequestAttemptPhase::Claimed
+            || !current.transport_observations.is_empty()
+            || current.owner_readback.is_some()
+            || current.input_commitment_sha256.as_deref() != Some(input.commitment_sha256.as_str())
+        {
+            return Err(OrsError::InvalidTransition);
+        }
+        record.state = record
+            .state
+            .transition_to(crate::HostRequestState::Submitted)?;
+        record.validate()?;
+        let payload = encode(&record)?;
+        {
+            let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        self.reservation_lifecycle_changed.notify_waiters();
+        Ok(Some(record))
     }
 
     /// Moves one expired v1 send claim to reconciliation while retaining the
@@ -10599,6 +10991,7 @@ impl RedbRecoveryStore {
             }
         }
         write.commit().map_err(storage)?;
+        self.reservation_lifecycle_changed.notify_waiters();
         Ok(Some(record))
     }
 
@@ -10627,6 +11020,7 @@ impl RedbRecoveryStore {
             return Ok(None);
         };
         record.validate()?;
+        let previous_state = record.state;
         if record.operation_id != *operation_id || record.request_digest != request_digest {
             return Err(OrsError::HostRequestIdentityConflict {
                 operation_id: operation_id.as_str().to_owned(),
@@ -10667,6 +11061,7 @@ impl RedbRecoveryStore {
                 }
             }
             write.commit().map_err(storage)?;
+            self.reservation_lifecycle_changed.notify_waiters();
             return Err(OrsError::HostRequestAttemptExpired);
         }
         if current.phase != crate::HostRequestAttemptPhase::Claimed
@@ -10689,6 +11084,9 @@ impl RedbRecoveryStore {
                 .map_err(storage)?;
         }
         write.commit().map_err(storage)?;
+        if record.state != previous_state {
+            self.reservation_lifecycle_changed.notify_waiters();
+        }
         Ok(Some(record))
     }
 
@@ -10721,6 +11119,7 @@ impl RedbRecoveryStore {
             return Ok(None);
         };
         record.validate()?;
+        let previous_state = record.state;
         if record.operation_id != *operation_id || record.request_digest != request_digest {
             return Err(OrsError::HostRequestIdentityConflict {
                 operation_id: operation_id.as_str().to_owned(),
@@ -10827,6 +11226,9 @@ impl RedbRecoveryStore {
                 .map_err(storage)?;
         }
         write.commit().map_err(storage)?;
+        if record.state != previous_state {
+            self.reservation_lifecycle_changed.notify_waiters();
+        }
         Ok(Some(record))
     }
 
@@ -10854,6 +11256,7 @@ impl RedbRecoveryStore {
             return Ok(None);
         };
         record.validate()?;
+        let previous_state = record.state;
         if record.operation_id != *operation_id || record.request_digest != request_digest {
             return Err(OrsError::HostRequestIdentityConflict {
                 operation_id: operation_id.as_str().to_owned(),
@@ -10932,6 +11335,9 @@ impl RedbRecoveryStore {
                 .map_err(storage)?;
         }
         write.commit().map_err(storage)?;
+        if record.state != previous_state {
+            self.reservation_lifecycle_changed.notify_waiters();
+        }
         Ok(Some(record))
     }
 
@@ -10958,6 +11364,46 @@ impl RedbRecoveryStore {
             return Ok(None);
         };
         record.validate()?;
+        let previous_state = record.state;
+        if let Some(input) = record.executable_input.as_ref() {
+            let Some(current) = record.attempt.as_ref() else {
+                return Err(OrsError::InvalidTransition);
+            };
+            if record.send_claim_protocol_version != 0
+                || record.kind != crate::HostRequestKind::Invocation
+                || record.capability_ref.as_str() != "eliot.observe"
+                || current != attempt
+                || current.phase != crate::HostRequestAttemptPhase::Claimed
+                || current.input_commitment_sha256.as_deref()
+                    != Some(input.commitment_sha256.as_str())
+            {
+                return Err(OrsError::InvalidTransition);
+            }
+            if matches!(
+                record.state,
+                crate::HostRequestState::Unknown | crate::HostRequestState::Reconciling
+            ) {
+                write.commit().map_err(storage)?;
+                return Ok(Some(record));
+            }
+            if record.state != crate::HostRequestState::Submitted {
+                return Err(OrsError::InvalidTransition);
+            }
+            record.state = crate::HostRequestState::Unknown;
+            record.validate()?;
+            let payload = encode(&record)?;
+            {
+                let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+                table
+                    .insert(key.as_str(), payload.as_str())
+                    .map_err(storage)?;
+            }
+            write.commit().map_err(storage)?;
+            if record.state != previous_state {
+                self.reservation_lifecycle_changed.notify_waiters();
+            }
+            return Ok(Some(record));
+        }
         if record.send_claim_protocol_version == crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION {
             return Err(OrsError::InvalidTransition);
         }
@@ -10993,6 +11439,9 @@ impl RedbRecoveryStore {
                 .map_err(storage)?;
         }
         write.commit().map_err(storage)?;
+        if record.state != previous_state {
+            self.reservation_lifecycle_changed.notify_waiters();
+        }
         Ok(Some(record))
     }
 
@@ -11159,6 +11608,7 @@ impl RedbRecoveryStore {
                 .map_err(storage)?;
         }
         write.commit().map_err(storage)?;
+        self.reservation_lifecycle_changed.notify_waiters();
         Ok(Some(record))
     }
 
@@ -11194,6 +11644,12 @@ impl RedbRecoveryStore {
             return Ok(None);
         };
         existing.validate()?;
+        if existing.executable_input.is_some() {
+            return Err(OrsError::InvalidField {
+                field: "host_request_payload_body",
+                reason: "protected executable requests cannot acquire a plaintext payload body",
+            });
+        }
         crate::model::validate_payload_body(body, &existing.payload_digest)?;
         if let Some(staged) = existing.payload_body.as_ref() {
             if staged == body {
@@ -11234,10 +11690,6 @@ impl RedbRecoveryStore {
     /// lineage are written with the result in the same transaction, so the
     /// operation/effect identity and its evidence references are never
     /// separable at the authority boundary.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the result-retention transaction keeps replay, lifecycle, and immutable-view joins together"
-    )]
     pub fn persist_host_request_result(
         &self,
         operation_id: &crate::OperationIdentity,
@@ -11247,6 +11699,55 @@ impl RedbRecoveryStore {
         result_evidence: Option<&crate::HostRequestEffectEvidence>,
         result_lineage: Option<&crate::HostRequestRetainedLineage>,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        self.persist_host_request_result_inner(HostRequestResultPersistence {
+            operation_id,
+            request_digest,
+            observe_attempt: None,
+            prepared_transition_sha256: None,
+            result_digest,
+            result_response,
+            result_evidence,
+            result_lineage,
+        })
+    }
+
+    /// Persists a protected Observe result under its exact durable pair
+    /// attempt. Unlike generic local-read completion, this path accepts only
+    /// the same submitted input commitment and an actual canonical receipt.
+    pub fn persist_host_request_observe_result(
+        &self,
+        result: crate::HostRequestObserveResult<'_>,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        self.persist_host_request_result_inner(HostRequestResultPersistence {
+            operation_id: result.operation_id,
+            request_digest: result.request_digest,
+            observe_attempt: Some(result.attempt),
+            prepared_transition_sha256: Some(result.prepared_transition_sha256),
+            result_digest: result.result_digest,
+            result_response: result.result_response,
+            result_evidence: result.result_evidence,
+            result_lineage: result.result_lineage,
+        })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the result-retention transaction keeps replay, lifecycle, and immutable-view joins together"
+    )]
+    fn persist_host_request_result_inner(
+        &self,
+        persistence: HostRequestResultPersistence<'_>,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        let HostRequestResultPersistence {
+            operation_id,
+            request_digest,
+            observe_attempt,
+            prepared_transition_sha256,
+            result_digest,
+            result_response,
+            result_evidence,
+            result_lineage,
+        } = persistence;
         crate::model::validate_digest(result_digest, "host_request_result_digest")?;
         let campaign_view = campaign_view_publication(result_response)?;
         let key = format!("{}::{}", operation_id.as_str(), request_digest);
@@ -11263,6 +11764,73 @@ impl RedbRecoveryStore {
             return Ok(None);
         };
         existing.validate()?;
+        let original_reservation = if observe_attempt.is_some() {
+            let reservation_id = {
+                let operations = write.open_table(OPERATIONS).map_err(storage)?;
+                operations
+                    .get(operation_id.as_str())
+                    .map_err(storage)?
+                    .map(|value| value.value().to_owned())
+            }
+            .ok_or(OrsError::ReservationNotFound)?;
+            let reservation_id = OperationIdentity::new(reservation_id)?;
+            let reservation = {
+                let reservations = write.open_table(RESERVATIONS).map_err(storage)?;
+                reservations
+                    .get(reservation_id.as_str())
+                    .map_err(storage)?
+                    .map(|value| decode::<ReservationRecord>(value.value()))
+                    .transpose()?
+            }
+            .ok_or_else(|| OrsError::IntegrityProblem {
+                record_type: "reservation_operation_index",
+                reason: "operation index names a missing primary reservation".to_owned(),
+            })?;
+            if reservation.token.reservation_id != reservation_id
+                || reservation.token.operation_id != *operation_id
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "reservation_operation_index",
+                    reason: "operation index differs from the primary reservation".to_owned(),
+                });
+            }
+            Some(reservation)
+        } else {
+            None
+        };
+        let original_envelope = if observe_attempt.is_some() {
+            let envelope = {
+                let table = write.open_table(ENVELOPES).map_err(storage)?;
+                table
+                    .get(operation_id.as_str())
+                    .map_err(storage)?
+                    .map(|value| decode::<RecoveryPayloadEnvelope>(value.value()))
+                    .transpose()?
+            }
+            .ok_or(OrsError::InvalidField {
+                field: "host_request_result_observe_binding",
+                reason: "protected Observe requires the exact staged write envelope",
+            })?;
+            envelope.validate()?;
+            if envelope.operation_or_checkpoint_id != existing.operation_id {
+                return Err(OrsError::HostRequestIdentityConflict {
+                    operation_id: operation_id.as_str().to_owned(),
+                    request_digest: request_digest.to_owned(),
+                });
+            }
+            Some(envelope)
+        } else {
+            None
+        };
+        validate_host_request_result_scope(
+            &existing,
+            observe_attempt,
+            prepared_transition_sha256,
+            original_reservation.as_ref(),
+            original_envelope.as_ref(),
+            result_response,
+            result_lineage,
+        )?;
         if existing.send_claim_protocol_version == crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION {
             return Err(OrsError::InvalidTransition);
         }
@@ -11406,6 +11974,7 @@ impl RedbRecoveryStore {
                 .map_err(storage)?;
         }
         write.commit().map_err(storage)?;
+        self.reservation_lifecycle_changed.notify_waiters();
         Ok(Some(next))
     }
 
@@ -27294,6 +27863,19 @@ impl RedbRecoveryStore {
         Ok((store, record.installed_identity()?))
     }
 
+    /// Opens ORS for one Host-authenticated installation with the
+    /// composition-owned canonical/readback authenticator, preserving the
+    /// same installation binding and durable object-generation checks as
+    /// [`Self::open_for_installation`].
+    pub fn open_for_installation_with_evidence(
+        path: impl AsRef<Path>,
+        installation_id: &str,
+        evidence: Arc<dyn CanonicalEvidenceProvider>,
+    ) -> Result<(Self, OrsStoreIdentity), OrsError> {
+        let (store, record) = Self::open_inner(path, evidence, Some(installation_id))?;
+        Ok((store, record.installed_identity()?))
+    }
+
     /// Opens ORS with the composition-owned canonical/readback authenticator.
     pub fn open_with_evidence(
         path: impl AsRef<Path>,
@@ -27301,6 +27883,77 @@ impl RedbRecoveryStore {
     ) -> Result<Self, OrsError> {
         let (store, _) = Self::open_inner(path, evidence, None)?;
         Ok(store)
+    }
+
+    /// Waits until this reservation passes the store's durable eligibility
+    /// transition, preserving its exact token and writer epoch throughout the
+    /// wait. A pending predecessor is rechecked after every committed
+    /// predecessor closure; no polling delay or replacement deadline is added.
+    pub async fn wait_until_eligible(
+        &self,
+        token: &WriterReservationToken,
+        writer_epoch: &EpochIdentity,
+    ) -> Result<ReservationRecord, OrsError> {
+        require_writer_epoch(token, writer_epoch)?;
+        loop {
+            let notified = self.reservation_lifecycle_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            match <Self as OperationalRecoveryStore>::mark_eligible(self, token) {
+                Ok(record) => return Ok(record),
+                Err(OrsError::PredecessorPending) => notified.await,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Waits for the exact Host write's durable Host or reservation state to
+    /// differ from the caller's last observation.
+    ///
+    /// The waiter arms the existing lifecycle notification before reading
+    /// either owner, so a commit racing the read cannot be lost. The Host row
+    /// is loaded by its exact operation/request pair and the reservation by
+    /// its exact operation index; notifications carry no state or authority.
+    /// Callers may repeat with the returned states when they need a later
+    /// boundary, such as the Host result after stage acceptance.
+    pub async fn wait_for_host_write_change(
+        &self,
+        operation_id: &OperationIdentity,
+        request_digest: &str,
+        previous_host_state: HostRequestState,
+        previous_reservation_state: Option<ReservationState>,
+    ) -> Result<(HostRequestRecord, Option<ReservationRecord>), OrsError> {
+        crate::model::validate_digest(request_digest, "host_request_request_digest")?;
+        loop {
+            let notified = self.reservation_lifecycle_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            let host_request = self
+                .load_host_request(operation_id, request_digest)?
+                .ok_or(OrsError::InvalidField {
+                    field: "host_request_change_wait",
+                    reason: "the exact original Host request is missing",
+                })?;
+            if host_request.operation_id != *operation_id
+                || host_request.request_digest != request_digest
+            {
+                return Err(OrsError::HostRequestIdentityConflict {
+                    operation_id: operation_id.as_str().to_owned(),
+                    request_digest: request_digest.to_owned(),
+                });
+            }
+            let reservation = self.load_write_reservation_by_operation(operation_id)?;
+            let reservation_state = reservation.as_ref().map(|record| record.state);
+            if host_request.state != previous_host_state
+                || reservation_state != previous_reservation_state
+            {
+                return Ok((host_request, reservation));
+            }
+
+            notified.await;
+        }
     }
 
     /// Reads the installed identity and object generation from durable ORS metadata.
@@ -27326,6 +27979,7 @@ impl RedbRecoveryStore {
         let store = Self {
             database,
             evidence,
+            reservation_lifecycle_changed: tokio::sync::Notify::new(),
             #[cfg(feature = "test-support")]
             authority_handoff_failpoint: std::sync::Mutex::new(None),
         };
@@ -28234,6 +28888,15 @@ impl RedbRecoveryStore {
             .transpose()
     }
 
+    /// Loads the exact original reservation through its operation index and
+    /// validates the primary row and its durable indexes in one read snapshot.
+    pub fn load_write_reservation_by_operation(
+        &self,
+        operation_id: &OperationIdentity,
+    ) -> Result<Option<ReservationRecord>, OrsError> {
+        load_write_reservation_by_operation_in_read(&self.database, operation_id)
+    }
+
     fn load_record(
         table: &impl ReadableTable<&'static str, &'static str>,
         reservation_id: &crate::OperationIdentity,
@@ -28291,6 +28954,25 @@ impl RedbRecoveryStore {
             }
         }
         Ok(())
+    }
+
+    fn validate_execute_transition(
+        write: &redb::WriteTransaction,
+        table: &impl ReadableTable<&'static str, &'static str>,
+        record: &ReservationRecord,
+        token: &WriterReservationToken,
+        allow_executing_replay: bool,
+    ) -> Result<bool, OrsError> {
+        Self::validate_token(record, token)?;
+        match record.state {
+            ReservationState::Eligible => {
+                Self::ensure_no_predecessor(table, token)?;
+                Self::ensure_canonical_heads(write, token)?;
+                Ok(false)
+            }
+            ReservationState::Executing if allow_executing_replay => Ok(true),
+            _ => Err(OrsError::InvalidTransition),
+        }
     }
 
     fn clear_recovery_blocks(
@@ -34158,7 +34840,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         if let Some(token) = Self::existing_token(&write, &request)? {
             return Ok(token);
         }
-        self.evidence.verify_ordering_heads(&request.scopes)?;
+        self.evidence.verify_reservation(&request)?;
         let reservation_order = Self::next_reservation_order(&write)?;
         let reserved_scopes = Self::reserve_scope_sequences(&write, &request)?;
 
@@ -34184,7 +34866,10 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         if let Err(error) = write.commit() {
             let commit_error = storage(error);
             return match self.staged_reservation_readback(&token) {
-                Ok(true) => Ok(token),
+                Ok(true) => {
+                    self.reservation_lifecycle_changed.notify_waiters();
+                    Ok(token)
+                }
                 Ok(false) => Err(OrsError::StagingCommitOutcomeUnknown {
                     operation_id: token.operation_id,
                     reservation_id: token.reservation_id,
@@ -34199,6 +34884,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                 }),
             };
         }
+        self.reservation_lifecycle_changed.notify_waiters();
         Ok(token)
     }
 
@@ -34224,6 +34910,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         }
         Self::bump_recovery_inventory_revision(&write, RecoveryInventorySource::Reservations)?;
         write.commit().map_err(storage)?;
+        self.reservation_lifecycle_changed.notify_waiters();
         Ok(record)
     }
 
@@ -34238,14 +34925,9 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         {
             let mut table = write.open_table(RESERVATIONS).map_err(storage)?;
             record = Self::load_record(&table, &token.reservation_id)?;
-            Self::validate_token(&record, token)?;
-            match record.state {
-                ReservationState::Executing => return Ok(record),
-                ReservationState::Eligible => {}
-                _ => return Err(OrsError::InvalidTransition),
+            if Self::validate_execute_transition(&write, &table, &record, token, true)? {
+                return Ok(record);
             }
-            Self::ensure_no_predecessor(&table, token)?;
-            Self::ensure_canonical_heads(&write, token)?;
             record.state = ReservationState::Executing;
             let payload = encode(&record)?;
             table
@@ -34254,6 +34936,31 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         }
         Self::bump_recovery_inventory_revision(&write, RecoveryInventorySource::Reservations)?;
         write.commit().map_err(storage)?;
+        self.reservation_lifecycle_changed.notify_waiters();
+        Ok(record)
+    }
+
+    fn claim_execute(
+        &self,
+        token: &WriterReservationToken,
+        writer_epoch: &EpochIdentity,
+    ) -> Result<ReservationRecord, OrsError> {
+        require_writer_epoch(token, writer_epoch)?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let mut record;
+        {
+            let mut table = write.open_table(RESERVATIONS).map_err(storage)?;
+            record = Self::load_record(&table, &token.reservation_id)?;
+            Self::validate_execute_transition(&write, &table, &record, token, false)?;
+            record.state = ReservationState::Executing;
+            let payload = encode(&record)?;
+            table
+                .insert(token.reservation_id.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        Self::bump_recovery_inventory_revision(&write, RecoveryInventorySource::Reservations)?;
+        write.commit().map_err(storage)?;
+        self.reservation_lifecycle_changed.notify_waiters();
         Ok(record)
     }
 
@@ -34304,6 +35011,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             }
         }
         write.commit().map_err(storage)?;
+        self.reservation_lifecycle_changed.notify_waiters();
         Ok(record)
     }
 
@@ -34353,6 +35061,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         Self::record_scope_terminals(&write, reconciliation)?;
         Self::clear_recovery_blocks(&write, &record)?;
         write.commit().map_err(storage)?;
+        self.reservation_lifecycle_changed.notify_waiters();
         Ok(record)
     }
 
@@ -34383,6 +35092,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         }
         Self::bump_recovery_inventory_revision(&write, RecoveryInventorySource::Reservations)?;
         write.commit().map_err(storage)?;
+        self.reservation_lifecycle_changed.notify_waiters();
         Ok(record)
     }
 
@@ -34436,6 +35146,13 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             .map_err(storage)?
             .map(|value| decode(value.value()))
             .transpose()
+    }
+
+    fn load_write_reservation_by_operation(
+        &self,
+        operation_id: &crate::OperationIdentity,
+    ) -> Result<Option<ReservationRecord>, OrsError> {
+        RedbRecoveryStore::load_write_reservation_by_operation(self, operation_id)
     }
 
     #[expect(
@@ -34979,7 +35696,9 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             drop(reservations);
             Self::bump_recovery_inventory_revision(&write, RecoveryInventorySource::Reservations)?;
         }
-        write.commit().map_err(storage)
+        write.commit().map_err(storage)?;
+        self.reservation_lifecycle_changed.notify_waiters();
+        Ok(())
     }
 
     fn stage_host_request(
@@ -35028,6 +35747,20 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         attempt: &crate::HostRequestAttempt,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
         RedbRecoveryStore::claim_host_request_attempt(self, operation_id, request_digest, attempt)
+    }
+
+    fn begin_host_request_observe_pair(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        RedbRecoveryStore::begin_host_request_observe_pair(
+            self,
+            operation_id,
+            request_digest,
+            attempt,
+        )
     }
 
     fn reconcile_expired_host_request_claim(
@@ -35121,6 +35854,13 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         )
     }
 
+    fn persist_host_request_observe_result(
+        &self,
+        result: crate::HostRequestObserveResult<'_>,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        RedbRecoveryStore::persist_host_request_observe_result(self, result)
+    }
+
     fn persist_claimed_host_request_result(
         &self,
         operation_id: &crate::OperationIdentity,
@@ -35147,6 +35887,13 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         request_digest: &str,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
         RedbRecoveryStore::load_host_request(self, operation_id, request_digest)
+    }
+
+    fn load_host_request_by_operation(
+        &self,
+        operation_id: &crate::OperationIdentity,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        RedbRecoveryStore::load_host_request_by_operation(self, operation_id)
     }
 
     fn resolve_or_stage_host_request(
@@ -35591,6 +36338,15 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
         self.store.verify_staged_envelope(operation_id)
     }
 
+    /// Loads the exact original reservation through its durable operation
+    /// index and validates the primary row and indexes before returning it.
+    pub fn load_write_reservation_by_operation(
+        &self,
+        operation_id: &crate::OperationIdentity,
+    ) -> Result<Option<ReservationRecord>, OrsError> {
+        self.store.load_write_reservation_by_operation(operation_id)
+    }
+
     /// Retains one caller-reported missing-key/decryption-failure problem.
     /// Digest-only: no payload bytes are accepted or stored.
     pub fn report_recovery_problem(
@@ -35692,6 +36448,18 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
             .claim_host_request_attempt(operation_id, request_digest, attempt)
     }
 
+    /// Durably marks an exact protected Observe claim submitted before its
+    /// executable pair is exposed to the daemon.
+    pub fn begin_host_request_observe_pair(
+        &self,
+        operation_id: &OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+    ) -> Result<Option<HostRequestRecord>, OrsError> {
+        self.store
+            .begin_host_request_observe_pair(operation_id, request_digest, attempt)
+    }
+
     /// Reconciles an expired active send claim under its retained identity.
     pub fn reconcile_expired_host_request_claim(
         &self,
@@ -35784,6 +36552,14 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
         )
     }
 
+    /// Persists a protected Observe result for the exact submitted claim.
+    pub fn persist_host_request_observe_result(
+        &self,
+        result: crate::HostRequestObserveResult<'_>,
+    ) -> Result<Option<HostRequestRecord>, OrsError> {
+        self.store.persist_host_request_observe_result(result)
+    }
+
     /// Atomically persists the exact response for the claim whose retained
     /// custody evidence already contains the same response commitment.
     pub fn persist_claimed_host_request_result(
@@ -35812,6 +36588,15 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
         request_digest: &str,
     ) -> Result<Option<HostRequestRecord>, OrsError> {
         self.store.load_host_request(operation_id, request_digest)
+    }
+
+    /// Resolves the unique original host-request row for a canonical caller
+    /// that carries its operation identity but no transport request digest.
+    pub fn load_host_request_by_operation(
+        &self,
+        operation_id: &OperationIdentity,
+    ) -> Result<Option<HostRequestRecord>, OrsError> {
+        self.store.load_host_request_by_operation(operation_id)
     }
 
     /// Atomically claims one logical host-request key or returns its winner.
@@ -36183,6 +36968,41 @@ pub(super) fn validate_write_reservation_inventory_in_read(
 }
 
 fn ignore_census_observation(_: &str, _: &str, _: &str) {}
+
+fn load_write_reservation_by_operation_in_read(
+    database: &Database,
+    operation_id: &OperationIdentity,
+) -> Result<Option<ReservationRecord>, OrsError> {
+    let read = database.begin_read().map_err(storage)?;
+    let reservation_id = {
+        let operations = read.open_table(OPERATIONS).map_err(storage)?;
+        operations
+            .get(operation_id.as_str())
+            .map_err(storage)?
+            .map(|value| value.value().to_owned())
+    };
+    let Some(reservation_id) = reservation_id else {
+        return Ok(None);
+    };
+    validate_write_reservation_operation_in_read(&read, operation_id.as_str(), &reservation_id)?;
+    let reservation_id = OperationIdentity::new(reservation_id)?;
+    let reservations = read.open_table(RESERVATIONS).map_err(storage)?;
+    let record = RedbRecoveryStore::load_record(&reservations, &reservation_id)?;
+    drop(reservations);
+    if record.token.operation_id != *operation_id || record.token.reservation_id != reservation_id {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "reservation_operation_index",
+            reason: "operation index differs from the primary reservation".to_owned(),
+        });
+    }
+    validate_write_reservation_primary_in_read(
+        &read,
+        reservation_id.as_str(),
+        &record,
+        &mut ignore_census_observation,
+    )?;
+    Ok(Some(record))
+}
 
 fn validate_write_reservation_primary_in_read(
     read: &redb::ReadTransaction,
@@ -37068,6 +37888,7 @@ mod host_request_result_tests {
             payload_digest: "b".repeat(64),
             payload_schema_id: None,
             payload_body: None,
+            executable_input: None,
             connection_ref: label("conn-1"),
             session_ref: Some(label("session-1")),
             task_ref: None,

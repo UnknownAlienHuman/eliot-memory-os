@@ -33,12 +33,13 @@ use eliot_store_api::{
     EVIDENCE_PACK_MAX_RECORDS, EventId, EventProjectionRelationIntents, MAX_RECOVERY_RECORD_BYTES,
     NamedMutationOperation, NamedReadOperation, NamedReadRequest, NamedReadResponse,
     OWNER_SNAPSHOT_SCHEMA, OperationId, OperationManifestDigest, OrderingHead,
-    OrderingHeadExpectation, OrderingScopeId, OutboxId, OutboxIntent, OutboxState,
-    PreparedTransition, ProjectionMode, ProjectionPublicationId, ProjectionPublicationRecord,
-    ProjectionStatus, RecoveryRecord, RecoveryRecordKey, RequestMeta, Resubmission, RevisionDelta,
-    RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SplitView,
-    StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus,
-    StoreRecoveryRequest, StoreRecoverySnapshot, TransitionClass, WriteReceipt, WriteReceiptStatus,
+    OrderingHeadExpectation, OrderingHeadReadback, OrderingScopeId, OutboxId, OutboxIntent,
+    OutboxState, PreparedTransition, ProjectionMode, ProjectionPublicationId,
+    ProjectionPublicationRecord, ProjectionStatus, RecoveryRecord, RecoveryRecordKey, RequestMeta,
+    Resubmission, RevisionDelta, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
+    ScopeRevisionView, SplitView, StateFence, StoreError, StoreGenesisRequest, StoreHealth,
+    StoreHealthStatus, StoreRecoveryRequest, StoreRecoverySnapshot, StoreWorkScopeOwnerRequest,
+    StoreWorkScopeOwnerResponse, TransitionClass, WriteReceipt, WriteReceiptStatus,
     audit_heads_digest, bind_issue18_receipt, bind_policy_config_schema_versions,
     canonical_json_bytes, canonical_request_hash, decode_automation_mutation,
     decode_erasure_surfaces, decode_notification_mutation, decode_reactive_mutation,
@@ -5117,6 +5118,52 @@ impl MemoryStore {
             .insert(request.operation_id.to_string(), receipt.clone());
         Ok(receipt)
     }
+
+    /// Applies the narrow `WorkScope` owner CAS under the same mutex used by
+    /// recovery reads. The requested record is the only owner row changed.
+    fn write_work_scope_owner_sync(
+        &self,
+        context: &RequestMeta,
+        request: &StoreWorkScopeOwnerRequest,
+    ) -> Result<StoreWorkScopeOwnerResponse, StoreError> {
+        request.validate_for_context(context)?;
+        let mut state = self.lock_state()?;
+        if state.fences.as_ref() != Some(&request.state_fence) {
+            return Err(StoreError::FenceMismatch);
+        }
+        let key = request.owner_record.record_key();
+        let current = state
+            .recovery_records
+            .get(&key)
+            .ok_or(StoreError::IdentityConflict)?;
+        current.validate()?;
+        if current.state_fence != request.state_fence {
+            return Err(StoreError::FenceMismatch);
+        }
+        if current == &request.owner_record {
+            return Ok(StoreWorkScopeOwnerResponse {
+                record: current.clone(),
+            });
+        }
+        if current.revision != request.expected_owner_revision
+            || current.namespace != request.owner_record.namespace
+            || current.key != request.owner_record.key
+            || current.schema != request.owner_record.schema
+        {
+            return Err(StoreError::IdentityConflict);
+        }
+        state
+            .recovery_records
+            .insert(key, request.owner_record.clone());
+        let readback = state
+            .recovery_records
+            .get(&request.owner_record.record_key())
+            .cloned()
+            .ok_or(StoreError::Unavailable)?;
+        let response = StoreWorkScopeOwnerResponse { record: readback };
+        response.validate_for_request(request)?;
+        Ok(response)
+    }
 }
 
 impl CanonicalStoreClient for MemoryStore {
@@ -5150,6 +5197,14 @@ impl CanonicalStoreClient for MemoryStore {
         self.initialize_genesis_sync(context, &request)
     }
 
+    async fn write_work_scope_owner(
+        &self,
+        context: &RequestMeta,
+        request: StoreWorkScopeOwnerRequest,
+    ) -> Result<StoreWorkScopeOwnerResponse, StoreError> {
+        self.write_work_scope_owner_sync(context, &request)
+    }
+
     async fn receipt(&self, operation_id: OperationId) -> Result<Option<WriteReceipt>, StoreError> {
         self.receipt_sync(&operation_id)
     }
@@ -5177,6 +5232,26 @@ impl CanonicalStoreClient for MemoryStore {
         scopes: Vec<OrderingScopeId>,
     ) -> Result<Vec<OrderingHead>, StoreError> {
         self.ordering_heads_sync(&scopes)
+    }
+
+    async fn ordering_head_readbacks(
+        &self,
+        scopes: Vec<OrderingScopeId>,
+    ) -> Result<Vec<OrderingHeadReadback>, StoreError> {
+        self.ordering_heads_sync(&scopes)?
+            .into_iter()
+            .map(|head| {
+                let canonical_bytes = canonical_json_bytes(&head)
+                    .map_err(|error| StoreError::Serialization(error.to_string()))?;
+                let readback = OrderingHeadReadback {
+                    head,
+                    canonical_sha256: sha256_hex(&canonical_bytes),
+                    canonical_bytes,
+                };
+                readback.validate()?;
+                Ok(readback)
+            })
+            .collect()
     }
 
     async fn execute_named(

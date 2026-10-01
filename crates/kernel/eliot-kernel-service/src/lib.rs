@@ -25,6 +25,7 @@ pub use commit_recovery::{
     PausedScopeSnapshot, classify_commit_receipt, paused_ordering_scope_view,
     paused_scopes_snapshot, receipt_evidence_digest, recover_commit,
 };
+mod canonical_store_evidence;
 mod capacity_evidence;
 mod contract_rejection_gate;
 mod doctor;
@@ -73,6 +74,7 @@ mod wasm_control;
 mod wasm_dispatch;
 mod write_coordinator;
 
+pub use canonical_store_evidence::CanonicalStoreEvidence;
 pub use capacity_evidence::{
     BoundaryOptimizationProposal, CAPACITY_EVIDENCE_SCHEMA_VERSION, CanonicalWriteLatencyProfile,
     CapacityEnvelope, CapacityEvidenceError, CorpusScaleProfile, EvidenceClass,
@@ -229,8 +231,6 @@ pub use store_client::{
     StoreClientFault, StoreClientFaultHarness,
 };
 #[cfg(windows)]
-pub use store_gateway::KernelStoreGateway;
-#[cfg(windows)]
 pub use store_gateway::NamedReadGatewayError;
 #[cfg(windows)]
 pub use store_gateway::StoreApplyRefusal;
@@ -242,6 +242,11 @@ pub use store_gateway::StoreApplyRefusal;
 // retained at all — instead of rendering one reason string for both.
 #[cfg(windows)]
 pub use store_gateway::UserAutomationHorizonPublicationRefusal;
+#[cfg(windows)]
+pub use store_gateway::{
+    AcceptedReservedWrite, BorrowedCanonicalStoreClient, KernelStoreGateway,
+    StagedReservedWriteError,
+};
 // Issue #1681 W3: the named-read refusal leaves the Kernel with a typed
 // `StoreError` and nothing else. These two are the missing half the transport
 // edge needs to turn that cause into the complete versioned #1679 directive
@@ -264,10 +269,10 @@ pub use store_write_reservation::{
     StartupEnvelopeProblem, StartupPendingOperation, StartupReconciliation,
     StartupReconciliationReadiness, StartupStagedEnvelope, StartupUnknownOperation,
     UNKNOWN_OUTCOME_REASON, begin_execute_after_send, cancel_before_send, ensure_eligible,
-    finalize_reservation, gateway_seed, mark_unknown_outcome, project_reserved_write,
-    reconcile_pending_at_startup, reconcile_receipt, reconcile_staged_writes_at_startup,
-    recovery_page, reserve_for_transition, unresolved_reservations, writer_epoch_for_fence,
-    writer_epoch_for_fence_from_epoch,
+    finalize_reservation, gateway_seed, gateway_seed_from_protected_original_operation,
+    mark_unknown_outcome, project_reserved_write, reconcile_pending_at_startup, reconcile_receipt,
+    reconcile_staged_writes_at_startup, recovery_page, reserve_for_transition,
+    unresolved_reservations, writer_epoch_for_fence, writer_epoch_for_fence_from_epoch,
 };
 pub use store_write_status::{
     CanonicalStoreWriteStatus, CanonicalStoreWriteStatusRefusal,

@@ -43,7 +43,10 @@
 use std::collections::BTreeMap;
 
 use eliot_canonical::CanonicalWriteEnvelope;
-use eliot_contracts::{OperationId, RequestMetadata, StateFence, TaskId, TaskRevision};
+use eliot_contracts::{
+    OperationId, RequestMetadata, SessionId, StateFence, TaskId, TaskRevision,
+    canonical_json_bytes, sha256_hex,
+};
 use eliot_learning_contracts::{
     CampaignSourceBinding, CampaignSourceRole, LearningStateViewRecipe,
     TASK_CONTROLLER_CAMPAIGN_OWNER_ID,
@@ -64,6 +67,7 @@ use thiserror::Error;
 
 use crate::{
     CanonicalAdmissionOwner, CompositionError, KernelPortError, KernelTransitionPort,
+    TaskSelectionAdmissionBinding,
     campaign_source_publishers::assemble_task_owner_matrix,
     campaign_task_sources::{
         TaskControllerCampaignSources, build_task_controller_campaign_sources,
@@ -81,9 +85,15 @@ pub struct PreparedTaskTransition {
     transition: PreparedTransition,
     expected_revision_heads: Vec<RevisionHeadExpectation>,
     expected_ordering_heads: Vec<OrderingHeadExpectation>,
-    fence: StateFence,
-    manifest_digest: OperationManifestDigest,
     failure_context: StoreFailureIdentityContext,
+}
+
+/// Additional owner-verified selection inputs for one Task Controller apply.
+pub struct TaskSelectionTransitionInput<'a> {
+    /// The owner-issued binding proved before the transition is prepared.
+    pub selection: &'a TaskSelectionAdmissionBinding,
+    /// Complete owner publications, when the caller read them before locking.
+    pub owner_publications: Option<Vec<CampaignSourcePublication>>,
 }
 
 impl PreparedTaskTransition {
@@ -118,14 +128,7 @@ impl PreparedTaskTransition {
             },
             Err(other) => return Err(TaskLifecycleError::Kernel(other)),
         };
-        check_committed_receipt(
-            &receipt,
-            &self.operation_id,
-            &self.fence,
-            &self.identity.idempotency_key,
-            &self.manifest_digest,
-            &self.failure_context,
-        )?;
+        check_committed_receipt(&receipt, &self.transition, &self.failure_context)?;
         Ok(receipt)
     }
 }
@@ -250,6 +253,7 @@ impl<'a, P: ?Sized> GovernorTaskLifecycle<'a, P> {
         let sources =
             build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
         let envelope = task_envelope(
+            self.canonical,
             identity,
             operation_id,
             &event,
@@ -260,7 +264,7 @@ impl<'a, P: ?Sized> GovernorTaskLifecycle<'a, P> {
             Some(&sources),
             None,
         )?;
-        prepare_task_exchange(self.canonical, identity, envelope, manifest_digest)
+        prepare_task_exchange(self.canonical, identity, envelope)
     }
 
     /// Prepares a recipe-bearing proposal with the complete authenticated
@@ -289,6 +293,7 @@ impl<'a, P: ?Sized> GovernorTaskLifecycle<'a, P> {
             build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
         let publications = complete_campaign_publications(&sources, owner_publications)?;
         let envelope = task_envelope(
+            self.canonical,
             identity,
             operation_id,
             &event,
@@ -299,7 +304,7 @@ impl<'a, P: ?Sized> GovernorTaskLifecycle<'a, P> {
             Some(&sources),
             Some(&publications),
         )?;
-        prepare_task_exchange(self.canonical, identity, envelope, manifest_digest)
+        prepare_task_exchange(self.canonical, identity, envelope)
     }
 
     /// Prepares a recipe-bearing guarded command using source heads read
@@ -318,6 +323,7 @@ impl<'a, P: ?Sized> GovernorTaskLifecycle<'a, P> {
         let sources =
             build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
         let envelope = task_envelope(
+            self.canonical,
             identity,
             operation_id,
             &event,
@@ -328,7 +334,7 @@ impl<'a, P: ?Sized> GovernorTaskLifecycle<'a, P> {
             Some(&sources),
             None,
         )?;
-        prepare_task_exchange(self.canonical, identity, envelope, manifest_digest)
+        prepare_task_exchange(self.canonical, identity, envelope)
     }
 
     /// Prepares a recipe-bearing guarded command with complete authenticated
@@ -349,6 +355,7 @@ impl<'a, P: ?Sized> GovernorTaskLifecycle<'a, P> {
             build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
         let publications = complete_campaign_publications(&sources, owner_publications)?;
         let envelope = task_envelope(
+            self.canonical,
             identity,
             operation_id,
             &event,
@@ -359,7 +366,56 @@ impl<'a, P: ?Sized> GovernorTaskLifecycle<'a, P> {
             Some(&sources),
             Some(&publications),
         )?;
-        prepare_task_exchange(self.canonical, identity, envelope, manifest_digest)
+        prepare_task_exchange(self.canonical, identity, envelope)
+    }
+
+    /// Prepares a Task Controller transition carrying the exact owner-issued
+    /// task-selection evidence in the canonical envelope before hashing.
+    ///
+    /// The selection binding is rechecked against the request, task record,
+    /// scope owner snapshot, and fence. Its source/evidence handles and the
+    /// original task revision and acceptance digest become envelope fields
+    /// before `PreparedTransition` is created.
+    pub fn prepare_apply_task_with_selection(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: OperationId,
+        guarded: GuardedTaskCommand,
+        recipe: LearningStateViewRecipe,
+        source_heads: crate::campaign_task_sources::TaskControllerCampaignSourceHeads,
+        input: TaskSelectionTransitionInput<'_>,
+    ) -> Result<PreparedTaskTransition, TaskLifecycleError> {
+        let (event, record, expected_revision) = self.checked_apply(identity, guarded)?;
+        let manifest_digest = production_manifest_digest()?;
+        let sources =
+            build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
+        let publications = input
+            .owner_publications
+            .map(|values| complete_campaign_publications(&sources, values))
+            .transpose()?;
+        let mut envelope = task_envelope(
+            self.canonical,
+            identity,
+            operation_id,
+            &event,
+            &record,
+            expected_revision,
+            manifest_digest.clone(),
+            Some(&sources.recipe),
+            Some(&sources),
+            publications.as_deref(),
+        )?;
+        bind_task_selection_to_envelope(&mut envelope, identity, &record, input.selection)?;
+        // The Kernel admission scope is the independently admitted WorkScope
+        // carried by the selection, not the Governor's global ordering scope.
+        // Keep ordering scopes unchanged; they are a separate store concern.
+        envelope.scope_id =
+            ScopeId::new(input.selection.work_scope().binding.scope.scope_ref.clone())
+                .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?;
+        envelope
+            .validate()
+            .map_err(|_| TaskLifecycleError::Owner(TaskError::InvalidField("task_envelope")))?;
+        prepare_task_exchange(self.canonical, identity, envelope)
     }
 
     fn check_proposal_identity(
@@ -426,7 +482,6 @@ fn prepare_task_exchange(
     canonical: &CanonicalAdmissionOwner,
     identity: &eliot_protocol::RequestIdentity,
     envelope: CanonicalWriteEnvelope,
-    manifest_digest: OperationManifestDigest,
 ) -> Result<PreparedTaskTransition, TaskLifecycleError> {
     identity.validate().map_err(|error| {
         TaskLifecycleError::Composition(CompositionError::Provider(error.to_string()))
@@ -457,8 +512,6 @@ fn prepare_task_exchange(
         transition,
         expected_revision_heads: envelope.expected_revision_heads,
         expected_ordering_heads: envelope.expected_ordering_heads,
-        fence: canonical.state_fence().clone(),
-        manifest_digest,
         failure_context,
     })
 }
@@ -572,6 +625,7 @@ fn state_wire(state: TaskState) -> Result<String, TaskLifecycleError> {
     reason = "the envelope binds every admitted identity field explicitly; grouping them would hide a binding"
 )]
 fn task_envelope(
+    canonical: &CanonicalAdmissionOwner,
     identity: &eliot_protocol::RequestIdentity,
     operation_id: OperationId,
     event: &TaskLifecycleEvent,
@@ -601,6 +655,22 @@ fn task_envelope(
         .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?;
     let ordering_scope = OrderingScopeId::new(GOVERNOR_ORDERING_SCOPE)
         .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?;
+    let expected_ordering_sequence = canonical
+        .scope()
+        .ordering_heads
+        .iter()
+        .find(|head| head.scope.as_str() == GOVERNOR_ORDERING_SCOPE)
+        .filter(|head| head.state_fence == *fence)
+        .map(|head| head.sequence)
+        .ok_or_else(|| {
+            TaskLifecycleError::Composition(CompositionError::Recovery(
+                "current Governor ordering head is unavailable at the Task fence".to_owned(),
+            ))
+        })?;
+    let admission_digest = sha256_hex(
+        &canonical_json_bytes(event)
+            .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?,
+    );
     let mut parameters = BTreeMap::new();
     parameters.insert(
         "task_id".to_owned(),
@@ -701,7 +771,7 @@ fn task_envelope(
         expected_revision_heads: Vec::new(),
         expected_ordering_heads: vec![OrderingHeadExpectation {
             scope: ordering_scope,
-            expected_sequence: 1,
+            expected_sequence: expected_ordering_sequence,
             state_fence: fence.clone(),
         }],
     };
@@ -709,6 +779,94 @@ fn task_envelope(
         .validate()
         .map_err(|_| TaskLifecycleError::Owner(TaskError::InvalidField("task_envelope")))?;
     Ok(envelope)
+}
+
+fn bind_task_selection_to_envelope(
+    envelope: &mut CanonicalWriteEnvelope,
+    identity: &eliot_protocol::RequestIdentity,
+    record: &TaskRecord,
+    selection: &TaskSelectionAdmissionBinding,
+) -> Result<(), TaskLifecycleError> {
+    bind_task_selection_evidence_to_envelope(envelope, identity, record.task_id.as_str(), selection)
+        .map_err(TaskLifecycleError::Composition)
+}
+
+/// Adds the existing task-selection evidence contract to a canonical
+/// envelope whose subject is task-bound but is not itself a Task record
+/// mutation (for example an Observation capture).
+pub(crate) fn bind_task_selection_evidence_to_envelope(
+    envelope: &mut CanonicalWriteEnvelope,
+    identity: &eliot_protocol::RequestIdentity,
+    task_ref: &str,
+    selection: &TaskSelectionAdmissionBinding,
+) -> Result<(), CompositionError> {
+    let evidence = selection.evidence();
+    evidence.validate().map_err(CompositionError::from)?;
+    let fence = &identity.request.state_fence;
+    if identity
+        .request
+        .metadata
+        .session_id
+        .as_ref()
+        .map(SessionId::as_str)
+        != Some(selection.session_ref())
+        || identity
+            .request
+            .metadata
+            .task_id
+            .as_ref()
+            .map(TaskId::as_str)
+            != Some(task_ref)
+        || selection.task_ref() != task_ref
+        || evidence.task_ref != task_ref
+        || evidence.task_revision != selection.task_revision()
+        || evidence.acceptance_digest != selection.acceptance_digest()
+        || selection.state_fence() != fence
+        || selection.work_scope().state_fence != *fence
+        || selection.work_scope().binding.scope.scope_ref != evidence.work_scope_ref
+        || fence.task_revision.map(TaskRevision::value) != Some(selection.task_revision())
+    {
+        return Err(CompositionError::ActivationStaleFence);
+    }
+
+    let operation = envelope.semantic_commands.first_mut().ok_or_else(|| {
+        CompositionError::Owner("task-selection envelope has no operation".to_owned())
+    })?;
+    let parameters = &mut operation.parameters;
+    parameters.insert(
+        "task_selection_evidence_json".to_owned(),
+        serde_json::Value::String(
+            serde_json::to_string(evidence)
+                .map_err(|error| CompositionError::Owner(error.to_string()))?,
+        ),
+    );
+    parameters.insert(
+        "task_selection_revision".to_owned(),
+        serde_json::Value::String(selection.task_revision().to_string()),
+    );
+    parameters.insert(
+        "task_selection_acceptance_digest".to_owned(),
+        serde_json::Value::String(evidence.acceptance_digest.clone()),
+    );
+    parameters.insert(
+        "task_selection_scope_ref".to_owned(),
+        serde_json::Value::String(evidence.work_scope_ref.clone()),
+    );
+    parameters.insert(
+        "task_selection_source_ref".to_owned(),
+        serde_json::Value::String(selection.selection_source_ref().to_owned()),
+    );
+    parameters.insert(
+        "task_selection_evidence_ref".to_owned(),
+        serde_json::Value::String(selection.evidence_ref().to_owned()),
+    );
+    envelope.required_proof_and_approval_refs.extend([
+        selection.selection_source_ref().to_owned(),
+        selection.evidence_ref().to_owned(),
+    ]);
+    envelope
+        .validate()
+        .map_err(|error| CompositionError::Owner(error.to_string()))
 }
 
 fn validate_campaign_recipe_anchor(
@@ -829,6 +987,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
         })?;
         let manifest_digest = production_manifest_digest()?;
         let envelope = task_envelope(
+            self.canonical,
             identity,
             operation_id.clone(),
             &event,
@@ -879,6 +1038,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
         let sources =
             build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
         let envelope = task_envelope(
+            self.canonical,
             identity,
             operation_id.clone(),
             &event,
@@ -931,6 +1091,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
             build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
         let publications = complete_campaign_publications(&sources, owner_publications)?;
         let envelope = task_envelope(
+            self.canonical,
             identity,
             operation_id.clone(),
             &event,
@@ -997,6 +1158,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
         })?;
         let manifest_digest = production_manifest_digest()?;
         let envelope = task_envelope(
+            self.canonical,
             identity,
             operation_id.clone(),
             &event,
@@ -1051,6 +1213,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
             build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
         let publications = complete_campaign_publications_from_builder(&sources, owner_builder)?;
         let envelope = task_envelope(
+            self.canonical,
             identity,
             operation_id.clone(),
             &event,
@@ -1113,6 +1276,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
         let sources =
             build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
         let envelope = task_envelope(
+            self.canonical,
             identity,
             operation_id.clone(),
             &event,
@@ -1176,6 +1340,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
             build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
         let publications = complete_campaign_publications(&sources, owner_publications)?;
         let envelope = task_envelope(
+            self.canonical,
             identity,
             operation_id.clone(),
             &event,
@@ -1243,6 +1408,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
             build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
         let publications = complete_campaign_publications_from_builder(&sources, owner_builder)?;
         let envelope = task_envelope(
+            self.canonical,
             identity,
             operation_id.clone(),
             &event,
@@ -1269,8 +1435,19 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
         envelope: CanonicalWriteEnvelope,
         manifest_digest: OperationManifestDigest,
     ) -> Result<WriteReceipt, TaskLifecycleError> {
-        let fence = identity.request.metadata.state_fence.clone();
         let ctx = store_failure_ctx(identity, &operation_id);
+        // Retain the exact immutable plan that Canonical will dispatch so a
+        // reconciled receipt is checked against the original request digest,
+        // rather than only against its operation id and manifest.
+        let transition = self.canonical.prepare(&envelope)?;
+        if transition.identity.operation_id != operation_id
+            || transition.operation_manifest_digest != manifest_digest
+        {
+            return Err(TaskLifecycleError::Composition(CompositionError::Provider(
+                "prepared task transition does not match its admitted operation and manifest"
+                    .to_owned(),
+            )));
+        }
         let receipt = match self.canonical.commit(self.kernel, identity, envelope).await {
             Ok(receipt) => receipt,
             Err(CompositionError::Kernel(KernelPortError::Unknown(_))) => {
@@ -1295,14 +1472,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
             }
             Err(other) => return Err(TaskLifecycleError::Composition(other)),
         };
-        check_committed_receipt(
-            &receipt,
-            &operation_id,
-            &fence,
-            &identity.idempotency_key,
-            &manifest_digest,
-            &ctx,
-        )?;
+        check_committed_receipt(&receipt, &transition, &ctx)?;
         Ok(receipt)
     }
 }
@@ -1315,18 +1485,16 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
 /// pending as a typed [`StoreFailure`], never reported as executed.
 fn check_committed_receipt(
     receipt: &WriteReceipt,
-    operation_id: &OperationId,
-    fence: &StateFence,
-    idempotency_key: &str,
-    manifest_digest: &OperationManifestDigest,
+    transition: &PreparedTransition,
     ctx: &StoreFailureIdentityContext,
 ) -> Result<(), TaskLifecycleError> {
     receipt
         .validate()
         .map_err(|error| map_store_error(error, ctx))?;
-    if receipt.operation_id != *operation_id
-        || receipt.state_fence != *fence
-        || receipt.idempotency_key != idempotency_key
+    if receipt.operation_id != transition.identity.operation_id
+        || receipt.state_fence != transition.state_fence
+        || receipt.idempotency_key != transition.identity.idempotency_key
+        || receipt.canonical_request_hash != transition.identity.canonical_request_hash
     {
         let failure = store_failure(
             StoreFailureDisposition::DeterministicRejection,
@@ -1338,8 +1506,14 @@ fn check_committed_receipt(
         )?;
         return Err(TaskLifecycleError::Store(Box::new(failure)));
     }
-    if receipt.transition_class != TransitionClass::TaskControl
-        || receipt.operation_manifest_digest != *manifest_digest
+    if receipt.transition_class != transition.transition_class
+        || receipt.transition_class != TransitionClass::TaskControl
+        || receipt.operation_manifest_digest != transition.operation_manifest_digest
+        || receipt.admission_digest != transition.admission_digest
+        || receipt.mutation_plan_digest != transition.mutation_plan_digest
+        || receipt.semantic_source_revisions != transition.semantic_source_revisions
+        || receipt.policy_config_schema_versions
+            != eliot_store_api::PolicyConfigSchemaVersions::bound_to(transition)
     {
         let failure = store_failure(
             StoreFailureDisposition::DeterministicRejection,

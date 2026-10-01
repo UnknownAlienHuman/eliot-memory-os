@@ -756,6 +756,7 @@ dependencies = [
  "eliot-receipts",
  "eliot-runtime",
  "eliot-runtime-contracts",
+ "eliot-store-api",
  "eliot-types",
  "eliot-user-broker-core",
  "eliot-workscope",
@@ -2819,6 +2820,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror",
+ "tokio",
  "uuid",
 ]
 
@@ -3562,6 +3564,7 @@ version = "0.1.0"
 dependencies = [
  "eliot-bootstrap",
  "eliot-contracts",
+ "eliot-observation",
  "eliot-security-contracts",
  "schemars",
  "serde",
