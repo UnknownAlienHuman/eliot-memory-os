@@ -455,6 +455,69 @@ pub struct SelectedSourceCaptureStagedAdmission {
     pub stage_receipt: OperationalMutationReceipt,
 }
 
+/// Original Kernel saga readback after the canonical ProposedAttempt has
+/// committed and the matching ORS reservation is active.
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+pub struct SelectedSourceCaptureActivation {
+    pub reservation_id: String,
+    pub canonical_operation_id: String,
+    pub launch_outbox_id: String,
+    pub commit_id: String,
+    pub activation_receipt: eliot_receipts::ReceiptIdentity,
+    pub canonical_admission_receipt: eliot_receipts::ReceiptIdentity,
+}
+
+#[cfg(windows)]
+fn parse_selected_source_capture_activation(
+    value: &serde_json::Value,
+    staged: &SelectedSourceCaptureStagedAdmission,
+) -> Result<SelectedSourceCaptureActivation, String> {
+    let string = |field: &str| -> Result<String, String> {
+        value
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| format!("admission_reservation.admit omits valid {field}"))
+    };
+    let result = SelectedSourceCaptureActivation {
+        reservation_id: string("reservation_id")?,
+        canonical_operation_id: string("canonical_operation_id")?,
+        launch_outbox_id: string("launch_outbox_id")?,
+        commit_id: string("commit_id")?,
+        activation_receipt: serde_json::from_value(
+            value
+                .get("activation_receipt")
+                .cloned()
+                .ok_or_else(|| "admission_reservation.admit omits activation_receipt".to_owned())?,
+        )
+        .map_err(|error| format!("activation receipt is not the original typed reference: {error}"))?,
+        canonical_admission_receipt: serde_json::from_value(
+            value
+                .get("canonical_admission_receipt")
+                .cloned()
+                .ok_or_else(|| {
+                    "admission_reservation.admit omits canonical_admission_receipt".to_owned()
+                })?,
+        )
+        .map_err(|error| {
+            format!("canonical admission receipt is not the original typed reference: {error}")
+        })?,
+    };
+    if result.reservation_id != staged.record.reservation_id
+        || result.canonical_operation_id != staged.staged_record.stage_operation_id.as_str()
+        || value.get("disposition").and_then(serde_json::Value::as_str) != Some("ACTIVATED")
+        || value.get("launch_authorized").and_then(serde_json::Value::as_bool) != Some(true)
+    {
+        return Err(
+            "admission_reservation.admit activation differs from the original staged canonical identity"
+                .to_owned(),
+        );
+    }
+    Ok(result)
+}
+
 /// Parses one `source_capture.claim` answer into its exact typed request.
 pub fn parse_selected_source_capture_claimed_pair(
     value: &serde_json::Value,
@@ -3048,6 +3111,42 @@ impl DaemonKernelClient {
             &staged_intent,
         )
         .map_err(super::DaemonError::Kernel)
+    }
+
+    /// Completes the existing ORS admission saga for the exact canonical
+    /// ProposedAttempt terminal receipt. The Kernel rereads that original
+    /// receipt and typed payload before it activates the reservation.
+    #[cfg(windows)]
+    pub async fn activate_selected_source_capture_async(
+        &self,
+        identity: &RequestIdentity,
+        staged: &SelectedSourceCaptureStagedAdmission,
+    ) -> Result<SelectedSourceCaptureActivation, super::DaemonError> {
+        let canonical_operation_id = staged.staged_record.stage_operation_id.as_str();
+        if canonical_operation_id != staged.record.reservation_stage_receipt_id
+            || staged.stage_receipt_id != staged.record.reservation_stage_receipt_id
+        {
+            return Err(super::DaemonError::Kernel(
+                "staged ORS operation identity differs from the ProposedAttempt stage receipt"
+                    .to_owned(),
+            ));
+        }
+        let value = self
+            .transact_async_with_identity(
+                "admission_reservation.admit",
+                serde_json::json!({
+                    "reservation_id": staged.record.reservation_id,
+                    "canonical_operation_id": canonical_operation_id,
+                    "work_item_id": staged.record.work_item_id,
+                    "proposed_attempt_id": staged.record.proposed_attempt_id,
+                    "state_fence": staged.record.state_fence,
+                }),
+                identity.clone(),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        parse_selected_source_capture_activation(&value, staged)
+            .map_err(super::DaemonError::Kernel)
     }
 
     /// Submits one daemon-produced local-read result body for its waiting
