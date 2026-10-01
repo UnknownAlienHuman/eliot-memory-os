@@ -4668,7 +4668,14 @@ fn validate_cold_start_installation(
     claim: &crate::ColdStartReadinessClaim,
     identity: &OrsStoreIdentity,
 ) -> Result<(), OrsError> {
-    if claim.key.installation_id != identity.installation_id {
+    validate_cold_start_installation_key(&claim.key, identity)
+}
+
+fn validate_cold_start_installation_key(
+    key: &crate::ColdStartReadinessOwnerKey,
+    identity: &OrsStoreIdentity,
+) -> Result<(), OrsError> {
+    if key.installation_id != identity.installation_id {
         return Err(OrsError::IntegrityProblem {
             record_type: crate::COLD_START_READINESS_RECORD_TYPE,
             reason: "cold-start readiness installation does not match the durable ORS binding"
@@ -4689,7 +4696,8 @@ pub trait ColdStartReadinessRecordOwner: Send + Sync {
     /// a new retained revision, while a terminal winner is immutable.
     fn claim_cold_start_readiness(
         &self,
-        claim: &crate::ColdStartReadinessClaim,
+        key: &crate::ColdStartReadinessOwnerKey,
+        lease_deadline: u64,
         now: u64,
     ) -> Result<crate::ColdStartReadinessStageOutcome, OrsError>;
 
@@ -4817,10 +4825,11 @@ impl ScanDisclosureRecordOwner for RedbRecoveryStore {
 impl ColdStartReadinessRecordOwner for RedbRecoveryStore {
     fn claim_cold_start_readiness(
         &self,
-        claim: &crate::ColdStartReadinessClaim,
+        key: &crate::ColdStartReadinessOwnerKey,
+        lease_deadline: u64,
         now: u64,
     ) -> Result<crate::ColdStartReadinessStageOutcome, OrsError> {
-        RedbRecoveryStore::claim_cold_start_readiness(self, claim, now)
+        RedbRecoveryStore::claim_cold_start_readiness(self, key, lease_deadline, now)
     }
 
     fn publish_cold_start_readiness(
@@ -6378,11 +6387,12 @@ impl RedbRecoveryStore {
     /// A terminal receipt is never overwritten.
     pub fn claim_cold_start_readiness(
         &self,
-        claim: &crate::ColdStartReadinessClaim,
+        key: &crate::ColdStartReadinessOwnerKey,
+        lease_deadline: u64,
         now: u64,
     ) -> Result<crate::ColdStartReadinessStageOutcome, OrsError> {
-        claim.validate()?;
-        if now == 0 || now > claim.lease_deadline {
+        key.validate()?;
+        if now == 0 || lease_deadline == 0 || now > lease_deadline {
             return Err(OrsError::InvalidField {
                 field: "cold_start_claim_now",
                 reason: "claim time must be non-zero and not past the lease deadline",
@@ -6393,9 +6403,18 @@ impl RedbRecoveryStore {
             let meta = write.open_table(META).map_err(storage)?;
             read_store_object_identity(&meta)?.installed_identity()?
         };
-        validate_cold_start_installation(claim, &store_identity)?;
+        validate_cold_start_installation_key(key, &store_identity)?;
 
-        if let Some(existing) = Self::load_cold_start_binding(&write, claim, &store_identity)?
+        // A revision-one claim is used only to address the existing binding
+        // index and revision head. It is not persisted unless the owner
+        // allocates revision one below.
+        let probe = crate::ColdStartReadinessClaim::issued_for_revision(
+            key.clone(),
+            1,
+            lease_deadline,
+        )?;
+
+        if let Some(existing) = Self::load_cold_start_binding(&write, &probe, &store_identity)?
             .filter(|existing| now <= existing.claim.lease_deadline)
         {
             write.commit().map_err(storage)?;
@@ -6404,9 +6423,18 @@ impl RedbRecoveryStore {
             });
         }
 
-        let revision = Self::next_cold_start_revision(&write, claim)?;
+        let revision = Self::next_cold_start_revision(&write, &probe)?;
+        let claim = if revision == 1 {
+            probe
+        } else {
+            crate::ColdStartReadinessClaim::issued_for_revision(
+                key.clone(),
+                revision,
+                lease_deadline,
+            )?
+        };
         let record = crate::ColdStartReadinessOrsRecord::leased(claim.clone(), revision);
-        Self::persist_cold_start_claim(&write, claim, &record)?;
+        Self::persist_cold_start_claim(&write, &claim, &record)?;
         write.commit().map_err(storage)?;
         Ok(crate::ColdStartReadinessStageOutcome::Stored {
             record: Box::new(record),
