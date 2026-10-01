@@ -123,6 +123,10 @@ impl SourceArtifactStagingTarget {
     pub(crate) fn blob_root_id(&self) -> &str {
         &self.blob_root_id
     }
+
+    pub(crate) fn archive_sha256_for_admission(&self) -> &str {
+        &self.archive_sha256
+    }
 }
 
 impl SourceArtifactOwner {

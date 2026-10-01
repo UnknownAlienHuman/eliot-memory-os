@@ -37,6 +37,12 @@ pub struct SourceSnapshotAdmissionBinding {
     pub blob_root_owner_id: String,
     /// Canonical locator/resource reference returned by the Blob owner.
     pub canonical_locator: String,
+    /// Exact five owner payloads whose digests are retained in this record's
+    /// ORS reservation claims. Persisting these values with the canonical
+    /// SourceSnapshotStage record makes the owner data available for exact
+    /// readback after the daemon process is gone; claim references alone are
+    /// not treated as payload evidence.
+    pub owner_claim_payloads: Vec<Value>,
 }
 
 impl SourceSnapshotAdmissionBinding {
@@ -71,6 +77,14 @@ impl SourceSnapshotAdmissionBinding {
             return Err(StoreError::InvalidField {
                 field: "proposed_attempt.source_snapshot.canonical_locator",
                 reason: "must be the canonical JSON object returned by the Blob owner",
+            });
+        }
+        if self.owner_claim_payloads.len() != 5
+            || self.owner_claim_payloads.iter().any(|payload| !payload.is_object())
+        {
+            return Err(StoreError::InvalidField {
+                field: "proposed_attempt.source_snapshot.owner_claim_payloads",
+                reason: "must retain exactly five original owner payload objects",
             });
         }
         Ok(())
@@ -182,7 +196,53 @@ impl ProposedAttemptRecord {
             });
         }
         match (&self.source_snapshot_admission, source_snapshot_stage) {
-            (Some(binding), true) => binding.validate()?,
+            (Some(binding), true) => {
+                binding.validate()?;
+                let role_names = ["resources", "lane", "environment", "effects", "quota_view"];
+                for (name, payload) in role_names.iter().zip(&binding.owner_claim_payloads) {
+                    let claim = self
+                        .reservation_claims
+                        .get(*name)
+                        .ok_or(StoreError::InvalidField {
+                            field: "proposed_attempt.reservation_claims",
+                            reason: "SourceSnapshotStage is missing an original owner claim",
+                        })?;
+                    let expected = claim
+                        .get("sha256")
+                        .and_then(Value::as_str)
+                        .ok_or(StoreError::InvalidField {
+                            field: "proposed_attempt.reservation_claims",
+                            reason: "SourceSnapshotStage is missing an exact owner claim digest",
+                        })?;
+                    let owner_reference = claim
+                        .get("reference")
+                        .and_then(Value::as_str)
+                        .ok_or(StoreError::InvalidField {
+                            field: "proposed_attempt.reservation_claims",
+                            reason: "SourceSnapshotStage is missing an original owner reference",
+                        })?;
+                    if payload
+                        .get("owner_reference")
+                        .and_then(Value::as_str)
+                        != Some(owner_reference)
+                    {
+                        return Err(StoreError::InvalidField {
+                            field: "proposed_attempt.source_snapshot.owner_claim_payloads",
+                            reason: "retained owner payload is not bound to its exact original owner reference",
+                        });
+                    }
+                    let payload_digest = sha256_hex(
+                        &canonical_json_bytes(payload)
+                            .map_err(|error| StoreError::Serialization(error.to_string()))?,
+                    );
+                    if expected != payload_digest {
+                        return Err(StoreError::InvalidField {
+                            field: "proposed_attempt.source_snapshot.owner_claim_payloads",
+                            reason: "owner payload bytes do not match their original reservation claim digest",
+                        });
+                    }
+                }
+            }
             (None, false) => {}
             (None, true) => {
                 return Err(StoreError::InvalidField {
@@ -404,6 +464,36 @@ mod tests {
             deadline_unix_ms: 1,
             cancellation_id: "source-snapshot-e-cancel".to_owned(),
         };
+        let claim_names = ["resources", "lane", "environment", "effects", "quota_view"];
+        let claim_refs = [
+            "owner:resources",
+            "owner:lane",
+            "owner:environment",
+            "owner:effects",
+            "owner:quota",
+        ];
+        let reservation_claims = if let Some(binding) = &source_snapshot_admission {
+            let values = claim_names
+                .iter()
+                .zip(claim_refs)
+                .zip(&binding.owner_claim_payloads)
+                .map(|((name, reference), payload)| {
+                    let digest = sha256_hex(
+                        &canonical_json_bytes(payload).expect("test owner payload is canonical"),
+                    );
+                    (*name, serde_json::json!({"reference": reference, "sha256": digest}))
+                })
+                .collect::<BTreeMap<_, _>>();
+            serde_json::to_value(values).expect("claim map JSON")
+        } else {
+            serde_json::json!({
+                "resources": {"reference": "owner:resources", "sha256": "e".repeat(64)},
+                "lane": {"reference": "owner:lane", "sha256": "f".repeat(64)},
+                "environment": {"reference": "owner:environment", "sha256": "a".repeat(64)},
+                "effects": {"reference": "owner:effects", "sha256": "b".repeat(64)},
+                "quota_view": {"reference": "owner:quota", "sha256": "c".repeat(64)}
+            })
+        };
         ProposedAttemptRecord {
             work_item_id: "work-item-source-snapshot".to_owned(),
             proposed_attempt_id: "attempt-source-snapshot".to_owned(),
@@ -423,13 +513,7 @@ mod tests {
             configuration_digest: "c".repeat(64),
             action_contract_digest: "d".repeat(64),
             authority_epoch: serde_json::json!({"lineage": "epoch-1", "sequence": 1}),
-            reservation_claims: serde_json::json!({
-                "resources": {"reference": "owner:resources", "sha256": "e".repeat(64)},
-                "lane": {"reference": "owner:lane", "sha256": "f".repeat(64)},
-                "environment": {"reference": "owner:environment", "sha256": "a".repeat(64)},
-                "effects": {"reference": "owner:effects", "sha256": "b".repeat(64)},
-                "quota_view": {"reference": "owner:quota", "sha256": "c".repeat(64)}
-            }),
+            reservation_claims,
             source_snapshot_admission,
             state_fence,
             disposition: "ADMITTED".to_owned(),
@@ -442,6 +526,13 @@ mod tests {
             archive_sha256: "a".repeat(64),
             blob_root_owner_id: "blob-root-owner-current".to_owned(),
             canonical_locator: "{\"domain\":\"source-tree\",\"key\":\"archive-1\"}".to_owned(),
+            owner_claim_payloads: vec![
+                serde_json::json!({"owner":"resources", "owner_reference":"owner:resources"}),
+                serde_json::json!({"owner":"lane", "owner_reference":"owner:lane"}),
+                serde_json::json!({"owner":"environment", "owner_reference":"owner:environment"}),
+                serde_json::json!({"owner":"effects", "owner_reference":"owner:effects"}),
+                serde_json::json!({"owner":"quota_view", "owner_reference":"owner:quota"}),
+            ],
         }
     }
 
@@ -449,6 +540,26 @@ mod tests {
     fn source_snapshot_stage_requires_exact_archive_and_owner_target_binding() {
         let valid = record(SOURCE_SNAPSHOT_STAGE_OPERATION, None, Some(binding()));
         assert!(valid.validate().is_ok());
+        let mut changed_owner_payload = valid.clone();
+        changed_owner_payload.source_snapshot_admission.as_mut().expect("E binding")
+            .owner_claim_payloads[0]["owner"] = serde_json::json!("substituted");
+        assert!(changed_owner_payload.validate().is_err());
+
+        let mut substituted_owner_reference = valid.clone();
+        substituted_owner_reference.reservation_claims["resources"]["reference"] =
+            serde_json::json!("different-original-owner-row");
+        assert!(substituted_owner_reference.validate().is_err());
+
+        let mut missing_owner_payload = binding();
+        missing_owner_payload.owner_claim_payloads.pop();
+        assert!(record(
+            SOURCE_SNAPSHOT_STAGE_OPERATION,
+            None,
+            Some(missing_owner_payload)
+        )
+        .validate()
+        .is_err());
+
         assert!(record(SOURCE_SNAPSHOT_STAGE_OPERATION, None, None)
             .validate()
             .is_err());

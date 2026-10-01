@@ -63,9 +63,13 @@ impl LspLaunchClaimSet {
                     .to_owned(),
             );
         }
-        if registration_receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+        if registration_receipt.validate().is_err()
+            || registry_readback.validate().is_err()
+            || registration_receipt.status != eliot_store_api::WriteReceiptStatus::Committed
             || registration_receipt.commit_id.is_none()
             || registration_receipt.state_fence != *selected.state_fence()
+            || registry_readback.operation
+                != eliot_store_api::NamedReadOperation::GetInstrumentRegistryState
             || registry_readback.state_fence != *selected.state_fence()
             || identity.request.state_fence != *selected.state_fence()
             || identity.request.metadata.state_fence != *selected.state_fence()
@@ -74,6 +78,17 @@ impl LspLaunchClaimSet {
                 .get("snapshot_json")
                 .and_then(Value::as_str)
                 != Some(registry.snapshot_json.as_str())
+            || registry_readback
+                .payload
+                .get("revision")
+                .and_then(Value::as_u64)
+                != Some(registry.revision)
+            || registry_readback
+                .payload
+                .get("state_fence")
+                .and_then(|value| serde_json::from_value::<StateFence>(value.clone()).ok())
+                .as_ref()
+                != Some(selected.state_fence())
         {
             return Err(
                 "LSP resource claim is not joined to the original current Instrument Registry receipt and exact readback"
@@ -238,6 +253,7 @@ impl LspLaunchClaimSet {
         let role_payloads = [
             json!({
                 "owner": "instrument_registry",
+                "owner_reference": registration_receipt.operation_id.as_str(),
                 "registration_receipt": registration_receipt,
                 "named_readback": registry_readback,
                 "registry_snapshot": registry.snapshot_json,
@@ -247,6 +263,7 @@ impl LspLaunchClaimSet {
             }),
             json!({
                 "owner": "coordination",
+                "owner_reference": active_work.work_item.work_item_id.as_str(),
                 "selection": active_work,
                 "operation": invocation,
                 "task_id": task_id,
@@ -254,6 +271,7 @@ impl LspLaunchClaimSet {
             }),
             json!({
                 "owner": "work_scope_and_environment",
+                "owner_reference": work_scope_id.as_str(),
                 "work_scope": selected.work_scope().binding,
                 "session": active_work.session,
                 "environment_projection": environment,
@@ -261,6 +279,7 @@ impl LspLaunchClaimSet {
             }),
             json!({
                 "owner": "authority",
+                "owner_reference": leases[0].lease_id.as_str(),
                 "scope": "currently admitted selected-source and launch actions only",
                 "actions": action_data,
                 "leases": lease_owner_data,
@@ -269,6 +288,7 @@ impl LspLaunchClaimSet {
             }),
             json!({
                 "owner": "work_lease_and_process_profile",
+                "owner_reference": active_work.lease.lease_id.as_str(),
                 "work_lease": active_work.lease,
                 "work_item": active_work.work_item,
                 "action_lease_budgets": lease_owner_data,
@@ -278,23 +298,23 @@ impl LspLaunchClaimSet {
         ];
         let refs = [
             claim_ref(
-                format!("instrument-registry:{}", registration_receipt.operation_id),
+                registration_receipt.operation_id.as_str().to_owned(),
                 &role_payloads[0],
             )?,
             claim_ref(
-                format!("work-item:{}", active_work.work_item.work_item_id),
+                active_work.work_item.work_item_id.as_str().to_owned(),
                 &role_payloads[1],
             )?,
             claim_ref(
-                format!("work-scope:{}", work_scope_id),
+                work_scope_id.clone(),
                 &role_payloads[2],
             )?,
             claim_ref(
-                format!("authority-actions:{}", action_owner_ids.join(",")),
+                leases[0].lease_id.as_str().to_owned(),
                 &role_payloads[3],
             )?,
             claim_ref(
-                format!("work-lease:{}+action-leases:{}", active_work.lease.lease_id, leases.iter().map(|lease| lease.lease_id.as_str()).collect::<Vec<_>>().join(",")),
+                active_work.lease.lease_id.as_str().to_owned(),
                 &role_payloads[4],
             )?,
         ];
@@ -322,6 +342,13 @@ impl LspLaunchClaimSet {
 
     pub(crate) fn claims(&self) -> &AdmissionReservationClaims {
         &self.claims
+    }
+
+    /// Exact original-owner payload values included in the SourceSnapshotStage
+    /// canonical record. The caller persists these alongside the ORS claims;
+    /// their digests are checked by the storage contract on every decode.
+    pub(crate) fn owner_claim_payloads(&self) -> Vec<Value> {
+        self.role_payloads.to_vec()
     }
 
     /// Rebuilds from newly read original owners and compares all five exact
@@ -421,12 +448,11 @@ impl LspSourcePublicationClaimSet {
             );
         }
 
+        // Preserve the exact original registry/resource-owner payload. The
+        // independently owner-derived target and archive digest are retained
+        // in SourceSnapshotAdmissionBinding and the E ActionContract instead
+        // of being grafted into the earlier resource owner's payload.
         let mut role_payloads = selected_source.role_payloads.clone();
-        role_payloads[0]["source_snapshot_target"] = json!({
-            "blob_root_owner_id": blob_root_id,
-            "artifact_resource_ref": artifact_resource_ref,
-            "archive_sha256": archive_sha256,
-        });
         let action_lease_data = json!({
             "lease_id": lease.lease_id.as_str(),
             "holder": lease.holder.as_str(),
@@ -443,6 +469,7 @@ impl LspSourcePublicationClaimSet {
         });
         role_payloads[3] = json!({
             "owner": "authority",
+            "owner_reference": lease.lease_id.as_str(),
             "scope": "one byte-bound source snapshot E mutation only",
             "action_contract": action,
             "action_contract_sha256": action_contract_sha256,
@@ -456,6 +483,7 @@ impl LspSourcePublicationClaimSet {
         });
         role_payloads[4] = json!({
             "owner": "work_lease_and_source_snapshot_quota",
+            "owner_reference": selected_source.claims.quota_view.reference.as_str(),
             "work_lease_role": selected_source.role_payloads[4],
             "source_snapshot_action_lease": action_lease_data,
             "operation_budget": {
@@ -476,11 +504,11 @@ impl LspSourcePublicationClaimSet {
                 &role_payloads[2],
             )?,
             effects: claim_ref(
-                format!("authority-action:{}+action-lease:{}", action.action_id, lease.lease_id.as_str()),
+                lease.lease_id.as_str().to_owned(),
                 &role_payloads[3],
             )?,
             quota_view: claim_ref(
-                format!("{}+action-lease:{}", old.quota_view.reference.as_str(), lease.lease_id.as_str()),
+                old.quota_view.reference.as_str().to_owned(),
                 &role_payloads[4],
             )?,
         };
@@ -502,6 +530,25 @@ impl LspSourcePublicationClaimSet {
 
     pub(crate) fn claims(&self) -> &AdmissionReservationClaims {
         &self.claims
+    }
+
+    /// Exact five role payloads retained beside this distinct E claim set.
+    /// The canonical SourceSnapshotStage record persists these exact values
+    /// and the storage validator checks them against the claim digests.
+    pub(crate) fn owner_claim_payloads(&self) -> Vec<Value> {
+        self.role_payloads.to_vec()
+    }
+
+    pub(crate) fn archive_sha256_for_admission(&self) -> &str {
+        &self.archive_sha256
+    }
+
+    pub(crate) fn blob_root_id_for_admission(&self) -> &str {
+        &self.blob_root_id
+    }
+
+    pub(crate) fn artifact_resource_ref_for_admission(&self) -> &str {
+        &self.artifact_resource_ref
     }
 
     pub(crate) fn require_same_current_owners(&self, current: &Self) -> Result<(), String> {

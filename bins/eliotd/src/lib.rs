@@ -201,6 +201,11 @@ pub enum CapturedLspAdoptionError {
     /// The daemon Blob owner refused the authenticated read.
     #[error("source-artifact Blob read failed: {0}")]
     SourceOwner(#[from] SourceArtifactOwnerError),
+    /// The original Git or Artifact owner refused an exact source-snapshot
+    /// capture, mutation stage, or receipt-bound readback.
+    #[cfg(windows)]
+    #[error("selected-source snapshot owner exchange failed: {0}")]
+    SourceSnapshot(#[from] crate::lsp_source_owner_inputs::SelectedSourceArtifactInputError),
     /// Governor/CodeCortex rejected the authenticated evidence join.
     #[error("captured LSP semantic adoption failed: {0}")]
     Semantic(#[from] eliot_governor::CapturedLspEvidenceError),
@@ -446,6 +451,8 @@ mod instrument_registry_submission;
 mod lsp_launch_claims;
 #[cfg(windows)]
 mod lsp_source_owner_inputs;
+#[cfg(windows)]
+mod selected_source_snapshot_admission;
 #[cfg(windows)]
 mod instrument_registry_registration;
 mod kernel_authority_client;
