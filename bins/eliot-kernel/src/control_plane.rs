@@ -459,19 +459,21 @@ impl KernelComposition {
             // into startup or generation authority.
             self.consume_host_startup_evidence(&evidence.startup_evidence)?;
         }
-        let supervision_revocation = if let KernelControlCommand::RevokeHostSupervisionEvidence(
-            revocation,
-        ) = &request.command
-        {
-            Some(self.revoke_host_observed_supervision_evidence(
-                &revocation.candidate_digest,
-                &revocation.state_fence,
-                revocation.expected_observation_digest.as_ref(),
-            )
-            .map_err(|_| TransportError::SessionFenced)?)
-        } else {
-            None
-        };
+        let supervision_revocation =
+            if let KernelControlCommand::RevokeHostSupervisionEvidence(revocation) =
+                &request.command
+            {
+                Some(
+                    self.revoke_host_observed_supervision_evidence(
+                        &revocation.candidate_digest,
+                        &revocation.state_fence,
+                        revocation.expected_observation_digest.as_ref(),
+                    )
+                    .map_err(|_| TransportError::SessionFenced)?,
+                )
+            } else {
+                None
+            };
         if let Some(handoff) = bootstrap {
             self.install_store_bootstrap(handoff.clone())
                 .map_err(|_| TransportError::SessionFenced)?;
