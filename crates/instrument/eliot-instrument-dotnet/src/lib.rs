@@ -78,7 +78,7 @@ impl DotnetTestSummary {
         }
         if self.total > 0
             && self.passed > 0
-            && self.passed.saturating_add(self.skipped) == self.total
+            && self.passed.checked_add(self.skipped) == Some(self.total)
             && self.failed == 0
         {
             VerificationOutcome::Pass
