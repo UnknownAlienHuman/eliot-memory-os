@@ -35,10 +35,10 @@ use eliot_kernel_core::{
 };
 use eliot_runtime_contracts::WakeIntent;
 use eliot_store_api::{
-    CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot,
-    NamedReadRequest, NamedReadResponse, OperationIdentity, OrderingHead, OrderingScopeId,
-    PreparedTransition, RequestMeta, ScopeId, ScopeRevisionView, StoreError, StoreHealth,
-    WriteReceipt, automation_read_request, canonical_request_hash,
+    CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, NamedReadRequest,
+    NamedReadResponse, OperationIdentity, OrderingHead, OrderingScopeId, PreparedTransition,
+    RequestMeta, ScopeId, ScopeRevisionView, StoreError, StoreHealth, WriteReceipt,
+    automation_read_request, canonical_request_hash,
 };
 use eliot_store_memory::MemoryStore;
 use serde_json::Value;

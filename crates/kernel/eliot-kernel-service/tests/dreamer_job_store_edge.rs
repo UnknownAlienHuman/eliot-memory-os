@@ -655,7 +655,10 @@ async fn connect_client_with_hello_binding(
         reply: DreamerReply::UnknownDelivery,
         state: Arc::clone(&state),
     };
-    (EbpCanonicalStoreClient::connect(peer, requirement).await, state)
+    (
+        EbpCanonicalStoreClient::connect(peer, requirement).await,
+        state,
+    )
 }
 
 fn peer_snapshot(state: &Arc<Mutex<PeerState>>) -> (usize, Vec<String>, Vec<(String, String)>) {
@@ -698,8 +701,14 @@ async fn dreamer_store_rejects_foreign_server_hello_principal_before_readiness()
         );
 
         let (dreamer_sends, receipt_ops, sent_frames) = peer_snapshot(&state);
-        assert_eq!(dreamer_sends, 0, "779/25 no Dreamer ledger send for {label}");
-        assert!(receipt_ops.is_empty(), "779/25 no receipt query for {label}");
+        assert_eq!(
+            dreamer_sends, 0,
+            "779/25 no Dreamer ledger send for {label}"
+        );
+        assert!(
+            receipt_ops.is_empty(),
+            "779/25 no receipt query for {label}"
+        );
         assert!(
             sent_frames.is_empty(),
             "779/25 no readiness or ledger request before rejecting {label}: {sent_frames:?}"

@@ -70,12 +70,12 @@ use eliot_runtime_contracts::{
 use eliot_store_api::{
     CAPABILITY_RESERVED_WRITE, CanonicalRequestView, CommitId, EffectClass,
     EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
-    OperationIdentity, OrderingHead, OrderingHeadExpectation,
-    OrderingScopeId, PreparedTransition, ReadinessReceipt, RequestMeta, ReservedWriteRequest,
-    Resubmission, RevisionHeadExpectation, RevisionKey, ScopeId, SecurityContext, StoreRequest,
-    StoreResponse, TransitionClass, WriteReceipt, WriteReceiptStatus, canonical_request_hash,
-    decode_request_frame, generated_operation_manifests, operation_manifest_set_digest,
-    response_frame, supported_admission_contract_set_digest,
+    OperationIdentity, OrderingHead, OrderingHeadExpectation, OrderingScopeId, PreparedTransition,
+    ReadinessReceipt, RequestMeta, ReservedWriteRequest, Resubmission, RevisionHeadExpectation,
+    RevisionKey, ScopeId, SecurityContext, StoreRequest, StoreResponse, TransitionClass,
+    WriteReceipt, WriteReceiptStatus, canonical_request_hash, decode_request_frame,
+    generated_operation_manifests, operation_manifest_set_digest, response_frame,
+    supported_admission_contract_set_digest,
 };
 use serde_json::json;
 

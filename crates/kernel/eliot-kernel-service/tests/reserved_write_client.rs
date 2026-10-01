@@ -43,8 +43,8 @@ use eliot_protocol::{
 };
 use eliot_store_api::{
     CanonicalStoreClient, CommitId, EffectClass, EventProjectionRelationIntents,
-    NamedMutationOperation, NamedMutationRequest, OperationIdentity,
-    OrderingHead, OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta,
+    NamedMutationOperation, NamedMutationRequest, OperationIdentity, OrderingHead,
+    OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta,
     ReservedScopeBinding, ReservedWriteRequest, Resubmission, RevisionHeadExpectation, RevisionKey,
     ScopeId, SecurityContext, StoreError, StoreFailure, StoreFailureIdentityContext, StoreRequest,
     StoreResponse, TransitionClass, WriteAdmissionParams, WriteAdmissionProjection, WriteReceipt,
