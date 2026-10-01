@@ -5,6 +5,24 @@ use eliot_types::{
 };
 use serde_json::Value;
 
+/// Decodes one `eliot_compile_packet_l3` argument object.
+///
+/// #933's `CompilePacketToolInput` visitor rejects a repeated member and an
+/// unknown member, and it keeps doing so here. The guarantee that reaches it
+/// depends on one upstream owner: `super::parse_raw_mcp_request`
+/// (`crates/eliot-app/src/mcp_stdio.rs`) is the raw-ingress gate that decodes the
+/// authenticated request line with `eliot_types::strict_json_value` before
+/// `id`, `method`, `params`, the tool `name` or `arguments` is read, so by the
+/// time this value exists a repeated `project_id`, `task_id`, `goal`,
+/// `candidate_handles`, `max_tokens`, `material_frame` or `memory_mode` has
+/// already been refused as a duplicate rather than collapsed to last-wins.
+///
+/// This function therefore takes a `Value` on purpose. The effective arguments
+/// are deliberately not the wire bytes: `enforce_bound_tool_scope` inserts the
+/// Governor-bound `project_id`, `task_id` and `project`, and the cognitive
+/// recall path clamps `limit`. Decoding from the raw argument bytes would drop
+/// those inserted members and break bound-scope compilation, so the raw
+/// duplicate decision belongs at the request boundary, not at this decoder.
 pub(super) fn decode_compile_packet_input(value: Value) -> Result<CompilePacketToolInput> {
     let schema = compile_packet_input_schema();
     let mut missing = Vec::new();

@@ -4078,3 +4078,81 @@ fn opaque_codex_scope_capability_rejects_tamper_expiry_and_substitution() -> Res
     );
     Ok(())
 }
+
+// WORK_UNIT_CASE: 937/AUD1
+//
+// The raw MCP request frame is the only place at which a repeated object member
+// still exists. These two cases pin both directions of that single gate: a
+// duplicate-free compile-packet request still decodes to the same
+// `CompilePacketToolInput`, and a request whose RAW BYTES repeat `project_id` is
+// refused. The refusal case is driven from a byte string, never from a
+// pre-parsed map, because the whole point is that the `Value` path cannot see
+// the repetition.
+const DUPLICATE_FREE_COMPILE_PACKET_FRAME: &str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"eliot_compile_packet_l3","arguments":{"project_id":"00000000-0000-7000-8000-000000000001","task_id":"task-example","goal":"Describe the required change","candidate_handles":[],"memory_mode":"include_case_candidates","material_frame":{"acceptance_items":[],"environment":[],"active_plan":[],"completed_work":[],"killed_paths":[],"causal_bridge":[],"negative_memory_checked":false,"exact_load_bearing_atoms":[],"cheapest_discriminative_probes":[],"responsibility_contour_route_refs":[],"next_allowed_action":"inspect the responsible boundary","expected_observable":"verifier:cargo test --workspace=pass","verifier":"replace with a registered verifier","stop_condition":"stop on verifier failure","tool_schema_bytes_visible":0,"instruction_hotset_size":0}}}}"#;
+
+const DUPLICATE_PROJECT_ID_COMPILE_PACKET_FRAME: &str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"eliot_compile_packet_l3","arguments":{"project_id":"00000000-0000-7000-8000-000000000001","task_id":"task-example","goal":"first","candidate_handles":[],"project_id":"00000000-0000-7000-8000-000000000002"}}}"#;
+
+#[test]
+fn raw_duplicate_free_compile_packet_request_still_decodes_to_the_same_typed_input() -> Result<()> {
+    // The gate admits a well-formed frame unchanged: its value is exactly what
+    // `serde_json::from_str` would produce, so the decoder result is byte-equal
+    // to the pre-repair result for valid input.
+    let request = parse_raw_mcp_request(DUPLICATE_FREE_COMPILE_PACKET_FRAME)
+        .context("a duplicate-free compile-packet frame must pass the raw ingress gate")?;
+    assert_eq!(
+        request,
+        serde_json::from_str::<Value>(DUPLICATE_FREE_COMPILE_PACKET_FRAME)
+            .context("the gate must return the same document serde_json would produce")?
+    );
+
+    let arguments = request
+        .pointer("/params/arguments")
+        .cloned()
+        .context("the frame must carry compile-packet arguments")?;
+    let decoded = super::input_validation::decode_compile_packet_input(arguments)
+        .context("a duplicate-free compile-packet request must still decode")?;
+    // `CompilePacketToolInput` is not `PartialEq`, so the whole-input identity
+    // claim is made on its published serialized form: the seam must produce the
+    // same typed input the pre-repair contour produced for valid bytes.
+    let expected: eliot_types::CompilePacketToolInput =
+        serde_json::from_value(eliot_types::compile_packet_minimal_example())?;
+    assert_eq!(
+        serde_json::to_value(&decoded)?,
+        serde_json::to_value(&expected)?,
+        "the raw ingress gate must not change a valid decode result"
+    );
+    // `max_tokens` keeps its documented 1,800 preferred-target wire default.
+    assert_eq!(decoded.request.max_tokens, 1_800);
+    Ok(())
+}
+
+#[test]
+fn raw_compile_packet_request_repeating_project_id_is_refused_before_any_value_exists() {
+    // The lossy parse the pre-repair contour used cannot see the repetition: it
+    // keeps only the last `project_id` and yields a well-formed single-key
+    // object. This is the exact defect, asserted so the refusal below cannot be
+    // satisfied by the `Value` path.
+    let collapsed = serde_json::from_str::<Value>(DUPLICATE_PROJECT_ID_COMPILE_PACKET_FRAME)
+        .expect("serde_json still accepts the duplicated frame");
+    assert_eq!(
+        collapsed.pointer("/params/arguments/project_id"),
+        Some(&json!("00000000-0000-7000-8000-000000000002")),
+        "the lossy parse must collapse the repeated member to last-wins"
+    );
+    assert!(
+        collapsed.pointer("/params/arguments").is_some_and(Value::is_object),
+        "the lossy parse must yield a well-formed arguments object"
+    );
+
+    // The raw ingress gate refuses the same bytes, before `id`, `method`,
+    // `params`, the tool `name` or `arguments` is read. The visitor never runs,
+    // so no downstream DTO can be reached with a collapsed duplicate.
+    let error = parse_raw_mcp_request(DUPLICATE_PROJECT_ID_COMPILE_PACKET_FRAME)
+        .err()
+        .expect("a frame repeating project_id must be refused at the raw ingress gate");
+    assert_eq!(
+        error.downcast_ref::<eliot_types::StrictJsonError>().map(|e| e.kind),
+        Some(eliot_types::StrictJsonErrorKind::DuplicateKey),
+        "the refusal must be the shared duplicate-member rejection: {error}"
+    );
+}

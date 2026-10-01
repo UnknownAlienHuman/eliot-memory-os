@@ -1661,6 +1661,37 @@ struct McpMemoryRuntime {
     projection_task: tokio::task::JoinHandle<Result<(), eliot_engine::EngineError>>,
 }
 
+/// Bounded recursive duplicate-rejecting parse of one raw authenticated MCP
+/// request frame.
+///
+/// This is the single raw-ingress gate for the named-pipe MCP contour.
+/// `serde_json::Map` collapses a repeated object member to last-wins the
+/// instant raw bytes become a `serde_json::Value`, so every later consumer of
+/// that value — a `deny_unknown_fields` DTO, the duplicate-rejecting
+/// `CompilePacketToolInput` `MapAccess` visitor, or a JSON Schema check — can no
+/// longer distinguish a duplicate document from its last-wins equivalent.
+/// Decoding the request line here, before `id`, `method`, `params`, the tool
+/// `name` or `arguments` is read, means no duplicate can reach a #937 decoder
+/// or steer routing. It reuses the one shared lexical owner,
+/// `eliot_types::strict_json_value`; it is not a per-tool parser.
+///
+/// The ceiling is the same `named_pipe_ipc::MAX_FRAME_BYTES` the framing reader
+/// already applies to a line, so this gate admits nothing the transport
+/// refused and bounds nothing the transport already bounded. For an accepted
+/// document the returned value is exactly what `serde_json::from_str` produces,
+/// so every downstream route, decoder and response byte is unchanged.
+///
+/// Downstream decoders therefore still receive a `Value`, and that is correct
+/// here: `enforce_bound_tool_scope` inserts the Governor-bound `project_id`,
+/// `task_id` and `project` members, and the cognitive recall path clamps
+/// `limit`, so the effective arguments are deliberately not the wire bytes. The
+/// gate is placed at the boundary where the raw document still exists, which is
+/// the only point at which a repeated member is observable at all.
+pub(crate) fn parse_raw_mcp_request(line: &str) -> Result<Value> {
+    eliot_types::strict_json_value(line.as_bytes(), named_pipe_ipc::MAX_FRAME_BYTES)
+        .with_context(|| "parse authenticated named-pipe request frame")
+}
+
 pub(crate) struct McpDaemon {
     host_governor_authority: Mutex<()>,
     projection: CognitiveProjectionCoordinatorHandle,
@@ -2130,8 +2161,10 @@ impl McpDaemon {
         line: &str,
     ) -> Result<Option<String>> {
         let profile = McpAccessProfile::parse(profile_name)?;
-        let request: Value =
-            serde_json::from_str(line).with_context(|| "parse authenticated named-pipe request")?;
+        // The raw ingress gate. Nothing below this line — `id`, `method`,
+        // `params`, the tool `name`, `arguments`, or any #937 decoder reached
+        // from them — may read a `Value` produced by a lossier parse.
+        let request: Value = parse_raw_mcp_request(line)?;
         let refreshed_scope = self.authoritative_host_scope(
             profile_name,
             session_id,
