@@ -459,9 +459,11 @@ mod tests {
         // A blank framed record takes the owner's `content_len == 0` route and
         // is accepted the same way.
         let mut blank = ChunkReader::new(b"\n", 8);
-        assert!(acquire_hook_payload(&mut blank)
-            .expect("blank framed record is accepted")
-            .is_empty());
+        assert!(
+            acquire_hook_payload(&mut blank)
+                .expect("blank framed record is accepted")
+                .is_empty()
+        );
 
         // Whitespace-only content is accepted and still parses as `{}`,
         // because the retired facade contract trims before the empty test.
@@ -512,7 +514,8 @@ mod tests {
 
         // EOF-final invalid UTF-8 with no trailing newline.
         let mut eof_final = ChunkReader::new(&[b'{', b'"', 0xFF, b'"', b'}'], 2);
-        let error = acquire_hook_payload(&mut eof_final).expect_err("invalid UTF-8 must be refused");
+        let error =
+            acquire_hook_payload(&mut eof_final).expect_err("invalid UTF-8 must be refused");
         assert!(matches!(error, HookIntakeError::StdinInvalidUtf8));
     }
 
@@ -570,9 +573,10 @@ mod tests {
         // final `fill_buf` the stop path had already pulled.
         let read_bytes = reader.into_inner().read_bytes();
         assert!(
-            read_bytes <= HOOK_INPUT_PROFILE.max_oversize_discard_bytes
-                + HOOK_INPUT_PROFILE.max_record_bytes
-                + CHUNK,
+            read_bytes
+                <= HOOK_INPUT_PROFILE.max_oversize_discard_bytes
+                    + HOOK_INPUT_PROFILE.max_record_bytes
+                    + CHUNK,
             "the reader must not be drained past the published discard bound, saw {read_bytes}"
         );
     }
@@ -695,8 +699,10 @@ mod tests {
         );
         // The spool write lives only behind `process`, so there is exactly one
         // service construction on this branch and it is last.
-        assert_eq!(production.matches("EliotHookService::for_session(").count(), 1);
+        assert_eq!(
+            production.matches("EliotHookService::for_session(").count(),
+            1
+        );
         assert_eq!(production.matches("EliotHookService::new(").count(), 0);
     }
 }
-
