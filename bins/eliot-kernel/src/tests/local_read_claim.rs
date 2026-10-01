@@ -1026,4 +1026,3 @@ fn selectors_of(tool: &serde_json::Value) -> Vec<String> {
         })
         .expect("state tool must carry an include array")
 }
-
