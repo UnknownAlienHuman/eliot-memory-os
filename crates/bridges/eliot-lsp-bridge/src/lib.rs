@@ -1705,11 +1705,9 @@ impl LspBridgeDeclaration {
                 detail: "upstream_artifact_digest must be 64 hexadecimal characters".to_owned(),
             });
         }
-        let upstream_version_line =
-            parse_version_output(upstream_version_line.as_bytes()).map_err(|error| {
-                GenerationError::UpstreamIdentity {
-                    detail: error.to_string(),
-                }
+        let upstream_version_line = parse_version_output(upstream_version_line.as_bytes())
+            .map_err(|error| GenerationError::UpstreamIdentity {
+                detail: error.to_string(),
             })?;
         let obligations = lsp_application_obligations();
         let admitted_operations: Vec<String> = obligations
