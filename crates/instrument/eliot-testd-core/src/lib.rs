@@ -287,6 +287,50 @@ pub struct InstrumentStageRequest {
     pub adapter_version: ContractVersion,
     /// Whether the stage requires a process or is decoder-only.
     pub execution: StageExecutionKind,
+    /// Exact command projected from the runner's current admitted stage.
+    /// TestD validates and executes this only after its owner has independently
+    /// resolved the same stage and measured the selected tool executable.
+    #[serde(default)]
+    pub stage_command: Option<InstrumentStageCommand>,
+}
+
+/// Closed executable selector and argv copied from one compiled runner stage.
+///
+/// The selector is a catalog identity (`cargo` or `cargo-nextest`), never a
+/// filesystem path. The runtime resolves it only through owner-observed tool
+/// identities retained with the durable job.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstrumentStageCommand {
+    /// Registered tool selector from the immutable InstrumentSpec.
+    pub executable: String,
+    /// Exact argv compiled by the admitted stage.
+    pub argv: Vec<String>,
+    /// Exact registered InstrumentSpec digest for this command.
+    pub spec_digest: String,
+}
+
+impl InstrumentStageCommand {
+    /// Validates closed selector, argument bounds, and exact specification
+    /// linkage without granting execution authority.
+    pub fn validate_for(&self, stage: &InstrumentStageRequest) -> Result<(), TestdError> {
+        if !matches!(self.executable.as_str(), "cargo" | "cargo-nextest")
+            || self.argv.is_empty()
+            || self.argv.len() > 64
+            || self.argv.iter().any(|argument| {
+                argument.is_empty()
+                    || argument.len() > 4_096
+                    || argument.chars().any(char::is_control)
+            })
+            || self.spec_digest != stage.spec_digest
+        {
+            return Err(TestdError::Invalid {
+                field: "stage_request.stage_command",
+                reason: "the command must be a bounded registered selector/argv bound to the exact stage spec digest",
+            });
+        }
+        Ok(())
+    }
 }
 
 impl InstrumentStageRequest {
@@ -329,12 +373,28 @@ impl InstrumentStageRequest {
         if let Some(lifecycle) = &self.provider_catalog_lifecycle {
             lifecycle.validate()?;
         }
-        if self.profile_name == TESTD_PRODUCTIVE_PROFILE
+        if is_testd_executor_profile(&self.profile_name)
             && (self.provider_freshness.is_none() || self.provider_catalog_lifecycle.is_none())
         {
             return Err(TestdError::Invalid {
                 field: "stage_request.provider_currentness",
                 reason: "productive stages require provider freshness and accepted catalog lifecycle evidence",
+            });
+        }
+        if is_testd_executor_profile(&self.profile_name)
+            && self.execution == StageExecutionKind::Process
+        {
+            self.stage_command
+                .as_ref()
+                .ok_or(TestdError::Invalid {
+                    field: "stage_request.stage_command",
+                    reason: "productive process stages require the exact runner-compiled command",
+                })?
+                .validate_for(self)?;
+        } else if self.stage_command.is_some() {
+            return Err(TestdError::Invalid {
+                field: "stage_request.stage_command",
+                reason: "only an admitted productive process stage may carry an executable command",
             });
         }
         Ok(())
@@ -629,13 +689,7 @@ fn profile_limits(profile: &str) -> (u64, Option<u64>, Option<u64>, u64, u64, u3
 /// Returns true only for the closed admitted testd profile name.
 #[must_use]
 pub fn is_admitted_testd_profile(profile: &str) -> bool {
-    matches!(
-        profile,
-        TESTD_ADMITTED_PROFILE
-            | TESTD_PRODUCTIVE_PROFILE
-            | TESTD_LIST_PROFILE
-            | TESTD_SCOPED_PROFILE
-    )
+    profile == TESTD_ADMITTED_PROFILE || is_productive_testd_profile(profile)
 }
 
 /// Returns true only for the slotted list/scoped profiles, whose
@@ -653,8 +707,22 @@ pub fn is_slotted_testd_profile(profile: &str) -> bool {
 pub fn is_productive_testd_profile(profile: &str) -> bool {
     matches!(
         profile,
-        TESTD_PRODUCTIVE_PROFILE | TESTD_LIST_PROFILE | TESTD_SCOPED_PROFILE
+        TESTD_PRODUCTIVE_PROFILE
+            | TESTD_LIST_PROFILE
+            | TESTD_SCOPED_PROFILE
+            | "compiler"
+            | "test"
+            | "package-verification"
+            | "bundle-verification"
     )
+}
+
+/// Returns true only for current runner catalog profiles whose process stages
+/// are admitted for productive TestD execution. The command itself always
+/// comes from the exact compiled stage, not from this classification.
+#[must_use]
+pub fn is_testd_executor_profile(profile: &str) -> bool {
+    is_productive_testd_profile(profile)
 }
 
 /// Resolves the closed binding for one admitted profile.
@@ -1230,7 +1298,7 @@ const META: TableDefinition<&str, &[u8]> = TableDefinition::new("testd_meta_v1")
 /// rewriting job payloads.
 const ADMITTED_IDENTITIES: TableDefinition<&str, &[u8]> =
     TableDefinition::new("testd_admitted_identities_v1");
-/// Durable capability-scoped TestD→Kernel call intents. Store effect outcomes
+/// Durable capability-scoped TestDâ†’Kernel call intents. Store effect outcomes
 /// remain owned by the Kernel issuer; this table records only the consumer's
 /// one-use token binding and bounded status projection.
 const BLOB_PROCESS_STREAM_CALLS: TableDefinition<&str, &[u8]> =
@@ -1709,7 +1777,7 @@ pub struct TestJob {
     pub work_envelope: Option<GovernedWorkEnvelope>,
     /// Fixture namespace allocated for this work item at admission (issue
     /// #1897, W4), derived by the retained envelope from the whole lane
-    /// tuple — work item, build mode, and normalized fingerprint — and never
+    /// tuple â€” work item, build mode, and normalized fingerprint â€” and never
     /// from the worktree, the project id, the job id, or a counter. `None`
     /// preserves the pre-lane authority for rows admitted without a lane; it
     /// never selects a fallback namespace.
@@ -2822,7 +2890,7 @@ pub struct RawArtifact {
     /// artifact-admission seam stamps it from the retained envelope, and
     /// `VerificationReceipt::validate` refuses an enveloped job whose emitted
     /// artifact records do not all carry the retained candidate and contract
-    /// revision. Presence alone is never accepted — the content is compared
+    /// revision. Presence alone is never accepted â€” the content is compared
     /// against the envelope's own `candidate_identity()`.
     #[serde(default)]
     pub lane_identity: Option<CandidateIdentity>,
@@ -2974,8 +3042,8 @@ impl TestdProcessToolIntent {
     /// the retained governed envelope, then returns the exact non-inheriting
     /// process environment projection.
     ///
-    /// Every lane-scoped binding this projection emits — the Cargo target root,
-    /// the Cargo cache root, and both fixture bindings — is read off the one
+    /// Every lane-scoped binding this projection emits â€” the Cargo target root,
+    /// the Cargo cache root, and both fixture bindings â€” is read off the one
     /// retained envelope rather than supplied by the caller, so a caller cannot
     /// compose a child environment whose fixture namespace disagrees with the
     /// envelope the store persists and admits. The two Cargo roots are still the
@@ -5368,9 +5436,9 @@ impl TestdStore {
         }
         // Issue #1897 (W1): allocate the governed work-execution envelope
         // for the productive submission path. The claims are the job's own
-        // declared exclusive resources — the submission carries no second
+        // declared exclusive resources â€” the submission carries no second
         // claim set, so the tuple cannot disagree with the scheduler's
-        // declaration — and the leases stay empty until `claim_next`
+        // declaration â€” and the leases stay empty until `claim_next`
         // grants them.
         let work_envelope = lane
             .map(|identity| {
@@ -5417,7 +5485,7 @@ impl TestdStore {
         // workspace/checkout identity only, and the envelope contributes the
         // whole governed root. `TargetRoots::validate` keeps its existing
         // `cache_root == target_root` equality and its strict-descendant
-        // requirement — this adds no distinctness on either side, it refuses
+        // requirement â€” this adds no distinctness on either side, it refuses
         // the disagreement.
         let mut target_roots = target_roots;
         target_roots.allowed_contour_root = grant.contour_root.clone();
@@ -6185,7 +6253,7 @@ impl TestdStore {
     /// release its runtime-environment leases: the process may still be alive
     /// and its effect on a port, service, fixture, or database volume is not yet
     /// observed. The retained [`SchedulingDecision`](super::SchedulingDecision)
-    /// therefore stays on the row, and the reconciler — not this call — resolves
+    /// therefore stays on the row, and the reconciler â€” not this call â€” resolves
     /// the attempt and frees the leases. A queued job holds no lease and is
     /// released immediately.
     pub fn cancel(
@@ -6224,8 +6292,8 @@ impl TestdStore {
         // cancelled worker loses write authority, but the process may still be
         // alive and its effect on a leased port, service, fixture, or database
         // volume is unobserved. The execution projection therefore stays
-        // `Running` — the one value that means "attempt started, outcome
-        // unproven" — so the lease holder set keeps holding and the reconciler
+        // `Running` â€” the one value that means "attempt started, outcome
+        // unproven" â€” so the lease holder set keeps holding and the reconciler
         // releases it. A queued job never started, so its outcome is the
         // cancellation itself.
         job.execution = Some(if was_running {
@@ -6415,8 +6483,8 @@ fn project_head_blocked<'a>(
 ///
 /// A job admitted without a lane keeps the pre-lane layout authority: the
 /// owner-issued binding resolves its own root. A job that carries a retained
-/// [`GovernedWorkEnvelope`] has exactly one root authority — the envelope's
-/// governed root — so the layout is verified against the envelope rather than
+/// [`GovernedWorkEnvelope`] has exactly one root authority â€” the envelope's
+/// governed root â€” so the layout is verified against the envelope rather than
 /// deriving a second root from its build-class level. Both branches keep the
 /// `cache_root == target_root` relation of
 /// [`TargetRoots::validate`] untouched and add no distinctness.
