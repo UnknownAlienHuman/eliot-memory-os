@@ -212,6 +212,27 @@ pub(crate) struct ValidatedDreamerMaterial {
     /// Exact original semantic input reference retained by the Store owner.
     pub(crate) semantic_input: Option<OpaqueContentRef>,
     /// Exact original inline bytes, when supplied by the Store owner.
+    ///
+    /// MEASURED UNREACHABLE (#40 W1/A1): these bytes are transported and
+    /// digest-verified here, and the Kernel writes them into the launch
+    /// envelope (`bins/eliot-kernel/src/dispatch_launch.rs`), but no
+    /// production path in this binary assembles them into the `DreamJobInput`
+    /// that `KernelSupervisedComposition::submit` requires. Measured on
+    /// `main`: every `DreamJobInput` construction in this crate is inside a
+    /// `#[cfg(test)]` module (10 sites), so the claimed job has no semantic
+    /// input here. This is the earliest link that cannot fire, ahead of
+    /// `submit` having no production caller and ahead of the Orientation
+    /// supply source being unwired.
+    ///
+    /// I9.4 canonizes `DreamJobInput` as the semantic bundle and states the
+    /// denominator "arrives with the governed material"; I9.1 places "bounded
+    /// input bundle" in the standard job loop. Neither fragment names an
+    /// owner for that assembly, and no crate may depend on this one, so the
+    /// assembly cannot simply be moved into a library either. Sourcing the
+    /// bundle from these bytes, or from any constant, literal, default, flag,
+    /// env var or caller JSON, would be a new owner and is not done here. No
+    /// fragment in `docs/architecture` names an orientation supply owner
+    /// (`A9`/`I9` are stubs), so this remains a Contract Challenge.
     pub(crate) semantic_input_bytes: Option<Vec<u8>>,
     /// Scope the ledger bound to this job.
     pub(crate) scope_id: String,
