@@ -23,8 +23,8 @@ use eliot_context_assembly::{
 };
 use eliot_context_contracts::*;
 use eliot_contracts::{
-    ArtifactId, DecisionId, EpochId, EpochLineageId, ResourceGeneration, StateFence, TaskId,
-    TaskRevision, sha256_hex,
+    ArtifactId, ContractVersion, DecisionId, EpochId, EpochLineageId, PolicyRevision,
+    ResourceGeneration, StateFence, TaskId, TaskRevision, sha256_hex,
 };
 use eliot_evidence::{Assertability, EpistemicStatus};
 use eliot_governor::{
@@ -33,7 +33,7 @@ use eliot_governor::{
 };
 use eliot_improvement::candidate_bounds::{BoundedBacklog, GovernedOverlay, OverlayState};
 use eliot_improvement::{PresentedLearning, datetime_from_unix};
-use eliot_receipts::{ProofCeiling, WorkScopeId};
+use eliot_receipts::{ProofCeiling, ProtectedReserves, WorkScopeId};
 
 const LINEAGE_1869: &str = "550e8400-e29b-41d4-a716-446655440000";
 const CAMPAIGN_1869: &str = "campaign-1869-a";
@@ -326,6 +326,71 @@ fn quality(context: &ContextBinding) -> QualityScorecard {
     }
 }
 
+/// The card a real packet accepts: it records the exact output it graded, so
+/// the recipe revision, the fence, the admitted set's own canonical payload
+/// digest, the ordered rendered payload digest, the serializer/route identity
+/// the bytes are produced under and the source revisions they are read from are
+/// this packet's values. A card that omits or forges any of them is refused by
+/// `require_graded_output` rather than accepted on the strength of its twelve
+/// passing dimensions, which is why [`fixture_output_binding`] is a card for a
+/// packet this path refuses before the grade is read and not the card behind a
+/// delivered view.
+fn quality_for(admitted: &AdmittedContextSet, recipe: &ContextRecipe) -> QualityScorecard {
+    let mut card = quality(&admitted.binding);
+    let fence_digest =
+        eliot_context_contracts::canonical_fence_digest(&admitted.binding.state_fence)
+            .expect("fixture fence digest");
+    let rendered = rendered_for(admitted);
+    card.output.recipe_digest = recipe.recipe_sha256.clone();
+    card.output.fence_digest = fence_digest.clone();
+    card.output.admitted_digest = admitted
+        .canonical_payload_digest()
+        .expect("fixture admitted digest");
+    card.output.rendered_digest = ActiveUnderstandingView::canonical_output_digest(
+        &admitted.binding,
+        &recipe.recipe_sha256,
+        &fence_digest,
+        &rendered,
+    )
+    .expect("fixture rendered digest");
+    card.output.omission_handles = admitted.economy.displaced.clone();
+    // The source revisions this packet was actually read from, deduplicated in
+    // canonical order exactly as the owner derives them from the admitted
+    // records. These are real observations, so the binding is satisfied by the
+    // packet and not by a self-referential list.
+    card.output.evidence_revisions = admitted
+        .records
+        .iter()
+        .map(|record| record.candidate.source.snapshot_id.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    card
+}
+
+/// The ordered rendered payload the approved revision produces for `admitted`.
+///
+/// #1724 W4: the order the renderer applies is the approved revision's own
+/// declared `layout.role_positions`, then provider, then atom identity. This
+/// fixture's revision declares a single configured role, so every rendered atom
+/// shares one declared position and that order is the role/provider/atom order
+/// below — the same sequence `tests/assembly.rs` derives, kept identical so the
+/// three copies of this fixture assert one thing under one name.
+fn rendered_for(admitted: &AdmittedContextSet) -> Vec<RenderedAtom> {
+    let mut rendered: Vec<RenderedAtom> = admitted
+        .records
+        .iter()
+        .map(RenderedAtom::from_admitted)
+        .collect();
+    rendered.sort_by(|left, right| {
+        left.role
+            .cmp(&right.role)
+            .then_with(|| left.provider.cmp(&right.provider))
+            .then_with(|| left.atom_id.cmp(&right.atom_id))
+    });
+    rendered
+}
+
 fn measurement(context: &ContextBinding, bytes: &[u8]) -> SerializedContextMeasurement {
     SerializedContextMeasurement {
         measurement_id: id("measurement"),
@@ -372,7 +437,11 @@ fn recipe(context: &ContextBinding) -> ContextRecipe {
         decision: DecisionRevision {
             decision_id: context.decision_id.clone(),
             recipe_revision: TaskRevision::new(1).expect("recipe revision"),
-            policy_sha256: digest(),
+            // The approved revision this instance was issued under. The
+            // assembly entrypoint runs `binds_recipe`, which compares this
+            // recorded value with the approved revision's own `policy_sha256`,
+            // so the two halves of one compilation name one revision.
+            policy_sha256: approved_policy().policy_sha256,
         },
         recipe_sha256: digest(),
         denominator: ProviderRoleDenominator {
@@ -401,6 +470,165 @@ fn recipe(context: &ContextBinding) -> ContextRecipe {
     };
     recipe.recipe_sha256 = recipe.canonical_policy_digest().expect("recipe digest");
     recipe
+}
+
+/// The approved reusable `ContextRecipePolicy` revision this fixture compiles
+/// under.
+///
+/// This is a hand-built revision, not a resolved one: the point of the helper
+/// is to hand the assembly entrypoint an `approved` value that passes the
+/// three checks `require_approved_recipe_binding` runs, in order, against the
+/// SAME `ContextRecipe` the call site passes:
+///
+/// 1. `approved.validate()` re-derives `identity`, `approval`, `applicability`,
+///    `execution` and `resolution_sha256` from the selected policy it carries,
+///    so the approval must be the policy's own `supersession.activation`, the
+///    execution contour must be the policy's own, the declared applicability
+///    must cover the compilation's, and both digests must be the canonical ones
+///    for the content they cover. `policy_sha256` is therefore computed by
+///    `canonical_policy_digest` and `resolution_sha256` by
+///    `canonical_resolution_digest`, never a placeholder.
+/// 2. `policy.binds_recipe(recipe)` compares the instance's recorded
+///    `DecisionRevision::policy_sha256` with this revision's own
+///    `policy_sha256` and refuses a mandatory role the revision does not
+///    configure. `recipe` above records exactly this digest, and the revision
+///    configures `SemanticRole::Goal` with the instance's own
+///    `LossPolicy::NonDroppable`, so the binding holds.
+/// 3. `policy.require_executable(&assembly_execution_support())` refuses a
+///    revision that declares a stage graph, a repetition treatment, a section
+///    unit-boundary kind, a degradation disposition or a feature-disable rule
+///    this path does not run. The declarations below are the executed ones:
+///    the single `EXECUTED_CONTEXT_STAGE` with no predecessor edge,
+///    `EXECUTED_REPETITION_POLICY`, `BoundaryUnitKind::Unit` per section,
+///    `EXECUTED_SECTION_DEGRADATION` per section, and no feature disable
+///    (which this path has no capability for).
+///
+/// The `ordering_revision` half of `require_executable` compares the EXECUTING
+/// path's own `ASSEMBLY_ORDERING_REVISION` against the contract's
+/// `EXECUTED_ORDERING_REVISION`; both spellings are `"a18.declared-role-position.v1"`,
+/// so that check is a property of the two constants and not of this revision.
+///
+/// `layout.role_positions` is APPLIED, not merely validated: `render::render`
+/// sorts the rendered payload by these positions, so the single declared
+/// position covers every role this fixture's admitted set carries.
+fn approved_policy() -> ContextRecipePolicy {
+    let route = "route";
+    let mut policy = ContextRecipePolicy {
+        policy_schema_version: CONTEXT_RECIPE_POLICY_SCHEMA_VERSION,
+        policy_id: id("recipe-policy-1724"),
+        policy_revision: PolicyRevision::new(1).expect("policy revision"),
+        // Placeholder: replaced by the canonical digest of the finished
+        // content below, exactly as `canonical_policy_digest` expects.
+        policy_sha256: "0".repeat(64),
+        applicability: RecipeApplicability {
+            task_profiles: vec![TASK_1869.to_owned()],
+            route_profiles: vec![route.to_owned()],
+            impact_profiles: vec!["decision".to_owned()],
+            governance_profiles: vec!["default".to_owned()],
+        },
+        stages: vec![RecipeStage {
+            stage_id: ArtifactId::new(EXECUTED_CONTEXT_STAGE)
+                .expect("executed stage"),
+            semantic_role: SemanticRole::Goal,
+            predecessors: Vec::new(),
+        }],
+        candidate_features: vec![SemanticRole::Goal],
+        admission: RecipeAdmissionPolicy {
+            admission_rule: id("admission-rule"),
+            safety_floor: id("floor-rule"),
+            suppressible_roles: Vec::new(),
+        },
+        section_budgets: vec![ContextSectionBudget {
+            semantic_role: SemanticRole::Goal,
+            unit_boundary_kind: BoundaryUnitKind::Unit,
+            minimum_required_whole_units: 1,
+            required_exact_references: vec![id("atom-1869")],
+            protected_floor_refs: vec![id("floor-rule")],
+            planning_maximum_whole_units: 1,
+            planning_route_profile: route.to_owned(),
+            // The one representation contract `binds_recipe` compares with the
+            // instance's own per-role `RoleLossRule`.
+            omission_or_handle_policy: LossPolicy::NonDroppable,
+            degradation_behavior: EXECUTED_SECTION_DEGRADATION,
+            // This execution path has no feature-disable capability, so a
+            // budget that relies on one is refused by name.
+            disable_feature_when_floor_cannot_be_preserved: false,
+        }],
+        protected_reserve: ProtectedReservePolicy {
+            reserves: ProtectedReserves {
+                reasoning_reserve: 1,
+                review_reserve: 1,
+                evidence_reserve: 1,
+                owner_ref: "context-budget-owner".to_owned(),
+            },
+            margin_reserve: 1,
+        },
+        layout: RecipeLayoutPolicy {
+            role_positions: vec![RecipeRolePosition {
+                semantic_role: SemanticRole::Goal,
+                position: 0,
+            }],
+            repetition: EXECUTED_REPETITION_POLICY,
+        },
+        omission: RecipeOmissionPolicy {
+            permitted_reasons: vec![OmissionReason::Capacity],
+            non_recoverable_reasons: Vec::new(),
+        },
+        blocking_dimensions: vec![QualityDimension::AcceptanceDecisionCoverage],
+        execution: RecipeExecutionContour {
+            contour: id("execution-contour"),
+            generation: 1,
+            transform: BoundaryTransformerRevision {
+                transformer_id: "identity".to_owned(),
+                revision: ContractVersion::new(1, 0, 0),
+                configuration_sha256: digest(),
+            },
+        },
+        qualification: RecipeQualification {
+            qualification: id("qualification"),
+            state: RecipeQualificationState::Unqualified,
+            counter_metrics: Vec::new(),
+        },
+        supersession: RecipeSupersession {
+            activation: id("activation"),
+        },
+    };
+    policy.policy_sha256 = policy.canonical_policy_digest().expect("policy digest");
+    policy
+}
+
+/// The owner-resolved `ResolvedContextRecipe` the assembly entrypoints require.
+///
+/// Every recorded member is re-derived from the approved content rather than
+/// written: the identity is the policy's own three values, the approval IS the
+/// policy's activation decision, the execution contour IS the policy's, the
+/// applicability is the policy's own declaration (so it covers itself), and
+/// `resolution_sha256` is the canonical resolution digest. That is what makes
+/// `ResolvedContextRecipe::validate` — the first of the three checks
+/// `require_approved_recipe_binding` runs — pass.
+fn approved_for(recipe: &ContextRecipe) -> ResolvedContextRecipe {
+    let policy = approved_policy();
+    assert_eq!(
+        recipe.decision.policy_sha256,
+        policy.policy_sha256,
+        "the instance must name the approved revision the resolution carries"
+    );
+    let mut resolution = ResolvedContextRecipe {
+        identity: RecipePolicyIdentity {
+            policy_id: policy.policy_id.clone(),
+            policy_revision: policy.policy_revision,
+            policy_sha256: policy.policy_sha256.clone(),
+        },
+        approval: policy.supersession.activation.clone(),
+        applicability: policy.applicability.clone(),
+        execution: policy.execution.clone(),
+        policy,
+        resolution_sha256: "0".repeat(64),
+    };
+    resolution.resolution_sha256 = resolution
+        .canonical_resolution_digest()
+        .expect("resolution digest");
+    resolution
 }
 
 fn owner_permit(
@@ -472,10 +700,13 @@ fn assemble_marked(
     now: u64,
 ) -> Result<ActiveUnderstandingViewResult, AssemblyError> {
     let context = value.binding.clone();
+    let instance = recipe(&context);
+    let approved = approved_for(&instance);
     assemble_active_view_with_learning(
         value,
-        &recipe(&context),
-        quality(&context),
+        &instance,
+        &approved,
+        quality_for(value, &instance),
         &policy_for(&context, 100_000),
         |bytes| Ok(measurement(&context, bytes)),
         presented_1869(governor, verified, overlay, backlog, now),
@@ -513,9 +744,15 @@ fn drifted_fence_refuses_before_render() {
     let mut calls = 0;
     let overlay = live_overlay_1869(&fence);
     let backlog = BoundedBacklog::default();
+    let instance = recipe(&context);
+    let approved = approved_for(&instance);
+    // The drifted admitted set is deliberately not self-consistent, so no card
+    // can name its output: the wrapper refuses on the fence before the grade is
+    // read, which is exactly what this test asserts.
     let result = assemble_active_view_with_learning(
         &value,
-        &recipe(&context),
+        &instance,
+        &approved,
         quality(&context),
         &policy_for(&context, 100_000),
         |bytes| {
@@ -579,10 +816,13 @@ fn expired_mark_refuses_delivery_and_plain_projection_survives() {
     let context = value.binding.clone();
     let overlay = live_overlay_1869(&fence);
     let backlog = BoundedBacklog::default();
+    let instance = recipe(&context);
+    let approved = approved_for(&instance);
     let result = assemble_active_view_with_learning(
         &value,
-        &recipe(&context),
-        quality(&context),
+        &instance,
+        &approved,
+        quality_for(&value, &instance),
         &policy_for(&context, 100_000),
         |bytes| Ok(measurement(&context, bytes)),
         presented_1869(&governor, &verified, &overlay, &backlog, NOW_1869),
@@ -610,10 +850,13 @@ fn expired_mark_refuses_delivery_and_plain_projection_survives() {
     plain.economy.measurement.digest = plain.canonical_payload_digest().expect("admitted digest");
     refresh_economy_receipt(&mut plain);
     let context = plain.binding.clone();
+    let instance = recipe(&context);
+    let approved = approved_for(&instance);
     let view = assemble_active_view(
         &plain,
-        &recipe(&context),
-        quality(&context),
+        &instance,
+        &approved,
+        quality_for(&plain, &instance),
         &policy_for(&context, 100_000),
         |bytes| Ok(measurement(&context, bytes)),
     )
