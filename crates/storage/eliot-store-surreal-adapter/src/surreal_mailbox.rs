@@ -45,8 +45,8 @@ pub(crate) fn mailbox_item_statements(
     if transition.transition_class != eliot_store_api::TransitionClass::CaptureCandidate {
         return Err(AdapterError::Store(StoreError::TransitionClassExceeded));
     }
-    let admission = decode_mailbox_item(command.operation, &command.parameters)
-        .map_err(AdapterError::Store)?;
+    let admission =
+        decode_mailbox_item(command.operation, &command.parameters).map_err(AdapterError::Store)?;
     if admission.record.state_fence != transition.state_fence {
         return Err(AdapterError::Store(StoreError::FenceMismatch));
     }
