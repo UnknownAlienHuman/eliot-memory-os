@@ -964,6 +964,29 @@ fn resolve_tier_match(
     None
 }
 
+/// Collects Tier 4 content-plus-structural fingerprint matches.
+fn fingerprint_matches(
+    candidates: &[ReviewCandidate],
+    original: &ReviewAnchor,
+) -> Vec<usize> {
+    candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            candidate.anchor.target_id == original.target_id
+                && candidate
+                    .content_digest
+                    .as_deref()
+                    .is_some_and(|digest| digest == original.target_digest.as_str())
+                && candidate
+                    .structural_digest
+                    .as_deref()
+                    .is_some_and(|digest| !digest.trim().is_empty())
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
 pub fn resolve_review_anchor(
     original: &ReviewAnchor,
     candidates: &[ReviewCandidate],
@@ -1042,22 +1065,7 @@ pub fn resolve_review_anchor(
         return Ok(resolution);
     }
     // Tier 4: content-plus-structural fingerprint match.
-    let fingerprinted: Vec<usize> = candidates
-        .iter()
-        .enumerate()
-        .filter(|(_, candidate)| {
-            candidate.anchor.target_id == original.target_id
-                && candidate
-                    .content_digest
-                    .as_deref()
-                    .is_some_and(|digest| digest == original.target_digest.as_str())
-                && candidate
-                    .structural_digest
-                    .as_deref()
-                    .is_some_and(|digest| !digest.trim().is_empty())
-        })
-        .map(|(index, _)| index)
-        .collect();
+    let fingerprinted = fingerprint_matches(candidates, original);
     if fingerprinted.len() == 1 {
         let current = &candidates[fingerprinted[0]].anchor;
         let status = if same_location(current, original) {
