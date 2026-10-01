@@ -106,7 +106,7 @@ impl McpForwardingPort for FakeForwarder {
     fn forward_event(
         &mut self,
         _binding: &AttachBinding,
-        _event: &EventEnvelope,
+        event: &EventEnvelope,
     ) -> Result<EventPortOutcome, ProviderFailure> {
         let mut state = self
             .state
@@ -707,6 +707,55 @@ fn received_and_durable_ack_retry_until_required_normalized_phase()
             .events,
         3
     );
+    Ok(())
+}
+
+#[test]
+fn qualified_later_sequence_waits_for_the_missing_contiguous_ack()
+-> Result<(), Box<dyn std::error::Error>> {
+    let forward_state = Arc::new(Mutex::new(ForwardState::default()));
+    let mut state = forward_state
+        .lock()
+        .map_err(|_| "forward state lock poisoned")?;
+    for event_id in ["event-2", "event-1"] {
+        state
+            .outcomes
+            .push_back(EventPortOutcome::Acknowledged(EventForwardAck::new(
+                "stream-1",
+                event_id,
+                AckPhase::Durable,
+                EventDisposition::Accepted,
+            )?));
+    }
+    drop(state);
+
+    let mut bridge = bridge(
+        Arc::new(Mutex::new(HostState::default())),
+        Arc::clone(&forward_state),
+    )?;
+    bridge.attach(managed_request("connection-1")?)?;
+    let later = event("durable_control", "event-2", 2)?;
+    assert_eq!(
+        bridge.forward_event(&later)?,
+        EventForwardStatus::Durable {
+            phase: AckPhase::Durable,
+            disposition: EventDisposition::Accepted,
+            cursor_advanced: false,
+        }
+    );
+    assert_eq!(bridge.cursor("stream-1"), None);
+    assert!(bridge.outstanding_deliveries().is_empty());
+
+    let missing = event("durable_control", "event-1", 1)?;
+    assert_eq!(
+        bridge.forward_event(&missing)?,
+        EventForwardStatus::Durable {
+            phase: AckPhase::Durable,
+            disposition: EventDisposition::Accepted,
+            cursor_advanced: true,
+        }
+    );
+    assert_eq!(bridge.cursor("stream-1"), Some(2));
     Ok(())
 }
 
