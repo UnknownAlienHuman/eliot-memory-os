@@ -22,7 +22,15 @@
 //!   helpers — the stream through
 //!   [`RestoreJournalAdmissionOwner::issue_journal_stream`], which publishes it
 //!   outward rather than taking it from a caller — so a caller cannot point the
-//!   issuer at a stream of its own choosing.
+//!   issuer at a stream of its own choosing. The operation identity therefore
+//!   reaches the stream key folded INTO `plan_id` rather than beside it, which
+//!   is why the key is still exactly `sha256(plan_id, bundle_sha256)` and still
+//!   takes no identity argument, yet differs for every operation identity as
+//!   well as for every plan/bundle pair: `KernelBackupRestore::bind_plan_operation`
+//!   in `bins/eliot-kernel/src/backup_restore.rs` appends the request's
+//!   correlated `idempotency_key` to `plan_id` before the journal engine is
+//!   entered. Two operations presenting byte-identical bundles no longer share
+//!   one stream.
 //! - It does not add a second trust scheme. The binding is the existing
 //!   [`OwnerTrustBinding`], and the production test remains the existing
 //!   `require_production_admitted` in the restore owner: this module never
@@ -114,12 +122,16 @@ pub struct DurableJournalRecord {
     /// This is NOT the per-execution stream key. A channel is fixed across
     /// every execution the owner issues for; the stream key is derived from
     /// the plan (`sha256(plan_id, bundle_sha256)`) and differs for every
-    /// plan/bundle pair, so it can never equal a fixed channel name. The
-    /// admission's `journal_identity_ref` therefore carries ONE meaning — the
-    /// durable channel — and consumers that need to know which store admitted a
-    /// restore compare it against that channel's own name, which is exactly
-    /// what a composition-side channel check must do. The per-execution stream
-    /// this record was read under is the `journal_key` argument
+    /// plan/bundle pair and every operation identity — `plan_id` carries the
+    /// correlated `idempotency_key`, folded in by
+    /// `KernelBackupRestore::bind_plan_operation` in
+    /// `bins/eliot-kernel/src/backup_restore.rs` — so it can never equal a
+    /// fixed channel name. The admission's `journal_identity_ref` therefore
+    /// carries ONE meaning — the durable channel — and consumers that need to
+    /// know which store admitted a restore compare it against that channel's
+    /// own name, which is exactly what a composition-side channel check must
+    /// do. The per-execution stream this record was read under is the
+    /// `journal_key` argument
     /// [`RestoreJournalAdmissionOwner::durable_journal_record`] was called with,
     /// and it is proved by that read rather than by this field;
     /// [`RestoreJournalAdmission::binds_owner_record`] supplies the operation
@@ -365,7 +377,11 @@ impl RestoreJournalAdmission {
     /// — the owner's own value, reported at issue time and re-read here. It is
     /// NOT the per-execution stream key: that key is
     /// `sha256(plan_id, bundle_sha256)`, a different value for every
-    /// plan/bundle pair, so requiring the channel field to equal it made the
+    /// plan/bundle pair and every operation identity, because `plan_id`
+    /// carries the correlated `idempotency_key` that
+    /// `KernelBackupRestore::bind_plan_operation` in
+    /// `bins/eliot-kernel/src/backup_restore.rs` folds in before the journal
+    /// engine is entered. Requiring the channel field to equal it made the
     /// re-proof unsatisfiable for every owner that issues an honest channel
     /// identity. It is compared here against what the owner reports for the
     /// exact stream this plan names, which is the strongest statement the field
