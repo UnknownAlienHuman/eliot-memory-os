@@ -5453,6 +5453,143 @@ struct LegacyUnscopedBackupVerificationRow {
     request_digest: String,
 }
 
+/// Owner-issued, one-shot succession grant for one stored `backup.verify`
+/// operation (#2883 instruction 4).
+///
+/// This is the explicit owner-authorized succession/recovery contract a fresh
+/// session must hold before it may reconcile a prior operation. It is NOT
+/// `ActivationSuccessorBinding`, and the reason is stated rather than assumed:
+/// that type is a PREDECESSOR reference plus a due time, carried by the
+/// successor itself, and it names an activation TICKET. It has no issuer
+/// signature of its own, no expiry, and no consumption state, because the
+/// activation path gets one-shotness from the ticket lifecycle's
+/// `successor_ticket_id` column instead. `backup.verify` has no ticket
+/// lifecycle, so one-shotness and expiry would have nowhere to live in that
+/// type. This type therefore carries them, and it lives beside its only
+/// durable owner rather than being spread across the activation family.
+///
+/// Every field is OWNER DATA, not a capability to read data:
+///
+/// - `grant_id` is 32 bytes of OS RNG material drawn by the capture owner at
+///   stage time. It is stored, never returned on the wire, and a caller that
+///   did not receive it cannot produce it. This is the whole reason a
+///   reconciliation is not replayable: the predecessor's `ok` reply carries
+///   `request_digest` and `operation_namespace`, so a replay of the pair is
+///   possible, but it carries no grant id.
+/// - `principal` and `scope_id` are the authenticated owner values the grant
+///   was issued to. A grant is bound to ONE principal in ONE `WorkScope`.
+/// - `authority_lineage_id` is the authority the grant was issued under. The
+///   sequence is deliberately absent: a rotation is the same authority observed
+///   later, exactly as on `successor_may_observe`, and a grant survives a
+///   rotation but not a lineage change.
+/// - `not_before_unix_ms` and `expires_at_unix_ms` are the owner's own due
+///   window. `expires_at_unix_ms` MUST be strictly greater than
+///   `not_before_unix_ms`, so a grant always has a positive lifetime and can
+///   never be born already expired.
+/// - `issued_at_unix_ms` is the owner's clock reading at issuance and is what
+///   `validate()` range-checks the other two against, so a row cannot carry a
+///   window the owner could not have issued.
+/// - `consumed_at_unix_ms` is the one-shot marker. It is `None` while the
+///   grant is open and is set to a value strictly greater than
+///   `not_before_unix_ms` by the single transaction that consumes it. A second
+///   reconciliation finds it non-`None` and is refused, which is what makes
+///   replaying the same bundle unable to mint or reuse a fresh grant.
+///
+/// `validate()` is shape only, matching how this module treats every other
+/// closed owner spelling: it does not interpret the window or the lineage. The
+/// SUCCESSOR PATH decides whether the window is open and the lineage is the
+/// caller's; ORS's job is to fail a malformed row closed on read, exactly as
+/// it does for the rest of this record.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupVerifySuccessionGrant {
+    /// OS-RNG material drawn once by the capture owner at stage time. Never
+    /// projected onto the wire and never derivable from any value the
+    /// predecessor's `ok` reply already carried.
+    pub grant_id: String,
+    /// Bare authenticated principal this grant was issued to.
+    ///
+    /// This is the SAME principal value the stored row's
+    /// `BackupVerifyRequestIdentity::principal` and the per-principal key use
+    /// (the authenticated user identity alone, NOT the composite
+    /// `user@session` carried on `CaptureCallerAuth`). The successor path
+    /// compares the grant against the live authenticated principal, so the two
+    /// definitions must be identical or no reconciliation could ever match.
+    pub principal: String,
+    /// `WorkScope` owner value this grant was issued under.
+    pub scope_id: String,
+    /// Authority LINEAGE this grant was issued under. The epoch sequence is
+    /// ambient for the same reason it is ambient in
+    /// [`BackupVerifyRequestIdentity`]: a rotation observes the same authority
+    /// later and must not revoke a reconciliation.
+    pub authority_lineage_id: String,
+    /// The owner's clock at issuance.
+    pub issued_at_unix_ms: u64,
+    /// Earliest reconciliation this grant authorizes. Never equal to
+    /// [`Self::expires_at_unix_ms`], so every grant has a positive lifetime.
+    pub not_before_unix_ms: u64,
+    /// Exclusive end of the owner's authorization window.
+    pub expires_at_unix_ms: u64,
+    /// Set by the single consuming transaction and `None` on every row the
+    /// capture owner writes. Non-`None` means the one reconciliation this
+    /// grant authorized has already happened.
+    pub consumed_at_unix_ms: Option<u64>,
+}
+
+impl BackupVerifySuccessionGrant {
+    /// Validates one incoming or persisted succession grant row.
+    ///
+    /// Shape only, and deliberately not a decision: it proves the row is a
+    /// well-formed owner grant, never that the grant is still open for this
+    /// caller. The window, the lineage and the consumption marker are compared
+    /// by the successor path against live values, because only that path holds
+    /// them.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_digest(&self.grant_id, "backup_verify_succession_grant_id")?;
+        validate_text(&self.principal, "backup_verify_succession_grant_principal")?;
+        validate_text(&self.scope_id, "backup_verify_succession_grant_scope_id")?;
+        validate_text(
+            &self.authority_lineage_id,
+            "backup_verify_succession_grant_authority_lineage_id",
+        )?;
+        if self.not_before_unix_ms <= self.issued_at_unix_ms {
+            return Err(OrsError::InvalidField {
+                field: "backup_verify_succession_grant_not_before_unix_ms",
+                reason: "grant due time must be after the owner's issuance clock",
+            });
+        }
+        if self.expires_at_unix_ms <= self.not_before_unix_ms {
+            return Err(OrsError::InvalidField {
+                field: "backup_verify_succession_grant_expires_at_unix_ms",
+                reason: "grant expiry must be strictly after its due time",
+            });
+        }
+        // A consumption marker must fall INSIDE the grant's own window: not
+        // before it opens, and not at or after it expires. A marker outside the
+        // window would otherwise pass validation and make a spent grant look
+        // live, so both bounds are checked here rather than trusting the writer.
+        match self.consumed_at_unix_ms {
+            Some(consumed_at_unix_ms)
+                if consumed_at_unix_ms < self.not_before_unix_ms
+                    || consumed_at_unix_ms >= self.expires_at_unix_ms =>
+            {
+                return Err(OrsError::InvalidField {
+                    field: "backup_verify_succession_grant_consumed_at_unix_ms",
+                    reason: "grant consumption must fall inside its own authorization window",
+                });
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Returns whether this grant has already spent its one reconciliation.
+    #[must_use]
+    pub const fn is_consumed(&self) -> bool {
+        self.consumed_at_unix_ms.is_some()
+    }
+}
+
 /// Durable owner-backed result of one `backup.verify` operation (issue #2802,
 /// rescoped by #2883).
 ///
@@ -5606,6 +5743,30 @@ pub struct BackupVerificationResultRecord {
     /// recomputes it, so a row that cannot rebuild the answer it claims to hold
     /// fails closed instead of projecting one it never produced.
     pub reply_digest: String,
+    /// #2883 instruction 4: the OWNER-ISSUED succession grant a fresh session
+    /// must hold before it may reconcile THIS operation through
+    /// `successor_of`. `None` means the capture owner issued none, which is its
+    /// own answer and never a placeholder: on a build with no OS entropy seam
+    /// the grant is absent and every reconciliation is refused, which is the
+    /// fail-closed direction.
+    ///
+    /// The field holds the grant DATA, not a capability to read it: a 32-byte
+    /// OS-RNG `grant_id` the predecessor's `ok` reply never carried, the
+    /// principal and scope it is bound to, the authority lineage it was issued
+    /// under, the owner's own due window, and the consumption marker that makes
+    /// it one-shot. Because `grant_id` is owner-drawn and never projected, an
+    /// identical `(namespace, identity_digest)` pair plus an identical bundle
+    /// can no longer reconcile from any further session: there is no second
+    /// occurrence to compare against, so a replay cannot present the id and
+    /// cannot cause a fresh one to be minted.
+    ///
+    /// It is deliberately NOT part of `identity`, so it is in neither the
+    /// canonical request hash nor the durable key. That is what makes a grant
+    /// issuable and consumable on a row that is already committed under its own
+    /// identity: adding it to the preimage would make every consumption a
+    /// different operation identity and would move the key.
+    #[serde(default)]
+    pub succession_grant: Option<BackupVerifySuccessionGrant>,
 }
 
 impl BackupVerificationResultRecord {
@@ -5782,6 +5943,15 @@ impl BackupVerificationResultRecord {
         }
         if let Some(digest) = &self.validity_attestation_digest {
             validate_digest(digest, "backup_verification_validity_attestation_digest")?;
+        }
+        // #2883 instruction 4: the owner-issued succession grant is shape-checked
+        // on every load, exactly as the three owner-evidence references above
+        // are. It is a CLOSED owner spelling with a real clock window and a
+        // consumption marker, so a bit-rotted or hand-edited grant must fail the
+        // row closed rather than be handed to the successor path as an open
+        // authorization it is not.
+        if let Some(grant) = &self.succession_grant {
+            grant.validate()?;
         }
         validate_digest(&self.request_digest, "backup_verification_request_digest")?;
         validate_digest(&self.archive_sha256, "backup_verification_archive_sha256")?;
