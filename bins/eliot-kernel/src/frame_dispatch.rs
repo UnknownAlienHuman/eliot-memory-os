@@ -1552,6 +1552,21 @@ fn is_daemon_operation(operation: &str) -> bool {
             | "local_read"
             | "local_read_claim"
             | "local_read_result"
+            // Issue #2564: the retained `eliot.state` pair legs. The State pair
+            // is admitted into the same bounded local-read carrier but under its
+            // own queue kind, so the claim and result markers are distinct
+            // strings from the Query pair above. Without these entries a State
+            // claim or result frame fell through every predicate here, failed
+            // the `ProcessExecutionRequest` decode, and was fenced at the
+            // "kernel semantic gateway is closed for this session" frame above,
+            // which left the admitted dispatch arms in
+            // `daemon_request_dispatch.rs` unreachable and the retained
+            // request silently unanswered. The entries only let the frame
+            // reach those arms; the arms still prove the module binding, the
+            // peer principal, the exact session State Fence and the queue kind,
+            // and the pair identity and attempt are re-compared by the owner.
+            | "local_state_claim"
+            | "local_state_result"
             | "semantic_observe_claim"
             | "semantic_observe_result"
             | "semantic_observe_deferred"
