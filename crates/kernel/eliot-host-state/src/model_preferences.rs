@@ -1,5 +1,5 @@
 //! Owner-side typed load and compare-and-swap publication for the Human
-//! model preference policy (issue #485, audit 5872395796 steps 2-3).
+//! model preference policy (issue #485, audit 5872395796 steps 2-4).
 //!
 //! Owner: `eliot-host-state`. The schema stays where step 1 put it
 //! (`eliot-agent-contracts::model_preference`, I/O-free); the pure validator
@@ -22,11 +22,18 @@
 //! [`preference_policy_digest`](eliot_agent_contracts::model_preference::preference_policy_digest);
 //! this module never branches on preference content.
 //!
-//! Residuals (later slices, not this one): R4 reconstructs the immutable
-//! publication receipt from the retained committed document; R5 wires the
-//! #484 candidate-side CAS anchor to this owner recheck. No production
-//! caller exists yet on purpose: the daemon/publication wiring is STITCH
-//! and must arrive with its own review.
+//! Residuals (later slices, not this one): R5 wires the #484
+//! candidate-side CAS anchor to this owner recheck. No production caller
+//! exists yet on purpose: the daemon/publication wiring is STITCH and must
+//! arrive with its own review.
+//!
+//! Receipt discipline (step 4): the immutable publication receipt is
+//! projected only from the retained committed envelope bytes re-read
+//! inside a read transaction, so the same receipt reconstructs after
+//! restart from a fresh handle. No receipt is manufactured from the store
+//! path or caller-supplied fields. Legacy, corrupt, oversized, and
+//! unknown-write outcomes stay explicit typed errors; explicit absence
+//! stays `Ok(None)`.
 //!
 //! Critical-section discipline (step 3): the CAS opens the store with a
 //! single open-or-create, then performs the entire predecessor re-read,
@@ -193,6 +200,35 @@ pub struct StoredModelPreferenceEnvelope {
     pub policy: HumanModelPreferencePolicy,
     /// Owner-recomputed canonical digest of `policy`.
     pub policy_digest: String,
+}
+
+/// Immutable publication receipt projected from the retained committed
+/// document (issue #485, audit 5872395796 step 4).
+///
+/// Every field is copied from the stored envelope bytes re-read inside a
+/// read transaction by
+/// [`ModelPreferenceStore::load_publication_receipt`]: the store revision,
+/// the policy id/revision/digest, and the prior revision/digest link. A
+/// receipt is never built from the store path or from caller-supplied
+/// expected/replacement fields, so the same receipt reconstructs
+/// byte-identically after restart from a fresh handle. There is no mutation
+/// API: a receipt only ever names a retained publication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelPreferencePublicationReceipt {
+    /// Monotonic store revision of the retained document. Genesis is 1;
+    /// 0 never names a committed publication.
+    pub store_revision: u64,
+    /// Policy ID of the retained policy, copied from the stored envelope.
+    pub policy_id: String,
+    /// Policy revision of the retained policy, copied from the stored envelope.
+    pub policy_revision: String,
+    /// Canonical digest of the retained policy, copied from the stored
+    /// envelope after validity and digest match were rechecked on read.
+    pub policy_digest: String,
+    /// Store revision of the superseded document; 0 for genesis.
+    pub prior_store_revision: u64,
+    /// Canonical policy digest of the superseded document; empty for genesis.
+    pub prior_policy_digest: String,
 }
 
 /// Owner handle for one configured preference store file.
@@ -458,6 +494,88 @@ impl ModelPreferenceStore {
             }
         };
         validated_publication(envelope).map(Some)
+    }
+
+    /// Reconstructs the immutable publication receipt from the retained
+    /// committed document.
+    ///
+    /// The stored envelope is re-read inside a read transaction and the
+    /// receipt is projected from those bytes only: store revision, policy
+    /// id/revision/digest, and the prior revision/digest link. Policy
+    /// validity and the digest match are rechecked on read, exactly as in
+    /// [`ModelPreferenceStore::load_model_preferences`]. The same receipt
+    /// reconstructs after restart from a fresh handle bound to the same
+    /// path; no receipt is ever manufactured from the path or from
+    /// caller-supplied fields.
+    ///
+    /// Returns `Ok(None)` only for explicit absence: a missing file, or a
+    /// reachable store whose metadata envelope was never initialized.
+    /// Legacy, corrupt, oversized, digest-mismatched, or structurally
+    /// invalid content fails closed with the matching typed
+    /// [`ModelPreferenceStoreError`]; a metadata envelope with no retained
+    /// document (unknown write outcome) reports
+    /// [`ModelPreferenceStoreError::Corrupt`.
+    pub fn load_publication_receipt(
+        &self,
+    ) -> Result<Option<ModelPreferencePublicationReceipt>, ModelPreferenceStoreError> {
+        validate_store_path(&self.path)?;
+        let database = match ReadOnlyDatabase::open(&self.path) {
+            Ok(database) => database,
+            Err(error) => {
+                if matches!(
+                    error,
+                    redb::DatabaseError::Storage(redb::StorageError::Io(ref io))
+                        if io.kind() == std::io::ErrorKind::NotFound
+                ) {
+                    return Ok(None);
+                }
+                return Err(map_database_error(&error));
+            }
+        };
+        let read = database
+            .begin_read()
+            .map_err(|_| ModelPreferenceStoreError::Unavailable)?;
+        let meta = match read.open_table(META_TABLE) {
+            Ok(meta) => meta,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(_) => return Err(ModelPreferenceStoreError::Corrupt),
+        };
+        match meta
+            .get(META_KEY)
+            .map_err(|_| ModelPreferenceStoreError::Corrupt)?
+        {
+            None => return Ok(None),
+            Some(guard) => {
+                let bytes = copy_bounded_table_value(guard.value())?;
+                classify_meta(&bytes)?;
+            }
+        }
+        let prefs = match read.open_table(PREFS_TABLE) {
+            Ok(prefs) => prefs,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Err(ModelPreferenceStoreError::Corrupt);
+            }
+            Err(_) => return Err(ModelPreferenceStoreError::Corrupt),
+        };
+        let envelope = match prefs
+            .get(CURRENT_KEY)
+            .map_err(|_| ModelPreferenceStoreError::Corrupt)?
+        {
+            None => return Err(ModelPreferenceStoreError::Corrupt),
+            Some(guard) => {
+                let bytes = copy_bounded_table_value(guard.value())?;
+                decode_envelope(&bytes)?
+            }
+        };
+        validated_publication(envelope.clone())?;
+        Ok(Some(ModelPreferencePublicationReceipt {
+            store_revision: envelope.store_revision,
+            policy_id: envelope.policy.policy_id.clone(),
+            policy_revision: envelope.policy.revision.clone(),
+            policy_digest: envelope.policy_digest,
+            prior_store_revision: envelope.prior_store_revision,
+            prior_policy_digest: envelope.prior_policy_digest,
+        }))
     }
 
     /// Atomically compares the retained publication against the exact
