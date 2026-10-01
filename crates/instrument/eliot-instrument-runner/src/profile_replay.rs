@@ -56,6 +56,9 @@ pub enum ProfileReplayError {
     /// Profile registry has moved since the stage was admitted.
     #[error("profile registry generation or digest is stale for the retained stage")]
     StaleProfileGeneration,
+    /// Stage admission lacks the current provider-registry issuer material.
+    #[error("retained stage has no provider-registry freshness issuer record")]
+    MissingProviderFreshness,
     /// The provider registry could not resolve a current entry.
     #[error(transparent)]
     Registry(#[from] RegistryError),
@@ -174,6 +177,28 @@ fn current_selection<'a>(
         }
     }
     let entry = provider_registry.resolve_current(&stage.invocation, freshness)?;
+    let retained_freshness = stage
+        .provider_freshness
+        .as_ref()
+        .ok_or(ProfileReplayError::MissingProviderFreshness)?;
+    let current_fingerprints = freshness.fingerprints;
+    if retained_freshness.generation != freshness.generation
+        || retained_freshness.normative_pair_digest != freshness.normative_pair_digest
+        || retained_freshness.fingerprints.source != current_fingerprints.source
+        || retained_freshness.fingerprints.lock != current_fingerprints.lock
+        || retained_freshness.fingerprints.toolchain != current_fingerprints.toolchain
+        || retained_freshness.fingerprints.env != current_fingerprints.env
+        || retained_freshness.fingerprints.exe != current_fingerprints.exe
+        || retained_freshness.fingerprints.profile != current_fingerprints.profile
+        || retained_freshness.fingerprints.parser != current_fingerprints.parser
+        || entry.generation != freshness.generation
+        || entry.normative_pair_digest != freshness.normative_pair_digest
+        || entry.invalidation != *current_fingerprints
+    {
+        return Err(ProfileReplayError::StageMismatch {
+            field: "provider_freshness",
+        });
+    }
     for (matches, field) in [
         (stage.adapter == entry.adapter, "adapter"),
         (stage.adapter_version == entry.adapter_version, "adapter_version"),

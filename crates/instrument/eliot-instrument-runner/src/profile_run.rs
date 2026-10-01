@@ -40,7 +40,10 @@ use crate::registry::{
     RegistryEntry, RegistryError, ResolvedExecutableIdentity, SupplyChainReceipt,
 };
 use crate::testd_port::{TestdAdmission, TestdAdmissionPort, TestdPortError, testd_dispatchable};
-use eliot_testd_core::{InstrumentStageRequest, StageExecutionKind};
+use eliot_testd_core::{
+    InstrumentStageRequest, StageExecutionKind, TestdProviderFingerprints,
+    TestdProviderRegistryFreshness,
+};
 use crate::{
     InstrumentBinding, InstrumentRequestPort, InstrumentRunner, InstrumentStartReceipt,
     RunnerError, bridge_executor_observation,
@@ -1460,6 +1463,19 @@ pub fn stage_request(
         dag_digest: plan.dag_digest.clone(),
         registry_generation: plan.registry_generation,
         registry_digest: plan.registry_digest.clone(),
+        provider_freshness: Some(TestdProviderRegistryFreshness {
+            generation: entry.generation,
+            normative_pair_digest: entry.normative_pair_digest.clone(),
+            fingerprints: TestdProviderFingerprints {
+                source: entry.invalidation.source.clone(),
+                lock: entry.invalidation.lock.clone(),
+                toolchain: entry.invalidation.toolchain.clone(),
+                env: entry.invalidation.env.clone(),
+                exe: entry.invalidation.exe.clone(),
+                profile: entry.invalidation.profile.clone(),
+                parser: entry.invalidation.parser.clone(),
+            },
+        }),
         stage_id: stage.stage_id.clone(),
         spec: stage.spec.clone(),
         spec_revision: stage.spec_revision,

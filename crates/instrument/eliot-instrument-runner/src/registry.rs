@@ -180,6 +180,12 @@ pub enum RegistryError {
         /// The drifted identity slot.
         slot: IdentitySlot,
     },
+    /// A current provider registry was built without one required invalidation input.
+    #[error("provider registry is missing the {field} currentness fingerprint")]
+    MissingFreshnessInput {
+        /// Missing invalidation input.
+        field: FingerprintField,
+    },
 }
 
 /// Exact cause of a [`RegistryError::Stale`] rejection.
@@ -292,6 +298,20 @@ pub struct InvalidationSet {
 }
 
 impl InvalidationSet {
+    fn first_missing(&self) -> Option<FingerprintField> {
+        [
+            (&self.source, FingerprintField::Source),
+            (&self.lock, FingerprintField::Lock),
+            (&self.toolchain, FingerprintField::Toolchain),
+            (&self.env, FingerprintField::Env),
+            (&self.exe, FingerprintField::Exe),
+            (&self.profile, FingerprintField::Profile),
+            (&self.parser, FingerprintField::Parser),
+        ]
+        .into_iter()
+        .find_map(|(value, field)| value.trim().is_empty().then_some(field))
+    }
+
     /// Returns the first moved slot in deterministic field order, if any.
     ///
     /// Field order is fixed (source, lock, toolchain, env, exe, profile,
@@ -889,6 +909,12 @@ pub struct RegistryEntry {
     pub evaluator: ContractId,
     /// Exact evaluator implementation version owned by this provider entry.
     pub evaluator_version: ContractVersion,
+    /// Normative-pair digest of the ProviderRegistry snapshot that owns this entry.
+    ///
+    /// `ProviderRegistry::ready` records the registry-wide owner input before
+    /// calling `build`; the shared builder preserves this value and rejects a
+    /// mismatch instead of repairing it.
+    pub normative_pair_digest: String,
     /// Verifier contract identity.
     pub verifier: ContractId,
     /// Fingerprints this entry was validated against.
@@ -1038,7 +1064,9 @@ impl ProviderRegistry {
     /// instrument/adapter pair, [`RegistryError::IdentitySlotBlank`] when a
     /// required profile identity slot is blank, or
     /// [`RegistryError::IdentitySlotDrift`] when a retained identity differs
-    /// from its corresponding entry field.
+    /// from its corresponding entry field, [`RegistryError::MissingFreshnessInput`]
+    /// when an invalidation slot is empty, or [`RegistryError::Stale`] when an
+    /// entry's normative-pair digest differs from the registry owner input.
     pub fn build(
         entries: Vec<RegistryEntry>,
         generation: u64,
@@ -1049,7 +1077,18 @@ impl ProviderRegistry {
             entry.kinds.sort_by_key(|kind| kind_rank(*kind));
             entry.kinds.dedup();
             entry.verify_profile_identities()?;
+            if let Some(field) = entry.invalidation.first_missing() {
+                return Err(RegistryError::MissingFreshnessInput { field });
+            }
             let instrument = entry.instrument.as_str().to_owned();
+            if normative_pair_digest.trim().is_empty()
+                || entry.normative_pair_digest != normative_pair_digest
+            {
+                return Err(RegistryError::Stale {
+                    instrument,
+                    reason: StaleReason::NormativePair,
+                });
+            }
             let key = (instrument.clone(), entry.adapter.clone());
             if map.insert(key, entry).is_some() {
                 return Err(RegistryError::Duplicate { instrument });
@@ -1075,8 +1114,11 @@ impl ProviderRegistry {
     /// is a decoder over emitted index bytes (`ScipIndex::decode`, no
     /// `ProcessExecutor` use) and is bound to inspect with no executable.
     ///
-    /// Fingerprints are caller-attested and cloned into every entry; exact
-    /// per-executable digests remain follow-up work with the environment owner.
+    /// Fingerprints are caller-attested and cloned into every entry. The
+    /// registry-wide normative-pair digest is recorded on each entry by this
+    /// closed producer before the shared builder validates it. Empty
+    /// freshness values refuse to construct; exact per-executable digests
+    /// remain follow-up work with the environment owner.
     ///
     /// # Errors
     ///
@@ -1088,7 +1130,7 @@ impl ProviderRegistry {
         normative_pair_digest: String,
         fingerprints: &InvalidationSet,
     ) -> Result<Self, RegistryError> {
-        let entries = vec![
+        let mut entries = vec![
             cargo_entry(fingerprints, generation)?,
             rustc_entry(fingerprints, generation)?,
             rustfmt_entry(fingerprints, generation)?,
@@ -1096,6 +1138,9 @@ impl ProviderRegistry {
             scip_entry(fingerprints, generation)?,
             dotnet_entry(fingerprints, generation)?,
         ];
+        for entry in &mut entries {
+            entry.normative_pair_digest.clone_from(&normative_pair_digest);
+        }
         let registry = Self::build(entries, generation, normative_pair_digest)?;
         registry.verify_profile_identities()?;
         crate::package_disposition::verify_disposition_coverage(&registry)?;
@@ -1387,6 +1432,7 @@ fn cargo_entry(
         normalizer: diagnostic_id()?,
         evaluator: diagnostic_id()?,
         evaluator_version: ContractVersion::new(1, 0, 0),
+        normative_pair_digest: String::new(),
         verifier: verifier_id()?,
         invalidation: fingerprints.clone(),
         identities: ProfileIdentities::new(ProfileIdentityParams {
@@ -1441,6 +1487,7 @@ fn rustc_entry(
         normalizer: diagnostic_id()?,
         evaluator: contract_id(RUSTC_INSTRUMENT)?,
         evaluator_version: ContractVersion::new(1, 0, 0),
+        normative_pair_digest: String::new(),
         verifier: verifier_id()?,
         invalidation: fingerprints.clone(),
         identities: ProfileIdentities::new(ProfileIdentityParams {
@@ -1497,6 +1544,7 @@ fn rustfmt_entry(
         normalizer: diagnostic_id()?,
         evaluator: contract_id(RUSTFMT_INSTRUMENT)?,
         evaluator_version: ContractVersion::new(1, 0, 0),
+        normative_pair_digest: String::new(),
         verifier: verifier_id()?,
         invalidation: fingerprints.clone(),
         identities: ProfileIdentities::new(ProfileIdentityParams {
@@ -1554,6 +1602,7 @@ fn nextest_entry(
         normalizer: diagnostic_id()?,
         evaluator: contract_id(NEXTEST_INSTRUMENT)?,
         evaluator_version: ContractVersion::new(1, 0, 0),
+        normative_pair_digest: String::new(),
         verifier: verifier_id()?,
         invalidation: fingerprints.clone(),
         identities: ProfileIdentities::new(ProfileIdentityParams {
@@ -1609,6 +1658,7 @@ fn scip_entry(
         normalizer: contract_id(SCIP_INSTRUMENT)?,
         evaluator: contract_id(SCIP_INSTRUMENT)?,
         evaluator_version: ContractVersion::new(1, 0, 0),
+        normative_pair_digest: String::new(),
         verifier: verifier_id()?,
         invalidation: fingerprints.clone(),
         identities: ProfileIdentities::new(ProfileIdentityParams {
@@ -1670,6 +1720,7 @@ fn dotnet_entry(
         normalizer: diagnostic_id()?,
         evaluator: diagnostic_id()?,
         evaluator_version: ContractVersion::new(1, 0, 0),
+        normative_pair_digest: String::new(),
         verifier: verifier_id()?,
         invalidation: fingerprints.clone(),
         identities: ProfileIdentities::new(ProfileIdentityParams {
