@@ -10382,6 +10382,7 @@ impl RedbRecoveryStore {
                 .map_err(storage)?;
         }
         write.commit().map_err(storage)?;
+        self.reservation_lifecycle_changed.notify_waiters();
         Ok(Some(next))
     }
 
@@ -10570,6 +10571,7 @@ impl RedbRecoveryStore {
                 .map_err(storage)?;
         }
         write.commit().map_err(storage)?;
+        self.reservation_lifecycle_changed.notify_waiters();
         Ok(Some(next))
     }
 
@@ -10675,6 +10677,7 @@ impl RedbRecoveryStore {
                     .map_err(storage)?;
             }
             write.commit().map_err(storage)?;
+            self.reservation_lifecycle_changed.notify_waiters();
             return Ok(Some(fenced));
         }
         let next = if existing.send_claim_protocol_version == 0 {
@@ -10788,6 +10791,7 @@ impl RedbRecoveryStore {
                             .map_err(storage)?;
                     }
                     write.commit().map_err(storage)?;
+                    self.reservation_lifecycle_changed.notify_waiters();
                     return Err(OrsError::HostRequestAttemptLimitExceeded);
                 }
                 Some(current)
@@ -10816,6 +10820,9 @@ impl RedbRecoveryStore {
                 .map_err(storage)?;
         }
         write.commit().map_err(storage)?;
+        if next.state != existing.state {
+            self.reservation_lifecycle_changed.notify_waiters();
+        }
         Ok(Some(next))
     }
 
@@ -10887,6 +10894,7 @@ impl RedbRecoveryStore {
                 .map_err(storage)?;
         }
         write.commit().map_err(storage)?;
+        self.reservation_lifecycle_changed.notify_waiters();
         Ok(Some(record))
     }
 
@@ -10983,6 +10991,7 @@ impl RedbRecoveryStore {
             }
         }
         write.commit().map_err(storage)?;
+        self.reservation_lifecycle_changed.notify_waiters();
         Ok(Some(record))
     }
 
@@ -11051,6 +11060,7 @@ impl RedbRecoveryStore {
                 }
             }
             write.commit().map_err(storage)?;
+            self.reservation_lifecycle_changed.notify_waiters();
             return Err(OrsError::HostRequestAttemptExpired);
         }
         if current.phase != crate::HostRequestAttemptPhase::Claimed
@@ -11073,6 +11083,9 @@ impl RedbRecoveryStore {
                 .map_err(storage)?;
         }
         write.commit().map_err(storage)?;
+        if record.state != previous_state {
+            self.reservation_lifecycle_changed.notify_waiters();
+        }
         Ok(Some(record))
     }
 
@@ -11105,6 +11118,7 @@ impl RedbRecoveryStore {
             return Ok(None);
         };
         record.validate()?;
+        let previous_state = record.state;
         if record.operation_id != *operation_id || record.request_digest != request_digest {
             return Err(OrsError::HostRequestIdentityConflict {
                 operation_id: operation_id.as_str().to_owned(),
@@ -11238,6 +11252,7 @@ impl RedbRecoveryStore {
             return Ok(None);
         };
         record.validate()?;
+        let previous_state = record.state;
         if record.operation_id != *operation_id || record.request_digest != request_digest {
             return Err(OrsError::HostRequestIdentityConflict {
                 operation_id: operation_id.as_str().to_owned(),
@@ -11316,6 +11331,9 @@ impl RedbRecoveryStore {
                 .map_err(storage)?;
         }
         write.commit().map_err(storage)?;
+        if record.state != previous_state {
+            self.reservation_lifecycle_changed.notify_waiters();
+        }
         Ok(Some(record))
     }
 
@@ -11342,6 +11360,7 @@ impl RedbRecoveryStore {
             return Ok(None);
         };
         record.validate()?;
+        let previous_state = record.state;
         if let Some(input) = record.executable_input.as_ref() {
             let Some(current) = record.attempt.as_ref() else {
                 return Err(OrsError::InvalidTransition);
@@ -11376,6 +11395,9 @@ impl RedbRecoveryStore {
                     .map_err(storage)?;
             }
             write.commit().map_err(storage)?;
+            if record.state != previous_state {
+                self.reservation_lifecycle_changed.notify_waiters();
+            }
             return Ok(Some(record));
         }
         if record.send_claim_protocol_version == crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION {
@@ -11413,6 +11435,9 @@ impl RedbRecoveryStore {
                 .map_err(storage)?;
         }
         write.commit().map_err(storage)?;
+        if record.state != previous_state {
+            self.reservation_lifecycle_changed.notify_waiters();
+        }
         Ok(Some(record))
     }
 
@@ -11579,6 +11604,7 @@ impl RedbRecoveryStore {
                 .map_err(storage)?;
         }
         write.commit().map_err(storage)?;
+        self.reservation_lifecycle_changed.notify_waiters();
         Ok(Some(record))
     }
 
@@ -11944,6 +11970,7 @@ impl RedbRecoveryStore {
                 .map_err(storage)?;
         }
         write.commit().map_err(storage)?;
+        self.reservation_lifecycle_changed.notify_waiters();
         Ok(Some(next))
     }
 
@@ -27877,6 +27904,54 @@ impl RedbRecoveryStore {
         }
     }
 
+    /// Waits for the exact Host write's durable Host or reservation state to
+    /// differ from the caller's last observation.
+    ///
+    /// The waiter arms the existing lifecycle notification before reading
+    /// either owner, so a commit racing the read cannot be lost. The Host row
+    /// is loaded by its exact operation/request pair and the reservation by
+    /// its exact operation index; notifications carry no state or authority.
+    /// Callers may repeat with the returned states when they need a later
+    /// boundary, such as the Host result after stage acceptance.
+    pub async fn wait_for_host_write_change(
+        &self,
+        operation_id: &OperationIdentity,
+        request_digest: &str,
+        previous_host_state: HostRequestState,
+        previous_reservation_state: Option<ReservationState>,
+    ) -> Result<(HostRequestRecord, Option<ReservationRecord>), OrsError> {
+        crate::model::validate_digest(request_digest, "host_request_request_digest")?;
+        loop {
+            let notified = self.reservation_lifecycle_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            let host_request = self
+                .load_host_request(operation_id, request_digest)?
+                .ok_or(OrsError::InvalidField {
+                    field: "host_request_change_wait",
+                    reason: "the exact original Host request is missing",
+                })?;
+            if host_request.operation_id != *operation_id
+                || host_request.request_digest != request_digest
+            {
+                return Err(OrsError::HostRequestIdentityConflict {
+                    operation_id: operation_id.as_str().to_owned(),
+                    request_digest: request_digest.to_owned(),
+                });
+            }
+            let reservation = self.load_write_reservation_by_operation(operation_id)?;
+            let reservation_state = reservation.as_ref().map(|record| record.state);
+            if host_request.state != previous_host_state
+                || reservation_state != previous_reservation_state
+            {
+                return Ok((host_request, reservation));
+            }
+
+            notified.await;
+        }
+    }
+
     /// Reads the installed identity and object generation from durable ORS metadata.
     ///
     /// This is a readback of the store-owned binding, not a cached or caller-
@@ -34787,7 +34862,10 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         if let Err(error) = write.commit() {
             let commit_error = storage(error);
             return match self.staged_reservation_readback(&token) {
-                Ok(true) => Ok(token),
+                Ok(true) => {
+                    self.reservation_lifecycle_changed.notify_waiters();
+                    Ok(token)
+                }
                 Ok(false) => Err(OrsError::StagingCommitOutcomeUnknown {
                     operation_id: token.operation_id,
                     reservation_id: token.reservation_id,
@@ -34802,6 +34880,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                 }),
             };
         }
+        self.reservation_lifecycle_changed.notify_waiters();
         Ok(token)
     }
 
@@ -34827,6 +34906,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         }
         Self::bump_recovery_inventory_revision(&write, RecoveryInventorySource::Reservations)?;
         write.commit().map_err(storage)?;
+        self.reservation_lifecycle_changed.notify_waiters();
         Ok(record)
     }
 
@@ -34852,6 +34932,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         }
         Self::bump_recovery_inventory_revision(&write, RecoveryInventorySource::Reservations)?;
         write.commit().map_err(storage)?;
+        self.reservation_lifecycle_changed.notify_waiters();
         Ok(record)
     }
 
@@ -34875,6 +34956,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         }
         Self::bump_recovery_inventory_revision(&write, RecoveryInventorySource::Reservations)?;
         write.commit().map_err(storage)?;
+        self.reservation_lifecycle_changed.notify_waiters();
         Ok(record)
     }
 
@@ -34925,6 +35007,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             }
         }
         write.commit().map_err(storage)?;
+        self.reservation_lifecycle_changed.notify_waiters();
         Ok(record)
     }
 
