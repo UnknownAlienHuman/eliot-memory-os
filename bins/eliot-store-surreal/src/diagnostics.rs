@@ -1192,7 +1192,6 @@ pub fn emit_dispatch_outcome(
         Response::Transaction { receipt } | Response::Genesis { receipt } => {
             event.receipt_status = Some(receipt.status);
         }
-        Response::WorkScopeOwner { .. } => {}
         Response::Failure { failure } => {
             let (reason, recovery) = project_failure_control(failure);
             event.reason = reason;
@@ -1208,6 +1207,7 @@ pub fn emit_dispatch_outcome(
         | Response::OrderingHeadReadbacks { .. }
         | Response::ValidationSnapshot { .. }
         | Response::Recovery { .. }
+        | Response::WorkScopeOwner { .. }
         | Response::DreamerJob { .. }
         | Response::Backup { .. }
         | Response::Unknown { .. }
@@ -1290,12 +1290,13 @@ pub fn operation_name(request: &Request) -> &'static str {
 #[must_use]
 pub fn dispatch_boundary(request: &Request) -> BridgeBoundary {
     match request {
-        Request::Apply { .. } | Request::ReservedWrite { .. } => BridgeBoundary::MutationResult,
+        Request::Apply { .. }
+        | Request::ReservedWrite { .. }
+        | Request::WriteWorkScopeOwner { .. } => BridgeBoundary::MutationResult,
         Request::Receipt { .. } => BridgeBoundary::ReceiptLookup,
         Request::Backup { .. } => BridgeBoundary::BackupBoundary,
         Request::Recovery { .. } => BridgeBoundary::RecoveryBoundary,
         Request::InitializeGenesis { .. } => BridgeBoundary::GenesisBoundary,
-        Request::WriteWorkScopeOwner { .. } => BridgeBoundary::MutationResult,
         Request::DreamerJob { .. } => BridgeBoundary::DreamerLedger,
         Request::Health
         | Request::Readiness

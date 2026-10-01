@@ -352,7 +352,7 @@ pub enum ExclusiveOpKind {
     Migration,
     /// First-generation genesis where applicable.
     Genesis,
-    /// Authenticated post-genesis WorkScope owner replacement CAS.
+    /// Authenticated post-genesis `WorkScope` owner replacement CAS.
     WorkScopeOwner,
     /// Schema replacement outside the migration entrypoint.
     SchemaReplacement,

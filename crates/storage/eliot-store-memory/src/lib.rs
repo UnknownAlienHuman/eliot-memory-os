@@ -5117,7 +5117,7 @@ impl MemoryStore {
         Ok(receipt)
     }
 
-    /// Applies the narrow WorkScope owner CAS under the same mutex used by
+    /// Applies the narrow `WorkScope` owner CAS under the same mutex used by
     /// recovery reads. The requested record is the only owner row changed.
     fn write_work_scope_owner_sync(
         &self,

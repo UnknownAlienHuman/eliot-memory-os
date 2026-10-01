@@ -62,7 +62,7 @@ pub const CAPABILITY_ORDERING_HEADS: &str = "store.ordering_heads";
 pub const CAPABILITY_VALIDATION_SNAPSHOT: &str = "store.validation_snapshot";
 pub const CAPABILITY_RECOVERY: &str = "store.recovery";
 pub const CAPABILITY_INITIALIZE_GENESIS: &str = "store.initialize_genesis";
-/// Capability for the authenticated post-genesis WorkScope owner CAS.
+/// Capability for the authenticated post-genesis `WorkScope` owner CAS.
 pub const CAPABILITY_WORK_SCOPE_OWNER_WRITE: &str = "store.work_scope_owner.write";
 /// Intent capability gate for neutral erasure dispatch (issue #688).
 ///
@@ -342,10 +342,7 @@ impl StoreRequest {
             Self::ReservedWrite { request } => request.validate(),
             Self::Backup { request } => request.validate(),
             Self::RevisionHeads { keys } => bounded_unique(keys, "revision_keys", Clone::clone),
-            Self::OrderingHeads { scopes } => {
-                bounded_unique(scopes, "ordering_scopes", Clone::clone)
-            }
-            Self::OrderingHeadReadbacks { scopes } => {
+            Self::OrderingHeads { scopes } | Self::OrderingHeadReadbacks { scopes } => {
                 bounded_unique(scopes, "ordering_scopes", Clone::clone)
             }
             Self::DreamerJob { context, request } => {
@@ -370,8 +367,9 @@ impl StoreRequest {
             Self::Backup { .. } => CAPABILITY_STORE_BACKUP,
             Self::Receipt { .. } => CAPABILITY_RECEIPT,
             Self::RevisionHeads { .. } => CAPABILITY_REVISION_HEADS,
-            Self::OrderingHeads { .. } => CAPABILITY_ORDERING_HEADS,
-            Self::OrderingHeadReadbacks { .. } => CAPABILITY_ORDERING_HEADS,
+            Self::OrderingHeads { .. } | Self::OrderingHeadReadbacks { .. } => {
+                CAPABILITY_ORDERING_HEADS
+            }
             Self::ValidationSnapshot => CAPABILITY_VALIDATION_SNAPSHOT,
             Self::Recovery { .. } => CAPABILITY_RECOVERY,
             Self::InitializeGenesis { .. } => CAPABILITY_INITIALIZE_GENESIS,
@@ -488,39 +486,13 @@ impl StoreRequest {
                 transition,
                 expected_revision_heads,
                 expected_ordering_heads,
-            } => {
-                if context != &identity.request.metadata {
-                    return Err(StoreWireError::Identity(
-                        "apply context does not match request identity metadata".to_owned(),
-                    ));
-                }
-                if transition.identity.idempotency_key != identity.idempotency_key {
-                    return Err(StoreWireError::Identity(
-                        "prepared transition idempotency key does not match request identity"
-                            .to_owned(),
-                    ));
-                }
-                if transition.state_fence != identity.request.state_fence {
-                    return Err(StoreWireError::Identity(
-                        "prepared transition fence does not match request identity".to_owned(),
-                    ));
-                }
-                for head in expected_revision_heads {
-                    if head.state_fence != identity.request.state_fence {
-                        return Err(StoreWireError::Identity(
-                            "revision expectation fence does not match request identity".to_owned(),
-                        ));
-                    }
-                }
-                for head in expected_ordering_heads {
-                    if head.state_fence != identity.request.state_fence {
-                        return Err(StoreWireError::Identity(
-                            "ordering expectation fence does not match request identity".to_owned(),
-                        ));
-                    }
-                }
-                Ok(())
-            }
+            } => validate_apply_identity(
+                context,
+                transition,
+                expected_revision_heads,
+                expected_ordering_heads,
+                identity,
+            ),
             Self::DreamerJob { context, request } => {
                 validate_dreamer_identity(context, request, identity)
             }
@@ -535,6 +507,45 @@ impl StoreRequest {
             _ => Ok(()),
         }
     }
+}
+
+fn validate_apply_identity(
+    context: &RequestMeta,
+    transition: &PreparedTransition,
+    expected_revision_heads: &[RevisionHeadExpectation],
+    expected_ordering_heads: &[OrderingHeadExpectation],
+    identity: &RequestIdentity,
+) -> Result<(), StoreWireError> {
+    if context != &identity.request.metadata {
+        return Err(StoreWireError::Identity(
+            "apply context does not match request identity metadata".to_owned(),
+        ));
+    }
+    if transition.identity.idempotency_key != identity.idempotency_key {
+        return Err(StoreWireError::Identity(
+            "prepared transition idempotency key does not match request identity".to_owned(),
+        ));
+    }
+    if transition.state_fence != identity.request.state_fence {
+        return Err(StoreWireError::Identity(
+            "prepared transition fence does not match request identity".to_owned(),
+        ));
+    }
+    for head in expected_revision_heads {
+        if head.state_fence != identity.request.state_fence {
+            return Err(StoreWireError::Identity(
+                "revision expectation fence does not match request identity".to_owned(),
+            ));
+        }
+    }
+    for head in expected_ordering_heads {
+        if head.state_fence != identity.request.state_fence {
+            return Err(StoreWireError::Identity(
+                "ordering expectation fence does not match request identity".to_owned(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Binds one decoded reserved-write request to the authenticated EBP
