@@ -118,11 +118,11 @@ use eliot_canonical::CanonicalWriteEnvelope;
 use eliot_contracts::{OperationId, StateFence};
 use eliot_protocol::RequestIdentity;
 use eliot_store_api::{
-    EffectClass, EventProjectionRelationIntents, NamedMutationRequest, OrderingHeadExpectation,
-    RevisionHeadExpectation, ScopeId, SecurityContext, TransitionClass, WriteReceipt,
-    WriteReceiptStatus, canonical_json_bytes, decode_capability_evidence_mutation,
-    generated_operation_manifests, operation_manifest_set_digest,
-    reject_direct_capability_evidence_write, sha256_hex,
+    EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
+    OrderingHeadExpectation, RevisionHeadExpectation, ScopeId, SecurityContext, TransitionClass,
+    WriteReceipt, WriteReceiptStatus, canonical_json_bytes, decode_capability_evidence_mutation,
+    decode_instrument_registry_mutation, generated_operation_manifests,
+    operation_manifest_set_digest, reject_direct_capability_evidence_write, sha256_hex,
 };
 
 use crate::capability_evidence::{
@@ -417,4 +417,238 @@ pub async fn commit_capability_evidence_record<P: KernelGenerationPort + ?Sized>
             CompositionError::Owner(format!("capability evidence issued revision: {error}"))
         })?;
     Ok((receipt, revision))
+}
+
+/// The single operation text the committed instrument-registry `operation_id`
+/// is derived from (issue #1814).
+///
+/// `instrument-registry-{snapshot_digest}` is exactly the durable snapshot's
+/// identity: the presented digest is over the verbatim accepted snapshot
+/// bytes, so the SAME registry content always addresses the same operation
+/// (a retry converges at the store instead of appending a second head) and
+/// ANY spec, receipt, or generation change addresses a different one. A
+/// drifted snapshot therefore cannot replay as the admitted one.
+fn instrument_registry_operation_text(snapshot_digest: &str) -> String {
+    format!("instrument-registry-{snapshot_digest}")
+}
+
+/// Reports whether one canonical receipt really committed the named
+/// instrument-registry request, with no stale projection reported healthy
+/// (issue #223 P2 discipline).
+///
+/// Identity/fence agreement mirrors the store's own receipt-identity rule and
+/// head agreement follows the owner CAS contract. This is the same freshness
+/// check the sibling commit paths apply, named for this leg.
+fn check_instrument_registry_commit_freshness(
+    receipt: &WriteReceipt,
+    operation_id: &OperationId,
+    idempotency_key: &str,
+    envelope_fence: &StateFence,
+    expected_revision_heads: &[RevisionHeadExpectation],
+    expected_ordering_heads: &[OrderingHeadExpectation],
+) -> Result<(), CompositionError> {
+    receipt.validate().map_err(|error| {
+        CompositionError::Owner(format!("instrument registry commit receipt invalid: {error}"))
+    })?;
+    if receipt.status != WriteReceiptStatus::Committed {
+        return Err(CompositionError::Owner(
+            "instrument registry commit receipt is not committed; stale projection refused"
+                .to_owned(),
+        ));
+    }
+    if receipt.operation_id != *operation_id || receipt.idempotency_key != idempotency_key {
+        return Err(CompositionError::Owner(
+            "instrument registry commit receipt identity does not match the committed envelope"
+                .to_owned(),
+        ));
+    }
+    if receipt.state_fence != *envelope_fence {
+        return Err(CompositionError::Owner(
+            "instrument registry commit receipt fence does not match the committed envelope fence"
+                .to_owned(),
+        ));
+    }
+    for expected in expected_revision_heads {
+        if let Some(delta) = receipt
+            .revision_before_after
+            .iter()
+            .find(|delta| delta.key == expected.key)
+            && delta.before != expected.expected_revision
+        {
+            return Err(CompositionError::Owner(format!(
+                "instrument registry commit receipt revision is stale for {}: expected base {}, observed {}",
+                expected.key.as_str(),
+                expected.expected_revision,
+                delta.before,
+            )));
+        }
+    }
+    for expected in expected_ordering_heads {
+        if let Some(head) = receipt
+            .ordering_sequences
+            .iter()
+            .find(|head| head.scope == expected.scope)
+            && head.sequence <= expected.expected_sequence
+        {
+            return Err(CompositionError::Owner(format!(
+                "instrument registry commit receipt ordering is stale for {}: expected advance past {}, observed {}",
+                expected.scope.as_str(),
+                expected.expected_sequence,
+                head.sequence,
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Commits one prebuilt named instrument-registry request through the
+/// canonical owner (issue #1814).
+///
+/// This is the Governor-owned sibling of [`commit_capability_evidence_record`]
+/// for the closed `ApplyInstrumentRegistryState` mutation: it executes the
+/// admitted `AdmissionSubmission` snapshot the instrument admission boundary
+/// produced, so the snapshot reaches durable storage through
+/// canonical-store authority instead of any runner-invented write. It
+/// derives the real [`CanonicalWriteEnvelope`] from
+/// the caller identity, the decoded closed parameters of the single named
+/// registry command, the caller-addressed scope, proof refs, live head
+/// expectations, and the live store manifest digest — then invokes
+/// [`GovernorComposition::commit_canonical`](crate::composition::GovernorComposition::commit_canonical)
+/// and checks the returned receipt for freshness.
+///
+/// Envelope field provenance (every field bound, none synthesized; mirrors
+/// `commit_learning_record`):
+///
+/// ```text
+/// operation_id            derived deterministically as
+///                         `instrument-registry-{snapshot_digest}` over the
+///                         verbatim accepted snapshot bytes (stable across
+///                         retries, unique per snapshot revision: any spec,
+///                         receipt, or generation change is a new digest)
+/// request                 the caller-supplied request metadata, cloned verbatim
+/// idempotency_key         the caller identity key: the registry mutation
+///                         declares no idempotency parameter, so there is no
+///                         named-request key to agree with; convergence across
+///                         retries comes from the deterministic operation_id
+///                         plus the store's fenced compare-and-set
+/// scope_id                caller-addressed scope carried into the envelope
+/// task_id                 none: a registry snapshot is scope-addressed, never
+///                         task-bound
+/// transition_class        InstrumentRegistry; ceiling ReversibleMutation (the
+///                         class maximum: a registry snapshot is a durable
+///                         owner snapshot, and the memory dispatch refuses any
+///                         other class with TransitionClassExceeded)
+/// admission_contract_set_digest
+///                         the current supported Store API admission contract
+///                         set; the snapshot digest remains bound in the named
+///                         operation parameters and operation identity
+/// operation_manifest_digest
+///                         computed live from `generated_operation_manifests`
+/// semantic_commands       the single named registry command, refused here
+///                         unless it is exactly ApplyInstrumentRegistryState
+/// event/projection/relation intents
+///                         empty: a durable registry snapshot is not a
+///                         projection or relation; the registry is a
+///                         rebuildable view
+/// security                default context: the snapshot travels inside the
+///                         command parameters, not the envelope security block
+/// required_proof_and_approval_refs
+///                         caller-supplied proof refs, passed through
+/// expected revision/ordering heads
+///                         caller-supplied live owner expectations, each bound
+///                         to the request fence
+/// ```
+///
+/// Fail-closed checks before any commit: the closed-operation guard, the
+/// closed parameter decode through the shared snapshot acceptance boundary
+/// (unsupported schema/version refuses here, before any apply), and
+/// caller-identity validity. The live-registry content drift check itself
+/// already ran where the submission was built
+/// (`submit_admission_snapshot` refuses a replaced spec, receipt, or
+/// generation before producing the snapshot); what this entry refuses on is
+/// any request that is not exactly the admitted closed mutation.
+///
+/// Never accepts a caller-created `PreparedTransition` (there is no such
+/// parameter), never mints a revision from a local clock, never invents a
+/// store operation or a catalogue activation, and never reinterprets the
+/// receipt: the returned [`WriteReceipt`] is the owner's receipt,
+/// unmodified.
+///
+/// Downstream note, stated rather than worked around: the Kernel store
+/// gateway validates the prepared transition against the generated operation
+/// catalogue, which currently carries no activated
+/// `ApplyInstrumentRegistryState` entry, so execution fails closed there
+/// with a typed store refusal until the store owner activates the operation.
+/// That activation is a store-owned slice; this entry does not anticipate it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the commit caller joins every handoff-required envelope input in one typed call"
+)]
+pub async fn commit_instrument_registry_snapshot<P: KernelGenerationPort + ?Sized>(
+    composition: &GovernorComposition<P>,
+    identity: &RequestIdentity,
+    request: NamedMutationRequest,
+    scope_id: ScopeId,
+    proof_refs: Vec<String>,
+    expected_revision_heads: Vec<RevisionHeadExpectation>,
+    expected_ordering_heads: Vec<OrderingHeadExpectation>,
+) -> Result<WriteReceipt, CompositionError> {
+    if request.operation != NamedMutationOperation::ApplyInstrumentRegistryState {
+        return Err(CompositionError::Owner(
+            "instrument registry guard: direct write outside the closed registry operation refused"
+                .to_owned(),
+        ));
+    }
+    let snapshot_json =
+        decode_instrument_registry_mutation(&request.parameters).map_err(|error| {
+            CompositionError::Owner(format!("instrument registry parameters: {error}"))
+        })?;
+    identity.validate().map_err(|error| {
+        CompositionError::Owner(format!("instrument registry identity invalid: {error}"))
+    })?;
+    let snapshot_digest = sha256_hex(snapshot_json.as_bytes());
+    let operation_id = OperationId::new(instrument_registry_operation_text(&snapshot_digest))
+        .map_err(|error| {
+            CompositionError::Owner(format!("instrument registry identity invalid: {error}"))
+        })?;
+    let envelope_fence = identity.request.metadata.state_fence.clone();
+    let idempotency_key = identity.idempotency_key.clone();
+    let manifest_digest =
+        operation_manifest_set_digest(&generated_operation_manifests().map_err(|error| {
+            CompositionError::Owner(format!("operation manifest set unavailable: {error}"))
+        })?)
+        .map_err(|error| CompositionError::Owner(format!("operation manifest digest: {error}")))?;
+    let revision_expectations = expected_revision_heads.clone();
+    let ordering_expectations = expected_ordering_heads.clone();
+    let envelope = CanonicalWriteEnvelope {
+        operation_id: operation_id.clone(),
+        request: identity.request.metadata.clone(),
+        idempotency_key: idempotency_key.clone(),
+        scope_id,
+        task_id: None,
+        transition_class: TransitionClass::InstrumentRegistry,
+        requested_effect_ceiling: EffectClass::ReversibleMutation,
+        admission_contract_set_digest: eliot_canonical::supported_admission_contract_set_digest()?,
+        operation_manifest_digest: manifest_digest,
+        semantic_commands: vec![request],
+        event_projection_relation_intents: EventProjectionRelationIntents {
+            event_ids: Vec::new(),
+            projection_kinds: Vec::new(),
+            relation_kinds: Vec::new(),
+        },
+        security: SecurityContext::default(),
+        required_proof_and_approval_refs: proof_refs,
+        expected_revision_heads,
+        expected_ordering_heads,
+    };
+    let receipt = composition.commit_canonical(identity, envelope).await?;
+    check_instrument_registry_commit_freshness(
+        &receipt,
+        &operation_id,
+        &idempotency_key,
+        &envelope_fence,
+        &revision_expectations,
+        &ordering_expectations,
+    )?;
+    Ok(receipt)
 }
