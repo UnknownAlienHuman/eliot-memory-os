@@ -581,6 +581,7 @@ mod tests {
             request: context(),
             idempotency_key: "idem-golden-1".to_owned(),
             scope_id: ScopeId::new("scope-golden").expect("scope"),
+            ordering_scopes: vec![OrderingScopeId::new("scope-golden").expect("ordering")],
             task_id: Some("task-golden-1".to_owned()),
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
