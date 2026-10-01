@@ -1061,14 +1061,18 @@ impl StartupCoordinator {
     /// the recorded one.
     pub(crate) fn record_live_supervision_evidence(
         &mut self,
-        incarnation: PlatformHandle,
-        candidate_digest: PlatformHandle,
-        state_fence: StateFence,
-        watchdog_epoch: SupervisionJournalEpoch,
-        heartbeat_proof: eliot_kernel_service::AdmittedWatchdogHeartbeatProof,
-        observed_at_ms: u64,
-        valid_for_ms: u64,
+        observation: WatchdogSupervisionObservation,
     ) -> Result<bool, String> {
+        let WatchdogSupervisionObservation {
+            incarnation,
+            candidate_digest,
+            state_fence,
+            watchdog_epoch,
+            heartbeat_proof,
+            observed_at_ms,
+            progress_frontier,
+            valid_for_ms,
+        } = observation;
         if valid_for_ms == 0 {
             return Err(
                 "a Watchdog supervision observation needs a non-zero validity interval".to_owned(),
@@ -1080,22 +1084,21 @@ impl StartupCoordinator {
         if !has_current
             && let Some(frontier) = self.supervision_owner_sequence_frontier.as_ref()
             && frontier.matches_progress_epoch(&incarnation, &watchdog_epoch)
+            && heartbeat_proof.readiness_sequence <= frontier.highest_readiness_sequence
         {
-            if heartbeat_proof.readiness_sequence <= frontier.highest_readiness_sequence {
-                let binding_changed = frontier.candidate_digest != candidate_digest
-                    || frontier.state_fence != state_fence
-                    || frontier.kernel_epoch != kernel_epoch;
-                let reason = if binding_changed {
-                    "candidate, fence, or Kernel epoch rotation cannot lower the retained original Watchdog sequence"
-                } else if frontier.transport_descriptor_digest
-                    != heartbeat_proof.transport_descriptor_digest
-                {
-                    "the transport descriptor changed without advancing the retained owner sequence"
-                } else {
-                    "the admitted Watchdog heartbeat sequence does not advance the retained exact-owner frontier"
-                };
-                return Err(reason.to_owned());
-            }
+            let binding_changed = frontier.candidate_digest != candidate_digest
+                || frontier.state_fence != state_fence
+                || frontier.kernel_epoch != kernel_epoch;
+            let reason = if binding_changed {
+                "candidate, fence, or Kernel epoch rotation cannot lower the retained original Watchdog sequence"
+            } else if frontier.transport_descriptor_digest
+                != heartbeat_proof.transport_descriptor_digest
+            {
+                "the transport descriptor changed without advancing the retained owner sequence"
+            } else {
+                "the admitted Watchdog heartbeat sequence does not advance the retained exact-owner frontier"
+            };
+            return Err(reason.to_owned());
         }
         if let Some(current) = self.current_supervision_observation.as_ref() {
             if current.candidate_digest == candidate_digest
@@ -1143,14 +1146,14 @@ impl StartupCoordinator {
             incarnation: incarnation.clone(),
             watchdog_epoch: watchdog_epoch.clone(),
             transport_descriptor_digest: heartbeat_proof.transport_descriptor_digest.clone(),
-            highest_readiness_sequence: heartbeat_proof.readiness_sequence,
+            highest_readiness_sequence: progress_frontier,
         });
         self.current_supervision_observation = Some(WatchdogSupervisionObservation {
             incarnation,
             candidate_digest,
             state_fence,
             watchdog_epoch,
-            progress_frontier: heartbeat_proof.readiness_sequence,
+            progress_frontier,
             heartbeat_proof,
             observed_at_ms,
             valid_for_ms,

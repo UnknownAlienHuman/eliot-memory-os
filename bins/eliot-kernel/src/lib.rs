@@ -3430,16 +3430,18 @@ impl KernelComposition {
                     "original Host heartbeat deadline precedes its receive time".to_owned(),
                 )
             })?;
+        let observation = startup_coordinator::WatchdogSupervisionObservation {
+            incarnation: incarnation.clone(),
+            candidate_digest: candidate_digest.clone(),
+            state_fence: state_fence.clone(),
+            watchdog_epoch: watchdog_epoch.clone(),
+            heartbeat_proof: heartbeat_proof.clone(),
+            observed_at_ms: heartbeat_proof.received_wall_ms,
+            progress_frontier: heartbeat_proof.readiness_sequence,
+            valid_for_ms,
+        };
         coordinator
-            .record_live_supervision_evidence(
-                incarnation.clone(),
-                candidate_digest.clone(),
-                state_fence.clone(),
-                watchdog_epoch.clone(),
-                heartbeat_proof.clone(),
-                heartbeat_proof.received_wall_ms,
-                valid_for_ms,
-            )
+            .record_live_supervision_evidence(observation)
             .map(|_| ())
             .map_err(KernelServiceError::Platform)
     }
