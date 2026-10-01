@@ -2719,6 +2719,26 @@ impl KernelStoreGateway {
         request
             .validate_for_schedule_normalization()
             .map_err(UserAutomationExecutionError::Contract)?;
+        if let UserAutomationOperation::MigrateLegacySchedule {
+            previous_revision,
+            ..
+        } = &request.intent.operation
+        {
+            let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(self));
+            let retained_predecessor = store
+                .read_revision_predecessor_document(
+                    &request.context.state_fence,
+                    &previous_revision.automation_id,
+                    &previous_revision.revision,
+                )
+                .await
+                .map_err(user_automation_gateway_unknown)?;
+            if retained_predecessor != **previous_revision
+                || retained_predecessor.owner_principal != request.authenticated_principal
+            {
+                return Err(normalization_receipt_binding());
+            }
+        }
         let (automation_id, revision_id) = normalization_selector(request)?;
         let record = self
             .read_user_automation_normalization_record(
