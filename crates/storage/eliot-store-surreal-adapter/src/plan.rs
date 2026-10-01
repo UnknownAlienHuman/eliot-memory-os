@@ -861,7 +861,10 @@ pub(crate) fn validate_receipt_identity(
 ///
 /// Shared-helper only: builds [`CanonicalRequestView::from_apply`] from the
 /// transported `ctx` + `transition` + expected heads and hashes via
-/// [`canonical_request_hash`]. Never reimplements hashing.
+/// [`canonical_request_hash`]. The recomputed commitment includes the
+/// carried ordering scopes as hash-bound set-like input (issue #63 audit
+/// 5870555183), so a scope addition/removal/substitution forks it even on
+/// legs carrying no ordering CAS expectations. Never reimplements hashing.
 #[allow(dead_code)]
 pub(crate) fn recomputed_canonical_request_hash(
     ctx: &RequestMeta,
@@ -881,9 +884,16 @@ pub(crate) fn recomputed_canonical_request_hash(
 /// Verifies the supplied claim against the recomputed digest and returns the
 /// recomputed value for receipt binding.
 ///
-/// The carried ordering scopes must also still equal the hashed expected
-/// ordering heads (a post-admission scope edit leaves the shared digest
-/// unchanged but changes head advancement). The carried bound semantic
+/// The carried ordering scopes are hash-bound content through the shared
+/// view (issue #63 audit 5870555183): a post-admission scope addition,
+/// removal, or substitution forks the recomputed digest, so an unchanged
+/// claimed hash fails here as [`StoreError::TransitionDigestMismatch`]
+/// with no transaction and no lookup success — including on legs carrying
+/// no ordering CAS expectations, where the plan still advances one ordering
+/// head and one chain link per declared scope. On legs carrying an ordering
+/// contract the scopes must additionally still equal the hashed expected
+/// ordering heads as sets (content commitment and CAS expectation are
+/// different obligations). The carried bound semantic
 /// source revisions are hash-bound set-like input through the shared view,
 /// so substituted lineage forks the digest here. Supplied != recomputed,
 /// or a scope/head divergence, is [`StoreError::TransitionDigestMismatch`]

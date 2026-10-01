@@ -6,14 +6,22 @@
 //! carries the State Fence); scope/task/class/effect ceiling; the
 //! contract-set and operation-manifest digests; named operations plus
 //! event/projection/relation intents; the security/provenance closure plus
-//! proof/approval refs; and the expected revision and ordering heads.
+//! proof/approval refs; the expected revision and ordering heads; and the
+//! carried ordering scopes bound as set-like input.
 //!
-//! The transition's `ordering_scopes` are not hashed as a separate field:
-//! Governor derives them from the admitted expected ordering heads and every
-//! gate enforces exact set-equality through
-//! [`verify_ordering_scope_binding`], so a post-admission scope edit fails
-//! with the same typed mismatch as a digest divergence (see the set-ordering
-//! rule below).
+//! The transition's `ordering_scopes` are hash-bound as a separate set-like
+//! field: every gate binds the complete carried scope set (sorted,
+//! duplicate-rejecting) into the digest via
+//! [`CanonicalRequestView::from_apply`], including on legs carrying no
+//! ordering CAS expectations, so a post-admission scope addition, removal,
+//! or substitution forks the recomputed digest into the typed mismatch
+//! before any idempotency lookup, transaction, or receipt (see the
+//! set-ordering rule below). Governor populates the hashed field from the
+//! same scope set it places into the prepared transition; Kernel/store
+//! rebind it from the carried transition. The exact set-equality between
+//! carried scopes and hashed expected ordering heads stays enforced through
+//! [`verify_ordering_scope_binding`] on legs carrying an ordering contract;
+//! a content commitment and a CAS expectation are different obligations.
 //!
 //! The input [`CanonicalRequestView`] is the full envelope-equivalent shape:
 //! Governor builds it from [`crate`] admission values, while Kernel/store
@@ -34,6 +42,7 @@
 //! Semantically set-like collections are sorted into canonical order before
 //! hashing, so producer emission order cannot fork the digest:
 //! `expected_revision_heads` by key, `expected_ordering_heads` by scope,
+//! `ordering_scopes` by scope text,
 //! `semantic_source_revisions` lexicographically (`key@revision` heads),
 //! `required_proof_and_approval_refs` lexicographically, and each
 //! event/projection/relation intent list (`event_ids` by id,
@@ -47,12 +56,17 @@
 //! order. Reordering a set-like collection therefore yields the identical
 //! hash, while reordering `semantic_commands` yields a different hash.
 //!
-//! The transition's `ordering_scopes` follow the same set semantics without
-//! appearing in the hashed view: [`verify_ordering_scope_binding`] requires
-//! the carried scopes to equal the hashed expected ordering heads as sets
-//! (sorted, duplicates rejected) on every path carrying an ordering
-//! contract, so adding or removing that executable set fails closed with
-//! [`StoreError::TransitionDigestMismatch`].
+//! The transition's `ordering_scopes` follow the same set semantics as
+//! hashed view input: [`CanonicalRequestView::from_apply`] rebinds the
+//! carried scopes verbatim and [`canonical_request_bytes`] sorts them into
+//! canonical order (duplicates rejected with the typed error), so adding,
+//! removing, or substituting that executable set forks the digest into
+//! [`StoreError::TransitionDigestMismatch`] — including on legs carrying no
+//! ordering CAS expectations, where the plan still advances one ordering
+//! head and one chain link per declared scope. [`verify_ordering_scope_binding`]
+//! additionally requires the carried scopes to equal the hashed expected
+//! ordering heads as sets (sorted, duplicates rejected) on every path
+//! carrying an ordering contract.
 //!
 //! The transition's `semantic_source_revisions` ARE hash-bound set-like
 //! input (issue #63 cross-check): I1.8 names them part of the load-bearing
@@ -63,6 +77,22 @@
 //! [`crate::render_semantic_source_revisions`] (canonically sorted) and are
 //! sorted again here before hashing, so producer emission order cannot fork
 //! the digest while any content edit forks it into the typed mismatch.
+//!
+//! Hash-version and legacy-replay discipline: the canonical bytes above ARE
+//! the versioned encoding — there is no separate hash-version field and no
+//! migration or restamp path. Extending the hashed input (as this module did
+//! for `semantic_source_revisions` and now for `ordering_scopes`) changes
+//! the digest by design: a retained digest computed under pre-binding bytes
+//! is never reinterpreted under the new bytes, so its recompute diverges
+//! into [`StoreError::TransitionDigestMismatch`], and the same
+//! operation/idempotency key with forked executable bytes resolves through
+//! the existing stored-vs-recomputed `IdentityConflict` arm with no
+//! transaction — never a silent replay. Contract-revision support stays
+//! with the existing exact gate (`PreparedTransition::validate` admits only
+//! the recorded [`crate::CONTRACT_VERSION`], so an unsupported revision
+//! fails before any content is interpreted). Genesis keeps its separately
+//! defined request identity (`StoreGenesisRequest` digest and validation);
+//! this family adds no genesis branch.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -128,6 +158,22 @@ pub struct CanonicalRequestView {
     /// and Kernel/store rebind them from the carried transition via
     /// [`CanonicalRequestView::from_apply`].
     pub semantic_source_revisions: Vec<String>,
+    /// Carried ordering scopes bound as set-like hash input (issue #63
+    /// audit 5870555183).
+    ///
+    /// Sorted into canonical order by [`canonical_request_bytes`] before
+    /// hashing (duplicates rejected with the typed error), so producer
+    /// emission order cannot fork the digest while any scope
+    /// addition/removal/substitution forks it — including on legs carrying
+    /// no ordering CAS expectations (empty `expected_ordering_heads`), where
+    /// the scopes previously travelled outside request identity while the
+    /// plan still advanced one ordering head and one chain link per declared
+    /// scope. Governor populates this from the same scope set it places
+    /// into the prepared transition; Kernel/store rebind it from the
+    /// carried transition via [`CanonicalRequestView::from_apply`]. This is
+    /// the content commitment; the CAS expectation stays the exact-equality
+    /// check in [`verify_ordering_scope_binding`].
+    pub ordering_scopes: Vec<OrderingScopeId>,
     /// Compare-and-swap expectations for affected revision heads.
     pub expected_revision_heads: Vec<RevisionHeadExpectation>,
     /// Compare-and-swap expectations for affected ordering heads.
@@ -143,9 +189,11 @@ impl CanonicalRequestView {
     /// `context` and head lists. The transition's stored
     /// `identity.canonical_request_hash` is the claimed digest under test and
     /// is never copied into the hashed input. The transition's own
-    /// `ordering_scopes` are carried through untouched (the plan executes
-    /// them directly); gates enforce their correspondence with the hashed
-    /// heads via [`verify_ordering_scope_binding`]. The transition's
+    /// `ordering_scopes` are rebound verbatim into the hash-bound
+    /// [`CanonicalRequestView::ordering_scopes`] set: a post-admission scope
+    /// edit forks the recomputed digest into the typed mismatch at every
+    /// gate, including when no ordering CAS expectations travel alongside.
+    /// The transition's
     /// `semantic_source_revisions` are rebound verbatim: they are hash-bound
     /// set-like input, so a post-admission edit forks the recomputed digest
     /// into the typed mismatch at every gate.
@@ -170,6 +218,7 @@ impl CanonicalRequestView {
             security: transition.security.clone(),
             required_proof_and_approval_refs: transition.required_proof_and_approval_refs.clone(),
             semantic_source_revisions: transition.semantic_source_revisions.clone(),
+            ordering_scopes: transition.ordering_scopes.clone(),
             expected_revision_heads: expected_revision_heads.to_vec(),
             expected_ordering_heads: expected_ordering_heads.to_vec(),
         }
@@ -193,6 +242,19 @@ pub fn canonical_request_bytes(view: &CanonicalRequestView) -> Result<Vec<u8>, S
     // Bound source lineage is set-like (`key@revision` heads): canonical
     // order before hashing so emission order cannot fork the digest.
     normalized.semantic_source_revisions.sort();
+    // Carried ordering scopes are execution-bearing set-like input (issue
+    // #63 audit 5870555183): canonical order before hashing so emission
+    // order cannot fork the digest, while any scope addition, removal, or
+    // substitution forks it. Duplicates are rejected on the carried values
+    // (the same typed refusal `PreparedTransition::validate` issues), so a
+    // post-admission scope duplication fails here before any
+    // lookup/transaction as well.
+    normalized.ordering_scopes.sort();
+    if normalized.ordering_scopes.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(StoreError::Duplicate {
+            field: "ordering_scopes",
+        });
+    }
     normalized
         .event_projection_relation_intents
         .event_ids
@@ -264,24 +326,30 @@ pub fn derive_corrected_operation_id(rejected_operation_id: &str, rejection_id: 
 /// Verifies that the transition-carried ordering scopes are the exact
 /// execution of the hashed expected ordering heads (issue #63).
 ///
-/// [`CanonicalRequestView`] covers the expected heads but not the
-/// transition's own `ordering_scopes`, which the store executes: the plan
+/// [`CanonicalRequestView`] covers both the expected heads and the carried
+/// `ordering_scopes` (audit 5870555183), which the store executes: the plan
 /// advances one ordering head per declared scope
 /// (`surreal plan.rs`, `memory transaction_plan`) and the attempt reads the
 /// union of declared and expected scopes. Governor derives the carried
 /// scopes from the admitted heads (`prepare()`), so on any path carrying an
 /// ordering contract (non-empty `expected_ordering_heads`) the two sets must
 /// still coincide here: a post-admission scope addition, removal, or
-/// substitution that leaves the shared digest unchanged fails closed with
+/// substitution fails closed with
 /// [`StoreError::TransitionDigestMismatch`] before any idempotency lookup,
-/// transaction, or receipt. The comparison is set-like (sorted, duplicates
-/// rejected), matching the module ordering rule and the Kernel staging
-/// admission (`validate_admitted`, `pre_stage_check`).
+/// transaction, or receipt — and independently forks the shared digest
+/// through the hash-bound scopes, so an unchanged claimed hash is also
+/// rejected by [`verify_canonical_request_hash`]. The comparison is
+/// set-like (sorted, duplicates rejected), matching the module ordering rule
+/// and the Kernel staging admission (`validate_admitted`,
+/// `pre_stage_check`).
 ///
 /// Legs carrying no ordering contract (empty `expected_ordering_heads` —
-/// Kernel-direct automation/notification/reactive/lifecycle writes) have
-/// nothing to contradict and are unchecked by this function; their
-/// transitions are admitted by their owning legs. Callers must invoke this
+/// Kernel-direct automation/notification/reactive/lifecycle writes) carry no
+/// CAS expectation to equate against, so they are never rejected here for
+/// being expectation-free; their carried scopes are still content-committed
+/// through the shared digest, and their set shape (no duplicated scope) is
+/// enforced here. Their transitions are admitted by their owning legs.
+/// Callers must invoke this
 /// BEFORE any idempotency-lookup success is returned and BEFORE any
 /// transaction/receipt, next to [`verify_canonical_request_hash`].
 pub fn verify_ordering_scope_binding(
@@ -289,6 +357,17 @@ pub fn verify_ordering_scope_binding(
     expected_ordering_heads: &[OrderingHeadExpectation],
 ) -> Result<(), StoreError> {
     if expected_ordering_heads.is_empty() {
+        // No CAS expectation to contradict — but the carried scopes remain
+        // hash-bound request identity, so a duplicated scope is still a
+        // post-admission edit and fails typed before any lookup/transaction.
+        // Legitimate first-write/no-CAS legs carry each scope once and pass.
+        let mut ordered = transition.ordering_scopes.clone();
+        ordered.sort();
+        if ordered.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(StoreError::Duplicate {
+                field: "ordering_scopes",
+            });
+        }
         return Ok(());
     }
     let mut declared: Vec<&str> = transition
