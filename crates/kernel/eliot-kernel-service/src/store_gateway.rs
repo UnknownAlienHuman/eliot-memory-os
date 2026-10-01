@@ -2855,12 +2855,14 @@ impl KernelStoreGateway {
         })?;
         let (original, retained_revision, retained_envelope) =
             super::user_automation_store::validate_normalization_record(&record)
-                .map_err(|_| normalization_receipt_binding())?;
+                .map_err(user_automation_gateway_unknown)?;
         if !Self::same_normalization_intent(&original, request)
             || retained_revision != *revision
             || retained_envelope != *envelope
         {
-            return Err(normalization_receipt_binding());
+            return Err(user_automation_gateway_unknown(
+                "committed normalization does not match its exact readback",
+            ));
         }
         Ok((original, retained_revision, retained_envelope))
     }
