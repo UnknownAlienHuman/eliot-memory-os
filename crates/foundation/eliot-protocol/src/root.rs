@@ -57,8 +57,9 @@ pub mod activation_resolution_v1;
 
 mod reason_codes;
 pub use reason_codes::{
-    AGENT_REASON_CODES, AgentReasonCode, BRIDGE_REASON_CODE_ALIASES, agent_reason_code,
-    bridge_reason_code_alias,
+    AGENT_REASON_CODES, AgentReasonCode, BRIDGE_DENIAL_PROJECTION, BRIDGE_REASON_CODE_ALIASES,
+    BridgeDenialProjection, agent_reason_code, bridge_denial_projection, bridge_reason_code_alias,
+    canonical_denial_projection,
 };
 
 mod activation_resolution;

@@ -61,13 +61,17 @@ over the entire additive reason registry.
 
 This transport column is interpreted only at the bridge compatibility boundary.
 An identity mapping retains the same canonical spelling and does not create a second registry entry.
+The disposition and directive columns are the generated #204 denial
+projection: the closed I7.20 disposition plus the typed directive
+wire value for each legacy transport name. The Kernel-owned
+no-result row keeps the retry directive, never the failure capsule.
 
-| Legacy transport name | Canonical reason code |
-| --- | --- |
-| `TASK_SELECTION_REQUIRED` | `TASK_SELECTION_REQUIRED` |
-| `SCOPE_SELECTION_REQUIRED` | `TASK_SCOPE_INCOMPATIBLE` |
-| `SCOPE_AMBIGUOUS` | `AMBIGUOUS_RESULT` |
-| `NOT_READY` | `DEFERRED_CAPACITY` |
-| `STALE_FENCE` | `STALE_STATE_FENCE` |
-| `FAILED_INTERNAL` | `RUNTIME_FAILED` |
-| `SEMANTIC_RESOLUTION_UNAVAILABLE` | `UNKNOWN_OUTCOME` |
+| Legacy transport name | Canonical reason code | Disposition | Directive |
+| --- | --- | --- | --- |
+| `TASK_SELECTION_REQUIRED` | `TASK_SELECTION_REQUIRED` | `INVALID_REQUEST` | `candidate-recovery-no-auto-selection` |
+| `SCOPE_SELECTION_REQUIRED` | `TASK_SCOPE_INCOMPATIBLE` | `INVALID_REQUEST` | `candidate-recovery-no-auto-selection` |
+| `SCOPE_AMBIGUOUS` | `AMBIGUOUS_RESULT` | `STALE_OR_CONFLICT` | `candidate-recovery-no-auto-selection` |
+| `NOT_READY` | `DEFERRED_CAPACITY` | `UNAVAILABLE_OR_CAPACITY` | `retry-requires-new-ticket` |
+| `STALE_FENCE` | `STALE_STATE_FENCE` | `STALE_OR_CONFLICT` | `stale-fence-fail-closed` |
+| `FAILED_INTERNAL` | `RUNTIME_FAILED` | `FAILED` | `failure-capsule` |
+| `SEMANTIC_RESOLUTION_UNAVAILABLE` | `UNKNOWN_OUTCOME` | `FAILED` | `retry-requires-new-ticket` |
