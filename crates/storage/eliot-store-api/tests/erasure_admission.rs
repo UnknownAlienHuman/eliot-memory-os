@@ -37,6 +37,8 @@ fn admission_request() -> ErasureAdmissionRequest {
             idempotency_key: "idem-erasure-1".to_owned(),
             canonical_request_hash: "c".repeat(64),
         },
+        write_intent_id: "intent-erasure-1".to_owned(),
+        write_envelope_protocol_version: 1,
         scope_id: ScopeId::new("scope-erasure").unwrap(),
         ordering_scope: OrderingScopeId::new("scope-erasure").unwrap(),
         state_fence: fence(),

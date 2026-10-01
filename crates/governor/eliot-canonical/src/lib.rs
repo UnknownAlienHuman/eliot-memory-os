@@ -460,6 +460,23 @@ pub struct CanonicalWriteEnvelope {
     pub request: RequestMetadata,
     /// Stable logical retry identity.
     pub idempotency_key: String,
+    /// Stable user/agent write intent across typed correction attempts.
+    ///
+    /// `I05-05-write-envelope.md` gives this member exactly one purpose and
+    /// `I06-08-contract-rejection.md` requires a schema-invalid
+    /// `NOT_ATTEMPTED` request to leave it unconsumed, so it is a THIRD,
+    /// DISTINCT identity beside `operation_id` (rotates per attempt) and
+    /// `idempotency_key` (rotates per typed correction). It is taken verbatim
+    /// from the admitted [`VersionedWriteSubmission::write_intent_id`] and is
+    /// never derived from either neighbouring identity.
+    pub write_intent_id: String,
+    /// Write-envelope protocol version this envelope was admitted under.
+    ///
+    /// [`write_envelope::WRITE_ENVELOPE_PROTOCOL_VERSION`] is the only
+    /// version this boundary admits; [`CanonicalWriteEnvelope::validate`]
+    /// performs that exact equality check so the carried copy can never
+    /// disagree with the submission's own `protocol_version`.
+    pub write_envelope_protocol_version: u32,
     /// `WorkScope` addressed by the transition.
     pub scope_id: ScopeId,
     /// Optional task binding; unbound capture remains cold evidence.
@@ -492,6 +509,7 @@ impl CanonicalWriteEnvelope {
     pub fn validate(&self) -> Result<(), CanonicalError> {
         self.request.validate()?;
         self.idempotency_key_valid()?;
+        self.write_intent_identity_valid()?;
         self.task_binding_valid()?;
         digest(
             &self.admission_contract_set_digest,
@@ -563,6 +581,57 @@ impl CanonicalWriteEnvelope {
         text(&self.idempotency_key, "idempotency_key")
     }
 
+    /// Refuses a missing or unsupported write-intent identity.
+    ///
+    /// A blank intent is a TYPED REFUSAL, never a manufactured owner value:
+    /// this boundary refuses rather than default, because a defaulted intent
+    /// would make "no owner supplied one" silently acceptable and would
+    /// collapse the third, distinct write identity into a shared placeholder
+    /// that two unrelated callers could both adopt. The protocol-version arm
+    /// is the exact gate: this crate owns
+    /// [`write_envelope::WRITE_ENVELOPE_PROTOCOL_VERSION`], so a carried copy
+    /// of any other revision is a contract conflict and fails closed instead
+    /// of being forwarded to a store that would only refuse the
+    /// unrepresentable `0`.
+    fn write_intent_identity_valid(&self) -> Result<(), CanonicalError> {
+        write_envelope::validate_write_intent_id(&self.write_intent_id)?;
+        if self.write_envelope_protocol_version != write_envelope::WRITE_ENVELOPE_PROTOCOL_VERSION
+        {
+            return Err(CanonicalError::InvalidField {
+                field: "write_envelope_protocol_version",
+                reason: "unsupported write envelope version",
+            });
+        }
+        Ok(())
+    }
+
+    /// Refuses an envelope whose carried write-intent members disagree with
+    /// the admitted submission that owns them.
+    ///
+    /// The two copies exist on both sides of admission, so they can only ever
+    /// be equal. A divergence is a TYPED REFUSAL: repairing it would mean
+    /// picking one of two owner values by fiat, and picking the submission's
+    /// would silently overwrite what the envelope's own hash binds.
+    pub(crate) fn write_intent_identity_matches(
+        &self,
+        write_intent_id: &str,
+        protocol_version: u32,
+    ) -> Result<(), CanonicalError> {
+        if self.write_intent_id != write_intent_id {
+            return Err(CanonicalError::InvalidField {
+                field: "write_intent_id",
+                reason: "envelope write intent does not match the admitted submission",
+            });
+        }
+        if self.write_envelope_protocol_version != protocol_version {
+            return Err(CanonicalError::InvalidField {
+                field: "write_envelope_protocol_version",
+                reason: "envelope protocol version does not match the admitted submission",
+            });
+        }
+        Ok(())
+    }
+
     fn task_binding_valid(&self) -> Result<(), CanonicalError> {
         if let Some(task_id) = &self.task_id {
             text(task_id, "task_id")?;
@@ -608,6 +677,8 @@ impl CanonicalWriteEnvelope {
             operation_id: self.operation_id.clone(),
             request: self.request.clone(),
             idempotency_key: self.idempotency_key.clone(),
+            write_intent_id: self.write_intent_id.clone(),
+            write_envelope_protocol_version: self.write_envelope_protocol_version,
             scope_id: self.scope_id.clone(),
             task_id: self.task_id.clone(),
             transition_class: self.transition_class,
@@ -642,6 +713,15 @@ impl CanonicalWriteEnvelope {
                 idempotency_key: self.idempotency_key.clone(),
                 canonical_request_hash: self.canonical_request_hash()?,
             },
+            // Issue #1925: the two unsourced write-intent identity members are
+            // carried verbatim from the admitted envelope. They are NOT
+            // re-derived from `operation_id` or `idempotency_key`: the stable
+            // intent is a third, distinct identity (I05-5 / I6.8), so the
+            // envelope is their only admissible source and the prepared
+            // transition is what the store, Kernel and reserved-write
+            // producer all read to bind the real `RecoveryWriteBinding`.
+            write_intent_id: self.write_intent_id.clone(),
+            write_envelope_protocol_version: self.write_envelope_protocol_version,
             state_fence: self.state_fence(),
             scope_id: self.scope_id.clone(),
             task_id: self.task_id.clone(),
@@ -1354,6 +1434,8 @@ mod tests {
             operation_id: OperationId::new("op-byte-identity-min").expect("operation id"),
             request: test_request(fence),
             idempotency_key: "idem-byte-identity-min".to_owned(),
+            write_intent_id: "intent-byte-identity-min".to_owned(),
+            write_envelope_protocol_version: write_envelope::WRITE_ENVELOPE_PROTOCOL_VERSION,
             scope_id: ScopeId::new("scope-byte-identity").expect("scope"),
             task_id: None,
             transition_class: TransitionClass::CaptureCandidate,
@@ -1483,6 +1565,11 @@ mod tests {
                 },
             },
             idempotency_key: "idem-golden-chain-63".to_owned(),
+            // The cross-crate golden chain carries a fixture-owned stable
+            // write intent, distinct from its operation identity and its
+            // idempotency key, so the pinned bytes cover both new members.
+            write_intent_id: "intent-golden-chain-63".to_owned(),
+            write_envelope_protocol_version: write_envelope::WRITE_ENVELOPE_PROTOCOL_VERSION,
             scope_id: ScopeId::new("scope-golden-chain-63").expect("scope"),
             task_id: None,
             transition_class: TransitionClass::CaptureCandidate,
@@ -1519,8 +1606,16 @@ mod tests {
     /// Pinned digest of [`golden_chain_envelope`], derived by running the
     /// shared hash over those fixed inputs (not hand-written):
     /// `eliot-store-api` and `eliot-store-memory` assert the same literal.
+    ///
+    /// #1925 re-pin: the hashed request input gained the two write-intent
+    /// identity members, so the digest changes by design under the
+    /// documented `request_hash.rs` discipline (a retained pre-carry digest
+    /// is never reinterpreted under the new bytes). The literal is the value
+    /// `canonical_request_hash` emits over the current fixture, including the
+    /// `ordering_scopes` field added by #4728, which the previous pin never
+    /// covered.
     const ISSUE_63_GOLDEN_CHAIN_DIGEST: &str =
-        "32d9235499c0e63f72509808c0b1439cd7e879c754fbc1bc5e965bb6af4d6a36";
+        "REPIN_PENDING_ISSUE_63_GOLDEN_CHAIN_DIGEST";
 
     #[test]
     fn golden_chain_envelope_hash_matches_the_pinned_cross_crate_digest() {
@@ -1536,5 +1631,84 @@ mod tests {
             transition.identity.canonical_request_hash,
             ISSUE_63_GOLDEN_CHAIN_DIGEST
         );
+    }
+
+    /// #1925: the two write-intent identity members cross admission verbatim
+    /// and are never re-derived from the operation identity or the
+    /// idempotency key.
+    #[test]
+    fn prepare_carries_the_admitted_write_intent_and_protocol_version() {
+        let fence = test_fence();
+        let mut envelope = golden_chain_envelope(&fence);
+        envelope.write_intent_id = "intent-1925-carried".to_owned();
+        let submission = write_envelope::VersionedWriteSubmission::bind(
+            write_envelope::WRITE_ENVELOPE_PROTOCOL_VERSION,
+            "intent-1925-carried".to_owned(),
+            envelope,
+            WriteResponseMode::WaitForCommit,
+        )
+        .expect("submission binds under the carried identity");
+        let transition = submission
+            .envelope
+            .prepare()
+            .expect("chain envelope prepares");
+        assert_eq!(transition.write_intent_id, submission.write_intent_id);
+        assert_eq!(transition.write_intent_id, "intent-1925-carried");
+        assert_eq!(
+            transition.write_envelope_protocol_version,
+            write_envelope::WRITE_ENVELOPE_PROTOCOL_VERSION
+        );
+        // The carry is not a re-derivation of either neighbouring identity.
+        assert_ne!(transition.write_intent_id, transition.identity.operation_id.as_str());
+        assert_ne!(transition.write_intent_id, transition.identity.idempotency_key);
+    }
+
+    /// #1925: a submission whose envelope carries a different write intent
+    /// than the submission itself is refused, never repaired.
+    #[test]
+    fn submission_refuses_an_envelope_intent_that_contradicts_the_submission() {
+        let fence = test_fence();
+        let envelope = golden_chain_envelope(&fence);
+        let result = write_envelope::VersionedWriteSubmission::bind(
+            write_envelope::WRITE_ENVELOPE_PROTOCOL_VERSION,
+            "intent-1925-other".to_owned(),
+            envelope,
+            WriteResponseMode::WaitForCommit,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(CanonicalError::InvalidField {
+                    field: "write_intent_id",
+                    ..
+                })
+            ),
+            "a contradictory owner value must be a typed refusal, got {result:?}"
+        );
+    }
+
+    /// #1925: a blank or absent owner intent is refused, never defaulted.
+    #[test]
+    fn blank_write_intent_is_refused_rather_than_defaulted() {
+        let fence = test_fence();
+        let mut envelope = golden_chain_envelope(&fence);
+        envelope.write_intent_id = String::new();
+        assert!(matches!(
+            envelope.validate(),
+            Err(CanonicalError::InvalidField {
+                field: "write_intent_id",
+                ..
+            })
+        ));
+        let mut unsupported = golden_chain_envelope(&fence);
+        unsupported.write_envelope_protocol_version =
+            write_envelope::WRITE_ENVELOPE_PROTOCOL_VERSION + 1;
+        assert!(matches!(
+            unsupported.validate(),
+            Err(CanonicalError::InvalidField {
+                field: "write_envelope_protocol_version",
+                ..
+            })
+        ));
     }
 }

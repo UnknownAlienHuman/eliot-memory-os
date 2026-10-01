@@ -117,6 +117,14 @@ impl VersionedWriteSubmission {
     /// `ordering_scopes` set via the prepared transition), and the
     /// already-typed agent response mode. Computes the canonical request
     /// hash over the immutable request identity.
+    ///
+    /// Issue #1925: the submission's own `write_intent_id` and
+    /// `protocol_version` and the envelope's carried copies of the same two
+    /// members must be the SAME owner value. `PreparedTransition` now carries
+    /// them, so a submission that admitted one intent while declaring another
+    /// would make the ledger's decision identity and the executed transition's
+    /// intent identity disagree; that is a TYPED REFUSAL here rather than a
+    /// repair, and neither copy is ever re-derived from the other.
     pub fn bind(
         protocol_version: u32,
         write_intent_id: String,
@@ -130,6 +138,7 @@ impl VersionedWriteSubmission {
             });
         }
         validate_write_intent_id(&write_intent_id)?;
+        envelope.write_intent_identity_matches(&write_intent_id, protocol_version)?;
         envelope.validate()?;
         // Require the complete ordering-scope declaration before staging:
         // the prepared transition rejects an empty ordering set.
@@ -388,6 +397,11 @@ mod tests {
             operation_id: OperationId::new(operation).expect("operation id"),
             request: request(fence),
             idempotency_key: idem.to_owned(),
+            // The fixture's own stable intent, matching the value
+            // `submission` binds: it is deliberately distinct from the
+            // operation identity and the idempotency key.
+            write_intent_id: "intent-1928".to_owned(),
+            write_envelope_protocol_version: WRITE_ENVELOPE_PROTOCOL_VERSION,
             scope_id: ScopeId::new("scope-1928").expect("scope"),
             task_id: None,
             transition_class: TransitionClass::CaptureCandidate,

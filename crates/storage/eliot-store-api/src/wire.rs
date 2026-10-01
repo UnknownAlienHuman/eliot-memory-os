@@ -1942,6 +1942,10 @@ mod tests {
                 idempotency_key: "idem-authority".to_owned(),
                 canonical_request_hash: "a".repeat(64),
             },
+            // Authority fixtures admit their own stable write intent; the
+            // identity is supplied, never derived from the operation id.
+            write_intent_id: "intent-authority".to_owned(),
+            write_envelope_protocol_version: 1,
             state_fence: fence,
             scope_id: ScopeId::new("scope-authority").expect("scope"),
             task_id: None,

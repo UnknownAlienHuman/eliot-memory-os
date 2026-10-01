@@ -114,6 +114,20 @@ pub fn decode_erasure_surfaces(value: &str) -> Result<Vec<String>, StoreError> {
 pub struct ErasureAdmissionRequest {
     /// Stable operation identity shared by staging, execution, and receipt.
     pub identity: OperationIdentity,
+    /// Stable user/agent write intent of the admitted submission (issue #1925).
+    ///
+    /// An erasure request is a user-initiated write, so it carries the same
+    /// third, distinct write identity every other admitted transition carries.
+    /// It is supplied by the admitting owner and is never derived from
+    /// `identity.operation_id` or `identity.idempotency_key`; a caller that has
+    /// no write intent to supply must be refused, not defaulted.
+    pub write_intent_id: String,
+    /// Write-envelope protocol version the admitting owner admitted under.
+    ///
+    /// The admitting owner (`eliot-canonical`) owns the exact supported
+    /// revision; this builder only refuses the unrepresentable `0` and carries
+    /// the owner's value verbatim into the transition.
+    pub write_envelope_protocol_version: u32,
     /// Exact admitted scope: the only scope the deletion may touch.
     pub scope_id: ScopeId,
     /// Ordering scope serializing this transition.
@@ -156,6 +170,13 @@ impl ErasureAdmissionRequest {
     /// Validates the explicit-request shape without issuing any authority.
     pub fn validate(&self) -> Result<(), StoreError> {
         self.identity.validate()?;
+        super::validate_text(&self.write_intent_id, "erasure.write_intent_id")?;
+        if self.write_envelope_protocol_version == 0 {
+            return Err(StoreError::InvalidField {
+                field: "erasure.write_envelope_protocol_version",
+                reason: "must be greater than zero",
+            });
+        }
         super::validate_text(&self.subject, "erasure.subject")?;
         super::validate_text(&self.payload_ref, "erasure.payload_ref")?;
         super::validate_text(&self.encryption_key_ref, "erasure.encryption_key_ref")?;
@@ -254,6 +275,10 @@ pub fn admit_erasure_transition(
     let mut transition = PreparedTransition {
         contract_version: crate::CONTRACT_VERSION,
         identity: request.identity.clone(),
+        // Issue #1925: carried verbatim from the admitting owner; the erasure
+        // builder is not the owner of the write intent and never mints one.
+        write_intent_id: request.write_intent_id.clone(),
+        write_envelope_protocol_version: request.write_envelope_protocol_version,
         state_fence: request.state_fence.clone(),
         scope_id: request.scope_id.clone(),
         task_id: None,
