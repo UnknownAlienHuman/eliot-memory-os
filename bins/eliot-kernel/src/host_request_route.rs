@@ -1360,6 +1360,164 @@ impl KernelComposition {
         })
     }
 
+    /// Records the terminal owner's per-record dispositions onto the durable
+    /// Watchdog intent projections this Kernel already staged, exactly once per
+    /// retained spool record.
+    ///
+    /// This is the Kernel half of the I8.1 terminal leg and the sibling of
+    /// [`Self::record_watchdog_export_outcomes`]: where the admit entry stops
+    /// at the durable `Admitted` pending intent, this entry binds the
+    /// Governor's own recorded terminal disposition onto that same durable
+    /// identity through the owner's ORS result path. The distinction the issue
+    /// requires is preserved by construction: the Watchdog's intent row is
+    /// never rewritten into a decision, and the Governor's canonical
+    /// Problem/Incident transition itself stays the Governor lane's (AUD5) —
+    /// this entry only persists the submitted closed dispositions after proving
+    /// each one answers the exact retained record the intent route projected.
+    ///
+    /// Terminal-owner enforcement is structural: this mutation takes typed
+    /// submissions, never a Watchdog front-door frame — there is deliberately
+    /// no `watchdog_intent_outcome` front-door operation, so the observed
+    /// party can never record its own terminal outcome. The only caller is the
+    /// Governor lane's daemon dispatch arm (STITCH, Governor writer owns that
+    /// arm plus the eliotd canonical intake and readback); the Watchdog learns
+    /// the outcome only through its own export-contour acknowledgement
+    /// validation, which still owns every cursor and compaction decision. This
+    /// entry advances no cursor, compacts nothing, and writes no canonical
+    /// state: an identical resubmission replays to the same durable record
+    /// while a changed disposition under the same identity is an identity
+    /// conflict, never a second decision.
+    ///
+    /// A pending intent the Governor has not decided is simply absent from the
+    /// submitted list: there is no way to express "not yet" as a disposition,
+    /// so a missing outcome leaves the record pending exactly as before.
+    ///
+    /// Outcomes are prompt by contract: each answered row carries the intent
+    /// batch's acknowledgement deadline, and an elapsed deadline is a
+    /// `Timeout` rather than a late bind, mirroring the export outcome leg.
+    /// The Governor flow is claim-then-decide-then-record, so a Governor that
+    /// decides after the window expired retries against a fresh window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::SessionFenced`] when the session, service
+    /// state, installation, outcome bound, ordering, shape, or row binding is
+    /// unusable, [`TransportError::UnknownRequest`] when an outcome names an
+    /// intent identity this Kernel never staged, [`TransportError::Timeout`]
+    /// when the answered row's deadline elapsed, and
+    /// [`TransportError::IdentityConflict`] when an outcome replays under a key
+    /// already bound to different bytes.
+    pub(crate) fn record_watchdog_intent_outcomes(
+        &self,
+        session: &Session,
+        installation_id: &str,
+        outcomes: &[WatchdogIntentOutcomeSubmission],
+    ) -> Result<Vec<WatchdogIntentOutcomeProjection>, TransportError> {
+        let _transition = self.agent_bridge_transition_read()?;
+        if installation_id.is_empty()
+            || outcomes.is_empty()
+            || outcomes.len() > eliot_protocol::MAX_WATCHDOG_SPOOL_INTENT_SUBMISSIONS
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let now = unix_ms();
+        if self
+            .service_state()
+            .map_err(|_| TransportError::SessionFenced)?
+            != KernelServiceState::Ready
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        session
+            .peer
+            .validate()
+            .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        if !session.accepts(&session.authority_epoch, session.session_epoch) {
+            return Err(TransportError::SessionFenced);
+        }
+        let mut previous: Option<u64> = None;
+        for outcome in outcomes {
+            outcome.validate(installation_id)?;
+            if previous.is_some_and(|sequence| outcome.sequence <= sequence) {
+                return Err(TransportError::SessionFenced);
+            }
+            previous = Some(outcome.sequence);
+        }
+        let mut projections = Vec::with_capacity(outcomes.len());
+        for outcome in outcomes {
+            projections.push(self.stage_watchdog_intent_outcome(installation_id, outcome, now)?);
+        }
+        Ok(projections)
+    }
+
+    /// Binds one Governor-recorded terminal disposition onto its durable intent
+    /// projection.
+    fn stage_watchdog_intent_outcome(
+        &self,
+        installation_id: &str,
+        outcome: &WatchdogIntentOutcomeSubmission,
+        now_ms: u64,
+    ) -> Result<WatchdogIntentOutcomeProjection, TransportError> {
+        outcome.validate(installation_id)?;
+        let operation_id = OperationIdentity::new(format!(
+            "{WATCHDOG_INTENT_OPERATION_ID_PREFIX}{}",
+            outcome.idempotency_key
+        ))
+        .map_err(|_| TransportError::SessionFenced)?;
+        let stored = self
+            .generation_gateway
+            .ors
+            .load_host_request(&operation_id, &outcome.record_digest)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::UnknownRequest)?;
+        // The stored row must be this route's own durable intent projection
+        // for the exact record the outcome answers. Anything else is a
+        // requested-versus-actual route divergence, never a silent fence: in
+        // particular an export-drain row can never receive an intent outcome,
+        // so the two contours cannot be confused into advancing each other's
+        // state.
+        if stored.capability_ref.as_str() != WATCHDOG_INTENT_CAPABILITY {
+            return Err(TransportError::SessionFenced);
+        }
+        if stored.request_digest != outcome.record_digest
+            || stored.idempotency_key.as_str() != outcome.idempotency_key
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        if now_ms >= stored.deadline_unix_ms {
+            return Err(TransportError::Timeout);
+        }
+        let recorded = serde_json::to_value(outcome).map_err(|_| TransportError::SessionFenced)?;
+        let result_digest = sha256_json(&recorded).map_err(|_| TransportError::SessionFenced)?;
+        let recorded_now = stored.state != HostRequestState::ResultReceived;
+        let persisted = self
+            .generation_gateway
+            .ors
+            .persist_host_request_result(
+                &operation_id,
+                &outcome.record_digest,
+                &result_digest,
+                &recorded,
+                None,
+                None,
+            )
+            .map_err(|error| match error {
+                OrsError::HostRequestIdentityConflict { .. } => TransportError::IdentityConflict,
+                _ => TransportError::SessionFenced,
+            })?
+            .ok_or(TransportError::UnknownRequest)?;
+        Ok(WatchdogIntentOutcomeProjection {
+            sequence: outcome.sequence,
+            idempotency_key: outcome.idempotency_key.clone(),
+            record_digest: outcome.record_digest.clone(),
+            payload_digest: stored.payload_digest.clone(),
+            operation_id: persisted.operation_id.as_str().to_owned(),
+            state: persisted.state,
+            recorded_now,
+            outcome: outcome.outcome.clone(),
+        })
+    }
+
     /// Records one admitted export window in the bounded Kernel-owned pending
     /// drain queue the daemon poller serves from.
     ///
@@ -8179,6 +8337,116 @@ pub(crate) struct WatchdogIntentProjection {
     pub(crate) admitted_now: bool,
 }
 
+/// One terminal outcome the Governor recorded for one reconciled Watchdog intent.
+///
+/// This is the intent-contour sibling of the export contour's
+/// [`WatchdogSpoolExportOutcomeSubmission`]: the same closed terminal-disposition
+/// vocabulary ([`WatchdogSpoolEntryOutcome`]) over the same per-record identity
+/// shape (retained sequence, owner-computed record digest, derived
+/// reconciliation key). It is a distinct Kernel-local type rather than a reuse
+/// because its [`WatchdogIntentOutcomeSubmission::validate`] derives the
+/// *intent* reconciliation key, and the export submission's validator derives
+/// the *export* key: sharing one type would let an export-keyed outcome pass a
+/// check that must prove intent identity. No new vocabulary is introduced: the
+/// disposition stays the closed protocol enum, and the key stays the protocol's
+/// intent derivation.
+///
+/// The value carries no canonical Problem/Incident decision body: `Applied`
+/// means the Governor canonically applied the intent, `Rejected` carries its
+/// bounded refusal reason, and `GapRequiresRecovery` marks terminal
+/// gap-resolution. Which canonical record the Governor created, and the
+/// Governor's intake/readback of that decision, stay the Governor lane's
+/// (AUD5); this type only binds the Governor's recorded disposition onto the
+/// durable intent projection the fenced intent route staged.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WatchdogIntentOutcomeSubmission {
+    /// Retained spool sequence this outcome answers.
+    pub(crate) sequence: u64,
+    /// Owner-computed record digest this outcome answers.
+    pub(crate) record_digest: String,
+    /// Exactly-once reconciliation key the intent route projected for this
+    /// record; the Kernel re-derives it and fences on any presented value it
+    /// cannot reproduce.
+    pub(crate) idempotency_key: String,
+    /// Exactly the terminal disposition the Governor recorded.
+    pub(crate) outcome: WatchdogSpoolEntryOutcome,
+}
+
+impl WatchdogIntentOutcomeSubmission {
+    /// Validates the closed outcome shape and its intent-identity binding.
+    ///
+    /// The presented key must equal the protocol's derived intent
+    /// reconciliation key for this installation, sequence, and record digest,
+    /// so an outcome can never be bound to an intent the fenced route never
+    /// projected, and a lost-reply retry presents byte-identical material that
+    /// re-derives the same key. Digest-shape checks mirror the protocol's
+    /// lowercase-SHA-256 predicate; the refusal-reason bound mirrors the
+    /// protocol's bounded-text ceiling. All failures are typed
+    /// [`TransportError::SessionFenced`]: no error prose drives routing.
+    fn validate(&self, installation_id: &str) -> Result<(), TransportError> {
+        if installation_id.is_empty() || self.sequence == 0 {
+            return Err(TransportError::SessionFenced);
+        }
+        if !is_lowercase_sha256(&self.record_digest) {
+            return Err(TransportError::SessionFenced);
+        }
+        let expected = eliot_protocol::watchdog_intent_reconciliation_idempotency_key(
+            installation_id,
+            self.sequence,
+            &self.record_digest,
+        );
+        if self.idempotency_key != expected {
+            return Err(TransportError::SessionFenced);
+        }
+        if let WatchdogSpoolEntryOutcome::Rejected { reason } = &self.outcome {
+            if reason.trim().is_empty()
+                || reason.len() > eliot_protocol::MAX_HOST_REQUEST_TEXT_BYTES
+                || reason.chars().any(char::is_control)
+            {
+                return Err(TransportError::SessionFenced);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One durable intent projection carrying the Governor's recorded terminal
+/// disposition.
+///
+/// This is what `record_watchdog_intent_outcomes` returns per answered
+/// record: the durable ORS facts (`operation_id`, `state`) plus the exact
+/// disposition the terminal owner recorded. `recorded_now` distinguishes a
+/// first recording from an exact replay, which is what lets the Governor's
+/// outcome leg answer retries honestly. Unlike the export projection there is
+/// no entry kind here: the durable intent row is digest-only by design, so the
+/// kind travels only in the Watchdog's retained spool record and the
+/// Governor's own intake, never fabricated by this projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WatchdogIntentOutcomeProjection {
+    pub(crate) sequence: u64,
+    pub(crate) idempotency_key: String,
+    pub(crate) record_digest: String,
+    pub(crate) payload_digest: String,
+    pub(crate) operation_id: String,
+    pub(crate) state: HostRequestState,
+    pub(crate) recorded_now: bool,
+    /// The Governor's own recorded terminal disposition for this intent.
+    pub(crate) outcome: WatchdogSpoolEntryOutcome,
+}
+
+/// Closed lowercase-SHA-256 shape predicate for one presented digest.
+///
+/// Mirrors the protocol and ORS digest predicates without adding a shared
+/// helper: the strong identity proof stays the re-derived reconciliation-key
+/// comparison, and this shape check only fences malformed material early.
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
 /// Decodes the exact typed Watchdog spool intent batch from a frame payload.
 ///
 /// The payload must carry the closed operation string plus the full typed
@@ -8440,6 +8708,84 @@ pub(crate) fn watchdog_export_result_response(
                     "state": projection.state,
                     "outcome": projection.outcome,
                     "recorded_now": projection.admitted_now,
+                }))
+                .collect::<Vec<_>>(),
+        },
+        "recovery": null,
+    })
+}
+
+/// Decodes the closed Governor intent-outcome submission from a daemon payload.
+///
+/// The payload must carry the owning installation plus the full typed outcome
+/// list under the single `intent_outcome` key; the installation binding, the
+/// intent-contour bound, strict ascending order, and every outcome's derived
+/// reconciliation key are re-validated here, so this is typed dispatch rather
+/// than generic JSON routing. The Governor lane's daemon dispatch arm owns the
+/// call site (STITCH); there is no Watchdog front-door operation carrying this
+/// shape.
+pub(crate) fn watchdog_intent_outcome_from_payload(
+    payload: &serde_json::Value,
+) -> Result<(String, Vec<WatchdogIntentOutcomeSubmission>), TransportError> {
+    let outcome_value = payload
+        .get("intent_outcome")
+        .cloned()
+        .ok_or(TransportError::SessionFenced)?;
+    let installation_id = outcome_value
+        .get("installation_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(TransportError::SessionFenced)?;
+    if installation_id.is_empty() {
+        return Err(TransportError::SessionFenced);
+    }
+    let outcomes: Vec<WatchdogIntentOutcomeSubmission> = outcome_value
+        .get("outcomes")
+        .cloned()
+        .ok_or(TransportError::SessionFenced)
+        .and_then(|value| {
+            serde_json::from_value(value).map_err(|_| TransportError::SessionFenced)
+        })?;
+    if outcomes.is_empty()
+        || outcomes.len() > eliot_protocol::MAX_WATCHDOG_SPOOL_INTENT_SUBMISSIONS
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    let mut previous: Option<u64> = None;
+    for outcome in &outcomes {
+        outcome.validate(installation_id)?;
+        if previous.is_some_and(|sequence| outcome.sequence <= sequence) {
+            return Err(TransportError::SessionFenced);
+        }
+        previous = Some(outcome.sequence);
+    }
+    Ok((installation_id.to_owned(), outcomes))
+}
+
+/// Typed answer for one recorded Watchdog intent outcome batch.
+///
+/// The response carries the durable projection of each answered intent with
+/// the disposition the Governor's own outcome leg recorded, and nothing else.
+/// It grants the Watchdog no authority of its own, advances no cursor, and
+/// compacts nothing: the cursor decision still runs exclusively through the
+/// spool owner's own export-contour acknowledgement validation.
+pub(crate) fn watchdog_intent_outcome_response(
+    projections: &[WatchdogIntentOutcomeProjection],
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": "known",
+        "value": {
+            "accepted": true,
+            "intents": projections
+                .iter()
+                .map(|projection| serde_json::json!({
+                    "sequence": projection.sequence,
+                    "idempotency_key": projection.idempotency_key,
+                    "record_digest": projection.record_digest,
+                    "payload_digest": projection.payload_digest,
+                    "operation_id": projection.operation_id,
+                    "state": projection.state,
+                    "recorded_now": projection.recorded_now,
+                    "outcome": projection.outcome,
                 }))
                 .collect::<Vec<_>>(),
         },
