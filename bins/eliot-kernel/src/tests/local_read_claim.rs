@@ -22,7 +22,56 @@ use eliot_protocol::{
     HOST_REQUEST_RESULT_BODY_WIRE_ID, HOST_REQUEST_WIRE_ID, HostRequestEnvelope,
     HostRequestIdentity, HostRequestKind, HostRequestResultBody, LocalReadAttempt,
 };
-use host_request_route::{LocalReadSubmitDisposition, StaleLocalReadReason};
+use host_request_route::{LocalReadPairKind, LocalReadSubmitDisposition, StaleLocalReadReason};
+
+/// Claims one bounded read on the QUERY lane and returns its envelope, tool
+/// bytes, and attempt capability.
+///
+/// `claim_local_read_pair` is the query-form entry point, so every pair it
+/// yields must carry the `Query` carrier form (issue #2564). The form is
+/// asserted here rather than discarded: it is the discriminator that keeps the
+/// query and State lanes from completing each other's attempts, and a claim
+/// that came back untagged or tagged `State` would be exactly the capability
+/// confusion the tag exists to prevent.
+fn claim_query_pair(
+    kernel: &KernelComposition,
+    session: &Session,
+) -> (HostRequestEnvelope, serde_json::Value, LocalReadAttempt) {
+    let claimed = kernel
+        .claim_local_read_pair(session)
+        .expect("claim must not fail")
+        .expect("queued pair must claim");
+    assert_eq!(
+        claimed.form,
+        LocalReadPairKind::Query,
+        "the query claim returns the Query carrier form, never State or untagged"
+    );
+    (claimed.envelope, claimed.tool, claimed.attempt)
+}
+
+/// Enqueues one bounded read on the shared carrier and pins the form actually
+/// retained.
+///
+/// Every fixture here stages an `eliot.query` tool, so the admission gate
+/// resolves the carrier form to `Query` (issue #2564). The returned form is
+/// asserted rather than discarded: the enqueue resolves the form ONCE from the
+/// two closed admission owners, so this is the disposition the carrier was
+/// tagged with, and an untagged or `State` result would mean the query pair was
+/// staged under the wrong form.
+fn enqueue_query_pair(
+    kernel: &KernelComposition,
+    envelope: &HostRequestEnvelope,
+    tool: &serde_json::Value,
+) {
+    let retained = kernel
+        .enqueue_local_read_pair(envelope, tool)
+        .expect("enqueue must succeed");
+    assert_eq!(
+        retained,
+        LocalReadPairKind::Query,
+        "an admitted eliot.query pair retains as the Query carrier form"
+    );
+}
 
 fn tool_digest(tool: &serde_json::Value) -> String {
     let bytes = eliot_contracts::canonical_json_bytes(tool).expect("tool must canonicalize");
@@ -209,17 +258,10 @@ fn local_read_claim_submit_roundtrip_with_exact_replay_conflict_and_expiry() {
     stage_admitted(&kernel, &envelope);
 
     // Exact replay never duplicates the queued pair.
-    kernel
-        .enqueue_local_read_pair(&envelope, &tool)
-        .expect("enqueue must succeed");
-    kernel
-        .enqueue_local_read_pair(&envelope, &tool)
-        .expect("replay enqueue must stay idempotent");
+    enqueue_query_pair(&kernel, &envelope, &tool);
+    enqueue_query_pair(&kernel, &envelope, &tool);
 
-    let (claimed_envelope, claimed_tool, attempt) = kernel
-        .claim_local_read_pair(&daemon_session)
-        .expect("claim must not fail")
-        .expect("queued pair must claim");
+    let (claimed_envelope, claimed_tool, attempt) = claim_query_pair(&kernel, &daemon_session);
     assert_eq!(
         claimed_envelope.envelope_sha256, envelope.envelope_sha256,
         "the claim returns the exact admitted envelope"
@@ -234,10 +276,7 @@ fn local_read_claim_submit_roundtrip_with_exact_replay_conflict_and_expiry() {
         .expect("the minted capability must validate");
     // A re-claim by the same owner session returns the identical current
     // capability: lost-answer retry without a new identity.
-    let (_, _, reattempt) = kernel
-        .claim_local_read_pair(&daemon_session)
-        .expect("re-claim must not fail")
-        .expect("the owned pair must re-claim");
+    let (_, _, reattempt) = claim_query_pair(&kernel, &daemon_session);
     assert_eq!(
         reattempt.attempt_id, attempt.attempt_id,
         "same-owner re-claim returns the identical attempt"
@@ -328,13 +367,8 @@ fn local_read_claim_submit_roundtrip_with_exact_replay_conflict_and_expiry() {
     // A changed body under a fresh live attempt still conflicts: currency
     // passes, then the ORS result path refuses the overwrite. The caller
     // re-invokes (re-enqueue after retire), claims anew, and submits.
-    kernel
-        .enqueue_local_read_pair(&envelope, &tool)
-        .expect("re-enqueue after retire must succeed");
-    let (_, _, fresh) = kernel
-        .claim_local_read_pair(&daemon_session)
-        .expect("fresh claim must not fail")
-        .expect("re-enqueued pair must claim");
+    enqueue_query_pair(&kernel, &envelope, &tool);
+    let (_, _, fresh) = claim_query_pair(&kernel, &daemon_session);
     assert_ne!(
         fresh.attempt_id, attempt.attempt_id,
         "a new claim mints a fresh attempt identity"
@@ -363,9 +397,7 @@ fn local_read_claim_submit_roundtrip_with_exact_replay_conflict_and_expiry() {
         &tool_digest(&expired_tool),
     );
     stage_admitted(&kernel, &expired);
-    kernel
-        .enqueue_local_read_pair(&expired, &expired_tool)
-        .expect("expired enqueue must succeed");
+    enqueue_query_pair(&kernel, &expired, &expired_tool);
     assert!(
         kernel
             .claim_local_read_pair(&daemon_session)
@@ -435,18 +467,10 @@ fn governed_claim_replacement(
         &tool_digest(&tool),
     );
     stage_admitted(kernel, &envelope);
-    kernel
-        .enqueue_local_read_pair(&envelope, &tool)
-        .expect("enqueue must succeed");
-    let (_, _, first) = kernel
-        .claim_local_read_pair(owner)
-        .expect("owner claim must not fail")
-        .expect("pair must claim");
+    enqueue_query_pair(kernel, &envelope, &tool);
+    let (_, _, first) = claim_query_pair(kernel, owner);
     assert_eq!(first.fencing_generation, 1);
-    let (_, _, second) = kernel
-        .claim_local_read_pair(rival)
-        .expect("rival claim must not fail")
-        .expect("pair must re-claim");
+    let (_, _, second) = claim_query_pair(kernel, rival);
     assert_eq!(
         second.fencing_generation, 2,
         "reassignment bumps the fencing generation"
@@ -529,13 +553,8 @@ fn governed_revocation_roundtrip(kernel: &KernelComposition, fence: &StateFence,
         &tool_digest(&revoked_tool),
     );
     stage_admitted(kernel, &revoked);
-    kernel
-        .enqueue_local_read_pair(&revoked, &revoked_tool)
-        .expect("enqueue must succeed");
-    let (_, _, revoked_attempt) = kernel
-        .claim_local_read_pair(owner)
-        .expect("claim must not fail")
-        .expect("pair must claim");
+    enqueue_query_pair(kernel, &revoked, &revoked_tool);
+    let (_, _, revoked_attempt) = claim_query_pair(kernel, owner);
     kernel.fence_host_requests_for_connection("conn-test-1");
     let revoked_body = body_with_revision(&revoked, revoked_attempt, 5);
     match kernel
@@ -559,13 +578,8 @@ fn governed_revocation_roundtrip(kernel: &KernelComposition, fence: &StateFence,
         waiter.result_digest.is_none() && waiter.result_response.is_none(),
         "the waiter must observe no revoked result"
     );
-    kernel
-        .enqueue_local_read_pair(&revoked, &revoked_tool)
-        .expect("re-enqueue after revoke must succeed");
-    let (_, _, fresh) = kernel
-        .claim_local_read_pair(owner)
-        .expect("fresh claim must not fail")
-        .expect("re-enqueued pair must claim");
+    enqueue_query_pair(kernel, &revoked, &revoked_tool);
+    let (_, _, fresh) = claim_query_pair(kernel, owner);
     let fresh_body = body_with_revision(&revoked, fresh, 6);
     assert!(
         matches!(
