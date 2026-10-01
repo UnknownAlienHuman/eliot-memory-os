@@ -1265,6 +1265,10 @@ impl KernelComposition {
             || admitted.work_item_id != *work_item_id
             || admitted.proposed_attempt_id != *proposed_attempt_id
             || admitted.stage_operation_id != staged.stage_operation_id
+            || staged.semantic_admission_revision.as_ref()
+                != Some(&admitted.semantic_admission_revision)
+            || staged.semantic_admission_predecessor_revision
+                != Some(admitted.semantic_admission_predecessor_revision)
             || admitted.canonical_operation_id.as_str() != canonical_operation_id.as_str()
             || submission.expected.operation_id.as_str() != canonical_operation_id.as_str()
             || admitted.launch_outbox_id != submission.expected.launch_outbox_id

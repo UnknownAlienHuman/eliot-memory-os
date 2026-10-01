@@ -364,6 +364,11 @@ fn test_claim_request(
         predecessor_revision: "rev-1".to_owned(),
         authority_epoch: test_epoch(1),
         state_fence: fence,
+        semantic_admission_revision: Some(eliot_protocol::WorkAdmissionSemanticRevision {
+            key: "owner/canonical".to_owned(),
+            revision: "1".to_owned(),
+        }),
+        semantic_admission_predecessor_revision: Some(0),
         executable_binding: Some(test_executable_join()),
         visibility: None,
         privacy_class: None,

@@ -45,6 +45,7 @@
 use eliot_contracts::{
     CapabilityCellId, EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
 };
+use eliot_protocol::WorkAdmissionSemanticRevision;
 use eliot_store_api::EffectClass;
 use eliot_security_contracts::PrivacyClass;
 use schemars::JsonSchema;
@@ -739,6 +740,14 @@ pub struct NativeWorkerClaimRequest {
     pub authority_epoch: EpochId,
     /// Exact immutable fence paired with the generation and epoch.
     pub state_fence: StateFence,
+    /// Governor-issued semantic revision for work-admission claims. Absent
+    /// only for older or non-reservation claims; the reservation stage refuses
+    /// to proceed without this original owner proposal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_admission_revision: Option<WorkAdmissionSemanticRevision>,
+    /// Owner-observed predecessor revision used by the same canonical CAS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_admission_predecessor_revision: Option<u64>,
     /// T9-02 executable join: owner-produced digest plus M1 currentness
     /// inputs. Absent (`None`) on wire v1, which predates the join and can
     /// never carry executable authority; required on wire v2.
@@ -793,6 +802,8 @@ impl NativeWorkerClaimRequest {
             "registration_id": self.registration_id,
             "route_class": self.route_class,
             "state_fence": self.state_fence,
+            "semantic_admission_revision": self.semantic_admission_revision,
+            "semantic_admission_predecessor_revision": self.semantic_admission_predecessor_revision,
             "swarm_id": self.swarm_id,
             "task_id": self.task_id,
             "work_scope_id": self.work_scope_id,
@@ -836,6 +847,8 @@ impl NativeWorkerClaimRequest {
             predecessor_revision: &'a str,
             authority_epoch: EpochId,
             state_fence: &'a StateFence,
+            semantic_admission_revision: Option<&'a WorkAdmissionSemanticRevision>,
+            semantic_admission_predecessor_revision: Option<u64>,
             executable_binding: Option<&'a NativeWorkerExecutableBinding>,
             visibility: Option<&'a str>,
             privacy_class: Option<PrivacyClass>,
@@ -868,6 +881,8 @@ impl NativeWorkerClaimRequest {
             predecessor_revision: &self.predecessor_revision,
             authority_epoch: self.authority_epoch.clone(),
             state_fence: &self.state_fence,
+            semantic_admission_revision: self.semantic_admission_revision.as_ref(),
+            semantic_admission_predecessor_revision: self.semantic_admission_predecessor_revision,
             executable_binding: self.executable_binding.as_ref(),
             visibility: self.visibility.as_deref(),
             privacy_class: self.privacy_class,
@@ -986,6 +1001,23 @@ impl NativeWorkerClaimRequest {
             return Err(KernelServiceError::HandshakeMismatch {
                 field: "native_worker_claim.epoch_fence",
             });
+        }
+        match (
+            &self.semantic_admission_revision,
+            self.semantic_admission_predecessor_revision,
+        ) {
+            (Some(revision), Some(predecessor)) => revision
+                .validate_owner_canonical(predecessor)
+                .map_err(|_| KernelServiceError::HandshakeMismatch {
+                    field: "native_worker_claim.semantic_admission_revision",
+                })?,
+            (None, None) => {}
+            _ => {
+                return Err(KernelServiceError::InvalidField {
+                    field: "native_worker_claim.semantic_admission_revision",
+                    reason: "revision and its canonical owner predecessor must be present together",
+                });
+            }
         }
         if self.wire_version == NATIVE_WORKER_CLAIM_WIRE_VERSION_V1 {
             if self.executable_binding.is_some() {
@@ -1718,6 +1750,11 @@ mod executable_binding_tests {
             predecessor_revision: "rev-1".to_owned(),
             authority_epoch: test_epoch(1),
             state_fence: live_fence(),
+            semantic_admission_revision: Some(WorkAdmissionSemanticRevision {
+                key: "owner/canonical".to_owned(),
+                revision: "1".to_owned(),
+            }),
+            semantic_admission_predecessor_revision: Some(0),
             executable_binding: Some(join.clone()),
             visibility: None,
             privacy_class: None,
