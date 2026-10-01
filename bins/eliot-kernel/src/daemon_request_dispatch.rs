@@ -9142,7 +9142,7 @@ impl KernelComposition {
         let context = &identity.request.metadata;
         if context.product_id.as_str() != ACTIVE_DAEMON_CALLER
             || context.source_id.as_str() != ACTIVE_DAEMON_CALLER
-            || context.session_id.as_ref().map(SessionId::as_str)
+            || context.session_id.as_ref().map(|session| session.as_str())
                 != Some(operation.attempt.session_id.as_str())
             || context.task_id.as_ref() != Some(&operation.attempt.task_id)
             || identity.request.state_fence != operation.attempt.state_fence
@@ -9159,14 +9159,6 @@ impl KernelComposition {
             || operation.request_sha256.chars().any(char::is_control)
         {
             return Err(TransportError::SessionFenced);
-        }
-        if let Err(error) = operation.request.validate_for_context(context) {
-            return work_scope_owner_store_failure_response(
-                error,
-                context,
-                &operation.request.operation_id,
-                &operation.request.idempotency_key,
-            );
         }
         validate_store_session_fence(session, &context.state_fence)?;
         if let Some(rejection) = self.material_write_admission_response(&context.state_fence) {
@@ -9192,6 +9184,14 @@ impl KernelComposition {
             || identity.cancellation_id != envelope.identity.cancellation_id
         {
             return Err(TransportError::SessionFenced);
+        }
+        if let Err(error) = operation.request.validate_for_context(context) {
+            return work_scope_owner_store_failure_response(
+                error,
+                context,
+                &operation.request.operation_id,
+                &operation.request.idempotency_key,
+            );
         }
         validate_work_scope_record_against_retained_input(
             &operation.request.owner_record,
