@@ -2550,6 +2550,38 @@ impl KernelStoreGateway {
         if snapshot.state_fence != request.state_fence {
             return Err("Store recovery snapshot fence does not match request".to_owned());
         }
+        if !request.receipt_authority_operation_ids.is_empty() {
+            let expected = request
+                .receipt_authority_operation_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let returned = snapshot
+                .receipts
+                .iter()
+                .map(|receipt| receipt.operation_id.clone())
+                .collect::<BTreeSet<_>>();
+            if snapshot.receipts.len() != request.receipt_authority_operation_ids.len()
+                || returned != expected
+            {
+                return Err("Store recovery receipts do not match exact request".to_owned());
+            }
+        }
+        let requested_authority_ids = request
+            .receipt_authority_operation_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let returned_authority_ids = snapshot
+            .receipt_authorities
+            .iter()
+            .map(|authority| authority.operation_id.clone())
+            .collect::<BTreeSet<_>>();
+        if snapshot.receipt_authorities.len() != request.receipt_authority_operation_ids.len()
+            || returned_authority_ids != requested_authority_ids
+        {
+            return Err("Store recovery receipt authority set does not match request".to_owned());
+        }
         Ok(snapshot)
     }
 
@@ -3874,6 +3906,7 @@ impl KernelStoreGateway {
             payload_digest,
             payload_schema_id: None,
             payload_body: None,
+            finish_replay_binding: None,
             connection_ref: obligation_label(
                 obligation,
                 USER_AUTOMATION_RUNTIME_CHANNEL.to_owned(),
@@ -4036,6 +4069,7 @@ impl KernelStoreGateway {
             records,
             include_receipts: false,
             include_jobs: true,
+            receipt_authority_operation_ids: Vec::new(),
         };
         let recovery = self
             .recovery(request)

@@ -65,7 +65,7 @@ pub struct ApplicationRequest {
     pub tool: ToolRequest,
 }
 
-/// Authenticated Kernel selector for the UserAutomation operator route.
+/// Authenticated Kernel selector for the `UserAutomation` operator route.
 pub const USER_AUTOMATION_ROUTE: &str = "eliot_user_automation";
 
 /// Closed typed requests used by the MCP hot surface and the authenticated
@@ -105,7 +105,7 @@ pub enum ToolRequest {
     /// Candidate finish attempt.
     #[serde(rename = "eliot.finish")]
     Finish(FinishAttemptDraft),
-    /// Authenticated UserAutomation operator operation carried by Host/CLI.
+    /// Authenticated `UserAutomation` operator operation carried by Host/CLI.
     #[serde(rename = "eliot_user_automation")]
     UserAutomation(UserAutomationInput),
     /// Hotset intake for Skill delivery (host-request skill leg only).
@@ -149,7 +149,17 @@ impl ToolRequest {
             Self::Act(value) => value.validate(),
             Self::Verify(value) => value.validate(),
             Self::Coordinate(value) => value.validate(),
-            Self::Finish(value) => value.validate(),
+            Self::Finish(value) => value.validate().map_err(|error| match error {
+                eliot_contracts::FinishDraftValidationError::InvalidField { field, reason } => {
+                    ContractViolation::InvalidField { field, reason }
+                }
+                eliot_contracts::FinishDraftValidationError::Duplicate { field } => {
+                    ContractViolation::InvalidField {
+                        field,
+                        reason: "must not contain duplicate values",
+                    }
+                }
+            }),
             Self::UserAutomation(value) => value.validate(),
             Self::SkillInject(value) | Self::SkillDisplay(value) => {
                 if !value.is_object() {
@@ -164,11 +174,11 @@ impl ToolRequest {
     }
 }
 
-/// Typed UserAutomation operator input for the authenticated Host/MCP route.
+/// Typed `UserAutomation` operator input for the authenticated Host/MCP route.
 ///
 /// The surface carries only the closed Kernel-owned operation vocabulary and a
 /// retry-stable idempotency key. Principal, session, request metadata,
-/// StateFence, WorkScope authority, provider identity, scheduler state and
+/// `StateFence`, `WorkScope` authority, provider identity, scheduler state and
 /// Store receipts are authenticated and supplied by Kernel composition.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -726,68 +736,7 @@ impl SendRequest {
     }
 }
 
-/// Candidate-only public finish input. There is no `CompletionProof` field.
-#[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FinishAttemptDraft {
-    /// Task named by the request metadata and finish candidate.
-    pub task_id: String,
-    /// Expected current task revision.
-    pub expected_task_revision: u64,
-    /// Requested outcome candidate, not a decision.
-    pub requested_outcome: RequestedFinishOutcome,
-    /// Immutable artifact handles.
-    #[serde(default)]
-    pub artifact_refs: Vec<String>,
-    /// Observation handles.
-    #[serde(default)]
-    pub observation_refs: Vec<String>,
-    /// Executed verifier-run handles.
-    #[serde(default)]
-    pub verifier_run_refs: Vec<String>,
-    /// Unknowns disclosed by the caller.
-    #[serde(default)]
-    pub remaining_unknowns_declared_by_caller: Vec<String>,
-    /// Public rationale candidate.
-    pub rationale_candidate: String,
-}
-
-impl FinishAttemptDraft {
-    fn validate(&self) -> Result<(), ContractViolation> {
-        non_blank(&self.task_id, "finish.task_id")?;
-        positive(self.expected_task_revision, "finish.expected_task_revision")?;
-        unique_non_blank(&self.artifact_refs, "finish.artifact_refs")?;
-        unique_non_blank(&self.observation_refs, "finish.observation_refs")?;
-        unique_non_blank(&self.verifier_run_refs, "finish.verifier_run_refs")?;
-        unique_non_blank(
-            &self.remaining_unknowns_declared_by_caller,
-            "finish.remaining_unknowns_declared_by_caller",
-        )?;
-        non_blank(&self.rationale_candidate, "finish.rationale_candidate")
-    }
-}
-
-/// Caller-requested finish outcome. The Governor derives the actual outcome.
-#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum RequestedFinishOutcome {
-    /// Request evaluation for complete work.
-    CompleteCandidate,
-    /// Declare partial work.
-    Partial,
-    /// Declare a blocker.
-    Blocked,
-    /// Declare a verification failure.
-    FailedVerification,
-    /// Declare degraded proof.
-    DegradedNoProof,
-    /// Declare that finishing would be unsafe.
-    UnsafeToFinish,
-    /// Declare cancellation.
-    Cancelled,
-    /// Declare supersession.
-    Superseded,
-}
+pub use eliot_contracts::{FinishAttemptDraft, RequestedFinishOutcome};
 
 /// Contract-level validation failure before the Kernel/Governor port.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

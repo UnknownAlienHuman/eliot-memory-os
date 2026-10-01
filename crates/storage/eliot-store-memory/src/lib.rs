@@ -368,6 +368,11 @@ impl MemoryStore {
             }
         }
         let mut plan = transaction_plan(&state, &transition, &operation_key)?;
+        // Build the optional, exact-byte receipt authority before any named
+        // operation dispatcher mutates in-memory state. Genesis-compatible
+        // transitions have no named operation to index and need no such
+        // authority record.
+        let receipt_authority = memory_receipt_authority(&transition, plan.commit_sequence)?;
         // Issue #1780: admitted notification-state legs execute here, before
         // the receipt is built, so the receipt's outbox references include
         // the appended notification outbox intents. State, receipt, and
@@ -424,6 +429,7 @@ impl MemoryStore {
             operation_key,
             plan,
             receipt,
+            receipt_authority,
         ))
     }
 }
@@ -1001,7 +1007,6 @@ fn dispatch_apply_reactive_state(
     if transition.transition_class != TransitionClass::ReactiveState {
         return Err(StoreError::TransitionClassExceeded);
     }
-    let operation_key = transition.identity.operation_id.to_string();
     let mut reactive_index = 0_usize;
     for command in &transition.named_operations {
         let decoded = match command.operation {
@@ -1075,25 +1080,7 @@ fn dispatch_apply_reactive_state(
                     .map_err(|error| StoreError::Serialization(error.to_string()))?
             }
         };
-        let payload_digest = sha256_hex(
-            &canonical_json_bytes(&row_json)
-                .map_err(|error| StoreError::Serialization(error.to_string()))?,
-        );
-        let sequence = plan.next_outbox_sequence;
-        plan.next_outbox_sequence =
-            checked_increment(sequence, "outbox.sequence", "sequence overflow")?;
-        let outbox = OutboxIntent {
-            outbox_id: OutboxId::new(format!("outbox-{operation_key}-reactive-{reactive_index}"))?,
-            operation_id: transition.identity.operation_id.clone(),
-            sequence,
-            payload_digest,
-            state_fence: transition.state_fence.clone(),
-            arrival_fence: format!("arrival-{operation_key}"),
-            claim_fence: None,
-            state: OutboxState::Arrived,
-        };
-        outbox.validate()?;
-        plan.outbox_records.push(outbox);
+        append_state_outbox(transition, plan, "reactive", reactive_index, &row_json)?;
         reactive_index = reactive_index.saturating_add(1);
     }
     Ok(())
@@ -1188,6 +1175,38 @@ fn dispatch_apply_instrument_registry_state(
 /// contain `\x1f` per the wire contract.
 fn automation_revision_key(automation_id: &str, revision: &str) -> String {
     format!("{automation_id}\x1f{revision}")
+}
+
+fn append_state_outbox(
+    transition: &PreparedTransition,
+    plan: &mut TransactionPlan,
+    operation_kind: &str,
+    operation_index: usize,
+    row_json: &serde_json::Value,
+) -> Result<(), StoreError> {
+    let operation_key = transition.identity.operation_id.to_string();
+    let payload_digest = sha256_hex(
+        &canonical_json_bytes(row_json)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?,
+    );
+    let sequence = plan.next_outbox_sequence;
+    plan.next_outbox_sequence =
+        checked_increment(sequence, "outbox.sequence", "sequence overflow")?;
+    let outbox = OutboxIntent {
+        outbox_id: OutboxId::new(format!(
+            "outbox-{operation_key}-{operation_kind}-{operation_index}"
+        ))?,
+        operation_id: transition.identity.operation_id.clone(),
+        sequence,
+        payload_digest,
+        state_fence: transition.state_fence.clone(),
+        arrival_fence: format!("arrival-{operation_key}"),
+        claim_fence: None,
+        state: OutboxState::Arrived,
+    };
+    outbox.validate()?;
+    plan.outbox_records.push(outbox);
+    Ok(())
 }
 
 /// Executes admitted automation legs on already-locked state
@@ -1673,7 +1692,6 @@ fn dispatch_apply_experience_state(
     if transition.transition_class != TransitionClass::CaptureCandidate {
         return Err(StoreError::TransitionClassExceeded);
     }
-    let operation_key = transition.identity.operation_id.to_string();
     let mut experience_index = 0_usize;
     for command in &transition.named_operations {
         let decoded = match command.operation {
@@ -1745,27 +1763,7 @@ fn dispatch_apply_experience_state(
                 }
             }
         }
-        let payload_digest = sha256_hex(
-            &canonical_json_bytes(&row_json)
-                .map_err(|error| StoreError::Serialization(error.to_string()))?,
-        );
-        let sequence = plan.next_outbox_sequence;
-        plan.next_outbox_sequence =
-            checked_increment(sequence, "outbox.sequence", "sequence overflow")?;
-        let outbox = OutboxIntent {
-            outbox_id: OutboxId::new(format!(
-                "outbox-{operation_key}-experience-{experience_index}"
-            ))?,
-            operation_id: transition.identity.operation_id.clone(),
-            sequence,
-            payload_digest,
-            state_fence: transition.state_fence.clone(),
-            arrival_fence: format!("arrival-{operation_key}"),
-            claim_fence: None,
-            state: OutboxState::Arrived,
-        };
-        outbox.validate()?;
-        plan.outbox_records.push(outbox);
+        append_state_outbox(transition, plan, "experience", experience_index, &row_json)?;
         experience_index = experience_index.saturating_add(1);
     }
     Ok(())
@@ -4127,12 +4125,49 @@ fn transaction_receipt(
     Ok(receipt)
 }
 
+fn memory_receipt_authority(
+    transition: &PreparedTransition,
+    commit_sequence: u64,
+) -> Result<Option<eliot_store_api::RecoveryReceiptAuthority>, StoreError> {
+    if commit_sequence == 0 {
+        return Err(StoreError::InvalidReceipt);
+    }
+    if transition.named_operations.is_empty() {
+        return Ok(None);
+    }
+    let named_operation_count = transition.named_operations.len();
+    let records = transition
+        .named_operations
+        .iter()
+        .enumerate()
+        .map(|(operation_index, operation)| {
+            let bytes = canonical_json_bytes(&operation.parameters)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            Ok(eliot_store_api::RecoveryReceiptAuthorityRecord {
+                operation_index,
+                parameters: eliot_store_api::ExactJsonBytes::parse(
+                    eliot_store_api::PayloadSource::NamedOperationParameter,
+                    &bytes,
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    Ok(Some(eliot_store_api::RecoveryReceiptAuthority {
+        operation_id: transition.identity.operation_id.clone(),
+        state_fence: transition.state_fence.clone(),
+        commit_sequence,
+        named_operation_count,
+        records,
+    }))
+}
+
 fn commit_transaction(
     state: &mut MemoryState,
     transition: PreparedTransition,
     operation_key: String,
     plan: TransactionPlan,
     receipt: WriteReceipt,
+    receipt_authority: Option<eliot_store_api::RecoveryReceiptAuthority>,
 ) -> WriteReceipt {
     for head in plan.next_revision_heads {
         state
@@ -4183,6 +4218,11 @@ fn commit_transaction(
     state
         .receipts_by_operation
         .insert(operation_key, receipt.clone());
+    if let Some(receipt_authority) = receipt_authority {
+        state
+            .receipt_authorities
+            .insert(receipt.operation_id.as_str().to_owned(), receipt_authority);
+    }
     receipt
 }
 
@@ -5122,10 +5162,35 @@ impl MemoryStore {
             Vec::new()
         };
         let receipts = if request.include_receipts {
-            state.receipts_by_operation.values().cloned().collect()
+            if request.receipt_authority_operation_ids.is_empty() {
+                state.receipts_by_operation.values().cloned().collect()
+            } else {
+                request
+                    .receipt_authority_operation_ids
+                    .iter()
+                    .map(|operation_id| {
+                        state
+                            .receipts_by_operation
+                            .get(operation_id.as_str())
+                            .cloned()
+                            .ok_or(StoreError::InvalidReceipt)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            }
         } else {
             Vec::new()
         };
+        let receipt_authorities = request
+            .receipt_authority_operation_ids
+            .iter()
+            .map(|operation_id| {
+                state
+                    .receipt_authorities
+                    .get(operation_id.as_str())
+                    .cloned()
+                    .ok_or(StoreError::InvalidReceipt)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let canonical_scope = ScopeRevisionView {
             scope_id: ScopeId::new("store")?,
             revision_heads: state.revision_heads.values().cloned().collect(),
@@ -5140,6 +5205,7 @@ impl MemoryStore {
             owner_records,
             job_records,
             receipts,
+            receipt_authorities,
         };
         snapshot.validate()?;
         Ok(snapshot)
@@ -5591,6 +5657,7 @@ struct MemoryState {
     revision_heads: BTreeMap<String, RevisionHead>,
     ordering_heads: BTreeMap<String, OrderingHead>,
     receipts_by_operation: BTreeMap<String, WriteReceipt>,
+    receipt_authorities: BTreeMap<String, eliot_store_api::RecoveryReceiptAuthority>,
     receipts_by_idempotency: BTreeMap<String, (String, String)>,
     projections: BTreeMap<String, ProjectionPublicationRecord>,
     outbox: BTreeMap<String, OutboxIntent>,
@@ -5697,6 +5764,7 @@ impl PartialEq for MemoryState {
             && self.revision_heads == other.revision_heads
             && self.ordering_heads == other.ordering_heads
             && self.receipts_by_operation == other.receipts_by_operation
+            && self.receipt_authorities == other.receipt_authorities
             && self.receipts_by_idempotency == other.receipts_by_idempotency
             && self.projections == other.projections
             && self.outbox == other.outbox
@@ -5738,6 +5806,7 @@ impl Default for MemoryState {
             revision_heads: BTreeMap::new(),
             ordering_heads: BTreeMap::new(),
             receipts_by_operation: BTreeMap::new(),
+            receipt_authorities: BTreeMap::new(),
             receipts_by_idempotency: BTreeMap::new(),
             projections: BTreeMap::new(),
             outbox: BTreeMap::new(),
@@ -5776,6 +5845,7 @@ impl MemoryState {
             && self.revision_heads.is_empty()
             && self.ordering_heads.is_empty()
             && self.receipts_by_operation.is_empty()
+            && self.receipt_authorities.is_empty()
             && self.receipts_by_idempotency.is_empty()
             && self.projections.is_empty()
             && self.outbox.is_empty()
@@ -6120,6 +6190,7 @@ mod tests {
             records,
             include_receipts,
             include_jobs,
+            receipt_authority_operation_ids: Vec::new(),
         }
     }
 

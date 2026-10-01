@@ -2254,6 +2254,7 @@ async fn case_16_recovery_completeness() {
             records: Vec::new(),
             include_receipts: false,
             include_jobs: true,
+            receipt_authority_operation_ids: Vec::new(),
         })
         .await
         .expect("recovery snapshots");

@@ -866,81 +866,19 @@ impl<S: CanonicalStoreClient + Send + Sync> WriteAdmissionApi for CanonicalTrans
     }
 }
 
-/// Caller-requested finish candidate.  It contains no completion proof.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FinishAttemptDraft {
-    /// Task identity selected by the caller.
-    pub task_id: String,
-    /// Exact current task revision expected by the caller.
-    pub expected_task_revision: u64,
-    /// Candidate outcome; Governor derives the decision.
-    pub requested_outcome: RequestedFinishOutcome,
-    /// Immutable artifact handles.
-    #[serde(default)]
-    pub artifact_refs: Vec<String>,
-    /// Observation handles.
-    #[serde(default)]
-    pub observation_refs: Vec<String>,
-    /// Executed verifier-run handles.
-    #[serde(default)]
-    pub verifier_run_refs: Vec<String>,
-    /// Unknowns disclosed by the caller.
-    #[serde(default)]
-    pub remaining_unknowns_declared_by_caller: Vec<String>,
-    /// Public rationale candidate.
-    pub rationale_candidate: String,
-}
+pub use eliot_contracts::{FinishAttemptDraft, RequestedFinishOutcome};
 
-impl FinishAttemptDraft {
-    /// Validates strict finish input without treating it as proof.
-    pub fn validate(&self) -> Result<(), CanonicalError> {
-        text(&self.task_id, "finish.task_id")?;
-        if self.expected_task_revision == 0 {
-            return Err(CanonicalError::InvalidField {
-                field: "finish.expected_task_revision",
-                reason: "must be non-zero",
-            });
-        }
-        text(&self.rationale_candidate, "finish.rationale_candidate")?;
-        for (values, field) in [
-            (&self.artifact_refs, "finish.artifact_refs"),
-            (&self.observation_refs, "finish.observation_refs"),
-            (&self.verifier_run_refs, "finish.verifier_run_refs"),
-            (
-                &self.remaining_unknowns_declared_by_caller,
-                "finish.remaining_unknowns_declared_by_caller",
-            ),
-        ] {
-            unique(values.iter(), field)?;
-            for value in values {
-                text(value, field)?;
+impl From<eliot_contracts::FinishDraftValidationError> for CanonicalError {
+    fn from(error: eliot_contracts::FinishDraftValidationError) -> Self {
+        match error {
+            eliot_contracts::FinishDraftValidationError::InvalidField { field, reason } => {
+                Self::InvalidField { field, reason }
+            }
+            eliot_contracts::FinishDraftValidationError::Duplicate { field } => {
+                Self::Duplicate { field }
             }
         }
-        Ok(())
     }
-}
-
-/// Caller-requested finish outcome.  It is never persisted as the decision.
-#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum RequestedFinishOutcome {
-    /// Request evaluation for complete work.
-    CompleteCandidate,
-    /// Declare partial work.
-    Partial,
-    /// Declare a blocker.
-    Blocked,
-    /// Declare a verification failure.
-    FailedVerification,
-    /// Declare degraded proof.
-    DegradedNoProof,
-    /// Declare that finishing would be unsafe.
-    UnsafeToFinish,
-    /// Declare cancellation.
-    Cancelled,
-    /// Declare supersession.
-    Superseded,
 }
 
 /// `ELIOT_ARCH_OWNER`: ARCH-FIN-01

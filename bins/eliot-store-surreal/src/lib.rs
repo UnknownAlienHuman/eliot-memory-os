@@ -2723,6 +2723,7 @@ mod tests {
             records: Vec::new(),
             include_receipts: false,
             include_jobs: false,
+            receipt_authority_operation_ids: Vec::new(),
         };
         let Response::Failure { failure } =
             map_recovery_dispatch_result(&request, Err(StoreError::Unavailable))

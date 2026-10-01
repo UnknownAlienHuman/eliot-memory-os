@@ -109,7 +109,8 @@ use receipt_reconciliation::{
     read_receipt_by_operation,
 };
 use recovery::{
-    RecoverySnapshotInput, build_recovery_bindings, build_recovery_snapshot, build_recovery_sql,
+    RecoveryReceiptAuthorityRow, RecoverySnapshotInput, build_recovery_bindings,
+    build_recovery_snapshot, build_recovery_sql, decode_recovery_receipt_authorities,
 };
 #[cfg(test)]
 use schema_contract::SchemaMigrationIdentity;
@@ -2077,6 +2078,13 @@ pub(crate) async fn recovery(
     } else {
         Vec::new()
     };
+    let receipt_authorities = if request.receipt_authority_operation_ids.is_empty() {
+        Vec::new()
+    } else {
+        let rows = response.take::<Vec<RecoveryReceiptAuthorityRow>>(index)?;
+        index += 1;
+        decode_recovery_receipt_authorities(rows, &request.receipt_authority_operation_ids)?
+    };
     let revision_heads = response.take::<Vec<RevisionHead>>(index)?;
     index += 1;
     let ordering_heads = response.take::<Vec<OrderingHead>>(index)?;
@@ -2087,12 +2095,14 @@ pub(crate) async fn recovery(
             owner_records,
             job_records,
             receipts,
+            receipt_authorities,
             revision_heads,
             ordering_heads,
         },
         &adapter.config.expected_schema_generation,
         &request.state_fence,
         &request.records,
+        &request.receipt_authority_operation_ids,
     )
 }
 
@@ -3603,6 +3613,7 @@ mod concurrent_allocation_tests {
                     records: Vec::new(),
                     include_receipts: true,
                     include_jobs: false,
+                    receipt_authority_operation_ids: Vec::new(),
                 })
                 .await
                 .expect("recovery snapshot");
@@ -3698,6 +3709,7 @@ mod concurrent_allocation_tests {
                     records: Vec::new(),
                     include_receipts: true,
                     include_jobs: false,
+                    receipt_authority_operation_ids: Vec::new(),
                 })
                 .await
                 .expect("recovery snapshot");
@@ -3749,6 +3761,7 @@ mod concurrent_allocation_tests {
                     records: Vec::new(),
                     include_receipts: true,
                     include_jobs: false,
+                    receipt_authority_operation_ids: Vec::new(),
                 })
                 .await
                 .expect("recovery snapshot");

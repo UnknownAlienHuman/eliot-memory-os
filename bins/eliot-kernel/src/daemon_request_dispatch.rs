@@ -4117,7 +4117,7 @@ impl KernelComposition {
                     let body: eliot_protocol::FinishResultBody =
                         serde_json::from_value(result_value)
                             .map_err(|_| TransportError::SessionFenced)?;
-                    match self.submit_finish_result(session, &body) {
+                    match self.submit_finish_result_async(session, &body).await {
                         Ok(host_request_route::LocalReadSubmitDisposition::Persisted(_)) => {
                             Ok(Self::accepted_daemon_response())
                         }
@@ -4175,6 +4175,17 @@ impl KernelComposition {
                 // owns the single designated terminal for this operation.
                 observe_daemon_request("kernel.daemon_cancel_requested", "attempt");
                 let envelope = host_request_route::host_request_envelope_from_payload(payload)?;
+                if Box::pin(self.finish_receipt_before_cancellation(&envelope)).await? {
+                    // The canonical receipt is immutable and the retained
+                    // attempt is already durable in ORS. Applying the
+                    // existing cancellation transition therefore preserves
+                    // this operation as Unknown/for reconciliation instead of
+                    // claiming that the committed Finish was cancelled.
+                    observe_daemon_request(
+                        "kernel.daemon_cancel_observed",
+                        "committed_finish_receipt_present",
+                    );
+                }
                 let cancel = self.cancel_host_request(&envelope);
                 match &cancel {
                     Ok(_) => {
@@ -6649,6 +6660,7 @@ impl KernelComposition {
             records,
             include_receipts: false,
             include_jobs: true,
+            receipt_authority_operation_ids: Vec::new(),
         };
         let gateway = self.retained_store_gateway().map_err(|_| {
             UserAutomationRuntimeError::Unavailable(

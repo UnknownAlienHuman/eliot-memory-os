@@ -2193,6 +2193,17 @@ pub struct CanonicalVerifierExecutionFact {
     pub terminal_binding: TerminalVerifierBinding,
     pub input_artifact_bindings: Vec<ArtifactId>,
     pub raw_artifact_bindings: Vec<CanonicalVerifierRawArtifactBinding>,
+    /// Exact original `TestD` row used to evaluate this fact. It is retained so
+    /// Finish can revalidate raw bytes instead of treating a copied handle or
+    /// digest as a byte read. JSON preserves `TestD`'s closed row shape without
+    /// widening this type's dependency surface to the full job schema.
+    #[serde(default)]
+    pub retained_testd_job: Option<serde_json::Value>,
+    /// Exact original `TestD` receipt, including its immutable raw artifact
+    /// bytes. Finish decodes and revalidates this receipt and reruns the
+    /// existing verifier against its bytes and original plan denominator.
+    #[serde(default)]
+    pub retained_testd_receipt: Option<serde_json::Value>,
     pub effect_reference_bindings: Vec<CanonicalVerifierEffectBinding>,
 }
 
@@ -2264,6 +2275,14 @@ impl CanonicalVerifierExecutionFact {
                     truncated: artifact.truncated,
                 })
                 .collect(),
+            retained_testd_job: Some(serde_json::to_value(job).map_err(|error| {
+                verifier_fact_error(format!("TestD job retention serialization failed: {error}"))
+            })?),
+            retained_testd_receipt: Some(serde_json::to_value(receipt).map_err(|error| {
+                verifier_fact_error(format!(
+                    "TestD receipt retention serialization failed: {error}"
+                ))
+            })?),
             effect_reference_bindings: vec![CanonicalVerifierEffectBinding {
                 task_id: task_id.as_str().to_owned(),
                 job_id: receipt.job_id.clone(),
@@ -2285,6 +2304,71 @@ impl CanonicalVerifierExecutionFact {
         check_fact_run_and_receipt(self, expected_fence, verifier_plan)?;
         check_fact_artifact_lineage(self)?;
         check_fact_terminal_effect_join(self, expected_fence)?;
+        Ok(())
+    }
+
+    /// Revalidates the original durable `TestD` row and its stored bytes against
+    /// this exact task, plan and State Fence, then compares the existing
+    /// verifier's result with the immutable fact. Missing retained bytes are a
+    /// prerequisite gap and cannot be replaced by a digest or handle.
+    pub fn revalidate_retained_testd_bytes(
+        &self,
+        expected_fence: &StateFence,
+        expected_plan: &CanonicalPlanBinding,
+    ) -> Result<(), CompositionError> {
+        self.validate(expected_fence)?;
+        if &self.plan != expected_plan {
+            return Err(verifier_fact_error(
+                "retained TestD bytes belong to another task plan",
+            ));
+        }
+        let job: TestJob =
+            serde_json::from_value(self.retained_testd_job.clone().ok_or_else(|| {
+                verifier_fact_error("canonical verifier fact has no retained original TestD job")
+            })?)
+            .map_err(|error| {
+                verifier_fact_error(format!("retained TestD job does not decode: {error}"))
+            })?;
+        let receipt: VerificationReceipt =
+            serde_json::from_value(self.retained_testd_receipt.clone().ok_or_else(|| {
+                verifier_fact_error(
+                    "canonical verifier fact has no retained original TestD receipt",
+                )
+            })?)
+            .map_err(|error| {
+                verifier_fact_error(format!("retained TestD receipt does not decode: {error}"))
+            })?;
+        receipt.validate(&job).map_err(|error| {
+            verifier_fact_error(format!(
+                "retained TestD receipt or bytes failed validation: {error}"
+            ))
+        })?;
+        let task_id = TaskId::new(self.task_id.clone()).map_err(|error| {
+            verifier_fact_error(format!("retained TestD task identity is invalid: {error}"))
+        })?;
+        let run = evaluate_testd_verification_current(
+            &job,
+            &receipt,
+            expected_plan.verifier_binding().map_err(|error| {
+                verifier_fact_error(format!(
+                    "retained TestD plan has no verifier binding: {error}"
+                ))
+            })?,
+        )?;
+        let revalidated = Self::from_testd(
+            &task_id,
+            self.task_revision,
+            expected_plan,
+            expected_fence,
+            &job,
+            &receipt,
+            run,
+        )?;
+        if revalidated != *self {
+            return Err(verifier_fact_error(
+                "revalidated original TestD bytes differ from the canonical verifier fact",
+            ));
+        }
         Ok(())
     }
 
@@ -6063,7 +6147,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .into());
         }
         let service = self.finish_attempt_service();
-        let plan = service.admit_task_controller_plan(task_id)?;
+        let (plan, task_revision) = service.admit_task_controller_plan(task_id)?;
         // Already current: the owner holds exactly this plan, so there is no
         // owner image to publish and no revision to advance.
         if self
@@ -6075,7 +6159,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             return Ok(None);
         }
         let snapshot = self.owners.canonical.prepare_current_plan(plan)?;
-        let envelope = current_plan_envelope(identity, operation_id, &snapshot, task_id)?;
+        let envelope =
+            current_plan_envelope(identity, operation_id, &snapshot, task_id, task_revision)?;
         Ok(Some(
             service.prepare_current_plan_exchange(identity, envelope)?,
         ))
@@ -6696,6 +6781,28 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         self.finish_attempt_service()
             .rehydrate_task_contract_acceptance(task_id)
             .await
+    }
+
+    /// Finds the locally retained receipt for the exact original Finish
+    /// attempt before the live task revision is consulted. The caller must
+    /// read and validate the matching canonical Kernel receipt before it
+    /// returns this value; this method performs no evaluation or mutation.
+    pub fn historical_finish_receipt(
+        &self,
+        identity: &RequestIdentity,
+        operation_id: &OperationId,
+        draft: &FinishAttemptDraft,
+        kernel_attempt: &eliot_protocol::FinishAttempt,
+    ) -> Result<Option<FinishDecisionReceipt>, FinishAttemptError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
+        }
+        self.finish_attempt_service().historical_finish_receipt(
+            identity,
+            operation_id,
+            draft,
+            kernel_attempt,
+        )
     }
 
     /// Prepares the exact exchange that publishes the Governor-derived

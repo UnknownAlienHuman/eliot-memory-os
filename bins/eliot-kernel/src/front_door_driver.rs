@@ -532,6 +532,13 @@ async fn serve_connection(
                     return Err(error);
                 }
             }
+            #[cfg(windows)]
+            KernelFrameAction::FinishReplay(_) => {
+                // The correlated async replay is only served by the activated
+                // agent-bridge loop with its retained owner connection.
+                session.fence();
+                return Err(TransportError::SessionFenced);
+            }
             KernelFrameAction::Fence(rejection) => {
                 let result = send_checked(&mut front_door, &rejection, limits).await;
                 session.fence();
@@ -622,7 +629,8 @@ async fn serve_user_broker_connection(
             | KernelFrameAction::Testd { .. }
             | KernelFrameAction::Dreamer { .. }
             | KernelFrameAction::Research { .. }
-            | KernelFrameAction::Backup { .. } => break Err(TransportError::SessionFenced),
+            | KernelFrameAction::Backup { .. }
+            | KernelFrameAction::FinishReplay(_) => break Err(TransportError::SessionFenced),
         }
     };
     session.fence();
@@ -857,6 +865,19 @@ async fn serve_admitted_bridge_host_requests(
                     return Err(error);
                 }
             }
+            KernelFrameAction::FinishReplay(replay) => {
+                let reply = match kernel.finish_replay_reply(&connection_id, *replay).await {
+                    Ok(reply) => reply,
+                    Err(error) => {
+                        kernel.revoke_agent_bridge(&connection_id);
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
+                    kernel.revoke_agent_bridge(&connection_id);
+                    return Err(error);
+                }
+            }
             KernelFrameAction::Fence(rejection) => {
                 let result = send_checked(&mut front_door, &rejection, limits).await;
                 kernel.revoke_agent_bridge(&connection_id);
@@ -869,7 +890,8 @@ async fn serve_admitted_bridge_host_requests(
             | KernelFrameAction::Testd { .. }
             | KernelFrameAction::Research { .. }
             | KernelFrameAction::Dreamer { .. }
-            | KernelFrameAction::Backup { .. } => {
+            | KernelFrameAction::Backup { .. }
+            | KernelFrameAction::FinishReplay(_) => {
                 // Bridge transports never carry process, daemon, Doctor,
                 // testd, research-provider, Dreamer, or isolated-restore
                 // authority: the Doctor

@@ -22,13 +22,14 @@
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
-use eliot_ors::{HostRequestState, OperationIdentity, OrsError};
+use eliot_ors::{HostRequestRecord, HostRequestState, OperationIdentity, OrsError};
 use eliot_protocol::{
-    FinishAttempt, FinishResultBody, HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope,
-    HostRequestInvokeReadPayload, HostRequestResultBody, TaskControllerAttempt,
-    TaskControllerInvocation, TaskControllerResultBody, host_request_operation_id,
+    FinishAttempt, FinishResultBody, HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestAdmissionReceipt,
+    HostRequestEnvelope, HostRequestInvokeReadPayload, HostRequestResultBody,
+    TaskControllerAttempt, TaskControllerInvocation, TaskControllerResultBody,
+    host_request_operation_id,
 };
-use eliot_store_api::ScopeId;
+use eliot_store_api::{CONTRACT_VERSION, OperationId, ScopeId, StoreRecoveryRequest, WriteReceipt};
 
 use crate::{
     AuditEventDraft, KernelComposition, Session, TransportError, activation_deadline_expired,
@@ -92,6 +93,356 @@ fn evict_one_stale_campaign_packet(
 }
 
 impl KernelComposition {
+    async fn read_finish_decision_authority(
+        &self,
+        gateway: &crate::KernelStoreGateway,
+        envelope: &HostRequestEnvelope,
+        operation_id: &str,
+    ) -> Result<Option<(WriteReceipt, serde_json::Value)>, TransportError> {
+        let operation =
+            OperationId::new(operation_id.to_owned()).map_err(|_| TransportError::SessionFenced)?;
+        let observed = gateway
+            .receipt(&envelope.state_fence, operation.clone())
+            .await
+            .map_err(|_| TransportError::SessionFenced)?;
+        let Some(observed) = observed else {
+            return Ok(None);
+        };
+        if observed.status != eliot_store_api::WriteReceiptStatus::Committed
+            || observed.transition_class != eliot_store_api::TransitionClass::RecoverySchema
+        {
+            return Ok(None);
+        }
+        let snapshot = gateway
+            .recovery(StoreRecoveryRequest {
+                contract_version: CONTRACT_VERSION,
+                state_fence: envelope.state_fence.clone(),
+                records: Vec::new(),
+                include_receipts: true,
+                include_jobs: false,
+                receipt_authority_operation_ids: vec![operation.clone()],
+            })
+            .await
+            .map_err(|_| TransportError::SessionFenced)?;
+        finish_authority_from_snapshot(&snapshot, &observed, &operation, envelope)
+    }
+
+    /// Reconciles an exact completed Finish invoke-read on the asynchronous
+    /// public bridge path. The presented envelope/tool/admission receipt bind
+    /// the original request; the ORS result body is served only after the
+    /// current retained application owner is revalidated around an actual
+    /// canonical Store receipt read.
+    pub async fn finish_replay_reply(
+        &self,
+        connection_id: &str,
+        replay: crate::FinishReplayAction,
+    ) -> Result<crate::Frame, TransportError> {
+        let crate::FinishReplayAction {
+            request_id,
+            protocol_version,
+            envelope,
+            tool,
+            admission_receipt,
+            record: expected_record,
+            reconnect_envelope,
+            logical_key,
+        } = replay;
+        let persisted: super::PersistedFinishReplayBinding = serde_json::from_value(
+            expected_record
+                .finish_replay_binding
+                .clone()
+                .ok_or(TransportError::UnknownRequest)?,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        if persisted.envelope != envelope || persisted.tool != tool {
+            return Err(TransportError::IdentityConflict);
+        }
+        let session_before = self.host_request_bridge_session(connection_id)?;
+        let validate = |session: &Session| {
+            if let Some(current) = reconnect_envelope.as_ref() {
+                self.validate_finish_reconnect_binding(
+                    session,
+                    current,
+                    &persisted,
+                    &admission_receipt,
+                    &expected_record,
+                )
+            } else {
+                self.validate_finish_replay_binding(
+                    session,
+                    &envelope,
+                    &tool,
+                    &admission_receipt,
+                    &expected_record,
+                    &persisted.owner,
+                )
+            }
+        };
+        let (operation_id, owner_before) = validate(&session_before)?;
+        let gateway = self.retained_store_gateway()?;
+        let historical = self
+            .read_finish_decision_authority(&gateway, &envelope, &operation_id)
+            .await?;
+
+        // Store I/O may overlap cancellation, owner revocation, or queue
+        // retirement. Reacquire every original owner binding after the await;
+        // no Kernel mutex is held across the asynchronous receipt query.
+        let session_after = self.host_request_bridge_session(connection_id)?;
+        if session_before != session_after {
+            return Err(TransportError::SessionFenced);
+        }
+        let (operation_after, owner_after) = validate(&session_after)?;
+        if operation_after != operation_id || owner_after != owner_before {
+            return Err(TransportError::SessionFenced);
+        }
+        let operation = OperationIdentity::new(operation_id.clone())
+            .map_err(|_| TransportError::SessionFenced)?;
+        let response = expected_record
+            .result_response
+            .as_ref()
+            .ok_or(TransportError::UnknownRequest)?;
+        let result_digest = expected_record
+            .result_digest
+            .as_deref()
+            .ok_or(TransportError::UnknownRequest)?;
+        if !finish_result_digest_matches(response, result_digest) {
+            return Err(TransportError::IdentityConflict);
+        }
+        match historical {
+            Some((receipt, decision))
+                if committed_finish_receipt_matches_owner(
+                    &receipt,
+                    &operation,
+                    &envelope,
+                    &owner_after,
+                ) && finish_response_matches_committed_decision(
+                    response, &envelope, &tool, &receipt, &decision,
+                ) => {}
+            None if finish_refusal_response_matches(response, &operation_id, &envelope) => {}
+            _ => return Err(TransportError::IdentityConflict),
+        }
+        let value = if let Some(key) = logical_key.as_deref() {
+            super::host_request_resolved_response(&expected_record, Some(key))
+        } else if reconnect_envelope.is_some() {
+            super::host_request_resolved_response(&expected_record, None)
+        } else {
+            super::host_request_admitted_response(&admission_receipt, &expected_record)
+        };
+        super::KernelComposition::host_request_correlated_reply(
+            &session_after,
+            request_id,
+            protocol_version,
+            value,
+        )
+        .and_then(|action| match action {
+            crate::KernelFrameAction::Reply(frame) => Ok(frame),
+            _ => Err(TransportError::SessionFenced),
+        })
+    }
+
+    fn validate_finish_replay_binding(
+        &self,
+        session: &Session,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+        admission_receipt: &eliot_protocol::HostRequestAdmissionReceipt,
+        expected_record: &HostRequestRecord,
+        original_owner: &super::super::ActivatedApplicationBinding,
+    ) -> Result<(String, super::super::ActivatedApplicationBinding), TransportError> {
+        envelope
+            .validate_for_admission()
+            .map_err(|_| TransportError::SessionFenced)?;
+        admission_receipt
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if envelope.kind != eliot_protocol::HostRequestKind::Invocation
+            || envelope.identity.capability != "eliot.finish"
+            || envelope.connection_id != session.connection_id
+            || session.module_generation.state_fence != envelope.state_fence
+            || !session
+                .authority_epoch
+                .is_same_authority(&envelope.state_fence.authority_epoch)
+            || eliot_protocol::HostRequestAdmissionReceipt::issue(envelope)
+                .map_err(|_| TransportError::SessionFenced)?
+                != *admission_receipt
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        eliot_protocol::HostRequestInvokeReadPayload {
+            wire_id: HOST_REQUEST_INVOKE_READ_WIRE_ID.to_owned(),
+            wire_version: HostRequestInvokeReadPayload::CONTRACT_VERSION,
+            envelope: envelope.clone(),
+            tool: tool.clone(),
+        }
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+        super::check_finish_admission(envelope, tool)?;
+        expected_record
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if !matches!(
+            expected_record.state,
+            HostRequestState::ResultReceived | HostRequestState::Terminal
+        ) || expected_record.result_digest.is_none()
+            || expected_record.result_response.is_none()
+            || expected_record.payload_body.as_ref() != Some(tool)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let persisted: super::PersistedFinishReplayBinding = serde_json::from_value(
+            expected_record
+                .finish_replay_binding
+                .clone()
+                .ok_or(TransportError::UnknownRequest)?,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        if persisted.envelope != *envelope
+            || persisted.tool != *tool
+            || persisted.owner != *original_owner
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        let operation_id = host_request_operation_id(envelope);
+        let operation = OperationIdentity::new(operation_id.clone())
+            .map_err(|_| TransportError::SessionFenced)?;
+        let stored = self
+            .generation_gateway
+            .ors
+            .load_host_request(&operation, &envelope.envelope_sha256)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::UnknownRequest)?;
+        if stored != *expected_record
+            || stored.operation_id.as_str() != operation_id
+            || stored.request_digest != envelope.envelope_sha256
+            || stored.capability_ref.as_str() != "eliot.finish"
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        let mut expected = super::requested_host_request_record(envelope)?;
+        expected
+            .finish_replay_binding
+            .clone_from(&expected_record.finish_replay_binding);
+        if !stored.same_binding(&expected) {
+            return Err(TransportError::IdentityConflict);
+        }
+        let retained_attempt = stored
+            .attempt
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        if retained_attempt.phase != eliot_ors::HostRequestAttemptPhase::ResponseReceived {
+            return Err(TransportError::SessionFenced);
+        }
+        let _transition = self.agent_bridge_transition_read()?;
+        let admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        // Historical readback is bound to the original retained activation
+        // tuple below; requiring a still-live task lease here would turn a
+        // completed decision into a new-work admission and strand legitimate
+        // post-closure replay.
+        let owner = self.finish_owner_binding_for_pair(envelope, tool, &admission_owner)?;
+        if &owner != original_owner {
+            return Err(TransportError::IdentityConflict);
+        }
+        Ok((operation_id, owner))
+    }
+
+    fn validate_finish_reconnect_binding(
+        &self,
+        session: &Session,
+        reconnect_envelope: &HostRequestEnvelope,
+        persisted: &super::PersistedFinishReplayBinding,
+        admission_receipt: &eliot_protocol::HostRequestAdmissionReceipt,
+        expected_record: &HostRequestRecord,
+    ) -> Result<(String, super::super::ActivatedApplicationBinding), TransportError> {
+        validate_finish_reconnect_request(
+            session,
+            reconnect_envelope,
+            persisted,
+            admission_receipt,
+            expected_record,
+        )?;
+        let original = &persisted.owner;
+        let current = self
+            .agent_bridge_connections
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .get(&reconnect_envelope.connection_id)
+            .and_then(|state| state.activated_binding.clone())
+            .ok_or(TransportError::SessionFenced)?;
+        let pending = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let lifecycle = self
+            .generation_gateway
+            .ors
+            .load_activation_lifecycle(&original.activation_ticket_id)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::UnknownRequest)?;
+        if !KernelComposition::activation_result_still_retained_in(&pending, original)
+            || !self.activation_result_still_retained(&pending, original, &lifecycle.connection_id)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        if current.principal_id != original.principal_id
+            || current.session_id != original.session_id
+            || current.task_id != original.task_id
+            || current.work_scope_id != original.work_scope_id
+            || !current
+                .authority_epoch
+                .is_same_authority(&original.authority_epoch)
+            || current.activation_generation != original.activation_generation
+            || expected_record.operation_id.as_str()
+                != host_request_operation_id(&persisted.envelope)
+            || expected_record.request_digest != persisted.envelope.envelope_sha256
+            || expected_record.capability_ref.as_str() != "eliot.finish"
+            || expected_record.payload_body.as_ref() != Some(&persisted.tool)
+            || expected_record.finish_replay_binding.as_ref()
+                != serde_json::to_value(persisted).ok().as_ref()
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        let operation_id = self.validate_finish_reconnect_record(persisted, expected_record)?;
+        Ok((operation_id, original.clone()))
+    }
+
+    fn validate_finish_reconnect_record(
+        &self,
+        persisted: &super::PersistedFinishReplayBinding,
+        expected_record: &HostRequestRecord,
+    ) -> Result<String, TransportError> {
+        let operation_id = host_request_operation_id(&persisted.envelope);
+        let operation = OperationIdentity::new(operation_id.clone())
+            .map_err(|_| TransportError::SessionFenced)?;
+        let stored = self
+            .generation_gateway
+            .ors
+            .load_host_request(&operation, &persisted.envelope.envelope_sha256)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::UnknownRequest)?;
+        let mut requested = super::requested_host_request_record(&persisted.envelope)?;
+        requested
+            .finish_replay_binding
+            .clone_from(&expected_record.finish_replay_binding);
+        if stored != *expected_record
+            || !stored.same_binding(&requested)
+            || !matches!(
+                stored.state,
+                HostRequestState::ResultReceived | HostRequestState::Terminal
+            )
+            || stored.result_digest.is_none()
+            || stored.result_response.is_none()
+            || stored.attempt.as_ref().is_none_or(|attempt| {
+                attempt.phase != eliot_ors::HostRequestAttemptPhase::ResponseReceived
+            })
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        Ok(operation_id)
+    }
+
     pub(super) fn enqueue_campaign_packet_pair_under_transition(
         &self,
         envelope: &HostRequestEnvelope,
@@ -109,6 +460,17 @@ impl KernelComposition {
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
         self.host_request_connection_gate_under_transition(envelope)?;
+        let durable_operation_id = OperationIdentity::new(host_request_operation_id(envelope))
+            .map_err(|_| TransportError::SessionFenced)?;
+        let durable = self
+            .generation_gateway
+            .ors
+            .bind_host_request_payload(&durable_operation_id, &envelope.envelope_sha256, tool)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::UnknownRequest)?;
+        if durable.payload_body.as_ref() != Some(tool) {
+            return Err(TransportError::IdentityConflict);
+        }
         let mut index = self
             .host_request_connection_index
             .lock()
@@ -181,18 +543,24 @@ impl KernelComposition {
                 finish_envelope: None,
                 finish_tool: None,
                 finish_attempt: LocalReadAttemptState::default(),
+                finish_result_received: false,
             });
         }
-        // Issue #1745 R7 persistence tail: same dispatch-owned exposure
-        // evidence as the query/skill lane, from the packet admission owner.
-        // Fresh staging only — replays return early above — so the recorded
-        // original is reconciled, never duplicated. Best-effort like every
-        // observation: a populate failure is terminal-visible but never
-        // changes the staged admission.
-        crate::tool_exposure::observe_dispatch_exposure(envelope, tool, &admission, |draft| {
+        self.observe_campaign_packet_exposure(envelope, tool, &admission);
+        Ok(())
+    }
+
+    fn observe_campaign_packet_exposure(
+        &self,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+        admission: &LocalReadAdmission,
+    ) {
+        // Exposure evidence is recorded only on fresh staging. Failure to
+        // populate remains observation-only and cannot undo queue admission.
+        crate::tool_exposure::observe_dispatch_exposure(envelope, tool, admission, |draft| {
             self.audit_observe(draft);
         });
-        Ok(())
     }
 
     pub(super) fn enqueue_task_controller_pair_under_transition(
@@ -290,6 +658,7 @@ impl KernelComposition {
                 finish_envelope: None,
                 finish_tool: None,
                 finish_attempt: LocalReadAttemptState::default(),
+                finish_result_received: false,
             });
         }
         Ok(())
@@ -470,10 +839,11 @@ impl KernelComposition {
         tool: &serde_json::Value,
     ) -> Result<(), TransportError> {
         finish_admission(envelope, tool)?;
-        let _admission_owner = self
+        let admission_owner = self
             .agent_activation_pending
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
+        self.finish_owner_binding_for_pair(envelope, tool, &admission_owner)?;
         self.host_request_connection_gate_under_transition(envelope)?;
         let mut index = self
             .host_request_connection_index
@@ -514,7 +884,8 @@ impl KernelComposition {
             let mut evicted = false;
             for refs in index.values_mut() {
                 if let Some(position) = refs.iter().position(|candidate| {
-                    candidate.finish_envelope.is_some() && !candidate.finish_attempt.is_live()
+                    candidate.finish_envelope.is_some()
+                        && (!candidate.finish_attempt.is_live() || candidate.finish_result_received)
                 }) {
                     refs.remove(position);
                     evicted = true;
@@ -537,6 +908,7 @@ impl KernelComposition {
             candidate.finish_envelope = Some(envelope.clone());
             candidate.finish_tool = Some(tool.clone());
             candidate.finish_attempt = finish_attempt;
+            candidate.finish_result_received = false;
         } else {
             refs.push(HostRequestOperationRef {
                 operation_id,
@@ -558,6 +930,7 @@ impl KernelComposition {
                 finish_envelope: Some(envelope.clone()),
                 finish_tool: Some(tool.clone()),
                 finish_attempt,
+                finish_result_received: false,
             });
         }
         Ok(())
@@ -586,60 +959,108 @@ impl KernelComposition {
         for refs in index.values_mut() {
             for candidate in refs.iter_mut() {
                 let (Some(envelope), Some(tool)) = (
-                    candidate.finish_envelope.as_ref(),
-                    candidate.finish_tool.as_ref(),
+                    candidate.finish_envelope.clone(),
+                    candidate.finish_tool.clone(),
                 ) else {
                     continue;
                 };
-                if activation_deadline_expired(now, envelope.identity.deadline_unix_ms) {
+                finish_admission(&envelope, &tool)?;
+                if !self.application_binding_live_for_claim(&envelope, &admission_owner, true)? {
                     continue;
                 }
-                finish_admission(envelope, tool)?;
-                if !self.application_binding_live_for_claim(envelope, &admission_owner, true)? {
-                    continue;
-                }
-                if !candidate.finish_attempt.is_owned_by(session) {
-                    let generation = candidate
-                        .finish_attempt
-                        .generation
-                        .checked_add(1)
-                        .ok_or(TransportError::SessionFenced)?;
-                    candidate.finish_attempt = LocalReadAttemptState {
-                        attempt_id: self.mint_local_read_attempt_id(
-                            &candidate.operation_id,
-                            candidate.finish_attempt.enqueue_salt,
-                            generation,
-                        ),
-                        generation,
-                        enqueue_salt: candidate.finish_attempt.enqueue_salt,
-                        owner_connection_id: session.connection_id.clone(),
-                        owner_launch_nonce: session.launch_nonce.clone(),
-                        owner_session_epoch: session.session_epoch,
-                    };
-                }
-                let session_id = envelope
-                    .identity
-                    .session_id
-                    .as_deref()
-                    .ok_or(TransportError::SessionFenced)?;
-                let attempt = eliot_protocol::FinishAttempt {
-                    wire_id: eliot_protocol::FINISH_ATTEMPT_WIRE_ID.to_owned(),
-                    wire_version: eliot_protocol::FINISH_ATTEMPT_WIRE_VERSION,
-                    operation_id: candidate.operation_id.clone(),
-                    attempt_id: candidate.finish_attempt.attempt_id.clone(),
-                    fencing_generation: candidate.finish_attempt.generation,
-                    session_id: session_id.to_owned(),
-                    authority_epoch: envelope.state_fence.authority_epoch.clone(),
-                    expires_at_unix_ms: envelope.identity.deadline_unix_ms,
-                    use_budget: 1,
-                };
-                attempt
-                    .validate()
+                let owner_binding =
+                    self.finish_owner_binding_for_pair(&envelope, &tool, &admission_owner)?;
+                let operation = OperationIdentity::new(candidate.operation_id.clone())
                     .map_err(|_| TransportError::SessionFenced)?;
-                return Ok(Some((envelope.clone(), tool.clone(), attempt)));
+                let stored = self
+                    .generation_gateway
+                    .ors
+                    .load_host_request(&operation, &candidate.request_digest)
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .ok_or(TransportError::UnknownRequest)?;
+                if stored.operation_id.as_str() != candidate.operation_id
+                    || stored.request_digest != candidate.request_digest
+                    || stored.capability_ref.as_str() != "eliot.finish"
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                let mut expected = super::requested_host_request_record(&envelope)?;
+                expected
+                    .finish_replay_binding
+                    .clone_from(&stored.finish_replay_binding);
+                if !stored.same_binding(&expected) || stored.payload_body.as_ref() != Some(&tool) {
+                    return Err(TransportError::IdentityConflict);
+                }
+                if !self.bind_claimed_finish_attempt(
+                    candidate, &operation, &stored, session, now, &envelope,
+                )? {
+                    continue;
+                }
+                let attempt = finish_attempt_from_claim(candidate, &envelope, &owner_binding)?;
+                return Ok(Some((envelope, tool, attempt)));
             }
         }
         Ok(None)
+    }
+
+    fn bind_claimed_finish_attempt(
+        &self,
+        candidate: &mut HostRequestOperationRef,
+        operation: &OperationIdentity,
+        stored: &HostRequestRecord,
+        session: &Session,
+        now: u64,
+        envelope: &HostRequestEnvelope,
+    ) -> Result<bool, TransportError> {
+        let expired = activation_deadline_expired(now, envelope.identity.deadline_unix_ms);
+        if expired {
+            // Expired claims reuse the pre-deadline durable attempt. They do
+            // not mint a new effect capability; submit still requires receipt.
+            if !matches!(
+                stored.state,
+                HostRequestState::Routed
+                    | HostRequestState::Unknown
+                    | HostRequestState::Reconciling
+            ) {
+                return Ok(false);
+            }
+            let Some(prior) = stored
+                .attempt
+                .as_ref()
+                .filter(|attempt| attempt.phase == eliot_ors::HostRequestAttemptPhase::Claimed)
+            else {
+                return Ok(false);
+            };
+            candidate.finish_attempt = LocalReadAttemptState {
+                attempt_id: prior.attempt_id.as_str().to_owned(),
+                generation: prior.generation,
+                enqueue_salt: candidate.finish_attempt.enqueue_salt,
+                owner_connection_id: session.connection_id.clone(),
+                owner_launch_nonce: session.launch_nonce.clone(),
+                owner_session_epoch: session.session_epoch,
+            };
+            return Ok(true);
+        }
+        let queue_attempt = candidate.finish_attempt.clone();
+        let Some(durable) = self.persist_observe_claim_attempt(
+            operation,
+            &candidate.request_digest,
+            stored,
+            &queue_attempt,
+            session,
+        )?
+        else {
+            return Ok(false);
+        };
+        candidate.finish_attempt = LocalReadAttemptState {
+            attempt_id: durable.attempt_id.as_str().to_owned(),
+            generation: durable.generation,
+            enqueue_salt: candidate.finish_attempt.enqueue_salt,
+            owner_connection_id: durable.owner_connection_ref.as_str().to_owned(),
+            owner_launch_nonce: durable.owner_launch_nonce.as_str().to_owned(),
+            owner_session_epoch: durable.owner_session_epoch,
+        };
+        Ok(true)
     }
 
     pub(super) fn live_campaign_packet_attempt_under_transition(
@@ -782,44 +1203,42 @@ impl KernelComposition {
     /// Submits the result of one claimed `eliot.finish` candidate. The
     /// attempt, operation, authority and State Fence joins are checked
     /// against the same live queue record before the result reaches ORS.
-    pub(crate) fn submit_finish_result(
+    pub(crate) async fn submit_finish_result_async(
         &self,
         session: &Session,
         body: &FinishResultBody,
     ) -> Result<LocalReadSubmitDisposition, TransportError> {
         body.validate().map_err(|_| TransportError::SessionFenced)?;
+        // Read the immutable canonical receipt before entering the synchronous
+        // route locks. Every Finish result, including an ordinary first submit,
+        // must match the committed canonical operation before ORS can retain
+        // its response. A deadline can pass while the Store read is in flight;
+        // a missing receipt still times out below.
+        let (envelope, _, _) = self.finish_queued_pair(body)?;
+        let gateway = self.retained_store_gateway()?;
+        let historical = self
+            .read_finish_decision_authority(&gateway, &envelope, &body.operation_id)
+            .await?;
+        self.submit_finish_result(session, body, historical.as_ref())
+    }
+
+    fn submit_finish_result(
+        &self,
+        session: &Session,
+        body: &FinishResultBody,
+        historical: Option<&(WriteReceipt, serde_json::Value)>,
+    ) -> Result<LocalReadSubmitDisposition, TransportError> {
+        body.validate().map_err(|_| TransportError::SessionFenced)?;
         let _transition = self.agent_bridge_transition_read()?;
-        let _admission_owner = self
+        let admission_owner = self
             .agent_activation_pending
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
         let operation_id = OperationIdentity::new(body.operation_id.clone())
             .map_err(|_| TransportError::SessionFenced)?;
-        let stored = self
-            .generation_gateway
-            .ors
-            .load_host_request(&operation_id, &body.request_sha256)
-            .map_err(|_| TransportError::SessionFenced)?
-            .ok_or(TransportError::UnknownRequest)?;
-        if stored.operation_id.as_str() != body.operation_id
-            || stored.request_digest != body.request_sha256
-            || stored.capability_ref.as_str() != "eliot.finish"
-        {
-            // Issue #1839: durable audit evidence for the refused route.
-            if stored.capability_ref.as_str() != "eliot.finish" {
-                self.audit_observe(AuditEventDraft::route_mismatch_submit(
-                    session, &stored, "finish",
-                ));
-            }
-            return Err(TransportError::SessionFenced);
-        }
-        if stored.state == HostRequestState::ResultReceived
-            && stored.result_digest.as_deref() == Some(body.result_digest.as_str())
-            && stored.result_response.as_ref() == Some(&body.response)
-        {
-            return Ok(LocalReadSubmitDisposition::Persisted(Box::new(stored)));
-        }
-        if activation_deadline_expired(unix_ms(), stored.deadline_unix_ms) {
+        let stored = self.load_finish_submit_record(session, body, &operation_id)?;
+        let expired = activation_deadline_expired(unix_ms(), stored.deadline_unix_ms);
+        if expired && historical.is_none() {
             return self.expired_claim_timeout(ExpiredClaimObservation {
                 session: Some(session),
                 stored: &stored,
@@ -831,8 +1250,42 @@ impl KernelComposition {
             });
         }
         let (envelope, state, tool) = self.finish_queued_pair(body)?;
+        let mut expected = super::requested_host_request_record(&envelope)?;
+        expected
+            .finish_replay_binding
+            .clone_from(&stored.finish_replay_binding);
+        if !stored.same_binding(&expected) || stored.payload_body.as_ref() != tool.as_ref() {
+            return Err(TransportError::IdentityConflict);
+        }
+        if !self.application_binding_live_for_claim(&envelope, &admission_owner, true)?
+            || !self.finish_attempt_binding_matches_owner(
+                body,
+                &envelope,
+                tool.as_ref().ok_or(TransportError::SessionFenced)?,
+                &admission_owner,
+            )?
+        {
+            return Ok(LocalReadSubmitDisposition::StaleAttempt(
+                StaleLocalReadObservation {
+                    operation_id: body.operation_id.clone(),
+                    request_digest: body.request_sha256.clone(),
+                    presented_attempt_id: Some(body.attempt.attempt_id.clone()),
+                    presented_generation: Some(body.attempt.fencing_generation),
+                    current_generation: Some(state.generation),
+                    reason: StaleLocalReadReason::Superseded,
+                },
+            ));
+        }
         if let Some(observation) = finish_stale_attempt(body, &state, session, &envelope) {
             return Ok(LocalReadSubmitDisposition::StaleAttempt(observation));
+        }
+        if !finish_result_matches_committed_authority(
+            historical,
+            body,
+            &envelope,
+            tool.as_ref().ok_or(TransportError::SessionFenced)?,
+        ) {
+            return Err(TransportError::IdentityConflict);
         }
         if !session
             .authority_epoch
@@ -847,7 +1300,7 @@ impl KernelComposition {
         // restart still blocks governed finish-candidate acceptance. A
         // corrupt or unreadable sidecar fails closed: acceptance blocks
         // instead of trusting a half-read projection.
-        if super::change_monitor::hydrate_ledger_sidecar_if_empty().is_err() {
+        if !expired && super::change_monitor::hydrate_ledger_sidecar_if_empty().is_err() {
             return Err(TransportError::SessionFenced);
         }
         // #1824 (I10.21 A2): an unreconciled unknown-origin Material change
@@ -860,29 +1313,7 @@ impl KernelComposition {
         // replays above stay readback and unrelated lanes are untouched: the
         // monitor owns its ledger, this leg only queries its gate, and the
         // refusal fails closed without crashing the route.
-        let candidate_blocked = {
-            let resources = finish_candidate_resources(tool.as_ref());
-            let mut resolved_paths = Vec::new();
-            let mut has_opaque_handle = false;
-            for resource in &resources {
-                match normalize_finish_candidate_resource(resource) {
-                    Some(normalized) => resolved_paths.push(normalized),
-                    None => has_opaque_handle = true,
-                }
-            }
-            if resolved_paths.is_empty() || has_opaque_handle {
-                // No resolvable declared target, or an opaque job/operation
-                // handle that could name a blocked resource: keep the global
-                // gate as fallback instead of letting an unresolvable list
-                // silently pass the per-resource comparison below.
-                super::change_monitor::governed_acceptance_blocked()
-            } else {
-                resolved_paths.iter().any(|resource| {
-                    super::change_monitor::governed_acceptance_blocked_for(resource.as_str())
-                })
-            }
-        };
-        if candidate_blocked {
+        if !expired && finish_candidate_acceptance_blocked(tool.as_ref()) {
             return Err(TransportError::SessionFenced);
         }
         let persisted = self
@@ -906,8 +1337,55 @@ impl KernelComposition {
                 _ => TransportError::SessionFenced,
             })?
             .ok_or(TransportError::UnknownRequest)?;
-        self.retire_finish_pair_under_transition(&body.operation_id, &body.request_sha256);
+        self.mark_finish_result_received_under_transition(
+            &body.operation_id,
+            &body.request_sha256,
+        )?;
         Ok(LocalReadSubmitDisposition::Persisted(Box::new(persisted)))
+    }
+
+    fn load_finish_submit_record(
+        &self,
+        session: &Session,
+        body: &FinishResultBody,
+        operation_id: &OperationIdentity,
+    ) -> Result<HostRequestRecord, TransportError> {
+        let stored = self
+            .generation_gateway
+            .ors
+            .load_host_request(operation_id, &body.request_sha256)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::UnknownRequest)?;
+        if stored.operation_id.as_str() != body.operation_id
+            || stored.request_digest != body.request_sha256
+            || stored.capability_ref.as_str() != "eliot.finish"
+        {
+            if stored.capability_ref.as_str() != "eliot.finish" {
+                self.audit_observe(AuditEventDraft::route_mismatch_submit(
+                    session, &stored, "finish",
+                ));
+            }
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(stored)
+    }
+
+    fn finish_attempt_binding_matches_owner(
+        &self,
+        body: &FinishResultBody,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+        pending: &super::super::AgentActivationPendingState,
+    ) -> Result<bool, TransportError> {
+        let owner_binding = self.finish_owner_binding_for_pair(envelope, tool, pending)?;
+        let mut semantic_fence = envelope.state_fence.clone();
+        semantic_fence.task_revision = Some(owner_binding.task_revision);
+        Ok(body.attempt.principal_id == owner_binding.principal_id
+            && body.attempt.session_id == owner_binding.session_id
+            && body.attempt.task_id == owner_binding.task_id
+            && body.attempt.work_scope_id == owner_binding.work_scope_id
+            && body.attempt.task_revision == owner_binding.task_revision.value()
+            && body.attempt.semantic_state_fence == semantic_fence)
     }
 
     /// Loads the exact live finish queue record for a submitted result. An
@@ -947,20 +1425,157 @@ impl KernelComposition {
             })
             .ok_or(TransportError::UnknownRequest)?;
         let envelope = envelope.ok_or(TransportError::UnknownRequest)?;
-        Ok((envelope, state, tool))
+        let tool = tool.ok_or(TransportError::UnknownRequest)?;
+        finish_admission(&envelope, &tool)?;
+        Ok((envelope, state, Some(tool)))
     }
 
-    fn retire_finish_pair_under_transition(&self, operation_id: &str, request_digest: &str) {
-        let Ok(mut index) = self.host_request_connection_index.lock() else {
-            return;
-        };
-        for refs in index.values_mut() {
-            refs.retain(|candidate| {
-                !(candidate.operation_id == operation_id
+    pub(crate) fn finish_pair_for_operation(
+        &self,
+        operation_id: &str,
+        request_digest: &str,
+    ) -> Result<(HostRequestEnvelope, serde_json::Value), TransportError> {
+        let index = self
+            .host_request_connection_index
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let (envelope, tool) = index
+            .values()
+            .flatten()
+            .find(|candidate| {
+                candidate.operation_id == operation_id
                     && candidate.request_digest == request_digest
-                    && candidate.finish_envelope.is_some())
-            });
+                    && candidate.finish_envelope.is_some()
+            })
+            .and_then(|candidate| {
+                Some((
+                    candidate.finish_envelope.clone()?,
+                    candidate.finish_tool.clone()?,
+                ))
+            })
+            .ok_or(TransportError::UnknownRequest)?;
+        finish_admission(&envelope, &tool)?;
+        Ok((envelope, tool))
+    }
+
+    /// Reads the original canonical Finish receipt before a pending
+    /// cancellation is applied. Store I/O occurs with no Kernel mutex held;
+    /// the exact queued bytes and retained activation binding are re-read after
+    /// the await so a concurrent retirement or owner change fails closed.
+    pub(crate) async fn finish_receipt_before_cancellation(
+        &self,
+        cancellation: &HostRequestEnvelope,
+    ) -> Result<bool, TransportError> {
+        let (parent_operation, parent_digest) = super::parent_operation_key(cancellation)?;
+        let parent = self
+            .generation_gateway
+            .ors
+            .load_host_request(&parent_operation, &parent_digest)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::UnknownRequest)?;
+        if parent.capability_ref.as_str() != "eliot.finish"
+            || matches!(
+                parent.state,
+                HostRequestState::ResultReceived
+                    | HostRequestState::Cancelled
+                    | HostRequestState::Expired
+                    | HostRequestState::Conflicted
+                    | HostRequestState::Terminal
+            )
+        {
+            return Ok(false);
         }
+        if parent.attempt.is_none()
+            && matches!(
+                parent.state,
+                HostRequestState::Admitted | HostRequestState::Routed
+            )
+        {
+            // Finish owner work cannot be reached until Kernel has durably
+            // claimed an ORS attempt. With no attempt to reconcile, there is
+            // no Finish capability that has been handed to the daemon.
+            return Ok(false);
+        }
+        let (envelope_before, tool_before) =
+            self.finish_pair_for_operation(parent_operation.as_str(), &parent_digest)?;
+        let mut expected = super::requested_host_request_record(&envelope_before)?;
+        expected
+            .finish_replay_binding
+            .clone_from(&parent.finish_replay_binding);
+        if !parent.same_binding(&expected) {
+            return Err(TransportError::IdentityConflict);
+        }
+        let gateway = self.retained_store_gateway()?;
+        let historical = self
+            .read_finish_decision_authority(&gateway, &envelope_before, parent_operation.as_str())
+            .await?;
+
+        let parent_after = self
+            .generation_gateway
+            .ors
+            .load_host_request(&parent_operation, &parent_digest)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::UnknownRequest)?;
+        if parent_after.state == HostRequestState::ResultReceived
+            || matches!(
+                parent_after.state,
+                HostRequestState::Cancelled
+                    | HostRequestState::Expired
+                    | HostRequestState::Conflicted
+                    | HostRequestState::Terminal
+            )
+        {
+            return Ok(false);
+        }
+        if !parent_after.same_binding(&expected) {
+            return Err(TransportError::IdentityConflict);
+        }
+
+        let (envelope_after, tool_after) =
+            self.finish_pair_for_operation(parent_operation.as_str(), &parent_digest)?;
+        if envelope_after != envelope_before || tool_after != tool_before {
+            return Err(TransportError::SessionFenced);
+        }
+        let pending = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let owner = self.finish_owner_binding_for_pair(&envelope_after, &tool_after, &pending)?;
+        let Some((receipt, decision)) = historical else {
+            return Ok(false);
+        };
+        if !committed_finish_receipt_matches_owner(
+            &receipt,
+            &parent_operation,
+            &envelope_after,
+            &owner,
+        ) || !finish_decision_matches_owner(&decision, &envelope_after, &owner)
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        Ok(true)
+    }
+
+    fn mark_finish_result_received_under_transition(
+        &self,
+        operation_id: &str,
+        request_digest: &str,
+    ) -> Result<(), TransportError> {
+        let mut index = self
+            .host_request_connection_index
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let candidate = index
+            .values_mut()
+            .flatten()
+            .find(|candidate| {
+                candidate.operation_id == operation_id
+                    && candidate.request_digest == request_digest
+                    && candidate.finish_envelope.is_some()
+            })
+            .ok_or(TransportError::UnknownRequest)?;
+        candidate.finish_result_received = true;
+        Ok(())
     }
 
     /// Loads the exact live Task Controller queue record for a submitted
@@ -1008,6 +1623,630 @@ impl KernelComposition {
             });
         }
     }
+}
+
+fn validate_finish_reconnect_request(
+    session: &Session,
+    reconnect_envelope: &HostRequestEnvelope,
+    persisted: &super::PersistedFinishReplayBinding,
+    admission_receipt: &HostRequestAdmissionReceipt,
+    expected_record: &HostRequestRecord,
+) -> Result<(), TransportError> {
+    reconnect_envelope
+        .validate_for_admission()
+        .map_err(|_| TransportError::SessionFenced)?;
+    persisted
+        .envelope
+        .validate_for_admission()
+        .map_err(|_| TransportError::SessionFenced)?;
+    super::check_finish_admission(&persisted.envelope, &persisted.tool)?;
+    HostRequestInvokeReadPayload {
+        wire_id: HOST_REQUEST_INVOKE_READ_WIRE_ID.to_owned(),
+        wire_version: HostRequestInvokeReadPayload::CONTRACT_VERSION,
+        envelope: persisted.envelope.clone(),
+        tool: persisted.tool.clone(),
+    }
+    .validate()
+    .map_err(|_| TransportError::SessionFenced)?;
+    admission_receipt
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    expected_record
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+
+    let owner = &persisted.owner;
+    let original = &persisted.envelope;
+    let matches_reconnect = reconnect_envelope.kind == eliot_protocol::HostRequestKind::Status
+        && reconnect_envelope.connection_id == session.connection_id
+        && session.module_generation.state_fence == reconnect_envelope.state_fence
+        && session
+            .authority_epoch
+            .is_same_authority(&reconnect_envelope.state_fence.authority_epoch)
+        && owner.activation_generation == original.state_fence.resource_generation
+        && owner
+            .authority_epoch
+            .is_same_authority(&original.state_fence.authority_epoch)
+        && original.identity.session_id.as_deref() == Some(owner.session_id.as_str())
+        && original.identity.task_id.as_deref() == Some(owner.task_id.as_str())
+        && original.identity.work_scope_id.as_deref() == Some(owner.work_scope_id.as_str())
+        && !owner.principal_id.trim().is_empty()
+        && reconnect_envelope.identity.session_id.as_deref() == Some(owner.session_id.as_str())
+        && reconnect_envelope.identity.task_id.as_deref() == Some(owner.task_id.as_str())
+        && reconnect_envelope.identity.work_scope_id.as_deref()
+            == Some(owner.work_scope_id.as_str())
+        && HostRequestAdmissionReceipt::issue(original)
+            .map_err(|_| TransportError::SessionFenced)?
+            == *admission_receipt;
+    if !matches_reconnect {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(())
+}
+
+fn finish_authority_from_snapshot(
+    snapshot: &eliot_store_api::StoreRecoverySnapshot,
+    observed: &WriteReceipt,
+    operation: &OperationId,
+    envelope: &HostRequestEnvelope,
+) -> Result<Option<(WriteReceipt, serde_json::Value)>, TransportError> {
+    let receipts = snapshot
+        .receipts
+        .iter()
+        .filter(|receipt| receipt.operation_id == *operation)
+        .collect::<Vec<_>>();
+    let authorities = snapshot
+        .receipt_authorities
+        .iter()
+        .filter(|authority| authority.operation_id == *operation)
+        .collect::<Vec<_>>();
+    if receipts.is_empty() && authorities.is_empty() {
+        return Ok(None);
+    }
+    if receipts.len() != 1 || authorities.len() != 1 {
+        return Err(TransportError::IdentityConflict);
+    }
+    let receipt = receipts[0];
+    let authority = authorities[0];
+    if receipt != observed
+        || receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+        || receipt.operation_id != *operation
+        || receipt.idempotency_key != envelope.identity.idempotency_key
+        || receipt.state_fence != envelope.state_fence
+        || receipt.transition_class != eliot_store_api::TransitionClass::RecoverySchema
+        || authority.state_fence != envelope.state_fence
+        || authority.commit_sequence == 0
+        || receipt.committed_at.as_deref()
+            != Some(format!("commit-sequence-{:016}", authority.commit_sequence).as_str())
+        || authority.named_operation_count != authority.records.len()
+    {
+        return Err(TransportError::IdentityConflict);
+    }
+
+    let mut finish_receipts = Vec::new();
+    for record in &authority.records {
+        let parameters: serde_json::Value = serde_json::from_slice(&record.parameters.bytes)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let Some(object) = parameters.as_object() else {
+            return Err(TransportError::IdentityConflict);
+        };
+        if object.contains_key("attempt_id")
+            && object.contains_key("expected_finish_revision")
+            && object.contains_key("receipt_json")
+        {
+            if object.len() != 4
+                || object.get("attempt_id").and_then(serde_json::Value::as_str)
+                    != Some(envelope.identity.idempotency_key.as_str())
+                || object
+                    .get("expected_finish_revision")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|revision| revision.parse::<u64>().ok())
+                    .is_none_or(|revision| revision == 0)
+                || object
+                    .get("task_revision")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|revision| revision.parse::<u64>().ok())
+                    .is_none_or(|revision| revision == 0)
+            {
+                return Err(TransportError::IdentityConflict);
+            }
+            let raw = object
+                .get("receipt_json")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(TransportError::IdentityConflict)?;
+            let retained_decisions: serde_json::Value =
+                serde_json::from_str(raw).map_err(|_| TransportError::IdentityConflict)?;
+            let retained_decisions = retained_decisions
+                .as_array()
+                .ok_or(TransportError::IdentityConflict)?;
+            let current_attempt = retained_decisions
+                .iter()
+                .filter(|decision| {
+                    decision
+                        .get("attempt_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(envelope.identity.idempotency_key.as_str())
+                })
+                .collect::<Vec<_>>();
+            if current_attempt.len() != 1 {
+                return Err(TransportError::IdentityConflict);
+            }
+            let decision = current_attempt[0];
+            if object
+                .get("task_revision")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|revision| revision.parse::<u64>().ok())
+                != decision
+                    .get("task_revision")
+                    .and_then(serde_json::Value::as_u64)
+                || !finish_decision_projection_shape(decision)
+            {
+                return Err(TransportError::IdentityConflict);
+            }
+            finish_receipts.push(decision.to_owned());
+        }
+    }
+    if finish_receipts.len() != 1 {
+        return Err(TransportError::IdentityConflict);
+    }
+    Ok(Some((receipt.clone(), finish_receipts.remove(0))))
+}
+
+fn finish_attempt_from_claim(
+    candidate: &HostRequestOperationRef,
+    envelope: &HostRequestEnvelope,
+    owner: &super::super::ActivatedApplicationBinding,
+) -> Result<FinishAttempt, TransportError> {
+    let session_id = envelope
+        .identity
+        .session_id
+        .as_deref()
+        .ok_or(TransportError::SessionFenced)?;
+    let mut semantic_state_fence = envelope.state_fence.clone();
+    semantic_state_fence.task_revision = Some(owner.task_revision);
+    let attempt = FinishAttempt {
+        wire_id: eliot_protocol::FINISH_ATTEMPT_WIRE_ID.to_owned(),
+        wire_version: eliot_protocol::FINISH_ATTEMPT_WIRE_VERSION,
+        operation_id: candidate.operation_id.clone(),
+        attempt_id: candidate.finish_attempt.attempt_id.clone(),
+        fencing_generation: candidate.finish_attempt.generation,
+        session_id: session_id.to_owned(),
+        principal_id: owner.principal_id.clone(),
+        task_id: owner.task_id.clone(),
+        work_scope_id: owner.work_scope_id.clone(),
+        task_revision: owner.task_revision.value(),
+        semantic_state_fence,
+        authority_epoch: envelope.state_fence.authority_epoch.clone(),
+        expires_at_unix_ms: envelope.identity.deadline_unix_ms,
+        use_budget: 1,
+    };
+    attempt
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    Ok(attempt)
+}
+
+fn finish_candidate_acceptance_blocked(tool: Option<&serde_json::Value>) -> bool {
+    let resources = finish_candidate_resources(tool);
+    let mut resolved_paths = Vec::new();
+    let mut has_opaque_handle = false;
+    for resource in &resources {
+        match normalize_finish_candidate_resource(resource) {
+            Some(normalized) => resolved_paths.push(normalized),
+            None => has_opaque_handle = true,
+        }
+    }
+    if resolved_paths.is_empty() || has_opaque_handle {
+        // No resolvable declared target, or an opaque job/operation handle
+        // that could name a blocked resource: keep the global gate as fallback
+        // instead of letting an unresolvable list silently pass below.
+        super::change_monitor::governed_acceptance_blocked()
+    } else {
+        resolved_paths.iter().any(|resource| {
+            super::change_monitor::governed_acceptance_blocked_for(resource.as_str())
+        })
+    }
+}
+
+/// Requires an actual committed Store receipt for expired Finish reconciliation.
+/// The owner tuple is independently checked against the retained Kernel
+/// activation binding by `finish_attempt_binding_matches_owner`; this receipt
+/// check binds the immutable canonical operation and its semantic task revision
+/// while keeping the transport State Fence in its original shape.
+fn committed_finish_receipt_matches_attempt(
+    receipt: &eliot_store_api::WriteReceipt,
+    body: &FinishResultBody,
+    envelope: &HostRequestEnvelope,
+) -> bool {
+    if receipt.validate().is_err()
+        || receipt.operation_id.as_str() != body.operation_id
+        || receipt.idempotency_key != envelope.identity.idempotency_key
+        || receipt.state_fence != envelope.state_fence
+        || receipt.transition_class != eliot_store_api::TransitionClass::RecoverySchema
+        || receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+    {
+        return false;
+    }
+    let Some(core) = receipt.envelope.as_ref().map(|envelope| &envelope.core) else {
+        return false;
+    };
+    let Some(task) = core.task.as_ref() else {
+        return false;
+    };
+    core.operation.operation_id.as_str() == body.operation_id
+        && core.operation.idempotency_key == envelope.identity.idempotency_key
+        && core.request.state_fence == envelope.state_fence
+        && core.request.metadata.task_id.as_ref().is_some_and(|task_id| {
+            task_id.as_str() == body.attempt.task_id
+        })
+        && core.request.metadata.session_id.as_ref().is_some_and(|session_id| {
+            session_id.as_str() == body.attempt.session_id
+        })
+        && task.task_id.as_str() == body.attempt.task_id
+        && task.task_revision.value() == body.attempt.task_revision
+        && task.state_fence == body.attempt.semantic_state_fence
+        // Governor's canonical owner mutations intentionally use this fixed
+        // physical Store scope; the application WorkScope remains bound by the
+        // retained Kernel activation tuple checked separately above.
+        && core.work_scope.scope_id.as_str() == "governor"
+}
+
+fn finish_result_matches_committed_authority(
+    historical: Option<&(WriteReceipt, serde_json::Value)>,
+    body: &FinishResultBody,
+    envelope: &HostRequestEnvelope,
+    tool: &serde_json::Value,
+) -> bool {
+    match historical {
+        Some((receipt, decision)) => {
+            committed_finish_receipt_matches_attempt(receipt, body, envelope)
+                && finish_response_matches_committed_decision(
+                    &body.response,
+                    envelope,
+                    tool,
+                    receipt,
+                    decision,
+                )
+        }
+        None => {
+            finish_refusal_response_matches(&body.response, &body.attempt.operation_id, envelope)
+        }
+    }
+}
+
+fn finish_response_matches_committed_decision(
+    response: &serde_json::Value,
+    envelope: &HostRequestEnvelope,
+    tool: &serde_json::Value,
+    receipt: &eliot_store_api::WriteReceipt,
+    decision: &serde_json::Value,
+) -> bool {
+    let Some(arguments) = tool.get("arguments").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    let task_id = arguments.get("task_id").and_then(serde_json::Value::as_str);
+    let task_revision = arguments
+        .get("expected_task_revision")
+        .and_then(serde_json::Value::as_u64);
+    let requested_outcome = arguments.get("requested_outcome");
+    let decision_task_id = decision.get("task_id").and_then(serde_json::Value::as_str);
+    let decision_revision = decision
+        .get("task_revision")
+        .and_then(serde_json::Value::as_u64);
+    let decision_fence = decision.get("state_fence");
+    let decision_outcome = decision.get("requested_outcome");
+    let Ok(expected_fence) = serde_json::to_value(&envelope.state_fence) else {
+        return false;
+    };
+    if !finish_decision_projection_shape(decision)
+        || task_id.is_none()
+        || task_revision.is_none()
+        || requested_outcome.is_none()
+        || decision
+            .get("attempt_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(envelope.identity.idempotency_key.as_str())
+        || decision_task_id != task_id
+        || decision_revision != task_revision
+        || decision_fence != Some(&expected_fence)
+        || decision_outcome != requested_outcome
+        || decision
+            .get("decision")
+            .and_then(|value| value.get("proof"))
+            .and_then(|proof| proof.get("task_id"))
+            .and_then(serde_json::Value::as_str)
+            != task_id
+        || decision
+            .get("decision")
+            .and_then(|value| value.get("proof"))
+            .and_then(|proof| proof.get("task_revision"))
+            .and_then(serde_json::Value::as_u64)
+            != task_revision
+        || receipt.idempotency_key != envelope.identity.idempotency_key
+        || receipt.state_fence != envelope.state_fence
+    {
+        return false;
+    }
+    let Ok(request_sha) = eliot_contracts::canonical_json_bytes(&(
+        envelope.envelope_sha256.clone(),
+        envelope.identity.request_id.clone(),
+        envelope.identity.idempotency_key.clone(),
+    ))
+    .map(|bytes| eliot_contracts::sha256_hex(&bytes)) else {
+        return false;
+    };
+    let expected = serde_json::json!({
+        "request_id": envelope.identity.request_id.clone(),
+        "idempotency_key": envelope.identity.idempotency_key.clone(),
+        "canonical_request_sha256": request_sha,
+        "kind": "CANDIDATE",
+        "canonical_tool_name": "eliot.finish",
+        "content": decision,
+        "artifacts": [],
+        "proof_ceiling": "SCOPED_VERIFICATION",
+        "resource": null,
+        "job": null,
+    });
+    response == &expected
+}
+
+fn finish_result_digest_matches(response: &serde_json::Value, digest: &str) -> bool {
+    eliot_contracts::canonical_json_bytes(response)
+        .is_ok_and(|bytes| eliot_contracts::sha256_hex(&bytes) == digest)
+}
+
+fn finish_decision_projection_shape(decision: &serde_json::Value) -> bool {
+    let Some(receipt) = decision.as_object() else {
+        return false;
+    };
+    let Some(derived) = receipt
+        .get("decision")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return false;
+    };
+    let Some(proof) = derived.get("proof").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    exact_projection_fields(
+        receipt,
+        &[
+            "decision_id",
+            "attempt_id",
+            "task_id",
+            "task_revision",
+            "state_fence",
+            "finish_authority_ref",
+            "closure_authority_ref",
+            "requested_outcome",
+            "decision",
+            "lifecycle_action",
+            "unresolved_descendant_refs",
+            "attempt_digest",
+            "receipt_digest",
+        ],
+    ) && exact_projection_fields(derived, &["outcome", "proof", "next_allowed_action"])
+        && exact_projection_fields(
+            proof,
+            &[
+                "task_id",
+                "task_revision",
+                "per_acceptance_coverage",
+                "artifact_and_verifier_bindings",
+                "checks_not_executed_or_stale",
+                "unresolved_effects_and_unknowns",
+                "proof_ceiling",
+                "derivation_digest",
+            ],
+        )
+        && finish_receipt_fields_valid(receipt)
+        && finish_derived_fields_valid(derived)
+        && finish_proof_fields_valid(proof)
+}
+
+fn exact_projection_fields(
+    object: &serde_json::Map<String, serde_json::Value>,
+    required: &[&str],
+) -> bool {
+    object.len() == required.len() && required.iter().all(|key| object.contains_key(*key))
+}
+
+fn finish_receipt_fields_valid(receipt: &serde_json::Map<String, serde_json::Value>) -> bool {
+    [
+        "decision_id",
+        "attempt_id",
+        "task_id",
+        "finish_authority_ref",
+        "lifecycle_action",
+        "attempt_digest",
+        "receipt_digest",
+    ]
+    .iter()
+    .all(|key| receipt.get(*key).is_some_and(serde_json::Value::is_string))
+        && receipt
+            .get("task_revision")
+            .is_some_and(serde_json::Value::is_u64)
+        && receipt
+            .get("state_fence")
+            .is_some_and(serde_json::Value::is_object)
+        && receipt
+            .get("requested_outcome")
+            .is_some_and(serde_json::Value::is_string)
+        && receipt
+            .get("decision")
+            .is_some_and(serde_json::Value::is_object)
+        && receipt
+            .get("unresolved_descendant_refs")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|values| values.iter().all(serde_json::Value::is_string))
+        && receipt
+            .get("closure_authority_ref")
+            .is_some_and(|value| value.is_null() || value.is_string())
+}
+
+fn finish_derived_fields_valid(derived: &serde_json::Map<String, serde_json::Value>) -> bool {
+    derived
+        .get("outcome")
+        .is_some_and(serde_json::Value::is_string)
+        && derived
+            .get("next_allowed_action")
+            .is_some_and(serde_json::Value::is_string)
+}
+
+fn finish_proof_fields_valid(proof: &serde_json::Map<String, serde_json::Value>) -> bool {
+    ["task_id", "derivation_digest"]
+        .iter()
+        .all(|key| proof.get(*key).is_some_and(serde_json::Value::is_string))
+        && proof
+            .get("task_revision")
+            .is_some_and(serde_json::Value::is_u64)
+        && proof
+            .get("proof_ceiling")
+            .is_some_and(serde_json::Value::is_string)
+        && [
+            "per_acceptance_coverage",
+            "artifact_and_verifier_bindings",
+            "checks_not_executed_or_stale",
+            "unresolved_effects_and_unknowns",
+        ]
+        .iter()
+        .all(|key| {
+            proof
+                .get(*key)
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|values| values.iter().all(serde_json::Value::is_string))
+        })
+}
+
+fn finish_decision_matches_owner(
+    decision: &serde_json::Value,
+    envelope: &HostRequestEnvelope,
+    owner: &super::super::ActivatedApplicationBinding,
+) -> bool {
+    if !finish_decision_projection_shape(decision) {
+        return false;
+    }
+    let Ok(expected_fence) = serde_json::to_value(&envelope.state_fence) else {
+        return false;
+    };
+    decision
+        .get("attempt_id")
+        .and_then(serde_json::Value::as_str)
+        == Some(envelope.identity.idempotency_key.as_str())
+        && decision.get("task_id").and_then(serde_json::Value::as_str)
+            == Some(owner.task_id.as_str())
+        && decision
+            .get("task_revision")
+            .and_then(serde_json::Value::as_u64)
+            == Some(owner.task_revision.value())
+        && decision.get("state_fence") == Some(&expected_fence)
+        && decision
+            .get("decision")
+            .and_then(|value| value.get("proof"))
+            .and_then(|proof| proof.get("task_id"))
+            .and_then(serde_json::Value::as_str)
+            == Some(owner.task_id.as_str())
+        && decision
+            .get("decision")
+            .and_then(|value| value.get("proof"))
+            .and_then(|proof| proof.get("task_revision"))
+            .and_then(serde_json::Value::as_u64)
+            == Some(owner.task_revision.value())
+}
+
+fn finish_refusal_response_matches(
+    response: &serde_json::Value,
+    operation_id: &str,
+    envelope: &HostRequestEnvelope,
+) -> bool {
+    let Ok(request_sha) = eliot_contracts::canonical_json_bytes(&(
+        envelope.envelope_sha256.clone(),
+        envelope.identity.request_id.clone(),
+        envelope.identity.idempotency_key.clone(),
+    ))
+    .map(|bytes| eliot_contracts::sha256_hex(&bytes)) else {
+        return false;
+    };
+    let Some(content) = response
+        .get("content")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return false;
+    };
+    response.get("request_id") == Some(&serde_json::json!(envelope.identity.request_id))
+        && response.get("idempotency_key")
+            == Some(&serde_json::json!(envelope.identity.idempotency_key))
+        && response.get("canonical_request_sha256") == Some(&serde_json::json!(request_sha))
+        && response.get("kind") == Some(&serde_json::json!("PLAN_GAP"))
+        && response.get("canonical_tool_name") == Some(&serde_json::json!("eliot.finish"))
+        && response.get("artifacts") == Some(&serde_json::json!([]))
+        && response.get("proof_ceiling") == Some(&serde_json::json!("OBSERVATION"))
+        && response
+            .get("resource")
+            .is_some_and(serde_json::Value::is_null)
+        && response.get("job").is_some_and(serde_json::Value::is_null)
+        && response
+            .as_object()
+            .is_some_and(|object| object.len() == 10)
+        && content.len() == 4
+        && content.get("status") == Some(&serde_json::json!("rejected"))
+        && content
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+        && content
+            .get("disposition")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+        && content
+            .get("reason_code")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+        && operation_id == host_request_operation_id(envelope)
+}
+
+fn committed_finish_receipt_matches_owner(
+    receipt: &eliot_store_api::WriteReceipt,
+    operation_id: &OperationIdentity,
+    envelope: &HostRequestEnvelope,
+    owner: &super::super::ActivatedApplicationBinding,
+) -> bool {
+    if receipt.validate().is_err()
+        || receipt.operation_id.as_str() != operation_id.as_str()
+        || receipt.idempotency_key != envelope.identity.idempotency_key
+        || receipt.state_fence != envelope.state_fence
+        || receipt.transition_class != eliot_store_api::TransitionClass::RecoverySchema
+        || receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+    {
+        return false;
+    }
+    let Some(core) = receipt.envelope.as_ref().map(|envelope| &envelope.core) else {
+        return false;
+    };
+    let Some(task) = core.task.as_ref() else {
+        return false;
+    };
+    let mut semantic_fence = envelope.state_fence.clone();
+    semantic_fence.task_revision = Some(owner.task_revision);
+    core.operation.operation_id.as_str() == operation_id.as_str()
+        && core.operation.idempotency_key == envelope.identity.idempotency_key
+        && core.request.state_fence == envelope.state_fence
+        && core
+            .request
+            .metadata
+            .task_id
+            .as_ref()
+            .is_some_and(|task_id| task_id.as_str() == owner.task_id.as_str())
+        && core
+            .request
+            .metadata
+            .session_id
+            .as_ref()
+            .is_some_and(|session_id| session_id.as_str() == owner.session_id.as_str())
+        && task.task_id.as_str() == owner.task_id.as_str()
+        && task.task_revision == owner.task_revision
+        && task.state_fence == semantic_fence
+        && core.work_scope.scope_id.as_str() == "governor"
 }
 
 /// Joins a presented Task Controller result against its live queue record.
@@ -1167,15 +2406,16 @@ fn finish_admission(
     if task_id.len() > MAX_FINISH_REF_BYTES {
         return Err(TransportError::SessionFenced);
     }
-    // #1861 hard boundary 1 (strict canonical finish only): a finish draft
-    // that names a different task than the envelope's bound task is a weak
-    // legacy finish survivor. The envelope's task binding is the Kernel-owned
-    // authority for which task this finish may complete, so the draft's
-    // `task_id` must equal it whenever the envelope binds one. An envelope
-    // without a task binding leaves the draft's task standing alone, exactly
-    // as before; the join never widens what the draft may name.
-    if let Some(bound_task) = envelope.identity.task_id.as_deref()
-        && bound_task != task_id
+    // Draft task/revision are selectors only. Both must join to an activation
+    // owner before staging, and the task/scope fields are mandatory here so a
+    // caller draft can never supply its own missing binding.
+    if envelope.identity.task_id.as_deref() != Some(task_id)
+        || envelope
+            .identity
+            .work_scope_id
+            .as_deref()
+            .is_none_or(|scope| scope.trim().is_empty() || scope.chars().any(char::is_control))
+        || envelope.state_fence.task_revision.is_some()
     {
         return Err(TransportError::SessionFenced);
     }
@@ -1302,6 +2542,9 @@ fn finish_stale_attempt(
     session: &Session,
     envelope: &HostRequestEnvelope,
 ) -> Option<StaleLocalReadObservation> {
+    let mut semantic_fence = envelope.state_fence.clone();
+    semantic_fence.task_revision =
+        eliot_contracts::TaskRevision::new(body.attempt.task_revision).ok();
     let observation = |reason| StaleLocalReadObservation {
         operation_id: body.operation_id.clone(),
         request_digest: body.request_sha256.clone(),
@@ -1316,6 +2559,7 @@ fn finish_stale_attempt(
     if body.attempt.operation_id != body.operation_id
         || body.attempt.attempt_id != state.attempt_id
         || body.attempt.fencing_generation != state.generation
+        || body.attempt.principal_id.trim().is_empty()
         || body.attempt.session_id
             != envelope
                 .identity
@@ -1323,6 +2567,21 @@ fn finish_stale_attempt(
                 .as_deref()
                 .ok_or(TransportError::SessionFenced)
                 .ok()?
+        || body.attempt.task_id
+            != envelope
+                .identity
+                .task_id
+                .as_deref()
+                .ok_or(TransportError::SessionFenced)
+                .ok()?
+        || body.attempt.work_scope_id
+            != envelope
+                .identity
+                .work_scope_id
+                .as_deref()
+                .ok_or(TransportError::SessionFenced)
+                .ok()?
+        || body.attempt.semantic_state_fence != semantic_fence
         || body.attempt.expires_at_unix_ms != envelope.identity.deadline_unix_ms
         || !body
             .attempt

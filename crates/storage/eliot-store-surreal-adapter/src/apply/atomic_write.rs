@@ -152,6 +152,10 @@ const SEMANTIC_CONFLICT_MARKERS: &[&str] = &[
     "ordering_head_create_conflict",
     "finish_owner_cas_conflict",
     "finish_owner_create_conflict",
+    "finish_task_owner_missing",
+    "finish_task_owner_stale",
+    "finish_task_owner_ambiguous",
+    "finish_task_owner_malformed",
     "canonical_owner_cas_conflict",
     "canonical_owner_create_conflict",
     "instrument_registry_fence_conflict",
@@ -533,6 +537,16 @@ pub(super) async fn write_canonical_transaction_with_expected_heads(
         learning,
         instrument_registry,
     )?;
+    if let Some(task) = eliot_store_api::finish_task_binding_from_prepared(transition)? {
+        let assertion = super::read_boundary::finish_task_owner_assertion(
+            db,
+            config,
+            &transition.scope_id,
+            &task,
+        )
+        .await?;
+        bindings.insert("finish_task_owner_assertion".to_owned(), assertion);
+    }
     let (head_checks, head_bindings) = expected_head_predicates(
         expected_revision_heads,
         expected_ordering_heads,
@@ -1193,6 +1207,15 @@ fn append_finish_evidence_owner_statement(
     if snapshot_json.len() > eliot_store_api::MAX_RECOVERY_RECORD_BYTES {
         return Err(AdapterError::Store(StoreError::PayloadTooLarge));
     }
+    let task_binding = eliot_store_api::finish_task_binding_from_prepared(transition)?
+        .ok_or(StoreError::InvalidReceipt)?;
+    append_finish_task_owner_guard(
+        sql,
+        bindings,
+        transition,
+        task_binding.task_id.as_str(),
+        task_binding.task_revision.value(),
+    )?;
 
     let canonical_key = eliot_store_api::RecoveryRecordKey::new("owner", "canonical")
         .map_err(AdapterError::Store)?;
@@ -1287,6 +1310,15 @@ fn append_finish_owner_statement(
     if receipt_json.len() > eliot_store_api::MAX_RECOVERY_RECORD_BYTES {
         return Err(AdapterError::Store(StoreError::PayloadTooLarge));
     }
+    let task_binding = eliot_store_api::finish_task_binding_from_prepared(transition)?
+        .ok_or(StoreError::InvalidReceipt)?;
+    append_finish_task_owner_guard(
+        sql,
+        bindings,
+        transition,
+        task_binding.task_id.as_str(),
+        task_binding.task_revision.value(),
+    )?;
 
     let finish_key =
         eliot_store_api::RecoveryRecordKey::new("owner", "finish").map_err(AdapterError::Store)?;
@@ -1335,6 +1367,42 @@ fn append_finish_owner_statement(
     // prevents a future caller from silently dropping the required parameter
     // while preserving Governor ownership of its interpretation.
     bindings.insert("finish_attempt_id".to_owned(), json!(attempt_id));
+    Ok(())
+}
+
+/// Appends an atomic assertion against the same typed `TaskControl` projection
+/// used by `GetTaskState`. Every canonical write first CASes the shared
+/// canonical fence, so this comparison and the owner writes share the
+/// serialization point with every `UpdateTaskState` commit.
+fn append_finish_task_owner_guard(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    transition: &eliot_store_api::PreparedTransition,
+    task_id: &str,
+    task_revision: u64,
+) -> Result<(), AdapterError> {
+    if transition.task_id.as_deref() != Some(task_id) || task_revision == 0 {
+        return Err(AdapterError::Store(StoreError::InvalidField {
+            field: "finish.task_binding",
+            reason: "Finish owner payload does not match the admitted task",
+        }));
+    }
+    let prior_revision = task_revision.checked_sub(1).ok_or({
+        AdapterError::Store(StoreError::InvalidField {
+            field: "finish.task_revision",
+            reason: "revision has no TaskControl predecessor",
+        })
+    })?;
+    bindings.insert(
+        "finish_task_scope".to_owned(),
+        json!(transition.scope_id.as_str()),
+    );
+    bindings.insert("finish_task_id".to_owned(), json!(task_id));
+    bindings.insert(
+        "finish_task_expected_revision".to_owned(),
+        json!(prior_revision.to_string()),
+    );
+    sql.push_str(schema::TX_FINISH_TASK_OWNER_GUARD);
     Ok(())
 }
 

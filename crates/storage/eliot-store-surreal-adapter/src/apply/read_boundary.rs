@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::SurrealStoreAdapter;
@@ -1293,22 +1293,22 @@ fn evidence_pack_payload(
 /// authority-carrying captures are served. Strict: a malformed
 /// authority-carrying record fails closed at deserialization/validation,
 /// never as a silent empty.
-#[derive(Clone, Debug, Deserialize)]
-struct AuthorityRecordRow {
-    operation_index: usize,
-    version: u16,
-    encoding: String,
-    digest_hex: String,
-    byte_len: usize,
-    bytes_utf8: String,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) struct AuthorityRecordRow {
+    pub(super) operation_index: usize,
+    pub(super) version: u16,
+    pub(super) encoding: String,
+    pub(super) digest_hex: String,
+    pub(super) byte_len: usize,
+    pub(super) bytes_utf8: String,
 }
 
 /// One receipt row of the closed T11.3 authority SELECT.
 #[derive(Clone, Debug, Deserialize)]
-struct AuthorityReceiptRow {
-    commit_sequence: Option<u64>,
-    named_operation_count: Option<usize>,
-    payload_authority: Option<Vec<AuthorityRecordRow>>,
+pub(super) struct AuthorityReceiptRow {
+    pub(super) commit_sequence: Option<u64>,
+    pub(super) named_operation_count: Option<usize>,
+    pub(super) payload_authority: Option<Vec<AuthorityRecordRow>>,
     /// Joined by the immutable commit marker, never by the caller's scope.
     #[serde(skip)]
     receipt: Option<WriteReceipt>,
@@ -1359,12 +1359,79 @@ async fn read_authority_records(
     Ok(rows)
 }
 
+/// Reuses the named-read authority validators to freeze the exact current
+/// `TaskControl` row. The atomic writer compares this same original row inside
+/// its transaction, so neither a task advance nor changed receipt/authority
+/// bytes between this read and the write can authorize Finish.
+pub(super) async fn finish_task_owner_assertion(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    scope_id: &ScopeId,
+    task: &eliot_store_api::TaskBinding,
+) -> Result<Value, AdapterError> {
+    let rows = read_authority_records(db, config).await?;
+    let indexed = indexed_authorities(&rows)?;
+    let current = indexed
+        .iter()
+        .rev()
+        .find(|record| {
+            record.scope_id == scope_id.as_str()
+                && record.operation == eliot_store_api::NamedMutationOperation::UpdateTaskState
+                && record.parameters.get("task_id").and_then(Value::as_str)
+                    == Some(task.task_id.as_str())
+        })
+        .ok_or(StoreError::InvalidReceipt)?;
+    let expected_revision = task
+        .task_revision
+        .value()
+        .checked_sub(1)
+        .ok_or(StoreError::InvalidReceipt)?
+        .to_string();
+    if current
+        .parameters
+        .get("expected_revision")
+        .and_then(Value::as_str)
+        != Some(expected_revision.as_str())
+    {
+        return Err(AdapterError::ProviderConflict);
+    }
+    let mut ordered: Vec<_> = rows.iter().collect();
+    ordered.sort_by_key(|row| row.commit_sequence.unwrap_or(0));
+    for row in ordered.into_iter().rev() {
+        let Some(receipt) = row.receipt.as_ref() else {
+            continue;
+        };
+        if receipt.transition_class != eliot_store_api::TransitionClass::TaskControl
+            || receipt
+                .require_reconciliation_envelope()?
+                .core
+                .work_scope
+                .scope_id
+                .as_str()
+                != scope_id.as_str()
+        {
+            continue;
+        }
+        for record in row.payload_authority.as_deref().unwrap_or_default() {
+            if validate_authority_record(row, record)? == current.parameters {
+                return Ok(json!({
+                    "commit_sequence": row.commit_sequence.ok_or(StoreError::InvalidReceipt)?,
+                    "named_operation_count": row.named_operation_count.ok_or(StoreError::InvalidReceipt)?,
+                    "payload_authority": row.payload_authority,
+                    "body": receipt,
+                }));
+            }
+        }
+    }
+    Err(StoreError::InvalidReceipt.into())
+}
+
 /// Validates one persisted payload-authority record against its own provenance.
 ///
 /// The writer bound the exact bytes to version/encoding/digest/length; any
 /// durable mismatch fails closed here instead of serving a lossy projection.
 /// Returns the decoded admitted parameters on success.
-fn validate_authority_record(
+pub(super) fn validate_authority_record(
     row: &AuthorityReceiptRow,
     record: &AuthorityRecordRow,
 ) -> Result<BTreeMap<String, Value>, StoreError> {
@@ -1392,9 +1459,76 @@ fn validate_authority_record(
             "authority record digest mismatch".to_owned(),
         ));
     }
-    let parameters = bound.decode_object_parameters()?;
+    let Value::Object(parameters) = bound.projection_value()? else {
+        return Err(StoreError::InvalidReceipt);
+    };
+    let parameters: BTreeMap<String, Value> = parameters.into_iter().collect();
+    let receipt = row.receipt.as_ref().ok_or(StoreError::InvalidReceipt)?;
+    let operation = infer_authority_operation(receipt.transition_class, &parameters)?;
+    // Named TaskControl parameters legitimately include the declared scalar
+    // task_id. Reuse the closed operation declaration, rather than treating
+    // admitted owner parameters as an arbitrary control-free payload.
+    eliot_store_api::NamedMutationRequest {
+        operation,
+        parameters: parameters.clone(),
+    }
+    .validate()?;
     let _ = record_operation_count(row, record)?;
     Ok(parameters)
+}
+
+/// Validates and returns every exact original named-operation parameter for
+/// one requested immutable receipt. Recovery uses the same closed-operation
+/// validator as the existing authority read, while preserving each stored
+/// byte string for consumers that must bind their response to that original
+/// operation rather than to a later mutable owner head.
+pub(super) fn recovery_receipt_authority(
+    receipt: &WriteReceipt,
+    commit_sequence: u64,
+    named_operation_count: usize,
+    records: Vec<AuthorityRecordRow>,
+) -> Result<eliot_store_api::RecoveryReceiptAuthority, StoreError> {
+    receipt.validate()?;
+    if receipt.status != WriteReceiptStatus::Committed
+        || receipt.transition_class != eliot_store_api::TransitionClass::RecoverySchema
+        || commit_sequence == 0
+        || receipt.committed_at.as_deref()
+            != Some(format!("commit-sequence-{commit_sequence:016}").as_str())
+        || named_operation_count == 0
+        || records.len() != named_operation_count
+    {
+        return Err(StoreError::InvalidReceipt);
+    }
+    let row = AuthorityReceiptRow {
+        commit_sequence: Some(commit_sequence),
+        named_operation_count: Some(named_operation_count),
+        payload_authority: Some(records.clone()),
+        receipt: Some(receipt.clone()),
+    };
+    let mut ordered = records;
+    ordered.sort_by_key(|record| record.operation_index);
+    let mut exact_parameters = Vec::with_capacity(ordered.len());
+    for (expected_index, record) in ordered.iter().enumerate() {
+        if record.operation_index != expected_index {
+            return Err(StoreError::InvalidReceipt);
+        }
+        let parameters = validate_authority_record(&row, record)?;
+        let _operation = infer_authority_operation(receipt.transition_class, &parameters)?;
+        exact_parameters.push(eliot_store_api::RecoveryReceiptAuthorityRecord {
+            operation_index: expected_index,
+            parameters: ExactJsonBytes::parse(
+                PayloadSource::NamedOperationParameter,
+                record.bytes_utf8.as_bytes(),
+            )?,
+        });
+    }
+    Ok(eliot_store_api::RecoveryReceiptAuthority {
+        operation_id: receipt.operation_id.clone(),
+        state_fence: receipt.state_fence.clone(),
+        commit_sequence,
+        named_operation_count,
+        records: exact_parameters,
+    })
 }
 
 fn record_operation_count(
@@ -1434,6 +1568,19 @@ fn infer_authority_operation(
             if parameters.contains_key("task_id") && parameters.contains_key("event_id") =>
         {
             Ok(NamedMutationOperation::UpdateTaskState)
+        }
+        TransitionClass::RecoverySchema
+            if parameters.contains_key("attempt_id")
+                && parameters.contains_key("expected_finish_revision")
+                && parameters.contains_key("receipt_json") =>
+        {
+            Ok(NamedMutationOperation::RecordFinishDecision)
+        }
+        TransitionClass::RecoverySchema
+            if parameters.contains_key("expected_canonical_revision")
+                && parameters.contains_key("snapshot_json") =>
+        {
+            Ok(NamedMutationOperation::RecordFinishEvidence)
         }
         TransitionClass::LifecyclePolicy if parameters.contains_key("skill_id") => {
             Ok(NamedMutationOperation::ApplyLifecyclePolicy)

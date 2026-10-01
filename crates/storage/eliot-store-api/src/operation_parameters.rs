@@ -414,9 +414,15 @@ static APPLY_PROBLEM_OWNER_STATE_PARAMETERS: [ParameterDeclaration; 8] = [
     },
 ];
 /// Owner-approved Governor finish persistence fields. The receipt remains an
-/// opaque canonical JSON document at this boundary; only the fixed
-/// `owner/finish` record address and outer revision are storage semantics.
-static RECORD_FINISH_DECISION_PARAMETERS: [ParameterDeclaration; 3] = [
+/// opaque canonical JSON document at this boundary. Storage arbitrates the
+/// fixed `owner/finish` address and owner revision, and mechanically checks the
+/// admitted task revision against the exact selected decision's task binding.
+static RECORD_FINISH_DECISION_PARAMETERS: [ParameterDeclaration; 4] = [
+    ParameterDeclaration {
+        name: "task_revision",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
     ParameterDeclaration {
         name: "attempt_id",
         shape: ParameterShape::Subject,
@@ -434,9 +440,15 @@ static RECORD_FINISH_DECISION_PARAMETERS: [ParameterDeclaration; 3] = [
     },
 ];
 /// Owner-approved Governor finish-evidence persistence fields. The canonical
-/// owner image remains an opaque JSON document at this boundary; the store
-/// only arbitrates its fixed owner address and revision.
-static RECORD_FINISH_EVIDENCE_PARAMETERS: [ParameterDeclaration; 2] = [
+/// owner image remains an opaque JSON document at this boundary. Storage
+/// arbitrates its fixed owner address and revision, and mechanically checks
+/// the admitted task binding before issuing the original write receipt.
+static RECORD_FINISH_EVIDENCE_PARAMETERS: [ParameterDeclaration; 3] = [
+    ParameterDeclaration {
+        name: "task_revision",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
     ParameterDeclaration {
         name: "expected_canonical_revision",
         shape: ParameterShape::Subject,

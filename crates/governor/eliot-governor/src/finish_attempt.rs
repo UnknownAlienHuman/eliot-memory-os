@@ -132,6 +132,144 @@ impl<'a, P: ?Sized> GovernorFinishAttempt<'a, P> {
             finish_owner_revision,
         }
     }
+
+    /// Returns the retained receipt for an exact original Finish attempt,
+    /// without consulting current task state or deriving a new decision.
+    ///
+    /// The receipt is only a candidate for historical replay here. The caller
+    /// must still read the exact canonical operation receipt from Kernel and
+    /// validate its operation, idempotency key, fence, and committed status
+    /// before returning the historical decision to the host.
+    pub(crate) fn historical_finish_receipt(
+        &self,
+        identity: &RequestIdentity,
+        operation_id: &OperationId,
+        draft: &FinishAttemptDraft,
+        kernel_attempt: &eliot_protocol::FinishAttempt,
+    ) -> Result<Option<FinishDecisionReceipt>, FinishAttemptError> {
+        validate_identity(identity)?;
+        draft
+            .validate()
+            .map_err(eliot_canonical::CanonicalError::from)
+            .map_err(FinishError::from)?;
+        kernel_attempt
+            .validate()
+            .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?;
+
+        let task_id = TaskId::new(draft.task_id.clone())
+            .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?;
+        let semantic_fence = &kernel_attempt.semantic_state_fence;
+        if kernel_attempt.operation_id != operation_id.as_str()
+            || kernel_attempt.task_id != task_id.as_str()
+            || kernel_attempt.task_revision != draft.expected_task_revision
+            || kernel_attempt.session_id
+                != identity
+                    .request
+                    .metadata
+                    .session_id
+                    .as_ref()
+                    .map_or("", eliot_contracts::SessionId::as_str)
+            || identity.request.metadata.task_id.as_ref() != Some(&task_id)
+            || semantic_fence.authority_epoch
+                != identity.request.metadata.state_fence.authority_epoch
+            || semantic_fence.resource_generation
+                != identity.request.metadata.state_fence.resource_generation
+            || semantic_fence
+                .task_revision
+                .map(eliot_contracts::TaskRevision::value)
+                != Some(draft.expected_task_revision)
+        {
+            return Err(FinishError::IdentityConflict.into());
+        }
+
+        let attempt = FinishAttempt {
+            attempt_id: identity.idempotency_key.clone(),
+            state_fence: identity.request.metadata.state_fence.clone(),
+            closure_intent: closure_intent(draft.requested_outcome),
+            draft: draft.clone(),
+            completion_proof: None,
+        };
+        let Some(receipt) = self.finish.receipt(&attempt.attempt_id) else {
+            return Ok(None);
+        };
+        receipt.validate()?;
+        if receipt.attempt_digest != attempt.digest()?
+            || receipt.attempt_id != identity.idempotency_key
+            || receipt.task_id != task_id.as_str()
+            || receipt.task_revision != draft.expected_task_revision
+            || receipt.requested_outcome != draft.requested_outcome
+            || receipt.state_fence != identity.request.metadata.state_fence
+        {
+            return Err(FinishError::IdentityConflict.into());
+        }
+        Ok(Some(receipt.clone()))
+    }
+}
+
+fn validate_nominated_artifact_bytes(
+    verifier_fact: &CanonicalVerifierExecutionFact,
+    references: &[String],
+) -> Result<(), FinishAttemptError> {
+    for reference in references {
+        let artifact = verifier_fact
+            .raw_artifact_bindings
+            .iter()
+            .find(|artifact| artifact.handle == *reference)
+            .ok_or_else(|| {
+                FinishAttemptError::Composition(CompositionError::Recovery(format!(
+                    "artifact {reference:?} has no verified stored-byte binding in the current task/plan/fence-bound TestD receipt"
+                )))
+            })?;
+        if artifact.truncated {
+            return Err(FinishAttemptError::Composition(CompositionError::Recovery(
+                format!("artifact {reference:?} is truncated in the original TestD receipt"),
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A caller may nominate the verifier run it expects Finish to use, but the
+/// selector is admitted only when it names the exact current owner run. The
+/// caller list never supplies or narrows the verifier denominator.
+fn validate_nominated_verifier_run_refs(
+    fact: &CanonicalVerifierExecutionFact,
+    current_run_ref: &str,
+    task_id: &TaskId,
+    task_revision: u64,
+    plan: &CanonicalPlanBinding,
+    fence: &StateFence,
+    references: &[String],
+) -> Result<(), FinishAttemptError> {
+    // The selector is only meaningful after the selected owner record has
+    // itself been checked. Bind its run identity and result to this exact
+    // task/plan/fence before comparing caller-supplied handles.
+    fact.validate(fence)?;
+    if fact.task_id != task_id.as_str()
+        || fact.task_revision != task_revision
+        || fact.plan != *plan
+        || fact.state_fence != *fence
+        || fact.verification_run.run_id.to_string() != current_run_ref
+        || fact.terminal_binding.evidence.run_id.to_string() != current_run_ref
+        || fact.terminal_binding.evidence.execution != fact.verification_run.execution
+        || fact.terminal_binding.evidence.outcome != fact.verification_run.outcome
+    {
+        return Err(FinishAttemptError::Composition(CompositionError::Recovery(
+            "current verifier run identity or result is not bound to the exact task, plan, and State Fence"
+                .to_owned(),
+        )));
+    }
+    if let Some(reference) = references
+        .iter()
+        .find(|reference| reference.as_str() != current_run_ref)
+    {
+        return Err(FinishAttemptError::Composition(CompositionError::Recovery(
+            format!(
+                "caller-nominated verifier run {reference:?} is not the current task-and-plan-bound executed run"
+            ),
+        )));
+    }
+    Ok(())
 }
 
 /// Pure output of one canonical finish-evidence derivation. The snapshot is
@@ -391,6 +529,7 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
         task: &TaskRecord,
         plan: &CanonicalPlanBinding,
         fence: &StateFence,
+        nominated_refs: &[String],
         observation_refs: &mut BTreeSet<String>,
     ) -> Result<String, FinishAttemptError> {
         let mut selection_identity: Option<String> = None;
@@ -424,6 +563,16 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
             }
             selection_identity = Some(selection.acceptance_digest.clone());
             observation_refs.insert(receipt.record_id.clone());
+        }
+        if let Some(reference) = nominated_refs
+            .iter()
+            .find(|reference| !observation_refs.contains(*reference))
+        {
+            return Err(FinishAttemptError::Composition(CompositionError::Recovery(
+                format!(
+                    "caller-nominated observation {reference:?} is not a current task-and-plan-bound accepted observation"
+                ),
+            )));
         }
         selection_identity.ok_or_else(|| {
             FinishAttemptError::Composition(CompositionError::Recovery(
@@ -462,6 +611,9 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
                 "canonical verifier execution fact is stale for the current task/plan".to_owned(),
             )));
         }
+        verifier_fact
+            .revalidate_retained_testd_bytes(fence, plan)
+            .map_err(FinishAttemptError::Composition)?;
         let verifier_run_ref = verifier_fact.verification_run.run_id.to_string();
         Ok((verifier_fact, verifier_run_ref))
     }
@@ -544,6 +696,7 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
         task: &TaskRecord,
         fence: &StateFence,
         plan: &CanonicalPlanBinding,
+        nominated_refs: (&[String], &[String], &[String]),
         contract_acceptance_set: &RehydratedContractAcceptanceSet,
     ) -> Result<ProducedFinishEvidence, FinishAttemptError> {
         let (frame_refs, finish_authority_ref) =
@@ -565,12 +718,23 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
         // an executed verifier outcome.
         let (verifier_fact, verifier_run_ref) =
             self.read_current_verifier_fact(task_id, task, plan, fence)?;
+        validate_nominated_artifact_bytes(&verifier_fact, nominated_refs.0)?;
+        validate_nominated_verifier_run_refs(
+            &verifier_fact,
+            &verifier_run_ref,
+            task_id,
+            task.revision,
+            plan,
+            fence,
+            nominated_refs.2,
+        )?;
         // This fact has already been rehydrated and validated against the
         // current task, plan, fence, and durable terminal TestD receipt. A
         // failed or partial verifier is still an executed run; its outcome is
         // represented per required test below, not mislabeled as stale.
 
         let coordination = self.read_current_finish_projection(task_id, fence)?;
+        validate_nominated_artifact_bytes(&verifier_fact, &coordination.artifact_refs)?;
 
         let mut observation_refs = BTreeSet::new();
         // The task-and-plan-bound observation receipts are joined here so their
@@ -584,6 +748,7 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
             task,
             plan,
             fence,
+            nominated_refs.1,
             &mut observation_refs,
         )?;
         // The verifier requirement is unchanged: a plan the Task Controller has
@@ -782,7 +947,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
     pub fn admit_task_controller_plan(
         &self,
         task_id: &TaskId,
-    ) -> Result<CanonicalPlanBinding, FinishAttemptError> {
+    ) -> Result<(CanonicalPlanBinding, u64), FinishAttemptError> {
         let task = self.task.task(task_id).ok_or_else(|| {
             FinishAttemptError::Composition(CompositionError::Recovery(format!(
                 "canonical task {} is absent; no current plan can be admitted for it",
@@ -806,7 +971,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
         if let Some(retained) = self.retained_verifier_state(&plan, &fence) {
             plan.verifier = retained;
         }
-        Ok(plan)
+        Ok((plan, task.revision))
     }
 
     /// Resolves the Task Controller's published plan identity for one task from
@@ -1323,6 +1488,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
             fact_operation,
             &snapshot,
             task_id.as_str(),
+            fact.task_revision,
             &fact.verification_run.run_id.to_string(),
         )?;
         prepare_exchange(self.canonical, fact_identity, envelope).map(Some)
@@ -1364,7 +1530,10 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
         contract_acceptance_set: &RehydratedContractAcceptanceSet,
     ) -> Result<Option<PreparedKernelExchange>, FinishAttemptError> {
         validate_identity(identity)?;
-        draft.validate().map_err(FinishError::from)?;
+        draft
+            .validate()
+            .map_err(eliot_canonical::CanonicalError::from)
+            .map_err(FinishError::from)?;
         let fence = identity.request.metadata.state_fence.clone();
         if self.canonical.state_fence() != &fence {
             return Err(FinishError::FenceMismatch.into());
@@ -1400,8 +1569,18 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
                 "canonical task does not match the current canonical plan".to_owned(),
             )));
         }
-        let produced =
-            self.produce_finish_evidence(&task_id, task, &fence, &plan, contract_acceptance_set)?;
+        let produced = self.produce_finish_evidence(
+            &task_id,
+            task,
+            &fence,
+            &plan,
+            (
+                &draft.artifact_refs,
+                &draft.observation_refs,
+                &draft.verifier_run_refs,
+            ),
+            contract_acceptance_set,
+        )?;
         if self
             .canonical
             .read_finish_evidence(&fence)
@@ -1420,8 +1599,12 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
             deadline_unix_ms: identity.deadline_unix_ms,
             cancellation_id: identity.cancellation_id.clone(),
         };
-        let envelope =
-            finish_evidence_envelope(&evidence_identity, evidence_operation, &produced.snapshot)?;
+        let envelope = finish_evidence_envelope(
+            &evidence_identity,
+            evidence_operation,
+            &produced.snapshot,
+            produced.canonical.evidence.current_task_revision,
+        )?;
         prepare_exchange(self.canonical, &evidence_identity, envelope).map(Some)
     }
 
@@ -1447,7 +1630,10 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
         draft: FinishAttemptDraft,
     ) -> Result<PreparedFinishDecision, FinishAttemptError> {
         validate_identity(identity)?;
-        draft.validate().map_err(FinishError::from)?;
+        draft
+            .validate()
+            .map_err(eliot_canonical::CanonicalError::from)
+            .map_err(FinishError::from)?;
         let fence = identity.request.metadata.state_fence.clone();
         if self.canonical.state_fence() != &fence {
             return Err(FinishError::FenceMismatch.into());
@@ -1537,6 +1723,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
             &context,
             &receipts,
             self.finish_owner_revision,
+            context.current_task_revision,
         )?;
         let exchange = prepare_exchange(self.canonical, identity, envelope)?;
         Ok(PreparedFinishDecision {
@@ -1612,6 +1799,7 @@ fn canonical_owner_snapshot_envelope(
     operation_id: OperationId,
     snapshot: &CanonicalAdmissionSnapshot,
     task_id: &str,
+    task_revision: u64,
     required_proof_ref: &str,
 ) -> Result<CanonicalWriteEnvelope, FinishAttemptError> {
     let snapshot_bytes = canonical_json_bytes(snapshot)
@@ -1636,6 +1824,15 @@ fn canonical_owner_snapshot_envelope(
     parameters.insert(
         "snapshot_json".to_owned(),
         serde_json::Value::String(snapshot_json),
+    );
+    if task_revision == 0 {
+        return Err(FinishAttemptError::Serialization(
+            "canonical owner snapshot has no admitted task revision".to_owned(),
+        ));
+    }
+    parameters.insert(
+        "task_revision".to_owned(),
+        serde_json::Value::String(task_revision.to_string()),
     );
     let scope_id = ScopeId::new(GOVERNOR_SCOPE_ID)
         .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?;
@@ -1689,6 +1886,7 @@ pub(crate) fn current_plan_envelope(
     operation_id: &OperationId,
     snapshot: &CanonicalAdmissionSnapshot,
     task_id: &TaskId,
+    task_revision: u64,
 ) -> Result<CanonicalWriteEnvelope, FinishAttemptError> {
     let plan = snapshot.current_plan.as_ref().ok_or_else(|| {
         FinishAttemptError::Serialization(
@@ -1709,6 +1907,7 @@ pub(crate) fn current_plan_envelope(
         operation_id.clone(),
         snapshot,
         task_id.as_str(),
+        task_revision,
         &format!("current-plan:{plan_digest}"),
     )
 }
@@ -1717,6 +1916,7 @@ fn finish_evidence_envelope(
     identity: &RequestIdentity,
     operation_id: OperationId,
     snapshot: &CanonicalAdmissionSnapshot,
+    task_revision: u64,
 ) -> Result<CanonicalWriteEnvelope, FinishAttemptError> {
     let evidence = snapshot.finish_evidence.as_ref().ok_or_else(|| {
         FinishAttemptError::Serialization(
@@ -1728,6 +1928,7 @@ fn finish_evidence_envelope(
         operation_id,
         snapshot,
         &evidence.evidence.task_id,
+        task_revision,
         &evidence.finish_authority_ref,
     )
 }
@@ -1739,6 +1940,7 @@ fn finish_envelope(
     context: &FinishContext,
     receipts: &[FinishDecisionReceipt],
     expected_finish_revision: u64,
+    task_revision: u64,
 ) -> Result<CanonicalWriteEnvelope, FinishAttemptError> {
     let receipt_bytes = canonical_json_bytes(&receipts)
         .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?;
@@ -1759,6 +1961,15 @@ fn finish_envelope(
     parameters.insert(
         "receipt_json".to_owned(),
         serde_json::Value::String(receipt_json),
+    );
+    if task_revision == 0 {
+        return Err(FinishAttemptError::Serialization(
+            "finish decision has no admitted task revision".to_owned(),
+        ));
+    }
+    parameters.insert(
+        "task_revision".to_owned(),
+        serde_json::Value::String(task_revision.to_string()),
     );
     let scope_id = ScopeId::new(GOVERNOR_SCOPE_ID)
         .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?;

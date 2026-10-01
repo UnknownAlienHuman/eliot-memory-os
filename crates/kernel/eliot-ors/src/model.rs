@@ -7792,6 +7792,15 @@ pub struct HostRequestRecord {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload_body: Option<Value>,
+    /// Original Kernel-authenticated Finish replay material retained with
+    /// the admitted operation so a replacement Kernel can authenticate and
+    /// read back a completed decision without relying on volatile connection
+    /// state. Opaque to ORS; Kernel decodes and revalidates the exact typed
+    /// envelope, tool and owner tuple before any historical result is served.
+    /// Missing on legacy rows, which therefore remain non-replayable.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_replay_binding: Option<Value>,
     pub connection_ref: OpaqueLabel,
     pub session_ref: Option<OpaqueLabel>,
     pub task_ref: Option<OpaqueLabel>,
@@ -7897,7 +7906,9 @@ impl HostRequestRecord {
     /// State, result, commit order, and the post-stage payload body are
     /// excluded: they are ORS-owned progression, not caller binding. The body
     /// stays implied by the compared `payload_digest` because `validate`
-    /// re-checks body/digest equality on every read.
+    /// re-checks body/digest equality on every read. The original Finish
+    /// replay binding is present at stage time and participates in exact
+    /// identity comparison because it never advances independently.
     pub fn same_binding(&self, other: &Self) -> bool {
         self.operation_id == other.operation_id
             && self.kind == other.kind
@@ -7912,6 +7923,7 @@ impl HostRequestRecord {
                 self.payload_schema_id.as_ref(),
                 other.payload_schema_id.as_ref(),
             )
+            && self.finish_replay_binding == other.finish_replay_binding
             && self.connection_ref == other.connection_ref
             && self.session_ref == other.session_ref
             && self.task_ref == other.task_ref
@@ -7994,6 +8006,7 @@ impl HostRequestRecord {
         if let Some(body) = &self.payload_body {
             validate_payload_body(body, &self.payload_digest)?;
         }
+        self.validate_finish_replay_binding()?;
         match (&self.state, &self.result_digest, &self.result_response) {
             (
                 HostRequestState::ResultReceived | HostRequestState::Terminal,
@@ -8052,6 +8065,22 @@ impl HostRequestRecord {
             return Err(OrsError::InvalidField {
                 field: "host_request_commit_order",
                 reason: "non-terminal states must not carry a commit order",
+            });
+        }
+        Ok(())
+    }
+
+    /// Validates the opaque original Finish replay binding without interpreting it.
+    fn validate_finish_replay_binding(&self) -> Result<(), OrsError> {
+        if let Some(binding) = &self.finish_replay_binding
+            && (!binding.is_object()
+                || serde_json::to_vec(binding).map_or(true, |bytes| {
+                    bytes.len() > MAX_HOST_REQUEST_RESULT_RESPONSE_BYTES
+                }))
+        {
+            return Err(OrsError::InvalidField {
+                field: "host_request_finish_replay_binding",
+                reason: "must be a bounded JSON object",
             });
         }
         Ok(())

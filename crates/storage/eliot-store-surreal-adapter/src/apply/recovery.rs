@@ -12,9 +12,9 @@ use crate::plan;
 use crate::plan::validate_revision_heads;
 use crate::schema;
 use eliot_store_api::{
-    CONTRACT_VERSION, OrderingHead, RecoveryRecord, RecoveryRecordKey, RevisionHead, ScopeId,
-    ScopeRevisionView, StateFence, StoreError, StoreRecoveryRequest, StoreRecoverySnapshot,
-    WriteReceipt,
+    CONTRACT_VERSION, OperationId, OrderingHead, RecoveryRecord, RecoveryRecordKey, RevisionHead,
+    ScopeId, ScopeRevisionView, StateFence, StoreError, StoreRecoveryRequest,
+    StoreRecoverySnapshot, WriteReceipt,
 };
 
 use super::schema_contract::{
@@ -27,8 +27,43 @@ pub(super) struct RecoverySnapshotInput {
     pub(super) owner_records: Vec<RecoveryRecord>,
     pub(super) job_records: Vec<RecoveryRecord>,
     pub(super) receipts: Vec<WriteReceipt>,
+    pub(super) receipt_authorities: Vec<eliot_store_api::RecoveryReceiptAuthority>,
     pub(super) revision_heads: Vec<RevisionHead>,
     pub(super) ordering_heads: Vec<OrderingHead>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RecoveryReceiptAuthorityRow {
+    body: WriteReceipt,
+    commit_sequence: u64,
+    named_operation_count: usize,
+    payload_authority: Option<Vec<super::read_boundary::AuthorityRecordRow>>,
+}
+
+pub(super) fn decode_recovery_receipt_authorities(
+    rows: Vec<RecoveryReceiptAuthorityRow>,
+    requested_operation_ids: &[OperationId],
+) -> Result<Vec<eliot_store_api::RecoveryReceiptAuthority>, AdapterError> {
+    let mut authorities = Vec::with_capacity(rows.len());
+    for row in rows {
+        if !requested_operation_ids.contains(&row.body.operation_id) {
+            return Err(AdapterError::Store(StoreError::IdentityConflict));
+        }
+        let records = row
+            .payload_authority
+            .ok_or(AdapterError::Store(StoreError::InvalidReceipt))?;
+        authorities.push(
+            super::read_boundary::recovery_receipt_authority(
+                &row.body,
+                row.commit_sequence,
+                row.named_operation_count,
+                records,
+            )
+            .map_err(AdapterError::Store)?,
+        );
+    }
+    Ok(authorities)
 }
 
 pub(super) fn build_recovery_sql(request: &StoreRecoveryRequest) -> String {
@@ -42,7 +77,14 @@ pub(super) fn build_recovery_sql(request: &StoreRecoveryRequest) -> String {
         sql.push_str(schema::READ_ALL_RECOVERY_JOBS);
     }
     if request.include_receipts {
-        sql.push_str(schema::READ_ALL_RECEIPTS);
+        if request.receipt_authority_operation_ids.is_empty() {
+            sql.push_str(schema::READ_ALL_RECEIPTS);
+        } else {
+            sql.push_str(schema::READ_REQUESTED_RECOVERY_RECEIPTS);
+        }
+    }
+    if !request.receipt_authority_operation_ids.is_empty() {
+        sql.push_str(schema::READ_REQUESTED_RECEIPT_AUTHORITIES);
     }
     sql.push_str(schema::READ_ALL_REVISION_HEADS);
     sql.push_str(schema::READ_ALL_ORDERING_HEADS);
@@ -57,6 +99,18 @@ pub(super) fn build_recovery_bindings(request: &StoreRecoveryRequest) -> Map<Str
         bindings.insert(format!("recovery_namespace{suffix}"), json!(key.namespace));
         bindings.insert(format!("recovery_key{suffix}"), json!(key.key));
     }
+    if !request.receipt_authority_operation_ids.is_empty() {
+        bindings.insert(
+            "recovery_authority_operation_ids".to_owned(),
+            json!(
+                request
+                    .receipt_authority_operation_ids
+                    .iter()
+                    .map(eliot_store_api::OperationId::as_str)
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
     bindings
 }
 
@@ -65,6 +119,7 @@ pub(super) fn build_recovery_snapshot(
     expected_generation: &SchemaGeneration,
     expected_fence: &StateFence,
     requested_keys: &[RecoveryRecordKey],
+    requested_authority_operation_ids: &[eliot_store_api::OperationId],
 ) -> Result<StoreRecoverySnapshot, AdapterError> {
     let schema = input.schema.take().ok_or(AdapterError::MigrationRequired)?;
     validate_schema_meta_record(&schema)?;
@@ -102,12 +157,45 @@ pub(super) fn build_recovery_snapshot(
             return Err(AdapterError::Store(StoreError::FenceMismatch));
         }
     }
+    if !requested_authority_operation_ids.is_empty() {
+        let mut actual_receipt_ids = input
+            .receipts
+            .iter()
+            .map(|receipt| receipt.operation_id.clone())
+            .collect::<Vec<_>>();
+        actual_receipt_ids.sort();
+        let mut expected_receipt_ids = requested_authority_operation_ids.to_vec();
+        expected_receipt_ids.sort();
+        if actual_receipt_ids != expected_receipt_ids {
+            return Err(AdapterError::Store(StoreError::InvalidField {
+                field: "recovery.receipts",
+                reason: "requested receipt is missing or substituted",
+            }));
+        }
+    }
+    let mut actual_authority_ids = input
+        .receipt_authorities
+        .iter()
+        .map(|authority| authority.operation_id.clone())
+        .collect::<Vec<_>>();
+    actual_authority_ids.sort();
+    let mut expected_authority_ids = requested_authority_operation_ids.to_vec();
+    expected_authority_ids.sort();
+    if actual_authority_ids != expected_authority_ids {
+        return Err(AdapterError::Store(StoreError::InvalidField {
+            field: "recovery.receipt_authorities",
+            reason: "requested operation authority is missing or substituted",
+        }));
+    }
     validate_revision_heads(&input.revision_heads)?;
     plan::validate_ordering_heads(&input.ordering_heads)?;
     input.owner_records.sort_by_key(RecoveryRecord::record_key);
     input.job_records.sort_by_key(RecoveryRecord::record_key);
     input
         .receipts
+        .sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
+    input
+        .receipt_authorities
         .sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
     input
         .revision_heads
@@ -129,6 +217,7 @@ pub(super) fn build_recovery_snapshot(
         owner_records: input.owner_records,
         job_records: input.job_records,
         receipts: input.receipts,
+        receipt_authorities: input.receipt_authorities,
     };
     snapshot.validate()?;
     Ok(snapshot)

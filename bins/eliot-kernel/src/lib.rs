@@ -1049,7 +1049,7 @@ struct AgentBridgeProfile {
 /// ticket and typed result that produced it, so a stored `Resolved` projection
 /// is never treated as perpetual authority on its own.
 #[cfg(windows)]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct ActivatedApplicationBinding {
     /// Application principal the activation owner resolved for this
     /// connection. Never the bridge module identity or the pipe peer identity.
@@ -1655,8 +1655,39 @@ pub enum KernelFrameAction {
         /// Bounded operation payload carrying context, batch and archive.
         payload: serde_json::Value,
     },
+    /// Continue an exact completed Finish invoke-read on the asynchronous
+    /// bridge owner. The synchronous dispatcher may carry the retained
+    /// envelope, tool, admission receipt, and ORS row here, but the front-door
+    /// driver must re-read the canonical Store receipt before serving the
+    /// retained result body.
+    #[cfg(windows)]
+    FinishReplay(Box<FinishReplayAction>),
     /// Return a typed rejection, then fence the connection.
     Fence(Frame),
+}
+
+/// Deferred asynchronous readback material for one completed Finish row.
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct FinishReplayAction {
+    /// Public request correlation identity.
+    pub request_id: RequestId,
+    /// Protocol version negotiated by the authenticated connection.
+    pub protocol_version: eliot_protocol::ProtocolVersion,
+    /// Exact original admitted Finish envelope.
+    pub envelope: eliot_protocol::HostRequestEnvelope,
+    /// Exact original admitted Finish tool payload.
+    pub tool: serde_json::Value,
+    /// Admission receipt issued for the original Finish envelope.
+    pub admission_receipt: eliot_protocol::HostRequestAdmissionReceipt,
+    /// Durable ORS result row selected by the original operation identity.
+    pub record: eliot_ors::HostRequestRecord,
+    /// Present only for reconnect `Status`; this is the newly authenticated
+    /// transport request used for current read authorization and delivery.
+    /// New authenticated transport envelope when resolving a reconnect.
+    pub reconnect_envelope: Option<eliot_protocol::HostRequestEnvelope>,
+    /// Logical key to bind into a reconnect resolution, if one was supplied.
+    pub logical_key: Option<String>,
 }
 
 /// Milliseconds since the Unix epoch, saturating at the `u64` boundary.

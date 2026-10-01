@@ -224,6 +224,7 @@ fn recovery_sql_is_one_transaction_with_requested_owner_bindings_and_sorted_outp
         records: vec![request.owner_records[0].record_key()],
         include_receipts: true,
         include_jobs: true,
+        receipt_authority_operation_ids: Vec::new(),
     };
     let sql = build_recovery_sql(&recovery_request);
     assert!(sql.starts_with(schema::TX_BEGIN));
@@ -869,6 +870,7 @@ fn canonical_fence_record_reads_use_explicit_flat_projection() {
         records: vec![request.owner_records[0].record_key()],
         include_receipts: true,
         include_jobs: true,
+        receipt_authority_operation_ids: Vec::new(),
     };
     let expected_projection = "SELECT VALUE { state_fence: state_fence, next_commit_sequence: next_commit_sequence, next_outbox_sequence: next_outbox_sequence } FROM ONLY canonical_fence:current";
     let recovery_sql = build_recovery_sql(&recovery_request);

@@ -305,6 +305,7 @@ impl DaemonKernelClient {
             records,
             include_receipts,
             include_jobs,
+            receipt_authority_operation_ids: Vec::new(),
         };
         request
             .validate()
@@ -336,6 +337,11 @@ impl DaemonKernelClient {
         if !include_receipts && !snapshot.receipts.is_empty() {
             return Err(KernelPortError::Contract(
                 "Kernel Store recovery returned excluded receipts".to_owned(),
+            ));
+        }
+        if !snapshot.receipt_authorities.is_empty() {
+            return Err(KernelPortError::Contract(
+                "Kernel Store recovery returned unrequested receipt authority".to_owned(),
             ));
         }
         if !include_jobs && !snapshot.job_records.is_empty() {
