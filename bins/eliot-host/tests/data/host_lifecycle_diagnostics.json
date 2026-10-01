@@ -109,8 +109,8 @@
   },
   "boundary_table": {
   "source": "bins/eliot-host/src/lib.rs::HOST_LIFECYCLE_BOUNDARY_TABLE",
-  "rows": 120,
-  "emitting": 117,
+  "rows": 121,
+  "emitting": 118,
   "propagated": 3,
   "propagated_exclusions": [
     "propagated.phase-b-rollback",
@@ -188,10 +188,6 @@
     "liveness.requested",
     "liveness.terminal",
     "liveness.observed",
-    "backup-prepare.terminal",
-    "backup-cutover.terminal",
-    "backup-cutover-disposition.terminal",
-    "backup-cutover-retire.terminal",
     "reconcile.requested",
     "reconcile.terminal",
     "reconcile.admitted",
@@ -237,7 +233,12 @@
     "lease-census.requested",
     "wake-revalidation.observed",
     "wake-satisfy.terminal",
-    "wake-satisfied.observed"
+    "wake-satisfied.observed",
+    "backup-dispatch.terminal",
+    "backup-cutover.terminal",
+    "backup-cutover-disposition.terminal",
+    "backup-prepare.terminal",
+    "backup-cutover-retire.terminal"
   ]
 },
   "deferred_cases": [

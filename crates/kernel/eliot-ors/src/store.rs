@@ -4454,6 +4454,17 @@ pub trait OperationalRecoveryStore: Send + Sync {
         &self,
         record: &crate::NativeWorkerClaimRecord,
     ) -> Result<crate::NativeWorkerClaimStageOutcome, OrsError>;
+    /// Atomically binds one exact full Governor executable record to an
+    /// existing requested claim row. It adds no table and never changes the
+    /// claim's work identity.
+    fn bind_native_worker_claim_executable_binding(
+        &self,
+        claim_id: &crate::OperationIdentity,
+        binding_digest: &str,
+        record_json: &str,
+        capability_cell: &crate::OpaqueLabel,
+        capability_cell_registry_digest: &str,
+    ) -> Result<Option<crate::NativeWorkerClaimRecord>, OrsError>;
     /// Advances one staged claim to its next mechanical state.
     ///
     /// An exact repeat of an applied advance returns the durable record
@@ -22794,6 +22805,111 @@ impl RedbRecoveryStore {
         })
     }
 
+    /// Atomically retains the full Governor-issued binding on an existing
+    /// requested claim row. The binding is immutable once attached; exact
+    /// retries return the same durable row, while any changed record under
+    /// the claim identity conflicts.
+    pub fn bind_native_worker_claim_executable_binding(
+        &self,
+        claim_id: &crate::OperationIdentity,
+        binding_digest: &str,
+        record_json: &str,
+        capability_cell: &crate::OpaqueLabel,
+        capability_cell_registry_digest: &str,
+    ) -> Result<Option<crate::NativeWorkerClaimRecord>, OrsError> {
+        crate::model::validate_digest(
+            binding_digest,
+            "native_worker_claim_executable_binding_digest",
+        )?;
+        crate::model::validate_text(
+            capability_cell.as_str(),
+            "native_worker_claim_capability_cell",
+        )?;
+        crate::model::validate_digest(
+            capability_cell_registry_digest,
+            "native_worker_claim_capability_cell_registry_digest",
+        )?;
+        if record_json.len() > crate::MAX_NATIVE_WORKER_EXECUTABLE_BINDING_RECORD_BYTES {
+            return Err(OrsError::InvalidField {
+                field: "native_worker_claim_executable_binding_record",
+                reason: "owner binding record exceeds its byte bound",
+            });
+        }
+        let value = serde_json::from_str::<serde_json::Value>(record_json).map_err(|_| {
+            OrsError::InvalidField {
+                field: "native_worker_claim_executable_binding_record",
+                reason: "owner binding record is not JSON",
+            }
+        })?;
+        if !value.is_object()
+            || eliot_contracts::canonical_json_bytes(&value)
+                .map_err(|_| OrsError::InvalidField {
+                    field: "native_worker_claim_executable_binding_record",
+                    reason: "owner binding record cannot be canonicalized",
+                })?
+                .as_slice()
+                != record_json.as_bytes()
+        {
+            return Err(OrsError::InvalidField {
+                field: "native_worker_claim_executable_binding_record",
+                reason: "owner binding record must be a canonical JSON object",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let durable = {
+            let mut table = write.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?;
+            let Some(encoded) = table.get(claim_id.as_str()).map_err(storage)? else {
+                return Ok(None);
+            };
+            let mut record: crate::NativeWorkerClaimRecord = decode(encoded.value())?;
+            record.validate()?;
+            if record.claim_id != *claim_id {
+                return Err(OrsError::NativeWorkerClaimIdentityConflict {
+                    claim_id: claim_id.as_str().to_owned(),
+                });
+            }
+            if record.executable_binding_digest == binding_digest
+                && record.executable_binding_record_json.as_deref() == Some(record_json)
+                && record.capability_cell.as_ref() == Some(capability_cell)
+                && record.capability_cell_registry_digest.as_deref()
+                    == Some(capability_cell_registry_digest)
+            {
+                record
+            } else {
+                if record.state != crate::NativeWorkerClaimState::Requested {
+                    return Err(OrsError::NativeWorkerClaimIdentityConflict {
+                        claim_id: claim_id.as_str().to_owned(),
+                    });
+                }
+                if !record.executable_binding_digest.is_empty()
+                    && record.executable_binding_digest != binding_digest
+                {
+                    return Err(OrsError::NativeWorkerClaimIdentityConflict {
+                        claim_id: claim_id.as_str().to_owned(),
+                    });
+                }
+                if record.executable_binding_record_json.is_some() {
+                    return Err(OrsError::NativeWorkerClaimIdentityConflict {
+                        claim_id: claim_id.as_str().to_owned(),
+                    });
+                }
+                record.executable_binding_digest = binding_digest.to_owned();
+                record.executable_binding_record_json = Some(record_json.to_owned());
+                record.capability_cell = Some(capability_cell.clone());
+                record.capability_cell_registry_digest =
+                    Some(capability_cell_registry_digest.to_owned());
+                record.validate()?;
+                let payload = encode(&record)?;
+                table
+                    .insert(claim_id.as_str(), payload.as_str())
+                    .map_err(storage)?;
+                record
+            }
+        };
+        write.commit().map_err(storage)?;
+        Ok(Some(durable))
+    }
+
     /// Loads one native-worker claim by exact claim identity.
     pub fn load_native_worker_claim(
         &self,
@@ -33121,6 +33237,10 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             reservation_id: stage.reservation_id,
             work_item_id: stage.work_item_id,
             proposed_attempt_id: stage.proposed_attempt_id,
+            semantic_admission_revision: Some(stage.semantic_admission_revision),
+            semantic_admission_predecessor_revision: Some(
+                stage.semantic_admission_predecessor_revision,
+            ),
             stage_operation_id,
             operation_id: stage.operation_id,
             claims: stage.claims,
@@ -33157,6 +33277,9 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             let same_stage_request = existing_record.reservation_id == record.reservation_id
                 && existing_record.work_item_id == record.work_item_id
                 && existing_record.proposed_attempt_id == record.proposed_attempt_id
+                && existing_record.semantic_admission_revision == record.semantic_admission_revision
+                && existing_record.semantic_admission_predecessor_revision
+                    == record.semantic_admission_predecessor_revision
                 && existing_record.stage_operation_id == record.stage_operation_id
                 && existing_record.claims == record.claims
                 && existing_record.authority_epoch == record.authority_epoch
@@ -35601,6 +35724,24 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         record: &crate::NativeWorkerClaimRecord,
     ) -> Result<crate::NativeWorkerClaimStageOutcome, OrsError> {
         RedbRecoveryStore::stage_native_worker_claim(self, record)
+    }
+
+    fn bind_native_worker_claim_executable_binding(
+        &self,
+        claim_id: &crate::OperationIdentity,
+        binding_digest: &str,
+        record_json: &str,
+        capability_cell: &crate::OpaqueLabel,
+        capability_cell_registry_digest: &str,
+    ) -> Result<Option<crate::NativeWorkerClaimRecord>, OrsError> {
+        RedbRecoveryStore::bind_native_worker_claim_executable_binding(
+            self,
+            claim_id,
+            binding_digest,
+            record_json,
+            capability_cell,
+            capability_cell_registry_digest,
+        )
     }
 
     fn advance_native_worker_claim(

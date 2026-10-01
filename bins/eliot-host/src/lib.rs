@@ -8598,6 +8598,21 @@ impl HostComposition {
         // runtime-control (SCM) action, and `AdmittedEvent` admits service
         // start/stop/failure only, so no fitting taxonomy value exists here
         // and none is guessed.
+        // Package D six-link audit for this correlation: producer
+        // (`launch_options` owner; process owner via the `HostProcessBinding`
+        // identity) -> input/identity (installation, generation, process
+        // id) -> production caller (this SCM dispatch,
+        // `main::process_runtime_control_requests`) -> effect and adoption
+        // (restart receipt or typed Unknown; one terminal on failure) ->
+        // persisted owner result (the `HostRuntimeControlResponse` built
+        // from `request`) -> ordinary consumer (the SCM reader of that
+        // response). Named missing links, never filled: `request` (no
+        // console-request value fits an SCM dispatch); `reason` (no
+        // `HostError` in hand at an entry sighting - failure attribution
+        // stays with the terminal boundary); request/mutation digests and
+        // fence/recovery (held by `request` and the store-recovery/phase-b
+        // owners, but this projection has no digest/fence slot on main -
+        // wire the #889 Package-D tx/effect/req/fence slots when they land).
         host_lifecycle_observe_identity(
             &host_diagnostics::HostRequestProjection::observed(
                 host_diagnostics::EntrypointStage::ScmDispatch,

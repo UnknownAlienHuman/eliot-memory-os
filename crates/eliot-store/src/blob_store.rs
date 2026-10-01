@@ -1130,6 +1130,10 @@ mod tests {
         assert!(format!("{error}").contains("blob.put_bytes"));
         assert!(!format!("{error:?}").contains("private configured path"));
 
+        // Release the root lease before removing the scratch root: the live
+        // `.eliot-root.lock` handle (#19) cannot be deleted on Windows while
+        // the store holds it (ERROR_SHARING_VIOLATION, OS code 32).
+        drop(store);
         std::fs::remove_dir_all(temp_dir)?;
         Ok(())
     }
@@ -1189,6 +1193,10 @@ mod tests {
             assert_eq!(error.raw_os_error(), Some(28));
         }
 
+        // Release the root lease before removing the scratch root: the live
+        // `.eliot-root.lock` handle (#19) cannot be deleted on Windows while
+        // the store holds it (ERROR_SHARING_VIOLATION, OS code 32).
+        drop(store);
         std::fs::remove_dir_all(temp_dir)?;
         Ok(())
     }
@@ -1243,6 +1251,10 @@ mod tests {
         assert!(matches!(&error.cleanup, StorageCleanup::Failed(_)));
         std::fs::remove_dir_all(cleanup_path)?;
 
+        // Release the root lease before removing the scratch root: the live
+        // `.eliot-root.lock` handle (#19) cannot be deleted on Windows while
+        // the store holds it (ERROR_SHARING_VIOLATION, OS code 32).
+        drop(store);
         std::fs::remove_dir_all(temp_dir)?;
         Ok(())
     }
@@ -1444,6 +1456,10 @@ mod tests {
             Err(StoreError::PolicyViolation(_))
         ));
 
+        // Release the root lease before removing the scratch root: the live
+        // `.eliot-root.lock` handle (#19) cannot be deleted on Windows while
+        // the store holds it (ERROR_SHARING_VIOLATION, OS code 32).
+        drop(store);
         std::fs::remove_dir_all(temp_dir)?;
         Ok(())
     }

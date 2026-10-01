@@ -10,6 +10,7 @@
 //! only this module can construct.
 
 use serde::{Deserialize, Serialize};
+use eliot_store_api::WorkAdmissionSemanticRevision;
 
 use crate::{
     EpochLineage, OpaqueLabel, OperationIdentity, OperationalMutationReceipt, OrsError,
@@ -329,6 +330,14 @@ pub struct AdmissionReservationRecord {
     pub work_item_id: OperationIdentity,
     /// Attempt identity proposed before canonical admission.
     pub proposed_attempt_id: OperationIdentity,
+    /// Governor-issued semantic admission revision retained from the original
+    /// canonical owner proposal. Missing only on pre-v2 historical rows;
+    /// such rows remain inspectable but cannot be newly activated/launched.
+    #[serde(default)]
+    pub semantic_admission_revision: Option<WorkAdmissionSemanticRevision>,
+    /// Owner-observed canonical CAS predecessor for the revision above.
+    #[serde(default)]
+    pub semantic_admission_predecessor_revision: Option<u64>,
     /// Immutable identity of the first stage request for this reservation.
     pub stage_operation_id: OperationIdentity,
     /// ORS mutation identity for the current lifecycle revision.
@@ -380,6 +389,16 @@ impl AdmissionReservationRecord {
                 field: "admission_reservation.timestamps",
                 reason: "creation and update times must be positive and ordered",
             });
+        }
+        match (
+            &self.semantic_admission_revision,
+            self.semantic_admission_predecessor_revision,
+        ) {
+            (Some(revision), Some(predecessor)) => revision
+                .validate_owner_canonical(predecessor)
+                .map_err(|_| OrsError::ReconciliationMismatch)?,
+            (None, None) => {}
+            _ => return Err(OrsError::ReconciliationMismatch),
         }
         if self.expires_at_ms <= self.created_at_ms {
             return Err(OrsError::InvalidExpiry);
@@ -534,6 +553,10 @@ pub struct AdmissionReservationStage {
     pub work_item_id: OperationIdentity,
     /// Stable proposed attempt identity.
     pub proposed_attempt_id: OperationIdentity,
+    /// Exact Governor-issued canonical owner revision proposal.
+    pub semantic_admission_revision: WorkAdmissionSemanticRevision,
+    /// Exact owner-observed predecessor used by the same canonical CAS.
+    pub semantic_admission_predecessor_revision: u64,
     /// ORS operation identity for this first stage.
     pub operation_id: OperationIdentity,
     /// Exact complete owner-defined claims.

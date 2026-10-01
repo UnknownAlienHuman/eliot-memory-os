@@ -686,6 +686,7 @@ mod tests {
             selection_coverage: Vec::new(),
             selection_frontier: None,
             applicability_history: Vec::new(),
+            admission_history: Vec::new(),
         })
     }
 
@@ -732,6 +733,7 @@ mod tests {
             selection_coverage: Vec::new(),
             selection_frontier: None,
             applicability_history: Vec::new(),
+            admission_history: Vec::new(),
         })
     }
 
@@ -846,7 +848,7 @@ mod tests {
         OperatorIntentPlanRevisionRef,
         DurableJobRecord,
         OperatorIntentEpistemic,
-        Vec<OperatorIntentEffectDisposition>,
+        Vec<eliot_governor::OperatorIntentEffectDisposition>,
     )> {
         let plan = test_plan(input)?;
         let plan_revision = OperatorIntentPlanRevisionRef {

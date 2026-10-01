@@ -398,6 +398,7 @@ fn base_response(request: &DurableJobRequest, bound_scope: WorkScopeBinding) -> 
         result_under_verification: None,
         outcome: None,
         applicability_history: Vec::new(),
+        admission_history: Vec::new(),
         selection_coverage: Vec::new(),
         selection_frontier: None,
     }
@@ -1066,7 +1067,7 @@ fn canonical_lifecycle_vocabulary_matches_i14_20() {
         identity.name,
         ContractId::new("eliot.foundation.protocol.durable-job").expect("contract")
     );
-    assert_eq!(identity.version, ContractVersion::new(1, 0, 0));
+    assert_eq!(identity.version, ContractVersion::new(1, 2, 0));
 }
 
 // WORK_UNIT_CASE: 769/2
@@ -2309,6 +2310,7 @@ fn no_candidate_application_or_effect_authority() {
             JobOperationKind::RequestCancel => "REQUEST_CANCEL",
             JobOperationKind::Reconcile => "RECONCILE_MUTATION",
             JobOperationKind::RecordApplicability => "RECORD_APPLICABILITY",
+            JobOperationKind::RecordAdmission => "RECORD_ADMISSION",
         };
         assert_eq!(observed, wire);
         assert_eq!(kind.as_str(), wire);

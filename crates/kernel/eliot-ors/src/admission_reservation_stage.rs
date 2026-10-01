@@ -118,6 +118,7 @@
 use eliot_contracts::EpochId;
 use eliot_receipts::ReceiptIdentity;
 use serde::{Deserialize, Serialize};
+use eliot_store_api::WorkAdmissionSemanticRevision;
 
 use crate::{
     AdmissionReservationActivatedOutcome, AdmissionReservationActivationEvidence,
@@ -341,11 +342,12 @@ pub struct CanonicalLaunchOutboxIntent {
 /// them is the launch row that store issued under
 /// [`eliot_store_api::OutboxIntentKind::Launch`].
 ///
-/// The row is selected by the store's own prefix classifier, never by a
-/// caller-supplied id, so an event-projection row can never be adopted as
-/// launch authority. The check is also scoped to THIS operation: a receipt
-/// whose operation identity is not the one being proven, or which is not a
-/// committed receipt at all, proves nothing.
+/// Exactly one launch row must appear in the owner receipt, and its ID must
+/// equal the original owner-prepared transition's expected launch ID. The
+/// ID is also checked against the store's `Launch.outbox_id(operation, 0)`
+/// naming rule; a foreign same-operation launch or duplicate launch cannot be
+/// adopted by selecting the first matching prefix. The check is scoped to THIS
+/// committed operation and exact prepared launch identity.
 ///
 /// # Errors
 ///
@@ -355,6 +357,7 @@ pub struct CanonicalLaunchOutboxIntent {
 pub fn verify_launch_outbox_intent(
     receipt: &CanonicalWriteReceipt,
     operation_id: &OperationIdentity,
+    expected_launch_outbox_id: &eliot_store_api::OutboxId,
 ) -> Result<CanonicalLaunchOutboxIntent, OrsError> {
     receipt
         .validate()
@@ -364,18 +367,28 @@ pub fn verify_launch_outbox_intent(
     {
         return Err(OrsError::ReconciliationMismatch);
     }
-    // The store's own launch-row naming is the only spelling accepted, and the
-    // row must be one the receipt itself enumerates: a launch row the owner did
-    // not record against this operation is not this operation's launch intent.
-    let prefix = format!("{}-", eliot_store_api::OutboxIntentKind::Launch.id_prefix());
-    let outbox_id = receipt
+    let derived_expected = eliot_store_api::OutboxIntentKind::Launch
+        .outbox_id(operation_id.as_str(), 0)
+        .map_err(|_| OrsError::ReconciliationMismatch)?;
+    if expected_launch_outbox_id != &derived_expected {
+        return Err(OrsError::ReconciliationMismatch);
+    }
+    // The store's own launch-kind classifier is the only selector accepted;
+    // exactly one launch row must be in the exact receipt, and that ID must
+    // equal both the prepared expectation and the operation-derived ID.
+    let launch_rows = receipt
         .outbox_refs
         .iter()
-        .map(eliot_store_api::OutboxId::as_str)
-        .find(|outbox_id| outbox_id.starts_with(&prefix))
-        .ok_or(OrsError::ReconciliationMismatch)?;
+        .filter(|outbox_id| {
+            eliot_store_api::OutboxIntentKind::of(outbox_id)
+                == Some(eliot_store_api::OutboxIntentKind::Launch)
+        })
+        .collect::<Vec<_>>();
+    if launch_rows.len() != 1 || launch_rows[0] != expected_launch_outbox_id {
+        return Err(OrsError::ReconciliationMismatch);
+    }
     Ok(CanonicalLaunchOutboxIntent {
-        outbox_id: outbox_id.to_owned(),
+        outbox_id: expected_launch_outbox_id.as_str().to_owned(),
         operation_id: operation_id.as_str().to_owned(),
     })
 }
@@ -450,6 +463,7 @@ pub fn prove_canonical_admission_for_reservation<S: OperationalRecoveryStore + ?
     proposed_attempt_id: &OperationIdentity,
     operation_id: &OperationIdentity,
     commit: &CanonicalAdmissionCommit,
+    expected_launch_outbox_id: &eliot_store_api::OutboxId,
     authority_epoch: &EpochLineage,
     state_fence: &StateFenceSnapshot,
     now_ms: i64,
@@ -501,7 +515,11 @@ pub fn prove_canonical_admission_for_reservation<S: OperationalRecoveryStore + ?
     // derived from that receipt's own reconciliation envelope — is built from
     // that same owner-issued receipt: never from a Kernel assertion and never
     // inferred from a successful transport call.
-    let launch = verify_launch_outbox_intent(&commit.receipt, operation_id)?;
+    let launch = verify_launch_outbox_intent(
+        &commit.receipt,
+        operation_id,
+        expected_launch_outbox_id,
+    )?;
     let retained = canonical_admission_from_owner_commit(
         &commit.receipt,
         operation_id.as_str(),
@@ -614,7 +632,19 @@ pub fn reconcile_canonical_admission(
             // intent for this operation is also proven: a committed `ADMITTED`
             // decision without its launch outbox is not the complete I14.6 step
             // 3, so it stays Unknown rather than becoming activation authority.
-            if verify_launch_outbox_intent(receipt, &reconciled_operation).is_err() {
+            let expected_launch_id = match eliot_store_api::OutboxIntentKind::Launch
+                .outbox_id(reconciled_operation.as_str(), 0)
+            {
+                Ok(expected) => expected,
+                Err(_) => {
+                    return Ok(CanonicalAdmissionResolution::Unknown {
+                        reason: CanonicalAdmissionUnknownReason::LaunchIntentUnproven,
+                    });
+                }
+            };
+            if verify_launch_outbox_intent(receipt, &reconciled_operation, &expected_launch_id)
+                .is_err()
+            {
                 return Ok(CanonicalAdmissionResolution::Unknown {
                     reason: CanonicalAdmissionUnknownReason::LaunchIntentUnproven,
                 });
@@ -693,15 +723,15 @@ pub enum CanonicalAdmissionUnknownReason {
 /// breaking change for every reservation staged under the old revision, so the
 /// revision travels inside the preimage: two different revisions can never
 /// collide on one reservation identity.
-pub const ADMISSION_RESERVATION_STAGE_VERSION: u16 = 1;
+pub const ADMISSION_RESERVATION_STAGE_VERSION: u16 = 2;
 
 /// Domain separator binding a derived identity to this exact contract and
 /// revision. Without it a derived digest could collide with any other ORS
 /// identity derived from the same immutable inputs.
-const RESERVATION_IDENTITY_DOMAIN: &str = "eliot.ors.admission-reservation.identity.v1";
+const RESERVATION_IDENTITY_DOMAIN: &str = "eliot.ors.admission-reservation.identity.v2";
 
 /// Domain separator binding a proposed-attempt identity to this saga half.
-const PROPOSED_ATTEMPT_DOMAIN: &str = "eliot.ors.admission-reservation.attempt.v1";
+const PROPOSED_ATTEMPT_DOMAIN: &str = "eliot.ors.admission-reservation.attempt.v2";
 
 /// The exact immutable inputs one reservation identity is derived from.
 ///
@@ -717,7 +747,9 @@ pub struct AdmissionReservationIdentityInput {
     /// Attempt identity proposed before canonical admission.
     pub proposed_attempt_id: OperationIdentity,
     /// Exact semantic admission revision this reservation is bound to.
-    pub semantic_admission_revision: String,
+    pub semantic_admission_revision: WorkAdmissionSemanticRevision,
+    /// Owner-observed predecessor for the original canonical owner CAS.
+    pub semantic_admission_predecessor_revision: u64,
     /// Complete immutable claim set the reservation reserves.
     pub claims: AdmissionReservationClaims,
     /// Exact State Fence observed for this admission proposal.
@@ -760,16 +792,17 @@ pub fn admission_reservation_identity(
             reason: "work item and proposed attempt identities must be non-blank",
         });
     }
-    crate::model::validate_text(
-        &input.semantic_admission_revision,
-        "admission_reservation.semantic_admission_revision",
-    )?;
+    input
+        .semantic_admission_revision
+        .validate_owner_canonical(input.semantic_admission_predecessor_revision)
+        .map_err(|_| OrsError::ReconciliationMismatch)?;
     let preimage = serde_json::to_vec(&(
         RESERVATION_IDENTITY_DOMAIN,
         ADMISSION_RESERVATION_STAGE_VERSION,
         &input.work_item_id,
         &input.proposed_attempt_id,
         &input.semantic_admission_revision,
+        input.semantic_admission_predecessor_revision,
         &input.claims,
         &input.state_fence,
         &input.authority_epoch,
@@ -822,6 +855,7 @@ pub fn proposed_attempt_identity(
         ADMISSION_RESERVATION_STAGE_VERSION,
         &input.work_item_id,
         &input.semantic_admission_revision,
+        input.semantic_admission_predecessor_revision,
         &input.claims,
         &input.state_fence,
         &input.authority_epoch,
@@ -959,6 +993,10 @@ pub struct AdmissionReservationStageRequest {
     pub work_item_id: OperationIdentity,
     /// Stable proposed attempt identity.
     pub proposed_attempt_id: OperationIdentity,
+    /// Exact semantic revision proposed by the canonical admission owner.
+    pub semantic_admission_revision: WorkAdmissionSemanticRevision,
+    /// Exact predecessor captured from the same owner state before staging.
+    pub semantic_admission_predecessor_revision: u64,
     /// ORS operation identity for this first stage.
     pub operation_id: OperationIdentity,
     /// Exact complete owner-defined claims (resource, lane, environment,
@@ -1028,6 +1066,10 @@ pub fn stage_admission_reservation_inactive<S: OperationalRecoveryStore + ?Sized
     // The immutable binding is validated BEFORE the write with the existing
     // validators, by value, against the ORIGINAL recorded fence and epoch.
     request.claims.validate()?;
+    request
+        .semantic_admission_revision
+        .validate_owner_canonical(request.semantic_admission_predecessor_revision)
+        .map_err(|_| OrsError::ReconciliationMismatch)?;
     request.authority_epoch.validate()?;
     request
         .state_fence
@@ -1046,6 +1088,10 @@ pub fn stage_admission_reservation_inactive<S: OperationalRecoveryStore + ?Sized
         reservation_id: request.reservation_id.clone(),
         work_item_id: request.work_item_id.clone(),
         proposed_attempt_id: request.proposed_attempt_id.clone(),
+        semantic_admission_revision: Some(request.semantic_admission_revision.clone()),
+        semantic_admission_predecessor_revision: Some(
+            request.semantic_admission_predecessor_revision,
+        ),
         stage_operation_id: request.operation_id.clone(),
         operation_id: request.operation_id.clone(),
         claims: request.claims.clone(),
@@ -1069,6 +1115,8 @@ pub fn stage_admission_reservation_inactive<S: OperationalRecoveryStore + ?Sized
         reservation_id: request.reservation_id.clone(),
         work_item_id: request.work_item_id.clone(),
         proposed_attempt_id: request.proposed_attempt_id.clone(),
+        semantic_admission_revision: request.semantic_admission_revision.clone(),
+        semantic_admission_predecessor_revision: request.semantic_admission_predecessor_revision,
         operation_id: request.operation_id.clone(),
         claims: request.claims.clone(),
         authority_epoch: request.authority_epoch.clone(),
@@ -1088,6 +1136,9 @@ pub fn stage_admission_reservation_inactive<S: OperationalRecoveryStore + ?Sized
         || staged.record().state != candidate.state
         || staged.record().work_item_id != candidate.work_item_id
         || staged.record().proposed_attempt_id != candidate.proposed_attempt_id
+        || staged.record().semantic_admission_revision != candidate.semantic_admission_revision
+        || staged.record().semantic_admission_predecessor_revision
+            != candidate.semantic_admission_predecessor_revision
         || staged.record().operation_id != candidate.operation_id
         || staged.record().expires_at_ms != candidate.expires_at_ms
         || staged.record().canonical_admission.is_some()
