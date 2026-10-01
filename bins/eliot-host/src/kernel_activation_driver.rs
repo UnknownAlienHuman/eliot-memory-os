@@ -91,13 +91,13 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
         // rebind consults only the disposition binding, so the driver
         // refuses a forked lineage here, before any nonce can be issued for
         // it. Rollback is a newer activation, never a reused generation.
-        if let PriorKernelDisposition::Terminated(source) = &prior_kernel_disposition {
-            if !kernel_generation.advances(&source.generation.current) {
-                return Err(HostError::ProcessContour(
-                    "candidate Kernel generation must directly advance the terminated prior contour"
-                        .to_owned(),
-                ));
-            }
+        if let PriorKernelDisposition::Terminated(source) = &prior_kernel_disposition
+            && !kernel_generation.advances(&source.generation.current)
+        {
+            return Err(HostError::ProcessContour(
+                "candidate Kernel generation must directly advance the terminated prior contour"
+                    .to_owned(),
+            ));
         }
         let current = KernelRecord {
             fence: record_fence(host, activation_id, activation_generation),
