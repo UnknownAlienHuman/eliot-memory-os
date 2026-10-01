@@ -3802,7 +3802,7 @@ impl KernelComposition {
                         return Err(TransportError::SessionFenced);
                     }
                     let result =
-                        host_request_route::watchdog_export_result_from_payload(&payload)?;
+                        host_request_route::watchdog_export_result_from_payload(payload)?;
                     let projections = self.record_watchdog_export_outcomes(session, &result)?;
                     Ok(host_request_route::watchdog_export_result_response(
                         &projections,
