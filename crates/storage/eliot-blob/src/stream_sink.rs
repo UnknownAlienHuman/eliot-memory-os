@@ -896,7 +896,13 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         }
 
         if !publishes {
-            return Self::withheld_plan(&state, existing, request, identity, admitted_sha256);
+            return Ok(Self::withheld_plan(
+                &state,
+                existing,
+                request,
+                identity,
+                admitted_sha256,
+            ));
         }
 
         // One reservation per session: bound to this session, this exact
