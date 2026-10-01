@@ -5,15 +5,27 @@ use eliot_context_contracts::{
     ContextRecipe, DownstreamHeadroomRequest, DownstreamHeadroomResult, HeadroomAttempt,
     HeadroomDimension, HeadroomRefusal, HeadroomReleaseInstruction, MeasurementStatus,
     QualityOperation, QualityRefusal, QualityRefusalKind, QualityScorecard,
-    SerializedContextMeasurement,
+    ResolvedContextRecipe, SerializedContextMeasurement,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{AssemblyError, boundary, bounds, measurement, render};
 
-/// Stable local ordering revision for the A-15 canonical rendered payload.
-pub const ASSEMBLY_ORDERING_REVISION: &str = "a18.role-provider-atom.v1";
+/// Stable ordering SCHEME for the A-15 canonical rendered payload.
+///
+/// #1724 W4. This names the SCHEME, not the order: the approved revision's declared
+/// role position, then provider, then atom identity. Before this change the scheme
+/// sorted the `SemanticRole` enum's own ordinal and this constant named an order
+/// the approved recipe never chose — a value inside `policy_sha256` that no
+/// execution path read. The order is now the approved revision's declared
+/// `layout.role_positions`, so the value stamped into a
+/// [`ContextExecutionIdentity`] is this scheme qualified by the identity of the
+/// approved revision whose declaration was just executed; see
+/// [`executed_ordering_revision`]. Two revisions that declare different orders
+/// therefore cannot present the same executed ordering revision, and a revision
+/// whose declared order is refused produces no view at all.
+pub const ASSEMBLY_ORDERING_REVISION: &str = "a18.declared-role-position.v1";
 
 /// Caller-owned immutable parameters for one A-18 projection.
 ///
@@ -333,18 +345,70 @@ pub struct RenderedOutputIdentity {
     pub fence_digest: String,
 }
 
+/// The ordering revision this assembly stamps for one approved revision.
+///
+/// #1724 W4. The stamped value is NOT the bare scheme constant: the order that
+/// produced the delivered bytes is a function of the approved revision's declared
+/// `layout.role_positions`, so an executed-order identity that did not name the
+/// approved revision would be the same string for two different delivered orders.
+/// It is therefore [`ASSEMBLY_ORDERING_REVISION`] qualified by the approved
+/// revision's OWN recorded content digest — a value the revision already certifies
+/// and this crate already stamps on the view, not a digest recomputed here and not
+/// a second ordering scheme. Two approved revisions that declare different orders
+/// carry different `policy_sha256` values and therefore different executed
+/// ordering revisions.
+///
+/// The scheme prefix stays the scheme: it names WHICH order was applied (declared
+/// role position, then provider, then atom identity), while the qualifier names
+/// WHICH approved revision's declaration supplied the positions.
+fn executed_ordering_revision(approved: &ResolvedContextRecipe) -> String {
+    format!(
+        "{ASSEMBLY_ORDERING_REVISION}@{}",
+        approved.identity.policy_sha256
+    )
+}
+
+/// Require that the approved revision supplying the executed order is the exact
+/// revision the compilation-bound instance was issued under.
+///
+/// #1724 W4. The executed order is read from the approved revision, so before any
+/// of it is applied the two records must be the same revision: `approved.validate()`
+/// and `ContextRecipePolicy::binds_recipe` are the owners' own validators, and
+/// the latter compares the instance's recorded
+/// `DecisionRevision::policy_sha256` with the approved revision's own
+/// `policy_sha256`. A resolution of a different revision therefore cannot supply
+/// an order for this instance, and the ORDER and the INSTANCE cannot diverge —
+/// there is no path on which a delivered order comes from a revision other than
+/// the one the recipe names.
+///
+/// # Errors
+///
+/// Returns [`AssemblyError::Contract`] over the exact [`ContextError`] from the
+/// contract owners' validators, so a stale, forged or mismatched resolution is
+/// refused by name and the cross-bound refusal type survives this layer.
+fn require_approved_recipe_binding(
+    approved: &ResolvedContextRecipe,
+    recipe: &ContextRecipe,
+) -> Result<(), AssemblyError> {
+    approved.validate()?;
+    approved.policy.binds_recipe(recipe)?;
+    Ok(())
+}
+
 /// The one render-and-match derivation, shared by the pre-render identity and
 /// by the assembly itself.
 ///
 /// `fence_digest` is passed in rather than recomputed so the caller's already
 /// validated fence value is the one that binds the render, and so this function
-/// adds no second computation of it.
+/// adds no second computation of it. `approved` is the approved revision whose
+/// declared layout order the projection applies.
 fn render_and_match(
     admitted: &AdmittedContextSet,
     recipe: &ContextRecipe,
+    approved: &ResolvedContextRecipe,
     fence_digest: &str,
 ) -> Result<(Vec<eliot_context_contracts::RenderedAtom>, String, Vec<u8>), AssemblyError> {
-    let rendered = render::render(admitted);
+    let rendered = render::render(admitted, &approved.policy)?;
     let (output_digest, bytes) = measurement::canonical_matches(
         &admitted.binding,
         &recipe.recipe_sha256,
@@ -360,7 +424,8 @@ fn render_and_match(
 /// The caller needs this to build the `QualityScorecard` that
 /// `assemble_active_view` requires, and it needs it before that call because the
 /// card names the rendered output. The admission and recipe are validated with
-/// their own owners' validators first, and the render is the same
+/// their own owners' validators first, `approved` is bound to the instance with
+/// [`require_approved_recipe_binding`], and the render is the same
 /// `render::render` + `measurement::canonical_matches` pair the assembly runs, so
 /// the value returned here is the value the assembly later recomputes and
 /// compares rather than an independent prediction of it.
@@ -368,21 +433,25 @@ fn render_and_match(
 /// # Errors
 ///
 /// Returns [`AssemblyError`] when the admitted set or the recipe fails its own
-/// closed contract, when they are not bound to one another, or when the render
-/// cannot be canonicalised. Nothing is defaulted and no empty identity is
-/// returned: a caller that cannot learn the real rendered digest must not grade.
+/// closed contract, when they are not bound to one another, when `approved` is not
+/// the revision the instance was issued under, when the approved declared layout
+/// order is not executable, or when the render cannot be canonicalised. Nothing is
+/// defaulted and no empty identity is returned: a caller that cannot learn the real
+/// rendered digest must not grade.
 pub fn rendered_output_identity(
     admitted: &AdmittedContextSet,
     recipe: &ContextRecipe,
+    approved: &ResolvedContextRecipe,
 ) -> Result<RenderedOutputIdentity, AssemblyError> {
     recipe.validate()?;
     if recipe.binding != admitted.binding {
         return Err(AssemblyError::Contract(ContextError::IdentityConflict));
     }
     admitted.validate()?;
+    require_approved_recipe_binding(approved, recipe)?;
     let fence_digest =
         eliot_context_contracts::canonical_fence_digest(&admitted.binding.state_fence)?;
-    let (_, output_digest, _) = render_and_match(admitted, recipe, &fence_digest)?;
+    let (_, output_digest, _) = render_and_match(admitted, recipe, approved, &fence_digest)?;
     Ok(RenderedOutputIdentity {
         output_digest,
         fence_digest,
@@ -394,9 +463,20 @@ pub fn rendered_output_identity(
 /// The callback receives the exact canonical A-15 rendered payload bytes and
 /// is invoked once. This prototype accepts only exact UTF-8 byte measurement;
 /// tokenizer and STU observations remain data for a later qualified route.
+///
+/// #1724 W4. `approved` is the owner-resolved approved revision this compilation
+/// is pinned to. It is not a hint about the order: it IS the executed order, because
+/// [`render::render`] reads the rendered sequence from its
+/// `layout.role_positions` declaration, and [`require_approved_recipe_binding`]
+/// refuses a resolution that is not the revision the compilation-bound instance was
+/// issued under. The recipe instance still supplies the capacity, denominator,
+/// membership and loss rules, so both halves of the same compilation are consumed:
+/// the approved revision for what order and features mean, the bound instance for
+/// this task's envelope.
 pub fn assemble_active_view<F>(
     admitted: &AdmittedContextSet,
     recipe: &ContextRecipe,
+    approved: &ResolvedContextRecipe,
     quality: QualityScorecard,
     policy: &AssemblyPolicy,
     measure: F,
@@ -414,6 +494,7 @@ where
         return Err(AssemblyError::Contract(ContextError::IdentityConflict));
     }
     require_recipe_policy_binding(admitted, recipe)?;
+    require_approved_recipe_binding(approved, recipe)?;
     if admitted.economy.measurement.digest != admitted.canonical_payload_digest()? {
         return Err(AssemblyError::Contract(ContextError::IdentityConflict));
     }
@@ -456,11 +537,12 @@ where
     // Preserve boundaries before presentation sorting. This projection is the
     // membership-changing transform the shared boundary contract is about: it emits
     // one envelope per rendered unit plus the exact input-to-output member relation,
-    // keyed to the admitted source order rather than the role/provider sort below.
+    // keyed to the admitted source order rather than the approved declared role order
+    // applied below.
     let boundaries = boundary::project_assembly_boundaries(admitted, recipe)?;
     let (rendered, output_digest, bytes) =
-        render_and_match(admitted, recipe, &expected_fence_digest)?;
-    let execution = applied_execution_identity(policy);
+        render_and_match(admitted, recipe, approved, &expected_fence_digest)?;
+    let execution = applied_execution_identity(policy, approved);
     require_graded_output(
         &quality,
         admitted,
@@ -496,7 +578,13 @@ where
         execution,
         output_digest,
         recipe_digest: recipe.recipe_sha256.clone(),
-        policy_sha256: recipe.decision.policy_sha256.clone(),
+        // Read from the approved resolution rather than from the instance, so the
+        // value the view carries is the identity of the revision whose declared
+        // order produced `rendered`. `require_approved_recipe_binding` has already
+        // proved the two records name the same revision, so this is the same value
+        // `ActiveUnderstandingView::validate_against` cross-checks against the
+        // admitted economy receipt's own `policy_sha256`.
+        policy_sha256: approved.identity.policy_sha256.clone(),
         fence_digest: expected_fence_digest,
     };
     view.validate_against(admitted)?;
@@ -522,16 +610,21 @@ where
 /// The execution identity this assembly is about to stamp on its view.
 ///
 /// #1724 W4/W5. Every member is a value this assembly actually applied: the
-/// ordering revision is the one [`ASSEMBLY_ORDERING_REVISION`] names and
-/// `render_and_match` renders under, and the serializer/options/route/model
-/// identity is the [`AssemblyPolicy`] this assembly already required the
-/// injected measurement to match in `measurement::verify`. The view therefore
-/// cannot claim an execution it did not perform, and
-/// `ActiveUnderstandingView::validate` re-compares the stamped identity against
-/// the independently recorded measurement before the view is returned.
-fn applied_execution_identity(policy: &AssemblyPolicy) -> ContextExecutionIdentity {
+/// ordering revision is [`executed_ordering_revision`], which names the scheme
+/// AND the approved revision whose declared role order `render::render` just
+/// applied, so the stamped order cannot name an ordering this assembly did not
+/// run; the serializer/options/route/model identity is the [`AssemblyPolicy`]
+/// this assembly already required the injected measurement to match in
+/// `measurement::verify`. The view therefore cannot claim an execution it did not
+/// perform, and `ActiveUnderstandingView::validate` re-compares the stamped
+/// identity against the independently recorded measurement before the view is
+/// returned.
+fn applied_execution_identity(
+    policy: &AssemblyPolicy,
+    approved: &ResolvedContextRecipe,
+) -> ContextExecutionIdentity {
     ContextExecutionIdentity {
-        ordering_revision: ASSEMBLY_ORDERING_REVISION.to_owned(),
+        ordering_revision: executed_ordering_revision(approved),
         serializer_id: policy.serializer_id.clone(),
         serializer_version: policy.serializer_version.clone(),
         serializer_options_digest: policy.serializer_options_digest.clone(),
@@ -553,6 +646,11 @@ fn applied_execution_identity(policy: &AssemblyPolicy) -> ContextExecutionIdenti
 /// ORIGINAL recorded value on each side that
 /// `ContextRecipePolicy::binds_recipe` compares against the approved revision's
 /// own `policy_sha256`; no digest is recomputed to stand in for either record.
+///
+/// Together with [`require_approved_recipe_binding`] this makes the rendered
+/// order's source a three-record join rather than a claim: the admitted receipt,
+/// the compilation-bound instance and the owner-resolved approved revision must
+/// all name one `policy_sha256` before any atom is ordered.
 fn require_recipe_policy_binding(
     admitted: &AdmittedContextSet,
     recipe: &ContextRecipe,
