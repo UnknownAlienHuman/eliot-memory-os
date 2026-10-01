@@ -20366,8 +20366,16 @@ impl RedbRecoveryStore {
                 });
             }
             Self::require_bridge_event_relation_in(write, &record, record_key.as_str())?;
+            // Issue #2731 item 6 (retire-arm exact match): the page already
+            // stops at the first non-eligible row, so this re-check stops the
+            // contiguous prefix instead of skipping past its blocker to free
+            // space. Only the exact witnessed owner-bound covering evidence
+            // retires; legacy bare-state rows never retire on their state
+            // string, and the receiving-owner terminal disposition stays
+            // BLOCKED-BY #1934/#2561 and is never fabricated here. Saturation
+            // keeps typed Backpressure at admission; cursors are never reset.
             if !row.retirement_eligible(&owner, acked) {
-                continue;
+                break;
             }
             let commitment = Self::bridge_replay_commitment_for(&record, now_ms, acked);
             Self::write_bridge_commitment_in(write, &commitment)?;
