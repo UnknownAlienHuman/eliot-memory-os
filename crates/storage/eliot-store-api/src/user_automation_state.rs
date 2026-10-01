@@ -68,6 +68,11 @@
 //! resolves and validates that retained record against the current request
 //! before applying the private row boundary. Legacy V1 JSON selectors fail
 //! with a typed refresh response and cannot resume an authoritative denominator.
+//!
+//! Issue #2860: the retained returned-tail is always the post-slice last
+//! returned row, never the one-over probe (see each backend's shared
+//! page-slicing rule and its continuation mint). Replaying a retained page
+//! reuses its linked successor, and changed tail/bindings fail closed.
 
 use std::collections::BTreeMap;
 
