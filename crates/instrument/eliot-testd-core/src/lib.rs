@@ -1128,6 +1128,11 @@ const META: TableDefinition<&str, &[u8]> = TableDefinition::new("testd_meta_v1")
 /// rewriting job payloads.
 const ADMITTED_IDENTITIES: TableDefinition<&str, &[u8]> =
     TableDefinition::new("testd_admitted_identities_v1");
+/// Durable capability-scoped TestD→Kernel call intents. Store effect outcomes
+/// remain owned by the Kernel issuer; this table records only the consumer's
+/// one-use token binding and bounded status projection.
+const BLOB_PROCESS_STREAM_CALLS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("testd_blob_process_stream_calls_v1");
 
 /// Persistent daemon failures.
 #[derive(Debug, Error)]
@@ -1571,6 +1576,20 @@ pub struct TestJob {
     /// cannot be upgraded from legacy profile labels alone.
     #[serde(default)]
     pub stage_request: Option<InstrumentStageRequest>,
+    /// Exact owner-observed installed tool identities retained for worker-side
+    /// currentness re-observation. Productive submissions require this value.
+    #[serde(default)]
+    pub provider_tool_observation: Option<TestdToolObservation>,
+    /// Secret-safe child environment projection admitted with the process.
+    /// Productive submissions retain it so replay currentness can be rebuilt
+    /// after restart without consulting ambient environment state.
+    #[serde(default)]
+    pub provider_environment_projection: Option<EnvironmentProjection>,
+    /// Kernel-issued opaque grant and bounded one-use operation tokens. The
+    /// TestD daemon carries these references but cannot derive authority from
+    /// them.
+    #[serde(default)]
+    pub blob_process_stream_grant: Option<TestdBlobProcessStreamGrant>,
     /// Identity projection of the consuming process contract.
     pub process: ProcessAdmission,
     /// Canonical roots retained for later execution/reconciliation checks.
@@ -1647,6 +1666,150 @@ pub struct TestJob {
     pub updated_at_ms: u64,
     /// Immutable digest of the submitted contracts and scheduling fields.
     pub payload_digest: String,
+}
+
+/// Opaque stream capability and ordered single-use call references retained
+/// against the durable productive job that received them.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdBlobProcessStreamGrant {
+    pub capability_ref: String,
+    pub binding_sha256: String,
+    pub process_binding_sha256: String,
+    pub fence_sha256: String,
+    pub policy_sha256: String,
+    pub source_set_sha256: String,
+    pub currentness_sha256: String,
+    pub revoked_at_ms: Option<u64>,
+    pub tokens: Vec<TestdBlobProcessStreamTokenRef>,
+}
+
+impl TestdBlobProcessStreamGrant {
+    pub fn validate(&self) -> Result<(), TestdError> {
+        for (field, value) in [
+            ("blob_stream.capability_ref", self.capability_ref.as_str()),
+            ("blob_stream.binding_sha256", self.binding_sha256.as_str()),
+            (
+                "blob_stream.process_binding_sha256",
+                self.process_binding_sha256.as_str(),
+            ),
+            ("blob_stream.fence_sha256", self.fence_sha256.as_str()),
+            ("blob_stream.policy_sha256", self.policy_sha256.as_str()),
+            ("blob_stream.source_set_sha256", self.source_set_sha256.as_str()),
+            ("blob_stream.currentness_sha256", self.currentness_sha256.as_str()),
+        ] {
+            validate_text(value, field)?;
+        }
+        for (field, value) in [
+            ("blob_stream.binding_sha256", self.binding_sha256.as_str()),
+            (
+                "blob_stream.process_binding_sha256",
+                self.process_binding_sha256.as_str(),
+            ),
+            ("blob_stream.fence_sha256", self.fence_sha256.as_str()),
+            ("blob_stream.policy_sha256", self.policy_sha256.as_str()),
+            ("blob_stream.source_set_sha256", self.source_set_sha256.as_str()),
+            ("blob_stream.currentness_sha256", self.currentness_sha256.as_str()),
+        ] {
+            if !is_binding_digest(value) {
+                return Err(TestdError::Invalid {
+                    field,
+                    reason: "must be a lowercase SHA-256 digest",
+                });
+            }
+        }
+        if self.tokens.is_empty() || self.tokens.len() > 8_336 {
+            return Err(TestdError::Invalid {
+                field: "blob_stream.tokens",
+                reason: "grant must contain a bounded non-empty token sequence",
+            });
+        }
+        if self.revoked_at_ms == Some(0) {
+            return Err(TestdError::Invalid {
+                field: "blob_stream.revoked_at_ms",
+                reason: "revocation clock must be non-zero",
+            });
+        }
+        for (index, token) in self.tokens.iter().enumerate() {
+            validate_text(&token.reference, "blob_stream.token.reference")?;
+            if token.ordinal as usize != index {
+                return Err(TestdError::Invalid {
+                    field: "blob_stream.tokens",
+                    reason: "token ordinals must be contiguous from zero",
+                });
+            }
+            if self.tokens[..index]
+                .iter()
+                .any(|previous| previous.reference == token.reference)
+            {
+                return Err(TestdError::Invalid {
+                    field: "blob_stream.tokens",
+                    reason: "token references must be unique within a grant",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdBlobProcessStreamTokenRef {
+    pub reference: String,
+    pub ordinal: u32,
+}
+
+/// Compact Kernel-return projection retained by TestD. It intentionally has
+/// no field for stream chunk bytes or RequestIdentity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum TestdBlobProcessStreamCallOutcome {
+    Completed {
+        response_sha256: String,
+        response_ref: Option<String>,
+    },
+    NotStarted,
+    Unknown,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum TestdBlobProcessStreamCallState {
+    Reserved,
+    Dispatched,
+    Completed(TestdBlobProcessStreamCallOutcome),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdBlobProcessStreamCallRecord {
+    pub job_id: String,
+    pub capability_ref: String,
+    pub token_ref: String,
+    pub ordinal: u32,
+    pub operation_sha256: String,
+    pub state: TestdBlobProcessStreamCallState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TestdBlobProcessStreamReserve {
+    Reserved,
+    Replay(TestdBlobProcessStreamCallOutcome),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TestdBlobProcessStreamResolution {
+    NotReady,
+    Unknown,
+    Completed(TestdBlobProcessStreamCallOutcome),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TestdBlobProcessStreamGrantResolution {
+    NotFound,
+    Revoked,
+    Active(TestdBlobProcessStreamGrant),
 }
 
 /// Immutable owner binding persisted before a productive verifier starts.
@@ -2101,6 +2264,12 @@ pub struct TestdVerifierJobSubmission {
     /// Missing values decode only for legacy rows and fail productive submit.
     #[serde(default)]
     pub stage_request: Option<InstrumentStageRequest>,
+    /// Owner-observed tool bytes and selected toolchain used to derive the
+    /// provider freshness record; this is not inferred by the worker.
+    pub provider_tool_observation: TestdToolObservation,
+    /// Exact secret-safe process environment projection validated by the
+    /// Kernel before admission and retained for worker re-observation.
+    pub provider_environment_projection: EnvironmentProjection,
     pub target_roots: TargetRoots,
     /// Owner-issued layout binding the roots resolve from, when the
     /// submitting owner derived them from a workspace/checkout/class layout.
@@ -2411,6 +2580,19 @@ impl TestdVerifierJobSubmission {
             reason: "productive submission requires the runner-admitted stage",
         })?;
         stage.validate()?;
+        self.provider_tool_observation.validate()?;
+        EnvironmentProjection::new(
+            self.provider_environment_projection.non_secret().clone(),
+            self.provider_environment_projection.secret_refs().to_vec(),
+            self.provider_environment_projection.inheritance(),
+        )
+        .map_err(|error| TestdError::Contract(error.to_string()))?;
+        if stage.provider_freshness.is_none() {
+            return Err(TestdError::Invalid {
+                field: "stage_request.provider_freshness",
+                reason: "productive submission requires owner-issued provider currentness",
+            });
+        }
         if stage.invocation != self.invocation
             || stage.execution != StageExecutionKind::Process
             || stage.adapter != TESTD_PRODUCTIVE_ADAPTER
@@ -3574,6 +3756,77 @@ fn corrupt(reason: &'static str) -> TestdError {
     TestdError::Corrupt(reason.to_owned())
 }
 
+fn validate_blob_call_binding(
+    job_id: &str,
+    capability_ref: &str,
+    token_ref: &str,
+    operation_sha256: &str,
+) -> Result<(), TestdError> {
+    validate_text(job_id, "blob_stream.job_id")?;
+    validate_text(capability_ref, "blob_stream.capability_ref")?;
+    validate_text(token_ref, "blob_stream.token_ref")?;
+    if !is_binding_digest(operation_sha256) {
+        return Err(TestdError::Invalid {
+            field: "blob_stream.operation_sha256",
+            reason: "must be a lowercase SHA-256 digest",
+        });
+    }
+    Ok(())
+}
+
+fn validate_blob_process_stream_outcome(
+    outcome: &TestdBlobProcessStreamCallOutcome,
+) -> Result<(), TestdError> {
+    if let TestdBlobProcessStreamCallOutcome::Completed {
+        response_sha256,
+        response_ref,
+    } = outcome
+    {
+        if !is_binding_digest(response_sha256) {
+            return Err(TestdError::Invalid {
+                field: "blob_stream.response_sha256",
+                reason: "must be a lowercase SHA-256 digest",
+            });
+        }
+        if let Some(response_ref) = response_ref {
+            validate_text(response_ref, "blob_stream.response_ref")?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_blob_process_stream_call_record(
+    record: &TestdBlobProcessStreamCallRecord,
+    job_id: &str,
+    capability_ref: &str,
+    token_ref: &str,
+    ordinal: u32,
+    operation_sha256: &str,
+) -> Result<(), TestdError> {
+    if record.job_id != job_id
+        || record.capability_ref != capability_ref
+        || record.token_ref != token_ref
+        || record.ordinal != ordinal
+        || record.operation_sha256 != operation_sha256
+    {
+        return Err(TestdError::InvalidBinding);
+    }
+    if let TestdBlobProcessStreamCallState::Completed(outcome) = &record.state {
+        validate_blob_process_stream_outcome(outcome)?;
+    }
+    Ok(())
+}
+
+fn blob_process_stream_call_key(
+    job_id: &str,
+    capability_ref: &str,
+    token_ref: &str,
+) -> Result<String, TestdError> {
+    let canonical = eliot_contracts::canonical_json_bytes(&(job_id, capability_ref, token_ref))
+        .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+    Ok(blake3::hash(&canonical).to_hex().to_string())
+}
+
 fn decode_project_sequence(bytes: &[u8]) -> Result<u64, TestdError> {
     serde_json::from_slice(bytes).map_err(|_| corrupt("project sequence metadata is invalid"))
 }
@@ -3711,6 +3964,7 @@ impl TestdStore {
         // stores migrate idempotently without rewriting job payloads.
         let write = db.begin_write().map_err(database)?;
         drop(write.open_table(ADMITTED_IDENTITIES).map_err(database)?);
+        drop(write.open_table(BLOB_PROCESS_STREAM_CALLS).map_err(database)?);
         write.commit().map_err(database)?;
         Ok(Self {
             database: Arc::new(db),
@@ -3731,6 +3985,403 @@ impl TestdStore {
                     .map(Some)
                     .map_err(|error| TestdError::Corrupt(error.to_string()))
             })
+    }
+
+    /// Persists the Kernel-issued stream capability and its ordered one-use
+    /// token table on the original durable job. This method records opaque
+    /// references only; the Kernel remains the sole issuer and validator.
+    pub fn persist_blob_process_stream_grant(
+        &self,
+        job_id: &str,
+        grant: TestdBlobProcessStreamGrant,
+    ) -> Result<TestJob, TestdError> {
+        validate_text(job_id, "job_id")?;
+        grant.validate()?;
+        let write = self.database.begin_write().map_err(database)?;
+        let mut job = {
+            let table = write.open_table(JOBS).map_err(database)?;
+            let value = table
+                .get(job_id)
+                .map_err(database)?
+                .ok_or_else(|| corrupt("job not found"))?;
+            serde_json::from_slice::<TestJob>(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?
+        };
+        let Some(stage_freshness) = job
+            .stage_request
+            .as_ref()
+            .and_then(|stage| stage.provider_freshness.as_ref())
+        else {
+            return Err(TestdError::Invalid {
+                field: "blob_stream.grant",
+                reason: "stream capability requires a currentness-bound productive job",
+            });
+        };
+        let Some(tool_observation) = job.provider_tool_observation.as_ref() else {
+            return Err(TestdError::Invalid {
+                field: "blob_stream.grant",
+                reason: "stream capability requires retained tool observation",
+            });
+        };
+        let Some(environment) = job.provider_environment_projection.as_ref() else {
+            return Err(TestdError::Invalid {
+                field: "blob_stream.grant",
+                reason: "stream capability requires retained process environment",
+            });
+        };
+        let currentness_bytes = canonical_json_bytes(&(
+            stage_freshness,
+            tool_observation,
+            environment,
+        ))
+        .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        if sha256_hex(&currentness_bytes) != grant.currentness_sha256
+            || job.invocation.profile != TESTD_PRODUCTIVE_PROFILE
+        {
+            return Err(TestdError::Invalid {
+                field: "blob_stream.grant",
+                reason: "stream capability requires a currentness-bound productive job",
+            });
+        }
+        if let Some(existing) = &job.blob_process_stream_grant {
+            if existing == &grant {
+                return Ok(job);
+            }
+            return Err(TestdError::JobConflict(job_id.to_owned()));
+        }
+        job.blob_process_stream_grant = Some(grant);
+        let encoded = serde_json::to_vec(&job)
+            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        let mut table = write.open_table(JOBS).map_err(database)?;
+        table
+            .insert(job_id, encoded.as_slice())
+            .map_err(database)?;
+        write.commit().map_err(database)?;
+        Ok(job)
+    }
+
+    /// Resolves an exact opaque capability from the original job row. The
+    /// caller is expected to be the authenticated Kernel issuer; this method
+    /// does not interpret or mint any authority value.
+    pub fn resolve_blob_process_stream_grant(
+        &self,
+        job_id: &str,
+        capability_ref: &str,
+    ) -> Result<TestdBlobProcessStreamGrantResolution, TestdError> {
+        validate_text(job_id, "blob_stream.job_id")?;
+        validate_text(capability_ref, "blob_stream.capability_ref")?;
+        let Some(job) = self.get(job_id)? else {
+            return Ok(TestdBlobProcessStreamGrantResolution::NotFound);
+        };
+        let Some(grant) = job.blob_process_stream_grant else {
+            return Ok(TestdBlobProcessStreamGrantResolution::NotFound);
+        };
+        if grant.capability_ref != capability_ref {
+            return Ok(TestdBlobProcessStreamGrantResolution::NotFound);
+        }
+        grant.validate()?;
+        if grant.revoked_at_ms.is_some() {
+            Ok(TestdBlobProcessStreamGrantResolution::Revoked)
+        } else {
+            Ok(TestdBlobProcessStreamGrantResolution::Active(grant))
+        }
+    }
+
+    /// Permanently revokes the exact retained capability. Repeated revocation
+    /// is idempotent; the first owner clock remains authoritative.
+    pub fn revoke_blob_process_stream_grant(
+        &self,
+        job_id: &str,
+        capability_ref: &str,
+        now_ms: u64,
+    ) -> Result<(), TestdError> {
+        validate_text(job_id, "blob_stream.job_id")?;
+        validate_text(capability_ref, "blob_stream.capability_ref")?;
+        if now_ms == 0 {
+            return Err(TestdError::Invalid {
+                field: "blob_stream.revoked_at_ms",
+                reason: "revocation clock must be non-zero",
+            });
+        }
+        let write = self.database.begin_write().map_err(database)?;
+        let mut job = {
+            let table = write.open_table(JOBS).map_err(database)?;
+            let value = table
+                .get(job_id)
+                .map_err(database)?
+                .ok_or(TestdError::InvalidBinding)?;
+            serde_json::from_slice::<TestJob>(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?
+        };
+        let grant = job
+            .blob_process_stream_grant
+            .as_mut()
+            .filter(|grant| grant.capability_ref == capability_ref)
+            .ok_or(TestdError::InvalidBinding)?;
+        if grant.revoked_at_ms.is_none() {
+            grant.revoked_at_ms = Some(now_ms);
+            let encoded = serde_json::to_vec(&job)
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+            write
+                .open_table(JOBS)
+                .map_err(database)?
+                .insert(job_id, encoded.as_slice())
+                .map_err(database)?;
+            write.commit().map_err(database)?;
+        }
+        Ok(())
+    }
+
+    /// Atomically reserves the next exact capability token before Kernel sends
+    /// an operation to Blob. Replayed or uncertain reservations never authorize
+    /// another Store dispatch.
+    pub fn reserve_blob_process_stream_call(
+        &self,
+        job_id: &str,
+        capability_ref: &str,
+        token_ref: &str,
+        ordinal: u32,
+        operation_sha256: &str,
+    ) -> Result<TestdBlobProcessStreamReserve, TestdError> {
+        validate_blob_call_binding(job_id, capability_ref, token_ref, operation_sha256)?;
+        let write = self.database.begin_write().map_err(database)?;
+        let job = {
+            let table = write.open_table(JOBS).map_err(database)?;
+            let Some(value) = table.get(job_id).map_err(database)? else {
+                return Ok(TestdBlobProcessStreamReserve::Replay(
+                    TestdBlobProcessStreamCallOutcome::Unavailable,
+                ));
+            };
+            serde_json::from_slice::<TestJob>(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?
+        };
+        let Some(grant) = job.blob_process_stream_grant.as_ref() else {
+            return Ok(TestdBlobProcessStreamReserve::Replay(
+                TestdBlobProcessStreamCallOutcome::Unavailable,
+            ));
+        };
+        grant.validate()?;
+        if grant.revoked_at_ms.is_some() {
+            return Ok(TestdBlobProcessStreamReserve::Replay(
+                TestdBlobProcessStreamCallOutcome::Unavailable,
+            ));
+        }
+        if grant.capability_ref != capability_ref
+            || grant.tokens.get(ordinal as usize).is_none_or(|token| {
+                token.ordinal != ordinal || token.reference != token_ref
+            })
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        let key = blob_process_stream_call_key(job_id, capability_ref, token_ref)?;
+        {
+            let table = write
+                .open_table(BLOB_PROCESS_STREAM_CALLS)
+                .map_err(database)?;
+            if let Some(value) = table.get(key.as_str()).map_err(database)? {
+                let existing: TestdBlobProcessStreamCallRecord =
+                    serde_json::from_slice(value.value())
+                        .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+                if existing.job_id != job_id
+                    || existing.capability_ref != capability_ref
+                    || existing.token_ref != token_ref
+                    || existing.ordinal != ordinal
+                    || existing.operation_sha256 != operation_sha256
+                {
+                    return Err(TestdError::InvalidBinding);
+                }
+                return Ok(TestdBlobProcessStreamReserve::Replay(match existing.state {
+                    TestdBlobProcessStreamCallState::Completed(outcome) => outcome,
+                    TestdBlobProcessStreamCallState::Reserved
+                    | TestdBlobProcessStreamCallState::Dispatched => {
+                        TestdBlobProcessStreamCallOutcome::Unknown
+                    }
+                }));
+            }
+        }
+        let mut highest = None;
+        {
+            let table = write
+                .open_table(BLOB_PROCESS_STREAM_CALLS)
+                .map_err(database)?;
+            for item in table.iter().map_err(database)? {
+                let (_, value) = item.map_err(database)?;
+                let row: TestdBlobProcessStreamCallRecord =
+                    serde_json::from_slice(value.value())
+                        .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+                if row.job_id == job_id && row.capability_ref == capability_ref {
+                    highest = Some(highest.map_or(row.ordinal, |value: u32| value.max(row.ordinal)));
+                }
+            }
+        }
+        if ordinal != highest.map_or(0, |value| value.saturating_add(1)) {
+            return Err(TestdError::InvalidBinding);
+        }
+        let record = TestdBlobProcessStreamCallRecord {
+            job_id: job_id.to_owned(),
+            capability_ref: capability_ref.to_owned(),
+            token_ref: token_ref.to_owned(),
+            ordinal,
+            operation_sha256: operation_sha256.to_owned(),
+            state: TestdBlobProcessStreamCallState::Reserved,
+        };
+        let encoded = serde_json::to_vec(&record)
+            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        write
+            .open_table(BLOB_PROCESS_STREAM_CALLS)
+            .map_err(database)?
+            .insert(key.as_str(), encoded.as_slice())
+            .map_err(database)?;
+        write.commit().map_err(database)?;
+        Ok(TestdBlobProcessStreamReserve::Reserved)
+    }
+
+    /// Durably marks that Kernel is about to send the reserved logical call to
+    /// Blob. A restart after this point must reconcile and cannot resend.
+    pub fn mark_blob_process_stream_call_dispatched(
+        &self,
+        job_id: &str,
+        capability_ref: &str,
+        token_ref: &str,
+        ordinal: u32,
+        operation_sha256: &str,
+    ) -> Result<(), TestdError> {
+        self.update_blob_process_stream_call(
+            job_id,
+            capability_ref,
+            token_ref,
+            ordinal,
+            operation_sha256,
+            None,
+        )
+    }
+
+    /// Retains a compact response reference/status after the Kernel exchange.
+    /// Response bytes are never copied into the TestD owner ledger.
+    pub fn complete_blob_process_stream_call(
+        &self,
+        job_id: &str,
+        capability_ref: &str,
+        token_ref: &str,
+        ordinal: u32,
+        operation_sha256: &str,
+        outcome: TestdBlobProcessStreamCallOutcome,
+    ) -> Result<(), TestdError> {
+        validate_blob_process_stream_outcome(&outcome)?;
+        self.update_blob_process_stream_call(
+            job_id,
+            capability_ref,
+            token_ref,
+            ordinal,
+            operation_sha256,
+            Some(outcome),
+        )
+    }
+
+    /// Returns the durable state of an exact logical call. It does not send or
+    /// allocate another token; a dispatched call without a retained result is
+    /// explicitly Unknown.
+    pub fn reconcile_blob_process_stream_call(
+        &self,
+        job_id: &str,
+        capability_ref: &str,
+        token_ref: &str,
+        ordinal: u32,
+        operation_sha256: &str,
+    ) -> Result<TestdBlobProcessStreamResolution, TestdError> {
+        validate_blob_call_binding(job_id, capability_ref, token_ref, operation_sha256)?;
+        let read = self.database.begin_read().map_err(database)?;
+        let table = read
+            .open_table(BLOB_PROCESS_STREAM_CALLS)
+            .map_err(database)?;
+        let key = blob_process_stream_call_key(job_id, capability_ref, token_ref)?;
+        let Some(value) = table.get(key.as_str()).map_err(database)? else {
+            return Ok(TestdBlobProcessStreamResolution::NotReady);
+        };
+        let record: TestdBlobProcessStreamCallRecord =
+            serde_json::from_slice(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        validate_blob_process_stream_call_record(
+            &record,
+            job_id,
+            capability_ref,
+            token_ref,
+            ordinal,
+            operation_sha256,
+        )?;
+        Ok(match record.state {
+            TestdBlobProcessStreamCallState::Reserved => {
+                TestdBlobProcessStreamResolution::Completed(
+                    TestdBlobProcessStreamCallOutcome::NotStarted,
+                )
+            }
+            TestdBlobProcessStreamCallState::Dispatched => {
+                TestdBlobProcessStreamResolution::Unknown
+            }
+            TestdBlobProcessStreamCallState::Completed(outcome) => {
+                TestdBlobProcessStreamResolution::Completed(outcome)
+            }
+        })
+    }
+
+    fn update_blob_process_stream_call(
+        &self,
+        job_id: &str,
+        capability_ref: &str,
+        token_ref: &str,
+        ordinal: u32,
+        operation_sha256: &str,
+        outcome: Option<TestdBlobProcessStreamCallOutcome>,
+    ) -> Result<(), TestdError> {
+        validate_blob_call_binding(job_id, capability_ref, token_ref, operation_sha256)?;
+        let write = self.database.begin_write().map_err(database)?;
+        let key = blob_process_stream_call_key(job_id, capability_ref, token_ref)?;
+        let mut record = {
+            let table = write
+                .open_table(BLOB_PROCESS_STREAM_CALLS)
+                .map_err(database)?;
+            let value = table
+                .get(key.as_str())
+                .map_err(database)?
+                .ok_or(TestdError::InvalidBinding)?;
+            serde_json::from_slice::<TestdBlobProcessStreamCallRecord>(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?
+        };
+        validate_blob_process_stream_call_record(
+            &record,
+            job_id,
+            capability_ref,
+            token_ref,
+            ordinal,
+            operation_sha256,
+        )?;
+        match (record.state.clone(), outcome) {
+            (TestdBlobProcessStreamCallState::Reserved, None) => {
+                record.state = TestdBlobProcessStreamCallState::Dispatched;
+            }
+            (TestdBlobProcessStreamCallState::Dispatched, None) => return Ok(()),
+            (TestdBlobProcessStreamCallState::Reserved, Some(outcome))
+                if matches!(outcome, TestdBlobProcessStreamCallOutcome::NotStarted
+                    | TestdBlobProcessStreamCallOutcome::Unavailable) =>
+            {
+                record.state = TestdBlobProcessStreamCallState::Completed(outcome);
+            }
+            (TestdBlobProcessStreamCallState::Dispatched, Some(outcome)) => {
+                record.state = TestdBlobProcessStreamCallState::Completed(outcome);
+            }
+            (TestdBlobProcessStreamCallState::Completed(existing), Some(outcome))
+                if existing == outcome => return Ok(()),
+            _ => return Err(TestdError::InvalidBinding),
+        }
+        let encoded = serde_json::to_vec(&record)
+            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        write
+            .open_table(BLOB_PROCESS_STREAM_CALLS)
+            .map_err(database)?
+            .insert(key.as_str(), encoded.as_slice())
+            .map_err(database)?;
+        write.commit().map_err(database)?;
+        Ok(())
     }
 
     /// Attaches the exact Governor request and current plan before a
@@ -4359,6 +5010,8 @@ impl TestdStore {
             at_ms,
             None,
             Some(stage_request),
+            None,
+            None,
         )
     }
 
@@ -4386,6 +5039,8 @@ impl TestdStore {
             priority,
             metadata,
             at_ms,
+            None,
+            None,
             None,
             None,
         )
@@ -4421,6 +5076,8 @@ impl TestdStore {
             at_ms,
             None,
             None,
+            None,
+            None,
         )
     }
 
@@ -4442,6 +5099,8 @@ impl TestdStore {
         at_ms: u64,
         identity: Option<RequestIdentity>,
         stage_request: Option<InstrumentStageRequest>,
+        provider_tool_observation: Option<TestdToolObservation>,
+        provider_environment_projection: Option<EnvironmentProjection>,
     ) -> Result<TestJob, TestdError> {
         validate_text(&job_id, "job_id")?;
         validate_text(&project_id, "project_id")?;
@@ -4459,7 +5118,24 @@ impl TestdStore {
                 return Err(TestdError::InvalidBinding);
             }
         }
+        if provider_tool_observation.is_some() != provider_environment_projection.is_some() {
+            return Err(TestdError::InvalidBinding);
+        }
+        if let Some(observation) = &provider_tool_observation {
+            observation.validate()?;
+        }
         let (process, grant) = permit.into_parts();
+        if let Some(environment) = &provider_environment_projection {
+            if process.environment() != environment {
+                return Err(TestdError::InvalidBinding);
+            }
+            EnvironmentProjection::new(
+                environment.non_secret().clone(),
+                environment.secret_refs().to_vec(),
+                environment.inheritance(),
+            )
+            .map_err(|error| TestdError::Contract(error.to_string()))?;
+        }
         process
             .validate()
             .map_err(|error| TestdError::Contract(error.to_string()))?;
@@ -4601,6 +5277,8 @@ impl TestdStore {
             work_envelope.as_ref(),
             fixture_namespace.as_deref(),
             stage_request.as_ref(),
+            provider_tool_observation.as_ref(),
+            provider_environment_projection.as_ref(),
         )?;
         let process = ProcessAdmission::from_request(&process);
         let write = self.database.begin_write().map_err(database)?;
@@ -4699,6 +5377,9 @@ impl TestdStore {
             project_sequence: sequence,
             invocation,
             stage_request,
+            provider_tool_observation,
+            provider_environment_projection,
+            blob_process_stream_grant: None,
             process,
             target_roots,
             target_layout,
@@ -4788,6 +5469,8 @@ impl TestdStore {
             now,
             Some(identity),
             submission.stage_request,
+            Some(submission.provider_tool_observation),
+            Some(submission.provider_environment_projection),
         )
     }
 
@@ -5653,10 +6336,30 @@ fn payload_digest(
     work_envelope: Option<&GovernedWorkEnvelope>,
     fixture_namespace: Option<&str>,
     stage_request: Option<&InstrumentStageRequest>,
+    provider_tool_observation: Option<&TestdToolObservation>,
+    provider_environment_projection: Option<&EnvironmentProjection>,
 ) -> Result<String, TestdError> {
-    // Preserve the pre-stage digest format for legacy submissions, while
-    // binding every new stage identity into its idempotency key.
-    let bytes = if let Some(stage_request) = stage_request {
+    // Preserve existing legacy and nonproductive stage digest formats while
+    // binding the new durable currentness inputs into productive submission.
+    let bytes = if let (Some(stage_request), Some(tool_observation), Some(environment)) = (
+        stage_request,
+        provider_tool_observation,
+        provider_environment_projection,
+    ) {
+        serde_json::to_vec(&(
+            invocation,
+            process,
+            target_roots,
+            priority,
+            job_class,
+            resource_profile,
+            work_envelope,
+            fixture_namespace,
+            stage_request,
+            tool_observation,
+            environment,
+        ))
+    } else if let Some(stage_request) = stage_request {
         serde_json::to_vec(&(
             invocation,
             process,
