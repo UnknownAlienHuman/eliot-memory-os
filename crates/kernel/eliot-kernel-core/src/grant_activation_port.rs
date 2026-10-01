@@ -2837,11 +2837,7 @@ impl GrantActivationPort {
             });
         }
         let closure_anchor = closure_anchor_grant(&request.enumeration)?;
-        validate_complete_owner_closure(
-            boundary,
-            &closure_anchor,
-            &request.enumeration,
-        )?;
+        validate_complete_owner_closure(boundary, &closure_anchor, &request.enumeration)?;
         check_revision(
             &ledger,
             &request.enumeration.authority_root_ref,
@@ -3141,11 +3137,7 @@ impl GrantActivationPort {
             ));
         }
         let closure_anchor = closure_anchor_grant(&request.enumeration)?;
-        validate_complete_owner_closure(
-            boundary,
-            &closure_anchor,
-            &request.enumeration,
-        )?;
+        validate_complete_owner_closure(boundary, &closure_anchor, &request.enumeration)?;
         // I12.20 revocation fan-out (issue #1732): propagate durable
         // revocation into recovery before any durable write. The re-presented
         // affected set must carry no revoked support: the live revoked
@@ -9355,15 +9347,12 @@ pub(crate) mod tests {
         let epoch = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 7)?;
         let binding = restart_test_binding(&epoch)?;
         let complete = chain_enumeration(&epoch, &binding, 5, Vec::new())?;
-        let fixture_dir =
-            OwnedTestDirectory::create("grant-closure-activation-incomplete-owner")?;
+        let fixture_dir = OwnedTestDirectory::create("grant-closure-activation-incomplete-owner")?;
         let path = fixture_dir.path().join("closure.redb");
         let store = Arc::new(eliot_ors::RedbRecoveryStore::open(&path)?);
         let hydration_source = Arc::new(TestClosureHydration::new(complete.clone()));
-        let port = GrantActivationPort::with_durable_root_grant(
-            hydration_source.clone(),
-            store.clone(),
-        );
+        let port =
+            GrantActivationPort::with_durable_root_grant(hydration_source.clone(), store.clone());
 
         // The owner enumeration is structurally valid and agrees with what
         // GovernorClosureSource's declaration-backed enumeration returns
@@ -9397,8 +9386,8 @@ pub(crate) mod tests {
             })
         ));
 
-        let root_subject =
-            eliot_ors::OperationIdentity::new("grant-chain-root").map_err(KernelError::RecoveryState)?;
+        let root_subject = eliot_ors::OperationIdentity::new("grant-chain-root")
+            .map_err(KernelError::RecoveryState)?;
         let closure_operation = eliot_ors::OperationIdentity::new(&request.operation_id)?;
         assert!(store.load_capability_grant(&root_subject)?.is_none());
         assert!(store.load_grant_closure(&closure_operation)?.is_none());
