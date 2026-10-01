@@ -832,46 +832,7 @@ fn refuse_clean_marker_without_drain_termination_evidence(
             )));
         }
     }
-    if let Some(kernel) = snapshot.kernel.as_ref() {
-        if kernel.fence.activation_id != activation.activation_id
-            || kernel.fence.activation_generation != activation.fence.activation_generation
-            || kernel.activation_identity != activation.activation_id
-        {
-            return Err(HostError::RecoveryRequired(
-                "Host clean marker covers a foreign Kernel contour; reconcile the current generation's Kernel record before claiming this generation clean"
-                    .to_owned(),
-            ));
-        }
-        match &kernel.prior_kernel_disposition {
-            PriorKernelDisposition::NoPriorKernel => {}
-            PriorKernelDisposition::Terminated(source) => {
-                if source.activation_identity != activation.activation_id
-                    || source.host != activation.fence.host
-                    || !source.history_complete
-                    || !source.job_empty
-                    || !source.root_reaped
-                    || !source.process.state.is_terminal()
-                {
-                    return Err(HostError::RecoveryRequired(
-                        "Host Kernel termination evidence is not the exact fully-terminated prior Kernel of this activation (identity, complete history, empty Job, reaped root and terminal process); re-observe termination through the prior-Kernel owner before the clean marker"
-                            .to_owned(),
-                    ));
-                }
-            }
-            PriorKernelDisposition::Running(_) => {
-                return Err(HostError::RecoveryRequired(
-                    "Host journal still records a running Kernel for this contour; a clean marker is never issued inside a still-running Kernel; terminate and re-observe the Kernel before the clean marker"
-                        .to_owned(),
-                ));
-            }
-            PriorKernelDisposition::Unknown(_) => {
-                return Err(HostError::RecoveryRequired(
-                    "Host Kernel termination outcome is unknown; an unknown outcome stays fenced and never becomes a clean stop; reconcile the Kernel termination before the clean marker"
-                        .to_owned(),
-                ));
-            }
-        }
-    }
+    refuse_foreign_or_unterminated_kernel_before_clean_marker(snapshot, activation)?;
     let open_rebinds: Vec<PlatformHandle> = snapshot
         .store_rebinds
         .iter()
@@ -919,6 +880,68 @@ fn refuse_clean_marker_without_drain_termination_evidence(
             bounded_residual_list(&unstopped)
         )));
     }
+    refuse_unsettled_delivery_before_clean_marker(snapshot)?;
+    Ok(())
+}
+
+/// Refuses the clean marker while delivery obligations stay unsettled:
+/// reactive-context queue without terminal outcomes, a still-Pending durable
+/// cutover intent, or backup preparations without a settled disposition.
+/// Refuses the clean marker on a foreign, running, or unknown Kernel contour.
+///
+/// The Kernel record must belong to this activation (identity + generation),
+/// and a terminated prior Kernel must carry the exact fully-terminated
+/// evidence (identity, complete history, empty Job, reaped root, terminal
+/// process). Genesis contours (`NoPriorKernel`) pass; anything else fails
+/// closed with the exact residual.
+fn refuse_foreign_or_unterminated_kernel_before_clean_marker(
+    snapshot: &HostState,
+    activation: &EliotActivationRecord,
+) -> Result<(), HostError> {
+    if let Some(kernel) = snapshot.kernel.as_ref() {
+        if kernel.fence.activation_id != activation.activation_id
+            || kernel.fence.activation_generation != activation.fence.activation_generation
+            || kernel.activation_identity != activation.activation_id
+        {
+            return Err(HostError::RecoveryRequired(
+                "Host clean marker covers a foreign Kernel contour; reconcile the current generation's Kernel record before claiming this generation clean"
+                    .to_owned(),
+            ));
+        }
+        match &kernel.prior_kernel_disposition {
+            PriorKernelDisposition::NoPriorKernel => {}
+            PriorKernelDisposition::Terminated(source) => {
+                if source.activation_identity != activation.activation_id
+                    || source.host != activation.fence.host
+                    || !source.history_complete
+                    || !source.job_empty
+                    || !source.root_reaped
+                    || !source.process.state.is_terminal()
+                {
+                    return Err(HostError::RecoveryRequired(
+                        "Host Kernel termination evidence is not the exact fully-terminated prior Kernel of this activation (identity, complete history, empty Job, reaped root and terminal process); re-observe termination through the prior-Kernel owner before the clean marker"
+                            .to_owned(),
+                    ));
+                }
+            }
+            PriorKernelDisposition::Running(_) => {
+                return Err(HostError::RecoveryRequired(
+                    "Host journal still records a running Kernel for this contour; a clean marker is never issued inside a still-running Kernel; terminate and re-observe the Kernel before the clean marker"
+                        .to_owned(),
+                ));
+            }
+            PriorKernelDisposition::Unknown(_) => {
+                return Err(HostError::RecoveryRequired(
+                    "Host Kernel termination outcome is unknown; an unknown outcome stays fenced and never becomes a clean stop; reconcile the Kernel termination before the clean marker"
+                        .to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn refuse_unsettled_delivery_before_clean_marker(snapshot: &HostState) -> Result<(), HostError> {
     if let Some(queue) = snapshot.reactive_context.as_ref()
         && !queue.clean_for_drain()
     {
