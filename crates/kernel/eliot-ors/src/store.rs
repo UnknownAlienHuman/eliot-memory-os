@@ -10192,10 +10192,7 @@ impl RedbRecoveryStore {
         unpersisted_result_commitment_sha256: &str,
         owner_receipt: &crate::HostRequestRetainedLineage,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
-        Self::validate_possible_effect_request(
-            target,
-            unpersisted_result_commitment_sha256,
-        )?;
+        Self::validate_possible_effect_request(target, unpersisted_result_commitment_sha256)?;
         let key = format!("{}::{}", operation_id.as_str(), request_digest);
         let write = self.database.begin_write().map_err(storage)?;
         let existing: Option<crate::HostRequestRecord> = {
@@ -10238,8 +10235,11 @@ impl RedbRecoveryStore {
             return Ok(Some(next));
         }
         next.state = next.state.transition_to(target)?;
-        let reference =
-            Self::build_possible_effect_reference(&next, unpersisted_result_commitment_sha256, owner_receipt)?;
+        let reference = Self::build_possible_effect_reference(
+            &next,
+            unpersisted_result_commitment_sha256,
+            owner_receipt,
+        )?;
         reference.validate_for(&next)?;
         next.validate()?;
         Self::write_possible_effect_row(&write, key.as_str(), &next, &reference)?;
@@ -10343,9 +10343,7 @@ impl RedbRecoveryStore {
     ) -> Result<(), OrsError> {
         {
             let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
-            table
-                .insert(key, encode(next)?.as_str())
-                .map_err(storage)?;
+            table.insert(key, encode(next)?.as_str()).map_err(storage)?;
         }
         {
             let mut table = write

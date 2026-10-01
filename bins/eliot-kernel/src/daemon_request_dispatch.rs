@@ -3716,7 +3716,11 @@ impl KernelComposition {
                         Ok(host_request_route::LocalReadSubmitDisposition::StaleAttempt(
                             observation,
                         )) => Ok(Self::stale_attempt_daemon_response(&observation)),
-                        Ok(host_request_route::LocalReadSubmitDisposition::PossibleEffectRetained(_)) => {
+                        Ok(
+                            host_request_route::LocalReadSubmitDisposition::PossibleEffectRetained(
+                                _,
+                            ),
+                        ) => {
                             // Issue #2565 AUD14: unreachable on this path and
                             // refused rather than answered. The variant is
                             // constructed in exactly one place —
@@ -4010,7 +4014,11 @@ impl KernelComposition {
                         Ok(host_request_route::LocalReadSubmitDisposition::StaleAttempt(
                             observation,
                         )) => Ok(Self::stale_attempt_daemon_response(&observation)),
-                        Ok(host_request_route::LocalReadSubmitDisposition::PossibleEffectRetained(_)) => {
+                        Ok(
+                            host_request_route::LocalReadSubmitDisposition::PossibleEffectRetained(
+                                _,
+                            ),
+                        ) => {
                             // Issue #2565 AUD14: the campaign-packet leg shares
                             // `submit_claimed_result` with local read and is not
                             // the observe lane, so it can never produce the
@@ -4089,7 +4097,11 @@ impl KernelComposition {
                         Ok(host_request_route::LocalReadSubmitDisposition::StaleAttempt(
                             observation,
                         )) => Ok(Self::stale_attempt_daemon_response(&observation)),
-                        Ok(host_request_route::LocalReadSubmitDisposition::PossibleEffectRetained(_)) => {
+                        Ok(
+                            host_request_route::LocalReadSubmitDisposition::PossibleEffectRetained(
+                                _,
+                            ),
+                        ) => {
                             // Issue #2565 AUD14: `submit_task_controller_result`
                             // has its own body in `daemon_claim_queue.rs` and
                             // only ever yields `Persisted` or `StaleAttempt`, so
@@ -4166,7 +4178,11 @@ impl KernelComposition {
                         Ok(host_request_route::LocalReadSubmitDisposition::StaleAttempt(
                             observation,
                         )) => Ok(Self::stale_attempt_daemon_response(&observation)),
-                        Ok(host_request_route::LocalReadSubmitDisposition::PossibleEffectRetained(_)) => {
+                        Ok(
+                            host_request_route::LocalReadSubmitDisposition::PossibleEffectRetained(
+                                _,
+                            ),
+                        ) => {
                             // Issue #2565 AUD14: `submit_finish_result` has its
                             // own body in `daemon_claim_queue.rs` and only ever
                             // yields `Persisted` or `StaleAttempt`, so this arm
