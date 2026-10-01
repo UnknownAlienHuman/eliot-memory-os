@@ -549,7 +549,7 @@ public static class UserAutomationScheduleMirror
             throw new UserAutomationScheduleContractException(
                 "Invalid",
                 OwnerText("Invalid", "schedule.occurrence_key.encoding"),
-                $"re-normalize the schedule under {OperatorScheduleContract.NORMALIZED_OCCURRENCE_ENCODING}; this Operator admits that contract version only");
+                $"use normalize_schedule for a new draft, or migrate_legacy_schedule for an existing immutable revision, to obtain the supported {OperatorScheduleContract.NORMALIZED_OCCURRENCE_ENCODING} owner result; the Operator does not rewrite the revision in place");
         }
         if (!string.Equals(fields[1], timezone, StringComparison.Ordinal))
         {
@@ -819,7 +819,7 @@ public static class UserAutomationScheduleMirror
         new(
             "LegacyScheduleEncoding",
             OwnerText("LegacyScheduleEncoding", "schedule.next_occurrences"),
-            "this occurrence uses a retired encoding; this Operator has no owner re-normalization or migration route, so preserve the legacy revision and obtain a current owner-normalized result before creating a NEW revision; an immutable revision is never rewritten in place");
+            "this occurrence uses a retired encoding; preserve the immutable predecessor and use migrate_legacy_schedule to obtain a current Kernel owner result before creating a NEW revision; an immutable revision is never rewritten in place");
 
     private static bool IsCanonicalCivilWallClock(string value)
     {
@@ -2954,9 +2954,9 @@ public static class UserAutomationOutcomeClassifier
         explanation = code switch
         {
             "unsupported_contract_version" =>
-                $"Action: obtain an owner-normalized result under {OperatorScheduleContract.NORMALIZED_OCCURRENCE_ENCODING} and submit a new immutable revision; this Operator build exposes no re-normalization route, and the existing revision must not be rewritten.",
+                $"Action: use normalize_schedule for a new draft, or migrate_legacy_schedule to replace an existing immutable revision, then submit the Kernel owner result as a new revision under {OperatorScheduleContract.NORMALIZED_OCCURRENCE_ENCODING}; the existing revision is never rewritten in place.",
             "legacy_encoding" =>
-                "Action: preserve the legacy immutable revision and obtain a current owner-normalized result before submitting a NEW revision; this Operator build exposes no migration route and never rewrites a revision in place.",
+                "Action: preserve the legacy immutable revision and use migrate_legacy_schedule to obtain a current Kernel owner result for a NEW revision; this Operator never rewrites a revision in place.",
             "stale_normalization_revision" =>
                 "Action: obtain a fresh owner normalization for the current effect-relevant schedule fields, then submit a new immutable revision.",
             "invalid_or_moved_receipt" =>
