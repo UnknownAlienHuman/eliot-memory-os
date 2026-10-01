@@ -515,20 +515,7 @@ impl KernelTransportOwner {
                 // session they were issued under; Finish uses the revision as
                 // a selector check against the Kernel-retained current task
                 // binding, never as authority supplied by the draft.
-                let task_revision = b
-                    .task_revision
-                    .parse::<u64>()
-                    .ok()
-                    .filter(|revision| *revision > 0)
-                    .ok_or_else(provider_failure)?;
-                self.activated_task_binding = Some(crate::ActivatedTaskBinding {
-                    principal_id: b.principal_id.clone(),
-                    session_id: b.session_id.clone(),
-                    task_id: b.task_id.clone(),
-                    work_scope_id: b.work_scope_id.clone(),
-                    task_revision,
-                    state_fence: b.state_fence.clone(),
-                });
+                self.activated_task_binding = Some(retained_task_binding(&b)?);
                 let principal_id =
                     PrincipalId::new(b.principal_id).map_err(|_| provider_failure())?;
                 let session_id = SessionId::new(b.session_id).map_err(|_| provider_failure())?;
@@ -564,4 +551,23 @@ impl KernelTransportOwner {
             }
         }
     }
+}
+
+fn retained_task_binding(
+    binding: &eliot_protocol::AgentBridgeAuthenticatedBinding,
+) -> Result<crate::ActivatedTaskBinding, ProviderFailure> {
+    let task_revision = binding
+        .task_revision
+        .parse::<u64>()
+        .ok()
+        .filter(|revision| *revision > 0)
+        .ok_or_else(provider_failure)?;
+    Ok(crate::ActivatedTaskBinding {
+        principal_id: binding.principal_id.clone(),
+        session_id: binding.session_id.clone(),
+        task_id: binding.task_id.clone(),
+        work_scope_id: binding.work_scope_id.clone(),
+        task_revision,
+        state_fence: binding.state_fence.clone(),
+    })
 }

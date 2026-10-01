@@ -250,7 +250,7 @@ struct ActivatedTaskBinding {
     /// Current task revision selected at activation time.
     task_revision: u64,
     /// Activation's generation fence, without the semantic task revision.
-    state_fence: StateFence,
+    state_fence: eliot_protocol::AgentBridgeActivationFence,
 }
 
 /// Disposition of the one retained consumed-frontier offer (issue #2800).

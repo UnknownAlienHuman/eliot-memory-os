@@ -1473,7 +1473,7 @@ fn build_invocation_envelope(
                 .state_fence
                 .authority_epoch
                 .is_same_authority(&facts.state_fence.authority_epoch)
-            || binding.state_fence.resource_generation != facts.state_fence.resource_generation
+            || binding.state_fence.generation != facts.state_fence.resource_generation
         {
             return Err(request_failure());
         }

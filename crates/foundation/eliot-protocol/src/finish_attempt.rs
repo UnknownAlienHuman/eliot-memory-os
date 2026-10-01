@@ -54,9 +54,9 @@ pub struct FinishAttempt {
     pub principal_id: String,
     /// Owner-selected task retained by Kernel activation.
     pub task_id: String,
-    /// Owner-selected WorkScope retained by Kernel activation.
+    /// Owner-selected `WorkScope` retained by Kernel activation.
     pub work_scope_id: String,
-    /// Current TaskContract revision retained by Kernel activation.
+    /// Current `TaskContract` revision retained by Kernel activation.
     pub task_revision: u64,
     /// Semantic task fence, retained separately from the transport Session
     /// fence. Its epoch and generation must agree with the admitted envelope;
@@ -107,7 +107,7 @@ impl FinishAttempt {
             || self
                 .semantic_state_fence
                 .task_revision
-                .map(|revision| revision.value())
+                .map(eliot_contracts::TaskRevision::value)
                 != Some(self.task_revision)
         {
             return Err(ProtocolError::InvalidField {

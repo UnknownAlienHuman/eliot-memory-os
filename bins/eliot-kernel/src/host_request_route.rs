@@ -2444,8 +2444,8 @@ impl KernelComposition {
             // transport Session fence, which remains epoch+generation only.
             let task_named =
                 envelope.identity.task_id.as_deref() == Some(retained.task_id.as_str());
-            let scope_named = envelope.identity.work_scope_id.as_deref()
-                == Some(retained.work_scope_id.as_str());
+            let scope_named =
+                envelope.identity.work_scope_id.as_deref() == Some(retained.work_scope_id.as_str());
             if !task_named || !scope_named || envelope.state_fence.task_revision.is_some() {
                 return Err(TransportError::SessionFenced);
             }
@@ -2494,8 +2494,7 @@ impl KernelComposition {
             || retained.activation_generation != envelope.state_fence.resource_generation
             || envelope.identity.session_id.as_deref() != Some(retained.session_id.as_str())
             || envelope.identity.task_id.as_deref() != Some(retained.task_id.as_str())
-            || envelope.identity.work_scope_id.as_deref()
-                != Some(retained.work_scope_id.as_str())
+            || envelope.identity.work_scope_id.as_deref() != Some(retained.work_scope_id.as_str())
         {
             return Err(TransportError::SessionFenced);
         }
@@ -3332,10 +3331,10 @@ impl KernelComposition {
             }
             if task_relative {
                 let finish = envelope.identity.capability == "eliot.finish";
-                let task_scope_match =
-                    envelope.identity.task_id.as_deref() == Some(retained.task_id.as_str())
-                        && envelope.identity.work_scope_id.as_deref()
-                            == Some(retained.work_scope_id.as_str());
+                let task_scope_match = envelope.identity.task_id.as_deref()
+                    == Some(retained.task_id.as_str())
+                    && envelope.identity.work_scope_id.as_deref()
+                        == Some(retained.work_scope_id.as_str());
                 let revision_match = if finish {
                     // Finish compares expected_task_revision from its retained
                     // strict draft to the owner tuple when issuing the attempt.
@@ -3374,6 +3373,14 @@ impl KernelComposition {
         {
             return Ok(false);
         }
+        self.application_session_live_for_claim(claimed, envelope)
+    }
+
+    fn application_session_live_for_claim(
+        &self,
+        claimed: &str,
+        envelope: &HostRequestEnvelope,
+    ) -> Result<bool, TransportError> {
         let now = unix_ms();
         let sessions = self
             .agent_application_sessions
