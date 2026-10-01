@@ -792,11 +792,28 @@ impl InstallationTransaction {
                 state: InstallationEffectProgressState::Pending,
             })
             .collect();
-        // Unit tests historically use constructor-produced synthetic plans.
-        // Give those fixtures the exact root binding already present in the
-        // validated launch descriptor; production constructors leave the
-        // field unset until the published-selection planner binds it below.
-        let profile_governed_roots = if cfg!(test) {
+        // The fixture seam documents a VALIDATED projection, and the durable
+        // wire carries `profile_governed_roots` non-optionally, so a fixture
+        // built through `new_unbound_for_fixture` must bind the exact root
+        // binding already present in the validated launch descriptor. Without
+        // it the fixture's own serialized form is rejected by its own
+        // validator with a missing field. That rejection is observed from a
+        // CONSUMER crate, where `cfg!(test)` is false, so binding the fixture
+        // seam cannot be gated on `cfg!(test)` alone. The bound reads that
+        // already-validated launch value; it invents nothing.
+        //
+        // A bound construction proof still leaves the field unset in a
+        // non-test build: production plans must come from the in-crate
+        // generation planner, which retains the sealed construction proof and
+        // binds the field there after published selection. The `cfg!(test)`
+        // arm only preserves this crate's own unit tests, which drive the bound
+        // constructor directly with constructor-produced synthetic plans
+        // instead of going through the planner.
+        let profile_governed_roots = if matches!(
+            planner_construction_proof,
+            PlannerConstructionProof::Unbound
+        ) || cfg!(test)
+        {
             Some(
                 candidate_manifest
                     .runtime_launch

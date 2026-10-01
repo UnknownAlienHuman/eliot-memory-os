@@ -1001,10 +1001,13 @@ fn installation_cli_rejects_exact_diagnostic_transaction_import() {
         ])
         .output()
         .expect("run plan command");
+    // The CLI writes its installation diagnostic to stdout, not stderr, so
+    // the failure message must read the stream the product actually writes or
+    // it prints a bare `plan failed:` with no diagnostic.
     assert!(
         plan.status.success(),
         "plan failed: {}",
-        String::from_utf8_lossy(&plan.stderr)
+        String::from_utf8_lossy(&plan.stdout)
     );
     let planned: Value = serde_json::from_slice(&plan.stdout).expect("plan JSON");
     assert_eq!(
