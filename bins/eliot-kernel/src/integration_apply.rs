@@ -230,21 +230,6 @@ pub struct IntegrationSemanticConflict {
     pub observed_at_unix_ms: u64,
 }
 
-/// Closed apply outcome recorded on an [`OutcomeReceipt`]. The receipt
-/// records exactly one of these; terminal candidate transitions mirror it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum IntegrationApplyOutcomeKind {
-    /// Applied through the governed bridge; post-apply verifier passed.
-    Applied,
-    /// Pre-apply verifier failed; nothing applied, candidate intact.
-    PreApplyVerifierFailed,
-    /// Post-apply verifier failed; declared rollback/compensation recorded.
-    PostApplyVerifierFailed,
-    /// Semantic conflict held as durable conflict work, never auto-merged.
-    ConflictHeld,
-}
-
 /// Post-apply receipt for one governed bridge application. Recorded for
 /// every apply attempt that passes lease and revalidation binding, including
 /// verifier failures and semantic conflicts, so the attempt, the preserved
