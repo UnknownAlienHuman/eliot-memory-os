@@ -28711,8 +28711,7 @@ impl RedbRecoveryStore {
             .retain_staging_problem_for(&operation_id, &token, &original, None)
             .map_err(|recorder| Self::staging_problem_record_failed(&token, original, recorder))?;
         if let Some(StagedEnvelopeRecoveryEntry {
-            reservation:
-                StagedEnvelopeReservationBinding::Unresolved { problem, .. },
+            reservation: StagedEnvelopeReservationBinding::Unresolved { problem, .. },
             ..
         }) = records.get_mut(index)
         {
