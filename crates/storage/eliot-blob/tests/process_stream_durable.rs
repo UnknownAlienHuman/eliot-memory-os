@@ -20,7 +20,9 @@ mod windows_durable_owner {
         BlobCapacityFailure, BlobCapacityIdentity, BlobCapacityRecovery, BlobCapacityStage,
         BlobCasCapability, BlobCasProviderResult, BlobCasRequest, BlobError, BlobHash, BlobId,
         BlobPolicyBinding, BlobProcessStreamSourceBinding,
-        BlobProcessStreamStageAppendRequest, BlobProcessStreamStageOpenRequest,
+        BLOB_PROCESS_STREAM_STAGE_MAX_CHUNKS, BLOB_PROCESS_STREAM_STAGE_MAX_PREVIEW_BYTES,
+        BlobProcessStreamStageAppendRequest, BlobProcessStreamStageFinalizeRequest,
+        BlobProcessStreamStageOpenRequest,
         BlobProcessStreamStageResumeRequest, BlobReceiptContext, BlobStoreClient, ObjectResidencyKey,
         RetentionClass, VersionedContentDigest,
     };
@@ -171,7 +173,6 @@ mod windows_durable_owner {
             &format!("{session_id}-stage"),
             generation,
         );
-        let read_context = context("READ", &format!("{session_id}-read"), generation);
         let root_lease = owner
             .lease_for_request(stage_context.request.clone())
             .expect("root lease from authenticated request binding");
@@ -202,7 +203,6 @@ mod windows_durable_owner {
             terminal_id: format!("terminal-{session_id}"),
             open_request_sha256: sha256(format!("open-{session_id}").as_bytes()),
             stage_context,
-            read_context,
             root_lease,
             policy,
             residency,
@@ -216,6 +216,7 @@ mod windows_durable_owner {
             max_bytes,
             max_chunk_bytes,
             max_chunks: 4,
+            max_preview_bytes: 1024,
         }
     }
 
@@ -309,6 +310,25 @@ mod windows_durable_owner {
         }
     }
 
+    fn finalize(
+        session: &BlobProcessStreamStageOpenRequest,
+        final_sequence: u64,
+        bytes: &[u8],
+    ) -> BlobProcessStreamStageFinalizeRequest {
+        BlobProcessStreamStageFinalizeRequest {
+            session: BlobProcessStreamStageResumeRequest {
+                session_id: session.session_id.clone(),
+                source_id: session.source_id.clone(),
+                terminal_id: session.terminal_id.clone(),
+                open_request_sha256: session.open_request_sha256.clone(),
+            },
+            terminal_command_sha256: sha256(b"complete-source-finalize"),
+            final_sequence,
+            final_offset: bytes.len() as u64,
+            admitted_sha256: sha256(bytes),
+        }
+    }
+
     fn isolated_root() -> PathBuf {
         let suffix = ROOT_COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
@@ -386,8 +406,8 @@ mod windows_durable_owner {
             .expect("open stdout");
         let stderr_open = block_on(store.open_process_stream_stage(stderr.clone()))
             .expect("open stderr");
-        assert_eq!(stdout_open.bytes, b"");
-        assert_eq!(stderr_open.bytes, b"");
+        assert_eq!(stdout_open.preview_bytes, b"");
+        assert_eq!(stderr_open.preview_bytes, b"");
 
         // Cancellation before a future is polled has no owner effect. A
         // skipped sequence is likewise refused without advancing the durable
@@ -402,7 +422,7 @@ mod windows_durable_owner {
                 open_request_sha256: stdout.open_request_sha256.clone(),
             }))
             .expect("prefix after pre-poll cancellation")
-            .bytes,
+            .preview_bytes,
             b""
         );
         assert!(matches!(
@@ -458,7 +478,7 @@ mod windows_durable_owner {
         );
         let reopened = block_on(store.open_process_stream_stage(stdout_reopened))
             .expect("reopen exact stdout identity after restart");
-        assert_eq!(reopened.bytes, b"out");
+        assert_eq!(reopened.preview_bytes, b"out");
         assert_eq!(reopened.next_sequence, 2);
         let mut changed_operation = open_request(
             &owner,
@@ -502,7 +522,7 @@ mod windows_durable_owner {
             },
         ))
         .expect("recover stdout after restart");
-        assert_eq!(stdout_readback.bytes, b"out");
+        assert_eq!(stdout_readback.preview_bytes, b"out");
         assert_eq!(stdout_readback.next_sequence, 2);
         let stderr_readback = block_on(store.resume_process_stream_stage(
             BlobProcessStreamStageResumeRequest {
@@ -513,7 +533,7 @@ mod windows_durable_owner {
             },
         ))
         .expect("recover stderr after restart");
-        assert_eq!(stderr_readback.bytes, b"err");
+        assert_eq!(stderr_readback.preview_bytes, b"err");
         let after_restart = append(&stdout, 2, 3, b"put");
         // Model a process crash after the durable commit and before the caller
         // observes its acknowledgement: discard the first result, restart the
@@ -544,7 +564,7 @@ mod windows_durable_owner {
             },
         ))
         .expect("read exact append frontier");
-        assert_eq!(after_append.bytes, b"output");
+        assert_eq!(after_append.preview_bytes, b"output");
         let wrong_session = block_on(store.resume_process_stream_stage(
             BlobProcessStreamStageResumeRequest {
                 session_id: stdout.session_id.clone(),
@@ -558,6 +578,203 @@ mod windows_durable_owner {
         assert_ne!(stdout_readback.session.root_lease.lease_id, owner.lease_for_request(
             stdout.stage_context.request.clone()
         ).expect("new owner lease").lease_id);
+        drop(store);
+        drop(owner);
+        std::fs::remove_dir_all(root).expect("remove isolated Blob root");
+    }
+
+    #[test]
+    fn finalization_promotes_bounded_source_larger_than_queue_and_preview_after_restart() {
+        let root = isolated_root();
+        let generation = windows_root_generation(&root);
+        let owner = BlobRootOwner::claim(
+            root.to_string_lossy().into_owned(),
+            "process-stream-finalize-owner",
+            std::process::id(),
+        )
+        .expect("exclusive root claim");
+        let mut session = open_request(
+            &owner,
+            "session-finalize-bounded",
+            "source-finalize-bounded",
+            "STDOUT",
+            generation,
+            128 * 1024,
+            8 * 1024,
+        );
+        session.max_chunks = 64;
+        session.max_preview_bytes = 4 * 1024;
+        let bytes: Vec<u8> = (0..128 * 1024)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let store = service(&root, &owner, &session);
+        block_on(store.open_process_stream_stage(session.clone())).expect("open durable stage");
+        for (sequence, chunk) in bytes.chunks(8 * 1024).enumerate() {
+            let offset = u64::try_from(sequence * 8 * 1024).expect("bounded offset");
+            block_on(store.append_process_stream_stage(append(
+                &session,
+                u64::try_from(sequence).expect("bounded sequence"),
+                offset,
+                chunk,
+            )))
+            .expect("persist bounded append before acknowledgement");
+        }
+        let finalize_request = finalize(&session, 16, &bytes);
+        let ready = block_on(store.finalize_process_stream_stage(finalize_request.clone()))
+            .expect("owner promotes the exact durable source");
+        assert_eq!(ready.plaintext_sha256(), sha256(&bytes));
+        assert_eq!(ready.plaintext_length(), bytes.len() as u64);
+        let first_receipt_id = ready.receipt().identity.receipt_id.to_string();
+        drop(store);
+        drop(owner);
+
+        // 128 KiB exceeds the executor's 64 KiB in-flight queue ceiling and
+        // the owner's 4 KiB preview. Restart recovery must still promote the
+        // exact durable append prefix under the original Stage operation.
+        let owner = BlobRootOwner::claim(
+            root.to_string_lossy().into_owned(),
+            "process-stream-finalize-owner",
+            std::process::id(),
+        )
+        .expect("reclaim after finalized source");
+        let mut reopened = open_request(
+            &owner,
+            "session-finalize-bounded",
+            "source-finalize-bounded",
+            "STDOUT",
+            generation,
+            128 * 1024,
+            8 * 1024,
+        );
+        reopened.max_chunks = 64;
+        reopened.max_preview_bytes = 4 * 1024;
+        let store = service(&root, &owner, &reopened);
+        let snapshot = block_on(store.open_process_stream_stage(reopened.clone()))
+            .expect("recover the original stage after restart");
+        assert_eq!(snapshot.preview_bytes, bytes[..4 * 1024]);
+        assert_eq!(snapshot.next_sequence, 16);
+        assert_eq!(snapshot.sha256, sha256(&bytes));
+        let recovered = block_on(store.finalize_process_stream_stage(finalize_request))
+            .expect("same finalization identity resolves after restart");
+        assert_eq!(recovered.plaintext_sha256(), sha256(&bytes));
+        assert_eq!(recovered.plaintext_length(), bytes.len() as u64);
+        assert_eq!(
+            recovered.receipt().identity.receipt_id.to_string(),
+            first_receipt_id
+        );
+        drop(store);
+        drop(owner);
+        std::fs::remove_dir_all(root).expect("remove isolated Blob root");
+    }
+
+    #[test]
+    fn process_stream_stage_rejects_unbounded_chunk_and_preview_limits() {
+        let root = isolated_root();
+        let generation = windows_root_generation(&root);
+        let owner = BlobRootOwner::claim(
+            root.to_string_lossy().into_owned(),
+            "process-stream-bounds-owner",
+            std::process::id(),
+        )
+        .expect("exclusive root claim");
+        let mut too_many_chunks = open_request(
+            &owner,
+            "session-too-many-chunks",
+            "source-too-many-chunks",
+            "STDOUT",
+            generation,
+            32 * 1024 * 1024,
+            1024,
+        );
+        too_many_chunks.max_chunks = BLOB_PROCESS_STREAM_STAGE_MAX_CHUNKS + 1;
+        assert!(too_many_chunks.validate().is_err());
+
+        let mut oversized_preview = open_request(
+            &owner,
+            "session-oversized-preview",
+            "source-oversized-preview",
+            "STDOUT",
+            generation,
+            32 * 1024 * 1024,
+            1024,
+        );
+        oversized_preview.max_preview_bytes = BLOB_PROCESS_STREAM_STAGE_MAX_PREVIEW_BYTES + 1;
+        assert!(oversized_preview.validate().is_err());
+        drop(owner);
+        std::fs::remove_dir_all(root).expect("remove isolated Blob root");
+    }
+
+    #[test]
+    fn zero_byte_source_can_be_promoted_under_its_exact_stage_identity() {
+        let root = isolated_root();
+        let generation = windows_root_generation(&root);
+        let owner = BlobRootOwner::claim(
+            root.to_string_lossy().into_owned(),
+            "process-stream-empty-owner",
+            std::process::id(),
+        )
+        .expect("exclusive root claim");
+        let session = open_request(
+            &owner,
+            "session-empty-source",
+            "source-empty-source",
+            "STDOUT",
+            generation,
+            32,
+            8,
+        );
+        let store = service(&root, &owner, &session);
+        block_on(store.open_process_stream_stage(session.clone())).expect("open empty stage");
+        let ready = block_on(store.finalize_process_stream_stage(finalize(&session, 0, b"")))
+            .expect("promote exact zero-byte source");
+        assert_eq!(ready.plaintext_sha256(), sha256(b""));
+        assert_eq!(ready.plaintext_length(), 0);
+        drop(store);
+        drop(owner);
+        std::fs::remove_dir_all(root).expect("remove isolated Blob root");
+    }
+
+    #[test]
+    fn omitted_prefix_is_refused_before_it_can_reserve_finalization_identity() {
+        let root = isolated_root();
+        let generation = windows_root_generation(&root);
+        let owner = BlobRootOwner::claim(
+            root.to_string_lossy().into_owned(),
+            "process-stream-omission-owner",
+            std::process::id(),
+        )
+        .expect("exclusive root claim");
+        let session = open_request(
+            &owner,
+            "session-omission",
+            "source-omission",
+            "STDOUT",
+            generation,
+            32,
+            8,
+        );
+        let store = service(&root, &owner, &session);
+        block_on(store.open_process_stream_stage(session.clone())).expect("open stage");
+        block_on(store.append_process_stream_stage(append(&session, 0, 0, b"prefix")))
+            .expect("persist prefix");
+        assert!(matches!(
+            block_on(store.finalize_process_stream_stage(finalize(
+                &session,
+                2,
+                b"prefix-suffix",
+            ))),
+            Err(BlobError::MetadataPayloadMismatch)
+        ));
+        block_on(store.append_process_stream_stage(append(&session, 1, 6, b"-suffix")))
+            .expect("append the previously omitted suffix");
+        let ready = block_on(store.finalize_process_stream_stage(finalize(
+            &session,
+            2,
+            b"prefix-suffix",
+        )))
+        .expect("valid complete frontier remains promotable");
+        assert_eq!(ready.plaintext_sha256(), sha256(b"prefix-suffix"));
+        assert_eq!(ready.plaintext_length(), 13);
         drop(store);
         drop(owner);
         std::fs::remove_dir_all(root).expect("remove isolated Blob root");
@@ -641,7 +858,7 @@ mod windows_durable_owner {
             },
         ))
         .expect("readback reconciled append");
-        assert_eq!(recovered.bytes, b"durable-prefix");
+        assert_eq!(recovered.preview_bytes, b"durable-prefix");
         drop(store);
         drop(owner);
         std::fs::remove_dir_all(root).expect("remove isolated Blob root");

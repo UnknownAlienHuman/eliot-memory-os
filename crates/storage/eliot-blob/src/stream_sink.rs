@@ -46,7 +46,7 @@
 //! a session owns exactly one [`FinalizeReservation`] whose phase is
 //! `Reserved` (validated, nothing handed to the blob owner),
 //! `StageOutcomeUnknown` (the exact stage request may or may not have taken
-//! effect) or `ReadbackPending` (the owner returned a real
+//! effect) or `ReadyPending` (the owner returned a real
 //! [`BlobReadyReceipt`], the readback is outstanding). The reservation is
 //! bookkeeping bound to the same session, the same terminal command digest
 //! and the same blob stage operation identity — it is not a second external
@@ -145,14 +145,13 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use serde::Serialize;
 
+use eliot_contracts::canonical_json_bytes;
 use eliot_blob_api::{
-    BlobCapacityCause, BlobCapacityEffect, BlobCapacityStage, BlobCasFailure, BlobError, BlobHash,
-    BlobPolicyBinding, BlobProcessStreamSourceBinding, BlobProcessStreamStageTerminal,
-    BlobReadRequest, BlobReadyReceipt, BlobReceiptContext, BlobRootLease,
-    BlobStageRecovery, BlobStageRecoveryRequest, BlobStageRequest, BlobStoreClient,
-    BlobProcessStreamStageAppendRequest, BlobProcessStreamStageOpenRequest,
-    BlobProcessStreamStageSnapshot, BlobProcessStreamStageResumeRequest,
-    ObjectResidencyKey, VersionedContentDigest,
+    BlobCapacityCause, BlobCapacityEffect, BlobCapacityStage, BlobCasFailure, BlobError,
+    BlobPolicyBinding, BlobProcessStreamStageAppendRequest, BlobProcessStreamStageFinalizeRequest,
+    BlobProcessStreamStageOpenRequest, BlobProcessStreamStageResumeRequest,
+    BlobProcessStreamStageSnapshot, BlobProcessStreamStageTerminal, BlobReadyReceipt,
+    BlobReceiptContext, BlobRootLease, BlobStoreClient, ObjectResidencyKey,
 };
 use eliot_process::{
     DurableProcessStreamSource,
@@ -360,7 +359,7 @@ const U64_SERIALIZED_BYTES: u64 = 8;
 pub struct BlobStreamSinkStoreBinding {
     root_lease: BlobRootLease,
     stage_context: BlobReceiptContext,
-    read_context: BlobReceiptContext,
+    read_context: Option<BlobReceiptContext>,
     policy: BlobPolicyBinding,
     residency: ObjectResidencyKey,
 }
@@ -370,15 +369,17 @@ impl BlobStreamSinkStoreBinding {
     pub fn new(
         root_lease: BlobRootLease,
         stage_context: BlobReceiptContext,
-        read_context: BlobReceiptContext,
+        read_context: Option<BlobReceiptContext>,
         policy: BlobPolicyBinding,
         residency: ObjectResidencyKey,
     ) -> Result<Self, BlobError> {
         root_lease.validate()?;
         root_lease.validate_context(&stage_context)?;
-        root_lease.validate_context(&read_context)?;
         stage_context.validate_for(EffectClass::ReversibleMutation)?;
-        read_context.validate_for(EffectClass::Read)?;
+        if let Some(read_context) = &read_context {
+            root_lease.validate_context(read_context)?;
+            read_context.validate_for(EffectClass::Read)?;
+        }
         policy.validate_for_residency(&residency)?;
         Ok(Self {
             root_lease,
@@ -403,8 +404,8 @@ impl BlobStreamSinkStoreBinding {
 
     /// The bound read operation/request identity.
     #[must_use]
-    pub const fn read_context(&self) -> &BlobReceiptContext {
-        &self.read_context
+    pub const fn read_context(&self) -> Option<&BlobReceiptContext> {
+        self.read_context.as_ref()
     }
 
     /// The bound blob policy binding.
@@ -422,10 +423,6 @@ impl BlobStreamSinkStoreBinding {
 
 struct SinkState {
     session: Option<ProcessStreamSinkSession>,
-    /// Admitted-but-not-yet-published plaintext. It is handed to the publish
-    /// ticket as a CLONE and stays in the session until `record_locked` drops
-    /// it, so planning or dropping a publish never destroys the only copy.
-    staged: Vec<u8>,
     /// The exact publication outcome proven for this session, once a terminal
     /// recorded it. `None` means no terminal has landed yet.
     publication: Option<BlobStreamPublication>,
@@ -471,7 +468,7 @@ struct SinkState {
 #[derive(Clone, Debug)]
 struct TransportDigest {
     algorithm: ProcessStreamDigestAlgorithm,
-    state: Sha256,
+    sha256: String,
     byte_count: u64,
 }
 
@@ -649,7 +646,7 @@ enum FinalizePhase {
     /// evidence settles it.
     StageOutcomeUnknown,
     /// The owner returned a real ready receipt; the readback is outstanding.
-    ReadbackPending { ready: Box<BlobReadyReceipt> },
+    ReadyPending { ready: Box<BlobReadyReceipt> },
 }
 
 impl FinalizeReservation {
@@ -660,7 +657,7 @@ impl FinalizeReservation {
 
     fn ready(&self) -> Option<&BlobReadyReceipt> {
         match &self.phase {
-            FinalizePhase::ReadbackPending { ready } => Some(ready.as_ref()),
+            FinalizePhase::ReadyPending { ready } => Some(ready.as_ref()),
             FinalizePhase::Reserved | FinalizePhase::StageOutcomeUnknown => None,
         }
     }
@@ -668,16 +665,12 @@ impl FinalizeReservation {
 
 /// What the next durable publication step must be for one reserved command.
 enum PublishStep {
-    /// Hand the exact admitted bytes to the one blob owner under the bound
-    /// stage operation identity. The bytes are a clone of what the session
-    /// still retains, so a dropped publication future stays recoverable.
-    Stage { staged: Vec<u8> },
-    /// The previous stage handoff may have taken effect. Query only the same
-    /// owner operation; `Unknown` never falls through to another stage call.
-    Recover { staged: Vec<u8> },
-    /// The owner already returned a real ready receipt; resume the readback
-    /// only. `stage` must not be called again for this command.
-    Readback { ready: Box<BlobReadyReceipt> },
+    /// Ask the Blob owner to promote only its exact durable append prefix.
+    /// The owner persists and recovers this terminal identity independently.
+    Promote,
+    /// A real owner capability already returned; resume only terminal
+    /// persistence for the same command.
+    Ready { ready: Box<BlobReadyReceipt> },
 }
 
 struct PublishTicket {
@@ -737,7 +730,7 @@ impl TransportDigest {
     fn new() -> Self {
         Self {
             algorithm: ProcessStreamDigestAlgorithm::Sha256,
-            state: Sha256::new(),
+            sha256: sha256_hex(&[]),
             byte_count: 0,
         }
     }
@@ -750,14 +743,18 @@ impl TransportDigest {
     }
 
     fn absorb(&mut self, bytes: &[u8]) {
-        self.state.update(bytes);
         self.byte_count = self
             .byte_count
             .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
     }
 
+    fn retain_owner_prefix(&mut self, sha256: String, byte_count: u64) {
+        self.sha256 = sha256;
+        self.byte_count = byte_count;
+    }
+
     fn digest(&self) -> String {
-        format!("{:x}", self.state.clone().finalize())
+        self.sha256.clone()
     }
 
     fn measure(&self) -> BlobStreamTransportMeasure {
@@ -795,18 +792,18 @@ impl BoundedPreviewDigest {
     /// covers exactly the retained bytes the preview ends up representing, and
     /// the accumulated preview cost never exceeds the session ceiling.
     fn absorb(&mut self, bytes: &[u8], ceiling: u64) {
-        self.state.update(bytes);
-        let admitted = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        if self.truncated_at_ceiling {
-            return;
+        let remaining = usize::try_from(ceiling)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(self.retained.len());
+        let retained = bytes.len().min(remaining);
+        if retained > 0 {
+            self.state.update(&bytes[..retained]);
+            self.retained.extend_from_slice(&bytes[..retained]);
+            self.retained_bytes = self.retained.len() as u64;
         }
-        if self.retained_bytes.saturating_add(admitted) > ceiling {
+        if retained < bytes.len() {
             self.truncated_at_ceiling = true;
-            self.retained = Vec::new();
-            return;
         }
-        self.retained.extend_from_slice(bytes);
-        self.retained_bytes = self.retained_bytes.saturating_add(admitted);
     }
 
     fn digest(&self) -> String {
@@ -818,7 +815,6 @@ impl SinkState {
     fn new() -> Self {
         Self {
             session: None,
-            staged: Vec::new(),
             publication: None,
             transport: TransportDigest::new(),
             preview: BoundedPreviewDigest::new(),
@@ -872,7 +868,6 @@ impl SinkState {
     fn absorb_admitted(&mut self, bytes: &[u8], preview_ceiling: u64) {
         self.transport.absorb(bytes);
         self.preview.absorb(bytes, preview_ceiling);
-        self.staged.extend_from_slice(bytes);
     }
 
     /// The exact transport measure over the admitted physical bytes.
@@ -1023,31 +1018,49 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn stage_session_request(
+    /// Builds the exact owner Stage Open record for an already admitted
+    /// process-stream session. Store recovery uses this to compare a caller's
+    /// exact retry bytes against the original durable Stage identity before
+    /// it resolves an uncertain append. This derives no authority: the
+    /// contexts come only from this adapter's Store-created binding and the
+    /// already validated session.
+    pub fn durable_stage_open_request(
         &self,
         session: &ProcessStreamSinkSession,
     ) -> Result<BlobProcessStreamStageOpenRequest, ProcessStreamSinkError> {
-        let process_binding_json = serde_json::to_string(session.binding()).map_err(|error| {
+        let process_binding_bytes = canonical_json_bytes(session.binding()).map_err(|error| {
             ProcessStreamSinkError::Serialization {
                 field: "process_binding",
                 reason: error.to_string(),
             }
         })?;
-        let policy_json = serde_json::to_string(session.policy()).map_err(|error| {
+        let process_binding_json = String::from_utf8(process_binding_bytes.clone()).map_err(|error| {
+            ProcessStreamSinkError::Serialization {
+                field: "process_binding",
+                reason: error.to_string(),
+            }
+        })?;
+        let policy_bytes = canonical_json_bytes(session.policy()).map_err(|error| {
+            ProcessStreamSinkError::Serialization {
+                field: "process_policy",
+                reason: error.to_string(),
+            }
+        })?;
+        let policy_json = String::from_utf8(policy_bytes.clone()).map_err(|error| {
             ProcessStreamSinkError::Serialization {
                 field: "process_policy",
                 reason: error.to_string(),
             }
         })?;
         let process_source_binding = BlobProcessStreamSourceBinding {
-            process_binding_sha256: sha256_hex(process_binding_json.as_bytes()),
+            process_binding_sha256: sha256_hex(&process_binding_bytes),
             process_binding_json,
             stream_kind: match session.stream() {
                 ProcessStreamKind::Stdout => "STDOUT",
                 ProcessStreamKind::Stderr => "STDERR",
             }
             .to_owned(),
-            policy_sha256: sha256_hex(policy_json.as_bytes()),
+            policy_sha256: sha256_hex(&policy_bytes),
             policy_json,
         };
         let limits = session.limits();
@@ -1057,7 +1070,6 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             terminal_id: session.terminal_id().as_str().to_owned(),
             open_request_sha256: session.open_request_sha256().to_owned(),
             stage_context: self.binding.stage_context().clone(),
-            read_context: self.binding.read_context().clone(),
             root_lease: self.binding.root_lease().clone(),
             policy: self.binding.policy().clone(),
             residency: self.binding.residency().clone(),
@@ -1065,6 +1077,7 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             max_bytes: limits.max_total_admitted_bytes(),
             max_chunk_bytes: limits.max_chunk_bytes(),
             max_chunks: limits.max_chunks(),
+            max_preview_bytes: limits.max_preview_bytes(),
         };
         request.validate().map_err(|error| map_blob_error(&error))?;
         Ok(request)
@@ -1074,6 +1087,7 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         state: &mut SinkState,
         session: ProcessStreamSinkSession,
         snapshot: BlobProcessStreamStageSnapshot,
+        ready_receipt: Option<BlobReadyReceipt>,
     ) -> Result<(), ProcessStreamSinkError> {
         snapshot.validate().map_err(|error| map_blob_error(&error))?;
         if snapshot.session.session_id != session.session_id().as_str()
@@ -1109,18 +1123,52 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
                 });
             }
         }
+        match (&terminal, &ready_receipt, snapshot.terminal.as_ref()) {
+            (Some(terminal), Some(ready), Some(record))
+                if terminal.state() == ProcessStreamSinkState::CompleteSource =>
+            {
+                ready.validate().map_err(|error| map_blob_error(&error))?;
+                let persisted_json = record
+                    .ready_receipt_json
+                    .as_deref()
+                    .ok_or(ProcessStreamSinkError::ProviderUnavailable)?;
+                let persisted: serde_json::Value = serde_json::from_str(persisted_json)
+                    .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+                let actual = serde_json::to_value(ready)
+                    .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+                if persisted != actual {
+                    return Err(ProcessStreamSinkError::EvidenceInvariant {
+                        reason: "durable Ready receipt differs from the Blob owner result".to_owned(),
+                    });
+                }
+                let source = terminal
+                    .evidence()
+                    .source()
+                    .ok_or(ProcessStreamSinkError::ProviderUnavailable)?;
+                if source.sha256() != ready.plaintext_sha256()
+                    || source.byte_length() != ready.plaintext_length()
+                    || source.ready_receipt_ref()
+                        != ready.receipt().identity.receipt_id.as_str()
+                {
+                    return Err(ProcessStreamSinkError::EvidenceInvariant {
+                        reason: "durable Blob receipt differs from process terminal".to_owned(),
+                    });
+                }
+            }
+            (Some(terminal), None, Some(_))
+                if terminal.state() != ProcessStreamSinkState::CompleteSource => {}
+            (None, None, None) => {}
+            _ => {
+                return Err(ProcessStreamSinkError::EvidenceInvariant {
+                    reason: "terminal and owner Ready capability do not form one exact outcome".to_owned(),
+                });
+            }
+        }
         let preview_ceiling = session.limits().max_preview_bytes();
         state.bind_measure_revisions(&session);
+        state.transport.retain_owner_prefix(snapshot.sha256.clone(), snapshot.next_offset);
+        state.preview.absorb(&snapshot.preview_bytes, preview_ceiling);
         state.session = Some(session);
-        state.staged = if terminal.is_some() {
-            Vec::new()
-        } else {
-            snapshot.bytes.clone()
-        };
-        if terminal.is_none() {
-            state.transport.absorb(&snapshot.bytes);
-            state.preview.absorb(&snapshot.bytes, preview_ceiling);
-        }
         state.admitted_chunks = snapshot
             .append_receipts
             .into_iter()
@@ -1137,25 +1185,16 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         state.persistence_queue.queued_bytes = 0;
         state.pending_append = None;
         if let Some(terminal) = terminal {
-            let ready = snapshot
-                .terminal
-                .as_ref()
-                .and_then(|record| record.ready_receipt.clone());
+            let ready = ready_receipt;
             let publication = if let Some(ready) = &ready {
                 let source = terminal
                     .evidence()
                     .source()
                     .ok_or(ProcessStreamSinkError::ProviderUnavailable)?;
-                if source.sha256() != ready.plaintext_sha256()
-                    || source.byte_length() != ready.plaintext_length()
-                    || source.ready_receipt_ref()
-                        != ready.receipt().identity.receipt_id.as_str()
-                {
-                    return Err(ProcessStreamSinkError::EvidenceInvariant {
-                        reason: "durable Blob receipt differs from process terminal".to_owned(),
-                    });
-                }
-                Self::publication_of(source.sha256(), ready)?
+                Self::publication_of(source.sha256(), ready, &state.measures_for(
+                    terminal.evidence().preview(),
+                    terminal.evidence().transformation(),
+                )?)?
             } else {
                 BlobStreamPublication::Unavailable {
                     reason: match terminal.state() {
@@ -1171,7 +1210,7 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             };
             if terminal.state() == ProcessStreamSinkState::CompleteSource && ready.is_none() {
                 return Err(ProcessStreamSinkError::EvidenceInvariant {
-                    reason: "complete durable terminal has no owner ready receipt".to_owned(),
+                    reason: "complete durable terminal has no owner ready capability".to_owned(),
                 });
             }
             state.ready_receipt = ready;
@@ -1194,6 +1233,20 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
                 reason: error.to_string(),
             }
         })?;
+        let ready_receipt_json = ready_receipt
+            .map(|ready| {
+                let bytes = eliot_contracts::canonical_json_bytes(ready).map_err(|error| {
+                    ProcessStreamSinkError::Serialization {
+                        field: "blob_ready_receipt",
+                        reason: error.to_string(),
+                    }
+                })?;
+                String::from_utf8(bytes).map_err(|error| ProcessStreamSinkError::Serialization {
+                    field: "blob_ready_receipt",
+                    reason: error.to_string(),
+                })
+            })
+            .transpose()?;
         let terminal_record = BlobProcessStreamStageTerminal {
             terminal_json: String::from_utf8(terminal_bytes.clone()).map_err(|error| {
                 ProcessStreamSinkError::Serialization {
@@ -1202,7 +1255,10 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
                 }
             })?,
             terminal_json_sha256: sha256_hex(&terminal_bytes),
-            ready_receipt: ready_receipt.cloned(),
+            ready_receipt_sha256: ready_receipt_json
+                .as_ref()
+                .map(|json| sha256_hex(json.as_bytes())),
+            ready_receipt_json,
         };
         self.store
             .record_process_stream_stage_terminal(
@@ -1281,15 +1337,6 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         Box::pin(async move { result })
     }
 
-    /// Returns the admitted prefix slice when the coordinates are
-    /// representable, without panicking or casting.
-    fn admitted_prefix(state: &SinkState, offset: u64, length: u64) -> Option<&[u8]> {
-        let start = usize::try_from(offset).ok()?;
-        let length = usize::try_from(length).ok()?;
-        let end = start.checked_add(length)?;
-        state.staged.get(start..end)
-    }
-
     fn check_session(
         state: &SinkState,
         session: &ProcessStreamSinkSession,
@@ -1355,7 +1402,9 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
                 reason: "preview retained length does not fit the platform".to_owned(),
             }
         })?;
-        if retained > state.staged.len() || preview.bytes() != &state.staged[..retained] {
+        if retained > state.preview.retained.len()
+            || preview.bytes() != &state.preview.retained[..retained]
+        {
             return Err(ProcessStreamSinkError::EvidenceInvariant {
                 reason: "transport preview does not match admitted bytes".to_owned(),
             });
@@ -1512,6 +1561,7 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         state: &mut SinkState,
         session: &ProcessStreamSinkSession,
         request: &ProcessStreamSinkAppend,
+        prefix_sha256: &str,
     ) -> Result<ProcessStreamSinkAppendDisposition, ProcessStreamSinkError> {
         if state.finalization.is_some() {
             return Err(ProcessStreamSinkError::AppendAfterFinalizing);
@@ -1532,8 +1582,6 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
                         && chunk.offset == request.offset()
                         && chunk.length == request.byte_length()
                         && chunk.sha256 == request.sha256()
-                        && Self::admitted_prefix(state, chunk.offset, chunk.length)
-                            == Some(request.bytes())
                 });
             if matches_admitted_chunk {
                 return Ok(ProcessStreamSinkAppendDisposition::Replayed {
@@ -1582,6 +1630,7 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         state.absorb_admitted(request.bytes(), limits.max_preview_bytes());
         state.next_sequence = state.next_sequence.saturating_add(1);
         state.next_offset = state.next_offset.saturating_add(request.byte_length());
+        state.transport.retain_owner_prefix(prefix_sha256.to_owned(), state.next_offset);
         Ok(ProcessStreamSinkAppendDisposition::Accepted {
             next_sequence: state.next_sequence,
             next_offset: state.next_offset,
@@ -1708,110 +1757,6 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         Self::record_locked(state, identity, publication, terminal)
     }
 
-    /// Builds the one exact stage request for these bytes under the bound root
-    /// lease, policy and stage operation identity. Deriving it twice from the
-    /// same bytes reproduces the same canonical request, so an exact replay is
-    /// an owner-side resolution of one operation, not a new command.
-    fn stage_request(&self, staged: &[u8]) -> Result<BlobStageRequest, ProcessStreamSinkError> {
-        let template = self.binding.residency();
-        let digest = BlobHash::new(blake3::hash(staged).to_hex().to_string())
-            .map_err(|error| map_blob_error(&error))?;
-        let residency = ObjectResidencyKey {
-            scope_domain_id: template.scope_domain_id.clone(),
-            access_domain_id: template.access_domain_id.clone(),
-            confidentiality_domain_id: template.confidentiality_domain_id.clone(),
-            encryption_key_domain_id: template.encryption_key_domain_id.clone(),
-            retention_domain_id: template.retention_domain_id.clone(),
-            erasure_domain_id: template.erasure_domain_id.clone(),
-            content_digest: VersionedContentDigest {
-                algorithm: template.content_digest.algorithm.clone(),
-                version: template.content_digest.version,
-                digest,
-            },
-        };
-        let request = BlobStageRequest {
-            context: self.binding.stage_context().clone(),
-            root_lease: self.binding.root_lease().clone(),
-            bytes: staged.to_vec(),
-            policy: self.binding.policy().clone(),
-            residency,
-        };
-        request.validate().map_err(|error| map_blob_error(&error))?;
-        Ok(request)
-    }
-
-    fn stage_recovery_request(
-        &self,
-        session: &ProcessStreamSinkSession,
-        request: &ProcessStreamSinkFinalizeRequest,
-        identity: &ProcessStreamSinkTerminalCommandIdentity,
-        stage: &BlobStageRequest,
-    ) -> Result<BlobStageRecoveryRequest, ProcessStreamSinkError> {
-        if request.command_identity()? != *identity {
-            return Err(ProcessStreamSinkError::TerminalIdentityConflict);
-        }
-        let process_binding_json = serde_json::to_string(session.binding()).map_err(|error| {
-            ProcessStreamSinkError::Serialization {
-                field: "process_binding",
-                reason: error.to_string(),
-            }
-        })?;
-        let policy_json = serde_json::to_string(session.policy()).map_err(|error| {
-            ProcessStreamSinkError::Serialization {
-                field: "process_policy",
-                reason: error.to_string(),
-            }
-        })?;
-        let process_source_binding = BlobProcessStreamSourceBinding {
-            process_binding_sha256: sha256_hex(process_binding_json.as_bytes()),
-            process_binding_json,
-            stream_kind: match session.stream() {
-                ProcessStreamKind::Stdout => "STDOUT",
-                ProcessStreamKind::Stderr => "STDERR",
-            }
-            .to_owned(),
-            policy_sha256: sha256_hex(policy_json.as_bytes()),
-            policy_json,
-        };
-        Ok(BlobStageRecoveryRequest {
-            session_id: session.session_id().as_str().to_owned(),
-            terminal_id: identity.terminal_id().as_str().to_owned(),
-            open_request_sha256: session.open_request_sha256().to_owned(),
-            terminal_command_sha256: identity.request_sha256().to_owned(),
-            stage_context: self.binding.stage_context().clone(),
-            read_context: self.binding.read_context().clone(),
-            root_lease: self.binding.root_lease().clone(),
-            expected_content_hash: stage.residency.content_digest.digest.clone(),
-            expected_plaintext_sha256: sha256_hex(&stage.bytes),
-            expected_plaintext_length: stage.bytes.len() as u64,
-            policy: self.binding.policy().clone(),
-            residency: stage.residency.clone(),
-            process_source_binding,
-            expected_ready_receipt_id: None,
-        })
-    }
-
-    /// Hands the exact bytes to the owner only after its durable intent lookup
-    /// proves this exact session/finalize operation is NotStarted, or resolves
-    /// an existing ready result. The local phase is marked before the await so
-    /// a dropped future stays unknown.
-    async fn stage_once(
-        &self,
-        session: &ProcessStreamSinkSession,
-        request: &ProcessStreamSinkFinalizeRequest,
-        identity: &ProcessStreamSinkTerminalCommandIdentity,
-        incarnation: u64,
-        staged: &[u8],
-    ) -> Result<BlobReadyReceipt, ProcessStreamSinkError> {
-        let stage = self.stage_request(staged)?;
-        let recovery = self.stage_recovery_request(session, request, identity, &stage)?;
-        self.mark_stage_handoff(identity, incarnation)?;
-        match self.store.stage_with_recovery(stage, recovery).await {
-            Ok(ready) => self.retain_ready(identity, incarnation, staged, ready),
-            Err(error) => Err(map_blob_error(&error)),
-        }
-    }
-
     /// Records that the exact stage request may or may not have taken effect.
     fn mark_stage_handoff(
         &self,
@@ -1830,46 +1775,6 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         }
         reservation.phase = FinalizePhase::StageOutcomeUnknown;
         Ok(())
-    }
-
-    /// Retains the real ready receipt and its exact byte commitment
-    /// immediately after `stage` returned, before any further await. The
-    /// staged plaintext is then dropped: the receipt carries the same
-    /// commitment, so a resumed readback needs no second plaintext copy.
-    fn retain_ready(
-        &self,
-        identity: &ProcessStreamSinkTerminalCommandIdentity,
-        incarnation: u64,
-        staged: &[u8],
-        ready: BlobReadyReceipt,
-    ) -> Result<BlobReadyReceipt, ProcessStreamSinkError> {
-        ready.validate().map_err(|error| map_blob_error(&error))?;
-        let staged_length =
-            u64::try_from(staged.len()).map_err(|_| ProcessStreamSinkError::EvidenceInvariant {
-                reason: "staged length does not fit the session counters".to_owned(),
-            })?;
-        if ready.plaintext_sha256() != sha256_hex(staged)
-            || ready.plaintext_length() != staged_length
-        {
-            return Err(ProcessStreamSinkError::EvidenceInvariant {
-                reason: "blob ready receipt does not describe the staged bytes".to_owned(),
-            });
-        }
-        let mut state = self.lock();
-        let Some(reservation) = state.finalization.as_mut() else {
-            return Err(ProcessStreamSinkError::TerminalIdentityConflict);
-        };
-        if reservation.identity != *identity || reservation.incarnation != incarnation {
-            return Err(ProcessStreamSinkError::TerminalIdentityConflict);
-        }
-        if matches!(reservation.phase, FinalizePhase::Reserved) {
-            return Err(ProcessStreamSinkError::TerminalIdentityConflict);
-        }
-        reservation.phase = FinalizePhase::ReadbackPending {
-            ready: Box::new(ready.clone()),
-        };
-        state.staged = Vec::new();
-        Ok(ready)
     }
 
     /// Retains a ready receipt recovered from the owner's durable operation
@@ -1902,82 +1807,10 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         {
             return Err(ProcessStreamSinkError::TerminalIdentityConflict);
         }
-        reservation.phase = FinalizePhase::ReadbackPending {
+        reservation.phase = FinalizePhase::ReadyPending {
             ready: Box::new(ready.clone()),
         };
-        state.staged.clear();
         Ok(ready)
-    }
-
-    async fn recover_stage_once(
-        &self,
-        session: &ProcessStreamSinkSession,
-        request: &ProcessStreamSinkFinalizeRequest,
-        identity: &ProcessStreamSinkTerminalCommandIdentity,
-        incarnation: u64,
-        staged: &[u8],
-    ) -> Result<BlobReadyReceipt, ProcessStreamSinkError> {
-        let stage = self.stage_request(staged)?;
-        let recovery = self.stage_recovery_request(session, request, identity, &stage)?;
-        let ready = match self.store.recover_stage(recovery.clone()).await {
-            Ok(BlobStageRecovery::Ready(ready)) => *ready,
-            Ok(BlobStageRecovery::NotStarted) => self
-                .store
-                .stage_with_recovery(stage, recovery)
-                .await
-                .map_err(|error| map_blob_error(&error))?,
-            Ok(BlobStageRecovery::Unknown) => {
-                return Err(ProcessStreamSinkError::PossibleEffectUnknown {
-                    operation: "blob-stage",
-                });
-            }
-            Err(error) => return Err(map_blob_error(&error)),
-        };
-        self.retain_recovered_ready(
-            identity,
-            incarnation,
-            ready,
-            &sha256_hex(staged),
-            staged.len() as u64,
-        )
-    }
-
-    /// Reads the retained object back and proves it is the very object the
-    /// ready receipt commits to. A zero-byte complete source verifies as a
-    /// real immutable object with the same exact rules.
-    async fn verify_readback(
-        &self,
-        ready: &BlobReadyReceipt,
-    ) -> Result<(), ProcessStreamSinkError> {
-        let chunk = self
-            .store
-            .read(BlobReadRequest {
-                context: self.binding.read_context().clone(),
-                root_lease: self.binding.root_lease().clone(),
-                locator: ready.locator().clone(),
-                expected_metadata_sha256: ready.metadata_sha256().to_owned(),
-                expected_ready_receipt_id: ready.receipt().identity.receipt_id.to_string(),
-                max_bytes: ready.plaintext_length().max(1),
-            })
-            .await
-            .map_err(|error| map_blob_error(&error))?;
-        chunk.validate().map_err(|error| map_blob_error(&error))?;
-        let readback_length = u64::try_from(chunk.bytes().len()).map_err(|_| {
-            ProcessStreamSinkError::EvidenceInvariant {
-                reason: "readback length does not fit the session counters".to_owned(),
-            }
-        })?;
-        // The retained receipt was already proven against the admitted bytes,
-        // so verifying the readback against the same commitment closes the
-        // chain without retaining another plaintext copy.
-        if readback_length != ready.plaintext_length()
-            || sha256_hex(chunk.bytes()) != ready.plaintext_sha256()
-        {
-            return Err(ProcessStreamSinkError::EvidenceInvariant {
-                reason: "blob readback does not match the retained ready receipt".to_owned(),
-            });
-        }
-        Ok(())
     }
 
     fn complete_source(
@@ -2111,17 +1944,10 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             let resumed_admitted_sha256 = reservation.admitted_sha256.clone();
             let resumed_ready = reservation.ready().cloned();
             let step = match resumed_ready {
-                Some(ready) => PublishStep::Readback {
+                Some(ready) => PublishStep::Ready {
                     ready: Box::new(ready),
                 },
-                None if matches!(reservation.phase, FinalizePhase::Reserved) => {
-                    PublishStep::Stage {
-                        staged: state.staged.clone(),
-                    }
-                }
-                None => PublishStep::Recover {
-                    staged: state.staged.clone(),
-                },
+                None => PublishStep::Promote,
             };
             return Ok(FinalizePlan::Publish(Box::new(PublishTicket {
                 session: existing,
@@ -2247,17 +2073,7 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             // publication recorded after the readback describes the same
             // digests this planning pass measured.
             measures,
-            // The staged plaintext is handed to the ticket as the one live
-            // full-plaintext buffer. It is CLONED, not moved: the reservation
-            // below retains only the admitted digest, never the bytes, so a
-            // publish future dropped before `stage` completes would otherwise
-            // destroy the only durable copy and leave a reservation that can
-            // never be satisfied. The session keeps the bytes until
-            // `record_locked` drops them, so a dropped future stays
-            // recoverable and a retry re-derives the same terminal.
-            step: PublishStep::Stage {
-                staged: state.staged.clone(),
-            },
+            step: PublishStep::Promote,
         }))
     }
 
@@ -2295,50 +2111,50 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         // is precisely the pressure the ceiling above is there to refuse.
         state.persistence_queue.queued_chunks = 0;
         state.persistence_queue.queued_bytes = 0;
-        state.staged = Vec::new();
         state.publication = Some(publication);
         state.terminal = Some(terminal.clone());
         Ok(terminal)
     }
 
-    /// Publishes the reserved complete source: at most one stage under the
-    /// original identity, then the readback, then the `CompleteSource`
-    /// terminal. A failure leaves the phase advanced, never a bare flag.
+    /// Promotes the exact owner-retained append stage under the original Stage
+    /// operation. The Blob owner verifies every persisted ciphertext and its
+    /// AEAD/plaintext commitment before returning a Ready capability; a fresh
+    /// full SourceReadback remains a later caller obligation after ReadyAttach.
     async fn publish_reserved(
         &self,
         ticket: PublishTicket,
         _hold: FinalizeHold<'_, C>,
     ) -> Result<ProcessStreamSinkTerminal, ProcessStreamSinkError> {
         let ready = match ticket.step {
-            PublishStep::Readback { ready } => *ready,
-            PublishStep::Stage { staged } => {
-                // `staged` is the one live full-plaintext buffer. It is handed
-                // to the owner and dropped when the call returns, so no
-                // second simultaneous copy of the stream exists at any point.
+            PublishStep::Ready { ready } => *ready,
+            PublishStep::Promote => {
+                self.mark_stage_handoff(&ticket.identity, ticket.incarnation)?;
+                let owner_request = BlobProcessStreamStageFinalizeRequest {
+                    session: BlobProcessStreamStageResumeRequest {
+                        session_id: ticket.session.session_id().as_str().to_owned(),
+                        source_id: ticket.session.source_id().as_str().to_owned(),
+                        terminal_id: ticket.session.terminal_id().as_str().to_owned(),
+                        open_request_sha256: ticket.session.open_request_sha256().to_owned(),
+                    },
+                    terminal_command_sha256: ticket.identity.request_sha256().to_owned(),
+                    final_sequence: ticket.next_sequence,
+                    final_offset: ticket.next_offset,
+                    admitted_sha256: ticket.admitted_sha256.clone(),
+                };
                 let ready = self
-                    .stage_once(
-                        &ticket.session,
-                        &ticket.request,
-                        &ticket.identity,
-                        ticket.incarnation,
-                        &staged,
-                    )
-                    .await?;
-                drop(staged);
-                ready
-            }
-            PublishStep::Recover { staged } => {
-                self.recover_stage_once(
-                    &ticket.session,
-                    &ticket.request,
+                    .store
+                    .finalize_process_stream_stage(owner_request)
+                    .await
+                    .map_err(|error| map_blob_error(&error))?;
+                self.retain_recovered_ready(
                     &ticket.identity,
                     ticket.incarnation,
-                    &staged,
-                )
-                .await?
+                    ready,
+                    &ticket.admitted_sha256,
+                    ticket.next_offset,
+                )?
             }
         };
-        self.verify_readback(&ready).await?;
         let publication = Self::publication_of(&ticket.admitted_sha256, &ready, &ticket.measures)?;
         let evidence = Self::complete_source(
             &ticket.session,
@@ -2748,12 +2564,47 @@ impl<C: BlobStoreClient> ProcessStreamSinkClient for BlobStoreStreamSink<C> {
                 }
                 None => ProcessStreamSinkSession::from_open_request(request)?,
             };
-            let store_request = self.stage_session_request(&session)?;
+            let store_request = self.durable_stage_open_request(&session)?;
             let snapshot = self
                 .store
                 .open_process_stream_stage(store_request)
                 .await
                 .map_err(|error| map_blob_error(&error))?;
+            let ready_receipt = if let Some(record) = &snapshot.terminal {
+                let terminal: ProcessStreamSinkTerminal =
+                    serde_json::from_str(&record.terminal_json).map_err(|error| {
+                        ProcessStreamSinkError::Serialization {
+                            field: "durable_process_terminal",
+                            reason: error.to_string(),
+                        }
+                    })?;
+                if terminal.state() == ProcessStreamSinkState::CompleteSource {
+                    Some(
+                        self.store
+                            .finalize_process_stream_stage(BlobProcessStreamStageFinalizeRequest {
+                                session: BlobProcessStreamStageResumeRequest {
+                                    session_id: session.session_id().as_str().to_owned(),
+                                    source_id: session.source_id().as_str().to_owned(),
+                                    terminal_id: session.terminal_id().as_str().to_owned(),
+                                    open_request_sha256: session.open_request_sha256().to_owned(),
+                                },
+                                terminal_command_sha256: terminal
+                                    .command_identity()
+                                    .request_sha256()
+                                    .to_owned(),
+                                final_sequence: snapshot.next_sequence,
+                                final_offset: snapshot.next_offset,
+                                admitted_sha256: snapshot.sha256.clone(),
+                            })
+                            .await
+                            .map_err(|error| map_blob_error(&error))?,
+                    )
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             let mut state = self.lock();
             if state.pending_append.is_some() {
                 return Err(ProcessStreamSinkError::PossibleEffectUnknown {
@@ -2764,16 +2615,29 @@ impl<C: BlobStoreClient> ProcessStreamSinkClient for BlobStoreStreamSink<C> {
                 if retained != &session {
                     return Err(ProcessStreamSinkError::OpenDigestMismatch);
                 }
+                let old_prefix_matches = state
+                    .admitted_chunks
+                    .iter()
+                    .zip(snapshot.append_receipts.iter())
+                    .all(|(old, current)| {
+                        old.sequence == current.sequence
+                            && old.offset == current.offset
+                            && old.length == current.byte_length
+                            && old.sha256 == current.chunk_sha256
+                    });
                 if snapshot.next_sequence < state.next_sequence
                     || snapshot.next_offset < state.next_offset
-                    || !snapshot.bytes.starts_with(&state.staged)
+                    || !old_prefix_matches
+                    || !snapshot.preview_bytes.starts_with(&state.preview.retained)
+                    || (snapshot.next_offset == state.next_offset
+                        && snapshot.sha256 != state.admitted_sha256())
                 {
                     return Err(ProcessStreamSinkError::EvidenceInvariant {
                         reason: "durable Blob append frontier regressed or changed".to_owned(),
                     });
                 }
             }
-            Self::restore_stage_snapshot(&mut state, session.clone(), snapshot)?;
+            Self::restore_stage_snapshot(&mut state, session.clone(), snapshot, ready_receipt)?;
             Ok(session)
         })
     }
@@ -2785,7 +2649,7 @@ impl<C: BlobStoreClient> ProcessStreamSinkClient for BlobStoreStreamSink<C> {
     ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkAppendDisposition> {
         Box::pin(async move {
             let durable_request = Self::durable_append_request(&session, &request);
-            let stage_request = self.stage_session_request(&session)?;
+            let stage_request = self.durable_stage_open_request(&session)?;
             {
                 let mut state = self.lock();
                 let existing = Self::check_session(&state, &session)?;
@@ -2855,7 +2719,7 @@ impl<C: BlobStoreClient> ProcessStreamSinkClient for BlobStoreStreamSink<C> {
             }
             let mut state = self.lock();
             let existing = Self::check_session(&state, &session)?;
-            match Self::append_locked(&mut state, &existing, &request) {
+            match Self::append_locked(&mut state, &existing, &request, &receipt.prefix_sha256) {
                 Ok(accepted @ ProcessStreamSinkAppendDisposition::Accepted { .. })
                 | Ok(accepted @ ProcessStreamSinkAppendDisposition::Replayed { .. }) => {
                     Self::settle_append_commit(&mut state);

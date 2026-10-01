@@ -44,6 +44,13 @@ pub const CONTRACT_NAME: &str = "eliot.storage.blob";
 pub const CONTRACT_VERSION: &str = "s-04-v2";
 /// Provider-neutral upper bound accepted for one plaintext Blob object.
 pub const BLOB_MAX_PLAINTEXT_BYTES: u64 = 32 * 1024 * 1024;
+/// Maximum append count retained for one durable process-stream stage.
+///
+/// The byte ceiling alone cannot bound an attacker-controlled run of empty
+/// appends or the corresponding owner-side receipt vector.
+pub const BLOB_PROCESS_STREAM_STAGE_MAX_CHUNKS: u64 = 65_536;
+/// Maximum preview bytes retained alongside a process-stream stage.
+pub const BLOB_PROCESS_STREAM_STAGE_MAX_PREVIEW_BYTES: u64 = 16 * 1024 * 1024;
 
 pub mod backup_io;
 pub mod wire;
@@ -1242,7 +1249,6 @@ pub struct BlobProcessStreamStageOpenRequest {
     pub terminal_id: String,
     pub open_request_sha256: String,
     pub stage_context: BlobReceiptContext,
-    pub read_context: BlobReceiptContext,
     pub root_lease: BlobRootLease,
     pub policy: BlobPolicyBinding,
     pub residency: ObjectResidencyKey,
@@ -1250,6 +1256,7 @@ pub struct BlobProcessStreamStageOpenRequest {
     pub max_bytes: u64,
     pub max_chunk_bytes: u64,
     pub max_chunks: u64,
+    pub max_preview_bytes: u64,
 }
 
 impl BlobProcessStreamStageOpenRequest {
@@ -1260,23 +1267,17 @@ impl BlobProcessStreamStageOpenRequest {
         canonical_sha256(&self.open_request_sha256, "open_request_sha256")?;
         self.stage_context
             .validate_for(EffectClass::ReversibleMutation)?;
-        self.read_context.validate_for(EffectClass::Read)?;
         self.root_lease.validate_context(&self.stage_context)?;
-        self.root_lease.validate_context(&self.read_context)?;
         self.policy.validate_for_residency(&self.residency)?;
         self.process_source_binding.validate()?;
-        if self.stage_context.work_scope != self.read_context.work_scope
-            || self.stage_context.task != self.read_context.task
-            || self.stage_context.session != self.read_context.session
-            || self.stage_context.authority.authority_id != self.read_context.authority.authority_id
-            || self.stage_context.authority.authority_owner != self.read_context.authority.authority_owner
-            || self.stage_context.authority.authority_epoch != self.read_context.authority.authority_epoch
-            || self.stage_context.authority.state_fence != self.read_context.authority.state_fence
-            || self.max_bytes == 0
+        if self.max_bytes == 0
             || self.max_bytes > BLOB_MAX_PLAINTEXT_BYTES
             || self.max_chunk_bytes == 0
             || self.max_chunk_bytes > self.max_bytes
             || self.max_chunks == 0
+            || self.max_chunks > BLOB_PROCESS_STREAM_STAGE_MAX_CHUNKS
+            || self.max_preview_bytes > self.max_bytes
+            || self.max_preview_bytes > BLOB_PROCESS_STREAM_STAGE_MAX_PREVIEW_BYTES
         {
             return Err(BlobError::InvalidContract(
                 "process stream staging identity is not one bounded owner session".to_owned(),
@@ -1361,6 +1362,8 @@ pub struct BlobProcessStreamStageAppendReceipt {
     pub offset: u64,
     pub byte_length: u64,
     pub chunk_sha256: String,
+    /// Cumulative SHA-256 over the durable prefix through this append.
+    pub prefix_sha256: String,
     pub next_sequence: u64,
     pub next_offset: u64,
 }
@@ -1372,6 +1375,7 @@ impl BlobProcessStreamStageAppendReceipt {
         request: &BlobProcessStreamStageAppendRequest,
     ) -> Result<(), BlobError> {
         let commitment = request.request_commitment_sha256()?;
+        canonical_sha256(&self.prefix_sha256, "prefix_sha256")?;
         if self.session_key_sha256 != session.session_key_sha256()?
             || self.request_commitment_sha256 != commitment
             || self.sequence != request.sequence
@@ -1398,6 +1402,30 @@ pub struct BlobProcessStreamStageResumeRequest {
     pub open_request_sha256: String,
 }
 
+/// Exact terminal command that promotes a durable append prefix. The Blob
+/// owner compares this frontier with its authenticated append records and
+/// retains the command before publishing under the original Stage operation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobProcessStreamStageFinalizeRequest {
+    pub session: BlobProcessStreamStageResumeRequest,
+    pub terminal_command_sha256: String,
+    pub final_sequence: u64,
+    pub final_offset: u64,
+    pub admitted_sha256: String,
+}
+
+impl BlobProcessStreamStageFinalizeRequest {
+    pub fn validate(&self) -> Result<(), BlobError> {
+        valid_text(&self.session.session_id, "session_id")?;
+        valid_text(&self.session.source_id, "source_id")?;
+        valid_text(&self.session.terminal_id, "terminal_id")?;
+        canonical_sha256(&self.session.open_request_sha256, "open_request_sha256")?;
+        canonical_sha256(&self.terminal_command_sha256, "terminal_command_sha256")?;
+        canonical_sha256(&self.admitted_sha256, "admitted_sha256")
+    }
+}
+
 /// Exact process sink terminal retained by the Blob owner after a terminal
 /// transition. Terminal bytes are canonical typed process JSON; a complete
 /// source also carries the original Blob-ready receipt returned by this owner.
@@ -1406,7 +1434,8 @@ pub struct BlobProcessStreamStageResumeRequest {
 pub struct BlobProcessStreamStageTerminal {
     pub terminal_json: String,
     pub terminal_json_sha256: String,
-    pub ready_receipt: Option<BlobReadyReceipt>,
+    pub ready_receipt_json: Option<String>,
+    pub ready_receipt_sha256: Option<String>,
 }
 
 impl BlobProcessStreamStageTerminal {
@@ -1422,22 +1451,32 @@ impl BlobProcessStreamStageTerminal {
         {
             return Err(BlobError::IntegrityMismatch);
         }
-        if let Some(ready) = &self.ready_receipt {
-            ready.validate()?;
+        match (&self.ready_receipt_json, &self.ready_receipt_sha256) {
+            (Some(json), Some(digest)) => {
+                canonical_sha256(digest, "ready_receipt_sha256")?;
+                let value: serde_json::Value = serde_json::from_str(json)
+                    .map_err(|_| BlobError::InvalidContract("ready receipt is not JSON".to_owned()))?;
+                let canonical = eliot_contracts::canonical_json_bytes(&value)
+                    .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+                if !value.is_object() || canonical != json.as_bytes() || hex_sha256(json.as_bytes()) != *digest {
+                    return Err(BlobError::IntegrityMismatch);
+                }
+            }
+            (None, None) => {}
+            _ => return Err(BlobError::IntegrityMismatch),
         }
         Ok(())
     }
 }
 
-/// Durable ordered staging snapshot. `bytes` is reconstructed only from the
-/// owner-authenticated append records; callers cannot supply a replacement
-/// prefix or advance the sequence from this readback.
+/// Durable ordered staging snapshot. The owner returns only a bounded preview
+/// and cumulative commitments; complete plaintext stays inside the Blob owner.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlobProcessStreamStageSnapshot {
     pub session: BlobProcessStreamStageOpenRequest,
     pub append_receipts: Vec<BlobProcessStreamStageAppendReceipt>,
-    pub bytes: Vec<u8>,
+    pub preview_bytes: Vec<u8>,
     pub sha256: String,
     pub next_sequence: u64,
     pub next_offset: u64,
@@ -1449,15 +1488,23 @@ impl BlobProcessStreamStageSnapshot {
     pub fn validate(&self) -> Result<(), BlobError> {
         self.session.validate()?;
         canonical_sha256(&self.sha256, "staged_sha256")?;
-        if self.bytes.len() as u64 != self.next_offset
-            || self.next_offset > self.session.max_bytes
-            || hex_sha256(&self.bytes) != self.sha256
+        let preview_length = self.next_offset.min(self.session.max_preview_bytes);
+        let final_prefix_sha256 = self
+            .append_receipts
+            .last()
+            .map(|receipt| receipt.prefix_sha256.as_str())
+            .unwrap_or("");
+        if self.next_offset > self.session.max_bytes
+            || self.preview_bytes.len() as u64 != preview_length
             || self.append_receipts.len() as u64 != self.next_sequence
+            || (self.next_sequence == 0 && self.sha256 != hex_sha256(&[]))
+            || (self.next_sequence > 0 && final_prefix_sha256 != self.sha256)
         {
             return Err(BlobError::IntegrityMismatch);
         }
         let mut offset = 0_u64;
         for (index, receipt) in self.append_receipts.iter().enumerate() {
+            canonical_sha256(&receipt.prefix_sha256, "append.prefix_sha256")?;
             if receipt.sequence != index as u64 || receipt.offset != offset {
                 return Err(BlobError::IntegrityMismatch);
             }
@@ -1558,7 +1605,7 @@ pub struct BlobStageRecoveryRequest {
     pub open_request_sha256: String,
     pub terminal_command_sha256: String,
     pub stage_context: BlobReceiptContext,
-    pub read_context: BlobReceiptContext,
+    pub read_context: Option<BlobReceiptContext>,
     pub root_lease: BlobRootLease,
     pub expected_content_hash: BlobHash,
     pub expected_plaintext_sha256: String,
@@ -1577,7 +1624,7 @@ struct BlobStageRecoveryRequestWire {
     open_request_sha256: String,
     terminal_command_sha256: String,
     stage_context: BlobReceiptContext,
-    read_context: BlobReceiptContext,
+    read_context: Option<BlobReceiptContext>,
     root_lease: BlobRootLease,
     expected_content_hash: BlobHash,
     expected_plaintext_sha256: String,
@@ -1609,24 +1656,23 @@ impl BlobStageRecoveryRequest {
         canonical_sha256(&self.terminal_command_sha256, "terminal_command_sha256")?;
         self.stage_context
             .validate_for(EffectClass::ReversibleMutation)?;
-        self.read_context.validate_for(EffectClass::Read)?;
         self.root_lease.validate_context(&self.stage_context)?;
-        self.root_lease.validate_context(&self.read_context)?;
-        if self.stage_context.work_scope != self.read_context.work_scope
-            || self.stage_context.task != self.read_context.task
-            || self.stage_context.session != self.read_context.session
-            || self.stage_context.authority.authority_id != self.read_context.authority.authority_id
-            || self.stage_context.authority.authority_owner
-                != self.read_context.authority.authority_owner
-            || self.stage_context.authority.authority_epoch
-                != self.read_context.authority.authority_epoch
-            || self.stage_context.authority.proof_ceiling
-                != self.read_context.authority.proof_ceiling
-            || self.stage_context.authority.state_fence != self.read_context.authority.state_fence
-        {
-            return Err(BlobError::AuthorityRequired(
-                "stage recovery contexts must share the exact owner/session authority",
-            ));
+        if let Some(read_context) = &self.read_context {
+            read_context.validate_for(EffectClass::Read)?;
+            self.root_lease.validate_context(read_context)?;
+            if self.stage_context.work_scope != read_context.work_scope
+                || self.stage_context.task != read_context.task
+                || self.stage_context.session != read_context.session
+                || self.stage_context.authority.authority_id != read_context.authority.authority_id
+                || self.stage_context.authority.authority_owner != read_context.authority.authority_owner
+                || self.stage_context.authority.authority_epoch != read_context.authority.authority_epoch
+                || self.stage_context.authority.proof_ceiling != read_context.authority.proof_ceiling
+                || self.stage_context.authority.state_fence != read_context.authority.state_fence
+            {
+                return Err(BlobError::AuthorityRequired(
+                    "stage recovery contexts must share the exact owner/session authority",
+                ));
+            }
         }
         self.policy.validate_for_residency(&self.residency)?;
         self.process_source_binding.validate()?;
@@ -4165,6 +4211,19 @@ pub trait BlobStoreClient: Send + Sync {
             ))
         })
     }
+    /// Promotes the exact durable process-stage bytes under their original
+    /// Stage operation. The owner verifies the staged ciphertext and plaintext
+    /// commitments and persists the exact Ready receipt before returning it.
+    fn finalize_process_stream_stage(
+        &self,
+        _request: BlobProcessStreamStageFinalizeRequest,
+    ) -> BlobFuture<'_, BlobReadyReceipt> {
+        Box::pin(async {
+            Err(BlobError::PlanGap(
+                "Blob owner does not expose durable process-stream promotion".to_owned(),
+            ))
+        })
+    }
     /// Resolves only owner-persisted evidence for the original stage
     /// identity. A missing commit or unsettled journal is `Unknown`; callers
     /// must not turn that result into a fresh stage attempt.
@@ -4260,6 +4319,13 @@ where
 {
     fn stage(&self, request: BlobStageRequest) -> BlobFuture<'_, BlobReadyReceipt> {
         (**self).stage(request)
+    }
+
+    fn finalize_process_stream_stage(
+        &self,
+        request: BlobProcessStreamStageFinalizeRequest,
+    ) -> BlobFuture<'_, BlobReadyReceipt> {
+        (**self).finalize_process_stream_stage(request)
     }
 
     fn recover_stage(

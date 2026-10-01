@@ -66,6 +66,12 @@ pub enum BlobProcessStreamOperationRequest {
         /// Exact closed source readback request.
         request: Box<ProcessStreamSourceReadbackRequest>,
     },
+    /// Distinct profile-stage source lifecycle delegated to the canonical
+    /// Store owner over the already authenticated EBP session.
+    VerificationStageSource {
+        /// Exact closed profile-stage source request.
+        request: Box<crate::verification_wire::VerificationStageSourceRequest>,
+    },
 }
 
 /// Closed semantic request on the dedicated Blob EBP path.
@@ -101,6 +107,9 @@ impl BlobProcessStreamFrameRequest {
         match &self.operation {
             BlobProcessStreamOperationRequest::Sink { request } => request.validate(),
             BlobProcessStreamOperationRequest::SourceReadback { request } => request.validate(),
+            BlobProcessStreamOperationRequest::VerificationStageSource { request } => {
+                request.validate()
+            }
         }
     }
 }
@@ -122,6 +131,11 @@ pub enum BlobProcessStreamOperationResponse {
     SourceReadback {
         /// Closed owner response.
         response: Box<ProcessStreamSourceReadbackResponse>,
+    },
+    /// Distinct profile-stage source lifecycle result.
+    VerificationStageSource {
+        /// Closed owner response.
+        response: Box<crate::verification_wire::VerificationStageSourceResponse>,
     },
 }
 
@@ -154,6 +168,9 @@ impl BlobProcessStreamFrameResponse {
         match &self.operation {
             BlobProcessStreamOperationResponse::Sink { response } => response.validate()?,
             BlobProcessStreamOperationResponse::SourceReadback { response } => {
+                response.validate()?;
+            }
+            BlobProcessStreamOperationResponse::VerificationStageSource { response } => {
                 response.validate()?;
             }
         }
@@ -2151,9 +2168,14 @@ impl ProcessStreamSinkCapabilityRef {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessStreamSinkBindingRef {
-    /// Opaque Store-generated lookup reference bound to this authenticated
-    /// connection, Kernel capability, and exact Open request.
+    /// Stable Store-generated commitment to the selector tuple below and the
+    /// Kernel capability. It is a lookup selector, never an authority grant.
     pub binding_ref: String,
+    /// Current WorkScope selector, checked against the Store-owned pending
+    /// admission before recovery.
+    pub work_scope_ref: String,
+    /// SHA-256 of the exact admitted process execution binding.
+    pub process_binding_sha256: String,
     /// Owner-bound sink session identity.
     pub session_id: String,
     /// Owner-bound source identity.
@@ -2168,6 +2190,8 @@ impl ProcessStreamSinkBindingRef {
     /// Validates exact bounded sink identities.
     pub fn validate(&self) -> Result<(), WireValidationError> {
         validate_text("binding_ref", &self.binding_ref)?;
+        validate_text("work_scope_ref", &self.work_scope_ref)?;
+        validate_digest("process_binding_sha256", &self.process_binding_sha256)?;
         validate_text("session_id", &self.session_id)?;
         validate_text("source_id", &self.source_id)?;
         validate_text("terminal_id", &self.terminal_id)?;

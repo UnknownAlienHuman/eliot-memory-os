@@ -8,7 +8,7 @@
 //! operations within that boundary.
 
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -30,6 +30,18 @@ pub enum WindowsBlobPathState {
     ReparsePoint,
     /// Another filesystem entry kind exists.
     Other,
+}
+
+/// Outcome of reconciling a publication while the caller holds the original
+/// operation journal and root-owner fence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowsBlobPublicationReconciliation {
+    /// Exact bytes were observed and the file plus containing directory were
+    /// flushed successfully during this reconciliation.
+    ConfirmedDurable,
+    /// Neither the exact source nor destination (or create destination) was
+    /// present after the operation-bound observation.
+    KnownAbsent,
 }
 
 /// Root-pinned durable filesystem primitive set used by the Blob adapter.
@@ -279,6 +291,173 @@ impl WindowsBlobStorePlatform {
         verify_pinned_directories(&source_pins)
     }
 
+    /// Resolves a prior uncertain no-replace publication under the same
+    /// durable Blob operation. It never treats matching bytes as durability:
+    /// an installed destination is reopened, checked, and flushed; an exact
+    /// source with a known-missing destination may be published once more
+    /// under the caller's unchanged journal identity.
+    pub fn reconcile_rename_publication(
+        &self,
+        operation_id: &str,
+        idempotency_key: &str,
+        source: &WorkScopePath,
+        destination: &WorkScopePath,
+        expected_sha256: &str,
+        hard_ceiling: u64,
+    ) -> Result<WindowsBlobPublicationReconciliation, PortError> {
+        validate_reconciliation_binding(operation_id, idempotency_key, expected_sha256, hard_ceiling)?;
+        self.prove_contained(source)?;
+        self.prove_contained(destination)?;
+        let source_state = self.stat(source)?;
+        let destination_state = self.stat(destination)?;
+        if destination_state == WindowsBlobPathState::Missing
+            && source_state == WindowsBlobPathState::Missing
+        {
+            return Ok(WindowsBlobPublicationReconciliation::KnownAbsent);
+        }
+        if let WindowsBlobPathState::File { .. } = destination_state {
+            if !self.exact_bytes_at(destination, expected_sha256, hard_ceiling)? {
+                return Err(PortError::InvalidPath);
+            }
+            if matches!(source_state, WindowsBlobPathState::File { .. })
+                && !self.exact_bytes_at(source, expected_sha256, hard_ceiling)?
+            {
+                return Err(PortError::InvalidPath);
+            }
+            self.flush_exact_file_and_parents(destination, expected_sha256, hard_ceiling)?;
+            return Ok(WindowsBlobPublicationReconciliation::ConfirmedDurable);
+        }
+        if destination_state != WindowsBlobPathState::Missing {
+            return Err(PortError::InvalidPath);
+        }
+        if !matches!(source_state, WindowsBlobPathState::File { .. })
+            || !self.exact_bytes_at(source, expected_sha256, hard_ceiling)?
+        {
+            return Err(PortError::InvalidPath);
+        }
+
+        match self.rename_no_replace_durable(source, destination) {
+            Ok(()) => {}
+            Err(error) => {
+                let destination_state = self.stat(destination)?;
+                if !matches!(destination_state, WindowsBlobPathState::File { .. })
+                    || !self.exact_bytes_at(destination, expected_sha256, hard_ceiling)?
+                {
+                    return Err(error);
+                }
+            }
+        }
+        self.flush_exact_file_and_parents(destination, expected_sha256, hard_ceiling)?;
+        Ok(WindowsBlobPublicationReconciliation::ConfirmedDurable)
+    }
+
+    /// Resolves a prior uncertain create-new publication under the same
+    /// operation journal. When the exact object is absent it attempts only
+    /// those original bytes; a foreign occupant is never replaced.
+    pub fn reconcile_create_publication(
+        &self,
+        operation_id: &str,
+        idempotency_key: &str,
+        destination: &WorkScopePath,
+        expected_sha256: &str,
+        bytes: &[u8],
+        hard_ceiling: u64,
+    ) -> Result<WindowsBlobPublicationReconciliation, PortError> {
+        validate_reconciliation_binding(operation_id, idempotency_key, expected_sha256, hard_ceiling)?;
+        if bytes.len() as u64 > hard_ceiling || sha256_digest(bytes) != expected_sha256 {
+            return Err(PortError::InvalidPath);
+        }
+        self.prove_contained(destination)?;
+        match self.stat(destination)? {
+            WindowsBlobPathState::File { .. } => {
+                if !self.exact_bytes_at(destination, expected_sha256, hard_ceiling)? {
+                    return Err(PortError::InvalidPath);
+                }
+                self.flush_exact_file_and_parents(destination, expected_sha256, hard_ceiling)?;
+                Ok(WindowsBlobPublicationReconciliation::ConfirmedDurable)
+            }
+            WindowsBlobPathState::Missing => match self.write_new_durable(destination, bytes) {
+                Ok(()) => {
+                    self.flush_exact_file_and_parents(destination, expected_sha256, hard_ceiling)?;
+                    Ok(WindowsBlobPublicationReconciliation::ConfirmedDurable)
+                }
+                Err(error) => match self.stat(destination)? {
+                    WindowsBlobPathState::File { .. }
+                        if self.exact_bytes_at(destination, expected_sha256, hard_ceiling)? =>
+                    {
+                        self.flush_exact_file_and_parents(destination, expected_sha256, hard_ceiling)?;
+                        Ok(WindowsBlobPublicationReconciliation::ConfirmedDurable)
+                    }
+                    WindowsBlobPathState::Missing => {
+                        let _ = error;
+                        Ok(WindowsBlobPublicationReconciliation::KnownAbsent)
+                    }
+                    _ => Err(PortError::InvalidPath),
+                },
+            },
+            _ => Err(PortError::InvalidPath),
+        }
+    }
+
+    fn exact_bytes_at(
+        &self,
+        path: &WorkScopePath,
+        expected_sha256: &str,
+        hard_ceiling: u64,
+    ) -> Result<bool, PortError> {
+        match self.stat(path)? {
+            WindowsBlobPathState::File { length, .. } if length <= hard_ceiling => {
+                Ok(sha256_digest(&self.read_bounded(path, hard_ceiling)?) == expected_sha256)
+            }
+            WindowsBlobPathState::Missing => Ok(false),
+            _ => Err(PortError::InvalidPath),
+        }
+    }
+
+    fn flush_exact_file_and_parents(
+        &self,
+        path: &WorkScopePath,
+        expected_sha256: &str,
+        hard_ceiling: u64,
+    ) -> Result<(), PortError> {
+        self.verify_root_pin().map_err(|_| PortError::InvalidPath)?;
+        let (target, parent_pins) = self.resolve_and_pin_parent(path)?;
+        let mut file = open_blob_file_for_reconciliation(&target)?;
+        let before = file
+            .metadata()
+            .map_err(|error| PortError::Provider(super::provider_from_io(&error)))?;
+        if !before.is_file() || before.len() > hard_ceiling {
+            return Err(PortError::InvalidPath);
+        }
+        let identity = super::file_identity_from_handle(&file).map_err(|_| PortError::InvalidPath)?;
+        let mut bytes = Vec::new();
+        let capacity = usize::try_from(before.len()).map_err(|_| PortError::InvalidPath)?;
+        bytes.try_reserve_exact(capacity).map_err(|_| PortError::InvalidPath)?;
+        (&mut file)
+            .take(hard_ceiling.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|error| PortError::Provider(super::provider_from_io(&error)))?;
+        if bytes.len() as u64 != before.len()
+            || bytes.len() as u64 > hard_ceiling
+            || sha256_digest(&bytes) != expected_sha256
+        {
+            return Err(PortError::InvalidPath);
+        }
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| PortError::Provider(super::provider_from_io(&error)))?;
+        file.sync_all()
+            .map_err(|error| PortError::Provider(super::provider_from_io(&error)))?;
+        let reopened = open_blob_file_read(&target)?;
+        if super::file_identity_from_handle(&reopened).map_err(|_| PortError::InvalidPath)?
+            != identity
+        {
+            return Err(PortError::InvalidPath);
+        }
+        flush_pins(&parent_pins)?;
+        verify_pinned_directories(&parent_pins)?;
+        self.verify_root_pin().map_err(|_| PortError::InvalidPath)
+    }
+
     /// Removes a regular file and flushes its parent directory.
     pub fn remove_durable(&self, path: &WorkScopePath) -> Result<(), PortError> {
         let (target, parent_pins) = self.resolve_and_pin_parent(path)?;
@@ -457,6 +636,37 @@ fn open_blob_file_read(path: &Path) -> Result<fs::File, PortError> {
     Ok(file)
 }
 
+#[cfg(windows)]
+fn open_blob_file_for_reconciliation(path: &Path) -> Result<fs::File, PortError> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+    };
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|error| PortError::Provider(super::provider_from_io(&error)))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| PortError::Provider(super::provider_from_io(&error)))?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(PortError::InvalidPath);
+    }
+    Ok(file)
+}
+
+#[cfg(not(windows))]
+fn open_blob_file_for_reconciliation(path: &Path) -> Result<fs::File, PortError> {
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| PortError::Provider(super::provider_from_io(&error)))
+}
+
 #[cfg(not(windows))]
 fn open_blob_file_read(path: &Path) -> Result<fs::File, PortError> {
     fs::File::open(path).map_err(|error| PortError::Provider(super::provider_from_io(&error)))
@@ -486,4 +696,31 @@ fn flush_pins(pins: &[fs::File]) -> Result<(), PortError> {
             retryable: false,
         })
     })
+}
+
+fn validate_reconciliation_binding(
+    operation_id: &str,
+    idempotency_key: &str,
+    expected_sha256: &str,
+    hard_ceiling: u64,
+) -> Result<(), PortError> {
+    if operation_id.trim().is_empty()
+        || operation_id.len() > 1024
+        || operation_id.chars().any(char::is_control)
+        || idempotency_key.trim().is_empty()
+        || idempotency_key.len() > 1024
+        || idempotency_key.chars().any(char::is_control)
+        || expected_sha256.len() != 64
+        || !expected_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        || hard_ceiling == 0
+    {
+        return Err(PortError::InvalidPath);
+    }
+    Ok(())
+}
+
+fn sha256_digest(bytes: &[u8]) -> String {
+    format!("{:x}", sha2::Sha256::digest(bytes))
 }

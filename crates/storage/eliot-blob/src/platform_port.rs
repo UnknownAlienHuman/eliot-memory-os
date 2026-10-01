@@ -14,10 +14,15 @@ use eliot_blob_api::{
     BlobCasState, BlobCasSuccessKind, BlobError, BlobIssuerTrustAnchor, BlobRootLease,
 };
 use eliot_platform::{PortError, ProviderErrorCode, WorkScopePath};
-use eliot_platform_windows::{WindowsBlobPathState, WindowsBlobStorePlatform};
+use eliot_platform_windows::{
+    WindowsBlobPathState, WindowsBlobPublicationReconciliation, WindowsBlobStorePlatform,
+};
 use serde::{Deserialize, Serialize};
 
-use crate::{BlobPathState, BlobPlatformPort, RootClaimProof, cas_unknown, sha256_hex};
+use crate::{
+    BlobPathState, BlobPlatformPort, BlobPublicationReconciliation, RootClaimProof, cas_unknown,
+    sha256_hex,
+};
 
 const CAS_STATUS_DIR: &str = ".eliot-cas-status";
 const CAS_STATUS_MAX_BYTES: u64 = 16 * 1024;
@@ -548,6 +553,64 @@ impl BlobPlatformPort for WindowsBlobPlatformPort {
     ) -> Result<(), BlobError> {
         self.filesystem
             .rename_no_replace_durable(source, destination)
+            .map_err(|error| BlobError::Provider(error.to_string()))
+    }
+
+    fn reconcile_rename_publication(
+        &mut self,
+        operation_id: &str,
+        idempotency_key: &str,
+        source: &WorkScopePath,
+        destination: &WorkScopePath,
+        expected_sha256: &str,
+        hard_ceiling: u64,
+    ) -> Result<BlobPublicationReconciliation, BlobError> {
+        self.filesystem
+            .reconcile_rename_publication(
+                operation_id,
+                idempotency_key,
+                source,
+                destination,
+                expected_sha256,
+                hard_ceiling,
+            )
+            .map(|result| match result {
+                WindowsBlobPublicationReconciliation::ConfirmedDurable => {
+                    BlobPublicationReconciliation::ConfirmedDurable
+                }
+                WindowsBlobPublicationReconciliation::KnownAbsent => {
+                    BlobPublicationReconciliation::KnownAbsent
+                }
+            })
+            .map_err(|error| BlobError::Provider(error.to_string()))
+    }
+
+    fn reconcile_create_publication(
+        &mut self,
+        operation_id: &str,
+        idempotency_key: &str,
+        destination: &WorkScopePath,
+        expected_sha256: &str,
+        bytes: &[u8],
+        hard_ceiling: u64,
+    ) -> Result<BlobPublicationReconciliation, BlobError> {
+        self.filesystem
+            .reconcile_create_publication(
+                operation_id,
+                idempotency_key,
+                destination,
+                expected_sha256,
+                bytes,
+                hard_ceiling,
+            )
+            .map(|result| match result {
+                WindowsBlobPublicationReconciliation::ConfirmedDurable => {
+                    BlobPublicationReconciliation::ConfirmedDurable
+                }
+                WindowsBlobPublicationReconciliation::KnownAbsent => {
+                    BlobPublicationReconciliation::KnownAbsent
+                }
+            })
             .map_err(|error| BlobError::Provider(error.to_string()))
     }
 
