@@ -94,6 +94,7 @@ use eliot_maintenance::{
 };
 use eliot_module_registry::ModuleCatalog;
 use eliot_module_registry::ModuleCatalogSnapshot;
+use eliot_module_registry::ModuleCatalogOwnerReadback;
 use eliot_observation::{ObservationJournal, ObservationJournalEntry};
 use eliot_ors::{
     ColdStartReadinessClaim, ColdStartReadinessOrsRecord, ColdStartReadinessOwnerKey,
@@ -5440,6 +5441,87 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     #[must_use]
     pub const fn owners(&self) -> &GovernorOwners<P> {
         &self.owners
+    }
+
+    /// Reads the current Module Registry owner through the authenticated named
+    /// owner-read transport and joins it to the canonical in-process owner.
+    ///
+    /// The semantic snapshot comes from `GovernorOwners::module_registry`; the
+    /// Store outer revision comes only from the fresh Kernel named-read reply.
+    /// Neither the startup recovery snapshot nor a caller-supplied revision is
+    /// sufficient for this readback. A mismatch between the independent
+    /// durable owner row and the live semantic owner is refused.
+    pub fn read_current_module_catalog_owner_readback(
+        &self,
+        expected_state_fence: &StateFence,
+    ) -> Result<ModuleCatalogOwnerReadback, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        if self.snapshot.state_fence() != expected_state_fence {
+            return Err(CompositionError::Recovery(
+                "Module Registry owner read requested under a stale State Fence".to_owned(),
+            ));
+        }
+        let reply = self
+            .kernel
+            .named_read(KernelNamedReadRequest {
+                owner: RecoveryOwner::ModuleRegistry,
+                state_fence: expected_state_fence.clone(),
+                protected_snapshot_digest: self.snapshot.protected_snapshot_digest.clone(),
+            })
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "Kernel named read omitted the Module Registry owner".to_owned(),
+                )
+            })?;
+        if reply.owner != RecoveryOwner::ModuleRegistry
+            || reply.state_fence != *expected_state_fence
+            || reply.revision == 0
+            || reply.schema != OWNER_SNAPSHOT_SCHEMA
+            || reply.payload.len() > MAX_OWNER_SNAPSHOT_BYTES
+            || sha256_hex(&reply.payload) != reply.value_digest
+        {
+            return Err(CompositionError::Recovery(
+                "Kernel Module Registry owner read has an invalid owner, fence, revision, schema, or digest"
+                    .to_owned(),
+            ));
+        }
+        let snapshot: ModuleCatalogSnapshot = serde_json::from_slice(&reply.payload).map_err(|error| {
+            CompositionError::Recovery(format!(
+                "Kernel Module Registry owner payload is invalid: {error}"
+            ))
+        })?;
+        snapshot
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let canonical = canonical_json_bytes(&snapshot).map_err(|error| {
+            CompositionError::Recovery(format!(
+                "Module Registry owner snapshot cannot be canonically encoded: {error}"
+            ))
+        })?;
+        if canonical != reply.payload {
+            return Err(CompositionError::Recovery(
+                "Kernel Module Registry owner payload is not the canonical snapshot encoding"
+                    .to_owned(),
+            ));
+        }
+        let semantic = self
+            .owners
+            .module_registry
+            .snapshot()
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        if snapshot != semantic || reply.revision != snapshot.catalog_revision {
+            return Err(CompositionError::Recovery(
+                "fresh Store Module Registry owner read differs from the canonical Governor owner"
+                    .to_owned(),
+            ));
+        }
+        Ok(ModuleCatalogOwnerReadback {
+            owner_revision: reply.revision,
+            snapshot,
+        })
     }
 
     /// Retains one execution-evidence page in the existing Skill lifecycle
