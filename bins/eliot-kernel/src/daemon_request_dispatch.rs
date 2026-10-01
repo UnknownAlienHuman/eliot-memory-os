@@ -76,7 +76,8 @@ use eliot_store_api::{
     MAX_RECOVERY_OWNER_RECORDS, NamedReadOperation, NamedReadRequest, NamedReadResponse,
     OperationIdentity, OrderingHeadExpectation, PreparedTransition, ReadConsistency,
     RecoveryRecord, RecoveryRecordKey, RequestMeta, RevisionHeadExpectation, StoreError,
-    StoreGenesisRequest, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
+    StoreFailure, StoreFailureIdentityContext, StoreGenesisRequest, StoreRecoveryRequest,
+    StoreRecoverySnapshot, WriteReceipt,
     StoreWorkScopeOwnerRequest,
     WriteReceiptStatus, verify_canonical_request_hash, verify_ordering_scope_binding,
 };
@@ -837,6 +838,42 @@ fn validate_work_scope_record_against_retained_input(
         return Err(TransportError::SessionFenced);
     }
     Ok(())
+}
+
+fn work_scope_owner_store_failure_response(
+    error: StoreError,
+    context: &RequestMeta,
+    operation_id: &eliot_store_api::OperationId,
+    idempotency_key: &str,
+) -> Result<serde_json::Value, TransportError> {
+    let failure = StoreFailure::from_store_error(
+        error,
+        StoreFailureIdentityContext {
+            request_id: Some(context.request_id.clone()),
+            operation_id: Some(operation_id.clone()),
+            idempotency_key_ref_or_digest: Some(idempotency_key.to_owned()),
+            state_fence_ref_or_exact_safe_projection: Some(context.state_fence.clone()),
+            evidence_ref: None,
+            transport_unavailable: false,
+        },
+    )
+    .map_err(|_| TransportError::SessionFenced)?;
+    if failure.validate().is_err()
+        || failure.request_id.as_ref() != Some(&context.request_id)
+        || failure.operation_id.as_ref() != Some(operation_id)
+        || failure.idempotency_key_ref_or_digest.as_deref() != Some(idempotency_key)
+        || failure.state_fence_ref_or_exact_safe_projection.as_ref()
+            != Some(&context.state_fence)
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(serde_json::json!({
+        "status": "error",
+        "code": "STORE_FAILURE",
+        "reason": "The canonical WorkScope owner write was refused.",
+        "value": { "kind": "store_work_scope_owner", "value": null },
+        "failure": failure,
+    }))
 }
 
 /// Closed Governor owner-bundle publish operation (`#2100`).
@@ -9115,16 +9152,20 @@ impl KernelComposition {
         if operation.request.state_fence != context.state_fence
             || operation.attempt.state_fence != context.state_fence
             || operation.operation_id != operation.attempt.operation_id
+            || operation.request.operation_id.as_str() != operation.operation_id
+            || operation.request.idempotency_key != identity.idempotency_key
             || operation.request_sha256.trim().is_empty()
             || operation.request_sha256.chars().any(char::is_control)
         {
             return Err(TransportError::SessionFenced);
         }
         if let Err(error) = operation.request.validate_for_context(context) {
-            return Ok(Self::store_error_response_text(
-                "store_work_scope_owner",
-                &error.to_string(),
-            ));
+            return work_scope_owner_store_failure_response(
+                error,
+                context,
+                &operation.request.operation_id,
+                &operation.request.idempotency_key,
+            );
         }
         validate_store_session_fence(session, &context.state_fence)?;
         if let Some(rejection) = self.material_write_admission_response(&context.state_fence) {
@@ -9143,6 +9184,8 @@ impl KernelComposition {
             || context.request_id != envelope.identity.request_id
             || context.session_id.as_ref().map(|id| id.as_str())
                 != envelope.identity.session_id.as_deref()
+            || operation.request.operation_id.as_str() != operation.operation_id
+            || operation.request.idempotency_key != envelope.identity.idempotency_key
             || identity.idempotency_key != envelope.identity.idempotency_key
             || identity.deadline_unix_ms != envelope.identity.deadline_unix_ms
             || identity.cancellation_id != envelope.identity.cancellation_id
@@ -9165,6 +9208,8 @@ impl KernelComposition {
         if operation.request.protected_snapshot_digest != protected_snapshot_digest {
             return Err(TransportError::SessionFenced);
         }
+        let failure_operation_id = operation.request.operation_id.clone();
+        let failure_idempotency_key = operation.request.idempotency_key.clone();
         let gateway = self.retained_store_gateway()?;
         match gateway
             .write_work_scope_owner(context, operation.request)
@@ -9172,12 +9217,23 @@ impl KernelComposition {
         {
             Ok(response) => Ok(serde_json::json!({
                 "kind": "store_work_scope_owner",
-                "record": response.record,
+                "value": response.record,
             })),
-            Err(error) => Ok(Self::store_error_response_text(
-                "store_work_scope_owner",
-                &error,
-            )),
+            Err(NamedReadGatewayError::Store(error)) => {
+                work_scope_owner_store_failure_response(
+                    error,
+                    context,
+                    &failure_operation_id,
+                    &failure_idempotency_key,
+                )
+            }
+            Err(NamedReadGatewayError::GatewayRefusal(_)) => Ok(serde_json::json!({
+                "status": "error",
+                "code": "KERNEL_GATEWAY_REFUSAL",
+                "reason": "The canonical WorkScope owner route refused the request.",
+                "value": { "kind": "store_work_scope_owner", "value": null },
+                "recovery": null,
+            })),
         }
     }
 

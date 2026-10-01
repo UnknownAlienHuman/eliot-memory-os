@@ -835,7 +835,7 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
                     request: request.clone(),
                 },
                 Some(context),
-                context.request_id.as_str(),
+                &request.idempotency_key,
             )
             .await;
         match result {
@@ -873,7 +873,7 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
                     request: request.clone(),
                 },
                 Some(context),
-                context.request_id.as_str(),
+                &request.idempotency_key,
             )
             .await;
         match response {
