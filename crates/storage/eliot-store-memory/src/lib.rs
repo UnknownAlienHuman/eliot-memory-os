@@ -1342,6 +1342,7 @@ fn apply_automation_leg(
             automation_id,
             revision,
             revision_json,
+            normalization_request_json,
             normalization_receipt_json,
         } => retain_automation_normalization(
             state,
@@ -1349,6 +1350,7 @@ fn apply_automation_leg(
             automation_id,
             revision,
             revision_json,
+            normalization_request_json,
             normalization_receipt_json,
         ),
     }
@@ -1588,7 +1590,8 @@ fn retain_automation_revision(
 /// Retains one immutable, owner-normalized revision independently of the
 /// activated automation revision and its current pointer.
 ///
-/// The original revision bytes and generic validated receipt stay intact.
+/// The original revision/request bytes and generic validated receipt stay
+/// intact; the request is opaque and is never reconstructed from the result.
 /// The row is create-only over the exact automation/revision address; replay
 /// succeeds only when the content and the producing transition provenance
 /// are unchanged.
@@ -1598,12 +1601,9 @@ fn retain_automation_normalization(
     automation_id: String,
     revision: String,
     revision_json: String,
+    normalization_request_json: String,
     normalization_receipt_json: Value,
 ) -> Result<Value, StoreError> {
-    eliot_store_api::validate_automation_doc(
-        &revision_json,
-        eliot_store_api::AUTOMATION_PARAM_REVISION_JSON,
-    )?;
     let normalization_receipt_json = validate_automation_normalization_envelope(Some(
         normalization_receipt_json,
     ))?
@@ -1612,6 +1612,7 @@ fn retain_automation_normalization(
         automation_id,
         revision,
         revision_json,
+        normalization_request_json,
         normalization_receipt_json,
         operation_id: transition.identity.operation_id.to_string(),
         idempotency_key: transition.identity.idempotency_key.clone(),
@@ -2896,6 +2897,7 @@ fn automation_state_payload(
                     "automation_id": row.automation_id,
                     "revision": row.revision,
                     "revision_json": row.revision_json,
+                    "normalization_request_json": row.normalization_request_json,
                     "normalization_receipt_json": row.normalization_receipt_json,
                     "operation_id": row.operation_id,
                     "idempotency_key": row.idempotency_key,
@@ -5648,14 +5650,17 @@ struct AutomationRevisionRow {
 }
 
 /// One independently retained immutable normalization result keyed by
-/// `(automation_id, revision)`. It preserves the exact revision and receipt
-/// carried by the admitted retention transition plus that transition's
-/// original identity and applicability metadata.
+/// `(automation_id, revision)`. It preserves the exact revision, original
+/// request, and receipt carried by the admitted retention transition plus
+/// that transition's original identity and applicability metadata. The
+/// request bytes preserve the original authenticated input, including its
+/// legacy predecessor and historical request metadata.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct AutomationNormalizationRow {
     automation_id: String,
     revision: String,
     revision_json: String,
+    normalization_request_json: String,
     normalization_receipt_json: Value,
     operation_id: String,
     idempotency_key: String,
