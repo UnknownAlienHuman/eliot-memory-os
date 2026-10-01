@@ -132,7 +132,7 @@ pub(crate) mod table {
     ///   continuations create their schemaless table only during explicit
     ///   truncated-page issuance. `automation_normalization` has an explicit
     ///   owner DDL body but remains outside admitted schema-generation migrations.
-    pub(crate) const ALL_TABLES: [&str; 26] = [
+    pub(crate) const ALL_TABLES: [&str; 27] = [
         SCHEMA_META,
         WRITE_RECEIPT,
         REVISION_HEAD,
