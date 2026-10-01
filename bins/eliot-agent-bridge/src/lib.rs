@@ -91,7 +91,7 @@ use kernel_activation_client::{
     activation_frame_for_request, build_neutral_activation_request, decode_activation_response,
 };
 use kernel_host_request_client::ReplayCacheEntry;
-pub use kernel_host_request_client::{KernelHostRequestClient, OwnerDryRunPreview};
+pub use kernel_host_request_client::{BindScopeReadback, KernelHostRequestClient, OwnerDryRunPreview};
 pub use memory_handle_join::{ResolvedMemoryHandle, parse_memory_handle};
 pub use reactive_injection_receipts::{
     AdmissionBasis, AttentionItem, CueOrigin, DeliveryPoint, FiringEvidence, InjectionReceipt,
