@@ -436,6 +436,82 @@ fn task_controller_rejection(
 /// Decodes one claim and performs every external campaign read before the
 /// caller borrows the shared composition. Owner-specific checks still happen
 /// under that composition through `prepare_task_controller_transition`.
+fn prepare_scope_binding_claim(
+    claimed: TaskControllerClaimedInvocation,
+) -> Result<TaskControllerClaimPreparation, String> {
+    let invocation = &claimed.invocation;
+    let Ok(request) =
+        serde_json::from_value::<InitialWorkScopeBindingRequest>(invocation.task_input.clone())
+    else {
+        return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
+            task_controller_rejection(&claimed, "invalid_scope_binding")?,
+        )));
+    };
+    if request
+        .validate_for_task_scope(invocation.work_scope_id.as_str())
+        .is_err()
+    {
+        return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
+            task_controller_rejection(&claimed, "invalid_scope_binding")?,
+        )));
+    }
+    let observed = match observe_explicit_workspace(
+        request.explicit_root.as_path(),
+        &claimed.envelope.state_fence,
+    ) {
+        Ok(observed) => observed,
+        Err(error) => {
+            let code = error.code();
+            return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
+                task_controller_rejection(&claimed, code)?,
+            )));
+        }
+    };
+    Ok(TaskControllerClaimPreparation::BindScope(Box::new(
+        PreparedInitialWorkScopeBinding {
+            claimed,
+            request,
+            observed,
+        },
+    )))
+}
+
+async fn prepare_authenticated_owner_publications(
+    reads: &KernelContextReadClient,
+    recipe: &LearningStateViewRecipe,
+    claimed: &TaskControllerClaimedInvocation,
+) -> Result<Option<Vec<CampaignSourcePublication>>, &'static str> {
+    let Some(materials) = claimed.invocation.campaign_owner_materials.as_ref() else {
+        return Ok(None);
+    };
+    reject_caller_owner_material(materials).map_err(|_| "invalid_owner_materials")?;
+    let invocation = &claimed.invocation;
+    let candidate_context_recipe = validate_invocation_context_recipe(
+        &invocation.context_campaign_recipe_catalogue,
+        &invocation.context_campaign_recipe,
+        &invocation.context_input,
+        invocation.task_id.as_str(),
+        &invocation.work_scope_id,
+        &claimed.envelope.state_fence,
+    )
+    .map_err(|_| "invalid_owner_materials")?;
+    let publications = read_authenticated_owner_publications(
+        reads,
+        recipe,
+        &claimed.envelope.state_fence,
+    )
+    .await
+    .map_err(|_| "owner_read_unavailable")?;
+    validate_authenticated_context_recipe(
+        &candidate_context_recipe,
+        recipe,
+        &publications,
+        &claimed.envelope.state_fence,
+    )
+    .map_err(|_| "owner_read_unavailable")?;
+    Ok(Some(publications))
+}
+
 pub async fn prepare_task_controller_claim(
     reads: &KernelContextReadClient,
     kernel: &dyn KernelTransitionPort,
@@ -444,91 +520,24 @@ pub async fn prepare_task_controller_claim(
 ) -> Result<TaskControllerClaimPreparation, String> {
     let invocation = &claimed.invocation;
     if invocation.action == TaskControllerAction::BindScope {
-        let Ok(request) =
-            serde_json::from_value::<InitialWorkScopeBindingRequest>(invocation.task_input.clone())
-        else {
-            return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
-                task_controller_rejection(&claimed, "invalid_scope_binding")?,
-            )));
-        };
-        if request
-            .validate_for_task_scope(invocation.work_scope_id.as_str())
-            .is_err()
-        {
-            return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
-                task_controller_rejection(&claimed, "invalid_scope_binding")?,
-            )));
-        }
-        let observed = match observe_explicit_workspace(
-            request.explicit_root.as_path(),
-            &claimed.envelope.state_fence,
-        ) {
-            Ok(observed) => observed,
-            Err(error) => {
-                let code = error.code();
-                return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
-                    task_controller_rejection(&claimed, code)?,
-                )));
-            }
-        };
-        return Ok(TaskControllerClaimPreparation::BindScope(Box::new(
-            PreparedInitialWorkScopeBinding {
-                claimed,
-                request,
-                observed,
-            },
-        )));
+        return prepare_scope_binding_claim(claimed);
     }
     let Some(recipe) = decode_task_controller_claim_recipe(&claimed) else {
         return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
             task_controller_rejection(&claimed, "invalid_recipe")?,
         )));
     };
-    let complete_owner_publications = match invocation.campaign_owner_materials.as_ref() {
-        Some(materials) => {
-            if reject_caller_owner_material(materials).is_err() {
-                return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
-                    task_controller_rejection(&claimed, "invalid_owner_materials")?,
-                )));
-            }
-            let Ok(candidate_context_recipe) = validate_invocation_context_recipe(
-                &invocation.context_campaign_recipe_catalogue,
-                &invocation.context_campaign_recipe,
-                &invocation.context_input,
-                invocation.task_id.as_str(),
-                &invocation.work_scope_id,
-                &claimed.envelope.state_fence,
-            ) else {
-                return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
-                    task_controller_rejection(&claimed, "invalid_owner_materials")?,
-                )));
-            };
-            let Ok(publications) = read_authenticated_owner_publications(
-                reads,
-                &recipe,
-                &claimed.envelope.state_fence,
-            )
-            .await
-            else {
-                return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
-                    task_controller_rejection(&claimed, "owner_read_unavailable")?,
-                )));
-            };
-            if validate_authenticated_context_recipe(
-                &candidate_context_recipe,
-                &recipe,
-                &publications,
-                &claimed.envelope.state_fence,
-            )
-            .is_err()
-            {
-                return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
-                    task_controller_rejection(&claimed, "owner_read_unavailable")?,
-                )));
-            }
-            Some(publications)
+    let complete_owner_publications = match prepare_authenticated_owner_publications(
+        reads, &recipe, &claimed,
+    )
+    .await
+    {
+        Ok(publications) => publications,
+        Err(reason) => {
+            return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
+                task_controller_rejection(&claimed, reason)?,
+            )));
         }
-        None => None,
     };
 
     let Ok(action) = decode_task_controller_action(&claimed) else {
@@ -574,7 +583,163 @@ pub async fn prepare_task_controller_claim(
     )))
 }
 
-/// Admits and durably installs one explicit initial WorkScope binding. The
+async fn persist_or_reconcile_work_scope_owner(
+    kernel: &DaemonKernelClient,
+    claimed: &TaskControllerClaimedInvocation,
+    snapshot: &eliot_governor::WorkScopeBindingSnapshot,
+    expected_owner_revision: u64,
+) -> Result<eliot_store_api::RecoveryRecord, WorkScopeOwnerWriteFailure> {
+    match kernel
+        .persist_work_scope_binding_snapshot(claimed, snapshot, expected_owner_revision)
+        .await
+    {
+        Ok(record) => Ok(record),
+        Err(WorkScopeOwnerWriteFailure::Store { failure, expected })
+            if failure.disposition == StoreFailureDisposition::UnknownOutcome =>
+        {
+            let Ok(reconciled) = kernel
+                .read_work_scope_owner(
+                    &claimed.envelope.state_fence,
+                    kernel.protected_snapshot_digest(),
+                )
+                .await
+            else {
+                return Err(WorkScopeOwnerWriteFailure::Store { failure, expected });
+            };
+            if reconciled.validate_for_fence(&claimed.envelope.state_fence).is_err()
+                || reconciled != expected
+            {
+                return Err(WorkScopeOwnerWriteFailure::Store { failure, expected });
+            }
+            Ok(reconciled)
+        }
+        Err(WorkScopeOwnerWriteFailure::Kernel {
+            error: error @ KernelPortError::Unknown(_),
+            expected: Some(expected),
+        }) => {
+            let Ok(reconciled) = kernel
+                .read_work_scope_owner(
+                    &claimed.envelope.state_fence,
+                    kernel.protected_snapshot_digest(),
+                )
+                .await
+            else {
+                return Err(WorkScopeOwnerWriteFailure::Kernel {
+                    error,
+                    expected: Some(expected),
+                });
+            };
+            if reconciled.validate_for_fence(&claimed.envelope.state_fence).is_err()
+                || reconciled != expected
+            {
+                return Err(WorkScopeOwnerWriteFailure::Kernel {
+                    error,
+                    expected: Some(expected),
+                });
+            }
+            Ok(reconciled)
+        }
+        Err(failure) => Err(failure),
+    }
+}
+
+async fn admit_initial_scope_owner(
+    composition: &tokio::sync::Mutex<DaemonComposition>,
+    claimed: &TaskControllerClaimedInvocation,
+    request: &InitialWorkScopeBindingRequest,
+    observed: &ObservedScopeResources,
+    fence: &StateFence,
+    retained_snapshot: Option<&eliot_governor::WorkScopeBindingSnapshot>,
+    owner_revision: u64,
+    task_revision: u64,
+    session_ref: &str,
+    now: u64,
+) -> Result<eliot_governor::WorkScopeBindingOwner, &'static str> {
+    let guard = composition.lock().await;
+    if guard.governor_kernel_fence() != *fence {
+        return Err("TASK_SCOPE_INCOMPATIBLE");
+    }
+    guard
+        .governor
+        .admit_initial_scope_binding(InitialScopeBindingAdmissionRequest {
+            now,
+            authenticated_identity: (claimed.authenticated_principal.as_str(), session_ref),
+            task_binding: (claimed.invocation.task_id.as_str(), task_revision),
+            work_scope_ref: claimed.invocation.work_scope_id.as_str(),
+            state_fence: fence,
+            descriptor: &request.descriptor,
+            owner_revision,
+            retained_snapshot,
+            binding: &request.binding,
+            observed,
+            sources: &request.sources,
+            privacy: &request.privacy,
+            source_candidates: &request.source_candidates,
+            declared_precedences: &request.declared_precedences,
+            absence_reason_ref: request.absence_reason_ref.as_deref(),
+            admission_deadline: request.admission_deadline,
+        })
+        .await
+        .map_err(|error| {
+            task_selection_composition_reason_code(&error).unwrap_or("SCOPE_AUTHORITY_REQUIRED")
+        })
+}
+
+async fn install_initial_scope_owner(
+    composition: &tokio::sync::Mutex<DaemonComposition>,
+    claimed: &TaskControllerClaimedInvocation,
+    fence: &StateFence,
+    owner: eliot_governor::WorkScopeBindingOwner,
+    snapshot: eliot_governor::WorkScopeBindingSnapshot,
+    readback: eliot_store_api::RecoveryRecord,
+) -> Result<TaskControllerResultBody, String> {
+    let installed = {
+        let mut guard = composition.lock().await;
+        if guard.governor_kernel_fence() != *fence {
+            return task_controller_rejection(claimed, "TASK_SCOPE_INCOMPATIBLE");
+        }
+        guard
+            .governor
+            .install_admitted_work_scope_owner(owner)
+            .map_err(|error| format!("durable WorkScope owner install failed: {error}"))?
+    };
+    if installed != snapshot {
+        return task_controller_rejection(claimed, "scope_owner_readback_mismatch");
+    }
+    task_controller_result_body(
+        claimed,
+        json!({
+            "status": "admitted",
+            "work_scope_owner_revision": snapshot.owner_revision,
+            "work_scope_owner_digest": readback.value_digest,
+        }),
+    )
+}
+
+fn initial_scope_task_revision(
+    claimed: &TaskControllerClaimedInvocation,
+    fence: &StateFence,
+) -> Result<u64, &'static str> {
+    let Some(task_revision) = fence
+        .task_revision
+        .map(eliot_contracts::TaskRevision::value)
+        .filter(|revision| *revision > 0)
+    else {
+        return Err("TASK_SELECTION_REQUIRED");
+    };
+    let session_ref = claimed.attempt.session_id.as_str();
+    if claimed.envelope.identity.session_id.as_deref() != Some(session_ref)
+        || claimed.envelope.identity.task_id.as_deref() != Some(claimed.invocation.task_id.as_str())
+        || claimed.envelope.identity.work_scope_id.as_deref()
+            != Some(claimed.invocation.work_scope_id.as_str())
+        || claimed.attempt.state_fence != *fence
+    {
+        return Err("TASK_SCOPE_INCOMPATIBLE");
+    }
+    Ok(task_revision)
+}
+
+/// Admits and durably installs one explicit initial `WorkScope` binding. The
 /// Store CAS/readback completes before the in-memory Governor owner changes;
 /// the result acknowledges only the exact snapshot both owners retained.
 pub async fn complete_initial_work_scope_binding(
@@ -588,18 +753,17 @@ pub async fn complete_initial_work_scope_binding(
         observed,
     } = prepared;
     let fence = &claimed.envelope.state_fence;
-    let current = match kernel
+    let Ok(current) = kernel
         .read_work_scope_owner(fence, kernel.protected_snapshot_digest())
         .await
-    {
-        Ok(record) => record,
-        Err(_) => return task_controller_rejection(&claimed, "owner_read_unavailable"),
+    else {
+        return task_controller_rejection(&claimed, "owner_read_unavailable");
     };
-    let (expected_owner_revision, retained_snapshot) =
-        match work_scope_owner_revision_state(&current, fence) {
-            Ok(state) => state,
-            Err(()) => return task_controller_rejection(&claimed, "scope_owner_invalid"),
-        };
+    let Ok((expected_owner_revision, retained_snapshot)) =
+        work_scope_owner_revision_state(&current, fence)
+    else {
+        return task_controller_rejection(&claimed, "scope_owner_invalid");
+    };
     let is_empty_owner = retained_snapshot.is_none();
     let owner_revision = if is_empty_owner {
         let Some(revision) = expected_owner_revision.checked_add(1) else {
@@ -609,57 +773,28 @@ pub async fn complete_initial_work_scope_binding(
     } else {
         expected_owner_revision
     };
-    let Some(task_revision) = fence
-        .task_revision
-        .map(eliot_contracts::TaskRevision::value)
-        .filter(|revision| *revision > 0)
-    else {
-        return task_controller_rejection(&claimed, "TASK_SELECTION_REQUIRED");
-    };
     let session_ref = claimed.attempt.session_id.as_str();
-    if claimed.envelope.identity.session_id.as_deref() != Some(session_ref)
-        || claimed.envelope.identity.task_id.as_deref() != Some(claimed.invocation.task_id.as_str())
-        || claimed.envelope.identity.work_scope_id.as_deref()
-            != Some(claimed.invocation.work_scope_id.as_str())
-        || claimed.attempt.state_fence != *fence
-    {
-        return task_controller_rejection(&claimed, "TASK_SCOPE_INCOMPATIBLE");
-    }
+    let task_revision = match initial_scope_task_revision(&claimed, fence) {
+        Ok(revision) => revision,
+        Err(code) => return task_controller_rejection(&claimed, code),
+    };
     let now = unix_ms();
-    let owner = {
-        let guard = composition.lock().await;
-        if guard.governor_kernel_fence() != *fence {
-            return task_controller_rejection(&claimed, "TASK_SCOPE_INCOMPATIBLE");
-        }
-        match guard
-            .governor
-            .admit_initial_scope_binding(InitialScopeBindingAdmissionRequest {
-                now,
-                authenticated_identity: (claimed.authenticated_principal.as_str(), session_ref),
-                task_binding: (claimed.invocation.task_id.as_str(), task_revision),
-                work_scope_ref: claimed.invocation.work_scope_id.as_str(),
-                state_fence: fence,
-                descriptor: &request.descriptor,
-                owner_revision,
-                retained_snapshot: retained_snapshot.as_ref(),
-                binding: &request.binding,
-                observed: &observed,
-                sources: &request.sources,
-                privacy: &request.privacy,
-                source_candidates: &request.source_candidates,
-                declared_precedences: &request.declared_precedences,
-                absence_reason_ref: request.absence_reason_ref.as_deref(),
-                admission_deadline: request.admission_deadline,
-            })
-            .await
-        {
-            Ok(owner) => owner,
-            Err(error) => {
-                let code = task_selection_composition_reason_code(&error)
-                    .unwrap_or("SCOPE_AUTHORITY_REQUIRED");
-                return task_controller_rejection(&claimed, code);
-            }
-        }
+    let owner = match admit_initial_scope_owner(
+        composition,
+        &claimed,
+        &request,
+        &observed,
+        fence,
+        retained_snapshot.as_ref(),
+        owner_revision,
+        task_revision,
+        session_ref,
+        now,
+    )
+    .await
+    {
+        Ok(owner) => owner,
+        Err(code) => return task_controller_rejection(&claimed, code),
     };
     let snapshot = owner
         .read_current(fence)
@@ -670,71 +805,23 @@ pub async fn complete_initial_work_scope_binding(
     let expected_payload = canonical_json_bytes(&snapshot)
         .map_err(|error| format!("WorkScope snapshot serialization failed: {error}"))?;
     let readback = if is_empty_owner {
-        match kernel
-            .persist_work_scope_binding_snapshot(&claimed, &snapshot, expected_owner_revision)
-            .await
+        match persist_or_reconcile_work_scope_owner(
+            kernel,
+            &claimed,
+            &snapshot,
+            expected_owner_revision,
+        )
+        .await
         {
             Ok(record) => record,
-            Err(WorkScopeOwnerWriteFailure::Store { failure, expected })
-                if failure.disposition == StoreFailureDisposition::UnknownOutcome =>
-            {
-                let reconciled = match kernel
-                    .read_work_scope_owner(fence, kernel.protected_snapshot_digest())
-                    .await
-                {
-                    Ok(record) => record,
-                    Err(_) => {
-                        return task_controller_result_body(
-                            &claimed,
-                            json!({"status": "rejected", "store_failure": failure}),
-                        );
-                    }
-                };
-                if reconciled.validate_for_fence(fence).is_err() {
-                    return task_controller_result_body(
-                        &claimed,
-                        json!({"status": "rejected", "store_failure": failure}),
-                    );
-                }
-                if reconciled == expected {
-                    reconciled
-                } else {
-                    return task_controller_result_body(
-                        &claimed,
-                        json!({"status": "rejected", "store_failure": failure}),
-                    );
-                }
-            }
             Err(WorkScopeOwnerWriteFailure::Store { failure, .. }) => {
                 return task_controller_result_body(
                     &claimed,
                     json!({"status": "rejected", "store_failure": failure}),
                 );
             }
-            Err(WorkScopeOwnerWriteFailure::Kernel { error, expected }) => {
-                if matches!(&error, KernelPortError::Unknown(_)) {
-                    if let Some(expected) = expected {
-                        let reconciled = match kernel
-                            .read_work_scope_owner(fence, kernel.protected_snapshot_digest())
-                            .await
-                        {
-                            Ok(record) => record,
-                            Err(_) => return Err(error.to_string()),
-                        };
-                        if reconciled.validate_for_fence(fence).is_err() {
-                            return Err(error.to_string());
-                        }
-                        if reconciled == expected {
-                            reconciled
-                        } else {
-                            return Err(error.to_string());
-                        }
-                    } else {
-                        return Err(error.to_string());
-                    }
-                } else {
-                    return Err(error.to_string());
-                }
+            Err(WorkScopeOwnerWriteFailure::Kernel { error, .. }) => {
+                return Err(error.to_string());
             }
         }
     } else {
@@ -750,28 +837,7 @@ pub async fn complete_initial_work_scope_binding(
     {
         return task_controller_rejection(&claimed, "scope_owner_readback_mismatch");
     }
-    let installed = {
-        let mut guard = composition.lock().await;
-        if guard.governor_kernel_fence() != *fence {
-            return task_controller_rejection(&claimed, "TASK_SCOPE_INCOMPATIBLE");
-        }
-        guard
-            .governor
-            .install_admitted_work_scope_owner(owner)
-            .map_err(|error| format!("durable WorkScope owner install failed: {error}"))?
-    };
-    if installed != snapshot {
-        return task_controller_rejection(&claimed, "scope_owner_readback_mismatch");
-    }
-    let snapshot_digest = readback.value_digest.clone();
-    task_controller_result_body(
-        &claimed,
-        json!({
-            "status": "admitted",
-            "work_scope_owner_revision": snapshot.owner_revision,
-            "work_scope_owner_digest": snapshot_digest,
-        }),
-    )
+    install_initial_scope_owner(composition, &claimed, fence, owner, snapshot, readback).await
 }
 
 fn work_scope_owner_revision_state(

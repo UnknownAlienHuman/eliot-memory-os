@@ -69,9 +69,9 @@ pub(crate) enum WireOutcome {
         #[serde(default)]
         value: Option<serde_json::Value>,
         /// Typed Store refusal when the operation preserves the existing
-        /// StoreFailure contract. Absent for all legacy/non-Store failures.
+        /// `StoreFailure` contract. Absent for all legacy/non-Store failures.
         #[serde(default)]
-        failure: Option<StoreFailure>,
+        failure: Option<Box<StoreFailure>>,
     },
 }
 
