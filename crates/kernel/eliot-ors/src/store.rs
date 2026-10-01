@@ -540,6 +540,19 @@ const BRIDGE_EVENT_GAPS: TableDefinition<&str, &str> =
 /// intake or application claim.
 const BRIDGE_EVENT_HANDOFFS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_bridge_event_handoffs_v1");
+/// Receiving-owner durable acceptance receipts for staged bridge events
+/// (issue #2731, item 1). One receipt per handoff identity at most, keyed
+/// exactly like [`BRIDGE_EVENT_HANDOFFS`], so receipts never outnumber
+/// handoffs and share their bound: the table needs no separate capacity
+/// constant. The row carries the exact owner receipt digest, the bound
+/// receiving operation, the admitted terminal disposition
+/// (`applied`/`rejected`/`unknown`, never interchanged), the explicit
+/// custody-transfer guarantee, and the retained source/projection
+/// references the receipt binds. Local staging, producer acknowledgement,
+/// and this receiving-owner acceptance stay three separate retained facts;
+/// retirement joins all three and never reads the reconciled flag alone.
+const BRIDGE_EVENT_OWNER_RECEIPTS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_bridge_event_owner_receipts_v1");
 /// Durable normalized projections of staged bridge events (issue #1934,
 /// I7.23). One projection per staged event identity, keyed exactly like
 /// [`BRIDGE_EVENT_RECORDS`], and bound to that record by the immutable
@@ -777,6 +790,18 @@ const BRIDGE_EVENT_HANDOFF_HANDED_OFF: &str = "handed_off";
 /// normalization, application, and the host/native cursor stay owned by the
 /// receiver; nothing here may be read as completed downstream consumption.
 const BRIDGE_EVENT_HANDOFF_RECONCILED: &str = "reconciled";
+/// Admitted receiving-owner terminal dispositions for one handoff (issue
+/// #2731, item 1). Exact strings carried on the retained owner receipt;
+/// they are never coerced into each other. `applied` proves the receiving
+/// owner applied the event exactly once under its bound receipt;
+/// `rejected` proves the receiving owner durably refused it, which is also
+/// terminal — no normalization/application obligation remains. `unknown`
+/// proves only durable acceptance with the outcome still open: it retires
+/// the source work solely under the receipt's explicit custody-transfer
+/// guarantee, never on its own.
+const BRIDGE_EVENT_HANDOFF_DISPOSITION_APPLIED: &str = "applied";
+const BRIDGE_EVENT_HANDOFF_DISPOSITION_REJECTED: &str = "rejected";
+const BRIDGE_EVENT_HANDOFF_DISPOSITION_UNKNOWN: &str = "unknown";
 /// Durable bridge-stream owner bindings (issue #2729): one authenticated
 /// owner binding per admitted stream namespace plus one per unscoped-gap
 /// reporter occurrence. Keyed by the versioned namespace digest; the row
@@ -1957,18 +1982,23 @@ impl BridgeEventHandoffRow {
         Ok(())
     }
 
-    /// Reports whether the retained owner evidence permits retirement
-    /// (issues #2731 and #2730/AUD1). The reconcile tuple is admitted
-    /// terminal evidence only when it binds the retiring operation's
-    /// exact admitted owner with a covering frontier inside the current
-    /// acknowledged receipt: the tuple was written by the
+    /// Reports whether the retained producer evidence permits retirement
+    /// (issues #2731 and #2730/AUD1). The reconcile tuple proves local
+    /// staging plus producer receipt acknowledgement only when it binds the
+    /// retiring operation's exact admitted owner with a covering frontier
+    /// inside the current acknowledged receipt: the tuple was written by the
     /// owner-authenticated reconcile entry under `Acknowledge` right with
     /// `StaleWriterEpoch` protection, carrying the admitting owner's
     /// revision/incarnation and a frontier covering the row's sequence.
     /// Comparing that retained tuple against this operation's owner and
     /// acked frontier — rather than trusting row state alone — is what
     /// activates the certified compacted boundary without ever retiring
-    /// on stale-owner or unacknowledged evidence. The caller still
+    /// on stale-owner or unacknowledged evidence. This leg is necessary but
+    /// insufficient: the reconciled flag and reconcile key alone never
+    /// retire. The receiving-owner terminal condition lives on the separate
+    /// retained receipt (see
+    /// [`BridgeEventOwnerReceiptRow::receiver_terminal`]) and the caller
+    /// joins it before terminalizing. The caller still
     /// validates the original row with `validate()` first and only
     /// terminalizes a contiguous gap-free prefix, so deletions stay
     /// behind the certified gate and old sequences stay non-reusable
@@ -2002,6 +2032,116 @@ impl BridgeEventHandoffRow {
 
 impl persistence_codec::PersistedValue for BridgeEventHandoffRow {
     const RECORD_TYPE: &'static str = "bridge_event_handoff";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+/// One retained receiving-owner durable acceptance receipt for a staged
+/// bridge-event handoff (issue #2731, item 1).
+///
+/// This is the handoff's actual terminal-condition evidence, kept separate
+/// from local staging (the [`BridgeEventRow`] plus its pending handoff) and
+/// from producer receipt acknowledgement (the handoff's `reconciled` flag
+/// with its reconcile tuple). The row binds the exact owner receipt digest,
+/// the receiving operation it covers, the admitted terminal disposition,
+/// the explicit custody-transfer guarantee, and the retained
+/// source/projection references: stream, incarnation, event, content
+/// (envelope digest), and the durable normalized projection's transport
+/// hash. The admitting stream owner epoch (revision/incarnation) is taken
+/// from the checked access that records the receipt, never from caller
+/// text, so retirement compares retained evidence against the retiring
+/// operation's currently admitted owner instead of trusting a stale epoch.
+/// At most one receipt exists per handoff key; the recording entry writes it
+/// monotonically (an `unknown` acceptance may resolve to its admitted
+/// `applied`/`rejected` disposition, nothing else rewrites), and retirement
+/// removes it together with the handoff it terminalizes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BridgeEventOwnerReceiptRow {
+    contract_version: u16,
+    owner_namespace: String,
+    stream_id: String,
+    event_id: String,
+    sequence: u64,
+    envelope_sha256: String,
+    projection_hash: String,
+    owner_receipt: String,
+    receiving_operation: String,
+    receiver_disposition: String,
+    custody_guaranteed: bool,
+    receiver_owner_revision: u64,
+    receiver_owner_incarnation: u64,
+    recorded_at_ms: u64,
+}
+
+impl BridgeEventOwnerReceiptRow {
+    fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != crate::CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        crate::model::validate_digest(&self.owner_namespace, "owner_namespace")?;
+        bridge_identity_text(&self.stream_id, "stream_id")?;
+        bridge_identity_text(&self.event_id, "event_id")?;
+        if self.sequence == 0 {
+            return Err(OrsError::InvalidField {
+                field: "sequence",
+                reason: "bridge event owner receipt sequence must be nonzero",
+            });
+        }
+        crate::model::validate_digest(&self.envelope_sha256, "envelope_sha256")?;
+        crate::model::validate_digest(&self.projection_hash, "projection_hash")?;
+        crate::model::validate_digest(&self.owner_receipt, "owner_receipt")?;
+        bridge_identity_text(&self.receiving_operation, "receiving_operation")?;
+        if self.receiver_disposition != BRIDGE_EVENT_HANDOFF_DISPOSITION_APPLIED
+            && self.receiver_disposition != BRIDGE_EVENT_HANDOFF_DISPOSITION_REJECTED
+            && self.receiver_disposition != BRIDGE_EVENT_HANDOFF_DISPOSITION_UNKNOWN
+        {
+            return Err(OrsError::InvalidField {
+                field: "receiver_disposition",
+                reason: "bridge event handoff receiver disposition must be applied, rejected, or unknown",
+            });
+        }
+        if self.receiver_owner_revision == 0 || self.receiver_owner_incarnation == 0 {
+            return Err(OrsError::InvalidField {
+                field: "receiver_owner_revision",
+                reason: "bridge event owner receipt binds the nonzero admitting owner revision and incarnation",
+            });
+        }
+        Ok(())
+    }
+
+    /// Reports whether this retained receipt terminalizes its handoff under
+    /// the retiring operation's admitted owner (issue #2731, item 1). The
+    /// receipt counts only when it names the currently admitted owner epoch:
+    /// stale-epoch evidence never retires. An admitted `applied` or
+    /// `rejected` disposition is terminal — the downstream obligation is
+    /// closed either way, and the two are never interchanged. An `unknown`
+    /// disposition proves durable acceptance with the outcome still open, so
+    /// it transfers custody before final application only under the
+    /// receipt's explicit guarantee; without it the source work stays
+    /// pending.
+    fn receiver_terminal(&self, owner: &BridgeStreamOwnerRow) -> bool {
+        if self.receiver_owner_revision != owner.revision
+            || self.receiver_owner_incarnation != owner.incarnation
+        {
+            return false;
+        }
+        if self.receiver_disposition == BRIDGE_EVENT_HANDOFF_DISPOSITION_APPLIED
+            || self.receiver_disposition == BRIDGE_EVENT_HANDOFF_DISPOSITION_REJECTED
+        {
+            return true;
+        }
+        if self.receiver_disposition == BRIDGE_EVENT_HANDOFF_DISPOSITION_UNKNOWN {
+            return self.custody_guaranteed;
+        }
+        false
+    }
+}
+
+impl persistence_codec::PersistedValue for BridgeEventOwnerReceiptRow {
+    const RECORD_TYPE: &'static str = "bridge_event_owner_receipt";
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()
@@ -19416,6 +19556,276 @@ impl RedbRecoveryStore {
         Ok(outcome)
     }
 
+    /// Records one receiving-owner durable acceptance receipt on its exact
+    /// handoff (issue #2731, item 1). The receipt is the handoff's terminal
+    /// leg, retained separately from local staging and producer receipt
+    /// acknowledgement: it may arrive before or after the producer reconcile
+    /// tuple, and recording it never advances a cursor or evicts anything.
+    /// Every presented binding is checked against the retained originals in
+    /// this transaction — the handoff row, its source record, and the
+    /// durable normalized projection behind
+    /// [`Self::require_bridge_event_relation_in`] — so the receipt binds
+    /// this stream, this incarnation, this event, this content, this
+    /// receiving operation, and these retained source/projection references,
+    /// never a guess. The admitting owner epoch comes from the checked
+    /// access, never from caller text. The write is monotonic: the same
+    /// receipt re-presents idempotently (rebinding a moved owner epoch), an
+    /// `unknown` acceptance may resolve to its admitted `applied`/`rejected`
+    /// disposition, and any other rewrite fails as a
+    /// [`OrsError::DuplicateConflict`]. A receipt naming a never-staged
+    /// handoff is an [`OrsError::InvalidTransition`]: the handoff never
+    /// synthesizes intake. No cross-store atomicity with the Governor intake
+    /// is claimed: a lost answer replays safely.
+    pub fn record_bridge_event_owner_receipt_checked(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, OrsError> {
+        let namespace = bridge_text(request, "namespace")?;
+        crate::model::validate_digest(&namespace, "owner_namespace")?;
+        let expected_revision = request
+            .get("expected_revision")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(OrsError::InvalidField {
+                field: "expected_revision",
+                reason: "owner receipt must carry the expected owner revision",
+            })?;
+        let expected_incarnation = request
+            .get("expected_incarnation")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(OrsError::InvalidField {
+                field: "expected_incarnation",
+                reason: "owner receipt must carry the expected stream incarnation",
+            })?;
+        if expected_revision == 0 || expected_incarnation == 0 {
+            return Err(OrsError::InvalidField {
+                field: "expected_revision",
+                reason: "expected owner revision and incarnation must be nonzero",
+            });
+        }
+        let event_id = bridge_key_text(request, "event_id")?;
+        let sequence = bridge_sequence(request, "sequence")?;
+        let envelope_sha256 = bridge_text(request, "envelope_sha256")?;
+        crate::model::validate_digest(&envelope_sha256, "envelope_sha256")?;
+        let projection_hash = bridge_text(request, "projection_hash")?;
+        crate::model::validate_digest(&projection_hash, "projection_hash")?;
+        let owner_receipt = bridge_text(request, "owner_receipt")?;
+        crate::model::validate_digest(&owner_receipt, "owner_receipt")?;
+        let receiving_operation = bridge_text(request, "receiving_operation")?;
+        bridge_identity_text(&receiving_operation, "receiving_operation")?;
+        let receiver_disposition = bridge_text(request, "receiver_disposition")?;
+        if receiver_disposition != BRIDGE_EVENT_HANDOFF_DISPOSITION_APPLIED
+            && receiver_disposition != BRIDGE_EVENT_HANDOFF_DISPOSITION_REJECTED
+            && receiver_disposition != BRIDGE_EVENT_HANDOFF_DISPOSITION_UNKNOWN
+        {
+            return Err(OrsError::InvalidField {
+                field: "receiver_disposition",
+                reason: "bridge event handoff receiver disposition must be applied, rejected, or unknown",
+            });
+        }
+        // The custody-transfer guarantee is an explicit positive claim by the
+        // receiving owner's contract: absence never reads as granted.
+        let custody_guaranteed =
+            request
+                .get("custody_guaranteed")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or(OrsError::InvalidField {
+                    field: "custody_guaranteed",
+                    reason: "owner receipt must state its custody-transfer guarantee explicitly",
+                })?;
+        let key = format!("{namespace}::{event_id}");
+        let now_ms = current_unix_ms_u64()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let outcome = Self::record_bridge_owner_receipt_in(
+            &write,
+            &namespace,
+            expected_revision,
+            expected_incarnation,
+            &key,
+            &event_id,
+            sequence,
+            &envelope_sha256,
+            &projection_hash,
+            &owner_receipt,
+            &receiving_operation,
+            &receiver_disposition,
+            custody_guaranteed,
+            now_ms,
+        )?;
+        write.commit().map_err(storage)?;
+        Ok(outcome)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "The receipt binds eleven presented facts to three retained rows; grouping them would hide the exact binding the terminal condition requires."
+    )]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "The owner check, three retained-row joins, binding comparisons, and monotonic receipt write must remain one reviewable write-transaction flow."
+    )]
+    fn record_bridge_owner_receipt_in(
+        write: &redb::WriteTransaction,
+        namespace: &str,
+        expected_revision: u64,
+        expected_incarnation: u64,
+        key: &str,
+        event_id: &str,
+        sequence: u64,
+        envelope_sha256: &str,
+        projection_hash: &str,
+        owner_receipt: &str,
+        receiving_operation: &str,
+        receiver_disposition: &str,
+        custody_guaranteed: bool,
+        now_ms: u64,
+    ) -> Result<serde_json::Value, OrsError> {
+        let owner = Self::load_bridge_owner_row_in(write, namespace)?;
+        if owner.kind != BRIDGE_STREAM_OWNER_KIND_STREAM {
+            return Err(OrsError::RecoveryOwnerMismatch);
+        }
+        let access = Self::check_bridge_stream_access(
+            &owner,
+            expected_revision,
+            expected_incarnation,
+            BridgeStreamRight::Acknowledge,
+        )?;
+        let handoff: BridgeEventHandoffRow = {
+            let handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
+            handoffs
+                .get(key)
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        }
+        .ok_or(OrsError::InvalidTransition)?;
+        handoff.validate()?;
+        if handoff.owner_namespace != access.namespace
+            || handoff.stream_id != owner.local_stream
+            || handoff.event_id != event_id
+            || handoff.sequence != sequence
+            || handoff.envelope_sha256 != envelope_sha256
+        {
+            return Err(OrsError::DuplicateConflict);
+        }
+        let record = Self::peek_bridge_event_row_in(write, key)?.ok_or(
+            OrsError::IntegrityProblem {
+                record_type: "bridge_event_record",
+                reason: "retained handoff lost its retained source".to_owned(),
+            },
+        )?;
+        record.validate()?;
+        if record.owner_namespace != access.namespace
+            || record.stream_id != owner.local_stream
+            || record.event_id != event_id
+            || record.sequence != sequence
+            || record.envelope_sha256 != envelope_sha256
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_event_record",
+                reason: "terminal handoff does not bind its exact retained source".to_owned(),
+            });
+        }
+        Self::require_bridge_event_relation_in(write, &record, key)?;
+        let projection: BridgeEventProjectionRow = {
+            let projections = write
+                .open_table(BRIDGE_EVENT_PROJECTIONS)
+                .map_err(storage)?;
+            projections
+                .get(key)
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        }
+        .ok_or(OrsError::IntegrityProblem {
+            record_type: "bridge_event_projection",
+            reason: "staged bridge event has no durable normalized projection".to_owned(),
+        })?;
+        if projection.record_transport_hash != projection_hash
+            || projection.record_transport_hash != record.transport_hash
+        {
+            return Err(OrsError::DuplicateConflict);
+        }
+        let stored: Option<BridgeEventOwnerReceiptRow> = {
+            let receipts = write
+                .open_table(BRIDGE_EVENT_OWNER_RECEIPTS)
+                .map_err(storage)?;
+            receipts
+                .get(key)
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let (receipt, fresh) = match stored {
+            None => (
+                BridgeEventOwnerReceiptRow {
+                    contract_version: crate::CONTRACT_VERSION,
+                    owner_namespace: access.namespace.clone(),
+                    stream_id: owner.local_stream.clone(),
+                    event_id: event_id.to_owned(),
+                    sequence,
+                    envelope_sha256: envelope_sha256.to_owned(),
+                    projection_hash: projection_hash.to_owned(),
+                    owner_receipt: owner_receipt.to_owned(),
+                    receiving_operation: receiving_operation.to_owned(),
+                    receiver_disposition: receiver_disposition.to_owned(),
+                    custody_guaranteed,
+                    receiver_owner_revision: owner.revision,
+                    receiver_owner_incarnation: owner.incarnation,
+                    recorded_at_ms: now_ms,
+                },
+                true,
+            ),
+            Some(mut stored) => {
+                stored.validate()?;
+                if stored.owner_namespace != access.namespace
+                    || stored.stream_id != owner.local_stream
+                    || stored.event_id != event_id
+                    || stored.sequence != sequence
+                    || stored.envelope_sha256 != envelope_sha256
+                    || stored.projection_hash != projection_hash
+                    || stored.owner_receipt != owner_receipt
+                    || stored.receiving_operation != receiving_operation
+                    || stored.custody_guaranteed != custody_guaranteed
+                {
+                    return Err(OrsError::DuplicateConflict);
+                }
+                if stored.receiver_disposition != receiver_disposition {
+                    let resolves = stored.receiver_disposition
+                        == BRIDGE_EVENT_HANDOFF_DISPOSITION_UNKNOWN
+                        && (receiver_disposition == BRIDGE_EVENT_HANDOFF_DISPOSITION_APPLIED
+                            || receiver_disposition
+                                == BRIDGE_EVENT_HANDOFF_DISPOSITION_REJECTED);
+                    if !resolves {
+                        return Err(OrsError::DuplicateConflict);
+                    }
+                    receiver_disposition.clone_into(&mut stored.receiver_disposition);
+                }
+                // The admitting epoch moves with the owner: a revision bump
+                // never orphans an otherwise identical receipt.
+                stored.receiver_owner_revision = owner.revision;
+                stored.receiver_owner_incarnation = owner.incarnation;
+                (stored, false)
+            }
+        };
+        receipt.validate()?;
+        {
+            let mut receipts = write
+                .open_table(BRIDGE_EVENT_OWNER_RECEIPTS)
+                .map_err(storage)?;
+            receipts
+                .insert(key, encode(&receipt)?.as_str())
+                .map_err(storage)?;
+        }
+        Ok(json!({
+            "namespace": access.namespace,
+            "event_id": event_id,
+            "sequence": sequence,
+            "receiver_disposition": receipt.receiver_disposition,
+            "custody_guaranteed": receipt.custody_guaranteed,
+            "fresh": fresh,
+        }))
+    }
+
     /// Advances one bounded owner-index page of independent handoff repair
     /// and eligible-retirement maintenance (issue #2731, item 5). The
     /// presenter supplies only its retained lineage/principal; ORS derives
@@ -19714,15 +20124,61 @@ impl RedbRecoveryStore {
         }))
     }
 
+    /// Joins one handoff's receiving-owner receipt and reports whether the
+    /// retained terminal condition holds (issue #2731, item 1). The receipt
+    /// is loaded by the handoff's own key, validated, and bound against the
+    /// retained originals: namespace, stream, event, sequence, and content
+    /// must equal the handoff and its source record, and the receipt's
+    /// projection reference must still name the record's retained transport
+    /// hash — a re-pointed source/projection relation fails closed as a torn
+    /// binding instead of retiring. A missing receipt is not an error: the
+    /// delivery obligation may still exist, so the caller treats the handoff
+    /// as nonterminal and keeps the source work pending.
+    fn bridge_handoff_receiver_terminal_in(
+        write: &redb::WriteTransaction,
+        access: &BridgeStreamAccess,
+        owner: &BridgeStreamOwnerRow,
+        row: &BridgeEventHandoffRow,
+        record: &BridgeEventRow,
+    ) -> Result<bool, OrsError> {
+        let key = format!("{}::{}", access.namespace, row.event_id);
+        let receipts = write
+            .open_table(BRIDGE_EVENT_OWNER_RECEIPTS)
+            .map_err(storage)?;
+        let Some(value) = receipts.get(key.as_str()).map_err(storage)? else {
+            return Ok(false);
+        };
+        let receipt: BridgeEventOwnerReceiptRow = decode(value.value())?;
+        receipt.validate()?;
+        if receipt.owner_namespace != access.namespace
+            || receipt.stream_id != owner.local_stream
+            || receipt.event_id != row.event_id
+            || receipt.sequence != row.sequence
+            || receipt.envelope_sha256 != row.envelope_sha256
+            || receipt.envelope_sha256 != record.envelope_sha256
+            || receipt.projection_hash != record.transport_hash
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_event_owner_receipt",
+                reason: "owner receipt does not bind its retained handoff, source, and projection"
+                    .to_owned(),
+            });
+        }
+        Ok(receipt.receiver_terminal(owner))
+    }
+
     /// Collects terminal-eligible handoffs as one contiguous prefix over a
     /// bounded position page (issues #2731 item 5 and #2885 item 6).
     /// Positions are examined in sequence order from just above the
     /// compacted boundary; the first gap-covered, unknown-handoff,
     /// nonterminal, or missing position stops the range instead of being
-    /// skipped to free space, and torn bindings fail closed. A retained
-    /// reconcile tuple counts as terminal evidence only when it binds the
-    /// current owner epoch with a covering frontier inside the acknowledged
-    /// receipt, so no stale or unacknowledged row enters the prefix.
+    /// skipped to free space, and torn bindings fail closed. The producer
+    /// reconcile tuple is necessary but insufficient: a retained tuple
+    /// counts only when it binds the current owner epoch with a covering
+    /// frontier inside the acknowledged receipt, and the handoff additionally
+    /// joins its receiving-owner receipt (see
+    /// [`Self::bridge_handoff_receiver_terminal_in`]), so no stale,
+    /// unacknowledged, or receiver-unaccepted row enters the prefix.
     /// Source/projection joins still run before a row
     /// could enter a future terminalization path. `gaps` carries this
     /// namespace's scoped coverage intervals loaded once by the caller,
@@ -19788,7 +20244,11 @@ impl RedbRecoveryStore {
                         .to_owned(),
                 });
             }
-            if !row.retirement_eligible(owner, cursor.last_acked_sequence) {
+            if !row.retirement_eligible(owner, cursor.last_acked_sequence)
+                || !Self::bridge_handoff_receiver_terminal_in(
+                    write, access, owner, &row, &record,
+                )?
+            {
                 // A nonterminal event stops the range: later positions
                 // are never terminalized past it.
                 stopped = true;
@@ -20237,16 +20697,19 @@ impl RedbRecoveryStore {
     }
 
     /// Retires one namespace's handoffs inside the recovery transaction
-    /// (issue #2731, items 4 and 5) over a contiguous eligible prefix
+    /// (issue #2731, items 1, 4, and 5) over a contiguous eligible prefix
     /// (issue #2885, item 6). Eligibility is evaluated per row by
     /// [`BridgeEventHandoffRow::retirement_eligible`] against the retiring
-    /// operation's admitted owner and acknowledged receipt, and the first
+    /// operation's admitted owner and acknowledged receipt, joined to the
+    /// handoff's receiving-owner receipt (see
+    /// [`Self::bridge_handoff_receiver_terminal_in`]), and the first
     /// gap-covered, unknown-handoff, nonterminal, or missing position
     /// stops the prefix instead of being skipped to free space. The
     /// stored reconcile tuple is the admitting owner's frontier/owner
-    /// evidence: it retires a row only when it names the currently
-    /// admitted owner epoch with a covering frontier inside the
-    /// acknowledged receipt. A terminalized prefix is
+    /// evidence: it is necessary but insufficient, counting only when it
+    /// names the currently admitted owner epoch with a covering frontier
+    /// inside the acknowledged receipt — producer acknowledgement alone
+    /// never retires an unconsumed event. A terminalized prefix is
     /// certified as a cumulative compacted range binding owner
     /// namespace/incarnation, interval, predecessor, ack frontier,
     /// segment commitment, schema version, and retention revision (issue
@@ -20366,7 +20829,11 @@ impl RedbRecoveryStore {
                 });
             }
             Self::require_bridge_event_relation_in(write, &record, record_key.as_str())?;
-            if !row.retirement_eligible(&owner, acked) {
+            if !row.retirement_eligible(&owner, acked)
+                || !Self::bridge_handoff_receiver_terminal_in(
+                    write, &access, &owner, row, &record,
+                )?
+            {
                 continue;
             }
             let commitment = Self::bridge_replay_commitment_for(&record, now_ms, acked);
@@ -20384,6 +20851,15 @@ impl RedbRecoveryStore {
                     .open_table(BRIDGE_EVENT_PROJECTIONS)
                     .map_err(storage)?;
                 projections.remove(record_key.as_str()).map_err(storage)?;
+            }
+            {
+                // The terminal receipt leaves with the handoff it
+                // terminalized: one receipt per handoff key, removed in the
+                // same transaction, so no orphan evidence accumulates.
+                let mut receipts = write
+                    .open_table(BRIDGE_EVENT_OWNER_RECEIPTS)
+                    .map_err(storage)?;
+                receipts.remove(key.as_str()).map_err(storage)?;
             }
             terminalized += 1;
             terminalized_leaves.push((
