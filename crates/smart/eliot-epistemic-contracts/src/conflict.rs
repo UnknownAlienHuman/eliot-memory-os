@@ -4,6 +4,15 @@
 //! flag, plus common lineage, unresolved residue and owners, probe, and receipt digest. Count, recency, and
 //! scalar confidence never resolve a conflict: a set closes only when its residue is empty and its lifecycle
 //! says so.
+//!
+//! A member of the position denominator may be declared but not carried, and the set says so in its own
+//! typed vocabulary rather than by dropping the member. [`MissingConflictPosition`] pairs the absent owner
+//! with the [`MemberDisposition`] its owner issued for it, and
+//! [`ConflictSet::position_denominator`] counts a carried position and a still-open declared member alike.
+//! Qualification is the disposition's, never a flag: [`MemberDisposition::is_terminal`] closes a member on
+//! observed presence or authoritative absence, so a closed member is refused here and an open one stays in
+//! the denominator as a named gap. The absent member must also appear in the set's own `unresolved_owners`
+//! residue, so a set cannot claim a rival exists that its own declaration does not name.
 use std::collections::BTreeSet;
 
 use eliot_contracts::{ArtifactId, SourceId, TaskId};
@@ -15,6 +24,7 @@ use crate::error::{
     shape_digest, validate_bounded_text, validate_digest,
 };
 use crate::identity::LineageRootId;
+use crate::receipt::MemberDisposition;
 
 /// The eight canonical conflict kinds of I13.1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
@@ -69,6 +79,57 @@ pub enum ConflictLifecycle {
     Superseded,
     /// Closed with empty unresolved residue.
     Resolved,
+}
+
+/// One declared-but-absent conflict position: a member the set's own
+/// `unresolved_owners` declaration names whose stance it does not carry.
+///
+/// The disposition is this crate's canonical per-member outcome vocabulary
+/// ([`MemberDisposition`]), not a flag, and it is the whole of the
+/// qualification. [`MemberDisposition::is_terminal`] is the documented
+/// discriminator — "only observed presence and authoritative absence close" —
+/// so a member whose outcome is still open stays in the denominator as a named
+/// gap, while a member whose outcome has closed is not a rival at all and
+/// cannot be admitted as one. A caller therefore cannot manufacture a conflict
+/// by asserting a rival exists: it has to record the typed outcome its owner
+/// issued for that rival, and `Observed` or `AuthoritativeAbsence` is refused.
+///
+/// The reason is bounded prose because the outcome type alone says what kind of
+/// gap this is, not which member of the set it belongs to; it is preserved
+/// verbatim and never parsed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MissingConflictPosition {
+    /// Owner whose declared position this set does not carry.
+    pub owner: SourceId,
+    /// Owner-issued outcome for that absent member.
+    pub disposition: MemberDisposition,
+    /// Bounded reason the owner's position is not in the set.
+    pub reason: String,
+}
+impl MissingConflictPosition {
+    /// Constructs a declared-but-absent member after validating its reason.
+    pub fn new(
+        owner: SourceId,
+        disposition: MemberDisposition,
+        reason: impl Into<String>,
+    ) -> Result<Self, ContractError> {
+        let missing = Self {
+            owner,
+            disposition,
+            reason: reason.into(),
+        };
+        missing.validate()?;
+        Ok(missing)
+    }
+    /// Validates the bounded reason; the disposition vocabulary is closed by type.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        validate_bounded_text(&self.reason, "conflict.missing_position.reason", MAX_SHORT_TEXT)
+    }
+    /// Returns whether this member is still open and therefore in the denominator.
+    pub const fn is_in_denominator(&self) -> bool {
+        !self.disposition.is_terminal()
+    }
 }
 
 /// One preserved position inside a conflict set.
@@ -138,6 +199,12 @@ pub struct ConflictSet {
     pub task_id: Option<TaskId>,
     /// Preserved positions in declaration order.
     pub positions: Vec<ConflictPosition>,
+    /// Declared-but-absent members of the position denominator, in declaration
+    /// order. Empty for an ordinary set; a set with a member here and one
+    /// position still holds a two-member denominator, which is the one shape
+    /// that is a conflict with fewer than two carried positions.
+    #[serde(default)]
+    pub missing_positions: Vec<MissingConflictPosition>,
     /// Evidence and lineage handles behind the set; order carries no meaning.
     pub evidence_refs: BTreeSet<ArtifactId>,
     /// Authority owners of the set; order carries no meaning.
@@ -176,6 +243,7 @@ struct ConflictDigestShape<'a> {
     scope: &'a str,
     task_id: &'a Option<TaskId>,
     positions: &'a [ConflictPosition],
+    missing_positions: &'a [MissingConflictPosition],
     evidence_refs: &'a BTreeSet<ArtifactId>,
     owners: &'a BTreeSet<SourceId>,
     common_lineage: &'a BTreeSet<LineageRootId>,
@@ -214,13 +282,31 @@ pub struct ConflictSetParams {
     pub receipt_digest: String,
 }
 impl ConflictSet {
+    /// Constructs an ordinary set: every declared member is carried as a position.
     pub fn new(params: ConflictSetParams) -> Result<Self, ContractError> {
+        Self::new_with_missing_positions(params, Vec::new())
+    }
+    /// Constructs a set that also declares members of its position denominator
+    /// it does not carry, each with the outcome its owner issued for it.
+    ///
+    /// The declared-but-absent members are named separately from
+    /// [`ConflictSetParams`] so the ordinary construction path is unchanged for
+    /// every caller that has no absent member to declare, and so admitting one
+    /// is a deliberate act of this constructor rather than a field a caller can
+    /// leave set. Both constructors run the same `validate_shape` and mint the
+    /// digest the same way, so an absent member is bound into the frozen digest
+    /// exactly like any other field.
+    pub fn new_with_missing_positions(
+        params: ConflictSetParams,
+        missing_positions: Vec<MissingConflictPosition>,
+    ) -> Result<Self, ContractError> {
         let mut set = Self {
             conflict_id: params.conflict_id,
             kind: params.kind,
             scope: params.scope,
             task_id: params.task_id,
             positions: params.positions,
+            missing_positions,
             evidence_refs: params.evidence_refs,
             owners: params.owners,
             common_lineage: params.common_lineage,
@@ -247,6 +333,7 @@ impl ConflictSet {
             scope: self.scope.as_str(),
             task_id: &self.task_id,
             positions: self.positions.as_slice(),
+            missing_positions: self.missing_positions.as_slice(),
             evidence_refs: &self.evidence_refs,
             owners: &self.owners,
             common_lineage: &self.common_lineage,
@@ -268,21 +355,70 @@ impl ConflictSet {
             && self.unresolved.is_empty()
             && self.unresolved_owners.is_empty()
     }
+    /// Returns the exact, recheckable width of the position denominator.
+    ///
+    /// A carried position and a declared-but-absent member are both members of
+    /// the denominator and are counted by their own declaration, so a caller
+    /// cannot narrow a conflict by dropping a member it already declared. Only
+    /// a member whose owner-issued outcome is still open counts: a member whose
+    /// outcome has closed is not a position of this conflict at all, and
+    /// counting it would be inventing a rival rather than preserving one.
+    pub fn position_denominator(&self) -> usize {
+        self.positions.len()
+            + self
+                .missing_positions
+                .iter()
+                .filter(|missing| missing.is_in_denominator())
+                .count()
+    }
+    /// Returns the set's declared-but-absent members, in declaration order.
+    pub fn missing_positions(&self) -> &[MissingConflictPosition] {
+        &self.missing_positions
+    }
     fn validate_shape(&self) -> Result<(), ContractError> {
         validate_bounded_text(&self.conflict_id, "conflict.conflict_id", MAX_SHORT_TEXT)?;
         validate_bounded_text(&self.scope, "conflict.scope", MAX_SHORT_TEXT)?;
-        if self.positions.len() < 2 {
-            return Err(ContractError::EmptyCollection {
-                field: "conflict.positions",
-            });
-        }
-        if self.positions.len() > MAX_POSITIONS {
+        if self.positions.len() + self.missing_positions.len() > MAX_POSITIONS {
             return Err(ContractError::TooMany {
                 field: "conflict.positions",
             });
         }
+        let mut carried: BTreeSet<&SourceId> = BTreeSet::new();
         for position in &self.positions {
             position.validate()?;
+            carried.insert(&position.source);
+        }
+        let mut absent: BTreeSet<&SourceId> = BTreeSet::new();
+        for missing in &self.missing_positions {
+            missing.validate()?;
+            // A member already carried as a position is not absent, and a
+            // member named twice is one member counted twice. Either way the
+            // declaration and the set disagree about the denominator.
+            if carried.contains(&missing.owner) || !absent.insert(&missing.owner) {
+                return Err(ContractError::Duplicate {
+                    field: "conflict.missing_positions",
+                });
+            }
+            // A closed outcome means the owner settled this member's question;
+            // recording it here would claim a rival the owner already resolved.
+            if !missing.is_in_denominator() {
+                return Err(ContractError::ImpossibleCombination {
+                    field: "conflict.missing_positions",
+                });
+            }
+            // The set's own residue is what makes the absent member a member.
+            // Without that declaration this record is an unowned assertion that
+            // a rival exists, which is exactly the suppression it must prevent.
+            if !self.unresolved_owners.contains(&missing.owner) {
+                return Err(ContractError::MissingReference {
+                    field: "conflict.missing_positions",
+                });
+            }
+        }
+        if self.position_denominator() < 2 {
+            return Err(ContractError::EmptyCollection {
+                field: "conflict.positions",
+            });
         }
         if self.evidence_refs.len() > MAX_HANDLES {
             return Err(ContractError::TooMany {
