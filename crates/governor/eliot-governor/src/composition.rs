@@ -48,8 +48,8 @@ use crate::{
     QueueLimits, STARTUP_ORDER, ServiceId, ServiceObservation,
 };
 use eliot_authority::{
-    CrossRootQuarantineEvidence, GrantActivationRequest, GrantId, GrantRevocationRequest,
-    GrantStatus, IntroductionActivationRequest, IntroductionId, IntroductionRevocationRequest,
+    CrossRootQuarantineEvidence, GrantActivationRequest, GrantId, GrantRecoveryRecord,
+    GrantRevocationRequest, GrantStatus, IntroductionActivationRequest, IntroductionId, IntroductionRevocationRequest,
     IntroductionStatus, P07AuthorityPort, P07PortError, RevocationOperationIdentity,
     RevocationOrigin, RevocationTransitionDisposition, RevocationTransitionRequest,
     RootTransitionActivationReceipt, RootTransitionActivationRequest,
@@ -79,6 +79,7 @@ use eliot_finish::{
     DescendantClosure, FinishDecisionReceipt, FinishError, FinishLifecycleAction, FinishService,
 };
 use eliot_influence::RevocationBounds;
+use eliot_kernel_core::GrantActivationIntent;
 use eliot_instrument_api::{
     CaptureProvenance, EvidenceAxes, EvidenceCoverage, EvidenceFreshness, ExecutionStatus,
     InstrumentInvocation, InstrumentKind, NormalizedEvidence, RawEvidence, RawEvidenceSource,
@@ -130,7 +131,7 @@ use eliot_workscope::{
     ReadinessLifecycle, RepositoryLineageIdentity, RequestedEffect, ResolutionAuthentication,
     ResolutionRequest, ScanDisclosureOwnerBinding, ScanDisclosureStore, ScanReceiptHandle,
     ScannerResolverInputs, ScopeBinding, ScopeBindingDisposition, ScopeBindingGuard, ScopeIdentity,
-    ScopeKind, ScopeRelocationOrAttachReceipt, ScopeResolution, SourceAdmissionRequest,
+    ScopeRelocationOrAttachReceipt, ScopeResolution, SourceAdmissionRequest,
     SourceCandidateOrigin, TaskBindingInput, TaskBindingState, TaskIntakeCandidate,
     TaskSelectionRequired, TriggerAdmission, TriggerReport, WorkScopeBindingOwner,
     WorkScopeBindingSnapshot, WorkScopeCandidate, WorkScopeCandidateSet, WorkScopeDescriptor,
@@ -3705,6 +3706,27 @@ pub struct GovernorActivationSnapshot {
     pub plan_revision: String,
 }
 
+/// Original owner proof that a uniquely selected task can bind its current
+/// canonical WorkScope before the first WorkScope owner exists. This is a
+/// projection of the existing activation owner chain, not an alternate
+/// identity source: WorkLease, lifecycle session, Task, Canonical plan, and
+/// TaskContract acceptance are read under the exact supplied fence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernorPreScopeBindScopeProjection {
+    pub owner_revision: u64,
+    pub state_fence: StateFence,
+    pub principal_id: String,
+    pub session_id: String,
+    pub work_lease_id: String,
+    pub work_item_id: String,
+    pub task_id: TaskId,
+    pub task_revision: u64,
+    pub work_scope_id: String,
+    pub plan_id: String,
+    pub plan_revision: u64,
+    pub acceptance_digest: String,
+}
+
 impl CanonicalAdmissionOwner {
     /// Creates the sole semantic Canonical owner for one fence.
     pub fn new(
@@ -4733,6 +4755,110 @@ pub struct InitialScopeBindingAdmissionRequest<'a> {
     pub declared_precedences: &'a [PrecedenceDeclaration],
     pub absence_reason_ref: Option<&'a str>,
     pub admission_deadline: u64,
+}
+
+/// Owner-issued evidence and independent bindings for one explicit
+/// authenticated Task Controller request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskSelectionAdmissionBinding {
+    evidence: TaskSelectionEvidence,
+    principal_ref: String,
+    session_ref: String,
+    task_ref: String,
+    task_revision: u64,
+    acceptance_digest: String,
+    work_scope: WorkScopeBindingSnapshot,
+    source_closure: (GoverningSourceSet, PrivacyProfile),
+    selection_source_ref: String,
+    evidence_ref: String,
+    state_fence: StateFence,
+}
+
+impl TaskSelectionAdmissionBinding {
+    #[must_use]
+    pub fn evidence(&self) -> &TaskSelectionEvidence {
+        &self.evidence
+    }
+
+    #[must_use]
+    pub fn principal_ref(&self) -> &str {
+        &self.principal_ref
+    }
+
+    #[must_use]
+    pub fn session_ref(&self) -> &str {
+        &self.session_ref
+    }
+
+    #[must_use]
+    pub fn task_ref(&self) -> &str {
+        &self.task_ref
+    }
+
+    #[must_use]
+    pub const fn task_revision(&self) -> u64 {
+        self.task_revision
+    }
+
+    #[must_use]
+    pub fn acceptance_digest(&self) -> &str {
+        &self.acceptance_digest
+    }
+
+    #[must_use]
+    pub const fn work_scope(&self) -> &WorkScopeBindingSnapshot {
+        &self.work_scope
+    }
+
+    #[must_use]
+    pub fn selection_source_ref(&self) -> &str {
+        &self.selection_source_ref
+    }
+
+    #[must_use]
+    pub fn evidence_ref(&self) -> &str {
+        &self.evidence_ref
+    }
+
+    #[must_use]
+    pub const fn state_fence(&self) -> &StateFence {
+        &self.state_fence
+    }
+}
+
+/// Non-forgeable owner snapshot held while the exact Kernel acceptance set is
+/// read; only the Governor can construct this token.
+pub struct PendingTaskSelectionRequest {
+    now: u64,
+    activation: GovernorActivationSnapshot,
+    selected: ActiveWorkLeaseProjection,
+    work_scope: WorkScopeBindingSnapshot,
+    source_closure: (GoverningSourceSet, PrivacyProfile),
+}
+
+impl PendingTaskSelectionRequest {
+    #[must_use]
+    pub const fn task_id(&self) -> &TaskId {
+        &self.activation.task_id
+    }
+
+    #[must_use]
+    pub const fn task_revision(&self) -> u64 {
+        self.activation.task_revision
+    }
+
+    #[must_use]
+    pub const fn state_fence(&self) -> &StateFence {
+        &self.activation.state_fence
+    }
+}
+
+struct InitialScopeGrantValidation<'a> {
+    intents: Vec<&'a GrantActivationIntent>,
+    grants: &'a [GrantRecoveryRecord],
+    graph_revision: u64,
+    fence: &'a StateFence,
+    now_ms: i64,
 }
 
 #[derive(Clone, Copy)]
@@ -7390,7 +7516,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             boundary
                 .validate()
                 .map_err(CompositionError::ScanDisclosure)?;
-            if boundary.boundary_ref != privacy.boundary_ref
+            if bootstrap_discovery.privacy_boundary.as_ref() != Some(boundary)
                 || !boundary.admits(binding.privacy_class)
             {
                 return Err(CompositionError::Recovery(
@@ -8662,7 +8788,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         {
             return Err(CompositionError::ActivationStaleFence);
         }
-        acceptance.validate()?;
+        acceptance
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         if acceptance.task_id != activation.task_id
             || acceptance.task_revision != activation.task_revision
             || !fences_match_exact(&acceptance.read_state_fence, &activation.state_fence)
@@ -8679,7 +8807,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             evidence_ref: selected.work_item.work_item_id.clone(),
             contamination_flags: Vec::new(),
         };
-        evidence.validate()?;
+        evidence
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         Ok(TaskSelectionAdmissionBinding {
             selection_source_ref: evidence.selection_source_ref.clone(),
             evidence_ref: evidence.evidence_ref.clone(),
@@ -8792,7 +8922,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .kernel
             .task_contract_acceptance_set(&task_id, task.revision, state_fence)
             .await?;
-        acceptance.validate()?;
+        acceptance
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         if acceptance.task_id != task_id
             || acceptance.task_revision != task.revision
             || expected_acceptance_digest
@@ -8811,7 +8943,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             evidence_ref: work.work_item.work_item_id,
             contamination_flags: Vec::new(),
         };
-        evidence.validate()?;
+        evidence
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         Ok((evidence, acceptance))
     }
 
@@ -12473,6 +12607,78 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// projection before binding. The seam is still one ordered admission
     /// cascade; each owner agreement is now a named private function, so every
     /// guard still runs in the same order over the same effects.
+    ///
+    /// The initial BIND_SCOPE leg deliberately stops before WorkScope. It
+    /// retains the same original owner chain used by activation, with the
+    /// current Canonical plan providing the selected scope and the live
+    /// TaskContract owner providing its acceptance digest.
+    pub async fn read_pre_scope_bind_scope_projection(
+        &self,
+        now: u64,
+        state_fence: &StateFence,
+    ) -> Result<GovernorPreScopeBindScopeProjection, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        if !fences_match_exact(&self.snapshot.state_fence(), state_fence) {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+
+        let work = self.prove_unique_activation_work(now, state_fence)?;
+        let task_id = self.admit_activation_lifecycle_session(now, state_fence, &work)?;
+        let task = self.admit_activation_task(&task_id, state_fence)?;
+        let plan = self.owners.canonical.read_current_activation_plan(state_fence)?;
+        if task_id != plan.task_id
+            || work.work_item.task_id != task_id.as_str()
+            || work.work_item.state_fence != *state_fence
+            || work.work_item.owner_session_id.as_deref() != Some(work.session.session_id.as_str())
+            || work.lease.work_item_id != work.work_item.work_item_id
+            || work.lease.holder_session_id != work.session.session_id
+            || work.lease.state_fence != *state_fence
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+
+        let acceptance = self
+            .kernel
+            .task_contract_acceptance_set(&task_id, task.revision, state_fence)
+            .await?;
+        acceptance
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if acceptance.task_id != task_id
+            || acceptance.task_revision != task.revision
+            || !fences_match_exact(&acceptance.read_state_fence, state_fence)
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        let plan_revision = plan
+            .plan_revision
+            .parse::<u64>()
+            .ok()
+            .filter(|revision| *revision > 0)
+            .filter(|revision| revision.to_string() == plan.plan_revision)
+            .ok_or(CompositionError::ActivationStaleFence)?;
+        if self.owners.canonical.owner_revision() == 0 {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+
+        Ok(GovernorPreScopeBindScopeProjection {
+            owner_revision: self.owners.canonical.owner_revision(),
+            state_fence: state_fence.clone(),
+            principal_id: work.session.principal_id,
+            session_id: work.session.session_id,
+            work_lease_id: work.lease.lease_id,
+            work_item_id: work.work_item.work_item_id,
+            task_id,
+            task_revision: task.revision,
+            work_scope_id: plan.work_scope_id,
+            plan_id: plan.plan_id,
+            plan_revision,
+            acceptance_digest: acceptance.acceptance_digest,
+        })
+    }
+
     pub fn read_unique_agent_activation(
         &self,
         now: u64,
@@ -12497,6 +12703,37 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             plan_id: plan.plan_id,
             plan_revision: plan.plan_revision,
         })
+    }
+
+    /// Reads the validated activation together with the exact retained
+    /// coordination records that established its unique task selection.
+    /// The lease and work-item handles come from the same owner projection
+    /// whose session/task/scope join is checked below.
+    fn read_unique_agent_activation_with_selection(
+        &self,
+        now: u64,
+    ) -> Result<(GovernorActivationSnapshot, ActiveWorkLeaseProjection), CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let state_fence = self.snapshot.state_fence();
+        let work = self.prove_unique_activation_work(now, &state_fence)?;
+        let task_id = self.admit_activation_lifecycle_session(now, &state_fence, &work)?;
+        let task = self.admit_activation_task(&task_id, &state_fence)?;
+        let (work_scope_id, plan) = self.admit_activation_plan(&task_id, &state_fence)?;
+        let activation = GovernorActivationSnapshot {
+            state_fence,
+            owner_revision: self.owners.canonical.owner_revision(),
+            principal_id: work.session.principal_id.clone(),
+            session_id: work.session.session_id.clone(),
+            task_id,
+            work_unit_id: work.work_item.work_item_id.clone(),
+            work_scope_id,
+            task_revision: task.revision,
+            plan_id: plan.plan_id,
+            plan_revision: plan.plan_revision,
+        };
+        Ok((activation, work))
     }
 
     /// Proves exactly one live work lease for this exact fence.

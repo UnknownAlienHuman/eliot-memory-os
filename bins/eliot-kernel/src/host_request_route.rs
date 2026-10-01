@@ -693,12 +693,29 @@ impl KernelComposition {
         envelope: &HostRequestEnvelope,
         task_relative_tool: Option<bool>,
     ) -> Result<(HostRequestAdmissionReceipt, HostRequestRecord), TransportError> {
+        self.admit_host_request_envelope_with_bind_scope_evidence_under_transition(
+            envelope,
+            task_relative_tool,
+            None,
+        )
+    }
+
+    fn admit_host_request_envelope_with_bind_scope_evidence_under_transition(
+        &self,
+        envelope: &HostRequestEnvelope,
+        task_relative_tool: Option<bool>,
+        bind_scope_evidence: Option<&eliot_protocol::AgentActivationBindScopeEvidence>,
+    ) -> Result<(HostRequestAdmissionReceipt, HostRequestRecord), TransportError> {
         Self::validate_host_request_admission(envelope)?;
         let now = unix_ms();
         let expired = activation_deadline_expired(now, envelope.identity.deadline_unix_ms);
 
         let (descriptor, receipt) = self.host_request_connection_gate_under_transition(envelope)?;
-        self.host_request_application_binding_gate_under_transition(envelope, task_relative_tool)?;
+        if let Some(evidence) = bind_scope_evidence {
+            self.pre_scope_bind_scope_application_gate_under_transition(envelope, evidence)?;
+        } else {
+            self.host_request_application_binding_gate_under_transition(envelope, task_relative_tool)?;
+        }
         if matches!(
             envelope.kind,
             HostRequestKind::Cancellation
@@ -1536,19 +1553,38 @@ impl KernelComposition {
         .validate()
         .map_err(|_| TransportError::SessionFenced)?;
         let _transition = self.agent_bridge_transition_read()?;
-        // Issue #77 W2: Kernel-owned bind/dispatch leg runs BEFORE the
-        // route's own admit staging. The binder's `admit_and_stage` advances
-        // `Requested -> Admitted` itself, and only the call that stages first
-        // reaches `Fresh` and therefore `build_application` — the single
-        // product construction of the Kernel-owned `RequestIdentity`
-        // (authority epoch, admitted operation identity, absolute deadline)
-        // and `EffectCeiling::CandidateOnly`. A route-first staging would
-        // reduce every fresh envelope to a replay inside `invoke_admitted`,
-        // so the Kernel-owned identity would never be minted. The leg is
-        // fail-closed: any non-dispatched disposition falls through to the
-        // existing admit-and-queue path below unchanged.
-        let binder_dispatched = self.invoke_admitted_binder_leg(envelope, tool);
-        let (receipt, mut record) = self.admit_host_request_envelope_under_transition(envelope)?;
+        // A first-scope bind has no resolved scope yet. Carry its retained
+        // typed evidence into admission before the normal binder path can stage
+        // it without the pre-scope owner gate.
+        let bind_scope_evidence = daemon_claim_queue::task_controller_admission(envelope, tool)
+            .ok()
+            .filter(|invocation| invocation.action == eliot_protocol::TaskControllerAction::BindScope)
+            .and_then(|invocation| invocation.bind_scope_evidence);
+        let binder_dispatched = if bind_scope_evidence.is_some() {
+            false
+        } else {
+            // Issue #77 W2: Kernel-owned bind/dispatch leg runs BEFORE the
+            // route's own admit staging. The binder's `admit_and_stage` advances
+            // `Requested -> Admitted` itself, and only the call that stages first
+            // reaches `Fresh` and therefore `build_application` — the single
+            // product construction of the Kernel-owned `RequestIdentity`
+            // (authority epoch, admitted operation identity, absolute deadline)
+            // and `EffectCeiling::CandidateOnly`. A route-first staging would
+            // reduce every fresh envelope to a replay inside `invoke_admitted`,
+            // so the Kernel-owned identity would never be minted. The leg is
+            // fail-closed: any non-dispatched disposition falls through to the
+            // existing admit-and-queue path below unchanged.
+            self.invoke_admitted_binder_leg(envelope, tool)
+        };
+        let (receipt, mut record) = if let Some(evidence) = bind_scope_evidence.as_ref() {
+            self.admit_host_request_envelope_with_bind_scope_evidence_under_transition(
+                envelope,
+                Some(false),
+                Some(evidence),
+            )?
+        } else {
+            self.admit_host_request_envelope_under_transition(envelope)?
+        };
         // A dispatched leg stored its bounded answer through the single ORS
         // durability owner, so reload the owner-stored record: an answered
         // operation is never queued twice.
@@ -2210,7 +2246,11 @@ impl KernelComposition {
             | HostRequestKind::Cancellation
             | HostRequestKind::Status
             | HostRequestKind::Reconciliation => {
-                if !activation_done || !session_live {
+                let pre_scope_task_controller = envelope.kind == HostRequestKind::Invocation
+                    && envelope.identity.capability == "eliot.task-controller"
+                    && activation_done
+                    && !session_live;
+                if !pre_scope_task_controller && (!activation_done || !session_live) {
                     return Err(TransportError::SessionFenced);
                 }
             }
@@ -2353,6 +2393,148 @@ impl KernelComposition {
             return false;
         }
         self.activation_owner_projection_is_live(retained)
+    }
+
+    /// Verifies the one narrow first-scope continuation against the exact
+    /// accepted activation result, durable ORS lifecycle/result, same bridge
+    /// connection, complete fence, and current independent P-07 owner. This
+    /// does not publish an application Session or an activated task binding.
+    fn pre_scope_bind_scope_evidence_still_retained_in(
+        &self,
+        pending: &super::AgentActivationPendingState,
+        evidence: &eliot_protocol::AgentActivationBindScopeEvidence,
+        envelope: &HostRequestEnvelope,
+    ) -> bool {
+        if evidence.validate().is_err()
+            || envelope.kind != HostRequestKind::Invocation
+            || envelope.identity.capability != "eliot.task-controller"
+            || envelope.identity.session_id.as_deref() != Some(evidence.session_id.as_str())
+            || envelope.identity.task_id.as_deref() != Some(evidence.task_id.as_str())
+            || envelope.identity.work_scope_id.as_deref()
+                != Some(evidence.work_scope_id.as_str())
+            || envelope.identity.deadline_unix_ms != evidence.ticket_deadline_unix_ms
+            || envelope.state_fence != evidence.state_fence
+        {
+            return false;
+        }
+        let Some(local) = pending.results.get(&evidence.ticket_id) else {
+            return false;
+        };
+        if local.phase != super::AgentActivationResultPhase::AcceptedTerminal
+            || local.result.bind_scope_evidence.as_ref() != Some(evidence)
+            || !matches!(
+                &local.result.disposition,
+                eliot_protocol::AgentActivationResolutionDisposition::ScopeSelectionRequired { .. }
+            )
+            || local.result.validate().is_err()
+        {
+            return false;
+        }
+        let Ok(Some(lifecycle)) = self
+            .generation_gateway
+            .ors
+            .load_activation_lifecycle(&evidence.ticket_id)
+        else {
+            return false;
+        };
+        if lifecycle.state != eliot_ors::ActivationLifecycleState::ResultAccepted
+            || lifecycle.ticket_id != evidence.ticket_id
+            || lifecycle.ticket_sha256 != evidence.ticket_sha256
+            || lifecycle.connection_id != envelope.connection_id
+            || lifecycle.result_sha256.as_deref() != Some(local.result.result_sha256.as_str())
+        {
+            return false;
+        }
+        let Ok(Some(retained)) = self.generation_gateway.ors.load_activation_result(
+            &evidence.ticket_id,
+            &local.result.result_sha256,
+        ) else {
+            return false;
+        };
+        if retained.phase != eliot_ors::ActivationResultRetentionPhase::AcceptedTerminal
+            || retained.ticket_id != lifecycle.ticket_id
+            || retained.ticket_sha256 != lifecycle.ticket_sha256
+            || retained.ticket_payload != lifecycle.ticket_payload
+            || retained.result_sha256 != local.result.result_sha256
+            || retained.connection_id != envelope.connection_id
+            || retained.state_fence != lifecycle.state_fence
+        {
+            return false;
+        }
+        let Ok(ticket) = serde_json::from_str::<eliot_protocol::AgentActivationResolutionTicket>(
+            &lifecycle.ticket_payload,
+        ) else {
+            return false;
+        };
+        let Ok(result) = serde_json::from_str::<eliot_protocol::AgentActivationResolutionResult>(
+            &retained.result_payload,
+        ) else {
+            return false;
+        };
+        let Ok(ticket_state_fence_sha256) = sha256_json(&ticket.state_fence) else {
+            return false;
+        };
+        if ticket.validate().is_err()
+            || ticket.successor_of.is_some()
+            || ticket.connection_id != envelope.connection_id
+            || ticket.state_fence != evidence.state_fence
+            || ticket.ticket_id != lifecycle.ticket_id
+            || ticket.ticket_sha256 != lifecycle.ticket_sha256
+            || ticket.activation_request_id.as_str() != lifecycle.activation_request_id
+            || ticket.activation_request_sha256 != lifecycle.activation_request_sha256
+            || ticket.kernel_deadline_unix_ms != lifecycle.kernel_deadline_unix_ms
+            || ticket.cancellation_id != lifecycle.cancellation_id
+            || ticket_state_fence_sha256 != lifecycle.state_fence
+            || result.validate_against(&ticket).is_err()
+            || result != local.result
+            || result.bind_scope_evidence.as_ref() != Some(evidence)
+        {
+            return false;
+        }
+        let Ok(_transition) = self.p07_owner_transition.read() else {
+            return false;
+        };
+        let Ok(owner) = self.p07_owner.lock() else {
+            return false;
+        };
+        let Ok(digest) = self.p07_owner_digest.lock() else {
+            return false;
+        };
+        owner
+            .as_ref()
+            .map(eliot_kernel_core::BoundCanonicalOwner::bound_revision)
+            == Some(evidence.kernel_owner.revision)
+            && digest.as_deref() == Some(evidence.kernel_owner.bundle_sha256.as_str())
+    }
+
+    fn pre_scope_bind_scope_application_gate_under_transition(
+        &self,
+        envelope: &HostRequestEnvelope,
+        evidence: &eliot_protocol::AgentActivationBindScopeEvidence,
+    ) -> Result<(), TransportError> {
+        let pending = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if !self.pre_scope_bind_scope_evidence_still_retained_in(&pending, evidence, envelope) {
+            Err(TransportError::SessionFenced)
+        } else {
+            drop(pending);
+            let connections = self
+                .agent_bridge_connections
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let state = connections
+                .get(&envelope.connection_id)
+                .ok_or(TransportError::SessionFenced)?;
+            if !state.activation_completed
+                || state.session.is_some()
+                || state.activated_binding.is_some()
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            Ok(())
+        }
     }
 
     /// The activation's exact P-07 owner revision and bundle digest must still
@@ -6295,6 +6477,152 @@ fn require_host_request_parent_generation(
 }
 
 impl KernelComposition {
+    /// Dispatches the one explicit BIND_SCOPE host-request continuation while
+    /// the bridge has an accepted pre-scope activation result but no admitted
+    /// application Session. The proof is rejoined against the retained
+    /// terminal ticket and independent P-07 owner for every frame; this entry
+    /// never creates or publishes a Session.
+    #[cfg(windows)]
+    pub(crate) fn dispatch_pre_scope_bind_scope_host_request_frame(
+        &self,
+        connection_id: &str,
+        frame: &Frame,
+    ) -> Result<KernelFrameAction, TransportError> {
+        if self
+            .generation_poison
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .is_some()
+            || !matches!(
+                self.service_state()
+                    .map_err(|_| TransportError::SessionFenced)?,
+                KernelServiceState::Ready | KernelServiceState::Degraded
+            )
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        frame.validate()?;
+        if frame.kind != FrameKind::Request
+            || frame.message_type != MessageType::Execute
+            || frame.connection_id != connection_id
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let request_id = frame
+            .request_id
+            .clone()
+            .ok_or(TransportError::SessionFenced)?;
+        let identity = frame
+            .request_identity
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        let payload = match &frame.payload {
+            ProtocolPayload::Json(payload) => payload.clone(),
+            _ => return Err(TransportError::SessionFenced),
+        };
+        let operation = payload
+            .get("operation")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TransportError::SessionFenced)?;
+        if !matches!(
+            operation,
+            AGENT_HOST_REQUEST_INVOKE_READ_OPERATION
+                | AGENT_HOST_REQUEST_SUBMIT_OPERATION
+                | AGENT_HOST_REQUEST_REHYDRATE_OPERATION
+        ) {
+            return Err(TransportError::SessionFenced);
+        }
+        let envelope = host_request_envelope_from_payload(&payload)?;
+        if envelope.connection_id != connection_id
+            || frame.request_id.as_ref() != Some(&envelope.identity.request_id)
+            || identity.request != envelope.identity
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let (tool, bind_scope_evidence) =
+            if operation == AGENT_HOST_REQUEST_REHYDRATE_OPERATION {
+                let evidence = payload
+                    .get("bind_scope_evidence")
+                    .cloned()
+                    .ok_or(TransportError::SessionFenced)
+                    .and_then(|value| {
+                        serde_json::from_value::<
+                            eliot_protocol::AgentActivationBindScopeEvidence,
+                        >(value)
+                        .map_err(|_| TransportError::SessionFenced)
+                    })?;
+                (None, evidence)
+            } else {
+                let tool = host_request_tool_from_payload(&payload)?;
+                let invocation = daemon_claim_queue::task_controller_admission(&envelope, &tool)?;
+                if invocation.action != eliot_protocol::TaskControllerAction::BindScope {
+                    return Err(TransportError::SessionFenced);
+                }
+                let evidence = invocation
+                    .bind_scope_evidence
+                    .ok_or(TransportError::SessionFenced)?;
+                (Some(tool), evidence)
+            };
+        let evidence = &bind_scope_evidence;
+        if envelope.state_fence != evidence.state_fence
+            || envelope.identity.session_id.as_deref() != Some(evidence.session_id.as_str())
+            || envelope.identity.task_id.as_deref() != Some(evidence.task_id.as_str())
+            || envelope.identity.work_scope_id.as_deref()
+                != Some(evidence.work_scope_id.as_str())
+        {
+            return Err(TransportError::SessionFenced);
+        }
+
+        let outcome = (|| -> Result<serde_json::Value, TransportError> {
+            Ok(match operation {
+                AGENT_HOST_REQUEST_INVOKE_READ_OPERATION => {
+                    let tool = tool.as_ref().ok_or(TransportError::SessionFenced)?;
+                    let (receipt, record) = self.invoke_read_host_request(&envelope, tool)?;
+                    host_request_admitted_response(&receipt, &record)
+                }
+                AGENT_HOST_REQUEST_SUBMIT_OPERATION => {
+                    let _transition = self.agent_bridge_transition_read()?;
+                    let (receipt, record) = self
+                        .admit_host_request_envelope_with_bind_scope_evidence_under_transition(
+                            &envelope,
+                            Some(false),
+                            Some(evidence),
+                        )?;
+                    host_request_admitted_response(&receipt, &record)
+                }
+                AGENT_HOST_REQUEST_REHYDRATE_OPERATION => {
+                    {
+                        let _transition = self.agent_bridge_transition_read()?;
+                        self.pre_scope_bind_scope_application_gate_under_transition(
+                            &envelope,
+                            evidence,
+                        )?;
+                    }
+                    let receipt = host_request_receipt_from_payload(&payload)?;
+                    let record = self.rehydrate_host_request(&envelope, &receipt)?;
+                    host_request_rehydrated_response(&record)
+                }
+                _ => return Err(TransportError::SessionFenced),
+            })
+        })();
+        let result = outcome.or_else(|error| {
+            self.host_request_failure_value(operation, &envelope, frame.protocol_version, error)
+        })?;
+        let reply = Frame {
+            protocol_version: frame.protocol_version,
+            encoding_profile: eliot_protocol::EncodingProfile::JsonV1,
+            connection_id: connection_id.to_owned(),
+            request_id: Some(request_id),
+            kind: FrameKind::Response,
+            message_type: MessageType::Result,
+            request_identity: None,
+            payload: ProtocolPayload::Json(result),
+            trace_context: BTreeMap::new(),
+        };
+        reply.validate()?;
+        Ok(KernelFrameAction::Reply(reply))
+    }
+
     /// Dispatches one typed host-request frame from the admitted bridge transport.
     ///
     /// The caller ([`crate::KernelComposition::dispatch_frame`]) has already

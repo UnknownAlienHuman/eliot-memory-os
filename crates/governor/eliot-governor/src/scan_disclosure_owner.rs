@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_ors::{
-    ColdStartReadinessClaim, ColdStartReadinessOrsRecord, ColdStartReadinessRecordOwner,
+    ColdStartReadinessOrsRecord, ColdStartReadinessRecordOwner,
     ColdStartReadinessStageOutcome, ColdStartReadinessTerminalDisposition, OrsError,
     SCAN_DISCLOSURE_RECORD_TYPE, ScanDisclosureOrsRecord, ScanDisclosureReadFailure,
     ScanDisclosureRecordOwner, ScanDisclosureRecordState, ScanDisclosureStageOutcome,
@@ -161,14 +161,14 @@ impl InstallationColdStartReadinessOwner {
 impl ColdStartReadinessRecordOwner for InstallationColdStartReadinessOwner {
     fn claim_cold_start_readiness(
         &self,
-        claim: &ColdStartReadinessClaim,
+        key: &eliot_ors::ColdStartReadinessOwnerKey,
+        lease_deadline: u64,
         now: u64,
     ) -> Result<ColdStartReadinessStageOutcome, OrsError> {
-        claim.validate()?;
-        self.validate_key(&claim.key)?;
-        let outcome =
-            self.owner
-                .claim_cold_start_readiness(&claim.key, claim.lease_deadline, now)?;
+        self.validate_key(key)?;
+        let outcome = self
+            .owner
+            .claim_cold_start_readiness(key, lease_deadline, now)?;
         match &outcome {
             ColdStartReadinessStageOutcome::Stored { record }
             | ColdStartReadinessStageOutcome::AlreadyBound { record } => {
