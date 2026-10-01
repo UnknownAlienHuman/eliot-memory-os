@@ -3865,9 +3865,11 @@ impl KernelComposition {
                         Ok(host_request_route::LocalReadSubmitDisposition::StaleAttempt(
                             observation,
                         )) => Ok(Self::stale_attempt_daemon_response(&observation)),
-                        Ok(host_request_route::LocalReadSubmitDisposition::PossibleEffectRetained(
-                            reference,
-                        )) => Ok(Self::possible_effect_retained_daemon_response(&reference)),
+                        Ok(
+                            host_request_route::LocalReadSubmitDisposition::PossibleEffectRetained(
+                                reference,
+                            ),
+                        ) => Ok(Self::possible_effect_retained_daemon_response(&reference)),
                         Err(TransportError::Timeout) => {
                             // F-LOG-KERNEL-1 (#897 T19): timeout after
                             // possible work stays `unknown` in the diagnostic

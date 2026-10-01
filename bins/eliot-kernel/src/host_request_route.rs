@@ -6131,7 +6131,9 @@ fn same_possible_effect_owner_receipt(
 ) -> bool {
     match (
         retained.owner_receipt.semantic_receipt_ref.as_deref(),
-        body.lineage.as_ref().and_then(|lineage| lineage.semantic_receipt_ref.as_deref()),
+        body.lineage
+            .as_ref()
+            .and_then(|lineage| lineage.semantic_receipt_ref.as_deref()),
     ) {
         (Some(retained_ref), Some(presented_ref)) => {
             retained_ref == presented_ref

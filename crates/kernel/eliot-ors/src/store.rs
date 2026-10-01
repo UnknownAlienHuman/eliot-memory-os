@@ -10247,8 +10247,7 @@ impl RedbRecoveryStore {
                 .transpose()?
         };
         if let Some(retained) = retained {
-            if retained.unpersisted_result_commitment_sha256
-                != unpersisted_result_commitment_sha256
+            if retained.unpersisted_result_commitment_sha256 != unpersisted_result_commitment_sha256
                 || retained.owner_receipt != *owner_receipt
             {
                 return Err(OrsError::HostRequestIdentityConflict {

@@ -7279,32 +7279,6 @@ impl HostRequestPossibleEffectReference {
             .validate(&self.unpersisted_result_commitment_sha256)?;
         Ok(())
     }
-
-    pub(crate) fn validate_for(&self, record: &HostRequestRecord) -> Result<(), OrsError> {
-        self.validate_standalone()?;
-        if self.operation_id != record.operation_id
-            || self.request_digest != record.request_digest
-            || self.payload_digest != record.payload_digest
-        {
-            return Err(OrsError::HostRequestIdentityConflict {
-                operation_id: record.operation_id.as_str().to_owned(),
-                request_digest: record.request_digest.clone(),
-            });
-        }
-        let Some(attempt) = record.attempt.as_ref() else {
-            return Err(OrsError::InvalidField {
-                field: "host_request_possible_effect_reference",
-                reason: "a possible-effect reference must name the attempt that held custody",
-            });
-        };
-        if self.attempt_id != attempt.attempt_id || self.attempt_generation != attempt.generation {
-            return Err(OrsError::HostRequestIdentityConflict {
-                operation_id: record.operation_id.as_str().to_owned(),
-                request_digest: record.request_digest.clone(),
-            });
-        }
-        Ok(())
-    }
 }
 
 impl HostRequestAttemptPhase {
