@@ -1469,6 +1469,7 @@ pub fn stage_request(
         || entry.instrument.as_str() != stage.spec.as_str()
         || !entry.supports(stage.kind)
         || lifecycle.provider_registry_generation() != entry.generation
+        || lifecycle.state_fence() != &invocation.request.state_fence
     {
         return Err(TestdPortError::StageBinding {
             detail: "planned stage, invocation, and selected entry identities disagree",
