@@ -48,6 +48,15 @@ use serde_json::json;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+/// The SOURCE installation: the store the snapshot is captured from.
+const SOURCE_INSTALLATION: &str = "installation-953-w3k1-source";
+/// The DESTINATION installation: the store the archive is reconciled into.
+///
+/// It must DIFFER from [`SOURCE_INSTALLATION`], because `validate_import_binding`
+/// refuses an import whose source and destination are the same installation. Two
+/// separately-bound temporary databases is how that is expressed here; neither
+/// store borrows or fabricates the other's binding.
+const DESTINATION_INSTALLATION: &str = "installation-953-w3k1-destination";
 /// A positive Unix millisecond stamp, well past 1970 and not a sentinel.
 const NOW_MS: i64 = 1_757_000_000_000;
 /// 64 lowercase hex characters, the shape `require_digest` enforces for a fence.
@@ -66,6 +75,34 @@ fn database_path(case: &str) -> PathBuf {
 
 fn cleanup(path: &PathBuf) {
     let _ignored = std::fs::remove_file(path);
+}
+
+/// Opens one temporary ORS database BOUND to `installation_id`.
+///
+/// `RedbRecoveryStore::open` deliberately leaves the installation binding unset, and
+/// every bound read then fails with "ORS database is not bound to an installed
+/// identity" (`StoreObjectIdentityRecord::installed_identity`,
+/// `store.rs:362`) — including `installed_store_identity`, which the export fence
+/// and this fixture both need. `open_for_installation` is the entry point that binds
+/// one: it writes the Host-issued identity into durable META exactly once and reads
+/// the binding back, and it is what production composition uses
+/// (`bins/eliot-kernel/src/composition_bootstrap.rs:597`).
+///
+/// The identity is a real durable binding written by the store, not a value the test
+/// supplies to satisfy a check: the binding still fails closed on a later open for a
+/// different installation, and the object generation is still allocated by ORS rather
+/// than accepted from this test.
+fn open_bound(path: &PathBuf, installation_id: &str) -> Result<RedbRecoveryStore, OrsError> {
+    let (store, identity) = RedbRecoveryStore::open_for_installation(path, installation_id)?;
+    // The binding is asserted, not assumed: the same readback the export fence
+    // performs, so a fixture that silently failed to bind fails here with a clear
+    // message instead of three confusing ones later.
+    assert_eq!(
+        identity.installation_id(),
+        installation_id,
+        "the store must report the installation it was bound to"
+    );
+    Ok(store)
 }
 
 fn label(value: &str) -> Result<OpaqueLabel, OrsError> {
@@ -219,8 +256,8 @@ fn nonempty_member_set_refuses_known_zero_for_an_untriaged_member() -> TestResul
     let destination_path = database_path("discriminator-destination");
     cleanup(&source_path);
     cleanup(&destination_path);
-    let source_store = RedbRecoveryStore::open(&source_path)?;
-    let destination = RedbRecoveryStore::open(&destination_path)?;
+    let source_store = open_bound(&source_path, SOURCE_INSTALLATION)?;
+    let destination = open_bound(&destination_path, DESTINATION_INSTALLATION)?;
     let high_water = commit_authority(&source_store, "953-w3k1-discriminator-authority")?;
 
     let Exported { snapshot, import } = export_snapshot(&source_store, &destination, high_water)?;
@@ -286,8 +323,8 @@ fn empty_member_set_still_produces_known_zero() -> TestResult {
     let destination_path = database_path("positive-destination");
     cleanup(&source_path);
     cleanup(&destination_path);
-    let source_store = RedbRecoveryStore::open(&source_path)?;
-    let destination = RedbRecoveryStore::open(&destination_path)?;
+    let source_store = open_bound(&source_path, SOURCE_INSTALLATION)?;
+    let destination = open_bound(&destination_path, DESTINATION_INSTALLATION)?;
 
     // A source store with NO operational rows at all: opening and initializing it
     // writes only META, so the ordering high-water is still zero and the
@@ -343,8 +380,8 @@ fn duplicate_outcome_identifier_is_a_typed_rejection() -> TestResult {
     let destination_path = database_path("duplicate-destination");
     cleanup(&source_path);
     cleanup(&destination_path);
-    let source_store = RedbRecoveryStore::open(&source_path)?;
-    let destination = RedbRecoveryStore::open(&destination_path)?;
+    let source_store = open_bound(&source_path, SOURCE_INSTALLATION)?;
+    let destination = open_bound(&destination_path, DESTINATION_INSTALLATION)?;
     let high_water = commit_authority(&source_store, "953-w3k1-duplicate-authority")?;
 
     let Exported { snapshot, import } = export_snapshot(&source_store, &destination, high_water)?;
