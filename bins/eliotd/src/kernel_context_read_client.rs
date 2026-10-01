@@ -1783,9 +1783,7 @@ impl KernelContextReadClient {
             &assembly.serializer_version,
             &assembly.serializer_options_digest,
         )
-        .map_err(|error| {
-            PacketCompositionError::Assembly(Box::new(AssemblyError::from(error)))
-        })?;
+        .map_err(|error| PacketCompositionError::Assembly(Box::new(AssemblyError::from(error))))?;
         Self::require_campaign_view_for_admission(
             request,
             campaign_view,
@@ -1935,7 +1933,11 @@ fn require_context_render_codec(
     serializer_version: &str,
     serializer_options_digest: &str,
 ) -> Result<(), ContextError> {
-    canonical_render_serializer()?.binds(serializer_id, serializer_version, serializer_options_digest)
+    canonical_render_serializer()?.binds(
+        serializer_id,
+        serializer_version,
+        serializer_options_digest,
+    )
 }
 
 /// Rechecks the assembled packet against the reservation it was compiled under.
