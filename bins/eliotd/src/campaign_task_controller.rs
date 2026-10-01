@@ -12,8 +12,9 @@ use eliot_context_contracts::SessionDeliverySnapshot;
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_governor::{
     CampaignOwnerSourceInput, GuardedTaskCommand, KernelPortError, KernelTransitionPort,
-    PreparedTaskTransition, TaskCommand, TaskCommandContext, TaskProposal,
-    TaskSelectionAdmissionBinding,
+    InitialScopeBindingAdmissionRequest, PreparedTaskTransition, TaskCommand, TaskCommandContext,
+    TaskProposal,
+    TaskSelectionAdmissionBinding, OWNER_SNAPSHOT_SCHEMA,
 };
 use eliot_learning_contracts::{
     CampaignSourceBinding, CampaignSourceRevisionRef, CampaignSourceRole, LearningStateViewRecipe,
@@ -34,6 +35,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::{
     DaemonComposition, KernelContextReadClient,
     daemon_kernel_client::{DaemonKernelClient, TaskControllerClaimedInvocation},
+    task_binding_admission::{InitialWorkScopeBindingRequest, observe_explicit_workspace},
+    unix_ms,
 };
 
 /// Task Controller input fully decoded and all required campaign reads
@@ -65,7 +68,15 @@ enum PreparedTaskControllerAction {
 /// semantic preparation.
 pub enum TaskControllerClaimPreparation {
     Rejected(Box<TaskControllerResultBody>),
+    BindScope(Box<PreparedInitialWorkScopeBinding>),
     Ready(Box<PreparedTaskControllerClaim>),
+}
+
+/// Exact explicit scope-binding claim after independent Host observation.
+pub struct PreparedInitialWorkScopeBinding {
+    pub claimed: TaskControllerClaimedInvocation,
+    pub request: InitialWorkScopeBindingRequest,
+    pub observed: ObservedScopeResources,
 }
 
 /// Canonical task plan plus the exact claim which will carry its result.
@@ -431,6 +442,42 @@ pub async fn prepare_task_controller_claim(
     claimed: TaskControllerClaimedInvocation,
 ) -> Result<TaskControllerClaimPreparation, String> {
     let invocation = &claimed.invocation;
+    if invocation.action == TaskControllerAction::BindScope {
+        let Ok(request) = serde_json::from_value::<InitialWorkScopeBindingRequest>(
+            invocation.task_input.clone(),
+        ) else {
+            return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
+                task_controller_rejection(&claimed, "invalid_scope_binding")?,
+            )));
+        };
+        if request
+            .validate_for_task_scope(invocation.work_scope_id.as_str())
+            .is_err()
+        {
+            return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
+                task_controller_rejection(&claimed, "invalid_scope_binding")?,
+            )));
+        }
+        let observed = match observe_explicit_workspace(
+            request.explicit_root.as_path(),
+            &claimed.envelope.state_fence,
+        ) {
+            Ok(observed) => observed,
+            Err(error) => {
+                let code = error.code();
+                return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
+                    task_controller_rejection(&claimed, code)?,
+                )));
+            }
+        };
+        return Ok(TaskControllerClaimPreparation::BindScope(Box::new(
+            PreparedInitialWorkScopeBinding {
+                claimed,
+                request,
+                observed,
+            },
+        )));
+    }
     let Some(recipe) = decode_task_controller_claim_recipe(&claimed) else {
         return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
             task_controller_rejection(&claimed, "invalid_recipe")?,
@@ -524,6 +571,208 @@ pub async fn prepare_task_controller_claim(
             action,
         },
     )))
+}
+
+/// Admits and durably installs one explicit initial WorkScope binding. The
+/// Store CAS/readback completes before the in-memory Governor owner changes;
+/// the result acknowledges only the exact snapshot both owners retained.
+pub async fn complete_initial_work_scope_binding(
+    kernel: &DaemonKernelClient,
+    composition: &tokio::sync::Mutex<DaemonComposition>,
+    prepared: PreparedInitialWorkScopeBinding,
+) -> Result<TaskControllerResultBody, String> {
+    let PreparedInitialWorkScopeBinding {
+        claimed,
+        request,
+        observed,
+    } = prepared;
+    let fence = &claimed.envelope.state_fence;
+    let current = match kernel
+        .read_work_scope_owner(fence, kernel.protected_snapshot_digest())
+        .await
+    {
+        Ok(record) => record,
+        Err(_) => return task_controller_rejection(&claimed, "owner_read_unavailable"),
+    };
+    let (expected_owner_revision, retained_snapshot) = match work_scope_owner_revision_state(&current, fence) {
+        Ok(state) => state,
+        Err(()) => return task_controller_rejection(&claimed, "scope_owner_invalid"),
+    };
+    let is_empty_owner = retained_snapshot.is_none();
+    let owner_revision = if is_empty_owner {
+        let Some(revision) = expected_owner_revision.checked_add(1) else {
+            return task_controller_rejection(&claimed, "scope_owner_revision_exhausted");
+        };
+        revision
+    } else {
+        expected_owner_revision
+    };
+    let Some(task_revision) = fence
+        .task_revision
+        .map(eliot_contracts::TaskRevision::value)
+        .filter(|revision| *revision > 0)
+    else {
+        return task_controller_rejection(&claimed, "TASK_SELECTION_REQUIRED");
+    };
+    let session_ref = claimed.attempt.session_id.as_str();
+    if claimed.envelope.identity.session_id.as_deref() != Some(session_ref)
+        || claimed.envelope.identity.task_id.as_deref() != Some(claimed.invocation.task_id.as_str())
+        || claimed.envelope.identity.work_scope_id.as_deref()
+            != Some(claimed.invocation.work_scope_id.as_str())
+        || claimed.attempt.state_fence != *fence
+    {
+        return task_controller_rejection(&claimed, "TASK_SCOPE_INCOMPATIBLE");
+    }
+    let now = unix_ms();
+    let owner = {
+        let guard = composition.lock().await;
+        if guard.governor_kernel_fence() != *fence {
+            return task_controller_rejection(&claimed, "TASK_SCOPE_INCOMPATIBLE");
+        }
+        match guard
+            .governor
+            .admit_initial_scope_binding(InitialScopeBindingAdmissionRequest {
+                now,
+                authenticated_identity: (
+                    claimed.authenticated_principal.as_str(),
+                    session_ref,
+                ),
+                task_binding: (claimed.invocation.task_id.as_str(), task_revision),
+                work_scope_ref: claimed.invocation.work_scope_id.as_str(),
+                state_fence: fence,
+                descriptor: &request.descriptor,
+                owner_revision,
+                retained_snapshot: retained_snapshot.as_ref(),
+                binding: &request.binding,
+                observed: &observed,
+                sources: &request.sources,
+                privacy: &request.privacy,
+                source_candidates: &request.source_candidates,
+                declared_precedences: &request.declared_precedences,
+                absence_reason_ref: request.absence_reason_ref.as_deref(),
+                admission_deadline: request.admission_deadline,
+            })
+            .await
+        {
+            Ok(owner) => owner,
+            Err(error) => {
+                let code = task_selection_composition_reason_code(&error)
+                    .unwrap_or("SCOPE_AUTHORITY_REQUIRED");
+                return task_controller_rejection(&claimed, code);
+            }
+        }
+    };
+    let snapshot = owner
+        .read_current(fence)
+        .map_err(|error| format!("admitted WorkScope owner read failed: {error}"))?;
+    if snapshot.owner_revision != owner_revision || snapshot.state_fence != *fence {
+        return task_controller_rejection(&claimed, "scope_owner_revision_mismatch");
+    }
+    let expected_payload = canonical_json_bytes(&snapshot)
+        .map_err(|error| format!("WorkScope snapshot serialization failed: {error}"))?;
+    let readback = if is_empty_owner {
+        match kernel
+            .persist_work_scope_binding_snapshot(&claimed, &snapshot, expected_owner_revision)
+            .await
+        {
+            Ok(record) => record,
+            Err(_) => {
+                let reconciled = kernel
+                    .read_work_scope_owner(fence, kernel.protected_snapshot_digest())
+                    .await
+                    .map_err(|error| format!("WorkScope owner write readback failed: {error}"))?;
+                if reconciled.payload == expected_payload
+                    && reconciled.value_digest == sha256_hex(&expected_payload)
+                    && reconciled.revision == snapshot.owner_revision
+                    && reconciled.state_fence == *fence
+                    && reconciled.schema == OWNER_SNAPSHOT_SCHEMA
+                {
+                    reconciled
+                } else if reconciled.revision == expected_owner_revision {
+                    return task_controller_rejection(&claimed, "scope_owner_write_rejected");
+                } else {
+                    return Err("WorkScope owner write outcome conflicts with retained readback".to_owned());
+                }
+            }
+        }
+    } else {
+        current
+    };
+    if readback.payload != expected_payload
+        || readback.value_digest != sha256_hex(&expected_payload)
+        || readback.revision != snapshot.owner_revision
+        || readback.state_fence != *fence
+        || readback.schema != OWNER_SNAPSHOT_SCHEMA
+    {
+        return task_controller_rejection(&claimed, "scope_owner_readback_mismatch");
+    }
+    let installed = {
+        let mut guard = composition.lock().await;
+        if guard.governor_kernel_fence() != *fence {
+            return task_controller_rejection(&claimed, "TASK_SCOPE_INCOMPATIBLE");
+        }
+        guard
+            .governor
+            .install_admitted_work_scope_owner(owner)
+            .map_err(|error| format!("durable WorkScope owner install failed: {error}"))?
+    };
+    if installed != snapshot {
+        return task_controller_rejection(&claimed, "scope_owner_readback_mismatch");
+    }
+    let snapshot_digest = sha256_hex(&expected_payload);
+    task_controller_result_body(
+        &claimed,
+        json!({
+            "status": "admitted",
+            "work_scope_owner_revision": snapshot.owner_revision,
+            "work_scope_owner_digest": snapshot_digest,
+        }),
+    )
+}
+
+fn work_scope_owner_revision_state(
+    record: &eliot_store_api::RecoveryRecord,
+    expected_fence: &StateFence,
+) -> Result<(u64, Option<eliot_governor::WorkScopeBindingSnapshot>), ()> {
+    if record.namespace != "owner"
+        || record.key != "work_scope"
+        || record.state_fence != *expected_fence
+        || record.revision == 0
+        || record.schema != OWNER_SNAPSHOT_SCHEMA
+        || record.payload.is_empty()
+        || record.value_digest != sha256_hex(&record.payload)
+    {
+        return Err(());
+    }
+    let value: serde_json::Value = serde_json::from_slice(&record.payload).map_err(|_| ())?;
+    let canonical = canonical_json_bytes(&value).map_err(|_| ())?;
+    if canonical != record.payload {
+        return Err(());
+    }
+    let Some(object) = value.as_object() else {
+        return Err(());
+    };
+    if object.len() == 2 && object.contains_key("revision") && object.contains_key("state_fence") {
+        let embedded_revision = object
+            .get("revision")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(())?;
+        let embedded_fence: StateFence = serde_json::from_value(
+            object.get("state_fence").cloned().ok_or(())?,
+        )
+        .map_err(|_| ())?;
+        if embedded_revision != record.revision || embedded_fence != *expected_fence {
+            return Err(());
+        }
+        return Ok((record.revision, None));
+    }
+    let snapshot: eliot_governor::WorkScopeBindingSnapshot =
+        serde_json::from_value(value).map_err(|_| ())?;
+    snapshot.validate().map_err(|_| ())?;
+    if snapshot.owner_revision != record.revision || snapshot.state_fence != *expected_fence {
+        return Err(());
+    }
+    Ok((record.revision, Some(snapshot)))
 }
 
 fn decode_task_controller_claim_recipe(
@@ -684,6 +933,7 @@ fn decode_task_controller_action(
                 command: input.command,
             }))
         }
+        TaskControllerAction::BindScope => Err(()),
     }
 }
 
@@ -707,10 +957,16 @@ pub fn prepare_task_controller_transition(
             Err(error) => TaskControllerTransitionPreparation::Failed(error),
         };
     };
+    let Some(request_identity) = claimed.request_identity.as_ref() else {
+        return match task_controller_rejection(&claimed, "owner_not_ready") {
+            Ok(body) => TaskControllerTransitionPreparation::Rejected(Box::new(body)),
+            Err(error) => TaskControllerTransitionPreparation::Failed(error),
+        };
+    };
     let transition = match (action, owner_publications) {
         (PreparedTaskControllerAction::Propose(proposal), Some(publications)) => lifecycle
             .prepare_propose_task_with_complete_campaign_sources(
-                &claimed.request_identity,
+                request_identity,
                 claimed.operation_id.clone(),
                 proposal,
                 recipe,
@@ -719,7 +975,7 @@ pub fn prepare_task_controller_transition(
             ),
         (PreparedTaskControllerAction::Propose(proposal), None) => lifecycle
             .prepare_propose_task_with_learning_state_recipe(
-                &claimed.request_identity,
+                request_identity,
                 claimed.operation_id.clone(),
                 proposal,
                 recipe,
@@ -733,7 +989,7 @@ pub fn prepare_task_controller_transition(
                 };
             };
             lifecycle.prepare_apply_task_with_selection(
-                &claimed.request_identity,
+                request_identity,
                 claimed.operation_id.clone(),
                 guarded,
                 recipe,

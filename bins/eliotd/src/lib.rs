@@ -4735,15 +4735,19 @@ impl DaemonComposition {
     /// accepted input and its `receipt_ref` is a reference the Governor binds,
     /// not an authority the daemon asserts.
     ///
-    /// # Not yet reached (issue #1929)
+    /// # Attach-transport boundary (issue #1929)
     ///
-    /// This method currently has zero call sites, and it cannot acquire one
-    /// without inventing authority, so it is reported here rather than wired to
-    /// a synthetic caller. Three measured reasons:
+    /// This rebind/attach method currently has zero call sites, and it cannot
+    /// acquire one without inventing authority. Initial WorkScope binding is
+    /// admitted through the separate authenticated Task Controller
+    /// `BIND_SCOPE` action; that path checks the current task and policy owners,
+    /// independently observes the explicit root, and durably installs the
+    /// admitted initial snapshot before acknowledging it. Three measured
+    /// reasons this attach method remains unwired:
     ///
     /// - it is **circular** — `GovernorComposition::admit_observed_scope_attach`
-    ///   fails closed unless a `WorkScope` owner is already retained, and this
-    ///   method is the only daemon path that installs one;
+    ///   fails closed unless a `WorkScope` owner is already retained; the
+    ///   separate initial binding route does not create an attach receipt;
     /// - the daemon holds no `WorkScopeDescriptor`, no `GoverningSourceSet`, and
     ///   no authenticated authorization reference, so three of the nine
     ///   `ScopeAttachIngress` fields would have to be fabricated;
