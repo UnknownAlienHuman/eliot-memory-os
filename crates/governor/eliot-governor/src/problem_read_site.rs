@@ -55,9 +55,7 @@
 use std::collections::BTreeMap;
 
 use eliot_context_candidates::ProjectionState;
-use eliot_problem::{
-    OwnerLeaseGrant, OwnerLeaseIssuer, OwnerLeaseRevocation, Ownership, Problem,
-};
+use eliot_problem::{OwnerLeaseGrant, OwnerLeaseIssuer, OwnerLeaseRevocation, Problem};
 use eliot_store_api::{
     PROBLEM_OWNER_STATE_MUTATION_NAME, PROBLEM_PARAM_PROBLEM_ID, ProblemOwnerTransition,
     SequenceDispositionChoice, SequenceDispositionEvidence, SequenceGapStatus,
