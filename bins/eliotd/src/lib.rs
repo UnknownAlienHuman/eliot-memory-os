@@ -314,8 +314,8 @@ pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
 pub use maintenance_dispatch::{MaintenanceDecisionGap, MaintenanceDispatch, decision_gap};
 pub use maintenance_resume_admission::{
-    ReconciledAttemptView, ResumeAdmission, ResumeContinuity, ResumeFreshEvidence,
-    ResumeRefusal, ResumeRefusalReason, ResumeSessionBinding, ResumeStatus, attempt_reconciliation,
+    ReconciledAttemptView, ResumeAdmission, ResumeContinuity, ResumeFreshEvidence, ResumeRefusal,
+    ResumeRefusalReason, ResumeSessionBinding, ResumeStatus, attempt_reconciliation,
     decide_resume_admission, project_resume_status,
 };
 pub use maintenance_trigger_evaluator::{

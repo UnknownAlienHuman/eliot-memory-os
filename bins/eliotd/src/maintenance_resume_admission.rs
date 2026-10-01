@@ -180,16 +180,32 @@ impl ResumeRefusalReason {
     #[must_use]
     pub const fn next_action(self) -> &'static str {
         match self {
-            Self::StoredJobInvalid => "none: the stored revision is rejected; re-admit through a fresh evaluated decision",
-            Self::IllegalResumeState => "reconcile_unknown for UNKNOWN_OUTCOME, start for ADMITTED, none otherwise",
-            Self::AttemptBudgetExhausted => "none: the policy attempt budget is spent; a new evaluated decision admits new work",
-            Self::LeaseInactive => "none through resume: re-acquire the runtime lease through its owner, then a fresh admission",
+            Self::StoredJobInvalid => {
+                "none: the stored revision is rejected; re-admit through a fresh evaluated decision"
+            }
+            Self::IllegalResumeState => {
+                "reconcile_unknown for UNKNOWN_OUTCOME, start for ADMITTED, none otherwise"
+            }
+            Self::AttemptBudgetExhausted => {
+                "none: the policy attempt budget is spent; a new evaluated decision admits new work"
+            }
+            Self::LeaseInactive => {
+                "none through resume: re-acquire the runtime lease through its owner, then a fresh admission"
+            }
             Self::StaleFence => "re-evaluate the trigger under the live admitted fence",
             Self::EvidenceMismatch => "none: bind evidence issued for this family and scope",
-            Self::AutomationOff => "none while the Human policy mode is off; a verified mandatory safety/recovery obligation follows its own protected owner",
-            Self::SessionRequirementChanged => "fresh admission under the current policy, not resume of this job",
-            Self::SessionUnavailable => "re-authenticate the User Broker session, then resume; service-safe work is unaffected",
-            Self::UnsettledPriorAttempt => "admit_maintenance_observation_receipt or record_maintenance_observation_gap for the pending publication, then resume",
+            Self::AutomationOff => {
+                "none while the Human policy mode is off; a verified mandatory safety/recovery obligation follows its own protected owner"
+            }
+            Self::SessionRequirementChanged => {
+                "fresh admission under the current policy, not resume of this job"
+            }
+            Self::SessionUnavailable => {
+                "re-authenticate the User Broker session, then resume; service-safe work is unaffected"
+            }
+            Self::UnsettledPriorAttempt => {
+                "admit_maintenance_observation_receipt or record_maintenance_observation_gap for the pending publication, then resume"
+            }
         }
     }
 }
@@ -454,10 +470,10 @@ pub fn project_resume_status(
         policy_episode: policy_episode_summary(policy),
         route_binding: format!(
             "fingerprint={fingerprint}, generation={generation:?}, unattended_suitable={suitable}",
-            fingerprint = route.capability_fingerprint.as_deref().map_or_else(
-                || "unpublished".to_owned(),
-                sanitize_identity
-            ),
+            fingerprint = route
+                .capability_fingerprint
+                .as_deref()
+                .map_or_else(|| "unpublished".to_owned(), sanitize_identity),
             generation = route.generation,
             suitable = route.unattended_suitable,
         ),
@@ -484,9 +500,7 @@ pub fn project_resume_status(
 /// digest, and override provenance — without restating the fingerprint scheme:
 /// this is a status line, not key material.
 fn policy_episode_summary(policy: &eliot_maintenance::MaintenancePolicyEvidence) -> String {
-    if policy.revision.is_none()
-        && policy.digest.is_none()
-        && policy.override_provenance.is_none()
+    if policy.revision.is_none() && policy.digest.is_none() && policy.override_provenance.is_none()
     {
         return "unpublished".to_owned();
     }
