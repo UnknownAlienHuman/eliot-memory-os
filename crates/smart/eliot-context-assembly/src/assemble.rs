@@ -4,8 +4,8 @@ use eliot_context_contracts::{
     ActiveUnderstandingView, AdmittedContextSet, ContextError, ContextExecutionIdentity,
     ContextRecipe, DownstreamHeadroomRequest, DownstreamHeadroomResult, HeadroomAttempt,
     HeadroomDimension, HeadroomRefusal, HeadroomReleaseInstruction, MeasurementStatus,
-    QualityOperation, QualityRefusal, QualityRefusalKind, QualityScorecard,
-    ResolvedContextRecipe, SerializedContextMeasurement,
+    QualityOperation, QualityRefusal, QualityRefusalKind, QualityScorecard, ResolvedContextRecipe,
+    SerializedContextMeasurement,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
