@@ -3446,11 +3446,9 @@ impl KernelComposition {
                 // its dedicated queue and no arbitrary tool becomes claimable.
                 if !matches!(
                     check_local_read_admission(envelope, tool),
-                    Ok(
-                        LocalReadAdmission::Query(_)
-                            | LocalReadAdmission::Skill
-                            | LocalReadAdmission::ControlBoardRead { .. }
-                    )
+                    Ok(LocalReadAdmission::Query(_)
+                        | LocalReadAdmission::Skill
+                        | LocalReadAdmission::ControlBoardRead { .. })
                 ) {
                     continue;
                 }
