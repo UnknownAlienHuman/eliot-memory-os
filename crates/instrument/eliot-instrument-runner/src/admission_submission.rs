@@ -148,15 +148,22 @@ pub fn submit_admission_snapshot(
         }
     }
     let snapshot_json = registry.persist()?;
-    let parameters = BTreeMap::from([(
-        "snapshot_json".to_owned(),
-        Value::String(snapshot_json.clone()),
-    )]);
-    let admitted_bytes = decode_instrument_registry_mutation(&parameters).map_err(|error| {
-        ProfileError::Snapshot {
+    let submission = AdmissionSubmission {
+        snapshot_json,
+        spec_digest: stage.spec_digest.clone(),
+        supply_digest: admitted_supply.clone(),
+        executable_path: observed.canonical_path.clone(),
+        content_digest: observed.content_digest.clone(),
+    };
+    // Validate the exact operation content this submission executes: the
+    // shared `ApplyInstrumentRegistryState` acceptance boundary runs over
+    // `submission.parameters()`, so the compared bytes can never diverge
+    // from the executed mutation.
+    let admitted_bytes = decode_instrument_registry_mutation(&submission.parameters()).map_err(
+        |error| ProfileError::Snapshot {
             detail: error.to_string(),
-        }
-    })?;
+        },
+    )?;
     let recovered = InstrumentRegistry::recover(&admitted_bytes)?;
     let recovered_spec = recovered
         .spec(kind)
@@ -177,11 +184,5 @@ pub fn submit_admission_snapshot(
             detail: "instrument registry readback differs from the admitted record".to_owned(),
         });
     }
-    Ok(AdmissionSubmission {
-        snapshot_json: admitted_bytes,
-        spec_digest: stage.spec_digest.clone(),
-        supply_digest: admitted_supply,
-        executable_path: observed.canonical_path.clone(),
-        content_digest: observed.content_digest.clone(),
-    })
+    Ok(submission)
 }
