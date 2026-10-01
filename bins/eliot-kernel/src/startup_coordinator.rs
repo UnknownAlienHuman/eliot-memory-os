@@ -504,8 +504,7 @@ impl SupervisionOwnerSequenceFrontier {
         incarnation: &PlatformHandle,
         watchdog_epoch: &SupervisionJournalEpoch,
     ) -> bool {
-        self.incarnation == *incarnation
-            && self.watchdog_epoch == *watchdog_epoch
+        self.incarnation == *incarnation && self.watchdog_epoch == *watchdog_epoch
     }
 }
 
@@ -1095,9 +1094,7 @@ impl StartupCoordinator {
                 } else {
                     "the admitted Watchdog heartbeat sequence does not advance the retained exact-owner frontier"
                 };
-                return Err(
-                    reason.to_owned(),
-                );
+                return Err(reason.to_owned());
             }
         }
         if let Some(current) = self.current_supervision_observation.as_ref() {
@@ -1120,8 +1117,7 @@ impl StartupCoordinator {
                 || current.heartbeat_proof.service_instance_guid
                     != heartbeat_proof.service_instance_guid
                 || current.heartbeat_proof.host_boot_id != heartbeat_proof.host_boot_id
-                || current.heartbeat_proof.observation_digest
-                    == heartbeat_proof.observation_digest
+                || current.heartbeat_proof.observation_digest == heartbeat_proof.observation_digest
                 || heartbeat_proof.readiness_sequence <= current.progress_frontier
             {
                 if let Some(previous) = self.current_supervision_observation.take() {
@@ -1198,7 +1194,7 @@ impl StartupCoordinator {
             {
                 return Err(
                     "supervision revocation names a different candidate or consumer fence"
-                    .to_owned(),
+                        .to_owned(),
                 );
             }
             let Some(expected_observation_digest) = expected_observation_digest else {
@@ -1230,7 +1226,10 @@ impl StartupCoordinator {
                         },
                     );
                 }
-                return Err("supervision revocation observation digest does not match the current proof".to_owned());
+                return Err(
+                    "supervision revocation observation digest does not match the current proof"
+                        .to_owned(),
+                );
             }
         }
         if has_current {

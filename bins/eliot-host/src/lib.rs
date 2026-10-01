@@ -1654,14 +1654,14 @@ use eliot_kernel_core::KernelRuntimeHealthEvidence;
 use eliot_kernel_service::KERNEL_CONTROL_PIPE;
 use eliot_kernel_service::{
     AdmittedWatchdogHeartbeatProof, EliotdLaunchDescriptor, HostJobBinding,
-    HostKernelCandidateBinding, HostProcessBinding, HostStartupEvidence,
-    HostStartupEvidenceReport, HostStartupHeartbeatCoverage, HostStoreBootstrapRequirement,
-    HostSupervisionEvidenceRevocation, HostSupervisionRevocationDisposition,
-    KernelActivationPermit, KernelActivationQuery, KernelActivationReceipt, KernelControlCommand,
-    KernelControlRequest, KernelControlResponse, KernelReadyReceipt, KernelServiceState,
-    ProcessAuthorityHandoffDescriptor, RestartBudget, StoreBootstrapHandoff, StoreProcessBinding,
-    StoreRebindHandoff, StoreRebindQuery, StoreRebindReceipt, control_request_frame,
-    decode_control_response_frame, semantic_store_config_hash_from_json,
+    HostKernelCandidateBinding, HostProcessBinding, HostStartupEvidence, HostStartupEvidenceReport,
+    HostStartupHeartbeatCoverage, HostStoreBootstrapRequirement, HostSupervisionEvidenceRevocation,
+    HostSupervisionRevocationDisposition, KernelActivationPermit, KernelActivationQuery,
+    KernelActivationReceipt, KernelControlCommand, KernelControlRequest, KernelControlResponse,
+    KernelReadyReceipt, KernelServiceState, ProcessAuthorityHandoffDescriptor, RestartBudget,
+    StoreBootstrapHandoff, StoreProcessBinding, StoreRebindHandoff, StoreRebindQuery,
+    StoreRebindReceipt, control_request_frame, decode_control_response_frame,
+    semantic_store_config_hash_from_json,
 };
 use eliot_observation_contracts::{
     CoverageGap, GapDisposition, ObservationRecordEnvelope, ObservationRecordKind,
@@ -2140,8 +2140,7 @@ fn kernel_heartbeat_proof(
                 .as_ref()
                 .ok_or_else(|| {
                     HostError::ProcessContour(
-                        "admitted heartbeat has no verified transport descriptor digest"
-                            .to_owned(),
+                        "admitted heartbeat has no verified transport descriptor digest".to_owned(),
                     )
                 })?
                 .clone(),
@@ -2165,9 +2164,7 @@ fn kernel_heartbeat_proof(
             watchdog_heartbeat::HostHeartbeatCoverage::Partial => {
                 HostStartupHeartbeatCoverage::Partial
             }
-            watchdog_heartbeat::HostHeartbeatCoverage::Blind => {
-                HostStartupHeartbeatCoverage::Blind
-            }
+            watchdog_heartbeat::HostHeartbeatCoverage::Blind => HostStartupHeartbeatCoverage::Blind,
         },
         handshake_count: observation.handshake_count,
     })
@@ -3086,8 +3083,7 @@ impl HostJobBranches {
             }
             Some(HostSupervisionRevocationDisposition::Superseded {
                 current_observation_digest,
-            }) if had_expected_observation && response.error.is_none() =>
-            {
+            }) if had_expected_observation && response.error.is_none() => {
                 Ok(HostSupervisionRevocationDisposition::Superseded {
                     current_observation_digest,
                 })
@@ -3116,11 +3112,9 @@ impl HostJobBranches {
                 let cleanup = self.terminate_kernel();
                 return Err(match cleanup {
                     Ok(()) => HostError::RecoveryRequired(error.to_string()),
-                    Err(cleanup) => HostError::KernelSupervisionRevocationUncontained(
-                        format!(
-                            "could not create the authenticated revocation runtime ({error}); retained Kernel Job containment failed ({cleanup})"
-                        ),
-                    ),
+                    Err(cleanup) => HostError::KernelSupervisionRevocationUncontained(format!(
+                        "could not create the authenticated revocation runtime ({error}); retained Kernel Job containment failed ({cleanup})"
+                    )),
                 });
             }
         };
@@ -3189,8 +3183,7 @@ impl HostJobBranches {
                 current_observation_digest,
             }) => {
                 if self.current_supervision_observation_digest == expected_selector {
-                    self.current_supervision_observation_digest =
-                        Some(current_observation_digest);
+                    self.current_supervision_observation_digest = Some(current_observation_digest);
                 }
                 Err(HostError::KernelSupervisionRevocationSuperseded(
                     "a newer original heartbeat proof remains current".to_owned(),
@@ -3955,8 +3948,7 @@ impl HostJobBranches {
                     return Err(error);
                 }
                 if !startup_report_compensation_attempted
-                    && let Err(revocation_error) =
-                        self.revoke_host_supervision_evidence(generation)
+                    && let Err(revocation_error) = self.revoke_host_supervision_evidence(generation)
                 {
                     return Err(revocation_error);
                 }
@@ -4863,8 +4855,7 @@ impl HostJobBranches {
             // Retain the exact attempted original digest before sending. A
             // lost ACK may follow a committed report, so this is a CAS
             // selector only and does not claim acceptance.
-            self.current_supervision_observation_digest =
-                reported_observation_digest.clone();
+            self.current_supervision_observation_digest = reported_observation_digest.clone();
             report_attempted = true;
             HostJobBranches::send_bound_host_startup_evidence(
                 &mut transport,
@@ -5629,9 +5620,7 @@ impl HostJobBranches {
         let kernel = self.terminate_kernel();
         match (store, kernel) {
             (Ok(()), Ok(())) => Ok(()),
-            (store, Err(kernel))
-                if self.current_supervision_observation_digest.is_some() =>
-            {
+            (store, Err(kernel)) if self.current_supervision_observation_digest.is_some() => {
                 Err(HostError::KernelSupervisionRevocationUncontained(format!(
                     "Store-first termination was incomplete while an attempted supervision proof may remain current: store={store:?}; kernel={kernel}"
                 )))
@@ -10842,10 +10831,7 @@ impl HostComposition {
             ) {
             Ok(value) => value,
             Err(error) => {
-                if matches!(
-                    &error,
-                    HostError::KernelSupervisionRevocationSuperseded(_)
-                ) {
+                if matches!(&error, HostError::KernelSupervisionRevocationSuperseded(_)) {
                     return Err(error);
                 }
                 return self.cleanup_launched_contour(error);
@@ -10899,10 +10885,7 @@ impl HostComposition {
         ) {
             Ok(value) => value,
             Err(error) => {
-                if matches!(
-                    &error,
-                    HostError::KernelSupervisionRevocationSuperseded(_)
-                ) {
+                if matches!(&error, HostError::KernelSupervisionRevocationSuperseded(_)) {
                     return Err(error);
                 }
                 return self.cleanup_launched_contour(error);
@@ -11165,10 +11148,7 @@ impl HostComposition {
                     .authority_epoch
                     .clone(),
             ) {
-                if matches!(
-                    &error,
-                    HostError::KernelSupervisionRevocationSuperseded(_)
-                ) {
+                if matches!(&error, HostError::KernelSupervisionRevocationSuperseded(_)) {
                     return Err(error);
                 }
                 return self.cleanup_launched_contour(HostError::RecoveryRequired(format!(
@@ -11210,11 +11190,7 @@ impl HostComposition {
             }
             if let Err(cleanup) = self.jobs.terminate_store_then_kernel() {
                 return Err(
-                    if self
-                        .jobs
-                        .current_supervision_observation_digest
-                        .is_some()
-                    {
+                    if self.jobs.current_supervision_observation_digest.is_some() {
                         HostError::KernelSupervisionRevocationUncontained(format!(
                             "candidate activation failed ({candidate_error}); retained Kernel Job containment failed ({cleanup}) while an attempted supervision proof may remain current"
                         ))
@@ -11898,18 +11874,13 @@ impl HostComposition {
                 kernel_authority_epoch,
                 &active.manifest,
             ) {
-                if matches!(
-                    &error,
-                    HostError::KernelSupervisionRevocationSuperseded(_)
-                ) {
+                if matches!(&error, HostError::KernelSupervisionRevocationSuperseded(_)) {
                     return Err(error);
                 }
                 let cleanup = self.jobs.terminate_kernel();
                 return Err(match cleanup {
                     Ok(()) => error,
-                    Err(cleanup)
-                        if self.jobs.current_supervision_observation_digest.is_some() =>
-                    {
+                    Err(cleanup) if self.jobs.current_supervision_observation_digest.is_some() => {
                         HostError::KernelSupervisionRevocationUncontained(format!(
                             "Kernel restart activation failed ({error}); retained Kernel Job containment failed ({cleanup}) while an attempted supervision proof may remain current"
                         ))
@@ -12688,7 +12659,10 @@ impl HostComposition {
         })?;
         let original_supervision = read_manifest_current_supervision_lease(
             &active.manifest,
-            candidate.supervision_incarnation.supervision_lease_id.as_str(),
+            candidate
+                .supervision_incarnation
+                .supervision_lease_id
+                .as_str(),
         )?;
         require_exact_supervision_head(&original_supervision, || {
             read_manifest_current_supervision_lease(
@@ -12796,12 +12770,7 @@ impl HostComposition {
             Ok(confirmed)
         })();
         match post_probe {
-            Err(error)
-                if self
-                    .jobs
-                    .current_supervision_observation_digest
-                    .is_some() =>
-            {
+            Err(error) if self.jobs.current_supervision_observation_digest.is_some() => {
                 // Every fallible post-Probe publication, ORS check, journal
                 // admission/readback, and final contour confirmation belongs
                 // to this attempt. Withdraw its exact original proof before
@@ -13022,12 +12991,7 @@ impl HostComposition {
                 let reason = format!(
                     "persistence failed ({error}); launched contour cleanup requires recovery: projection={projection:?}, watchdog={watchdog:?}, kernel={kernel:?}, store={store:?}"
                 );
-                if kernel.is_err()
-                    && self
-                        .jobs
-                        .current_supervision_observation_digest
-                        .is_some()
-                {
+                if kernel.is_err() && self.jobs.current_supervision_observation_digest.is_some() {
                     Err(HostError::KernelSupervisionRevocationUncontained(reason))
                 } else {
                     Err(HostError::RecoveryRequired(reason))
@@ -13371,17 +13335,19 @@ impl HostComposition {
                 let kernel = self.jobs.terminate_kernel();
                 if store.is_err() || kernel.is_err() {
                     self.shutdown_failed = true;
-                    return Err(if kernel.is_err()
-                        && self.jobs.current_supervision_observation_digest.is_some()
-                    {
-                        HostError::KernelSupervisionRevocationUncontained(format!(
-                            "Store-first stop requires recovery while an attempted supervision proof may remain current: store={store:?}; kernel={kernel:?}"
-                        ))
-                    } else {
-                        HostError::RecoveryRequired(format!(
-                            "Store-first stop requires recovery: store={store:?}; kernel={kernel:?}"
-                        ))
-                    });
+                    return Err(
+                        if kernel.is_err()
+                            && self.jobs.current_supervision_observation_digest.is_some()
+                        {
+                            HostError::KernelSupervisionRevocationUncontained(format!(
+                                "Store-first stop requires recovery while an attempted supervision proof may remain current: store={store:?}; kernel={kernel:?}"
+                            ))
+                        } else {
+                            HostError::RecoveryRequired(format!(
+                                "Store-first stop requires recovery: store={store:?}; kernel={kernel:?}"
+                            ))
+                        },
+                    );
                 }
             }
             if degraded_recovery_stop {
