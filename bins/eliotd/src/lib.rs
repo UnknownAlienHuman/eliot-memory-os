@@ -208,6 +208,11 @@ pub use capability_evidence_wiring::{
     ScopeChangeRestrictionReport, commit_production_observation, commit_scope_change_restriction,
     drain_capability_evidence_records, evidence_scope_for_observed_route,
 };
+/// I1.9 Capability Registry: the Governor-owned composite capability
+/// projection, re-exported as the module so the exact registry name stays
+/// reachable without flattening it against the distinct canonical-evidence
+/// `CapabilityRegistry` that `eliot_governor` already exports at its root.
+pub use eliot_governor::capability_registry;
 pub use capability_outcome::{
     AttemptReceipt, CapabilityOutcome, CapabilityRegistryView, DegradationProjection,
     DegradationScope, FallbackOutcomeRequest, GenerationChallengeOutcomeRequest,

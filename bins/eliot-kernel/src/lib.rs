@@ -515,6 +515,12 @@ use eliot_ors::{
     OperationIdentity, OperationalRecoveryStore, RedbRecoveryStore, SupervisionLeaseOperation,
     SupervisionLeasePrepareRequest, SupervisionLeaseSnapshot,
 };
+/// I1.9 Kernel/ORS-owned Generation Registry operational records, re-exported
+/// so the kernel generation control surface can name the exact registry types.
+pub use eliot_ors::{
+    GenerationDrainState, GenerationOperationalState, GenerationProcessHandles, GenerationRegistry,
+    GenerationRegistryRecord, GenerationRouteState,
+};
 #[cfg(test)]
 pub use eliot_ors::{SupervisionLeaseCommitTicket, SupervisionLeaseStageReceipt};
 #[cfg(test)]
