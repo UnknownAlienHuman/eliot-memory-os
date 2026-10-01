@@ -719,7 +719,7 @@ pub enum RunRequestError {
     InvalidMessageIdentity,
 }
 
-/// Adapter-internal OpenCode wire route record (PRIVATE_WIRE_PROJECTION).
+/// Adapter-internal `OpenCode` wire route record (`PRIVATE_WIRE_PROJECTION`).
 ///
 /// Issue #369 (T4 S4, `workstreams/T4.md` §5.2): this is the provider-wire
 /// shape (`ModelSelection`, endpoint, directory, server/session fields plus
@@ -1841,9 +1841,9 @@ fn bind_opencode_source(
     })
 }
 
-/// Typed OpenCode host-event normalization input (issue #371 T4 S7).
+/// Typed `OpenCode` host-event normalization input (issue #371 T4 S7).
 ///
-/// The OpenCode wire event (`event_type` + `properties` + `extra`) travels as
+/// The `OpenCode` wire event (`event_type` + `properties` + `extra`) travels as
 /// the classification input only: the public normalized payload is the closed
 /// [`NormalizedHostEventPayload`] built inside (never a copied
 /// `serde_json::Value`). The exact execution lineage travels as
@@ -1858,7 +1858,7 @@ fn bind_opencode_source(
 /// cursor.
 #[derive(Clone, Debug)]
 pub struct OpenCodeHostEventInput<'a> {
-    /// OpenCode wire event being normalized. Raw `properties`/`extra` stay
+    /// `OpenCode` wire event being normalized. Raw `properties`/`extra` stay
     /// behind the restricted handle; only a bounded typed summary enters the
     /// public payload.
     pub event: &'a OpenCodeEvent,
@@ -1873,7 +1873,7 @@ pub struct OpenCodeHostEventInput<'a> {
     /// Exact session or execution-unit lineage. No string/JSON parsing, no new
     /// attempt invention.
     pub lineage: ProviderObservationLineage,
-    /// Raw OpenCode SSE/JSON bytes. Digested inside; never copied into the
+    /// Raw `OpenCode` SSE/JSON bytes. Digested inside; never copied into the
     /// public normalized payload.
     pub raw_source_bytes: &'a [u8],
     /// Restricted handle addressing the immutable raw source record.
@@ -2067,7 +2067,7 @@ fn finish_opencode_envelope(
     Ok((envelope, receipt))
 }
 
-/// Normalizes one OpenCode wire event into the closed v7 host-event schema
+/// Normalizes one `OpenCode` wire event into the closed v7 host-event schema
 /// (issue #371 T4 S7), mirroring `eliot-agent-acp::normalize_acp_event`.
 ///
 /// The adapter identity/version (`eliot-agent-opencode` /
@@ -2246,8 +2246,7 @@ fn classify_message_part_event(event: &OpenCodeEvent) -> ClassifiedOpenCodeEvent
         )
     } else {
         let delta_chars = serde_json::to_value(&event.properties)
-            .map(|value| value.to_string().chars().count() as u64)
-            .unwrap_or(0);
+            .map_or_else(|_| 0, |value| value.to_string().chars().count() as u64);
         (
             NormalizedHostEventPayload::AssistantDelta(AssistantDeltaObservation {
                 delta_chars,
@@ -2266,8 +2265,7 @@ fn classify_execution_opencode_event(event: &OpenCodeEvent) -> ClassifiedOpenCod
     match event.event_type.as_str() {
         "message.updated" => {
             let delta_chars = serde_json::to_value(&event.properties)
-                .map(|value| value.to_string().chars().count() as u64)
-                .unwrap_or(0);
+                .map_or_else(|_| 0, |value| value.to_string().chars().count() as u64);
             (
                 NormalizedHostEventPayload::AssistantDelta(AssistantDeltaObservation {
                     delta_chars,
@@ -2309,7 +2307,7 @@ fn classify_execution_opencode_event(event: &OpenCodeEvent) -> ClassifiedOpenCod
     }
 }
 
-/// Classifies one OpenCode wire event into the closed typed payload family.
+/// Classifies one `OpenCode` wire event into the closed typed payload family.
 ///
 /// Returns the typed payload, its privacy class, and base warnings (the
 /// quarantine warning is appended by [`normalize_opencode_event`]). The mapping
