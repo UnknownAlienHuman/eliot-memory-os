@@ -255,6 +255,7 @@ fn run() -> Result<String, Failure> {
             &admission,
             &receipt,
             bridge.last_failure(),
+            bridge.last_retained_stdout(),
         );
         // A terminal state that is not a completed acquisition degrades
         // acquisition coverage and exits with the degraded disposition. A
@@ -339,7 +340,13 @@ fn report_failed_operation(
         records,
         reconciliation,
     );
-    report_admitted_inquiry(&admitted.request, admission, &receipt, failure);
+    report_admitted_inquiry(
+        &admitted.request,
+        admission,
+        &receipt,
+        failure,
+        bridge.last_retained_stdout(),
+    );
     // The bounded secondary obligations and the stream-readback state are
     // reported so the primary cause on the receipt is never the whole story: a
     // timeout whose cancellation or readback never answered says so.
@@ -429,8 +436,9 @@ fn report_admitted_inquiry(
     admission: &ProviderAdmission,
     receipt: &ProviderExecutionReceipt,
     failure: Option<&eliot_mod_research::TerminalFailure>,
+    retained_stdout: Option<&[u8]>,
 ) {
-    match project_admitted_inquiry(request, admission, receipt, failure) {
+    match project_admitted_inquiry(request, admission, receipt, failure, retained_stdout) {
         Ok(inquiry) => {
             // The release gate is asked here, on the real run, and its answer is
             // published beside the governance view. Before this the run rendered
