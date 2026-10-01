@@ -1259,7 +1259,13 @@ fn map_attempt_error(error: AdapterError) -> AttemptOutcome {
                 AttemptOutcome::Unknown { retry_after_ms: 0 }
             }
         },
-        AdapterError::ProviderConflict => AttemptOutcome::Rejected(StoreError::RevisionConflict),
+        // A provider-side conflict reply arrives after the transaction RPC was
+        // submitted. The conflict marker is useful for refusing an automatic
+        // replay, but it is not by itself an effect-owner proof that every
+        // statement was rolled back. Keep the original identity under exact
+        // receipt reconciliation; only a separately retained transaction
+        // no-effect record may later authorize dead lettering.
+        AdapterError::ProviderConflict => AttemptOutcome::Unknown { retry_after_ms: 0 },
         // Pre-effect dispositions without provider effects: allocation
         // exhaustion proved no commit for this identity inside the #989
         // loop, and the local defects below all precede any provider send.
