@@ -625,8 +625,9 @@ impl KernelGovernedProcessEffectPort {
     /// filesystem/Git observation adapter (I10.21 A2): the retained previous
     /// digest against two fresh agreeing reads is evidence no admission
     /// explains by itself, so the transition is external and uncorrelated
-    /// until a recorded governed change reconciles it. Sets `observed` when
-    /// the adapter admits the transition and returns `false`; returns `true`
+    /// until a recorded governed change reconciles it. Sets `ledger_mutated`
+    /// when the adapter admits the transition or pins a blocking gap marker
+    /// instead, and returns `false`; returns `true`
     /// when the caller must skip the target (the transition stays
     /// unrecorded and a blocking gap marker pins the retained digest so the
     /// next capture re-detects it instead of advancing past evidence the
@@ -640,7 +641,7 @@ impl KernelGovernedProcessEffectPort {
         event_ref: &str,
         previous: &str,
         witness: &change_monitor::UnresolvedTransitionWitness,
-        observed: &mut bool,
+        ledger_mutated: &mut bool,
     ) -> Result<bool, GovernedProcessEffectPortError> {
         match Self::observe_external_filesystem_transition(
             workspace_root,
@@ -650,7 +651,7 @@ impl KernelGovernedProcessEffectPort {
             previous,
         ) {
             Ok(confirmation) => {
-                *observed = true;
+                *ledger_mutated = true;
                 observe_process(
                     "kernel.process.effect_external_transition",
                     match confirmation {
@@ -688,6 +689,10 @@ impl KernelGovernedProcessEffectPort {
                     Some(previous.to_owned()),
                 ) {
                     Ok(_) => {
+                        // The blocking gap marker is ledger state in its own
+                        // right (I10.21 W4): the capture leg persists it
+                        // below even when no transition was admitted.
+                        *ledger_mutated = true;
                         observe_process("kernel.process.effect_external_transition", "unresolved");
                     }
                     Err(change_monitor::ChangeMonitorError::LedgerPoisoned) => {
@@ -1033,6 +1038,10 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
             .binding
             .unresolved_witness(baseline.effect_digest.as_str());
         let mut targets = Vec::new();
+        // I10.21 W4: a readback-failure marker pins blocking ledger state
+        // without admitting a hint, so the leg tracks it for the
+        // best-effort persist below instead of leaving it memory-only.
+        let mut unresolved_any = false;
         for base in &baseline.targets {
             match Self::read_tracked_source(&base.path) {
                 Some(TrackedSourceRead::Present {
@@ -1085,7 +1094,10 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
                             &witness,
                             Some(digest),
                         ) {
-                            Ok(_) => "unresolved",
+                            Ok(_) => {
+                                unresolved_any = true;
+                                "unresolved"
+                            }
                             Err(change_monitor::ChangeMonitorError::LedgerPoisoned) => {
                                 return Err(GovernedProcessEffectPortError::LedgerPoisoned);
                             }
@@ -1096,6 +1108,20 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
                     observe_process("kernel.process.effect_readback_failed", outcome);
                 }
             }
+        }
+        // I10.21 W4 durability: readback-failure markers are blocking
+        // observations in their own right — the receipt carries nothing for
+        // these targets, so no later ingest persist covers them. Best-effort
+        // by the same contract: the observation stands regardless, only
+        // durability is best-effort, and it stays visible instead of silent.
+        if unresolved_any && change_monitor::persist_ledger_sidecar().is_err() {
+            observe_process("kernel.process.effect_readback_failed", "persist_failed");
+        }
+        if unresolved_any && change_monitor::persist_observation_transfer().is_err() {
+            observe_process(
+                "kernel.process.effect_readback_failed",
+                "transfer_persist_failed",
+            );
         }
         Ok(GovernedProcessChangeReceipt {
             targets,
@@ -1114,6 +1140,11 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
         }
         let operation = baseline.binding.operation_id().as_str().to_owned();
         let mut admitted_any = false;
+        // I10.21 W4: a refused hint pins a blocking gap marker without
+        // admitting anything (see `admit_host_event_hint`), so the leg
+        // tracks it for the best-effort persist below instead of leaving
+        // blocking state memory-only.
+        let mut unresolved_any = false;
         for base in &baseline.targets {
             let Some(back) = receipt
                 .targets
@@ -1135,6 +1166,7 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
                 &base.before_digest,
             )?;
             if skip_target {
+                unresolved_any = true;
                 continue;
             }
             admitted_any = true;
@@ -1210,17 +1242,18 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
             }
         }
         // I10.21 durability (AUD3): ingest-time ledger mutations (hint
-        // admissions, governed records, confirmations) are observations in
-        // their own right: persist them best-effort so a crash before the
-        // next mutation still retains them. The observation stands
-        // regardless; only durability is best-effort, and it stays visible
-        // instead of silent.
-        if admitted_any && change_monitor::persist_ledger_sidecar().is_err() {
+        // admissions, governed records, confirmations, gap markers) are
+        // observations in their own right: persist them best-effort so a
+        // crash before the next mutation still retains them. The observation
+        // stands regardless; only durability is best-effort, and it stays
+        // visible instead of silent.
+        let persist_needed = admitted_any || unresolved_any;
+        if persist_needed && change_monitor::persist_ledger_sidecar().is_err() {
             observe_process("kernel.process.effect_observed", "persist_failed");
         }
         // I10.21 W4 durability: the shared Governor projection travels
         // beside the sidecar (see the capture leg above).
-        if admitted_any && change_monitor::persist_observation_transfer().is_err() {
+        if persist_needed && change_monitor::persist_observation_transfer().is_err() {
             observe_process("kernel.process.effect_observed", "transfer_persist_failed");
         }
         Ok(())
