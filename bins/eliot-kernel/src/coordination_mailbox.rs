@@ -720,7 +720,7 @@ pub fn rebuild_coordination_map_view(
 ) -> Result<CoordinationMapView, CoordinationMailboxError> {
     require_text(plan_revision, "plan_revision", MAX_IDENTITY_LEN)?;
     require_text(wave_revision, "wave_revision", MAX_IDENTITY_LEN)?;
-    let mut entries = Vec::with_capacity(assignments.len());
+    let mut entries: Vec<CoordinationMapEntry> = Vec::with_capacity(assignments.len());
     for assignment in assignments {
         require_text(&assignment.work_item_id, "work_item_id", MAX_IDENTITY_LEN)?;
         if let Some(attempt_id) = assignment.assigned_attempt_id.as_deref() {
