@@ -28,6 +28,9 @@ uuid.workspace = true
 
 [dev-dependencies]
 eliot-receipts.workspace = true
+# Integration tests compile the library as a dependency, so enable its
+# explicitly test-only physical-journal helpers for package test targets.
+eliot-host-state = { path = ".", features = ["test-support"] }
 
 [lints]
 workspace = true
