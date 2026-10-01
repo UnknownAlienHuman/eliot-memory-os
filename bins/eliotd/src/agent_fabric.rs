@@ -4460,6 +4460,27 @@ impl AgentFabric {
             .get(dispatch_id)
             .cloned()
             .ok_or_else(|| FabricError::Contract(format!("unknown dispatch {dispatch_id}")))?;
+        let admitted = self
+            .coordinator
+            .admitted_provider_attempt(&intent.attempt_id)?;
+        if admitted.id != intent.attempt_id
+            || admitted.authority.epoch != intent.epoch
+            || !fences_match_exact(&admitted.authority.state_fence, &intent.fence)
+        {
+            return Err(FabricError::IdentityConflict(
+                "dispatch intent does not match the current admitted provider attempt".to_owned(),
+            ));
+        }
+        let stored_binding = admitted
+            .attributable_binding()
+            .map_err(|error| FabricError::Contract(error.to_string()))?;
+        if stored_binding.attempt_id != intent.attempt_id
+            || !fences_match_exact(&stored_binding.state_fence, &intent.fence)
+        {
+            return Err(FabricError::IdentityConflict(
+                "dispatch intent does not match the owner-retained execution binding".to_owned(),
+            ));
+        }
         let identity = match self.coordinator.snapshot()?.provider_binding {
             ProviderBindingSnapshot::Verified { identity } => identity,
             ProviderBindingSnapshot::Gap { .. } => {

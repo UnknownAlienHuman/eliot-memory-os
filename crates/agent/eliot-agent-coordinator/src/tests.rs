@@ -2186,6 +2186,43 @@ fn binding_identical_replay_returns_existing_without_new_event() -> TestResult {
 }
 
 #[test]
+fn admitted_provider_attempt_requires_and_returns_retained_binding() -> TestResult {
+    let proofs = ["proof-admission-readback", "proof-bind-readback"];
+    let mut coordinator = coordinator(config(2, 2), &proofs)?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "readback",
+        &[bind_lane_spec("work-readback", "reader-readback", "a")],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+
+    // Refusal side: an attempt projection without the owner-retained full
+    // execution binding cannot be returned as executable material.
+    let before_binding = coordinator.events().len();
+    assert_eq!(
+        coordinator.admitted_provider_attempt(&lane.attempt_id),
+        Err(CoordinatorError::MissingExecutionBinding)
+    );
+    assert_eq!(coordinator.events().len(), before_binding);
+
+    // Positive side: the readback re-verifies the exact admission and binding
+    // event, then returns the original attempt with its binding unchanged.
+    let binding = coordinator.bind_provider_execution(
+        context,
+        binding_submission("readback", &lane, "unit-readback", "scope-readback")?,
+    )?;
+    let before_readback = coordinator.events().len();
+    let attempt = coordinator.admitted_provider_attempt(&lane.attempt_id)?;
+    assert_eq!(attempt.id, lane.attempt_id);
+    assert_eq!(attempt.provider_binding, Some(binding));
+    assert_eq!(coordinator.events().len(), before_readback);
+    Ok(())
+}
+
+#[test]
 fn binding_second_unit_rebind_conflicts_and_preserves_stored() -> TestResult {
     let proofs = [
         "proof-admission-bind-b",

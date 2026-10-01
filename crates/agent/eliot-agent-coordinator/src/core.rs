@@ -2771,6 +2771,128 @@ impl AgentCoordinator {
         self.attempts.get(attempt_id)
     }
 
+    /// Reads one admitted provider attempt from its retained owner records and
+    /// revalidates the original admission and execution-binding proofs before
+    /// returning it to a production caller.
+    ///
+    /// This is a read-only currentness boundary, not a projection from a
+    /// caller-supplied binding or an in-memory index alone. It requires the
+    /// exact `ProviderExecutionBound` event, canonical submission, binding
+    /// index, attempt record, original frozen plan, and admission receipt to
+    /// agree. Both owner proofs are re-run from their retained receipt bytes;
+    /// the admission lane and route-capacity record are checked again, and the
+    /// full binding is validated against the same admitted attempt fence and
+    /// resource generation. A missing stored binding remains a typed refusal.
+    ///
+    /// The method makes no state transition and does not return terminal or
+    /// cancelled attempts as if they were still executable. A reassigned
+    /// attempt has its own identity and must have its own retained binding.
+    pub fn admitted_provider_attempt(
+        &self,
+        attempt_id: &AttemptId,
+    ) -> Result<AgentAttempt, CoordinatorError> {
+        let current = self
+            .attempts
+            .get(attempt_id)
+            .cloned()
+            .ok_or(CoordinatorError::UnknownAttempt)?;
+        if !matches!(
+            current.state,
+            CoordinatedAttemptState::Admitted | CoordinatedAttemptState::Running
+        ) {
+            return Err(CoordinatorError::InvalidAttemptState(current.state));
+        }
+        let receipt = self
+            .admissions
+            .get(&current.admission_id)
+            .map(|admission| admission.receipt.clone())
+            .ok_or(CoordinatorError::UnknownAdmission)?;
+        if receipt.admission_id != current.admission_id {
+            return Err(CoordinatorError::IdentityConflict("admitted_reservation"));
+        }
+        let context = ExecutionContext::from(&receipt);
+        self.validate_context(&context)?;
+        self.provider.verify(
+            ProviderProofKind::Admission,
+            &receipt.provider_identity,
+            &receipt.g11_admission_receipt_ref,
+            &canonical(&receipt)?,
+        )?;
+        self.validate_provider_identity(&receipt.provider_identity)?;
+        self.validate_reservation_admission(&current, &receipt)?;
+        self.validate_route_capacity(BTreeMap::from([(
+            route_key(&current.route),
+            RouteCapacityRequest {
+                requested: RoutePartitionDemand::of(current.work_class.capacity_class(), 0),
+                capacity_identity: current.capacity_identity.clone(),
+                capacity_revision: current.capacity_revision.clone(),
+                capacity_limit: current.capacity_limit,
+            },
+        )]))?;
+
+        let stored_binding = current
+            .provider_binding
+            .as_ref()
+            .ok_or(CoordinatorError::MissingExecutionBinding)?;
+        let binding_record = self
+            .bindings
+            .get(attempt_id)
+            .ok_or(CoordinatorError::MissingExecutionBinding)?;
+        let mut binding_events = self.events.iter().filter_map(|event| match event {
+            CoordinatorEvent::ProviderExecutionBound {
+                context,
+                submission,
+            } if submission.binding.attempt_id == *attempt_id => {
+                Some((context, submission.as_ref()))
+            }
+            _ => None,
+        });
+        let (binding_context, submission) = binding_events
+            .next()
+            .ok_or(CoordinatorError::MissingExecutionBinding)?;
+        if binding_events.next().is_some() {
+            return Err(CoordinatorError::IdentityConflict("execution_binding"));
+        }
+        if binding_context != &context
+            || submission.binding != *stored_binding
+            || binding_record.receipt != *stored_binding
+            || current.provider_binding.as_ref() != Some(&submission.binding)
+        {
+            return Err(CoordinatorError::IdentityConflict("execution_binding"));
+        }
+        let canonical_submission = canonical(submission)?;
+        if binding_record.canonical_input != canonical_submission {
+            return Err(CoordinatorError::IdentityConflict("execution_binding"));
+        }
+        self.provider.verify(
+            ProviderProofKind::Binding,
+            &submission.provider_identity,
+            &submission.provider_start_receipt_ref,
+            &canonical_submission,
+        )?;
+        self.validate_provider_identity(&submission.provider_identity)?;
+
+        let admitted = self.binding_subject_inner(&current, &receipt)?;
+        validate_execution_binding(
+            stored_binding,
+            &admitted,
+            &current.state_fence,
+            current.state_fence.resource_generation,
+        )
+        .map_err(binding_contract)?;
+        if self.attempts.values().any(|other| {
+            other.attempt_id != *attempt_id
+                && other.provider_binding.as_ref().is_some_and(|binding| {
+                    binding.provider_scope_ref == stored_binding.provider_scope_ref
+                        && binding.execution_unit == stored_binding.execution_unit
+                        && binding.runtime_generation == stored_binding.runtime_generation
+                })
+        }) {
+            return Err(CoordinatorError::DuplicateIdentity("execution_unit"));
+        }
+        Ok(admitted)
+    }
+
     pub fn events(&self) -> &[CoordinatorEvent] {
         &self.events
     }
