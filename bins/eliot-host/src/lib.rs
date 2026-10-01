@@ -1928,7 +1928,9 @@ mod host_lifecycle_boundary_table_tests {
     /// Returns the one frozen table row a `BOUNDARY_*` identifier selects, so a
     /// case can assert the row's own `name`/`event`/`owner_state` instead of a
     /// hand-written copy of the vocabulary.
-    fn row(boundary: &'static super::HostLifecycleBoundary) -> &'static super::HostLifecycleBoundary {
+    fn row(
+        boundary: &'static super::HostLifecycleBoundary,
+    ) -> &'static super::HostLifecycleBoundary {
         let resolved = super::boundary_by_event(boundary.event);
         assert_eq!(
             resolved.name, boundary.name,
@@ -2267,12 +2269,16 @@ mod host_lifecycle_boundary_table_tests {
         );
         restart_unknown.validate().unwrap();
         store_unknown.validate().unwrap();
-        assert!(eliot_host_service::runtime_control::response_matches_request(
-            &restart, &restart_unknown
-        ));
+        assert!(
+            eliot_host_service::runtime_control::response_matches_request(
+                &restart,
+                &restart_unknown
+            )
+        );
         assert!(
             !eliot_host_service::runtime_control::response_matches_request(
-                &store, &restart_unknown
+                &store,
+                &restart_unknown
             ),
             "one operation's receipt must never answer another operation's request"
         );
@@ -2280,7 +2286,9 @@ mod host_lifecycle_boundary_table_tests {
             panic!("restart refusal must be typed Unknown");
         };
         assert!(
-            pending_ref.as_str().contains(restart.request_digest.as_str()),
+            pending_ref
+                .as_str()
+                .contains(restart.request_digest.as_str()),
             "the refusal must carry its own request identity"
         );
         assert!(
@@ -2311,7 +2319,10 @@ mod host_lifecycle_boundary_table_tests {
             "the requested row must reach the real sink exactly once"
         );
         assert_eq!(
-            occurrences(&identity, super::BOUNDARY_RUNTIME_CONTROL_ADMITTED_RECEIPT.event),
+            occurrences(
+                &identity,
+                super::BOUNDARY_RUNTIME_CONTROL_ADMITTED_RECEIPT.event
+            ),
             1,
             "the admitted receipt row must reach the real sink exactly once"
         );
@@ -2355,7 +2366,8 @@ mod host_lifecycle_boundary_table_tests {
         );
         assert!(
             eliot_host_service::runtime_control::response_matches_request(
-                &store, &unsupported_response
+                &store,
+                &unsupported_response
             ),
             "the typed refusal must preserve the exact refused request identity"
         );
@@ -2622,8 +2634,11 @@ mod host_lifecycle_boundary_table_tests {
         // enforces the same distinctions in the journal.
         let journal = HostStateJournalService::from_backend(MemoryBackend::default(), host.clone())
             .expect("in-memory journal must open");
-        super::journal_append::append_reconciled(&journal, HostStateRecord::Activation(starting.clone()))
-            .unwrap();
+        super::journal_append::append_reconciled(
+            &journal,
+            HostStateRecord::Activation(starting.clone()),
+        )
+        .unwrap();
         let skipping_control_ready = super::journal_append::transition_activation_record(
             &starting,
             ActivationState::Active,
@@ -2643,7 +2658,9 @@ mod host_lifecycle_boundary_table_tests {
         )
         .unwrap();
         assert!(
-            journal.append(HostStateRecord::Activation(rewinding)).is_err(),
+            journal
+                .append(HostStateRecord::Activation(rewinding))
+                .is_err(),
             "an Active activation may not rewind to Starting in place"
         );
         // The ordered contour is admitted, which is what makes the refusals above
@@ -2720,8 +2737,11 @@ mod host_lifecycle_boundary_table_tests {
             )
             .unwrap()
         };
-        super::journal_append::append_reconciled(&journal, HostStateRecord::Activation(active.clone()))
-            .unwrap();
+        super::journal_append::append_reconciled(
+            &journal,
+            HostStateRecord::Activation(active.clone()),
+        )
+        .unwrap();
         let drain_generation = active.fence.activation_generation.clone();
 
         // Progressing without a request is refused: the reducer owns the order.
@@ -2734,9 +2754,7 @@ mod host_lifecycle_boundary_table_tests {
             expected_predecessor: None,
         };
         assert!(
-            journal
-                .append(HostStateRecord::Drain(unrequested))
-                .is_err(),
+            journal.append(HostStateRecord::Drain(unrequested)).is_err(),
             "Draining without a Requested predecessor must be refused"
         );
 
@@ -2951,8 +2969,7 @@ mod host_lifecycle_boundary_table_tests {
                 approved_kernel_artifact: PlatformHandle::new("891-case-10-kernel").unwrap(),
                 approved_store_artifact: PlatformHandle::new("891-case-10-store").unwrap(),
                 approved_config: PlatformHandle::new("891-case-10-config").unwrap(),
-                active_kernel_record_checksum: PlatformHandle::new("891-case-10-checksum")
-                    .unwrap(),
+                active_kernel_record_checksum: PlatformHandle::new("891-case-10-checksum").unwrap(),
                 candidate_binding_digest: PlatformHandle::new("891-case-10-binding").unwrap(),
                 store_requirement_digest: PlatformHandle::new("891-case-10-requirement").unwrap(),
                 store_proof_fence: None,
@@ -2997,8 +3014,7 @@ mod host_lifecycle_boundary_table_tests {
                 approved_kernel_artifact: PlatformHandle::new("891-case-10-kernel").unwrap(),
                 approved_store_artifact: PlatformHandle::new("891-case-10-store").unwrap(),
                 approved_config: PlatformHandle::new("891-case-10-config").unwrap(),
-                active_kernel_record_checksum: PlatformHandle::new("891-case-10-checksum")
-                    .unwrap(),
+                active_kernel_record_checksum: PlatformHandle::new("891-case-10-checksum").unwrap(),
                 candidate_binding_digest: PlatformHandle::new("891-case-10-binding").unwrap(),
                 store_requirement_digest: PlatformHandle::new("891-case-10-requirement").unwrap(),
                 store_proof_fence: None,
@@ -3041,7 +3057,10 @@ mod host_lifecycle_boundary_table_tests {
             super::host_lifecycle_observe_requested(super::BOUNDARY_LIVENESS_REQUESTED);
             super::host_lifecycle_observe_requested(super::BOUNDARY_LIVENESS_OBSERVED);
         });
-        assert_eq!(occurrences(&emitted, super::BOUNDARY_LIVENESS_OBSERVED.event), 1);
+        assert_eq!(
+            occurrences(&emitted, super::BOUNDARY_LIVENESS_OBSERVED.event),
+            1
+        );
         assert!(
             !emitted.contains(super::BOUNDARY_READINESS_READY_PROOF.event),
             "a liveness record must never carry the ready-proof spelling"
@@ -3169,7 +3188,10 @@ mod host_lifecycle_boundary_table_tests {
             1
         );
         assert_eq!(
-            occurrences(&emitted, super::BOUNDARY_KERNEL_RESTART_EXECUTE_REQUESTED.event),
+            occurrences(
+                &emitted,
+                super::BOUNDARY_KERNEL_RESTART_EXECUTE_REQUESTED.event
+            ),
             1
         );
         assert!(
