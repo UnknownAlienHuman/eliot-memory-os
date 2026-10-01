@@ -164,6 +164,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::SurrealStoreAdapter;
+use crate::apply::schema_contract::{SchemaMetaRecord, validate_recorded_bridge_range};
 use crate::error::AdapterError;
 
 /// Closed named-operation label for binding one snapshot consistency point.
@@ -216,12 +217,12 @@ pub enum EcxfCaptureGap {
     /// only. `StateFence::resource_generation` is the generation relevant to one
     /// decision, not the store's own generation, so it cannot stand in for it.
     StoreResourceGenerationUnavailable,
-    /// The adapter declares no identity or version of its own, and a build
-    /// constant of the running binary is not an observation of the source store.
-    SourceAdapterIdentityUnavailable,
-    /// No owner declares the compression or encryption profile this export
-    /// applies; the emitted package's codecs are not read from the source store.
-    ExportProfileUnavailable,
+    /// The adapter's own VERSION has no source at all: the store records which
+    /// adapter owns it (`schema_meta.compatible_bridge_range`, read inside the
+    /// capture transaction and validated by `apply::schema_contract`), but no
+    /// baseline declares a column carrying a version, and a crate version of the
+    /// running binary is a build constant rather than an observation.
+    SourceAdapterVersionUnavailable,
 }
 
 /// Exact transaction observation available to the ECXF composition owner.
@@ -241,6 +242,18 @@ pub struct EcxfSourceCapture {
     pub state_fence: StateFence,
     /// Schema generation observed in that transaction.
     pub schema_generation: String,
+    /// Store adapter identity the SOURCE STORE recorded in its own
+    /// `schema_meta.compatible_bridge_range`, read in the same transaction and
+    /// validated by `apply::schema_contract::validate_schema_meta_record`.
+    ///
+    /// This is the observed identity half of the manifest's `source_adapter` /
+    /// `source_adapter_version` pair. It is deliberately NOT `crate::ADAPTER_NAME`
+    /// read out of the running binary: the exporter compares this value against
+    /// the observer it stamps on every fence observation, so a manifest that
+    /// named the build constant instead would let a binary describe a store it
+    /// never read. The VERSION half has no source at all and stays a declared
+    /// gap.
+    pub source_adapter: String,
     /// Next commit sequence observed in that transaction.
     pub next_commit_sequence: u64,
     /// Next outbox sequence observed in that transaction.
@@ -816,26 +829,44 @@ fn captures_blob_residency() -> bool {
 
 /// The evidence gaps of one ECXF capture, derived from what the capture can read.
 ///
-/// The first three entries are *predicates* over the admitted generation's own
-/// baseline and over the census this module ran, not fixed refusals: a baseline
-/// that gives the captured tables a scope column, a census that captures an
-/// erasure ledger, or a census that captures a blob member each close its gap
-/// with no second vocabulary and no edit to this list.
+/// Every entry is a *predicate* over something this call actually observed, over
+/// the admitted generation's own baseline, or over the census this module ran —
+/// never a fixed refusal. That is what makes the list honest in both directions:
+/// an entry cannot appear for evidence the capture read, and an owner that later
+/// supplies the evidence closes its entry with no edit here and no second
+/// vocabulary.
 ///
-/// The remaining entries are declared absences of *this owner*, and no baseline
-/// or census can close them:
+/// The first three are predicates over the baseline and the census: a baseline
+/// that gives the captured tables a scope column, a census that captures an
+/// erasure ledger, or a census that captures a blob member each close its gap.
+///
+/// The remaining four are predicates over the SAME baseline text, one entry per
+/// gap and one `eliot_ecxf` member name behind each, read through the schema
+/// owner's own `declares_column_name` so the two sides cannot disagree about
+/// which names are absent:
 ///
 /// * the Architecture source digest and the `NormativePair` identity receipt are
-///   sealed by owners outside the store, so they are not columns any baseline
-///   defines;
-/// * a source-side ECXF export receipt has no durable artifact anywhere;
-/// * the capture point reads the schema generation and the canonical fence, and
-///   `StateFence::resource_generation` is the generation relevant to one
-///   decision, not the store's own generation, so it cannot stand in for one;
-/// * this adapter declares no identity or version of its own, and a build
-///   constant of the running binary is not an observation of the source store;
-/// * no owner declares the compression or encryption profile this export
-///   applies, and the emitted package's codecs are not read from the store.
+///   sealed by owners outside the store, so no baseline this owner ships defines
+///   a column for either and the point cannot read one;
+/// * a source-side ECXF export receipt has no durable artifact anywhere — the
+///   exporter mints the package receipt at emit time — so no baseline defines one;
+/// * the store's own aggregate generation is not a column: the two near-misses
+///   were examined and rejected, because `schema_meta.generation` is the SCHEMA
+///   generation and `StateFence::resource_generation` is the generation relevant
+///   to one decision;
+/// * the adapter's VERSION is not a column either. Its IDENTITY is observed:
+///   the capture point reads the store's own `schema_meta.compatible_bridge_range`
+///   in this same transaction and refuses the capture unless that row passes
+///   `apply::schema_contract::validate_schema_meta_record`, so the manifest's
+///   `source_adapter` is a value the source store recorded rather than a
+///   constant of the running binary, while `source_adapter_version` stays
+///   unobserved until some owner records one.
+///
+/// The compression and encryption profiles of the EMITTED package are
+/// deliberately absent from this list: they are not source-store evidence at
+/// all. The exporter owns the codec it hands to `layout`, and
+/// `eliot_backup::export_ecxf_package` now reads the profiles off that codec
+/// rather than asking the source to declare them.
 fn observed_capture_gaps(generation: &str) -> Result<Vec<EcxfCaptureGap>, StoreError> {
     let Some(ddl) = admitted_generation_ddl(generation) else {
         return Err(StoreError::InvalidField {
@@ -853,13 +884,35 @@ fn observed_capture_gaps(generation: &str) -> Result<Vec<EcxfCaptureGap>, StoreE
     if !captures_blob_residency() {
         gaps.push(EcxfCaptureGap::BlobStoreEvidenceUnavailable);
     }
-    gaps.extend([
-        EcxfCaptureGap::ExternalSourceIdentityEvidenceUnavailable,
-        EcxfCaptureGap::SourceExportReceiptUnavailable,
-        EcxfCaptureGap::StoreResourceGenerationUnavailable,
-        EcxfCaptureGap::SourceAdapterIdentityUnavailable,
-        EcxfCaptureGap::ExportProfileUnavailable,
-    ]);
+    for (gap, columns) in [
+        (
+            EcxfCaptureGap::ExternalSourceIdentityEvidenceUnavailable,
+            &["architecture_source_digest", "normative_pair_identity_receipt_digest"][..],
+        ),
+        (
+            EcxfCaptureGap::SourceExportReceiptUnavailable,
+            &["export_receipt"][..],
+        ),
+        (
+            EcxfCaptureGap::StoreResourceGenerationUnavailable,
+            &["store_generation"][..],
+        ),
+        (
+            EcxfCaptureGap::SourceAdapterVersionUnavailable,
+            &["source_adapter_version"][..],
+        ),
+    ] {
+        // One entry per gap, not per column: the Architecture and `NormativePair`
+        // digests are two `eliot_ecxf` members behind ONE piece of evidence, and
+        // a list that repeated its own gap would report the same absence twice.
+        // The gap closes when the baseline defines what it would need.
+        if columns
+            .iter()
+            .all(|column| !crate::schema::declares_column_name(ddl, column))
+        {
+            gaps.push(gap);
+        }
+    }
     Ok(gaps)
 }
 
@@ -983,10 +1036,19 @@ fn verify_canonical_source_classes(generation: &str) -> Result<(), StoreError> {
 }
 
 /// The schema-meta projection of the bound point.
-#[derive(Deserialize)]
-struct PointSchemaMeta {
-    generation: String,
-}
+///
+/// This is the adapter's own `SchemaMetaRecord` shape, decoded from the very
+/// statement `crate::schema::READ_SCHEMA_META` pins, so the capture point reads
+/// the store's durable record rather than a bespoke projection of it, and the
+/// recorded adapter identity it carries is the one the store actually wrote.
+///
+/// `compatible_bridge_range` is what makes that possible: `apply::schema_contract`
+/// writes it and refuses any row naming a different adapter, so
+/// `parse_capture_point` can hand the exporter an observed adapter identity for
+/// the manifest's `source_adapter` / `source_adapter_version` pair — whose
+/// `observed_by` must name something the source store itself recorded — without
+/// this module restating the rule or reaching for `crate::ADAPTER_NAME`.
+type PointSchemaMeta = SchemaMetaRecord;
 
 /// The canonical-fence projection of the bound point.
 #[derive(Deserialize)]
@@ -1009,6 +1071,9 @@ struct CapturePoint {
     next_commit_sequence: u64,
     next_outbox_sequence: u64,
     schema_generation: String,
+    /// Adapter identity the store itself recorded in `schema_meta`, read in the
+    /// same transaction as every other member of this point.
+    source_adapter: String,
 }
 
 /// Frozen per-capture state. No `Debug` impl by design: registry contents
@@ -1955,15 +2020,33 @@ async fn observe_capture_point(
     parse_capture_point(meta, fence)
 }
 
-/// Decodes one point observation, failing closed on a blank or control-bearing
-/// generation and on an absent fence. A half-observed point is never a usable
-/// consistency point, so neither half is defaulted.
+/// Decodes one point observation, failing closed on an unusable schema-meta row,
+/// on a blank or control-bearing generation and on an absent fence. A
+/// half-observed point is never a usable consistency point, so neither half is
+/// defaulted.
+///
+/// The recorded adapter identity is taken through its owner's own rule,
+/// `apply::schema_contract::validate_recorded_bridge_range`, rather than compared
+/// here: that is the single place this crate decides what the store's recorded
+/// bridge range means, and it returns the ORIGINAL RECORDED value so this point
+/// carries what the store wrote rather than a constant of the running binary. The
+/// narrower rule is used on purpose — the full `validate_schema_meta_record`
+/// additionally demands the applied state and the migration history, which this
+/// read has no use for and which would newly refuse a snapshot capture taken
+/// while a migration is in flight. Its failure maps to the typed
+/// [`StoreError::InvalidField`] this module uses for its own point defects, so no
+/// provider or serde text crosses.
 fn parse_capture_point(
     meta: Option<PointSchemaMeta>,
     fence: Option<PointFence>,
 ) -> Result<CapturePoint, StoreError> {
-    let generation = meta.map(|meta| meta.generation).unwrap_or_default();
-    if generation.is_empty() || generation.chars().any(char::is_control) {
+    let meta = meta.ok_or(StoreError::Unavailable)?;
+    let source_adapter =
+        validate_recorded_bridge_range(&meta).map_err(|_error| StoreError::InvalidField {
+            field: SNAPSHOT_CLASS_FIELD,
+            reason: "captured schema metadata does not record this adapter as its owner",
+        })?;
+    if meta.generation.is_empty() || meta.generation.chars().any(char::is_control) {
         return Err(StoreError::Unavailable);
     }
     let fence = fence.ok_or(StoreError::Unavailable)?;
@@ -1971,11 +2054,15 @@ fn parse_capture_point(
         .state_fence
         .validate()
         .map_err(StoreError::Foundation)?;
+    // Owned before the row is destructured below, so the borrow of the recorded
+    // value ends here and the two halves of this point cannot be entangled.
+    let source_adapter = source_adapter.to_owned();
     Ok(CapturePoint {
         state_fence: fence.state_fence,
         next_commit_sequence: fence.next_commit_sequence,
         next_outbox_sequence: fence.next_outbox_sequence,
-        schema_generation: generation,
+        schema_generation: meta.generation,
+        source_adapter,
     })
 }
 
@@ -2255,6 +2342,7 @@ pub async fn capture_ecxf_source(
         scope_id: request.scope_id.clone(),
         state_fence: point.state_fence,
         schema_generation: point.schema_generation,
+        source_adapter: point.source_adapter,
         next_commit_sequence: point.next_commit_sequence,
         next_outbox_sequence: point.next_outbox_sequence,
         source_classes,

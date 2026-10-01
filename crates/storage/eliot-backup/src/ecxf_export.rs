@@ -118,6 +118,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use eliot_blob_api::BlobReadyReceipt;
+use eliot_ecxf::SectionCodec;
 use eliot_security_contracts::PurgeLedgerEntry;
 use eliot_store_api::{
     CanonicalEvent, OrderingHead, OrderingScopeId, RevisionHead, RevisionKey, ScopeId,
@@ -178,6 +179,14 @@ impl SealedBlobEntry {
 /// Every field is read from the source store owner. This crate never defaults,
 /// constants or guesses any of them: a source that cannot observe a value must
 /// fail rather than fill it in.
+///
+/// The emitted package's compression and encryption profiles are deliberately
+/// NOT members of this view: they describe the codec this exporter encodes the
+/// sections with, so [`export_ecxf_package`] reads them off that codec and
+/// `eliot_ecxf::EcxfArchive::layout` re-checks the assembled manifest against it
+/// on the way out. A source store was being asked to declare a property of bytes
+/// it never produces, which is how a manifest ends up recording a codec profile
+/// nobody applied.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CoherentSourceExport {
     /// Completeness of the source's own capture. Only
@@ -238,10 +247,6 @@ pub struct CoherentSourceExport {
     pub blobs: Vec<SealedBlobEntry>,
     /// Privacy/purge ledger entries of the view.
     pub purge_ledger: Vec<PurgeLedgerEntry>,
-    /// Compression profile the source applies to the emitted sections.
-    pub compression: eliot_ecxf::CompressionProfile,
-    /// Encryption profile the source declares for the emitted package.
-    pub encryption: eliot_ecxf::EncryptionProfile,
     /// Features the source could not represent in this export.
     pub missing_features: Vec<String>,
 }
@@ -295,6 +300,10 @@ pub async fn export_ecxf_package<S: EcxfSourceStore + ?Sized>(
     let export_id = request.identity.operation_id.to_string();
     let snapshot = source.coherent_export(request).await?;
     prove_coherent_boundary(&snapshot, request)?;
+    // The one codec this exporter encodes sections with. It is bound here, once,
+    // so the manifest's recorded profiles and the bytes `layout` writes come from
+    // the same value and cannot disagree.
+    let codec = eliot_ecxf::IdentitySectionCodec;
     let (revision_start, revision_end) = revision_range(&snapshot.revision_heads);
     let fence = eliot_ecxf::ExportFence {
         export_id: export_id.clone(),
@@ -324,8 +333,12 @@ pub async fn export_ecxf_package<S: EcxfSourceStore + ?Sized>(
         // `EcxfArchive::build` from the members it is given, so this crate
         // supplies none of them and cannot disagree with them.
         checksums: BTreeMap::new(),
-        compression: snapshot.compression.clone(),
-        encryption: snapshot.encryption.clone(),
+        // The codec members are read off the ONE codec this function encodes
+        // with, and `layout` re-checks the assembled manifest against that same
+        // codec before writing, so the recorded profile describes the bytes that
+        // actually land on disk. It is not a source-store claim.
+        compression: codec.compression_profile(),
+        encryption: codec.encryption_profile(),
         missing_features: snapshot.missing_features.clone(),
         purge_state: purge_export_state(snapshot.purge_ledger.len()),
         purge_ledger_revision: None,
@@ -353,9 +366,7 @@ pub async fn export_ecxf_package<S: EcxfSourceStore + ?Sized>(
     // `layout` re-validates the whole archive against its own emitted bytes and
     // returns the complete package in memory, so no byte is written before the
     // fence, residency, checksum and integrity proofs have all held.
-    let files = archive
-        .layout(&eliot_ecxf::IdentitySectionCodec)
-        .map_err(ecxf_error)?;
+    let files = archive.layout(&codec).map_err(ecxf_error)?;
     publish_package(&files, out_dir, &export_id)?;
     // The rename has already made the destination exist, so every refusal from
     // here on is a publication/reconciliation outcome carrying the published
