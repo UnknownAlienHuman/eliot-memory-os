@@ -616,22 +616,25 @@
 //! causal document under the Governor scope would refuse the live exhaustive
 //! backlog rebuild over an untaught shape.
 //!
-//! The production caller is STITCH, stated not papered over: no live daemon
-//! path holds a `CausalCandidate` yet, so the writer is reachable API with no
-//! caller rather than a caller that fabricates one. Three prerequisites belong
-//! to other owners and are named so the next owner does not re-derive them:
-//! (1) the `eliot-types` edge — `bins/eliotd` names `eliot_types::cognition`
-//! here but carries no such dependency today (one `eliot-types.workspace =
-//! true` row plus its dependency-policy inventory entry; the edge is outside
-//! every `architecture-boundaries.toml` forbidden set for `eliotd`); (2) a
-//! producer that hands this daemon an explicitly assessed outcome for a live
-//! candidate; (3) the inspector and Active View readers (issue #1910 W6/A1/A2)
-//! paging [`CAUSAL_OUTCOME_SCOPE`]. The typed owner refusal crosses this
-//! boundary inside [`ImprovementDispatchError::Contract`] with its message
-//! intact — the error enum lives in `improvement_intake_dispatch`, another
-//! writer's file, so no second error scheme is opened here — and the commit
-//! refusal travels as [`ImprovementDispatchError::Commit`], as every other
-//! write in this file does.
+//! The production caller is the W5 assessed-outcome slice's own ingress,
+//! [`crate::causal_outcome_caller`]: it hands this writer the arrived live
+//! candidate with its explicitly assessed outcome and carries the updated
+//! candidate beside the receipt back to the producer, so the run loop — or
+//! the verification-dispatcher completion leg, once it holds a live
+//! candidate — invokes one typed ingress rather than re-deriving the seam.
+//! What remains STITCH, stated not papered over: (1) a producer that hands
+//! this daemon an explicitly assessed outcome for a live candidate — no live
+//! daemon path holds a `CausalCandidate` yet, so the caller is reachable
+//! production API awaiting its first arrival rather than a caller that
+//! fabricates one; (2) the inspector and Active View readers (issue #1910
+//! W6/A1/A2) paging [`CAUSAL_OUTCOME_SCOPE`]. (The `eliot-types` edge this
+//! writer names is landed in `bins/eliotd/Cargo.toml`.) The typed owner
+//! refusal crosses this boundary inside [`ImprovementDispatchError::Contract`]
+//! with its message intact — the error enum lives in
+//! `improvement_intake_dispatch`, another writer's file, so no second error
+//! scheme is opened here — and the commit refusal travels as
+//! [`ImprovementDispatchError::Commit`], as every other write in this file
+//! does.
 
 #![forbid(unsafe_code)]
 

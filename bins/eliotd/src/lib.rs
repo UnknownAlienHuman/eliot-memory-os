@@ -55,6 +55,7 @@ pub mod canonical_config_precedence;
 mod capability_admission;
 mod capability_evidence_wiring;
 pub mod capability_outcome;
+pub mod causal_outcome_caller;
 pub mod cell_declaration_registry;
 /// Issue #2857 W1/W2/W4: the live `eliot.query` `ContextReconstruction`
 /// route. This is the one production edge that resolves the closed selector set
