@@ -3,6 +3,7 @@ using System.ComponentModel;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
 using Eliot.Operator.Protocol;
+using Eliot.Operator.Protocol.Generated;
 using Eliot.Operator.Services;
 
 namespace Eliot.Operator.ViewModels;
@@ -189,7 +190,15 @@ public sealed class MainViewModel : INotifyPropertyChanged
     /// carries the command capability. A known binding that withholds commands
     /// gets the withheld explanation instead of an operable-looking panel.
     public bool IsUserAutomationOperable => IsUserAutomationPage && CanIssueCommands;
-    public bool IsBusy { get => _isBusy; private set => Set(ref _isBusy, value); }
+    public bool IsBusy
+    {
+        get => _isBusy;
+        private set
+        {
+            if (Set(ref _isBusy, value)) OnPropertyChanged(nameof(CanRunUserAutomation));
+        }
+    }
+    public bool CanRunUserAutomation => !IsBusy;
     public string ProjectId
     {
         get => _projectId;
@@ -659,6 +668,15 @@ public sealed class MainViewModel : INotifyPropertyChanged
     /// envelope returned by a known owner normalization or migration result.
     public async Task RunUserAutomationAsync()
     {
+        if (IsBusy)
+        {
+            SetBanner(
+                "UserAutomation request already running",
+                "Wait for the current owner request to finish before sending another operation.",
+                OperatorBannerSeverity.Informational);
+            return;
+        }
+
         if ((UserAutomationOperation is "create" or "edit" or "normalize_schedule" or "migrate_legacy_schedule")
             && string.IsNullOrWhiteSpace(UserAutomationRevisionJson))
         {
@@ -991,6 +1009,13 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 return;
             }
 
+            if (!IsCurrentScheduleNormalizationInput(action, request.Operation))
+            {
+                ResultSummary = "The owner returned a valid normalization result for the submitted request, but the operation, draft, predecessor, or occurrence count changed while it was in flight. The answer remains available for inspection; run normalization again for the current inputs before Create/Edit.";
+                SetBanner("Normalization result is stale for the current inputs", ResultSummary, OperatorBannerSeverity.Warning);
+                return;
+            }
+
             try
             {
                 var revisionJson = ReadOwnerNormalizationRevisionJson(answer);
@@ -1097,6 +1122,39 @@ public sealed class MainViewModel : INotifyPropertyChanged
             throw new InvalidOperationException("the known normalization result has no exact revision object");
         }
         return revision.Clone();
+    }
+
+    private bool IsCurrentScheduleNormalizationInput(string action, UserAutomationOperation operation)
+    {
+        try
+        {
+            if (!string.Equals(UserAutomationOperation, action, StringComparison.Ordinal)) return false;
+            return operation switch
+            {
+                UserAutomationNormalizeScheduleOperation normalize =>
+                    ParseOccurrenceCount() == normalize.OccurrenceCount
+                    && RevisionInputMatches(UserAutomationRevisionJson, normalize.Revision, legacySource: false),
+                UserAutomationMigrateLegacyScheduleOperation migration =>
+                    ParseOccurrenceCount() == migration.OccurrenceCount
+                    && RevisionInputMatches(UserAutomationRevisionJson, migration.Revision, legacySource: false)
+                    && RevisionInputMatches(UserAutomationPreviousRevisionJson, migration.PreviousRevision, legacySource: true),
+                _ => false
+            };
+        }
+        catch (Exception error) when (error is InvalidOperationException or JsonException)
+        {
+            return false;
+        }
+    }
+
+    private static bool RevisionInputMatches(string value, UserAutomationRevision expected, bool legacySource)
+    {
+        var current = legacySource
+            ? ParseMigrationSource(value).Revision
+            : ParseNormalizationDraft(value);
+        var currentJson = JsonSerializer.SerializeToElement(current, OperatorJson.Writer);
+        var expectedJson = JsonSerializer.SerializeToElement(expected, OperatorJson.Writer);
+        return JsonElement.DeepEquals(currentJson, expectedJson);
     }
 
     private static string DescribeOwnerNormalizedSchedule(
@@ -1248,7 +1306,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
         var element = ReadRevisionJson(value, "legacy predecessor UserAutomation revision");
         var revision = element.Deserialize<UserAutomationRevision>(OperatorJson.Reader)
             ?? throw new InvalidOperationException("A legacy predecessor revision JSON object is required.");
-        revision.ValidateForMigrationSource();
+        revision.ValidateForLegacyScheduleMigration();
         return (revision, element);
     }
 
