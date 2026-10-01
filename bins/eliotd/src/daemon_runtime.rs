@@ -7039,7 +7039,13 @@ async fn trigger_accepted_cold_start(
             );
         }
         tokio::task::spawn_blocking(move || {
-            trigger_cold_start_controller(trigger, &kernel, &worker_ticket, discovery, contour_result)
+            trigger_cold_start_controller(
+                trigger,
+                &kernel,
+                &worker_ticket,
+                discovery,
+                contour_result,
+            )
         })
         .await
         .map_or_else(
