@@ -198,12 +198,19 @@ const GOVERNOR_SCOPE_ID: &str = "governor";
 
 /// Governor-owned observation/verified-repair reconciliation over one
 /// serialized owner triple plus the retained neutral Kernel port.
+///
+/// The three borrowed owners are `pub(crate)` because the sibling
+/// `mcp_observation_admission` module is the SAME owner reached through a
+/// second entrypoint: it drives this one owner triple through the same private
+/// commit checks, not a second journal, problem map, or canonical owner.
+/// Crate-internal visibility is what makes that one owner; it is not a second
+/// admission owner.
 pub struct GovernorObservationReconciliation<'a, P: ?Sized> {
-    observation: &'a ObservationJournal,
-    problem_revisions: &'a BTreeMap<String, u64>,
-    canonical: &'a CanonicalAdmissionOwner,
-    kernel: &'a P,
-    readiness: CompositionReadiness,
+    pub(crate) observation: &'a ObservationJournal,
+    pub(crate) problem_revisions: &'a BTreeMap<String, u64>,
+    pub(crate) canonical: &'a CanonicalAdmissionOwner,
+    pub(crate) kernel: &'a P,
+    pub(crate) readiness: CompositionReadiness,
 }
 
 impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
@@ -553,7 +560,11 @@ fn recovery_envelope(
 /// canonical identity. The canonical request hash comparison is what makes a
 /// same-operation retry return the identical receipt instead of executing a
 /// second transition.
-fn check_receipt(
+///
+/// `pub(crate)`: the sibling `mcp_observation_admission` entrypoint runs this
+/// exact check on its returned receipt, so there is one receipt binding rule
+/// on this owner rather than a copied one.
+pub(crate) fn check_receipt(
     receipt: &WriteReceipt,
     operation_id: &OperationId,
     identity: &eliot_protocol::RequestIdentity,
@@ -1823,7 +1834,11 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
     /// Mirrors [`Self::validate_identity_fence`] without the doctor echo: the
     /// request binding fence, the envelope metadata fence, and the canonical
     /// owner fence must coincide. No verifier endorsement applies here.
-    fn validate_capture_identity_fence(
+    ///
+    /// `pub(crate)`: the sibling `mcp_observation_admission` entrypoint is the
+    /// same owner and must run this exact private commit check rather than a
+    /// re-implemented copy of it.
+    pub(crate) fn validate_capture_identity_fence(
         &self,
         identity: &eliot_protocol::RequestIdentity,
     ) -> Result<(), CompositionError> {

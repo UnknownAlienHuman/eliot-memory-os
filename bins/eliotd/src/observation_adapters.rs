@@ -153,6 +153,29 @@ impl<P: KernelTransitionPort + ?Sized> ForwardingObservationReconciliation<'_, P
             .collect();
         Ok(forward_watchdog_batch(batch, &outcomes))
     }
+
+    /// Forwards one admitted MCP `Observation` capture to the Governor's narrow
+    /// MCP observation admission and returns the exact owner outcome.
+    ///
+    /// The maintenance and Watchdog entrypoints above show the owner pattern;
+    /// they are NOT an identity for user payload. This forwards the caller's
+    /// own retained-operation-derived [`McpObservationInput`] unchanged, and
+    /// adds no admission rule: readiness, fence agreement, task-selection
+    /// currency, the scratch journal admission, the proactive same-operation
+    /// receipt check, the canonical `CaptureObservation` commit, and the
+    /// lost-acknowledgement readback all stay with the Governor owner. A
+    /// capture with no selected task stays a cold candidate there; this
+    /// adapter never supplies a task the caller did not read from the owner.
+    pub async fn admit_mcp_observation(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        current_selection: Option<&eliot_observation::CurrentTaskSelection>,
+        input: &eliot_governor::McpObservationInput,
+    ) -> Result<eliot_governor::McpObservationOutcome, CompositionError> {
+        self.inner
+            .admit_mcp_observation(identity, current_selection, input)
+            .await
+    }
 }
 
 /// Maps a canonical outcome to its Watchdog spool sink disposition.

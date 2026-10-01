@@ -118,6 +118,7 @@ mod learning_closure;
 mod learning_delta_integration;
 mod learning_promotion;
 mod learning_record_commit;
+mod mcp_observation_admission;
 mod migration_inventory;
 mod module_registry_admission;
 mod negative_memory_activation;
@@ -177,6 +178,9 @@ pub use capability_evidence_commit::{
     commit_capability_evidence_record,
 };
 pub use composition::*;
+pub use mcp_observation_admission::{
+    McpObservationInput, McpObservationOutcome, McpTaskSelection,
+};
 pub use controlboard_projection::{
     ControlBoardAttentionEvaluationRow, ControlBoardGovernorSnapshot, ControlBoardOwnerBinding,
     ControlBoardProjectionError, ControlBoardReviewBatch, ControlBoardReviewBatchObligation,

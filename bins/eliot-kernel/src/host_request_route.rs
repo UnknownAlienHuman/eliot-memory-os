@@ -5140,6 +5140,63 @@ fn observe_tool_requires_exact_task_binding(
     }
 }
 
+/// The disclosure decision the `WorkScope` privacy owner reached over one
+/// observe payload's exact source bytes, resolved BEFORE the raw write
+/// (issue #2565 package O, I7.23).
+///
+/// Every leg is the owner's own decided value, read back from the decision the
+/// store re-derives. Nothing here is defaulted and nothing is inferred: an
+/// absent verdict is [`Self::admits_verbatim`] `false`, because unresolved
+/// evidence is unresolved and never permission.
+pub(crate) struct ObservePayloadPrivacy {
+    /// Immutable source digest of the exact canonical payload bytes.
+    pub(crate) source_sha256: String,
+    /// Whether the owner admitted these exact bytes for verbatim retention.
+    pub(crate) admits_verbatim: bool,
+    /// The owner's closed disposition spelling for these bytes.
+    pub(crate) disposition: String,
+    /// The redaction classes the owner recorded; empty when admitted.
+    pub(crate) redacted_classes: Vec<String>,
+    /// The owner's redaction reason; empty when admitted.
+    pub(crate) redaction_reason: String,
+    /// The Governor-resolved scope the verdict was decided in, when the
+    /// request was admitted in one.
+    pub(crate) scope_ref: Option<String>,
+}
+
+impl ObservePayloadPrivacy {
+    /// Returns the owner-decided privacy/retention reference pair plus the
+    /// disclosure class for one admitted capture.
+    ///
+    /// The three values are projections of the recorded decision, not fresh
+    /// policy: the domain names the decision that governed persistence, the
+    /// policy reference names that decision together with its recorded
+    /// redaction reason, and the disclosure class is the class the owner
+    /// actually recorded. A redacted decision therefore never projects as an
+    /// admitted internal class.
+    pub(crate) fn owner_references(&self) -> (String, String, String) {
+        let domain = if self.redacted_classes.is_empty() {
+            format!("observe-payload-admitted:{}", self.disposition)
+        } else {
+            format!("observe-payload-redacted:{}", self.disposition)
+        };
+        let policy = if self.redaction_reason.trim().is_empty() {
+            format!("observe-payload-retention:{}", self.disposition)
+        } else {
+            format!(
+                "observe-payload-retention:{}:{}",
+                self.disposition, self.redaction_reason
+            )
+        };
+        let disclosure_class = if self.redacted_classes.is_empty() {
+            "internal".to_owned()
+        } else {
+            self.redacted_classes.join("+")
+        };
+        (domain, policy, disclosure_class)
+    }
+}
+
 impl KernelComposition {
     /// Admits a host request and atomically hands linked Observe input to the
     /// bounded daemon queue before the caller may acknowledge it.
@@ -5159,6 +5216,7 @@ impl KernelComposition {
     /// stays the projection owner's at the future live state claim/flight.
     pub(crate) fn admit_and_queue_observe_submit(
         &self,
+        session: &Session,
         envelope: &HostRequestEnvelope,
         tool: Option<&serde_json::Value>,
     ) -> Result<(HostRequestAdmissionReceipt, HostRequestRecord), TransportError> {
@@ -5260,7 +5318,7 @@ impl KernelComposition {
             ObserveQueueReservation::Reserved {
                 token,
                 had_reference,
-            } => self.fill_observe_reservation(envelope, tool, token, had_reference, admitted),
+            } => self.fill_observe_reservation(session, envelope, tool, token, had_reference, admitted),
         }
     }
 
@@ -5404,6 +5462,7 @@ impl KernelComposition {
 
     fn fill_observe_reservation(
         &self,
+        session: &Session,
         envelope: &HostRequestEnvelope,
         tool: &serde_json::Value,
         token: u64,
@@ -5453,8 +5512,12 @@ impl KernelComposition {
         // Issue #1739 W2: bind the exact typed payload bytes durably before
         // the in-memory observe pair is attached and the claim is handed out.
         // A digest alone cannot execute after a restart.
+        // Issue #2565 package O (I7.23): the privacy/retention decision runs
+        // inside that same turn, before the raw write, so nothing undecided is
+        // ever persisted raw.
         if executable {
             match self.bind_observe_payload_before_claim(
+                session,
                 envelope,
                 tool,
                 &admitted.1.operation_id,
@@ -5512,14 +5575,63 @@ impl KernelComposition {
     /// An out-of-band body that is not the admitted bytes conflicts instead
     /// of replacing the admitted operation; every failure rolls the observe
     /// reservation back so no claim is handed out for unbound bytes.
+    ///
+    /// Issue #2565 package O (I7.23): the privacy/retention decision now
+    /// happens BEFORE the raw write, in this same route turn.
+    /// [`Self::observe_payload_privacy`] resolves the `WorkScope` privacy
+    /// owner's disclosure verdict over the EXACT canonical payload bytes --
+    /// the same owner rule, the same evidence, the same re-verification, and
+    /// the same conservative in-store deny scan the bridge-event durable stage
+    /// already uses ([`Self::bridge_event_privacy_authorization`] plus
+    /// [`RedbRecoveryStore::bridge_event_privacy_decision`]). No new staging
+    /// scheme, no second privacy owner, and no second digest scheme is
+    /// introduced.
+    ///
+    /// Only an owner-admitted payload reaches redb. A withheld verdict -- which
+    /// includes an ABSENT verdict, because unresolved evidence is unresolved and
+    /// never permission -- never persists verbatim raw and never becomes a
+    /// claimable pair: the reservation rolls back and this entry returns the
+    /// typed refusal `TransportError::SessionFenced` on the same turn, so the
+    /// caller observes a bounded refusal rather than an accepted record whose
+    /// bytes were never adjudicated.
+    ///
+    /// Named ceiling (recorded here rather than worked around): the withheld
+    /// form this entry would retain is the existing deterministic redacted
+    /// projection plus its redaction receipt, exactly as
+    /// `stage_bridge_event_durable` retains one. That projection is a
+    /// source-free marker string, and the ORS payload contract
+    /// (`eliot_ors::HostRequestRecord::payload_body`) validates the retained
+    /// body against the ADMITTED `payload_digest`, so a redacted projection
+    /// cannot be bound through it without a second, looser commitment field on
+    /// the durable record. That field belongs to the ORS `HostRequestRecord`
+    /// owner, which this route does not own, so this entry refuses instead of
+    /// inventing one. The prerequisite is therefore named: a protected
+    /// exact-payload artifact locator bound to the host-request row by the ORS
+    /// owner (the #1713 protected staging/artifact contract), after which the
+    /// withheld projection is retained here through that locator with no change
+    /// to this ordering.
     fn bind_observe_payload_before_claim(
         &self,
+        session: &Session,
         envelope: &HostRequestEnvelope,
         tool: &serde_json::Value,
         operation_id: &OperationIdentity,
         token: u64,
         had_reference: bool,
     ) -> Result<(), TransportError> {
+        let privacy = self.observe_payload_privacy(session, envelope, tool)?;
+        if !privacy.admits_verbatim {
+            // Nothing undecided is ever persisted raw. The decision is recorded
+            // and the pair is rolled back, so the claim leg can never hand this
+            // operation executable bytes the privacy owner did not admit.
+            self.rollback_observe_reservation(
+                operation_id.as_str(),
+                &envelope.envelope_sha256,
+                token,
+                had_reference,
+            );
+            return Err(TransportError::SessionFenced);
+        }
         let bound = self.generation_gateway.ors.bind_host_request_payload(
             operation_id,
             &envelope.envelope_sha256,
@@ -5555,6 +5667,119 @@ impl KernelComposition {
                 Err(TransportError::SessionFenced)
             }
         }
+    }
+
+    /// Resolves the `WorkScope` privacy owner's disclosure verdict for one
+    /// observe payload's exact source bytes, BEFORE anything persists them.
+    ///
+    /// The evidence threaded in is exactly what the owner can evaluate for
+    /// these bytes, and no more:
+    ///
+    /// - the immutable source digest of the canonical payload bytes;
+    /// - the Governor-resolved `work_scope_id` the request was admitted in --
+    ///   the scope this verdict is authorized within;
+    /// - the retained `Session`'s negotiated `privacy_classes` grant, read from
+    ///   the retained session, never assumed;
+    /// - the event source class: none -- the retained payload is a
+    ///   `ToolRequest`, and no privacy class is proven for it, so no grant
+    ///   membership can hold. No grant is invented to fill the gap;
+    /// - the provider-restriction and retention-terms legs: undecided, because
+    ///   no caller on this route presents either. They enter the owner rule as
+    ///   deny-only gates, so the owner withholds raw persistence and names the
+    ///   side the evaluated evidence determined.
+    ///
+    /// Absent evidence is UNRESOLVED, never permission, so an absent
+    /// authorization is a withhold. The store re-derives its own decision from
+    /// the presented authorization and the deny scan before the stage entry
+    /// accepts it; this entry never grants.
+    fn observe_payload_privacy(
+        &self,
+        session: &Session,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+    ) -> Result<ObservePayloadPrivacy, TransportError> {
+        let payload_bytes = eliot_contracts::canonical_json_bytes(tool)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let source_sha256 = eliot_contracts::sha256_hex(&payload_bytes);
+        let evidence = bridge_owner_evidence(session, &envelope.state_fence)?;
+        // The verdict is authorized inside the scope this request was admitted
+        // in. A request admitted with no resolved work scope has no scope to be
+        // authorized within, so it resolves no verdict and the withhold path
+        // applies: content outside a proven privacy scope is never persisted raw
+        // merely to preserve rawness (I7.23).
+        let authorization = match envelope.identity.work_scope_id.as_deref() {
+            None => None,
+            Some(scope_ref) => {
+                let scope = RedbRecoveryStore::bridge_event_privacy_scope(
+                    &evidence.authority_lineage,
+                    &evidence.principal,
+                    &envelope.identity.capability,
+                    &envelope.connection_id,
+                    scope_ref,
+                )
+                .map_err(|_| TransportError::SessionFenced)?;
+                // The verdict is the owner's evaluation over the evidence for
+                // THESE bytes: the retained session's recipient grant, the
+                // (unproven) source class of these exact bytes, and the
+                // (undecided) provider-restriction and retention-terms legs.
+                let disclosure = eliot_workscope::resolve_bridge_ingest_disclosure(
+                    scope_ref,
+                    None,
+                    &session.privacy_classes,
+                    eliot_workscope::BridgeIngestPolicyLeg::Unavailable,
+                    eliot_workscope::BridgeIngestPolicyLeg::Unavailable,
+                )
+                .map_err(|_| TransportError::SessionFenced)?;
+                Some(serde_json::json!({
+                    "verdict": disclosure.verdict(),
+                    "source_sha256": source_sha256,
+                    "scope": scope,
+                    "policy_revision": eliot_workscope::BRIDGE_INGEST_PRIVACY_POLICY_REVISION,
+                    "declared_class": disclosure.declared_class().map_or(serde_json::Value::Null, serde_json::Value::from),
+                    "scope_ref": scope_ref,
+                    "source_class": serde_json::Value::Null,
+                    "recipient_grant": &session.privacy_classes,
+                    "provider_restriction": eliot_workscope::BridgeIngestPolicyLeg::Unavailable.as_str(),
+                    "retention_terms": eliot_workscope::BridgeIngestPolicyLeg::Unavailable.as_str(),
+                }))
+            }
+        };
+        let decision = RedbRecoveryStore::bridge_event_privacy_decision(
+            &payload_bytes,
+            authorization.as_ref(),
+        );
+        let disposition = decision
+            .get("privacy_disposition")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TransportError::SessionFenced)?
+            .to_owned();
+        let redacted_classes = decision
+            .get("redacted_classes")
+            .and_then(serde_json::Value::as_array)
+            .map(|classes| {
+                classes
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let redaction_reason = decision["redaction_reason"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        Ok(ObservePayloadPrivacy {
+            source_sha256,
+            // `allowed` is the only disposition under which the exact admitted
+            // bytes may be persisted. Every other value -- `redacted`, and an
+            // absent authorization that the owner records as out-of-scope --
+            // withholds raw persistence.
+            admits_verbatim: disposition == "allowed",
+            disposition,
+            redacted_classes,
+            redaction_reason,
+            scope_ref: envelope.identity.work_scope_id.clone(),
+        })
     }
 
     fn finish_existing_observe_replay(
@@ -6861,11 +7086,16 @@ impl KernelComposition {
                     // payload carries them for the admitted `eliot.observe`
                     // capability, the pure linkage gate runs before any staging,
                     // and the bounded reservation helper completes admission and
-                    // payload handoff before the acknowledgement below.
+                    // payload handoff before the acknowledgement below. The
+                    // privacy/retention decision runs inside that same turn,
+                    // before the raw payload write (I7.23).
                     // Digest-only submits keep the legacy shape untouched.
                     let observe_tool = payload.get("tool").cloned();
-                    let (receipt, record) =
-                        self.admit_and_queue_observe_submit(envelope, observe_tool.as_ref())?;
+                    let (receipt, record) = self.admit_and_queue_observe_submit(
+                        session,
+                        envelope,
+                        observe_tool.as_ref(),
+                    )?;
                     host_request_admitted_response(&receipt, &record)
                 }
                 AGENT_HOST_REQUEST_CANCEL_OPERATION => {
