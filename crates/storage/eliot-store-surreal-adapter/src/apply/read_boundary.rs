@@ -2348,26 +2348,28 @@ async fn automation_normalization_payload(
     state_fence: &StateFence,
     decoded: &eliot_store_api::DecodedAutomationRead,
 ) -> Result<Value, AdapterError> {
-    let scope_id = query
-        .scope_id
-        .as_ref()
-        .ok_or(AdapterError::Store(StoreError::InvalidField {
-            field: "scope_id",
-            reason: "normalization reads require the exact automation scope",
-        }))?;
+    let scope_id =
+        query
+            .scope_id
+            .as_ref()
+            .ok_or(AdapterError::Store(StoreError::InvalidField {
+                field: "scope_id",
+                reason: "normalization reads require the exact automation scope",
+            }))?;
     if scope_id.as_str() != eliot_store_api::USER_AUTOMATION_SCOPE {
         return Err(AdapterError::Store(StoreError::InvalidField {
             field: "scope_id",
             reason: "normalization read scope does not match the canonical automation scope",
         }));
     }
-    let automation_id = decoded
-        .automation_id
-        .as_deref()
-        .ok_or(AdapterError::Store(StoreError::InvalidField {
-            field: "automation.automation_id",
-            reason: "exact automation selector is required",
-        }))?;
+    let automation_id =
+        decoded
+            .automation_id
+            .as_deref()
+            .ok_or(AdapterError::Store(StoreError::InvalidField {
+                field: "automation.automation_id",
+                reason: "exact automation selector is required",
+            }))?;
     let revision = decoded
         .requested_revision
         .as_deref()

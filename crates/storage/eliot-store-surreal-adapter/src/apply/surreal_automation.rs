@@ -1526,10 +1526,9 @@ impl PrepareContext<'_> {
         normalization_receipt_json: Value,
         normalization_request_json: String,
     ) -> Result<(), AdapterError> {
-        let normalization_receipt_json = validate_automation_normalization_envelope(Some(
-            normalization_receipt_json,
-        ))?
-        .ok_or(AdapterError::Store(StoreError::InvalidReceipt))?;
+        let normalization_receipt_json =
+            validate_automation_normalization_envelope(Some(normalization_receipt_json))?
+                .ok_or(AdapterError::Store(StoreError::InvalidReceipt))?;
         let (state_fence, scope_id, task_id) = self.provenance();
         if scope_id.as_str() != eliot_store_api::USER_AUTOMATION_SCOPE {
             return Err(AdapterError::Store(StoreError::InvalidField {
@@ -1545,22 +1544,14 @@ impl PrepareContext<'_> {
             normalization_request_json,
             operation_id: self.transition.identity.operation_id.to_string(),
             idempotency_key: self.transition.identity.idempotency_key.clone(),
-            canonical_request_hash: self
-                .transition
-                .identity
-                .canonical_request_hash
-                .clone(),
+            canonical_request_hash: self.transition.identity.canonical_request_hash.clone(),
             state_fence,
             scope_id,
             task_id,
         };
-        if let Some(existing) = read_normalization_row(
-            self.db,
-            self.config,
-            &write.automation_id,
-            &write.revision,
-        )
-        .await?
+        if let Some(existing) =
+            read_normalization_row(self.db, self.config, &write.automation_id, &write.revision)
+                .await?
         {
             if !normalization_write_matches_row(&write, &existing) {
                 return Err(AdapterError::Store(StoreError::IdentityConflict));
@@ -2100,10 +2091,9 @@ fn decode_normalization_row(value: &Value) -> Result<StoredAutomationNormalizati
         .filter(|value| !value.is_null())
         .cloned()
         .ok_or(AdapterError::Store(StoreError::InvalidReceipt))?;
-    let normalization_receipt_json = validate_automation_normalization_envelope(Some(
-        normalization_receipt_json,
-    ))?
-    .ok_or(AdapterError::Store(StoreError::InvalidReceipt))?;
+    let normalization_receipt_json =
+        validate_automation_normalization_envelope(Some(normalization_receipt_json))?
+            .ok_or(AdapterError::Store(StoreError::InvalidReceipt))?;
     let task_id = match object.get("task_id") {
         None | Some(Value::Null) => None,
         Some(Value::String(task_id)) => Some(task_id.clone()),
