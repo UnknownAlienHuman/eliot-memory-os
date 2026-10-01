@@ -79,6 +79,12 @@ use super::generation_control::{
     ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION, ActiveGenerationRegistryProjection,
     ActiveGenerationRegistryQuery, GENERATION_CUTOVER_OPERATION, GenerationCutoverRequest,
 };
+use super::integration_bridge::{
+    BridgeApplyRequest, INTEGRATION_BRIDGE_APPLY_NAME, IntegrationBridgeError,
+    apply_integration_candidate,
+};
+use super::integration_candidate::IntegrationCandidate;
+use super::integration_lease::{IntegrationLeaseError, IntegrationOwnerLease};
 
 /// Governor's existing authenticated publish operation. The semantic
 /// `EliotdStartupEvidence` carrier remains bin-owned; Kernel consumes its
@@ -639,6 +645,7 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         STORAGE_REPLACEMENT_RESUME_OPERATION => STORAGE_REPLACEMENT_RESUME_OPERATION,
         STORAGE_REPLACEMENT_ROLLBACK_OPERATION => STORAGE_REPLACEMENT_ROLLBACK_OPERATION,
         MAINTENANCE_TRIGGER_INTAKE_OPERATION => MAINTENANCE_TRIGGER_INTAKE_OPERATION,
+        INTEGRATION_BRIDGE_APPLY_NAME => INTEGRATION_BRIDGE_APPLY_NAME,
         DAEMON_STARTUP_EVIDENCE_OPERATION => DAEMON_STARTUP_EVIDENCE_OPERATION,
         USER_AUTOMATION_RUNTIME_OPERATION => USER_AUTOMATION_RUNTIME_OPERATION,
         "health" => "health",
@@ -2910,6 +2917,130 @@ impl KernelComposition {
     }
 }
 
+/// Closed bridge-apply envelope for one `ApplyIntegrationCandidateBridge`
+/// daemon request (issue #1818 W3).
+///
+/// The daemon caller presents the exact views it read back through its Store
+/// bridge (`candidates`, `active_leases`) plus the typed bridge input whose
+/// live sets it proved against the live target. The transport routing key is
+/// already stripped by [`without_daemon_routing_key`], so this carrier
+/// declares only application data.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntegrationBridgeApplyEnvelope {
+    candidates: Vec<IntegrationCandidate>,
+    active_leases: Vec<IntegrationOwnerLease>,
+    request: BridgeApplyRequest,
+}
+
+/// The ONE stable diagnostic code for one refused bridge apply. A code is
+/// present only when the bridge refused; success carries `None` beside the
+/// transitioned candidate and its `OutcomeReceipt`.
+fn integration_bridge_apply_terminal_code(error: &IntegrationBridgeError) -> &'static str {
+    match error {
+        IntegrationBridgeError::InvalidField { .. } => "BRIDGE_APPLY_REJECTED",
+        IntegrationBridgeError::Candidate(_) => "BRIDGE_CANDIDATE_REFUSED",
+        IntegrationBridgeError::Lease(error) => match error.as_ref() {
+            IntegrationLeaseError::StaleMarked { .. } => "BRIDGE_CANDIDATE_STALE",
+            IntegrationLeaseError::LeaseHeld { .. } => "BRIDGE_LEASE_HELD",
+            _ => "BRIDGE_LEASE_REFUSED",
+        },
+        IntegrationBridgeError::LeaseMismatch { .. } => "BRIDGE_LEASE_MISMATCH",
+        IntegrationBridgeError::EnvironmentMismatch { .. } => "BRIDGE_ENVIRONMENT_MISMATCH",
+        IntegrationBridgeError::VerifierFailed { .. } => "BRIDGE_VERIFIER_FAILED",
+        IntegrationBridgeError::ApplyScopeMismatch => "BRIDGE_SCOPE_MISMATCH",
+        IntegrationBridgeError::DirtyHumanChanges { .. } => "BRIDGE_DIRTY_OVERLAP",
+        IntegrationBridgeError::RollbackMissing { .. } => "BRIDGE_ROLLBACK_MISSING",
+    }
+}
+
+/// Answers one bridge apply in the closed envelope every other arm on this
+/// channel uses. A refused apply carries its terminal code and the typed
+/// refusal; a pre-apply verifier failure additionally carries the
+/// `OutcomeReceipt` that records the failure while the candidate and its
+/// history stay intact. Nothing is applied on any refusal path.
+fn integration_bridge_apply_answer(
+    terminal_code: Option<&'static str>,
+    body: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": "known",
+        "value": {
+            "terminal_code": terminal_code,
+            "bridge": body,
+        },
+        "recovery": null,
+    })
+}
+
+/// Answers one refused bridge apply. The refusal echoes only what the caller
+/// presented (identities, paths, handles) plus, on the pre-apply verifier
+/// failure, the receipt that records the failure and any
+/// rollback/compensation result.
+fn integration_bridge_apply_refusal(
+    error: &IntegrationBridgeError,
+) -> Result<serde_json::Value, TransportError> {
+    let receipt = match error {
+        IntegrationBridgeError::VerifierFailed { receipt } => Some(
+            serde_json::to_value(receipt.as_ref()).map_err(|_| TransportError::SessionFenced)?,
+        ),
+        _ => None,
+    };
+    Ok(integration_bridge_apply_answer(
+        Some(integration_bridge_apply_terminal_code(error)),
+        serde_json::json!({
+            "reason": error.to_string(),
+            "receipt": receipt,
+        }),
+    ))
+}
+
+impl KernelComposition {
+    /// Drives one governed bridge apply for the presenting daemon caller
+    /// (issue #1818 W3).
+    ///
+    /// The production caller of [`apply_integration_candidate`]: it decodes
+    /// the caller-read-back views plus the typed bridge input and routes them
+    /// through the existing owner path (W1 read, W2 lease acquire first —
+    /// refuse-before-apply). The I10.16 order holds inside the bridge: the
+    /// declared verifier runs bound to the candidate environment before
+    /// apply, the write set must equal the candidate manifest, the post-apply
+    /// verifier is recorded in the `OutcomeReceipt`, and a failure carries
+    /// its executed rollback/compensation evidence while the
+    /// candidate/history stays intact. A malformed envelope is fenced at the
+    /// transport; every typed bridge refusal is answered, so the caller keeps
+    /// its retry identity and persists nothing on refusal. Persisting the
+    /// returned transitioned candidate and receipt stays with the Store
+    /// bridge slice.
+    fn integration_bridge_apply_operation(
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let envelope: IntegrationBridgeApplyEnvelope =
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
+        match apply_integration_candidate(
+            &envelope.candidates,
+            &envelope.active_leases,
+            &envelope.request,
+        ) {
+            Ok(success) => {
+                let candidate = serde_json::to_value(&success.candidate)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let receipt = serde_json::to_value(&success.receipt)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                Ok(integration_bridge_apply_answer(
+                    None,
+                    serde_json::json!({
+                        "candidate": candidate,
+                        "receipt": receipt,
+                    }),
+                ))
+            }
+            Err(error) => integration_bridge_apply_refusal(&error),
+        }
+    }
+}
+
 impl KernelComposition {
     /// Executes one authenticated daemon lifecycle request.  Only the
     /// narrow handshake/health dispositions are handled here; semantic
@@ -4720,6 +4851,19 @@ impl KernelComposition {
             }
             "bind_operator_session_token" => {
                 self.operator_session_token_operation(session, payload.clone())
+            }
+            // Issue #1818 W3: the governed bridge-apply ingress. The arm is
+            // the production caller of the Kernel-mechanical bridge: it
+            // routes the caller-read-back views plus the typed bridge input
+            // through the existing owner path (W1 read, W2 lease first), so
+            // every lease, verifier, scope, dirty-overlap, or rollback
+            // refusal answers typed with nothing applied. The arm is
+            // recognized here and unreachable from the front door until
+            // `frame_dispatch::is_daemon_operation` lists the marker (same
+            // caveat as the resume arm above); persisting the returned
+            // records stays with the Store bridge slice.
+            INTEGRATION_BRIDGE_APPLY_NAME => {
+                Self::integration_bridge_apply_operation(payload.clone())
             }
             _ => return Err(TransportError::SessionFenced),
         };
