@@ -44,6 +44,12 @@ pub struct PreparedWorkScopeSourceAdmission {
     pub authority_binding: AuthorityBinding,
     /// The exact causal binding checked against the request fence.
     pub causal_binding: CausalBinding,
+    /// Receipt-domain scope binding using the request's admitted ProductId.
+    pub receipt_work_scope_binding: eliot_receipts::WorkScopeBinding,
+    /// Canonical JSON projection of `receipt_work_scope_binding`.
+    pub receipt_work_scope_binding_json: String,
+    /// SHA-256 of the canonical receipt scope-binding projection.
+    pub receipt_work_scope_binding_sha256: String,
 }
 
 /// Refusal while preparing an initial WorkScope source-admission transition.
@@ -168,6 +174,19 @@ pub fn prepare_initial_work_scope_source_admission(
     let owner = WorkScopeBindingOwner::new(snapshot.clone())
         .map_err(|error| WorkScopeSourceAdmissionError::Snapshot(error.to_string()))?;
 
+    let receipt_work_scope_binding = eliot_receipts::WorkScopeBinding {
+        scope_id: eliot_receipts::WorkScopeId::new(binding.scope.scope_ref.clone())
+            .map_err(|error| WorkScopeSourceAdmissionError::Transition(error.to_string()))?,
+        product_id: identity.request.metadata.product_id.clone(),
+        resource_generation: fence.resource_generation,
+        state_fence: fence.clone(),
+    };
+    let receipt_binding_bytes = canonical_json_bytes(&receipt_work_scope_binding)
+        .map_err(|error| WorkScopeSourceAdmissionError::Transition(error.to_string()))?;
+    let receipt_work_scope_binding_json = String::from_utf8(receipt_binding_bytes.clone())
+        .map_err(|error| WorkScopeSourceAdmissionError::Transition(error.to_string()))?;
+    let receipt_work_scope_binding_sha256 = sha256_hex(&receipt_binding_bytes);
+
     let snapshot_json = String::from_utf8(
         canonical_json_bytes(&snapshot)
             .map_err(|error| WorkScopeSourceAdmissionError::Snapshot(error.to_string()))?,
@@ -240,5 +259,8 @@ pub fn prepare_initial_work_scope_source_admission(
         transition,
         authority_binding: authority.clone(),
         causal_binding: causal.clone(),
+        receipt_work_scope_binding,
+        receipt_work_scope_binding_json,
+        receipt_work_scope_binding_sha256,
     })
 }
