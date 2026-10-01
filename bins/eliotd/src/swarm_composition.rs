@@ -88,10 +88,13 @@
 //! [`LaunchIntentLedger`] directly:
 //!
 //! - [`SwarmComposition::launch_child`] verifies the fresh intent against the
-//!   ledger's prior dispatch for that slot before appending: an identical
-//!   prior is refused idempotently (no second append, no second runner call),
-//!   and same-identity drift in the pinned route lineage is a replay conflict.
-//!   So a second append plus a second runner call can never mint the same
+//!   ledger's prior dispatch for that slot before appending. An identical
+//!   prior is idempotent replay: the persisted intent is returned verbatim and
+//!   nothing is re-minted — no second durable append, no second runner call —
+//!   so the already-dispatched child stays exactly one entry in restart and
+//!   reconciliation accounting. Same-identity drift in the pinned route
+//!   lineage is a conflict instead, and a fresh slot appends once. So a second
+//!   append plus a second runner call can never mint the same
 //!   `operation_id`/`attempt_id` twice and drop one of them from restart
 //!   accounting.
 //! - [`SwarmComposition::attach_admitted_plan`] grants launch rights only when
@@ -485,15 +488,21 @@ pub enum SwarmCompositionError {
     /// Rehydrate first; nonterminal children reconcile before any relaunch.
     #[error("swarm composition requires reconciliation before launch")]
     ReconcileRequired,
-    /// The slot already carries a persisted launch intent and the candidate
-    /// reproduces it exactly. Exact child replay is idempotent here: nothing
-    /// is re-minted — no second durable append and no second runner call — so
-    /// the already-dispatched child stays a single entry in restart and
-    /// reconciliation accounting. Changed input under the same identity is
-    /// [`SwarmCompositionError::PayloadConflict`], never this variant.
+    /// One denominator or ledger names the same child slot twice, which would
+    /// double-count a single child: the presented drain denominator
+    /// ([`plan_drain`]) repeats a slot, or [`LaunchIntentLedger::intents`]
+    /// returns two intents for one slot. The child denominator is a finite
+    /// closed set with one entry per slot, so a repeated slot is refused
+    /// rather than reconciled.
+    ///
+    /// This is NOT the launch replay arm. Exact replay of an
+    /// already-dispatched child through [`SwarmComposition::launch_child`] is
+    /// idempotent and returns the persisted intent; changed same-identity input
+    /// is [`SwarmCompositionError::PayloadConflict`]. Neither reaches this
+    /// variant.
     #[error("swarm composition duplicate child slot: {slot}")]
     DuplicateSlot {
-        /// Slot that already carries the identical persisted intent.
+        /// Slot named twice by one denominator or one ledger.
         slot: String,
     },
     /// Same child identity, changed input: the candidate disagrees with the
@@ -797,6 +806,17 @@ fn reconcile_persisted_intent(
     }
 }
 
+/// Launch-path outcome of the exact-replay check for one child slot.
+enum SlotReplayVerdict {
+    /// The ledger holds no dispatch for this slot: a fresh launch may be
+    /// minted (durable append, then runner).
+    Fresh,
+    /// The ledger's persisted dispatch reproduces the candidate exactly.
+    /// Carries the durable intent from the ledger, which the caller returns
+    /// verbatim. Nothing is re-minted: no second append, no second runner call.
+    ExactReplay(ChildLaunchIntent),
+}
+
 /// Verifies the fresh candidate intent against the durable ledger's prior
 /// dispatch for the same child slot.
 ///
@@ -807,16 +827,18 @@ fn reconcile_persisted_intent(
 /// — and the replay is exact only when the whole dispatch envelope, intent plus
 /// lineage, matches. Fail-closed, in order:
 ///
-/// - no persisted dispatch for the slot is `Ok(())`: a fresh launch may be
-///   minted (append, then runner);
+/// - no persisted dispatch for the slot is [`SlotReplayVerdict::Fresh`]: a
+///   fresh launch may be minted (append, then runner);
 /// - a persisted prior whose own operation, attempt, cancellation, or fence
 ///   lineage does not re-derive from the sealed attachment is
 ///   [`SwarmCompositionError::StaleLineage`] (identity drift, the same
 ///   [`check_intent_lineage`] verdict rehydration applies);
 /// - a persisted prior equal to the candidate is
-///   [`SwarmCompositionError::DuplicateSlot`]: exact replay is idempotent
-///   here — nothing is re-minted, no second append and no second runner call —
-///   so the launched child stays exactly one entry in restart and
+///   [`SlotReplayVerdict::ExactReplay`] carrying that prior: exact child replay
+///   is idempotent. An idempotent operation returns the same result for the
+///   same input, so the caller returns the PERSISTED intent (never a freshly
+///   minted one) and reaches neither the ledger nor the runner a second time —
+///   the already-dispatched child stays exactly one entry in restart and
 ///   reconciliation accounting;
 /// - a persisted prior that differs in any pinned field (route class, route
 ///   generation, adapter-entry digest, or generation fingerprint) is
@@ -824,21 +846,20 @@ fn reconcile_persisted_intent(
 ///   needs a new slot identity under an explicit parent revision, never a
 ///   silent relaunch or a silently substituted result.
 ///
-/// Runs before the durable append, so a conflicting or already-dispatched slot
-/// can neither persist a second intent nor reach the runner.
+/// Runs before the durable append, so a conflicting slot can neither persist a
+/// second intent nor reach the runner, and an exact replay mints nothing at
+/// all.
 fn verify_slot_exact_replay(
     persisted: &[ChildLaunchIntent],
     candidate: &ChildLaunchIntent,
     sealed: &AttachedPlan,
-) -> Result<(), SwarmCompositionError> {
+) -> Result<SlotReplayVerdict, SwarmCompositionError> {
     let Some(prior) = persisted.iter().find(|prior| prior.slot == candidate.slot) else {
-        return Ok(());
+        return Ok(SlotReplayVerdict::Fresh);
     };
     check_intent_lineage(prior, sealed)?;
     if prior == candidate {
-        return Err(SwarmCompositionError::DuplicateSlot {
-            slot: candidate.slot.clone(),
-        });
+        return Ok(SlotReplayVerdict::ExactReplay(prior.clone()));
     }
     let mut drifted: Vec<&str> = Vec::new();
     if prior.route_class != candidate.route_class {
@@ -1291,13 +1312,15 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
     /// timeout. Launching requires an attached plan and, after a restart,
     /// reconciliation ([`SwarmCompositionError::ReconcileRequired`]).
     ///
-    /// Replay against the ledger, not the in-memory cache: a slot whose
-    /// persisted dispatch the candidate reproduces exactly is
-    /// [`SwarmCompositionError::DuplicateSlot`] — idempotent, nothing
-    /// re-minted, so the launched child remains exactly one entry in restart
-    /// and reconciliation accounting — and same-identity drift in the pinned
-    /// route lineage is [`SwarmCompositionError::PayloadConflict`] (changed
-    /// input needs a new slot identity under an explicit parent revision).
+    /// Replay against the ledger, not the in-memory cache. Exact child replay is
+    /// idempotent: a slot whose persisted dispatch the candidate reproduces
+    /// byte for byte returns that PERSISTED intent verbatim, with no second
+    /// durable append and no second runner call, so the launched child remains
+    /// exactly one entry in restart and reconciliation accounting. Changed
+    /// same-identity input — drifted route class, route generation,
+    /// adapter-entry digest, or generation fingerprint under one identity — is
+    /// [`SwarmCompositionError::PayloadConflict`] and needs a new slot identity
+    /// under an explicit parent revision, never a silent relaunch.
     ///
     /// # Errors
     ///
@@ -1307,7 +1330,6 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
     /// [`SwarmCompositionError::RouteBlocked`],
     /// [`SwarmCompositionError::StaleLineage`],
     /// [`SwarmCompositionError::InternalContract`],
-    /// [`SwarmCompositionError::DuplicateSlot`],
     /// [`SwarmCompositionError::PayloadConflict`], or
     /// [`SwarmCompositionError::OwnerFailure`].
     pub fn launch_child(
@@ -1348,7 +1370,7 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
                 ),
             });
         }
-        // Duplicate detection is a completeness check against the durable
+        // Replay detection is a completeness check against the durable
         // denominator, so it reads the ledger — the source of truth for every
         // persisted intent — and never the in-memory cache, which a fresh
         // composition over a surviving ledger owner does not hold. Reading
@@ -1378,16 +1400,21 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
         // append — and can neither persist nor reconcile later.
         check_intent_lineage(&intent, &plan)?;
         // Exact-replay verification against the durable ledger's prior dispatch
-        // for this slot, before the append and before the runner: an identical
-        // prior is refused idempotently (nothing re-minted, the launched child
-        // stays one entry in restart accounting), and same-identity drift in
-        // the pinned route lineage is a conflict. A slot this composition
-        // already dispatched therefore reaches neither the ledger nor the
-        // runner a second time.
-        verify_slot_exact_replay(&self.ledger.intents(), &intent, &plan)?;
-        // Persist BEFORE the runner call: a crash between the two leaves a
-        // persisted intent with unknown outcome, which rehydration reconciles.
-        // No runner call happens before this append returns.
+        // for this slot, before the append and before the runner. An identical
+        // prior is idempotent: return the PERSISTED intent from the ledger and
+        // mint nothing, so the already-dispatched child reaches neither the
+        // ledger nor the runner a second time and stays exactly one entry in
+        // restart and reconciliation accounting. Same-identity drift in the
+        // pinned route lineage is a conflict instead.
+        match verify_slot_exact_replay(&self.ledger.intents(), &intent, &plan)? {
+            SlotReplayVerdict::ExactReplay(persisted) => return Ok(persisted),
+            SlotReplayVerdict::Fresh => {}
+        }
+        // Fresh slot: the ledger holds nothing for it, so this append is the
+        // child's first and only durable record. Persist BEFORE the runner
+        // call: a crash between the two leaves a persisted intent with unknown
+        // outcome, which rehydration reconciles. No runner call happens before
+        // this append returns.
         let _sequence = self.ledger.append_intent(&intent)?;
         // Pin the admitted route binding once the intent is durable: later
         // launches under this plan must present the same generation, adapter
