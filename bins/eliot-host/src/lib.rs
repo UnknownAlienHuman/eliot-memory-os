@@ -3271,7 +3271,7 @@ impl HostJobBranches {
             }
         };
         self.finish_fresh_supervision_control_context(
-            &expected_selector,
+            expected_selector.as_ref(),
             runtime,
             transport,
             disposition,
@@ -3283,7 +3283,7 @@ impl HostJobBranches {
     #[cfg(windows)]
     fn finish_fresh_supervision_control_context(
         &mut self,
-        expected_selector: &Option<PlatformHandle>,
+        expected_selector: Option<&PlatformHandle>,
         runtime: tokio::runtime::Runtime,
         transport: NamedPipeTransport,
         disposition: HostSupervisionRevocationDisposition,
@@ -3293,14 +3293,14 @@ impl HostJobBranches {
         match disposition {
             HostSupervisionRevocationDisposition::Revoked
             | HostSupervisionRevocationDisposition::AlreadyAbsent => {
-                if self.current_supervision_observation_digest == *expected_selector {
+                if self.current_supervision_observation_digest.as_ref() == expected_selector {
                     self.current_supervision_observation_digest = None;
                 }
             }
             HostSupervisionRevocationDisposition::Superseded {
                 current_observation_digest,
             } => {
-                if self.current_supervision_observation_digest == *expected_selector {
+                if self.current_supervision_observation_digest.as_ref() == expected_selector {
                     self.current_supervision_observation_digest = Some(current_observation_digest);
                 }
                 return Err(HostError::KernelSupervisionRevocationSuperseded(
