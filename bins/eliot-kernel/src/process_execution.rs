@@ -48,6 +48,7 @@ use eliot_process::{
     ProcessExecutor, ProcessLaunchAdmission, ProcessLifecycle, ProcessOwnerBinding, ProcessRequest,
     ProcessSessionBinding, ProcessStartReceipt, ProcessStreamEvidence, SessionId,
     SuspendedLaunchEvidence, SuspendedProcessIdentity, ValidatedDispatch,
+    ProcessStreamSinkClient,
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_store_api::{
@@ -1756,6 +1757,10 @@ pub(crate) struct ProcessExecutionGateway {
     pub(crate) validation_contexts: Arc<ValidationContextSlot>,
     #[cfg(windows)]
     pub(crate) canonical_store: Arc<Mutex<Option<Arc<KernelStoreGateway>>>>,
+    /// A per-launch outer TestD stream factory backed by the same retained
+    /// Kernel/Store owner as `canonical_store`; it is installed by the
+    /// composition after the owner-facts and ORS routes are ready.
+    outer_stream_sink_factory: Mutex<Option<Arc<dyn KernelProcessStreamSinkFactory>>>,
     pub(crate) path_admission: Arc<KernelPathAdmission>,
     /// Launched-but-not-closed descendants (CHILD-1/CHILD-2).
     pub(crate) descendants: Arc<Mutex<DescendantRegistry>>,
@@ -1782,6 +1787,66 @@ pub(crate) struct KernelIssuedBlobProcessStreamGrant {
     pub(crate) initial_call_token: eliot_blob_api::wire::BlobProcessStreamCallToken,
     pub(crate) owner_projection: KernelBlobProcessStreamOwnerProjection,
     pub(crate) owner_facts_response: eliot_blob_api::wire::BlobProcessStreamOwnerFactsPullResponse,
+}
+
+/// Exact retained TestD owner inputs needed to admit a second, Kernel-side
+/// stream grant for the outer `eliot-testd` process. This is built from the
+/// durable verifier dispatch row; it is never read from worker material.
+#[derive(Clone, Debug)]
+pub(crate) struct TestdOuterProcessStreamAdmission {
+    pub(crate) request_identity: eliot_protocol::RequestIdentity,
+    pub(crate) invocation_id: String,
+    pub(crate) source_root_identity_sha256: String,
+    pub(crate) expected_module_id: String,
+    pub(crate) expected_generation_id: String,
+}
+
+impl TestdOuterProcessStreamAdmission {
+    pub(crate) fn new(
+        request_identity: eliot_protocol::RequestIdentity,
+        invocation_id: impl Into<String>,
+        source_root_identity_sha256: impl Into<String>,
+        expected_module_id: impl Into<String>,
+        expected_generation_id: impl Into<String>,
+    ) -> Result<Self, ProcessExecutionError> {
+        request_identity
+            .validate()
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        let admission = Self {
+            request_identity,
+            invocation_id: invocation_id.into(),
+            source_root_identity_sha256: source_root_identity_sha256.into(),
+            expected_module_id: expected_module_id.into(),
+            expected_generation_id: expected_generation_id.into(),
+        };
+        if admission.invocation_id.trim().is_empty()
+            || admission.expected_module_id.trim().is_empty()
+            || admission.expected_generation_id.trim().is_empty()
+            || admission.source_root_identity_sha256.len() != 64
+            || !admission
+                .source_root_identity_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(ProcessExecutionError::Unavailable(
+                "retained TestD stream admission is malformed".to_owned(),
+            ));
+        }
+        Ok(admission)
+    }
+}
+
+/// Kernel-owned factory for a per-start Blob stream sink. Implementations
+/// retain the one Store gateway and issue their own call identities; callers
+/// provide only the exact admitted owner/process inputs.
+#[allow(async_fn_in_trait)]
+pub(crate) trait KernelProcessStreamSinkFactory: Send + Sync {
+    async fn for_testd_outer_process(
+        &self,
+        owner: &ProcessOwnerBinding,
+        process: &ProcessRequest,
+        admission: &TestdOuterProcessStreamAdmission,
+    ) -> Result<Arc<dyn ProcessStreamSinkClient>, ProcessExecutionError>;
 }
 
 /// Exact launch-time owner-facts projection. These digest domains stay
@@ -1987,6 +2052,15 @@ pub(crate) trait ProcessStartPorts {
         request: Self::Request,
         outer_binding: Option<&HostKernelCandidateBinding>,
     ) -> Result<Self::Receipt, ProcessExecutionError>;
+    async fn execute_with_testd_outer_stream(
+        &self,
+        owner: &ProcessOwnerBinding,
+        request: Self::Request,
+        outer_binding: Option<&HostKernelCandidateBinding>,
+        _stream_admission: Option<&TestdOuterProcessStreamAdmission>,
+    ) -> Result<Self::Receipt, ProcessExecutionError> {
+        self.execute(owner, request, outer_binding).await
+    }
     fn persist_completed(
         &self,
         operation_id: &eliot_process::OperationId,
@@ -2167,11 +2241,30 @@ impl ProcessExecutionGateway {
             validation_contexts,
             #[cfg(windows)]
             canonical_store: Arc::new(Mutex::new(None)),
+            outer_stream_sink_factory: Mutex::new(None),
             path_admission,
             descendants: Arc::new(Mutex::new(DescendantRegistry::new())),
             effect_port: Mutex::new(Some(effect_port)),
             effect_baselines: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    pub(crate) fn install_outer_stream_sink_factory(
+        &self,
+        factory: Arc<dyn KernelProcessStreamSinkFactory>,
+    ) -> Result<(), ProcessExecutionError> {
+        let mut slot = self.outer_stream_sink_factory.lock().map_err(|_| {
+            ProcessExecutionError::Unavailable(
+                "outer process-stream factory lock is poisoned".to_owned(),
+            )
+        })?;
+        if slot.is_some() {
+            return Err(ProcessExecutionError::Unavailable(
+                "outer process-stream factory is already installed".to_owned(),
+            ));
+        }
+        *slot = Some(factory);
+        Ok(())
     }
 
     pub(crate) fn readiness_configuration_valid(&self) -> bool {
@@ -2804,6 +2897,46 @@ impl ProcessExecutionGateway {
         outer_binding: HostKernelCandidateBinding,
         context: &tracing::Span,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
+        self.start_in_context_with_testd_outer_stream(
+            owner,
+            admission,
+            path_proof,
+            outer_binding,
+            context,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn start_testd_outer_stream(
+        &self,
+        owner: &ProcessOwnerBinding,
+        admission: ProcessExecutionAdmissionRequest,
+        path_proof: ProcessPathProof,
+        outer_binding: HostKernelCandidateBinding,
+        stream_admission: &TestdOuterProcessStreamAdmission,
+    ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
+        let context = Self::start_context_for(owner, &admission);
+        self.start_in_context_with_testd_outer_stream(
+            owner,
+            admission,
+            path_proof,
+            outer_binding,
+            &context,
+            Some(stream_admission),
+        )
+        .await
+    }
+
+    async fn start_in_context_with_testd_outer_stream(
+        &self,
+        owner: &ProcessOwnerBinding,
+        admission: ProcessExecutionAdmissionRequest,
+        path_proof: ProcessPathProof,
+        outer_binding: HostKernelCandidateBinding,
+        context: &tracing::Span,
+        stream_admission: Option<&TestdOuterProcessStreamAdmission>,
+    ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
         if admission.validate().is_ok() && self.validate_admission(&admission, owner).is_ok() {
             record_process_context_field(
                 context,
@@ -2839,7 +2972,7 @@ impl ProcessExecutionGateway {
         }
         let effect_operation_id = admission.intent().operation_id().clone();
         let mut replayed = false;
-        match Box::pin(run_process_start(
+        match Box::pin(run_process_start_with_testd_outer_stream(
             self,
             owner,
             admission,
@@ -2847,6 +2980,7 @@ impl ProcessExecutionGateway {
             Some(outer_binding),
             context,
             &mut replayed,
+            stream_admission,
         ))
         .await
         {
@@ -4068,6 +4202,33 @@ pub(crate) async fn run_process_start<P: ProcessStartPorts>(
     diagnostic_context: &tracing::Span,
     replayed: &mut bool,
 ) -> Result<P::Receipt, ProcessExecutionError> {
+    run_process_start_with_testd_outer_stream(
+        ports,
+        owner,
+        admission,
+        path_proof,
+        outer_binding,
+        diagnostic_context,
+        replayed,
+        None,
+    )
+    .await
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the original process-start tuple and optional exact TestD capture authority stay explicit"
+)]
+async fn run_process_start_with_testd_outer_stream<P: ProcessStartPorts>(
+    ports: &P,
+    owner: &ProcessOwnerBinding,
+    admission: ProcessExecutionAdmissionRequest,
+    path_proof: P::PathProof,
+    outer_binding: Option<HostKernelCandidateBinding>,
+    diagnostic_context: &tracing::Span,
+    replayed: &mut bool,
+    stream_admission: Option<&TestdOuterProcessStreamAdmission>,
+) -> Result<P::Receipt, ProcessExecutionError> {
     *replayed = false;
     admission.validate()?;
     ports.validate_path(&admission, &path_proof)?;
@@ -4251,7 +4412,15 @@ pub(crate) async fn run_process_start<P: ProcessStartPorts>(
         "kernel.process.start_handoff",
         "attempt",
     );
-    let receipt = match ports.execute(owner, request, outer_binding.as_ref()).await {
+    let receipt = match ports
+        .execute_with_testd_outer_stream(
+            owner,
+            request,
+            outer_binding.as_ref(),
+            stream_admission,
+        )
+        .await
+    {
         Ok(receipt) => receipt,
         Err(error) => {
             drop(context_guard);
@@ -4467,6 +4636,17 @@ impl ProcessStartPorts for ProcessExecutionGateway {
         request: Self::Request,
         outer_binding: Option<&HostKernelCandidateBinding>,
     ) -> Result<Self::Receipt, ProcessExecutionError> {
+        self.execute_with_testd_outer_stream(owner, request, outer_binding, None)
+            .await
+    }
+
+    async fn execute_with_testd_outer_stream(
+        &self,
+        owner: &ProcessOwnerBinding,
+        request: Self::Request,
+        outer_binding: Option<&HostKernelCandidateBinding>,
+        stream_admission: Option<&TestdOuterProcessStreamAdmission>,
+    ) -> Result<Self::Receipt, ProcessExecutionError> {
         // CHILD-1 (#1918): register the descendant before the executor
         // handoff. A poisoned or conflicting registry refuses the launch: an
         // unregistered child must never start.
@@ -4503,6 +4683,30 @@ impl ProcessStartPorts for ProcessExecutionGateway {
             }),
         });
         #[cfg(windows)]
+        let stream_sink = if let Some(stream_admission) = stream_admission {
+            let factory = self
+                .outer_stream_sink_factory
+                .lock()
+                .map_err(|_| {
+                    ProcessExecutionError::Unavailable(
+                        "outer process-stream factory lock is poisoned".to_owned(),
+                    )
+                })?
+                .clone()
+                .ok_or_else(|| {
+                    ProcessExecutionError::Unavailable(
+                        "outer TestD process-stream factory is unavailable".to_owned(),
+                    )
+                })?;
+            Some(
+                factory
+                    .for_testd_outer_process(owner, &request, stream_admission)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        #[cfg(windows)]
         let started = match outer_binding {
             Some(candidate) => {
                 let binding: Result<RecoverableJobBinding, ProcessExecutionError> =
@@ -4523,8 +4727,17 @@ impl ProcessStartPorts for ProcessExecutionGateway {
                     Ok(binding)
                         if binding.job_identity().name() == candidate.job_object_id.as_str() =>
                     {
-                        self.executor
-                            .start_with_kernel_outer_job_binding(request, sink, binding)
+                        match stream_sink {
+                            Some(stream_sink) => self.executor
+                                .start_with_kernel_outer_job_binding_and_stream_sink(
+                                    request,
+                                    sink,
+                                    binding,
+                                    stream_sink,
+                                ),
+                            None => self.executor
+                                .start_with_kernel_outer_job_binding(request, sink, binding),
+                        }
                     }
                     Ok(_) => Err(ProcessExecutionError::Contract(
                         eliot_process::ContractError::DispatchBindingMismatch,
@@ -4538,7 +4751,7 @@ impl ProcessStartPorts for ProcessExecutionGateway {
         };
         #[cfg(not(windows))]
         let started = {
-            let _ = (request, sink, outer_binding);
+            let _ = (request, sink, outer_binding, stream_admission);
             Err(ProcessExecutionError::Unavailable(
                 "Windows process launch is unavailable on this platform".to_owned(),
             ))

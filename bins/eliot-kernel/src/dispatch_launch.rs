@@ -157,6 +157,7 @@ use super::{
     ActionLeaseRef, EnvironmentInheritance, EnvironmentProjection, FencingToken, Generation,
     ImageId, JobId, KernelComposition, ProcessExecutionAdmissionRequest, ProcessExecutionError,
     ProcessIntent, ProcessOwnerBinding, ProcessStartReceipt, ProcessTreeId, RequestIdentity,
+    TestdOuterProcessStreamAdmission,
     ResourceLimits, SessionId,
 };
 
@@ -3242,6 +3243,7 @@ pub async fn start_ready_doctor_launch(
             generation: ready.generation,
             authority_epoch: &ready.authority_epoch,
             material_path: Some(ready.material_path.as_path()),
+            testd_outer_stream_admission: None,
         },
     )
     .await?
@@ -3328,6 +3330,9 @@ struct SpawnInputs<'a> {
     generation: Generation,
     authority_epoch: &'a EpochId,
     material_path: Option<&'a Path>,
+    /// Present only for a productive TestD worker, from its durable verifier
+    /// dispatch row rather than protected worker material.
+    testd_outer_stream_admission: Option<&'a TestdOuterProcessStreamAdmission>,
 }
 
 /// The exact process admission shared by Doctor, testd, and native-worker
@@ -3591,7 +3596,21 @@ async fn spawn_ready_child(
     );
     let pending_native_worker_claim =
         stage_pending_native_worker_process_start(inputs, &admission, executable_file_identity)?;
-    match gateway.start(&owner, admission, proof, outer_binding).await {
+    let started = match inputs.testd_outer_stream_admission {
+        Some(stream_admission) => {
+            gateway
+                .start_testd_outer_stream(
+                    &owner,
+                    admission,
+                    proof,
+                    outer_binding,
+                    stream_admission,
+                )
+                .await
+        }
+        None => gateway.start(&owner, admission, proof, outer_binding).await,
+    };
+    match started {
         Ok(receipt) => Ok(SpawnOutcome::Started(
             Box::new(receipt),
             executable_file_identity,
@@ -4962,6 +4981,35 @@ pub async fn start_ready_testd_launch(
     kernel: &KernelComposition,
     ready: &ReadyTestdLaunch,
 ) -> Result<ChildStartOutcome, DispatchLaunchError> {
+    let outer_stream_admission = match (
+        ready.owner_binding.verifier_dispatch.as_ref(),
+        ready.owner_binding.stage_request.as_ref(),
+    ) {
+        (Some(dispatch), Some(stage)) => {
+            let lifecycle = stage.provider_catalog_lifecycle.as_ref().ok_or_else(|| {
+                DispatchLaunchError::Gate(
+                    "productive TestD process capture lacks the admitted catalog lifecycle"
+                        .to_owned(),
+                )
+            })?;
+            Some(
+                TestdOuterProcessStreamAdmission::new(
+                    dispatch.request_identity.clone(),
+                    dispatch.operation_id.clone(),
+                    sha256_hex(ready.owner_binding.source_root.to_string_lossy().as_bytes()),
+                    lifecycle.module_id.clone(),
+                    lifecycle.generation_id.clone(),
+                )
+                .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?,
+            )
+        }
+        (None, None) => None,
+        _ => {
+            return Err(DispatchLaunchError::Gate(
+                "TestD outer capture owner and stage bindings disagree".to_owned(),
+            ));
+        }
+    };
     match spawn_ready_child(
         kernel,
         &SpawnInputs {
@@ -4976,6 +5024,7 @@ pub async fn start_ready_testd_launch(
             generation: ready.generation,
             authority_epoch: &ready.authority_epoch,
             material_path: Some(ready.material_path.as_path()),
+            testd_outer_stream_admission: outer_stream_admission.as_ref(),
         },
     )
     .await?
@@ -5628,6 +5677,7 @@ pub async fn start_ready_native_worker_launch(
             generation: ready.generation,
             authority_epoch: &ready.authority_epoch,
             material_path: Some(ready.material_path.as_path()),
+            testd_outer_stream_admission: None,
         },
     )
     .await?
@@ -6317,6 +6367,7 @@ pub async fn start_ready_dreamer_launch(
             generation: ready.generation,
             authority_epoch: &ready.authority_epoch,
             material_path: Some(ready.material_path.as_path()),
+            testd_outer_stream_admission: None,
         },
     )
     .await
