@@ -3168,8 +3168,17 @@ async fn daemon_readiness_requires_fresh_running_executor_receipt() {
         inspection.is_ok(),
         "gateway exact inspection must accept the live receipt: {inspection:?}"
     );
+    // #901 renamed this boundary to `validate_daemon_process_readiness_in_context`
+    // and gave it the operation span plus an explicit terminal-ownership flag.
+    // `context` above is the operation context production derives for this exact
+    // owner and operation. `true` declares that THIS call site owns the single
+    // terminal for a rejection, which is what the assertions below require: the
+    // rejected leg proves the rejection is terminal (`!daemon_ready()` and a
+    // `Failed` runtime status). That is the same contract
+    // `validated_authenticated_daemon_ready_inputs` asserts in production, so
+    // this is the production-owned value, not a placeholder.
     kernel
-        .validate_daemon_process_readiness(&launch, &receipt)
+        .validate_daemon_process_readiness_in_context(&launch, &receipt, &context, true)
         .await
         .expect("live exact process accepted");
     assert!(kernel.daemon_ready());
@@ -3180,7 +3189,7 @@ async fn daemon_readiness_requires_fresh_running_executor_receipt() {
         .expect("terminate executor child");
     assert!(
         kernel
-            .validate_daemon_process_readiness(&launch, &receipt)
+            .validate_daemon_process_readiness_in_context(&launch, &receipt, &context, true)
             .await
             .is_err(),
         "terminal executor inspection must reject readiness"
@@ -3282,10 +3291,31 @@ async fn daemon_recovery_closes_exact_prior_tree_and_rejects_stale_receipt() {
         state.status = DaemonRuntimeStatus::Failed("daemon timeout".to_owned());
         state.receipt = Some(receipt.clone());
     }
+    // #901 gave the recovery closure the operation span it records under and an
+    // out-parameter naming whether this call took ownership of the single child
+    // terminal. The span is the owner-bound operation context production derives
+    // for this exact owner and operation (`operation_context_for`), read off this
+    // fixture's own owner binding and receipt operation. The flag starts `false`
+    // because this caller has not yet emitted a terminal; production asserts the
+    // same invariant at `recover_eliotd_in_context`. A proven closure owns no
+    // terminal (every `child_terminal_owned = true` in the callee is on an error
+    // path), which the assertion below now pins instead of leaving unobserved.
+    let closure_context =
+        ProcessExecutionGateway::operation_context_for(&owner, receipt.operation_id());
+    let mut closure_terminal_owned = false;
     kernel
-        .close_previous_daemon_process(&launch, &receipt)
+        .close_previous_daemon_process(
+            &launch,
+            &receipt,
+            &closure_context,
+            &mut closure_terminal_owned,
+        )
         .await
         .expect("exact prior process tree closure");
+    assert!(
+        !closure_terminal_owned,
+        "a proven exact closure is not a terminal; the recovery owner keeps it"
+    );
     let closed = gateway
         .inspect(&owner, receipt.operation_id().clone())
         .await
@@ -3293,12 +3323,26 @@ async fn daemon_recovery_closes_exact_prior_tree_and_rejects_stale_receipt() {
     assert_eq!(closed.lifecycle(), ProcessLifecycle::Exited);
 
     let stale = test_process_start_receipt(41_002);
+    // The stale leg inspects a different operation, so it carries that
+    // operation's own owner-bound span rather than the closure leg's.
+    let stale_context =
+        ProcessExecutionGateway::operation_context_for(&owner, stale.operation_id());
+    let mut stale_terminal_owned = false;
     assert!(
         kernel
-            .close_previous_daemon_process(&launch, &stale)
+            .close_previous_daemon_process(
+                &launch,
+                &stale,
+                &stale_context,
+                &mut stale_terminal_owned,
+            )
             .await
             .is_err(),
         "a stale completed receipt must not be adopted for recovery"
+    );
+    assert!(
+        !stale_terminal_owned,
+        "a stale receipt is refused as a validation error before any child terminal is taken"
     );
     gateway
         .executor
@@ -5840,10 +5884,26 @@ async fn daemon_close_reconciles_by_original_identity_with_ors_readback() {
         state.status = DaemonRuntimeStatus::Failed("daemon timeout".to_owned());
         state.receipt = Some(receipt.clone());
     }
+    // #901 signature: the owner-bound operation span plus the child-terminal
+    // out-parameter. Both values are read off this fixture's own owner binding
+    // and receipt operation, exactly as production derives them; `false` is the
+    // entry state production uses before it has emitted any terminal.
+    let closure_context =
+        ProcessExecutionGateway::operation_context_for(&owner, receipt.operation_id());
+    let mut closure_terminal_owned = false;
     kernel
-        .close_previous_daemon_process(&launch, &receipt)
+        .close_previous_daemon_process(
+            &launch,
+            &receipt,
+            &closure_context,
+            &mut closure_terminal_owned,
+        )
         .await
         .expect("exact prior supervised generation closes with reconcile and ORS readback");
+    assert!(
+        !closure_terminal_owned,
+        "a proven reconcile closure owns no child terminal; the recovery owner keeps it"
+    );
     let closed = gateway
         .inspect(&owner, receipt.operation_id().clone())
         .await
@@ -5895,12 +5955,25 @@ async fn daemon_close_reconciles_by_original_identity_with_ors_readback() {
     // same identity instead of a fresh launch.
     let stale = test_process_start_receipt(41_002);
     assert_ne!(stale.operation_id(), receipt.operation_id());
+    // Distinct operation, so distinct owner-bound span for the refusal leg.
+    let stale_context =
+        ProcessExecutionGateway::operation_context_for(&owner, stale.operation_id());
+    let mut stale_terminal_owned = false;
     assert!(
         kernel
-            .close_previous_daemon_process(&launch, &stale)
+            .close_previous_daemon_process(
+                &launch,
+                &stale,
+                &stale_context,
+                &mut stale_terminal_owned,
+            )
             .await
             .is_err(),
         "a stale completed receipt must not be adopted for recovery"
+    );
+    assert!(
+        !stale_terminal_owned,
+        "a stale receipt is refused as a validation error before any child terminal is taken"
     );
     assert!(
         gateway
