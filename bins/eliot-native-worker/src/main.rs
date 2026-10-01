@@ -2340,7 +2340,7 @@ mod tests {
         let frame = WorkerFrame {
             protocol_version: PROTOCOL_VERSION.to_owned(),
             encoding_profile: JSON_ENCODING_PROFILE.to_owned(),
-            connection_id: hello_connection,
+            connection_id: hello_connection.clone(),
             request_id: load(RequestId::new("health-kernel-drive-1")),
             trace_context: BTreeMap::from([(
                 "trace_id".to_owned(),
