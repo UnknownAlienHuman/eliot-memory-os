@@ -1703,7 +1703,10 @@ fn contract_source_carries_no_implementation_authority() {
     assert!(!comment_probe_code.contains("provider fsync"));
     assert!(!comment_probe_code.contains("nested fsync"));
     assert!(comment_probe_code.contains("r#\"// slash text inside a raw string\"#"));
-    assert_eq!(first_forbidden_marker(&comment_probe_code, &forbidden), None);
+    assert_eq!(
+        first_forbidden_marker(&comment_probe_code, &forbidden),
+        None
+    );
 
     let fsync_code_probe = rust_code_without_comments("fn flush() { fsync(); }\n");
     assert_eq!(
