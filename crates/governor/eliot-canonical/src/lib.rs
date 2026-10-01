@@ -1487,7 +1487,10 @@ mod tests {
             task_id: None,
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "c".repeat(64),
+            // I05-06: bind the contracts THIS build supports (issue #1927).
+            admission_contract_set_digest:
+                eliot_store_api::supported_admission_contract_set_digest()
+                    .expect("supported admission contracts compute"),
             operation_manifest_digest: golden_chain_manifest().digest.clone(),
             semantic_commands: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
@@ -1498,7 +1501,8 @@ mod tests {
             }],
             event_projection_relation_intents: EventProjectionRelationIntents {
                 event_ids: vec![EventId::new("event-golden-chain-1").expect("event id")],
-                projection_kinds: vec!["projection-golden-chain-1".to_owned()],
+                // I05-08: must name a DECLARED projection kind (issue #1931).
+                projection_kinds: vec!["CurrentEpistemicPosition".to_owned()],
                 relation_kinds: vec!["relation-golden-chain-1".to_owned()],
             },
             security: SecurityContext::default(),
@@ -1519,8 +1523,16 @@ mod tests {
     /// Pinned digest of [`golden_chain_envelope`], derived by running the
     /// shared hash over those fixed inputs (not hand-written):
     /// `eliot-store-api` and `eliot-store-memory` assert the same literal.
+    ///
+    /// REGENERATED, not hand-written. Its predecessor `32d92354…` was frozen
+    /// in 3f60670a2 before the envelope began binding the build's supported
+    /// admission contract set (2ef1cbef0, issue #1927) and a DECLARED
+    /// projection kind (777b92307, issue #1931). Both crates changed
+    /// together and were re-read from the failing assertion of this very test,
+    /// which is what makes the cross-crate agreement real rather than
+    /// two independently-matching literals.
     const ISSUE_63_GOLDEN_CHAIN_DIGEST: &str =
-        "32d9235499c0e63f72509808c0b1439cd7e879c754fbc1bc5e965bb6af4d6a36";
+        "c6d6434a01e468723d1f59c6bbd1a8df07850d673176de049c38f241442a51e4";
 
     #[test]
     fn golden_chain_envelope_hash_matches_the_pinned_cross_crate_digest() {

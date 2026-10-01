@@ -31,6 +31,7 @@ use eliot_store_api::{
     NamedMutationRequest, OperationIdentity, OrderingScopeId, PreparedTransition, RequestMeta,
     ScopeId, SecurityContext, StoreError, TransitionClass, WriteReceipt, WriteReceiptStatus,
     bind_issue18_digests, canonical_request_hash, operation_manifest_set_digest,
+    supported_admission_contract_set_digest,
 };
 use serde_json::{Value, json};
 
@@ -190,7 +191,9 @@ fn transition_with(
         ordering_scopes: vec![OrderingScopeId::new("notification-state").expect("ordering")],
         transition_class: TransitionClass::NotificationState,
         requested_effect_ceiling: EffectClass::ReversibleMutation,
-        admission_contract_set_digest: "c".repeat(64),
+        // I05-06: bind the contracts THIS build supports (issue #1927).
+        admission_contract_set_digest: supported_admission_contract_set_digest()
+            .expect("supported admission contracts compute"),
         operation_manifest_digest: manifest_digest,
         // Issue-#18 digests are derived below via `bind_issue18_digests`,
         // never defaulted; no semantic source is bound here (`[]`).

@@ -165,7 +165,10 @@ pub fn envelope(
         task_id: Some("task".to_owned()),
         transition_class: TransitionClass::Epistemic,
         requested_effect_ceiling: TransitionClass::Epistemic.maximum_effect(),
-        admission_contract_set_digest: sha256_hex(b"reference admission fixture"),
+        // I05-06: a recorded plan is admissible only when this build supports
+        // the same admission contract set, so bind the owner-computed digest
+        // rather than a fixture placeholder (issue #1927 / PR #4781).
+        admission_contract_set_digest: supported_admission_contract_set_digest()?,
         operation_manifest_digest: operation_manifest_set_digest(&generated_operation_manifests()?)?,
         semantic_commands: vec![epistemic_revision_command(
             PositionId::new(position)?,

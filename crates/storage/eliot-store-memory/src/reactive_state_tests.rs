@@ -23,7 +23,7 @@ use eliot_store_api::{
     ScopeId, SecurityContext, StoreError, TransitionClass, WriteReceipt, bind_issue18_digests,
     canonical_request_hash, operation_manifest_set_digest, reactive_ledger_mutation_request,
     reactive_ledger_read_request, resource_snapshot_mutation_request,
-    resource_snapshot_read_request,
+    resource_snapshot_read_request, supported_admission_contract_set_digest,
 };
 use serde_json::{Value, json};
 
@@ -90,7 +90,9 @@ fn transition_with(
         ordering_scopes: vec![OrderingScopeId::new("reactive-state").expect("ordering")],
         transition_class: TransitionClass::ReactiveState,
         requested_effect_ceiling: EffectClass::ReversibleMutation,
-        admission_contract_set_digest: "c".repeat(64),
+        // I05-06: bind the contracts THIS build supports (issue #1927).
+        admission_contract_set_digest: supported_admission_contract_set_digest()
+            .expect("supported admission contracts compute"),
         operation_manifest_digest: manifest_digest,
         // Issue-#18 digests are derived below via `bind_issue18_digests`,
         // never defaulted; no semantic source is bound here (`[]`).

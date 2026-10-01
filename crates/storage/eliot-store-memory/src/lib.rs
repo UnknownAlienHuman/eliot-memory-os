@@ -6278,7 +6278,11 @@ mod tests {
             ordering_scopes: vec![OrderingScopeId::new("scope-1")?],
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "a".repeat(64),
+            // I05-06: the recorded admission contract-set digest must name the
+            // contracts THIS build supports, so bind the owner-computed value
+            // rather than a placeholder (issue #1927 / PR #4781).
+            admission_contract_set_digest:
+                eliot_store_api::supported_admission_contract_set_digest()?,
             operation_manifest_digest: manifest()?.digest,
             // Issue-#18 digests are derived below via `bind_issue18_digests`,
             // never defaulted; no semantic source is bound here (`[]`).
@@ -6291,7 +6295,10 @@ mod tests {
             }],
             event_projection_relation_intents: EventProjectionRelationIntents {
                 event_ids: vec![],
-                projection_kinds: vec![String::from("task_state")],
+                // I05-08: a publication names a DECLARED projection kind; an
+                // undeclared kind can neither be published nor read as current
+                // (issue #1931 / PR #3516). `task_state` is no longer declared.
+                projection_kinds: vec![String::from("CurrentEpistemicPosition")],
                 relation_kinds: vec![String::from("causes")],
             },
             security: eliot_store_api::SecurityContext::default(),
@@ -7161,8 +7168,13 @@ mod tests {
 
     /// Pinned digest of the Governor chain envelope, asserted independently
     /// by `eliot-canonical` (see its `golden_chain_envelope` test).
+    ///
+    /// REGENERATED, not hand-written, after the envelope began binding the
+    /// build's supported admission contract set (issue #1927 / PR #4781) and a
+    /// DECLARED projection kind (issue #1931 / PR #3516). `eliot-canonical`
+    /// regenerated its copy in the same change, so the two crates still agree.
     const ISSUE_63_GOLDEN_CHAIN_DIGEST: &str =
-        "32d9235499c0e63f72509808c0b1439cd7e879c754fbc1bc5e965bb6af4d6a36";
+        "c6d6434a01e468723d1f59c6bbd1a8df07850d673176de049c38f241442a51e4";
 
     #[test]
     fn governor_envelope_store_view_and_receipt_share_one_golden_digest() -> Result<(), StoreError>
@@ -7206,7 +7218,9 @@ mod tests {
             task_id: None,
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "c".repeat(64),
+            // I05-06: bind the contracts THIS build supports (issue #1927).
+            admission_contract_set_digest:
+                eliot_store_api::supported_admission_contract_set_digest()?,
             operation_manifest_digest: manifest.digest.clone(),
             semantic_commands: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
@@ -7217,7 +7231,8 @@ mod tests {
             }],
             event_projection_relation_intents: EventProjectionRelationIntents {
                 event_ids: vec![EventId::new("event-golden-chain-1")?],
-                projection_kinds: vec!["projection-golden-chain-1".to_owned()],
+                // I05-08: must name a DECLARED projection kind (issue #1931).
+                projection_kinds: vec!["CurrentEpistemicPosition".to_owned()],
                 relation_kinds: vec!["relation-golden-chain-1".to_owned()],
             },
             security: eliot_store_api::SecurityContext::default(),
@@ -7855,7 +7870,9 @@ mod tests {
             reason: "user requested deletion".to_owned(),
             requester: "user:test".to_owned(),
             approval_refs: approvals,
-            admission_contract_set_digest: "b".repeat(64),
+            // I05-06: bind the contracts THIS build supports (issue #1927).
+            admission_contract_set_digest:
+                eliot_store_api::supported_admission_contract_set_digest()?,
             operation_manifest_digest: erasure_set_digest()?,
             security: eliot_store_api::SecurityContext::default(),
             event_projection_relation_intents: EventProjectionRelationIntents {
@@ -8129,7 +8146,9 @@ mod tests {
             ordering_scopes: vec![OrderingScopeId::new("scope-1")?],
             transition_class: class,
             requested_effect_ceiling: effect,
-            admission_contract_set_digest: "a".repeat(64),
+            // I05-06: bind the contracts THIS build supports (issue #1927).
+            admission_contract_set_digest:
+                eliot_store_api::supported_admission_contract_set_digest()?,
             operation_manifest_digest: manifest_digest,
             // Issue-#18 digests are derived below via `bind_issue18_digests`,
             // never defaulted; no semantic source is bound here (`[]`).

@@ -35,6 +35,7 @@ use eliot_store_api::{
     automation_edit_params, automation_failure_params, automation_mutation_request,
     automation_read_request, automation_run_now_params, automation_state_transition_params,
     bind_issue18_digests, canonical_request_hash, operation_manifest_set_digest,
+    supported_admission_contract_set_digest,
 };
 use serde_json::Value;
 
@@ -65,13 +66,71 @@ fn context(tag: &str) -> RequestMeta {
     }
 }
 
+/// Owner-normalized schedule with its real normalization binding.
+///
+/// `apply_compiled_utc_instants` is the owner's own pinned-zone compiler
+/// entry point, so the occurrence key and both digests are code-derived
+/// rather than hand-written. The binding fields the structural validator
+/// compares against (`source_digest`, `occurrences_digest`) come from the
+/// same owner functions; only the issuer identity strings are fixture text,
+/// because authenticating an issuer is the Store compiler call's job, not
+/// this crate's.
+fn normalized_schedule() -> NormalizedSchedule {
+    let mut schedule = NormalizedSchedule {
+        kind: ScheduleKind::OneShot,
+        expression: "once".to_owned(),
+        calendar: "gregorian".to_owned(),
+        timezone: "UTC".to_owned(),
+        dst_fold: eliot_kernel_core::user_automation::DstFoldPolicy::First,
+        dst_gap: eliot_kernel_core::user_automation::DstGapPolicy::ShiftForward,
+        start_at: "2026-09-21T00:00:00Z".to_owned(),
+        end_at: None,
+        next_occurrences: Vec::new(),
+        // The compiler entry point accepts only the fully unissued draft
+        // sentinel, so every field starts empty; the pinned zone revision is
+        // a compiler OUTPUT and is set below.
+        normalization_receipt: Box::new(
+            eliot_kernel_core::user_automation::ScheduleNormalizationReceipt {
+                receipt_id: String::new(),
+                normalizer_authority: String::new(),
+                source_digest: String::new(),
+                zone_database_revision: String::new(),
+                occurrences_digest: String::new(),
+            },
+        ),
+    };
+    // 2026-09-21T00:00:00Z: the declared `start_at`, so the occurrence lies
+    // inside the declared interval, and inside the pinned zone table window.
+    schedule
+        .apply_compiled_utc_instants(&[1_789_948_800])
+        .expect("fixture schedule normalizes");
+    let source_digest = schedule.source_digest().expect("source digest");
+    let occurrences_digest = schedule
+        .compiled_occurrences_digest()
+        .expect("compiled occurrences digest");
+    let receipt = schedule.normalization_receipt.as_mut();
+    receipt.receipt_id = "normalization-receipt-automation-fixture".to_owned();
+    receipt.normalizer_authority = "owner:automation-fixture".to_owned();
+    receipt.source_digest = source_digest;
+    receipt.occurrences_digest = occurrences_digest;
+    receipt.zone_database_revision =
+        eliot_kernel_core::user_automation::PINNED_ZONE_DATABASE_REVISION.to_owned();
+    schedule
+}
+
 /// Minimal domain-valid revision: deterministic script mode with all
 /// capability gates closed, so every nested owner validation passes.
+///
+/// The schedule carries a real owner-normalized occurrence set and its
+/// matching normalization binding: `UserAutomationRevision::validate`
+/// requires both, so a bare shape-only occurrence key is refused before any
+/// store effect.
 fn valid_revision(
     automation_id: &str,
     revision: &str,
     state: UserAutomationConfigurationState,
 ) -> UserAutomationRevision {
+    let schedule = normalized_schedule();
     UserAutomationRevision {
         automation_id: automation_id.to_owned(),
         revision: revision.to_owned(),
@@ -83,31 +142,7 @@ fn valid_revision(
             workdir_ref: "workdir-1".to_owned(),
         },
         natural_language_intent: "nightly backup".to_owned(),
-        schedule: NormalizedSchedule {
-            kind: ScheduleKind::OneShot,
-            expression: "once".to_owned(),
-            calendar: "gregorian".to_owned(),
-            timezone: "UTC".to_owned(),
-            dst_fold: eliot_kernel_core::user_automation::DstFoldPolicy::First,
-            dst_gap: eliot_kernel_core::user_automation::DstGapPolicy::ShiftForward,
-            start_at: "2026-09-21T00:00:00Z".to_owned(),
-            end_at: None,
-            next_occurrences: vec!["2026-09-21T00:00:00Z".to_owned()],
-            // This fixture carries a retired shape-only occurrence key, so the
-            // owning calendar adapter has not issued a normalization binding
-            // for it. Empty evidence can never satisfy the required binding, so
-            // the revision stays refused instead of becoming admitted.
-            normalization_receipt: Box::new(
-                eliot_kernel_core::user_automation::ScheduleNormalizationReceipt {
-                    receipt_id: String::new(),
-                    normalizer_authority: String::new(),
-                    source_digest: String::new(),
-                    zone_database_revision:
-                        eliot_kernel_core::user_automation::PINNED_ZONE_DATABASE_REVISION.to_owned(),
-                    occurrences_digest: String::new(),
-                },
-            ),
-        },
+        schedule,
         mode: UserAutomationExecutionMode::DeterministicProcess,
         task: AutomationTaskBinding {
             qualified_ref: "script:backup".to_owned(),
@@ -203,7 +238,9 @@ fn transition_with(
         ordering_scopes: vec![OrderingScopeId::new("user-automation").expect("ordering")],
         transition_class: TransitionClass::UserAutomation,
         requested_effect_ceiling: EffectClass::ReversibleMutation,
-        admission_contract_set_digest: "c".repeat(64),
+        // I05-06: bind the contracts THIS build supports (issue #1927).
+        admission_contract_set_digest: supported_admission_contract_set_digest()
+            .expect("supported admission contracts compute"),
         operation_manifest_digest: manifest_digest,
         // Issue-#18 digests are derived below via `bind_issue18_digests`,
         // never defaulted; no semantic source is bound here (`[]`).

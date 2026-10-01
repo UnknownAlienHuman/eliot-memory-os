@@ -102,7 +102,8 @@ fn transition(
         ordering_scopes: vec![OrderingScopeId::new("scope-1")?],
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
-        admission_contract_set_digest: "a".repeat(64),
+        // I05-06: bind the contracts THIS build supports (issue #1927).
+        admission_contract_set_digest: eliot_store_api::supported_admission_contract_set_digest()?,
         operation_manifest_digest: manifest()?.digest,
         // Issue-#18 digests are derived below via `bind_issue18_digests`,
         // never defaulted; no semantic source is bound here (`[]`).
@@ -115,7 +116,10 @@ fn transition(
         }],
         event_projection_relation_intents: EventProjectionRelationIntents {
             event_ids: vec![],
-            projection_kinds: vec![String::from("task_state")],
+            // I05-08: a publication names a DECLARED projection kind; an
+            // undeclared kind can neither be published nor read as current
+            // (issue #1931 / PR #3516). `task_state` is no longer declared.
+            projection_kinds: vec![String::from("CurrentEpistemicPosition")],
             relation_kinds: vec![String::from("causes")],
         },
         security: eliot_store_api::SecurityContext::default(),
