@@ -347,8 +347,7 @@ pub fn apply_integration_candidate(
         .map_err(|error| IntegrationBridgeError::Candidate(Box::new(error)))?;
     let lease = acquire_integration_lease(candidates, active_leases, &request.lease_request)
         .map_err(|error| IntegrationBridgeError::Lease(Box::new(error)))?;
-    if lease.candidate_id != candidate.candidate_id
-        || lease.target_scope != candidate.target_scope
+    if lease.candidate_id != candidate.candidate_id || lease.target_scope != candidate.target_scope
     {
         return Err(IntegrationBridgeError::LeaseMismatch {
             candidate_id: lease.candidate_id.clone(),
