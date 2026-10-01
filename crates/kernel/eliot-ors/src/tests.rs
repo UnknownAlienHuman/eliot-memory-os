@@ -3273,6 +3273,7 @@ fn replay_claim_fixture(
         binding_digest: "c".repeat(64),
         request_digest: "d".repeat(64),
         executable_binding_digest: String::new(),
+        executable_binding_record_json: None,
         execution_unit_schema_version: 1,
         predecessor_revision: OpaqueLabel::new("predecessor-replay-0")?,
         resource_envelope_digest: "e".repeat(64),

@@ -100,6 +100,7 @@ use eliot_contracts::{ReceiptId, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_ors::{
     ActiveAdmissionReservation,
     AdmissionReservationLaunchPrerequisite,
+    AdmissionReservationRecord,
     AdmissionReservationRowDisposition,
     AdmissionReservationState,
     CanonicalAdmissionCommit,
@@ -125,7 +126,10 @@ use eliot_ors::{
     stage_operation_identity,
 };
 use eliot_receipts::ReceiptIdentity;
-use eliot_store_api::WriteReceipt;
+use eliot_store_api::{
+    OutboxId, WriteReceipt,
+    work_admission::{WorkAdmissionRecord, WorkAdmissionSubmission, decode_work_admission_record},
+};
 use serde::Deserialize;
 
 use super::generation_recovery::OrsGenerationCoordinator;
@@ -182,6 +186,10 @@ struct AdmissionReservationAdmitOperation {
     proposed_attempt_id: String,
     /// The session fence the daemon presents for this operation.
     state_fence: StateFence,
+    /// Governor-prepared canonical work admission. The transition and CAS
+    /// heads are retained verbatim; Kernel never reconstructs them from a
+    /// receipt or from the claim presentation.
+    work_admission_submission: WorkAdmissionSubmission,
 }
 
 /// F-LOG-KERNEL-5 (#1678): admission-reservation saga boundary observations.
@@ -801,6 +809,8 @@ struct ProveAndReadBack {
     ors_state_fence: StateFenceSnapshot,
     /// The same operation identity in the store's typed form.
     store_operation_id: eliot_contracts::OperationId,
+    /// Exact launch outbox row committed by the original prepared transition.
+    expected_launch_outbox_id: OutboxId,
     /// The caller's live fence, used only for the store read.
     state_fence: StateFence,
     /// Admission time in unix milliseconds.
@@ -823,14 +833,16 @@ impl KernelComposition {
         &self,
         state_fence: &StateFence,
         operation_id: &eliot_contracts::OperationId,
-    ) -> Option<WriteReceipt> {
+    ) -> Result<Option<WriteReceipt>, String> {
         // `retained_store_gateway` is the SAME `KernelComposition` method every
         // other canonical read on this channel uses
         // (`daemon_request_dispatch::KernelComposition::retained_store_gateway`).
         // It is called as a method, not imported as a free function, so this
         // readback reaches the canonical owner through the one retained
         // generation-routed gateway rather than opening a second client.
-        let gateway = self.retained_store_gateway().ok()?;
+        let gateway = self
+            .retained_store_gateway()
+            .map_err(|_| "retained canonical-store gateway is unavailable".to_owned())?;
         // The gateway returns `Result<Option<WriteReceipt>>`: `Err` is a
         // transport failure and `Ok(None)` is "the owner holds no receipt for
         // this operation". Both are absent proof here, and the ORS reconcile
@@ -838,11 +850,7 @@ impl KernelComposition {
         // so an unreachable owner leaves the reservation inactive and launch
         // blocked. Neither case is a presumed commit and neither is a presumed
         // non-commit.
-        gateway
-            .receipt(state_fence, operation_id.clone())
-            .await
-            .ok()
-            .flatten()
+        gateway.receipt(state_fence, operation_id.clone()).await
     }
 
     /// Admits one staged reservation through the canonical owner and activates
@@ -928,6 +936,7 @@ impl KernelComposition {
     async fn prove_and_read_back(
         &self,
         facts: ProveAndReadBack,
+        submission: &WorkAdmissionSubmission,
     ) -> Result<ProvenCanonicalAdmission, TransportError> {
         let ProveAndReadBack {
             reservation_id,
@@ -938,9 +947,19 @@ impl KernelComposition {
             authority_epoch,
             ors_state_fence,
             store_operation_id,
+            expected_launch_outbox_id,
             state_fence,
             now_unix_ms,
         } = facts;
+        let second_readback = self
+            .canonical_admission_receipt_readback(&state_fence, &store_operation_id)
+            .await;
+        let second_receipt = second_readback
+            .map_err(|_| TransportError::IdentityConflict)?
+            .ok_or(TransportError::IdentityConflict)?;
+        submission
+            .validate_receipt(&second_receipt)
+            .map_err(|_| TransportError::IdentityConflict)?;
         let proven = prove_canonical_admission_for_reservation(
             self.generation_gateway.ors.as_ref(),
             &reservation_id,
@@ -948,23 +967,19 @@ impl KernelComposition {
             &proposed_attempt,
             &canonical_operation_id,
             &commit,
+            &expected_launch_outbox_id,
             &authority_epoch,
             &ors_state_fence,
             now_unix_ms,
         )
         .map_err(|_| TransportError::SessionFenced)?;
-        let second_readback = self
-            .canonical_admission_receipt_readback(&state_fence, &store_operation_id)
-            .await;
-        launch_outbox_readback(second_readback.as_ref(), &proven.canonical_admission).map_err(
-            |_| {
+        launch_outbox_readback(Some(&second_receipt), &proven.canonical_admission).map_err(|_| {
                 observe_admission_saga(
                     "kernel.admission_reservation.admit_rejected:readback_mismatch",
                     "rejected",
                 );
                 TransportError::IdentityConflict
-            },
-        )?;
+            })?;
         Ok(proven)
     }
 
@@ -983,21 +998,112 @@ impl KernelComposition {
             proposed_attempt,
         } = AdmitIdentities::derive(operation, &reservation_id)?;
 
-        // The owner readback for the ORIGINAL operation identity. An absent
-        // receipt is `Unknown`, never a presumed non-commit.
-        let readback = self
-            .canonical_admission_receipt_readback(state_fence, &store_operation_id)
-            .await;
-        let committed_receipt = readback.ok_or_else(|| {
-            // The owner classifies an absent receipt as `Unknown`; this is the
-            // same refusal, made before the reconcile call can be skipped. An
-            // absent receipt is never a fabricated commit.
-            observe_admission_saga(
-                "kernel.admission_reservation.admit_rejected:unknown",
-                "rejected",
-            );
-            TransportError::IdentityConflict
+        let submission = &operation.work_admission_submission;
+        submission
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if submission.expected.operation_id.as_str() != canonical_operation_id.as_str()
+            || submission.request.state_fence != operation.state_fence
+            || submission.request.state_fence != *state_fence
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+
+        // Re-read the exact staged row and compare the independent owner plan
+        // against it before any canonical write. This binds all five claims,
+        // reservation/work/attempt identities, the original fence and the
+        // singleton launch row to the row Kernel staged earlier.
+        let now_unix_ms =
+            i64::try_from(super::unix_ms()).map_err(|_| TransportError::SessionFenced)?;
+        let staged = reload_staged_admission_reservation(
+            self.generation_gateway.ors.as_ref(),
+            &reservation_id,
+            now_unix_ms,
+        )
+        .map_err(|error| match error {
+            OrsError::ReservationNotFound => TransportError::UnknownRequest,
+            _ => TransportError::SessionFenced,
         })?;
+        let admission_operation = submission
+            .prepared_transition
+            .named_operations
+            .first()
+            .ok_or(TransportError::IdentityConflict)?;
+        let admission_record = decode_work_admission_record(&admission_operation.parameters)
+            .map_err(|_| TransportError::IdentityConflict)?;
+        Self::validate_work_admission_submission(
+            submission,
+            &admission_record,
+            staged.record(),
+            &reservation_id,
+            &work_item,
+            &proposed_attempt,
+            &canonical_operation_id,
+        )?;
+
+        // Read the receipt for the ORIGINAL operation identity before a write.
+        // A failed read is unknown and never falls through to another send. A
+        // confirmed empty result permits the unchanged original transition to
+        // be applied exactly once under the same operation/idempotency identity.
+        let initial_readback = match self
+            .canonical_admission_receipt_readback(state_fence, &store_operation_id)
+            .await
+        {
+            Ok(readback) => readback,
+            Err(_) => {
+                observe_admission_saga(
+                    "kernel.admission_reservation.admit_rejected:unknown",
+                    "rejected",
+                );
+                return Ok(Self::unknown_admission_projection(
+                    &reservation_id,
+                    &canonical_operation_id,
+                ));
+            }
+        };
+        let committed_receipt = match initial_readback {
+            Some(receipt) => {
+                submission
+                    .validate_receipt(&receipt)
+                    .map_err(|_| TransportError::IdentityConflict)?;
+                receipt
+            }
+            None => {
+                let gateway = self.retained_store_gateway()?;
+                let _apply_response = gateway
+                    .apply(
+                        &submission.request,
+                        submission.prepared_transition.clone(),
+                        submission.expected_revision_heads.clone(),
+                        submission.expected_ordering_heads.clone(),
+                    )
+                    .await;
+                // The apply response is not activation evidence. Resolve the
+                // original operation through the retained receipt owner again
+                // and adopt only that exact readback.
+                match self
+                    .canonical_admission_receipt_readback(state_fence, &store_operation_id)
+                    .await
+                {
+                    Ok(Some(receipt)) => {
+                        submission
+                            .validate_receipt(&receipt)
+                            .map_err(|_| TransportError::IdentityConflict)?;
+                        receipt
+                    }
+                    Ok(None) | Err(_) => {
+                        observe_admission_saga(
+                            "kernel.admission_reservation.admit_rejected:unknown",
+                            "rejected",
+                        );
+                        return Ok(Self::unknown_admission_projection(
+                            &reservation_id,
+                            &canonical_operation_id,
+                        ));
+                    }
+                }
+            }
+        };
         let resolution = reconcile_canonical_admission(
             Some(&committed_receipt),
             canonical_operation_id.as_str(),
@@ -1032,6 +1138,15 @@ impl KernelComposition {
             OrsError::ReservationNotFound => TransportError::UnknownRequest,
             _ => TransportError::SessionFenced,
         })?;
+        Self::validate_work_admission_submission(
+            submission,
+            &admission_record,
+            staged.record(),
+            &reservation_id,
+            &work_item,
+            &proposed_attempt,
+            &canonical_operation_id,
+        )?;
         let authority_epoch = staged.record().authority_epoch.clone();
         let ors_state_fence = staged.record().state_fence.clone();
 
@@ -1049,18 +1164,22 @@ impl KernelComposition {
         // is read back before activation, and a receipt whose content disagrees
         // with what this reservation retained is a typed refusal, not a pass.
         let proven = self
-            .prove_and_read_back(ProveAndReadBack {
-                reservation_id: reservation_id.clone(),
-                work_item: work_item.clone(),
-                proposed_attempt: proposed_attempt.clone(),
-                canonical_operation_id: canonical_operation_id.clone(),
-                commit: commit.clone(),
-                authority_epoch: authority_epoch.clone(),
-                ors_state_fence: ors_state_fence.clone(),
-                store_operation_id: store_operation_id.clone(),
-                state_fence: state_fence.clone(),
-                now_unix_ms,
-            })
+            .prove_and_read_back(
+                ProveAndReadBack {
+                    reservation_id: reservation_id.clone(),
+                    work_item: work_item.clone(),
+                    proposed_attempt: proposed_attempt.clone(),
+                    canonical_operation_id: canonical_operation_id.clone(),
+                    commit: commit.clone(),
+                    authority_epoch: authority_epoch.clone(),
+                    ors_state_fence: ors_state_fence.clone(),
+                    store_operation_id: store_operation_id.clone(),
+                    expected_launch_outbox_id: submission.expected.launch_outbox_id.clone(),
+                    state_fence: state_fence.clone(),
+                    now_unix_ms,
+                },
+                submission,
+            )
             .await?;
 
         // Activate exactly once, under the reservation-bound activation
@@ -1109,6 +1228,55 @@ impl KernelComposition {
             "canonical_admission_receipt": canonical_admission_receipt,
             "launch_authorized": true,
         }))
+    }
+
+    fn validate_work_admission_submission(
+        submission: &WorkAdmissionSubmission,
+        admitted: &WorkAdmissionRecord,
+        staged: &AdmissionReservationRecord,
+        reservation_id: &OperationIdentity,
+        work_item_id: &OperationIdentity,
+        proposed_attempt_id: &OperationIdentity,
+        canonical_operation_id: &OperationIdentity,
+    ) -> Result<(), TransportError> {
+        submission
+            .validate()
+            .map_err(|_| TransportError::IdentityConflict)?;
+        let staged_fence = StateFenceSnapshot::capture(
+            &admitted.state_fence,
+            admitted.authority_epoch.sequence.get(),
+        )
+        .map_err(|_| TransportError::IdentityConflict)?;
+        let claims_match = [
+            (&admitted.claims.resources, &staged.claims.resources),
+            (&admitted.claims.lane, &staged.claims.lane),
+            (&admitted.claims.environment, &staged.claims.environment),
+            (&admitted.claims.effects, &staged.claims.effects),
+            (&admitted.claims.quota_view, &staged.claims.quota_view),
+        ]
+        .into_iter()
+        .all(|(owner, durable)| {
+            owner.reference == durable.reference.as_str() && owner.sha256 == durable.sha256
+        });
+        let epoch_matches = admitted.authority_epoch.lineage_id.as_str()
+            == staged.authority_epoch.current.lineage_id.as_str()
+            && admitted.authority_epoch.sequence.get() == staged.authority_epoch.current.epoch;
+        if admitted.reservation_id != *reservation_id
+            || admitted.work_item_id != *work_item_id
+            || admitted.proposed_attempt_id != *proposed_attempt_id
+            || admitted.stage_operation_id != staged.stage_operation_id
+            || admitted.canonical_operation_id.as_str() != canonical_operation_id.as_str()
+            || submission.expected.operation_id.as_str() != canonical_operation_id.as_str()
+            || admitted.launch_outbox_id != submission.expected.launch_outbox_id
+            || !claims_match
+            || !epoch_matches
+            || admitted.state_fence != submission.request.state_fence
+            || staged_fence != staged.state_fence
+            || admitted.expires_at_ms != staged.expires_at_ms
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        Ok(())
     }
 
     /// Classifies one resolved canonical admission outcome (A3, I14.21).
@@ -1233,6 +1401,18 @@ impl KernelComposition {
             "reservation_id": reservation_id.as_str(),
             "disposition": disposition,
             "error_code_present": error_code_present,
+            "launch_authorized": false,
+        })
+    }
+
+    fn unknown_admission_projection(
+        reservation_id: &OperationIdentity,
+        canonical_operation_id: &OperationIdentity,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "reservation_id": reservation_id.as_str(),
+            "canonical_operation_id": canonical_operation_id.as_str(),
+            "disposition": "UNKNOWN_COMMIT",
             "launch_authorized": false,
         })
     }

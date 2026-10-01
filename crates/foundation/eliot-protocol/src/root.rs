@@ -103,6 +103,13 @@ pub use task_controller::{
     TaskControllerInvocation, TaskControllerResultBody,
 };
 
+mod native_worker_material;
+pub use native_worker_material::{
+    MAX_NATIVE_WORKER_RETAINED_PROVIDER_MATERIAL_BYTES,
+    NativeWorkerRetainedProviderMaterialReadbackV1,
+    NativeWorkerRetainedProviderMaterialRefV1,
+};
+
 mod finish_attempt;
 pub use finish_attempt::{
     FINISH_ATTEMPT_WIRE_ID, FINISH_ATTEMPT_WIRE_VERSION, FINISH_INVOKE_PAYLOAD_SCHEMA_ID,

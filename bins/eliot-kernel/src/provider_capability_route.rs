@@ -50,7 +50,7 @@ use eliot_ipc::{Session, TransportError};
 use eliot_kernel_service::{
     KernelService, PROVIDER_CAPABILITY_WIRE_VERSION, ProviderCapabilityError,
     ProviderCapabilityExpectation, ProviderCapabilityRequest, ProviderProofKind,
-    verify_provider_capability,
+    NativeWorkerExecutableBindingPublication, verify_provider_capability,
 };
 use eliot_ors::{OperationIdentity, RedbRecoveryStore};
 use eliot_protocol::{Frame, FrameKind, MessageType, ProtocolPayload};
@@ -255,6 +255,46 @@ impl ProviderCapabilityContext {
                 bounded_identity(claim_id),
             ));
         }
+        let owner_record_json = row
+            .executable_binding_record_json
+            .as_deref()
+            .ok_or_else(|| {
+                ProviderCapabilityRouteError::Capability(ProviderCapabilityError::DigestMismatch)
+            })?;
+        let owner_binding: NativeWorkerExecutableBindingPublication =
+            serde_json::from_str(owner_record_json).map_err(|_| {
+                ProviderCapabilityRouteError::Store(
+                    "retained executable owner record is malformed".to_owned(),
+                )
+            })?;
+        owner_binding.validate_original_binding().map_err(|_| {
+            ProviderCapabilityRouteError::Store(
+                "retained executable owner record failed its original digest".to_owned(),
+            )
+        })?;
+        if owner_binding.claim_id != row.claim_id.as_str()
+            || owner_binding.registration_id != row.registration_id.as_str()
+            || owner_binding.task_id != row.task_id.as_str()
+            || owner_binding.work_scope_id != row.work_scope_id.as_str()
+            || owner_binding.operation_id != row.operation_id.as_str()
+            || owner_binding.worker_generation != row.worker_generation
+            || owner_binding.authority_epoch.sequence.get() != row.authority_epoch
+            || owner_binding.binding_digest != row.executable_binding_digest
+            || owner_binding.deadline_unix_ms != row.deadline_unix_ms
+            || sha256_json(&owner_binding.state_fence)
+                .map_err(|_| {
+                    ProviderCapabilityRouteError::Store(
+                        "retained executable owner fence is malformed".to_owned(),
+                    )
+                })?
+                != row.fence_digest
+            || unix_ms() >= owner_binding.deadline_unix_ms
+            || unix_ms() >= owner_binding.expires_at_unix_ms
+        {
+            return Err(ProviderCapabilityRouteError::BindingMismatch(
+                bounded_identity(claim_id),
+            ));
+        }
         // Fresh live epoch on every call: never the construction-time copy.
         let live_epoch = self
             .service
@@ -263,6 +303,11 @@ impl ProviderCapabilityContext {
                 ProviderCapabilityRouteError::Store("kernel owner state is unavailable".to_owned())
             })?
             .authority_epoch();
+        if !owner_binding.authority_epoch.is_same_authority(&live_epoch) {
+            return Err(ProviderCapabilityRouteError::Capability(
+                ProviderCapabilityError::StaleEpoch,
+            ));
+        }
         // Freshness gate: the durable row's admission epoch sequence must
         // equal the live authority sequence, so restore observes fresh owner
         // evidence and a stale admission fails closed as StaleEpoch (mapped
@@ -414,11 +459,14 @@ impl ProviderCapabilityContext {
         Ok(serde_json::json!({
             "kind": "native_worker_provider_capability_claim_row",
             "wire_version": PROVIDER_CAPABILITY_WIRE_VERSION,
+            "status": "Found",
+            "claim_record": &row,
             "claim_id": row.claim_id.as_str(),
             "attempt_id": row.attempt_id.as_str(),
             "operation_id": row.operation_id.as_str(),
             "binding_digest": row.binding_digest.as_str(),
             "executable_binding_digest": row.executable_binding_digest.as_str(),
+            "executable_binding_record_json": row.executable_binding_record_json.as_deref(),
             "worker_generation": row.worker_generation,
             "fence_digest": row.fence_digest.as_str(),
             "read_at_unix_ms": unix_ms(),
