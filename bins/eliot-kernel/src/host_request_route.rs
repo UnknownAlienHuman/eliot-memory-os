@@ -7027,7 +7027,28 @@ impl KernelComposition {
                         &event.event_id,
                     ));
                 }
-                OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge => {
+                OrsError::ProjectionLimitExceeded => {
+                    // The event row above is already durably staged (its
+                    // DURABLE phase was checked before this handoff
+                    // admission), so this shed reports that exact pending
+                    // phase instead of a blanket safe-to-resubmit answer:
+                    // the pending-handoff admission refused while the staged
+                    // event stays durable for duplicate/reconcile recovery.
+                    // This names the handoff operation's own budget — the
+                    // same pending-handoff dimension the ORS typed budget
+                    // reports for this call — with the observed durable
+                    // phase and the reconcile-pending-delivery recovery.
+                    return Ok(bridge_event_capacity_response(
+                        eliot_contracts::BridgeEventCapacityPressure::pending_handoffs(
+                            eliot_contracts::BridgeEventLocalPhase::Durable,
+                        ),
+                        "stream_id",
+                        &event.stream_id,
+                        "event_id",
+                        &event.event_id,
+                    ));
+                }
+                OrsError::PayloadTooLarge => {
                     return Err(TransportError::Backpressure);
                 }
                 _ => return Err(TransportError::SessionFenced),
