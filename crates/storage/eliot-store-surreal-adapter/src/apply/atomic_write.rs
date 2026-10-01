@@ -515,6 +515,16 @@ pub(super) async fn write_canonical_transaction_with_expected_heads(
         experience,
         learning,
     )?;
+    if let Some(task) = eliot_store_api::finish_task_binding_from_prepared(transition)? {
+        let assertion = super::read_boundary::finish_task_owner_assertion(
+            db,
+            config,
+            &transition.scope_id,
+            &task,
+        )
+        .await?;
+        bindings.insert("finish_task_owner_assertion".to_owned(), assertion);
+    }
     let (head_checks, head_bindings) = expected_head_predicates(
         expected_revision_heads,
         expected_ordering_heads,
@@ -1171,8 +1181,15 @@ fn append_finish_evidence_owner_statement(
     if snapshot_json.len() > eliot_store_api::MAX_RECOVERY_RECORD_BYTES {
         return Err(AdapterError::Store(StoreError::PayloadTooLarge));
     }
-    let (task_id, task_revision) = finish_evidence_task_binding(snapshot_json)?;
-    append_finish_task_owner_guard(sql, bindings, transition, &task_id, task_revision)?;
+    let task_binding = eliot_store_api::finish_task_binding_from_prepared(transition)?
+        .ok_or(StoreError::InvalidReceipt)?;
+    append_finish_task_owner_guard(
+        sql,
+        bindings,
+        transition,
+        task_binding.task_id.as_str(),
+        task_binding.task_revision.value(),
+    )?;
 
     let canonical_key = eliot_store_api::RecoveryRecordKey::new("owner", "canonical")
         .map_err(AdapterError::Store)?;
@@ -1267,8 +1284,15 @@ fn append_finish_owner_statement(
     if receipt_json.len() > eliot_store_api::MAX_RECOVERY_RECORD_BYTES {
         return Err(AdapterError::Store(StoreError::PayloadTooLarge));
     }
-    let (task_id, task_revision) = finish_decision_task_binding(receipt_json, attempt_id)?;
-    append_finish_task_owner_guard(sql, bindings, transition, &task_id, task_revision)?;
+    let task_binding = eliot_store_api::finish_task_binding_from_prepared(transition)?
+        .ok_or(StoreError::InvalidReceipt)?;
+    append_finish_task_owner_guard(
+        sql,
+        bindings,
+        transition,
+        task_binding.task_id.as_str(),
+        task_binding.task_revision.value(),
+    )?;
 
     let finish_key =
         eliot_store_api::RecoveryRecordKey::new("owner", "finish").map_err(AdapterError::Store)?;
@@ -1318,93 +1342,6 @@ fn append_finish_owner_statement(
     // while preserving Governor ownership of its interpretation.
     bindings.insert("finish_attempt_id".to_owned(), json!(attempt_id));
     Ok(())
-}
-
-/// Extracts the task binding from the existing canonical Finish evidence
-/// owner image. These fields are owner-derived by Governor and already form
-/// part of the persisted snapshot; the adapter does not accept a new revision
-/// selector from transport.
-fn finish_evidence_task_binding(snapshot_json: &str) -> Result<(String, u64), AdapterError> {
-    let snapshot: Value = serde_json::from_str(snapshot_json).map_err(|_| {
-        AdapterError::Store(StoreError::InvalidField {
-            field: "canonical.finish_evidence_snapshot_json",
-            reason: "must contain the canonical Finish evidence owner image",
-        })
-    })?;
-    let evidence = snapshot
-        .get("finish_evidence")
-        .and_then(Value::as_object)
-        .and_then(|owner| owner.get("evidence"))
-        .ok_or(AdapterError::Store(StoreError::InvalidField {
-            field: "canonical.finish_evidence_snapshot_json",
-            reason: "missing owner-derived Finish evidence task binding",
-        }))?;
-    let task_id = evidence
-        .get("task_id")
-        .and_then(Value::as_str)
-        .filter(|task_id| !task_id.trim().is_empty())
-        .ok_or(AdapterError::Store(StoreError::InvalidField {
-            field: "canonical.finish_evidence_snapshot_json",
-            reason: "missing owner-derived Finish task id",
-        }))?;
-    let task_revision = evidence
-        .get("current_task_revision")
-        .and_then(Value::as_u64)
-        .filter(|revision| *revision > 0)
-        .ok_or(AdapterError::Store(StoreError::InvalidField {
-            field: "canonical.finish_evidence_snapshot_json",
-            reason: "missing owner-derived Finish task revision",
-        }))?;
-    Ok((task_id.to_owned(), task_revision))
-}
-
-/// Selects the admitted operation's exact receipt from the historical receipt
-/// collection by its attempt identity. Older receipts remain part of the owner
-/// image, but they do not describe the task state this operation asserts as
-/// current.
-fn finish_decision_task_binding(
-    receipt_json: &str,
-    attempt_id: &str,
-) -> Result<(String, u64), AdapterError> {
-    let receipts: Vec<Value> = serde_json::from_str(receipt_json).map_err(|_| {
-        AdapterError::Store(StoreError::InvalidField {
-            field: "finish.receipt_json",
-            reason: "must contain canonical Finish decision receipts",
-        })
-    })?;
-    let mut admitted_receipts = receipts
-        .iter()
-        .filter(|receipt| receipt.get("attempt_id").and_then(Value::as_str) == Some(attempt_id));
-    let receipt =
-        admitted_receipts
-            .next()
-            .ok_or(AdapterError::Store(StoreError::InvalidField {
-                field: "finish.receipt_json",
-                reason: "missing Finish decision receipt for the admitted attempt",
-            }))?;
-    if admitted_receipts.next().is_some() {
-        return Err(AdapterError::Store(StoreError::InvalidField {
-            field: "finish.receipt_json",
-            reason: "multiple Finish decision receipts match the admitted attempt",
-        }));
-    }
-    let task_id = receipt
-        .get("task_id")
-        .and_then(Value::as_str)
-        .filter(|task_id| !task_id.trim().is_empty())
-        .ok_or(AdapterError::Store(StoreError::InvalidField {
-            field: "finish.receipt_json",
-            reason: "missing Finish decision task id",
-        }))?;
-    let task_revision = receipt
-        .get("task_revision")
-        .and_then(Value::as_u64)
-        .filter(|revision| *revision > 0)
-        .ok_or(AdapterError::Store(StoreError::InvalidField {
-            field: "finish.receipt_json",
-            reason: "missing Finish decision task revision",
-        }))?;
-    Ok((task_id.to_owned(), task_revision))
 }
 
 /// Appends an atomic assertion against the same typed `TaskControl` projection

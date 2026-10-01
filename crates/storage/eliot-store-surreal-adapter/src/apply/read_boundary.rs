@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::SurrealStoreAdapter;
@@ -1266,7 +1266,7 @@ fn evidence_pack_payload(
 /// authority-carrying captures are served. Strict: a malformed
 /// authority-carrying record fails closed at deserialization/validation,
 /// never as a silent empty.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct AuthorityRecordRow {
     operation_index: usize,
     version: u16,
@@ -1332,6 +1332,73 @@ async fn read_authority_records(
     Ok(rows)
 }
 
+/// Reuses the named-read authority validators to freeze the exact current
+/// `TaskControl` row. The atomic writer compares this same original row inside
+/// its transaction, so neither a task advance nor changed receipt/authority
+/// bytes between this read and the write can authorize Finish.
+pub(super) async fn finish_task_owner_assertion(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    scope_id: &ScopeId,
+    task: &eliot_store_api::TaskBinding,
+) -> Result<Value, AdapterError> {
+    let rows = read_authority_records(db, config).await?;
+    let indexed = indexed_authorities(&rows)?;
+    let current = indexed
+        .iter()
+        .rev()
+        .find(|record| {
+            record.scope_id == scope_id.as_str()
+                && record.operation == eliot_store_api::NamedMutationOperation::UpdateTaskState
+                && record.parameters.get("task_id").and_then(Value::as_str)
+                    == Some(task.task_id.as_str())
+        })
+        .ok_or(StoreError::InvalidReceipt)?;
+    let expected_revision = task
+        .task_revision
+        .value()
+        .checked_sub(1)
+        .ok_or(StoreError::InvalidReceipt)?
+        .to_string();
+    if current
+        .parameters
+        .get("expected_revision")
+        .and_then(Value::as_str)
+        != Some(expected_revision.as_str())
+    {
+        return Err(AdapterError::ProviderConflict);
+    }
+    let mut ordered: Vec<_> = rows.iter().collect();
+    ordered.sort_by_key(|row| row.commit_sequence.unwrap_or(0));
+    for row in ordered.into_iter().rev() {
+        let Some(receipt) = row.receipt.as_ref() else {
+            continue;
+        };
+        if receipt.transition_class != eliot_store_api::TransitionClass::TaskControl
+            || receipt
+                .require_reconciliation_envelope()?
+                .core
+                .work_scope
+                .scope_id
+                .as_str()
+                != scope_id.as_str()
+        {
+            continue;
+        }
+        for record in row.payload_authority.as_deref().unwrap_or_default() {
+            if validate_authority_record(row, record)? == current.parameters {
+                return Ok(json!({
+                    "commit_sequence": row.commit_sequence.ok_or(StoreError::InvalidReceipt)?,
+                    "named_operation_count": row.named_operation_count.ok_or(StoreError::InvalidReceipt)?,
+                    "payload_authority": row.payload_authority,
+                    "body": receipt,
+                }));
+            }
+        }
+    }
+    Err(StoreError::InvalidReceipt.into())
+}
+
 /// Validates one persisted payload-authority record against its own provenance.
 ///
 /// The writer bound the exact bytes to version/encoding/digest/length; any
@@ -1365,7 +1432,20 @@ fn validate_authority_record(
             "authority record digest mismatch".to_owned(),
         ));
     }
-    let parameters = bound.decode_object_parameters()?;
+    let Value::Object(parameters) = bound.projection_value()? else {
+        return Err(StoreError::InvalidReceipt);
+    };
+    let parameters: BTreeMap<String, Value> = parameters.into_iter().collect();
+    let receipt = row.receipt.as_ref().ok_or(StoreError::InvalidReceipt)?;
+    let operation = infer_authority_operation(receipt.transition_class, &parameters)?;
+    // Named TaskControl parameters legitimately include the declared scalar
+    // task_id. Reuse the closed operation declaration, rather than treating
+    // admitted owner parameters as an arbitrary control-free payload.
+    eliot_store_api::NamedMutationRequest {
+        operation,
+        parameters: parameters.clone(),
+    }
+    .validate()?;
     let _ = record_operation_count(row, record)?;
     Ok(parameters)
 }
@@ -1407,6 +1487,19 @@ fn infer_authority_operation(
             if parameters.contains_key("task_id") && parameters.contains_key("event_id") =>
         {
             Ok(NamedMutationOperation::UpdateTaskState)
+        }
+        TransitionClass::RecoverySchema
+            if parameters.contains_key("attempt_id")
+                && parameters.contains_key("expected_finish_revision")
+                && parameters.contains_key("receipt_json") =>
+        {
+            Ok(NamedMutationOperation::RecordFinishDecision)
+        }
+        TransitionClass::RecoverySchema
+            if parameters.contains_key("expected_canonical_revision")
+                && parameters.contains_key("snapshot_json") =>
+        {
+            Ok(NamedMutationOperation::RecordFinishEvidence)
         }
         TransitionClass::LifecyclePolicy if parameters.contains_key("skill_id") => {
             Ok(NamedMutationOperation::ApplyLifecyclePolicy)

@@ -26,10 +26,10 @@ pub use eliot_learning_contracts::{
 use eliot_reactive_context_plan::RetrievalPlan;
 use eliot_receipts::{
     ArtifactBinding, AuthorityBinding, CausalBinding, OperationBinding, ProofCeiling, ReceiptCore,
-    ReceiptDisposition, ReceiptKind, RequestBinding, SessionBinding, TaskBinding, WorkScopeBinding,
+    ReceiptDisposition, ReceiptKind, RequestBinding, SessionBinding, WorkScopeBinding,
     contract_identity as receipt_contract_identity,
 };
-pub use eliot_receipts::{EffectClass, ReceiptEnvelope};
+pub use eliot_receipts::{EffectClass, ReceiptEnvelope, TaskBinding};
 pub use eliot_security_contracts::{
     DisclosureDependencyClosure, InfluenceDependencyClosure, InfluenceState, PurgeLedgerEntry,
     RevocationReason, SelectionChainHead, SelectionChainSeal, SelectionIntegrityReceipt,
@@ -6001,6 +6001,147 @@ fn validate_receipt_inputs(
     }
 }
 
+/// Reads the semantic task binding frozen by the admitted Finish owner.
+///
+/// The transport fence can have no task revision. The original task owner
+/// supplies this separate revision in the declared mutation parameters, whose
+/// exact bytes are covered by the admitted plan. Stored owner images and the
+/// selected decision must agree with it; the Store never selects a task or
+/// infers a revision from its independently advancing owner/commit counters.
+pub fn finish_task_binding_from_prepared(
+    transition: &PreparedTransition,
+) -> Result<Option<TaskBinding>, StoreError> {
+    let mut selected = None;
+    for command in &transition.named_operations {
+        if !matches!(
+            command.operation,
+            NamedMutationOperation::RecordFinishEvidence
+                | NamedMutationOperation::RecordFinishDecision
+        ) {
+            continue;
+        }
+        let (task_id, revision) = finish_payload_task_binding(
+            command,
+            transition
+                .state_fence
+                .task_revision
+                .map(eliot_contracts::TaskRevision::value),
+        )?;
+        let task_revision =
+            eliot_contracts::TaskRevision::new(revision).map_err(StoreError::Foundation)?;
+        if transition.task_id.as_deref() != Some(task_id.as_str())
+            || transition
+                .state_fence
+                .task_revision
+                .is_some_and(|bound| bound != task_revision)
+        {
+            return Err(StoreError::InvalidReceipt);
+        }
+        let binding = TaskBinding {
+            task_id: eliot_contracts::TaskId::new(task_id).map_err(StoreError::Foundation)?,
+            task_revision,
+            state_fence: transition.state_fence.clone(),
+        };
+        if selected
+            .as_ref()
+            .is_some_and(|retained| retained != &binding)
+        {
+            return Err(StoreError::InvalidReceipt);
+        }
+        selected = Some(binding);
+    }
+    Ok(selected)
+}
+
+fn finish_payload_task_binding(
+    command: &NamedMutationRequest,
+    original_fence_revision: Option<u64>,
+) -> Result<(String, u64), StoreError> {
+    let revision = match command.parameters.get("task_revision") {
+        Some(value) => value.as_str().and_then(|value| value.parse::<u64>().ok()),
+        // Older admitted commands carried the actual task revision in their
+        // full fence. Preserve that original binding; an unscoped fence may
+        // never manufacture the missing semantic revision.
+        None => original_fence_revision,
+    }
+    .filter(|value| *value > 0)
+    .ok_or(StoreError::InvalidReceipt)?;
+    let (task_id, recorded_revision) = match command.operation {
+        NamedMutationOperation::RecordFinishEvidence => {
+            let snapshot = finish_json_parameter(command, "snapshot_json")?;
+            if let Some(owner) = snapshot
+                .get("finish_evidence")
+                .filter(|value| !value.is_null())
+            {
+                let evidence = owner.get("evidence").ok_or(StoreError::InvalidReceipt)?;
+                finish_json_task_fields(evidence, "current_task_revision")?
+            } else {
+                let plan = snapshot
+                    .get("current_plan")
+                    .ok_or(StoreError::InvalidReceipt)?;
+                let task_id = plan
+                    .get("task_id")
+                    .and_then(Value::as_str)
+                    .ok_or(StoreError::InvalidReceipt)?;
+                (task_id.to_owned(), revision)
+            }
+        }
+        NamedMutationOperation::RecordFinishDecision => {
+            let receipts = finish_json_parameter(command, "receipt_json")?;
+            let attempt_id = command
+                .parameters
+                .get("attempt_id")
+                .and_then(Value::as_str)
+                .ok_or(StoreError::InvalidReceipt)?;
+            let mut matching = receipts
+                .as_array()
+                .ok_or(StoreError::InvalidReceipt)?
+                .iter()
+                .filter(|receipt| {
+                    receipt.get("attempt_id").and_then(Value::as_str) == Some(attempt_id)
+                });
+            let receipt = matching.next().ok_or(StoreError::InvalidReceipt)?;
+            if matching.next().is_some() {
+                return Err(StoreError::InvalidReceipt);
+            }
+            finish_json_task_fields(receipt, "task_revision")?
+        }
+        _ => return Err(StoreError::InvalidReceipt),
+    };
+    if recorded_revision != revision {
+        return Err(StoreError::InvalidReceipt);
+    }
+    Ok((task_id, revision))
+}
+
+fn finish_json_parameter(
+    command: &NamedMutationRequest,
+    parameter: &str,
+) -> Result<Value, StoreError> {
+    let bytes = command
+        .parameters
+        .get(parameter)
+        .and_then(Value::as_str)
+        .ok_or(StoreError::InvalidReceipt)?;
+    serde_json::from_str(bytes).map_err(|_| StoreError::InvalidReceipt)
+}
+
+fn finish_json_task_fields(
+    value: &Value,
+    revision_field: &str,
+) -> Result<(String, u64), StoreError> {
+    let task_id = value
+        .get("task_id")
+        .and_then(Value::as_str)
+        .ok_or(StoreError::InvalidReceipt)?;
+    let revision = value
+        .get(revision_field)
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or(StoreError::InvalidReceipt)?;
+    Ok((task_id.to_owned(), revision))
+}
+
 fn receipt_task(
     context: &RequestMeta,
     transition: &PreparedTransition,
@@ -6029,7 +6170,9 @@ fn receipt_task(
                 }
                 Some(revision)
             }
-            None => state_fence.task_revision,
+            None => finish_task_binding_from_prepared(transition)?
+                .map(|binding| binding.task_revision)
+                .or(state_fence.task_revision),
         };
     match (&context.task_id, task_revision) {
         (Some(task_id), Some(task_revision)) => Ok(Some(TaskBinding {
