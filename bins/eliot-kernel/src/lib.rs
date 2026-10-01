@@ -4097,6 +4097,34 @@ pub struct AgentBridgeHandshake {
 pub enum KernelFrameAction {
     /// Return a bounded liveness or status reply.
     Reply(Frame),
+    /// Observe an admitted tool version on a protected ProfileResolver session.
+    ProfileResolverToolProbe {
+        /// Original transport correlation identity.
+        request_id: RequestId,
+        /// Closed tool projection; Kernel derives the process authority.
+        request: eliot_blob_api::verification_wire::VerificationStageToolProbeRequest,
+    },
+    /// Launch one declared verification stage through its retained Kernel owner.
+    ProfileResolverLaunch {
+        /// Original transport correlation identity.
+        request_id: RequestId,
+        /// Stage declaration bound to the original admitted tool observation.
+        request: eliot_blob_api::verification_wire::VerificationStageLaunchRequest,
+    },
+    /// Inspect, cancel, or reconcile the original admitted verification process.
+    ProfileResolverLifecycle {
+        /// Original transport correlation identity.
+        request_id: RequestId,
+        /// Exact execution reservation and process binding.
+        request: eliot_blob_api::verification_wire::VerificationStageLifecycleRequest,
+    },
+    /// Read immutable source bytes owned by the original verification stage.
+    ProfileResolverReadback {
+        /// Original transport correlation identity.
+        request_id: RequestId,
+        /// Exact retained grant, stream identity, and readback position.
+        request: eliot_blob_api::verification_wire::VerificationStageReadbackRequest,
+    },
     /// Execute one narrow authenticated TestD Blob process-stream exchange.
     /// This action has no caller-supplied RequestIdentity; the Kernel resolves
     /// its retained grant and mints the Store-facing identity internally.

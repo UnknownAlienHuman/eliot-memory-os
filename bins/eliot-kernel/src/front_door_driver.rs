@@ -346,6 +346,82 @@ async fn serve_connection(
                     return Err(error);
                 }
             }
+            KernelFrameAction::ProfileResolverToolProbe {
+                request_id,
+                request,
+            } => {
+                let reply = match kernel
+                    .verification_stage_tool_probe(&session, request_id, request)
+                    .await
+                {
+                    Ok(reply) => reply,
+                    Err(error) => {
+                        session.fence();
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
+                    session.fence();
+                    return Err(error);
+                }
+            }
+            KernelFrameAction::ProfileResolverLaunch {
+                request_id,
+                request,
+            } => {
+                let reply = match kernel
+                    .verification_stage_launch(&session, request_id, request)
+                    .await
+                {
+                    Ok(reply) => reply,
+                    Err(error) => {
+                        session.fence();
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
+                    session.fence();
+                    return Err(error);
+                }
+            }
+            KernelFrameAction::ProfileResolverLifecycle {
+                request_id,
+                request,
+            } => {
+                let reply = match kernel
+                    .verification_stage_lifecycle(&session, request_id, request)
+                    .await
+                {
+                    Ok(reply) => reply,
+                    Err(error) => {
+                        session.fence();
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
+                    session.fence();
+                    return Err(error);
+                }
+            }
+            KernelFrameAction::ProfileResolverReadback {
+                request_id,
+                request,
+            } => {
+                let reply = match kernel
+                    .verification_stage_readback(&session, request_id, request)
+                    .await
+                {
+                    Ok(reply) => reply,
+                    Err(error) => {
+                        session.fence();
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
+                    session.fence();
+                    return Err(error);
+                }
+            }
             KernelFrameAction::BlobProcessStream {
                 request_id,
                 request,
@@ -641,6 +717,10 @@ async fn serve_user_broker_connection(
                 break send_checked(&mut front_door, &rejection, limits).await;
             }
             KernelFrameAction::Process { .. }
+            | KernelFrameAction::ProfileResolverToolProbe { .. }
+            | KernelFrameAction::ProfileResolverLaunch { .. }
+            | KernelFrameAction::ProfileResolverLifecycle { .. }
+            | KernelFrameAction::ProfileResolverReadback { .. }
             | KernelFrameAction::BlobProcessStream { .. }
             | KernelFrameAction::BlobProcessStreamReconcile { .. }
             | KernelFrameAction::Daemon { .. }
@@ -890,6 +970,10 @@ async fn serve_admitted_bridge_host_requests(
                 return Ok(());
             }
             KernelFrameAction::Process { .. }
+            | KernelFrameAction::ProfileResolverToolProbe { .. }
+            | KernelFrameAction::ProfileResolverLaunch { .. }
+            | KernelFrameAction::ProfileResolverLifecycle { .. }
+            | KernelFrameAction::ProfileResolverReadback { .. }
             | KernelFrameAction::BlobProcessStream { .. }
             | KernelFrameAction::BlobProcessStreamReconcile { .. }
             | KernelFrameAction::Daemon { .. }
