@@ -221,7 +221,7 @@
 //! one-directional floor bounds. A policy cannot reach a delivered View by
 //! declaring a setting unless something outside the policy agrees with it.
 //!
-//! Two residuals stay named rather than papered over.
+//! Three residuals stay named rather than papered over.
 //!
 //! 1. The two whole-unit amounts are read only as a FLOOR. Raising
 //!    `minimum_required_whole_units` or `planning_maximum_whole_units` above what
@@ -237,10 +237,23 @@
 //!    disagree, so the coupling cannot be silently wrong, but promoting both
 //!    facts into [`RecipeExecutionSupport`] is the change that would let the
 //!    execution owner state them, and it is owed there.
+//! 3. [`EXECUTED_ORDERING_REVISION`] is a SCHEME LABEL that a re-sequencing of
+//!    the executed order must bump BY HAND. It is not a function of the order, so
+//!    re-sequencing `eliot_context_assembly::EXECUTED_CONTEXT_ROLE_ORDER` while
+//!    leaving both revision literals alone passes every check here and delivers two
+//!    Views under one revision string in different orders. Deriving it instead was
+//!    measured and rejected — the value names the provider/atom tiebreak as well as
+//!    the role order, and deriving from the order's bytes would certify strictly
+//!    less under the same name — so this is a REVIEW obligation, stated in full at
+//!    the constant. It does not weaken the order check itself, which is made
+//!    against the execution owner's own list.
 //!
-//! Also owed outside this file, and refusing rather than passing until it lands:
-//! publishing [`RecipeExecutionSupport::role_order`] from the order the execution
-//! path actually renders under.
+//! [`RecipeExecutionSupport::role_order`] is published by the execution owner at
+//! `eliot-context/src/campaign_publication.rs`, from that owner's own
+//! `EXECUTED_CONTEXT_ROLE_ORDER`, so the layout comparison in
+//! [`ContextRecipePolicy::require_executable`] is made against the order the
+//! renderer actually sorts by rather than against an implicit `Ord`. That is
+//! landed, not owed.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -447,6 +460,83 @@ pub const EXECUTED_REPETITION_POLICY: RecipeRepetitionPolicy =
 /// promotion, applies to [`EXECUTED_SECTION_UNIT_BOUNDARY`]: both facts are
 /// stated here because this file is the only one in scope, and both belong in
 /// [`RecipeExecutionSupport`] once the execution owner can restate them.
+///
+/// # THIS REVISION IS A HAND-BUMPED LABEL, NOT A DERIVATION OF THE ORDER.
+///
+/// **Re-sequencing [`EXECUTED_CONTEXT_ROLE_ORDER`] without also bumping this
+/// constant is a defect in the change that does it, and must be refused in
+/// review.** Every other self-consistent-but-wrong input is caught by machinery;
+/// this one is not, and it is the reviewer's job to catch it.
+///
+/// The input that is NOT caught: re-sequence the order and leave both revision
+/// literals alone. The revision check still passes (both literals still agree),
+/// [`RecipeExecutionSupport::role_order`] moves with the order it is read from, so
+/// a policy must follow the new order, and two Views then carry
+/// `a18.role-provider-atom.v1` while their rendered atoms are in DIFFERENT orders.
+/// Nothing in this crate can notice: this constant and
+/// `ASSEMBLY_ORDERING_REVISION` are two literals that agree, and neither is a
+/// function of the order.
+///
+/// What a change that re-sequences the order MUST do, all three parts:
+///
+/// 1. bump [`EXECUTED_ORDERING_REVISION`] here;
+/// 2. bump `ASSEMBLY_ORDERING_REVISION` in `eliot-context-assembly` to the SAME
+///    string, because a disagreement between the two refuses every publication
+///    with `recipe_support.ordering_revision` rather than degrading quietly;
+/// 3. say in its own message that the role order changed and the revision was
+///    bumped for that reason, so the two literals are not later "cleaned up" back
+///    into agreement.
+///
+/// ## Why this is a hand-bumped label and NOT derived from the order
+///
+/// Deriving it was measured and rejected; this paragraph is the record, so the
+/// question is not reopened as if it had never been asked.
+///
+/// The value is a SCHEME NAME, and it names more than the order.
+/// `ASSEMBLY_ORDERING_REVISION`'s own documentation states that it names "the
+/// order in `render::EXECUTED_CONTEXT_ROLE_ORDER` … followed by the provider and
+/// atom identity tiebreak", and `render` really does apply that tiebreak
+/// (`provider`, then `atom_id`) within each role. A value derived from the role
+/// order's own bytes would certify the role sequence and NOTHING ELSE, so it
+/// would silently drop both tiebreaks from the identity — a weaker claim wearing
+/// the name of the stronger one, which is the direction #1724 exists to close.
+/// There is no second owner record of the tiebreak to derive those from either:
+/// the tiebreak is a property of `SemanticRole`'s own identity types.
+///
+/// The existing content-address machinery does not fit the domain. This constant
+/// is scheme-name text validated by `validate_text` (non-blank, no control
+/// characters) and carried as an `ArtifactId`, while
+/// [`ContextRecipePolicy::canonical_policy_digest`] and
+/// [`ResolvedContextRecipe::canonical_resolution_digest`] are two SEPARATE
+/// domain-separated digests over two different records, whose only shared
+/// primitive is `canonical_json_bytes` + `sha256_hex`. None of them is a general
+/// "address these bytes" function this value could join as a peer, and minting a
+/// fourth domain for the ordering revision would be a new scheme rather than a
+/// reuse of one.
+///
+/// It is wire-visible, which is the reason the change would not be small.
+/// [`RecipeExecutionSupport::ordering_revision`] is published on the
+/// `#[serde(deny_unknown_fields)]` support record, and the same string is stamped
+/// onto every delivered View as
+/// [`ContextExecutionIdentity::ordering_revision`]
+/// (`eliot-context-contracts/src/measurement.rs`), where it is a plain `String`
+/// on the delivered payload. Replacing a scheme name with a hex content address
+/// changes what an already-serialized field MEANS while leaving its shape
+/// identical — exactly the class of change that reads as compatible and is not.
+/// It would need a wire decision about the field's meaning, not only a digest
+/// domain bump, and that decision is root's to take.
+///
+/// ## What IS derived, and what this label adds to it
+///
+/// Nothing here weakens the order check. The order itself is not certified by
+/// this label at all: [`ContextRecipePolicy::require_executable`] compares
+/// [`RecipeExecutionSupport::role_order`] — the execution owner's own list, read
+/// from the crate that sorts by it — against the policy's declared
+/// `layout.role_positions`, and refuses on disagreement. That comparison is
+/// unaffected by whether this string is a label or a digest, and it is the
+/// load-bearing half. This label's own job is narrower: it names the SCHEME, so
+/// that a payload rendered under a different scheme is refused by name instead of
+/// being compared elementwise against a scheme it was never claimed to follow.
 pub const EXECUTED_ORDERING_REVISION: &str = "a18.role-provider-atom.v1";
 
 /// I12.13 `applicable_task_route_impact_and_governance_profiles`.
@@ -1850,7 +1940,14 @@ impl ContextRecipePolicy {
     ///   [`EXECUTED_ORDERING_REVISION`], the scheme this contract authorises.
     ///   The revision was previously populated and validated as text and read by
     ///   nothing, so the execution identity stamped on a delivered View named a
-    ///   scheme this contract never checked.
+    ///   scheme this contract never checked. Note what this comparison does NOT
+    ///   establish: the revision is a hand-bumped scheme LABEL, not a derivation
+    ///   of the order, so it cannot tell that the order was re-sequenced while
+    ///   both literals stood still. The order is certified by the
+    ///   `role_positions` comparison above, against the execution owner's own
+    ///   list; this one only refuses an unrecognised scheme. Re-sequencing the
+    ///   executed order therefore owes a hand bump of both literals, and that
+    ///   obligation is stated in full at [`EXECUTED_ORDERING_REVISION`].
     ///
     /// Both refusals name the field whose value is unsupported, so the two
     /// different halves of the ordering pair stay distinguishable in the refusal
@@ -2052,6 +2149,12 @@ pub struct RecipeExecutionSupport {
     /// was validated as non-empty text and compared with nothing, so the revision
     /// stamped on a delivered execution identity was never checked against the
     /// scheme this contract authorises.
+    ///
+    /// This is a scheme LABEL, not a content address of the role order. Publishing
+    /// the order does not derive this member, so a re-sequencing of the executed
+    /// order that leaves the literals alone is not detected by anything; it is a
+    /// review obligation recorded at [`EXECUTED_ORDERING_REVISION`], which also
+    /// records why deriving it instead was rejected.
     pub ordering_revision: ArtifactId,
     /// The role order this path actually renders under, in position order.
     ///

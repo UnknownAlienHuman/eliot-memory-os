@@ -22,6 +22,35 @@ use crate::{AssemblyError, boundary, bounds, measurement, render};
 /// policy's declared layout is compared against it by
 /// `ContextRecipePolicy::require_executable`, so a policy declaring a
 /// different order refuses instead of being certified and ignored.
+///
+/// # RE-SEQUENCING THE ORDER REQUIRES BUMPING THIS CONSTANT BY HAND.
+///
+/// This is a scheme label, not a function of `EXECUTED_CONTEXT_ROLE_ORDER`.
+/// Re-sequencing that order while leaving this literal alone passes every check
+/// in both crates and delivers two Views carrying this same revision string with
+/// their rendered atoms in different orders. There is no mechanism that can
+/// notice, so the bump is a REVIEW obligation on the change that re-sequences
+/// the order:
+///
+/// 1. change this constant, and
+/// 2. change `EXECUTED_ORDERING_REVISION` in `eliot-context-contracts` to the
+///    SAME string — the two are compared at
+///    `ContextRecipePolicy::require_executable`, so a one-sided change refuses
+///    every publication with `recipe_support.ordering_revision` rather than
+///    degrading quietly, which is the intended behaviour, and
+/// 3. state in the change message that the role order changed, so the literals are
+///    not later reconciled back into agreement by someone reading the mismatch as
+///    an accident.
+///
+/// Deriving this string from the order's bytes instead was measured and rejected:
+/// it names the provider/atom tiebreak as well as the role order, so a digest of
+/// the order alone would certify strictly less under the same name. The full
+/// reasoning, and why no derivation was adopted, is recorded at
+/// `EXECUTED_ORDERING_REVISION` in `eliot-context-contracts/src/recipe.rs`.
+///
+/// The order itself is not left uncertified by any of this: the approved policy's
+/// `layout.role_positions` is compared against the order this crate renders under,
+/// and that comparison is what refuses a policy declaring a different order.
 pub const ASSEMBLY_ORDERING_REVISION: &str = "a18.role-provider-atom.v1";
 
 /// Caller-owned immutable parameters for one A-18 projection.
