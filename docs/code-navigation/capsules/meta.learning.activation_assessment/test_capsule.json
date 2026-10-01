@@ -43,7 +43,12 @@
       ]
     },
     "forbidden_pattern_hits": [],
-    "inline_cfg_test_modules": 0
+    "inline_cfg_test_modules": 0,
+    "test_only_modules": {
+      "classification_rule": "A module reachable only through cfg(test) module edges or from a test target root is test source; a path component named `tests` is not evidence of anything. Coverage is preserved: classified test-only modules stay in the test slice and their test attributes are still counted.",
+      "paths": []
+    },
+    "unselected_package_files": []
   },
   "unit_property_model_tests": {
     "declared_proof_surface": {
@@ -59,20 +64,22 @@
     "selected_tests": [
       {
         "path": "crates/meta/eliot-learning-activation-assessment/tests/activation.rs",
-        "bytes": 42282,
-        "sha256": "7eecf341ca4f282044f8d18a48d812b503cdb78797794e26fdde8ce27fe98462",
+        "bytes": 43281,
+        "sha256": "d62899192e560caa5683904ef7184e9e1e4ad9911afab2b18d9b7dca2151981c",
         "test_attributes": 6,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
       },
       {
         "path": "crates/meta/eliot-learning-activation-assessment/tests/work_unit_620.rs",
-        "bytes": 146435,
-        "sha256": "0d1f46c73222377016acacd7531bece1b56b3bddc7fe40bc4f7cffd30f8799ea",
+        "bytes": 147423,
+        "sha256": "fd1d0c4a83bf81c76107dc670d04d47145fc243532fd44119ab8bc2c280cab51",
         "test_attributes": 51,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
@@ -131,16 +138,12 @@
   "expected_nonzero_test_count": {
     "method": "count of #[test]/#[tokio::test] attributes in the selected test slice",
     "test_attribute_count": 57,
-    "test_stu": 62906,
+    "test_stu": 63568,
     "nonzero": true
   },
-  "bound_contract_digest": "d2a80d6f0e1d53414bb042300518a4bcd9a088a1410ad909a0cb5eb32940d70b",
+  "bound_contract_digest": "dff666f65b258bdd",
   "source_provenance": {
-    "input_digests": {
-      "workspace_manifest": {
-        "path": "Cargo.toml",
-        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
-      },
+    "contract_semantic_inputs": {
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
         "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
@@ -160,18 +163,31 @@
       "module_manifest": {
         "path": "crates/meta/eliot-learning-activation-assessment/module.toml",
         "sha256": "ff3076cb7592c7aee1b6c75fced78ee22376f7e8c4a97fc4bb07ba737171c0fc"
+      }
+    },
+    "exact_provenance": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "f2ab651b76ac9f5870f8268c52d1db5839cdb957f5939cd0d8e3a2edcd91fe45"
       },
-      "selected_source": {
+      "physical_source_inventory": {
         "path_count": 8,
-        "sha256": "5a040a0cb231441aad520db580b9a822fa7cbe1c42ca18c1cd63afb99d12fe1e"
+        "sha256": "caef6e1a246e48ed608edc1f39219dee93bd300448f15f10ab7a9ef00ed577b0"
+      },
+      "selected_workset": {
+        "allocation_scope": "PACKAGE_WIDE",
+        "allocation_state": "EXPLICIT_PACKAGE_WIDE",
+        "path_count": 8,
+        "sha256": "caef6e1a246e48ed608edc1f39219dee93bd300448f15f10ab7a9ef00ed577b0"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
-    "generator_version": "1.0.0"
+    "generator_version": "1.0.0",
+    "note": "A change under exact_provenance moves artifact_digest only. It is not a public API or semantic-contract change and is not an instruction to re-read or re-test every cell."
   },
-  "artifact_digest": "577d8cf0c8e3bdf46307cbf1bf97901569e895d258d68f3378ef4a42a848e675",
+  "artifact_digest": "40c1980f990156b2a96bec39357a0188c08ee6e2fb1a62af4c62c2889fe753a0",
   "contract_revision": {
-    "derivation": "first 16 hex characters of the artifact digest",
-    "value": "577d8cf0c8e3bdf4"
+    "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
+    "value": "19800a3c2e326974"
   }
 }

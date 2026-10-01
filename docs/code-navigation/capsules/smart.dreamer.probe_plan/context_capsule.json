@@ -24,11 +24,25 @@
   },
   "source_token_estimate": {
     "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
+    "scope": "the selected decision workset of this cell",
     "source_stu": 34070,
-    "test_stu": 51004,
-    "selected_file_count": 8,
+    "test_stu": 48938,
+    "selected_file_count": 7,
+    "physical_source_stu": 85074,
+    "physical_file_count": 8,
     "inline_cfg_test_modules": 0,
     "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
+  },
+  "workset_allocation": {
+    "scope": "PACKAGE_WIDE",
+    "state": "EXPLICIT_PACKAGE_WIDE",
+    "declared_by": "[package.metadata.eliot].functional_cell_refs / functional_cell / module.toml|module_id, plus [package.metadata.eliot].functional_cell_source",
+    "rationale": "This package declares exactly one functional cell, so the complete package source is the cell's decision workset. That is a deliberate cohesive-unit choice, not an unresolved allocation (I2.20).",
+    "unresolved_reason": null,
+    "required_common_inputs": [
+      "crates/smart/eliot-dreamer-probe-plan/src/lib.rs"
+    ],
+    "observation": null
   },
   "selected_source_and_tests": {
     "selected_source": [
@@ -68,17 +82,8 @@
         "sha256": "dfdfd1a76671b0e907234e704f7b0591b215a43a1c26e828bd1933bd55030e75",
         "test_attributes": 9,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": []
-      },
-      {
-        "path": "crates/smart/eliot-dreamer-probe-plan/tests/support/mod.rs",
-        "bytes": 6197,
-        "sha256": "3486bb410b74e78fb7ba6adf052cf8bbd240ce6f6bfa2c2544fb1f83dd7d6ffe",
-        "test_attributes": 0,
-        "inline_cfg_test": false,
-        "classes": [
-          "fault_restart_replay"
-        ]
       },
       {
         "path": "crates/smart/eliot-dreamer-probe-plan/tests/update_set_consumption.rs",
@@ -86,6 +91,7 @@
         "sha256": "06eccb09bd485d7a999e1ad3b435ec754e8c0de581707cac2f7e2258d4372e84",
         "test_attributes": 2,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": []
       },
       {
@@ -94,12 +100,25 @@
         "sha256": "0542ed2e730becc8fce3e5bfe4c8c1124d551f76db5383530739f04f58f02f37",
         "test_attributes": 39,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
       }
     ],
-    "source_selection_digest": "0ff34deb19f78cee4ad1c6633fc6c2261eaa7d63579e181bb196752f10c80367"
+    "source_selection_digest": "898dbc61b01c68b94439f645e4324b7616a434f25148d0634e6fc9dcb3ee640e"
+  },
+  "unselected_package_files": {
+    "physical_inventory_file_count": 8,
+    "physical_inventory_digest": "0ff34deb19f78cee4ad1c6633fc6c2261eaa7d63579e181bb196752f10c80367",
+    "unselected_files": [
+      {
+        "path": "crates/smart/eliot-dreamer-probe-plan/tests/support/mod.rs",
+        "bytes": 6197,
+        "reason": "not reachable from any Cargo target root of this package"
+      }
+    ],
+    "note": "Physical package inventory beyond this cell's selected workset. No file is dropped: an unlinked or unresolved file is reported here with the reason it was not selected."
   },
   "one_hop_providers": [
     "eliot-dreamer-contracts",
@@ -107,8 +126,7 @@
     "serde"
   ],
   "one_hop_consumers": [
-    "bins/eliot-dreamer",
-    "bins/eliotd"
+    "bins/eliot-dreamer"
   ],
   "architecture_implementation_refs": [
     {
@@ -130,51 +148,61 @@
   },
   "omitted_material_and_handles": {
     "unresolved_contract_refs": [],
-    "omitted": "Files outside the package source/test selection, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
+    "omitted": "Files outside the cell's selected workset, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
   },
   "effective_context_profile": {
     "estimate": "planning_estimate_only",
     "qualification": "UNVALIDATED (I2.16, I0.5)",
     "reference_capsule_handle": "I2.20"
   },
-  "bound_contract_digest": "6c13ac64f97f94fe970f8c7140ca6261bcf71ed0d4d662908efa066289486d89",
+  "bound_contract_digest": "7ac93a8431c5fd63",
   "source_provenance": {
     "input_digests": {
-      "workspace_manifest": {
-        "path": "Cargo.toml",
-        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
+      "contract_semantic_inputs": {
+        "contract_catalogue": {
+          "path": "docs/architecture/handle-index.json",
+          "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
+        },
+        "architecture_boundaries": {
+          "path": "config/architecture-boundaries.toml",
+          "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
+        },
+        "logical_block_config": {
+          "path": "docs/code-navigation/logical-blocks.toml",
+          "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+        },
+        "package_manifest": {
+          "path": "crates/smart/eliot-dreamer-probe-plan/Cargo.toml",
+          "sha256": "99348914c32a52ca1eedcdd95ae49424b2200e51bc27dcd6cfab6dc73e779034"
+        },
+        "module_manifest": {
+          "path": "crates/smart/eliot-dreamer-probe-plan/module.toml",
+          "sha256": "3ac52421cdfe55abf451c2bfa6414d4451f76b1d3712ef27f9962407c7cb00c1"
+        }
       },
-      "contract_catalogue": {
-        "path": "docs/architecture/handle-index.json",
-        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
-      },
-      "architecture_boundaries": {
-        "path": "config/architecture-boundaries.toml",
-        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
-      },
-      "logical_block_config": {
-        "path": "docs/code-navigation/logical-blocks.toml",
-        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
-      },
-      "package_manifest": {
-        "path": "crates/smart/eliot-dreamer-probe-plan/Cargo.toml",
-        "sha256": "99348914c32a52ca1eedcdd95ae49424b2200e51bc27dcd6cfab6dc73e779034"
-      },
-      "module_manifest": {
-        "path": "crates/smart/eliot-dreamer-probe-plan/module.toml",
-        "sha256": "3ac52421cdfe55abf451c2bfa6414d4451f76b1d3712ef27f9962407c7cb00c1"
-      },
-      "selected_source": {
-        "path_count": 8,
-        "sha256": "0ff34deb19f78cee4ad1c6633fc6c2261eaa7d63579e181bb196752f10c80367"
+      "exact_provenance": {
+        "workspace_manifest": {
+          "path": "Cargo.toml",
+          "sha256": "f2ab651b76ac9f5870f8268c52d1db5839cdb957f5939cd0d8e3a2edcd91fe45"
+        },
+        "physical_source_inventory": {
+          "path_count": 8,
+          "sha256": "0ff34deb19f78cee4ad1c6633fc6c2261eaa7d63579e181bb196752f10c80367"
+        },
+        "selected_workset": {
+          "allocation_scope": "PACKAGE_WIDE",
+          "allocation_state": "EXPLICIT_PACKAGE_WIDE",
+          "path_count": 7,
+          "sha256": "898dbc61b01c68b94439f645e4324b7616a434f25148d0634e6fc9dcb3ee640e"
+        }
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "5fba99bf9ad5b9b7f5e6dbb742645d7eb0ce62ebb722bf9f7d81a9b1fa97d0ea",
+  "artifact_digest": "aa8b0a370639dd7b4924d0ceae19ed646b6ccc66b402839c3d0c717f0d1de1e7",
   "contract_revision": {
-    "derivation": "first 16 hex characters of the artifact digest",
-    "value": "5fba99bf9ad5b9b7"
+    "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
+    "value": "f5695cfd61ed70a2"
   }
 }

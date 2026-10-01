@@ -39,7 +39,12 @@
       "value": null
     },
     "forbidden_pattern_hits": [],
-    "inline_cfg_test_modules": 7
+    "inline_cfg_test_modules": 7,
+    "test_only_modules": {
+      "classification_rule": "A module reachable only through cfg(test) module edges or from a test target root is test source; a path component named `tests` is not evidence of anything. Coverage is preserved: classified test-only modules stay in the test slice and their test attributes are still counted.",
+      "paths": []
+    },
+    "unselected_package_files": []
   },
   "unit_property_model_tests": {
     "declared_proof_surface": {
@@ -47,8 +52,32 @@
       "origin": "module.toml|proof_surface",
       "value": null
     },
-    "selected_tests": [],
-    "test_attribute_count": 59
+    "selected_tests": [
+      {
+        "path": "crates/foundation/eliot-runtime-contracts/tests/hot_path_queue_binding.rs",
+        "bytes": 3068,
+        "sha256": "809f5e344095fc5d830be28e3a332c44a93e7910ac937424ddcfb5653f367921",
+        "test_attributes": 5,
+        "inline_cfg_test": false,
+        "test_only_module": false,
+        "classes": [
+          "edge_profile"
+        ]
+      },
+      {
+        "path": "crates/foundation/eliot-runtime-contracts/tests/shipped_hot_path.rs",
+        "bytes": 6022,
+        "sha256": "affb3293dafd2af6c473933ae9d3abc12896f99f0a60a2d2c18012695ec5bd5a",
+        "test_attributes": 4,
+        "inline_cfg_test": false,
+        "test_only_module": false,
+        "classes": [
+          "edge_profile",
+          "fault_restart_replay"
+        ]
+      }
+    ],
+    "test_attribute_count": 68
   },
   "parser_or_golden_corpus": [],
   "fake_port_contract_tests": [],
@@ -72,6 +101,7 @@
       "crates/governor/eliot-config",
       "crates/governor/eliot-governor",
       "crates/governor/eliot-maintenance",
+      "crates/governor/eliot-module-registry",
       "crates/instrument/eliot-r13-harness",
       "crates/kernel/eliot-host-service",
       "crates/kernel/eliot-host-state",
@@ -86,6 +116,7 @@
       "crates/meta/eliot-runtime-status",
       "crates/modules/eliot-native-worker-core",
       "crates/modules/eliot-wasm-runtime",
+      "crates/smart/eliot-context-contracts",
       "crates/surfaces/eliot-cli",
       "crates/surfaces/eliot-user-broker-core"
     ],
@@ -94,7 +125,10 @@
       "origin": "module.toml|consumers",
       "value": null
     },
-    "edge_profile_tests": []
+    "edge_profile_tests": [
+      "crates/foundation/eliot-runtime-contracts/tests/hot_path_queue_binding.rs",
+      "crates/foundation/eliot-runtime-contracts/tests/shipped_hot_path.rs"
+    ]
   },
   "fault_restart_replay_cases": {
     "declared_failure_behavior": {
@@ -102,7 +136,9 @@
       "origin": "module.toml|failure_behavior",
       "value": null
     },
-    "selected_cases": []
+    "selected_cases": [
+      "crates/foundation/eliot-runtime-contracts/tests/shipped_hot_path.rs"
+    ]
   },
   "resource_and_serial_groups": {
     "declared_serial_groups": {
@@ -127,17 +163,13 @@
   },
   "expected_nonzero_test_count": {
     "method": "count of #[test]/#[tokio::test] attributes in the selected test slice",
-    "test_attribute_count": 59,
-    "test_stu": 0,
+    "test_attribute_count": 68,
+    "test_stu": 3030,
     "nonzero": true
   },
-  "bound_contract_digest": "e4622b1c65f5362f2766712379b3ac8112c9ee89d144ef3b610f66f933eef366",
+  "bound_contract_digest": "122eb276837a1ff2",
   "source_provenance": {
-    "input_digests": {
-      "workspace_manifest": {
-        "path": "Cargo.toml",
-        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
-      },
+    "contract_semantic_inputs": {
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
         "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
@@ -154,18 +186,31 @@
         "path": "crates/foundation/eliot-runtime-contracts/Cargo.toml",
         "sha256": "0112b845ce000230377e5de702745a161a786968d31fb2df83e5460cc920e324"
       },
-      "module_manifest": null,
-      "selected_source": {
-        "path_count": 18,
-        "sha256": "2f5b25bc9df9cbd514dfc7ece0e78df1a02a8bf86b2f1c7b3379d2e943c6112b"
+      "module_manifest": null
+    },
+    "exact_provenance": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "f2ab651b76ac9f5870f8268c52d1db5839cdb957f5939cd0d8e3a2edcd91fe45"
+      },
+      "physical_source_inventory": {
+        "path_count": 21,
+        "sha256": "a711c10110fc7afe3a9d9baa694bc76b12b8c6571a03fd55b940fea126b6def0"
+      },
+      "selected_workset": {
+        "allocation_scope": "PACKAGE_WIDE",
+        "allocation_state": "EXPLICIT_PACKAGE_WIDE",
+        "path_count": 21,
+        "sha256": "a711c10110fc7afe3a9d9baa694bc76b12b8c6571a03fd55b940fea126b6def0"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
-    "generator_version": "1.0.0"
+    "generator_version": "1.0.0",
+    "note": "A change under exact_provenance moves artifact_digest only. It is not a public API or semantic-contract change and is not an instruction to re-read or re-test every cell."
   },
-  "artifact_digest": "4172b42388b9b0aea402879b1c08c7a49bf09aeee60974d34ade29dbd3b4a804",
+  "artifact_digest": "1e79e4bde47f029053ff389bf7cb81a23098370ba0e2c28c28264257f71f99e7",
   "contract_revision": {
-    "derivation": "first 16 hex characters of the artifact digest",
-    "value": "4172b42388b9b0ae"
+    "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
+    "value": "76ba5f1003d8974b"
   }
 }

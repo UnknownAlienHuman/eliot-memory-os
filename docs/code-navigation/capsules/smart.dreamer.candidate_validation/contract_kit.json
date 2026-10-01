@@ -244,11 +244,7 @@
     ]
   },
   "source_provenance": {
-    "input_digests": {
-      "workspace_manifest": {
-        "path": "Cargo.toml",
-        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
-      },
+    "contract_semantic_inputs": {
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
         "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
@@ -268,18 +264,31 @@
       "module_manifest": {
         "path": "crates/smart/eliot-dreamer-candidate-validation/module.toml",
         "sha256": "e0e06205dfd2df42078fa1dfc688dad3da5118ed93826b453b2a8b10f6da7e39"
+      }
+    },
+    "exact_provenance": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "f2ab651b76ac9f5870f8268c52d1db5839cdb957f5939cd0d8e3a2edcd91fe45"
       },
-      "selected_source": {
+      "physical_source_inventory": {
+        "path_count": 18,
+        "sha256": "a7de43a18b4d95b139a9ba1d4c43938337a9f799f743085b7bf8da42f108b272"
+      },
+      "selected_workset": {
+        "allocation_scope": "PACKAGE_WIDE",
+        "allocation_state": "EXPLICIT_PACKAGE_WIDE",
         "path_count": 18,
         "sha256": "a7de43a18b4d95b139a9ba1d4c43938337a9f799f743085b7bf8da42f108b272"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
-    "generator_version": "1.0.0"
+    "generator_version": "1.0.0",
+    "note": "A change under exact_provenance moves artifact_digest only. It is not a public API or semantic-contract change and is not an instruction to re-read or re-test every cell."
   },
-  "artifact_digest": "7d7bb785f79abd6080c49d658c8b11059c113bfc1f8d59f2cdc816d094c99c02",
+  "artifact_digest": "ec095cd0b1593d30232f50225ef91ada48c9a91ea4e7355ab23622d229664675",
   "contract_revision": {
-    "derivation": "first 16 hex characters of the artifact digest",
-    "value": "7d7bb785f79abd60"
+    "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
+    "value": "d1c230bab774dcc3"
   }
 }

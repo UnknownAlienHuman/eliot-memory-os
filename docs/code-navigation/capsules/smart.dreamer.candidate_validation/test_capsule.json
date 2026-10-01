@@ -43,7 +43,12 @@
       ]
     },
     "forbidden_pattern_hits": [],
-    "inline_cfg_test_modules": 0
+    "inline_cfg_test_modules": 0,
+    "test_only_modules": {
+      "classification_rule": "A module reachable only through cfg(test) module edges or from a test target root is test source; a path component named `tests` is not evidence of anything. Coverage is preserved: classified test-only modules stay in the test slice and their test attributes are still counted.",
+      "paths": []
+    },
+    "unselected_package_files": []
   },
   "unit_property_model_tests": {
     "declared_proof_surface": {
@@ -64,6 +69,7 @@
         "sha256": "996ab85b182ca232ae59a51bf1fad70d1d786d5b8274c0c9843a65d99b8cb679",
         "test_attributes": 2,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
@@ -74,6 +80,7 @@
         "sha256": "1a88337af2eddfdc3f83c64da54eb774c1a1ded1c0bab64742605ca1729e5fe7",
         "test_attributes": 6,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
@@ -84,6 +91,7 @@
         "sha256": "2121efadce7fd65fbec96daf9db6785936471c04ddba2d258c636c3fb20583f6",
         "test_attributes": 9,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
@@ -94,6 +102,7 @@
         "sha256": "753ea76870f012fb198f098234b17b47a7d17d1fb8b344ede67e068ebff1fc8a",
         "test_attributes": 9,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
@@ -104,6 +113,7 @@
         "sha256": "afba2771c79c3fec6df94d9e59befe517c08dbd3bff39838b578e9bb7d3f645e",
         "test_attributes": 9,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
@@ -114,6 +124,7 @@
         "sha256": "b0498221765519ae1c7d8e3423527154c6372083f84ab7cfe9e347a2018606bf",
         "test_attributes": 9,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
@@ -124,6 +135,7 @@
         "sha256": "11e7261bd33488356ad027f6ced73630ec0d014f5acd53bd2cb4846e049e2fa7",
         "test_attributes": 9,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
@@ -134,6 +146,7 @@
         "sha256": "b81a7220767be3f32a100bbba4e87c6f8a69f4a4ea86b9842445ce6717714dbf",
         "test_attributes": 7,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
@@ -145,8 +158,7 @@
   "fake_port_contract_tests": [],
   "real_edge_profiles": {
     "one_hop_consumers": [
-      "bins/eliot-dreamer",
-      "bins/eliotd"
+      "bins/eliot-dreamer"
     ],
     "declared_consumers": {
       "state": "DECLARED",
@@ -201,13 +213,9 @@
     "test_stu": 44146,
     "nonzero": true
   },
-  "bound_contract_digest": "7d7bb785f79abd6080c49d658c8b11059c113bfc1f8d59f2cdc816d094c99c02",
+  "bound_contract_digest": "d1c230bab774dcc3",
   "source_provenance": {
-    "input_digests": {
-      "workspace_manifest": {
-        "path": "Cargo.toml",
-        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
-      },
+    "contract_semantic_inputs": {
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
         "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
@@ -227,18 +235,31 @@
       "module_manifest": {
         "path": "crates/smart/eliot-dreamer-candidate-validation/module.toml",
         "sha256": "e0e06205dfd2df42078fa1dfc688dad3da5118ed93826b453b2a8b10f6da7e39"
+      }
+    },
+    "exact_provenance": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "f2ab651b76ac9f5870f8268c52d1db5839cdb957f5939cd0d8e3a2edcd91fe45"
       },
-      "selected_source": {
+      "physical_source_inventory": {
+        "path_count": 18,
+        "sha256": "a7de43a18b4d95b139a9ba1d4c43938337a9f799f743085b7bf8da42f108b272"
+      },
+      "selected_workset": {
+        "allocation_scope": "PACKAGE_WIDE",
+        "allocation_state": "EXPLICIT_PACKAGE_WIDE",
         "path_count": 18,
         "sha256": "a7de43a18b4d95b139a9ba1d4c43938337a9f799f743085b7bf8da42f108b272"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
-    "generator_version": "1.0.0"
+    "generator_version": "1.0.0",
+    "note": "A change under exact_provenance moves artifact_digest only. It is not a public API or semantic-contract change and is not an instruction to re-read or re-test every cell."
   },
-  "artifact_digest": "6e5fb20946b8273ad786e2db0aafda469e3af2a033cf1dcf348a04c6f246e29f",
+  "artifact_digest": "aa209d13f5f7fb940e2921741ed19a9786f261e1fc24487dc6799f8c4fb5cc7d",
   "contract_revision": {
-    "derivation": "first 16 hex characters of the artifact digest",
-    "value": "6e5fb20946b8273a"
+    "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
+    "value": "bdd42eb6647a407e"
   }
 }

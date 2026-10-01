@@ -48,7 +48,18 @@
       ]
     },
     "forbidden_pattern_hits": [],
-    "inline_cfg_test_modules": 1
+    "inline_cfg_test_modules": 1,
+    "test_only_modules": {
+      "classification_rule": "A module reachable only through cfg(test) module edges or from a test target root is test source; a path component named `tests` is not evidence of anything. Coverage is preserved: classified test-only modules stay in the test slice and their test attributes are still counted.",
+      "paths": []
+    },
+    "unselected_package_files": [
+      {
+        "path": "crates/smart/eliot-dreamer-clarification/src/tests/strict_regressions.rs",
+        "bytes": 5475,
+        "reason": "not reachable from any Cargo target root of this package"
+      }
+    ]
   },
   "unit_property_model_tests": {
     "declared_proof_surface": {
@@ -62,16 +73,7 @@
         "no transport, answer, mutation, authority or Finish path"
       ]
     },
-    "selected_tests": [
-      {
-        "path": "crates/smart/eliot-dreamer-clarification/src/tests/strict_regressions.rs",
-        "bytes": 5475,
-        "sha256": "d18869c7d9693c252ab1a2db5ab42ff55f7a3f7410565b01cdde720d47be679e",
-        "test_attributes": 6,
-        "inline_cfg_test": false,
-        "classes": []
-      }
-    ],
+    "selected_tests": [],
     "test_attribute_count": 45
   },
   "parser_or_golden_corpus": [],
@@ -133,16 +135,12 @@
   "expected_nonzero_test_count": {
     "method": "count of #[test]/#[tokio::test] attributes in the selected test slice",
     "test_attribute_count": 45,
-    "test_stu": 1825,
+    "test_stu": 0,
     "nonzero": true
   },
-  "bound_contract_digest": "386acb565cca84d1b3b055089adb71edb2c8dfac42bf6ecf9a25ccffe9724fb8",
+  "bound_contract_digest": "1b29b8766dea8caf",
   "source_provenance": {
-    "input_digests": {
-      "workspace_manifest": {
-        "path": "Cargo.toml",
-        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
-      },
+    "contract_semantic_inputs": {
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
         "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
@@ -162,18 +160,31 @@
       "module_manifest": {
         "path": "crates/smart/eliot-dreamer-clarification/module.toml",
         "sha256": "9f8778e0e4769fff40b378cf3c8648f0424a3dba6789bc4cb4b53e4e964eb6e0"
+      }
+    },
+    "exact_provenance": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "f2ab651b76ac9f5870f8268c52d1db5839cdb957f5939cd0d8e3a2edcd91fe45"
       },
-      "selected_source": {
+      "physical_source_inventory": {
         "path_count": 13,
         "sha256": "6be4e76a7745b2677be11395626f68f6a0f92740da8cba90fbe8f8b772fe31a3"
+      },
+      "selected_workset": {
+        "allocation_scope": "PACKAGE_WIDE",
+        "allocation_state": "EXPLICIT_PACKAGE_WIDE",
+        "path_count": 12,
+        "sha256": "5d90099600ac30e65866eb712ba4badd39c5ccfdc738a41d2d27a79c92fef441"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
-    "generator_version": "1.0.0"
+    "generator_version": "1.0.0",
+    "note": "A change under exact_provenance moves artifact_digest only. It is not a public API or semantic-contract change and is not an instruction to re-read or re-test every cell."
   },
-  "artifact_digest": "ffed8f30e5f110dac8b054e8c6e52d265e1db51335feec25d2a93e49f7f27ce0",
+  "artifact_digest": "96850fa4ac804bf8066b06798b3f5bf2c80e3e9a71d8fcfe489f26c3e3db708f",
   "contract_revision": {
-    "derivation": "first 16 hex characters of the artifact digest",
-    "value": "ffed8f30e5f110da"
+    "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
+    "value": "025a632c2765ef1a"
   }
 }

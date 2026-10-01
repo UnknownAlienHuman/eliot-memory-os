@@ -240,11 +240,7 @@
     ]
   },
   "source_provenance": {
-    "input_digests": {
-      "workspace_manifest": {
-        "path": "Cargo.toml",
-        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
-      },
+    "contract_semantic_inputs": {
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
         "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
@@ -259,23 +255,36 @@
       },
       "package_manifest": {
         "path": "crates/smart/eliot-context-contracts/Cargo.toml",
-        "sha256": "34e893003fbd76c6cc4f2283ce6653174650fe0273462122abf1718b0e8531cd"
+        "sha256": "4ad10eda8289fcac19f48f071b1c2ba142e95ee3364ede2d6d1bd6016c9afb3f"
       },
       "module_manifest": {
         "path": "crates/smart/eliot-context-contracts/module.toml",
         "sha256": "c10b80229e5f2151bce52bfea8e34a4ebc437116026da21eed46f35d6922e35f"
+      }
+    },
+    "exact_provenance": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "f2ab651b76ac9f5870f8268c52d1db5839cdb957f5939cd0d8e3a2edcd91fe45"
       },
-      "selected_source": {
-        "path_count": 26,
-        "sha256": "0cf02685f0af9e85c6f2a225b08d9c629edcfe2712a6db801e88aa56708deb3a"
+      "physical_source_inventory": {
+        "path_count": 29,
+        "sha256": "a367157a17926ceba953a3e70330a6cb7b2f1cad8891ba3404e6cf90e9805d73"
+      },
+      "selected_workset": {
+        "allocation_scope": "PACKAGE_WIDE",
+        "allocation_state": "EXPLICIT_PACKAGE_WIDE",
+        "path_count": 29,
+        "sha256": "a367157a17926ceba953a3e70330a6cb7b2f1cad8891ba3404e6cf90e9805d73"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
-    "generator_version": "1.0.0"
+    "generator_version": "1.0.0",
+    "note": "A change under exact_provenance moves artifact_digest only. It is not a public API or semantic-contract change and is not an instruction to re-read or re-test every cell."
   },
-  "artifact_digest": "1bf91771fe164915a60888521e119c549bc1c3429a985344d56ef5dea5400844",
+  "artifact_digest": "b607639fe7a5c7ab68500aaa25ad44bac31783668a423fbeccb7e8058468cdf0",
   "contract_revision": {
-    "derivation": "first 16 hex characters of the artifact digest",
-    "value": "1bf91771fe164915"
+    "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
+    "value": "c8d8caf300d1e039"
   }
 }
