@@ -69,39 +69,27 @@
 //! bounded retained-operation table that refuses rather than grows.
 //!
 //! Production lifecycle: the Watchdog's own startup path registers, starts, and
-//! stops this channel. Registration binds the composition's real owner spool
-//! and proves that owner resource is live by reading its own durable high-water
-//! sequence; start re-reads it and re-observes the authenticated context as a
-//! second, independent observation; stop releases the bounded registration slot
-//! and reports the operations this composition still holds unresolved. A
-//! refusal at either step is bounded to this one capability: it is typed, it
-//! happens on a path where readiness is already published, and the process
-//! creates no listener, task, slot, or authority on either side of it.
+//! stops this channel, and the canonical signals listener is started from the
+//! same started handle and stopped with it. Registration binds the
+//! composition's real owner spool and proves that owner resource is live by
+//! reading its own durable high-water sequence; start re-reads it and
+//! re-observes the authenticated context as a second, independent observation;
+//! stop releases the bounded registration slot and reports the operations this
+//! composition still holds unresolved. A refusal at either step is bounded to
+//! this one capability: it is typed, it happens on a path where readiness is
+//! already published, and the process creates no listener, task, slot, or
+//! authority on either side of it.
 //!
-//! What that lifecycle does NOT establish, stated plainly so the claims are
-//! never read wider than the code: this process still opens no backup listener
-//! and spawns no backup task.
-//!
-//! The reason is no longer a missing dependency. `eliot-watchdog` DOES declare
-//! the `eliot-ipc` edge and DOES use its bounded framed codec on the path that
-//! already exists here — the outbound Kernel front-door intent exchange in
-//! `watchdog_spool::export_driver`. What is still absent is the *server* side:
-//! no process in this repository creates the canonical
-//! `\\.\pipe\eliot\watchdog\signals` server. `EliotPipeName::watchdog_signals`
-//! names the pipe and `bins/eliot-kernel/src/backup_owner_clients.rs` names it
-//! as the client endpoint, but nothing binds or serves it, and this crate is
-//! only ever the *client* of the Kernel front door. There is therefore no
-//! existing canonical signals-transport message arm for a backup request to be
-//! added beside, and the typed backup request/response carrier this arm would
-//! have to reuse lives in `eliot-host-service`, which this crate does not
-//! depend on.
-//!
-//! So the authenticated context above is derived from this composition's
-//! retained admission state rather than from a live transport peer observation,
-//! and the transport peer SID, service, nonce, and session checks belong to a
-//! listener that does not exist yet — not to this module. Adding that listener
-//! is a separate prerequisite, and until it exists no backup request can reach
-//! this handle over any transport at all.
+//! The transport peer is proved by the OS, not by this module. The canonical
+//! signals server module binds `EliotPipeName::watchdog_signals` through the
+//! existing `eliot-ipc` server, which authenticates the connected client from the
+//! live pipe handle — impersonated token, SID, session id, and process image with
+//! its no-follow file identity — against an expectation pinned to the
+//! installer-approved Kernel image, and refuses before a single frame is read when
+//! that proof does not hold. Only an authenticated frame from such a peer reaches
+//! this handle, so the gates below compare each request against this composition's
+//! retained admission state and against the `#954` owner's own tables, and never
+//! against a peer identity the request itself carried.
 //!
 //! Lifecycle scope: the bounded registration table belongs to ONE composition
 //! lifecycle and is opened when that composition starts. Starting supervision
@@ -112,6 +100,13 @@
 //! reconnecting requester in one composition reconciles against that
 //! composition's retained owner results, and a fresh composition starts empty
 //! rather than inheriting another lifecycle's records.
+//!
+//! What the retained table is NOT: it is not the recovery authority after a
+//! restart. It is process memory and dies with the composition, so a restarted
+//! owner cannot consult it and must not pretend it still exists. The durable
+//! decision for `RECONCILE_RESTORE` is read by the owner itself from the admitted
+//! destination installation's own retained spool records, and `READ_SNAPSHOT_PAGE`
+//! is a pure owner read re-observed live from the owner's own `watchdog.redb`.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
@@ -1045,6 +1040,22 @@ impl BackupControlHandle {
         self.state.admits_dispatch()
     }
 
+    /// Returns whether this owner registers `operation` yet holds no method for it.
+    ///
+    /// Recognition is not availability: this reads the endpoint's OWN two tables
+    /// — the registered method set and the executable owner contour — through
+    /// this module's own `executable_owner_method`, so no second table exists
+    /// anywhere else. It is what makes a registered-but-uninvokable method
+    /// answerable as an explicit typed refusal on the canonical transport
+    /// instead of vanishing or looking like an admission failure.
+    #[must_use]
+    pub fn is_recognized_without_owner_method(&self, operation: BackupOperationKind) -> bool {
+        accepted_watchdog_backup_methods()
+            .iter()
+            .any(|method| method.op == operation)
+            && executable_owner_method(operation).is_err()
+    }
+
     /// Returns the owner's own durable spool sequence, observed live from the
     /// bound owner resource when this handle was registered and re-observed
     /// when it was started.
@@ -1068,6 +1079,30 @@ impl BackupControlHandle {
     #[must_use]
     pub fn owner_installation(&self) -> &str {
         self.port.source_installation()
+    }
+
+    /// Returns this owner's own retained ACTIVE installation admission, or
+    /// `Err` when the bound owner port retains none.
+    ///
+    /// The ACTIVE side of an isolated-restore isolation proof is read from the
+    /// admission this owner's spool was opened from, never from the reconcile
+    /// request. A request that presented its own "active" identity would turn
+    /// the isolation comparison into a comparison of that claim with itself, so
+    /// an owner holding no retained admission refuses the import instead of
+    /// falling back to any active identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackupControlError::OwnerRefused`] when the bound owner port
+    /// retains no ACTIVE admission, because an import cannot then be proved
+    /// isolated from anything.
+    pub fn active_runtime_binding(&self) -> Result<&WatchdogRuntimeBinding, BackupControlError> {
+        self.port
+            .active_runtime_binding()
+            .ok_or_else(|| BackupControlError::OwnerRefused(SpoolError::InvalidLease(
+                "watchdog backup control refuses an isolated reconcile: this owner retains no ACTIVE installation admission to prove isolation against"
+                    .to_owned(),
+            )))
     }
 
     /// Returns how many operations this composition entered at the owner and
@@ -1505,9 +1540,10 @@ impl BackupControlHandle {
 /// owner port itself, and it is refused rather than returned when that resource
 /// is not readable.
 ///
-/// No listener is opened, no task is spawned, and no authority is minted; the
-/// owning [`crate::KernelWatchdogPort`] implementation keeps all effects. The
-/// handle is registered-but-not-yet-started; [`start_backup_control`] admits
+/// No listener is opened and no task is spawned by this function; the canonical
+/// signals listener is started from the STARTED handle by the composition, and
+/// the owning [`crate::KernelWatchdogPort`] implementation keeps all effects.
+/// The handle is registered-but-not-yet-started; [`start_backup_control`] admits
 /// dispatch.
 ///
 /// # Errors
@@ -1621,6 +1657,33 @@ pub fn start_backup_control(handle: &mut BackupControlHandle) -> Result<(), Back
     handle.admission = handle.admission.reobserved(&handle.port);
     handle.state = BackupControlState::Started;
     Ok(())
+}
+
+/// Releases one SHARED, started backup-control registration.
+///
+/// Same release as [`stop_backup_control`] — it releases the bounded slot in the
+/// registering composition's own table and reports the operations this
+/// composition still holds unresolved — but it borrows instead of consuming, so a
+/// supervised ingress task and the composition's release point can share ONE
+/// handle rather than the listener holding a registration the release path cannot
+/// see. Releasing an already-released slot is a no-op and a second call is
+/// therefore harmless, while a handle whose slot is released can no longer
+/// dispatch: `require_dispatchable` re-checks the live slot on every request.
+pub fn release_shared_backup_control(handle: &std::sync::Arc<BackupControlHandle>) {
+    let unresolved = handle
+        .registration
+        .unresolved()
+        .unwrap_or(UNRESOLVED_COUNT_UNREADABLE);
+    // Bounded, redacted diagnostics: two integers and the slot, never payload text,
+    // owner internals, or identity material.
+    tracing::warn!(
+        event = "watchdog.backup_control_stopped",
+        registration_slot = handle.slot,
+        unresolved_operations = unresolved,
+        retained_operation_bound = MAX_RETAINED_BACKUP_OPERATIONS,
+        "watchdog backup control released; unresolved owner operations remain retained"
+    );
+    handle.registration.release(handle.slot);
 }
 
 /// Stops backup control with bounded cleanup.

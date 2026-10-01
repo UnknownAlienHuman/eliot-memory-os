@@ -61,6 +61,7 @@
 use std::collections::BTreeMap;
 
 use eliot_contracts::sha256_hex;
+use serde::{Deserialize, Serialize};
 
 use crate::observation_coverage::IntervalCoverageReport;
 use crate::{GapRecoveryReason, SpoolError};
@@ -953,7 +954,11 @@ impl WatchdogSpoolBackupLimits {
 /// counts/bytes, and the `complete` flag. Continuation binds exactly one
 /// snapshot: [`check_page_continuation`] rejects any page whose snapshot
 /// digest drifts.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// The serde shape is the same bounded page this owner serves; it exists so the
+/// owner page crosses the canonical Watchdog signals transport directly, with no
+/// second parallel page struct anywhere.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct WatchdogSpoolSnapshotPage {
     /// Snapshot digest of the fence entries this page was read from.
     ///
@@ -1727,7 +1732,13 @@ impl SpoolImportReplayLedger {
 /// `predecessor_digest` chaining to the previous step (or the preparation
 /// digest for step zero), and the stable `operation_id` binding the admitted
 /// operation. Carries no content bytes and no authority material.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// The serde shape is the same four fields this owner already validates in
+/// [`validate_restore_chain`]. It exists so this OWNER type crosses the
+/// canonical Watchdog signals transport directly: no second parallel step struct
+/// and no untyped JSON copy of its fields exist anywhere.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SpoolRestoreStep {
     /// Zero-based step index within the admitted restore.
     pub step_index: u64,
@@ -1800,7 +1811,11 @@ pub fn validate_restore_chain(
 /// `Unknown` keeps an unresolved critical signal visible: it blocks recovery
 /// acceptance through [`acceptance_allowed`] instead of returning zero by
 /// default.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// The serde spelling is the owner's own variant name in `SCREAMING_SNAKE_CASE`,
+/// so a published disposition cannot be respelled by the transport.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum SpoolRestoreDisposition {
     /// Step applied exactly once.
     Accepted,

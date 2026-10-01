@@ -1007,6 +1007,25 @@ impl WatchdogComposition {
         self.kernel.spool_backup_port()
     }
 
+    /// Returns this composition's own retained ACTIVE installation admission,
+    /// or `None` when the injected kernel port holds none.
+    ///
+    /// Same read the owner-bound backup port already carries: it is the
+    /// admission this process's spool was opened from, never a request value.
+    pub(crate) fn active_runtime_binding(&self) -> Option<Arc<WatchdogRuntimeBinding>> {
+        self.kernel.active_runtime_binding()
+    }
+
+    /// Returns a one-for-one supervisor over this composition's own runtime.
+    ///
+    /// The canonical Watchdog signals listener is the one task this composition
+    /// starts besides supervision, and it must fail alone: `OneForOne` means a
+    /// signals-listener failure restarts only the listener and can never stop,
+    /// stall, or quarantine the supervision task or anything downstream of it.
+    pub(crate) fn signals_supervisor(&self) -> eliot_runtime::Supervisor {
+        self.runtime.supervisor(SupervisionStrategy::OneForOne)
+    }
+
     /// Requests bounded shutdown from an SCM control path.
     pub fn request_shutdown(&self) {
         // Genuine lifecycle end: this composition closes its OWN backup-control
@@ -1414,6 +1433,17 @@ pub struct WatchdogBackupPort {
     /// a caller asserted. It holds observations only: no lease, heartbeat,
     /// supervision, or epoch authority passes through it.
     coverage: Arc<IntervalCoverageCell>,
+    /// The digest-verified, root-leased ACTIVE installation admission this owner
+    /// itself was opened from.
+    ///
+    /// Retained so an isolated restore can be proved isolated from the ACTIVE
+    /// installation by owner-issued fact. An isolated import takes this binding as
+    /// its `active` side, never a caller string: a caller that could present a
+    /// convenient "active" identity would turn the isolation comparison into a
+    /// comparison of its own claim with itself. `None` only for a port that has
+    /// no retained admission, where an import refuses instead of falling back to
+    /// any active identity.
+    active_runtime_binding: Option<Arc<WatchdogRuntimeBinding>>,
 }
 
 impl WatchdogBackupPort {
@@ -1427,6 +1457,10 @@ impl WatchdogBackupPort {
     /// capture and page read is bound against them. `limits` bounds every
     /// later [`Self::read_page`] call.
     ///
+    /// `active_runtime_binding` is the ACTIVE admission this same owner was
+    /// opened from, retained so an isolated import can never be handed a
+    /// caller-chosen "active" identity.
+    ///
     /// # Errors
     ///
     /// Returns [`SpoolError`] when `limits` is unbounded, unprogressable, or
@@ -1438,6 +1472,7 @@ impl WatchdogBackupPort {
         watchdog_generation: u64,
         limits: WatchdogSpoolBackupLimits,
         coverage: Arc<IntervalCoverageCell>,
+        active_runtime_binding: Option<Arc<WatchdogRuntimeBinding>>,
     ) -> Result<Self, SpoolError> {
         limits.validate()?;
         if source_installation.trim().is_empty()
@@ -1458,6 +1493,7 @@ impl WatchdogBackupPort {
             watchdog_generation,
             limits,
             coverage,
+            active_runtime_binding,
         })
     }
 
@@ -1465,6 +1501,17 @@ impl WatchdogBackupPort {
     #[must_use]
     pub(crate) fn coverage(&self) -> &Arc<IntervalCoverageCell> {
         &self.coverage
+    }
+
+    /// Returns the ACTIVE installation admission this owner was opened from, or
+    /// `None` when the port has no retained admission.
+    ///
+    /// This is the only `active` an isolated import may be compared against. A
+    /// port that retains no admission refuses the import instead of comparing the
+    /// destination against a caller-supplied "active" identity.
+    #[must_use]
+    pub fn active_runtime_binding(&self) -> Option<&WatchdogRuntimeBinding> {
+        self.active_runtime_binding.as_deref()
     }
 
     /// Returns the owner-held installation identity this port is bound to.
