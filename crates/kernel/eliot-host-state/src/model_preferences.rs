@@ -31,7 +31,7 @@
 
 use std::path::{Path, PathBuf};
 
-use eliot_agent_contracts::model_preference::{
+use eliot_agent_contracts::{
     HumanModelPreferencePolicy, ModelControlError, preference_policy_digest,
 };
 use redb::{Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition};
@@ -215,13 +215,13 @@ fn validate_store_path(path: &Path) -> Result<PathBuf, ModelPreferenceStoreError
     Ok(path.to_path_buf())
 }
 
-fn map_database_error(error: redb::DatabaseError) -> ModelPreferenceStoreError {
+fn map_database_error(error: &redb::DatabaseError) -> ModelPreferenceStoreError {
     match error {
         redb::DatabaseError::Storage(redb::StorageError::Corrupted(_)) => {
             ModelPreferenceStoreError::Corrupt
         }
         redb::DatabaseError::UpgradeRequired(version) => ModelPreferenceStoreError::Legacy {
-            version: u16::from(version),
+            version: u16::from(*version),
         },
         _ => ModelPreferenceStoreError::Unavailable,
     }
@@ -278,6 +278,88 @@ fn validated_publication(
     })
 }
 
+/// Pending CAS envelope for a validated predecessor: genesis demands a
+/// zero/empty expectation; a retained publication demands an exact
+/// predecessor match with scope/policy continuity, then replay on identical
+/// digest or the next-revision envelope. No I/O, no writes.
+enum CasPendingEnvelope {
+    /// Canonically identical replacement under a matching predecessor:
+    /// idempotent, persists nothing.
+    Replayed {
+        /// The retained store revision, unchanged.
+        store_revision: u64,
+    },
+    /// Fresh envelope to persist as the next store revision.
+    Commit(Box<StoredModelPreferenceEnvelope>),
+}
+
+/// Decides the CAS envelope for `compare_and_swap_model_preferences`
+/// without touching the store.
+fn decide_cas_envelope(
+    expected: &PreferenceCasExpected,
+    replacement: &HumanModelPreferencePolicy,
+    replacement_digest: &str,
+    current: Option<ModelPreferencePublication>,
+) -> Result<CasPendingEnvelope, ModelPreferenceStoreError> {
+    match current {
+        None => {
+            if expected.store_revision != 0
+                || !expected.policy_id.is_empty()
+                || !expected.policy_revision.is_empty()
+                || !expected.policy_digest.is_empty()
+            {
+                return Err(ModelPreferenceStoreError::Stale);
+            }
+            Ok(CasPendingEnvelope::Commit(Box::new(
+                StoredModelPreferenceEnvelope {
+                    magic: MODEL_PREFERENCE_STORE_MAGIC.to_owned(),
+                    envelope_version: MODEL_PREFERENCE_ENVELOPE_VERSION,
+                    store_revision: 1,
+                    prior_store_revision: 0,
+                    prior_policy_digest: String::new(),
+                    policy: replacement.clone(),
+                    policy_digest: replacement_digest.to_owned(),
+                },
+            )))
+        }
+        Some(current) => {
+            if expected.store_revision != current.store_revision
+                || expected.policy_id != current.policy.policy_id
+                || expected.policy_revision != current.policy.revision
+                || expected.policy_digest != current.policy_digest
+            {
+                return Err(ModelPreferenceStoreError::Stale);
+            }
+            if replacement.account_scope != current.policy.account_scope {
+                return Err(ModelPreferenceStoreError::ScopeMismatch);
+            }
+            if replacement.policy_id != current.policy.policy_id {
+                return Err(ModelPreferenceStoreError::PolicyIdMismatch);
+            }
+            if replacement_digest == current.policy_digest {
+                return Ok(CasPendingEnvelope::Replayed {
+                    store_revision: current.store_revision,
+                });
+            }
+            let next = current
+                .store_revision
+                .checked_add(1)
+                .ok_or(ModelPreferenceStoreError::Unavailable)?;
+            Ok(CasPendingEnvelope::Commit(Box::new(
+                StoredModelPreferenceEnvelope {
+                    magic: MODEL_PREFERENCE_STORE_MAGIC.to_owned(),
+                    envelope_version: MODEL_PREFERENCE_ENVELOPE_VERSION,
+                    store_revision: next,
+                    prior_store_revision: current.store_revision,
+                    prior_policy_digest: current.policy_digest,
+                    policy: replacement.clone(),
+                    policy_digest: replacement_digest.to_owned(),
+                },
+            )))
+        }
+    }
+}
+
 impl ModelPreferenceStore {
     /// Binds this owner to one configured absolute store path.
     ///
@@ -318,7 +400,7 @@ impl ModelPreferenceStore {
                 ) {
                     return Ok(None);
                 }
-                return Err(map_database_error(error));
+                return Err(map_database_error(&error));
             }
         };
         let read = database
@@ -385,9 +467,9 @@ impl ModelPreferenceStore {
         validate_store_path(&self.path)?;
         let database = match std::fs::symlink_metadata(&self.path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Database::create(&self.path).map_err(map_database_error)?
+                Database::create(&self.path).map_err(|error| map_database_error(&error))?
             }
-            Ok(_) => Database::open(&self.path).map_err(map_database_error)?,
+            Ok(_) => Database::open(&self.path).map_err(|error| map_database_error(&error))?,
             Err(_) => return Err(ModelPreferenceStoreError::Unavailable),
         };
         let write = database
@@ -400,10 +482,11 @@ impl ModelPreferenceStore {
             let mut prefs = write
                 .open_table(PREFS_TABLE)
                 .map_err(|_| ModelPreferenceStoreError::Unavailable)?;
-            let current = match meta
+            let current_meta: Option<Vec<u8>> = meta
                 .get(META_KEY)
                 .map_err(|_| ModelPreferenceStoreError::Corrupt)?
-            {
+                .map(|guard| guard.value().to_vec());
+            let current = match current_meta {
                 None => {
                     let meta_bytes = serde_json::to_vec(&StoreMeta {
                         magic: MODEL_PREFERENCE_STORE_MAGIC.to_owned(),
@@ -414,8 +497,8 @@ impl ModelPreferenceStore {
                         .map_err(|_| ModelPreferenceStoreError::Unavailable)?;
                     None
                 }
-                Some(guard) => {
-                    classify_meta(guard.value())?;
+                Some(bytes) => {
+                    classify_meta(&bytes)?;
                     match prefs
                         .get(CURRENT_KEY)
                         .map_err(|_| ModelPreferenceStoreError::Corrupt)?
@@ -427,59 +510,13 @@ impl ModelPreferenceStore {
                     }
                 }
             };
-            let committed = match current {
-                None => {
-                    if expected.store_revision != 0
-                        || !expected.policy_id.is_empty()
-                        || !expected.policy_revision.is_empty()
-                        || !expected.policy_digest.is_empty()
-                    {
-                        return Err(ModelPreferenceStoreError::Stale);
+            let committed =
+                match decide_cas_envelope(expected, replacement, &replacement_digest, current)? {
+                    CasPendingEnvelope::Replayed { store_revision } => {
+                        return Ok(ModelPreferenceCasOutcome::Replayed { store_revision });
                     }
-                    StoredModelPreferenceEnvelope {
-                        magic: MODEL_PREFERENCE_STORE_MAGIC.to_owned(),
-                        envelope_version: MODEL_PREFERENCE_ENVELOPE_VERSION,
-                        store_revision: 1,
-                        prior_store_revision: 0,
-                        prior_policy_digest: String::new(),
-                        policy: replacement.clone(),
-                        policy_digest: replacement_digest,
-                    }
-                }
-                Some(current) => {
-                    if expected.store_revision != current.store_revision
-                        || expected.policy_id != current.policy.policy_id
-                        || expected.policy_revision != current.policy.revision
-                        || expected.policy_digest != current.policy_digest
-                    {
-                        return Err(ModelPreferenceStoreError::Stale);
-                    }
-                    if replacement.account_scope != current.policy.account_scope {
-                        return Err(ModelPreferenceStoreError::ScopeMismatch);
-                    }
-                    if replacement.policy_id != current.policy.policy_id {
-                        return Err(ModelPreferenceStoreError::PolicyIdMismatch);
-                    }
-                    if replacement_digest == current.policy_digest {
-                        return Ok(ModelPreferenceCasOutcome::Replayed {
-                            store_revision: current.store_revision,
-                        });
-                    }
-                    let next = current
-                        .store_revision
-                        .checked_add(1)
-                        .ok_or(ModelPreferenceStoreError::Unavailable)?;
-                    StoredModelPreferenceEnvelope {
-                        magic: MODEL_PREFERENCE_STORE_MAGIC.to_owned(),
-                        envelope_version: MODEL_PREFERENCE_ENVELOPE_VERSION,
-                        store_revision: next,
-                        prior_store_revision: current.store_revision,
-                        prior_policy_digest: current.policy_digest,
-                        policy: replacement.clone(),
-                        policy_digest: replacement_digest,
-                    }
-                }
-            };
+                    CasPendingEnvelope::Commit(envelope) => *envelope,
+                };
             let bytes = serde_json::to_vec(&committed)
                 .map_err(|_| ModelPreferenceStoreError::Unavailable)?;
             if bytes.len() > MAX_MODEL_PREFERENCE_DOCUMENT_BYTES {
