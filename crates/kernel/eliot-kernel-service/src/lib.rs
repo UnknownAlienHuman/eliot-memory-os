@@ -350,6 +350,13 @@ pub use user_automation_store::{
     CanonicalUserAutomationStore, UserAutomationNamedReadProvenance, UserAutomationOwnerLookup,
     UserAutomationOwnerReadProvenance, UserAutomationOwnerSnapshot,
 };
+// The sibling `user_automation_store_tests` module reaches this normalization
+// through `super::`, which is the crate root, so the crate-root re-export is
+// the only resolution path. Without it the whole `lib test` target of this
+// crate fails to compile with E0425 and every other test in the crate is
+// unreachable. Pre-existing on main; this is the minimal repair.
+#[cfg(test)]
+pub(crate) use user_automation_store::normalize_user_automation_operation;
 pub use wasm_control::{
     ControlAckPhase, ControlDeliveryIdentity, ControlDisposition, ControlDispositionRecord,
     WASM_CONTROL_ACK_WIRE_ID, WASM_CONTROL_ACK_WIRE_VERSION, WASM_CONTROL_DELIVERY_WIRE_ID,
