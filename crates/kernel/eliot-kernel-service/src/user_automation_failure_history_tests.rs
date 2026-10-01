@@ -25,8 +25,9 @@ use eliot_kernel_core::user_automation::{
     DstGapPolicy, NormalizedSchedule, NotificationDraft, OverlapPolicy, ProviderFingerprintPolicy,
     RecursionPolicy, RouteCostPolicy, ScheduleKind, USER_AUTOMATION_PREFLIGHT_CONTRACT_REVISION,
     USER_AUTOMATION_SCOPE, UserAutomationConfigurationState, UserAutomationExecutionMode,
-    UserAutomationExecutionProjection, UserAutomationInvocation, UserAutomationPreflightProjection,
-    UserAutomationRevision, UserAutomationTrigger, UserAutomationTriggerOrigin,
+    UserAutomationExecutionProjection, UserAutomationInvocation, UserAutomationOperation,
+    UserAutomationOperatorIntent, UserAutomationPreflightProjection, UserAutomationRevision,
+    UserAutomationTrigger, UserAutomationTriggerOrigin,
 };
 use eliot_kernel_core::{
     AutomationExecutionReference, AutomationFailureNotificationProjection, AutomationRecipient,
@@ -35,11 +36,9 @@ use eliot_kernel_core::{
 use eliot_runtime_contracts::WakeIntent;
 use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot,
-    EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest, NamedReadRequest,
-    NamedReadResponse, OperationIdentity, OrderingHead, OrderingScopeId, PreparedTransition,
-    RequestMeta, ScopeId, ScopeRevisionView, SecurityContext, StoreError, StoreHealth,
-    TransitionClass, WriteReceipt, automation_create_params, automation_read_request,
-    canonical_request_hash, generated_operation_manifests, operation_manifest_set_digest,
+    NamedReadRequest, NamedReadResponse, OperationIdentity, OrderingHead, OrderingScopeId,
+    PreparedTransition, RequestMeta, ScopeId, ScopeRevisionView, StoreError, StoreHealth,
+    WriteReceipt, automation_read_request, canonical_request_hash,
 };
 use eliot_store_memory::MemoryStore;
 use serde_json::Value;
@@ -96,28 +95,15 @@ fn revision(automation_id: &str, revision_id: &str) -> UserAutomationRevision {
         natural_language_intent: "run the qualified deterministic check".to_owned(),
         schedule: NormalizedSchedule {
             kind: ScheduleKind::Recurring,
-            expression: "at 12:00".to_owned(),
-            calendar: "gregorian".to_owned(),
+            expression: "local-daily:2026-09-21T12:00:00/1".to_owned(),
+            calendar: "gregorian-local".to_owned(),
             timezone: "America/New_York".to_owned(),
             dst_fold: DstFoldPolicy::First,
             dst_gap: DstGapPolicy::ShiftForward,
             start_at: "2026-09-21T00:00:00Z".to_owned(),
             end_at: None,
-            next_occurrences: vec!["2026-09-21T12:00:00-04:00".to_owned()],
-            // This fixture carries a retired shape-only occurrence key, so the
-            // owning calendar adapter has not issued a normalization binding
-            // for it. Empty evidence can never satisfy the required binding, so
-            // the revision stays refused instead of becoming admitted.
-            normalization_receipt: Box::new(
-                eliot_kernel_core::user_automation::ScheduleNormalizationReceipt {
-                    receipt_id: String::new(),
-                    normalizer_authority: String::new(),
-                    source_digest: String::new(),
-                    zone_database_revision:
-                        eliot_kernel_core::user_automation::PINNED_ZONE_DATABASE_REVISION.to_owned(),
-                    occurrences_digest: String::new(),
-                },
-            ),
+            next_occurrences: Vec::new(),
+            normalization_receipt: Box::new(Default::default()),
         },
         mode: UserAutomationExecutionMode::DeterministicProcess,
         task: AutomationTaskBinding {
@@ -155,11 +141,56 @@ fn revision(automation_id: &str, revision_id: &str) -> UserAutomationRevision {
             allow_child_automation: false,
             max_child_depth: 0,
         },
-        configuration_state: UserAutomationConfigurationState::BlockedConfig,
+        configuration_state: UserAutomationConfigurationState::Active,
         work_class: eliot_kernel_core::user_automation::AutomationWorkClass::Maintenance,
         current_execution_refs: Vec::new(),
         execution_history_query_ref: "history:automation-1".to_owned(),
     }
+}
+
+/// Uses the production Kernel normalizer so both the schedule declaration and
+/// the original receipt envelope belong to the same authenticated request.
+fn normalized_revision(
+    context: &RequestMeta,
+    draft: UserAutomationRevision,
+) -> (
+    UserAutomationRevision,
+    eliot_receipts::ReceiptEnvelope,
+    crate::user_automation::UserAutomationServiceRequest,
+) {
+    let normalization_operation_id =
+        format!("normalize-{}-{}", draft.automation_id, draft.revision);
+    let request = crate::user_automation::UserAutomationServiceRequest {
+        context: context.clone(),
+        authenticated_principal: "human-1".to_owned(),
+        identity: OperationIdentity {
+            operation_id: OperationId::new(normalization_operation_id.as_str())
+                .expect("normalization operation"),
+            idempotency_key: format!("idem-{normalization_operation_id}"),
+            canonical_request_hash: String::new(),
+        },
+        intent: UserAutomationOperatorIntent {
+            intent_id: format!("intent-{normalization_operation_id}"),
+            principal_ref: "human-1".to_owned(),
+            state_fence: context.state_fence.clone(),
+            operation: UserAutomationOperation::NormalizeSchedule {
+                revision: Box::new(draft),
+                occurrence_count: 1,
+            },
+        },
+    };
+    let (revision, envelope) =
+        super::user_automation_store::normalize_user_automation_operation(&request)
+            .expect("Kernel normalization fixture");
+    revision
+        .schedule
+        .validate_normalization_receipt_envelope(
+            &revision.schedule.normalization_receipt,
+            &envelope,
+            &revision,
+        )
+        .expect("normalization receipt binds the produced revision");
+    (revision, envelope, request)
 }
 
 fn source_receipt(context: &RequestMeta) -> eliot_receipts::ReceiptEnvelope {
@@ -245,7 +276,7 @@ fn blocked_projection(
     UserAutomationPreflightProjection,
     WakeIntent,
 ) {
-    let rev = revision(automation_id, revision_id);
+    let (rev, _, _) = normalized_revision(context, revision(automation_id, revision_id));
     let invocation = UserAutomationInvocation {
         automation_id: rev.automation_id.clone(),
         automation_revision: rev.revision.clone(),
@@ -409,70 +440,72 @@ impl super::user_automation_execution::UserAutomationNotificationPort for StubNo
     }
 }
 
-/// Creates the owning revision directly through the reference contour.
+/// Creates and retains an owner-normalized revision through the production
+/// Kernel Store port before the failure-history tests consume that revision.
 async fn create_revision(store: &MemoryStore, automation_id: &str, revision_id: &str) {
-    let rev = revision(automation_id, revision_id);
-    let document = serde_json::to_string(&rev).expect("revision serializes");
-    let parameters = automation_create_params(
-        automation_id.to_owned(),
-        revision_id.to_owned(),
-        eliot_store_api::AUTOMATION_STATE_ACTIVE.to_owned(),
-        document,
-    );
     let context = metadata();
-    let manifest_digest =
-        operation_manifest_set_digest(&generated_operation_manifests().expect("catalogue"))
-            .expect("set digest");
-    let mut transition = PreparedTransition {
-        contract_version: eliot_store_api::CONTRACT_VERSION,
+    let (revision, normalization_envelope, normalization_request) =
+        normalized_revision(&context, revision(automation_id, revision_id));
+    let normalization_request_json =
+        serde_json::to_string(&normalization_request).expect("normalization request serializes");
+    let normalization_store_request = UserAutomationStoreRequest {
+        context: normalization_request.context.clone(),
+        authenticated_principal: normalization_request.authenticated_principal.clone(),
+        identity: normalization_request.identity.clone(),
+        intent: normalization_request.intent.clone(),
+    };
+    let canonical_store = super::CanonicalUserAutomationStore::new(SharedStore(store));
+    let (normalization_transition, normalization_manifest_digest) =
+        super::CanonicalUserAutomationStore::<SharedStore<'_>>::build_normalization_transition(
+            &normalization_store_request,
+            &revision,
+            &normalization_envelope,
+            normalization_request_json,
+        )
+        .expect("normalization retention transition builds");
+    canonical_store
+        .apply_normalization_transition(
+            &normalization_store_request.context,
+            normalization_transition,
+            normalization_manifest_digest,
+        )
+        .await
+        .expect("owner normalization result is retained");
+
+    let mut create_request = UserAutomationStoreRequest {
+        context: context.clone(),
+        authenticated_principal: "human-1".to_owned(),
         identity: OperationIdentity {
             operation_id: OperationId::new(format!("op-create-{automation_id}-{revision_id}"))
                 .expect("operation"),
             idempotency_key: format!("idem-create-{automation_id}-{revision_id}"),
             canonical_request_hash: "0".repeat(64),
         },
-        state_fence: state_fence(),
-        scope_id: ScopeId::new("user-automation").expect("scope"),
-        task_id: None,
-        ordering_scopes: vec![OrderingScopeId::new("user-automation").expect("ordering")],
-        transition_class: TransitionClass::UserAutomation,
-        requested_effect_ceiling: eliot_receipts::EffectClass::ReversibleMutation,
-        admission_contract_set_digest: "c".repeat(64),
-        operation_manifest_digest: manifest_digest,
-        // Issue-#18 digests are derived below via `bind_issue18_digests`,
-        // never defaulted; no semantic source is bound here (`[]`).
-        admission_digest: String::new(),
-        mutation_plan_digest: String::new(),
-        semantic_source_revisions: Vec::new(),
-        named_operations: vec![NamedMutationRequest {
-            operation: NamedMutationOperation::ApplyUserAutomationState,
-            parameters,
-        }],
-        event_projection_relation_intents: EventProjectionRelationIntents {
-            event_ids: Vec::new(),
-            projection_kinds: Vec::new(),
-            relation_kinds: Vec::new(),
+        intent: UserAutomationOperatorIntent {
+            intent_id: format!("intent-create-{automation_id}-{revision_id}"),
+            principal_ref: "human-1".to_owned(),
+            state_fence: context.state_fence.clone(),
+            operation: UserAutomationOperation::Create {
+                revision: Box::new(revision),
+                normalization_receipt_envelope: Box::new(normalization_envelope),
+            },
         },
-        security: SecurityContext::default(),
-        required_proof_and_approval_refs: Vec::new(),
     };
-    eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
+    let (transition, _) = canonical_store
+        .build_transition(&create_request)
+        .await
+        .expect("owner create transition builds from retained normalization");
     let view = CanonicalRequestView::from_apply(&context, &transition, &[], &[]);
-    transition.identity.canonical_request_hash =
-        canonical_request_hash(&view).expect("hash computes");
-    let receipt = eliot_store_api::CanonicalStoreClient::apply_prepared(
-        store,
-        &context,
-        transition,
-        Vec::new(),
-        Vec::new(),
-    )
-    .await
-    .expect("create commits");
-    assert_eq!(
-        receipt.status,
-        eliot_store_api::WriteReceiptStatus::Committed
-    );
+    create_request.identity.canonical_request_hash =
+        canonical_request_hash(&view).expect("canonical create hash computes");
+    let response = canonical_store
+        .execute_user_automation(create_request)
+        .await
+        .expect("create commits");
+    assert!(matches!(
+        response.outcome,
+        super::UserAutomationStoreOutcome::Committed { .. }
+    ));
 }
 
 fn expected_history_ref(fingerprint: &str) -> String {

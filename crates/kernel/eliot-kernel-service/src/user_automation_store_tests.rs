@@ -18,7 +18,7 @@ use std::sync::Mutex;
 
 use eliot_contracts::{
     ClockReading, EpochId, EpochLineageId, OperationId, ProductId, RequestId, ResourceGeneration,
-    SessionId, SourceId, StateFence, TaskId,
+    SessionId, SourceId, StateFence, TaskId, TaskRevision,
 };
 use eliot_kernel_core::user_automation::{
     AutomationCapabilityProfile, AutomationDeliveryTarget, AutomationResourceCeiling,
@@ -42,14 +42,16 @@ use super::{
 const LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
 
 fn fence() -> StateFence {
-    StateFence::new(
+    let mut fence = StateFence::new(
         EpochId::new(
             EpochLineageId::new(LINEAGE).expect("lineage"),
             NonZeroU64::new(1).expect("sequence"),
         )
         .expect("epoch"),
         ResourceGeneration::new(1).expect("generation"),
-    )
+    );
+    fence.task_revision = Some(TaskRevision::new(1).expect("task revision"));
+    fence
 }
 
 fn context() -> RequestMeta {
@@ -57,7 +59,7 @@ fn context() -> RequestMeta {
         request_id: RequestId::new("request-automation-port").expect("request"),
         session_id: Some(SessionId::new("session-automation-port").expect("session")),
         task_id: Some(TaskId::new("task-automation-port").expect("task")),
-        product_id: ProductId::new("product-automation").expect("product"),
+        product_id: ProductId::new("product-1").expect("product"),
         source_id: SourceId::new("owner-1").expect("source"),
         state_fence: fence(),
         clock: ClockReading::default(),
@@ -82,28 +84,15 @@ fn valid_revision(
         natural_language_intent: "nightly backup".to_owned(),
         schedule: NormalizedSchedule {
             kind: ScheduleKind::OneShot,
-            expression: "once".to_owned(),
-            calendar: "gregorian".to_owned(),
+            expression: "utc:2026-09-21T00:00:00Z".to_owned(),
+            calendar: "gregorian-utc".to_owned(),
             timezone: "UTC".to_owned(),
             dst_fold: eliot_kernel_core::user_automation::DstFoldPolicy::First,
             dst_gap: eliot_kernel_core::user_automation::DstGapPolicy::ShiftForward,
             start_at: "2026-09-21T00:00:00Z".to_owned(),
             end_at: None,
-            next_occurrences: vec!["2026-09-21T00:00:00Z".to_owned()],
-            // This fixture carries a retired shape-only occurrence key, so the
-            // owning calendar adapter has not issued a normalization binding
-            // for it. Empty evidence can never satisfy the required binding, so
-            // the revision stays refused instead of becoming admitted.
-            normalization_receipt: Box::new(
-                eliot_kernel_core::user_automation::ScheduleNormalizationReceipt {
-                    receipt_id: String::new(),
-                    normalizer_authority: String::new(),
-                    source_digest: String::new(),
-                    zone_database_revision:
-                        eliot_kernel_core::user_automation::PINNED_ZONE_DATABASE_REVISION.to_owned(),
-                    occurrences_digest: String::new(),
-                },
-            ),
+            next_occurrences: Vec::new(),
+            normalization_receipt: Box::new(Default::default()),
         },
         mode: UserAutomationExecutionMode::DeterministicProcess,
         task: AutomationTaskBinding {
@@ -148,34 +137,19 @@ fn valid_revision(
     }
 }
 
-/// Supplies the newly required typed field without certifying the retired
-/// shape-only revision used by these refused port fixtures.
-fn unbound_normalization_receipt_envelope() -> Box<eliot_receipts::ReceiptEnvelope> {
-    let mut revision = valid_revision(
-        "normalization-fixture",
-        "r-normalization-fixture",
-        UserAutomationConfigurationState::Active,
-    );
-    revision.schedule = NormalizedSchedule {
-        kind: ScheduleKind::OneShot,
-        expression: "utc:2026-09-21T00:00:00Z".to_owned(),
-        calendar: "gregorian-utc".to_owned(),
-        timezone: "UTC".to_owned(),
-        dst_fold: eliot_kernel_core::user_automation::DstFoldPolicy::First,
-        dst_gap: eliot_kernel_core::user_automation::DstGapPolicy::ShiftForward,
-        start_at: "2026-09-21T00:00:00Z".to_owned(),
-        end_at: None,
-        next_occurrences: Vec::new(),
-        normalization_receipt: Box::new(Default::default()),
-    };
-    let mut context = context();
-    context.task_id = None;
+/// Runs the production Kernel schedule normalizer and returns its exact
+/// normalized revision and owner-issued receipt as one fixture value.
+fn normalized_revision_and_receipt(
+    revision: UserAutomationRevision,
+    operation_id: &str,
+) -> (UserAutomationRevision, Box<eliot_receipts::ReceiptEnvelope>) {
     let request = crate::user_automation::UserAutomationServiceRequest {
-        context,
+        context: context(),
         authenticated_principal: "human-1".to_owned(),
         identity: OperationIdentity {
-            operation_id: OperationId::new("op-normalization-fixture").expect("operation"),
-            idempotency_key: "idem-normalization-fixture".to_owned(),
+            operation_id: OperationId::new(format!("normalize-{operation_id}"))
+                .expect("normalization operation"),
+            idempotency_key: format!("idem-normalize-{operation_id}"),
             canonical_request_hash: String::new(),
         },
         intent: intent(UserAutomationOperation::NormalizeSchedule {
@@ -183,17 +157,18 @@ fn unbound_normalization_receipt_envelope() -> Box<eliot_receipts::ReceiptEnvelo
             occurrence_count: 1,
         }),
     };
-    // `normalize_user_automation_operation` is defined `pub(crate)` in the
-    // sibling `user_automation_store` module and is deliberately NOT re-exported
-    // at the crate root, so `super::` (the crate root, this module's parent)
-    // cannot resolve it. This is the same qualified path the production caller
-    // in `store_gateway` uses, and the same shape every other sibling test
-    // module in this crate already uses. The fixture's intent is unchanged: it
-    // still obtains the route-issued envelope from the real production
-    // operation rather than fabricating one.
-    let (_, envelope) = super::user_automation_store::normalize_user_automation_operation(&request)
-        .expect("Kernel normalization fixture");
-    Box::new(envelope)
+    let (revision, envelope) =
+        super::user_automation_store::normalize_user_automation_operation(&request)
+            .expect("Kernel normalization fixture");
+    revision
+        .schedule
+        .validate_normalization_receipt_envelope(
+            &revision.schedule.normalization_receipt,
+            &envelope,
+            &revision,
+        )
+        .expect("normalization envelope binds the produced revision");
+    (revision, Box::new(envelope))
 }
 
 /// Builds the owner-issued denominator completeness block this double
@@ -599,13 +574,16 @@ async fn try_admitted(
 async fn create_lists_and_reads_back_typed_revision() {
     let fake = FakeStore::new();
     let port = CanonicalUserAutomationStore::new(fake);
-    let revision = valid_revision("auto-1", "r-1", UserAutomationConfigurationState::Active);
+    let (revision, normalization_receipt) = normalized_revision_and_receipt(
+        valid_revision("auto-1", "r-1", UserAutomationConfigurationState::Active),
+        "port-create-1",
+    );
     let response = admitted_response(
         &port,
         "op-port-create-1",
         UserAutomationOperation::Create {
             revision: Box::new(revision.clone()),
-            normalization_receipt_envelope: unbound_normalization_receipt_envelope(),
+            normalization_receipt_envelope: normalization_receipt,
         },
     )
     .await;
@@ -687,25 +665,31 @@ async fn create_lists_and_reads_back_typed_revision() {
 async fn edit_pause_remove_move_lineage_with_typed_results() {
     let fake = FakeStore::new();
     let port = CanonicalUserAutomationStore::new(fake);
-    let first = valid_revision("auto-1", "r-1", UserAutomationConfigurationState::Active);
+    let (first, first_normalization_receipt) = normalized_revision_and_receipt(
+        valid_revision("auto-1", "r-1", UserAutomationConfigurationState::Active),
+        "port-create-2",
+    );
     admitted_response(
         &port,
         "op-port-create-2",
         UserAutomationOperation::Create {
             revision: Box::new(first.clone()),
-            normalization_receipt_envelope: unbound_normalization_receipt_envelope(),
+            normalization_receipt_envelope: first_normalization_receipt,
         },
     )
     .await;
-    let mut second = valid_revision("auto-1", "r-2", UserAutomationConfigurationState::Active);
-    second.supersedes = Some("r-1".to_owned());
+    let mut second_draft =
+        valid_revision("auto-1", "r-2", UserAutomationConfigurationState::Active);
+    second_draft.supersedes = Some("r-1".to_owned());
+    let (second, second_normalization_receipt) =
+        normalized_revision_and_receipt(second_draft, "port-edit-2");
     let response = admitted_response(
         &port,
         "op-port-edit-2",
         UserAutomationOperation::Edit {
             previous_revision: Box::new(first),
             revision: Box::new(second.clone()),
-            normalization_receipt_envelope: unbound_normalization_receipt_envelope(),
+            normalization_receipt_envelope: second_normalization_receipt,
         },
     )
     .await;
@@ -774,13 +758,16 @@ async fn edit_pause_remove_move_lineage_with_typed_results() {
 async fn run_now_projects_invocation_and_pending_wake() {
     let fake = FakeStore::new();
     let port = CanonicalUserAutomationStore::new(fake);
-    let revision = valid_revision("auto-1", "r-1", UserAutomationConfigurationState::Active);
+    let (revision, normalization_receipt) = normalized_revision_and_receipt(
+        valid_revision("auto-1", "r-1", UserAutomationConfigurationState::Active),
+        "port-create-3",
+    );
     admitted_response(
         &port,
         "op-port-create-3",
         UserAutomationOperation::Create {
             revision: Box::new(revision.clone()),
-            normalization_receipt_envelope: unbound_normalization_receipt_envelope(),
+            normalization_receipt_envelope: normalization_receipt,
         },
     )
     .await;
@@ -883,10 +870,13 @@ async fn run_now_projects_invocation_and_pending_wake() {
 async fn replay_reports_replayed_without_remutation() {
     let fake = FakeStore::new();
     let port = CanonicalUserAutomationStore::new(fake);
-    let revision = valid_revision("auto-1", "r-1", UserAutomationConfigurationState::Active);
+    let (revision, normalization_receipt) = normalized_revision_and_receipt(
+        valid_revision("auto-1", "r-1", UserAutomationConfigurationState::Active),
+        "port-replay-4",
+    );
     let operation = UserAutomationOperation::Create {
         revision: Box::new(revision.clone()),
-        normalization_receipt_envelope: unbound_normalization_receipt_envelope(),
+        normalization_receipt_envelope: normalization_receipt,
     };
     let first = admitted_response(&port, "op-port-replay-4", operation.clone()).await;
     let UserAutomationStoreOutcome::Committed { receipt, .. } = first.outcome else {
@@ -916,13 +906,16 @@ async fn replay_reports_replayed_without_remutation() {
 async fn divergent_identity_and_unknown_automation_fail_closed() {
     let fake = FakeStore::new();
     let port = CanonicalUserAutomationStore::new(fake);
-    let revision = valid_revision("auto-1", "r-1", UserAutomationConfigurationState::Active);
+    let (revision, normalization_receipt) = normalized_revision_and_receipt(
+        valid_revision("auto-1", "r-1", UserAutomationConfigurationState::Active),
+        "port-sealed-5",
+    );
     admitted_response(
         &port,
         "op-port-sealed-5",
         UserAutomationOperation::Create {
             revision: Box::new(revision.clone()),
-            normalization_receipt_envelope: unbound_normalization_receipt_envelope(),
+            normalization_receipt_envelope: normalization_receipt.clone(),
         },
     )
     .await;
@@ -933,7 +926,7 @@ async fn divergent_identity_and_unknown_automation_fail_closed() {
     other.natural_language_intent = "forged intent".to_owned();
     let forged = UserAutomationOperation::Create {
         revision: Box::new(other),
-        normalization_receipt_envelope: unbound_normalization_receipt_envelope(),
+        normalization_receipt_envelope: normalization_receipt,
     };
     let draft = store_request("op-port-sealed-5", forged.clone());
     let observed = match port.execute_user_automation(draft).await {
