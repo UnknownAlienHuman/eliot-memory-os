@@ -122,13 +122,14 @@ use eliot_protocol::dreamer_job::{DurableJobResponse, JobState};
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use eliot_testd_core::{
     BUILD_ROOT_DIRECTORY, BuildClass, BuildFingerprint, BuildMode, GovernedWorkEnvelope,
-    JobState as TestdJobState, JobSubmissionMetadata, KernelProcessAdmissionEvidence,
+    JobClass, JobState as TestdJobState, JobSubmissionMetadata, KernelProcessAdmissionEvidence,
     KernelProcessAdmissionProvider, KernelProcessAdmissionRequest, LaneIdentity, ProcessAdmission,
-    RetryPolicy, TARGET_LAYOUT_REVISION, TESTD_OWNER_SUBMIT_OPERATION,
+    ResourceWeight, RetryPolicy, TARGET_LAYOUT_REVISION, TESTD_OWNER_SUBMIT_OPERATION,
     TESTD_OWNER_SUBMIT_WIRE_VERSION, TESTD_PRODUCTIVE_PROFILE, TargetLayoutBinding, TargetRoots,
     TestdOwnerSubmitDirective, TestdOwnerSubmitRequest, TestdOwnerSubmitResponse, TestdStore,
-    TestdVerifierDispatchBinding, TestdVerifierJobSubmission, issue_process_admission,
-    testd_profile_binding, verification_receipt_sha256, verify_envelope_layout_binding,
+    TestdVerifierDispatchBinding, TestdVerifierJobSubmission, TestResourceProfile,
+    issue_process_admission, testd_profile_binding, verification_receipt_sha256,
+    verify_envelope_layout_binding,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1510,12 +1511,32 @@ pub(crate) async fn submit_testd_owner_job(
         ),
     )
     .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
-    // The envelope is allocated here only to resolve the lane's ONE governed
-    // root, from the same identity the submission carries and the same declared
+    // Issue #1897 (AUD3): this route runs a test suite, so it touches mutable
+    // runtime fixture state that a worktree does not isolate. It therefore
+    // DECLARES the exclusive resource it will touch, instead of inheriting the
+    // parallel declaration `JobSubmissionMetadata::verification()` carries. The
+    // claim is the lane's own fixture root, derived from the admitted identity
+    // through the envelope's shared namespace derivation, so it is the same
+    // value the store derives when it allocates the persisted envelope and the
+    // allocator turns into a held lease: two concurrent jobs derive two roots,
+    // are granted two distinct leases, and never share one fixture directory.
+    // Leases stay empty here because they are the allocator's grant, attached at
+    // claim; declaring them at submission would be a caller-asserted DTO.
+    let submission_metadata = JobSubmissionMetadata::declared(
+        JobClass::Verification,
+        TestResourceProfile {
+            weight: ResourceWeight::Light,
+            exclusive_resources: lane_identity
+                .fixture_resource_claims()
+                .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?,
+            serial_group: String::new(),
+        },
+    );
+    // The envelope is allocated here to resolve the lane's ONE governed root,
+    // from the same identity the submission carries and the same declared
     // resource claims the submission carries. The store allocates and persists
     // its own copy from that identity; the two agree because both run the same
     // `derive_target_root` over the same admitted inputs.
-    let submission_metadata = JobSubmissionMetadata::verification();
     let lane_envelope = GovernedWorkEnvelope::allocate(
         lane_identity.clone(),
         submission_metadata
@@ -1535,6 +1556,20 @@ pub(crate) async fn submit_testd_owner_job(
             "Kernel TestD governed lane root is not canonical".to_owned(),
         ));
     }
+    // Issue #1897 (W4/AUD2): the physical fixture root is created here, from the
+    // lane's own namespace, and canonicalized before any child can be told
+    // about it. It is created per job rather than shared, so this operation owns
+    // the directory it hands out and no other job writes into it.
+    let fixture_root = lane_envelope
+        .fixture_root()
+        .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    std::fs::create_dir_all(&fixture_root)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    if std::fs::canonicalize(&fixture_root).ok().as_deref() != Some(fixture_root.as_path()) {
+        return Err(DispatchLaunchError::Gate(
+            "Kernel TestD lane fixture root is not canonical".to_owned(),
+        ));
+    }
     let target_roots = TargetRoots::new(
         contour_root.to_string_lossy().into_owned(),
         source_root.to_string_lossy().into_owned(),
@@ -1544,9 +1579,16 @@ pub(crate) async fn submit_testd_owner_job(
     .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
     verify_envelope_layout_binding(&target_roots, &target_layout, &lane_envelope)
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    // Issue #1897 (AUD2): the child environment is composed from the lane
+    // envelope itself, so the Cargo roots, the fixture namespace, and the
+    // physical fixture root the child runs with are exactly what this operation
+    // allocated and the store will admit. `validate_for_roots` re-observes the
+    // tool bytes and proves the fixture root it emits is an existing canonical
+    // directory, so a fixture tree this operation did not create cannot reach a
+    // test process.
     let environment = request
         .process_tool
-        .validate_for_roots(&target_roots.target_root, &target_roots.cache_root)
+        .validate_for_roots(&lane_envelope)
         .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
 
     let profile = testd_profile_binding(
@@ -1638,9 +1680,10 @@ pub(crate) async fn submit_testd_owner_job(
         priority: 0,
         // This is the Kernel's productive verifier launch: the job class is
         // verification, so it is ordered ahead of every background lane and
-        // reserves capacity against them (I2.22). It is the same declaration
-        // the lane envelope above was allocated from, so the persisted envelope
-        // and the job's resource profile cannot disagree.
+        // reserves capacity against them (I2.22). The resource profile is the
+        // one declared above, so the persisted envelope's claim set and the
+        // job's declared profile cannot disagree, and the store allocates the
+        // runtime leases against that exact profile at claim time.
         metadata: submission_metadata,
     };
     submission

@@ -661,11 +661,16 @@ impl GovernedWorkEnvelope {
     /// Refuses a work item that has not declared and been granted what it will
     /// touch, and returns the identity to attach to its result.
     ///
-    /// This is the fail-closed admission gate. It requires a non-empty claim
+    /// This is the fail-closed admission gate, and it is the gate the execution
+    /// path runs: a retained work item is admitted again before its process
+    /// starts, not merely requalified for shape. It requires a non-empty claim
     /// set, every claim covered by a held lease, every held lease backed by a
     /// claim, and every held lease granted to this work item, so a worktree
     /// alone cannot obtain a shared runtime resource: the tuple is the only
-    /// route to one, and the tuple carries who the grant was made for.
+    /// route to one, and the tuple carries who the grant was made for. A work
+    /// item that declares nothing is refused here rather than executed with an
+    /// implicit empty claim set, which is the only reading under which an empty
+    /// persisted lease vector would be a sufficient runtime isolation record.
     ///
     /// # Errors
     ///

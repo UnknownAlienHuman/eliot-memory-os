@@ -9,7 +9,8 @@
 
 pub use eliot_build_test_graph::{
     BUILD_ROOT_DIRECTORY, BuildFingerprint, BuildMode, CARGO_HOME_ENV, CARGO_TARGET_DIR_ENV,
-    CandidateIdentity, GovernedWorkEnvelope, LaneIdentity, RuntimeEnvironmentLease,
+    CandidateIdentity, FIXTURE_NAMESPACE_ENV, FIXTURE_ROOT_ENV, GovernedWorkEnvelope, LaneIdentity,
+    RuntimeEnvironmentLease,
 };
 use eliot_contracts::{
     ArtifactId, ClockReading, ContractId, EpochId, RequestId, canonical_json_bytes,
@@ -2432,12 +2433,19 @@ impl TestdToolObservation {
 
 impl TestdProcessToolIntent {
     /// Revalidates the tool observation and closed child environment against
-    /// the Kernel-selected target/cache roots, then returns the exact
-    /// non-inheriting process environment projection.
+    /// the retained governed envelope, then returns the exact non-inheriting
+    /// process environment projection.
+    ///
+    /// Every lane-scoped binding this projection emits — the Cargo target root,
+    /// the Cargo cache root, and both fixture bindings — is read off the one
+    /// retained envelope rather than supplied by the caller, so a caller cannot
+    /// compose a child environment whose fixture namespace disagrees with the
+    /// envelope the store persists and admits. The two Cargo roots are still the
+    /// same canonical directory (`cache_root == target_root`), which the checks
+    /// below keep proving.
     pub fn validate_for_roots(
         &self,
-        target_root: &str,
-        cache_root: &str,
+        envelope: &GovernedWorkEnvelope,
     ) -> Result<eliot_process::EnvironmentProjection, TestdError> {
         self.observation.validate()?;
         let nextest = validate_canonical_tool_file(&self.observation.nextest_path)?;
@@ -2470,8 +2478,16 @@ impl TestdProcessToolIntent {
             }
         }
 
-        let cargo_home = validate_canonical_tool_directory(cache_root)?;
-        let target = validate_canonical_tool_directory(target_root)?;
+        // Issue #1897 (AUD2): the governed roots are read off the retained
+        // envelope rather than accepted from the caller, so the child can never
+        // be composed against a target root or fixture root the store did not
+        // admit for this work item.
+        let governed_root = envelope
+            .derive_target_root()
+            .map_err(|error| TestdError::Contract(error.to_string()))?;
+        let governed_root = governed_root.to_string_lossy().into_owned();
+        let cargo_home = validate_canonical_tool_directory(&governed_root)?;
+        let target = validate_canonical_tool_directory(&governed_root)?;
         if cargo_home != target {
             return Err(TestdError::Invalid {
                 field: "process_tool.target_root",
@@ -2507,7 +2523,7 @@ impl TestdProcessToolIntent {
             reason: "observed tool directories cannot be composed into PATH",
         })?;
         let path_value = path_value.to_string_lossy().into_owned();
-        let values = BTreeMap::from([
+        let mut values = BTreeMap::from([
             (
                 "NEXTEST_EXPERIMENTAL_LIBTEST_JSON".to_owned(),
                 "1".to_owned(),
@@ -2526,7 +2542,7 @@ impl TestdProcessToolIntent {
                 "ELIOT_TESTD_RUSTC_SHA256".to_owned(),
                 self.observation.rustc_sha256.clone(),
             ),
-            ("CARGO_HOME".to_owned(), cache_root.to_owned()),
+            ("CARGO_HOME".to_owned(), governed_root.clone()),
             (
                 "RUSTUP_HOME".to_owned(),
                 rustup_home.to_string_lossy().into_owned(),
@@ -2536,8 +2552,40 @@ impl TestdProcessToolIntent {
                 self.observation.selected_toolchain.clone(),
             ),
             ("PATH".to_owned(), path_value),
-            ("CARGO_TARGET_DIR".to_owned(), target_root.to_owned()),
+            ("CARGO_TARGET_DIR".to_owned(), governed_root.clone()),
         ]);
+        // Issue #1897 (W4/AUD2): the fixture namespace and the physical root it
+        // resolves to travel into the child. Without them the child resolves an
+        // ambient fixture location shared with every concurrent run, and the
+        // namespace the store persisted would stay inert. Both values come from
+        // the retained envelope, and the root is proven to be the canonical
+        // existing directory the same envelope derives, so the child cannot be
+        // pointed at a fixture tree that was never admitted or created.
+        let fixture_root = envelope
+            .fixture_root()
+            .map_err(|error| TestdError::Contract(error.to_string()))?;
+        let canonical_fixture_root =
+            validate_canonical_tool_directory(&fixture_root.to_string_lossy())?
+                .to_string_lossy()
+                .into_owned();
+        let derived_fixture_root = envelope
+            .fixture_environment()
+            .map_err(|error| TestdError::Contract(error.to_string()))?
+            .into_iter()
+            .find(|(name, _)| name == FIXTURE_ROOT_ENV)
+            .map(|(_, value)| value);
+        if derived_fixture_root.as_deref() != Some(canonical_fixture_root.as_str()) {
+            return Err(TestdError::Invalid {
+                field: "process_tool.fixture_root",
+                reason: "the envelope fixture root is not the canonical fixture directory",
+            });
+        }
+        for (name, value) in envelope
+            .fixture_environment()
+            .map_err(|error| TestdError::Contract(error.to_string()))?
+        {
+            values.insert(name, value);
+        }
 
         eliot_process::EnvironmentProjection::new(
             values,
@@ -4382,18 +4430,21 @@ impl TestdStore {
             scheduling_decision(job.job_class, &job.resource_profile, leases.clone())
                 .map_err(|error| TestdError::ResourceConflict(error.to_string()))?,
         );
-        // Issue #1897 (W1/W5): record the allocator's ACTUAL grant on the
-        // allocated envelope, so the persisted work item keeps the leases it
+        // Issue #1897 (W1/W5/AUD3/AUD4): record the allocator's ACTUAL grant on
+        // the allocated envelope, so the persisted work item keeps the leases it
         // was admitted with. `leases` is the live `ResourceLeaseAllocator`
-        // outcome, not a reconstruction of matching field values: the
-        // allocator refused above if any declared resource or serial group was
-        // already held, and `with_granted_leases` additionally refuses a record
-        // whose holder is not this job. The envelope is the only writer of that
+        // outcome, not a reconstruction of matching field values: the allocator
+        // refused above if any declared resource or serial group was already
+        // held, and `with_granted_leases` additionally refuses a record whose
+        // holder is not this job. The envelope is the only writer of that
         // record, so two jobs cannot claim one exclusive resource by presenting
-        // identical lease DTOs. The scheduler's allocate-or-refuse above stays
-        // the enforced claims gate: a parallel declaration with no exclusive
-        // claim is legitimate, so the envelope-level non-empty admission gate is
-        // not the claim gate.
+        // identical lease DTOs. Because the allocator grants exactly the
+        // declared claims, this is also where a mutating work item acquires its
+        // runtime-environment lease: a lane that declared the fixture state it
+        // touches is granted a lease naming that same state, and the persisted
+        // envelope carries the grant. `GovernedWorkEnvelope::admit`, which the
+        // claimed start path runs, refuses any tuple whose claims and leases do
+        // not correspond.
         if let Some(envelope) = job.work_envelope.take() {
             job.work_envelope = Some(
                 envelope
@@ -4527,6 +4578,23 @@ impl TestdStore {
                     .find(|(name, _)| name == variable)
                     .map(|(_, value)| value.as_str());
                 if bound != Some(expected) {
+                    return Err(TestdError::InvalidBinding);
+                }
+            }
+            // Issue #1897 (AUD2): the fixture bindings the process request
+            // carries are compared against the same RETAINED envelope, by
+            // content and independently of the values this method was handed:
+            // the namespace the job was admitted under, and the physical root
+            // that namespace resolves to. A request naming another lane's
+            // namespace, or a fixture root that is not this lane's, refuses
+            // here before any process starts, so a restart cannot swap which
+            // fixture tree the run touches.
+            let non_secret = request.environment().non_secret();
+            for (name, expected) in envelope
+                .fixture_environment()
+                .map_err(|_| TestdError::InvalidBinding)?
+            {
+                if non_secret.get(&name) != Some(&expected) {
                     return Err(TestdError::InvalidBinding);
                 }
             }

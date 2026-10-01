@@ -529,6 +529,22 @@ pub(crate) async fn start_claimed_from_store<E: ProcessExecutor + 'static>(
     if grant.contour_root() != current.target_roots.allowed_contour_root {
         return Err(TestdError::InvalidBinding);
     }
+    // Issue #1897 (AUD2): the fixture bindings the child was composed with are
+    // read back here and compared, by content, against the namespace and root
+    // the RETAINED envelope derives. The child runs the fixture tree this job
+    // was admitted with, not one the presented request names; a mismatch refuses
+    // before the executor is reached.
+    if let Some(envelope) = current.work_envelope.as_ref() {
+        let non_secret = request.environment().non_secret();
+        for (name, expected) in envelope
+            .fixture_environment()
+            .map_err(|_| TestdError::InvalidBinding)?
+        {
+            if non_secret.get(&name) != Some(&expected) {
+                return Err(TestdError::InvalidBinding);
+            }
+        }
+    }
     let operation_id = request.operation_id().clone();
     let request_job_id = request.job_id().as_str().to_owned();
     let process_tree_id = request.process_tree_id().as_str().to_owned();
