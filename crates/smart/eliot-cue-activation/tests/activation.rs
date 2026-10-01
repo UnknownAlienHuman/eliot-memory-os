@@ -503,12 +503,26 @@ fn edge_and_output_limits_are_explicit() {
         &[(1, "second", MatchMode::Exact, ComparisonForm::Exact)],
         91,
     );
+    let third = normalized(
+        CueKind::Symbol,
+        "third",
+        "c",
+        "c",
+        &[(1, "third", MatchMode::Exact, ComparisonForm::Exact)],
+        92,
+    );
+    // Both edges leave the single seeded target, so the traversal follows the
+    // whole supplied edge set inside the edge cap. A back edge into the seed
+    // would instead stay un-followable forever and report a frontier, so the
+    // two supplied edges fan out from `a` and the cap refuses the evaluation
+    // with an empty un-followed remainder.
     let candidate = build(
         vec![
             projection(first.clone(), "a", "a", 92),
             projection(second, "b", "b", 93),
+            projection(third, "c", "c", 94),
         ],
-        vec![edge(1, "a", "b"), edge(2, "b", "a")],
+        vec![edge(1, "a", "b"), edge(2, "a", "c")],
     );
     let mut edge_limited_bounds = bounds(2);
     edge_limited_bounds.max_edges = 2;
@@ -1312,12 +1326,35 @@ fn stale_edge_is_rejected_not_traversed() {
     );
     let mut stale_edge = edge(1, "a", "b");
     stale_edge.evidence.freshness = EvidenceFreshness::Stale;
-    let candidate = build(
+    // A relation edge whose evidence is not current is refused at the index
+    // boundary, before `evaluate_activation` is reached at all: the published
+    // candidate admits only the three exact currentness labels, so a stale edge
+    // is rejected rather than admitted, traversed, or reported as an
+    // optional-stage gap. Nothing downstream can observe it.
+    let stale_projections = vec![
+        projection(seed_cue.clone(), "a", "a", 92),
+        projection(next.clone(), "b", "b", 93),
+    ];
+    assert!(matches!(
+        CueSnapshotBuildCandidate::seal(
+            WorkScopeId::new("scope-1").unwrap(),
+            snapshot(&stale_projections),
+            stale_projections,
+            vec![stale_edge],
+        ),
+        Err(eliot_cue_contracts::CueContractError::Foundation {
+            field: "index.edge.currentness",
+        })
+    ));
+    // The identical edge under current evidence is admitted and traversed, so
+    // the refusal above is caused by the currentness label alone and the
+    // rejection is not a blanket refusal of the edge.
+    let current = build(
         vec![
             projection(seed_cue.clone(), "a", "a", 92),
             projection(next, "b", "b", 93),
         ],
-        vec![stale_edge],
+        vec![edge(1, "a", "b")],
     );
     let p = profile(
         2,
@@ -1325,10 +1362,13 @@ fn stale_edge_is_rejected_not_traversed() {
         vec![RelationRule::new(RelationKind::Supports, 1000)],
         Some("registry-1".into()),
     );
-    assert!(matches!(
-        evaluate_activation(&candidate, &request(&candidate, vec![seed_cue], 2), &p),
-        Err(ActivationError::StaleInput)
-    ));
+    let traversal = evaluate_activation(&current, &request(&current, vec![seed_cue], 2), &p)
+        .expect("a current relation edge is traversable");
+    assert_eq!(traversal.derived_stage, DerivedStage::Evaluated);
+    assert_eq!(traversal.result.direct.len(), 1);
+    assert_eq!(traversal.result.direct[0].target.as_str(), "a");
+    assert_eq!(traversal.result.derived.len(), 1);
+    assert_eq!(traversal.result.derived[0].target.as_str(), "b");
 }
 
 // WORK_UNIT_CASE: 600/21
@@ -1810,11 +1850,28 @@ fn result_count_boundaries_are_explicit() {
         1,
     );
     derived_req.bounds = derived_limited;
+    // The derived-result cap is an admitted bound on the OPTIONAL stage, not a
+    // refusal of the evaluation: the completed direct result stands, the one
+    // derived hit the cap admits is kept, and the derived hit it does not admit
+    // becomes the resumable frontier instead of being discarded.
+    let derived_evaluation = evaluate_activation(&spread, &derived_req, &derived_profile).unwrap();
+    derived_evaluation
+        .validate_against(&spread, &derived_req, &derived_profile)
+        .unwrap();
+    assert_eq!(
+        derived_evaluation.derived_stage,
+        DerivedStage::BoundReached {
+            field: "activation.max_derived".to_owned(),
+        }
+    );
+    assert_eq!(derived_evaluation.result.direct.len(), 1);
+    assert_eq!(derived_evaluation.result.direct[0].target.as_str(), "a");
+    assert_eq!(derived_evaluation.result.derived.len(), 1);
+    assert_eq!(derived_evaluation.result.derived[0].target.as_str(), "b");
     assert!(matches!(
-        evaluate_activation(&spread, &derived_req, &derived_profile),
-        Err(ActivationError::Limit {
-            field: "activation.max_derived"
-        })
+        &derived_evaluation.result.completeness,
+        eliot_cue_contracts::Completeness::Partial { frontier }
+            if frontier.iter().any(|id| id.as_str() == "edge-2")
     ));
 }
 
