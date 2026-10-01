@@ -17961,9 +17961,48 @@ impl RedbRecoveryStore {
             });
         }
 
-        let prefix = Self::bridge_owner_list_index_prefix(&scope, BRIDGE_STREAM_OWNER_KIND_STREAM);
-        let end = Self::bridge_owner_list_index_key(
+        let (owner_total, page, has_more) = Self::read_bridge_observation_owner_page(
+            &read,
+            query,
             &scope,
+            lineage,
+            principal,
+            snapshot_cutoff,
+        )?;
+        if expected_total.is_some_and(|total| total != owner_total) {
+            return Err(OrsError::StaleWriterEpoch);
+        }
+        let result = BridgeEventObservationRosterPage {
+            authority_lineage: query.authority_lineage.clone(),
+            principal: query.principal.clone(),
+            owner_cutoff: snapshot_cutoff,
+            owner_total,
+            continuation: has_more
+                .then(|| page.last().map(|owner| owner.owner_list_sequence))
+                .flatten(),
+            owners: page,
+        };
+        if serde_json::to_vec(&result)
+            .map_err(|_| OrsError::ProjectionLimitExceeded)?
+            .len()
+            > MAX_BRIDGE_RECOVERY_REPLY_BYTES
+        {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        Ok(result)
+    }
+
+    fn read_bridge_observation_owner_page(
+        read: &redb::ReadTransaction,
+        query: &BridgeEventObservationRosterQuery,
+        scope: &str,
+        lineage: &str,
+        principal: &str,
+        snapshot_cutoff: u64,
+    ) -> Result<(u64, Vec<BridgeEventObservationOwner>, bool), OrsError> {
+        let prefix = Self::bridge_owner_list_index_prefix(scope, BRIDGE_STREAM_OWNER_KIND_STREAM);
+        let end = Self::bridge_owner_list_index_key(
+            scope,
             BRIDGE_STREAM_OWNER_KIND_STREAM,
             snapshot_cutoff,
         );
@@ -17993,7 +18032,7 @@ impl RedbRecoveryStore {
                 || sequence > snapshot_cutoff
                 || key
                     != Self::bridge_owner_list_index_key(
-                        &scope,
+                        scope,
                         BRIDGE_STREAM_OWNER_KIND_STREAM,
                         sequence,
                     )
@@ -18017,27 +18056,13 @@ impl RedbRecoveryStore {
                         .to_owned(),
                 });
             }
-            let owner_value = owners
-                .get(namespace.as_str())
-                .map_err(storage)?
-                .ok_or(OrsError::RecoveryOwnerMismatch)?;
-            let owner: BridgeStreamOwnerRow = decode(owner_value.value())?;
-            owner.validate()?;
-            if owner.namespace != namespace
-                || owner.kind != BRIDGE_STREAM_OWNER_KIND_STREAM
-                || owner.authority_lineage != lineage
-                || owner.principal != principal
-                || Self::bridge_stream_owner_digest(
-                    &owner.authority_lineage,
-                    &owner.principal,
-                    &owner.producer,
-                    &owner.local_stream,
-                )? != namespace
-                || Self::bridge_owner_scope_digest(&owner.authority_lineage, &owner.principal)?
-                    != scope
-            {
-                return Err(OrsError::RecoveryOwnerMismatch);
-            }
+            let owner = Self::checked_bridge_observation_owner_index(
+                &owners,
+                &scope,
+                lineage,
+                principal,
+                &namespace,
+            )?;
             if sequence <= query.after_owner_sequence {
                 continue;
             }
@@ -18059,27 +18084,38 @@ impl RedbRecoveryStore {
                 incarnation: owner.incarnation,
             });
         }
-        if expected_total.is_some_and(|total| total != owner_total) {
-            return Err(OrsError::StaleWriterEpoch);
-        }
-        let result = BridgeEventObservationRosterPage {
-            authority_lineage: query.authority_lineage.clone(),
-            principal: query.principal.clone(),
-            owner_cutoff: snapshot_cutoff,
-            owner_total,
-            continuation: has_more
-                .then(|| page.last().map(|owner| owner.owner_list_sequence))
-                .flatten(),
-            owners: page,
-        };
-        if serde_json::to_vec(&result)
-            .map_err(|_| OrsError::ProjectionLimitExceeded)?
-            .len()
-            > MAX_BRIDGE_RECOVERY_REPLY_BYTES
+        Ok((owner_total, page, has_more))
+    }
+
+    fn checked_bridge_observation_owner_index(
+        owners: &impl ReadableTable<&'static str, &'static str>,
+        scope: &str,
+        lineage: &str,
+        principal: &str,
+        namespace: &str,
+    ) -> Result<BridgeStreamOwnerRow, OrsError> {
+        let owner_value = owners
+            .get(namespace)
+            .map_err(storage)?
+            .ok_or(OrsError::RecoveryOwnerMismatch)?;
+        let owner: BridgeStreamOwnerRow = decode(owner_value.value())?;
+        owner.validate()?;
+        if owner.namespace != namespace
+            || owner.kind != BRIDGE_STREAM_OWNER_KIND_STREAM
+            || owner.authority_lineage != lineage
+            || owner.principal != principal
+            || Self::bridge_stream_owner_digest(
+                &owner.authority_lineage,
+                &owner.principal,
+                &owner.producer,
+                &owner.local_stream,
+            )? != namespace
+            || Self::bridge_owner_scope_digest(&owner.authority_lineage, &owner.principal)?
+                != scope
         {
-            return Err(OrsError::ProjectionLimitExceeded);
+            return Err(OrsError::RecoveryOwnerMismatch);
         }
-        Ok(result)
+        Ok(owner)
     }
 
     /// Reads original committed bridge source rows from one exact retained
@@ -18096,16 +18132,68 @@ impl RedbRecoveryStore {
             return Err(OrsError::InvalidCursorLimit);
         }
         let requested = &query.owner;
+        let read = self.database.begin_read().map_err(storage)?;
+        let stored_owner = Self::checked_bridge_observation_owner(&read, requested)?;
+        let cursor = Self::bridge_observation_cursor(&read, requested, &stored_owner)?;
+        if query.after_event_sequence > cursor.observed_sequence {
+            return Err(OrsError::InvalidField {
+                field: "after_event_sequence",
+                reason: "event observation cursor does not exceed the selected owner's observed frontier",
+            });
+        }
+        let namespace = requested.owner_namespace.as_str();
+        let positions = read.open_table(BRIDGE_EVENT_POSITIONS).map_err(storage)?;
+        let records = read.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
+        let projections = read.open_table(BRIDGE_EVENT_PROJECTIONS).map_err(storage)?;
+        let (page_records, continuation) = Self::read_bridge_observation_records(
+            namespace,
+            &stored_owner.local_stream,
+            query,
+            &cursor,
+            &positions,
+            &records,
+            &projections,
+        )?;
+        let (gaps, gap_total) = Self::read_bridge_observation_gaps(
+            &read,
+            namespace,
+            &stored_owner.local_stream,
+        )?;
+        let result = BridgeEventObservationPage {
+            owner: requested.clone(),
+            after_event_sequence: query.after_event_sequence,
+            observed_through_sequence: cursor.observed_sequence,
+            cursor,
+            records: page_records,
+            gaps,
+            gap_total,
+            continuation,
+        };
+        if serde_json::to_vec(&result)
+            .map_err(|_| OrsError::ProjectionLimitExceeded)?
+            .len()
+            > MAX_BRIDGE_RECOVERY_REPLY_BYTES
+        {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        Ok(result)
+    }
+
+    fn checked_bridge_observation_owner(
+        read: &redb::ReadTransaction,
+        requested: &BridgeEventObservationOwner,
+    ) -> Result<BridgeStreamOwnerRow, OrsError> {
         let lineage = requested.authority_lineage.as_str();
         let principal = requested.principal.as_str();
-        let producer = requested.producer_id.as_str();
-        let local_stream = requested.local_stream.as_str();
-        let expected_namespace =
-            Self::bridge_stream_owner_digest(lineage, principal, producer, local_stream)?;
+        let expected_namespace = Self::bridge_stream_owner_digest(
+            lineage,
+            principal,
+            requested.producer_id.as_str(),
+            requested.local_stream.as_str(),
+        )?;
         if expected_namespace != requested.owner_namespace {
             return Err(OrsError::RecoveryOwnerMismatch);
         }
-        let read = self.database.begin_read().map_err(storage)?;
         let owners = read.open_table(BRIDGE_STREAM_OWNERS).map_err(storage)?;
         let stored_owner: BridgeStreamOwnerRow = owners
             .get(requested.owner_namespace.as_str())
@@ -18118,8 +18206,8 @@ impl RedbRecoveryStore {
             || stored_owner.kind != BRIDGE_STREAM_OWNER_KIND_STREAM
             || stored_owner.authority_lineage != lineage
             || stored_owner.principal != principal
-            || stored_owner.producer != producer
-            || stored_owner.local_stream != local_stream
+            || stored_owner.producer != requested.producer_id.as_str()
+            || stored_owner.local_stream != requested.local_stream.as_str()
             || stored_owner.creating_connection != requested.creating_connection.as_str()
             || stored_owner.creating_launch_nonce != requested.creating_launch_nonce.as_str()
             || stored_owner.creating_session_epoch != requested.creating_session_epoch
@@ -18153,7 +18241,14 @@ impl RedbRecoveryStore {
         if indexed_namespace != requested.owner_namespace {
             return Err(OrsError::RecoveryOwnerMismatch);
         }
+        Ok(stored_owner)
+    }
 
+    fn bridge_observation_cursor(
+        read: &redb::ReadTransaction,
+        requested: &BridgeEventObservationOwner,
+        stored_owner: &BridgeStreamOwnerRow,
+    ) -> Result<BridgeEventObservationCursorBounds, OrsError> {
         let cursor_row: Option<BridgeEventCursorRow> = read
             .open_table(BRIDGE_EVENT_CURSORS)
             .map_err(storage)?
@@ -18161,7 +18256,7 @@ impl RedbRecoveryStore {
             .map_err(storage)?
             .map(|value| decode(value.value()))
             .transpose()?;
-        let cursor = match cursor_row {
+        match cursor_row {
             Some(row) => {
                 row.validate()?;
                 if row.owner_namespace != requested.owner_namespace
@@ -18172,28 +18267,28 @@ impl RedbRecoveryStore {
                         reason: "cursor key and selected owner disagree".to_owned(),
                     });
                 }
-                BridgeEventObservationCursorBounds {
+                Ok(BridgeEventObservationCursorBounds {
                     durable_sequence: row.last_durable_sequence,
                     observed_sequence: row.last_observed_sequence,
                     acked_sequence: row.last_acked_sequence,
                     compacted_sequence: row.last_compacted_sequence,
-                }
+                })
             }
-            None => BridgeEventObservationCursorBounds::default(),
-        };
-        if query.after_event_sequence > cursor.observed_sequence {
-            return Err(OrsError::InvalidField {
-                field: "after_event_sequence",
-                reason: "event observation cursor does not exceed the selected owner's observed frontier",
-            });
+            None => Ok(BridgeEventObservationCursorBounds::default()),
         }
+    }
 
-        let namespace = requested.owner_namespace.as_str();
+    fn read_bridge_observation_records(
+        namespace: &str,
+        stream_id: &str,
+        query: &BridgeEventObservationQuery,
+        cursor: &BridgeEventObservationCursorBounds,
+        positions: &impl ReadableTable<&'static str, &'static str>,
+        records: &impl ReadableTable<&'static str, &'static str>,
+        projections: &impl ReadableTable<&'static str, &'static str>,
+    ) -> Result<(Vec<BridgeEventObservationRecord>, Option<u64>), OrsError> {
         let position_prefix = format!("{namespace}::");
         let position_end = format!("{position_prefix}\u{10ffff}");
-        let positions = read.open_table(BRIDGE_EVENT_POSITIONS).map_err(storage)?;
-        let records = read.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
-        let projections = read.open_table(BRIDGE_EVENT_PROJECTIONS).map_err(storage)?;
         let mut page_records = Vec::new();
         let mut page_positions = 0_usize;
         let mut last_page_sequence = None;
@@ -18228,86 +18323,114 @@ impl RedbRecoveryStore {
             position.validate()?;
             page_positions += 1;
             last_page_sequence = Some(sequence);
-            let record_key = format!("{namespace}::{}", position.event_id);
-            let stored_record = records.get(record_key.as_str()).map_err(storage)?;
-            let Some(stored_record) = stored_record else {
-                if sequence > cursor.compacted_sequence {
-                    return Err(OrsError::IntegrityProblem {
-                        record_type: "bridge_event_record",
-                        reason: "position above compacted boundary has no committed source row"
-                            .to_owned(),
-                    });
-                }
-                continue;
-            };
-            let row: BridgeEventRow = decode(stored_record.value())?;
-            row.validate()?;
-            if row.owner_namespace != namespace
-                || row.stream_id != stored_owner.local_stream
-                || row.sequence != sequence
-                || row.event_id != position.event_id
-                || record_key != format!("{}::{}", row.owner_namespace, row.event_id)
-            {
+            if let Some(record) = Self::read_bridge_observation_record(
+                namespace,
+                stream_id,
+                sequence,
+                cursor.compacted_sequence,
+                &position,
+                records,
+                projections,
+            )? {
+                page_records.push(record);
+            }
+        }
+        Ok((page_records, continuation))
+    }
+
+    fn read_bridge_observation_record(
+        namespace: &str,
+        stream_id: &str,
+        sequence: u64,
+        compacted_sequence: u64,
+        position: &BridgeEventPosition,
+        records: &impl ReadableTable<&'static str, &'static str>,
+        projections: &impl ReadableTable<&'static str, &'static str>,
+    ) -> Result<Option<BridgeEventObservationRecord>, OrsError> {
+        let record_key = format!("{namespace}::{}", position.event_id);
+        let stored_record = records.get(record_key.as_str()).map_err(storage)?;
+        let Some(stored_record) = stored_record else {
+            if sequence > compacted_sequence {
                 return Err(OrsError::IntegrityProblem {
                     record_type: "bridge_event_record",
-                    reason: "source row does not match its selected owner position".to_owned(),
-                });
-            }
-            let projection_value = projections
-                .get(record_key.as_str())
-                .map_err(storage)?
-                .ok_or(OrsError::IntegrityProblem {
-                    record_type: "bridge_event_projection",
-                    reason: "committed source row has no normalized projection".to_owned(),
-                })?;
-            let projection: BridgeEventProjectionRow = decode(projection_value.value())?;
-            projection.validate()?;
-            if !projection.binds_record(&row) {
-                return Err(OrsError::IntegrityProblem {
-                    record_type: "bridge_event_projection",
-                    reason: "normalized projection does not bind the committed source row"
+                    reason: "position above compacted boundary has no committed source row"
                         .to_owned(),
                 });
             }
-            page_records.push(BridgeEventObservationRecord {
-                event_id: row.event_id,
-                sequence: row.sequence,
-                producer_generation: row.producer_generation,
-                authority_epoch: row.authority_epoch,
-                envelope_sha256: row.envelope_sha256,
-                transport_hash: row.transport_hash,
-                stored_envelope_bytes: String::from_utf8(row.envelope_bytes).map_err(|_| {
-                    OrsError::IntegrityProblem {
-                        record_type: "bridge_event_record",
-                        reason: "committed envelope bytes are not valid canonical JSON UTF-8"
-                            .to_owned(),
-                    }
-                })?,
-                normalized_projection_bytes: String::from_utf8(projection.normalized_envelope)
-                    .map_err(|_| OrsError::IntegrityProblem {
-                        record_type: "bridge_event_projection",
-                        reason: "normalized projection bytes are not valid canonical JSON UTF-8"
-                            .to_owned(),
-                    })?,
-                staging_connection: row.staging_connection,
-                staged_at_ms: row.staged_at_ms,
-                phase: row.phase,
-                redacted: row.redacted,
-                redaction_reason: row.redaction_reason,
-                redacted_classes: row.redacted_classes,
-                redaction_marker: row.redaction_marker,
-                redaction_version: row.redaction_version,
-                admitted_source: row.admitted_source,
-                admitted_scope: row.admitted_scope,
-                admitted_policy_revision: row.admitted_policy_revision,
-                adapter_version: row.adapter_version,
-                transformation_version: row.transformation_version,
-                requested_route: row.requested_route,
-                actual_route: row.actual_route,
-                normalization_warnings: row.normalization_warnings,
+            return Ok(None);
+        };
+        let row: BridgeEventRow = decode(stored_record.value())?;
+        row.validate()?;
+        if row.owner_namespace != namespace
+            || row.stream_id != stream_id
+            || row.sequence != sequence
+            || row.event_id != position.event_id
+            || record_key != format!("{}::{}", row.owner_namespace, row.event_id)
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_event_record",
+                reason: "source row does not match its selected owner position".to_owned(),
             });
         }
+        let projection_value = projections
+            .get(record_key.as_str())
+            .map_err(storage)?
+            .ok_or(OrsError::IntegrityProblem {
+                record_type: "bridge_event_projection",
+                reason: "committed source row has no normalized projection".to_owned(),
+            })?;
+        let projection: BridgeEventProjectionRow = decode(projection_value.value())?;
+        projection.validate()?;
+        if !projection.binds_record(&row) {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_event_projection",
+                reason: "normalized projection does not bind the committed source row".to_owned(),
+            });
+        }
+        Ok(Some(BridgeEventObservationRecord {
+            event_id: row.event_id,
+            sequence: row.sequence,
+            producer_generation: row.producer_generation,
+            authority_epoch: row.authority_epoch,
+            envelope_sha256: row.envelope_sha256,
+            transport_hash: row.transport_hash,
+            stored_envelope_bytes: String::from_utf8(row.envelope_bytes).map_err(|_| {
+                OrsError::IntegrityProblem {
+                    record_type: "bridge_event_record",
+                    reason: "committed envelope bytes are not valid canonical JSON UTF-8"
+                        .to_owned(),
+                }
+            })?,
+            normalized_projection_bytes: String::from_utf8(projection.normalized_envelope)
+                .map_err(|_| OrsError::IntegrityProblem {
+                    record_type: "bridge_event_projection",
+                    reason: "normalized projection bytes are not valid canonical JSON UTF-8"
+                        .to_owned(),
+                })?,
+            staging_connection: row.staging_connection,
+            staged_at_ms: row.staged_at_ms,
+            phase: row.phase,
+            redacted: row.redacted,
+            redaction_reason: row.redaction_reason,
+            redacted_classes: row.redacted_classes,
+            redaction_marker: row.redaction_marker,
+            redaction_version: row.redaction_version,
+            admitted_source: row.admitted_source,
+            admitted_scope: row.admitted_scope,
+            admitted_policy_revision: row.admitted_policy_revision,
+            adapter_version: row.adapter_version,
+            transformation_version: row.transformation_version,
+            requested_route: row.requested_route,
+            actual_route: row.actual_route,
+            normalization_warnings: row.normalization_warnings,
+        }))
+    }
 
+    fn read_bridge_observation_gaps(
+        read: &redb::ReadTransaction,
+        namespace: &str,
+        stream_id: &str,
+    ) -> Result<(Vec<BridgeEventObservationGap>, u64), OrsError> {
         let gap_prefix = format!("{namespace}::");
         let gap_end = format!("{gap_prefix}\u{10ffff}");
         let gap_table = read.open_table(BRIDGE_EVENT_GAPS).map_err(storage)?;
@@ -18321,7 +18444,7 @@ impl RedbRecoveryStore {
             let gap: BridgeEventGapRow = decode(value.value())?;
             gap.validate()?;
             if gap.owner_namespace != namespace
-                || gap.stream_id != stored_owner.local_stream
+                || gap.stream_id != stream_id
                 || key.value() != format!("{namespace}::{}", gap.gap_id)
             {
                 return Err(OrsError::IntegrityProblem {
@@ -18349,24 +18472,7 @@ impl RedbRecoveryStore {
                 recorded_at_ms: gap.recorded_at_ms,
             });
         }
-        let result = BridgeEventObservationPage {
-            owner: requested.clone(),
-            after_event_sequence: query.after_event_sequence,
-            observed_through_sequence: cursor.observed_sequence,
-            cursor,
-            records: page_records,
-            gaps,
-            gap_total,
-            continuation,
-        };
-        if serde_json::to_vec(&result)
-            .map_err(|_| OrsError::ProjectionLimitExceeded)?
-            .len()
-            > MAX_BRIDGE_RECOVERY_REPLY_BYTES
-        {
-            return Err(OrsError::ProjectionLimitExceeded);
-        }
-        Ok(result)
+        Ok((gaps, gap_total))
     }
 
     /// Finds the stream owner rows matching one presenter and local name

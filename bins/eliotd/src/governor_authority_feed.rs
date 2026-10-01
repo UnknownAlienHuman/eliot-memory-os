@@ -191,7 +191,8 @@ async fn read_governor_authority_observation(
         Ok(value) => value,
         Err(_) => return unavailable(None, "Kernel observation response kind was invalid"),
     };
-    let wire: GovernorAuthorityObservationResponseWire = match serde_json::from_value(value) {
+    let wire: GovernorAuthorityObservationResponseWire =
+        match serde_json::from_value::<GovernorAuthorityObservationResponseWire>(value) {
         Ok(wire) if wire.schema_version == 1 => wire,
         _ => return unavailable(None, "Kernel observation response schema was invalid"),
     };
