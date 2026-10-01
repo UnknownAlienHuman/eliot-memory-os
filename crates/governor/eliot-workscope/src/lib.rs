@@ -470,6 +470,10 @@ pub struct ColdStartOwnerInputs {
     pub descriptor: WorkScopeDescriptor,
     /// Root identity independently observed by the Host during admission.
     pub explicit_root_identity: String,
+    /// Exact Host observation used by the original admission, retained for
+    /// later guard readback; a matched receipt alone cannot reconstruct it.
+    #[serde(default)]
+    pub original_observed_scope: Option<ObservedScopeResources>,
     /// Privacy class admitted by the original authenticated scope binding.
     pub privacy_class: PrivacyClass,
     /// Authenticated principal that owned the original binding admission.
@@ -485,6 +489,14 @@ pub struct ColdStartOwnerInputs {
     pub governing_sources: GoverningSourceSet,
     /// Original privacy boundary admitted with the descriptor and source set.
     pub privacy: PrivacyProfile,
+    /// Exact full boundary admitted from original bootstrap discovery/Policy.
+    /// The profile boundary reference alone cannot recreate its admitted set.
+    #[serde(default)]
+    pub privacy_boundary: Option<PrivacyBoundary>,
+    /// Full original discovery producer input, retained to preserve its scan
+    /// identity and evidence provenance across restart.
+    #[serde(default)]
+    pub bootstrap_discovery_inputs: Option<BootstrapDiscoveryInputs>,
     /// Current Policy owner reference used to resolve source authority.
     pub policy_owner_ref: String,
     /// Current Policy owner revision checked during admission.
@@ -495,6 +507,16 @@ pub struct ColdStartOwnerInputs {
     /// Kernel issues it. Initial scope admission may precede that lease.
     #[serde(default)]
     pub discovery_lease: Option<DiscoveryReadLease>,
+    /// Original bounded scan output retained by the WorkScope owner so a
+    /// later readiness read can reproduce the exact dirty/source key.
+    #[serde(default)]
+    pub scan_evidence: Option<BootstrapScanEvidence>,
+    /// Exact installation-owner binding used for the retained scan receipt.
+    #[serde(default)]
+    pub scan_binding: Option<ScanDisclosureOwnerBinding>,
+    /// Exact durable receipt handle returned by the installation scan owner.
+    #[serde(default)]
+    pub scan_receipt_handle: Option<ScanReceiptHandle>,
     /// Expiry of the source admission request.
     pub admission_deadline: u64,
 }
@@ -554,6 +576,10 @@ pub enum WorkScopeError {
     SourceClosureUnavailable,
     #[error("the retained WorkScope owner is awaiting its Kernel-issued discovery lease")]
     DiscoveryLeaseMissing,
+    #[error("the retained WorkScope owner has no original admitted privacy boundary")]
+    PrivacyBoundaryMissing,
+    #[error("the retained WorkScope owner has no original independently observed Host scope")]
+    OriginalObservationMissing,
     #[error("governing sources are conflicted with no admitted winner")]
     UnresolvedSourceConflict,
     #[error("task promotion requires the decision owner or a delegated binding")]
@@ -1489,8 +1515,10 @@ impl OnboardingReadinessReceipt {
             || evidence.selection_source_ref != *selection_source_ref
             || evidence.evidence_ref != *evidence_ref
             || evidence.work_scope_ref != self.scope.scope_ref
-            || self.state_fence.task_revision.map(|revision| revision.value())
-                != Some(evidence.task_revision)
+            || self
+                .state_fence
+                .task_revision
+                .is_some_and(|revision| revision.value() != evidence.task_revision)
         {
             return Err(WorkScopeError::BindingReceiptMismatch);
         }
@@ -3399,17 +3427,9 @@ impl WorkScopeBindingSnapshot {
             if sources.generation != self.binding.governing_source_generation {
                 return Err(WorkScopeError::SourceSetMismatch);
             }
-            let current = ScopeBindingGuard.check(
-                &self.binding,
-                &self.binding,
-                sources,
-                privacy,
-            );
-            if current.disposition != ScopeBindingDisposition::Matched {
-                return Err(WorkScopeError::BindingReceiptNotMatched);
-            }
-            if current != self.guard_receipt {
-                return Err(WorkScopeError::BindingReceiptMismatch);
+            sources.validate_for(&self.binding.scope, privacy)?;
+            if !privacy.admits(self.binding.privacy_class) {
+                return Err(WorkScopeError::PrivacyDenied);
             }
         }
         if let Some(inputs) = &self.cold_start_inputs {
@@ -3468,6 +3488,18 @@ impl ColdStartOwnerInputs {
         {
             return Err(WorkScopeError::BindingReceiptMismatch);
         }
+        if let Some(observed) = &self.original_observed_scope {
+            observed.validate()?;
+            if observed_scope_binding(
+                &snapshot.binding,
+                observed,
+                self.privacy_class,
+                snapshot.binding.governing_source_generation,
+            )? != snapshot.binding
+            {
+                return Err(WorkScopeError::BindingReceiptMismatch);
+            }
+        }
         if let Some(discovery_lease) = &self.discovery_lease {
             discovery_lease.validate()?;
             if discovery_lease.proposer_ref != self.principal_ref
@@ -3476,6 +3508,71 @@ impl ColdStartOwnerInputs {
             {
                 return Err(WorkScopeError::BindingReceiptMismatch);
             }
+        }
+        if let Some(boundary) = &self.privacy_boundary {
+            boundary.validate()?;
+            if boundary.boundary_ref != self.privacy.boundary_ref
+                || !boundary.admits(self.privacy_class)
+            {
+                return Err(WorkScopeError::PrivacyDenied);
+            }
+        }
+        if let Some(discovery) = &self.bootstrap_discovery_inputs {
+            if discovery.privacy_boundary != self.privacy_boundary
+                || discovery.evidence.canonical_root_ref != self.explicit_root_identity
+                || discovery.candidate_privacy != Some(self.privacy_class)
+                || discovery.proposed_kind != self.descriptor.kind
+            {
+                return Err(WorkScopeError::BindingReceiptMismatch);
+            }
+            text(&discovery.scan_ref, "bootstrap_discovery.scan_ref")?;
+            discovery.evidence.validate()?;
+        }
+        match (
+            &self.scan_evidence,
+            &self.scan_binding,
+            &self.scan_receipt_handle,
+        ) {
+            (None, None, None) => (),
+            (Some(evidence), Some(binding), Some(handle)) => {
+                let lease = self
+                    .discovery_lease
+                    .as_ref()
+                    .ok_or(WorkScopeError::DiscoveryLeaseMissing)?;
+                let boundary = self
+                    .privacy_boundary
+                    .as_ref()
+                    .ok_or(WorkScopeError::PrivacyBoundaryMissing)?;
+                let original_discovery = self
+                    .bootstrap_discovery_inputs
+                    .as_ref()
+                    .ok_or(WorkScopeError::ScanReceiptMissing)?;
+                evidence.validate()?;
+                binding.admit()?;
+                handle.validate()?;
+                let fence_bytes = canonical_json_bytes(&self.state_fence)
+                    .map_err(|_| WorkScopeError::InvalidStateFence)?;
+                let fence_ref = sha256_hex(&fence_bytes);
+                if evidence.canonical_root_ref != self.explicit_root_identity
+                    || evidence.filesystem_identity_ref != lease.candidate_root_ref
+                    || original_discovery.evidence != *evidence
+                    || original_discovery.scan_ref != handle.receipt_ref
+                    || original_discovery.privacy_boundary.as_ref() != Some(boundary)
+                    || binding.principal_ref != self.principal_ref
+                    || binding.session_ref != self.session_ref
+                    || binding.host_generation_ref != lease.host_ref
+                    || binding.lease_ref != lease.lease_ref
+                    || binding.candidate_root_ref != self.explicit_root_identity
+                    || binding.privacy_boundary_ref != boundary.boundary_ref
+                    || binding.policy_revision != self.policy_revision
+                    || binding.deadline != lease.deadline
+                    || binding.state_fence_ref.as_deref() != Some(fence_ref.as_str())
+                    || binding.lease_consumed > u64::from(lease.consumed)
+                {
+                    return Err(WorkScopeError::BindingReceiptMismatch);
+                }
+            }
+            _ => return Err(WorkScopeError::ScanReceiptMissing),
         }
         Ok(())
     }
@@ -3606,19 +3703,43 @@ impl WorkScopeBindingOwner {
         if sources.generation != self.snapshot.binding.governing_source_generation {
             return Err(WorkScopeError::SourceSetMismatch);
         }
-        let receipt = ScopeBindingGuard.check(
-            &self.snapshot.binding,
-            &self.snapshot.binding,
-            sources,
-            privacy,
-        );
-        if receipt.disposition != ScopeBindingDisposition::Matched {
-            return Err(WorkScopeError::BindingReceiptNotMatched);
-        }
-        if receipt != self.snapshot.guard_receipt {
-            return Err(WorkScopeError::BindingReceiptMismatch);
+        sources.validate_for(&self.snapshot.binding.scope, privacy)?;
+        if !privacy.admits(self.snapshot.binding.privacy_class) {
+            return Err(WorkScopeError::PrivacyDenied);
         }
         Ok((sources.clone(), privacy.clone()))
+    }
+
+    /// Reads original admitted cold-start inputs before Kernel has issued a
+    /// discovery lease. This is the lease-stage owner-update read path: it
+    /// exposes validated source/root/task/privacy admission without
+    /// manufacturing a pre-scan lease.
+    pub fn read_current_cold_start_admission(
+        &self,
+        state_fence: &StateFence,
+        principal_ref: &str,
+        session_ref: &str,
+        root_identity: &str,
+        now: u64,
+    ) -> Result<ColdStartOwnerInputs, WorkScopeError> {
+        let snapshot = self.read_current(state_fence)?;
+        let inputs = snapshot
+            .cold_start_inputs
+            .as_ref()
+            .ok_or(WorkScopeError::SourceClosureUnavailable)?;
+        inputs.validate_for(&snapshot)?;
+        if inputs.original_observed_scope.is_none() {
+            return Err(WorkScopeError::OriginalObservationMissing);
+        }
+        if inputs.principal_ref != principal_ref
+            || inputs.session_ref != session_ref
+            || inputs.explicit_root_identity != root_identity
+            || now > inputs.admission_deadline
+        {
+            return Err(WorkScopeError::BindingReceiptMismatch);
+        }
+        inputs.source_admission.require_live(now)?;
+        Ok(inputs.clone())
     }
 
     /// Reads the exact retained cold-start inputs for the current owner fence,
@@ -3635,24 +3756,32 @@ impl WorkScopeBindingOwner {
             .as_ref()
             .ok_or(WorkScopeError::SourceClosureUnavailable)?;
         inputs.validate_for(&snapshot)?;
+        if inputs.original_observed_scope.is_none() {
+            return Err(WorkScopeError::OriginalObservationMissing);
+        }
         discovery_lease.validate()?;
-        let retained_lease = inputs
-            .discovery_lease
-            .as_ref()
-            .ok_or(WorkScopeError::DiscoveryLeaseMissing)?;
-        if now > inputs.admission_deadline
-            || now > retained_lease.deadline
-            || discovery_lease.lease_ref != retained_lease.lease_ref
-            || discovery_lease.proposer_ref != retained_lease.proposer_ref
-            || discovery_lease.session_ref != retained_lease.session_ref
-            || discovery_lease.host_ref != retained_lease.host_ref
-            || discovery_lease.root_filesystem_identity_ref
-                != retained_lease.root_filesystem_identity_ref
-            || discovery_lease.candidate_root_ref != retained_lease.candidate_root_ref
-            || discovery_lease.allowed_reads != retained_lease.allowed_reads
-            || discovery_lease.deadline != retained_lease.deadline
-            || discovery_lease.consumption_limit != retained_lease.consumption_limit
-            || discovery_lease.consumed < retained_lease.consumed
+        if now > inputs.admission_deadline || now > discovery_lease.deadline {
+            return Err(WorkScopeError::BindingReceiptMismatch);
+        }
+        if let Some(retained_lease) = &inputs.discovery_lease {
+            if now > retained_lease.deadline
+                || discovery_lease.lease_ref != retained_lease.lease_ref
+                || discovery_lease.proposer_ref != retained_lease.proposer_ref
+                || discovery_lease.session_ref != retained_lease.session_ref
+                || discovery_lease.host_ref != retained_lease.host_ref
+                || discovery_lease.root_filesystem_identity_ref
+                    != retained_lease.root_filesystem_identity_ref
+                || discovery_lease.candidate_root_ref != retained_lease.candidate_root_ref
+                || discovery_lease.allowed_reads != retained_lease.allowed_reads
+                || discovery_lease.deadline != retained_lease.deadline
+                || discovery_lease.consumption_limit != retained_lease.consumption_limit
+                || discovery_lease.consumed < retained_lease.consumed
+            {
+                return Err(WorkScopeError::BindingReceiptMismatch);
+            }
+        } else if discovery_lease.proposer_ref != inputs.principal_ref
+            || discovery_lease.session_ref != inputs.session_ref
+            || discovery_lease.candidate_root_ref != inputs.explicit_root_identity
         {
             return Err(WorkScopeError::BindingReceiptMismatch);
         }
@@ -3660,11 +3789,48 @@ impl WorkScopeBindingOwner {
         Ok(inputs.clone())
     }
 
-    /// Attaches the later Kernel-issued discovery lease to an already
-    /// admitted root/source/task owner snapshot. Initial scope authority is
-    /// preserved; only a lease for that exact principal, session and root may
-    /// complete the retained input set.
-    pub fn attach_discovery_lease(
+    /// Reads cold-start data from the retained owner itself when a caller has
+    /// no process-local copy of the discovery lease. The stored lease and scan
+    /// evidence remain owner data; this checks their exact identity and live
+    /// deadlines without accepting caller-reconstructed values.
+    pub fn read_current_cold_start_inputs_from_owner(
+        &self,
+        state_fence: &StateFence,
+        principal_ref: &str,
+        session_ref: &str,
+        root_identity: &str,
+        now: u64,
+    ) -> Result<ColdStartOwnerInputs, WorkScopeError> {
+        let snapshot = self.read_current(state_fence)?;
+        let inputs = snapshot
+            .cold_start_inputs
+            .as_ref()
+            .ok_or(WorkScopeError::SourceClosureUnavailable)?;
+        inputs.validate_for(&snapshot)?;
+        if inputs.original_observed_scope.is_none() {
+            return Err(WorkScopeError::OriginalObservationMissing);
+        }
+        let lease = inputs
+            .discovery_lease
+            .as_ref()
+            .ok_or(WorkScopeError::DiscoveryLeaseMissing)?;
+        lease.validate()?;
+        if inputs.principal_ref != principal_ref
+            || inputs.session_ref != session_ref
+            || inputs.explicit_root_identity != root_identity
+            || now > inputs.admission_deadline
+            || now > lease.deadline
+        {
+            return Err(WorkScopeError::BindingReceiptMismatch);
+        }
+        inputs.source_admission.require_live(now)?;
+        Ok(inputs.clone())
+    }
+
+    /// Attaches the actual Kernel-issued discovery lease and exact original
+    /// bootstrap privacy boundary before a scan-disclosure binding is issued.
+    /// Missing privacy remains a typed refusal rather than an inferred profile.
+    pub fn attach_discovery_lease_and_privacy_boundary(
         &self,
         lease: DiscoveryReadLease,
         next_owner_revision: u64,
@@ -3677,11 +3843,25 @@ impl WorkScopeBindingOwner {
             .as_ref()
             .ok_or(WorkScopeError::SourceClosureUnavailable)?;
         existing.validate_for(&snapshot)?;
+        let boundary = existing
+            .privacy_boundary
+            .as_ref()
+            .ok_or(WorkScopeError::PrivacyBoundaryMissing)?;
+        if existing.original_observed_scope.is_none() {
+            return Err(WorkScopeError::OriginalObservationMissing);
+        }
+        let original_discovery = existing
+            .bootstrap_discovery_inputs
+            .as_ref()
+            .ok_or(WorkScopeError::ScanReceiptMissing)?;
+        boundary.validate()?;
         if now > existing.admission_deadline
             || now > lease.deadline
             || lease.proposer_ref != existing.principal_ref
             || lease.session_ref != existing.session_ref
             || lease.candidate_root_ref != existing.explicit_root_identity
+            || boundary.boundary_ref != existing.privacy.boundary_ref
+            || !boundary.admits(existing.privacy_class)
         {
             return Err(WorkScopeError::BindingReceiptMismatch);
         }
@@ -3708,6 +3888,108 @@ impl WorkScopeBindingOwner {
             .ok_or(WorkScopeError::SourceClosureUnavailable)?;
         inputs.owner_revision = next_owner_revision;
         inputs.discovery_lease = Some(lease);
+        Self::new(snapshot)
+    }
+
+    /// Attaches original scan evidence and its exact durable receipt after the
+    /// installation scan owner has committed and read it back. The earlier
+    /// revision already owns the actual discovery lease and privacy boundary.
+    pub fn attach_scan_evidence(
+        &self,
+        discovery_lease: DiscoveryReadLease,
+        evidence: BootstrapScanEvidence,
+        binding: ScanDisclosureOwnerBinding,
+        receipt_handle: ScanReceiptHandle,
+        next_owner_revision: u64,
+        now: u64,
+    ) -> Result<Self, WorkScopeError> {
+        discovery_lease.validate()?;
+        evidence.validate()?;
+        binding.admit()?;
+        receipt_handle.validate()?;
+        let fence_bytes = canonical_json_bytes(&self.snapshot.state_fence)
+            .map_err(|_| WorkScopeError::InvalidStateFence)?;
+        let fence_ref = sha256_hex(&fence_bytes);
+        let mut snapshot = self.read_current(&self.snapshot.state_fence)?;
+        let existing = snapshot
+            .cold_start_inputs
+            .as_ref()
+            .ok_or(WorkScopeError::SourceClosureUnavailable)?;
+        existing.validate_for(&snapshot)?;
+        let lease = existing
+            .discovery_lease
+            .as_ref()
+            .ok_or(WorkScopeError::DiscoveryLeaseMissing)?;
+        let original_discovery = existing
+            .bootstrap_discovery_inputs
+            .as_ref()
+            .ok_or(WorkScopeError::ScanReceiptMissing)?;
+        if existing.original_observed_scope.is_none() {
+            return Err(WorkScopeError::OriginalObservationMissing);
+        }
+        let boundary = existing
+            .privacy_boundary
+            .as_ref()
+            .ok_or(WorkScopeError::PrivacyBoundaryMissing)?;
+        boundary.validate()?;
+        if now > existing.admission_deadline
+            || now > lease.deadline
+            || discovery_lease.lease_ref != lease.lease_ref
+            || discovery_lease.proposer_ref != lease.proposer_ref
+            || discovery_lease.session_ref != lease.session_ref
+            || discovery_lease.host_ref != lease.host_ref
+            || discovery_lease.root_filesystem_identity_ref != lease.root_filesystem_identity_ref
+            || discovery_lease.candidate_root_ref != lease.candidate_root_ref
+            || discovery_lease.allowed_reads != lease.allowed_reads
+            || discovery_lease.deadline != lease.deadline
+            || discovery_lease.consumption_limit != lease.consumption_limit
+            || discovery_lease.consumed < lease.consumed
+            || discovery_lease.consumed > discovery_lease.consumption_limit
+            || evidence.canonical_root_ref != existing.explicit_root_identity
+            || evidence.filesystem_identity_ref != discovery_lease.candidate_root_ref
+            || original_discovery.evidence != evidence
+            || original_discovery.scan_ref != receipt_handle.receipt_ref
+            || binding.principal_ref != existing.principal_ref
+            || binding.session_ref != existing.session_ref
+            || binding.host_generation_ref != lease.host_ref
+            || binding.lease_ref != discovery_lease.lease_ref
+            || binding.candidate_root_ref != existing.explicit_root_identity
+            || binding.privacy_boundary_ref != boundary.boundary_ref
+            || binding.policy_revision != existing.policy_revision
+            || binding.deadline != discovery_lease.deadline
+            || binding.state_fence_ref.as_deref() != Some(fence_ref.as_str())
+            || binding.lease_consumed > u64::from(discovery_lease.consumed)
+        {
+            return Err(WorkScopeError::BindingReceiptMismatch);
+        }
+        if existing.scan_evidence.is_some() {
+            if existing.scan_evidence.as_ref() == Some(&evidence)
+                && existing.scan_binding.as_ref() == Some(&binding)
+                && existing.scan_receipt_handle.as_ref() == Some(&receipt_handle)
+            {
+                return Ok(self.clone());
+            }
+            return Err(WorkScopeError::ScanReceiptReplaced);
+        }
+        let required_revision = snapshot
+            .owner_revision
+            .checked_add(1)
+            .ok_or(WorkScopeError::InvalidCounter {
+                field: "cold_start.owner_revision",
+            })?;
+        if next_owner_revision != required_revision {
+            return Err(WorkScopeError::BindingReceiptMismatch);
+        }
+        snapshot.owner_revision = next_owner_revision;
+        let inputs = snapshot
+            .cold_start_inputs
+            .as_mut()
+            .ok_or(WorkScopeError::SourceClosureUnavailable)?;
+        inputs.owner_revision = next_owner_revision;
+        inputs.discovery_lease = Some(discovery_lease);
+        inputs.scan_evidence = Some(evidence);
+        inputs.scan_binding = Some(binding);
+        inputs.scan_receipt_handle = Some(receipt_handle);
         Self::new(snapshot)
     }
 }
