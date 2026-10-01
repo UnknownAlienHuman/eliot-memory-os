@@ -25,6 +25,10 @@ pub use durable_host_event_ingest::{
     StageOutcome, StageRedacted, StoredPayload, StreamCursorState, contains_forbidden_content,
     deterministic_redacted_bytes,
 };
+mod fingerprint_coverage_run;
+pub use fingerprint_coverage_run::{
+    CoverageManifestDeclarations, FingerprintCoverageRun, run_fingerprint_coverage_denominator,
+};
 mod host_event_producer;
 pub use host_event_producer::{
     ExecutionUnitFrame, ProduceOutcome, ProducerError, ProducerFrame, produce_allowed,

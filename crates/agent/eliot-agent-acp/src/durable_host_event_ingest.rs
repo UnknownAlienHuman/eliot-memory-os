@@ -1149,6 +1149,30 @@ impl DurableHostEventJournal {
         }
     }
 
+    /// Returns every stream identifier this journal holds records for, in
+    /// ascending identifier order and deduplicated (issue #1936 W1, I7.23).
+    ///
+    /// This is the journal's own observed-stream roster, derived from the
+    /// retained records rather than supplied by a caller. The per-fingerprint
+    /// coverage run drives and resolves exactly these streams, so the streams
+    /// whose compliance facts are resolved and the streams the retained
+    /// denominator measures are the same partition by construction. A stream
+    /// with only staged records is included: the reconnect drive commits it
+    /// first, and its committed records then belong to the denominator. An
+    /// absent stream is absent because nothing was ever staged under it.
+    ///
+    /// The identifiers are returned owned so a caller can drive this journal
+    /// mutably afterwards while still holding the roster it resolved.
+    #[must_use]
+    pub fn known_streams(&self) -> Vec<String> {
+        // `records` is keyed by `(stream_id, sequence)` in a `BTreeMap`, so the
+        // keys already arrive grouped by stream in ascending stream order and
+        // equal identifiers are adjacent: `dedup` on that order is exact.
+        let mut streams: Vec<String> = self.records.keys().map(|(id, _)| id.clone()).collect();
+        streams.dedup();
+        streams
+    }
+
     /// Returns the record stored under a stream cursor, if any.
     #[must_use]
     pub fn get(&self, key: &EventKey) -> Option<&DurableHostEventRecord> {
