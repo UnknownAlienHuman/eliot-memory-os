@@ -4482,7 +4482,7 @@ impl KernelComposition {
                 let envelope = host_request_route::host_request_envelope_from_payload(payload)?;
                 let observe_tool = payload.get("tool").cloned();
                 let (receipt, record) =
-                    self.admit_and_queue_observe_submit(&envelope, observe_tool.as_ref())?;
+                    self.admit_and_queue_observe_submit(session, &envelope, observe_tool.as_ref())?;
                 Ok(host_request_route::host_request_admitted_response(
                     &receipt, &record,
                 ))

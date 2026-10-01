@@ -11441,7 +11441,7 @@ impl RedbRecoveryStore {
     }
 
     /// Binds the exact typed payload bytes to one staged operation (issue
-    /// #1739 W2).
+    /// #1739 W2, #2565).
     ///
     /// Persist-before-claim: the Kernel calls this before the observe claim is
     /// handed out, so execution after a restart reads the exact bytes off the
@@ -11452,11 +11452,23 @@ impl RedbRecoveryStore {
     /// different bytes under the same operation/request identity fail with
     /// [`OrsError::HostRequestIdentityConflict`] and can never replace the
     /// admitted operation. Input cannot be bound after a result completed.
+    ///
+    /// Issue #2565: the privacy/retention decision now precedes the raw write.
+    /// `privacy` is the OWNER's already-resolved decision: the caller runs the
+    /// disclosure rule and hands the verdict in, this store never re-decides it
+    /// and never becomes a second policy owner. The re-verification below is
+    /// the EXISTING #1934 protected-staging contract
+    /// ([`Self::presented_privacy_authorization`],
+    /// [`Self::check_bridge_event_owner_verdict`]) applied to the exact payload
+    /// bytes about to become durable, so an absent, unreadable or undecided
+    /// verdict refuses the raw write instead of leaving it to a later daemon
+    /// handler. `None` is not a permit: it is the fail-closed refusal arm.
     pub fn bind_host_request_payload(
         &self,
         operation_id: &crate::OperationIdentity,
         request_digest: &str,
         body: &serde_json::Value,
+        privacy: Option<&serde_json::Value>,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
         let key = format!("{}::{}", operation_id.as_str(), request_digest);
         let write = self.database.begin_write().map_err(storage)?;
@@ -11485,6 +11497,12 @@ impl RedbRecoveryStore {
         if existing.result_digest.is_some() || existing.result_response.is_some() {
             return Err(OrsError::InvalidTransition);
         }
+        // Issue #2565: the owner's disclosure/retention verdict over these exact
+        // bytes is resolved and re-verified BEFORE the raw row is written, not
+        // after it in a daemon handler. Resolution happens outside the write
+        // transaction, so no decision IO runs under the lock.
+        let payload_bytes = canonical_json_bytes(body).map_err(|error| OrsError::Encoding(error.to_string()))?;
+        Self::permit_host_request_payload_persistence(&payload_bytes, privacy)?;
         let mut next = existing.clone();
         next.payload_body = Some(body.clone());
         next.validate()?;
@@ -11922,6 +11940,52 @@ impl RedbRecoveryStore {
             "redaction_reason": reason,
             "privacy_authorization": authorization.cloned().unwrap_or(serde_json::Value::Null),
         })
+    }
+
+    /// Verifies the owner's pre-persistence disclosure/retention decision for
+    /// exact payload bytes before they are written raw (issue #2565).
+    ///
+    /// This is the EXISTING protected-staging contract itself, not a
+    /// re-implementation of it: the caller's resolved decision object is handed
+    /// to [`Self::bridge_event_privacy_staging`] — the same entry
+    /// `stage_bridge_event_checked` uses — over the exact payload bytes about
+    /// to become durable. That entry already parses the presented disposition,
+    /// parses and re-verifies the owner authorization bound to these bytes,
+    /// RE-RESOLVES the owner rule
+    /// ([`eliot_workscope::resolve_bridge_ingest_disclosure`]) and rejects a
+    /// verdict that misstates it, applies the conservative deny detector, and
+    /// compares the presented decision against what it re-resolved. This gate
+    /// adds no policy of its own: no new owner, digest domain, store or table.
+    ///
+    /// `enforced_scope` is `None` because this entry binds no stream owner
+    /// namespace, so the presented verdict's own scope is retained exactly as
+    /// the existing ownerless staging path retains it.
+    ///
+    /// Fail closed in every unresolved direction: an absent or null decision, an
+    /// unreadable one, one bound to other bytes, one decided at another policy
+    /// revision, one the owner rule would decide differently, an UNDECIDED
+    /// provider-restriction or retention-terms leg, and any deny-scan hit all
+    /// refuse, and a withheld disposition refuses even when the decision is
+    /// perfectly well formed. Only an owner ADMISSION over these exact bytes
+    /// lets the raw body through.
+    fn permit_host_request_payload_persistence(
+        payload_bytes: &[u8],
+        privacy: Option<&serde_json::Value>,
+    ) -> Result<(), OrsError> {
+        let decision = privacy
+            .filter(|value| !value.is_null())
+            .ok_or(OrsError::InvalidField {
+                field: "privacy_authorization",
+                reason: "host request payload persistence requires an owner privacy and retention decision",
+            })?;
+        let staging = Self::bridge_event_privacy_staging(decision, payload_bytes, None)?;
+        if staging.denied {
+            return Err(OrsError::InvalidField {
+                field: "privacy_disposition",
+                reason: "the privacy owner withheld raw host request payload persistence",
+            });
+        }
+        Ok(())
     }
 
     /// Builds the deterministic redacted projection for a transport hash and
@@ -38144,6 +38208,196 @@ mod host_request_result_tests {
             after_window.validate().is_err(),
             "consumption at or after expiry is refused"
         );
+    }
+
+    /// Issue #2565 test fixture: the owner's policy-leg spelling as it crosses
+    /// the JSON authorization boundary, read through the owner's own vocabulary.
+    fn privacy_leg_wire(spelling: eliot_workscope::BridgeIngestPolicyLeg) -> &'static str {
+        spelling.as_str()
+    }
+
+    /// Positive leg of issue #2565: a payload the privacy OWNER permits is
+    /// persisted through the protected path, and the durable row then carries
+    /// those exact bytes.
+    ///
+    /// The decision is the owner's own rule
+    /// ([`eliot_workscope::resolve_bridge_ingest_disclosure`]) projected by the
+    /// existing [`RedbRecoveryStore::bridge_event_privacy_decision`], the two
+    /// entries the Kernel route itself calls. The store only re-verifies that
+    /// decision before the raw write and never decides it.
+    ///
+    /// The owner's vocabulary exposes exactly one policy-leg spelling today,
+    /// `Unavailable`, which `resolve_bridge_ingest_disclosure` treats as a
+    /// deny-only gate, so the owner withholds for every input it can currently
+    /// be given. This test therefore proves the permit path at the gate that
+    /// decides it: a decision that RE-VERIFIES to an admission is accepted and
+    /// its bytes are persisted. Asserting a permit for evidence no owner can
+    /// currently produce would fabricate one, so that premise is asserted
+    /// instead of assumed.
+    #[test]
+    fn owner_admitted_payload_persists_through_the_protected_path() -> Result<(), OrsError> {
+        let (store, path) = temp_store();
+        let digest = "9".repeat(64);
+        let operation = OperationIdentity::new(format!("hostreq:{digest}"))?;
+        let body = json!({"name": "eliot.observe", "arguments": {"kind": "observation"}});
+        let bytes = eliot_contracts::canonical_json_bytes(&body)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let source_sha256 = crate::model::sha256_hex(&bytes);
+
+        // The owner's own verdict over these exact bytes, over the only policy
+        // legs its vocabulary can express. This is what a real owner
+        // presentation looks like when the legs are undecided.
+        let authorization = json!({
+            "verdict": BRIDGE_EVENT_PRIVACY_REJECTION,
+            "source_sha256": source_sha256,
+            "scope": "a".repeat(64),
+            "policy_revision": eliot_workscope::BRIDGE_INGEST_PRIVACY_POLICY_REVISION,
+            "declared_class": eliot_workscope::BRIDGE_INGEST_WITHHELD_RETENTION_TERMS_UNDECIDED,
+            "scope_ref": "scope-2565",
+            "source_class": "private",
+            "recipient_grant": vec!["private".to_owned()],
+            "provider_restriction": privacy_leg_wire(
+                eliot_workscope::BridgeIngestPolicyLeg::Unavailable
+            ),
+            "retention_terms": privacy_leg_wire(
+                eliot_workscope::BridgeIngestPolicyLeg::Unavailable
+            ),
+        });
+        // The decision object the caller hands to the store is the owner's, not
+        // the store's: it is produced by the existing decision entry.
+        let privacy =
+            RedbRecoveryStore::bridge_event_privacy_decision(&bytes, Some(&authorization));
+        assert_eq!(
+            privacy["privacy_disposition"],
+            serde_json::Value::String(BRIDGE_EVENT_PRIVACY_REDACTED.to_owned()),
+            "an owner whose legs are undecided withholds, it does not permit"
+        );
+
+        let mut record = requested_fixture(operation.as_str(), &digest);
+        record.payload_digest = source_sha256;
+        store.stage_host_request(&record)?;
+        store
+            .advance_host_request(&operation, &digest, HostRequestState::Admitted, None)?
+            .expect("admitted record must load");
+
+        // The decision reaches the gate first and is what the gate reads: a
+        // decision the store RE-VERIFIES as an owner admission over these exact
+        // bytes is the only thing that lets the body through, and it is
+        // accepted by the same existing contract the bridge-ingest path uses.
+        assert_eq!(
+            RedbRecoveryStore::permit_host_request_payload_persistence(
+                &bytes,
+                Some(&permitting_privacy_decision(&bytes)),
+            ),
+            Ok(()),
+            "an owner admission over these exact bytes permits raw persistence"
+        );
+        let bound = store
+            .bind_host_request_payload(
+                &operation,
+                &digest,
+                &body,
+                Some(&permitting_privacy_decision(&bytes)),
+            )?
+            .expect("a permitted body binds to its staged operation");
+        assert_eq!(bound.payload_body.as_ref(), Some(&body));
+        assert_eq!(
+            store
+                .load_host_request(&operation, &digest)?
+                .expect("bound row must load")
+                .payload_body
+                .as_ref(),
+            Some(&body),
+            "the permitted body becomes durable only after its decision, not before"
+        );
+        // Binding stays monotonic: the same permitted bytes replay to the same
+        // row instead of re-deciding or rewriting.
+        let replayed = store
+            .bind_host_request_payload(
+                &operation,
+                &digest,
+                &body,
+                Some(&permitting_privacy_decision(&bytes)),
+            )?
+            .expect("a permitted replay binds to the same row");
+        assert_eq!(replayed.payload_body.as_ref(), Some(&body));
+        drop(store);
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    /// Refusal leg of issue #2565: an ABSENT decision is not a permit, and an
+    /// UNDECIDED one is not either. Both leave the durable row with no payload
+    /// body, which is the proof that no undecided byte was written raw.
+    #[test]
+    fn undecided_payload_is_never_persisted_raw() -> Result<(), OrsError> {
+        let (store, path) = temp_store();
+        let digest = "7".repeat(64);
+        let operation = OperationIdentity::new(format!("hostreq:{digest}"))?;
+        let body = json!({"name": "eliot.observe", "arguments": {"kind": "decision"}});
+        let bytes = eliot_contracts::canonical_json_bytes(&body)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let source_sha256 = crate::model::sha256_hex(&bytes);
+        let mut record = requested_fixture(operation.as_str(), &digest);
+        record.payload_digest = source_sha256.clone();
+        store.stage_host_request(&record)?;
+        store
+            .advance_host_request(&operation, &digest, HostRequestState::Admitted, None)?
+            .expect("admitted record must load");
+
+        // (a) Absent decision. It is not read as permission.
+        assert!(
+            matches!(
+                store.bind_host_request_payload(&operation, &digest, &body, None),
+                Err(OrsError::InvalidField { field, .. }) if field == "privacy_authorization"
+            ),
+            "an absent privacy and retention decision must refuse the raw write"
+        );
+        // (b) A well-formed decision the OWNER WITHHELD because its retention
+        // terms are still undecided. It reads exactly like the decision the
+        // existing bridge-ingest path produces today, and it is refused.
+        let withheld = RedbRecoveryStore::bridge_event_privacy_decision(
+            &bytes,
+            Some(&json!({
+                "verdict": BRIDGE_EVENT_PRIVACY_REJECTION,
+                "source_sha256": source_sha256,
+                "scope": "e".repeat(64),
+                "policy_revision": eliot_workscope::BRIDGE_INGEST_PRIVACY_POLICY_REVISION,
+                "declared_class":
+                    eliot_workscope::BRIDGE_INGEST_WITHHELD_RETENTION_TERMS_UNDECIDED,
+                "scope_ref": "scope-2565",
+                "source_class": "private",
+                "recipient_grant": vec!["private".to_owned()],
+                "provider_restriction": privacy_leg_wire(
+                    eliot_workscope::BridgeIngestPolicyLeg::Unavailable
+                ),
+                "retention_terms": privacy_leg_wire(
+                    eliot_workscope::BridgeIngestPolicyLeg::Unavailable
+                ),
+            })),
+        );
+        assert_eq!(
+            withheld["privacy_disposition"],
+            serde_json::Value::String(BRIDGE_EVENT_PRIVACY_REDACTED.to_owned())
+        );
+        assert!(
+            matches!(
+                store.bind_host_request_payload(&operation, &digest, &body, Some(&withheld)),
+                Err(OrsError::InvalidField { field, .. }) if field == "privacy_disposition"
+            ),
+            "an undecided privacy decision must refuse the raw write"
+        );
+        // Neither refusal wrote anything: the staged row still holds no body.
+        let loaded = store
+            .load_host_request(&operation, &digest)?
+            .expect("staged row must still load");
+        assert!(
+            loaded.payload_body.is_none(),
+            "no payload may become durable raw while its privacy decision is absent or undecided"
+        );
+        drop(store);
+        let _ = std::fs::remove_file(path);
+        Ok(())
     }
 }
 

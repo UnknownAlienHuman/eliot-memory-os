@@ -5165,6 +5165,7 @@ impl KernelComposition {
     /// stays the projection owner's at the future live state claim/flight.
     pub(crate) fn admit_and_queue_observe_submit(
         &self,
+        session: &Session,
         envelope: &HostRequestEnvelope,
         tool: Option<&serde_json::Value>,
     ) -> Result<(HostRequestAdmissionReceipt, HostRequestRecord), TransportError> {
@@ -5266,7 +5267,7 @@ impl KernelComposition {
             ObserveQueueReservation::Reserved {
                 token,
                 had_reference,
-            } => self.fill_observe_reservation(envelope, tool, token, had_reference, admitted),
+            } => self.fill_observe_reservation(session, envelope, tool, token, had_reference, admitted),
         }
     }
 
@@ -5410,12 +5411,27 @@ impl KernelComposition {
 
     fn fill_observe_reservation(
         &self,
+        session: &Session,
         envelope: &HostRequestEnvelope,
         tool: &serde_json::Value,
         token: u64,
         had_reference: bool,
         admitted: (HostRequestAdmissionReceipt, HostRequestRecord),
     ) -> Result<(HostRequestAdmissionReceipt, HostRequestRecord), TransportError> {
+        // Issue #2565: the privacy/retention decision now precedes the raw
+        // write. It is resolved here, BEFORE the lock below and before the
+        // store is touched at all, through the existing `WorkScope` privacy
+        // owner and the existing decision projection
+        // ([`RedbRecoveryStore::bridge_event_privacy_decision`], the same pair
+        // `admit_bridge_event_envelope` uses). Both are pure: no IO, no lock,
+        // so the decision never runs inside a critical section and no byte is
+        // durable until a decision exists for it.
+        let payload_bytes = eliot_contracts::canonical_json_bytes(tool)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let privacy_authorization =
+            self.observe_payload_privacy_authorization(session, envelope, &payload_bytes)?;
+        let privacy =
+            RedbRecoveryStore::bridge_event_privacy_decision(&payload_bytes, Some(&privacy_authorization));
         let admission_owner = self
             .agent_activation_pending
             .lock()
@@ -5464,6 +5480,7 @@ impl KernelComposition {
                 envelope,
                 tool,
                 &admitted.1.operation_id,
+                &privacy,
                 token,
                 had_reference,
             ) {
@@ -5518,11 +5535,18 @@ impl KernelComposition {
     /// An out-of-band body that is not the admitted bytes conflicts instead
     /// of replacing the admitted operation; every failure rolls the observe
     /// reservation back so no claim is handed out for unbound bytes.
+    ///
+    /// Issue #2565: `privacy` is the owner's already-resolved decision, reached
+    /// by the caller ([`Self::fill_observe_reservation`]) BEFORE this raw write.
+    /// It is threaded in, never decided here: the store re-verifies the same
+    /// owner rule and refuses the write if the verdict does not match, so
+    /// undecided bytes never become durable in the first place.
     fn bind_observe_payload_before_claim(
         &self,
         envelope: &HostRequestEnvelope,
         tool: &serde_json::Value,
         operation_id: &OperationIdentity,
+        privacy: &serde_json::Value,
         token: u64,
         had_reference: bool,
     ) -> Result<(), TransportError> {
@@ -5530,6 +5554,7 @@ impl KernelComposition {
             operation_id,
             &envelope.envelope_sha256,
             tool,
+            Some(privacy),
         );
         match bound {
             Ok(Some(_)) => Ok(()),
@@ -5561,6 +5586,72 @@ impl KernelComposition {
                 Err(TransportError::SessionFenced)
             }
         }
+    }
+
+    /// Resolves the privacy owner's verdict over one observe payload's exact
+    /// bytes before they become durable (issue #2565, I7.23).
+    ///
+    /// Same owner, same rule, same evidence as
+    /// [`Self::bridge_event_privacy_authorization`]: the disclosure decision is
+    /// `eliot_workscope::resolve_bridge_ingest_disclosure` evaluated inside the
+    /// Governor-resolved `work_scope_id` named by the admitted envelope, over
+    /// the retained `Session`'s negotiated recipient grant, and bound to the
+    /// immutable source digest of the exact payload bytes about to be
+    /// persisted. This entry only serializes the owner's returned verdict; it
+    /// chooses no verdict, class or revision of its own, and the store
+    /// re-verifies the same rule before the raw write.
+    ///
+    /// The payload's proven source class is likewise absent:
+    /// `HostRequestEnvelope` carries no source privacy class, so no grant
+    /// membership is invented to fill the gap. The provider-restriction and
+    /// retention-terms legs stay `Unavailable` deny-only gates exactly as on
+    /// the bridge-ingest path, so an undecided retention leg withholds raw
+    /// persistence here rather than after it.
+    ///
+    /// `payload_bytes` are the exact canonical bytes the store will hash, so the
+    /// verdict's `source_sha256` is the same value the store compares against,
+    /// not a re-serialization of them.
+    fn observe_payload_privacy_authorization(
+        &self,
+        session: &Session,
+        envelope: &HostRequestEnvelope,
+        payload_bytes: &[u8],
+    ) -> Result<serde_json::Value, TransportError> {
+        let work_scope_id = envelope
+            .identity
+            .work_scope_id
+            .as_deref()
+            .filter(|scope| !scope.trim().is_empty())
+            .ok_or(TransportError::SessionFenced)?;
+        let evidence = bridge_owner_evidence(session, &envelope.state_fence)?;
+        let scope = RedbRecoveryStore::bridge_event_privacy_scope(
+            &evidence.authority_lineage,
+            &evidence.principal,
+            envelope.identity.capability.as_str(),
+            envelope.identity.request_id.as_str(),
+            work_scope_id,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        let disclosure = eliot_workscope::resolve_bridge_ingest_disclosure(
+            work_scope_id,
+            None,
+            &session.privacy_classes,
+            eliot_workscope::BridgeIngestPolicyLeg::Unavailable,
+            eliot_workscope::BridgeIngestPolicyLeg::Unavailable,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        Ok(serde_json::json!({
+            "verdict": disclosure.verdict(),
+            "source_sha256": eliot_contracts::sha256_hex(payload_bytes),
+            "scope": scope,
+            "policy_revision": eliot_workscope::BRIDGE_INGEST_PRIVACY_POLICY_REVISION,
+            "declared_class": disclosure.declared_class().map_or(serde_json::Value::Null, serde_json::Value::from),
+            "scope_ref": work_scope_id,
+            "source_class": serde_json::Value::Null,
+            "recipient_grant": &session.privacy_classes,
+            "provider_restriction": eliot_workscope::BridgeIngestPolicyLeg::Unavailable.as_str(),
+            "retention_terms": eliot_workscope::BridgeIngestPolicyLeg::Unavailable.as_str(),
+        }))
     }
 
     fn finish_existing_observe_replay(
@@ -6871,7 +6962,7 @@ impl KernelComposition {
                     // Digest-only submits keep the legacy shape untouched.
                     let observe_tool = payload.get("tool").cloned();
                     let (receipt, record) =
-                        self.admit_and_queue_observe_submit(envelope, observe_tool.as_ref())?;
+                        self.admit_and_queue_observe_submit(session, envelope, observe_tool.as_ref())?;
                     host_request_admitted_response(&receipt, &record)
                 }
                 AGENT_HOST_REQUEST_CANCEL_OPERATION => {
