@@ -234,10 +234,12 @@ fn unavailable_blob_owner_facts(
 }
 
 fn available_launch_owner_facts(
+    composition: &DaemonComposition,
     request: &BlobProcessStreamOwnerFactsPullRequest,
     scope: &CurrentWorkScopeSourceReceipt,
     policy: &CurrentBlobPolicyResidency,
     catalog: &CurrentModuleCatalogGeneration,
+    source_admission: Option<(&str, &str, &str, &str)>,
 ) -> Result<BlobProcessStreamOwnerFactsPullResponse, String> {
     let authority: eliot_receipts::AuthorityBinding =
         serde_json::from_str(&request.kernel_authority_binding_json)
@@ -282,9 +284,48 @@ fn available_launch_owner_facts(
         .map(canonical_json_bytes)
         .transpose()
         .map_err(|error| format!("SessionBinding encoding failed: {error}"))?;
+    let product_id = eliot_contracts::ProductId::new(request.product_id.clone())
+        .map_err(|error| format!("authenticated ProductId is invalid: {error}"))?;
+    let (work_scope_receipt_binding, work_scope_receipt_binding_json, work_scope_receipt_binding_sha256) = composition
+        .current_testd_blob_work_scope_receipt_binding(&request.state_fence, &product_id)?;
+    if work_scope_receipt_binding.scope_id.as_str() != scope.work_scope_ref
+        || work_scope_receipt_binding.state_fence != request.state_fence
+        || work_scope_receipt_binding.resource_generation != request.state_fence.resource_generation
+    {
+        return Err("current receipt-grade WorkScope binding differs from owner snapshot".to_owned());
+    }
+    let (stage_operation_binding_json, stage_operation_binding_sha256,
+         stage_authority_binding_json, stage_authority_binding_sha256,
+         stage_causal_binding_json, stage_causal_binding_sha256,
+         read_operation_binding_json, read_operation_binding_sha256,
+         read_authority_binding_json, read_authority_binding_sha256,
+         read_causal_binding_json, read_causal_binding_sha256) =
+        if request.purpose == BlobProcessStreamOwnerFactsPullPurpose::SourceReadback {
+            let operation_json = request.kernel_operation_binding_json.clone()
+                .ok_or_else(|| "SourceReadback lacks Kernel operation binding".to_owned())?;
+            let operation_sha = request.kernel_operation_binding_sha256.clone()
+                .ok_or_else(|| "SourceReadback lacks Kernel operation digest".to_owned())?;
+            (None, None, None, None, None, None,
+             Some(operation_json), Some(operation_sha),
+             Some(request.kernel_authority_binding_json.clone()), Some(request.kernel_authority_binding_sha256.clone()),
+             Some(request.kernel_causal_binding_json.clone()), Some(request.kernel_causal_binding_sha256.clone()))
+        } else if request.purpose != BlobProcessStreamOwnerFactsPullPurpose::LaunchGrant {
+            let operation_json = request.kernel_operation_binding_json.clone()
+                .ok_or_else(|| "stage owner-facts pull lacks Kernel operation binding".to_owned())?;
+            let operation_sha = request.kernel_operation_binding_sha256.clone()
+                .ok_or_else(|| "stage owner-facts pull lacks Kernel operation digest".to_owned())?;
+            (Some(operation_json), Some(operation_sha),
+             Some(request.kernel_authority_binding_json.clone()), Some(request.kernel_authority_binding_sha256.clone()),
+             Some(request.kernel_causal_binding_json.clone()), Some(request.kernel_causal_binding_sha256.clone()),
+             None, None, None, None, None, None)
+        } else {
+            (None, None, None, None, None, None, None, None, None, None, None, None)
+        };
     let facts = BlobProcessStreamVerifiedOwnerFacts {
         work_scope_binding_sha256: scope.work_scope_snapshot_sha256.clone(),
         work_scope_binding_json: scope.work_scope_snapshot_json.clone(),
+        work_scope_receipt_binding_json: work_scope_receipt_binding_json.clone(),
+        work_scope_receipt_binding_sha256: work_scope_receipt_binding_sha256.clone(),
         matched_guard_receipt_json: scope.matched_guard_receipt_json.clone(),
         matched_guard_receipt_sha256: scope.matched_guard_receipt_sha256.clone(),
         canonical_source_receipt_json: scope.canonical_source_receipt_json.clone(),
@@ -297,6 +338,18 @@ fn available_launch_owner_facts(
         causal_binding_sha256: request.kernel_causal_binding_sha256.clone(),
         authority_binding_json: request.kernel_authority_binding_json.clone(),
         authority_binding_sha256: request.kernel_authority_binding_sha256.clone(),
+        stage_operation_binding_json,
+        stage_operation_binding_sha256,
+        stage_authority_binding_json,
+        stage_authority_binding_sha256,
+        stage_causal_binding_json,
+        stage_causal_binding_sha256,
+        read_operation_binding_json,
+        read_operation_binding_sha256,
+        read_authority_binding_json,
+        read_authority_binding_sha256,
+        read_causal_binding_json,
+        read_causal_binding_sha256,
         currentness_sha256: String::new(),
         task_binding_sha256: task_binding_bytes.as_ref().map(|bytes| sha256_hex(bytes)),
         task_binding_json: task_binding_bytes
@@ -330,6 +383,12 @@ fn available_launch_owner_facts(
         authority_binding_sha256: &'a str,
         process_binding_sha256: &'a str,
         source_root_identity_sha256: &'a str,
+        stage_operation_binding_sha256: Option<&'a str>,
+        stage_authority_binding_sha256: Option<&'a str>,
+        stage_causal_binding_sha256: Option<&'a str>,
+        read_operation_binding_sha256: Option<&'a str>,
+        read_authority_binding_sha256: Option<&'a str>,
+        read_causal_binding_sha256: Option<&'a str>,
         task_binding_sha256: Option<&'a str>,
         session_binding_sha256: Option<&'a str>,
     }
@@ -349,6 +408,12 @@ fn available_launch_owner_facts(
         authority_binding_sha256: &request.kernel_authority_binding_sha256,
         process_binding_sha256: &request.process_binding_sha256,
         source_root_identity_sha256: &request.source_root_identity_sha256,
+        stage_operation_binding_sha256: facts.stage_operation_binding_sha256.as_deref(),
+        stage_authority_binding_sha256: facts.stage_authority_binding_sha256.as_deref(),
+        stage_causal_binding_sha256: facts.stage_causal_binding_sha256.as_deref(),
+        read_operation_binding_sha256: facts.read_operation_binding_sha256.as_deref(),
+        read_authority_binding_sha256: facts.read_authority_binding_sha256.as_deref(),
+        read_causal_binding_sha256: facts.read_causal_binding_sha256.as_deref(),
         task_binding_sha256: facts.task_binding_sha256.as_deref(),
         session_binding_sha256: facts.session_binding_sha256.as_deref(),
     })
@@ -387,39 +452,168 @@ fn available_launch_owner_facts(
         observed_state_fence: request.state_fence.clone(),
         outcome: BlobProcessStreamOwnerFactsPullOutcome::Available(Box::new(
             BlobProcessStreamOwnerFactsAvailable {
-                work_scope_ref: scope.work_scope_ref.clone(),
-                owner_facts_ref: facts_sha256.clone(),
-                owner_facts_sha256: facts_sha256,
-                work_scope_snapshot_sha256: scope.work_scope_snapshot_sha256.clone(),
-                matched_guard_receipt_ref: scope.matched_guard_receipt_sha256.clone(),
-                matched_guard_receipt_sha256: scope.matched_guard_receipt_sha256.clone(),
-                canonical_source_receipt_ref: scope.canonical_source_receipt_ref.clone(),
-                canonical_source_receipt_sha256: scope.canonical_source_receipt_sha256.clone(),
-                policy_ref,
-                policy_sha256: policy.policy_sha256.clone(),
-                residency_ref: policy.residency_sha256.clone(),
-                residency_sha256: policy.residency_sha256.clone(),
-                causal_receipt_ref: request.kernel_causal_binding_sha256.clone(),
-                causal_receipt_sha256: request.kernel_causal_binding_sha256.clone(),
-                authority_ref: request.kernel_authority_binding_sha256.clone(),
-                authority_sha256: request.kernel_authority_binding_sha256.clone(),
-                currentness_sha256,
-                owner_facts_json: facts_json,
-                module_catalog_owner_readback_json: catalog.owner_readback_json.clone(),
-                module_catalog_owner_readback_sha256: catalog.owner_readback_sha256.clone(),
-                generation_admission_json: catalog.generation_admission_json.clone(),
-                generation_admission_sha256: catalog.generation_admission_sha256.clone(),
-                process_source_admission_json: None,
-                process_source_admission_sha256: None,
-                source_admission_write_receipt_json: None,
-                source_admission_write_receipt_sha256: None,
-            },
+            work_scope_ref: scope.work_scope_ref.clone(),
+            owner_facts_ref: facts_sha256.clone(),
+            owner_facts_sha256: facts_sha256,
+            work_scope_snapshot_sha256: scope.work_scope_snapshot_sha256.clone(),
+            matched_guard_receipt_ref: scope.matched_guard_receipt_sha256.clone(),
+            matched_guard_receipt_sha256: scope.matched_guard_receipt_sha256.clone(),
+            canonical_source_receipt_ref: scope.canonical_source_receipt_ref.clone(),
+            canonical_source_receipt_sha256: scope.canonical_source_receipt_sha256.clone(),
+            policy_ref,
+            policy_sha256: policy.policy_sha256.clone(),
+            residency_ref: policy.residency_sha256.clone(),
+            residency_sha256: policy.residency_sha256.clone(),
+            causal_receipt_ref: request.kernel_causal_binding_sha256.clone(),
+            causal_receipt_sha256: request.kernel_causal_binding_sha256.clone(),
+            authority_ref: request.kernel_authority_binding_sha256.clone(),
+            authority_sha256: request.kernel_authority_binding_sha256.clone(),
+            currentness_sha256,
+            owner_facts_json: facts_json,
+            module_catalog_owner_readback_json: catalog.owner_readback_json.clone(),
+            module_catalog_owner_readback_sha256: catalog.owner_readback_sha256.clone(),
+            generation_admission_json: catalog.generation_admission_json.clone(),
+            generation_admission_sha256: catalog.generation_admission_sha256.clone(),
+            process_source_admission_json: source_admission.map(|(json, _, _, _)| json.to_owned()),
+            process_source_admission_sha256: source_admission.map(|(_, digest, _, _)| digest.to_owned()),
+            source_admission_write_receipt_json: source_admission.map(|(_, _, json, _)| json.to_owned()),
+            source_admission_write_receipt_sha256: source_admission.map(|(_, _, _, digest)| digest.to_owned()),
+        },
         )),
     };
     response
         .validate_for_request(request)
         .map_err(|error| format!("invalid available owner-facts response: {error}"))?;
     Ok(response)
+}
+
+fn source_readback_admission(
+    composition: &DaemonComposition,
+    request: &BlobProcessStreamOwnerFactsPullRequest,
+) -> Result<(String, String, String, String), String> {
+    use eliot_blob_api::wire::ProcessStreamKind;
+    use eliot_store_api::blob_process_source_admission::{
+        BlobProcessSourceAdmissionIdentity, BlobProcessSourceAdmissionPhase,
+    };
+    use eliot_process::stream_sink::ProcessStreamSinkOpenRequest;
+
+    let binding = request.process_stream_binding.as_ref()
+        .ok_or_else(|| "SourceReadback lacks its retained Store stream binding".to_owned())?;
+    let identity = BlobProcessSourceAdmissionIdentity {
+        work_scope_ref: request.expected_work_scope_ref.clone()
+            .ok_or_else(|| "SourceReadback lacks its retained WorkScope selector".to_owned())?,
+        session_id: binding.session_id.clone(),
+        source_id: binding.source_id.clone(),
+        process_binding_sha256: request.process_binding_sha256.clone(),
+    };
+    let readback = composition.current_testd_blob_process_source_admission(
+        &identity,
+        &request.state_fence,
+    )?.ok_or_else(|| "current process-source Ready admission is absent".to_owned())?;
+    readback.validate_for(&identity, &request.state_fence)
+        .map_err(|error| format!("current process-source admission is invalid: {error}"))?;
+    let admission = &readback.admission;
+    if admission.phase != BlobProcessSourceAdmissionPhase::Ready
+        || admission.pending_operation_id != request.source_admission_operation_id.as_deref().unwrap_or_default()
+        || admission.identity.session_id != binding.session_id
+        || admission.identity.source_id != binding.source_id
+        || admission.identity.process_binding_sha256 != request.process_binding_sha256
+    {
+        return Err("current process-source admission differs from the exact Ready selectors".to_owned());
+    }
+    let open: ProcessStreamSinkOpenRequest = serde_json::from_str(&admission.open_request_json)
+        .map_err(|error| format!("retained source Open request is invalid: {error}"))?;
+    open.validate().map_err(|error| format!("retained source Open request failed validation: {error}"))?;
+    let requested_binding: serde_json::Value = serde_json::from_str(&request.process_binding_json)
+        .map_err(|error| format!("SourceReadback process binding is invalid: {error}"))?;
+    let original_binding = serde_json::to_value(open.binding())
+        .map_err(|error| format!("retained Open process binding cannot be encoded: {error}"))?;
+    let open_policy_json = serde_json::to_string(open.policy())
+        .map_err(|error| format!("retained Open policy cannot be encoded: {error}"))?;
+    let requested_kind = request.process_stream_kind
+        .ok_or_else(|| "SourceReadback lacks stdout/stderr selector".to_owned())?;
+    if original_binding != requested_binding
+        || open.session_id().as_str() != binding.session_id
+        || open.source_id().as_str() != binding.source_id
+        || open.terminal_id().as_str() != binding.terminal_id
+        || open.stream() != requested_kind
+        || open_policy_json != request.process_stream_policy_json.as_deref().unwrap_or_default()
+        || admission.process_binding_json != request.process_binding_json
+        || admission.process_binding_sha256 != request.process_binding_sha256
+    {
+        return Err("SourceReadback selectors differ from the original admitted Open".to_owned());
+    }
+    let ready = admission.ready.as_ref()
+        .ok_or_else(|| "Ready source admission lacks its committed owner result".to_owned())?;
+    if ready.ready_operation_id != request.ready_operation_id.as_deref().unwrap_or_default()
+        || ready.whole_source_sha256 != request.whole_source_sha256.as_deref().unwrap_or_default()
+        || ready.whole_source_byte_length != request.whole_source_byte_length.unwrap_or_default()
+    {
+        return Err("SourceReadback differs from the admitted Ready whole-source commitment".to_owned());
+    }
+    let ready_receipt: serde_json::Value = serde_json::from_str(&ready.blob_ready_receipt_json)
+        .map_err(|error| format!("retained BlobReadyReceipt is invalid: {error}"))?;
+    let ready_id = ready_receipt.get("receipt")
+        .and_then(|receipt| receipt.get("identity"))
+        .and_then(|identity| identity.get("receipt_id"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "retained BlobReadyReceipt omits receipt identity".to_owned())?;
+    let content_hash = ready_receipt.get("locator")
+        .and_then(|locator| locator.get("hash"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "retained BlobReadyReceipt omits its immutable locator hash".to_owned())?;
+    if ready_id != request.ready_receipt_ref.as_deref().unwrap_or_default()
+        || format!("blob:{content_hash}") != request.process_stream_locator.as_deref().unwrap_or_default()
+    {
+        return Err("SourceReadback does not carry the exact owner-issued Ready receipt".to_owned());
+    }
+    let admission_bytes = canonical_json_bytes(&readback)
+        .map_err(|error| format!("process-source readback encoding failed: {error}"))?;
+    let admission_json = String::from_utf8(admission_bytes)
+        .map_err(|error| format!("process-source readback is not UTF-8: {error}"))?;
+    // The Ready WriteReceipt is supplied by the Kernel's correlated Ready PULL
+    // and must agree with the RequestIdentity retained in the Ready row.
+    let receipt = request.source_admission_write_receipt_json.as_deref()
+        .ok_or_else(|| "SourceReadback lacks the committed Ready WriteReceipt".to_owned())?;
+    let receipt_sha = request.source_admission_write_receipt_sha256.as_deref()
+        .ok_or_else(|| "SourceReadback lacks the Ready WriteReceipt digest".to_owned())?;
+    if sha256_hex(receipt.as_bytes()) != receipt_sha {
+        return Err("Ready WriteReceipt digest does not match its exact bytes".to_owned());
+    }
+    let receipt_value: eliot_store_api::WriteReceipt = serde_json::from_str(receipt)
+        .map_err(|error| format!("Ready WriteReceipt is invalid: {error}"))?;
+    receipt_value.validate().map_err(|error| format!("Ready WriteReceipt failed validation: {error}"))?;
+    let owner_identity: eliot_contracts::RequestIdentity = serde_json::from_str(
+        &ready.ready_request_identity_json,
+    ).map_err(|error| format!("Ready RequestIdentity is invalid: {error}"))?;
+    owner_identity.validate()
+        .map_err(|error| format!("Ready RequestIdentity failed validation: {error}"))?;
+    let envelope = receipt_value.envelope.as_ref()
+        .ok_or_else(|| "Ready WriteReceipt lacks its canonical envelope".to_owned())?;
+    let expected_authority: eliot_receipts::AuthorityBinding = serde_json::from_str(
+        &request.kernel_authority_binding_json,
+    ).map_err(|error| format!("SourceReadback authority binding is invalid: {error}"))?;
+    let expected_causal: eliot_receipts::CausalBinding = serde_json::from_str(
+        &request.kernel_causal_binding_json,
+    ).map_err(|error| format!("SourceReadback causal binding is invalid: {error}"))?;
+    if receipt_value.status != eliot_store_api::WriteReceiptStatus::Committed
+        || receipt_value.operation_id.as_str() != ready.ready_operation_id
+        || receipt_value.idempotency_key != owner_identity.idempotency_key
+        || envelope.core.request != owner_identity.request
+        || envelope.core.operation.operation_id.as_str() != ready.ready_operation_id
+        || envelope.core.operation.idempotency_key != owner_identity.idempotency_key
+        || envelope.core.operation.state_fence != request.state_fence
+        || envelope.core.authority != expected_authority
+        || envelope.core.causal != expected_causal
+    {
+        return Err("Ready WriteReceipt does not bind the stored Ready CAS and exact Kernel authority/cause".to_owned());
+    }
+    Ok((
+        admission_json.clone(),
+        sha256_hex(admission_json.as_bytes()),
+        receipt.to_owned(),
+        receipt_sha.to_owned(),
+    ))
 }
 
 /// Produces a closed owner answer for one Kernel-retained pull.
@@ -440,6 +634,78 @@ pub fn resolve_blob_owner_facts(
         return unavailable_blob_owner_facts(
             request,
             BlobProcessStreamOwnerFactsUnavailableReason::DeadlineElapsed,
+        );
+    }
+    if request.purpose == BlobProcessStreamOwnerFactsPullPurpose::SourceReadback {
+        let Some(expected_scope_ref) = request.expected_work_scope_ref.as_deref() else {
+            return unavailable_blob_owner_facts(
+                request,
+                BlobProcessStreamOwnerFactsUnavailableReason::ScopeGuardUnavailable,
+            );
+        };
+        let catalog = match read_current_module_catalog_generation(
+            composition,
+            &request.state_fence,
+            request.expected_module_id.as_deref(),
+            request.expected_generation_id.as_deref(),
+        ) {
+            Ok(value) => value,
+            Err(_) => return unavailable_blob_owner_facts(
+                request,
+                BlobProcessStreamOwnerFactsUnavailableReason::StaleBinding,
+            ),
+        };
+        let readback = match composition.current_testd_blob_work_scope_readback(&request.state_fence) {
+            Ok(Some(value)) => value,
+            _ => return unavailable_blob_owner_facts(
+                request,
+                BlobProcessStreamOwnerFactsUnavailableReason::ScopeGuardUnavailable,
+            ),
+        };
+        if readback.snapshot.binding.scope.scope_ref != expected_scope_ref {
+            return unavailable_blob_owner_facts(
+                request,
+                BlobProcessStreamOwnerFactsUnavailableReason::StaleBinding,
+            );
+        }
+        let scope = match canonical_current_work_scope_source_receipt(&readback.snapshot) {
+            Ok(value) if value.work_scope_snapshot_sha256 == readback.value_digest => value,
+            _ => return unavailable_blob_owner_facts(
+                request,
+                BlobProcessStreamOwnerFactsUnavailableReason::StaleBinding,
+            ),
+        };
+        let policy = match read_current_blob_policy_residency(
+            composition,
+            &request.state_fence,
+            expected_scope_ref,
+        ) {
+            Ok(value) => value,
+            Err(_) => return unavailable_blob_owner_facts(
+                request,
+                BlobProcessStreamOwnerFactsUnavailableReason::PolicyUnavailable,
+            ),
+        };
+        let (source_readback_json, source_readback_sha256, ready_receipt_json, ready_receipt_sha256) =
+            match source_readback_admission(composition, request) {
+                Ok(value) => value,
+                Err(_) => return unavailable_blob_owner_facts(
+                    request,
+                    BlobProcessStreamOwnerFactsUnavailableReason::SourceReceiptUnavailable,
+                ),
+            };
+        return available_launch_owner_facts(
+            composition,
+            request,
+            &scope,
+            &policy,
+            &catalog,
+            Some((
+                &source_readback_json,
+                &source_readback_sha256,
+                &ready_receipt_json,
+                &ready_receipt_sha256,
+            )),
         );
     }
     if request.purpose != BlobProcessStreamOwnerFactsPullPurpose::LaunchGrant {
@@ -519,7 +785,14 @@ pub fn resolve_blob_owner_facts(
                                     );
                                 }
                             };
-                            return match available_launch_owner_facts(request, &scope, &policy, &catalog) {
+                            return match available_launch_owner_facts(
+                                composition,
+                                request,
+                                &scope,
+                                &policy,
+                                &catalog,
+                                None,
+                            ) {
                                 Ok(response) => Ok(response),
                                 Err(_) => unavailable_blob_owner_facts(
                                     request,

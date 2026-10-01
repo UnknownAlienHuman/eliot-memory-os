@@ -2041,6 +2041,426 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
+    async fn prepare_blob_source_readback_context(
+        &self,
+        request: &eliot_blob_api::wire::BlobProcessStreamKernelRequest,
+        grant: &eliot_ors::BlobProcessStreamGrantRecord,
+        launch_request: &eliot_blob_api::wire::BlobProcessStreamOwnerFactsPullRequest,
+        source: &eliot_blob_api::wire::BlobProcessStreamKernelSourceReadbackRequest,
+    ) -> Result<(
+        eliot_blob_api::wire::BlobProcessStreamOwnerFactsPullRequest,
+        eliot_blob_api::wire::BlobProcessStreamOwnerFactsPullResponse,
+    ), String> {
+        use eliot_blob_api::wire::{
+            BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_ID, BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_REVISION,
+            BlobProcessStreamOwnerFactsPullOutcome, BlobProcessStreamOwnerFactsPullPurpose,
+            BlobProcessStreamOwnerFactsPullRecord, BlobProcessStreamOwnerFactsPullRequest,
+            BlobProcessStreamOwnerFactsPullResponse,
+        };
+        use eliot_contracts::{TransactionSequence, canonical_json_bytes, sha256_hex};
+        use eliot_ors::{BLOB_PROCESS_STREAM_ORS_VERSION, BlobProcessStreamOwnerFactsPullState};
+        use eliot_receipts::CausalBinding;
+        use eliot_store_api::WriteReceipt;
+
+        source.validate().map_err(|error| error.to_string())?;
+        if source.job_id != grant.job_id
+            || source.invocation_id != grant.invocation_id
+            || source.process_binding_sha256 != grant.process_binding_sha256
+            || source.deadline_ms > grant.expires_at_unix_ms
+            || source.deadline_ms <= unix_ms()
+            || launch_request.purpose != BlobProcessStreamOwnerFactsPullPurpose::LaunchGrant
+        {
+            return Err("SourceReadback selectors are outside the retained launch grant".to_owned());
+        }
+        let process_binding: eliot_process::ProcessExecutionBinding = serde_json::from_str(
+            &source.process_binding_json,
+        ).map_err(|error| format!("SourceReadback process binding is invalid: {error}"))?;
+        let mut selected_open: Option<(
+            eliot_process::stream_sink::ProcessStreamSinkOpenRequest,
+            eliot_blob_api::wire::ProcessStreamSinkBindingRef,
+            String,
+        )> = None;
+        let mut matching_ready_receipt = false;
+        for ordinal in 1..request.call_token.ordinal {
+            let token_ref = crate::process_execution::blob_process_stream_call_token_ref(
+                &request.capability.reference,
+                ordinal,
+            ).map_err(|error| error.to_string())?;
+            let Some(call) = self.p07_ors.load_blob_process_stream_call(
+                &request.capability.reference,
+                &token_ref,
+                ordinal,
+            ).map_err(|error| error.to_string())? else { continue };
+            if call.state != eliot_ors::BlobProcessStreamCallState::Completed {
+                continue;
+            }
+            let operation = call.operation_projection_json.as_deref()
+                .and_then(|json| serde_json::from_str::<eliot_blob_api::wire::BlobProcessStreamKernelOperationRequest>(json).ok());
+            let response = call.response_projection_json.as_deref()
+                .and_then(|json| serde_json::from_str::<eliot_blob_api::wire::BlobProcessStreamKernelResponse>(json).ok());
+            let (Some(operation), Some(response)) = (operation, response) else { continue };
+            if response.validate().is_err()
+                || !matches!(response.outcome, eliot_blob_api::wire::BlobProcessStreamKernelOutcome::Completed { .. })
+            {
+                continue;
+            }
+            match operation {
+                eliot_blob_api::wire::BlobProcessStreamKernelOperationRequest::SinkOpen { body, .. } => {
+                    let Ok(open) = serde_json::from_value::<eliot_process::stream_sink::ProcessStreamSinkOpenRequest>((**body).clone()) else { continue };
+                    let binding_json = String::from_utf8(canonical_json_bytes(open.binding()).map_err(|error| error.to_string())?)
+                        .map_err(|error| error.to_string())?;
+                    let matches_open = open.validate().is_ok()
+                        && sha256_hex(binding_json.as_bytes()) == source.process_binding_sha256
+                        && binding_json == source.process_binding_json
+                        && open.stream() == source.stream
+                        && serde_json::to_string(open.policy()).ok().as_deref() == Some(source.policy_json.as_str());
+                    if !matches_open { continue; }
+                    let binding = match response.outcome {
+                        eliot_blob_api::wire::BlobProcessStreamKernelOutcome::Completed { response, .. } => {
+                            match response.operation {
+                                eliot_blob_api::wire::BlobProcessStreamOperationResponse::Sink { response: eliot_blob_api::wire::ProcessStreamSinkWireResponse::Opened { binding } } => binding,
+                                _ => continue,
+                            }
+                        }
+                        _ => continue,
+                    };
+                    let open_pull_ref = format!(
+                        "blob-open-admission-{}",
+                        &sha256_hex(&canonical_json_bytes((
+                            request.capability.reference.as_str(),
+                            token_ref.as_str(),
+                            open.open_request_sha256(),
+                        )).map_err(|error| error.to_string())?)[..32],
+                    );
+                    if selected_open.replace((open, binding, open_pull_ref)).is_some() {
+                        return Err("more than one retained Open matches the source selectors".to_owned());
+                    }
+                }
+                eliot_blob_api::wire::BlobProcessStreamKernelOperationRequest::SinkFinalize { binding, body, .. } => {
+                    let Some((open, opened_binding, _)) = selected_open.as_ref() else { continue };
+                    if &binding != opened_binding { continue; }
+                    let Ok(finalize) = serde_json::from_value::<eliot_process::stream_sink::ProcessStreamSinkFinalizeRequest>((**body).clone()) else { continue };
+                    if finalize.terminal_id() != open.terminal_id()
+                        || finalize.observed_sha256() != source.expected_sha256
+                        || finalize.observed_bytes() != source.expected_byte_length
+                    { continue; }
+                    if let eliot_blob_api::wire::BlobProcessStreamKernelOutcome::Completed { response, .. } = response.outcome {
+                        if let eliot_blob_api::wire::BlobProcessStreamOperationResponse::Sink {
+                            response: eliot_blob_api::wire::ProcessStreamSinkWireResponse::Finalized {
+                                blob_ready_receipt_json: Some(receipt_json),
+                                blob_ready_receipt_sha256: Some(receipt_sha256),
+                                ..
+                            },
+                        } = response.operation {
+                            let receipt: serde_json::Value = serde_json::from_str(&receipt_json)
+                                .map_err(|error| error.to_string())?;
+                            let receipt_ref = receipt.get("receipt")
+                                .and_then(|receipt| receipt.get("identity"))
+                                .and_then(|identity| identity.get("receipt_id"))
+                                .and_then(serde_json::Value::as_str);
+                            if sha256_hex(receipt_json.as_bytes()) == receipt_sha256
+                                && receipt_ref == Some(source.ready_receipt_ref.as_str())
+                            {
+                                matching_ready_receipt = true;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let (open, binding, pending_pull_ref) = selected_open
+            .ok_or_else(|| "retained completed Open for this source is absent".to_owned())?;
+        if !matching_ready_receipt
+            || open.binding().operation_id().as_str() != source.operation_id
+            || open.binding().process_tree_id().as_str() != source.process_tree_id
+            || binding.open_request_sha256 != open.open_request_sha256()
+        {
+            return Err("SourceReadback is not bound to the exact completed Ready Finalize".to_owned());
+        }
+        let pending_record = self.p07_ors
+            .load_blob_process_stream_owner_facts_pull(&pending_pull_ref)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "retained OpenAdmission owner-facts PULL is absent".to_owned())?;
+        if pending_record.state != BlobProcessStreamOwnerFactsPullState::Completed {
+            return Err("retained OpenAdmission owner-facts PULL is not complete".to_owned());
+        }
+        let pending_request: BlobProcessStreamOwnerFactsPullRequest =
+            serde_json::from_str(&pending_record.request_json).map_err(|error| error.to_string())?;
+        let pending_response: BlobProcessStreamOwnerFactsPullResponse = serde_json::from_str(
+            pending_record.response_json.as_deref()
+                .ok_or_else(|| "OpenAdmission response projection is absent".to_owned())?,
+        ).map_err(|error| error.to_string())?;
+        pending_response.validate_for_request(&pending_request).map_err(|error| error.to_string())?;
+        if pending_request.purpose != BlobProcessStreamOwnerFactsPullPurpose::OpenAdmission
+            || pending_request.process_binding_json != source.process_binding_json
+            || pending_request.process_binding_sha256 != source.process_binding_sha256
+            || pending_request.open_request_json.as_deref().is_none_or(|json| {
+                serde_json::from_str::<eliot_process::stream_sink::ProcessStreamSinkOpenRequest>(json)
+                    .map(|retained| retained != open)
+                    .unwrap_or(true)
+            })
+        {
+            return Err("retained OpenAdmission PULL differs from the exact source Open".to_owned());
+        }
+        let (pending_readback_json, pending_readback_sha256, pending_write_receipt_json,
+            pending_write_receipt_sha256) = match &pending_response.outcome {
+            BlobProcessStreamOwnerFactsPullOutcome::Available {
+                process_source_admission_json: Some(readback_json),
+                process_source_admission_sha256: Some(readback_sha256),
+                source_admission_write_receipt_json: Some(receipt_json),
+                source_admission_write_receipt_sha256: Some(receipt_sha256),
+                ..
+            } => (readback_json, readback_sha256, receipt_json, receipt_sha256),
+            _ => return Err("OpenAdmission has no committed Pending owner proof".to_owned()),
+        };
+        if sha256_hex(pending_readback_json.as_bytes()) != *pending_readback_sha256
+            || sha256_hex(pending_write_receipt_json.as_bytes()) != *pending_write_receipt_sha256
+        {
+            return Err("Pending owner proof digest mismatch".to_owned());
+        }
+        let pending_readback: eliot_store_api::blob_process_source_admission::BlobProcessSourceAdmissionReadback =
+            serde_json::from_str(pending_readback_json).map_err(|error| error.to_string())?;
+        pending_readback.validate_for(
+            &pending_readback.admission.identity,
+            &launch_request.state_fence,
+        ).map_err(|error| error.to_string())?;
+        if pending_readback.admission.phase
+            != eliot_store_api::blob_process_source_admission::BlobProcessSourceAdmissionPhase::Pending
+            || pending_readback.admission.open_request_json
+                != pending_request.open_request_json.as_deref().unwrap_or_default()
+            || pending_readback.admission.pending_operation_id
+                != pending_request.source_admission_operation_id.as_deref().unwrap_or_default()
+        {
+            return Err("OpenAdmission readback is not the exact Pending source row".to_owned());
+        }
+        let pending_write_receipt: WriteReceipt = serde_json::from_str(pending_write_receipt_json)
+            .map_err(|error| format!("Pending WriteReceipt is invalid: {error}"))?;
+        pending_write_receipt.validate().map_err(|error| error.to_string())?;
+        let pending_envelope = pending_write_receipt.envelope.as_ref()
+            .ok_or_else(|| "Pending WriteReceipt lacks its canonical envelope".to_owned())?;
+        if pending_write_receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+            || pending_write_receipt.operation_id.as_str()
+                != pending_request.source_admission_operation_id.as_deref().unwrap_or_default()
+            || pending_envelope.core.operation.operation_id.as_str()
+                != pending_request.source_admission_operation_id.as_deref().unwrap_or_default()
+            || pending_envelope.core.operation.state_fence != launch_request.state_fence
+            || pending_envelope.core.authority != serde_json::from_str(
+                &pending_request.kernel_authority_binding_json,
+            ).map_err(|error| format!("Pending authority binding is invalid: {error}"))?
+            || pending_envelope.core.causal != serde_json::from_str(
+                &pending_request.kernel_causal_binding_json,
+            ).map_err(|error| format!("Pending causal binding is invalid: {error}"))?
+        {
+            return Err("Pending WriteReceipt does not bind the original OpenAdmission request".to_owned());
+        }
+        let ready_pull_ref = format!(
+            "blob-ready-attach-{}",
+            &sha256_hex(&canonical_json_bytes((
+                request.capability.reference.as_str(),
+                binding.open_request_sha256.as_str(),
+                source.ready_receipt_ref.as_str(),
+            )).map_err(|error| error.to_string())?)[..32],
+        );
+        let ready_record = self.p07_ors.load_blob_process_stream_owner_facts_pull(&ready_pull_ref)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "retained ReadyAttach owner-facts PULL is absent".to_owned())?;
+        if ready_record.state != BlobProcessStreamOwnerFactsPullState::Completed {
+            return Err("retained ReadyAttach owner-facts PULL is not complete".to_owned());
+        }
+        let ready_request: BlobProcessStreamOwnerFactsPullRequest =
+            serde_json::from_str(&ready_record.request_json).map_err(|error| error.to_string())?;
+        let ready_response: BlobProcessStreamOwnerFactsPullResponse = serde_json::from_str(
+            ready_record.response_json.as_deref()
+                .ok_or_else(|| "ReadyAttach response projection is absent".to_owned())?,
+        ).map_err(|error| error.to_string())?;
+        ready_response.validate_for_request(&ready_request).map_err(|error| error.to_string())?;
+        if ready_request.purpose != BlobProcessStreamOwnerFactsPullPurpose::ReadyAttach {
+            return Err("retained owner-facts PULL is not ReadyAttach".to_owned());
+        }
+        let pending_receipt_id = pending_envelope.identity.receipt_id.clone();
+        let pending_sequence = pending_envelope.core.causal.transaction_sequence.value();
+        let ready_causal: eliot_receipts::CausalBinding = serde_json::from_str(
+            &ready_request.kernel_causal_binding_json,
+        ).map_err(|error| format!("ReadyAttach causal binding is invalid: {error}"))?;
+        let expected_ready_sequence = pending_sequence.checked_add(1)
+            .ok_or_else(|| "Pending causal sequence is exhausted".to_owned())?;
+        if ready_request.process_binding_json != source.process_binding_json
+            || ready_request.process_binding_sha256 != source.process_binding_sha256
+            || ready_request.kernel_authority_binding_json != pending_request.kernel_authority_binding_json
+            || ready_request.kernel_authority_binding_sha256 != pending_request.kernel_authority_binding_sha256
+            || ready_causal.state_fence != launch_request.state_fence
+            || ready_causal.transaction_sequence.value() != expected_ready_sequence
+            || ready_causal.parent_receipt_id.as_ref() != Some(&pending_receipt_id)
+            || ready_causal.predecessor_receipt_ids != vec![pending_receipt_id.clone()]
+        {
+            return Err("ReadyAttach is not causally chained to the exact Pending WriteReceipt".to_owned());
+        }
+        let (
+            ready_admission_json,
+            ready_admission_sha256,
+            ready_receipt_json,
+            ready_receipt_sha256,
+        ) = match &ready_response.outcome {
+            BlobProcessStreamOwnerFactsPullOutcome::Available {
+                process_source_admission_json: Some(admission_json),
+                process_source_admission_sha256: Some(admission_sha256),
+                source_admission_write_receipt_json: Some(receipt_json),
+                source_admission_write_receipt_sha256: Some(receipt_sha256),
+                ..
+            } => (
+                admission_json.clone(), admission_sha256.clone(),
+                receipt_json.clone(), receipt_sha256.clone(),
+            ),
+            _ => return Err("ReadyAttach owner result is unavailable".to_owned()),
+        };
+        let admission: eliot_store_api::blob_process_source_admission::BlobProcessSourceAdmission =
+            serde_json::from_str(&ready_admission_json).map_err(|error| error.to_string())?;
+        admission.validate().map_err(|error| error.to_string())?;
+        let ready = admission.ready.as_ref()
+            .ok_or_else(|| "ReadyAttach response contains no Ready source row".to_owned())?;
+        let ready_receipt: serde_json::Value = serde_json::from_str(&ready.blob_ready_receipt_json)
+            .map_err(|error| error.to_string())?;
+        let ready_receipt_ref = ready_receipt.get("receipt")
+            .and_then(|receipt| receipt.get("identity"))
+            .and_then(|identity| identity.get("receipt_id"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "ReadyAttach receipt has no receipt identity".to_owned())?;
+        if ready_receipt_ref != source.ready_receipt_ref
+            || ready.whole_source_sha256 != source.expected_sha256
+            || ready.whole_source_byte_length != source.expected_byte_length
+            || admission.identity.process_binding_sha256 != source.process_binding_sha256
+            || admission.identity.session_id != binding.session_id
+            || admission.identity.source_id != binding.source_id
+        {
+            return Err("SourceReadback does not match the original ReadyAttach receipt".to_owned());
+        }
+        let ready_write_receipt: WriteReceipt = serde_json::from_str(&ready_receipt_json)
+            .map_err(|error| format!("Ready WriteReceipt is invalid: {error}"))?;
+        ready_write_receipt.validate().map_err(|error| error.to_string())?;
+        let ready_envelope = ready_write_receipt.envelope.as_ref()
+            .ok_or_else(|| "Ready WriteReceipt lacks its canonical envelope".to_owned())?;
+        if ready_write_receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+            || ready_write_receipt.operation_id.as_str() != ready.ready_operation_id
+            || ready_envelope.core.operation.operation_id.as_str() != ready.ready_operation_id
+            || ready_envelope.core.operation.state_fence != launch_request.state_fence
+            || ready_envelope.core.authority
+                != serde_json::from_str(&ready_request.kernel_authority_binding_json)
+                    .map_err(|error| format!("Ready authority binding is invalid: {error}"))?
+            || ready_envelope.core.causal != ready_causal
+        {
+            return Err("Ready WriteReceipt is not the committed exact Ready CAS".to_owned());
+        }
+
+        let deadline_ms = source.deadline_ms;
+        let store_identity = blob_store_request_identity(
+            launch_request,
+            &request.capability.reference,
+            &request.call_token.reference,
+            deadline_ms,
+        )?;
+        let read_operation_id = format!(
+            "blob-process-source-read:{}:{}",
+            request.capability.reference,
+            request.call_token.reference,
+        );
+        let (kernel_operation_binding_json, kernel_operation_binding_sha256) =
+            blob_operation_binding_json(&store_identity, &read_operation_id, eliot_receipts::EffectClass::Read)?;
+        let store_identity_json = String::from_utf8(
+            canonical_json_bytes(&store_identity).map_err(|error| error.to_string())?,
+        ).map_err(|error| error.to_string())?;
+        let next_sequence = ready_causal.transaction_sequence.value().checked_add(1)
+            .ok_or_else(|| "Ready causal sequence is exhausted".to_owned())?;
+        let ready_receipt_id = ready_envelope.identity.receipt_id.clone();
+        let causal = CausalBinding {
+            state_fence: launch_request.state_fence.clone(),
+            transaction_sequence: TransactionSequence::new(next_sequence)
+                .map_err(|error| error.to_string())?,
+            parent_receipt_id: Some(ready_receipt_id.clone()),
+            predecessor_receipt_ids: vec![ready_receipt_id],
+        };
+        let mut pull = launch_request.clone();
+        pull.pull_ref = format!(
+            "blob-source-readback-{}",
+            &sha256_hex(&canonical_json_bytes((
+                request.capability.reference.as_str(),
+                request.call_token.reference.as_str(),
+                request.operation_sha256.as_str(),
+            )).map_err(|error| error.to_string())?)[..32],
+        );
+        pull.purpose = BlobProcessStreamOwnerFactsPullPurpose::SourceReadback;
+        pull.kernel_causal_binding_json = String::from_utf8(
+            canonical_json_bytes(&causal).map_err(|error| error.to_string())?,
+        ).map_err(|error| error.to_string())?;
+        pull.kernel_causal_binding_sha256 = sha256_hex(pull.kernel_causal_binding_json.as_bytes());
+        pull.outer_request_sha256 = sha256_hex(store_identity_json.as_bytes());
+        pull.source_admission_operation_id = Some(admission.pending_operation_id.clone());
+        pull.open_request_json = None;
+        pull.open_request_sha256 = None;
+        pull.owner_update_identity_json = ready_request.owner_update_identity_json.clone();
+        pull.owner_update_identity_sha256 = ready_request.owner_update_identity_sha256.clone();
+        pull.kernel_operation_binding_json = Some(kernel_operation_binding_json);
+        pull.kernel_operation_binding_sha256 = Some(kernel_operation_binding_sha256);
+        pull.source_admission_json = None;
+        pull.source_admission_sha256 = None;
+        pull.source_admission_write_receipt_json = Some(ready_receipt_json);
+        pull.source_admission_write_receipt_sha256 = Some(ready_receipt_sha256);
+        pull.ready_operation_id = Some(ready.ready_operation_id.clone());
+        pull.blob_ready_receipt_json = None;
+        pull.blob_ready_receipt_sha256 = None;
+        pull.whole_source_sha256 = Some(ready.whole_source_sha256.clone());
+        pull.whole_source_byte_length = Some(ready.whole_source_byte_length);
+        pull.ready_receipt_ref = Some(ready_receipt_ref.to_owned());
+        pull.process_stream_binding = Some(binding);
+        pull.process_stream_kind = Some(source.stream);
+        pull.process_stream_locator_kind = Some(source.locator_kind);
+        pull.process_stream_locator = Some(source.locator.clone());
+        pull.process_stream_policy = Some(source.policy.clone());
+        pull.process_stream_policy_json = Some(source.policy_json.clone());
+        pull.process_stream_policy_sha256 = Some(source.policy_sha256.clone());
+        pull.deadline_ms = deadline_ms;
+        pull.validate().map_err(|error| error.to_string())?;
+        let request_json = String::from_utf8(canonical_json_bytes(&pull).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+        let pull_ref = pull.pull_ref.clone();
+        let record = BlobProcessStreamOwnerFactsPullRecord {
+            contract_version: BLOB_PROCESS_STREAM_ORS_VERSION,
+            pull_ref: pull_ref.clone(),
+            job_id: pull.job_id.clone(),
+            request_sha256: sha256_hex(request_json.as_bytes()),
+            request_json,
+            state: BlobProcessStreamOwnerFactsPullState::Pending,
+            response_json: None,
+            response_sha256: None,
+            prepared_write_transition_json: None,
+            prepared_write_transition_sha256: None,
+            prepared_write_canonical_request_hash: None,
+        };
+        self.p07_ors.persist_blob_process_stream_owner_facts_pull(&record)
+            .map_err(|error| error.to_string())?;
+        loop {
+            if unix_ms() >= deadline_ms {
+                return Err("SourceReadback owner-facts result is unknown".to_owned());
+            }
+            let retained = self.p07_ors.load_blob_process_stream_owner_facts_pull(&pull_ref)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "SourceReadback owner-facts row disappeared".to_owned())?;
+            if retained.state == BlobProcessStreamOwnerFactsPullState::Completed {
+                let response: BlobProcessStreamOwnerFactsPullResponse = serde_json::from_str(
+                    retained.response_json.as_deref()
+                        .ok_or_else(|| "SourceReadback owner-facts response is absent".to_owned())?,
+                ).map_err(|error| error.to_string())?;
+                response.validate_for_request(&pull).map_err(|error| error.to_string())?;
+                if !matches!(response.outcome, BlobProcessStreamOwnerFactsPullOutcome::Available { .. }) {
+                    return Err("fresh SourceReadback owner context is unavailable".to_owned());
+                }
+                return Ok((pull, response));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(windows)]
     async fn dispatch_blob_process_stream_call(
         &self,
         request: &eliot_blob_api::wire::BlobProcessStreamKernelRequest,
@@ -2219,7 +2639,7 @@ impl KernelComposition {
             let _ = self.p07_ors.complete_blob_process_stream_call(&terminal);
         };
 
-        let open_admission_response = match &request.operation {
+        let operation_owner_response = match &request.operation {
             eliot_blob_api::wire::BlobProcessStreamKernelOperationRequest::SinkOpen {
                 body,
                 deadline_ms,
@@ -2247,10 +2667,29 @@ impl KernelComposition {
                     }
                 }
             }
+            eliot_blob_api::wire::BlobProcessStreamKernelOperationRequest::SourceReadback {
+                request: source_request,
+            } => match self
+                .prepare_blob_source_readback_context(
+                    request,
+                    grant,
+                    pull_request,
+                    source_request,
+                )
+                .await
+            {
+                Ok((_source_pull_request, response)) => Some(response),
+                Err(_) => {
+                    mark_unknown(&dispatched);
+                    return BlobProcessStreamKernelOutcome::Unknown {
+                        operation_sha256: request.operation_sha256.clone(),
+                    };
+                }
+            },
             _ => None,
         };
-        let effective_pull_response = open_admission_response.as_ref().unwrap_or(pull_response);
-        let effective_pull_request = match open_admission_response.as_ref() {
+        let effective_pull_response = operation_owner_response.as_ref().unwrap_or(pull_response);
+        let effective_pull_request = match operation_owner_response.as_ref() {
             Some(response) => {
                 let Some(record) = self
                     .p07_ors
@@ -2315,14 +2754,85 @@ impl KernelComposition {
                 .zip(available.source_admission_write_receipt_sha256.as_deref()),
             _ => None,
         };
-        let store_request = match blob_store_sink_request(
-            &request.capability,
-            &owner_facts,
-            pull_request,
-            process_source_admission_readback,
-            source_admission_write_receipt,
-            &request.operation,
-        ) {
+        let store_request_result = match &request.operation {
+            eliot_blob_api::wire::BlobProcessStreamKernelOperationRequest::SourceReadback {
+                request: source_request,
+            } => {
+                let Some((admission_json, admission_sha256)) = process_source_admission_readback else {
+                    mark_unknown(&dispatched);
+                    return BlobProcessStreamKernelOutcome::Unknown {
+                        operation_sha256: request.operation_sha256.clone(),
+                    };
+                };
+                let Some((receipt_json, receipt_sha256)) = source_admission_write_receipt else {
+                    mark_unknown(&dispatched);
+                    return BlobProcessStreamKernelOutcome::Unknown {
+                        operation_sha256: request.operation_sha256.clone(),
+                    };
+                };
+                let Some(binding) = pull_request.process_stream_binding.clone() else {
+                    mark_unknown(&dispatched);
+                    return BlobProcessStreamKernelOutcome::Unknown {
+                        operation_sha256: request.operation_sha256.clone(),
+                    };
+                };
+                let (
+                    catalog_json,
+                    catalog_sha256,
+                    generation_json,
+                    generation_sha256,
+                ) = match &effective_pull_response.outcome {
+                    BlobProcessStreamOwnerFactsPullOutcome::Available {
+                        module_catalog_owner_readback_json,
+                        module_catalog_owner_readback_sha256,
+                        generation_admission_json,
+                        generation_admission_sha256,
+                        ..
+                    } => (
+                        module_catalog_owner_readback_json.clone(),
+                        module_catalog_owner_readback_sha256.clone(),
+                        generation_admission_json.clone(),
+                        generation_admission_sha256.clone(),
+                    ),
+                    _ => {
+                        mark_unknown(&dispatched);
+                        return BlobProcessStreamKernelOutcome::Unknown {
+                            operation_sha256: request.operation_sha256.clone(),
+                        };
+                    }
+                };
+                match source_request.with_state_fence(
+                    pull_request.state_fence.clone(),
+                    request.capability.clone(),
+                    binding,
+                    owner_facts.clone(),
+                    catalog_json,
+                    catalog_sha256,
+                    generation_json,
+                    generation_sha256,
+                    admission_json.to_owned(),
+                    admission_sha256.to_owned(),
+                    receipt_json.to_owned(),
+                    receipt_sha256.to_owned(),
+                ) {
+                    Ok(readback) => Ok(eliot_blob_api::wire::BlobProcessStreamFrameRequest {
+                        wire_id: eliot_blob_api::wire::BLOB_PROCESS_STREAM_WIRE_ID.to_owned(),
+                        wire_revision: eliot_blob_api::wire::BLOB_PROCESS_STREAM_WIRE_REVISION,
+                        operation: eliot_blob_api::wire::BlobProcessStreamOperationRequest::SourceReadback { request: readback },
+                    }),
+                    Err(_) => Err("fresh SourceReadback Store request failed validation".to_owned()),
+                }
+            }
+            _ => blob_store_sink_request(
+                &request.capability,
+                &owner_facts,
+                pull_request,
+                process_source_admission_readback,
+                source_admission_write_receipt,
+                &request.operation,
+            ),
+        };
+        let store_request = match store_request_result {
             Ok(request) => request,
             Err(_) => {
                 mark_unknown(&dispatched);
