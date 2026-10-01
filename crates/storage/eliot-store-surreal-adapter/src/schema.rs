@@ -576,6 +576,171 @@ DEFINE FIELD outcomes ON erasure_outcome TYPE array;
 DEFINE INDEX eo_operation ON erasure_outcome FIELDS operation_id UNIQUE;
 ";
 
+/// Reports whether `ddl` declares a field whose *whole* name is `column`.
+///
+/// Both boundaries are identifier-byte boundaries, so this is a whole-name
+/// match, never a substring one. `encryption` must not be satisfied by
+/// `encryption_key_ref`, and `export_receipt` must not be satisfied by a longer
+/// `export_receipt_digest`: an absence proven by a substring match is not an
+/// absence, and an evidence column "found" inside a different field's name is a
+/// fabricated observation rather than a measured one.
+///
+/// Const-evaluable so the negative inventory below is checked by `cargo check`
+/// rather than by a test that can be skipped.
+pub(crate) const fn declares_column_name(ddl: &str, column: &str) -> bool {
+    let haystack = ddl.as_bytes();
+    let needle = column.as_bytes();
+    if needle.is_empty() {
+        return false;
+    }
+    let mut start = 0;
+    while start + needle.len() <= haystack.len() {
+        let mut offset = 0;
+        while offset < needle.len() {
+            if haystack[start + offset] != needle[offset] {
+                break;
+            }
+            offset += 1;
+        }
+        if offset == needle.len() {
+            let end = start + needle.len();
+            let left_clear = start == 0 || !is_identifier_byte(haystack[start - 1]);
+            let right_clear = end == haystack.len() || !is_identifier_byte(haystack[end]);
+            if left_clear && right_clear {
+                return true;
+            }
+        }
+        start += 1;
+    }
+    false
+}
+
+/// Whether `byte` may appear inside a `SurrealQL` field name.
+///
+/// Deliberately the *identifier* set, not the alphanumeric set: `encryption`
+/// must not match `encryption_key_ref`, so `_` has to count as a name
+/// character here or the boundary check would pass a longer field.
+const fn is_identifier_byte(byte: u8) -> bool {
+    byte == b'_'
+        || (byte >= b'0' && byte <= b'9')
+        || (byte >= b'a' && byte <= b'z')
+        || (byte >= b'A' && byte <= b'Z')
+}
+
+/// The five ECXF capture-evidence column groups this owner does **not** define,
+/// and the real owner of each value.
+///
+/// This is a *negative* inventory, and it is the schema owner's half of the
+/// answer to "why does the ECXF capture report five evidence gaps". Each entry
+/// is the exact field name `eliot_ecxf` already uses, so the vocabulary stays the
+/// consumer's own and this file introduces no second set of names. For each,
+/// this module was checked for a *differently named* column that carries the same
+/// evidence; the const block below is the compiled proof that no such column
+/// exists in any baseline this owner ships, and the per-entry notes record which
+/// near-miss was examined and why it is a different quantity.
+///
+/// No entry is a `DEFINE FIELD`, deliberately. A declared column that no write
+/// path populates is a certified no-op: it would make a reader believe an
+/// evidence value exists when every real row reads back `NONE`, which is the
+/// "claimed but unbacked" defect class rather than a fix for it. The adapter
+/// crate contains no writer for any of these names today (`git grep` finds zero
+/// occurrences of all seven identifiers under `crates/storage/eliot-store-surreal-adapter`),
+/// so adding the field would back a claim with nothing. Each value below is
+/// therefore owned by the component that actually mints it, and closing its gap
+/// means that owner supplies the evidence, not that this file declares an empty
+/// column.
+pub(crate) const ECXF_UNDEFINED_CAPTURE_EVIDENCE: &[(&str, &str)] = &[
+    (
+        "architecture_source_digest",
+        "minted by the Architecture/Kernel compatibility handshake \
+         (crates/kernel/eliot-kernel-core/src/module/compatibility_handshake.rs); \
+         sealed outside the store, so no baseline can define it",
+    ),
+    (
+        "normative_pair_identity_receipt_digest",
+        "the `NormativePair` identity receipt, sealed by the same handshake \
+         owner; it is a receipt *about* this store, not a column of it",
+    ),
+    (
+        "export_receipt",
+        "a source-side ECXF export receipt; the exporter mints the package \
+         receipt at emit time and no store row records that an export happened",
+    ),
+    (
+        "store_generation",
+        "the store's own generation. The two near-misses were examined and \
+         rejected: `schema_meta.generation` is the SCHEMA generation, and \
+         `StateFence::resource_generation` is the generation relevant to one \
+         decision, not the store's aggregate",
+    ),
+    (
+        "source_adapter",
+        "this adapter's identity. `schema_meta.migration_id` names the \
+         *migration*, not the adapter, and `crate::ADAPTER_NAME` is a build \
+         constant of the running binary rather than an observation of the \
+         source store",
+    ),
+    (
+        "source_adapter_version",
+        "same owner and same rejection as `source_adapter`; the adapter declares \
+         no version column of its own",
+    ),
+    (
+        "compression",
+        "the codec profile of the EMITTED package. The only encryption-adjacent \
+         field, `erasure_intent.encryption_key_ref`, is a key *reference* on a \
+         table the admitted generation does not define, not a package profile",
+    ),
+];
+
+/// Compile-time proof that no baseline this owner ships defines any name in
+/// [`ECXF_UNDEFINED_CAPTURE_EVIDENCE`].
+///
+/// Both admitted baselines are covered (`SCHEMA_DDL_V2`, the generation a v2
+/// pin admits, and `SCHEMA_DDL_V3`), plus the first-generation baseline and
+/// every additive delta, so a gap cannot be closed by a table this owner already
+/// declares in some other generation or migration body.
+///
+/// This asserts a *negative*, and a negative assertion is the one direction that
+/// is safe to hard-wire: it can only ever fail if a real column is added, which
+/// is precisely the moment the owner must revisit the corresponding gap entry
+/// above. It can never make a gap report itself closed on its own, because it
+/// proves absence and never presence.
+const _: () = {
+    // Every baseline body this module defines, in declaration order:
+    // SCHEMA_DDL, SCHEMA_DDL_V2, SCHEMA_DDL_V3, RECOVERY_TABLES_DDL,
+    // ERASURE_TABLES_DDL, NOTIFICATION_TABLES_DDL, REACTIVE_TABLES_DDL,
+    // AUTOMATION_TABLES_DDL, EXPERIENCE_TABLES_DDL and LEARNING_TABLES_DDL.
+    let baselines: [&str; 10] = [
+        SCHEMA_DDL,
+        SCHEMA_DDL_V2,
+        SCHEMA_DDL_V3,
+        RECOVERY_TABLES_DDL,
+        ERASURE_TABLES_DDL,
+        NOTIFICATION_TABLES_DDL,
+        REACTIVE_TABLES_DDL,
+        AUTOMATION_TABLES_DDL,
+        EXPERIENCE_TABLES_DDL,
+        LEARNING_TABLES_DDL,
+    ];
+    let mut baseline_index = 0;
+    while baseline_index < baselines.len() {
+        let ddl = baselines[baseline_index];
+        let mut entry_index = 0;
+        while entry_index < ECXF_UNDEFINED_CAPTURE_EVIDENCE.len() {
+            let column = ECXF_UNDEFINED_CAPTURE_EVIDENCE[entry_index].0;
+            assert!(
+                !declares_column_name(ddl, column),
+                "a schema baseline this owner ships now defines a column recorded \
+                 here as absent; update ECXF_UNDEFINED_CAPTURE_EVIDENCE \
+                 deliberately rather than letting the record and the DDL disagree"
+            );
+            entry_index += 1;
+        }
+        baseline_index += 1;
+    }
+};
+
 /// Transaction delimiters for a single atomic apply.
 pub(crate) const TX_BEGIN: &str = "BEGIN TRANSACTION;";
 pub(crate) const TX_COMMIT: &str = "COMMIT TRANSACTION;";
