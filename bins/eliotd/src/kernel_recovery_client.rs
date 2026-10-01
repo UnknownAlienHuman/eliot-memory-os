@@ -35,16 +35,15 @@ use eliot_protocol::RequestIdentity;
 use eliot_protocol::TaskControllerAction;
 use eliot_receipts::RequestBinding;
 use eliot_store_api::{
-    CONTRACT_VERSION, RecoveryRecord, RecoveryRecordKey, ScopeRevisionView, StoreGenesisRequest,
-    StoreFailure, StoreRecoveryRequest, StoreRecoverySnapshot,
-    StoreWorkScopeOwnerRequest, StoreWorkScopeOwnerResponse, WriteReceipt,
-    validate_genesis_receipt_envelope,
+    CONTRACT_VERSION, RecoveryRecord, RecoveryRecordKey, ScopeRevisionView, StoreFailure,
+    StoreGenesisRequest, StoreRecoveryRequest, StoreRecoverySnapshot, StoreWorkScopeOwnerRequest,
+    StoreWorkScopeOwnerResponse, WriteReceipt, validate_genesis_receipt_envelope,
 };
 
 use crate::daemon_kernel_client::{TaskControllerClaimedInvocation, WireOutcome};
 
 use super::{
-    DaemonKernelClient, SERVICE_NAME, kind_value, kernel_port_error, unix_ms, unix_ms_i64,
+    DaemonKernelClient, SERVICE_NAME, kernel_port_error, kind_value, unix_ms, unix_ms_i64,
 };
 
 const OWNER_RECOVERY_NAMESPACE: &str = "owner";
@@ -655,8 +654,8 @@ impl DaemonKernelClient {
                 expected: Some(expected.clone()),
             }
         })?;
-        let record: RecoveryRecord = serde_json::from_value(value)
-            .map_err(|error| WorkScopeOwnerWriteFailure::Kernel {
+        let record: RecoveryRecord =
+            serde_json::from_value(value).map_err(|error| WorkScopeOwnerWriteFailure::Kernel {
                 error: KernelPortError::Contract(error.to_string()),
                 expected: Some(expected.clone()),
             })?;
