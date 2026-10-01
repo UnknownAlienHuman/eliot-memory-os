@@ -504,9 +504,10 @@ fn volume_cost_reading(
             ))
         })?;
     let (status, observed_count) = match &observation.value {
-        HumanAttentionMetricValue::ObservedNumber { coefficient, .. } => {
-            (ControlBoardAttentionReadingStatus::Observed, Some(*coefficient))
-        }
+        HumanAttentionMetricValue::ObservedNumber { coefficient, .. } => (
+            ControlBoardAttentionReadingStatus::Observed,
+            Some(*coefficient),
+        ),
         HumanAttentionMetricValue::ObservedText { .. } => {
             (ControlBoardAttentionReadingStatus::Observed, None)
         }
