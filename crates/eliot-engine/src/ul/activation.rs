@@ -32,14 +32,6 @@ impl ActivationEngine {
         }
     }
 
-    /// Sole production consumer of the UL activation graph (#940).
-    ///
-    /// `load_ul_activation_graph` is the only source of `UlActivationGraphRows`
-    /// reachable here, and it is built exclusively from the closed transport
-    /// decoder, so a partial relation family or an unknown
-    /// completeness/source/lineage member is refused at the Store boundary
-    /// before spreading activation sees any edge. A graph reaching this method
-    /// from any other source invalidates that guarantee.
     pub async fn activate(
         &self,
         project_id: ProjectId,

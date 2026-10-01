@@ -91,15 +91,21 @@ pub(super) struct RawActivationGraphRows {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod activation_graph_transport_tests {
     use super::{RawActivationGraphRows, RawActivationRelation};
 
     const PROJECT: &str = "0196a1b2-c3d4-7e5f-8000-bbbb00000002";
 
+    /// One projected `co_change` element, assembled by concatenation so no
+    /// fixture depends on format-string expansion.
     fn co_change_edge() -> String {
-        format!(
-            "{{\"edge_id\":\"edge-1\",\"project_id\":\"{PROJECT}\",\"path_a\":\"a.rs\",\"path_b\":\"b.rs\",\"support\":3,\"confidence_ab\":0.75,\"confidence_ba\":0.5,\"last_cochange_at_unix\":1720000000,\"static_edge_exists\":true,\"mining_run_ref\":\"run-1\",\"cue_bindings\":[]}}"
-        )
+        [
+            r#"{"edge_id":"edge-1","project_id":""#,
+            PROJECT,
+            r#"","path_a":"a.rs","path_b":"b.rs","support":3,"confidence_ab":0.75,"confidence_ba":0.5,"last_cochange_at_unix":1720000000,"static_edge_exists":true,"mining_run_ref":"run-1","cue_bindings":[]}"#,
+        ]
+        .concat()
     }
 
     fn seven_key_projection() -> String {
@@ -125,8 +131,7 @@ mod activation_graph_transport_tests {
         assert!(rows.verified_by.is_empty());
         // Same payload through the production `decode_value` boundary
         // (`serde_json::from_value`): required must not mean non-empty required.
-        let value: serde_json::Value =
-            serde_json::from_str(&raw).expect("fixture must parse");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("fixture must parse");
         let via_value: RawActivationGraphRows =
             serde_json::from_value(value).expect("production Value boundary must accept");
         assert_eq!(via_value.co_change.len(), 1);
@@ -136,18 +141,15 @@ mod activation_graph_transport_tests {
     // WORK_UNIT_CASE: 940/2
     #[test]
     fn absent_family_is_refused_not_defaulted() {
-        let raw = format!(
-            "{{\"co_change\":[],\"card_covers\":[],\"capsule_covers\":[],\"concept_implemented_by\":[],\"concept_depends_on\":[],\"supports\":[]}}"
-        );
-        let err = serde_json::from_str::<RawActivationGraphRows>(&raw)
+        let raw = "{\"co_change\":[],\"card_covers\":[],\"capsule_covers\":[],\"concept_implemented_by\":[],\"concept_depends_on\":[],\"supports\":[]}";
+        let err = serde_json::from_str::<RawActivationGraphRows>(raw)
             .expect_err("6-key payload must be refused");
         let message = err.to_string();
         assert!(
             message.contains("verified_by"),
             "refusal must name the absent family, got: {message}"
         );
-        let value: serde_json::Value =
-            serde_json::from_str(&raw).expect("fixture must parse");
+        let value: serde_json::Value = serde_json::from_str(raw).expect("fixture must parse");
         let value_err = serde_json::from_value::<RawActivationGraphRows>(value)
             .expect_err("production Value boundary must also refuse");
         assert!(
@@ -185,10 +187,8 @@ mod activation_graph_transport_tests {
     // WORK_UNIT_CASE: 940/4
     #[test]
     fn null_family_fails_closed() {
-        let raw = format!(
-            "{{\"co_change\":[],\"card_covers\":[],\"capsule_covers\":[],\"concept_implemented_by\":[],\"concept_depends_on\":[],\"supports\":null,\"verified_by\":[]}}"
-        );
-        let err = serde_json::from_str::<RawActivationGraphRows>(&raw)
+        let raw = "{\"co_change\":[],\"card_covers\":[],\"capsule_covers\":[],\"concept_implemented_by\":[],\"concept_depends_on\":[],\"supports\":null,\"verified_by\":[]}";
+        let err = serde_json::from_str::<RawActivationGraphRows>(raw)
             .expect_err("null family must fail closed, never decode as empty");
         assert!(!err.to_string().is_empty());
     }
