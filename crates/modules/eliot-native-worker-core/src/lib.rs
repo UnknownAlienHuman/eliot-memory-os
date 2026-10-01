@@ -1252,6 +1252,20 @@ where
             })?;
         let effect_request =
             EffectAdmissionRequest::new(proposal.clone(), request.attempt_id.clone(), grant);
+        // W1 ceiling-coverage join (#1793, I6.6 seq 4): the admitted ceiling
+        // must cover the exact shared domain class projected from the
+        // proposal, with no rank upgrade; rank stays with the Governor
+        // `ImpactClass` check. A miss is a typed rejection before the
+        // admission owner is consulted, never a silent pass.
+        if !grant
+            .authority()
+            .effect_ceiling
+            .permits_effect_class(effect_request.effect_class())
+        {
+            return Err(WorkerError::EffectRejected(
+                "effect class exceeds admitted ceiling".to_owned(),
+            ));
+        }
         let outcome = self
             .admission
             .as_mut()
