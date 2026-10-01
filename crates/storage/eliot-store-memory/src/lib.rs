@@ -25,7 +25,8 @@ use eliot_kernel_core::{
 use eliot_store_api::epistemic_revision::{EpistemicCommit, position_key};
 use eliot_store_api::{
     AUTOMATION_QUERY_CURRENT, AUTOMATION_QUERY_FAILURE, AUTOMATION_QUERY_HISTORY,
-    AUTOMATION_QUERY_INVOCATIONS, AUTOMATION_QUERY_LIST, AUTOMATION_STATE_RETIRED,
+    AUTOMATION_QUERY_INVOCATIONS, AUTOMATION_QUERY_LIST, AUTOMATION_QUERY_NORMALIZATION,
+    AUTOMATION_STATE_RETIRED,
     CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, CommitId,
     DecodedAutomationMutation, DecodedNotificationMutation, DecodedReactiveMutation,
     ERASURE_PARAM_DEADLINE_UNIX_MS, ERASURE_PARAM_ENCRYPTION_KEY_REF, ERASURE_PARAM_OPERATION_ID,
@@ -1337,6 +1338,19 @@ fn apply_automation_leg(
             &failure,
             &failure_json,
         ),
+        DecodedAutomationMutation::RetainNormalization {
+            automation_id,
+            revision,
+            revision_json,
+            normalization_receipt_json,
+        } => retain_automation_normalization(
+            state,
+            transition,
+            automation_id,
+            revision,
+            revision_json,
+            normalization_receipt_json,
+        ),
     }
 }
 
@@ -1567,6 +1581,53 @@ fn retain_automation_revision(
                 },
             );
             Ok(())
+        }
+    }
+}
+
+/// Retains one immutable, owner-normalized revision independently of the
+/// activated automation revision and its current pointer.
+///
+/// The original revision bytes and generic validated receipt stay intact.
+/// The row is create-only over the exact automation/revision address; replay
+/// succeeds only when the content and the producing transition provenance
+/// are unchanged.
+fn retain_automation_normalization(
+    state: &mut MemoryState,
+    transition: &PreparedTransition,
+    automation_id: String,
+    revision: String,
+    revision_json: String,
+    normalization_receipt_json: Value,
+) -> Result<Value, StoreError> {
+    eliot_store_api::validate_automation_doc(
+        &revision_json,
+        eliot_store_api::AUTOMATION_PARAM_REVISION_JSON,
+    )?;
+    let normalization_receipt_json = validate_automation_normalization_envelope(Some(
+        normalization_receipt_json,
+    ))?
+    .ok_or(StoreError::InvalidReceipt)?;
+    let row = AutomationNormalizationRow {
+        automation_id,
+        revision,
+        revision_json,
+        normalization_receipt_json,
+        operation_id: transition.identity.operation_id.to_string(),
+        idempotency_key: transition.identity.idempotency_key.clone(),
+        canonical_request_hash: transition.identity.canonical_request_hash.clone(),
+        state_fence: transition.state_fence.clone(),
+        scope_id: transition.scope_id.to_string(),
+        task_id: transition.task_id.clone(),
+    };
+    let key = automation_revision_key(&row.automation_id, &row.revision);
+    match state.automation_normalizations.get(&key) {
+        Some(existing) if existing != &row => Err(StoreError::IdentityConflict),
+        Some(existing) => serde_json::to_value(existing)
+            .map_err(|error| StoreError::Serialization(error.to_string())),
+        None => {
+            state.automation_normalizations.insert(key, row.clone());
+            serde_json::to_value(row).map_err(|error| StoreError::Serialization(error.to_string()))
         }
     }
 }
@@ -2805,6 +2866,52 @@ fn automation_state_payload(
     fence: &StateFence,
 ) -> Result<Value, StoreError> {
     let decoded = validate_automation_read_params(&query.parameters)?;
+    if decoded.query == AUTOMATION_QUERY_NORMALIZATION {
+        let automation_id = decoded
+            .automation_id
+            .as_deref()
+            .ok_or(StoreError::InvalidField {
+                field: "automation.automation_id",
+                reason: "exact automation selector is required",
+            })?;
+        let revision = decoded
+            .requested_revision
+            .as_deref()
+            .ok_or(StoreError::InvalidField {
+                field: "automation.revision",
+                reason: "exact revision selector is required",
+            })?;
+        let scope_id = query.scope_id.as_ref().ok_or(StoreError::InvalidField {
+            field: "scope_id",
+            reason: "normalization read requires scope_id",
+        })?;
+        let entries = state
+            .automation_normalizations
+            .get(&automation_revision_key(automation_id, revision))
+            .filter(|row| {
+                row.state_fence == *fence && row.scope_id == scope_id.as_str()
+            })
+            .map(|row| {
+                json!({
+                    "automation_id": row.automation_id,
+                    "revision": row.revision,
+                    "revision_json": row.revision_json,
+                    "normalization_receipt_json": row.normalization_receipt_json,
+                    "operation_id": row.operation_id,
+                    "idempotency_key": row.idempotency_key,
+                    "canonical_request_hash": row.canonical_request_hash,
+                    "state_fence": row.state_fence,
+                    "scope_id": row.scope_id,
+                    "task_id": row.task_id,
+                })
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
+        return Ok(json!({
+            "entries": entries,
+            "state_fence": fence,
+        }));
+    }
     let limit = usize::from(decoded.max_records.max(1));
     match decoded.query.as_str() {
         AUTOMATION_QUERY_LIST => {
@@ -5540,6 +5647,24 @@ struct AutomationRevisionRow {
     task_id: Option<String>,
 }
 
+/// One independently retained immutable normalization result keyed by
+/// `(automation_id, revision)`. It preserves the exact revision and receipt
+/// carried by the admitted retention transition plus that transition's
+/// original identity and applicability metadata.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct AutomationNormalizationRow {
+    automation_id: String,
+    revision: String,
+    revision_json: String,
+    normalization_receipt_json: Value,
+    operation_id: String,
+    idempotency_key: String,
+    canonical_request_hash: String,
+    state_fence: StateFence,
+    scope_id: String,
+    task_id: Option<String>,
+}
+
 /// One current automation pointer: the revision an automation names plus
 /// the closed admission state, fence, and provenance (issue #1779).
 #[derive(Clone, Debug, PartialEq)]
@@ -5622,6 +5747,10 @@ struct MemoryState {
     /// revision documents, driven only through the closed automation legs
     /// under the held transaction lock.
     automation_revisions: BTreeMap<String, AutomationRevisionRow>,
+    /// Independently immutable owner-normalized records keyed by joined
+    /// `(automation_id, revision)`. These records do not activate a schedule,
+    /// move its current pointer, or enter occurrence history.
+    automation_normalizations: BTreeMap<String, AutomationNormalizationRow>,
     /// Current automation pointers keyed by automation (issue #1779).
     /// Compare-and-set revision plus closed admission state, driven only
     /// through the closed automation legs under the held transaction lock.
@@ -5708,6 +5837,7 @@ impl PartialEq for MemoryState {
             && self.reactive_sessions == other.reactive_sessions
             && self.resource_snapshots == other.resource_snapshots
             && self.automation_revisions == other.automation_revisions
+            && self.automation_normalizations == other.automation_normalizations
             && self.automation_currents == other.automation_currents
             && self.automation_invocations == other.automation_invocations
             && self.automation_failures == other.automation_failures
@@ -5750,6 +5880,7 @@ impl Default for MemoryState {
             reactive_sessions: BTreeMap::new(),
             resource_snapshots: BTreeMap::new(),
             automation_revisions: BTreeMap::new(),
+            automation_normalizations: BTreeMap::new(),
             automation_currents: BTreeMap::new(),
             automation_invocations: BTreeMap::new(),
             automation_failures: BTreeMap::new(),
@@ -5787,6 +5918,7 @@ impl MemoryState {
             && self.reactive_sessions.is_empty()
             && self.resource_snapshots.is_empty()
             && self.automation_revisions.is_empty()
+            && self.automation_normalizations.is_empty()
             && self.automation_currents.is_empty()
             && self.automation_invocations.is_empty()
             && self.instrument_registry.is_none()
