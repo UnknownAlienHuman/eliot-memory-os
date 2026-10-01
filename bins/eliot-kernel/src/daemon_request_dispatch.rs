@@ -3027,7 +3027,9 @@ impl KernelComposition {
         &self,
         readback: Option<super::startup_coordinator::GovernorAuthorityObservationReadback>,
         session: &Session,
-        current_admission: Option<&super::startup_coordinator::GovernorObservationAdmissionIdentity>,
+        current_admission: Option<
+            &super::startup_coordinator::GovernorObservationAdmissionIdentity,
+        >,
         source_selectors: Option<&GovernorAuthorityObservationPublishSelectors>,
     ) -> Result<
         Option<super::startup_coordinator::GovernorAuthorityObservationReadback>,
@@ -3129,7 +3131,8 @@ impl KernelComposition {
                 self.p07_ors
                     .load_bridge_event_observation_page_checked(&query)
                     .is_ok_and(|page| page == *retained_page)
-            }) && snapshot.streams.len() == snapshot.roster.owners.len()
+            })
+            && snapshot.streams.len() == snapshot.roster.owners.len()
     }
 
     /// Reads one bounded page from original ORS bridge-event owners. The
@@ -3180,7 +3183,7 @@ impl KernelComposition {
             prior.as_ref(),
             session,
             bridge_peer_set_revision,
-            admission_identity.as_ref(),
+            Some(&admission_identity),
             selectors,
         ) {
             Ok(bounds) => bounds,
@@ -3263,7 +3266,11 @@ impl KernelComposition {
             "executable_sha256": admission.executable_sha256,
         }));
         if self.validate_active_bridge_profile(&admission).is_err() {
-            return Err(("active_original_admission_not_validated", Some(identity), wire));
+            return Err((
+                "active_original_admission_not_validated",
+                Some(identity),
+                wire,
+            ));
         }
         let authority_lineage =
             eliot_ors::OpaqueLabel::new(admission.state_fence.authority_epoch.lineage_id.as_str());
@@ -3294,7 +3301,7 @@ impl KernelComposition {
                     session_epoch: session.session_epoch,
                     state_fence: session.module_generation.state_fence.clone(),
                     bridge_peer_set_revision,
-                    admission,
+                    admission: Some(admission),
                     selectors,
                     source_snapshot: Some(source_snapshot.clone()),
                     source_reason: None,
@@ -3433,10 +3440,7 @@ impl KernelComposition {
         owner_total: Option<u64>,
         selectors: super::startup_coordinator::GovernorObservationSelectors,
         event_page_limit: u16,
-    ) -> Result<
-        super::startup_coordinator::GovernorObservationSourceSnapshot,
-        &'static str,
-    > {
+    ) -> Result<super::startup_coordinator::GovernorObservationSourceSnapshot, &'static str> {
         let roster_query = eliot_ors::BridgeEventObservationRosterQuery {
             authority_lineage,
             principal,
@@ -3480,14 +3484,16 @@ impl KernelComposition {
             }
             retained_streams.push((owner.clone(), page));
         }
-        Ok(super::startup_coordinator::GovernorObservationSourceSnapshot {
-            roster,
-            streams: retained_streams,
-            next: super::startup_coordinator::GovernorObservationContinuation {
-                after_owner_sequence: next_after_owner_sequence,
-                after_event_sequence: next_after_event_sequence,
+        Ok(
+            super::startup_coordinator::GovernorObservationSourceSnapshot {
+                roster,
+                streams: retained_streams,
+                next: super::startup_coordinator::GovernorObservationContinuation {
+                    after_owner_sequence: next_after_owner_sequence,
+                    after_event_sequence: next_after_event_sequence,
+                },
             },
-        })
+        )
     }
 
     /// Executes one authenticated daemon lifecycle request.  Only the
