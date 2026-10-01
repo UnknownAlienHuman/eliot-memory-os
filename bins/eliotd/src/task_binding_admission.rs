@@ -126,6 +126,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use serde::Deserialize;
+
 use eliot_bootstrap::capture::{
     WorkspaceInstanceFacts, WorkspaceSourceDocumentKind, observe_workspace_instance,
     observe_workspace_source_candidates,

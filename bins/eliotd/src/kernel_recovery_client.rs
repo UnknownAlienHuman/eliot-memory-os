@@ -35,15 +35,16 @@ use eliot_protocol::RequestIdentity;
 use eliot_protocol::TaskControllerAction;
 use eliot_receipts::RequestBinding;
 use eliot_store_api::{
-    CONTRACT_VERSION, RecoveryRecord, RecoveryRecordKey, ScopeRevisionView, StoreFailure,
-    StoreFailureDisposition, StoreGenesisRequest, StoreRecoveryRequest, StoreRecoverySnapshot,
+    CONTRACT_VERSION, RecoveryRecord, RecoveryRecordKey, ScopeRevisionView, StoreGenesisRequest,
+    StoreFailure, StoreRecoveryRequest, StoreRecoverySnapshot,
     StoreWorkScopeOwnerRequest, StoreWorkScopeOwnerResponse, WriteReceipt,
     validate_genesis_receipt_envelope,
 };
 
+use crate::daemon_kernel_client::{TaskControllerClaimedInvocation, WireOutcome};
+
 use super::{
-    DaemonKernelClient, SERVICE_NAME, TaskControllerClaimedInvocation, WireOutcome,
-    kernel_port_error, kind_value, unix_ms, unix_ms_i64,
+    DaemonKernelClient, SERVICE_NAME, kind_value, kernel_port_error, unix_ms, unix_ms_i64,
 };
 
 const OWNER_RECOVERY_NAMESPACE: &str = "owner";
@@ -401,14 +402,16 @@ impl DaemonKernelClient {
             return Err(KernelPortError::Contract(
                 "WorkScope snapshot does not bind the exact next owner revision and fence"
                     .to_owned(),
-            ));
+            )
+            .into());
         }
         let payload = canonical_json_bytes(snapshot)
             .map_err(|error| KernelPortError::Contract(error.to_string()))?;
         if payload.is_empty() || payload.len() > eliot_governor::MAX_OWNER_SNAPSHOT_BYTES {
             return Err(KernelPortError::Contract(
                 "WorkScope owner snapshot exceeds the recovery payload bound".to_owned(),
-            ));
+            )
+            .into());
         }
         let owner_record = RecoveryRecord {
             namespace: OWNER_RECOVERY_NAMESPACE.to_owned(),
@@ -508,7 +511,8 @@ impl DaemonKernelClient {
         {
             return Err(KernelPortError::Contract(
                 "WorkScope owner write does not match the admitted Kernel snapshot".to_owned(),
-            ));
+            )
+            .into());
         }
         let identity = task_controller_owner_request_identity(self, claimed)?;
         request
@@ -534,7 +538,8 @@ impl DaemonKernelClient {
             return Err(KernelPortError::Contract(
                 "WorkScope owner write does not bind the claimed Task Controller operation"
                     .to_owned(),
-            ));
+            )
+            .into());
         }
         let payload = serde_json::json!({
             "attempt": attempt,
@@ -644,26 +649,44 @@ impl DaemonKernelClient {
                 });
             }
         };
-        let value = kind_value(&value, "store_work_scope_owner")?;
+        let value = kind_value(&value, "store_work_scope_owner").map_err(|error| {
+            WorkScopeOwnerWriteFailure::Kernel {
+                error,
+                expected: Some(expected.clone()),
+            }
+        })?;
         let record: RecoveryRecord = serde_json::from_value(value)
-            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            .map_err(|error| WorkScopeOwnerWriteFailure::Kernel {
+                error: KernelPortError::Contract(error.to_string()),
+                expected: Some(expected.clone()),
+            })?;
         record
             .validate_for_fence(&self.snapshot.state_fence())
-            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            .map_err(|error| WorkScopeOwnerWriteFailure::Kernel {
+                error: KernelPortError::Contract(error.to_string()),
+                expected: Some(expected.clone()),
+            })?;
         if record != expected
             || record.namespace != OWNER_RECOVERY_NAMESPACE
             || record.key != "work_scope"
             || record.state_fence != self.snapshot.state_fence()
         {
-            return Err(KernelPortError::Contract(
-                "Kernel WorkScope owner write did not return the exact durable readback".to_owned(),
-            ));
+            return Err(WorkScopeOwnerWriteFailure::Kernel {
+                error: KernelPortError::Contract(
+                    "Kernel WorkScope owner write did not return the exact durable readback"
+                        .to_owned(),
+                ),
+                expected: Some(expected.clone()),
+            });
         }
         StoreWorkScopeOwnerResponse {
             record: record.clone(),
         }
         .validate_for_request(&request)
-        .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        .map_err(|error| WorkScopeOwnerWriteFailure::Kernel {
+            error: KernelPortError::Contract(error.to_string()),
+            expected: Some(expected.clone()),
+        })?;
         Ok(record)
     }
 
