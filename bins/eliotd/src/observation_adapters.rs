@@ -30,6 +30,12 @@
 //!   (issue #2565 W4); it adds no admission rule, and a retry of the same
 //!   capture reconciles the existing receipt rather than committing a second
 //!   observation.
+//! - `read_captured_observation_receipt` forwards the same base operation and
+//!   capture back to the Governor owner's own committed-receipt route, so the
+//!   read/wait verb of an `eliot.observe` pending handle resolves the exact
+//!   operation the admission minted. `None` is the owner's honest "no terminal
+//!   receipt yet" and a port failure stays a typed [`CompositionError`]; this
+//!   adapter never collapses the two into a disposition (issue #2565 W5).
 //! - Watchdog export acknowledgement mapping is pure and lives here (never
 //!   in the Governor, which must not depend on the Watchdog): a terminal
 //!   canonical receipt maps to its sink disposition, an unknown outcome maps
@@ -126,6 +132,30 @@ impl<P: KernelTransitionPort + ?Sized> ForwardingObservationReconciliation<'_, P
     ) -> Result<eliot_store_api::WriteReceipt, CompositionError> {
         self.inner
             .admit_captured_observation(identity, base_operation_id, capture)
+            .await
+    }
+
+    /// Reads the exact committed receipt the Governor owner holds for one
+    /// admitted `eliot.observe` capture (issue #2565 W5).
+    ///
+    /// This is the production read/wait verb of a pending capture handle. It
+    /// forwards the exact base operation and capture the admission already used
+    /// to the Governor owner's own
+    /// [`read_captured_observation_receipt`](eliot_governor::GovernorObservationReconciliation::read_captured_observation_receipt),
+    /// so the read resolves the same operation identity the admission minted
+    /// and never a re-derived or approximate one. `None` is the owner's honest
+    /// "no terminal receipt yet"; a port failure stays a typed
+    /// [`CompositionError`] and is never collapsed into `None`.
+    ///
+    /// No admission rule, retry or state lives here: this is a pure read of the
+    /// existing owner receipt route.
+    pub async fn read_captured_observation_receipt(
+        &self,
+        base_operation_id: &eliot_contracts::OperationId,
+        capture: &eliot_governor::CapturedObservation,
+    ) -> Result<Option<eliot_store_api::WriteReceipt>, CompositionError> {
+        self.inner
+            .read_captured_observation_receipt(base_operation_id, capture)
             .await
     }
 
