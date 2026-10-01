@@ -35,10 +35,12 @@
 //! [`IpcReserve::publish_claimed_row`] as a validated
 //! [`BottleneckCapacityProfile`] row for the Kernel profile composition to
 //! join. The file-descriptor/handle dimension
-//! ([`CapacityBottleneck::FileDescriptorHandleSlots`]) is not claimed here:
-//! the frozen owner map binds it to the joint "platform/process/IPC owner",
-//! whose partition mechanism is not resolved to this crate alone, so it stays
-//! `UNSUPPORTED`/`UNKNOWN` until that wave rather than borrowing this byte
+//! ([`IPC_HANDLE_BOTTLENECK`]) is not claimed here: the frozen owner map
+//! binds it to the joint "platform/process/IPC owner", whose partition
+//! mechanism is not resolved to this crate alone. This crate publishes the
+//! explicit [`BottleneckCoverageState::Unsupported`] row for it through
+//! [`IpcReserve::publish_handle_unsupported_row`] so the composition joins a
+//! real owner row carrying no capacity claim, rather than borrowing this byte
 //! partition's numbers.
 //!
 //! This module has no production caller yet (STITCH): it publishes the owner
@@ -71,6 +73,17 @@ use thiserror::Error;
 /// The exact pipe/control-channel message-bytes bottleneck enforced by
 /// [`IpcReserve`].
 pub const IPC_PIPE_BYTES_BOTTLENECK: CapacityBottleneck = CapacityBottleneck::PipeMessageBytes;
+
+/// The exact file-descriptor/handle bottleneck this crate reports on but
+/// does not enforce.
+///
+/// The frozen owner map binds it to the joint "platform/process/IPC owner",
+/// whose partition mechanism is not resolved to this crate alone, so this
+/// crate publishes only the explicit [`BottleneckCoverageState::Unsupported`]
+/// row from [`IpcReserve::publish_handle_unsupported_row`]: no handle
+/// capacity is claimed, and no byte-partition number is reused for it.
+pub const IPC_HANDLE_BOTTLENECK: CapacityBottleneck =
+    CapacityBottleneck::FileDescriptorHandleSlots;
 
 /// Typed IPC reserve failures. None grants semantic or completion authority.
 #[derive(Debug, Error)]
@@ -542,6 +555,56 @@ impl IpcReserve {
             proof_profile_ref: proof_profile_ref.to_owned(),
             evidence_refs: vec![evidence_ref.to_owned()],
             invalidation_set: vec![invalidation_ref.to_owned()],
+        };
+        row.validate()
+            .map_err(|error| IpcReserveError::Contract(error.to_string()))?;
+        Ok(row)
+    }
+
+    /// Publishes the explicit unsupported row for [`IPC_HANDLE_BOTTLENECK`].
+    ///
+    /// The joint "platform/process/IPC owner" bound by the frozen owner map
+    /// has no partition mechanism resolved to this crate alone, so no handle
+    /// capacity is established here: the row names the frozen owner and the
+    /// exact handle unit, declares
+    /// [`BottleneckCoverageState::Unsupported`], and carries no physical
+    /// total, partition, enforcement, proof, evidence or invalidation claim.
+    /// It is validated by the existing contract check before it is returned,
+    /// so the Kernel profile composition joins a real owner row with no
+    /// capacity claim instead of a substituted default.
+    ///
+    /// This is an associated function without `self` on purpose: the byte
+    /// partitions of [`IpcReserve`] neither observe nor bound handle
+    /// capacity, and reading them here would reuse another dimension's
+    /// numbers as handle evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcReserveError::Contract`] when the assembled row fails the
+    /// existing contract validation.
+    pub fn publish_handle_unsupported_row() -> Result<BottleneckCapacityProfile, IpcReserveError> {
+        let bound = frozen_bottleneck_owner_map()
+            .into_iter()
+            .find(|bound| bound.bottleneck == IPC_HANDLE_BOTTLENECK)
+            .ok_or(IpcReserveError::InvalidField {
+                field: "ipc_evidence.bottleneck",
+                reason: "the frozen owner map binds no owner to the handle dimension",
+            })?;
+        let row = BottleneckCapacityProfile {
+            bottleneck: IPC_HANDLE_BOTTLENECK,
+            coverage_state: BottleneckCoverageState::Unsupported,
+            owner_ref: bound.owner.to_owned(),
+            owner_generation_ref: String::new(),
+            unit: bound.unit,
+            physical_total_limit: None,
+            normal_work_applicable: false,
+            normal_limit: None,
+            protected_limit: None,
+            emergency_limit: None,
+            enforcement: None,
+            proof_profile_ref: String::new(),
+            evidence_refs: Vec::new(),
+            invalidation_set: Vec::new(),
         };
         row.validate()
             .map_err(|error| IpcReserveError::Contract(error.to_string()))?;

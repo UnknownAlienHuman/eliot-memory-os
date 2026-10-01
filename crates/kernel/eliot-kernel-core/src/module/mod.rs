@@ -4,6 +4,10 @@
 //!
 //! - [`epoch_and_fence`] — authority epoch activation and exact route fencing;
 //! - [`generation_routing`] — runtime generation routes and cutover decisions;
+//! - [`control_reserve_composition`] — the I14.3 Kernel composition
+//!   collecting the owner waves' published rows into compiler-ready evidence
+//!   and compiling one canonical profile, kept separate from the compiler
+//!   because it binds composition-resolved identity rather than joining rows;
 //! - [`control_reserve_front_door`] — the bounded control reserve and the
 //!   synchronous front-door admission core;
 //! - [`control_reserve_profile_compiler`] — the I14.3 multidimensional
@@ -28,6 +32,7 @@
 //!   reverse-required drain order over that resolved graph.
 
 pub mod compatibility_handshake;
+pub mod control_reserve_composition;
 pub mod control_reserve_front_door;
 pub mod control_reserve_ors_evidence;
 pub mod control_reserve_profile_compiler;
