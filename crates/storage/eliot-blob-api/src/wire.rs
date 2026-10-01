@@ -19,6 +19,113 @@ pub const PROCESS_STREAM_READBACK_MAX_CHUNK_BYTES: u32 = 256 * 1024;
 pub const PROCESS_STREAM_SINK_WIRE_REVISION: u16 = 1;
 /// Maximum encoded body carried by one sink-operation frame.
 pub const PROCESS_STREAM_SINK_MAX_BODY_BYTES: usize = 1024 * 1024;
+/// Closed EBP selector for the distinct owner-bound process-stream channel.
+pub const BLOB_PROCESS_STREAM_WIRE_ID: &str = "eliot.blob.process-stream";
+/// Dedicated negotiated EBP capability for the process-stream Blob channel.
+pub const BLOB_PROCESS_STREAM_CAPABILITY: &str = "blob.process-stream";
+/// Current revision for the distinct process-stream EBP channel.
+pub const BLOB_PROCESS_STREAM_WIRE_REVISION: u16 = 1;
+/// Bound for one encoded Blob process-stream JSON payload.
+pub const BLOB_PROCESS_STREAM_MAX_FRAME_BYTES: usize = 3 * 1024 * 1024;
+
+/// Operation tag inside the distinct Blob EBP channel.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum BlobProcessStreamOperationRequest {
+    /// Process stream sink mutation/readback operation.
+    Sink {
+        /// Exact closed stream-sink request.
+        request: ProcessStreamSinkWireRequest,
+    },
+    /// Immutable source readback chunk operation.
+    SourceReadback {
+        /// Exact closed source readback request.
+        request: ProcessStreamSourceReadbackRequest,
+    },
+}
+
+/// Closed semantic request on the dedicated Blob EBP path.
+///
+/// The Store receiver recognizes this exact `wire_id` before attempting the
+/// canonical `StoreRequest` decode. Blob bytes and sink commands never enter
+/// the canonical Store request vocabulary.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobProcessStreamFrameRequest {
+    /// Closed operation family selector.
+    pub wire_id: String,
+    /// Wire revision.
+    pub wire_revision: u16,
+    /// Exact operation-specific body.
+    pub operation: BlobProcessStreamOperationRequest,
+}
+
+impl BlobProcessStreamFrameRequest {
+    /// Validates the closed selector, revision, and exact operation body.
+    pub fn validate(&self) -> Result<(), WireValidationError> {
+        if self.wire_id != BLOB_PROCESS_STREAM_WIRE_ID
+            || self.wire_revision != BLOB_PROCESS_STREAM_WIRE_REVISION
+        {
+            return Err(WireValidationError::UnsupportedRevision);
+        }
+        let encoded_len = serde_json::to_vec(self)
+            .map_err(|_| WireValidationError::InvalidField("frame"))?
+            .len();
+        if encoded_len > BLOB_PROCESS_STREAM_MAX_FRAME_BYTES {
+            return Err(WireValidationError::InvalidField("frame"));
+        }
+        match &self.operation {
+            BlobProcessStreamOperationRequest::Sink { request } => request.validate(),
+            BlobProcessStreamOperationRequest::SourceReadback { request } => request.validate(),
+        }
+    }
+}
+
+/// Operation tag inside a Blob EBP response.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum BlobProcessStreamOperationResponse {
+    /// Process stream sink operation result.
+    Sink {
+        /// Closed owner response.
+        response: ProcessStreamSinkWireResponse,
+    },
+    /// Immutable source readback result.
+    SourceReadback {
+        /// Closed owner response.
+        response: ProcessStreamSourceReadbackResponse,
+    },
+}
+
+/// Closed semantic response on the dedicated Blob EBP path.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobProcessStreamFrameResponse {
+    /// Closed operation family selector.
+    pub wire_id: String,
+    /// Wire revision.
+    pub wire_revision: u16,
+    /// Exact operation-specific result.
+    pub operation: BlobProcessStreamOperationResponse,
+}
+
+impl BlobProcessStreamFrameResponse {
+    /// Validates the closed selector and response frame size.
+    pub fn validate(&self) -> Result<(), WireValidationError> {
+        if self.wire_id != BLOB_PROCESS_STREAM_WIRE_ID
+            || self.wire_revision != BLOB_PROCESS_STREAM_WIRE_REVISION
+        {
+            return Err(WireValidationError::UnsupportedRevision);
+        }
+        let encoded_len = serde_json::to_vec(self)
+            .map_err(|_| WireValidationError::InvalidField("frame"))?
+            .len();
+        if encoded_len > BLOB_PROCESS_STREAM_MAX_FRAME_BYTES {
+            return Err(WireValidationError::InvalidField("frame"));
+        }
+        Ok(())
+    }
+}
 
 /// Closed process-stream discriminator.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
