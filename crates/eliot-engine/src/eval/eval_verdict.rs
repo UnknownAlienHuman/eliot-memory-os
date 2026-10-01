@@ -21,8 +21,31 @@ use super::{u8_count, u32_count};
 
 pub struct EvalVerdictService;
 
-impl EvalVerdictService {
-    pub fn verdict(run: &EvalRun) -> EvalVerdict {
+struct CaseCoverageFacts {
+    has_no_cases: bool,
+    has_unobserved_pass: bool,
+    all_passed: bool,
+}
+
+struct CaseStatusFacts {
+    has_inconclusive_case: bool,
+    has_blocked_case: bool,
+    has_skipped_case: bool,
+}
+
+struct ProvenanceFacts {
+    has_stale_case: bool,
+    has_unknown_case: bool,
+}
+
+struct EvalVerdictFacts {
+    coverage: CaseCoverageFacts,
+    case_statuses: CaseStatusFacts,
+    provenance: ProvenanceFacts,
+}
+
+impl EvalVerdictFacts {
+    fn from_run(run: &EvalRun) -> Self {
         let has_no_cases = run.case_results.is_empty();
         let has_unobserved_pass = run.case_results.iter().any(|result| {
             result.status == EvalCaseStatus::Passed
@@ -74,64 +97,101 @@ impl EvalVerdictService {
             .case_results
             .iter()
             .any(|result| result.integrity_fingerprints.is_none());
-        let failure_clusters = Self::failure_clusters(run);
-        let status = match run.status {
-            EvalRunStatus::Completed if all_passed && !has_stale_case && !has_unknown_case => {
+
+        Self {
+            coverage: CaseCoverageFacts {
+                has_no_cases,
+                has_unobserved_pass,
+                all_passed,
+            },
+            case_statuses: CaseStatusFacts {
+                has_inconclusive_case,
+                has_blocked_case,
+                has_skipped_case,
+            },
+            provenance: ProvenanceFacts {
+                has_stale_case,
+                has_unknown_case,
+            },
+        }
+    }
+
+    fn status(&self, run_status: EvalRunStatus) -> EvalVerdictStatus {
+        match run_status {
+            EvalRunStatus::Completed
+                if self.coverage.all_passed
+                    && !self.provenance.has_stale_case
+                    && !self.provenance.has_unknown_case =>
+            {
                 EvalVerdictStatus::Pass
             }
             EvalRunStatus::BlockedInvalidDataset
             | EvalRunStatus::BlockedMutationAttempt
             | EvalRunStatus::BlockedUnsafeProfile => EvalVerdictStatus::Blocked,
-            _ if has_blocked_case => EvalVerdictStatus::Blocked,
-            _ if has_no_cases => EvalVerdictStatus::Inconclusive,
-            _ if has_unobserved_pass => EvalVerdictStatus::Inconclusive,
-            _ if has_stale_case => EvalVerdictStatus::Inconclusive,
-            _ if has_unknown_case => EvalVerdictStatus::Inconclusive,
+            _ if self.case_statuses.has_blocked_case => EvalVerdictStatus::Blocked,
+            _ if self.coverage.has_no_cases => EvalVerdictStatus::Inconclusive,
+            _ if self.coverage.has_unobserved_pass => EvalVerdictStatus::Inconclusive,
+            _ if self.provenance.has_stale_case => EvalVerdictStatus::Inconclusive,
+            _ if self.provenance.has_unknown_case => EvalVerdictStatus::Inconclusive,
             EvalRunStatus::Completed | EvalRunStatus::Failed
-                if has_inconclusive_case || has_skipped_case =>
+                if self.case_statuses.has_inconclusive_case
+                    || self.case_statuses.has_skipped_case =>
             {
                 EvalVerdictStatus::Inconclusive
             }
             EvalRunStatus::Completed | EvalRunStatus::Failed => EvalVerdictStatus::Fail,
             _ => EvalVerdictStatus::Inconclusive,
-        };
+        }
+    }
+
+    fn reasons(&self) -> Vec<String> {
         let mut reasons = vec!["eval verdict is report-only and grants no authority".to_owned()];
-        if has_no_cases {
+        if self.coverage.has_no_cases {
             reasons.push(
                 "run contains no case results; empty output cannot establish an evaluation verdict"
                     .to_owned(),
             );
         }
-        if has_unobserved_pass {
+        if self.coverage.has_unobserved_pass {
             reasons.push(
                 "at least one Passed result lacks complete observed measurement evidence; a status claim alone cannot produce PASS"
                     .to_owned(),
             );
         }
-        if has_blocked_case {
+        if self.case_statuses.has_blocked_case {
             reasons.push("at least one case was blocked before a measured outcome".to_owned());
         }
-        if has_skipped_case {
+        if self.case_statuses.has_skipped_case {
             reasons.push("at least one case was skipped and remains non-evidence".to_owned());
         }
-        if has_stale_case {
+        if self.provenance.has_stale_case {
             reasons.push(
                 "at least one retained integrity fingerprint set predates current evaluator identity; the run cannot support a fresh verdict"
                     .to_owned(),
             );
         }
-        if has_unknown_case {
+        if self.provenance.has_unknown_case {
             reasons.push(
                 "at least one result predates integrity fingerprint retention; unknown provenance cannot support a fresh verdict"
                     .to_owned(),
             );
         }
-        if has_inconclusive_case {
+        if self.case_statuses.has_inconclusive_case {
             reasons.push(
                 "at least one case is NotYetImplemented; an inconclusive integrity result cannot produce a PASS verdict"
                     .to_owned(),
             );
         }
+        reasons
+    }
+}
+
+impl EvalVerdictService {
+    pub fn verdict(run: &EvalRun) -> EvalVerdict {
+        let facts = EvalVerdictFacts::from_run(run);
+        let failure_clusters = Self::failure_clusters(run);
+        let status = facts.status(run.status);
+        let reasons = facts.reasons();
         EvalVerdict {
             eval_verdict_id: EvalVerdictId::new_v7(),
             eval_run_id: run.eval_run_id,

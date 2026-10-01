@@ -728,22 +728,7 @@ impl CompletionGate {
         {
             reasons.push("completion_proof_missing_patch_run_ref".to_owned());
         }
-        for run in canonical_runs
-            .iter()
-            .copied()
-            .filter(|run| run.required_for_done)
-        {
-            if !proof
-                .evidence
-                .iter()
-                .any(|evidence| evidence.contains(&run.verifier_run_id.to_string()))
-            {
-                reasons.push(format!(
-                    "completion_proof_missing_verifier_run_ref:{}",
-                    run.name
-                ));
-            }
-        }
+        append_missing_verifier_evidence_reasons(proof, &canonical_runs, &mut reasons);
         if reasons.is_empty() {
             completion_decision(proof, CompletionStatus::DoneVerified, reasons)
         } else {
@@ -1382,6 +1367,29 @@ fn required_verifiers_passed(runs: &[VerifierRun]) -> bool {
     runs.iter()
         .filter(|run| run.required_for_done)
         .all(|run| run.status == VerifierStatus::Passed && !is_quarantined_legacy_run(run))
+}
+
+fn append_missing_verifier_evidence_reasons(
+    proof: &CompletionProof,
+    canonical_runs: &[&VerifierRun],
+    reasons: &mut Vec<String>,
+) {
+    for run in canonical_runs
+        .iter()
+        .copied()
+        .filter(|run| run.required_for_done)
+    {
+        if !proof
+            .evidence
+            .iter()
+            .any(|evidence| evidence.contains(&run.verifier_run_id.to_string()))
+        {
+            reasons.push(format!(
+                "completion_proof_missing_verifier_run_ref:{}",
+                run.name
+            ));
+        }
+    }
 }
 
 fn canonical_verifier_runs<'a>(

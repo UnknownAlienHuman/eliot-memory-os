@@ -725,8 +725,8 @@ impl EvalDatasetManifestService {
             receipt.valid = false;
             receipt.mismatch_detected = true;
             receipt.blocked_run = true;
-            receipt.expected_checksum = "exact suite cases and Product Identity".to_owned();
-            receipt.actual_checksum = "case coverage or Product Identity mismatch".to_owned();
+            "exact suite cases and Product Identity".clone_into(&mut receipt.expected_checksum);
+            "case coverage or Product Identity mismatch".clone_into(&mut receipt.actual_checksum);
         }
         receipt
     }
@@ -787,7 +787,7 @@ pub enum EvaluationIntegrityStatus {
 /// This projection therefore remains `INCONCLUSIVE` at the explicit
 /// `STRUCTURAL_ONLY` proof ceiling. It is an in-memory advisory projection for
 /// the existing eval result path; `EvalCaseResult` does not retain it, so it is
-/// not ProductProof or a durable canonical receipt.
+/// not `ProductProof` or a durable canonical receipt.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct EvaluationIntegrityReceipt {
     pub receipt_id: String,
@@ -1061,18 +1061,17 @@ impl EvalMeasurementService {
             if !criterion.required {
                 return false;
             }
-            match measurements
+            if let Some(measurement) = measurements
                 .iter()
                 .find(|measurement| measurement.measurement_id == criterion.measurement_id)
             {
-                Some(measurement) => !measurement.passed,
-                None => {
-                    errors.push(format!(
-                        "required criterion {} has no matching measurement result ({})",
-                        criterion.criterion_id, criterion.measurement_id
-                    ));
-                    true
-                }
+                !measurement.passed
+            } else {
+                errors.push(format!(
+                    "required criterion {} has no matching measurement result ({})",
+                    criterion.criterion_id, criterion.measurement_id
+                ));
+                true
             }
         });
         let not_implemented = measurements.iter().any(|measurement| {

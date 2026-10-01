@@ -686,7 +686,6 @@ impl AdapterSupervisor {
         window.consecutive_failures = record.consecutive_failures;
         window.circuit_state = match event {
             CircuitEvent::HalfOpenProbe => AdapterCircuitState::HalfOpen,
-            CircuitEvent::Success => AdapterCircuitState::Closed,
             CircuitEvent::TransportFailure
             | CircuitEvent::IntegrityFailure
             | CircuitEvent::AdapterFailure
@@ -694,7 +693,8 @@ impl AdapterSupervisor {
             {
                 AdapterCircuitState::Open
             }
-            CircuitEvent::TransportFailure
+            CircuitEvent::Success
+            | CircuitEvent::TransportFailure
             | CircuitEvent::IntegrityFailure
             | CircuitEvent::AdapterFailure => AdapterCircuitState::Closed,
         };
