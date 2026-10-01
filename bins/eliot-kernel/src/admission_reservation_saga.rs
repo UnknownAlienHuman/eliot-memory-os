@@ -158,11 +158,12 @@ const ACTIVATION_RECEIPT_DOMAIN: &str = "eliot.ors.admission-reservation.activat
 /// owner to have committed for one reservation.
 ///
 /// Everything the coordinator needs is either an identity it re-derives from
-/// the durable reservation (never from this payload) or the owner-issued
-/// reference the owner itself must have returned. `admission_receipt` is NOT
-/// accepted as authority on its own: the retained commit the ORS owner builds
-/// from the owner's own `WriteReceipt` must name that exact receipt, and the
-/// retained commit is then compared BY VALUE against a fresh readback of the
+/// the durable reservation (never from this payload) or the owner's own
+/// committed receipt, read back through the store gateway for the ORIGINAL
+/// operation identity. The payload carries NO admission receipt: the retained
+/// commit's admission reference is derived from the owner's receipt itself by
+/// the ORS owner, so a caller assertion can never enter the saga as authority.
+/// The retained commit is then compared BY VALUE against a fresh readback of the
 /// same canonical operation.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -179,9 +180,6 @@ struct AdmissionReservationAdmitOperation {
     work_item_id: String,
     /// The proposed attempt the reservation covers.
     proposed_attempt_id: String,
-    /// Owner-issued canonical admission receipt reference the owner returned
-    /// from the `ADMITTED` commit.
-    admission_receipt: ReceiptIdentity,
     /// The session fence the daemon presents for this operation.
     state_fence: StateFence,
 }
@@ -1039,11 +1037,11 @@ impl KernelComposition {
 
         // Prove the committed `ADMITTED` decision and its exact launch outbox
         // belong to THIS reservation, and build the retained commit from the
-        // owner's OWN receipt. Nothing is fabricated in Kernel and nothing is
-        // inferred from a successful transport response.
+        // owner's OWN receipt — including the admission receipt derived from
+        // that receipt's own reconciliation envelope. Nothing is fabricated in
+        // Kernel and nothing is inferred from a successful transport response.
         let commit = CanonicalAdmissionCommit {
             receipt: committed_receipt,
-            admission_receipt: operation.admission_receipt.clone(),
         };
         // Prove the committed `ADMITTED` decision belongs to THIS reservation,
         // then re-read the committed content and compare it BY VALUE against the
@@ -1072,7 +1070,6 @@ impl KernelComposition {
         // (refused), so a second activation can never be minted under one
         // reservation.
         let activation_request = Self::admission_reservation_activation_request(
-            operation,
             &reservation_id,
             &work_item,
             &proposed_attempt,
@@ -1184,7 +1181,6 @@ impl KernelComposition {
     /// what distinguishes an exact replay (original active snapshot and receipt
     /// returned) from changed evidence (refused).
     fn admission_reservation_activation_request(
-        operation: &AdmissionReservationAdmitOperation,
         reservation_id: &OperationIdentity,
         work_item_id: &OperationIdentity,
         proposed_attempt_id: &OperationIdentity,
@@ -1201,7 +1197,9 @@ impl KernelComposition {
             operation_id: activation_operation,
             // The ORIGINAL recorded claim set, read back from the durable row.
             claims: staged.claims.clone(),
-            canonical_admission_receipt: operation.admission_receipt.clone(),
+            // The owner-issued canonical admission receipt, derived from the
+            // owner's own receipt by the ORS owner — never the payload's.
+            canonical_admission_receipt: proven.canonical_admission.admission_receipt.clone(),
             canonical_admission: Some(proven.canonical_admission.clone()),
             // The ORS activation receipt is the durable reference the activation
             // commits with the active row; it is derived from the reservation and
@@ -1209,7 +1207,7 @@ impl KernelComposition {
             // byte-identically instead of minting a second one.
             activation_receipt: activation_receipt_identity(
                 reservation_id,
-                &operation.admission_receipt,
+                &proven.canonical_admission.admission_receipt,
             )?,
             expected_current_receipt: proven.expected_current_receipt.clone(),
             authority_epoch: staged.authority_epoch.clone(),

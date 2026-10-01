@@ -222,15 +222,25 @@ pub struct AdmissionReservationCanonicalAdmission {
     pub mutation_plan_digest: String,
     /// Canonical commit identity the owner assigned to this `ADMITTED` write.
     pub commit_id: String,
-    /// Launch-outbox operation identity. Distinct from the admission operation
-    /// identity: they are three distinct operations linked by one saga
-    /// identity, and are NOT required to be accidentally equal.
+    /// Launch-outbox operation identity. This is the SAME operation identity as
+    /// the canonical admission above: the launch intent is the outbox row the
+    /// canonical owner committed inside the same store transaction as the
+    /// `ADMITTED` decision, under that operation's own identity
+    /// ([`eliot_store_api::OutboxIntentKind::Launch`]: "exactly one launch
+    /// intent is committed per canonical admission operation, under that
+    /// operation's own identity"). The intent is distinguished by its outbox
+    /// ROW identity ([`Self::launch_outbox_id`]), not by a second operation.
+    /// The first ORS stage, the canonical write and the activation remain three
+    /// distinct operations linked by one saga identity; the launch outbox is
+    /// part of the canonical write, not a fourth one.
     pub launch_outbox_operation_id: OperationIdentity,
     /// Launch-outbox item identity written by the same canonical transaction.
     pub launch_outbox_id: String,
-    /// Owner-issued canonical admission receipt reference. This is the
-    /// receipt the canonical owner returned from the `ADMITTED` commit; it is
-    /// copied verbatim and never fabricated in Kernel.
+    /// Owner-issued canonical admission receipt reference. This is the identity
+    /// of the store-owned reconciliation envelope the canonical owner issued
+    /// inside the `ADMITTED` commit transaction, derived from the owner's own
+    /// `WriteReceipt` by [`crate::canonical_admission_receipt_from_owner_receipt`];
+    /// it is copied verbatim and never fabricated in Kernel.
     pub admission_receipt: ReceiptIdentity,
     /// The commit-time marker the canonical owner recorded on the `WriteReceipt`
     /// for this `ADMITTED` commit, copied verbatim (I5.19 `committed_at`).
@@ -249,10 +259,11 @@ impl AdmissionReservationCanonicalAdmission {
     /// Validates the retained canonical commit and launch-outbox join.
     ///
     /// Every value is checked for the shape the canonical owner applies when it
-    /// issues it, and the two operation identities must be distinct: a launch
-    /// intent that reused the admission operation identity would be
-    /// indistinguishable from the admission itself, and I14.6 names them as
-    /// separate operations. A digest is only ever checked for shape here — the
+    /// issues it, and the launch-outbox operation identity must EQUAL the
+    /// canonical admission operation identity: the launch intent this record
+    /// retains is the outbox row the SAME canonical write committed, so a
+    /// record naming a different operation for its launch intent names a commit
+    /// that never happened. A digest is only ever checked for shape here — the
     /// authoritative `validate()` for each of them runs where the value is
     /// read, against the ORIGINAL recorded bytes, never recomputed.
     pub fn validate(&self) -> Result<(), OrsError> {
@@ -293,10 +304,10 @@ impl AdmissionReservationCanonicalAdmission {
                 reason: "canonical admission and launch-outbox operation identities must be non-blank",
             });
         }
-        if self.operation_id == self.launch_outbox_operation_id {
+        if self.operation_id != self.launch_outbox_operation_id {
             return Err(OrsError::InvalidField {
                 field: "canonical_admission.launch_outbox_operation_id",
-                reason: "the launch-outbox operation identity must differ from the canonical admission operation identity",
+                reason: "the launch-outbox intent is committed by the same canonical write, so its operation identity must equal the canonical admission operation identity",
             });
         }
         validate_receipt_identity(
