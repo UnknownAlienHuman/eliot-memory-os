@@ -570,13 +570,13 @@ fn launch_06_store_before_kernel() {
         .find("host.store-launch requested")
         .expect("must pin store request");
     let store_ready = sequence
-        .find("host.store-launch store-ready observed")
+        .find("host.store-launch store-live observed")
         .expect("must pin store-ready");
     let kernel_requested = sequence
         .find("host.kernel-launch requested")
         .expect("must pin kernel request");
     let kernel_ready = sequence
-        .find("host.kernel-launch kernel-ready observed")
+        .find("host.kernel-launch kernel-launched observed")
         .expect("must pin kernel-ready");
     assert!(
         requested < store_ready
@@ -585,21 +585,21 @@ fn launch_06_store_before_kernel() {
         "Store-before-Kernel order must be observed separately"
     );
     assert_ne!(
-        "host.store-launch store-ready observed",
-        "host.kernel-launch kernel-ready observed"
+        "host.store-launch store-live observed",
+        "host.kernel-launch kernel-launched observed"
     );
     let text = capture_emit(|| {
         observe_entrypoint_with_detail(
             EntrypointStage::Startup,
-            "host.store-launch store-ready observed",
+            "host.store-launch store-live observed",
         );
         observe_entrypoint_with_detail(
             EntrypointStage::Startup,
-            "host.kernel-launch kernel-ready observed",
+            "host.kernel-launch kernel-launched observed",
         );
     });
-    assert!(text.contains("host.store-launch store-ready observed"));
-    assert!(text.contains("host.kernel-launch kernel-ready observed"));
+    assert!(text.contains("host.store-launch store-live observed"));
+    assert!(text.contains("host.kernel-launch kernel-launched observed"));
 }
 
 // WORK_UNIT_CASE: 978/7
@@ -709,7 +709,7 @@ fn launch_08_readiness_needs_owner_evidence() {
     });
     assert!(text.contains("host.kernel-activation readiness requested"));
     assert!(text.contains("host.kernel-activation readiness observed"));
-    assert!(!text.contains("host.kernel-launch kernel-ready observed"));
+    assert!(!text.contains("host.kernel-launch kernel-launched observed"));
 }
 
 // WORK_UNIT_CASE: 978/9
@@ -855,7 +855,7 @@ fn launch_13_deterministic_semantic_fields() {
         );
         observe_entrypoint_with_detail(
             EntrypointStage::Startup,
-            "host.store-launch store-ready observed",
+            "host.store-launch store-live observed",
         );
     });
     let second = capture_emit(|| {
@@ -865,7 +865,7 @@ fn launch_13_deterministic_semantic_fields() {
         );
         observe_entrypoint_with_detail(
             EntrypointStage::Startup,
-            "host.store-launch store-ready observed",
+            "host.store-launch store-live observed",
         );
     });
     assert_eq!(
