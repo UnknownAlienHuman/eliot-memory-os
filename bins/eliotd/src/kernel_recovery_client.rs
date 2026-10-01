@@ -159,12 +159,11 @@ fn work_scope_owner_record(
             expected: Some(expected.clone()),
         }
     })?;
-    let record: RecoveryRecord = serde_json::from_value(value).map_err(|error| {
-        WorkScopeOwnerWriteFailure::Kernel {
+    let record: RecoveryRecord =
+        serde_json::from_value(value).map_err(|error| WorkScopeOwnerWriteFailure::Kernel {
             error: KernelPortError::Contract(error.to_string()),
             expected: Some(expected.clone()),
-        }
-    })?;
+        })?;
     record
         .validate_for_fence(state_fence)
         .map_err(|error| WorkScopeOwnerWriteFailure::Kernel {
@@ -178,8 +177,7 @@ fn work_scope_owner_record(
     {
         return Err(WorkScopeOwnerWriteFailure::Kernel {
             error: KernelPortError::Contract(
-                "Kernel WorkScope owner write did not return the exact durable readback"
-                    .to_owned(),
+                "Kernel WorkScope owner write did not return the exact durable readback".to_owned(),
             ),
             expected: Some(expected.clone()),
         });
@@ -701,12 +699,7 @@ impl DaemonKernelClient {
                 expected: Some(expected.clone()),
             })?;
         let value = work_scope_owner_wire_value(outcome, claimed, &expected)?;
-        work_scope_owner_record(
-            value,
-            &request,
-            &expected,
-            &self.snapshot.state_fence(),
-        )
+        work_scope_owner_record(value, &request, &expected, &self.snapshot.state_fence())
     }
 
     fn recovery_snapshot(
