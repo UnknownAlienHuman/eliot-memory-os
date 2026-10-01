@@ -1227,16 +1227,30 @@ fn the_declared_hooks_are_the_ones_that_carry_eliot_evidence() -> anyhow::Result
 
     // A hook that can block must be able to answer before the turn moves
     // on; one that only records must not hold the turn up.
+    //
+    // Only the seven rows this edge actually declares are listed here.
+    // `PostToolUseFailure` and `SessionEnd` were the two `host event --host
+    // claude --event` rows, and commit 1ee1246f5 ("feat: Close eliotd
+    // ownership and retire legacy eliot-app semantics (#18)") removed them
+    // from `integrations/claude/eliot/hooks/hooks.json` without touching this
+    // test, leaving it to assert an `async` flag on a hook the plugin no
+    // longer declares. The removal is the recorded current contract, not a
+    // regression: `crates/eliot-app/src/disposition.rs::MIGRATED_CONSUMER_EDGES`
+    // ("Claude Code plugin lifecycle hooks") states the two rows "are removed
+    // from this edge because record_event lease-gating plus
+    // reports/host-events writes are host-runtime behavior owned by the #77
+    // host-request protocol migration and are not servable by the hook intake".
+    // The bridge hook intake serves exactly the seven remaining events
+    // (`bins/eliot-agent-bridge/src/hook_intake.rs::parse_hook_event`), which is
+    // what this loop pins.
     for (event, blocking) in [
         ("SessionStart", true),
         ("PreToolUse", true),
         ("PostToolUse", false),
         ("PreCompact", true),
         ("Stop", true),
-        ("PostToolUseFailure", false),
         ("SubagentStart", false),
         ("SubagentStop", false),
-        ("SessionEnd", false),
     ] {
         let is_async = hooks
             .pointer(&format!("/hooks/{event}/0/hooks/0/async"))
@@ -1247,6 +1261,14 @@ fn the_declared_hooks_are_the_ones_that_carry_eliot_evidence() -> anyhow::Result
             !blocking,
             "{event} is declared {}synchronous",
             if blocking { "a" } else { "" }
+        );
+    }
+    // The two retired host-event rows must stay absent rather than merely
+    // unasserted, so a re-add cannot silently skip the synchronicity contract.
+    for retired in ["PostToolUseFailure", "SessionEnd"] {
+        assert!(
+            !declared.contains_key(retired),
+            "{retired} is a retired host-event row and must not return to this edge"
         );
     }
     Ok(())
