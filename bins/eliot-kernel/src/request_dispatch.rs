@@ -6,7 +6,9 @@
 //! owner is named. `backup.verify` reaches the real capture owner and answers
 //! from it, and `backup.restore-test` reaches the real restore owner through
 //! [`KernelComposition::backup_restore_with_ors_journal`] and answers with the
-//! owner's own receipt; `backup.create` is the remaining owner-blocked leg, and
+//! owner's own receipt — or, while this route presents no destination
+//! admission, with the owner's own `DestinationNotAdmitted` refusal;
+//! `backup.create` is the remaining owner-blocked leg, and
 //! `backup.restore-store` is the fourth selector, which carries the admitted
 //! #950 carrier itself and reaches the admitted destination only through the
 //! composition's retained `KernelStoreGateway`. None of the four performs a
@@ -139,7 +141,12 @@
 //!   [`KernelComposition::backup_restore_with_ors_journal`] on this
 //!   composition's own durable journal, answering `ok` with the owner's own
 //!   `RestoreReceipt`, its exact `evidence_level`, the evidence document the
-//!   owner finalized and the applied phase log. `plan_gap` survives on this arm
+//!   owner finalized and the applied phase log. That `ok` is reachable only for
+//!   an ADMITTED destination: this route builds `RestorePorts` with
+//!   `manifest_evidence: None`, and the restore owner refuses that absent
+//!   admission with [`KernelRestoreError::DestinationNotAdmitted`] before any
+//!   destination root is constructed — answered `refused` with
+//!   `code = restore-destination-not-admitted`. `plan_gap` survives on this arm
 //!   for exactly ONE genuinely absent owner capability — the destination-side
 //!   key and blob-scope admission named by
 //!   [`BACKUP_RESTORE_TEST_MISSING_OWNER`] — and is never the endpoint of a
@@ -151,11 +158,13 @@
 //!   `destination-manifest-admission`, because #958's owner-issued PREPARED,
 //!   UNACTIVATED destination binding has no channel on this front door to issue
 //!   one. The second is the honest limit of what `backup.restore-test`
-//!   establishes: the declared destination is re-proved by the owner against
-//!   the destination the execution constructs and against the durable stream
-//!   row, but it is not pinned by an owner admission this route can obtain, and
-//!   [`handle_backup_restore_test`] says so where it is implemented rather than
-//!   claiming the conjunct. The gates that ran are reported in `gates_passed`
+//!   establishes: this route builds no owner admission at all, so the owner
+//!   refuses the destination with [`KernelRestoreError::DestinationNotAdmitted`]
+//!   before it constructs the root, rather than re-proving a destination this
+//!   front door merely declared; the declared destination is still re-proved
+//!   against the durable stream row, and [`handle_backup_restore_test`] says so
+//!   where it is implemented rather than claiming the conjunct. The gates that
+//!   ran are reported in `gates_passed`
 //!   and the gates that did not run are reported in `gates_not_admitted`; the
 //!   two sets are disjoint, so a gate is never reported as passed and as
 //!   deferred-to-owner at the same time.
@@ -293,6 +302,20 @@ const BACKUP_RESTORE_STORE_REFUSAL_CODE: &str = "restore_refused";
 /// `CapabilityMissing` and this route reports that refusal as the plan gap it
 /// is.
 ///
+/// A SECOND thing is absent on the same front door and is named here because it
+/// is NOT a plan gap: the Host-side destination manifest admission
+/// (`RestorePorts::manifest_evidence`). The restore owner REQUIRES that record —
+/// `KernelBackupRestore::restore_with_owner` returns
+/// [`KernelRestoreError::DestinationNotAdmitted`] when it is `None`, before it
+/// compiles a plan or constructs a destination root — and this route builds
+/// `RestorePorts` with `None`, because no channel here issues the record. The
+/// owner checks the blob capabilities first, so a blob-carrying archive is still
+/// refused `CapabilityMissing` and reported `plan_gap` by this constant, while
+/// an archive without blobs is refused `DestinationNotAdmitted` and reported
+/// `refused`. There is therefore no admitted import on this front door at all:
+/// the constant below stays exact about the plan gap it names, and it is not a
+/// complete inventory of what this command cannot do.
+///
 /// A FOURTH name this same doc used to carry became false when `0a93a0307`
 /// landed, and is corrected here rather than left standing: the ORS
 /// `RestoreJournalStreamBinding` row DOES have a producer that runs before
@@ -390,11 +413,14 @@ const RESTORE_TEST_SHAPE_GATES_ADMITTED: [&str; 6] = [
 /// split exists to make impossible.
 ///
 /// The first entry is structural: the Host-side destination manifest binding
-/// (#958) reaches no owner channel on this front door, so the rehearsal runs
-/// with `RestorePorts::manifest_evidence == None` — the shape that type's own
-/// doc names as "a bundle with no Host admission", under which isolated import
-/// still runs, prepare pins nothing, and cutover qualification refuses for want
-/// of a pinned owner admission. The second is the no-cutover boundary this
+/// (#958) reaches no owner channel on this front door, so this route builds
+/// `RestorePorts` with `manifest_evidence == None` - an ABSENT admission - and
+/// the restore owner refuses that with
+/// [`KernelRestoreError::DestinationNotAdmitted`] before it constructs a
+/// destination root. The answer is therefore `refused` with
+/// `code = restore-destination-not-admitted`, carrying the executed route, so
+/// the gate is reported here rather than implied by an `ok` this route cannot
+/// reach. The second is the no-cutover boundary this
 /// command may never cross (A13.7: "Cutover requires separate authority"): the
 /// route never calls `qualify_cutover`, so that gate is reported as not admitted
 /// on every answer, successful or not. The two gates in
@@ -3385,9 +3411,12 @@ fn require_object<'a>(
 /// ([`OrsRestoreBinding::from_composition`]), and runs the full isolated
 /// rehearsal through
 /// [`KernelComposition::backup_restore_with_ors_journal`]
-/// (#960) on the composition-owned durable ORS journal. It answers with the
-/// owner's own receipt and evidence level, so the reply carries the persisted
-/// rehearsal result rather than a refusal.
+/// (#960) on the composition-owned durable ORS journal. On an ADMITTED
+/// destination it answers with the owner's own receipt and evidence level, so
+/// the reply carries the persisted rehearsal result rather than a refusal; on
+/// the destination this route can actually present — none — the owner's own
+/// `DestinationNotAdmitted` refusal is the answer, as
+/// [`RESTORE_TEST_GATES_NOT_ADMITTED`] states.
 ///
 /// ## The execution identity: what is owner-derived and what is only re-proved
 ///
@@ -3408,7 +3437,8 @@ fn require_object<'a>(
 /// `RestoreContext::target_id` of the request's own typed target, and this
 /// route does not dress that up as an owner fact. What keeps it from being a
 /// caller-chosen destination is the owner's own re-proof of it, not a claim
-/// here: `check_ors_journal_binding` (`backup_restore.rs`) refuses any binding
+/// here. For an ADMITTED caller, that is
+/// `check_ors_journal_binding` (`backup_restore.rs`), which refuses any binding
 /// whose `destination_ref` is not exactly the target this execution
 /// constructs, the ORS owner refuses to establish or to append to a stream
 /// whose durable row names another destination, and the shape gate above
@@ -3423,7 +3453,10 @@ fn require_object<'a>(
 /// front door holds no channel that issues it — see
 /// [`RESTORE_TEST_GATES_NOT_ADMITTED`], which names
 /// `destination-manifest-admission` on every answer this route gives rather
-/// than papering over the difference. Opening that seam is #958/A13.7's
+/// than papering over the difference. On THIS route the owner's re-proof of the
+/// declared target therefore decides nothing: without the admission the engine
+/// refuses with [`KernelRestoreError::DestinationNotAdmitted`] before a
+/// destination root exists. Opening that seam is #958/A13.7's
 /// governance decision, not a wiring choice made here.
 ///
 /// ## What the ports carry, and what they deliberately do not
@@ -3444,9 +3477,14 @@ fn require_object<'a>(
 /// no key owner" is decided by the owner's own gate and reported, never guessed.
 /// `manifest_evidence` is `None` for the reason
 /// [`RESTORE_TEST_GATES_NOT_ADMITTED`] states: the Host-side manifest binding
-/// reaches no owner channel here, and `None` is the shape that type's own doc
-/// names as a bundle with no Host admission — under which isolated import still
-/// runs and cutover qualification refuses.
+/// reaches no owner channel here. `None` is an ABSENT admission, not a supported
+/// import shape — `KernelBackupRestore::restore_with_owner` returns
+/// [`KernelRestoreError::DestinationNotAdmitted`] for it before it compiles a
+/// plan or calls `KernelIsolatedDestination::open`, so the `None` built here is
+/// the reason this rehearsal is refused and no destination byte exists when it
+/// is. An admitted rehearsal is this same route carrying the owner-issued
+/// evidence from [`RestorePorts::with_owner_destination_evidence`], which has no
+/// production call site on this tree either.
 ///
 /// `rehearsal` is `true`, because this is a rehearsal: the engine then validates
 /// the admission instead of demanding production durable recovery, activates

@@ -190,9 +190,17 @@ pub const MAX_TRACKED_JOURNAL_PAYLOADS: usize = MAX_JOURNAL_PAGE_ENTRIES;
 /// (never caller text); when the archive carries a `config` artifact, the
 /// admitted manifest digest must equal that artifact's digest; the admitted
 /// values pin to [`DESTINATION_ADMISSION_FILE`] at prepare and any drift
-/// refuses later effects. Rehearsal without Host admission carries `None`
-/// instead: isolated import still runs, but cutover refuses without a
-/// pinned owner-approved admission.
+/// refuses later effects.
+///
+/// This record is REQUIRED, not inspected only when it happens to be present.
+/// `KernelBackupRestore::restore_with_owner` (`backup_restore.rs`) returns
+/// [`KernelRestoreError::DestinationNotAdmitted`] when
+/// `RestorePorts::manifest_evidence` is `None`, and it does so before it
+/// compiles a plan and before `KernelIsolatedDestination::open` constructs any
+/// root, so an absent Host admission is a refusal rather than a degraded import
+/// into a root this owner built from the request's own label. Rehearsal is
+/// refused on exactly the rule a production run is: the rehearsal flag governs
+/// cutover and activation, never whether a destination was admitted.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DestinationManifestEvidence {
@@ -645,12 +653,17 @@ pub struct RestorePorts<'a> {
     /// value is #962/AUDIT-7 and lives in this file, so the value is now
     /// constructible from owner evidence rather than only describable.
     ///
-    /// `None` is a supported shape, not an absent one: it is a bundle with no Host
-    /// admission, which is the rehearsal-without-admission case the
-    /// [`DestinationManifestEvidence`] doc names.
+    /// The field is an `Option` in the type — absence is representable, and
+    /// nothing here coerces it — but absence is NOT an importable shape.
+    /// `None` is a bundle with no Host admission, and the restore owner refuses
+    /// it with [`KernelRestoreError::DestinationNotAdmitted`] before it
+    /// constructs a destination root, so an unadmitted bundle imports nothing.
+    /// An import that runs carries the owner-issued evidence; there is no
+    /// degraded third shape.
     pub manifest_evidence: Option<DestinationManifestEvidence>,
-    /// Rehearsal mode: isolated import runs, but cutover refuses and no
-    /// activation, retirement, or effect unblocking exists on any path.
+    /// Rehearsal mode: cutover refuses and no activation, retirement, or effect
+    /// unblocking exists on any path. Isolated import runs only for an ADMITTED
+    /// destination — rehearsal relaxes cutover, never destination admission.
     pub rehearsal: bool,
 }
 
@@ -693,17 +706,25 @@ impl RestorePorts<'_> {
     /// defaulted and nothing is dropped: absent key material or blob scope stays
     /// absent, and the rehearsal posture is untouched.
     ///
-    /// ## Why `None` is a supported answer and is not repaired here
+    /// ## Why an absent `None` is a refusal and is still not repaired here
     ///
     /// A bundle whose `manifest_evidence` is `None` is a bundle with **no Host
-    /// admission** — the rehearsal-without-admission shape the type's own doc names.
-    /// That is not a missing value to fill in: isolated import still runs under
-    /// it, prepare writes no [`DESTINATION_ADMISSION_FILE`] pin, and cutover
-    /// qualification refuses for want of a pinned owner-approved admission. A
-    /// caller that holds Host admission calls this method; a caller that does not
-    /// simply keeps the `None` it has, and the gate is what makes the difference
-    /// observable instead of guessed. This method therefore never invents an
-    /// evidence value to fill the gap, and it never clears an existing one.
+    /// admission**, and the restore owner refuses it with
+    /// [`KernelRestoreError::DestinationNotAdmitted`] before it compiles a plan
+    /// or constructs a destination root. It is therefore not a missing value to
+    /// fill in on the caller's behalf: it is a refusal, and this method never
+    /// invents an evidence value to turn that refusal into an import, nor clears
+    /// one that is already present. A caller that holds Host admission calls this
+    /// method; a caller that does not is refused by the owner, and the gate is
+    /// what makes that difference observable instead of guessed.
+    ///
+    /// The admitting side is not yet published on any live path, measured rather
+    /// than assumed: `with_owner_destination_evidence` occurs only in this
+    /// definition and in prose, never as a call, and the Host-side value it
+    /// consumes (`OwnerEvidence::owner_manifest_binding`,
+    /// `bins/eliot-host/src/backup_preparation.rs`) has no caller either. So the
+    /// owner-issued evidence is constructible and not yet reachable — which is
+    /// why an unadmitted production front door is refused rather than served.
     ///
     /// The rehearsal flag is deliberately NOT a reason to refuse. A rehearsal that
     /// *does* hold Host admission is a supported shape: it carries this evidence,
@@ -955,13 +976,17 @@ pub struct OrsRestoreBinding {
     /// because the owner-issued PREPARED, UNACTIVATED destination admission —
     /// `PinnedDestinationAdmission` (#958), pinned at prepare from
     /// `RestorePorts::manifest_evidence` — has no channel on that front door to
-    /// issue one. What stands behind the value is therefore the owner's re-proof
-    /// named above and the owner's refusal, not a sanitiser in this constructor:
-    /// a declaration that disagrees with the destination the engine constructs,
-    /// or with the durable row, is refused by the owner. Callers that can obtain
-    /// Host admission pin it instead and are still structurally unable to
-    /// become a cutover candidate, because the pin carries the rehearsal
-    /// posture beside the evidence.
+    /// issue one. That front door therefore builds its `RestorePorts` with
+    /// `manifest_evidence: None`, and the owner refuses the import with
+    /// [`KernelRestoreError::DestinationNotAdmitted`] before it constructs the
+    /// root this value names: the re-proof named above never gets to decide
+    /// anything there. For a caller that DOES hold Host admission, what stands
+    /// behind the value is the owner's re-proof named above and the owner's
+    /// refusal, not a sanitiser in this constructor: a declaration that disagrees
+    /// with the destination the engine constructs, or with the durable row, is
+    /// refused by the owner. Callers that can obtain Host admission pin it
+    /// instead and are still structurally unable to become a cutover candidate,
+    /// because the pin carries the rehearsal posture beside the evidence.
     destination_ref: String,
     /// Exact Kernel writer identity that owns the stream.
     writer_id: String,
