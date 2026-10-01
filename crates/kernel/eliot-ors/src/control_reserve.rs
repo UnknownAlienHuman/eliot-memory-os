@@ -61,14 +61,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use eliot_contracts::{ArtifactId, OperationId, ResourceGeneration};
 use eliot_runtime_contracts::{
     AffectedOperationClass, BackpressureDisposition, BottleneckAvailability,
-    BottleneckCoverageState, BottleneckObservationV1, CapacityBottleneck, CapacityClass,
-    CapacityPermitBinding, CapacityRequest, ControlOperationClass, EarliestRecoveryCondition,
-    EmergencyOperationClass, EvidenceCoverageState, HumanActionRequirement,
-    I14_BACKPRESSURE_RESPONSE_VERSION, I14BackpressureCause, I14BackpressureResponseV1,
-    I14CurrentnessState, I14EscalationCondition, I14ForbiddenAction, I14RecoveryAction,
-    I14RecoveryDirectiveV1, I14RequiredAuthority, I14ResolutionState, I14WorkOutcome,
-    NormalWorkClass, RecoveryCommitStatus, RequestedOperationClass, StatePreservationStatus,
-    frozen_bottleneck_owner_map,
+    BottleneckCoverageState, BottleneckObservationV1, BottleneckOwnerBinding, CapacityBottleneck,
+    CapacityClass, CapacityPermitBinding, CapacityRequest, ControlOperationClass,
+    EarliestRecoveryCondition, EmergencyOperationClass, EvidenceCoverageState,
+    HumanActionRequirement, I14_BACKPRESSURE_RESPONSE_VERSION, I14BackpressureCause,
+    I14BackpressureResponseV1, I14CurrentnessState, I14EscalationCondition, I14ForbiddenAction,
+    I14RecoveryAction, I14RecoveryDirectiveV1, I14RequiredAuthority, I14ResolutionState,
+    I14WorkOutcome, NormalWorkClass, RecoveryCommitStatus, RequestedOperationClass,
+    StatePreservationStatus, frozen_bottleneck_owner_map,
 };
 use thiserror::Error;
 
@@ -747,6 +747,30 @@ impl OrsReserve {
                 });
             }
         };
+        let (sequence, binding) =
+            self.mint_permit_binding(request, &owner, owner_generation, dimension, issued_at_ms);
+        debug_assert!(
+            binding.validate().is_ok(),
+            "ORS minted permit binding must satisfy the contract"
+        );
+        debug_assert!(
+            binding.matches_request(request),
+            "ORS minted permit binding must match its request"
+        );
+        Ok((permit, binding))
+    }
+
+    /// Mints the binding for one acquired permit: sequence, identities, class,
+    /// frozen-map owner, generations, epoch/profile refs and evidence. Separated
+    /// so the acquire leg above stays within the line budget; behavior unchanged.
+    fn mint_permit_binding(
+        &self,
+        request: &CapacityRequest,
+        owner: &BottleneckOwnerBinding,
+        owner_generation: ResourceGeneration,
+        dimension: OrsDimension,
+        issued_at_ms: u64,
+    ) -> (u64, CapacityPermitBinding) {
         let sequence = self.inner.permit_sequence.fetch_add(1, Ordering::AcqRel);
         let binding = CapacityPermitBinding {
             permit_id: format!(
@@ -772,15 +796,7 @@ impl OrsReserve {
                 self.issue_evidence(dimension, request.operation.capacity_class()),
             ],
         };
-        debug_assert!(
-            binding.validate().is_ok(),
-            "ORS minted permit binding must satisfy the contract"
-        );
-        debug_assert!(
-            binding.matches_request(request),
-            "ORS minted permit binding must match its request"
-        );
-        Ok((permit, binding))
+        (sequence, binding)
     }
 
     /// Records the owner's contemporaneous partition observation for one issuance.
