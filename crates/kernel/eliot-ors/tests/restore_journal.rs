@@ -16,8 +16,7 @@ use eliot_ors::{
     MAX_JOURNAL_PAYLOAD_BYTES, OpaqueLabel, RESTORE_JOURNAL_RECORD_SCHEMA,
     RESTORE_JOURNAL_SCHEMA_VERSION, RecoveryAccessClass, RecoveryEnvelopeContext,
     RecoveryPayloadEnvelope, RedbRecoveryStore, RestoreJournalArchiveClass,
-    RestoreJournalOperation, RestoreJournalResult, RestoreJournalStreamBinding,
-    StateFenceSnapshot,
+    RestoreJournalOperation, RestoreJournalResult, RestoreJournalStreamBinding, StateFenceSnapshot,
 };
 use eliot_platform::SecretReference;
 use eliot_security_contracts::{InstructionTaint, PrivacyClass};
@@ -234,12 +233,7 @@ fn wrong_writer_fence_source_destination_archive_rejected() -> TestResult {
     let (payload, payload_sha) = recovery_payload_envelope(&bad_schema, stream, PAYLOAD_GENESIS)?;
     bad_schema.record_schema = "restore-journal-v9".to_owned();
     assert!(matches!(
-        store.append_restore_journal_intent(
-            stream,
-            &bad_schema,
-            &payload_sha,
-            &payload
-        ),
+        store.append_restore_journal_intent(stream, &bad_schema, &payload_sha, &payload),
         Err(eliot_ors::OrsError::InvalidField { .. })
     ));
     let _ = std::fs::remove_file(&path);
@@ -479,7 +473,10 @@ fn known_empty_distinct_from_unavailable() -> TestResult {
             .is_empty(),
         "validated new journal reads known-empty"
     );
-    assert_eq!(store.load_restore_journal_binding(stream)?, Some(expected_binding));
+    assert_eq!(
+        store.load_restore_journal_binding(stream)?,
+        Some(expected_binding)
+    );
     assert_eq!(store.load_restore_journal_result(stream, "verify")?, None);
     assert!(matches!(
         store.load_restore_journal_stream("unavailable-stream-957-11", MAX_JOURNAL_PAGE_ENTRIES),
@@ -527,7 +524,29 @@ fn bounds_hold_and_prune_retains_unresolved() -> TestResult {
         )?,
     )?;
     assert_eq!(store.prune_restore_journal(stream, 1)?, 1);
-    let entries = store.load_restore_journal_stream(stream, MAX_JOURNAL_PAGE_ENTRIES)?;
+    // I14.14: retained history requires the original durable-head denominator.
+    assert!(matches!(
+        store.load_restore_journal_stream(stream, MAX_JOURNAL_PAGE_ENTRIES),
+        Err(eliot_ors::OrsError::ProjectionLimitExceeded)
+    ));
+    let head = store.restore_journal_durable_head(stream)?;
+    let readback =
+        store.load_restore_journal_readback_against(&eliot_ors::RestoreJournalReadbackRequest {
+            stream: stream.to_owned(),
+            limit: MAX_JOURNAL_PAGE_ENTRIES,
+            denominator: eliot_ors::RestoreJournalMemberDenominator::for_head(head.as_ref())?,
+        })?;
+    assert_eq!(
+        readback.completeness,
+        eliot_ors::RestoreJournalCompleteness::Complete
+    );
+    assert_eq!(readback.total_members, 3);
+    assert_eq!(readback.retired_members, 1);
+    assert_eq!(
+        readback.history_fence,
+        Some(predecessor_of(intent_a.sequence, &intent_a.record_digest))
+    );
+    let entries = readback.entries;
     assert_eq!(
         entries.len(),
         2,
@@ -535,7 +554,16 @@ fn bounds_hold_and_prune_retains_unresolved() -> TestResult {
     );
     assert_eq!(entries[0].operation.phase_operation, "materialize");
     assert_eq!(entries[1].operation.phase_operation, "reconcile");
-    assert_eq!(store.load_restore_journal_result(stream, "verify")?, None);
+    assert!(
+        matches!(
+            store.load_restore_journal_result(stream, "verify"),
+            Err(eliot_ors::OrsError::IntegrityProblem {
+                record_type: "restore_journal_operation",
+                ..
+            })
+        ),
+        "a retired result cannot be proved absent from a retained suffix"
+    );
     assert!(
         store
             .load_restore_journal_result(stream, "reconcile")?

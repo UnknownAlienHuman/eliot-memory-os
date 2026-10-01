@@ -37496,9 +37496,7 @@ mod host_request_result_tests {
             store.stage_host_request(&uncorrelated),
             Err(OrsError::HostRequestLegacyCorrelationUnresolved)
         ));
-        assert!(store
-            .load_host_request(&operation, &digest)?
-            .is_none());
+        assert!(store.load_host_request(&operation, &digest)?.is_none());
 
         // With its full typed request carrier retained, the exact legacy result
         // digest may be completed with its body without weakening identity.
