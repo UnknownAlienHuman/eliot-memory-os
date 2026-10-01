@@ -9896,7 +9896,12 @@ impl HostComposition {
     ) -> Result<(), HostError> {
         // F-LOG-HOST-1: request vs admitted vs started vs ready preserved.
         // Single terminal via guard; inner `start_manifest_contour` is phase
-        // only and shares correlation without its own terminal.
+        // only and shares correlation without its own terminal. The physical
+        // launch failure itself is terminally owned by the leaf
+        // `HostJobBranches::start_approved` guard (`host-launch-failed`,
+        // F-LOG-HOST-3 #978 audit 5910159678 defect 2): the manifest contour
+        // disarms this outer guard while propagating that leaf-owned error,
+        // so one launch failure yields exactly one terminal record.
         host_lifecycle_observe_requested(BOUNDARY_START_REQUESTED);
         let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_START_TERMINAL);
         let active =
@@ -9914,6 +9919,7 @@ impl HostComposition {
             store_executable.as_ref(),
             store_artifact,
             None,
+            Some(&mut host_terminal),
         )?;
         host_terminal.disarm();
         // Started is distinct from ready: readiness still requires its own
@@ -10297,6 +10303,14 @@ impl HostComposition {
         store_executable: &Path,
         store_artifact: &PlatformHandle,
         pending: Option<&eliot_installation::PendingActivation>,
+        // F-LOG-HOST-3 (#978, audit 5910159678 defect 2): the caller's outer
+        // terminal guard, disarmed here only while propagating the leaf-owned
+        // physical launch failure. `None` where the caller owns no outer
+        // terminal (cutover/pending dispatch: the leaf stays the single
+        // terminal owner there). Never an error-model flag: the disarm fires
+        // at the single leaf-error site below, identified by control flow,
+        // never by matching error text or variant.
+        outer_terminal: Option<&mut HostTerminalGuard>,
     ) -> Result<(), HostError> {
         // F-LOG-HOST-1: inner phase only; outer `start_approved_contour`/`open`
         // owns the single terminal. Requested vs started vs ready preserved:
@@ -10447,6 +10461,17 @@ impl HostComposition {
             &self.host,
             &phase_b.launch,
         ) {
+            // F-LOG-HOST-3 (#978, audit 5910159678 defect 2): the physical
+            // launch failure is terminally owned by the leaf
+            // `HostJobBranches::start_approved` guard (`host-launch-failed`),
+            // already emitted on this path. Disarm the propagating outer
+            // `host-start-failed` guard so one launch failure yields exactly
+            // one terminal record; the exact error, cleanup and return are
+            // preserved. All other manifest-contour failures keep the outer
+            // terminal: they never entered the leaf guard.
+            if let Some(outer_terminal) = outer_terminal {
+                outer_terminal.disarm();
+            }
             return self.cleanup_launched_contour(error);
         }
         let agent_bridge_admission = match (phase_b.agent_bridge(), phase_b.final_agent_bridge()) {
@@ -12916,6 +12941,10 @@ impl ApprovedHostStartupPort for HostComposition {
             store_bridge_executable,
             store_artifact,
             pending,
+            // No outer terminal guard on this dispatch path: the leaf
+            // `HostJobBranches::start_approved` guard stays the single
+            // terminal owner for a physical launch failure here.
+            None,
         )
     }
 }

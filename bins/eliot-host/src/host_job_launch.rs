@@ -65,7 +65,12 @@ use crate::store_kernel_launch_sequence::{
 // result/order/count/handle/cleanup/timeout. There is no mutable global dedup
 // cache: one terminal emission per failed launch-owned operation is enforced
 // by the single outermost guard (`start_approved` owns `host-launch-failed`),
-// while inner phases correlate by stage order only. Typed rejections stay
+// while inner phases correlate by stage order only. The leaf is the
+// designated terminal owner for the physical launch failure (audit 5910159678
+// defect 2): the outer Host start operation in `lib.rs`
+// (`HostComposition::start_approved_contour`, `host-start-failed`) disarms
+// its propagating guard while receiving this leaf-owned error, so one launch
+// failure yields exactly one terminal record. Typed rejections stay
 // `HostError::ProcessContour`/`RecoveryRequired` (cases 978/2/978/3);
 // admitted launches are distinct from readiness (case 978/4 — admitted here
 // is never readiness, which stays with the readiness contour).
@@ -97,7 +102,10 @@ fn host_launch_observe_terminal(code: &str) {
 /// never changes the `Result`: the guard only observes the already-produced
 /// outcome. No dedup cache, no lock, no second evaluation. This mirrors the
 /// `HostTerminalGuard` model in `lib.rs` (F-LOG-HOST-1, #891) without touching
-/// it.
+/// it. This leaf guard is the designated terminal owner for the physical
+/// launch failure (audit 5910159678 defect 2): the outer Host start operation
+/// disarms its own propagating guard on this leaf-owned error instead of
+/// emitting a second terminal.
 #[cfg(windows)]
 struct HostLaunchTerminalGuard<'a> {
     code: &'a str,
@@ -1706,6 +1714,98 @@ mod approved_path_tests {
         assert!(
             reason.to_lowercase().contains("doctor"),
             "missing-role error must name the doctor role, got: {reason}"
+        );
+    }
+}
+
+/// Designated terminal-owner contract for the physical launch failure
+/// (audit 5910159678 defect 2, case 978/10 at unit level).
+///
+/// The leaf `HostJobBranches::start_approved` guard (`host-launch-failed`)
+/// owns the terminal for a failed physical launch; the outer Host start
+/// operation disarms its propagating guard on this leaf-owned error instead
+/// of emitting a second terminal. These two tests pin the leaf side of that
+/// contract through the real #889 facade: exactly one terminal on failure,
+/// none on disarmed success. The outer-disarm wiring in `lib.rs`
+/// (`start_manifest_contour`) is a control-flow disarm at the single
+/// leaf-error site — no error-model flag, no dedup cache — and its
+/// end-to-end single-terminal proof belongs to the TEST-PHASE matrix, which
+/// drives the real nested contour through existing seams.
+#[cfg(all(test, windows))]
+mod launch_terminal_tests {
+    use super::HostLaunchTerminalGuard;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct CaptureSink {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for CaptureSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.bytes
+                .lock()
+                .map_err(|_| std::io::Error::other("capture lock poisoned"))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_emit(emit: impl FnOnce()) -> String {
+        let sink = CaptureSink::default();
+        let writer_sink = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer_sink.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, emit);
+        let bytes = sink
+            .bytes
+            .lock()
+            .unwrap_or_else(|_| panic!("capture lock poisoned"))
+            .clone();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn count_occurrences(haystack: &str, needle: &str) -> usize {
+        haystack.matches(needle).count()
+    }
+
+    // WORK_UNIT_CASE: 978/10 — refusal: an armed (failed) physical launch
+    // emits exactly one terminal record with the frozen leaf code.
+    #[test]
+    fn armed_launch_failure_emits_single_terminal() {
+        let text = capture_emit(|| {
+            drop(HostLaunchTerminalGuard::armed("host-launch-failed"));
+        });
+        assert_eq!(
+            count_occurrences(&text, "host.terminal_error"),
+            1,
+            "one failed launch must emit exactly one terminal, got: {text}"
+        );
+        assert!(
+            text.contains("host-launch-failed"),
+            "terminal must carry the frozen leaf code, got: {text}"
+        );
+    }
+
+    // WORK_UNIT_CASE: 978/10 — positive: a disarmed (admitted) physical
+    // launch emits no terminal record.
+    #[test]
+    fn disarmed_launch_success_emits_no_terminal() {
+        let text = capture_emit(|| {
+            let mut guard = HostLaunchTerminalGuard::armed("host-launch-failed");
+            guard.disarm();
+        });
+        assert_eq!(
+            count_occurrences(&text, "host.terminal_error"),
+            0,
+            "disarmed success must emit no terminal, got: {text}"
         );
     }
 }
