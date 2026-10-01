@@ -395,10 +395,10 @@ impl KernelGovernedProcessEffectPort {
 
     /// Confirms a proven-absent tracked image observed at pre-effect
     /// capture (I10.21 AUD5): two agreeing not-found reads against the
-    /// retained digest are an external deletion, confirmed as a
-    /// filesystem hint with agreeing `Absent` reads through the same
-    /// [`Self::confirm_external_transition`] scheme as a present-image
-    /// transition. With no retained digest there is no transition to
+    /// retained digest are an external deletion, fed through the existing
+    /// owner port ([`ingest_hint`] + [`confirm_hint`]) as a host-event
+    /// leg with agreeing `Absent` reads — never a `FilesystemNotification`
+    /// (content polling alone cannot mint one under the W2 rule). With no retained digest there is no transition to
     /// confirm. A deletion already observed for the exact transition
     /// needs no re-ingest; its unreconciled record keeps blocking
     /// governed acceptance until a governed deletion reconciles it.
@@ -411,7 +411,6 @@ impl KernelGovernedProcessEffectPort {
         &self,
         resource: &str,
         lane_path: &str,
-        artifact: &str,
         binding: &GovernedProcessEffectBinding,
     ) {
         let previous = self
@@ -423,7 +422,7 @@ impl KernelGovernedProcessEffectPort {
             observe_process("kernel.process.effect_baseline_unavailable", "unobserved");
             return;
         };
-        let hint_id = change_monitor::filesystem_hint_id(artifact, &previous);
+        let hint_id = change_monitor::filesystem_hint_id(lane_path, &previous);
         let (change_id, transition_digest) =
             change_monitor::material_transition_ids(&hint_id, Some(previous.as_str()), None);
         let already_observed = change_monitor::deletion_observations_for(resource)
@@ -438,7 +437,7 @@ impl KernelGovernedProcessEffectPort {
                 hint_id: hint_id.clone(),
                 resource: resource.to_owned(),
                 path: lane_path.to_owned(),
-                origin: change_monitor::HintOrigin::FilesystemNotification,
+                origin: change_monitor::HintOrigin::HostEvent,
                 origin_ref: Some(binding.owner.module_id().to_owned()),
             };
             let verification = change_monitor::HintVerification {
@@ -447,7 +446,9 @@ impl KernelGovernedProcessEffectPort {
                 reread: change_monitor::ContentRead::Absent,
                 git: None,
             };
-            if !Self::confirm_external_transition(&hint_id, hint, &verification) {
+            if change_monitor::ingest_hint(hint).is_err()
+                || change_monitor::confirm_hint(&hint_id, &verification).is_err()
+            {
                 observe_process("kernel.process.effect_baseline_unavailable", "unobserved");
             }
         }
@@ -596,7 +597,7 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
             // I10.21 AUD5: two agreeing not-found reads prove the tracked
             // image is absent (see `confirm_absent_at_capture`). No
             // baseline is attributable, so the operation runs unobserved.
-            self.confirm_absent_at_capture(&resource, &lane_path, &artifact, binding);
+            self.confirm_absent_at_capture(&resource, &lane_path, binding);
             return Ok(unobserved());
         };
         let previous = self
