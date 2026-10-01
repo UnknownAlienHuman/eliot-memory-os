@@ -1653,8 +1653,10 @@ use eliot_kernel_core::KernelRuntimeHealthEvidence;
 #[cfg(all(test, windows))]
 use eliot_kernel_service::KERNEL_CONTROL_PIPE;
 use eliot_kernel_service::{
-    EliotdLaunchDescriptor, HostJobBinding, HostKernelCandidateBinding, HostProcessBinding,
-    HostStartupEvidence, HostStartupEvidenceReport, HostStoreBootstrapRequirement,
+    AdmittedWatchdogHeartbeatProof, EliotdLaunchDescriptor, HostJobBinding,
+    HostKernelCandidateBinding, HostProcessBinding, HostStartupEvidence,
+    HostStartupEvidenceReport, HostStartupHeartbeatCoverage, HostStoreBootstrapRequirement,
+    HostSupervisionEvidenceRevocation,
     KernelActivationPermit, KernelActivationQuery, KernelActivationReceipt, KernelControlCommand,
     KernelControlRequest, KernelControlResponse, KernelReadyReceipt, KernelServiceState,
     ProcessAuthorityHandoffDescriptor, RestartBudget, StoreBootstrapHandoff, StoreProcessBinding,
@@ -1765,6 +1767,12 @@ pub enum HostError {
     StoreNotLive { evidence: StoreLivenessEvidence },
     #[error("Host child cleanup requires recovery: {0}")]
     RecoveryRequired(String),
+    /// Kernel authority withdrawal had uncertain delivery and its retained
+    /// Kernel Job could not be proven terminal. This must escape ordinary
+    /// readiness degradation because the old Kernel may still admit Material.
+    #[cfg(windows)]
+    #[error("Kernel supervision revocation is uncontained: {0}")]
+    KernelSupervisionRevocationUncontained(String),
     /// A planned Store endpoint is occupied by a listener whose exact
     /// installation ownership is unproven.
     ///
@@ -2110,6 +2118,53 @@ struct AuthenticatedKernelReadiness {
     supervision_lease: eliot_ors::SupervisionLeaseSnapshot,
     store_fence: PlatformHandle,
     peer_evidence: PlatformHandle,
+}
+
+#[cfg(windows)]
+fn kernel_heartbeat_proof(
+    admitted: &watchdog_heartbeat::AdmittedHostHeartbeat,
+) -> Result<AdmittedWatchdogHeartbeatProof, HostError> {
+    let observation = &admitted.observation;
+    Ok(AdmittedWatchdogHeartbeatProof {
+        observation_digest: PlatformHandle::new(observation.observation_digest.clone())
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+        transport_descriptor_digest: PlatformHandle::new(
+            admitted
+                .transport_descriptor_digest
+                .as_ref()
+                .ok_or_else(|| {
+                    HostError::ProcessContour(
+                        "admitted heartbeat has no verified transport descriptor digest"
+                            .to_owned(),
+                    )
+                })?
+                .clone(),
+        )
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?,
+        pipe_name: observation.pipe_name.clone(),
+        service_instance_guid: observation.service_instance_guid.clone(),
+        readiness_sequence: observation.watchdog_readiness_sequence,
+        received_wall_ms: observation.host_receive_wall_ms,
+        received_monotonic_ms: observation.host_receive_monotonic_ms,
+        freshness_deadline_wall_ms: observation.freshness_deadline_wall_ms,
+        host_boot_id: observation.host_boot_id,
+        scm_watchdog_pid: observation.watchdog_incarnation_pid,
+        scm_watchdog_start_100ns: observation.watchdog_incarnation_start_100ns,
+        kernel_epoch_sequence: observation.kernel_epoch,
+        watchdog_epoch_sequence: observation.watchdog_epoch,
+        coverage: match observation.coverage {
+            watchdog_heartbeat::HostHeartbeatCoverage::Continuous => {
+                HostStartupHeartbeatCoverage::Continuous
+            }
+            watchdog_heartbeat::HostHeartbeatCoverage::Partial => {
+                HostStartupHeartbeatCoverage::Partial
+            }
+            watchdog_heartbeat::HostHeartbeatCoverage::Blind => {
+                HostStartupHeartbeatCoverage::Blind
+            }
+        },
+        handshake_count: observation.handshake_count,
+    })
 }
 
 #[cfg(windows)]
@@ -2818,14 +2873,13 @@ impl HostJobBranches {
         )
     }
 
-    /// Sends one closed Host startup evidence payload (I1.11 steps 1, 2, 4) on
-    /// the live authenticated control connection and checks the exact
-    /// response binding.
+    /// Sends one closed Host startup evidence payload, optionally bound to the
+    /// already admitted continuous Watchdog heartbeat, on the live
+    /// authenticated control connection and checks the exact response binding.
     ///
-    /// The Kernel records steps only from validated fields; any rejection —
-    /// including the not-yet-landed consumer arms — fails this start closed
-    /// instead of proceeding to `ProbeReady` without evidence. The sequence
-    /// continues the caller's per-connection numbering.
+    /// The Kernel records steps only from validated fields. Any rejection
+    /// fails this start closed instead of proceeding to `ProbeReady` without
+    /// evidence. The sequence continues the caller's per-connection numbering.
     ///
     /// # Errors
     ///
@@ -2845,6 +2899,7 @@ impl HostJobBranches {
         authority_generation: ResourceGeneration,
         host_state_root: &Path,
         store_data_root: &Path,
+        supervision_heartbeat: Option<AdmittedWatchdogHeartbeatProof>,
         sequence: u64,
     ) -> Result<(), HostError> {
         let evidence = host_startup_evidence::build_host_startup_evidence(
@@ -2864,6 +2919,7 @@ impl HostJobBranches {
             Some(module_build_provenance),
             candidate,
             generation_handle,
+            supervision_heartbeat,
             sequence,
         )
         .await
@@ -2872,10 +2928,9 @@ impl HostJobBranches {
     /// Sends one already-built startup-evidence carrier on this connection and
     /// requires the exact response binding.
     ///
-    /// I1.5 (#1750): this is the single wire seam for the carrier, shared by
-    /// the activation sequence and by the bounded readiness cadence that
-    /// republishes a CURRENT independent Watchdog observation before its repeat
-    /// probe. One send, one binding check, no second protocol.
+    /// This is the single wire seam for process evidence and, when present,
+    /// the already admitted original heartbeat proof. Process evidence with
+    /// `None` cannot establish step 11 or authorize readiness.
     ///
     /// # Errors
     ///
@@ -2889,6 +2944,7 @@ impl HostJobBranches {
         module_build_provenance: Option<Vec<ModuleBuildProvenanceRecord>>,
         candidate: &HostKernelCandidateBinding,
         generation_handle: &PlatformHandle,
+        supervision_heartbeat: Option<AdmittedWatchdogHeartbeatProof>,
         sequence: u64,
     ) -> Result<(), HostError> {
         let request = kernel_control_request(
@@ -2897,6 +2953,7 @@ impl HostJobBranches {
             KernelControlCommand::ReportHostStartupEvidence(HostStartupEvidenceReport {
                 startup_evidence: evidence.clone(),
                 module_build_provenance,
+                supervision_heartbeat,
             }),
             sequence,
         )?;
@@ -2934,6 +2991,136 @@ impl HostJobBranches {
             return Err(HostError::ProcessContour(
                 "Kernel startup-evidence response binding failed".to_owned(),
             ));
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    async fn send_bound_host_supervision_revocation(
+        transport: &mut NamedPipeTransport,
+        candidate: &HostKernelCandidateBinding,
+        generation: ResourceGeneration,
+        sequence: u64,
+    ) -> Result<(), HostError> {
+        let candidate_digest = candidate
+            .compute_digest()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let state_fence = StateFence::new(candidate.kernel_epoch.clone(), generation);
+        let request = kernel_control_request(
+            candidate,
+            generation,
+            KernelControlCommand::RevokeHostSupervisionEvidence(
+                HostSupervisionEvidenceRevocation {
+                    candidate_digest,
+                    state_fence,
+                    expected_observation_digest: None,
+                },
+            ),
+            sequence,
+        )?;
+        let frame = control_request_frame(
+            format!(
+                "host-supervision-revoke:{}:{}",
+                generation.value(),
+                candidate.activation_id.as_str()
+            ),
+            &request,
+        )
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        match transport
+            .send_frame(&frame, TransportLimits::default())
+            .await
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?
+        {
+            DeliveryOutcome::Delivered => {}
+            DeliveryOutcome::UnknownOutcome => {
+                return Err(HostError::RecoveryRequired(
+                    "Kernel supervision revocation delivery outcome is unknown".to_owned(),
+                ));
+            }
+        }
+        let frame = transport
+            .receive_frame(TransportLimits::default())
+            .await
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+        let response = decode_control_response_frame(&frame)
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+        if response.message_id != request.message_id
+            || response.request_digest != request.payload_digest
+            || response.error.is_some()
+        {
+            return Err(HostError::RecoveryRequired(
+                "Kernel supervision revocation response binding failed".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Withdraws any supervision proof for the exact current candidate/fence
+    /// before a new readiness attempt reads local evidence or contacts
+    /// Watchdog. An uncertain response closes the retained Kernel Job branch,
+    /// which fences Material admission without affecting SCM-owned Watchdog.
+    #[cfg(windows)]
+    fn revoke_host_supervision_evidence(
+        &mut self,
+        generation: &PlatformHandle,
+    ) -> Result<(), HostError> {
+        let result = (|| {
+            let launch = self.launch.as_ref().ok_or_else(|| {
+                HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
+            })?;
+            let candidate = self.kernel_candidate.as_ref().ok_or_else(|| {
+                HostError::ProcessContour("retained Kernel candidate binding is missing".to_owned())
+            })?;
+            if self.approved_generation.as_ref() != Some(generation) {
+                return Err(HostError::ProcessContour(
+                    "supervision revocation is not for the approved active generation".to_owned(),
+                ));
+            }
+            let kernel = self
+                .kernel
+                .as_ref()
+                .ok_or_else(|| HostError::ProcessContour("Kernel process is missing".to_owned()))?;
+            let process = kernel.evidence().process();
+            let expected_kernel_image = self
+                .kernel_executable
+                .as_ref()
+                .ok_or_else(|| HostError::ProcessContour("Kernel image is missing".to_owned()))?
+                .clone();
+            let candidate = candidate.clone();
+            let authority_generation = launch.authority_generation;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+            runtime.block_on(async {
+                let mut transport = connect_authenticated_kernel_front_door(&candidate, process)
+                    .await
+                    .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+                validate_authenticated_kernel_peer(
+                    transport.peer_identity(),
+                    process.process_id,
+                    process.start_time_100ns,
+                    &expected_kernel_image,
+                )
+                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+                Self::send_bound_host_supervision_revocation(
+                    &mut transport,
+                    &candidate,
+                    authority_generation,
+                    1,
+                )
+                .await
+            })
+        })();
+        if let Err(error) = result {
+            let cleanup = self.terminate_kernel();
+            return Err(match cleanup {
+                Ok(()) => error,
+                Err(cleanup) => HostError::KernelSupervisionRevocationUncontained(format!(
+                    "uncontained host-supervision revocation: revoke failed ({error}); Kernel Job containment failed ({cleanup})"
+                )),
+            });
         }
         Ok(())
     }
@@ -3037,6 +3224,8 @@ impl HostJobBranches {
     fn complete_kernel_control<B: JournalBackend>(
         &mut self,
         generation: &PlatformHandle,
+        registry: &ApprovedGenerationRegistry,
+        host_state_root: &Path,
         host: &HostInstallationEpoch,
         journal: &HostStateJournalService<B>,
         activation_id: &PlatformHandle,
@@ -3500,9 +3689,67 @@ impl HostJobBranches {
             activation_receipt
                 .validate(&permit)
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-            // I1.11 steps 1, 2, 4: closed Host startup evidence rides this
-            // connection after Activate and before ProbeReady, continuing the
-            // strict per-connection sequence. Any rejection fails closed.
+            // Revoke this exact candidate/fence before any Watchdog admission
+            // work. Activate already invalidates a predecessor, so an empty
+            // match is the expected idempotent result on a first activation.
+            if let Err(error) = Self::send_bound_host_supervision_revocation(
+                &mut transport,
+                &candidate,
+                launch.authority_generation,
+                probe_sequence,
+            )
+            .await
+            {
+                let cleanup = self.terminate_kernel();
+                return Err(match cleanup {
+                    Ok(()) => error,
+                    Err(cleanup) => HostError::KernelSupervisionRevocationUncontained(format!(
+                        "uncontained host-supervision revocation: revoke failed ({error}); Kernel Job containment failed ({cleanup})"
+                    )),
+                });
+            }
+            // Activate establishes the original Kernel-owned active lease.
+            // For SCM-managed contours, read that exact signed ORS head and
+            // publish its existing mirror before asking Watchdog for a beat;
+            // neither operation renews or creates a lease. Other profiles
+            // preserve the disarmed optional-heartbeat contour.
+            let admitted_heartbeat =
+                if active_manifest.runtime_launch.profile == InstallationProfile::SystemService {
+                    let authority = launch
+                        .provisioned_supervision_authority()
+                        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+                    let template = authority
+                        .watchdog_admission_template()
+                        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+                    let supervision = read_manifest_current_supervision_lease(
+                        active_manifest,
+                        candidate.supervision_incarnation.supervision_lease_id.as_str(),
+                    )?;
+                    publish_current_watchdog_supervision_bundle(
+                        host_state_root,
+                        active_manifest,
+                        &template,
+                        &authority.watchdog_admission_template_digest,
+                        &supervision,
+                    )?;
+                    require_exact_supervision_head(&supervision, || {
+                        read_manifest_current_supervision_lease(
+                            active_manifest,
+                            supervision.record.lease_id.as_str(),
+                        )
+                    })?;
+                    Some(HostComposition::admit_startup_watchdog_heartbeat(
+                        registry,
+                        host_state_root,
+                        active_manifest,
+                        &supervision,
+                    )?)
+                } else {
+                    None
+                };
+            // I1.11 steps 1, 2, 4 and 11: the combined report follows the
+            // real SCM-bound continuous heartbeat, then ProbeReady consumes
+            // the Kernel owner's admitted observation on the next sequence.
             Self::send_host_startup_evidence(
                 &mut transport,
                 journal,
@@ -3512,14 +3759,18 @@ impl HostJobBranches {
                 launch.authority_generation,
                 Path::new(launch.runtime_state_roots.host_state_root.as_str()),
                 Path::new(launch.runtime_state_roots.store_data_root.as_str()),
-                probe_sequence,
+                admitted_heartbeat
+                    .as_ref()
+                    .map(kernel_heartbeat_proof)
+                    .transpose()?,
+                probe_sequence + 1,
             )
             .await?;
             let probe_request = kernel_control_request(
                 &candidate,
                 launch.authority_generation,
                 KernelControlCommand::ProbeReady,
-                probe_sequence + 1,
+                probe_sequence + 2,
             )?;
             let probe_frame = control_request_frame(
                 format!(
@@ -4359,6 +4610,7 @@ impl HostJobBranches {
         approved_store_artifact: &PlatformHandle,
         approved_config: &PlatformHandle,
         supervision_evidence: &HostStartupEvidence,
+        supervision_heartbeat: Option<AdmittedWatchdogHeartbeatProof>,
     ) -> Result<AuthenticatedKernelReadiness, HostError> {
         let launch = self.launch.as_ref().ok_or_else(|| {
             HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
@@ -4443,18 +4695,17 @@ impl HostJobBranches {
             ))?;
             let peer_evidence = PlatformHandle::new(format!("kernel-peer:{peer_digest}"))
                 .map_err(|error| HostError::Platform(error.to_string()))?;
-            // I1.5 (#1750): the independent Watchdog observation is republished
-            // on this connection before the probe, so Kernel binds a CURRENT
-            // owner observation to this contour and this consumer fence rather
-            // than answering the probe from retained text. It occupies the first
-            // command on the strict per-connection sequence and the probe
-            // follows as the second.
+            // The combined report carries the original continuous heartbeat
+            // admitted against the exact current owner lease. It occupies the
+            // first command; ProbeReady follows on the strict connection
+            // sequence and cannot bootstrap the heartbeat.
             HostJobBranches::send_bound_host_startup_evidence(
                 &mut transport,
                 supervision_evidence,
                 None,
                 candidate,
                 approved_generation,
+                supervision_heartbeat,
                 1,
             )
             .await?;
@@ -8968,6 +9219,8 @@ impl HostComposition {
         let launch_generation = active_manifest.generation.clone();
         let complete_result = self.jobs.complete_kernel_control(
             &launch_generation,
+            &self.registry,
+            self.launch_options.host_state_root(),
             &host_clone,
             &self.journal,
             &activation_id,
@@ -9806,6 +10059,8 @@ impl HostComposition {
             .ok_or_else(|| HostError::ProcessContour("no approved active generation".to_owned()))?;
         let (_, receipt) = self.jobs.complete_kernel_control(
             generation,
+            &self.registry,
+            self.launch_options.host_state_root(),
             &self.host,
             &self.journal,
             &self.activation_id,
@@ -10417,6 +10672,8 @@ impl HostComposition {
         self.jobs.set_agent_bridge_admission(agent_bridge_admission);
         let (_activation_receipt, receipt) = match self.jobs.complete_kernel_control(
             &manifest.generation,
+            &self.registry,
+            self.launch_options.host_state_root(),
             &self.host,
             &self.journal,
             &self.activation_id,
@@ -11311,7 +11568,7 @@ impl HostComposition {
                     &materialized_config_digest,
                     HostBranchDisposition::LiveAwaitingReadiness,
                     std::time::Instant::now(),
-                );
+                )?;
                 host_terminal.disarm();
                 return Ok(disposition);
             }
@@ -11376,6 +11633,8 @@ impl HostComposition {
                 )?;
             if let Err(error) = self.jobs.complete_kernel_control(
                 &active.manifest.generation,
+                &self.registry,
+                self.launch_options.host_state_root(),
                 &self.host,
                 &self.journal,
                 &self.activation_id,
@@ -11401,7 +11660,7 @@ impl HostComposition {
             &materialized_config_digest,
             disposition,
             std::time::Instant::now(),
-        );
+        )?;
         host_terminal.disarm();
         // Admitted only; ready vs degraded is owned by the readiness contour.
         host_lifecycle_observe_requested(BOUNDARY_RECONCILE_ADMITTED);
@@ -11473,7 +11732,16 @@ impl HostComposition {
         config: &PlatformHandle,
         disposition: HostBranchDisposition,
         now: std::time::Instant,
-    ) -> HostBranchDisposition {
+    ) -> Result<HostBranchDisposition, HostError> {
+        // Invalidate the old exact candidate/fence before even the local
+        // contour inspection can fail or decide to skip fresh evidence.
+        if disposition == HostBranchDisposition::LiveAwaitingReadiness {
+            if let Err(error) = self.jobs.revoke_host_supervision_evidence(generation) {
+                self.readiness_gate
+                    .fail(None, readiness_failure_kind(&error), now);
+                return Err(error);
+            }
+        }
         // F-LOG-HOST-1: readiness is claimed only with authenticated proof.
         // Degraded vs ready preserved; liveness alone never becomes ready.
         // Phase only; outer reconcile owns the terminal.
@@ -11491,7 +11759,7 @@ impl HostComposition {
             if supervised_system_service
                 && !self.persist_supervised_degraded_activation(generation, disposition, now)
             {
-                return HostBranchDisposition::ReadinessDegraded;
+                return Ok(HostBranchDisposition::ReadinessDegraded);
             }
             // The durable activation fence above is written BEFORE this
             // observation, so a failure here cannot leave a supervised contour
@@ -11502,9 +11770,9 @@ impl HostComposition {
             {
                 self.readiness_gate
                     .fail(None, readiness_failure_kind(&error), now);
-                return HostBranchDisposition::ReadinessDegraded;
+                return Ok(HostBranchDisposition::ReadinessDegraded);
             }
-            return disposition;
+            return Ok(disposition);
         }
         // A late Store recovery result is not proof that Host supervision
         // recovered.  Require the exact current Active activation generation
@@ -11519,7 +11787,7 @@ impl HostComposition {
                     readiness_failure_kind(&HostError::Journal(error)),
                     now,
                 );
-                return HostBranchDisposition::ReadinessDegraded;
+                return Ok(HostBranchDisposition::ReadinessDegraded);
             }
         };
         let Some(activation) = activation else {
@@ -11530,7 +11798,7 @@ impl HostComposition {
                 )),
                 now,
             );
-            return HostBranchDisposition::ReadinessDegraded;
+            return Ok(HostBranchDisposition::ReadinessDegraded);
         };
         if activation.state != ActivationState::Active
             || activation.fence.activation_generation != self.activation_generation
@@ -11542,7 +11810,7 @@ impl HostComposition {
                 )),
                 now,
             );
-            return HostBranchDisposition::ReadinessDegraded;
+            return Ok(HostBranchDisposition::ReadinessDegraded);
         }
         host_lifecycle_observe_requested(BOUNDARY_READINESS_REQUESTED_PROOF);
         let contour =
@@ -11553,12 +11821,22 @@ impl HostComposition {
         // lease: every full reconcile consumes a fresh Watchdog heartbeat.
         readiness_gate.branch_degraded();
         let mut watchdog_failure = false;
+        let mut uncontained_kernel_revocation = None;
         let outcome = reconcile_authenticated_readiness(&mut readiness_gate, contour, now, || {
             let result = self.persist_fresh_authenticated_readiness(generation);
             watchdog_failure = matches!(&result, Err(HostError::WatchdogCoverageUnavailable(_)));
+            if let Err(HostError::KernelSupervisionRevocationUncontained(reason)) = &result {
+                uncontained_kernel_revocation = Some(reason.clone());
+            }
             result
         });
         self.readiness_gate = readiness_gate;
+        if let Some(reason) = uncontained_kernel_revocation {
+            let error = HostError::KernelSupervisionRevocationUncontained(reason);
+            self.readiness_gate
+                .fail(None, readiness_failure_kind(&error), now);
+            return Err(error);
+        }
         // Ready only when the authenticated gate admits it; degraded stays
         // degraded. A failed supervised proof also records a cause-specific
         // recovery state; generic Store/Kernel failures are not mislabeled as
@@ -11576,7 +11854,7 @@ impl HostComposition {
                 // Keep the fence explicit; a new activation generation or
                 // owner-led recovery must perform the legal transition.
                 self.readiness_gate.branch_degraded();
-                return HostBranchDisposition::ReadinessDegraded;
+                return Ok(HostBranchDisposition::ReadinessDegraded);
             }
             host_lifecycle_observe_requested(BOUNDARY_READINESS_READY_PROOF);
         } else if !self.persist_authenticated_readiness_degradation(
@@ -11587,23 +11865,20 @@ impl HostComposition {
             supervised_system_service,
             now,
         ) {
-            return HostBranchDisposition::ReadinessDegraded;
+            return Ok(HostBranchDisposition::ReadinessDegraded);
         }
-        outcome
+        Ok(outcome)
     }
 
-    /// Re-observes the independent Watchdog branch for one readiness contour
-    /// and returns the closed carrier that publishes it.
+    /// Re-observes Host process and SCM evidence for one readiness contour.
+    /// This carrier is process-only; step 11 remains withdrawn until an
+    /// original continuous heartbeat has been admitted and reported.
     ///
-    /// I1.5 (#1750): a repeated readiness probe is an ordinary request and must
-    /// not be answered from the observation retained since activation. This
-    /// re-runs the SAME single producer the startup path uses, so the live SCM
-    /// Watchdog incarnation is re-read from the OS right now (bound PID/start
-    /// pair, process liveness, and image bytes equal to the approved Watchdog
-    /// artifact) and the whole carrier is rebuilt from fresh probes. It runs on
-    /// the Host's own bounded readiness cadence, never synchronously on an
-    /// ordinary request, and it introduces no second supervisor, no second
-    /// observation protocol and no new wire field.
+    /// The live SCM Watchdog incarnation is re-read from the OS (bound
+    /// PID/start pair, process liveness, and image bytes equal to the approved
+    /// Watchdog artifact). This process observation does not assert heartbeat
+    /// responsiveness; the separate admitted proof must be supplied before
+    /// the combined Kernel report can advance readiness.
     ///
     /// # Errors
     ///
@@ -11947,11 +12222,25 @@ impl HostComposition {
     fn observe_watchdog_heartbeat_for_admission(
         &self,
         manifest: &CandidateManifest,
-        proof: &AuthenticatedKernelReadiness,
+        supervision: &eliot_ors::SupervisionLeaseSnapshot,
+    ) -> Result<watchdog_heartbeat::AdmittedHostHeartbeat, HostError> {
+        Self::admit_startup_watchdog_heartbeat(
+            &self.registry,
+            self.launch_options.host_state_root(),
+            manifest,
+            supervision,
+        )
+    }
+
+    #[cfg(windows)]
+    fn admit_startup_watchdog_heartbeat(
+        registry: &ApprovedGenerationRegistry,
+        host_state_root: &Path,
+        manifest: &CandidateManifest,
+        supervision: &eliot_ors::SupervisionLeaseSnapshot,
     ) -> Result<watchdog_heartbeat::AdmittedHostHeartbeat, HostError> {
         let scm_launch = &manifest.runtime_launch;
-        let Some(approval) = select_watchdog_approval_for_inspection(&self.registry, manifest)?
-        else {
+        let Some(approval) = select_watchdog_approval_for_inspection(registry, manifest)? else {
             return Err(HostError::WatchdogCoverageUnavailable(
                 "approved SystemService generation has no Watchdog SCM approval".to_owned(),
             ));
@@ -11977,21 +12266,10 @@ impl HostComposition {
                 ));
             }
         };
-        let expected_kernel_epoch = proof
-            .supervision_lease
-            .record
-            .binding
-            .kernel_epoch
-            .sequence
-            .get();
-        let expected_watchdog_epoch = proof
-            .supervision_lease
-            .record
-            .binding
-            .watchdog_epoch
-            .value();
+        let expected_kernel_epoch = supervision.record.binding.kernel_epoch.sequence.get();
+        let expected_watchdog_epoch = supervision.record.binding.watchdog_epoch.value();
         let admitted = watchdog_heartbeat::observe_armed_heartbeat_admitted(
-            self.launch_options.host_state_root(),
+            host_state_root,
             expected_kernel_epoch,
             expected_watchdog_epoch,
             &scm,
@@ -12045,24 +12323,16 @@ impl HostComposition {
                 "readiness probe has no materialized Store config digest".to_owned(),
             )
         })?;
-        // I1.5 (#1750): republish a CURRENT independent Watchdog observation
-        // before the repeat probe, on this bounded readiness cadence, so the
-        // probe is answered from a fresh owner observation instead of from the
-        // one retained since activation. The carrier rides the same connection
-        // and the same strict per-connection command sequence as the probe.
+        // This process-only carrier establishes current Host/SCM identity but
+        // cannot itself authorize independent supervision. The current signed
+        // ORS head below is the original owner lease used to admit a real
+        // heartbeat before the combined report reaches Kernel.
         let supervision_evidence = self.reobserve_watchdog_supervision_evidence(generation)?;
         let contour = self.current_readiness_contour(
             generation,
             kernel_artifact,
             store_artifact,
             materialized_config_digest,
-        )?;
-        let proof = self.jobs.probe_kernel_readiness(
-            generation,
-            kernel_artifact,
-            store_artifact,
-            materialized_config_digest,
-            &supervision_evidence,
         )?;
         let registry_authority = self
             .registry
@@ -12095,10 +12365,59 @@ impl HostComposition {
         let watchdog_template = registry_authority
             .watchdog_admission_template()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-        // The publication bundle is published for its durable side effect
-        // (exact current bundle plus trust-anchor signature verification);
-        // the admitted identity below is derived single-source from the same
-        // Kernel-renewed snapshot, never from this return value.
+        let candidate = self.jobs.kernel_candidate.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("retained Kernel candidate binding is missing".to_owned())
+        })?;
+        let original_supervision = read_manifest_current_supervision_lease(
+            &active.manifest,
+            candidate.supervision_incarnation.supervision_lease_id.as_str(),
+        )?;
+        require_exact_supervision_head(&original_supervision, || {
+            read_manifest_current_supervision_lease(
+                &active.manifest,
+                original_supervision.record.lease_id.as_str(),
+            )
+        })?;
+        let supervised_system_service =
+            active.manifest.runtime_launch.profile == InstallationProfile::SystemService;
+        let admitted_heartbeat = if supervised_system_service {
+            publish_current_watchdog_supervision_bundle(
+                self.launch_options.host_state_root(),
+                &active.manifest,
+                &watchdog_template,
+                &registry_authority.watchdog_admission_template_digest,
+                &original_supervision,
+            )?;
+            require_exact_supervision_head(&original_supervision, || {
+                read_manifest_current_supervision_lease(
+                    &active.manifest,
+                    original_supervision.record.lease_id.as_str(),
+                )
+            })?;
+            Some(self.observe_watchdog_heartbeat_for_admission(
+                &active.manifest,
+                &original_supervision,
+            )?)
+        } else {
+            None
+        };
+        // Only the already-admitted owner heartbeat accompanies process
+        // evidence to Kernel. ProbeReady and its material consumers follow
+        // that combined report on the same authenticated command sequence.
+        let proof = self.jobs.probe_kernel_readiness(
+            generation,
+            kernel_artifact,
+            store_artifact,
+            materialized_config_digest,
+            &supervision_evidence,
+            admitted_heartbeat
+                .as_ref()
+                .map(kernel_heartbeat_proof)
+                .transpose()?,
+        )?;
+        // ProbeReady may renew the same owner lease. Publish that actual
+        // renewed head only after the heartbeat-bound step-11 report was
+        // accepted; this dependent publication cannot bootstrap the proof.
         let published_supervision = publish_current_watchdog_supervision_bundle(
             self.launch_options.host_state_root(),
             &active.manifest,
@@ -12112,19 +12431,12 @@ impl HostComposition {
                 proof.supervision_lease.record.lease_id.as_str(),
             )
         })?;
-        // Transport1750 steps 7-8: the admitted readiness stores the Host
-        // observation digest, coverage, and receive time alongside kernel
-        // readiness and the watchdog-branch ref. Disarmed contours
-        // contribute no refs; armed contours fail closed without a fresh
-        // admitted heartbeat.
-        let supervised_system_service =
-            active.manifest.runtime_launch.profile == InstallationProfile::SystemService;
-        let heartbeat_refs = if supervised_system_service {
-            self.observe_watchdog_heartbeat_for_admission(&active.manifest, &proof)?
-                .evidence_refs
-        } else {
-            Vec::new()
-        };
+        // The admitted readiness stores the original heartbeat refs alongside
+        // Kernel readiness and Watchdog branch identity.
+        let heartbeat_refs = admitted_heartbeat
+            .as_ref()
+            .map(|admitted| admitted.evidence_refs.clone())
+            .unwrap_or_default();
         if supervised_system_service && heartbeat_refs.is_empty() {
             return Err(HostError::WatchdogCoverageUnavailable(
                 "fresh Watchdog heartbeat evidence is empty".to_owned(),

@@ -117,7 +117,10 @@ pub(crate) enum ReadinessFailureKind {
 #[cfg(windows)]
 pub(crate) fn readiness_failure_kind(error: &HostError) -> ReadinessFailureKind {
     match error {
-        HostError::RecoveryRequired(_) => ReadinessFailureKind::DeliveryUnknown,
+        HostError::RecoveryRequired(_)
+        | HostError::KernelSupervisionRevocationUncontained(_) => {
+            ReadinessFailureKind::DeliveryUnknown
+        }
         HostError::Journal(JournalError::OutcomeUnknown { .. }) => {
             ReadinessFailureKind::JournalOutcomeUnknown
         }

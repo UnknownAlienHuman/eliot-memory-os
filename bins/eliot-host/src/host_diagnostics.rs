@@ -748,6 +748,10 @@ const fn project_host_error_reason(error: &HostError) -> &'static str {
         HostError::StoreNotLive { .. } => "store_not_live",
         HostError::RecoveryRequired(_) => "recovery_required",
         #[cfg(windows)]
+        HostError::KernelSupervisionRevocationUncontained(_) => {
+            "kernel_supervision_revocation_uncontained"
+        }
+        #[cfg(windows)]
         HostError::OriginCollisionUnproven(_) => "origin_collision_unproven",
         #[cfg(windows)]
         HostError::StoreEndpointOwnerUnreadable(_) => "store_endpoint_owner_unreadable",
