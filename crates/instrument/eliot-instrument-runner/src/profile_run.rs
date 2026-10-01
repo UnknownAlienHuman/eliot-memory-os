@@ -35,6 +35,7 @@ use eliot_process_executor::ExecutableObservation;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::admission_submission::submit_admission_snapshot;
 use crate::profile::{AdmissionError, AdmittedProfile, AdmittedStage, InstrumentRegistry};
 use crate::registry::{
     RegistryEntry, RegistryError, ResolvedExecutableIdentity, SupplyChainReceipt,
@@ -1227,6 +1228,12 @@ impl StageOrchestrator {
             &process_request,
         ) {
             return InstrumentRun::missing(route, reason);
+        }
+        if let Some(registry) = live
+            && let Err(error) =
+                submit_admission_snapshot(registry, &planned.stage, &identity)
+        {
+            return InstrumentRun::missing(route, format!("stage admission refused: {error}"));
         }
         let mut binding = match InstrumentBinding::from_request(invocation, process_request) {
             Ok(binding) => binding,
