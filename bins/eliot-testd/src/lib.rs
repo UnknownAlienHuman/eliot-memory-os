@@ -1777,23 +1777,11 @@ fn validate_productive_tool_environment(
     ];
     // Issue #1897 (AUD8): the governed fixture pair is the only extension of the
     // registered set, it is admitted as a pair or not at all, and the pair must
-    // be internally consistent — the physical root the child is handed must BE
-    // the directory its own carried namespace owns. That is a content check on
-    // this operation's own bindings, not presence: a namespace with no root, a
-    // root with no namespace, or a root that is some other namespace's
-    // directory all refuse. The Kernel's single environment authority
-    // (`TestdProcessToolIntent::validate_for_roots`) emits both values from the
-    // one retained envelope and sealed them into this job's invocation digest,
-    // and `bind_tool_environment_to_roots` puts exactly those two into this
-    // map, so the store re-derives them from that same envelope again before
-    // the start.
-    let fixture_keys = [FIXTURE_NAMESPACE_ENV, FIXTURE_ROOT_ENV];
-    let bound_fixture_keys = fixture_keys
-        .iter()
-        .filter(|key| values.contains_key(**key))
-        .count();
-    if (bound_fixture_keys != 0 && bound_fixture_keys != fixture_keys.len())
-        || values.len() != environment.len()
+    // be internally consistent. `admit_governed_fixture_pair` owns that whole
+    // rule and returns how many of the two keys this map carries, which is the
+    // only extent the registered-set length equation below may allow.
+    let bound_fixture_keys = admit_governed_fixture_pair(&values)?;
+    if values.len() != environment.len()
         || values.len() != expected_keys.len() + bound_fixture_keys
         || expected_keys.iter().any(|key| !values.contains_key(*key))
         || values.get(TESTD_ENV_NEXTEST_GATE).map(String::as_str) != Some("1")
@@ -1803,39 +1791,6 @@ fn validate_productive_tool_environment(
             reason: "productive environment is not the owner-registered set",
         });
     }
-    if bound_fixture_keys == fixture_keys.len() {
-        // Both keys are proven present by the count and membership checks above,
-        // but they are read as an INSEPARABLE PAIR or not at all: binding one
-        // without the other would leave a lane naming a namespace it does not
-        // own a root for, which is the inert-namespace defect this closes.
-        let (Some(namespace), Some(root)) = (
-            values.get(FIXTURE_NAMESPACE_ENV),
-            values.get(FIXTURE_ROOT_ENV),
-        ) else {
-            return Err(TestdError::Invalid {
-                field: "tool_environment",
-                reason: "governed fixture bindings must carry the namespace and its root together",
-            });
-        };
-        if namespace.trim().is_empty() || namespace.chars().any(char::is_control) {
-            return Err(TestdError::Invalid {
-                field: "tool_environment",
-                reason: "governed fixture namespace is not a usable directory name",
-            });
-        }
-        let root = Path::new(root);
-        if !root.is_absolute()
-            || root
-                .components()
-                .any(|component| matches!(component, Component::ParentDir))
-            || root.file_name().and_then(|name| name.to_str()) != Some(namespace.as_str())
-        {
-            return Err(TestdError::Invalid {
-                field: "tool_environment",
-                reason: "governed fixture root is not the carried namespace's own directory",
-            });
-        }
-    }
     for key in [TESTD_ENV_CARGO, TESTD_ENV_RUSTC] {
         let path = values.get(key).ok_or(TestdError::Invalid {
             field: "tool_environment",
@@ -1844,29 +1799,12 @@ fn validate_productive_tool_environment(
         validate_owner_tool_path(path)?;
     }
     let nextest = validate_owner_tool_path(nextest_path)?;
-    let cargo = values.get(TESTD_ENV_CARGO).expect("checked above");
-    let rustc = values.get(TESTD_ENV_RUSTC).expect("checked above");
-    let expected_hashes = [
-        (TESTD_ENV_NEXTEST_SHA256, nextest_path),
-        (TESTD_ENV_CARGO_SHA256, cargo),
-        (TESTD_ENV_RUSTC_SHA256, rustc),
-    ];
-    for (hash_key, path) in expected_hashes {
-        let expected = values.get(hash_key).ok_or(TestdError::Invalid {
-            field: "tool_environment",
-            reason: "productive environment is missing a tool digest",
-        })?;
-        let bytes = std::fs::read(path).map_err(|_| TestdError::Invalid {
-            field: "tool_environment",
-            reason: "owner-bound tool cannot be reread before launch",
-        })?;
-        if expected != &eliot_testd_core::sha256_hex(&bytes) {
-            return Err(TestdError::Invalid {
-                field: "tool_environment",
-                reason: "owner-bound tool changed after resolution",
-            });
-        }
-    }
+    // Both names were proven present and path-validated immediately above, so
+    // they are read here rather than re-proved: the PATH composition below needs
+    // exactly these two tool directories.
+    let cargo = owner_tool_path(&values, TESTD_ENV_CARGO)?;
+    let rustc = owner_tool_path(&values, TESTD_ENV_RUSTC)?;
+    verify_bound_tool_digests(&values, nextest_path)?;
     if values
         .get(TESTD_ENV_TOOLCHAIN)
         .is_none_or(|value| value.trim().is_empty() || value.chars().any(char::is_control))
@@ -2307,6 +2245,132 @@ pub async fn drive_validated_dispatch_material_with_terminal_publisher(
     Ok(outcome)
 }
 
+/// The registered tool path this environment binds, or a typed refusal.
+///
+/// The membership and path-validity of both tool bindings are proven by the
+/// caller before either is read, so this performs no second proof: it names the
+/// one failure the caller's ordering cannot cover — a binding that is present in
+/// the map yet absent from it, which can only happen if the two checks are ever
+/// reordered — rather than asserting the caller's conclusion.
+fn owner_tool_path<'a>(
+    values: &'a BTreeMap<String, String>,
+    key: &str,
+) -> Result<&'a str, TestdError> {
+    values
+        .get(key)
+        .map(String::as_str)
+        .ok_or(TestdError::Invalid {
+            field: "tool_environment",
+            reason: "productive environment is missing a tool path",
+        })
+}
+
+/// Re-reads each owner-bound tool and compares it against its recorded digest.
+///
+/// The digests were resolved from the installed tool bytes earlier in the
+/// composition. Re-reading here proves nothing was substituted between
+/// resolution and launch, which a recorded digest alone cannot show.
+fn verify_bound_tool_digests(
+    values: &BTreeMap<String, String>,
+    nextest_path: &str,
+) -> Result<(), TestdError> {
+    let cargo = owner_tool_path(values, TESTD_ENV_CARGO)?;
+    let rustc = owner_tool_path(values, TESTD_ENV_RUSTC)?;
+    // Each recorded digest is compared against the tool it was resolved from:
+    // the nextest digest against the resolved nextest program, not against
+    // cargo, so a substituted tool cannot satisfy another tool's digest.
+    for (hash_key, path) in [
+        (TESTD_ENV_NEXTEST_SHA256, nextest_path),
+        (TESTD_ENV_CARGO_SHA256, cargo),
+        (TESTD_ENV_RUSTC_SHA256, rustc),
+    ] {
+        let expected = values.get(hash_key).ok_or(TestdError::Invalid {
+            field: "tool_environment",
+            reason: "productive environment is missing a tool digest",
+        })?;
+        let bytes = std::fs::read(path).map_err(|_| TestdError::Invalid {
+            field: "tool_environment",
+            reason: "owner-bound tool cannot be reread before launch",
+        })?;
+        if expected != &eliot_testd_core::sha256_hex(&bytes) {
+            return Err(TestdError::Invalid {
+                field: "tool_environment",
+                reason: "owner-bound tool changed after resolution",
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Admits the governed fixture pair as one inseparable unit, and returns how
+/// many of the two keys this environment actually carries (0 or 2).
+///
+/// Issue #1897 (AUD8): the pair is the only extension of the owner-registered
+/// productive set, and both halves of the isolation travel together. The
+/// physical root the child is handed must BE the directory its own carried
+/// namespace owns — that is a content check on this operation's own bindings,
+/// not a presence check: a namespace with no root, a root with no namespace, or
+/// a root that is some other namespace's directory all refuse. The Kernel's
+/// single environment authority
+/// (`TestdProcessToolIntent::validate_for_roots`) emits both values from the one
+/// retained envelope and sealed them into this job's invocation digest, and
+/// `bind_tool_environment_to_roots` puts exactly those two into this map, so
+/// the store re-derives them from that same envelope again before the start.
+///
+/// Returns `0` for a map that carries neither key (an unallocated lane, which
+/// has no namespace to isolate one with) and `2` for a map that carries both.
+fn admit_governed_fixture_pair(
+    values: &BTreeMap<String, String>,
+) -> Result<usize, TestdError> {
+    let fixture_keys = [FIXTURE_NAMESPACE_ENV, FIXTURE_ROOT_ENV];
+    let bound_fixture_keys = fixture_keys
+        .iter()
+        .filter(|key| values.contains_key(**key))
+        .count();
+    // Admitted as a pair or not at all: exactly one of the two is the
+    // inert-namespace defect this closes, because a lane would then name a
+    // namespace it does not own a root for.
+    if bound_fixture_keys != 0 && bound_fixture_keys != fixture_keys.len() {
+        return Err(TestdError::Invalid {
+            field: "tool_environment",
+            reason: "governed fixture bindings must carry the namespace and its root together",
+        });
+    }
+    if bound_fixture_keys == 0 {
+        return Ok(0);
+    }
+    // Both keys are proven present by the count above, but they are read as an
+    // INSEPARABLE PAIR or not at all.
+    let (Some(namespace), Some(root)) = (
+        values.get(FIXTURE_NAMESPACE_ENV),
+        values.get(FIXTURE_ROOT_ENV),
+    ) else {
+        return Err(TestdError::Invalid {
+            field: "tool_environment",
+            reason: "governed fixture bindings must carry the namespace and its root together",
+        });
+    };
+    if namespace.trim().is_empty() || namespace.chars().any(char::is_control) {
+        return Err(TestdError::Invalid {
+            field: "tool_environment",
+            reason: "governed fixture namespace is not a usable directory name",
+        });
+    }
+    let root = Path::new(root);
+    if !root.is_absolute()
+        || root
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+        || root.file_name().and_then(|name| name.to_str()) != Some(namespace.as_str())
+    {
+        return Err(TestdError::Invalid {
+            field: "tool_environment",
+            reason: "governed fixture root is not the carried namespace's own directory",
+        });
+    }
+    Ok(fixture_keys.len())
+}
+
 /// Refuses a start whose child environment disagrees with the lane's own
 /// retained fixture namespace.
 ///
@@ -2323,13 +2387,18 @@ fn verify_governed_fixture_bindings(
 ) -> Result<(), TestdError> {
     let environment = environment.non_secret();
     let Some(envelope) = envelope else {
-        return match [FIXTURE_NAMESPACE_ENV, FIXTURE_ROOT_ENV]
+        // A lane-less row that names either governed fixture key is refused. The
+        // condition is the same "either key is present" test the `match` arms
+        // expressed, and the refusal is still total: both keys are checked, so a
+        // row carrying only the namespace and a row carrying only the root are
+        // both refused rather than one slipping through an arm boundary.
+        if [FIXTURE_NAMESPACE_ENV, FIXTURE_ROOT_ENV]
             .iter()
             .any(|variable| environment.contains_key(*variable))
         {
-            true => Err(TestdError::InvalidBinding),
-            false => Ok(()),
-        };
+            return Err(TestdError::InvalidBinding);
+        }
+        return Ok(());
     };
     for (variable, expected) in envelope
         .fixture_environment()
