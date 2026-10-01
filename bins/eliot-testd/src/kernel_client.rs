@@ -1514,7 +1514,10 @@ impl KernelProcessStreamSinkClient {
             .exchange(operation.clone())
             .map_err(map_sink_ipc_error)?;
         let (owner, original_terminal) = completed_sink_response_with_terminal(response)?;
-        if original_terminal.as_ref() != Some(&operation) {
+        if original_terminal
+            .as_ref()
+            .is_some_and(|original| original != &operation)
+        {
             return Err(ProcessStreamSinkError::ProviderUnavailable);
         }
         let ProcessStreamSinkWireResponse::Finalized {
@@ -1525,6 +1528,11 @@ impl KernelProcessStreamSinkClient {
         else {
             return Err(ProcessStreamSinkError::ProviderUnavailable);
         };
+        // The immediate exchange is already validated against `operation`;
+        // use that exact locally retained request when the owner omits its
+        // optional echo. A conflicting echo is refused above. Restart
+        // reconciliation has no such local request and remains fail-closed
+        // unless Kernel returns its durable original terminal request.
         let terminal = terminal_from_projection(
             &session,
             TerminalCommand::Finalize(request),
@@ -1557,7 +1565,10 @@ impl KernelProcessStreamSinkClient {
             .exchange(operation.clone())
             .map_err(map_sink_ipc_error)?;
         let (owner, original_terminal) = completed_sink_response_with_terminal(response)?;
-        if original_terminal.as_ref() != Some(&operation) {
+        if original_terminal
+            .as_ref()
+            .is_some_and(|original| original != &operation)
+        {
             return Err(ProcessStreamSinkError::ProviderUnavailable);
         }
         let ProcessStreamSinkWireResponse::Aborted { body } = owner else {
