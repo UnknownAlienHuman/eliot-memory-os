@@ -1812,15 +1812,20 @@ pub fn materialise_prepared_isolated_destination(
     let publication = OwnedDirectoryPublication::create(std::path::Path::new(
         &derived_destination_root,
     ))
+    // Every arm is ONE typed failure, [`IsolatedDestinationError`]: a refusal
+    // class stays a distinct `Refused` variant and is never widened into a
+    // message, and the authority's own publication fault stays a typed
+    // `Installation` fault. The two types are never returned side by side from
+    // one `match`, so the layer boundary has a single error type.
     .map_err(|error| match error {
         // A destination that already existed by the time the owner
         // created it, including a concurrent create race, is not owned
         // by this operation.
         DirectoryPublicationError::AlreadyExists => {
-            IsolatedDestinationRefusal::DestinationNotAbsent
+            IsolatedDestinationError::Refused(IsolatedDestinationRefusal::DestinationNotAbsent)
         }
         DirectoryPublicationError::ReparsePoint => {
-            IsolatedDestinationRefusal::ForeignInstallationOwner
+            IsolatedDestinationError::Refused(IsolatedDestinationRefusal::ForeignInstallationOwner)
         }
         other => IsolatedDestinationError::Installation(InstallationError::Platform(format!(
             "the installation authority could not create the isolated destination: {other}"
