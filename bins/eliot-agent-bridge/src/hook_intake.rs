@@ -46,9 +46,14 @@
 //!   `found_terminator: false` and without draining past the owner's discard
 //!   bound;
 //! - the exact ceiling ACCEPTED and one byte over it REFUSED, in a single fill,
-//!   in fills that split the record, and in fills that leave the CRLF
-//!   terminator's carriage return on a fill of its own — the same byte stream,
-//!   one disposition;
+//!   in fills that split the record, in fills that leave the CRLF
+//!   terminator's carriage return on a fill of its own, in a one-byte fill, and
+//!   in a 1_000_000-byte fill that divides neither the ceiling nor the
+//!   terminator — the same byte stream, one content total, one disposition,
+//!   because a fill ending on a lone CR is consumed whole with the CR held out
+//!   of the charge and that held CR is charged exactly once by whichever later
+//!   fill resolves it, while every other fill charges its content bytes once
+//!   and consumes every byte it charges;
 //! - the public hook branch itself, end to end through argv, bounded
 //!   acquisition, decode, the real [`EliotHookService`], and the host decision
 //!   write, with the runtime root supplied by the caller: an accepted payload
@@ -269,20 +274,26 @@ fn hook_runtime_root() -> Result<PathBuf, HookIntakeError> {
 ///   record may be `max_record_bytes` content bytes plus its terminator.
 ///
 /// The content total is the length of the record with BOTH terminator bytes
-/// removed, and it is that total the owner compares — on every chunking path.
-/// The one arrival the owner's LF-only scan cannot classify is a fill that ends
-/// on a lone CR, because the CR and the newline that would prove it framing
-/// land in different fills; the owner holds that byte back out of the running
-/// total until the next fill classifies it. A record that therefore arrives as
-/// `max_record_bytes` content bytes, `\r`, `\n` is ACCEPTED in one fill, in
-/// 64 KiB fills that divide the content evenly, and in fills that leave the
-/// `\r` on a fill of its own, and the byte stream is refused identically once
-/// it carries one byte more of content. (Before that arm existed, the third of
-/// those arrivals was refused at exactly `max_record_bytes` content bytes, so
-/// the disposition depended on the caller's buffer size rather than on the
-/// bytes.) A carriage return that no newline follows is content, not framing:
-/// it is charged against the ceiling and kept in the record, so an EOF-final
-/// record that ends on a CR is not silently shortened.
+/// removed, and it is that total the owner compares — on every chunking path,
+/// because the owner makes the fills not matter: every fill charges its content
+/// bytes once and consumes every byte it charges, and a fill that ends on a
+/// lone CR leaves the stream whole with the CR held out of the charge, so that
+/// held CR is charged exactly once by whichever later fill resolves it rather
+/// than re-delivered with the content behind it. The one arrival the owner's
+/// LF-only scan cannot classify in the fill that carries it is therefore that
+/// fill ending on a lone CR, because the CR and the newline that would prove it
+/// framing land in different fills. A record of `max_record_bytes` content
+/// bytes, `\r`, `\n` is ACCEPTED in one fill, in 64 KiB fills that divide the
+/// content evenly, in fills that leave the `\r` on a fill of its own, in a
+/// one-byte fill, and in fills that divide neither the ceiling nor the
+/// terminator — the same total, from all of them — and the byte stream is
+/// refused identically once it carries one byte more of content. (Before the
+/// held-CR arm existed, the fourth of those arrivals was refused at exactly
+/// `max_record_bytes` content bytes, so the disposition depended on the
+/// caller's buffer size rather than on the bytes.) A carriage return that no
+/// newline follows is content, not framing: it is charged against the ceiling
+/// and kept in the record, so an EOF-final record that ends on a CR is not
+/// silently shortened.
 ///
 /// [`ReadOutcome::Record`] is reachable only when the ceiling held for every
 /// chunk of it, so an accepted payload is never a truncation of a longer
@@ -689,15 +700,19 @@ mod tests {
     /// record must be exactly the ceiling long.
     ///
     /// The arrival is the point. The byte stream is CRLF-terminated and is
-    /// driven through four readers: one fill holding everything, `CHUNK` fills
+    /// driven through five readers: one fill holding everything, `CHUNK` fills
     /// that divide the ceiling evenly, `CR_SPLIT_FILL_CHUNK` (one byte more
     /// than the ceiling) fills that leave the terminator's carriage return on a
-    /// fill of its own, and a one-byte fill that leaves it alone. That
+    /// fill of its own, a one-byte fill that leaves it alone, and a
+    /// 1_000_000-byte fill that divides neither the ceiling nor the terminator
+    /// and so lands that carriage return at neither boundary. That
     /// `CR_SPLIT_FILL_CHUNK` arrival is the contested one — it is the only
     /// shape whose carriage return cannot be classified by the owner's LF-only
     /// scan in the fill that carries it — so a ceiling charged for a
     /// not-yet-proven terminator byte would refuse there while accepting the
-    /// others.
+    /// others; the 1_000_000 arrival covers the case the deferred-CR mechanism
+    /// does not touch, where the same bytes are charged by ordinary content
+    /// charging instead.
     #[test]
     fn exact_record_limit_is_accepted_at_the_published_ceiling_for_every_chunking() {
         let body = r#"{"a":1}"#;
@@ -722,6 +737,17 @@ mod tests {
                 CR_SPLIT_FILL_CHUNK,
             ),
             ("the carriage return on a one-byte fill", 1),
+            // A fill that divides NEITHER the ceiling nor the terminator: it
+            // lands the carriage return at neither boundary — not on a fill's
+            // last byte, so the lone-CR arm never fires at all, and not on the
+            // byte after the ceiling, so no boundary is hit by construction
+            // here. Every byte is charged exactly once by ordinary content
+            // charging, which is the point: the invariant cannot be credited
+            // to the deferred-CR mechanism alone.
+            (
+                "fills dividing neither the ceiling nor the terminator",
+                1_000_000,
+            ),
         ] {
             assert_ne!(
                 chunk, 0,

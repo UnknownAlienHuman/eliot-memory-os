@@ -287,23 +287,38 @@ pub(crate) enum ReadOutcome {
 ///
 /// # The ceiling is on content bytes, on every chunking path
 ///
-/// A chunk that ends on a lone CR is the one arrival the LF-only scan cannot
-/// classify, because the byte that ends the chunk and the newline that proves
-/// the CR is framing both live in different fills. That fill is held out of the
-/// running total entirely — and out of `record` — so the ceiling that is
-/// finally compared is always the length of the content with both terminator
-/// bytes excluded, and the collected prefix never exceeds the ceiling even
-/// transiently. Without that, the ceiling would depend on the caller's read
-/// size: a record delivered in one fill, or in fills that land on a content
-/// byte, would be ACCEPTED at exactly `max_record_bytes` content bytes, while
-/// the identical byte stream whose CR arrives on a fill of its own would be
-/// REFUSED.
+/// The total compared against `max_record_bytes` is the content length with
+/// both terminator bytes removed, whatever the caller's read size is. Two
+/// mechanisms produce that, and together they are why the ceiling is not a
+/// property of the fills:
+///
+/// - **Content charging is exact.** A fill that is not itself the ambiguous
+///   case charges its content bytes once, through `checked_add`, and consumes
+///   every byte it charges. No byte is counted twice and none is counted
+///   twice-then-dropped.
+/// - **A fill ending on a lone CR is consumed whole, with the CR held out of
+///   the charge.** That fill leaves the stream entirely — its content is
+///   consumed WITH the CR, not merely charged short of it — so the next fill
+///   cannot re-receive bytes this one already charged. The held CR is then
+///   charged exactly once, by whichever later fill resolves it: an LF proves
+///   it terminator framing and it is discarded uncharged; EOF, a second CR, or
+///   any other byte proves it content and it is charged against the ceiling in
+///   that same iteration. A CR is therefore never both charged and then
+///   dropped.
+///
+/// The second mechanism is what covers the arrival the LF-only scan cannot
+/// classify in the fill that carries it: the byte that ends the fill and the
+/// newline that would prove it framing land in different fills, so at that
+/// moment the byte is indistinguishable from content and charging it would
+/// make a record of exactly `max_record_bytes` arrive as `ceiling + 1` and be
+/// REFUSED, while the identical byte stream delivered in one fill, or in
+/// fills that land on a content byte, was ACCEPTED. The first mechanism
+/// covers everything the second never touches — fills that divide neither the
+/// ceiling nor the terminator, where no CR is ever held and every byte is
+/// charged once as ordinary content.
 ///
 /// Nothing else is deferred, so a held CR is the only possibility at that
-/// point, and the next fill resolves it: an LF proves it terminator framing and
-/// it is discarded, while EOF, a second CR, or any other byte proves it record
-/// content and it is charged against the ceiling in that same iteration,
-/// before anything is buffered. A CR is never both charged and then dropped, so
+/// point, and the collected prefix never exceeds the ceiling even transiently:
 /// a record can neither exceed the ceiling nor be silently shortened.
 pub(crate) fn read_bounded_record<R: std::io::BufRead>(
     reader: &mut R,
