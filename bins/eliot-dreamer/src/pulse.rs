@@ -56,7 +56,7 @@ use eliot_context_candidates::{
 };
 use eliot_context_contracts::{
     AdmittedContextSet, CanonicalProjectionSet, ContextError, ContextRecipe, QualityScorecard,
-    SerializedContextMeasurement,
+    ResolvedContextRecipe, SerializedContextMeasurement,
 };
 use eliot_contracts::StateFence;
 use eliot_cue_activation::{ActivationProfile, evaluate_activation};
@@ -105,6 +105,12 @@ pub(crate) struct UnderstandingStage<'a, F> {
     pub admitted: &'a AdmittedContextSet,
     /// Recipe the admitted set must satisfy.
     pub recipe: &'a ContextRecipe,
+    /// APPROVED revision the compilation executes under (#1724).
+    ///
+    /// Distinct from `recipe`: the approved revision says what order and
+    /// features MEAN, the bound instance supplies this task's envelope. The
+    /// caller owns the resolution; nothing here derives or defaults it.
+    pub approved: &'a ResolvedContextRecipe,
     /// Quality scorecard bound to the admitted binding.
     pub quality: QualityScorecard,
     /// Caller-owned immutable assembly parameters.
@@ -582,6 +588,7 @@ where
             let output = assemble_active_view(
                 inputs.admitted,
                 inputs.recipe,
+                inputs.approved,
                 inputs.quality,
                 inputs.policy,
                 inputs.measure,

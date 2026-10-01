@@ -89,8 +89,8 @@ use eliot_context_contracts::{
     AdmittedContextSet, CONTEXT_CONTRACT_VERSION, ContextBinding, ContextError, ContextOutcome,
     ContextRecipe, DecisionContextIncomplete, DownstreamHeadroomRequest, DownstreamHeadroomResult,
     HeadroomAllocationLedger, MeasurementCompositionProfile, PriorityPolicyIdentity, ProviderId,
-    QualityRefusal, QualityScorecard, SafetyFloorIdentity, SerializedContextMeasurement,
-    SuppliedOmissionBinding, canonical_render_serializer,
+    QualityRefusal, QualityScorecard, ResolvedContextRecipe, SafetyFloorIdentity,
+    SerializedContextMeasurement, SuppliedOmissionBinding, canonical_render_serializer,
 };
 use eliot_contracts::{
     ArtifactId, ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence,
@@ -1753,11 +1753,19 @@ impl KernelContextReadClient {
     /// validated evidence. Admission runs under that reservation, and the
     /// assembled output is rechecked against it before the packet is
     /// action-ready.
+    ///
+    /// `approved` is the APPROVED revision this compilation executes under
+    /// (#1724). It is distinct from `recipe`: the approved revision says what
+    /// order and features MEAN, while the bound instance supplies this task's
+    /// envelope. The caller owns the resolution — it is the Context owner's
+    /// catalogue resolution, never a value derived here — so a caller that has
+    /// not resolved one cannot compile a packet at all.
     #[allow(clippy::too_many_arguments)]
     pub fn compile_context_packet(
         seven: &SevenRoleInputs,
         request: &CandidateRequest,
         recipe: &ContextRecipe,
+        approved: &ResolvedContextRecipe,
         policy: &CandidatePolicy,
         campaign_view: &CampaignLearningStateView,
         context_recipe_body_digest: &str,
@@ -1877,8 +1885,9 @@ impl KernelContextReadClient {
         // The admitted set now exists, so the scorecard owner is asked for the
         // card that grades exactly this admitted set and its rendered output.
         let quality = quality(&admitted)?;
-        let assembled = assemble_active_view(&admitted, recipe, quality, assembly, measure)
-            .map_err(|error| composition_failure(error, recipe, &request.binding))?;
+        let assembled =
+            assemble_active_view(&admitted, recipe, approved, quality, assembly, measure)
+                .map_err(|error| composition_failure(error, recipe, &request.binding))?;
         check_delivered_traces(&delivery, &assembled)
             .map_err(PacketCompositionError::TraceDelivery)?;
         assembled
