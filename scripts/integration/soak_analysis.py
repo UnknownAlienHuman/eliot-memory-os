@@ -25,6 +25,18 @@ window changes under the profile's predeclared rule, absolute peaks retained
 independently, and quiescent recovery compared against the profile's declared
 baseline window plus tolerance. All comparisons are exact integer/rational
 comparisons over a checked finite domain.
+
+Authentication ceiling (issue #943, audit comment 5926825135): qualification,
+pre-run plan commitment, workload outcomes and cleanup disposition can only be
+trusted when an owner issues them and this module can verify that issuance. No
+such owner exists, and nothing calls :func:`analyze_samples` in production, so
+this module refuses the acceptance path rather than deriving authentication
+from caller-authored strings and booleans. Consequently
+``ObservedWithinQualifiedEnvelope`` is unreachable until an owner-issued,
+independently verifiable receipt is defined and consumed. See the
+``_PROFILE_RECEIPT_REFUSAL`` / ``_WORKLOAD_RECEIPT_REFUSAL`` /
+``_CLEANUP_RECEIPT_REFUSAL`` reasons and the module comment above them. Resource
+violations derived from the bound sample series stay fully reportable.
 """
 
 from __future__ import annotations
@@ -95,6 +107,62 @@ ALGORITHM_REVISION = "fixed-window-v1"
 FINITE_MAX = 2**62
 
 _REASON_TRUNCATION_MARK = "reasons_truncated"
+
+# ---------------------------------------------------------------------------
+# Acceptance authentication (issue #943, audit comment 5926825135 blocking
+# defect 1)
+# ---------------------------------------------------------------------------
+#
+# Qualification, pre-run plan commitment, workload outcomes and cleanup
+# disposition are only meaningful when an owner issues them and this module
+# can verify that issuance independently. Verified against current main:
+#
+#   * no type, producer or issuer of a qualification, plan-commitment,
+#     workload-outcome or cleanup receipt exists anywhere in the tree
+#     (``git grep -l -E 'qualification_receipt|plan_commitment|
+#     commitment_receipt|QualificationReceipt|PreRunCommitmentReceipt|
+#     WorkloadOutcomeReceipt|CleanupReceipt' -- '*.py' '*.rs'`` matches only
+#     the unrelated feature-gated ``eliot-r13-harness`` service-cleanup
+#     struct);
+#   * no producer of ``qualification_ref``/``issuer_ref`` exists outside this
+#     module;
+#   * nothing calls :func:`analyze_samples` in production.
+#
+# So there is no independently verifiable receipt to consume. This module
+# therefore REFUSES the acceptance path with its own existing vocabulary: the
+# affected axes become ``unknown`` with a reason naming the missing receipt,
+# which yields ``IncompleteEvidence``/``InconclusiveProfile`` under the
+# documented precedence. It never mints a digest, signature or "verified" flag
+# to stand in for the absent owner: a fabricated verification scheme would
+# convert a visible gap into an invisible one that claims to verify.
+#
+# Consequences that are deliberate, not oversights:
+#   * a qualified profile can never reach ``ObservedWithinQualifiedEnvelope``;
+#   * a caller-authored workload failure is retained as uncertainty, never
+#     promoted to an authenticated ``WorkloadFailure``;
+#   * a caller-authored cleanup disposition is never an owner-issued one.
+# Resource violations derived from the sample series remain fully reportable,
+# because they are computed from the bound observations rather than from a
+# caller claim.
+
+_PROFILE_RECEIPT_REFUSAL = (
+    "qualification:not_authenticated: acceptance requires an owner-issued, "
+    "independently verifiable qualification receipt; no such owner exists, so "
+    "a non-empty qualification_ref/issuer_ref is not qualification evidence"
+)
+
+_WORKLOAD_RECEIPT_REFUSAL = (
+    "workload:not_authenticated: a required-work outcome requires an "
+    "owner-issued workload-outcome receipt over a pre-run required-work "
+    "denominator; no such owner exists, so producer_ref, producer_attested and "
+    "committed_before_workload are not authentication"
+)
+
+_CLEANUP_RECEIPT_REFUSAL = (
+    "cleanup:not_authenticated: a cleanup disposition requires an "
+    "owner-issued cleanup receipt; no such owner exists, so issuer_ref string "
+    "presence is not an owner-issued disposition"
+)
 
 _MAX_REF_LEN = 256
 _MAX_DETAIL_LEN = 512
@@ -474,9 +542,12 @@ def _validate_qualification(data: Any) -> Qualification:
     )
     issuer_ref = _profile_optional_ref(data["issuer_ref"], "qualification.issuer_ref")
     if status == "qualified":
-        # A bare caller assertion carries no owner evidence: a qualified claim
-        # without both owner-issued references is a shape error here, and the
-        # pre-run commitment binding is re-checked again at analysis time.
+        # A non-empty qualification_ref/issuer_ref pair is a shape requirement
+        # only. It is NOT authentication: these are caller-authored strings,
+        # and no owner issues a verifiable qualification receipt that this
+        # module could check. A "qualified" profile is therefore shape-valid
+        # but can never justify acceptance; :func:`analyze_samples` refuses it
+        # explicitly with _PROFILE_RECEIPT_REFUSAL.
         if not qualification_ref or not issuer_ref:
             raise _profile_fail(
                 "qualification: qualified status requires non-empty "
@@ -1128,6 +1199,17 @@ def validate_run_evidence(data: Any) -> RunEvidence:
                 last_slot=last,
             )
         )
+    # Duplicate phase IDs are an explicit rejection, never a silent overwrite
+    # when the phase map is built. Two rows claiming the same phase_id with
+    # different slot ranges are a contradiction; identical repeats carry no
+    # additional evidence.
+    phase_ids = [p.phase_id for p in phases]
+    duplicates = sorted({pid for pid in phase_ids if phase_ids.count(pid) > 1})
+    if duplicates:
+        raise _evidence_fail(
+            f"phases: duplicate phase_id rejected: {duplicates!r}"
+        )
+    declared_phase_ids = frozenset(phase_ids)
     operations_raw = data["operations"]
     if not isinstance(operations_raw, Sequence) or isinstance(
         operations_raw, (str, bytes)
@@ -1149,10 +1231,18 @@ def validate_run_evidence(data: Any) -> RunEvidence:
             raise _evidence_fail(f"{where}: unknown expected {expected!r}")
         if observed not in _OPERATION_OUTCOMES:
             raise _evidence_fail(f"{where}: unknown observed {observed!r}")
+        phase_id = _evidence_ref(entry["phase_id"], f"{where}.phase_id")
+        # An operation must sit in a phase this evidence document declares.
+        # This needs no owner: it is closure of the document being validated,
+        # not authentication of it.
+        if phase_id not in declared_phase_ids:
+            raise _evidence_fail(
+                f"{where}: phase_id {phase_id!r} is not a declared evidence phase"
+            )
         operations.append(
             OperationOutcome(
                 op_ref=_evidence_ref(entry["op_ref"], f"{where}.op_ref"),
-                phase_id=_evidence_ref(entry["phase_id"], f"{where}.phase_id"),
+                phase_id=phase_id,
                 required=_evidence_bool(entry["required"], f"{where}.required"),
                 expected=expected,
                 observed=observed,
@@ -1279,6 +1369,15 @@ class AnalysisResult:
     violations: Tuple[Dict[str, Any], ...] = ()
     coverage: Dict[str, Any] = field(default_factory=dict)
     semantic_digest: str = ""
+    # NOT a digest of the transport artifact. It is computed from the
+    # canonical re-encoding of the accepted records only: rejected, malformed,
+    # truncated and noncanonical source bytes are excluded, and mapping input
+    # is synthesized into canonical JSON before hashing. It is therefore an
+    # accepted-record canonical digest. The name is retained to avoid
+    # changing this result's serialized payload shape; renaming it is an
+    # owner decision because #944 persists this result. The sampler's
+    # owner-issued raw valid-prefix digest remains unconsumed and is reported
+    # as blocking defect 6 (see the lane report).
     transport_digest: str = ""
     records_accepted: int = 0
     records_rejected: int = 0
@@ -1523,8 +1622,17 @@ def analyze_samples(
     limits_exceeded = False
 
     plan_keys: Tuple[str, ...] = ()
+    # Slot -> (phase_id, workload_ref) taken from the plan. #942's public
+    # validator only checks that a record's phase_id exists *somewhere* in the
+    # plan, so a record whose phase_id contradicts its own slot would otherwise
+    # be accepted and then measured under the wrong phase. Binding is checked
+    # here against the same plan the analyzer measures with.
+    plan_slot_phase: Dict[int, Tuple[str, str]] = {}
     if plan is not None:
         plan_keys = tuple(b.stream_key() for b in plan.bindings)
+        for phase in plan.phases:
+            for slot in range(phase.first_slot, phase.last_slot + 1):
+                plan_slot_phase[slot] = (phase.phase_id, phase.workload_ref)
 
     # -- Step 1: three-way plan/profile/commitment bindings -------------------
     if plan is not None and profile is not None and evidence is not None:
@@ -1607,25 +1715,33 @@ def analyze_samples(
     elif profile is not None and evidence is not None:
         profile_r.add("qualification:plan missing, applicability unchecked")
 
-    # Qualification binding: only a qualified profile whose owner-issued
-    # reference is named by the pre-run commitment can justify acceptance. A
-    # caller self-assertion or self-computed digest never qualifies.
-    if profile is not None and evidence is not None:
+    # Qualification binding. A qualified profile plus a commitment repeating
+    # the same caller-authored qualification_ref proves nothing: both strings
+    # come from the document under judgement and no owner issues a verifiable
+    # qualification receipt. The axis is therefore refused as `unknown`, which
+    # under the documented precedence yields InconclusiveProfile rather than
+    # ObservedWithinQualifiedEnvelope. The cross-check below is kept only as an
+    # integrity signal about the two documents agreeing, never as the source
+    # of authentication.
+    if profile is not None:
         qual = profile.qualification
         if qual.status != "qualified":
             profile_r.add(
                 f"qualification:profile is {qual.status}, not qualified "
                 "(measurements only)"
             )
-        elif evidence.commitment.qualification_ref != qual.qualification_ref:
-            profile_r.add(
-                "qualification:commitment does not name the profile "
-                "qualification_ref"
-            )
-    elif profile is not None and profile.qualification.status != "qualified":
+        else:
+            profile_r.add(_PROFILE_RECEIPT_REFUSAL)
+    if (
+        profile is not None
+        and evidence is not None
+        and profile.qualification.status == "qualified"
+        and evidence.commitment.qualification_ref
+        != profile.qualification.qualification_ref
+    ):
         profile_r.add(
-            f"qualification:profile is {profile.qualification.status}, "
-            "not qualified (measurements only)"
+            "qualification:commitment does not name the profile "
+            "qualification_ref"
         )
 
     # -- Steps 1-2: bounded incremental ingest, per-stream order -------------
@@ -1698,6 +1814,31 @@ def analyze_samples(
                 _checked_int(normalized["seq"], "record.seq")
                 _checked_int(normalized["slot"], "record.slot")
                 _checked_int(normalized["elapsed_ms"], "record.elapsed_ms")
+                # Exact slot -> phase -> workload binding. A terminal record
+                # legitimately sits at slot == expected_slots, which the plan
+                # does not cover, so it is checked against the last declared
+                # phase exactly as the #942 collector stamps it.
+                bound = plan_slot_phase.get(
+                    min(int(normalized["slot"]), plan.expected_slots - 1)
+                    if plan is not None
+                    else 0
+                )
+                if bound is not None:
+                    bound_phase, bound_workload = bound
+                    if str(normalized["phase_id"]) != bound_phase:
+                        raise _soak.RecordRejected(
+                            f"record: slot {normalized['slot']} is bound to "
+                            f"phase {bound_phase!r}, not "
+                            f"{normalized['phase_id']!r} "
+                            "(phase contradicts the plan)"
+                        )
+                    if str(normalized["workload_ref"]) != bound_workload:
+                        raise _soak.RecordRejected(
+                            f"record: slot {normalized['slot']} is bound to "
+                            f"workload_ref {bound_workload!r}, not "
+                            f"{normalized['workload_ref']!r} "
+                            "(workload_ref contradicts the plan phase)"
+                        )
                 if normalized["kind"] == _soak.RecordKind.SAMPLE:
                     for counter in normalized["counters"]:
                         if counter["status"] == _soak.CounterStatus.OK:
@@ -1719,6 +1860,12 @@ def analyze_samples(
     if rejected_count:
         input_r.add(f"records_rejected:count={rejected_count}")
 
+    # Accepted-record canonical digest (not a raw transport/prefix digest):
+    # transport_hash is fed each *accepted* record re-encoded canonically by
+    # _soak.encode_transport, after rejection, decoding and normalization. The
+    # wire value and the field name are left unchanged so the serialized result
+    # payload is byte-identical; the inaccuracy is documented on the field and
+    # reported as blocking defect 6 rather than silently renamed here.
     transport_digest = (
         f"{_soak.SCHEMA_ID}.transport:sha256:{transport_hash.hexdigest()}"
         f":accepted={len(accepted)}:rejected={rejected_count}"
@@ -1737,11 +1884,11 @@ def analyze_samples(
         profile_counters = tuple(c.name for c in profile.counters)
 
     expected_slots = plan.expected_slots if plan is not None else 0
-    phase_of_slot: Dict[int, str] = {}
-    if plan is not None:
-        for phase in plan.phases:
-            for slot in range(phase.first_slot, phase.last_slot + 1):
-                phase_of_slot[slot] = phase.phase_id
+    # Derived from the same plan binding enforced above, so a record cannot be
+    # measured under a phase other than the one its slot declares.
+    phase_of_slot: Dict[int, str] = {
+        slot: phase_id for slot, (phase_id, _) in plan_slot_phase.items()
+    }
 
     # -- Step 3: measurements + coverage -------------------------------------
     measurements_streams: Dict[str, Any] = {}
@@ -2309,85 +2456,74 @@ def analyze_samples(
         resource_r.add("not_evaluated:recovery rule has no counters")
 
     # -- Step 6: workload semantics ------------------------------------------
-    workload_violated = False
+    # The workload axis cannot be `violated` while no owner-issued
+    # workload-outcome receipt exists: a claimed failure is not a proven one.
+    # The axis is therefore `unknown` whenever evidence is present, and the
+    # WorkloadFailure precedence branch below is currently unreachable from
+    # this axis. It stays in place, driven only by the same `violated` status,
+    # so that an owner-issued receipt can activate it without touching the
+    # disposition vocabulary.
     workload_unknown = False
     if evidence is None:
         workload_unknown = True
         workload_r.add("workload:run_evidence missing")
     else:
-        producer_ok = bool(evidence.producer.producer_ref)
-        committed = evidence.commitment.committed_before_workload
+        # No owner-issued workload-outcome receipt exists, so no operation
+        # outcome in this document can be authenticated. producer_ref,
+        # producer_attested and committed_before_workload are all
+        # caller-authored fields from the document under judgement; treating
+        # their presence as proof is exactly the defect being removed. Every
+        # claimed outcome is retained as an uncertainty reason and the axis is
+        # `unknown`; a claimed failure is never promoted to an authenticated
+        # WorkloadFailure.
+        workload_unknown = True
+        workload_r.add(_WORKLOAD_RECEIPT_REFUSAL)
         for operation in evidence.operations:
             if not operation.required:
                 continue
             if operation.observed in ("failed", "crashed"):
-                if operation.producer_attested and producer_ok and committed:
-                    workload_violated = True
-                    workload_r.add(
-                        f"workload:required {operation.op_ref} "
-                        f"observed {operation.observed} (authenticated)"
-                    )
-                else:
-                    workload_unknown = True
-                    workload_r.add(
-                        f"workload:required {operation.op_ref} "
-                        f"observed {operation.observed} (unattested)"
-                    )
+                workload_r.add(
+                    f"workload:required {operation.op_ref} "
+                    f"observed {operation.observed} (claimed, unauthenticated)"
+                )
             elif operation.observed in ("cancelled", "unknown"):
-                workload_unknown = True
                 workload_r.add(
                     f"workload:required {operation.op_ref} "
                     f"observed {operation.observed} (incomplete)"
                 )
             elif operation.observed != operation.expected:
-                workload_unknown = True
                 workload_r.add(
                     f"workload:required {operation.op_ref} observed "
                     f"{operation.observed} != expected {operation.expected}"
                 )
         for crash in evidence.crashes:
-            if producer_ok and committed:
-                workload_violated = True
-                workload_r.add(
-                    f"workload:crash {crash.crash_ref} (authenticated)"
-                )
-            else:
-                workload_unknown = True
-                workload_r.add(
-                    f"workload:crash {crash.crash_ref} (unattested)"
-                )
-        if evidence.cancellation.cancelled and not workload_violated:
-            workload_unknown = True
+            workload_r.add(
+                f"workload:crash {crash.crash_ref} (claimed, unauthenticated)"
+            )
+        if evidence.cancellation.cancelled:
             workload_r.add("workload:run cancelled (required work incomplete)")
 
     # -- Step 6: cleanup ------------------------------------------------------
-    cleanup_violated = False
+    # Same ceiling as the workload axis: without an owner-issued cleanup
+    # receipt neither `verified_clean` nor `failed` is proven, so this axis is
+    # `unknown` rather than `satisfied` or `violated`.
     cleanup_unknown = False
     if evidence is None:
         cleanup_unknown = True
         cleanup_r.add("cleanup:run_evidence missing")
     else:
+        # Same reasoning as the workload axis: a non-empty cleanup.issuer_ref
+        # is a caller string, not an owner-issued disposition. Every claimed
+        # disposition is retained as uncertainty and the axis is `unknown`, so
+        # neither `verified_clean` nor `failed` can be reported as proven.
         cleanup = evidence.cleanup
-        producer_ok = bool(evidence.producer.producer_ref)
-        issuer_ok = bool(cleanup.issuer_ref)
-        if cleanup.disposition == "verified_clean":
-            if issuer_ok and producer_ok:
-                pass
-            else:
-                cleanup_unknown = True
-                cleanup_r.add(
-                    "cleanup:verified_clean without owner issuer/producer"
-                )
-        elif cleanup.disposition == "failed":
-            if issuer_ok and producer_ok:
-                cleanup_violated = True
-                cleanup_r.add("cleanup:confirmed failed cleanup (owner-issued)")
-            else:
-                cleanup_unknown = True
-                cleanup_r.add("cleanup:failed claim without owner issuer")
-        else:
-            cleanup_unknown = True
-            cleanup_r.add(f"cleanup:disposition {cleanup.disposition} (unknown)")
+        cleanup_unknown = True
+        cleanup_r.add(_CLEANUP_RECEIPT_REFUSAL)
+        if cleanup.disposition != "unknown":
+            cleanup_r.add(
+                f"cleanup:disposition {cleanup.disposition} "
+                "(claimed, unauthenticated)"
+            )
 
     # -- Axes, disposition (presentation precedence only), digest -------------
     if curtailed and limits_exceeded:
@@ -2410,15 +2546,11 @@ def analyze_samples(
         resource_status = AxisStatus.NOT_EVALUATED.value
     else:
         resource_status = AxisStatus.SATISFIED.value
-    if workload_violated:
-        workload_status = AxisStatus.VIOLATED.value
-    elif workload_unknown:
+    if workload_unknown:
         workload_status = AxisStatus.UNKNOWN.value
     else:
         workload_status = AxisStatus.SATISFIED.value
-    if cleanup_violated:
-        cleanup_status = AxisStatus.VIOLATED.value
-    elif cleanup_unknown:
+    if cleanup_unknown:
         cleanup_status = AxisStatus.UNKNOWN.value
     else:
         cleanup_status = AxisStatus.SATISFIED.value
