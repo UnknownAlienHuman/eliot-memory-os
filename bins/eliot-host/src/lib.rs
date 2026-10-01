@@ -3176,8 +3176,10 @@ impl HostJobBranches {
         }
         .await;
         match result {
-            Ok(HostSupervisionRevocationDisposition::Revoked)
-            | Ok(HostSupervisionRevocationDisposition::AlreadyAbsent) => {
+            Ok(
+                HostSupervisionRevocationDisposition::Revoked
+                | HostSupervisionRevocationDisposition::AlreadyAbsent,
+            ) => {
                 if self.current_supervision_observation_digest == expected_selector {
                     self.current_supervision_observation_digest = None;
                 }
@@ -3788,8 +3790,10 @@ impl HostJobBranches {
             )
             .await;
             match revocation {
-                Ok(HostSupervisionRevocationDisposition::Revoked)
-                | Ok(HostSupervisionRevocationDisposition::AlreadyAbsent) => {}
+                Ok(
+                    HostSupervisionRevocationDisposition::Revoked
+                    | HostSupervisionRevocationDisposition::AlreadyAbsent,
+                ) => {}
                 Ok(HostSupervisionRevocationDisposition::Superseded {
                     current_observation_digest,
                 }) => {
