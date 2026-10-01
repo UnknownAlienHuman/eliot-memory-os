@@ -1881,6 +1881,100 @@ impl From<WindowsAdapterError> for SupervisionAuthorityKeyError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eliot_runtime_contracts::{
+        SupervisionAuthorityKeyReference, SupervisionOwnerSidReceipt,
+        USER_MODE_SUPERVISION_CREDENTIAL_TARGET_PREFIX,
+    };
+
+    /// One exact `NT SERVICE\EliotHost` service SID, in the shape the DPAPI-NG
+    /// protection descriptor admits.
+    const EXACT_HOST_SERVICE_SID: &str = "S-1-5-80-1-2-3-4-5";
+    /// A different, equally well-formed service SID. It must never unseal a
+    /// blob the exact host service SID sealed.
+    const FOREIGN_SERVICE_SID: &str = "S-1-5-80-6-7-8-9-10";
+
+    fn test_root() -> PathBuf {
+        std::env::temp_dir().join("eliot-supervision-authority-key")
+    }
+
+    fn test_spec(root: &Path) -> InstallerRootPrimitiveSpec {
+        let installation_root = root
+            .parent()
+            .map_or_else(|| root.to_path_buf(), Path::to_path_buf);
+        let profile_anchor = installation_root
+            .parent()
+            .map_or_else(|| installation_root.clone(), Path::to_path_buf);
+        InstallerRootPrimitiveSpec {
+            root: root.to_path_buf(),
+            installation_root,
+            profile_anchor,
+            profile: crate::InstallerRootProfile::SystemService,
+        }
+    }
+
+    fn test_anchor() -> SupervisionTrustAnchor {
+        let signer = Ed25519SupervisionLeaseSigner::from_secret_key(
+            "eliot-kernel",
+            "supervision-key-1",
+            [9_u8; 32],
+        )
+        .unwrap_or_else(|error| panic!("signer: {error}"));
+        SupervisionTrustAnchor::new(
+            "installation-1",
+            "eliot-kernel",
+            "supervision-key-1",
+            signer.public_key().to_vec(),
+        )
+        .unwrap_or_else(|error| panic!("anchor: {error}"))
+    }
+
+    fn system_service_authority(
+        relative_path: &str,
+        host_service_sid: &str,
+    ) -> ProvisionedSupervisionAuthority {
+        let reference = SupervisionSealedKeyReference::new(
+            relative_path,
+            host_service_sid,
+            SupervisionSealedKeyFileIdentity {
+                canonical_path_digest: "1".repeat(64),
+                volume_serial_number: 7,
+                file_index: 11,
+                security_descriptor_digest: "2".repeat(64),
+            },
+            "3".repeat(64),
+        )
+        .unwrap_or_else(|error| panic!("sealed key reference: {error}"));
+        ProvisionedSupervisionAuthority::new(
+            "lease-1",
+            "generation-1",
+            ResourceGeneration::genesis(),
+            reference,
+            test_anchor(),
+        )
+        .unwrap_or_else(|error| panic!("authority: {error}"))
+    }
+
+    fn user_mode_authority() -> ProvisionedSupervisionAuthority {
+        let receipt = SupervisionOwnerSidReceipt::new("S-1-5-21-1-2-3-4")
+            .unwrap_or_else(|error| panic!("owner sid receipt: {error}"));
+        let reference = SupervisionAuthorityKeyReference::user_mode(
+            format!(
+                "{}{}",
+                USER_MODE_SUPERVISION_CREDENTIAL_TARGET_PREFIX,
+                "4".repeat(64)
+            ),
+            receipt,
+        )
+        .unwrap_or_else(|error| panic!("user mode reference: {error}"));
+        ProvisionedSupervisionAuthority::new(
+            "lease-1",
+            "generation-1",
+            ResourceGeneration::genesis(),
+            reference,
+            test_anchor(),
+        )
+        .unwrap_or_else(|error| panic!("authority: {error}"))
+    }
 
     #[test]
     fn protection_descriptor_requires_exact_service_sid_text() {
@@ -1891,5 +1985,91 @@ mod tests {
         );
         assert!(protection_descriptor("NT SERVICE\\EliotHost").is_err());
         assert!(protection_descriptor("S-1-5-19").is_err());
+    }
+
+    /// The production store admits only the exact `SystemService` binding. A
+    /// `UserMode` authority never reaches the physical provider, and a nested
+    /// key path is contract-legal but is not one file directly below the
+    /// Kernel work root, so both are refused before any ciphertext is opened.
+    #[test]
+    fn kernel_unseal_admits_only_the_exact_system_service_binding() {
+        let store = WindowsSupervisionAuthorityKeyStore::new();
+        let root = test_root();
+        let spec = test_spec(&root);
+
+        assert_eq!(
+            store
+                .unseal_for_kernel(&spec, &root, &user_mode_authority())
+                .err(),
+            Some(SupervisionAuthorityKeyError::InvalidBinding),
+            "a non-SystemService authority must be refused before the physical provider"
+        );
+        assert_eq!(
+            store
+                .unseal_for_kernel(
+                    &spec,
+                    &root,
+                    &system_service_authority(
+                        "supervision/authority-1.sealed",
+                        EXACT_HOST_SERVICE_SID
+                    ),
+                )
+                .err(),
+            Some(SupervisionAuthorityKeyError::InvalidBinding),
+            "a nested sealed-key path must be refused by the production store"
+        );
+    }
+
+    /// The production DPAPI-NG provider seals to the exact service-SID
+    /// descriptor and refuses every other token. Both refusals below are
+    /// unconditional: the alias, the non-service account SID and the empty
+    /// ciphertext are rejected before any DPAPI-NG call, and a different
+    /// well-formed service SID either fails token admission or fails the
+    /// descriptor read-back — never both being satisfied.
+    #[cfg(windows)]
+    #[test]
+    fn physical_service_sid_token_seals_and_refuses_every_other_token() {
+        let provider = WindowsSupervisionAuthorityKeyProvider::new();
+        let sealed = provider
+            .generate_and_seal(
+                EXACT_HOST_SERVICE_SID,
+                "installation-1",
+                "eliot-kernel",
+                "supervision-key-1",
+            )
+            .unwrap_or_else(|error| panic!("seal to the exact host service SID: {error}"));
+        assert!(
+            !sealed.sealed_blob.is_empty(),
+            "the exact service SID must produce a real DPAPI-NG ciphertext"
+        );
+        assert_eq!(
+            sealed.trust_anchor.signer_id, "eliot-kernel",
+            "the sealed authority must carry the anchor derived from the sealed seed"
+        );
+        assert_eq!(sealed.trust_anchor.key_id, "supervision-key-1");
+
+        assert_eq!(
+            provider
+                .unseal("NT SERVICE\\EliotHost", &sealed.sealed_blob)
+                .err(),
+            Some(SupervisionAuthorityKeyError::InvalidBinding),
+            "the SCM account alias is never a DPAPI-NG descriptor input"
+        );
+        assert_eq!(
+            provider.unseal("S-1-5-19", &sealed.sealed_blob).err(),
+            Some(SupervisionAuthorityKeyError::InvalidBinding),
+            "a non-service account SID must be refused"
+        );
+        assert_eq!(
+            provider.unseal(EXACT_HOST_SERVICE_SID, &[]).err(),
+            Some(SupervisionAuthorityKeyError::InvalidBinding),
+            "an empty ciphertext must be refused"
+        );
+        assert!(
+            provider
+                .unseal(FOREIGN_SERVICE_SID, &sealed.sealed_blob)
+                .is_err(),
+            "a foreign service SID must never unseal the host-service ciphertext"
+        );
     }
 }
