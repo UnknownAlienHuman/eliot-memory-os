@@ -435,6 +435,17 @@ def materialize_catalogue(
         elif r.disposition is c.CatalogueDisposition.PLANNED:
             if r.descriptor is not None:
                 validate_descriptor_scope(r.descriptor, integration_owners=integration_owners)
+        elif r.disposition is c.CatalogueDisposition.BLOCKED:
+            # A blocked row is disposition-only until its finite test/source
+            # allocation is frozen: carrying an executable descriptor would
+            # smuggle unvalidated scope and matrix arithmetic into the
+            # full-catalogue counts, so it stays a migration failure here.
+            if r.descriptor is not None:
+                raise CohortError(
+                    CohortProblem.BLOCKED_ALLOCATION,
+                    f"blocked row #{r.issue.number} carries an executable descriptor; "
+                    "unresolved finite allocation is disposition-only, not executable coverage",
+                )
         elif r.disposition is c.CatalogueDisposition.SUPERSEDED and r.descriptor is not None:
             # A superseded historical row is a terminal record: #843 accepts no
             # implementation evidence ("Superseded source donor only") and #859
@@ -598,7 +609,7 @@ def discover_work_units(work_units_dir: Path | str) -> DescriptorDiscovery:
         except OSError:
             return DescriptorDiscovery(DescriptorDiscoveryStatus.UNREADABLE)
         stem = child.stem
-        if stem in ALLOWED_NAMED_INVENTORY:
+        if child.name in ALLOWED_NAMED_INVENTORY:
             continue
         if _RE_NUMERIC_STEM.fullmatch(stem) is None:
             raise CohortError(
@@ -945,14 +956,18 @@ def verify_assignment_binding(
 def locked_catalogue_rows(
     lock_path: Path | str,
     discovered: Optional[Mapping[int, c.WorkUnitDescriptor]] = None,
+    *,
+    expected_base_commit: Optional[str] = None,
+    expected_repository: Optional[c.RepositoryIdentity] = None,
+    assignment_receipts: Optional[Mapping[int, c.AssignmentSourceReceipt]] = None,
 ) -> Dict[int, c.CatalogueRow]:
     """Project the committed lock onto catalogue rows, preserving its edges.
 
     Pure projection over the closed lock schema `read_cohort_lock` already owns
-    (no second parser, no second discovery rule). Every locked row is returned
-    with the disposition, body digest, unit and `prerequisites` the lock
-    actually declares, bound to the caller's freshly decoded descriptor when
-    one exists for that issue.
+    (no second parser, no second discovery rule, no second digest scheme).
+    Every locked row is returned with the disposition, body digest, unit and
+    `prerequisites` the lock actually declares, bound to the caller's freshly
+    decoded descriptor when one exists for that issue.
 
     A missing lock declares nothing and projects to the empty mapping: a root
     that ships no lock has declared no row, no disposition and no prerequisite
@@ -963,6 +978,15 @@ def locked_catalogue_rows(
     missing. Prerequisite edges are never dropped here; a row that declares a
     prerequisite keeps it so the selected plan can demand the matching
     accepted evidence.
+
+    Currency and rebinding are caller-supplied, never assumed: when a current
+    base commit or repository is supplied the retained lock provenance must
+    match it (a stale base or moved source is invalidation), and when an
+    assignment-receipt map is supplied every covered row is rebound to its
+    live or explicitly admitted offline receipt. The stored [aggregate] sha256
+    is always recomputed over the projected rows through the single
+    contracts-owned catalogue digest and compared before anything is returned,
+    so a well-formed but wrong digest never becomes rows.
     """
     path = lock_path if isinstance(lock_path, Path) else Path(lock_path)
     try:
@@ -978,6 +1002,12 @@ def locked_catalogue_rows(
     except (OSError, ValueError):
         raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, "cohort lock stat failed") from None
     lock = read_cohort_lock(path)
+    if expected_base_commit is not None or expected_repository is not None:
+        verify_lock_currency(
+            lock,
+            expected_base_commit=expected_base_commit,
+            expected_repository=expected_repository,
+        )
     supplied = dict(discovered) if discovered else {}
     rows: Dict[int, c.CatalogueRow] = {}
     try:
@@ -998,6 +1028,20 @@ def locked_catalogue_rows(
         raise
     except c.ContractViolation as exc:
         raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, str(exc)) from exc
+    try:
+        ordered_rows = tuple(rows[entry.issue] for entry in lock.rows)
+        recomputed = c.CatalogueIntegrityReceipt(
+            ordered_rows, tuple(row.issue for row in ordered_rows))
+    except CohortError:
+        raise
+    except c.ContractViolation as exc:
+        raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, str(exc)) from exc
+    except KeyError as exc:
+        raise CohortError(CohortProblem.INTERNAL_ERROR, "committed lock rows lost their aggregate identity") from exc
+    if recomputed.sha256 != lock.aggregate.sha256:
+        raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, "cohort lock aggregate digest mismatch")
+    if assignment_receipts is not None:
+        verify_assignment_binding(lock, supplied, assignment_receipts)
     return rows
 
 
@@ -1009,6 +1053,8 @@ def verify_cohort_lock(
     expected_base_commit: Optional[str] = None,
     expected_repository: Optional[c.RepositoryIdentity] = None,
     assignment_receipts: Optional[Mapping[int, c.AssignmentSourceReceipt]] = None,
+    integration_owners: Optional[IntegrationOwnerProfile] = None,
+    package_sharing: Sequence[PackageSharingEdge] = (),
 ) -> c.CatalogueIntegrityReceipt:
     """Verify the committed aggregate lock against freshly discovered state.
 
@@ -1019,8 +1065,11 @@ def verify_cohort_lock(
     and compares the recomputed aggregate sha256 against the lock's
     [aggregate] sha256. When a current base commit or repository is supplied,
     the retained lock provenance must match it: a stale base or moved source
-    is invalidation, even when the lock is internally self-consistent. Any
-    mismatch fails closed with INVALID_AGGREGATE_LOCK (or the precise
+    is invalidation, even when the lock is internally self-consistent. The
+    caller also supplies the typed integration-owner profile and explicit
+    package-sharing edges the re-materialization must verify open; until
+    supplied those paths stay deny-by-default inside materialize_catalogue.
+    Any mismatch fails closed with INVALID_AGGREGATE_LOCK (or the precise
     structural problem); the lock is never trusted on its own bytes.
     """
     lock = read_cohort_lock(lock_path)
@@ -1065,7 +1114,12 @@ def verify_cohort_lock(
         raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, str(exc)) from exc
     if assignment_receipts is not None:
         verify_assignment_binding(lock, supplied, assignment_receipts)
-    receipt = materialize_catalogue(rows, expected, expected_cases=lock.aggregate.matrix_cases)
+    receipt = materialize_catalogue(
+        rows, expected,
+        expected_cases=lock.aggregate.matrix_cases,
+        integration_owners=integration_owners,
+        package_sharing=package_sharing,
+    )
 
     counted = {"assigned": 0, "blocked": 0, "planned": 0, "nonexecutable": 0,
                "superseded": 0, "accepted-historical": 0}
