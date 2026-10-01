@@ -245,6 +245,9 @@ fn required_registry_denominator(
     let mut required_profiles = BTreeSet::new();
     let mut required_providers = BTreeSet::new();
     for profile in profile_registry.iter() {
+        if !eliot_testd_core::is_testd_executor_profile(&profile.name) {
+            continue;
+        }
         required_profiles.insert(profile.name.clone());
         for stage in &profile.dag {
             let mut matches = provider_registry
