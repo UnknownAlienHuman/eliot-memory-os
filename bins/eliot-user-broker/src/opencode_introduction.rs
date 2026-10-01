@@ -327,7 +327,7 @@ impl OpenCodeIntroductionIssuer {
             return Err(BrokerError::StaleRegistrationIdentity);
         }
         let request = wire_request.into_owned()?;
-        let credential = BrokerSecretBoundary::mint(request, owner)?;
+        let credential = BrokerSecretBoundary::mint(&request, owner)?;
         let credential_handle = credential
             .handle()
             .ok_or(BrokerError::InvalidField("introduction.credential"))?

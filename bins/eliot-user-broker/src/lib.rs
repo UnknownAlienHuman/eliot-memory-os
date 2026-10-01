@@ -1787,12 +1787,11 @@ impl BrokerComposition {
         self.verify_launch_lease()?;
         // The live admitted registration is the owner source for installation
         // id, SID, session and broker generation; a broker with no admitted
-        // registration issues nothing.
-        let receipt = self.broker.active_registration().cloned().ok_or_else(|| {
-            CompositionError::Launch(
-                "no admitted broker registration backs an OpenCode introduction".to_owned(),
-            )
-        })?;
+        // registration issues nothing. `live_registration` is the composition's
+        // own owner read: it re-reads this broker's clock at use and refuses a
+        // registration that is not `Active` or is inside its expiry, so the
+        // introduction can never be minted against a stale or closed lease.
+        let receipt = self.live_registration()?;
         let process_id = self
             .process_binding
             .as_ref()
