@@ -7363,7 +7363,7 @@ impl KernelStoreGateway {
         result
     }
 
-    /// Performs the narrow durable WorkScope owner CAS on the active Store
+    /// Performs the narrow durable `WorkScope` owner CAS on the active Store
     /// generation. The Governor-issued canonical snapshot remains opaque here;
     /// the EBP client owns unknown-outcome same-fence readback.
     pub async fn write_work_scope_owner(

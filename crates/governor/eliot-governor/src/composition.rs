@@ -10275,6 +10275,23 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         Ok((lease, surface))
     }
 
+    /// Revalidates an attach projection through the installation's bound scan
+    /// owner, retaining the exact receipt handle and owner binding.
+    pub fn cold_start_attach_readback_for_claim(
+        &self,
+        claim: &ColdStartReadinessClaim,
+        now: u64,
+        scan_receipt: &ScanReceiptHandle,
+        scan_binding: &ScanDisclosureOwnerBinding,
+    ) -> Result<(OnboardingLease, ColdStartSurfaceView), CompositionError> {
+        let store = self.bound_installation_scan_store()?;
+        self.cold_start_owner_readback_for_claim(
+            claim,
+            now,
+            Some((&store, scan_receipt, scan_binding)),
+        )
+    }
+
     /// Reconstructs material-readiness inputs only after durable terminal,
     /// scan receipt, task selection, Policy owner and original `WorkScope`
     /// admission have all been revalidated against the current full fence.

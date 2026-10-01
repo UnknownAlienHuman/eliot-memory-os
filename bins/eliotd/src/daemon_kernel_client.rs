@@ -41,7 +41,7 @@ use eliot_agent_coordinator::OwnerLoadedClaimRow;
 #[cfg(windows)]
 use eliot_contracts::{ArtifactId, ContractId};
 use eliot_contracts::{
-    ClockReading, OperationId, ProductId, RequestId, RequestMetadata, SessionId, SourceId,
+    ClockReading, OperationId, ProductId, RequestId, RequestMetadata, SessionId, SourceId, TaskId,
 };
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError};
@@ -1394,6 +1394,11 @@ pub fn parse_observe_defer_outcome(
 }
 
 impl DaemonKernelClient {
+    /// Original protected snapshot identity validated at the Kernel handshake.
+    pub(crate) fn protected_snapshot_digest(&self) -> &str {
+        &self.snapshot.protected_snapshot_digest
+    }
+
     #[cfg(windows)]
     pub async fn claim_agent_activation_ticket(
         &self,

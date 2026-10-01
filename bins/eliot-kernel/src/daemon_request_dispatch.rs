@@ -9329,7 +9329,10 @@ impl KernelComposition {
             &authenticated_principal,
             &operation.attempt.session_id,
         )?;
-        self.validate_owner_protected_snapshot(&operation.request.protected_snapshot_digest)?;
+        let protected_snapshot =
+            PlatformHandle::new(operation.request.protected_snapshot_digest.clone())
+                .map_err(|_| TransportError::SessionFenced)?;
+        self.validate_daemon_config_mirror(&protected_snapshot)?;
         let failure_operation_id = operation.request.operation_id.clone();
         let failure_idempotency_key = operation.request.idempotency_key.clone();
         let gateway = self.retained_store_gateway()?;

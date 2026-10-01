@@ -2167,6 +2167,7 @@ impl OrsRestoreJournal {
 )]
 pub fn ors_to_backup(error: OrsError) -> BackupError {
     match error {
+        OrsError::ScanDisclosureReadFailure(cause) => BackupError::ScanDisclosureReadFailure(cause),
         OrsError::InvalidField { field, reason } => BackupError::InvalidField { field, reason },
         OrsError::FenceMismatch => BackupError::FenceMismatch {
             subject: "restore journal writer fence".to_owned(),

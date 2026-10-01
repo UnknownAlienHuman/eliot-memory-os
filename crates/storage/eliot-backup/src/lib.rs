@@ -2951,6 +2951,10 @@ pub trait PublicationPort {
 /// Typed failures that preserve integrity and recovery boundaries.
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum BackupError {
+    /// Preserve the original owner code if a scan receipt read failure reaches
+    /// the recovery seam; it cannot become a successful empty journal read.
+    #[error("scan receipt read failed: {0:?}")]
+    ScanDisclosureReadFailure(eliot_contracts::ScanDisclosureReadFailure),
     #[error("invalid {field}: {reason}")]
     InvalidField {
         field: &'static str,

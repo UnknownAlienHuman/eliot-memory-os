@@ -106,10 +106,11 @@ use eliot_governor::{
 use eliot_integration_coverage::{GovernanceProfile, IntegrationCoverageProfile};
 use eliot_observation::TaskSelectionEvidence;
 use eliot_ors::{
-    ColdStartReadinessClaim, ColdStartReadinessOrsRecord, ColdStartReadinessRecordOwner,
-    ColdStartReadinessStageOutcome, ColdStartReadinessTerminalDisposition, OrsError,
-    ScanDisclosureOrsRecord, ScanDisclosureQuarantineRecord, ScanDisclosureReadFailure,
-    ScanDisclosureRecordOwner, ScanDisclosureStageOutcome,
+    ColdStartReadinessClaim, ColdStartReadinessOrsRecord, ColdStartReadinessOwnerKey,
+    ColdStartReadinessRecordOwner, ColdStartReadinessStageOutcome,
+    ColdStartReadinessTerminalDisposition, OrsError, ScanDisclosureOrsRecord,
+    ScanDisclosureQuarantineRecord, ScanDisclosureReadFailure, ScanDisclosureRecordOwner,
+    ScanDisclosureStageOutcome,
 };
 use eliot_protocol::{
     AgentActivationBindScopeEvidence, AgentActivationCandidateCoverage,
@@ -421,7 +422,7 @@ struct ColdStartReadinessOwnerRpcRequest<'a> {
 )]
 enum ColdStartReadinessOwnerRpcAction<'a> {
     ReadinessClaim {
-        claim: &'a ColdStartReadinessClaim,
+        key: &'a ColdStartReadinessOwnerKey,
     },
     ReadinessPublish {
         record_key: &'a str,
@@ -941,11 +942,20 @@ impl KernelColdStartReadinessRecordOwner {
 impl ColdStartReadinessRecordOwner for KernelColdStartReadinessRecordOwner {
     fn claim_cold_start_readiness(
         &self,
-        claim: &ColdStartReadinessClaim,
+        key: &ColdStartReadinessOwnerKey,
+        lease_deadline: u64,
         _now: u64,
     ) -> Result<ColdStartReadinessStageOutcome, OrsError> {
-        match self.request(ColdStartReadinessOwnerRpcAction::ReadinessClaim { claim })? {
-            ColdStartReadinessOwnerRpcResult::ReadinessClaimed { outcome } => Ok(outcome),
+        match self.request(ColdStartReadinessOwnerRpcAction::ReadinessClaim { key })? {
+            ColdStartReadinessOwnerRpcResult::ReadinessClaimed { outcome } => {
+                let (ColdStartReadinessStageOutcome::Stored { record }
+                | ColdStartReadinessStageOutcome::AlreadyBound { record }) = &outcome;
+                record.validate()?;
+                if &record.claim.key != key || record.claim.lease_deadline > lease_deadline {
+                    return Err(OrsError::FenceMismatch);
+                }
+                Ok(outcome)
+            }
             ColdStartReadinessOwnerRpcResult::ReceiptReadFailure { failure } => {
                 Err(OrsError::ScanDisclosureReadFailure(failure))
             }
@@ -2879,11 +2889,11 @@ pub fn admit_bootstrap_context(
             "bootstrap surface names another receipt revision",
         ));
     }
-    bound(
-        "projection source",
-        &receipt.projection_source_ref,
-        &surface.projection_source_ref,
-    )?;
+    if receipt.projection_source_ref != surface.projection_source_ref {
+        return Err(TaskBindingError::scope_incompatible(
+            "bootstrap surface names another projection source",
+        ));
+    }
     if receipt.projection_generation != surface.projection_generation {
         return Err(TaskBindingError::scope_incompatible(
             "bootstrap surface names another projection generation",
@@ -2975,6 +2985,21 @@ pub fn admit_bootstrap_context(
                     selection: TaskSelectionResponse::Current(task),
                 });
             };
+            let (Some(projection_source_ref), Some(projection_generation)) = (
+                receipt
+                    .projection_source_ref
+                    .as_ref()
+                    .filter(|source| !source.trim().is_empty()),
+                receipt
+                    .projection_generation
+                    .filter(|generation| *generation > 0),
+            ) else {
+                return Ok(BootstrapAdmission::Diagnostic {
+                    reason: "bootstrap projection owner evidence is absent",
+                    next_safe_action: receipt.next_safe_action.clone(),
+                    selection: TaskSelectionResponse::Current(task),
+                });
+            };
             Ok(BootstrapAdmission::Material(MaterialBootstrap {
                 receipt_ref: receipt.receipt_ref.clone(),
                 lease_ref: receipt.lease_ref.clone(),
@@ -2987,8 +3012,8 @@ pub fn admit_bootstrap_context(
                 governance_profile_ref: receipt.governance_profile_ref.clone(),
                 governance_revision: governance.revision,
                 coverage_fingerprint: coverage.fingerprint.clone(),
-                projection_source_ref: receipt.projection_source_ref.clone(),
-                projection_generation: receipt.projection_generation,
+                projection_source_ref: projection_source_ref.clone(),
+                projection_generation,
             }))
         }
     }
@@ -3222,6 +3247,14 @@ pub fn admit_canonical_write(
                     write_fence,
                     compatibility,
                 )?;
+                let Ok(projection_generation) = required_task_projection_generation(receipt) else {
+                    return Ok(TaskBindingAdmission::ColdUnbound(
+                        ObservationCandidate::cold_unbound(
+                            cold_candidate_id,
+                            context.state_fence.clone(),
+                        ),
+                    ));
+                };
                 // Issue #1746, W6: seal the admitted identity (task, scope,
                 // principal, session, presented fence, bootstrap/profile
                 // revision) so the effect gate revalidates it instead of
@@ -3235,7 +3268,7 @@ pub fn admit_canonical_write(
                     write_fence,
                     receipt.receipt_revision,
                     &receipt.governance_profile_ref,
-                    receipt.projection_generation,
+                    projection_generation,
                     cold_candidate_id,
                 )?))
             }
@@ -3284,12 +3317,25 @@ pub fn admit_canonical_write(
             write_fence,
             receipt.receipt_revision,
             &receipt.governance_profile_ref,
-            receipt.projection_generation,
+            required_task_projection_generation(receipt)?,
             candidate_id,
         )?));
     }
 
     Ok(TaskBindingAdmission::NotTaskRelative)
+}
+
+fn required_task_projection_generation(
+    receipt: &OnboardingReadinessReceipt,
+) -> Result<u64, TaskBindingError> {
+    receipt
+        .projection_generation
+        .filter(|generation| *generation > 0)
+        .ok_or_else(|| {
+            TaskBindingError::scope_incompatible(
+                "task-bound dispatch has no original projection generation",
+            )
+        })
 }
 
 /// Admits one daemon named-mutation write with the live activation
@@ -3960,6 +4006,10 @@ pub struct ColdStartAttachInput {
     /// Partial lease fields are never sufficient for a durable readiness
     /// readback.
     pub readiness_claim: ColdStartReadinessClaim,
+    /// Exact original scan receipt handle, re-read from the installation owner.
+    pub scan_receipt_handle: eliot_workscope::ScanReceiptHandle,
+    /// Full admitted scan binding used by the protected owner readback.
+    pub scan_binding: eliot_workscope::ScanDisclosureOwnerBinding,
     /// The complete prior projection returned by the Governor for this lease.
     pub expected_surface: ColdStartSurfaceView,
     /// Fence observed by the authenticated attach boundary.

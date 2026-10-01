@@ -158,12 +158,6 @@ fn work_scope_owner_wire_value(
                 expected: Some(Box::new(expected.clone())),
             })
         }
-        WireOutcome::AcceptedPending { .. } => Err(WorkScopeOwnerWriteFailure::Kernel {
-            error: KernelPortError::Unknown(
-                "Kernel returned ACCEPTED_PENDING to an exact owner publisher".to_owned(),
-            ),
-            expected: Some(Box::new(expected.clone())),
-        }),
     }
 }
 

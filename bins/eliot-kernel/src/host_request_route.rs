@@ -59,10 +59,7 @@ use super::{
     Frame, FrameKind, KernelComposition, KernelFrameAction, MessageType, ProtocolPayload, Session,
     TransportError, activation_deadline_expired, sha256_json, status_frame, unix_ms,
 };
-use eliot_contracts::{
-    BridgeRecoverySelector, ClockReading, ProductId, RequestId, RequestMetadata, SessionId,
-    SourceId,
-};
+use eliot_contracts::{BridgeRecoverySelector, RequestId};
 use eliot_ipc::PeerIdentity;
 use eliot_kernel_service::{
     AgentBridgeAdmissionDescriptor, KernelHostRequestBinder, KernelServiceState,
@@ -86,7 +83,6 @@ use eliot_protocol::{
     WatchdogSpoolExportResultPayload, WatchdogSpoolExportSubmission,
     WatchdogSpoolIntentBatchPayload, WatchdogSpoolIntentSubmission, host_request_operation_id,
 };
-use eliot_receipts::RequestBinding;
 use eliot_runtime_contracts::RecoveryDirective;
 use eliot_store_api::{
     CampaignLearningStateViewPublication, EVIDENCE_PACK_MAX_RECORDS, RevisionHead, RevisionKey,
@@ -6538,9 +6534,30 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         let envelope = host_request_envelope_from_payload(&payload)?;
+        identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
         if envelope.connection_id != connection_id
             || frame.request_id.as_ref() != Some(&envelope.identity.request_id)
-            || identity.request != envelope.identity
+            || identity.request.metadata.request_id != envelope.identity.request_id
+            || identity.request.state_fence != envelope.state_fence
+            || identity
+                .request
+                .metadata
+                .session_id
+                .as_ref()
+                .map(eliot_contracts::SessionId::as_str)
+                != envelope.identity.session_id.as_deref()
+            || identity
+                .request
+                .metadata
+                .task_id
+                .as_ref()
+                .map(eliot_contracts::TaskId::as_str)
+                != envelope.identity.task_id.as_deref()
+            || identity.idempotency_key != envelope.identity.idempotency_key
+            || identity.deadline_unix_ms != envelope.identity.deadline_unix_ms
+            || identity.cancellation_id != envelope.identity.cancellation_id
         {
             return Err(TransportError::SessionFenced);
         }

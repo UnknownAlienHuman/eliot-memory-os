@@ -4336,9 +4336,12 @@ impl DaemonComposition {
             ));
         }
 
-        let (current_lease, current_surface) = self
-            .governor
-            .cold_start_owner_readback_for_claim(&input.readiness_claim, now)?;
+        let (current_lease, current_surface) = self.governor.cold_start_attach_readback_for_claim(
+            &input.readiness_claim,
+            now,
+            &input.scan_receipt_handle,
+            &input.scan_binding,
+        )?;
         if current_lease != input.lease || current_surface != input.expected_surface {
             return Err(DaemonError::Composition(
                 CompositionError::ActivationStaleFence,

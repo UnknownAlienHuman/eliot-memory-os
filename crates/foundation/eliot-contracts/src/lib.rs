@@ -10,6 +10,22 @@
 use std::{borrow::Cow, fmt, str::FromStr};
 
 use schemars::JsonSchema;
+
+/// Policy-free failure identity of an installation scan receipt read.
+///
+/// The receipt owner determines the observation and recovery behavior. This
+/// shared code carries no receipt, storage capability, authority or verdict.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanDisclosureReadFailure {
+    Missing,
+    Inaccessible,
+    Corrupt,
+    Replaced,
+    Stale,
+    Invalidated,
+    UnknownCommit,
+}
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};

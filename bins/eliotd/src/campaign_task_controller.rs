@@ -629,7 +629,7 @@ async fn admit_initial_scope_owner(
     admission: InitialScopeBindingAdmissionRequest<'_>,
 ) -> Result<eliot_governor::WorkScopeBindingOwner, &'static str> {
     let guard = composition.lock().await;
-    if guard.kernel_snapshot().state_fence() != admission.state_fence {
+    if guard.kernel_snapshot().state_fence() != *admission.state_fence {
         return Err("TASK_SCOPE_INCOMPATIBLE");
     }
     guard
@@ -648,7 +648,7 @@ async fn install_initial_scope_owner(
 ) -> Result<TaskControllerResultBody, String> {
     let installed = {
         let mut guard = composition.lock().await;
-        if guard.kernel_snapshot().state_fence() != fence {
+        if guard.kernel_snapshot().state_fence() != *fence {
             return task_controller_rejection(claimed, "TASK_SCOPE_INCOMPATIBLE");
         }
         guard

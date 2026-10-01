@@ -4480,17 +4480,7 @@ pub struct ActivationRecoverySnapshot {
 /// The owner transports this failure as data across the Kernel/daemon RPC
 /// boundary so a failed read cannot be confused with an empty successful
 /// receipt. It carries no semantic or completion authority.
-#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ScanDisclosureReadFailure {
-    Missing,
-    Inaccessible,
-    Corrupt,
-    Replaced,
-    Stale,
-    Invalidated,
-    UnknownCommit,
-}
+pub use eliot_contracts::ScanDisclosureReadFailure;
 
 /// Typed ORS failures. None grants semantic or completion authority.
 #[derive(Debug, Error)]

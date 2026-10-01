@@ -539,11 +539,7 @@ impl KernelComposition {
                 ] | [
                     DiscoveryRead::FilesystemIdentity,
                     DiscoveryRead::GoverningSourceCandidates,
-                    DiscoveryRead::VcsIdentity
-                ] | [
-                    DiscoveryRead::FilesystemIdentity,
-                    DiscoveryRead::GoverningSourceCandidates,
-                    DiscoveryRead::ManifestNamesAndHashes
+                    DiscoveryRead::VcsIdentity | DiscoveryRead::ManifestNamesAndHashes
                 ] | [
                     DiscoveryRead::FilesystemIdentity,
                     DiscoveryRead::GoverningSourceCandidates,
@@ -1490,7 +1486,12 @@ impl KernelComposition {
                     binding.principal_id.clone(),
                     binding.session_id.clone(),
                     binding.task_id.clone(),
-                    binding.task_revision.value(),
+                    binding
+                        .task_revision
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|revision| *revision > 0)
+                        .ok_or(TransportError::SessionFenced)?,
                     binding.work_scope_id.clone(),
                 )
             } else {
@@ -1806,7 +1807,7 @@ impl KernelComposition {
             || retained.session_id != binding.session_id
             || retained.task_id != binding.task_id
             || retained.work_scope_id != binding.work_scope_id
-            || retained.task_revision.value() != binding.task_revision.value()
+            || binding.task_revision.parse::<u64>().ok() != Some(retained.task_revision.value())
             || retained.authority_epoch != current.ticket.state_fence.authority_epoch
             || retained.activation_generation != current.ticket.state_fence.resource_generation
             || retained.kernel_owner_revision != current.kernel_owner_revision

@@ -688,9 +688,9 @@ pub struct KernelComposition {
     /// Retained no-follow protected root and exact ORS-file proof used before
     /// and after installation scan/readiness storage operations.
     #[cfg(windows)]
-    pub(super) scan_disclosure_storage: Option<ScanDisclosureStorageLease>,
+    pub(crate) scan_disclosure_storage: Option<ScanDisclosureStorageLease>,
     #[cfg(windows)]
-    pub(super) scan_disclosure_ors_generation: Option<u64>,
+    pub(crate) scan_disclosure_ors_generation: Option<u64>,
     work_root: PathBuf,
     runtime: Runtime,
     platform: Arc<WindowsPlatform>,
@@ -935,7 +935,7 @@ pub struct KernelComposition {
     pub(crate) diagnostic_brief: Mutex<Option<diagnostic_brief::DiagnosticBrief>>,
 }
 
-pub(super) struct ScanDisclosureStorageLease {
+pub(crate) struct ScanDisclosureStorageLease {
     #[cfg(windows)]
     root: ProtectedRootLease,
     #[cfg(windows)]
@@ -944,7 +944,7 @@ pub(super) struct ScanDisclosureStorageLease {
 
 #[cfg(windows)]
 impl ScanDisclosureStorageLease {
-    pub(super) fn verify(
+    pub(crate) fn verify(
         &self,
         expected_path: &Path,
     ) -> Result<(), eliot_platform_windows::ProtectedPathError> {
