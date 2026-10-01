@@ -3167,8 +3167,7 @@ pub fn admit_named_mutation_capture(
             .parameters
             .keys()
             .any(|key| key.starts_with("task_selection_") || key == "task_id")
-    })
-        || !transition.required_proof_and_approval_refs.is_empty()
+    }) || !transition.required_proof_and_approval_refs.is_empty()
     {
         return Err(TaskBindingError::selection_required(
             "cold unbound capture cannot discard flat task-selection markers or proof handles",
@@ -3212,8 +3211,8 @@ fn validate_cold_capture_submission(
                 "cold unbound capture omits its retained original ObservationSubmission",
             )
         })?;
-    let submission: eliot_observation::ObservationSubmission =
-        serde_json::from_str(encoded).map_err(|error| {
+    let submission: eliot_observation::ObservationSubmission = serde_json::from_str(encoded)
+        .map_err(|error| {
             TaskBindingError::selection_required(format!(
                 "retained original ObservationSubmission is invalid: {error}"
             ))

@@ -495,13 +495,10 @@ async fn prepare_authenticated_owner_publications(
         &claimed.envelope.state_fence,
     )
     .map_err(|_| "invalid_owner_materials")?;
-    let publications = read_authenticated_owner_publications(
-        reads,
-        recipe,
-        &claimed.envelope.state_fence,
-    )
-    .await
-    .map_err(|_| "owner_read_unavailable")?;
+    let publications =
+        read_authenticated_owner_publications(reads, recipe, &claimed.envelope.state_fence)
+            .await
+            .map_err(|_| "owner_read_unavailable")?;
     validate_authenticated_context_recipe(
         &candidate_context_recipe,
         recipe,
@@ -527,18 +524,15 @@ pub async fn prepare_task_controller_claim(
             task_controller_rejection(&claimed, "invalid_recipe")?,
         )));
     };
-    let complete_owner_publications = match prepare_authenticated_owner_publications(
-        reads, &recipe, &claimed,
-    )
-    .await
-    {
-        Ok(publications) => publications,
-        Err(reason) => {
-            return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
-                task_controller_rejection(&claimed, reason)?,
-            )));
-        }
-    };
+    let complete_owner_publications =
+        match prepare_authenticated_owner_publications(reads, &recipe, &claimed).await {
+            Ok(publications) => publications,
+            Err(reason) => {
+                return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
+                    task_controller_rejection(&claimed, reason)?,
+                )));
+            }
+        };
 
     let Ok(action) = decode_task_controller_action(&claimed) else {
         return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
@@ -606,7 +600,9 @@ async fn persist_or_reconcile_work_scope_owner(
             else {
                 return Err(WorkScopeOwnerWriteFailure::Store { failure, expected });
             };
-            if reconciled.validate_for_fence(&claimed.envelope.state_fence).is_err()
+            if reconciled
+                .validate_for_fence(&claimed.envelope.state_fence)
+                .is_err()
                 || reconciled != expected
             {
                 return Err(WorkScopeOwnerWriteFailure::Store { failure, expected });
@@ -629,7 +625,9 @@ async fn persist_or_reconcile_work_scope_owner(
                     expected: Some(expected),
                 });
             };
-            if reconciled.validate_for_fence(&claimed.envelope.state_fence).is_err()
+            if reconciled
+                .validate_for_fence(&claimed.envelope.state_fence)
+                .is_err()
                 || reconciled != expected
             {
                 return Err(WorkScopeOwnerWriteFailure::Kernel {
