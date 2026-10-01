@@ -25,7 +25,7 @@ use super::super::{
     AuthenticatedKernelReadiness, PublishedSupervisionIdentity, fresh_identity, operation,
 };
 use eliot_host_state::{
-    AppendReceipt, HostStateJournalService, JournalBackend, JournalError,
+    AppendDisposition, AppendReceipt, HostStateJournalService, JournalBackend, JournalError,
     KernelReadinessObservationRecord, ReadinessApprovedContour,
 };
 #[cfg(windows)]
@@ -51,7 +51,12 @@ use eliot_runtime_contracts::{
 // refs, digests, or arbitrary error text — so bounding limits size, not
 // sensitivity (I15.4). Appended evidence and granted readiness stay
 // distinct: this child observes the evidence funnel; the readiness grant
-// stays with the gate owner (I1.10). These primitives own no terminal: a
+// stays with the gate owner (I1.10). A new durable commit (`Applied`) and an
+// exact committed replay/readback (`Replayed`) stay distinct as well (I14.20:
+// `RECONCILING` cannot create a new effect; case 11): a committed replay is
+// observed as readback, never as another append. A readback that fails after
+// committed reconciliation keeps "commit known, readback failed" while the
+// original typed error still propagates. These primitives own no terminal: a
 // single terminal per failed readiness operation is enforced by the
 // outermost owner boundary, while these phases correlate by stage order
 // only. Sink outcome never alters result/order/cleanup.
@@ -63,6 +68,23 @@ fn host_readiness_append_observe(detail: &str) {
     );
 }
 
+/// Names one owner-issued readiness append receipt without creating an effect.
+///
+/// `Applied` is the new durable commit; `Replayed` is the exact committed
+/// replay/readback of the original effect (I14.20, case 11). The receipt
+/// itself is the owner's verdict; this branch only observes which one the
+/// owner returned.
+fn observe_readiness_append_outcome(receipt: &AppendReceipt) {
+    match receipt.disposition() {
+        AppendDisposition::Applied => {
+            host_readiness_append_observe("host.readiness append durable observed");
+        }
+        AppendDisposition::Replayed => {
+            host_readiness_append_observe("host.readiness append committed replay observed");
+        }
+    }
+}
+
 fn append_reconciled_readiness<B: JournalBackend>(
     journal: &HostStateJournalService<B>,
     observation: KernelReadinessObservationRecord,
@@ -71,15 +93,28 @@ fn append_reconciled_readiness<B: JournalBackend>(
     host_readiness_append_observe("host.readiness append requested");
     match journal.append_readiness_observation(observation.clone(), expected) {
         Ok(receipt) => {
-            host_readiness_append_observe("host.readiness append durable observed");
+            observe_readiness_append_outcome(&receipt);
             Ok(receipt)
         }
         Err(JournalError::OutcomeUnknown { transaction_id }) => {
             host_readiness_append_observe("host.readiness append outcome unknown observed");
             if super::reconcile_unknown_outcome(journal, &transaction_id)? {
-                journal
-                    .append_readiness_observation(observation, expected)
-                    .map_err(HostError::Journal)
+                // Reconciliation proved the original transaction committed, so
+                // the retry re-enters the idempotent owner and verifies the
+                // replay receipt. A failed readback keeps "commit known,
+                // readback failed" while the original typed error propagates.
+                match journal.append_readiness_observation(observation, expected) {
+                    Ok(receipt) => {
+                        observe_readiness_append_outcome(&receipt);
+                        Ok(receipt)
+                    }
+                    Err(error) => {
+                        host_readiness_append_observe(
+                            "host.readiness commit known readback failed observed",
+                        );
+                        Err(HostError::Journal(error))
+                    }
+                }
             } else {
                 // Unreachable today: the choke fails closed instead of returning
                 // `Ok(false)`. Retained fail-closed so semantics stay identical
