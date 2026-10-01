@@ -3584,7 +3584,7 @@ impl HostJobBranches {
         let mut startup_report_compensation_attempted = false;
         let ready = runtime.block_on(async {
             let mut transport =
-                connect_authenticated_kernel_front_door(&candidate, process).await?;
+                connect_authenticated_kernel_front_door(&candidate, &process).await?;
             validate_authenticated_kernel_peer(
                 transport.peer_identity(),
                 process.process_id,
@@ -3707,7 +3707,7 @@ impl HostJobBranches {
                 // Receive/decode/binding loss after Delivered is also an
                 // unknown outcome and follows this same path.
                 drop(transport);
-                transport = connect_authenticated_kernel_front_door(&candidate, process)
+                transport = connect_authenticated_kernel_front_door(&candidate, &process)
                     .await
                     .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
                 validate_authenticated_kernel_peer(
