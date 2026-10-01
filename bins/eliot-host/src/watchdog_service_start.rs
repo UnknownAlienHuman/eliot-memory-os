@@ -203,17 +203,38 @@ where
             }
             let service = PlatformHandle::new(registration.service_name())
                 .map_err(|error| HostError::Platform(error.to_string()))?;
-            // A StartService result can be Known, Partial, Unknown, or Error
-            // while the external SCM effect remains live. Reconciliation below
-            // is the only authority, and this branch is the sole Start call.
-            let _ = control.start(&eliot_platform::ServiceRequest {
+            // The returned StartService disposition is attempt evidence only:
+            // Known, Partial, Unknown, or Error reports what the provider
+            // observed, never whether the process runs. Reconciliation below
+            // stays the only Running authority, and this branch stays the sole
+            // Start call — a second start is never issued.
+            let start_disposition = control.start(&eliot_platform::ServiceRequest {
                 context,
                 service,
                 operation: eliot_platform::ServiceOperation::Start,
             });
-            // WORK_UNIT_CASE: 979/5 — SCM start issued; the ack is never
-            // process/readiness evidence, only reconciliation below decides.
-            watchdog_start_observe("watchdog.start SCM start issued");
+            match start_disposition {
+                // WORK_UNIT_CASE: 979/5 — SCM start acknowledged; the ack is
+                // never process/readiness evidence, only reconciliation below decides.
+                eliot_platform::PortOutcome::Known(_) => {
+                    watchdog_start_observe("watchdog.start SCM start acknowledged");
+                }
+                // WORK_UNIT_CASE: 979/5 — SCM start partially observed; the
+                // partial ack is never process/readiness evidence.
+                eliot_platform::PortOutcome::Partial { .. } => {
+                    watchdog_start_observe("watchdog.start SCM start partially observed");
+                }
+                // WORK_UNIT_CASE: 979/5 — SCM start effect unknown; the unknown
+                // ack is never process/readiness evidence.
+                eliot_platform::PortOutcome::Unknown(_) => {
+                    watchdog_start_observe("watchdog.start SCM start unknown effect");
+                }
+                // WORK_UNIT_CASE: 979/5 — SCM start provider error; the failure
+                // is never process/readiness evidence.
+                eliot_platform::PortOutcome::Error(_) => {
+                    watchdog_start_observe("watchdog.start SCM start provider error");
+                }
+            }
         }
         InstalledWatchdogRuntimeInspection::Matching {
             state: ServiceState::Starting,

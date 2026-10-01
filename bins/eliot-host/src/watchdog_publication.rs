@@ -400,6 +400,7 @@ pub(super) fn publish_current_watchdog_supervision_bundle(
         HostError::RecoveryRequired(error.to_string())
     })?);
 
+    let mut retained_candidate = false;
     match OwnedDirectoryPublication::create(&destination) {
         Ok(publication) => {
             let temporary = publication.temporary_path().to_path_buf();
@@ -440,9 +441,11 @@ pub(super) fn publish_current_watchdog_supervision_bundle(
                     "Watchdog publication temporary directory identity changed".to_owned(),
                 ));
             }
-            // A concurrent exact replay may win the create-new name, and a
+            // A concurrent exact publication may win the create-new name, and a
             // committed-unknown move may already own it. Neither outcome is
-            // authority until the exact retained readback below succeeds.
+            // authority until the exact retained readback plus the current-ORS
+            // comparison below succeed, so an occupied name is recorded only as
+            // an unverified retained candidate here — never as replay.
             match publication.publish(precommit.directory_identity) {
                 Ok(DirectoryPublicationOutcome::Published(_)) => {
                     // WORK_UNIT_CASE: 979/2 — directory committed, pending retained readback.
@@ -453,8 +456,12 @@ pub(super) fn publish_current_watchdog_supervision_bundle(
                     watchdog_publication_observe("watchdog.publication commit unknown");
                 }
                 Err(DirectoryPublicationError::AlreadyExists) => {
-                    // WORK_UNIT_CASE: 979/8 — concurrent exact replay retained, no new publication.
-                    watchdog_publication_observe("watchdog.publication replay retained");
+                    // WORK_UNIT_CASE: 979/8 — name already occupied; the retained
+                    // candidate requires reconciliation below, never replay yet.
+                    watchdog_publication_observe(
+                        "watchdog.publication name occupied candidate requires reconciliation",
+                    );
+                    retained_candidate = true;
                 }
                 Err(error) => {
                     // WORK_UNIT_CASE: 979/1 — directory commit boundary.
@@ -466,8 +473,12 @@ pub(super) fn publish_current_watchdog_supervision_bundle(
             }
         }
         Err(DirectoryPublicationError::AlreadyExists) => {
-            // WORK_UNIT_CASE: 979/8 — concurrent exact replay retained, no new publication.
-            watchdog_publication_observe("watchdog.publication replay retained");
+            // WORK_UNIT_CASE: 979/8 — name already occupied; the retained
+            // candidate requires reconciliation below, never replay yet.
+            watchdog_publication_observe(
+                "watchdog.publication name occupied candidate requires reconciliation",
+            );
+            retained_candidate = true;
         }
         Err(error) => {
             // WORK_UNIT_CASE: 979/1 — directory preparation boundary.
@@ -490,8 +501,15 @@ pub(super) fn publish_current_watchdog_supervision_bundle(
             "Kernel ORS head changed during Watchdog publication".to_owned(),
         ));
     }
-    // WORK_UNIT_CASE: 979/2 — retained publication read back as the exact current head.
-    watchdog_publication_observe("watchdog.publication observed");
+    if retained_candidate {
+        // WORK_UNIT_CASE: 979/8 — exact retained readback plus the current-ORS
+        // comparison above establish replay. A conflicting existing publication
+        // fails verification above and never appears as replay.
+        watchdog_publication_observe("watchdog.publication replay retained");
+    } else {
+        // WORK_UNIT_CASE: 979/2 — retained publication read back as the exact current head.
+        watchdog_publication_observe("watchdog.publication observed");
+    }
 
     // Retirement begins only after the new exact current bundle is durable.
     let observed = scan_host_watchdog_publications(host_state_root)?;
