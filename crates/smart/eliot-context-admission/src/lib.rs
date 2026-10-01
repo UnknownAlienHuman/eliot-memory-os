@@ -47,8 +47,8 @@ pub use decision::{
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use learning_gate::{
-    LearningSubject, admit_context_with_learning, screen_admission_input_learning,
-    screen_learning_subjects,
+    LearningSubject, admit_context_traced_with_learning_and_headroom, admit_context_with_learning,
+    screen_admission_input_learning, screen_learning_subjects,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -294,6 +294,27 @@ fn check_reserved_occupancy(
 /// and no admitted set, so a dependent operation can never observe a nominally
 /// complete view built without its headroom.
 pub fn admit_context_traced_with_headroom(
+    input: &AdmissionInput,
+    headroom: &HeadroomContext<'_>,
+) -> Result<HeadroomAdmissionOutcome, ContextError> {
+    // Holding a reservation is not learning authority. A marked or ticketed
+    // input still needs the governed learning checks, which this entry does not
+    // run, so the same existing guard `admit_context` applies refuses it here
+    // rather than treating learning-derived material as ordinary context. The
+    // mark is never stripped and the ticket is never ignored to make it pass;
+    // the caller uses `admit_context_traced_with_learning_and_headroom` to carry
+    // both authorities instead.
+    refuse_ungoverned_learning(input)?;
+    run_with_headroom(input, headroom)
+}
+
+/// The one bounded headroom orchestration the headroom entries share.
+///
+/// The refusal constructor, the headroom check, the refused-dimension arm and
+/// the single selection call are defined once here so a second entry cannot
+/// grow a second reservation scheme or a second selection pass. This entry
+/// selects nothing before both policies it is handed have had their say.
+pub(crate) fn run_with_headroom(
     input: &AdmissionInput,
     headroom: &HeadroomContext<'_>,
 ) -> Result<HeadroomAdmissionOutcome, ContextError> {
@@ -604,10 +625,12 @@ pub fn admit_context_traced(
 /// I12.13 headroom rule: a pipeline that can consume all currently free
 /// capacity reserves its downstream headroom through the existing Kernel
 /// resource/lease owner *before* optional filling. That owner join lives on
-/// [`admit_context_traced_with_headroom`], which additionally requires the
-/// owner-issued reservation evidence. This entry remains the unbounded
-/// reservation-free path and is not the one a production packet composition
-/// uses; see the measured runtime-consumer status on
+/// [`admit_context_traced_with_headroom`] and, when the owner also issued
+/// learning authority for the same decision, on
+/// [`admit_context_traced_with_learning_and_headroom`]; both additionally
+/// require the owner-issued reservation evidence. This entry remains the
+/// unbounded reservation-free path and is not the one a production packet
+/// composition uses; see the measured runtime-consumer status on
 /// [`admit_context_traced`].
 pub fn admit_context_traced_with_warnings(
     input: &AdmissionInput,

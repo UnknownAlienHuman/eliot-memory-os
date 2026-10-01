@@ -171,18 +171,24 @@ pub fn screen_admission_input_learning<'a>(
     screen_learning_subjects(&subjects, verified, cross_task, now_unix_secs)
 }
 
-/// Governed retrieval entrypoint: run the owner-bound carriage gate
-/// (ticket re-verification, overlay liveness, backlog backing, cross-task
-/// carryover) plus the per-mark screen, then the unchanged
-/// [`admit_context_inner`] decision.
+/// The governed learning checks, as a step that selects nothing.
 ///
-/// Inputs without learning marks and without tickets are decided exactly
-/// as before; any marked or ticketed input passes the full gate, and any
-/// failure refuses the whole retrieval before any value surfaces.
-pub fn admit_context_with_learning(
+/// Both live checks `admit_context_with_learning` performs are factored here so
+/// a composed entry can run them ahead of one selection without duplicating
+/// either rule: the owner-bound carriage gate
+/// ([`check_governed_carriage`], reached only when the input actually carries
+/// marks or tickets) and the per-mark screen
+/// ([`screen_admission_input_learning`]). Callers receive the existing typed
+/// [`ContextError`] either check already produces; this step never selects,
+/// ranks, or admits anything, so composing it ahead of a selection cannot
+/// change the selection itself.
+///
+/// An input with neither marks nor tickets skips the carriage gate exactly as
+/// before, so an ordinary packet is not asked for learning authority.
+pub(crate) fn check_governed_learning(
     input: &AdmissionInput,
     presented: PresentedLearning<'_>,
-) -> Result<AdmissionResult, ContextError> {
+) -> Result<(), ContextError> {
     let marked = input
         .candidates
         .candidates
@@ -214,6 +220,56 @@ pub fn admit_context_with_learning(
         presented.verified,
         presented.cross_task,
         presented.now_unix_secs,
-    )?;
+    )
+}
+
+/// Governed retrieval entrypoint: run the owner-bound carriage gate
+/// (ticket re-verification, overlay liveness, backlog backing, cross-task
+/// carryover) plus the per-mark screen, then the unchanged
+/// [`admit_context_inner`] decision.
+///
+/// Inputs without learning marks and without tickets are decided exactly
+/// as before; any marked or ticketed input passes the full gate, and any
+/// failure refuses the whole retrieval before any value surfaces.
+pub fn admit_context_with_learning(
+    input: &AdmissionInput,
+    presented: PresentedLearning<'_>,
+) -> Result<AdmissionResult, ContextError> {
+    check_governed_learning(input, presented)?;
     admit_context_inner(input)
+}
+
+/// Composed governed entrypoint: both required policy checks, then one
+/// selection.
+///
+/// I12.24/#1869 requires every learning-marked atom to be bound to a live
+/// Governor issuance; I12.13/#1725 requires the downstream reservation to be
+/// held back before optional filling. Neither guarantee alone covers a decision
+/// where both are applicable, because an [`AdmissionInput`] is ordinary data and
+/// not a proof that the live learning checks already ran.
+///
+/// This entry runs [`check_governed_learning`] and the headroom check, then
+/// invokes the unchanged selector exactly ONCE, and returns the material traces
+/// for THAT SAME selection. It deliberately does not call
+/// [`admit_context_with_learning`] and the headroom entry in sequence and
+/// compare their results: two selections would admit twice and prove nothing
+/// about the one actually returned.
+///
+/// The two failure vocabularies stay distinct. A learning failure keeps the
+/// typed [`ContextError`] the learning gate already returns, because there is no
+/// reservation to report limiting dimensions for; a headroom failure keeps
+/// `Ok(Refused(..))` with the limiting dimensions, because a caller narrowing
+/// the packet needs to know which reservation was withheld.
+///
+/// Both checks run before the selector, so missing, stale or cross-task learning
+/// authority refuses here even under a perfectly valid reservation, and a
+/// missing or stale reservation refuses here even under perfectly valid learning
+/// authority. Nothing is selected in either case.
+pub fn admit_context_traced_with_learning_and_headroom(
+    input: &AdmissionInput,
+    presented: PresentedLearning<'_>,
+    headroom: &crate::HeadroomContext<'_>,
+) -> Result<crate::HeadroomAdmissionOutcome, ContextError> {
+    check_governed_learning(input, presented)?;
+    crate::run_with_headroom(input, headroom)
 }

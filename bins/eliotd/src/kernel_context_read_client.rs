@@ -73,7 +73,8 @@ use std::sync::Arc;
 
 use eliot_context_admission::{
     HeadroomAdmissionOutcome, HeadroomContext, HeadroomRefusalRecord, MaterialRankTraceDelivery,
-    admit_context_traced_with_headroom, check_campaign_view_for_admission,
+    admit_context_traced_with_headroom, admit_context_traced_with_learning_and_headroom,
+    check_campaign_view_for_admission,
 };
 use eliot_context_assembly::{
     ActiveUnderstandingViewResult, AssemblyError, AssemblyPolicy, HeadroomHandoffRefusal,
@@ -102,6 +103,7 @@ use eliot_governor::{
     ROLE_CUE_ACTIVATION, ROLE_EPISTEMIC_POSITION, ROLE_EVIDENCE_ASSURANCE, ROLE_NEGATIVE_MEMORY,
     ROLE_TASK_FRAME, SevenRoleInputs,
 };
+use eliot_improvement::PresentedLearning;
 use eliot_learning_contracts::CampaignLearningStateView;
 use eliot_protocol::{
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope, HostRequestInvokeReadPayload,
@@ -1672,6 +1674,17 @@ impl KernelContextReadClient {
     /// keeps its unbound-closure gap; the per-identity account is recorded on
     /// `bins/eliotd/src/campaign_packet.rs::CampaignPacketGapCode::AdmissionClosureUnbound`.
     ///
+    /// #1869: `presented` is the owner-issued learning authority for THIS
+    /// compilation, when the owner issued any. It is the Governor's live
+    /// verified admission handle, the wire ticket it minted from the same
+    /// issuance, the overlay and production backlog it issued against, the
+    /// requesting identity, and the distinct owner-issued cross-task carryover
+    /// when the compilation is for another task. It is never synthesised here
+    /// and never defaulted: `None` is the owner's own absence of a learning
+    /// admission for this packet, not a fallback the composition chose. Its
+    /// presence is what selects the composed guarded admission entry, because
+    /// the ticket it carries is the owner record the learning gate must verify.
+    ///
     /// #1862: `campaign_view` is the validated immutable
     /// `CampaignLearningStateView` this compilation is bound to, and
     /// `context_recipe_body_digest` is the Context owner's own re-derivation of
@@ -1762,6 +1775,7 @@ impl KernelContextReadClient {
         campaign_view: &CampaignLearningStateView,
         context_recipe_body_digest: &str,
         floor: &SafetyFloorIdentity,
+        presented: Option<PresentedLearning<'_>>,
         headroom_request: &DownstreamHeadroomRequest,
         headroom_result: &DownstreamHeadroomResult,
         headroom_ledger: &HeadroomAllocationLedger,
@@ -1864,11 +1878,11 @@ impl KernelContextReadClient {
             recipe,
             &request.binding,
         )?;
-        let input = packet_admission_input(request, recipe, &candidates, &admission);
+        let input = packet_admission_input(request, recipe, &candidates, &admission, presented);
         input
             .validate()
             .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
-        let (admitted, delivery) = admit_packet_candidates(&input, &headroom)?;
+        let (admitted, delivery) = admit_packet_candidates(&input, &headroom, presented)?;
         Self::require_campaign_view_for_assembly(
             &admitted,
             campaign_view,
@@ -2001,18 +2015,27 @@ fn recheck_packet_headroom(
 /// `candidates` is the candidate stage's own result and the floor, priority,
 /// rule, measurement profile, omissions and measurements are exactly what
 /// [`PacketAdmissionBundle::build`] admitted.
+///
+/// `learning_tickets` is the owner-issued wire ticket when the owner issued a
+/// learning admission for this compilation and empty when it did not, so the
+/// input carries the same owner record the learning gate will re-verify
+/// against. It is never populated from anything but `presented`, and it is
+/// never emptied to make a marked packet pass.
 fn packet_admission_input(
     request: &CandidateRequest,
     recipe: &ContextRecipe,
     candidates: &ContextCandidateSetResult,
     admission: &PacketAdmissionBundle,
+    presented: Option<PresentedLearning<'_>>,
 ) -> AdmissionInput {
     AdmissionInput {
         schema_version: CONTEXT_CONTRACT_VERSION,
         binding: request.binding.clone(),
         recipe: recipe.clone(),
         candidates: candidates.set.clone(),
-        learning_tickets: Vec::new(),
+        learning_tickets: presented
+            .map(|presented| vec![presented.ticket.clone()])
+            .unwrap_or_default(),
         floor: admission.floor.clone(),
         priority: admission.priority.clone(),
         rule: admission.rule.clone(),
@@ -2053,16 +2076,41 @@ fn composition_failure(
 /// Admits one packet candidate set through the admission owner under one
 /// granted downstream reservation.
 ///
-/// Runs the admission owner's reservation-aware traced join
-/// ([`admit_context_traced_with_headroom`]) over the caller-built
-/// [`AdmissionInput`] and the caller's owner-issued headroom evidence. The pure
-/// compiler reads the owner-issued permit bindings out of that evidence and
-/// performs no I/O; the reservation owner stays the only party that can release
-/// or reconcile them.
+/// Chooses the guarded admission entry from owner-issued evidence.
 ///
-/// A refused reservation returns [`PacketCompositionError::HeadroomRefused`]
-/// carrying the attempted recipe and binding, so no admitted set and no
-/// nominally complete view exist for a dependent operation to observe.
+/// The choice is made on the owner record that reached this route, never on a
+/// preference between two functions. `presented` is the owner's own learning
+/// authority for this compilation: `Some` exists only when the Governor issued
+/// a learning admission and the caller re-verified it live against the current
+/// owner epoch/generation/fence (`eliot_governor::VerifiedLearningAdmission`
+/// has no other constructor). That fact decides the entry:
+///
+/// - `Some` ⇒ [`admit_context_traced_with_learning_and_headroom`]. The packet
+///   carries owner-issued learning authority, so BOTH guarantees apply at once:
+///   I12.24/#1869 requires the learning gate and I12.13/#1725 requires the
+///   reservation held back before optional filling. The composed entry runs
+///   both checks and then invokes the selector exactly ONCE, and returns the
+///   rank traces for that same selection. The single-check entry is not
+///   equivalent here: it runs the learning gate's refusal instead of its
+///   verification, so it would refuse this packet outright.
+/// - `None` ⇒ the owner issued no learning admission for this compilation, so
+///   there is no learning authority to verify and the reservation-only join
+///   [`admit_context_traced_with_headroom`] is the applicable one. It still
+///   refuses an input that carries learning marks or tickets (typed, as
+///   `learning.governed_path_required`), so a packet that needs governed
+///   learning cannot slip through this arm by arriving without the authority.
+///
+/// No arm falls back to the other. In particular the composed path's refusals
+/// stay refusals on this route: a learning failure keeps the admission owner's
+/// typed [`ContextError`] as [`PacketCompositionError::Admission`], and a
+/// withheld reservation keeps the typed
+/// [`PacketCompositionError::HeadroomRefused`] record. Neither is retried
+/// through `admit_context_traced_with_headroom`, which would silently downgrade
+/// a governed refusal into an ordinary headroom-only decision.
+///
+/// The pure compiler reads the owner-issued permit bindings out of that
+/// evidence and performs no I/O; the reservation owner stays the only party
+/// that can release or reconcile them.
 ///
 /// I12.26: the returned [`MaterialRankTraceDelivery`] is the delivery
 /// acceptance record for this packet. It carries one handle-bound
@@ -2074,8 +2122,15 @@ fn composition_failure(
 fn admit_packet_candidates(
     input: &AdmissionInput,
     headroom: &HeadroomContext<'_>,
+    presented: Option<PresentedLearning<'_>>,
 ) -> Result<(AdmittedContextSet, MaterialRankTraceDelivery), PacketCompositionError> {
-    let (result, traces) = match admit_context_traced_with_headroom(input, headroom)
+    let guarded = match presented {
+        Some(presented) => {
+            admit_context_traced_with_learning_and_headroom(input, presented, headroom)
+        }
+        None => admit_context_traced_with_headroom(input, headroom),
+    };
+    let (result, traces) = match guarded
         .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?
     {
         HeadroomAdmissionOutcome::Admitted { result, traces, .. } => (*result, traces),
