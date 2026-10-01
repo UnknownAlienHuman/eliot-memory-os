@@ -523,10 +523,7 @@ impl OwnerRole {
 /// the closed accepted sets stay the explicit component policy, and the
 /// canonical role matrix stays an additional admission check applied on top of
 /// it (see [`check_role_permits_effect`]).
-const fn requires_separate_cutover_admission(
-    owner: OwnerRole,
-    op: BackupOperationKind,
-) -> bool {
+const fn requires_separate_cutover_admission(owner: OwnerRole, op: BackupOperationKind) -> bool {
     match op {
         BackupOperationKind::AdmitCutover => match owner {
             OwnerRole::Host => true,
