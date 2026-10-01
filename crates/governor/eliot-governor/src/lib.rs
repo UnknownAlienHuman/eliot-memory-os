@@ -71,8 +71,14 @@ pub use cue_composition::{
 pub use epistemic_composition::{GovernorEpistemicComposition, ObservedEpistemicProposal};
 pub use experience_commit::{commit_experience_bank, commit_experience_feedback};
 pub use finish_attempt::{
-    FinishAttemptError, GOVERNOR_SCOPE_ID, GovernorFinishAttempt, PreparedFinishDecision,
-    PreparedKernelExchange,
+    FinishAttemptError, GOVERNOR_SCOPE_ID, GovernorFinishAttempt, KERNEL_CHANGE_TRANSFER_FILE_NAME,
+    KERNEL_CHANGE_TRANSFER_FORMAT_VERSION, KERNEL_CHANGE_TRANSFER_PROJECTION, KernelObservationTransfer,
+    KernelTransferEvidenceClass, KernelTransferHintOrigin, KernelTransferHydration,
+    KernelTransferredGovernedOriginal, KernelTransferredPendingHint,
+    KernelTransferredReconciliation, KernelTransferredResourceTip,
+    KernelTransferredUnknownChange, PreparedFinishDecision, PreparedKernelExchange,
+    hydrate_change_monitor_from_kernel_transfer, parse_kernel_change_transfer,
+    read_kernel_change_transfer_file, resolve_anchored_review,
 };
 pub use governor_authority_projection::{GovernorAuthorityProjection, LiveGovernorAuthority};
 pub use module_registry_admission::{ModuleCatalogOwnerReadback, ModuleRegistryAdmissionError};
