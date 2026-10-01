@@ -1,0 +1,52 @@
+{
+  "case": "985/A12",
+  "objective": "actual cross-child forced failure produces one terminal event and unchanged return/receipt/cleanup",
+  "correlation_contract": "The same tx/effect/request token binds a terminal record to its own operation's subordinate records; stage order across records is descriptive only, so two concurrent operations never mix. (Package D acceptance, #889 TASK: two concurrent operations do not mix; one injected nested failure gives exactly one terminal with the same return/receipt/cleanup; enabled/disabled/failing sink does not change semantics.)",
+  "operations": {
+    "alpha": {
+      "installation": "installation-7",
+      "generation": 7,
+      "process": 7011,
+      "console_request": "stop",
+      "operation": "service_stop",
+      "tx": "tx-985-alpha",
+      "effect": "eff-985-alpha",
+      "req": "req-985-alpha"
+    },
+    "beta": {
+      "installation": "installation-9",
+      "generation": 9,
+      "process": 9011,
+      "console_request": "status",
+      "operation_missing": true,
+      "tx": "tx-985-beta",
+      "effect": "eff-985-beta",
+      "req": "req-985-beta"
+    }
+  },
+  "forced_failure": {
+    "malformed_argv": ["--bogus-flag-985"],
+    "nested_site": "HostLaunchOptions::parse",
+    "nested_site_marker": "host.launch-options parse typed rejection",
+    "reason": "platform",
+    "evidence": "failed",
+    "terminal_event": "host.terminal_error",
+    "terminal_code": "console_failed",
+    "terminal_contract_sentence": "One underlying failed operation yields exactly one terminal record here",
+    "lib_terminal_guard": "observe_terminal_error(host_lifecycle_frozen_event",
+    "subordinate_event": "host.request",
+    "phase_event": "host.entrypoint_stage"
+  },
+  "receipt": {
+    "exit": 2,
+    "status": "error",
+    "stdout_marks_absent": ["host.terminal_error", "host.request", "host.entrypoint_stage", "event_log"]
+  },
+  "sink": {
+    "unavailable_outcome": "event_log_unavailable",
+    "unavailable_note": "host.event_log_sink_unavailable",
+    "fixed_source": "EliotHost",
+    "failure_event_id": 102
+  },
+  "ceiling": "Field-level tx/effect/request/fence slots on the terminal record arrive with #889 observe_phase_projection/observe_terminal_projection (fix/889-correlation-projection-W1a) and the sink-availability arms (fix/889-sink-availability-W1b); this oracle reuses the same HostRequestProjection type with no second scheme and adopts those symbols without changing the contract."
+}
