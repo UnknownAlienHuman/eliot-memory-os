@@ -103,6 +103,7 @@ use eliot_store_api::{
     RecoveryRecord, RecoveryRecordKey, RequestMeta, ReservedWriteRequest, RestoreValidationReceipt,
     RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, StoreError,
     StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
+    StoreWorkScopeOwnerRequest, StoreWorkScopeOwnerResponse,
     WriteReceiptStatus, WriteSubmission, admit_write_submission, canonical_request_hash,
     dreamer_job_queue_key, generated_operation_manifests, operation_manifest_set_digest,
     verify_canonical_request_hash,
@@ -8230,6 +8231,108 @@ impl KernelStoreGateway {
         .map_err(|error| error.to_string());
         drop(lease);
         result
+    }
+
+    /// Replaces the one durable WorkScope owner row by a fenced CAS and
+    /// returns only after the exact canonical record is visible on a same-
+    /// fence named recovery read. The Store remains the owner of persistence;
+    /// this gateway owns the active-route, source, lease, and readback checks.
+    pub async fn write_work_scope_owner(
+        &self,
+        context: &RequestMeta,
+        request: StoreWorkScopeOwnerRequest,
+    ) -> Result<StoreWorkScopeOwnerResponse, String> {
+        let _flight = self.flight.enter().map_err(|error| error.to_string())?;
+        if self.is_fenced() {
+            return Err("canonical-store gateway is fenced for rebind".to_owned());
+        }
+        self.refuse_shadow_mutation()?;
+        context.validate().map_err(|error| error.to_string())?;
+        request
+            .validate_for_context(context)
+            .map_err(|error| error.to_string())?;
+        if context.source_id.as_str() != ACTIVE_DAEMON_CALLER {
+            return Err("WorkScope owner caller is not the active daemon".to_owned());
+        }
+        self.validate_active_route(&context.state_fence)?;
+        if request.state_fence != context.state_fence {
+            return Err("WorkScope owner request fence does not match request metadata".to_owned());
+        }
+        let lease = {
+            let service = self
+                .service
+                .lock()
+                .map_err(|_| "Kernel service lock poisoned".to_owned())?;
+            if service.generation_fenced() {
+                return Err("Kernel generation is fenced".to_owned());
+            }
+            let lease = service
+                .acquire_admission()
+                .map_err(|error| error.to_string())?;
+            if lease.authority_epoch() != request.state_fence.authority_epoch {
+                return Err("WorkScope owner route authority epoch is stale".to_owned());
+            }
+            lease
+        };
+        if self.is_fenced() {
+            return Err("canonical-store gateway is fenced for rebind".to_owned());
+        }
+        let current = self
+            .store
+            .recovery(StoreRecoveryRequest {
+                contract_version: request.contract_version,
+                state_fence: request.state_fence.clone(),
+                records: vec![eliot_store_api::RecoveryRecordKey::new(
+                    "owner",
+                    "work_scope",
+                )
+                .map_err(|error| error.to_string())?],
+                include_receipts: false,
+                include_jobs: false,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        if current.state_fence != request.state_fence
+            || !matches!(current.owner_records.as_slice(), [record] if record.revision == request.expected_owner_revision)
+        {
+            return Err("current WorkScope owner revision does not match the admitted CAS".to_owned());
+        }
+        let expected_record = request.owner_record.clone();
+        let response = self
+            .store
+            .write_work_scope_owner(context, request.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        if response.record != expected_record {
+            drop(lease);
+            return Err("Store WorkScope owner response does not match the admitted record".to_owned());
+        }
+        // The provider response is not the Kernel's final evidence. Read the
+        // named record back through the ordinary recovery port while the
+        // admitted lease and fence are still held.
+        let snapshot = self
+            .store
+            .recovery(StoreRecoveryRequest {
+                contract_version: request.contract_version,
+                state_fence: request.state_fence.clone(),
+                records: vec![eliot_store_api::RecoveryRecordKey::new(
+                    "owner",
+                    "work_scope",
+                )
+                .map_err(|error| error.to_string())?],
+                include_receipts: false,
+                include_jobs: false,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        let same_record = matches!(snapshot.owner_records.as_slice(), [record] if record == &expected_record);
+        drop(lease);
+        if !same_record || snapshot.state_fence != request.state_fence {
+            return Err("WorkScope owner readback does not match the admitted record and fence".to_owned());
+        }
+        Ok(StoreWorkScopeOwnerResponse {
+            record: expected_record,
+        })
     }
 
     /// Applies one closed Dreamer ledger operation through the active Kernel

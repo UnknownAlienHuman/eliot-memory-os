@@ -27,7 +27,8 @@ use eliot_store_api::{
     RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SnapshotBeginRequest,
     SnapshotCursor, SnapshotEndReceipt, SnapshotHandle, SnapshotPage, StoreBackupStatus,
     StoreError, StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot,
-    StoreRequest, StoreResponse, StoreWireError, WriteReceipt, dreamer_job_capability,
+    StoreRequest, StoreResponse, StoreWireError, StoreWorkScopeOwnerRequest,
+    StoreWorkScopeOwnerResponse, WriteReceipt, dreamer_job_capability,
     map_durable_error, validate_genesis_receipt_envelope, verify_canonical_request_hash,
     verify_ordering_scope_binding,
 };
@@ -834,7 +835,7 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
                     request: request.clone(),
                 },
                 Some(context),
-                &request.idempotency_key,
+                context.request_id.as_str(),
             )
             .await;
         match result {
@@ -849,6 +850,64 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
             // admitted operation in `execute_raw`; reconcile exactly it.
             Err(error) if error.is_unknown_outcome_failure() => {
                 self.reconcile_genesis(context, &request).await
+            }
+            Err(error) => Err(error.into_store_error()),
+        }
+    }
+
+    async fn write_work_scope_owner(
+        &self,
+        context: &RequestMeta,
+        request: StoreWorkScopeOwnerRequest,
+    ) -> Result<StoreWorkScopeOwnerResponse, StoreError> {
+        request.validate_for_context(context)?;
+        self.validate_requirement_fence(&context.state_fence)?;
+        self.validate_requirement_fence(&request.state_fence)?;
+        let requested_record = request.owner_record.clone();
+        let expected_revision = request.expected_owner_revision;
+        let state_fence = request.state_fence.clone();
+        let response = self
+            .execute_raw(
+                StoreRequest::WriteWorkScopeOwner {
+                    context: context.clone(),
+                    request: request.clone(),
+                },
+                Some(context),
+                context.request_id.as_str(),
+            )
+            .await;
+        match response {
+            Ok(StoreResponse::WorkScopeOwner { response })
+                if response.record == requested_record =>
+            {
+                response.validate_for_request(&request)?;
+                Ok(response)
+            }
+            Ok(StoreResponse::WorkScopeOwner { .. }) | Ok(_) => Err(StoreError::InvalidReceipt),
+            Err(RequestFailure::Unknown { .. }) => {
+                // The CAS may have committed before its response was lost.
+                // Reconcile only through a same-fence named WorkScope owner
+                // read; never submit the mutation again on an uncertain answer.
+                let snapshot = self
+                    .recovery(StoreRecoveryRequest {
+                        contract_version: request.contract_version,
+                        state_fence,
+                        records: vec![RecoveryRecordKey::new("owner", "work_scope")?],
+                        include_receipts: false,
+                        include_jobs: false,
+                    })
+                    .await?;
+                match snapshot.owner_records.as_slice() {
+                    [record]
+                        if record == &requested_record
+                            && record.revision == expected_revision.saturating_add(1) =>
+                    {
+                        Ok(StoreWorkScopeOwnerResponse {
+                            record: record.clone(),
+                        })
+                    }
+                    _ => Err(StoreError::IdentityConflict),
+                }
             }
             Err(error) => Err(error.into_store_error()),
         }
