@@ -395,6 +395,20 @@ async fn dispatch_named_request(store: &StoreComposition, request: NamedReadRequ
     }
 }
 
+async fn dispatch_genesis_request(
+    composition: &StoreComposition,
+    context: RequestMeta,
+    request: StoreGenesisRequest,
+) -> Response {
+    let result = CanonicalStoreClient::initialize_genesis(
+        &composition.store,
+        &context,
+        request.clone(),
+    )
+    .await;
+    map_genesis_dispatch_result(&context, &request, result)
+}
+
 /// Classifies one closed request as a canonical mutation and returns its typed
 /// failure identity context, or `None` for the health/readiness/read surfaces.
 ///
@@ -717,13 +731,7 @@ impl StoreDispatchBackend for StoreComposition {
                 map_recovery_dispatch_result(&request, result)
             }
             Request::InitializeGenesis { context, request } => {
-                let result = CanonicalStoreClient::initialize_genesis(
-                    &self.store,
-                    &context,
-                    request.clone(),
-                )
-                .await;
-                map_genesis_dispatch_result(&context, &request, result)
+                dispatch_genesis_request(self, context, request).await
             }
             Request::DreamerJob { context, request } => {
                 // Boxed: the ledger request/response futures hold
