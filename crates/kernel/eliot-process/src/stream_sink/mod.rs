@@ -250,6 +250,8 @@ pub enum ProcessStreamSinkError {
     EvidenceInvariant { reason: String },
     #[error("provider unavailable before an exact session result")]
     ProviderUnavailable,
+    #[error("process-stream operation outcome is unknown and requires exact reconciliation")]
+    UnknownOutcome,
     #[error("serialization failed for {field}: {reason}")]
     Serialization { field: &'static str, reason: String },
 }
