@@ -418,12 +418,16 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
                 // is in hand never invalidates the answer, but the transport
                 // that carried it is not reused: it is aborted, and an
                 // incomplete abort is reported as a cleanup limitation under
-                // the same identity, never as an unknown owner outcome.
+                // the same identity, never as an unknown owner outcome. The
+                // settled answer travels ON that limitation: it is the same
+                // validated value this method would have returned, so the
+                // caller processes the owner outcome first and reports the
+                // local cleanup separately instead of discarding the answer.
                 if (budget.IsExpired
                     && !await AbortConnectionAsync(connection, OperatorHandoffInvalidation.PipeLost, OperatorExchangeStages.Cleanup).ConfigureAwait(false))
                 {
-                    throw new OperatorCleanupIncompleteException(
-                        operationScope, tool, OperatorFaultReason.RequestTimeout, OperatorExchangeStages.Cleanup, ownerAnswerObserved: true);
+                    throw new OperatorCleanupIncompleteException<T>(
+                        operationScope, tool, OperatorFaultReason.RequestTimeout, OperatorExchangeStages.Cleanup, value);
                 }
                 return value;
             }
@@ -437,9 +441,11 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
                 await AbortQuietlyAsync(connection).ConfigureAwait(false);
                 throw;
             }
-            catch (OperatorCleanupIncompleteException)
+            catch (OperatorCleanupIncompleteException<T>)
             {
-                // The transport was already aborted by the cleanup path.
+                // The transport was already aborted by the cleanup path, and
+                // the settled owner answer travels on the fault itself for
+                // the caller to process.
                 throw;
             }
             catch (OperationCanceledException)
@@ -862,21 +868,45 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
 
     private void RetainCompletion(Task completion)
     {
-        // Root the completion until it is observed, then forget it: a
-        // timed-out writer disposal is neither abandoned nor accumulated.
+        // Root the completion until ITS OWN continuation has observed it,
+        // then forget exactly it: a timed-out writer disposal is neither
+        // abandoned nor accumulated. A completion that already finished is
+        // observed inline and never rooted, and every add first evicts the
+        // entries whose own task has since completed, so the set holds only
+        // still-unwinding completions. Each entry is the one pending
+        // writer-disposal completion `DisposeStreamsAsync` already raced
+        // against the finite, explicitly accounted
+        // [`TeardownAllowanceSeconds`], and its own continuation removes it
+        // the moment that exact task completes: no entry outlives its task,
+        // and no blanket clear can drop an unobserved one.
         lock (_retainedGate)
         {
+            _retainedCompletions.RemoveAll(static pending => pending.IsCompleted);
+            if (completion.IsCompleted)
+            {
+                _ = completion.Exception;
+                return;
+            }
             _retainedCompletions.Add(completion);
         }
-        completion.ContinueWith(
-            static pending => { _ = pending.Exception; },
+        // THAT task removes ITSELF once THIS continuation has observed its
+        // completion or exception. The adding thread never removes: removal
+        // is the observation of that exact task, never a second lock beside
+        // the registration.
+        _ = completion.ContinueWith(
+            static (finished, state) =>
+            {
+                _ = finished.Exception;
+                var (owner, retained) = ((GovernorPipeClient, Task))state!;
+                lock (owner._retainedGate)
+                {
+                    owner._retainedCompletions.Remove(retained);
+                }
+            },
+            (this, completion),
             CancellationToken.None,
             TaskContinuationOptions.ExecuteSynchronously,
             TaskScheduler.Default);
-        lock (_retainedGate)
-        {
-            _retainedCompletions.Remove(completion);
-        }
     }
 
     /// Disposal is a bounded lifecycle transition.
