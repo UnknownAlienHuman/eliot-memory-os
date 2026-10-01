@@ -655,7 +655,10 @@ pub(super) fn persist_runtime_restart_pending(
                     // An earlier attempt may have linked this record and then failed its
                     // directory sync; confirm the entry is durable before treating it as published.
                     sync_runtime_restart_store_dir(&dir)?;
-                    host_restart_observe("host.restart pending replay observed");
+                    // F-LOG-HOST-6 (#981) defect 6: no observation here. The
+                    // common tail below emits the single terminal phase, which
+                    // branches on `Created | Replay` so one replay never reads
+                    // as both readback and fresh publication.
                     Ok(RuntimeRestartPendingPublication::Replay)
                 } else {
                     Err(HostError::RecoveryRequired(
@@ -700,7 +703,17 @@ pub(super) fn persist_runtime_restart_pending(
             sync_after_cleanup?;
             #[cfg(all(test, windows))]
             ordering::record("pending_publication_complete");
-            host_restart_observe("host.restart pending published observed");
+            // F-LOG-HOST-6 (#981) defect 6: carry the `Created | Replay`
+            // disposition through the complete cleanup path. One replay emits
+            // one readback terminal, never a fresh publication.
+            match value {
+                RuntimeRestartPendingPublication::Created => {
+                    host_restart_observe("host.restart pending published observed");
+                }
+                RuntimeRestartPendingPublication::Replay => {
+                    host_restart_observe("host.restart pending replay observed");
+                }
+            }
             Ok(value)
         }
     }
@@ -775,7 +788,7 @@ pub(super) fn persist_runtime_restart_receipt(
                 sync_runtime_restart_store_dir(&dir)?;
                 #[cfg(all(test, windows))]
                 ordering::record("receipt_publication_dir_sync_success");
-                Ok(())
+                Ok(false)
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 let bytes =
@@ -792,8 +805,10 @@ pub(super) fn persist_runtime_restart_receipt(
                     // An earlier attempt may have linked this record and then failed its
                     // directory sync; confirm the entry is durable before treating it as published.
                     sync_runtime_restart_store_dir(&dir)?;
-                    host_restart_observe("host.restart receipt replay observed");
-                    Ok(())
+                    // F-LOG-HOST-6 (#981) defect 6: no observation here. The
+                    // tail below emits the single terminal phase so one replay
+                    // never reads as both readback and fresh publication.
+                    Ok(true)
                 } else {
                     Err(HostError::RecoveryRequired(
                         "existing runtime restart receipt conflicts with reconstructed authority"
@@ -819,11 +834,13 @@ pub(super) fn persist_runtime_restart_receipt(
         }
     }
     // Publication failure is primary; cleanup cannot rename it as success.
-    let () = match publication {
+    // `replayed` carries the create-race `Replay` disposition through the
+    // complete cleanup path (F-LOG-HOST-6 #981 defect 6).
+    let replayed = match publication {
         Err(error) => return Err(error),
-        Ok(()) => match cleanup {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(replayed) => match cleanup {
+            Ok(()) => replayed,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => replayed,
             Err(error) => {
                 return Err(HostError::RecoveryRequired(format!(
                     "runtime restart receipt temporary cleanup failed: {error}"
@@ -834,9 +851,30 @@ pub(super) fn persist_runtime_restart_receipt(
     sync_after_cleanup?;
     #[cfg(all(test, windows))]
     ordering::record("receipt_durable_before_pending_remove");
+    if replayed {
+        // The receipt predates this call: re-confirm the directory entry and
+        // resume receipt-confirmed pending cleanup through the shared path,
+        // then report readback only — never a fresh publication.
+        if let Err(error) =
+            remove_receipt_confirmed_runtime_restart_pending(host_state_root, &dir, receipt)
+        {
+            host_restart_observe("host.restart receipt cleanup incomplete observed");
+            return Err(error);
+        }
+        host_restart_observe("host.restart receipt replay observed");
+        return Ok(());
+    }
     // Receipt is durable before pending removal.
     host_restart_observe("host.restart receipt durable observed");
-    remove_receipt_confirmed_runtime_restart_pending(host_state_root, &dir, receipt)?;
+    // After a durable receipt is known, a pending-cleanup failure retains
+    // "receipt committed; cleanup incomplete" instead of reading as
+    // publication failure or a second commit.
+    if let Err(error) =
+        remove_receipt_confirmed_runtime_restart_pending(host_state_root, &dir, receipt)
+    {
+        host_restart_observe("host.restart receipt cleanup incomplete observed");
+        return Err(error);
+    }
     host_restart_observe("host.restart receipt published observed");
     Ok(())
 }

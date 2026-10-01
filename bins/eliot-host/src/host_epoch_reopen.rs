@@ -179,10 +179,24 @@ pub(super) fn reopen_existing_epoch<B: JournalBackend>(
             "Host journal installation identity does not match admission".to_owned(),
         ));
     }
+    // F-LOG-HOST-6 (#981) defect 4: never infer a pending reconciliation
+    // from a readable snapshot. Zero pending transactions is an empty
+    // denominator, not a reconcile. The `NotCommitted` / `StillUnknown`
+    // observations stay distinct (defect 3) while the fail-closed caller
+    // policy is unchanged.
+    let mut pending_count = 0usize;
     for pending in current.pending_transactions()? {
+        pending_count += 1;
         match current.reconcile(&pending.transaction_id)? {
             ReconcileOutcome::Committed => {}
-            ReconcileOutcome::NotCommitted | ReconcileOutcome::StillUnknown => {
+            ReconcileOutcome::NotCommitted => {
+                host_epoch_observe("host.epoch pending not committed observed");
+                return Err(HostError::Journal(JournalError::OutcomeUnknown {
+                    transaction_id: pending.transaction_id,
+                }));
+            }
+            ReconcileOutcome::StillUnknown => {
+                host_epoch_observe("host.epoch pending unknown observed");
                 return Err(HostError::Journal(JournalError::OutcomeUnknown {
                     transaction_id: pending.transaction_id,
                 }));
@@ -190,7 +204,11 @@ pub(super) fn reopen_existing_epoch<B: JournalBackend>(
         }
     }
     let replayed = current.snapshot()?;
-    host_epoch_observe("host.epoch pending reconcile observed");
+    if pending_count == 0 {
+        host_epoch_observe("host.epoch pending empty observed");
+    } else {
+        host_epoch_observe("host.epoch pending reconcile observed");
+    }
     // An exact unresolved Store recovery contour outranks the shutdown marker:
     // a Host crash can occur between any two durable publications, and a
     // clean marker is never permission to attach a lost kill-on-close Job.
@@ -203,7 +221,13 @@ pub(super) fn reopen_existing_epoch<B: JournalBackend>(
     } else {
         StoreRecoveryStartupFence::Clear
     };
-    host_epoch_observe("host.epoch reopen fence observed");
+    // F-LOG-HOST-6 (#981) defect 4: a clear fence and an unresolved fence
+    // are different claims; one shared record cannot carry both.
+    if store_recovery_startup_fence.is_fenced() {
+        host_epoch_observe("host.epoch reopen fence unresolved observed");
+    } else {
+        host_epoch_observe("host.epoch reopen fence clear observed");
+    }
     let active_phase_b_rebind_recovery = active_phase_b_rebind_recovery_kind(active_phase_b_rebind);
     if pending.is_none()
         && active_phase_b_rebind.is_none()

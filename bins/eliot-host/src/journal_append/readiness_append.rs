@@ -25,7 +25,7 @@ use super::super::{
     AuthenticatedKernelReadiness, PublishedSupervisionIdentity, fresh_identity, operation,
 };
 use eliot_host_state::{
-    AppendReceipt, HostStateJournalService, JournalBackend, JournalError,
+    AppendDisposition, AppendReceipt, HostStateJournalService, JournalBackend, JournalError,
     KernelReadinessObservationRecord, ReadinessApprovedContour,
 };
 #[cfg(windows)]
@@ -63,6 +63,21 @@ fn host_readiness_append_observe(detail: &str) {
     );
 }
 
+/// F-LOG-HOST-6 (#981) defect 2: the readiness owner returns
+/// `AppendDisposition::Applied` for a new commit and `Replayed` for an exact
+/// existing observation. A committed replay is readback of the original
+/// evidence (I14.20, case 11), never another append.
+fn host_readiness_append_observe_receipt(receipt: &AppendReceipt) {
+    match receipt.disposition() {
+        AppendDisposition::Applied => {
+            host_readiness_append_observe("host.readiness append durable observed");
+        }
+        AppendDisposition::Replayed => {
+            host_readiness_append_observe("host.readiness append replay observed");
+        }
+    }
+}
+
 fn append_reconciled_readiness<B: JournalBackend>(
     journal: &HostStateJournalService<B>,
     observation: KernelReadinessObservationRecord,
@@ -71,15 +86,27 @@ fn append_reconciled_readiness<B: JournalBackend>(
     host_readiness_append_observe("host.readiness append requested");
     match journal.append_readiness_observation(observation.clone(), expected) {
         Ok(receipt) => {
-            host_readiness_append_observe("host.readiness append durable observed");
+            host_readiness_append_observe_receipt(&receipt);
             Ok(receipt)
         }
         Err(JournalError::OutcomeUnknown { transaction_id }) => {
             host_readiness_append_observe("host.readiness append outcome unknown observed");
             if super::reconcile_unknown_outcome(journal, &transaction_id)? {
-                journal
-                    .append_readiness_observation(observation, expected)
-                    .map_err(HostError::Journal)
+                // Reconciliation reported `Committed`: the retry re-enters the
+                // idempotent owner and must come back `Replayed`. A retry
+                // failure here means commit known, readback failed.
+                match journal.append_readiness_observation(observation, expected) {
+                    Ok(receipt) => {
+                        host_readiness_append_observe_receipt(&receipt);
+                        Ok(receipt)
+                    }
+                    Err(error) => {
+                        host_readiness_append_observe(
+                            "host.readiness reconcile committed readback failed observed",
+                        );
+                        Err(HostError::Journal(error))
+                    }
+                }
             } else {
                 // Unreachable today: the choke fails closed instead of returning
                 // `Ok(false)`. Retained fail-closed so semantics stay identical

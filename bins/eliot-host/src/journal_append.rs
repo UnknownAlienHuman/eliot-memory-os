@@ -6,7 +6,8 @@ pub(super) use readiness_append::{
 
 use super::{HostError, fresh_identity, fresh_lineage_id, operation, record_fence, sha256_json};
 use eliot_host_state::{
-    ActivationState, AppendReceipt, CleanMarker, DrainCommitRecord, DrainRecord, DrainState,
+    ActivationState, AppendDisposition, AppendReceipt, CleanMarker, DrainCommitRecord,
+    DrainRecord, DrainState,
     EliotActivationRecord, EpochTransition, FailureRecoveryDirective, HostInstallationEpoch,
     HostKernelStoreLineage, HostState, HostStateJournalService, HostStateRecord, JOURNAL_VERSION,
     JournalBackend, JournalError, JournalManifest, KernelJobBinding,
@@ -501,11 +502,36 @@ fn reconcile_unknown_outcome<B: JournalBackend>(
             host_journal_observe("host.journal reconcile committed observed");
             Ok(true)
         }
-        ReconcileOutcome::NotCommitted | ReconcileOutcome::StillUnknown => {
+        // F-LOG-HOST-6 (#981) defect 3: a known non-commit is not an unknown
+        // outcome (I14.21). The observation keeps the exact owner outcome
+        // while the caller policy stays fail-closed (`OutcomeUnknown`).
+        ReconcileOutcome::NotCommitted => {
+            host_journal_observe("host.journal reconcile not committed observed");
+            Err(HostError::Journal(JournalError::OutcomeUnknown {
+                transaction_id: transaction_id.clone(),
+            }))
+        }
+        ReconcileOutcome::StillUnknown => {
             host_journal_observe("host.journal reconcile unknown observed");
             Err(HostError::Journal(JournalError::OutcomeUnknown {
                 transaction_id: transaction_id.clone(),
             }))
+        }
+    }
+}
+
+/// F-LOG-HOST-6 (#981) defect 2: the journal owner returns
+/// `AppendDisposition::Applied` for a new commit and `Replayed` for an exact
+/// existing operation. A committed replay is readback of the original effect
+/// (I14.20, case 11), never another append, so the observation branches on
+/// the already-owned receipt disposition.
+fn host_journal_observe_append_receipt(receipt: &AppendReceipt) {
+    match receipt.disposition() {
+        AppendDisposition::Applied => {
+            host_journal_observe("host.journal append durable observed");
+        }
+        AppendDisposition::Replayed => {
+            host_journal_observe("host.journal append replay observed");
         }
     }
 }
@@ -517,13 +543,27 @@ pub(super) fn append_reconciled<B: JournalBackend>(
     host_journal_observe("host.journal append requested");
     match journal.append(record.clone()) {
         Ok(receipt) => {
-            host_journal_observe("host.journal append durable observed");
+            host_journal_observe_append_receipt(&receipt);
             Ok(receipt)
         }
         Err(JournalError::OutcomeUnknown { transaction_id }) => {
             host_journal_observe("host.journal append outcome unknown observed");
             if reconcile_unknown_outcome(journal, &transaction_id)? {
-                journal.append(record).map_err(HostError::Journal)
+                // Reconciliation reported `Committed`: the retry re-enters the
+                // idempotent append owner and must come back `Replayed`. A
+                // retry failure here means commit known, readback failed.
+                match journal.append(record) {
+                    Ok(receipt) => {
+                        host_journal_observe_append_receipt(&receipt);
+                        Ok(receipt)
+                    }
+                    Err(error) => {
+                        host_journal_observe(
+                            "host.journal reconcile committed readback failed observed",
+                        );
+                        Err(HostError::Journal(error))
+                    }
+                }
             } else {
                 // Unreachable today: the choke fails closed instead of returning
                 // `Ok(false)`. Retained fail-closed so semantics stay identical
