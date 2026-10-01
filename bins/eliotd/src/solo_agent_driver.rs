@@ -1710,6 +1710,17 @@ fn restore_solo_fabric(
 /// revoked projection still builds and the coordinator's event replay
 /// refuses it without mutation.
 ///
+/// Residual (issue #1108 A4/A5): this synchronous builder still constructs
+/// through `AdmittedProviderCapability::new` directly from presented halves,
+/// so the factory agreement gate never observes sync-restore material. The
+/// row source (`DaemonKernelClient::load_provider_claim_row_async`) is async
+/// and this builder's callers (`restore_solo_fabric` via `solo_request_cancel`,
+/// `solo_reconcile_cancel`, `solo_ingest_result`, `solo_ingest_tool_result`,
+/// `solo_restore`) are synchronous by contract, so the row cannot be resolved
+/// here without a sync-to-async conversion. The async restore path
+/// (`restore_solo_fabric_async` via `agent_fabric_restore_verified_async`)
+/// is factory-wired through `build_production_provider_capability`.
+///
 /// # Errors
 ///
 /// Returns the session-currency rejection or the coordinator owner rejection

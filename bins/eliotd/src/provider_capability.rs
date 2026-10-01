@@ -30,26 +30,23 @@
 //! diagnostics. Issue #265 catalogue/quota/liveness observations ride only in
 //! the health half: selection/health input, never admission.
 //!
-//! Residual STITCH (issue #1108 A4): this adapter still builds the sealed
-//! capability through `AdmittedProviderCapability::new` directly from
-//! operation-presented halves, so the agreement gate in
-//! `AdmittedProviderFactory::admit` never observes production material. The
-//! migration demands one input that no daemon seam returns today: the durable
-//! row as `OwnerLoadedClaimRow` from a Kernel/ORS claim read under the exact
-//! `claim_id`. `DaemonKernelClient::verify_provider_binding_async` returns no row
-//! (its receipt echoes presented values), and the ORS claim row carries no
-//! executable-digest column, so the row must not be rebuilt here from
-//! presented halves: that would make the factory gate tautological. Until the
-//! row-returning read lands, production Verified rests on the
-//! construction-time Binding probe plus the per-proof receipt/payload checks,
-//! not on factory agreement.
+//! Closed factory admission (issue #1108 A4): this adapter resolves the
+//! durable owner row as `OwnerLoadedClaimRow` through
+//! `DaemonKernelClient::load_provider_claim_row_async` under the exact
+//! `claim_id`, then admits through `AdmittedProviderFactory::new` + `admit`,
+//! so the agreement gate observes production material and fails closed with
+//! `StaleProviderBinding` unless every presented identity, digest,
+//! generation, and fence digest equals the Kernel/ORS-loaded owner row. No
+//! row is rebuilt here from presented halves: that would make the factory
+//! gate tautological. Production Verified therefore rests on the
+//! construction-time Binding probe plus the factory row agreement plus the
+//! per-proof receipt/payload checks.
 
-use eliot_agent_coordinator::{
-    AdmittedProviderCapability, OwnerCurrentness, PresentedClaimMaterial,
-};
+use eliot_agent_coordinator::{AdmittedProviderCapability, AdmittedProviderFactory};
 use eliot_contracts::fences_match_exact;
 
 use crate::agent_fabric::FabricError;
+use crate::daemon_kernel_client::DaemonKernelClient;
 use crate::provider_admission::ProviderAdmission;
 use crate::solo_agent_driver::SoloClaimedHalves;
 
@@ -58,24 +55,30 @@ use crate::solo_agent_driver::SoloClaimedHalves;
 ///
 /// Content comparison first: every presented field in the session-bound
 /// admission must equal the operation-presented halves the driver is
-/// currently driving (`claimed`). Only then are the admission halves
-/// forwarded into the existing presented/owner capability boundary, which
-/// fails closed on any presented-versus-owner disagreement or owner
-/// rejection. The capability is therefore bound to installation (session
-/// facts), principal/session (session binding), route and capacity revisions,
+/// currently driving (`claimed`). Only then is the durable owner row resolved
+/// through the authenticated Kernel claim-row read under the exact `claim_id`,
+/// and the admission halves are forwarded into the closed
+/// [`AdmittedProviderFactory`](eliot_agent_coordinator::AdmittedProviderFactory),
+/// which proves them equal to the loaded owner row before the existing
+/// presented/owner capability boundary judges shape, coherence, and currency.
+/// The capability is therefore bound to installation (session facts),
+/// principal/session (session binding), route and capacity revisions,
 /// worker generation, Authority Epoch, State Fence, and freshness (live fence
 /// re-queried per admission construction) — and to this operation's exact
-/// identities and digests.
+/// identities and digests, witnessed against the durable row.
 ///
 /// # Errors
 ///
 /// Returns [`FabricError::IdentityConflict`] when the bound admission content
 /// differs from the operation at hand in identity, claim/attempt/operation
 /// identity, binding digest, revision, worker generation, or presented fence;
-/// otherwise returns the coordinator owner rejection unchanged (shape,
-/// coherence, or stale/revoked binding) through
-/// [`FabricError::Coordinator`] or [`FabricError::Contract`].
-pub fn admit_provider_capability(
+/// returns [`FabricError::Contract`] when the Kernel row read fails closed
+/// (no live session, transport refusal, unsealed or misbound reply);
+/// otherwise returns the factory/coordinator owner rejection unchanged
+/// (row disagreement as `StaleProviderBinding`, shape, coherence, or
+/// stale/revoked binding) through [`FabricError::Coordinator`].
+pub async fn admit_provider_capability(
+    kernel: &DaemonKernelClient,
     admission: &ProviderAdmission,
     claimed: &SoloClaimedHalves,
 ) -> Result<AdmittedProviderCapability, FabricError> {
@@ -98,7 +101,14 @@ pub fn admit_provider_capability(
                 .to_owned(),
         ));
     }
-    let presented = PresentedClaimMaterial::new(
+    let loaded = kernel
+        .load_provider_claim_row_async(&material.claim_id)
+        .await
+        .map_err(|error| {
+            FabricError::Contract(format!("provider claim-row read refused: {error}"))
+        })?;
+    Ok(AdmittedProviderFactory::new(loaded).admit(
+        material.identity.clone(),
         material.claim_id.clone(),
         material.attempt_id.clone(),
         material.operation_id.clone(),
@@ -108,13 +118,8 @@ pub fn admit_provider_capability(
         material.capacity_revision.clone(),
         material.worker_generation,
         material.presented_fence.clone(),
-    )?;
-    let currentness =
-        OwnerCurrentness::new(material.expectation.clone(), material.live_fence.clone())?;
-    Ok(AdmittedProviderCapability::new(
-        material.identity.clone(),
-        presented,
-        currentness,
+        material.expectation.clone(),
+        material.live_fence.clone(),
         material.health.clone(),
         material.minimum_event_sequence,
     )?)

@@ -3520,8 +3520,10 @@ impl DaemonComposition {
     /// (session-half overwrite + owner validation) and
     /// [`crate::provider_capability::admit_provider_capability`]
     /// (per-operation content comparison against the driven `claimed`
-    /// halves): the only production path from resolved material to the
-    /// coordinator's closed admission. The `health` half rides input-only
+    /// halves, then the durable Kernel/ORS row read under the exact
+    /// `claim_id` plus the closed-factory agreement gate): the only
+    /// production path from resolved material to the coordinator's closed
+    /// admission. The `health` half rides input-only
     /// into the capability and never mints admission (issue #265, W6).
     ///
     /// Projects already-verified material only: the caller runs the
@@ -3534,8 +3536,10 @@ impl DaemonComposition {
     /// # Errors
     ///
     /// Returns the closed-port validation, the per-operation identity
-    /// conflict, or the coordinator owner rejection unchanged, each typed.
-    fn build_production_provider_capability(
+    /// conflict, the Kernel row-read refusal, or the coordinator owner
+    /// rejection unchanged, each typed.
+    async fn build_production_provider_capability(
+        kernel: &crate::daemon_kernel_client::DaemonKernelClient,
         material: VerifiedProviderMaterial,
         owner: &crate::daemon_kernel_client::OwnerSessionFacts,
         live_fence: eliot_contracts::StateFence,
@@ -3543,7 +3547,7 @@ impl DaemonComposition {
     ) -> Result<eliot_agent_coordinator::AdmittedProviderCapability, FabricError> {
         let admission =
             crate::provider_admission::ProviderAdmission::new(material, owner, live_fence)?;
-        crate::provider_capability::admit_provider_capability(&admission, claimed)
+        crate::provider_capability::admit_provider_capability(kernel, &admission, claimed).await
     }
 
     /// Constructs the production fabric on a sealed admitted provider
@@ -3595,8 +3599,10 @@ impl DaemonComposition {
             .verify_provider_binding_async(&material)
             .await
             .map_err(|error| DaemonError::Kernel(error.to_string()))?;
-        let capability =
-            Self::build_production_provider_capability(material, &owner, live_fence, claimed)?;
+        let capability = Self::build_production_provider_capability(
+            kernel, material, &owner, live_fence, claimed,
+        )
+        .await?;
         let config = daemon_coordinator_config()?;
         Ok(AgentFabric::new_with_admitted_provider(
             config, ports, capability,
@@ -3693,8 +3699,10 @@ impl DaemonComposition {
             .verify_provider_binding_async(&material)
             .await
             .map_err(|error| DaemonError::Kernel(error.to_string()))?;
-        let capability =
-            Self::build_production_provider_capability(material, &owner, live_fence, claimed)?;
+        let capability = Self::build_production_provider_capability(
+            kernel, material, &owner, live_fence, claimed,
+        )
+        .await?;
         let config = daemon_coordinator_config()?;
         let store = crate::semantic_revision_store::SemanticRevisionStore::new(self.state_root());
         Ok(AgentFabric::restore_with_admitted_provider(
