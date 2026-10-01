@@ -547,6 +547,90 @@ pub fn dispatch_lifecycle_cancel(
     Ok(registry.cancel_stable(&identity.cancellation_id))
 }
 
+/// Applies one lifecycle control frame as an explicit transition on the
+/// module-lifecycle owner (W4: quiesce/checkpoint/restore/drain/shutdown/
+/// fatal plus the correlated `Start` resume).
+///
+/// The frame is routed through [`eliot_protocol::ModuleLifecycle::apply`]:
+/// validation, phase gating, checkpoint retention, drain reporting and the
+/// restart-correlation check all live in that owner. This dispatcher never
+/// infers phase from process state and never touches any other owner.
+/// A post-restart frame carrying a fresh uncorrelated idempotency key is
+/// rejected by the owner as [`ProtocolError::InvalidField`].
+///
+/// # Errors
+///
+/// Returns the owner's typed protocol failure for invalid frames,
+/// non-control messages, illegal phase moves, missing checkpoints and
+/// uncorrelated restarts.
+pub fn dispatch_lifecycle_control(
+    frame: &Frame,
+    lifecycle: &mut eliot_protocol::ModuleLifecycle,
+) -> Result<eliot_protocol::ModuleControlEffect, TransportError> {
+    lifecycle
+        .apply(frame)
+        .map_err(TransportError::Protocol)
+}
+
+/// Observes one lifecycle `Execute` frame by idempotency identity (A2).
+///
+/// The frame is routed through the lifecycle-owned
+/// [`eliot_protocol::LifecycleExecuteLedger::observe`]: the first
+/// `request_id` per `idempotency_key` is retained and replayed, so a retried
+/// `Execute` with the same identity observes the prior disposition instead
+/// of a second effect. This dispatcher mints no identity and performs no
+/// effect itself.
+///
+/// # Errors
+///
+/// Returns the owner's typed protocol failure for invalid frames and for
+/// frames that are not lifecycle `Execute` requests.
+pub fn dispatch_lifecycle_execute(
+    frame: &Frame,
+    ledger: &mut eliot_protocol::LifecycleExecuteLedger,
+) -> Result<eliot_protocol::LifecycleExecuteDisposition, TransportError> {
+    ledger.observe(frame).map_err(TransportError::Protocol)
+}
+
+/// Records a deadline expiry for one lifecycle request frame (A3).
+///
+/// The frame must be a validated `Request` carrying its `RequestIdentity`;
+/// any other kind or an invalid frame is rejected with the existing typed
+/// protocol failure and never touches the registry. The presented
+/// `RequestIdentity.cancellation_id` is applied through the existing
+/// [`CancellationRegistry::expire`] point, so the recorded terminal is
+/// [`CancellationState::Expired`]: distinguishable from the explicit-cancel
+/// [`CancellationState::Cancelled`] terminal recorded by
+/// [`dispatch_lifecycle_cancel`] via [`CancellationRegistry::state`], stable
+/// across retries and reconnects. The registry is owned by the lifecycle
+/// owner, never by the fenced session, and entries persist until an explicit
+/// `reap`. An unregistered identity reports
+/// [`CancellationDisposition::Unknown`] without minting state.
+///
+/// # Errors
+///
+/// Returns the existing typed protocol failure for invalid frames,
+/// non-`Request` frames, and identities that fail validation.
+pub fn dispatch_lifecycle_expire(
+    frame: &Frame,
+    registry: &mut CancellationRegistry,
+) -> Result<CancellationDisposition, TransportError> {
+    frame.validate()?;
+    if frame.kind != FrameKind::Request {
+        return Err(TransportError::Protocol(ProtocolError::InvalidField {
+            field: "kind/message_type",
+            reason: "lifecycle expiry dispatch requires a Request frame carrying its RequestIdentity",
+        }));
+    }
+    let identity = frame.request_identity.as_ref().ok_or({
+        TransportError::Protocol(ProtocolError::InvalidField {
+            field: "request_identity",
+            reason: "required for request and cancel frames",
+        })
+    })?;
+    Ok(registry.expire(&identity.cancellation_id))
+}
+
 /// Transport failures are deliberately distinct from application outcomes.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TransportError {
