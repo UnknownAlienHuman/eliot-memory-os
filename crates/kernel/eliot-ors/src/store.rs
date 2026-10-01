@@ -12463,23 +12463,22 @@ impl RedbRecoveryStore {
     /// authorization (issue #1934, I7.23).
     ///
     /// The spelling is validated as text through the existing validator and
-    /// must equal the owner vocabulary
-    /// ([`eliot_workscope::BridgeIngestPolicyLeg::as_str`]): mere presence of
-    /// the field proves nothing, so any other spelling is a typed rejection
-    /// before any durable write.
+    /// then read with the OWNER's own vocabulary reader
+    /// ([`eliot_workscope::BridgeIngestPolicyLeg::from_wire`], the exact inverse
+    /// of its `as_str`): mere presence of the field proves nothing, so any
+    /// spelling the owner does not define is a typed rejection before any
+    /// durable write. This store keeps no leg table of its own.
     fn bridge_privacy_policy_leg(
         value: &serde_json::Value,
         field: &'static str,
     ) -> Result<eliot_workscope::BridgeIngestPolicyLeg, OrsError> {
         let spelling = bridge_text(value, field)?;
-        if spelling == eliot_workscope::BridgeIngestPolicyLeg::Unavailable.as_str() {
-            Ok(eliot_workscope::BridgeIngestPolicyLeg::Unavailable)
-        } else {
-            Err(OrsError::InvalidField {
+        eliot_workscope::BridgeIngestPolicyLeg::from_wire(&spelling).ok_or(
+            OrsError::InvalidField {
                 field,
                 reason: "privacy owner policy leg must name owner-decided evidence availability",
-            })
-        }
+            },
+        )
     }
 
     /// Re-resolves the `WorkScope` privacy owner's verdict for the staged
@@ -38228,6 +38227,64 @@ mod host_request_result_tests {
         spelling.as_str()
     }
 
+    /// The owner's ADMITTING authorization over the exact payload bytes
+    /// `payload_bytes` will be hashed over, in the owner's own wire shape.
+    ///
+    /// This is the owner AUTHORIZATION, which is then projected through the
+    /// existing `bridge_event_privacy_decision` into the staged decision the
+    /// persistence gate reads. It is deliberately not a decision handed straight
+    /// to the gate: the gate re-verifies the staged decision against the owner
+    /// rule, so a caller cannot assert a permit by passing one in.
+    ///
+    /// Every element here is evidence the OWNER rule re-derives:
+    /// - both policy legs are `Decided` — the provider-restriction and
+    ///   retention-terms owners resolved their rules for these exact bytes;
+    /// - `source_class` is a proven class the recipient grant below names, so
+    ///   grant membership holds;
+    /// - no `declared_class`, because the owner rule declares an out-of-scope
+    ///   class ONLY on a rejection — an admission carrying one would be refused
+    ///   as inconsistent with its own verdict.
+    fn admitting_privacy_authorization(payload_bytes: &[u8]) -> serde_json::Value {
+        json!({
+            "verdict": BRIDGE_EVENT_PRIVACY_ADMISSION,
+            "source_sha256": crate::model::sha256_hex(payload_bytes),
+            "scope": "b".repeat(64),
+            "policy_revision": eliot_workscope::BRIDGE_INGEST_PRIVACY_POLICY_REVISION,
+            "scope_ref": "scope-2565-permitted",
+            "source_class": "private",
+            "recipient_grant": vec!["private".to_owned()],
+            "provider_restriction": privacy_leg_wire(
+                eliot_workscope::BridgeIngestPolicyLeg::Decided
+            ),
+            "retention_terms": privacy_leg_wire(
+                eliot_workscope::BridgeIngestPolicyLeg::Decided
+            ),
+        })
+    }
+
+    /// The owner's WITHHOLDING authorization over the exact payload bytes:
+    /// the same proven-and-granted source class, but the provider-restriction
+    /// owner presented nothing for these bytes, so that leg withholds first.
+    fn undecided_leg_privacy_authorization(payload_bytes: &[u8], scope: &str) -> serde_json::Value {
+        json!({
+            "verdict": BRIDGE_EVENT_PRIVACY_REJECTION,
+            "source_sha256": crate::model::sha256_hex(payload_bytes),
+            "scope": scope,
+            "policy_revision": eliot_workscope::BRIDGE_INGEST_PRIVACY_POLICY_REVISION,
+            "declared_class":
+                eliot_workscope::BRIDGE_INGEST_WITHHELD_PROVIDER_RESTRICTION_UNDECIDED,
+            "scope_ref": "scope-2565",
+            "source_class": "private",
+            "recipient_grant": vec!["private".to_owned()],
+            "provider_restriction": privacy_leg_wire(
+                eliot_workscope::BridgeIngestPolicyLeg::Unavailable
+            ),
+            "retention_terms": privacy_leg_wire(
+                eliot_workscope::BridgeIngestPolicyLeg::Decided
+            ),
+        })
+    }
+
     /// Positive leg of issue #2565: a payload the privacy OWNER permits is
     /// persisted through the protected path, and the durable row then carries
     /// those exact bytes.
@@ -38238,51 +38295,13 @@ mod host_request_result_tests {
     /// entries the Kernel route itself calls. The store only re-verifies that
     /// decision before the raw write and never decides it.
     ///
-    /// The owner's vocabulary exposes exactly one policy-leg spelling today,
-    /// `Unavailable`, which `resolve_bridge_ingest_disclosure` treats as a
-    /// deny-only gate, so the owner withholds for every input it can currently
-    /// be given. The permit test therefore proves the permit path at the gate
-    /// that decides it: a decision that RE-VERIFIES to an admission is accepted
-    /// and its bytes are persisted, reached through a hand-built decision in the
-    /// owner's own wire shape rather than through a leg no owner can satisfy.
-    ///
-    /// The owner's ADMITTING verdict over the exact bytes `payload_bytes` will
-    /// be hashed over, in the owner's own wire shape.
-    ///
-    /// This is the owner AUTHORIZATION, which is then projected through the
-    /// existing `bridge_event_privacy_decision` into the staged decision the
-    /// persistence gate reads. It is deliberately not a decision handed straight
-    /// to the gate: the gate re-verifies the staged decision against the owner
-    /// rule, so a caller cannot assert a permit by passing one in.
-    ///
-    /// `BridgeIngestPolicyLeg` has exactly ONE variant today - `Unavailable` -
-    /// and `resolve_bridge_ingest_disclosure` treats it as a deny-only gate, so
-    /// the owner cannot currently produce an admission through that function at
-    /// all. The verdict below is therefore stated in the owner's wire shape and
-    /// the permit path is exercised at the gate that DECIDES it; the deny-only
-    /// legs are still carried verbatim, and the refusal test proves a decision
-    /// whose legs disagree with its verdict is refused.
-    fn admitting_privacy_authorization(payload_bytes: &[u8]) -> serde_json::Value {
-        json!({
-            "verdict": BRIDGE_EVENT_PRIVACY_ADMISSION,
-            "source_sha256": crate::model::sha256_hex(payload_bytes),
-            "scope": "b".repeat(64),
-            "policy_revision": eliot_workscope::BRIDGE_INGEST_PRIVACY_POLICY_REVISION,
-            // No `declared_class`: the owner rule admits a declared
-            // out-of-scope class ONLY on a rejection, so an admission that
-            // carried one would be refused as inconsistent with its own verdict.
-            "scope_ref": "scope-2565-permitted",
-            "source_class": "private",
-            "recipient_grant": vec!["private".to_owned()],
-            "provider_restriction": privacy_leg_wire(
-                eliot_workscope::BridgeIngestPolicyLeg::Unavailable
-            ),
-            "retention_terms": privacy_leg_wire(
-                eliot_workscope::BridgeIngestPolicyLeg::Unavailable
-            ),
-        })
-    }
-
+    /// The permit is REACHABLE and it is earned, never asserted: both
+    /// Governor-owned policy legs are `Decided` for these exact bytes and the
+    /// proven source class is named by the recipient grant, which is the full
+    /// evidence set `resolve_bridge_ingest_disclosure` requires before it
+    /// returns [`eliot_workscope::BridgeIngestDisclosure::Admitted`]. The
+    /// projection therefore carries `privacy_disposition: allowed`, and the
+    /// gate's own re-derivation of the same rule agrees.
     #[test]
     fn owner_admitted_payload_persists_through_the_protected_path() -> Result<(), OrsError> {
         let (store, path) = temp_store();
@@ -38293,33 +38312,19 @@ mod host_request_result_tests {
             .map_err(|error| OrsError::Encoding(error.to_string()))?;
         let source_sha256 = crate::model::sha256_hex(&bytes);
 
-        // The owner's own verdict over these exact bytes, over the only policy
-        // legs its vocabulary can express. This is what a real owner
-        // presentation looks like when the legs are undecided.
-        let authorization = json!({
-            "verdict": BRIDGE_EVENT_PRIVACY_REJECTION,
-            "source_sha256": source_sha256,
-            "scope": "a".repeat(64),
-            "policy_revision": eliot_workscope::BRIDGE_INGEST_PRIVACY_POLICY_REVISION,
-            "declared_class": eliot_workscope::BRIDGE_INGEST_WITHHELD_RETENTION_TERMS_UNDECIDED,
-            "scope_ref": "scope-2565",
-            "source_class": "private",
-            "recipient_grant": vec!["private".to_owned()],
-            "provider_restriction": privacy_leg_wire(
-                eliot_workscope::BridgeIngestPolicyLeg::Unavailable
-            ),
-            "retention_terms": privacy_leg_wire(
-                eliot_workscope::BridgeIngestPolicyLeg::Unavailable
-            ),
-        });
+        // The owner's own verdict over these exact bytes. `Decided` on both legs
+        // is the evidence the provider-restriction and retention-terms owners
+        // present, and grant membership is the rest of the owner's rule.
+        let authorization = admitting_privacy_authorization(&bytes);
         // The decision object the caller hands to the store is the owner's, not
         // the store's: it is produced by the existing decision entry.
         let privacy =
             RedbRecoveryStore::bridge_event_privacy_decision(&bytes, Some(&authorization));
         assert_eq!(
             privacy["privacy_disposition"],
-            serde_json::Value::String(BRIDGE_EVENT_PRIVACY_REDACTED.to_owned()),
-            "an owner whose legs are undecided withholds, it does not permit"
+            serde_json::Value::String(BRIDGE_EVENT_PRIVACY_ALLOWED.to_owned()),
+            "an owner whose policy legs are decided and whose grant names the proven \
+             source class admits these exact bytes"
         );
 
         let mut record = requested_fixture(operation.as_str(), &digest);
@@ -38334,24 +38339,87 @@ mod host_request_result_tests {
         // bytes, so it is the owner's projection - not the caller asserting a
         // permit - that decides whether the body may become durable. This is
         // the same staged decision the bridge-ingest path hands the store.
-        let admitted_authorization = admitting_privacy_authorization(&bytes);
-        let staged =
-            RedbRecoveryStore::bridge_event_privacy_decision(&bytes, Some(&admitted_authorization));
-        // The permit path is currently UNREACHABLE, and this asserts that
-        // honestly instead of asserting a permit that cannot happen.
-        // `BridgeIngestPolicyLeg` has one variant, `Unavailable`, which the
-        // owner rule treats as deny-only, so the store's own re-derivation
-        // refuses a presented admission verdict: a caller cannot assert a permit
-        // by passing one in. When eliot-workscope gains a permitting leg this
-        // arm becomes reachable and THIS assertion is what must change - it is
-        // written to fail loudly rather than silently pass at that point.
-        let refused =
-            RedbRecoveryStore::permit_host_request_payload_persistence(&bytes, Some(&staged));
+        RedbRecoveryStore::permit_host_request_payload_persistence(&bytes, Some(&privacy))?;
+        let bound = store
+            .bind_host_request_payload(&operation, &digest, &body, Some(&privacy))?
+            .expect("admitted row must bind its payload");
+        assert_eq!(
+            bound.payload_body.as_ref(),
+            Some(&body),
+            "an owner-admitted payload becomes durable with its exact bytes"
+        );
+        // The durable row is the proof the write really happened, read back
+        // through the ordinary load entry rather than the in-memory return.
+        let loaded = store
+            .load_host_request(&operation, &digest)?
+            .expect("staged row must still load");
+        assert_eq!(
+            loaded.payload_body.as_ref(),
+            Some(&body),
+            "the permitted payload survives as the durable executable input"
+        );
+        drop(store);
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    /// Refusal leg of issue #2565: a permit is EARNED, so the same payload is
+    /// still refused when one of the owner's policy legs withholds it, even
+    /// though the verdict claims an admission.
+    ///
+    /// This is the forgeability arm: a caller that presents an admission whose
+    /// staged legs do not re-derive to one cannot buy raw persistence by
+    /// passing it in. The refusal is typed and leaves nothing durable.
+    #[test]
+    fn presented_admission_with_an_undecided_leg_is_refused() -> Result<(), OrsError> {
+        let (store, path) = temp_store();
+        let digest = "8".repeat(64);
+        let operation = OperationIdentity::new(format!("hostreq:{digest}"))?;
+        let body = json!({"name": "eliot.observe", "arguments": {"kind": "observation"}});
+        let bytes = eliot_contracts::canonical_json_bytes(&body)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let source_sha256 = crate::model::sha256_hex(&bytes);
+
+        // The caller claims an ADMISSION, but the provider-restriction leg it
+        // presents withholds. The owner rule re-derives a rejection for exactly
+        // this evidence, so the misstated verdict is refused.
+        let mut authorization = admitting_privacy_authorization(&bytes);
+        authorization["provider_restriction"] =
+            serde_json::Value::String(privacy_leg_wire(
+                eliot_workscope::BridgeIngestPolicyLeg::Unavailable,
+            ));
+        let withholding_scope = "c".repeat(64);
+        assert_eq!(
+            undecided_leg_privacy_authorization(&bytes, &withholding_scope)["declared_class"],
+            serde_json::Value::String(
+                eliot_workscope::BRIDGE_INGEST_WITHHELD_PROVIDER_RESTRICTION_UNDECIDED.to_owned()
+            ),
+            "the withholding fixture names the side the undecided provider leg withholds on"
+        );
+        let staged = RedbRecoveryStore::bridge_event_privacy_decision(&bytes, Some(&authorization));
+
+        let mut record = requested_fixture(operation.as_str(), &digest);
+        record.payload_digest = source_sha256;
+        store.stage_host_request(&record)?;
+        store
+            .advance_host_request(&operation, &digest, HostRequestState::Admitted, None)?
+            .expect("admitted record must load");
+
         assert!(
-            matches!(refused, Err(OrsError::InvalidField { field, .. })
-                if field == "privacy_authorization" || field == "privacy_disposition"),
-            "with only the Unavailable policy leg the owner cannot permit raw persistence, \
-             so the gate refuses the presented admission: {refused:?}"
+            matches!(
+                RedbRecoveryStore::permit_host_request_payload_persistence(&bytes, Some(&staged)),
+                Err(OrsError::InvalidField { field, .. })
+                    if field == "privacy_authorization" || field == "privacy_disposition"
+            ),
+            "a presented admission whose legs do not re-derive to one is refused"
+        );
+        assert!(
+            matches!(
+                store.bind_host_request_payload(&operation, &digest, &body, Some(&staged)),
+                Err(OrsError::InvalidField { field, .. })
+                    if field == "privacy_authorization" || field == "privacy_disposition"
+            ),
+            "the gate refuses the misstated admission at the store call site too"
         );
         // The refused write left nothing durable, which is the whole point of
         // deciding before writing rather than after.
