@@ -21,10 +21,10 @@ use eliot_host::backup_config_projection::{
     project_backup_config,
 };
 use eliot_host::backup_preparation::{
-    BackupCallerAuth, CleanupReport, DelegatedPreparation, DestinationAdmission, OwnerEvidence,
-    PreparationClass, PreparationError, PreparationJournal, PreparedDestination,
-    PresentedPreparationRequest, ReconcileDisposition, RootIdentity, cancel_preparation,
-    cleanup_preparations, derive_destination_epoch, derive_destination_id,
+    BackupCallerAuth, CleanupReport, DelegatedPreparation, DestinationAdmission,
+    DestinationCustody, OwnerEvidence, PreparationClass, PreparationError, PreparationJournal,
+    PreparedDestination, PresentedPreparationRequest, ReconcileDisposition, RootIdentity,
+    cancel_preparation, cleanup_preparations, derive_destination_epoch, derive_destination_id,
     prepare_isolated_destination, reconcile_preparation,
 };
 #[cfg(windows)]
@@ -192,6 +192,15 @@ impl PreparationJournal for MemJournal {
             }
         }
         Ok(operations)
+    }
+
+    fn destination_custody(&self, _root: &Path) -> DestinationCustody {
+        // Test-world custody: this sink is the only owner inside the
+        // isolated roots and observes no restore/cutover claims, so none
+        // is unresolved here. The fail-closed Unresolved port default is
+        // untouched; the double answers Released for the world it owns so
+        // the suite reaches the owner-authorized reclamation path (#4193).
+        DestinationCustody::Released
     }
 }
 
