@@ -53,7 +53,11 @@ $dependencyPolicyReceiptPath = Join-Path $repoRoot (
 # (Justfile, CI) select a closed profile only; they must not duplicate these
 # commands. Quick = every gate this script ran on base, in base order.
 # Review = the same oracle block, then the locked cargo tail in the exact
-# issue order: metadata, fmt, check, clippy, test, deny. MergeCompile = the
+# issue order: metadata, fmt, check, clippy, test, deny, and then the
+# mandatory workspace no-run (issue #829 AUD5), which is a separate gate
+# because a required command that exists only as a flag on another gate
+# cannot be selected by a profile, cannot carry its own exit code, and
+# cannot be asserted on by any consumer. MergeCompile = the
 # shared oracle block (with the standalone verifier in compile-only mode),
 # then metadata, fmt, check, denominator, test-compile (no-run), bounded
 # changed-package clippy with normal warning semantics, standalone compile,
@@ -155,6 +159,24 @@ $allGates = @(
         # Review's "cargo deny check" contract is executed by the pinned private-copy runner.
         python $dependencyPolicyVerifier --root $repoRoot --profile current-advisories --receipt-out $dependencyPolicyReceiptPath
     } },
+    # The mandatory workspace no-run (issue #829 AUD5). Before this gate
+    # existed, `cargo test --locked --workspace --no-run` appeared NOWHERE in
+    # this table: Quick and Review ran workspace check only, and the sole
+    # no-run in the file was MergeCompile's `--all-targets` compile gate --
+    # a different command from the mandatory one. That is why a suite could
+    # name the mandatory no-run in a case title and still never execute it.
+    #
+    # It is deliberately named `cargo-norun-workspace`, not
+    # `cargo-test-norun-workspace`: `test_verification_profile.py`'s
+    # `normalize_gate` folds any `cargo-test-*` slug onto the single
+    # `cargo-test-workspace` Review-tail entry, so the longer name would read
+    # as a DUPLICATE mandatory Review gate and break the tail-order contract.
+    # This name contains no `test` substring, so it stays a distinct gate.
+    #
+    # It carries no `--all-targets`: MergeCompile already proves that variant
+    # through `cargo-test-compile`, and running the same compile twice under
+    # two names would be a second gate claiming one command's result.
+    [pscustomobject]@{ Name = 'cargo-norun-workspace'; Profiles = @('Quick', 'Review'); Command = { cargo test --locked --workspace --no-run } },
     # MergeCompile-only tail (accepted issue #3004). Review order above is
     # unchanged; these gates run only under -Profile MergeCompile.
     [pscustomobject]@{
