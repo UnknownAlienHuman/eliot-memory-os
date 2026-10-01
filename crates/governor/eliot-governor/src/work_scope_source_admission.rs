@@ -23,10 +23,13 @@ use eliot_store_api::{
 };
 use crate::composition::WorkScopeOwnerSnapshotReadback;
 use eliot_workscope::{
-    AuthorityBasis, GoverningSource, GoverningSourceRole, GoverningSourceSet,
-    ObservedScopeResources, PrivacyProfile, ScopeBinding, ScopeIdentity, SourceStatus,
+    AuthorityBasis, GoverningSourceAdmission, GoverningSourceCandidate,
+    GoverningSourceRole, GoverningSourceSet, IdentityEvidence, NewSourceCandidate,
+    ObservedScopeResources, PrivacyProfile, ResolutionAuthentication, ScopeBinding,
+    ScopeIdentity, SourceAdmissionRequest, SourceCandidateOrigin, SourceCoverage,
     WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeDescriptor,
-    admit_initial_binding, observed_scope_binding,
+    admit_governing_sources, admit_initial_binding, issue_resolution_receipt,
+    observed_scope_binding,
 };
 use eliot_security_contracts::{
     CompetenceLevel, EffectCeiling, EpistemicUse, FreshnessStatus, InstructionTaint,
@@ -213,83 +216,6 @@ impl GoverningSourceApproval {
             return Err(WorkScopeSourceAdmissionError::SourceApprovalBindingMismatch);
         }
         Ok(())
-    }
-
-    /// Build the two-source WorkScope closure authorized by this verified
-    /// approval and the exact current normative capture.
-    #[allow(clippy::too_many_arguments)]
-    fn derive_work_scope_sources(
-        &self,
-        capture: &NormativePairSourceCapture,
-        explicit_root_identity: &str,
-        product_id: &ProductId,
-        source_id: &SourceId,
-        privacy: &PrivacyProfile,
-        scope_privacy_class: eliot_security_contracts::PrivacyClass,
-        state_fence: &StateFence,
-        authenticated_approver_principal_ref: &str,
-        scope_ref: &str,
-        generation: u64,
-    ) -> Result<GoverningSourceSet, WorkScopeSourceAdmissionError> {
-        self.validate_live_binding(
-            capture,
-            explicit_root_identity,
-            product_id,
-            source_id,
-            privacy,
-            scope_privacy_class,
-            state_fence,
-            authenticated_approver_principal_ref,
-        )?;
-        if state_fence.resource_generation.value() != generation {
-            return Err(WorkScopeSourceAdmissionError::FenceMismatch);
-        }
-        let source = |document: &ApprovedNormativeSource, role, provenance: &str| {
-            GoverningSource {
-                source_ref: document.source_ref.clone(),
-                role,
-                assurance: SourceAssurance {
-                    source_ref: document.source_ref.clone(),
-                    provenance_ref: provenance.to_owned(),
-                    integrity: IntegrityStatus::Verified,
-                    freshness: FreshnessStatus::Current,
-                    competence: CompetenceLevel::Unknown,
-                    independence: IndependenceLevel::Unknown,
-                    privacy_class: document.privacy_class,
-                    instruction_taint: InstructionTaint::DataOnly,
-                    allowed_epistemic_use: vec![EpistemicUse::Observation],
-                    allowed_effects: vec![EffectCeiling::NoExternalEffect],
-                    required_verifier: None,
-                    quarantine: QuarantineState::ReviewRequired,
-                    state_fence: state_fence.clone(),
-                },
-                applicable_generation: generation,
-                status: SourceStatus::Admitted,
-                domains: Vec::new(),
-                digest: document.content_sha256.clone(),
-                authority_basis: Some(AuthorityBasis::HumanOwner {
-                    owner_ref: self.approver_principal_ref.clone(),
-                }),
-            }
-        };
-        GoverningSourceSet::new(
-            scope_ref,
-            generation,
-            vec![
-                source(
-                    &self.architecture,
-                    GoverningSourceRole::Architecture,
-                    &self.pair_key,
-                ),
-                source(
-                    &self.implementation,
-                    GoverningSourceRole::Implementation,
-                    &self.pair_key,
-                ),
-            ],
-            Vec::new(),
-        )
-        .map_err(|error| WorkScopeSourceAdmissionError::InitialAdmission(error.to_string()))
     }
 
     /// Serialize this approval as canonical bytes for the existing signed
