@@ -629,9 +629,7 @@ fn zero_digest() -> TestResult<LowercaseSha256> {
     ))?)
 }
 
-fn start_request_digest(
-    binding: &ProviderExecutionBinding,
-) -> TestResult<LowercaseSha256> {
+fn start_request_digest(binding: &ProviderExecutionBinding) -> TestResult<LowercaseSha256> {
     Ok(serde_json::from_value(serde_json::json!(
         binding.start_request_sha256.clone()
     ))?)
