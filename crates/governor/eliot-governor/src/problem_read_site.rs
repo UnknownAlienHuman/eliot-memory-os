@@ -113,6 +113,10 @@ pub struct ProblemReadback {
     /// scope-filtered Problem-owner read. A committed choice remains visible
     /// here while the Kernel reconciles its immutable receipt into ORS.
     pub sequence_gaps: Vec<SequenceGapStatus>,
+    /// Whether the bounded attention page proves the sequence-gap list is
+    /// complete for this Problem. A partial page never presents a prefix as
+    /// the complete set of open gaps.
+    pub sequence_gaps_complete: bool,
 }
 
 /// Typed refusals of the committed Problem read site.
@@ -251,6 +255,7 @@ pub fn read_committed_problem(
         timeline,
         history_complete,
         sequence_gaps: sequence_gaps.into_values().collect(),
+        sequence_gaps_complete: history_complete,
     }))
 }
 
