@@ -525,7 +525,9 @@ pub enum WorkScopeError {
     BindingReceiptNotMatched,
     #[error("scope binding guard receipt does not match the retained binding")]
     BindingReceiptMismatch,
-    #[error("scope quarantine retains unresolved conflicting identity evidence; rebind or resolve before scope-sensitive work")]
+    #[error(
+        "scope quarantine retains unresolved conflicting identity evidence; rebind or resolve before scope-sensitive work"
+    )]
     ScopeQuarantineUnresolved,
     #[error("scan disclosure storage contour is not admitted by the installation owner")]
     ScanContourNotAdmitted,
