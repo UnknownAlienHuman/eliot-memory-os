@@ -1336,11 +1336,12 @@ pub const FAIRNESS_QUANTUM: u64 = 1_000_000;
 ///   by `daemon_runtime.rs::maybe_start_fair_pull_recovery`.
 /// - `core.rs::AgentCoordinator::select_ready` — writes
 ///   `ReadySelectionOutcome::algorithm` for every single pull, including the
-///   ones the drive makes. In production it is reached only from that drive; the
-///   two single-shot wrappers `core.rs::AgentCoordinator::pull_next` and
-///   `core.rs::AgentCoordinator::next_ready` also call it, but neither wrapper
-///   has a production caller, so they are not counted as production readers of
-///   this constant. See the note on `core.rs::pull_next` for that measurement.
+///   ones the drive makes. In production it is reached through
+///   `core.rs::AgentCoordinator::pull_next`, which the drive calls for every
+///   pull it performs; the profile-free single-shot read
+///   `core.rs::AgentCoordinator::next_ready` also calls it and has no
+///   production caller, so it is not counted as a production reader of this
+///   constant. See the note on `core.rs::pull_next`.
 ///
 /// The constant is therefore live, not decorative: removing either reader would
 /// leave a published outcome unable to name the rule its own ordering

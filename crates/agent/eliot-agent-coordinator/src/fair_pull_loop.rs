@@ -8,22 +8,19 @@
 //! `AgentCoordinator::select_ready`; the types here are the *join* around it —
 //! what arms it, what one drive is allowed to do, and what the caller is told.
 //! The drive itself is [`AgentCoordinator::drive_fair_pull`], which calls that
-//! selector directly.
+//! selector through [`AgentCoordinator::pull_next`].
 //!
-//! It is worth being exact about which entry point the production path uses,
-//! because two sibling selectors sit next to it and neither is on that path.
-//! `drive_fair_pull` calls `AgentCoordinator::select_ready` twice per drive
-//! (once before the loop and once after every start), **not**
-//! [`AgentCoordinator::pull_next`], which is a thin profile-bound wrapper over
-//! the same selector and has no caller anywhere in the tree. Selecting over
-//! `select_ready` rather than over `pull_next` is not a stylistic choice: the
-//! drive needs the attempt record, the canonical enqueue ordinal and the stored
-//! admission receipt between the pull and the start, so an extra wrapper that
-//! returned only a `ReadySelectionOutcome` would be a hop it cannot use.
-//! [`AgentCoordinator::pull_next`] and [`AgentCoordinator::next_ready`] are
-//! single-shot reads for callers that want one decision and no drive; neither is
-//! reached from production, and this module's reachability claim below is a
-//! claim about `drive_fair_pull` only.
+//! It is worth being exact about which entry point the production path uses.
+//! `drive_fair_pull` pulls through [`AgentCoordinator::pull_next`] on every pull
+//! it performs — the first and the one after each start. That wrapper is the
+//! profile-bound *single pull* over [`AgentCoordinator::select_ready`], so
+//! there is one profile-bound entry to the selector rather than a bypass and a
+//! wrapper that could drift apart. The drive reads the attempt record, the
+//! canonical enqueue ordinal and the stored admission receipt between a pull
+//! and the start it acts on from the coordinator's own maps, not from the
+//! pull's return value. [`AgentCoordinator::next_ready`] is the profile-free
+//! single-shot read and is not reached from production; this module's
+//! reachability claim below is a claim about `drive_fair_pull` only.
 //!
 //! # Event-driven *with* bounded recovery polling, and which of the two is
 //! # authoritative
@@ -78,13 +75,14 @@
 //!    `CoordinatorConfig::max_admitted_attempts`, so the loop is finite with no
 //!    constant chosen by this module. The recovery poll's own cadence belongs
 //!    to the caller's existing bounded tick; this crate names no interval.
-//! 4. **The selector is one function, and the drive is its only production
-//!    entry.** `drive_fair_pull` calls `AgentCoordinator::select_ready`
-//!    directly. The two sibling selectors named above, `pull_next` and
-//!    `next_ready`, are single-shot reads and neither is on the production path;
-//!    keeping the drive on the selector itself is what lets it re-pull over the
-//!    live view after every start, which a wrapper returning one decision could
-//!    not do.
+//! 4. **There is one profile-bound entry to the selector.**
+//!    `drive_fair_pull` pulls through [`AgentCoordinator::pull_next`], so the
+//!    production path and the public single-shot entry run the same wrapper
+//!    over [`AgentCoordinator::select_ready`] and cannot diverge. The only
+//!    other entry, [`AgentCoordinator::next_ready`], is the profile-free
+//!    single-shot read; keeping the drive on the profile-bound wrapper is what
+//!    lets it re-pull over the live view after every start, because a profile-
+//!    free peek could not apply any per-class ceiling.
 //!
 //! Selection is not execution. A drive turns a selection into a `Running`
 //! attempt through the existing [`AgentCoordinator::start_attempt`] transition,

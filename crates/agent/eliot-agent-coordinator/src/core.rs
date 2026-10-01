@@ -2171,17 +2171,19 @@ impl AgentCoordinator {
     /// every start, so no selection it acts on is older than the view it was
     /// measured against.
     ///
-    /// **This method has no caller anywhere in the tree.** That is measured, not
-    /// assumed: `git grep -nE '[.>]pull_next\('` over `origin/main` returns zero
-    /// hits, in production and in test alike. It is the profile-bound *single
-    /// pull* wrapper, and the production join reaches the same selector through
-    /// [`Self::drive_fair_pull`] instead, which calls the underlying selector
-    /// directly and needs the attempt record, enqueue ordinal and stored
-    /// admission receipt between pull and start — a hop this wrapper's return
-    /// type does not carry. It is retained as the public single-shot entry point
-    /// a caller outside this crate can use, and its selection behaviour is
-    /// identical to the drive's first pull; but a reader must not infer from its
-    /// existence that anything drives the loop through it.
+    /// **The drive reaches the selector through this method.** It is the profile-bound
+    /// *single pull* wrapper, and [`Self::drive_fair_pull`] calls it for every pull
+    /// it performs — the first and the one after each start — so this is the
+    /// single profile-bound entry to the selector in the tree and there is no
+    /// second, differently-wired way into it. What the drive does between a pull
+    /// and the start it acts on is read from the coordinator's own stored maps
+    /// (`attempts`, `enqueue_sequence`, `admissions`), not from this method's
+    /// return value, which is why routing the drive through the wrapper costs it
+    /// nothing and needs no extra hop.
+    ///
+    /// A caller outside this crate that wants one decision and no drive uses
+    /// this method directly; its selection behaviour is identical to the
+    /// drive's per-pull behaviour because it is the drive's per-pull behaviour.
     ///
     /// What a *freshly admitted* pull sees is a separate question, and the
     /// answer is measured too:
@@ -2259,12 +2261,13 @@ impl AgentCoordinator {
     ///
     /// I14.8: "Scheduler is pull-based: terminal/deferred/blocked attempt
     /// releases its slot, then the next currently admissible Ready Work Item is
-    /// selected." This is that sentence as an operation. It pulls through the
-    /// same bounded selector [`Self::pull_next`] wraps, called directly rather
-    /// than through that wrapper, and each selection becomes a `Running` attempt
-    /// through the existing [`Self::start_attempt`] transition, so released
-    /// capacity advances work without another agent command and without a
-    /// notification this method could miss.
+    /// selected." This is that sentence as an operation. It pulls through
+    /// [`Self::pull_next`] — the profile-bound single pull over the same bounded
+    /// selector, so there is one profile-bound entry to the selector rather than
+    /// a drive that bypasses the public one — and each selection becomes a
+    /// `Running` attempt through the existing [`Self::start_attempt`] transition,
+    /// so released capacity advances work without another agent command and
+    /// without a notification this method could miss.
     ///
     /// The `ExecutionContext` each started attempt receives is derived through
     /// `ExecutionContext::from` from the coordinator's **own stored admission
@@ -2364,7 +2367,7 @@ impl AgentCoordinator {
         let poll_bound = self.active_attempt_count();
         let mut started = Vec::new();
         let mut pulls_performed = 0usize;
-        let mut last_selection = self.select_ready(Some(profile), true);
+        let mut last_selection = self.pull_next(profile)?;
         pulls_performed += 1;
         while let Some(attempt_id) = last_selection.selected_attempt_id.clone() {
             if started.len() >= poll_bound {
@@ -2399,7 +2402,7 @@ impl AgentCoordinator {
                 enqueue_sequence,
             });
             pulls_performed += 1;
-            last_selection = self.select_ready(Some(profile), true);
+            last_selection = self.pull_next(profile)?;
         }
         Ok(FairPullOutcome {
             algorithm: FAIR_PULL_ALGORITHM,
