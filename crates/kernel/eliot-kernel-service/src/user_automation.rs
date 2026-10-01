@@ -1,4 +1,4 @@
-//! Authenticated UserAutomation operator orchestration.
+//! Authenticated `UserAutomation` operator orchestration.
 //!
 //! This module is a stateless service over the existing canonical Store and
 //! Durable Job/WakeIntent owners. It validates the authenticated request and
@@ -28,10 +28,10 @@ pub const USER_AUTOMATION_SERVICE_CONTRACT_NAME: &str = "eliot.kernel.user-autom
 /// Current service contract revision.
 pub const USER_AUTOMATION_SERVICE_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
 
-/// Errors raised before a UserAutomation service response can be returned.
+/// Errors raised before a `UserAutomation` service response can be returned.
 #[derive(Debug, Error)]
 pub enum UserAutomationServiceError {
-    /// A request or response failed the closed UserAutomation contract.
+    /// A request or response failed the closed `UserAutomation` contract.
     #[error("UserAutomation service contract: {0}")]
     Contract(#[from] UserAutomationError),
     /// The authenticated request metadata is invalid.
@@ -106,7 +106,7 @@ pub struct UserAutomationStoreRequest {
     pub authenticated_principal: String,
     /// Canonical Store operation/idempotency/request identity.
     pub identity: OperationIdentity,
-    /// Closed UserAutomation operation selected by the authenticated caller.
+    /// Closed `UserAutomation` operation selected by the authenticated caller.
     pub intent: UserAutomationOperatorIntent,
 }
 
@@ -129,7 +129,7 @@ impl UserAutomationStoreRequest {
     }
 }
 
-/// Read projections returned by the canonical UserAutomation owner.
+/// Read projections returned by the canonical `UserAutomation` owner.
 ///
 /// The revision, execution and failure payloads are boxed because the read
 /// vocabulary mixes one 24-byte list with projections that inline a whole
@@ -171,7 +171,7 @@ pub enum UserAutomationReadResult {
     },
 }
 
-/// Mutation projections returned by the canonical UserAutomation owner.
+/// Mutation projections returned by the canonical `UserAutomation` owner.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum UserAutomationMutationResult {
@@ -228,14 +228,14 @@ pub struct UserAutomationStoreResponse {
     pub outcome: UserAutomationStoreOutcome,
 }
 
-/// Adapter over the existing CanonicalStoreClient.
+/// Adapter over the existing `CanonicalStoreClient`.
 ///
 /// Implementations must use the existing Store named-operation/transaction
 /// and receipt paths. This port is a service seam, not a second persistence
 /// or lifecycle owner.
 #[allow(async_fn_in_trait)]
 pub trait UserAutomationStorePort: Send + Sync {
-    /// Executes one authenticated UserAutomation read or mutation.
+    /// Executes one authenticated `UserAutomation` read or mutation.
     async fn execute_user_automation(
         &self,
         request: UserAutomationStoreRequest,
@@ -245,7 +245,7 @@ pub trait UserAutomationStorePort: Send + Sync {
     async fn receipt(&self, operation_id: OperationId) -> Result<Option<WriteReceipt>, StoreError>;
 }
 
-/// Stateless UserAutomation service over one canonical Store port.
+/// Stateless `UserAutomation` service over one canonical Store port.
 pub struct UserAutomationService<'a, P: ?Sized> {
     port: &'a P,
 }

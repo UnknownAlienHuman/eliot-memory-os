@@ -82,7 +82,7 @@ pub struct CanonicalUserAutomationStore<C> {
     client: C,
 }
 
-/// Kernel-authenticated selector for one production UserAutomation occurrence.
+/// Kernel-authenticated selector for one production `UserAutomation` occurrence.
 ///
 /// The daemon contributes only the automation and immutable revision selectors.
 /// Kernel supplies the authenticated principal and current State Fence before
@@ -149,7 +149,7 @@ pub struct UserAutomationNamedReadProvenance {
     /// Revision heads and the response fence are global observations.  The
     /// payload digest retains the target row/read projection as well, so a
     /// current-pointer revalidation can reject a response race even when the
-    /// global head list and StateFence happen to be unchanged.
+    /// global head list and `StateFence` happen to be unchanged.
     pub response_payload_digest: String,
 }
 

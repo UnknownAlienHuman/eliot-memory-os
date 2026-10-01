@@ -1,4 +1,4 @@
-//! Production execution joins for the Kernel-owned UserAutomation service.
+//! Production execution joins for the Kernel-owned `UserAutomation` service.
 //!
 //! The service owns the causal ordering at the boundary: authenticate and
 //! validate the owner-issued projection, run the model-free Kernel preflight,
@@ -285,7 +285,7 @@ use super::{
     UserAutomationStoreOutcome, UserAutomationStorePort,
 };
 
-/// Errors returned by an existing Durable Job, WakeIntent, or notification
+/// Errors returned by an existing Durable Job, `WakeIntent`, or notification
 /// owner. The service never turns an unknown owner outcome into success.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum UserAutomationRuntimeError {
@@ -372,7 +372,7 @@ pub enum UserAutomationExecutionError {
     OccurrenceDenominatorIncomplete(AutomationReconciliationReference),
 }
 
-/// Owner-issued Durable Job material for one admitted UserAutomation
+/// Owner-issued Durable Job material for one admitted `UserAutomation`
 /// occurrence.
 ///
 /// The complete K0 submission travels with the occurrence binding so the
@@ -386,7 +386,7 @@ pub enum UserAutomationExecutionError {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserAutomationDurableJobMaterial {
-    /// Stable UserAutomation occurrence bound by the owner.
+    /// Stable `UserAutomation` occurrence bound by the owner.
     pub occurrence_id: String,
     /// Immutable qualified task/script identity the owner admitted.
     ///
@@ -870,7 +870,7 @@ pub struct UserAutomationRuntimeAdmission {
     pub invocation: UserAutomationInvocation,
     /// Deterministic preflight receipt that permits admission.
     pub preflight: UserAutomationPreflightReceipt,
-    /// Existing pending WakeIntent bound to this occurrence.
+    /// Existing pending `WakeIntent` bound to this occurrence.
     pub wake_intent: WakeIntent,
     /// Complete Durable Job material. A caller that holds a submission from the
     /// Durable Job owner supplies it here; when it is absent, the concrete
@@ -1233,7 +1233,7 @@ impl UserAutomationAuthenticatedWakeCancellationReadback {
     }
 }
 
-/// Exact authenticated lookup for one persisted UserAutomation wake.
+/// Exact authenticated lookup for one persisted `UserAutomation` wake.
 ///
 /// The wake identity is derived from the owner-issued invocation. Callers do
 /// not supply a replacement `WakeIntent`; the existing Host journal returns
@@ -1241,13 +1241,13 @@ impl UserAutomationAuthenticatedWakeCancellationReadback {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserAutomationWakeReadRequest {
-    /// Original authenticated Human RunNow request metadata.
+    /// Original authenticated Human `RunNow` request metadata.
     pub context: RequestMetadata,
     /// Principal authenticated by Kernel/Host.
     pub authenticated_principal: String,
-    /// Exact committed RunNow operation identity.
+    /// Exact committed `RunNow` operation identity.
     pub identity: OperationIdentity,
-    /// Invocation read back from the canonical UserAutomation owner.
+    /// Invocation read back from the canonical `UserAutomation` owner.
     pub invocation: UserAutomationInvocation,
 }
 
@@ -3185,7 +3185,7 @@ impl CancellingCommit {
     }
 }
 
-/// Existing runtime composition owner for UserAutomation execution joins.
+/// Existing runtime composition owner for `UserAutomation` execution joins.
 ///
 /// Implementations adapt these three calls to the already-owned Durable Job,
 /// WakeIntent/Task Scheduler, canonical failure-history, and authenticated
@@ -3194,7 +3194,7 @@ impl CancellingCommit {
 #[allow(async_fn_in_trait)]
 pub trait UserAutomationRuntimePort: Send + Sync {
     /// Admits one preflight-approved occurrence to the existing Durable Job
-    /// and WakeIntent owners.
+    /// and `WakeIntent` owners.
     async fn admit_occurrence(
         &self,
         request: UserAutomationRuntimeAdmission,
@@ -3502,10 +3502,10 @@ pub trait UserAutomationNotificationPort: Send + Sync {
     ) -> Result<UserAutomationNotificationDelivery, UserAutomationRuntimeError>;
 }
 
-/// Production composition of the existing UserAutomation runtime owners.
+/// Production composition of the existing `UserAutomation` runtime owners.
 ///
 /// This adapter owns no mutable state. It only sequences the already-owned
-/// ports: Durable Job admission, WakeIntent cancellation, canonical failure
+/// ports: Durable Job admission, `WakeIntent` cancellation, canonical failure
 /// history, and the authenticated B3 notification route. The failure path
 /// records history before notification so a notification retry can reconcile
 /// against one immutable history identity.

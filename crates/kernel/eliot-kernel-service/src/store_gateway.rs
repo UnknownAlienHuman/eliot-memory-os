@@ -2609,8 +2609,8 @@ impl KernelStoreGateway {
         .await
     }
 
-    /// Reads and authenticates the current UserAutomation owner material through
-    /// the active generation-routed Store contour. The UserAutomation adapter
+    /// Reads and authenticates the current `UserAutomation` owner material through
+    /// the active generation-routed Store contour. The `UserAutomation` adapter
     /// constructs and projects the closed named reads; this gateway remains the
     /// only production path that performs their Store IO.
     pub async fn read_user_automation_owner(
