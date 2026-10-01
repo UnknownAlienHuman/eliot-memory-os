@@ -481,6 +481,80 @@ impl EndOfActivityMaintenanceAssessment {
     }
 }
 
+/// Continuous debt facts projected for the I8.18 `MaintenanceDebt` detector.
+///
+/// Built from the same `due_policies` and `maintenance_debt` source snapshots
+/// the [`assess_end_of_activity`] drain decision reads, plus the
+/// deferred-Problem and stale-capability reference snapshots the #1689
+/// evaluator reads from their owners. Identity-only throughout: the projection
+/// carries owner-assigned references, revisions, fences and coverage, and
+/// performs no policy evaluation, so the detector observes the same debt the
+/// drain decision sees without a second debt definition. I8.18 opens the
+/// signal from observed deltas across two such snapshots; one snapshot alone
+/// admits nothing. The detector consumes the projection and never rewrites it.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenanceDebtSnapshot {
+    /// Shared state fence all projected sources were read under.
+    pub source_fence: StateFence,
+    /// Due-policy facts from the existing maintenance owner.
+    pub due_policies: AssessmentSourceSnapshot<MaintenanceDuePolicyReference>,
+    /// Maintenance-debt facts from the existing debt owner.
+    pub maintenance_debt: AssessmentSourceSnapshot<MaintenanceDebtReference>,
+    /// Deferred-Problem identities from the Problem owner, as read by the
+    /// #1689 evaluator.
+    pub deferred_problems: AssessmentSourceSnapshot<AssessmentRecordReference>,
+    /// Stale-capability identities from the capability owner, as read by the
+    /// #1689 evaluator.
+    pub stale_capabilities: AssessmentSourceSnapshot<AssessmentRecordReference>,
+}
+
+impl MaintenanceDebtSnapshot {
+    /// Validates every projected source against the shared fence.
+    pub fn validate(&self) -> Result<(), EndOfActivityMaintenanceAssessmentValidationError> {
+        self.source_fence
+            .validate()
+            .map_err(|_| EndOfActivityMaintenanceAssessmentValidationError::InvalidFence)?;
+        self.due_policies.validate(&self.source_fence)?;
+        self.maintenance_debt.validate(&self.source_fence)?;
+        self.deferred_problems.validate(&self.source_fence)?;
+        self.stale_capabilities.validate(&self.source_fence)
+    }
+}
+
+/// Projects continuous debt facts without evaluating policy.
+///
+/// Reads the request's own `due_policies` and `maintenance_debt` snapshots —
+/// the same records [`assess_end_of_activity`] consumes — alongside the
+/// evaluator-supplied deferred-Problem and stale-capability reference
+/// snapshots, and returns them as one fenced fact set for the I8.18
+/// `MaintenanceDebt` detector. No drain decision is made or duplicated: an
+/// unknown coverage anywhere is carried as
+/// [`AssessmentSourceCoverage::Unknown`], never resolved here, so the detector
+/// still fails closed on missing owner evidence.
+///
+/// # Errors
+///
+/// Returns the request validation error when the evidence request is
+/// malformed, or the snapshot validation error when either supplied snapshot
+/// is malformed or was read under a different fence.
+pub fn project_maintenance_debt_snapshot(
+    request: &EndOfActivityMaintenanceAssessmentRequest,
+    deferred_problems: &AssessmentSourceSnapshot<AssessmentRecordReference>,
+    stale_capabilities: &AssessmentSourceSnapshot<AssessmentRecordReference>,
+) -> Result<MaintenanceDebtSnapshot, EndOfActivityMaintenanceAssessmentValidationError> {
+    request.validate()?;
+    deferred_problems.validate(&request.source_fence)?;
+    stale_capabilities.validate(&request.source_fence)?;
+    Ok(MaintenanceDebtSnapshot {
+        source_fence: request.source_fence.clone(),
+        due_policies: request.due_policies.clone(),
+        maintenance_debt: request.maintenance_debt.clone(),
+        deferred_problems: deferred_problems.clone(),
+        stale_capabilities: stale_capabilities.clone(),
+    })
+}
+
 /// Deterministic decision core of one end-of-activity assessment: the I14.22
 /// decision, the shutdown disposition, and its explicit reason. The owning
 /// evaluator attaches this core to the outcome receipts the persistence

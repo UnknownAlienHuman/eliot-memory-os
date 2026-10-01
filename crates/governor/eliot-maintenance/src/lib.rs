@@ -60,8 +60,9 @@ pub use end_of_activity::{
     EligibleServiceSafeRoute, EndOfActivityAssessment, EndOfActivityAssessmentDecision,
     EndOfActivityMaintenanceAssessment, EndOfActivityMaintenanceAssessmentOutcome,
     EndOfActivityMaintenanceAssessmentRequest, EndOfActivityMaintenanceAssessmentValidationError,
-    MaintenanceDebtReference, MaintenanceDuePolicyReference, UserSessionRequiredWorkReference,
-    assess_end_of_activity, end_of_activity_assessment_contract_identity,
+    MaintenanceDebtReference, MaintenanceDebtSnapshot, MaintenanceDuePolicyReference,
+    UserSessionRequiredWorkReference, assess_end_of_activity,
+    end_of_activity_assessment_contract_identity, project_maintenance_debt_snapshot,
 };
 
 pub use improvement_admission::{
