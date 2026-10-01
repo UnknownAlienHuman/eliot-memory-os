@@ -741,8 +741,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 21,
-          "source_stu": 431055,
-          "sha256": "52798806a70493379a626e0b7728666b15f52b1cabea23fce71972b2a4fbef17"
+          "source_stu": 431612,
+          "sha256": "8181de621b632e15255d874bc5ebde5cd39567e2d941fa30dec35df31db3bfd6"
         },
         "source_classification": {
           "production_source_file_count": 19,
@@ -976,12 +976,12 @@
         },
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
-          "file_count": 68,
-          "source_stu": 1135336,
-          "sha256": "7000677005ebcc299f0bf7728e158b2dc541f5f403f47ae4a167671134627a6c"
+          "file_count": 69,
+          "source_stu": 1143513,
+          "sha256": "2375a386dd3197323e4d47ca52c3f22d2ee15e81175b070d2db7ecf1c8a61cd6"
         },
         "source_classification": {
-          "production_source_file_count": 53,
+          "production_source_file_count": 54,
           "test_file_count": 15,
           "test_only_module_paths": [
             "bins/eliot-host/src/journal_termination_tests.rs",
@@ -1061,9 +1061,9 @@
         },
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
-          "file_count": 95,
-          "source_stu": 2186582,
-          "sha256": "0dd5c1e577f30b3926e88af5ab2f2e97b8337ef76d37073808ed5c618ba07162"
+          "file_count": 96,
+          "source_stu": 2204609,
+          "sha256": "d24578031d5949b1c44d7c432a899b183c2b98668d42cc7f4c965e45d4df93be"
         },
         "source_classification": {
           "production_source_file_count": 3,
@@ -1076,7 +1076,7 @@
             "bins/eliot-kernel/src/tests/native_worker_replay_route.rs",
             "bins/eliot-kernel/src/tests/provider_capability_plumbing.rs"
           ],
-          "unselected_file_count": 75,
+          "unselected_file_count": 76,
           "unselected_files": [
             {
               "path": "bins/eliot-kernel/src/activation_lifecycle.rs",
@@ -1155,7 +1155,7 @@
             },
             {
               "path": "bins/eliot-kernel/src/coordination_mailbox.rs",
-              "bytes": 39997,
+              "bytes": 59999,
               "reason": "production source not allocated to this cell"
             },
             {
@@ -1289,6 +1289,11 @@
               "reason": "production source not allocated to this cell"
             },
             {
+              "path": "bins/eliot-kernel/src/integration_owner.rs",
+              "bytes": 23958,
+              "reason": "production source not allocated to this cell"
+            },
+            {
               "path": "bins/eliot-kernel/src/kernel_audit.rs",
               "bytes": 138094,
               "reason": "production source not allocated to this cell"
@@ -1360,7 +1365,7 @@
             },
             {
               "path": "bins/eliot-kernel/src/request_dispatch.rs",
-              "bytes": 233618,
+              "bytes": 243714,
               "reason": "production source not allocated to this cell"
             },
             {
@@ -1931,8 +1936,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 24,
-          "source_stu": 357956,
-          "sha256": "2d16eca61187fc390badea33e749fc441505a8c4b9b71593cf0cb85ac3c9b9cb"
+          "source_stu": 358370,
+          "sha256": "0ec276f04b0636e71c9c1820e43fb76b6a84e151fbbe3af96492f03270495efa"
         },
         "source_classification": {
           "production_source_file_count": 22,
@@ -2009,8 +2014,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 40,
-          "source_stu": 480107,
-          "sha256": "3a15c720c555e4d7b37c77c6d29c8e8231c91c6ff2d4891f363c534ae08881db"
+          "source_stu": 484867,
+          "sha256": "26fe9639575e99d205b5d86bfb58890599acede89db266d2550c796f966a8cfe"
         },
         "source_classification": {
           "production_source_file_count": 31,
@@ -3327,8 +3332,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 13,
-          "source_stu": 167550,
-          "sha256": "d7273704f20b62d41b3ac33f9b6947cdce786bfd6ca3ae9a0105d21e8b530758"
+          "source_stu": 169556,
+          "sha256": "c0d7cb49b2b2f943f5341fd64d145fd0dd152d61e6c0e343c6ae6e2a98bd6ee8"
         },
         "source_classification": {
           "production_source_file_count": 10,
@@ -7239,8 +7244,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 24,
-          "source_stu": 236258,
-          "sha256": "e8e4bf1c79dd762b1c268b16ea3285684f2c399315c6c8cdffd26e17087a8f0c"
+          "source_stu": 238844,
+          "sha256": "4f7bb414efa92d3c7ba097320d6c4594676c0df921156cbee1333938055a6538"
         },
         "source_classification": {
           "production_source_file_count": 12,
@@ -9938,19 +9943,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/installation/contract_kit.json",
-          "artifact_digest": "e927dd316318f46d1133369b936a4fdda8cf9f6073ba3bd7ff5f124dca3aecc0",
+          "artifact_digest": "908700c4c7ab715eea66b1dc472a27168baa157735b7cf0ea0a673496683d324",
           "contract_revision": "174b4007676607d4"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/installation/context_capsule.json",
-          "artifact_digest": "4b45b74b831e716892f2597ffa7d57ad8b7bb5a903c201889c23e3b94156aed4",
+          "artifact_digest": "101dd5110c7367016eaa5499a6aac69880711d0a346267c22f232e09d59fdd1c",
           "contract_revision": "91e13d7eec882856"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/installation/test_capsule.json",
-          "artifact_digest": "76143727d97e76aa8a3df71ddef73f3af419b3e3ea82049166be0f4c2508071f",
+          "artifact_digest": "6ccf1ef08885178f2e6ef12f2130d1a2ee659665a447d4b8753de8cda5935df7",
           "contract_revision": "bfcacd6e7c7c7dc6"
         }
       }
@@ -10026,19 +10031,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/kernel-service/contract_kit.json",
-          "artifact_digest": "65cf302bc1e4f030f18950e0ae713207e4c27758bcf2b3fa776e7c3586365fca",
+          "artifact_digest": "9aeffa41e108356f99ac3a6c43f210a87ea3f3f2f49c595252bb995bd8a90843",
           "contract_revision": "5ea02eabb3332172"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/kernel-service/context_capsule.json",
-          "artifact_digest": "113cac6aa67c21c25935190cad85b224c51c585c3a752f136e6db6eab5a626aa",
+          "artifact_digest": "4f9feb4c5e42217e187950e7a6b1bb368c441d496a6bd90c542d22f977f00649",
           "contract_revision": "9ecd7eeec495b53c"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/kernel-service/test_capsule.json",
-          "artifact_digest": "25955db3e9c89b42481cb29df5b5f05f9ab4aabacb41d7f10bf7e6819cc88e2f",
+          "artifact_digest": "6b920ce4951a889949626e9bcfc209733356b5f6cf615a9a85159e55d2ad0265",
           "contract_revision": "01d9f1c2f17c8fc4"
         }
       }
@@ -10378,19 +10383,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/operational-recovery-state/contract_kit.json",
-          "artifact_digest": "e5c73ec368eb48a0fba6b31cb0b8976a62b9232bd375db55c488de40e7e5a8e2",
+          "artifact_digest": "c54008c63578f28c58114e490435a3e7b3a28a34c0512cdc064251566486cb48",
           "contract_revision": "f0f817c31b0daaf2"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/operational-recovery-state/context_capsule.json",
-          "artifact_digest": "99c63e19d51a84c6ee75cc163c28376a80f5be7976793dd3fdab5e2be1dc4c6a",
+          "artifact_digest": "32de15a6c72117638a6a72eda98cae715798aac10a895463901a23b5cebd5aaf",
           "contract_revision": "8d4e4476ef742678"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/operational-recovery-state/test_capsule.json",
-          "artifact_digest": "d5e3e85cecf5bcd0a52576040e732b31ded6481cd4e462c70783e5e687d39f2b",
+          "artifact_digest": "540193c2ef00d10f0a158b7f639cb8d508164d3eae05dd6a4ad5107a7a061672",
           "contract_revision": "d874d82a1f33c0fc"
         }
       }
@@ -16728,19 +16733,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/installation/contract_kit.json",
-          "artifact_digest": "e927dd316318f46d1133369b936a4fdda8cf9f6073ba3bd7ff5f124dca3aecc0",
+          "artifact_digest": "908700c4c7ab715eea66b1dc472a27168baa157735b7cf0ea0a673496683d324",
           "contract_revision": "174b4007676607d4"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/installation/context_capsule.json",
-          "artifact_digest": "4b45b74b831e716892f2597ffa7d57ad8b7bb5a903c201889c23e3b94156aed4",
+          "artifact_digest": "101dd5110c7367016eaa5499a6aac69880711d0a346267c22f232e09d59fdd1c",
           "contract_revision": "91e13d7eec882856"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/installation/test_capsule.json",
-          "artifact_digest": "76143727d97e76aa8a3df71ddef73f3af419b3e3ea82049166be0f4c2508071f",
+          "artifact_digest": "6ccf1ef08885178f2e6ef12f2130d1a2ee659665a447d4b8753de8cda5935df7",
           "contract_revision": "bfcacd6e7c7c7dc6"
         }
       },
@@ -16866,19 +16871,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/kernel-service/contract_kit.json",
-          "artifact_digest": "65cf302bc1e4f030f18950e0ae713207e4c27758bcf2b3fa776e7c3586365fca",
+          "artifact_digest": "9aeffa41e108356f99ac3a6c43f210a87ea3f3f2f49c595252bb995bd8a90843",
           "contract_revision": "5ea02eabb3332172"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/kernel-service/context_capsule.json",
-          "artifact_digest": "113cac6aa67c21c25935190cad85b224c51c585c3a752f136e6db6eab5a626aa",
+          "artifact_digest": "4f9feb4c5e42217e187950e7a6b1bb368c441d496a6bd90c542d22f977f00649",
           "contract_revision": "9ecd7eeec495b53c"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/kernel-service/test_capsule.json",
-          "artifact_digest": "25955db3e9c89b42481cb29df5b5f05f9ab4aabacb41d7f10bf7e6819cc88e2f",
+          "artifact_digest": "6b920ce4951a889949626e9bcfc209733356b5f6cf615a9a85159e55d2ad0265",
           "contract_revision": "01d9f1c2f17c8fc4"
         }
       },
@@ -17433,19 +17438,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/operational-recovery-state/contract_kit.json",
-          "artifact_digest": "e5c73ec368eb48a0fba6b31cb0b8976a62b9232bd375db55c488de40e7e5a8e2",
+          "artifact_digest": "c54008c63578f28c58114e490435a3e7b3a28a34c0512cdc064251566486cb48",
           "contract_revision": "f0f817c31b0daaf2"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/operational-recovery-state/context_capsule.json",
-          "artifact_digest": "99c63e19d51a84c6ee75cc163c28376a80f5be7976793dd3fdab5e2be1dc4c6a",
+          "artifact_digest": "32de15a6c72117638a6a72eda98cae715798aac10a895463901a23b5cebd5aaf",
           "contract_revision": "8d4e4476ef742678"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/operational-recovery-state/test_capsule.json",
-          "artifact_digest": "d5e3e85cecf5bcd0a52576040e732b31ded6481cd4e462c70783e5e687d39f2b",
+          "artifact_digest": "540193c2ef00d10f0a158b7f639cb8d508164d3eae05dd6a4ad5107a7a061672",
           "contract_revision": "d874d82a1f33c0fc"
         }
       },
@@ -22590,5 +22595,5 @@
       }
     }
   ],
-  "registry_digest": "13cdff94ea6b2f13a1237f8bb222fb1e0ff12b0ceec77c0a90ffbb1d0c2d96a2"
+  "registry_digest": "668122ee90a3a161660480ea448feb665f77a4a2cd5095d231867c42c4e4670d"
 }
