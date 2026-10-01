@@ -70,9 +70,8 @@ use eliot_store_api::{
     AutomationContinuationFailure, EXPERIENCE_BANK_READ_NAME, EXPERIENCE_FEEDBACK_READ_NAME,
     EXPERIENCE_PAGE_STATE_FENCE, NamedOperationManifest, NamedReadOperation, NamedReadRequest,
     NamedReadResponse, OrderingHead, ReadConsistency, RevisionHead, RevisionKey, ScopeId,
-    StoreError, activated_read_operations, declared_read_parameters,
-    generated_operation_manifests, named_read_operation_name, parameter_schema_digest,
-    project_parameter_schema,
+    StoreError, activated_read_operations, declared_read_parameters, generated_operation_manifests,
+    named_read_operation_name, parameter_schema_digest, project_parameter_schema,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -1266,7 +1265,10 @@ const STORE_DEPENDENCIES: [StoreDependency; 22] = [
 /// dependency set. A qualified `eliot_store_api::` path would be a dependency
 /// this derivation cannot see, so none is written here.
 const CRATE_SOURCES: [(&str, &str); 3] = [
-    ("crates/governor/eliot-read/src/lib.rs", include_str!("lib.rs")),
+    (
+        "crates/governor/eliot-read/src/lib.rs",
+        include_str!("lib.rs"),
+    ),
     (
         "crates/governor/eliot-read/src/owner_inventory.rs",
         include_str!("owner_inventory.rs"),
