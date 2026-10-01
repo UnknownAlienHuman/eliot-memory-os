@@ -327,6 +327,8 @@ pub struct AgentActivationBindScopeEvidence {
     pub owner_revision: u64,
     pub ticket_id: String,
     pub ticket_sha256: String,
+    /// Exact original activation-ticket deadline; never rebased from observation time.
+    pub ticket_deadline_unix_ms: u64,
     pub state_fence: StateFence,
     pub principal_id: String,
     pub session_id: String,
@@ -372,7 +374,11 @@ impl AgentActivationBindScopeEvidence {
         ] {
             bounded_text(value, field)?;
         }
-        if self.task_revision == 0 || self.plan_revision == 0 || self.observed_at_unix_ms == 0 {
+        if self.ticket_deadline_unix_ms == 0
+            || self.task_revision == 0
+            || self.plan_revision == 0
+            || self.observed_at_unix_ms == 0
+        {
             return Err(ProtocolError::InvalidField {
                 field: "agent_activation_bind_scope_evidence.revisions",
                 reason: "task, plan, and observation revisions must be non-zero",
@@ -394,6 +400,7 @@ impl AgentActivationBindScopeEvidence {
         ticket.validate()?;
         if self.ticket_id != ticket.ticket_id
             || self.ticket_sha256 != ticket.ticket_sha256
+            || self.ticket_deadline_unix_ms != ticket.kernel_deadline_unix_ms
             || self.state_fence != ticket.state_fence
             || ticket.successor_of.is_some()
         {
