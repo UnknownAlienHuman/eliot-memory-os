@@ -625,7 +625,7 @@
 //! true` row plus its dependency-policy inventory entry; the edge is outside
 //! every `architecture-boundaries.toml` forbidden set for `eliotd`); (2) a
 //! producer that hands this daemon an explicitly assessed outcome for a live
-//! candidate; (3) the inspector and Active View readers (issue #1910 W6/A1/A2)
+//! candidate; (3) the Active View readers (issue #1910 W6/A2)
 //! paging [`CAUSAL_OUTCOME_SCOPE`]. The typed owner refusal crosses this
 //! boundary inside [`ImprovementDispatchError::Contract`] with its message
 //! intact — the error enum lives in `improvement_intake_dispatch`, another
@@ -657,7 +657,10 @@ use eliot_store_api::{
     LearningRecordKind, ScopeId, WriteReceipt, canonical_json_bytes, learning_record_commit_params,
     learning_record_mutation_request,
 };
-use eliot_types::cognition::{CausalCandidate, CausalInterventionOutcomeRecord};
+use eliot_types::cognition::{
+    CausalCandidate, CausalCheckAssignment, CausalEdgeStatus, CausalInterventionOutcomeRecord,
+};
+use serde::{Deserialize, Serialize};
 
 use super::DaemonComposition;
 use super::improvement_candidate_route::{
@@ -695,8 +698,10 @@ const RECONCILIATION_SCOPE: &str = eliot_governor::GOVERNOR_SCOPE_ID;
 /// Governor-owned commit below — a caller-addressed scope is data, not a
 /// second durability scheme — and the record kind stays the closed `candidate`
 /// kind, which is the kind for a record ABOUT a candidate that claims no
-/// promotion. The inspector and Active View readers (issue #1910 W6/A1/A2)
-/// page this scope when they arrive; until then no reader enumerates it.
+/// promotion. The Active View readers (issue #1910 W6/A2)
+/// page this scope when they arrive; until then no reader enumerates it. The
+/// material-recommendation inspector ([`inspect_material_causal_recommendation`])
+/// projects a candidate rather than paging this scope.
 const CAUSAL_OUTCOME_SCOPE: &str = "causal-outcome";
 
 /// Deadline bounding one durable obligation-commit ingress, in Unix
@@ -1481,6 +1486,106 @@ fn causal_outcome_record_key(
     Ok(format!(
         "causal-intervention-outcome:{candidate_id}:{outcome_digest}"
     ))
+}
+
+/// Inspector projection of one material causal recommendation (issue #1910 A1).
+///
+/// The acceptance bar for a material causal recommendation: an inspector sees
+/// the candidate's mechanism, at least one predicted observable, its
+/// counterfactual, its confounder/rival field, its transfer boundary, and the
+/// linked `verification`-class work unit. Every field below is cloned out of
+/// the candidate (and its assigned check) that
+/// [`inspect_material_causal_recommendation`] already admitted through the
+/// owner's own gate, so the view is one projection rather than a second
+/// construction that could drift from it.
+///
+/// What this view is not: it performs no assessment and records no outcome. A
+/// status of `observed-under-intervention` records that an intervention was
+/// observed, and a successful outcome still supports an effect without
+/// confirming the claimed mechanism (A6.5) — that judgment belongs to the
+/// explicit assessment carried by
+/// [`eliot_types::cognition::CausalInterventionOutcomeRecord`], committed by
+/// [`commit_causal_intervention_outcome`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaterialCausalRecommendationView {
+    /// Which candidate this projection was read from.
+    pub candidate_id: String,
+    /// Current epistemic state: hypothetical, supported, or
+    /// observed-under-intervention. An outcome never promotes this by itself;
+    /// only an explicit assessment chooses a new value.
+    pub edge_status: CausalEdgeStatus,
+    /// The claimed mechanism (A6.5).
+    pub mechanism: String,
+    /// The preregistered predicted observable (A6.5). Non-blank by the
+    /// material gate, so at least one observable is always present.
+    pub predicted_observable: String,
+    /// The counterfactual the claim is tested against (A6.5).
+    pub counterfactual: String,
+    /// Possible confounders (A6.5).
+    pub possible_confounders: Vec<String>,
+    /// Rival explanations (A6.5). Non-empty unless an explicit
+    /// no-plausible-rival rationale is recorded instead; the material gate
+    /// enforces that one of the two is present.
+    pub rival_explanations: Vec<String>,
+    /// Explicit rationale for no plausible rival, when no rival explanation
+    /// is recorded.
+    pub no_plausible_rival_rationale: Option<String>,
+    /// Where the claim stops transferring (A6.5).
+    pub transfer_boundary: String,
+    /// The assigned discriminative check: a verifier work item or a bounded
+    /// inquiry. This is the linked verification work unit.
+    pub assigned_check: CausalCheckAssignment,
+    /// The I14.1 work class the check is submitted through — always
+    /// `verification`, read from the owner's own
+    /// [`eliot_types::cognition::CAUSAL_DISCRIMINATIVE_CHECK_WORK_CLASS`]
+    /// rather than spelled here.
+    pub verification_work_class: String,
+}
+
+/// Project one material causal recommendation for its inspector (issue #1910 A1).
+///
+/// # Gate, not construction
+///
+/// The projection runs the owner's own
+/// [`eliot_types::cognition::CausalCandidate::critical_action_check`]: the
+/// complete material record (mechanism, predicted observable, counterfactual,
+/// confounders, rival explanation or explicit no-rival rationale, calibration,
+/// transfer boundary) plus the assigned verifier or bounded inquiry. A
+/// candidate that fails the gate is refused through
+/// [`ImprovementDispatchError::Contract`] with the owner's message intact, and
+/// nothing is projected. The returned work class is the owner's own
+/// `verification` binding, so the linked unit stays a verification-class work
+/// unit whichever check form is assigned.
+///
+/// # Production caller
+///
+/// STITCH, stated not papered over: no live daemon path holds a
+/// `CausalCandidate` yet, so this projector is reachable API with no caller
+/// rather than a caller that fabricates one — the same standing as
+/// [`commit_causal_intervention_outcome`].
+pub fn inspect_material_causal_recommendation(
+    candidate: &CausalCandidate,
+) -> Result<MaterialCausalRecommendationView, ImprovementDispatchError> {
+    let (assigned_check, work_class) = candidate.critical_action_check().map_err(|error| {
+        ImprovementDispatchError::Contract(format!(
+            "material causal recommendation {} refused: {error}",
+            candidate.candidate_id
+        ))
+    })?;
+    Ok(MaterialCausalRecommendationView {
+        candidate_id: candidate.candidate_id.clone(),
+        edge_status: candidate.edge_status,
+        mechanism: candidate.mechanism.clone(),
+        predicted_observable: candidate.predicted_observable.clone(),
+        counterfactual: candidate.counterfactual.clone(),
+        possible_confounders: candidate.possible_confounders.clone(),
+        rival_explanations: candidate.rival_explanations.clone(),
+        no_plausible_rival_rationale: candidate.no_plausible_rival_rationale.clone(),
+        transfer_boundary: candidate.transfer_boundary.clone(),
+        assigned_check: assigned_check.clone(),
+        verification_work_class: work_class.to_owned(),
+    })
 }
 
 /// Derives the closed store handle of one durable terminal decision.
