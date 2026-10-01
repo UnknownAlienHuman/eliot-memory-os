@@ -263,13 +263,8 @@ impl KernelComposition {
         expected_sequence: u64,
     ) -> Result<KernelControlResponse, TransportError> {
         let mut session = KernelControlSessionContext::default();
-        self.apply_control_request_in_session(
-            request,
-            peer,
-            expected_sequence,
-            &mut session,
-        )
-        .await
+        self.apply_control_request_in_session(request, peer, expected_sequence, &mut session)
+            .await
     }
 
     /// Applies an authenticated request while retaining context bound to the
@@ -496,8 +491,7 @@ impl KernelComposition {
                     .filter(|freshness| {
                         freshness.candidate_digest == candidate_digest
                             && freshness.state_fence == target
-                            && freshness.revoke_sequence.checked_add(1)
-                                == Some(request.sequence)
+                            && freshness.revoke_sequence.checked_add(1) == Some(request.sequence)
                     })
                     .ok_or(TransportError::SessionFenced)?;
                 self.admit_host_observed_watchdog_branch(

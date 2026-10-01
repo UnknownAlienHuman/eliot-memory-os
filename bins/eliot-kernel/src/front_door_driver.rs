@@ -16,10 +16,10 @@ use eliot_ipc::{
     decode_client_hello_frame_unbound, handshake_rejection_frame, server_hello_frame,
 };
 #[cfg(windows)]
+use eliot_kernel::KernelControlSessionContext;
+#[cfg(windows)]
 use eliot_kernel::kernel_diagnostics::{EntrypointStage, observe_entrypoint_with_detail};
 use eliot_kernel::{KernelComposition, KernelFrameAction};
-#[cfg(windows)]
-use eliot_kernel::KernelControlSessionContext;
 #[cfg(windows)]
 use eliot_kernel_service::ProcessExecutionResponse;
 use eliot_kernel_service::{
