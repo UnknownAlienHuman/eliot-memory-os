@@ -75,9 +75,9 @@ pub use inquiry_governance::{
     InquiryProtocol, InquiryProtocolProfile, InquiryRisk, InquirySelectionFeatures,
     InquiryStopRule, InquiryTerminalRecord, InquiryUncertainty, LaneDisciplineOutcome,
     MissingSourceClass, PreservedNextProbe, PreservedUnknown, ReopenCondition, ResearchDebt,
-    ResearchDebtKind, ResearchDebtRestriction, ResearchGateRecord, ResearchGateStatus,
-    SourcePortfolio, SpecialistDiscoverability, StopRuleKind, StreamEvidence, UnadmittedReference,
-    UnadmittedReferenceKind, VerifierStrength, RESEARCH_GATE_FAMILY,
+    ResearchDebtKind, ResearchDebtRegistrationRequest, ResearchDebtRestriction, ResearchGateRecord,
+    ResearchGateStatus, SourcePortfolio, SpecialistDiscoverability, StopRuleKind, StreamEvidence,
+    UnadmittedReference, UnadmittedReferenceKind, VerifierStrength, RESEARCH_GATE_FAMILY,
 };
 pub use inquiry_lanes::{
     AttemptOutcome, AttemptRecord, AttemptRecordParams, BlindedDelivery, BlindedDeliveryParams,
