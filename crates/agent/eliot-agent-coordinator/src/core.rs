@@ -405,16 +405,36 @@ impl RoutePartitionDemand {
     }
 
     /// Narrows one partition's effective limit to `limit`, never widening it.
+    ///
+    /// The narrowing is written as an explicit conditional rather than
+    /// `.min(limit)` because `Ord::min` is not const-stable on this toolchain
+    /// and a `const fn` cannot call it (`E0658`). On `usize`,
+    /// `if held < limit { held } else { limit }` **is** `min`: the tie takes the
+    /// `else` branch and yields `limit`, which equals `held` there, so the
+    /// result is identical at every input and the limit-fold arithmetic is
+    /// unchanged.
     const fn tighten(&mut self, partition: CapacityClass, limit: usize) {
         match partition {
             CapacityClass::NormalWorkload => {
-                self.normal_workload = self.normal_workload.min(limit);
+                self.normal_workload = if self.normal_workload < limit {
+                    self.normal_workload
+                } else {
+                    limit
+                };
             }
             CapacityClass::ProtectedControl => {
-                self.protected_control = self.protected_control.min(limit);
+                self.protected_control = if self.protected_control < limit {
+                    self.protected_control
+                } else {
+                    limit
+                };
             }
             CapacityClass::EmergencyLastResort => {
-                self.emergency_last_resort = self.emergency_last_resort.min(limit);
+                self.emergency_last_resort = if self.emergency_last_resort < limit {
+                    self.emergency_last_resort
+                } else {
+                    limit
+                };
             }
         }
     }
@@ -2086,9 +2106,7 @@ impl AgentCoordinator {
                     {
                         return Err(CoordinatorError::RouteEvidence);
                     }
-                    current
-                        .requested
-                        .add(lane.work_class.capacity_class(), 1);
+                    current.requested.add(lane.work_class.capacity_class(), 1);
                 }
             }
         }
