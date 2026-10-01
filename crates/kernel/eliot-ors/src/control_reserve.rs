@@ -23,6 +23,28 @@
 //! the live reserve it reports and refuses while that reserve still admits
 //! the request, so pressure evidence is never manufactured.
 //!
+//! Owner-issued permit evidence (issue #1679, W4) rides on
+//! [`OrsReserve::issue_permit`]: the owner validates one canonical
+//! [`CapacityRequest`] carrying the exact bottleneck, unit and amount under
+//! its typed [`RequestedOperationClass`] tag, acquires from the tagged
+//! partition, and returns the non-clone [`OrsPermit`] together with the
+//! owner-minted [`CapacityPermitBinding`]. The tag alone selects the
+//! partition — `Normal` draws only the normal partition, `Protected` only
+//! the protected partition — so a normal Store write, named read, agent or
+//! maintenance admission can never acquire protected ORS capacity by
+//! relabelling priority or class: relabelling is unrepresentable, not merely
+//! refused. The binding matches its request only through
+//! [`CapacityPermitBinding::matches_request`]; changed content conflicts
+//! instead of replaying. This owner holds no emergency partition, so an
+//! `Emergency` tag is refused with a typed denial; recording reserve loss
+//! stays with the front-door last-resort slot.
+//! DISCLOSED LIMIT: `owner_generation`, the request epoch, the profile
+//! identity/revision and the issue clock are composition-supplied and echoed
+//! into the binding; this module opens no clock, reads no profile and holds
+//! no live Authority Epoch source, so epoch/generation/profile staleness is
+//! decided by the Kernel composition through `matches_request` and the
+//! profile join, exactly as the W2 compiler already does for owner rows.
+//!
 //! This module has no production caller yet (STITCH): it publishes the owner
 //! evidence the Kernel profile composition will join. There is no emergency
 //! partition here; recording reserve loss stays with the front-door
@@ -36,15 +58,17 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use eliot_contracts::{ArtifactId, OperationId};
+use eliot_contracts::{ArtifactId, OperationId, ResourceGeneration};
 use eliot_runtime_contracts::{
     AffectedOperationClass, BackpressureDisposition, BottleneckAvailability,
     BottleneckCoverageState, BottleneckObservationV1, CapacityBottleneck, CapacityClass,
-    ControlOperationClass, EarliestRecoveryCondition, EvidenceCoverageState,
-    HumanActionRequirement, I14_BACKPRESSURE_RESPONSE_VERSION, I14BackpressureCause,
-    I14BackpressureResponseV1, I14CurrentnessState, I14EscalationCondition, I14ForbiddenAction,
-    I14RecoveryAction, I14RecoveryDirectiveV1, I14RequiredAuthority, I14ResolutionState,
-    I14WorkOutcome, NormalWorkClass, RecoveryCommitStatus, StatePreservationStatus,
+    CapacityPermitBinding, CapacityRequest, ControlOperationClass, EarliestRecoveryCondition,
+    EmergencyOperationClass, EvidenceCoverageState, HumanActionRequirement,
+    I14_BACKPRESSURE_RESPONSE_VERSION, I14BackpressureCause, I14BackpressureResponseV1,
+    I14CurrentnessState, I14EscalationCondition, I14ForbiddenAction, I14RecoveryAction,
+    I14RecoveryDirectiveV1, I14RequiredAuthority, I14ResolutionState, I14WorkOutcome,
+    NormalWorkClass, RecoveryCommitStatus, RequestedOperationClass, StatePreservationStatus,
+    frozen_bottleneck_owner_map,
 };
 use thiserror::Error;
 
@@ -95,6 +119,24 @@ pub enum OrsReserveError {
         bottleneck: CapacityBottleneck,
         /// Control operation that was not admitted.
         operation: ControlOperationClass,
+        /// Operation that was not admitted.
+        operation_id: String,
+        /// Requesting owner.
+        owner: String,
+    },
+    /// The request names the emergency class, which this owner cannot issue.
+    ///
+    /// The ORS reserve holds no emergency partition, so no counter is touched
+    /// and no capacity is consumed; recording reserve loss stays with the
+    /// front-door last-resort slot.
+    #[error(
+        "ORS emergency capacity not issuable for {bottleneck:?}: emergency operation {operation:?} operation {operation_id} owned by {owner}"
+    )]
+    EmergencyNotIssuable {
+        /// Bottleneck whose emergency capacity was requested.
+        bottleneck: CapacityBottleneck,
+        /// Emergency operation that was not admitted.
+        operation: EmergencyOperationClass,
         /// Operation that was not admitted.
         operation_id: String,
         /// Requesting owner.
@@ -157,6 +199,9 @@ struct OrsReserveInner {
     transaction_protected_in_flight: AtomicU64,
     durable_normal_in_flight_bytes: AtomicU64,
     durable_protected_in_flight_bytes: AtomicU64,
+    /// Owner-minted permit sequence; never reset, so two issuances never
+    /// share a permit identity.
+    permit_sequence: AtomicU64,
 }
 
 /// The ORS control reserve: disjoint normal/protected partitions for the two
@@ -311,6 +356,7 @@ impl OrsReserve {
                 transaction_protected_in_flight: AtomicU64::new(0),
                 durable_normal_in_flight_bytes: AtomicU64::new(0),
                 durable_protected_in_flight_bytes: AtomicU64::new(0),
+                permit_sequence: AtomicU64::new(0),
             }),
         })
     }
@@ -584,6 +630,189 @@ impl OrsReserve {
             operation_id: operation_id.to_owned(),
             owner: owner.to_owned(),
         })
+    }
+
+    /// Issues one owner-bound permit for a validated capacity request.
+    ///
+    /// The W4 request/issue path for the two ORS bottlenecks: the request
+    /// names the exact bottleneck, unit and amount under its typed
+    /// [`RequestedOperationClass`] tag, and the owner returns the non-clone
+    /// [`OrsPermit`] together with the minted [`CapacityPermitBinding`]. The
+    /// tag alone selects the partition — `Normal` draws only the normal
+    /// partition, `Protected` only the protected partition — so no priority
+    /// or class relabelling can move a normal Store write, named read, agent
+    /// or maintenance operation onto protected ORS capacity. An `Emergency`
+    /// tag is refused with [`OrsReserveError::EmergencyNotIssuable`]: this
+    /// owner holds no emergency partition. The binding matches its request
+    /// only through [`CapacityPermitBinding::matches_request`]; changed
+    /// content conflicts instead of replaying.
+    ///
+    /// The caller supplies its clock (`now_ms`) and the issuing owner
+    /// generation: the reserve owns no generation counter and no clock, so
+    /// both bindings arrive with the call. The request epoch and profile
+    /// identity/revision are recorded as presented; this owner holds no live
+    /// Authority Epoch source, so staleness against current evidence is
+    /// decided by the Kernel composition through `matches_request` and the
+    /// profile join. The binding carries no wall-clock expiry (`u64::MAX`);
+    /// the permit lifetime is the handle lifetime (drop) and staleness is
+    /// fenced by epoch, profile revision and generations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrsReserveError::Contract`] when the request or the minted
+    /// binding fails the existing contract validation,
+    /// [`OrsReserveError::InvalidField`] when the request names another
+    /// owner's bottleneck, when a transaction request names an amount other
+    /// than one slot (this owner issues single-slot transaction permits; hold
+    /// one permit per slot), or when the issuing clock is negative,
+    /// [`OrsReserveError::EmergencyNotIssuable`] for the emergency class, or
+    /// the tagged saturation disposition
+    /// ([`OrsReserveError::NormalCapacityExhausted`]/
+    /// [`OrsReserveError::ProtectedReserveExhausted`]) naming the exact
+    /// bottleneck.
+    pub fn issue_permit(
+        &self,
+        request: &CapacityRequest,
+        owner_generation: ResourceGeneration,
+        now_ms: i64,
+    ) -> Result<(OrsPermit, CapacityPermitBinding), OrsReserveError> {
+        request
+            .validate()
+            .map_err(|error| OrsReserveError::Contract(error.to_string()))?;
+        if request.requested_bottleneck != ORS_TRANSACTION_BOTTLENECK
+            && request.requested_bottleneck != ORS_DURABLE_BYTES_BOTTLENECK
+        {
+            return Err(OrsReserveError::InvalidField {
+                field: "capacity_request.requested_bottleneck",
+                reason: "this owner enforces only ORS_TRANSACTION_SLOTS and ORS_DURABLE_QUEUE_BYTES; no other dimension is issuable here",
+            });
+        }
+        if request.requested_bottleneck == ORS_TRANSACTION_BOTTLENECK
+            && request.requested_limit.quantity.get() != 1
+        {
+            return Err(OrsReserveError::InvalidField {
+                field: "capacity_request.requested_limit",
+                reason: "the ORS owner issues single-slot transaction permits; hold one permit per slot",
+            });
+        }
+        let issued_at_ms = u64::try_from(now_ms).map_err(|_| OrsReserveError::InvalidField {
+            field: "capacity_request.issued_at_ms",
+            reason: "the issuing clock must be non-negative",
+        })?;
+        let owner = frozen_bottleneck_owner_map()
+            .into_iter()
+            .find(|bound| bound.bottleneck == request.requested_bottleneck)
+            .ok_or(OrsReserveError::InvalidField {
+                field: "capacity_request.requested_bottleneck",
+                reason: "the frozen owner map binds no ORS owner to the requested dimension",
+            })?;
+        let dimension = if request.requested_bottleneck == ORS_TRANSACTION_BOTTLENECK {
+            OrsDimension::TransactionSlots
+        } else {
+            OrsDimension::DurableQueueBytes
+        };
+        let permit = match request.operation {
+            RequestedOperationClass::Normal(work) => match dimension {
+                OrsDimension::TransactionSlots => self.try_acquire_normal_transaction(
+                    work,
+                    &request.requesting_owner_ref,
+                    &request.operation_id,
+                )?,
+                OrsDimension::DurableQueueBytes => self.try_acquire_normal_durable_bytes(
+                    work,
+                    &request.requesting_owner_ref,
+                    &request.operation_id,
+                    request.requested_limit.quantity,
+                )?,
+            },
+            RequestedOperationClass::Protected(operation) => match dimension {
+                OrsDimension::TransactionSlots => self.try_acquire_protected_transaction(
+                    operation,
+                    &request.requesting_owner_ref,
+                    &request.operation_id,
+                )?,
+                OrsDimension::DurableQueueBytes => self.try_acquire_protected_durable_bytes(
+                    operation,
+                    &request.requesting_owner_ref,
+                    &request.operation_id,
+                    request.requested_limit.quantity,
+                )?,
+            },
+            RequestedOperationClass::Emergency(operation) => {
+                return Err(OrsReserveError::EmergencyNotIssuable {
+                    bottleneck: request.requested_bottleneck,
+                    operation,
+                    operation_id: request.operation_id.clone(),
+                    owner: request.requesting_owner_ref.clone(),
+                });
+            }
+        };
+        let sequence = self.inner.permit_sequence.fetch_add(1, Ordering::AcqRel);
+        let binding = CapacityPermitBinding {
+            permit_id: format!(
+                "ORS-{}-{sequence}-{}",
+                request.operation.as_contract_str(),
+                request.operation_id
+            ),
+            operation_id: request.operation_id.clone(),
+            capacity_class: request.operation.capacity_class(),
+            operation: request.operation,
+            bottleneck: request.requested_bottleneck,
+            granted_limit: request.requested_limit,
+            capacity_owner_ref: owner.owner.to_owned(),
+            capacity_owner_generation_ref: owner_generation,
+            requesting_owner_ref: request.requesting_owner_ref.clone(),
+            requesting_generation_ref: request.requesting_generation_ref,
+            authority_epoch_ref: request.authority_epoch_ref.clone(),
+            profile_id: request.profile_id.clone(),
+            profile_revision: request.profile_revision.clone(),
+            issued_at_ms,
+            expires_at_ms: u64::MAX,
+            owner_evidence_refs: vec![
+                self.issue_evidence(dimension, request.operation.capacity_class())
+            ],
+        };
+        debug_assert!(
+            binding.validate().is_ok(),
+            "ORS minted permit binding must satisfy the contract"
+        );
+        debug_assert!(
+            binding.matches_request(request),
+            "ORS minted permit binding must match its request"
+        );
+        Ok((permit, binding))
+    }
+
+    /// Records the owner's contemporaneous partition observation for one issuance.
+    fn issue_evidence(&self, dimension: OrsDimension, class: CapacityClass) -> String {
+        let (bottleneck, capacity, available) = match (dimension, class) {
+            (OrsDimension::TransactionSlots, CapacityClass::NormalWorkload) => (
+                ORS_TRANSACTION_BOTTLENECK,
+                self.inner.transaction_normal_capacity,
+                self.available_normal_transactions(),
+            ),
+            (OrsDimension::TransactionSlots, _) => (
+                ORS_TRANSACTION_BOTTLENECK,
+                self.inner.transaction_protected_capacity,
+                self.available_protected_transactions(),
+            ),
+            (OrsDimension::DurableQueueBytes, CapacityClass::NormalWorkload) => (
+                ORS_DURABLE_BYTES_BOTTLENECK,
+                self.inner.durable_normal_capacity_bytes,
+                self.available_normal_durable_bytes(),
+            ),
+            (OrsDimension::DurableQueueBytes, _) => (
+                ORS_DURABLE_BYTES_BOTTLENECK,
+                self.inner.durable_protected_capacity_bytes,
+                self.available_protected_durable_bytes(),
+            ),
+        };
+        format!(
+            "ors-reserve:{}:{} capacity {capacity} in-flight {}",
+            bottleneck.as_contract_str(),
+            class.as_contract_str(),
+            capacity.saturating_sub(available),
+        )
     }
 
     /// Reports exhausted normal durable bytes as a `STORAGE_BACKPRESSURE`
