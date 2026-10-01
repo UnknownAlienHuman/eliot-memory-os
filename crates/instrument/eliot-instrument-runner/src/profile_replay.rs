@@ -79,6 +79,27 @@ pub struct VerifiedTestdReplayContext {
 }
 
 impl VerifiedTestdReplayContext {
+    /// Projects the accepted catalog lifecycle only after this context has
+    /// verified its owner readback, generation admission, and state fence.
+    /// This lets the Kernel compare the durable stage projection with the
+    /// actual current owner row before issuing the stream grant.
+    #[must_use]
+    pub fn accepted_catalog_lifecycle(&self) -> TestdProviderCatalogLifecycle {
+        TestdProviderCatalogLifecycle {
+            owner_revision: self.lifecycle.owner_revision(),
+            catalog_revision: self.lifecycle.catalog_revision(),
+            catalog_digest: self.lifecycle.catalog_digest().to_owned(),
+            state_fence: self.lifecycle.state_fence().clone(),
+            module_id: self.lifecycle.module_id().as_str().to_owned(),
+            generation_id: self.lifecycle.generation_id().as_str().to_owned(),
+            artifact_digest: self.lifecycle.artifact_digest().to_owned(),
+            config_digest: self.lifecycle.config_digest().to_owned(),
+            protocol_digest: self.lifecycle.protocol_digest().to_owned(),
+            manifest_digest: self.lifecycle.manifest_digest().to_owned(),
+            admission_receipt: self.lifecycle.admission_receipt().to_owned(),
+        }
+    }
+
     /// Issues a replay context only after the exact current catalog readback
     /// revalidates its accepted module generation and current WorkScope source
     /// snapshot at the same exact state fence.
