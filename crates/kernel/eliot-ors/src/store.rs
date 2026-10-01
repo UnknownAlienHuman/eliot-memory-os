@@ -37331,7 +37331,10 @@ mod host_request_result_tests {
             operation_id: OperationIdentity::new(operation.to_owned()).expect("valid operation"),
             kind: HostRequestKind::Invocation,
             request_id: label("req-1"),
-            correlation_projection: None,
+            correlation_projection: Some(HostCorrelationProjection::Opaque {
+                domain: eliot_contracts::HostCorrelationDomain::Request,
+                occurrence: "req-1".to_owned(),
+            }),
             idempotency_key: label("req-1:invoke"),
             cancellation_id: label("req-1:invoke:cancel"),
             parent_operation_id: None,
@@ -37484,6 +37487,21 @@ mod host_request_result_tests {
         let digest = "d".repeat(64);
         let operation =
             OperationIdentity::new(format!("hostreq:{digest}")).expect("valid operation");
+
+        // A legacy digest-only completion is not enough to admit an invocation:
+        // the original full request must retain authenticated correlation.
+        let mut uncorrelated = requested_fixture(operation.as_str(), &digest);
+        uncorrelated.correlation_projection = None;
+        assert!(matches!(
+            store.stage_host_request(&uncorrelated),
+            Err(OrsError::HostRequestLegacyCorrelationUnresolved)
+        ));
+        assert!(store
+            .load_host_request(&operation, &digest)?
+            .is_none());
+
+        // With its full typed request carrier retained, the exact legacy result
+        // digest may be completed with its body without weakening identity.
         store.stage_host_request(&requested_fixture(operation.as_str(), &digest))?;
         for target in [
             HostRequestState::Admitted,

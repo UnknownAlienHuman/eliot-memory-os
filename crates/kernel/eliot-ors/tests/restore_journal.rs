@@ -10,27 +10,100 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use eliot_contracts::sha256_hex;
 use eliot_ors::{
-    JournalPredecessor, MAX_JOURNAL_PAGE_ENTRIES, MAX_JOURNAL_PAYLOAD_BYTES,
-    RESTORE_JOURNAL_RECORD_SCHEMA, RESTORE_JOURNAL_SCHEMA_VERSION, RedbRecoveryStore,
-    RestoreJournalArchiveClass, RestoreJournalOperation, RestoreJournalResult,
-    RestoreJournalStreamBinding,
+    EpochIdentity, EpochLineage, JournalPredecessor, MAX_JOURNAL_PAGE_ENTRIES,
+    MAX_JOURNAL_PAYLOAD_BYTES, OpaqueLabel, RESTORE_JOURNAL_RECORD_SCHEMA,
+    RESTORE_JOURNAL_SCHEMA_VERSION, RecoveryAccessClass, RecoveryEnvelopeContext,
+    RecoveryPayloadEnvelope, RedbRecoveryStore, RestoreJournalArchiveClass,
+    RestoreJournalOperation, RestoreJournalResult, RestoreJournalStreamBinding,
+    StateFenceSnapshot,
 };
+use eliot_platform::SecretReference;
+use eliot_security_contracts::{InstructionTaint, PrivacyClass};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 const PAYLOAD_GENESIS: &str = "{\"note\":\"genesis-957\",\"phase\":\"verify\"}";
-const PAYLOAD_GENESIS_SHA: &str =
-    "043064b10d65863e06089279c619786b38aea72b3f87681886043ed7d6e226c5";
 const PAYLOAD_SECOND: &str = "{\"note\":\"second-957\",\"phase\":\"materialize\"}";
-const PAYLOAD_SECOND_SHA: &str = "71c7b8e8ce7aa9ae4be0df23b7df84cdf7a3892b6263c78f892961bc4a6ac598";
 const PAYLOAD_ALT: &str = "{\"note\":\"alt-957\",\"phase\":\"verify\"}";
-const PAYLOAD_ALT_SHA: &str = "fa48b699035e2f74e6b7b34299d7b5930795d0e8921a9778c1f0ab8f696afdf6";
 const RECEIPT_VERIFY: &str = "{\"outcome\":\"applied\",\"phase\":\"verify\"}";
-const RECEIPT_VERIFY_SHA: &str = "47fdfa3c389aa6174fb0bff29d75193864a04c669c5d784674d8e5e862f2a95a";
 const RECEIPT_MATERIALIZE: &str = "{\"outcome\":\"applied\",\"phase\":\"materialize\"}";
-const RECEIPT_MATERIALIZE_SHA: &str =
-    "c228d2326e2c714dee3501f372811d0d6717e79bc3873a77859d9e56b21eacbd";
+
+fn fixture_fence() -> StateFenceSnapshot {
+    StateFenceSnapshot::capture(&serde_json::json!({"authority_epoch": 1}), 1)
+        .expect("fixture fence is valid")
+}
+
+fn recovery_payload_envelope(
+    operation: &RestoreJournalOperation,
+    stream: &str,
+    body: &str,
+) -> Result<(String, String), eliot_ors::OrsError> {
+    let authority_epoch = EpochLineage {
+        current: EpochIdentity {
+            lineage_id: OpaqueLabel::new("restore-journal-fixture-lineage")
+                .map_err(|error| eliot_ors::OrsError::Contract(error.to_string()))?,
+            epoch: 1,
+        },
+        predecessor: None,
+    };
+    let state_fence = fixture_fence();
+    if state_fence.sha256 != operation.writer_fence_digest {
+        return Err(eliot_ors::OrsError::FenceMismatch);
+    }
+    let access_class = RecoveryAccessClass {
+        privacy: PrivacyClass::Private,
+        visibility: OpaqueLabel::new("owner-only")
+            .map_err(|error| eliot_ors::OrsError::Contract(error.to_string()))?,
+        instruction_taint: InstructionTaint::DataOnly,
+    };
+    let envelope = RecoveryPayloadEnvelope::encrypted(
+        RecoveryEnvelopeContext {
+            operation_or_checkpoint_id: OpaqueLabel::new(operation.identity(stream)?)
+                .map_err(|error| eliot_ors::OrsError::Contract(error.to_string()))?,
+            privacy_and_visibility_class: access_class,
+            authority_epoch,
+            state_fence,
+            created_at_ms: 1,
+            known_at_ms: 1,
+            expires_at_ms: None,
+        },
+        SecretReference::new("restore-journal-fixture", "test-key")
+            .map_err(|error| eliot_ors::OrsError::Contract(error.to_string()))?,
+        body.as_bytes().to_vec(),
+    )?;
+    let bytes = serde_json::to_string(&envelope)
+        .map_err(|error| eliot_ors::OrsError::Encoding(error.to_string()))?;
+    let digest = sha256_hex(bytes.as_bytes());
+    Ok((bytes, digest))
+}
+
+fn append_intent(
+    store: &RedbRecoveryStore,
+    stream: &str,
+    operation: &RestoreJournalOperation,
+    body: &str,
+) -> Result<eliot_ors::RestoreJournalAppendReceipt, eliot_ors::OrsError> {
+    let (payload, digest) = recovery_payload_envelope(operation, stream, body)?;
+    store.append_restore_journal_intent(stream, operation, &digest, &payload)
+}
+
+fn result_for(
+    stream: &str,
+    operation: &RestoreJournalOperation,
+    intent_sequence: u64,
+    receipt_body: &str,
+) -> Result<RestoreJournalResult, eliot_ors::OrsError> {
+    let (receipt, receipt_sha256) = recovery_payload_envelope(operation, stream, receipt_body)?;
+    Ok(RestoreJournalResult {
+        transaction_id: operation.transaction_id.clone(),
+        phase_operation: operation.phase_operation.clone(),
+        intent_sequence,
+        receipt_sha256,
+        receipt,
+    })
+}
 
 fn digest(byte: char) -> String {
     std::iter::repeat_n(byte, 64).collect()
@@ -71,7 +144,7 @@ fn binding(transaction: &str, writer: &str) -> RestoreJournalStreamBinding {
         archive_class: RestoreJournalArchiveClass::FullRecovery,
         destination_ref: "dest-957-a".to_owned(),
         writer_id: writer.to_owned(),
-        writer_fence_digest: digest('e'),
+        writer_fence_digest: fixture_fence().sha256,
     }
 }
 
@@ -88,29 +161,13 @@ fn operation(
         archive_class: RestoreJournalArchiveClass::FullRecovery,
         destination_ref: "dest-957-a".to_owned(),
         writer_id: "writer-957-a".to_owned(),
-        writer_fence_digest: digest('e'),
+        writer_fence_digest: fixture_fence().sha256,
         record_schema: RESTORE_JOURNAL_RECORD_SCHEMA.to_owned(),
         phase_operation: phase.to_owned(),
         request_digest: digest(request),
         body_digest: digest(body),
         expected_predecessor: predecessor,
         payload_handle: format!("payload-957-{transaction}-{phase}"),
-    }
-}
-
-fn result_for(
-    transaction: &str,
-    phase: &str,
-    intent_sequence: u64,
-    receipt: &str,
-    receipt_sha: &str,
-) -> RestoreJournalResult {
-    RestoreJournalResult {
-        transaction_id: transaction.to_owned(),
-        phase_operation: phase.to_owned(),
-        intent_sequence,
-        receipt_sha256: receipt_sha.to_owned(),
-        receipt: receipt.to_owned(),
     }
 }
 
@@ -132,12 +189,7 @@ fn exact_owner_neutral_transaction_identity() -> TestResult {
     assert_eq!(store.load_restore_journal_binding(stream)?, Some(fixture));
     let genesis: RestoreJournalOperation =
         serde_json::from_value(read_fixture("genesis-operation.json")?)?;
-    let receipt = store.append_restore_journal_intent(
-        stream,
-        &genesis,
-        PAYLOAD_GENESIS_SHA,
-        PAYLOAD_GENESIS,
-    )?;
+    let receipt = append_intent(&store, stream, &genesis, PAYLOAD_GENESIS)?;
     assert_eq!(receipt.transaction_id, "tx-957-fixture");
     assert_eq!(receipt.phase_operation, "verify");
     assert_eq!(receipt.sequence, 0);
@@ -179,13 +231,14 @@ fn wrong_writer_fence_source_destination_archive_rejected() -> TestResult {
         );
     }
     let mut bad_schema = operation("tx-957-a", "verify", 'a', 'b', None);
+    let (payload, payload_sha) = recovery_payload_envelope(&bad_schema, stream, PAYLOAD_GENESIS)?;
     bad_schema.record_schema = "restore-journal-v9".to_owned();
     assert!(matches!(
         store.append_restore_journal_intent(
             stream,
             &bad_schema,
-            PAYLOAD_GENESIS_SHA,
-            PAYLOAD_GENESIS
+            &payload_sha,
+            &payload
         ),
         Err(eliot_ors::OrsError::InvalidField { .. })
     ));
@@ -199,24 +252,16 @@ fn durable_intent_append_and_reopen() -> TestResult {
     let (store, path) = open_db("03")?;
     let stream = "stream-957-03";
     store.bind_restore_journal_stream(stream, &binding("tx-957-a", "writer-957-a"))?;
-    let first = store.append_restore_journal_intent(
-        stream,
-        &operation("tx-957-a", "verify", 'a', 'b', None),
-        PAYLOAD_GENESIS_SHA,
-        PAYLOAD_GENESIS,
-    )?;
-    let second = store.append_restore_journal_intent(
-        stream,
-        &operation(
-            "tx-957-a",
-            "materialize",
-            'c',
-            'd',
-            Some(predecessor_of(first.sequence, &first.record_digest)),
-        ),
-        PAYLOAD_SECOND_SHA,
-        PAYLOAD_SECOND,
-    )?;
+    let first_operation = operation("tx-957-a", "verify", 'a', 'b', None);
+    let first = append_intent(&store, stream, &first_operation, PAYLOAD_GENESIS)?;
+    let second_operation = operation(
+        "tx-957-a",
+        "materialize",
+        'c',
+        'd',
+        Some(predecessor_of(first.sequence, &first.record_digest)),
+    );
+    let second = append_intent(&store, stream, &second_operation, PAYLOAD_SECOND)?;
     assert_eq!((first.sequence, second.sequence), (0, 1));
     drop(store);
     let reopened = RedbRecoveryStore::open(&path)?;
@@ -239,19 +284,9 @@ fn durable_result_index_sequence_atomicity() -> TestResult {
     let (store, path) = open_db("04")?;
     let stream = "stream-957-04";
     store.bind_restore_journal_stream(stream, &binding("tx-957-a", "writer-957-a"))?;
-    let intent = store.append_restore_journal_intent(
-        stream,
-        &operation("tx-957-a", "verify", 'a', 'b', None),
-        PAYLOAD_GENESIS_SHA,
-        PAYLOAD_GENESIS,
-    )?;
-    let answered = result_for(
-        "tx-957-a",
-        "verify",
-        intent.sequence,
-        RECEIPT_VERIFY,
-        RECEIPT_VERIFY_SHA,
-    );
+    let verify_operation = operation("tx-957-a", "verify", 'a', 'b', None);
+    let intent = append_intent(&store, stream, &verify_operation, PAYLOAD_GENESIS)?;
+    let answered = result_for(stream, &verify_operation, intent.sequence, RECEIPT_VERIFY)?;
     let receipt = store.append_restore_journal_result(stream, &answered)?;
     assert_eq!(receipt.sequence, intent.sequence);
     assert!(!receipt.replayed);
@@ -283,26 +318,14 @@ fn two_writers_same_predecessor_one_advance() -> TestResult {
     let (store, path) = open_db("05")?;
     let stream = "stream-957-05";
     store.bind_restore_journal_stream(stream, &binding("tx-957-a", "writer-957-a"))?;
-    let head = store.append_restore_journal_intent(
-        stream,
-        &operation("tx-957-a", "verify", 'a', 'b', None),
-        PAYLOAD_GENESIS_SHA,
-        PAYLOAD_GENESIS,
-    )?;
+    let head_operation = operation("tx-957-a", "verify", 'a', 'b', None);
+    let head = append_intent(&store, stream, &head_operation, PAYLOAD_GENESIS)?;
     let shared = Some(predecessor_of(head.sequence, &head.record_digest));
-    let winner = store.append_restore_journal_intent(
-        stream,
-        &operation("tx-957-a", "materialize", 'c', 'd', shared.clone()),
-        PAYLOAD_SECOND_SHA,
-        PAYLOAD_SECOND,
-    )?;
+    let winner_operation = operation("tx-957-a", "materialize", 'c', 'd', shared.clone());
+    let winner = append_intent(&store, stream, &winner_operation, PAYLOAD_SECOND)?;
     assert_eq!(winner.sequence, 1);
-    let loser = store.append_restore_journal_intent(
-        stream,
-        &operation("tx-957-a", "reconcile", 'e', 'f', shared),
-        PAYLOAD_SECOND_SHA,
-        PAYLOAD_SECOND,
-    );
+    let loser_operation = operation("tx-957-a", "reconcile", 'e', 'f', shared);
+    let loser = append_intent(&store, stream, &loser_operation, PAYLOAD_SECOND);
     assert!(
         matches!(loser, Err(eliot_ors::OrsError::IntegrityProblem { .. })),
         "second writer on the same predecessor must fail"
@@ -324,18 +347,8 @@ fn exact_replay_returns_identical_receipt() -> TestResult {
     let stream = "stream-957-06";
     store.bind_restore_journal_stream(stream, &binding("tx-957-a", "writer-957-a"))?;
     let genesis = operation("tx-957-a", "verify", 'a', 'b', None);
-    let first = store.append_restore_journal_intent(
-        stream,
-        &genesis,
-        PAYLOAD_GENESIS_SHA,
-        PAYLOAD_GENESIS,
-    )?;
-    let replayed = store.append_restore_journal_intent(
-        stream,
-        &genesis,
-        PAYLOAD_GENESIS_SHA,
-        PAYLOAD_GENESIS,
-    )?;
+    let first = append_intent(&store, stream, &genesis, PAYLOAD_GENESIS)?;
+    let replayed = append_intent(&store, stream, &genesis, PAYLOAD_GENESIS)?;
     assert!(!first.replayed);
     assert!(replayed.replayed);
     assert_eq!(
@@ -360,9 +373,8 @@ fn changed_same_operation_payload_conflicts() -> TestResult {
     let stream = "stream-957-07";
     store.bind_restore_journal_stream(stream, &binding("tx-957-a", "writer-957-a"))?;
     let genesis = operation("tx-957-a", "verify", 'a', 'b', None);
-    store.append_restore_journal_intent(stream, &genesis, PAYLOAD_GENESIS_SHA, PAYLOAD_GENESIS)?;
-    let changed =
-        store.append_restore_journal_intent(stream, &genesis, PAYLOAD_ALT_SHA, PAYLOAD_ALT);
+    append_intent(&store, stream, &genesis, PAYLOAD_GENESIS)?;
+    let changed = append_intent(&store, stream, &genesis, PAYLOAD_ALT);
     assert!(
         matches!(changed, Err(eliot_ors::OrsError::IntegrityProblem { .. })),
         "changed payload under the same operation identity must conflict"
@@ -378,16 +390,13 @@ fn lost_acknowledgement_reconciles_by_readback() -> TestResult {
     let stream = "stream-957-08";
     store.bind_restore_journal_stream(stream, &binding("tx-957-a", "writer-957-a"))?;
     let genesis = operation("tx-957-a", "verify", 'a', 'b', None);
-    let _lost_receipt = store.append_restore_journal_intent(
-        stream,
-        &genesis,
-        PAYLOAD_GENESIS_SHA,
-        PAYLOAD_GENESIS,
-    )?;
+    let _lost_receipt = append_intent(&store, stream, &genesis, PAYLOAD_GENESIS)?;
+    let (_, expected_payload_sha256) =
+        recovery_payload_envelope(&genesis, stream, PAYLOAD_GENESIS)?;
     let entries = store.load_restore_journal_stream(stream, MAX_JOURNAL_PAGE_ENTRIES)?;
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].operation, genesis);
-    assert_eq!(entries[0].payload_sha256, PAYLOAD_GENESIS_SHA);
+    assert_eq!(entries[0].payload_sha256, expected_payload_sha256);
     let _ = std::fs::remove_file(&path);
     Ok(())
 }
@@ -404,18 +413,16 @@ fn acknowledged_record_survives_reopen_nothing_phantom() -> TestResult {
             .is_empty(),
         "no commit means no record"
     );
-    let receipt = store.append_restore_journal_intent(
-        stream,
-        &operation("tx-957-a", "verify", 'a', 'b', None),
-        PAYLOAD_GENESIS_SHA,
-        PAYLOAD_GENESIS,
-    )?;
+    let verify_operation = operation("tx-957-a", "verify", 'a', 'b', None);
+    let (expected_payload, _) =
+        recovery_payload_envelope(&verify_operation, stream, PAYLOAD_GENESIS)?;
+    let receipt = append_intent(&store, stream, &verify_operation, PAYLOAD_GENESIS)?;
     drop(store);
     let reopened = RedbRecoveryStore::open(&path)?;
     let entries = reopened.load_restore_journal_stream(stream, MAX_JOURNAL_PAGE_ENTRIES)?;
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].sequence, receipt.sequence);
-    assert_eq!(entries[0].payload, PAYLOAD_GENESIS);
+    assert_eq!(entries[0].payload, expected_payload);
     drop(reopened);
     let _ = std::fs::remove_file(&path);
     Ok(())
@@ -427,23 +434,19 @@ fn stale_missing_and_unbounded_history_fail_closed() -> TestResult {
     let (store, path) = open_db("10")?;
     let stream = "stream-957-10";
     store.bind_restore_journal_stream(stream, &binding("tx-957-a", "writer-957-a"))?;
-    let stale = store.append_restore_journal_intent(
-        stream,
-        &operation(
-            "tx-957-a",
-            "verify",
-            'a',
-            'b',
-            Some(predecessor_of(9, &digest('9'))),
-        ),
-        PAYLOAD_GENESIS_SHA,
-        PAYLOAD_GENESIS,
+    let stale_operation = operation(
+        "tx-957-a",
+        "verify",
+        'a',
+        'b',
+        Some(predecessor_of(9, &digest('9'))),
     );
+    let stale = append_intent(&store, stream, &stale_operation, PAYLOAD_GENESIS);
     assert!(
         matches!(stale, Err(eliot_ors::OrsError::IntegrityProblem { .. })),
         "stale predecessor must fail"
     );
-    let orphan = result_for("tx-957-a", "verify", 0, RECEIPT_VERIFY, RECEIPT_VERIFY_SHA);
+    let orphan = result_for(stream, &stale_operation, 0, RECEIPT_VERIFY)?;
     assert!(
         matches!(
             store.append_restore_journal_result(stream, &orphan),
@@ -468,14 +471,20 @@ fn stale_missing_and_unbounded_history_fail_closed() -> TestResult {
 fn known_empty_distinct_from_unavailable() -> TestResult {
     let (store, path) = open_db("11")?;
     let stream = "stream-957-11";
+    let expected_binding = binding("tx-957-a", "writer-957-a");
+    store.bind_restore_journal_stream(stream, &expected_binding)?;
     assert!(
         store
             .load_restore_journal_stream(stream, MAX_JOURNAL_PAGE_ENTRIES)?
             .is_empty(),
         "validated new journal reads known-empty"
     );
-    assert_eq!(store.load_restore_journal_binding(stream)?, None);
+    assert_eq!(store.load_restore_journal_binding(stream)?, Some(expected_binding));
     assert_eq!(store.load_restore_journal_result(stream, "verify")?, None);
+    assert!(matches!(
+        store.load_restore_journal_stream("unavailable-stream-957-11", MAX_JOURNAL_PAGE_ENTRIES),
+        Err(eliot_ors::OrsError::IntegrityProblem { .. })
+    ));
     let _ = std::fs::remove_file(&path);
     Ok(())
 }
@@ -486,55 +495,36 @@ fn bounds_hold_and_prune_retains_unresolved() -> TestResult {
     let (store, path) = open_db("12")?;
     let stream = "stream-957-12";
     store.bind_restore_journal_stream(stream, &binding("tx-957-a", "writer-957-a"))?;
-    let intent_a = store.append_restore_journal_intent(
+    let verify_operation = operation("tx-957-a", "verify", 'a', 'b', None);
+    let intent_a = append_intent(&store, stream, &verify_operation, PAYLOAD_GENESIS)?;
+    store.append_restore_journal_result(
         stream,
-        &operation("tx-957-a", "verify", 'a', 'b', None),
-        PAYLOAD_GENESIS_SHA,
-        PAYLOAD_GENESIS,
+        &result_for(stream, &verify_operation, intent_a.sequence, RECEIPT_VERIFY)?,
     )?;
+    let materialize_operation = operation(
+        "tx-957-a",
+        "materialize",
+        'c',
+        'd',
+        Some(predecessor_of(intent_a.sequence, &intent_a.record_digest)),
+    );
+    let intent_b = append_intent(&store, stream, &materialize_operation, PAYLOAD_SECOND)?;
+    let reconcile_operation = operation(
+        "tx-957-a",
+        "reconcile",
+        'e',
+        'f',
+        Some(predecessor_of(intent_b.sequence, &intent_b.record_digest)),
+    );
+    let intent_c = append_intent(&store, stream, &reconcile_operation, PAYLOAD_ALT)?;
     store.append_restore_journal_result(
         stream,
         &result_for(
-            "tx-957-a",
-            "verify",
-            intent_a.sequence,
-            RECEIPT_VERIFY,
-            RECEIPT_VERIFY_SHA,
-        ),
-    )?;
-    let intent_b = store.append_restore_journal_intent(
-        stream,
-        &operation(
-            "tx-957-a",
-            "materialize",
-            'c',
-            'd',
-            Some(predecessor_of(intent_a.sequence, &intent_a.record_digest)),
-        ),
-        PAYLOAD_SECOND_SHA,
-        PAYLOAD_SECOND,
-    )?;
-    let intent_c = store.append_restore_journal_intent(
-        stream,
-        &operation(
-            "tx-957-a",
-            "reconcile",
-            'e',
-            'f',
-            Some(predecessor_of(intent_b.sequence, &intent_b.record_digest)),
-        ),
-        PAYLOAD_ALT_SHA,
-        PAYLOAD_ALT,
-    )?;
-    store.append_restore_journal_result(
-        stream,
-        &result_for(
-            "tx-957-a",
-            "reconcile",
+            stream,
+            &reconcile_operation,
             intent_c.sequence,
             RECEIPT_MATERIALIZE,
-            RECEIPT_MATERIALIZE_SHA,
-        ),
+        )?,
     )?;
     assert_eq!(store.prune_restore_journal(stream, 1)?, 1);
     let entries = store.load_restore_journal_stream(stream, MAX_JOURNAL_PAGE_ENTRIES)?;
@@ -585,19 +575,15 @@ fn additive_schema_migration_replays_compatibly() -> TestResult {
         "ensure is idempotent"
     );
     let stream = "stream-957-13";
+    store.bind_restore_journal_stream(stream, &binding("tx-957-a", "writer-957-a"))?;
     assert!(
         store
             .load_restore_journal_stream(stream, MAX_JOURNAL_PAGE_ENTRIES)?
             .is_empty(),
         "an ensured-but-empty journal is known-empty, never complete"
     );
-    store.bind_restore_journal_stream(stream, &binding("tx-957-a", "writer-957-a"))?;
-    store.append_restore_journal_intent(
-        stream,
-        &operation("tx-957-a", "verify", 'a', 'b', None),
-        PAYLOAD_GENESIS_SHA,
-        PAYLOAD_GENESIS,
-    )?;
+    let verify_operation = operation("tx-957-a", "verify", 'a', 'b', None);
+    append_intent(&store, stream, &verify_operation, PAYLOAD_GENESIS)?;
     assert_eq!(
         store.ensure_restore_journal_schema()?,
         RESTORE_JOURNAL_SCHEMA_VERSION
@@ -620,8 +606,8 @@ fn payload_integrity_and_diagnostic_redaction() -> TestResult {
     let stream = "stream-957-14";
     store.bind_restore_journal_stream(stream, &binding("tx-957-a", "writer-957-a"))?;
     let genesis = operation("tx-957-a", "verify", 'a', 'b', None);
-    let tampered =
-        store.append_restore_journal_intent(stream, &genesis, &digest('7'), PAYLOAD_GENESIS);
+    let (payload, _) = recovery_payload_envelope(&genesis, stream, PAYLOAD_GENESIS)?;
+    let tampered = store.append_restore_journal_intent(stream, &genesis, &digest('7'), &payload);
     assert!(matches!(
         tampered,
         Err(eliot_ors::OrsError::PayloadIntegrityMismatch)
@@ -633,19 +619,8 @@ fn payload_integrity_and_diagnostic_redaction() -> TestResult {
             "diagnostics stay redacted"
         );
     }
-    let intent = store.append_restore_journal_intent(
-        stream,
-        &genesis,
-        PAYLOAD_GENESIS_SHA,
-        PAYLOAD_GENESIS,
-    )?;
-    let mut bad_receipt = result_for(
-        "tx-957-a",
-        "verify",
-        intent.sequence,
-        RECEIPT_VERIFY,
-        RECEIPT_VERIFY_SHA,
-    );
+    let intent = append_intent(&store, stream, &genesis, PAYLOAD_GENESIS)?;
+    let mut bad_receipt = result_for(stream, &genesis, intent.sequence, RECEIPT_VERIFY)?;
     bad_receipt.receipt = "tampered-receipt-bytes".to_owned();
     let rejected = store.append_restore_journal_result(stream, &bad_receipt);
     assert!(matches!(
@@ -662,12 +637,8 @@ fn temp_redb_concurrent_cas_and_reopen() -> TestResult {
     let (store, path) = open_db("15")?;
     let stream = "stream-957-15".to_owned();
     store.bind_restore_journal_stream(&stream, &binding("tx-957-a", "writer-957-a"))?;
-    let head = store.append_restore_journal_intent(
-        &stream,
-        &operation("tx-957-a", "verify", 'a', 'b', None),
-        PAYLOAD_GENESIS_SHA,
-        PAYLOAD_GENESIS,
-    )?;
+    let head_operation = operation("tx-957-a", "verify", 'a', 'b', None);
+    let head = append_intent(&store, &stream, &head_operation, PAYLOAD_GENESIS)?;
     let shared = Arc::new(store);
     let predecessor = predecessor_of(head.sequence, &head.record_digest);
     let racer = |phase: &'static str, request: char, body: char| {
@@ -675,12 +646,8 @@ fn temp_redb_concurrent_cas_and_reopen() -> TestResult {
         let stream = stream.clone();
         let predecessor = predecessor.clone();
         std::thread::spawn(move || {
-            store.append_restore_journal_intent(
-                stream.as_str(),
-                &operation("tx-957-a", phase, request, body, Some(predecessor)),
-                PAYLOAD_SECOND_SHA,
-                PAYLOAD_SECOND,
-            )
+            let operation = operation("tx-957-a", phase, request, body, Some(predecessor));
+            append_intent(store.as_ref(), stream.as_str(), &operation, PAYLOAD_SECOND)
         })
     };
     let first = racer("materialize", 'c', 'd')
@@ -729,12 +696,8 @@ fn guard_excludes_second_db_backup_dep_and_authority() -> TestResult {
     store.ensure_restore_journal_schema()?;
     let stream = "stream-957-16";
     store.bind_restore_journal_stream(stream, &binding("tx-957-a", "writer-957-a"))?;
-    store.append_restore_journal_intent(
-        stream,
-        &operation("tx-957-a", "verify", 'a', 'b', None),
-        PAYLOAD_GENESIS_SHA,
-        PAYLOAD_GENESIS,
-    )?;
+    let verify_operation = operation("tx-957-a", "verify", 'a', 'b', None);
+    append_intent(&store, stream, &verify_operation, PAYLOAD_GENESIS)?;
     drop(store);
     let mut databases = Vec::new();
     for entry in std::fs::read_dir(&dir)? {
@@ -746,14 +709,16 @@ fn guard_excludes_second_db_backup_dep_and_authority() -> TestResult {
         reopened.load_restore_journal_stream("has\0separator", MAX_JOURNAL_PAGE_ENTRIES),
         Err(eliot_ors::OrsError::InvalidField { .. })
     ));
+    let (foreign_payload, foreign_payload_sha) =
+        recovery_payload_envelope(&verify_operation, stream, PAYLOAD_GENESIS)?;
     let mut foreign = operation("tx-957-a", "verify", 'a', 'b', None);
     foreign.record_schema = "backup-journal-v9".to_owned();
     assert!(matches!(
         reopened.append_restore_journal_intent(
             stream,
             &foreign,
-            PAYLOAD_GENESIS_SHA,
-            PAYLOAD_GENESIS
+            &foreign_payload_sha,
+            &foreign_payload
         ),
         Err(eliot_ors::OrsError::InvalidField { .. })
     ));

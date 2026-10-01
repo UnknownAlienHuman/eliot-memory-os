@@ -575,28 +575,57 @@ fn request(
     scopes: &[&str],
 ) -> TestResult<ReservationRequest> {
     let state_fence = fence(&writer_epoch)?;
+    let operation_identity = label(operation_id)?;
+    let scope_identities = scopes
+        .iter()
+        .map(|scope| label(scope))
+        .collect::<Result<Vec<_>, OrsError>>()?;
+    let prepared_transition_sha256 = "11".repeat(32);
+    let recovery_access_class = access()?;
+    let key = SecretReference::new("test-key-provider", "key-1")?;
     let envelope = RecoveryPayloadEnvelope::encrypted(
         RecoveryEnvelopeContext {
-            operation_or_checkpoint_id: label(operation_id)?,
-            privacy_and_visibility_class: access()?,
+            operation_or_checkpoint_id: operation_identity.clone(),
+            privacy_and_visibility_class: recovery_access_class.clone(),
             authority_epoch: writer_epoch.clone(),
-            state_fence,
+            state_fence: state_fence.clone(),
             created_at_ms: 10,
             known_at_ms: 11,
             expires_at_ms: Some(10_000),
         },
-        SecretReference::new("test-key-provider", "key-1")?,
+        key.clone(),
         format!("opaque-{operation_id}").into_bytes(),
     )?;
+    let envelope = envelope.with_write_binding(RecoveryWriteBinding {
+        write_envelope_protocol_version: 1,
+        recovery_envelope_contract_version: envelope.contract_version,
+        recovery_access_class,
+        payload_created_at_ms: 10,
+        payload_known_at_ms: 11,
+        payload_expires_at_ms: Some(10_000),
+        operation_id: operation_identity,
+        write_intent_id: label(format!("write-intent-{operation_id}"))?,
+        idempotency_key: label(format!("idempotency-{reservation_id}"))?,
+        canonical_request_sha256: "22".repeat(32),
+        prepared_transition_sha256: prepared_transition_sha256.clone(),
+        ordering_scopes: scope_identities.clone(),
+        admission_contract_set_digest: "33".repeat(32),
+        operation_manifest_digest: label("ors-test-operation-manifest")?,
+        authority_epoch: writer_epoch.clone(),
+        state_fence,
+        protected_payload_sha256: envelope.payload_sha256.clone(),
+        protected_payload_length: envelope.payload_length,
+        payload_key_reference: key,
+    })?;
     Ok(ReservationRequest {
         reservation_id: label(reservation_id)?,
         envelope,
         writer_epoch,
-        scopes: scopes
-            .iter()
+        scopes: scope_identities
+            .into_iter()
             .map(|scope| {
                 Ok(ScopeReservationRequest {
-                    scope: label(scope)?,
+                    scope,
                     expected_head: ExpectedOrderingHead {
                         sequence: 0,
                         head_sha256: "00".repeat(32),
@@ -605,7 +634,7 @@ fn request(
                 })
             })
             .collect::<Result<Vec<_>, OrsError>>()?,
-        prepared_transition_sha256: "11".repeat(32),
+        prepared_transition_sha256,
         expires_at_ms: 1_000,
         recovery_owner: label("kernel-recovery-owner")?,
     })
@@ -2302,6 +2331,13 @@ fn multi_scope_reservation_is_atomic_ordered_and_conflict_on_duplicate() -> Test
 
     let mut conflict = original;
     conflict.prepared_transition_sha256 = "22".repeat(32);
+    let changed_transition_sha256 = conflict.prepared_transition_sha256.clone();
+    conflict
+        .envelope
+        .write_binding
+        .as_mut()
+        .expect("canonical write fixture carries its admitted binding")
+        .prepared_transition_sha256 = changed_transition_sha256;
     assert!(matches!(
         coordinator.reserve(conflict),
         Err(OrsError::DuplicateConflict)

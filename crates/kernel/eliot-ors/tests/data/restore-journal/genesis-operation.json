@@ -4,7 +4,7 @@
   "archive_class": "full_recovery",
   "destination_ref": "dest-957-fixture",
   "writer_id": "writer-957-fixture",
-  "writer_fence_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "writer_fence_digest": "4d8d9f78b4c2aa955ffae69f0278f1f07a1017aa1aeb1897dcb4a3a82b0fa4e9",
   "record_schema": "restore-journal-v1",
   "phase_operation": "verify",
   "request_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
