@@ -3129,10 +3129,10 @@ impl GrantActivationPort {
             )
         })?;
         if owner_enumeration != request.enumeration {
-            return Err(KernelError::InvalidField {
-                field: "enumeration",
-                reason: "the presented closure disagrees with the owner enumeration",
-            });
+            return Err(KernelError::RecoveryUnavailable(
+                "the re-presented activation closure disagrees with the current owner enumeration"
+                    .to_owned(),
+            ));
         }
         // I12.20 revocation fan-out (issue #1732): propagate durable
         // revocation into recovery before any durable write. The re-presented
@@ -3441,13 +3441,39 @@ impl GrantActivationPort {
         // the complete affected set, so exact replay re-derives the same
         // digest while any changed member is a typed conflict. These are
         // read-only derivations; no mutation happens above the gate.
-        let derived = derive_closure_fence(
+        let mut derived = derive_closure_fence(
             &ledger,
             request,
             Some(boundary),
             owner_enumeration,
             active_epoch,
         )?;
+        let operation_id =
+            OperationIdentity::new(&request.operation_id).map_err(KernelError::RecoveryState)?;
+        // Rebuild dependent intro fences from the durable closure row before
+        // computing the replay digest. After restart the live ledger is empty,
+        // while the already committed row remains the exact authority for its
+        // intro-fence set.
+        let mut introduction_ids = derived
+            .fenced_introductions
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if let Some(present) = boundary
+            .store
+            .load_grant_closure(&operation_id)
+            .map_err(|error| map_ors_recovery_error(&error))?
+        {
+            introduction_ids.extend(present.commit().fenced_introductions.iter().cloned());
+        }
+        let introduction_ids = introduction_ids.into_iter().collect::<Vec<_>>();
+        let introduction_fences =
+            closure_introduction_fences(boundary, &introduction_ids, &request.operation_id)?;
+        derived.fenced_introductions = introduction_ids.clone();
+        derived.fenced_introduction_records = introduction_fences
+            .iter()
+            .map(|fence| fence.record().clone())
+            .collect();
         let enumeration = owner_enumeration.ok_or_else(|| {
             KernelError::RecoveryUnavailable(
                 "grant-closure owner declaration is not bound".to_owned(),
@@ -3518,21 +3544,6 @@ impl GrantActivationPort {
                     .map_err(KernelError::RecoveryState)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let mut introduction_ids = live_closure_introduction_ids(&ledger, &derived.affected)
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        let operation_id =
-            OperationIdentity::new(&request.operation_id).map_err(KernelError::RecoveryState)?;
-        if let Some(present) = boundary
-            .store
-            .load_grant_closure(&operation_id)
-            .map_err(|error| map_ors_recovery_error(&error))?
-        {
-            introduction_ids.extend(present.commit().fenced_introductions.iter().cloned());
-        }
-        let introduction_ids = introduction_ids.into_iter().collect::<Vec<_>>();
-        let introduction_fences =
-            closure_introduction_fences(boundary, &introduction_ids, &request.operation_id)?;
         let fenced_introductions = introduction_ids
             .iter()
             .map(OperationIdentity::new)
@@ -4259,6 +4270,107 @@ fn closure_affected_set(enumeration: &GrantClosureEnumeration) -> Vec<String> {
     affected.into_iter().collect()
 }
 
+/// Cross-checks the owner's closure declaration against its complete admitted
+/// grant inventory. The inventory is read from the same canonical owner as the
+/// enumeration; Kernel uses it only to detect an omitted descendant and never
+/// derives a fence set from process-local state.
+fn validate_complete_owner_closure(
+    boundary: &DurableRootGrantBoundary,
+    request: &GrantClosureRevocationIntent,
+    enumeration: &GrantClosureEnumeration,
+    affected: &BTreeSet<&str>,
+) -> Result<(), KernelError> {
+    let hydrations = boundary
+        .hydration
+        .admitted_grant_hydrations()
+        .map_err(|error| KernelError::RecoveryUnavailable(error.to_string()))?;
+    let mut admitted = BTreeMap::new();
+    let mut operations = BTreeSet::new();
+    for hydration in hydrations {
+        if !operations.insert(hydration.intent.operation_id.clone())
+            || admitted
+                .insert(hydration.intent.grant_id.clone(), hydration)
+                .is_some()
+        {
+            return Err(KernelError::RecoveryUnavailable(
+                "owner grant inventory contains duplicate grant or activation identities"
+                    .to_owned(),
+            ));
+        }
+    }
+
+    let preserved = enumeration
+        .preserved
+        .iter()
+        .map(|survivor| survivor.grant_id.as_str())
+        .collect::<BTreeSet<_>>();
+    for member in &enumeration.members {
+        let owner_member = admitted.get(&member.intent.grant_id).ok_or_else(|| {
+            KernelError::RecoveryUnavailable(
+                "closure member is absent from the complete owner grant inventory".to_owned(),
+            )
+        })?;
+        if owner_member.intent.authority_root_ref != member.intent.authority_root_ref
+            || owner_member.intent.parent_grant_id != member.intent.parent_grant_id
+        {
+            return Err(KernelError::RecoveryUnavailable(
+                "closure member root or parent disagrees with its owner grant inventory"
+                    .to_owned(),
+            ));
+        }
+    }
+    for survivor in &enumeration.preserved {
+        let owner_member = admitted.get(&survivor.grant_id).ok_or_else(|| {
+            KernelError::RecoveryUnavailable(
+                "declared survivor is absent from the complete owner grant inventory".to_owned(),
+            )
+        })?;
+        if owner_member.intent.authority_root_ref != request.authority_root_ref {
+            return Err(KernelError::RecoveryUnavailable(
+                "declared survivor disagrees with the owner lineage root".to_owned(),
+            ));
+        }
+    }
+
+    // Walk owner-admitted parent links only as a consistency check. The
+    // canonical enumeration remains the sole source for the fence set.
+    for (grant_id, hydration) in &admitted {
+        let mut cursor = grant_id.clone();
+        let mut seen = BTreeSet::new();
+        loop {
+            if !seen.insert(cursor.clone()) {
+                return Err(KernelError::RecoveryUnavailable(
+                    "owner grant inventory contains a parent cycle".to_owned(),
+                ));
+            }
+            if cursor == request.grant_id {
+                if hydration.intent.authority_root_ref != request.authority_root_ref {
+                    return Err(KernelError::RecoveryUnavailable(
+                        "cross-root descendant cannot be fenced by this closure".to_owned(),
+                    ));
+                }
+                if !affected.contains(grant_id.as_str())
+                    && !preserved.contains(grant_id.as_str())
+                {
+                    return Err(KernelError::InvalidField {
+                        field: "enumeration.members",
+                        reason: "the owner closure omits an admitted descendant",
+                    });
+                }
+                break;
+            }
+            let Some(parent) = admitted
+                .get(&cursor)
+                .and_then(|member| member.intent.parent_grant_id.clone())
+            else {
+                break;
+            };
+            cursor = parent;
+        }
+    }
+    Ok(())
+}
+
 fn closure_proof_ceiling(enumeration: &GrantClosureEnumeration) -> ProofCeiling {
     enumeration
         .members
@@ -4658,6 +4770,7 @@ fn derive_closure_fence(
     }
     let affected = closure_affected_set(enumeration);
     let affected_set: BTreeSet<&str> = affected.iter().map(String::as_str).collect();
+    validate_complete_owner_closure(boundary, request, enumeration, &affected_set)?;
     // Preserved-survivor membership (`#2100` C73-F1): every declared
     // survivor must prove covering authority at the current revision and
     // fence. A declaration from an older revision is never carried
@@ -7712,6 +7825,10 @@ pub(crate) mod tests {
                 observed_at_ms: self.value.observed_at_ms,
             })
         }
+
+        fn admitted_grant_hydrations(&self) -> Result<Vec<GrantClosureMember>, KernelError> {
+            Ok(vec![self.hydrate_grant_member(&self.value.intent.grant_id)?])
+        }
     }
 
     fn durable_root_fixture(
@@ -7886,6 +8003,19 @@ pub(crate) mod tests {
                     observed_at_ms: value.observed_at_ms,
                 })
             }
+
+            fn admitted_grant_hydrations(&self) -> Result<Vec<GrantClosureMember>, KernelError> {
+                let value = self
+                    .value
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                Ok(vec![GrantClosureMember {
+                    intent: value.intent,
+                    durable_record: value.durable_record,
+                    observed_at_ms: value.observed_at_ms,
+                }])
+            }
         }
 
         let epoch = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 7)?;
@@ -7972,7 +8102,9 @@ pub(crate) mod tests {
         );
         assert!(matches!(
             P07AuthorityPort::revoke_grant(&missing_port, &revoke),
-            Err(P07PortError::Unavailable)
+            Err(P07PortError::Refused {
+                cause: eliot_authority::P07RefusalCause::RecoveryUnavailable
+            })
         ));
         assert!(!missing_port.grant_revoked("grant-root"));
         assert!(missing_port.disposition(&revoke_operation_id).is_none());
@@ -8349,6 +8481,16 @@ pub(crate) mod tests {
                         "fixture owner admits no hydration for the requested grant".to_owned(),
                     )
                 })
+        }
+
+        fn admitted_grant_hydrations(&self) -> Result<Vec<GrantClosureMember>, KernelError> {
+            Ok(self
+                .members
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .values()
+                .cloned()
+                .collect())
         }
     }
 
