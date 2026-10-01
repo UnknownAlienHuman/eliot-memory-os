@@ -87,10 +87,19 @@ pub(super) fn dispatch_skill_influence(arguments: Value) -> Result<Value> {
     // literal. `CONTEXT_COST_UNAVAILABLE` is a sentinel, not a measurement,
     // so it is republished as `MeasurementStatus::Unavailable` with a null
     // value instead of a number.
-    let mut response = serde_json::to_value(&report)?
+    //
+    // W4/A16/A23: a report that does not serialize to a JSON object is a typed
+    // failure. It used to be `unwrap_or_default()`, which silently produced an
+    // EMPTY record and then published `estimated_context_cost_measurement` into
+    // it - a measurement response whose entire owned report had been dropped,
+    // i.e. absent becoming a confident measurement rather than an error. The
+    // legacy bare `estimated_context_cost` and every other report field are
+    // preserved exactly; only the failure mode changes.
+    let mut response = serde_json::to_value(&report)
+        .context("serialize skill influence report")?
         .as_object()
         .cloned()
-        .unwrap_or_default();
+        .context("skill influence report did not serialize to a JSON object")?;
     response.insert(
         "estimated_context_cost_measurement".to_owned(),
         recorded_planning_wire(

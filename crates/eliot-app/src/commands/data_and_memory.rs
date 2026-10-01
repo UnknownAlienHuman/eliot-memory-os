@@ -833,10 +833,18 @@ pub async fn run_skill_influence(config_path: &Path, project: &str, task: &str) 
     // carry the owned report exactly as the engine produced it; the qualifier
     // is added only to the published response, and the legacy bare field is
     // kept beside it for wire compatibility.
-    let mut influence = serde_json::to_value(&report)?
+    //
+    // W4/A16/A23: a report that does not serialize to a JSON object is a typed
+    // failure. It used to be `unwrap_or_default()`, which silently produced an
+    // EMPTY record and then published `estimated_context_cost_measurement` into
+    // it - a measurement artifact whose entire owned report had been dropped.
+    // Every other report field is preserved exactly; only the failure mode
+    // changes.
+    let mut influence = serde_json::to_value(&report)
+        .context("serialize skill influence report")?
         .as_object()
         .cloned()
-        .unwrap_or_default();
+        .context("skill influence report did not serialize to a JSON object")?;
     influence.insert(
         "estimated_context_cost_measurement".to_owned(),
         mcp_stdio::recorded_planning_wire(
