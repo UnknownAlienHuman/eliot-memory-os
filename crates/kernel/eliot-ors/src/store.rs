@@ -2166,8 +2166,9 @@ impl persistence_codec::PersistedValue for BridgeEventReplayCommitment {
 /// terminal receipt, so `retention_policy_revision` names the owner revision
 /// whose acknowledgement/retirement admission certified it.
 /// `predecessor_end_sequence`/`predecessor_commitment` chain the previous
-/// cumulative state (genesis `(0, "")`); the start never moves, the frontier
-/// never moves backward, and another incarnation's ranges are never adopted.
+/// cumulative state (genesis `(0, "")`); each extension starts at its
+/// predecessor's end + 1, the frontier never moves backward, and another
+/// incarnation's ranges are never adopted.
 /// Whole-incarnation retirement stays with #2729's authenticated
 /// owner/successor evidence; this row retires positions only, never the
 /// incarnation itself.
@@ -19920,7 +19921,8 @@ impl RedbRecoveryStore {
     /// owner (retention admission) revision. The first certification is the
     /// genesis row; every later call must continue exactly at
     /// `stored.end_sequence + 1` with the same owner/incarnation/stream, so
-    /// the start never moves and the frontier never moves backward. Any
+    /// each extension starts where its certified predecessor ended and the
+    /// frontier never moves backward. Any
     /// overlap with already-certified history fails with
     /// [`OrsError::DuplicateConflict`] instead of rewriting it, while a
     /// hole past the certified frontier or another incarnation's history
