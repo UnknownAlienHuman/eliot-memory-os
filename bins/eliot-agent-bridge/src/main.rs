@@ -3470,7 +3470,12 @@ fn note_mcp_reject(frame: &Value, consecutive_invalid: &mut u32) -> bool {
 /// Processes one reserved-control record: notifications stay admissible while
 /// the single ordinary-call slot is occupied. Every control outcome is a
 /// well-formed exchange with no response; a shaped rejection can only arrive
-/// defensively and is emitted with the shared discipline.
+/// defensively and is emitted with the shared discipline. Returns true when
+/// the loop must stop emitting afterwards (zero bytes placed, unflushed,
+/// oversize, or slow consumer), exactly like the data-path emission: the
+/// reserved queue shares the one serialized stdout writer, so a break
+/// observed here fails the loop closed instead of polling the owner into a
+/// dead pipe.
 fn handle_mcp_control_record(
     gateway: HostRequestGateway,
     port: &mut KernelHostRequestClient,
@@ -3479,16 +3484,18 @@ fn handle_mcp_control_record(
     provider_failure: &mut bool,
     consecutive_invalid: &mut u32,
     text: &str,
-) {
+) -> bool {
     let outcome = handle_mcp_frame(gateway, port, runner, state, text, provider_failure);
+    let mut stop_emitting = false;
     if let Some(response) = outcome.response {
-        emit_mcp_frame(&response);
+        stop_emitting = emit_mcp_frame(&response);
     }
     if outcome.dispatched {
         *consecutive_invalid = 0;
     } else {
         *consecutive_invalid = consecutive_invalid.saturating_add(1);
     }
+    stop_emitting
 }
 
 /// Serves the MCP front door on stdio until EOF or a fail-closed break.
@@ -3545,7 +3552,7 @@ fn run_mcp_front_door(
                     }
                 }
                 Ok(McpQueuedIntake::Record(text)) => {
-                    handle_mcp_control_record(
+                    if handle_mcp_control_record(
                         gateway,
                         port,
                         runner,
@@ -3553,7 +3560,9 @@ fn run_mcp_front_door(
                         &mut provider_failure,
                         &mut consecutive_invalid,
                         &text,
-                    );
+                    ) {
+                        stdout_broken = true;
+                    }
                 }
             }
         }
@@ -3672,7 +3681,7 @@ fn run_mcp_front_door(
                     }
                 }
                 Ok(McpQueuedIntake::Record(text)) => {
-                    handle_mcp_control_record(
+                    if handle_mcp_control_record(
                         gateway,
                         port,
                         runner,
@@ -3680,7 +3689,9 @@ fn run_mcp_front_door(
                         &mut provider_failure,
                         &mut consecutive_invalid,
                         &text,
-                    );
+                    ) {
+                        stdout_broken = true;
+                    }
                 }
             }
         }
