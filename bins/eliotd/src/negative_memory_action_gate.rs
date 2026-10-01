@@ -42,6 +42,12 @@
 //! granted verdict grants no authority and no task Finish — it only removes one
 //! way for the effect to proceed.
 //!
+//! That refusal is correct but not yet reached from a run of this daemon:
+//! `commit_gated_action` has no call site in this workspace and `eliotd` has no
+//! reverse dependency, so the rule is in place and nothing currently invokes it.
+//! `require_effect_ready` is likewise a private helper with the one call site
+//! directly beneath it in `commit_gated_action`.
+//!
 //! [`GetLearningRecordRange`]: eliot_store_api::NamedReadOperation::GetLearningRecordRange
 //! [`commit_canonical_gated_by_negative_memory`]:
 //!     eliot_governor::GovernorComposition::commit_canonical_gated_by_negative_memory
@@ -125,8 +131,13 @@ pub enum NegativeMemoryActionError {
     ///
     /// This is not the negative-memory gate's refusal and it is not a generic
     /// quality error: the rule that produced it is
-    /// `QualityScorecard::suitability`, which is the one readiness rule every
-    /// other migrated consumer of a `QualityScorecard` already applies. A card
+    /// `QualityScorecard::suitability`, which is the one readiness rule the
+    /// migrated scorecard consumers apply — `assemble_active_view` for
+    /// `Compile`, the reactive delivery closure, `ActiveUnderstandingView::suitability`
+    /// and the understanding-assessment gate. It is not a universal: the sibling
+    /// structural checks `eliot_context_assembly`'s `bounds::quality` and
+    /// `require_graded_output` validate a card without asking for that verdict.
+    /// A card
     /// that was structurally valid but whose grades do not enable this operation
     /// stops the effect here, and this variant carries the exact cause rather
     /// than a string a caller would have to re-derive.
@@ -587,13 +598,16 @@ const fn observation_outcome(
 ///
 /// Before this, `commit_gated_action` graded the card at
 /// `project_action_response` and then committed the effect without ever reading
-/// the grade. That made the scoring write-only: a card whose
+/// the grade. That made the scoring write-only *for that function's own path*: a
+/// card whose
 /// `ExactAnchorProvenanceCoverage`, `InstructionSufficiency` or
 /// `VerifierActionReadiness` axis was `Failed`, `Unknown`, `Degraded`,
-/// `NotApplicable` or invalidated still produced a committed canonical effect,
-/// which is precisely the acceptance row "a packet with high relevance but a
-/// missing exact anchor, active directive or required verifier **cannot enable
-/// its dependent action**".
+/// `NotApplicable` or invalidated would still have produced a committed canonical
+/// effect, which is precisely the acceptance row "a packet with high relevance
+/// but a missing exact anchor, active directive or required verifier **cannot
+/// enable its dependent action**". Because `commit_gated_action` has no call site
+/// (see `commit_gated_action`'s "Reachability"), neither the write-only defect
+/// nor this fix is exercised in production today.
 ///
 /// This is not a second rule. It asks
 /// [`QualityScorecard::suitability`](eliot_context_contracts::QualityScorecard::suitability) —
@@ -649,8 +663,10 @@ fn require_effect_ready(
 
 /// Commits one canonical action under the negative-memory gate.
 ///
-/// This is the production caller of
-/// [`commit_canonical_gated_by_negative_memory`]. The order is fixed and
+/// This is the only caller in the repository of
+/// [`commit_canonical_gated_by_negative_memory`] — but it is not itself reached
+/// from a run of this daemon (see "Reachability" below), so the commit below is
+/// not currently exercised in production. The order is fixed and
 /// fail-closed: resolve the rule set through the authenticated bounded read,
 /// re-read the scope revision head for the dispatch revalidation, evaluate the
 /// gate, append the matched outcome, and only then commit. A refusing decision
@@ -658,16 +674,28 @@ fn require_effect_ready(
 ///
 /// # W5/A1: the scorecard's own verdict is read before the effect
 ///
-/// This is the only live production effect consumer that touches a
+/// This function is the only effect consumer in this module that touches a
 /// `QualityScorecard`, and until now it graded the card and committed the effect
 /// without ever consulting the grade: `project_action_response` writes the
 /// negative-memory axis and returns `Ok(())`, so a card carrying
 /// `ExactAnchorProvenanceCoverage`, `InstructionSufficiency` or
-/// `VerifierActionReadiness` in any non-`Passed` state was still committed as an
-/// effect and the grading was write-only. `require_effect_ready` now asks the
+/// `VerifierActionReadiness` in any non-`Passed` state would have been committed
+/// as an effect and the grading write-only. `require_effect_ready` now asks the
 /// one shared readiness rule what this operation requires and refuses the write
 /// with a typed cause naming the operation and the exact missing evidence, so a
 /// visible dimension failure stops its dependent action.
+///
+/// ## Reachability of that fix
+///
+/// The rule is correct and the refusal is in the right place, but it is not yet
+/// reached from a run of this daemon. `git grep -n commit_gated_action` over
+/// this workspace returns four hits and none is a call: this definition, the
+/// `pub use` re-export in `lib.rs`, and two prose mentions. `eliotd` declares no
+/// reverse dependency in any workspace `Cargo.toml`, so nothing outside this
+/// crate calls it either. What would change this is one call site — a producer
+/// that already holds a `NegativeMemoryPendingAction`, an
+/// `Option<&mut QualityScorecard>` and a `GovernorComposition` — invoking this
+/// function; no rule change is needed.
 ///
 /// # Errors
 ///

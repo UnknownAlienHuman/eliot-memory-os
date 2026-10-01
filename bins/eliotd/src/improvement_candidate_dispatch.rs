@@ -293,11 +293,21 @@
 //!   forward-repair references. The privacy class is the FIRST of three, and it
 //!   is the only one this daemon could clear by itself — which it does not.
 //! - [`admit_improvement_candidate_without_execution_evidence`] is wired and
-//!   live on this path, and it propagates that same typed refusal today, because
-//!   it commits the same proposal bytes through the same owner producer. The
-//!   moment an owner privacy class exists it returns the gate's own closed
-//!   `Rejected` disposition, and `admitting_pipeline_refusal` becomes `Some`
-//!   instead of the whole call propagating the error.
+//!   live on this path: `dispatch_improvement_candidate_route` has one call
+//!   site, `daemon_runtime::route_and_reconcile_improvement_candidate`, which
+//!   `maybe_start_improvement_intake` drives from the daemon's live run loop. It
+//!   propagates that same typed refusal today, because it commits the same
+//!   proposal bytes through the same owner producer. An owner privacy class is
+//!   NECESSARY but not SUFFICIENT for the `Rejected` disposition it would
+//!   otherwise return: the wrapper builds its fourth input through
+//!   `current_proposal_of`, whose commitment profile at
+//!   `improvement_pipeline.rs:3880` bounds `privacy_class` among the other
+//!   required fields, so an owner value there still has to survive that profile
+//!   and the identity/join checks ahead of it before the gate's own
+//!   `closure_valid` rejection at `improvement_admission.rs:651` is reached. On
+//!   this workspace `admitting_pipeline_refusal` is therefore always `None`,
+//!   because that refusal propagates as this call's own `Err` rather than as a
+//!   disposition plus the field.
 //!
 //! Nothing here promotes, activates, installs, completes or issues authority,
 //! and the advisory application-class ceiling (I12.24:81) is enforced upstream
@@ -874,7 +884,9 @@ fn route_operation_owner(
 /// Today the wrapper propagates the same typed refusal the admitting pipeline
 /// produced, because the absent owner privacy class is inside the proposal bytes
 /// it commits. That is stated, not worked around: the module documentation says
-/// exactly which field is the remaining link.
+/// exactly which field is the remaining link, and notes that supplying it is
+/// necessary but not sufficient — the wrapper's own commitment profile and join
+/// checks sit ahead of the gate.
 ///
 /// It returns the pipeline's own advisory-only terminal disposition, the exact
 /// experiment plan the run committed it over, and the repeat assessment the
