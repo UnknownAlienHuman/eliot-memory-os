@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 
 use eliot_process::OperationId;
 use eliot_user_broker::{
-    BrokerComposition, BrokerConfig, CompositionError, HumanStateAuthority, NotifyAcknowledge,
-    NotifyDeliver, OperatorClientBinding, canonical_root, request_names_notify_image,
+    BrokerComposition, BrokerConfig, CompositionError, HumanStateAuthority,
+    IssuedOpenCodeIntroduction, NotifyAcknowledge, NotifyDeliver, OpenCodeIntroductionRequest,
+    OperatorClientBinding, canonical_root, request_names_notify_image,
 };
 // There is exactly one operator pipe name. The minted `OperatorEndpoint` and
 // the pipe the broker serves are the same name, owned by the handoff contract
@@ -168,6 +169,36 @@ enum Request {
         #[serde(default)]
         authority: Option<HumanStateAuthority>,
     },
+    /// Issues and installs the `OpenCode` bridge introduction (issue #2898).
+    ///
+    /// This is the production entry to the broker's one admitted
+    /// client-identity path for `POST /v1/host-events`. It names only the peer
+    /// route this broker cannot observe for itself — the pinned loopback
+    /// endpoint, that bridge's generation and attach fence, the authority
+    /// epoch that bridge admitted under, the bridge server identity the peer
+    /// proved, and the exact `OpenCode` image being launched. Installation
+    /// identity, Windows SID, logon session, the broker generation, the
+    /// broker's own process identity, the credential bytes, the capability
+    /// set, and every issue/expiry/revocation instant are read by the broker
+    /// from its live registration, its live process binding and its own clock,
+    /// so a caller cannot widen the introduction by naming them.
+    ///
+    /// The peer-supplied fence and authority epoch are the two values a
+    /// foreign peer must not be able to present, and they are re-proved on the
+    /// serving side by exact tuple against the bridge's own live attach fence
+    /// before any request is admitted.
+    ///
+    /// A broker that cannot prove which process it is, or that has no admitted
+    /// registration, issues nothing.
+    ///
+    /// The wire spelling is the `opencode` vocabulary the introduction record
+    /// itself uses, not the mechanical `OpenCode` -> `open_code` split.
+    #[serde(rename = "opencode_bridge_introduction")]
+    OpenCodeBridgeIntroduction {
+        request: OpenCodeIntroductionRequest,
+        #[serde(default)]
+        authority: Option<HumanStateAuthority>,
+    },
     Status,
     Stop,
 }
@@ -190,6 +221,17 @@ enum Message {
     /// One owner-issued, generation-bound, expiring, single-use handoff.
     OperatorHandoff {
         endpoint: Value,
+    },
+    /// One installed `OpenCode` bridge introduction and the live session facts
+    /// that must accompany it.
+    ///
+    /// The introduction itself carries no secret material: only the opaque
+    /// credential handle travels, so this record is safe to answer on the
+    /// authenticated broker boundary. The bearer is reachable only through the
+    /// broker's own secret boundary.
+    #[serde(rename = "opencode_bridge_introduction")]
+    OpenCodeBridgeIntroduction {
+        issuance: Value,
     },
     Stopped,
     Error {
@@ -577,6 +619,20 @@ fn dispatch(
         Request::OperatorHandoff { request } => {
             dispatch_admitted_handoff(composition.admit_operator_handoff(&request))
         }
+        Request::OpenCodeBridgeIntroduction { request, authority } => {
+            // Minting a bridge introduction is a durable state change, so it is
+            // admitted as one against the live registration exactly like every
+            // other state-changing broker operation: an absent principal, stale
+            // session token, cross-session identity, or ungranted capability is
+            // refused before anything is issued.
+            let operation_key = request.revocation_scope();
+            match composition.admit_human_state_change(authority.as_ref(), &operation_key) {
+                Err(error) => composition_rejection(&error),
+                Ok(()) => dispatch_opencode_introduction(
+                    composition.introduce_opencode_bridge(request),
+                ),
+            }
+        }
         Request::RedeemOperatorHandoff { .. } => Message::Error {
             code: eliot_user_broker::BrokerAdmissionRefusal::OperatorClientProcessForeign.code(),
             detail: "stdin has no OS-observed peer process; redemption requires authenticated broker-pipe peer evidence"
@@ -792,6 +848,24 @@ fn encode_handoff<T: Serialize>(
         code: "BROKER_RECEIPT_ENCODING",
         detail: error.to_string(),
     })
+}
+
+/// Projects one installed `OpenCode` bridge introduction onto the wire.
+///
+/// The introduction and its live session facts travel together, because a
+/// consumer that received one without the other could neither name the route
+/// nor prove the live session. The record is re-serialized from the owner's
+/// own validated types rather than echoed from the request, and it carries the
+/// opaque credential handle only: no bearer byte is ever projected here.
+fn dispatch_opencode_introduction(
+    outcome: Result<IssuedOpenCodeIntroduction, eliot_user_broker::CompositionError>,
+) -> Message {
+    match outcome {
+        Err(error) => composition_rejection(&error),
+        Ok(issued) => Message::OpenCodeBridgeIntroduction {
+            issuance: issued.to_wire_json(),
+        },
+    }
 }
 
 /// Projects one admitted handoff issuance onto the wire.

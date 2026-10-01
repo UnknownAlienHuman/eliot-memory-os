@@ -29,6 +29,7 @@ use eliot_platform::WorkScopePath;
 use eliot_platform_windows::{
     NamedPipePeerEvidence, ProcessIdentity, ProtectedPathLease, WindowsPlatform,
 };
+use eliot_process::Generation;
 use eliot_process::{
     ActionLeaseRef, CancellationReceipt, DispatchAuthorityId, DispatchPermitAuthority,
     DispatchValidationContext, FencingToken, KernelDispatchKey, OperationId, PermitIssuance,
@@ -40,9 +41,10 @@ use eliot_user_broker_core::{
     AuthorityPort, BrokerAdmissionIdentity, BrokerControlOperation, BrokerError, BrokerSnapshot,
     CutoverReceipt, DurableRegistrationPort, HeartbeatReceipt, HeartbeatRequest,
     IssuedOperationIdentity, IssuedOperationIdentityLedger, LaunchGrant, LaunchRequest,
-    LostOperation, OperatorArtifact, OperatorEndpoint, OperatorHandoffRequest,
-    OperatorNativeResourceSelectionInput, PortError, ProcessEffectLineage, ProcessPort,
-    ProcessStartOutcome, RegistrationReceipt, RegistrationStatus, RequiredProvider, UserBroker,
+    LostOperation, OpenCodeBridgeIntroductionRegistry, OperatorArtifact, OperatorEndpoint,
+    OperatorHandoffRequest, OperatorNativeResourceSelectionInput, PortError, ProcessEffectLineage,
+    ProcessPort, ProcessStartOutcome, RegistrationReceipt, RegistrationStatus, RequiredProvider,
+    UserBroker,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -55,6 +57,7 @@ mod kernel_authority_port;
 mod native_resource_resolver;
 mod notify_fallback_ensure;
 pub mod notify_launch_callin;
+mod opencode_introduction;
 mod operation_identity;
 #[cfg(windows)]
 mod own_generation_job;
@@ -76,6 +79,11 @@ pub use notify_launch_callin::{
     NotifyLaunchStage, VerifiedLaunchRef, admit_notify_request, render_notify_acknowledge_line,
     render_notify_deliver_line, request_names_notify_image, resolve_broker_notify_launch,
     stage_normal_notify_launch,
+};
+pub use opencode_introduction::{
+    BrokerIntroductionOwnerFacts, BrokerSecretBoundary, IssuedOpenCodeIntroduction,
+    OPENCODE_ISSUANCE_VERSION, OpenCodeIntroductionIssuer, OpenCodeIntroductionRequest,
+    broker_now_ms,
 };
 use operation_identity::{
     BrokerOperation, DurableIssuedIdentity, IssuerHandle, OperationIdentityIssuer,
@@ -1308,6 +1316,28 @@ pub struct BrokerComposition {
     /// launchable only from here; see
     /// [`BrokerComposition::launch_notify`].
     notify_launch: BrokerNotifyLaunchAuthority,
+    /// Broker-owned `OpenCode` bridge introduction issuer (issue #2898, steps 2
+    /// and 3).
+    ///
+    /// This is the physical User Broker owner of the one admitted
+    /// client-identity path for `POST /v1/host-events`: it mints the
+    /// introduction from this broker's live registration, process identity and
+    /// clock, and it holds the minted short-lived bearer in this process's
+    /// memory. It is the only producer of an `OpenCodeIntroductionParams` and
+    /// the only implementor of `OpenCodeSecretBoundary` in the tree; before
+    /// this field neither existed, so nothing could ever mint or resolve a
+    /// bridge credential. See
+    /// [`BrokerComposition::introduce_opencode_bridge`].
+    opencode_introductions: OpenCodeIntroductionIssuer,
+    /// Broker-owned registry of the introduction currently installed.
+    ///
+    /// This is the retained owner that makes rotation real: installing a
+    /// successor retires the replaced introduction's revocation id **and** its
+    /// credential handle in the same step, so the previous generation can
+    /// neither be admitted nor have its secret resolved once its successor is
+    /// installed. Before this field the registry had no caller at all, so no
+    /// introduction was ever installed anywhere.
+    opencode_registry: OpenCodeBridgeIntroductionRegistry,
 }
 
 impl BrokerComposition {
@@ -1534,6 +1564,8 @@ impl BrokerComposition {
             notify_launch: BrokerNotifyLaunchAuthority::unstaged(NotifyLaunchStage::Deferred {
                 reason: "NOT_STAGED",
             }),
+            opencode_introductions: OpenCodeIntroductionIssuer::new(),
+            opencode_registry: OpenCodeBridgeIntroductionRegistry::new(),
         })
     }
 
@@ -1715,6 +1747,100 @@ impl BrokerComposition {
             idempotency_key: issued.idempotency_key,
             canonical_digest: issued.canonical_digest,
         }
+    }
+
+    /// Issues and installs the `OpenCode` bridge introduction for one admitted
+    /// peer route (issue #2898, steps 2 and 3).
+    ///
+    /// This is the broker's production entry to the only admitted
+    /// client-identity path for `POST /v1/host-events`. Before this method
+    /// existed, `OpenCodeIntroductionParams` had no producer, `OpenCodeSecretBoundary`
+    /// had no implementor, and the introduction was never installed anywhere,
+    /// so the serving side read an empty store and refused at its first typed
+    /// path on every contact.
+    ///
+    /// The owner half of the introduction is read from this broker's live
+    /// registration, its live process binding and its own clock — never from
+    /// the request — so a caller cannot widen the introduction by naming
+    /// values. The request carries only what this broker cannot observe
+    /// because it describes the peer route: the pinned loopback endpoint, that
+    /// bridge's generation and attach fence, the bridge server identity the
+    /// peer proved, and the exact `OpenCode` image being launched.
+    ///
+    /// The two owner-side admission gates the notify path already uses apply
+    /// here as well: the protected launch lease is re-verified, which also
+    /// re-proves that this is the same live broker process, and the live
+    /// registration must be admitted. The Human state-change gate is applied by
+    /// the caller that owns the broker's request boundary, so minting is
+    /// admitted exactly like every other state-changing broker operation.
+    /// A broker that cannot prove which process it is, or that has no admitted
+    /// registration, issues nothing.
+    ///
+    /// Installation is by replacement: issuing a successor retires the
+    /// previous generation here, so the replaced endpoint and credential stop
+    /// being current at the moment the successor is installed, which is what
+    /// makes rotation invalidate the old introduction before another request.
+    pub fn introduce_opencode_bridge(
+        &mut self,
+        request: OpenCodeIntroductionRequest,
+    ) -> Result<IssuedOpenCodeIntroduction, CompositionError> {
+        self.verify_launch_lease()?;
+        // The live admitted registration is the owner source for installation
+        // id, SID, session and broker generation; a broker with no admitted
+        // registration issues nothing.
+        let receipt = self.broker.active_registration().cloned().ok_or_else(|| {
+            CompositionError::Launch(
+                "no admitted broker registration backs an OpenCode introduction".to_owned(),
+            )
+        })?;
+        let process_id = self
+            .process_binding
+            .as_ref()
+            .ok_or_else(|| {
+                CompositionError::Launch("broker process identity is unprovable".to_owned())
+            })?
+            .identity
+            .process_id
+            .to_string();
+        let owner = BrokerIntroductionOwnerFacts {
+            installation_id: receipt.installation_id.clone(),
+            windows_sid: receipt.windows_sid.clone(),
+            interactive_session_id: receipt.interactive_session_id.clone(),
+            broker_generation: Generation::new(receipt.user_broker_epoch)
+                .map_err(|_| CompositionError::Launch("broker generation is zero".to_owned()))?,
+            broker_process_id: process_id,
+            issued_at: broker_now_ms().map_err(Self::classify)?,
+        };
+        let issued = self
+            .opencode_introductions
+            .issue(&owner, request)
+            .map_err(Self::classify)?;
+        // Installing into the retained registry is what makes the issuance
+        // real: this is the `install` call the whole route was missing. It
+        // retires the replaced introduction's revocation id and its credential
+        // handle together, so rotation invalidates the old generation before
+        // another request rather than leaving both current.
+        self.opencode_registry.install(issued.introduction.clone());
+        // The installed record and this broker's own physical secret seam must
+        // agree before the introduction is answered, so this resolves the
+        // installed handle through
+        // [`OpenCodeSecretBoundary`](eliot_user_broker_core::OpenCodeSecretBoundary)
+        // and withholds the answer if it does not. This is the production call
+        // site of the boundary's `resolve_secret`: before it, nothing in the
+        // tree implemented the trait, so an introduction could be minted and
+        // installed and still have no physical source for its bearer.
+        //
+        // It is a value-conditional check, not an existence one: the registry
+        // refuses an unintroduced route and a retired handle, and the boundary
+        // refuses any handle other than the one currently minted, so a boundary
+        // and a record that disagree here are refused rather than answered.
+        // The bytes are not projected anywhere by this call — they are proven to
+        // be reachable and are discarded, exactly as the retained identity
+        // proof in `verify_launch_lease` proves reachability and discards it.
+        self.opencode_registry
+            .resolve_current_credential(self.opencode_introductions.boundary())
+            .map_err(Self::classify)?;
+        Ok(issued)
     }
 
     /// Stages broker-bound Notify normal-launch inputs for one grant.
