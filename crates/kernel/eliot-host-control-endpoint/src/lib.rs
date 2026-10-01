@@ -317,7 +317,33 @@ impl HostRuntimeControl {
                 if Arc::ptr_eq(&correlation.0, &reply.correlation.0)
                     && response_matches_request(request, &reply.response) =>
             {
-                reply.response
+                // Bounded-interval identity recheck (#1757 W7): a queued reply
+                // that correlates is not yet proof the Host control loop made
+                // progress — a listener-thread echo cannot show that. Re-run
+                // the wire-owner validators on both peers after the wait, so
+                // a substituted or malformed answer stays an explicit
+                // challenge/identity uncertainty instead of health.
+                //
+                // PARTIAL: the loop-progress proof lives outside this file.
+                // STITCH: the Host composition owner contour must answer the
+                // owner queue with its current owner/epoch plus the defined
+                // control-progress observation, and the challenger must bind
+                // the expected owner digest per challenge identity (see
+                // `eliot-host-state::host_owner_epoch_digest`); only then can
+                // `responsiveness_challenge::validate_owner_challenge_response`
+                // gain its production caller on this path.
+                if request.validate().is_ok() && reply.response.validate().is_ok() {
+                    reply.response
+                } else {
+                    HostRuntimeControlResponse::unknown_for(
+                        request,
+                        operation_unknown_ref(
+                            &request.operation,
+                            "queue-response-identity",
+                            request,
+                        ),
+                    )
+                }
             }
             Ok(Ok(_)) => HostRuntimeControlResponse::unknown_for(
                 request,
