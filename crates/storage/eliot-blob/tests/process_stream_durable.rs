@@ -7,15 +7,19 @@ mod windows_durable_owner {
     use std::future::Future;
     use std::path::{Path, PathBuf};
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::task::{Context, Poll, Waker};
 
     use eliot_blob::{
         BlobRootOwner, BlobServicePorts, BlobStoreService, DpapiUserAeadPort, DpapiUserKeyPort,
-        RleCompressionPort, UnavailableBlobLiveSetPort, WindowsBlobPlatformPort,
+        BlobPathState, BlobPlatformPort, RleCompressionPort, RootClaimProof,
+        UnavailableBlobLiveSetPort, WindowsBlobPlatformPort,
     };
     use eliot_blob_api::{
-        BlobError, BlobHash, BlobId, BlobPolicyBinding, BlobProcessStreamSourceBinding,
+        BlobCapacityCause, BlobCapacityCleanup, BlobCapacityEffect, BlobCapacityEvidence,
+        BlobCapacityFailure, BlobCapacityIdentity, BlobCapacityRecovery, BlobCapacityStage,
+        BlobCasCapability, BlobCasProviderResult, BlobCasRequest, BlobError, BlobHash, BlobId,
+        BlobPolicyBinding, BlobProcessStreamSourceBinding,
         BlobProcessStreamStageAppendRequest, BlobProcessStreamStageOpenRequest,
         BlobProcessStreamStageResumeRequest, BlobReceiptContext, BlobStoreClient, ObjectResidencyKey,
         RetentionClass, VersionedContentDigest,
@@ -26,6 +30,96 @@ mod windows_durable_owner {
     use sha2::{Digest, Sha256};
 
     static ROOT_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    /// Test-only delegated platform wrapper that reports a precise Windows
+    /// disk-full result for the next ciphertext publication. It never fills a
+    /// volume or changes production fault behavior.
+    struct DiskFullAtChunkPublication {
+        inner: WindowsBlobPlatformPort,
+        armed: AtomicBool,
+        context: BlobReceiptContext,
+    }
+
+    impl BlobPlatformPort for DiskFullAtChunkPublication {
+        fn claim_root(&mut self, lease: &eliot_blob::BlobRootLease) -> Result<RootClaimProof, BlobError> {
+            self.inner.claim_root(lease)
+        }
+
+        fn inspect_root(&self, lease: &eliot_blob::BlobRootLease) -> Result<RootClaimProof, BlobError> {
+            self.inner.inspect_root(lease)
+        }
+
+        fn prove_contained(&self, lease: &eliot_blob::BlobRootLease, path: &eliot_platform::WorkScopePath) -> Result<(), BlobError> {
+            self.inner.prove_contained(lease, path)
+        }
+
+        fn read_bounded(&self, path: &eliot_platform::WorkScopePath, max_bytes: u64) -> Result<Vec<u8>, BlobError> {
+            self.inner.read_bounded(path, max_bytes)
+        }
+
+        fn write_new_durable(&mut self, path: &eliot_platform::WorkScopePath, bytes: &[u8]) -> Result<(), BlobError> {
+            if path.normalized_identity().contains(".chunk-") && self.armed.swap(false, Ordering::SeqCst) {
+                return Err(BlobError::StorageCapacity {
+                    failure: Box::new(BlobCapacityFailure {
+                        identity: BlobCapacityIdentity::Operation {
+                            context: Box::new(self.context.clone()),
+                            locator: None,
+                        },
+                        stage: BlobCapacityStage::PayloadWrite,
+                        evidence: BlobCapacityEvidence {
+                            cause: BlobCapacityCause::WindowsErrorDiskFull { code: 112 },
+                            attempted_bytes: Some(bytes.len() as u64),
+                            effect: BlobCapacityEffect::NotAttempted,
+                        },
+                        cas_request: None,
+                        cas_observed: None,
+                        cas_backend_generation: None,
+                        cas_durability: None,
+                        cleanup: BlobCapacityCleanup::NotApplicable,
+                        cleanup_stage: None,
+                        cleanup_evidence: None,
+                        gc_state: None,
+                        recovery: BlobCapacityRecovery::CapacityRevalidationRequired,
+                    }),
+                });
+            }
+            self.inner.write_new_durable(path, bytes)
+        }
+
+        fn replace_durable(&mut self, path: &eliot_platform::WorkScopePath, bytes: &[u8]) -> Result<(), BlobError> {
+            self.inner.replace_durable(path, bytes)
+        }
+
+        fn cas_capability(&self) -> BlobCasCapability { self.inner.cas_capability() }
+
+        fn compare_and_replace_durable(&mut self, request: &BlobCasRequest, bytes: &[u8]) -> Result<BlobCasProviderResult, BlobError> {
+            self.inner.compare_and_replace_durable(request, bytes)
+        }
+
+        fn cas_status(&self, operation_id: &str) -> Result<Option<BlobCasProviderResult>, BlobError> {
+            self.inner.cas_status(operation_id)
+        }
+
+        fn backend_generation(&self) -> Result<u64, BlobError> { self.inner.backend_generation() }
+
+        fn rename_no_replace_durable(&mut self, source: &eliot_platform::WorkScopePath, destination: &eliot_platform::WorkScopePath) -> Result<(), BlobError> {
+            self.inner.rename_no_replace_durable(source, destination)
+        }
+
+        fn remove_durable(&mut self, path: &eliot_platform::WorkScopePath) -> Result<(), BlobError> {
+            self.inner.remove_durable(path)
+        }
+
+        fn stat(&self, path: &eliot_platform::WorkScopePath) -> Result<BlobPathState, BlobError> {
+            self.inner.stat(path)
+        }
+
+        fn list(&self, prefix: &eliot_platform::WorkScopePath) -> Result<Vec<eliot_platform::WorkScopePath>, BlobError> {
+            self.inner.list(prefix)
+        }
+
+        fn now_unix_ms(&mut self) -> Result<u64, BlobError> { self.inner.now_unix_ms() }
+    }
 
     fn block_on<T>(future: impl Future<Output = T>) -> T {
         let waker = Waker::noop();
@@ -165,6 +259,43 @@ mod windows_durable_owner {
         .expect("single owner-bound Blob service")
     }
 
+    fn service_with_disk_full_at_chunk_publication(
+        root: &Path,
+        owner: &BlobRootOwner,
+        request: &BlobProcessStreamStageOpenRequest,
+    ) -> BlobStoreService<
+        DiskFullAtChunkPublication,
+        RleCompressionPort,
+        DpapiUserKeyPort,
+        DpapiUserAeadPort,
+        UnavailableBlobLiveSetPort,
+    > {
+        let inner = WindowsBlobPlatformPort::new(root.to_path_buf()).expect("Blob platform");
+        let anchor = inner.load_or_create_issuer_anchor().expect("pinned issuer anchor");
+        let aead_platform = WindowsPlatform::new(root.to_path_buf()).expect("DPAPI platform");
+        BlobStoreService::new_with_owner(
+            owner,
+            request.root_lease.clone(),
+            BlobServicePorts {
+                platform: DiskFullAtChunkPublication {
+                    inner,
+                    armed: AtomicBool::new(true),
+                    context: request.stage_context.clone(),
+                },
+                compression: RleCompressionPort,
+                keys: DpapiUserKeyPort::new(
+                    BlobId::new("process-stream-test-key").expect("key lineage"),
+                    1,
+                )
+                .expect("DPAPI key lineage"),
+                aead: DpapiUserAeadPort::new(aead_platform),
+                live_sets: UnavailableBlobLiveSetPort,
+                issuer_anchor: anchor,
+            },
+        )
+        .expect("single owner-bound Blob service with test-only fault adapter")
+    }
+
     fn append(session: &BlobProcessStreamStageOpenRequest, sequence: u64, offset: u64, bytes: &[u8]) -> BlobProcessStreamStageAppendRequest {
         BlobProcessStreamStageAppendRequest {
             session_id: session.session_id.clone(),
@@ -186,6 +317,39 @@ mod windows_durable_owner {
         ));
         std::fs::create_dir_all(&path).expect("isolated Blob root");
         path
+    }
+
+    fn simulate_pending_append_without_ciphertext(
+        root: &Path,
+        session: &BlobProcessStreamStageOpenRequest,
+        sequence: u64,
+    ) {
+        // Recreate the durable state at the crash boundary after the pending
+        // append record is fsynced but before ciphertext publication. The
+        // format/path are intentionally asserted here so recovery tests fail
+        // visibly if the owner record contract changes.
+        let session_key = session.session_key_sha256().expect("session key");
+        let stem = format!(".eliot-process-stream-stage-v1-{session_key}");
+        let record_path = root.join("transactions").join(format!(
+            "{stem}.append-{sequence:020}"
+        ));
+        let chunk_path = root
+            .join("transactions")
+            .join(format!("{stem}.chunk-{sequence:020}"));
+        let record = std::fs::read_to_string(&record_path).expect("committed append record");
+        let phase = record.replace("\"phase\":\"COMMITTED\"", "\"phase\":\"PENDING\"");
+        assert_ne!(phase, record, "append phase is part of the durable contract");
+        let digest_start = phase
+            .find("\"ciphertext_sha256\":\"")
+            .expect("ciphertext digest field")
+            + "\"ciphertext_sha256\":\"".len();
+        let digest_end = phase[digest_start..]
+            .find('"')
+            .map(|relative| digest_start + relative)
+            .expect("ciphertext digest terminator");
+        let pending = format!("{}null{}", &phase[..digest_start - 1], &phase[digest_end + 1..]);
+        std::fs::write(&record_path, pending).expect("persist simulated pending append boundary");
+        std::fs::remove_file(chunk_path).expect("remove unpublished ciphertext");
     }
 
     #[test]
@@ -260,7 +424,8 @@ mod windows_durable_owner {
         );
 
         let second = append(&stderr, 0, 0, b"err");
-        block_on(store.append_process_stream_stage(second)).expect("stderr append");
+        block_on(store.append_process_stream_stage(second.clone())).expect("stderr append");
+        simulate_pending_append_without_ciphertext(&root, &stderr, 0);
         let over_limit = append(&stdout, 2, 3, b"123456789");
         assert!(matches!(
             block_on(store.append_process_stream_stage(over_limit)),
@@ -278,6 +443,10 @@ mod windows_durable_owner {
         )
         .expect("reclaim after simulated restart");
         let store = service(&root, &owner, &stderr);
+        let recovered_pending = block_on(store.append_process_stream_stage(second))
+            .expect("exact retry completes a persisted pending append after restart");
+        assert_eq!(recovered_pending.sequence, 0);
+        assert_eq!(recovered_pending.next_offset, 3);
         let stdout_reopened = open_request(
             &owner,
             "session-stdout",
@@ -389,6 +558,90 @@ mod windows_durable_owner {
         assert_ne!(stdout_readback.session.root_lease.lease_id, owner.lease_for_request(
             stdout.stage_context.request.clone()
         ).expect("new owner lease").lease_id);
+        drop(store);
+        drop(owner);
+        std::fs::remove_dir_all(root).expect("remove isolated Blob root");
+    }
+
+    #[test]
+    fn typed_disk_full_keeps_pending_append_unknown_until_same_operation_reconciles() {
+        let root = isolated_root();
+        let generation = windows_root_generation(&root);
+        let owner = BlobRootOwner::claim(
+            root.to_string_lossy().into_owned(),
+            "process-stream-capacity-owner",
+            std::process::id(),
+        )
+        .expect("exclusive root claim");
+        let session = open_request(
+            &owner,
+            "session-disk-full",
+            "source-disk-full",
+            "STDOUT",
+            generation,
+            32,
+            8,
+        );
+        let store = service_with_disk_full_at_chunk_publication(&root, &owner, &session);
+        block_on(store.open_process_stream_stage(session.clone())).expect("open stream");
+        let append_request = append(&session, 0, 0, b"durable-prefix");
+        let failure = block_on(store.append_process_stream_stage(append_request.clone()))
+            .expect_err("injected ENOSPC at ciphertext publication");
+        match failure {
+            BlobError::StorageCapacity { failure } => {
+                assert_eq!(failure.stage, BlobCapacityStage::PayloadWrite);
+                assert_eq!(
+                    failure.evidence.cause,
+                    BlobCapacityCause::WindowsErrorDiskFull { code: 112 }
+                );
+                assert_eq!(
+                    failure.evidence.effect,
+                    BlobCapacityEffect::NotAttempted
+                );
+                assert!(failure
+                    .evidence
+                    .attempted_bytes
+                    .is_some_and(|attempted| attempted >= b"durable-prefix".len() as u64));
+                assert_eq!(
+                    failure.recovery,
+                    BlobCapacityRecovery::CapacityRevalidationRequired
+                );
+            }
+            other => panic!("expected typed storage-full failure, got {other:?}"),
+        }
+        assert!(matches!(
+            block_on(store.resume_process_stream_stage(BlobProcessStreamStageResumeRequest {
+                session_id: session.session_id.clone(),
+                source_id: session.source_id.clone(),
+                terminal_id: session.terminal_id.clone(),
+                open_request_sha256: session.open_request_sha256.clone(),
+            })),
+            Err(BlobError::UnknownStreamAppendOutcome { sequence: 0, .. })
+        ));
+        drop(store);
+        drop(owner);
+
+        let owner = BlobRootOwner::claim(
+            root.to_string_lossy().into_owned(),
+            "process-stream-capacity-owner",
+            std::process::id(),
+        )
+        .expect("reclaim after typed storage-full outcome");
+        let store = service(&root, &owner, &session);
+        let receipt = block_on(store.append_process_stream_stage(append_request))
+            .expect("retry exact pending operation after capacity revalidation");
+        assert_eq!(receipt.sequence, 0);
+        assert_eq!(receipt.next_offset, 14);
+        let recovered = block_on(store.resume_process_stream_stage(
+            BlobProcessStreamStageResumeRequest {
+                session_id: session.session_id.clone(),
+                source_id: session.source_id.clone(),
+                terminal_id: session.terminal_id.clone(),
+                open_request_sha256: session.open_request_sha256.clone(),
+            },
+        ))
+        .expect("readback reconciled append");
+        assert_eq!(recovered.bytes, b"durable-prefix");
         drop(store);
         drop(owner);
         std::fs::remove_dir_all(root).expect("remove isolated Blob root");
