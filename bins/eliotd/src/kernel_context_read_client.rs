@@ -1527,9 +1527,11 @@ impl PacketAdmissionBundle {
     /// no production construction site; the per-identity account of what each
     /// one lacks is recorded on
     /// `bins/eliotd/src/campaign_packet.rs::CampaignPacketGapCode::AdmissionClosureUnbound`.
-    /// The remaining suppliers — priority-policy owner, admission-rule record
-    /// owner, route capacity/measurement owner — call this builder with the
-    /// candidate set this compilation produced and feed the resulting bundle to
+    /// The remaining suppliers - priority-policy owner, admission-rule record
+    /// owner, route capacity/measurement owner, and the indivisible-unit
+    /// evidence owner that mints `PacketUnitGroupEvidence` - call this builder
+    /// with the candidate set this compilation produced and feed the resulting
+    /// bundle to
     /// [`KernelContextReadClient::compile_context_packet`]; until they do, the
     /// campaign packet reports the unbound-closure gap instead of compiling.
     pub fn build(
