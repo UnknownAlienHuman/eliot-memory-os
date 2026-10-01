@@ -121,7 +121,8 @@ pub use readback::{
 pub use recipe::{
     ApprovedRecipeCatalogue, CONTEXT_RECIPE_POLICY_DIGEST_DOMAIN,
     CONTEXT_RECIPE_POLICY_SCHEMA_VERSION, CONTEXT_RECIPE_RESOLUTION_DIGEST_DOMAIN,
-    ContextRecipePolicy, ContextSectionBudget, CounterMetricMovement, EXECUTED_CONTEXT_STAGE,
+    ContextRecipePolicy, ContextSectionBudget, CounterMetricMovement,
+    EXCLUDED_FROM_POLICY_DIGEST_DOMAIN, EXECUTED_CONTEXT_STAGE, EXECUTED_ORDERING_REVISION,
     EXECUTED_REPETITION_POLICY, EXECUTED_SECTION_DEGRADATION, GoverningContextRequirements,
     ProtectedReservePolicy, RECIPE_ACTIVATION_DIGEST_DOMAIN, RECIPE_REVOCATION_DIGEST_DOMAIN,
     RecipeActivationRecord, RecipeAdmissionPolicy, RecipeApplicability,
