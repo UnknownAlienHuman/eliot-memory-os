@@ -664,7 +664,15 @@ impl KernelComposition {
                 EntrypointStage::Composition,
                 "kernel.composition.shadow_candidate_descriptor_skipped",
             );
-            return Self::assemble(config, ors, ors_path, None, platform, Some(canonical_store_evidence)).map_err(&terminal);
+            return Self::assemble(
+                config,
+                ors,
+                ors_path,
+                None,
+                platform,
+                Some(canonical_store_evidence),
+            )
+            .map_err(&terminal);
         }
         let prepared = Self::prepare_authority_descriptor_material(
             &platform,
@@ -684,8 +692,15 @@ impl KernelComposition {
         #[cfg(windows)]
         Self::adopt_descriptor_supervision_authority(&mut config, &prepared.descriptor)
             .map_err(&terminal)?;
-        Self::assemble_with_prepared_material(config, prepared, ors, ors_path, platform, canonical_store_evidence)
-            .map_err(&terminal)
+        Self::assemble_with_prepared_material(
+            config,
+            prepared,
+            ors,
+            ors_path,
+            platform,
+            canonical_store_evidence,
+        )
+        .map_err(&terminal)
     }
 
     /// Adopts the installer-provisioned supervision authority from the

@@ -32,8 +32,8 @@ use eliot_contracts::{
 use eliot_kernel_core::KernelRuntimeHealthEvidence;
 use eliot_mcp::{
     HostCancellationPortOutcome, HostCancellationRequest, HostInvocationPortOutcome,
-    HostInvocationRequest, HostOperationHandle, KernelHostRequestPort, McpResponse, PortFailure,
-    ObserveInput, ResponseKind, ToolRequest,
+    HostInvocationRequest, HostOperationHandle, KernelHostRequestPort, McpResponse, ObserveInput,
+    PortFailure, ResponseKind, ToolRequest,
 };
 use eliot_protocol::{
     AgentHostRequestFailure, EncodingProfile, FINISH_INVOKE_PAYLOAD_SCHEMA_ID, Frame, FrameKind,
