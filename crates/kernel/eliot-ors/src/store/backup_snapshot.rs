@@ -915,8 +915,8 @@ struct DispositionedTable {
 /// and there it comes from redb, not from this file.
 ///
 /// Counted against `store.rs`, `store/restore_journal.rs` and `status.rs` at the
-/// time of writing: 77 distinct declared tables, of which 46 back a dispositioned
-/// row family and 31 are explicit source-bound exclusions.
+/// time of writing: 78 distinct declared tables, of which 46 back a dispositioned
+/// row family and 32 are explicit source-bound exclusions.
 /// `row_family_denominator` carries 43 families and every one of them is now bound
 /// to a table by this census.
 ///
@@ -934,7 +934,7 @@ struct DispositionedTable {
 /// in this issue. Until it exists, a table added to `store.rs` is on the author.
 ///
 /// Split in four so no half can grow past the point where a reader stops
-/// checking it: 46 table-backed tables and 31 source-bound exclusions.
+/// checking it: 46 table-backed tables and 32 source-bound exclusions.
 fn dispositioned_tables() -> Vec<DispositionedTable> {
     let mut tables = family_backed_tables();
     tables.extend(source_bound_exclusions());
@@ -1238,6 +1238,11 @@ fn owner_state_exclusions() -> Vec<DispositionedTable> {
             RowDisposition::ForensicOnly,
             "process-stream call records are tied to one installation's Store request identities and owner outcomes; they are forensic evidence only and cannot authorize replay after restore",
         ),
+        excluded(
+            super::BLOB_PROCESS_STREAM_OWNER_FACTS_PULLS,
+            RowDisposition::ForensicOnly,
+            "owner-facts pulls are correlated to one installation's authenticated daemon session and current authority fence; restored responses cannot serve as current owner evidence",
+        ),
     ]
 }
 
@@ -1535,7 +1540,7 @@ fn purge_ledger_exclusions() -> Vec<DispositionedTable> {
 ///    advertise a quarantined import path for a table that has no family and
 ///    therefore no import path.
 ///
-/// Cost is one `list_tables` plus a 77-entry linear scan, both bounded and both
+/// Cost is one `list_tables` plus a 78-entry linear scan, both bounded and both
 /// independent of store size: it is a schema census, not a data scan. It runs
 /// once per export entrypoint and once per quarantined import, never per page.
 ///

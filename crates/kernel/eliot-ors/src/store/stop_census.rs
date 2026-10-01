@@ -15,8 +15,9 @@ use super::{
     BRIDGE_EVENT_HANDOFFS, BRIDGE_EVENT_OWNER_MAINTENANCE_CURSORS, BRIDGE_EVENT_PROJECTIONS,
     BRIDGE_EVENT_RECORDS, CAMPAIGN_SOURCE_PENDING, COLD_START_READINESS_BINDINGS,
     COLD_START_READINESS_HEADS, COLD_START_READINESS_RECORDS, CUTOVER_OWNERSHIP, DOCTOR_ATTEMPTS,
-    DOCTOR_EFFECTS, BLOB_PROCESS_STREAM_CALLS, BLOB_PROCESS_STREAM_GRANTS, DurableInboxRecord,
-    DurableOperationalRecord, EFFECT_OPERATION_LEASES,
+    DOCTOR_EFFECTS, BLOB_PROCESS_STREAM_CALLS, BLOB_PROCESS_STREAM_GRANTS,
+    BLOB_PROCESS_STREAM_OWNER_FACTS_PULLS, DurableInboxRecord, DurableOperationalRecord,
+    EFFECT_OPERATION_LEASES,
     EFFECT_REPLAY_RECONCILIATIONS, HOST_REQUEST_LOGICAL_KEYS, HOST_REQUESTS, META,
     NATIVE_WORKER_CLAIMS, OPERATIONAL_CURRENT, PROCESS_START_REPLAY, PROCESS_STREAM_RECOVERY,
     RECOVERY_INBOX, RECOVERY_PROBLEMS, REPLAY_ACKS, REPLAY_EVENTS, RESERVATIONS,
@@ -29,7 +30,8 @@ use crate::{
     AdmissionReservationState, HostRequestRecord, KernelReconciliationItem, OperationalPhase,
     RecoveryInboxDisposition, RecoveryProblem, ReservationRecord, UnknownCommitRecord,
     BlobProcessStreamCallRecord, BlobProcessStreamCallState, BlobProcessStreamGrantRecord,
-    BlobProcessStreamGrantState,
+    BlobProcessStreamGrantState, BlobProcessStreamOwnerFactsPullRecord,
+    BlobProcessStreamOwnerFactsPullState,
 };
 use eliot_contracts::StateFence;
 use eliot_runtime_contracts::RuntimeLease;
@@ -71,6 +73,8 @@ pub struct StoreStopObligationCounts {
     pub blob_process_stream_grants: u64,
     /// Process-stream Blob calls with an issued, reserved, dispatched, or unresolved outcome.
     pub blob_process_stream_calls: u64,
+    /// Owner-facts pulls not yet answered by the authenticated daemon owner.
+    pub blob_process_stream_owner_facts_pulls: u64,
     /// Pending Store rebind operations without their committed owner receipt.
     pub store_rebinds: u64,
     /// Unknown-outcome Store failures without a reconciling receipt.
@@ -130,6 +134,7 @@ impl StoreStopObligationCounts {
             self.process_stream_recovery,
             self.blob_process_stream_grants,
             self.blob_process_stream_calls,
+            self.blob_process_stream_owner_facts_pulls,
             self.store_rebinds,
             self.unresolved_store_failures,
             self.prepared_scan_disclosures,
@@ -176,6 +181,7 @@ impl StoreStopObligationCounts {
             && self.process_stream_recovery == 0
             && self.blob_process_stream_grants == 0
             && self.blob_process_stream_calls == 0
+            && self.blob_process_stream_owner_facts_pulls == 0
             && self.store_rebinds == 0
             && self.unresolved_store_failures == 0
             && self.prepared_scan_disclosures == 0
@@ -341,6 +347,8 @@ pub(super) fn census_in_read(
     observe_process_stream_recovery(read, &mut builder)?;
 
     observe_blob_process_stream(read, &mut builder)?;
+
+    observe_blob_process_stream_owner_facts_pulls(read, &mut builder)?;
 
     observe_campaign_source_pending(read, &mut builder)?;
 
@@ -977,6 +985,36 @@ fn observe_blob_process_stream(
         ) {
             builder.counts.blob_process_stream_calls =
                 increment(builder.counts.blob_process_stream_calls)?;
+        }
+    }
+    Ok(())
+}
+
+fn observe_blob_process_stream_owner_facts_pulls(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let table = read
+        .open_table(BLOB_PROCESS_STREAM_OWNER_FACTS_PULLS)
+        .map_err(storage)?;
+    for row in table.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let pull: BlobProcessStreamOwnerFactsPullRecord = decode(value.value())?;
+        pull.validate()?;
+        if key.value() != pull.pull_ref {
+            return Err(integrity(
+                "blob_process_stream_owner_facts_pull",
+                "pull reference does not match its table key",
+            ));
+        }
+        builder.observe(
+            "blob_process_stream_owner_facts_pull",
+            key.value(),
+            value.value(),
+        );
+        if pull.state == BlobProcessStreamOwnerFactsPullState::Pending {
+            builder.counts.blob_process_stream_owner_facts_pulls =
+                increment(builder.counts.blob_process_stream_owner_facts_pulls)?;
         }
     }
     Ok(())

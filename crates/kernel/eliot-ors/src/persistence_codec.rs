@@ -20,6 +20,7 @@ use super::ScopeReservationHead;
 use crate::AuthorityHandoffRecord;
 use crate::BlobProcessStreamCallRecord;
 use crate::BlobProcessStreamGrantRecord;
+use crate::BlobProcessStreamOwnerFactsPullRecord;
 use crate::CanonicalDisposition;
 use crate::CanonicalStoreRouteOwnership;
 use crate::EffectOperationLease;
@@ -495,6 +496,14 @@ impl PersistedValue for ProcessStartReplayRecord {
 
 impl PersistedValue for BlobProcessStreamGrantRecord {
     const RECORD_TYPE: &'static str = "blob_process_stream_grant";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl PersistedValue for BlobProcessStreamOwnerFactsPullRecord {
+    const RECORD_TYPE: &'static str = "blob_process_stream_owner_facts_pull";
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()
