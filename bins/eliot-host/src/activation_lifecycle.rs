@@ -715,12 +715,13 @@ impl HostComposition {
     ///
     /// Reachability contract: the sole production caller is
     /// `HostIdleDrainSupervisor::observe_readiness`, which forwards only
-    /// [`HostBranchDisposition::Healthy`], and the sole production producer of
+    /// [`HostBranchDisposition::Healthy`], and one production producer of
     /// [`HostBranchDisposition::Healthy`] is the readiness gate behind the
-    /// exact-current-`Active` activation check in
-    /// `HostComposition::reconcile_branch_readiness_at`. A `Draining`
-    /// generation with a `Cancelled` drain therefore never observes that proof
-    /// through the tick reconcile; its I1.5 return to `ACTIVE` runs through
+    /// exact-current activation check in
+    /// `HostComposition::reconcile_branch_readiness_at` — whose fence admits
+    /// a pre-commit cancelled drain alongside `Active`. A `Draining`
+    /// generation with a `Cancelled` drain therefore observes that proof
+    /// through the tick reconcile; its I1.5 return to `ACTIVE` also runs through
     /// [`HostComposition::resume_cancelled_drain_on_observable_use`], which
     /// carries its own fresh probe. This entry stays for reconcile-driven
     /// dispositions and performs the same owner `Active` transition.
@@ -773,10 +774,9 @@ impl HostComposition {
     /// retries it on a later trigger the generation could not admit, so a
     /// failed probe never strands the generation).
     ///
-    /// The tick reconcile cannot serve this path: its `Healthy` proof requires
-    /// `activation.state == Active` (`HostComposition::reconcile_branch_readiness_at`),
-    /// which is exactly the state being restored. The revalidation here is
-    /// therefore the same fresh proof, not a weaker one, driven by the trigger
+    /// The tick reconcile serves this path as well for pre-commit cancelled
+    /// drains (its `Healthy` proof admits that state since the fence fix);
+    /// the revalidation here is therefore the same fresh proof, not a weaker one, driven by the trigger
     /// instead of the tick: `HostComposition::persist_process_observations`
     /// re-observes Watchdog supervision, probes Kernel readiness live, admits
     /// the observation into the journal and grants the readiness gate —
