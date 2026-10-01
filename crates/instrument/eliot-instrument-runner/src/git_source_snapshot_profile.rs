@@ -12,6 +12,7 @@ use eliot_process::{
     EnvironmentProjection, ProcessExecutionAdmissionRequest, ProcessIntent,
 };
 use eliot_receipts::EffectClass;
+use std::path::Path;
 use thiserror::Error;
 
 use crate::profile::{InstrumentClass, InstrumentRegistry, InstrumentSpec, ResourceLimits};
@@ -159,10 +160,26 @@ pub struct GitSourceSnapshotProcessProfile<'a> {
     /// Existing Governor/P-03 effect class for the process spawn and isolated
     /// Git-index command. Artifact publication is a separate admission.
     pub effect: EffectClass,
+    /// Exact owner-provided resources Governor must bind to the original
+    /// ActionContract and GrantGraph lease.
+    pub resource_targets: GitSourceSnapshotResourceTargets<'a>,
     /// The effective stdout ceiling: the tighter of admitted Instrument and
     /// original ProcessIntent bounds. This is the source archive capture cap.
     pub stdout_ceiling_bytes: u64,
     pub instrument_limits: ResourceLimits,
+}
+
+/// Exact process resources retained for original Governor authorization.
+/// This value is not itself a permission or a textual resource-reference
+/// selector.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GitSourceSnapshotResourceTargets<'a> {
+    /// Executable file currently resolved by the original executable owner.
+    pub executable_path: &'a str,
+    /// Canonical selected-worktree root used as the process working directory.
+    pub source_root: &'a str,
+    /// Isolated index file owned by the current Git snapshot capture.
+    pub isolated_index_file: &'a str,
 }
 
 /// Fail-closed refusal while preparing or completing one finite Git process
@@ -181,6 +198,9 @@ pub enum GitSourceSnapshotProfileError {
     /// Resolved executable, process intent, environment, or argv drifted.
     #[error("owner-produced Git executable or process intent does not match the typed operation")]
     IntentMismatch,
+    /// Original temporary index target is absent or differs from its process environment binding.
+    #[error("isolated Git index resource target is not bound to the original process environment")]
+    ResourceTargetMismatch,
     /// Tree/blob object identity is not a complete lowercase SHA-1 or SHA-256 ID.
     #[error("Git object ID must be 40 or 64 lowercase hexadecimal characters")]
     InvalidObjectId,
@@ -199,6 +219,9 @@ pub enum GitSourceSnapshotProfileError {
 /// Call this before lease issuance with the original `ProcessIntent`; after
 /// Governor returns the ActionLease and Kernel seals the P-03 request, call
 /// [`validate_git_source_snapshot_admission`] on the same retained proposal.
+/// `isolated_index_file` must come directly from the bridge's current
+/// operation-owned `GitProcessProfile::index_file()` and match the process
+/// EnvironmentProjection.
 pub fn prepare_current_git_source_snapshot_profile<'a>(
     profiles: &'a InstrumentRegistry,
     providers: &'a ProviderRegistry,
@@ -208,6 +231,7 @@ pub fn prepare_current_git_source_snapshot_profile<'a>(
     command: GitSourceSnapshotCommand,
     intent: &'a ProcessIntent,
     canonical_working_directory: &'a str,
+    isolated_index_file: &'a Path,
     environment: &'a EnvironmentProjection,
 ) -> Result<GitSourceSnapshotProcessProfile<'a>, GitSourceSnapshotProfileError> {
     if invocation.instrument.as_str() != command.instrument_id()
@@ -235,6 +259,7 @@ pub fn prepare_current_git_source_snapshot_profile<'a>(
     }
     provider.check_resolved_executable(Some(resolved_executable))?;
 
+    let index_file = validate_isolated_index_binding(isolated_index_file, environment)?;
     let argv = command.argv()?;
     if !resolved_executable.binds_argv(&argv)
         || intent.argv() != argv
@@ -242,6 +267,7 @@ pub fn prepare_current_git_source_snapshot_profile<'a>(
         || intent.executable_sha256() != resolved_executable.content_digest.as_str()
         || intent.working_directory() != canonical_working_directory
         || intent.environment() != environment
+        || environment_index != index_file
     {
         return Err(GitSourceSnapshotProfileError::IntentMismatch);
     }
@@ -267,6 +293,11 @@ pub fn prepare_current_git_source_snapshot_profile<'a>(
         canonical_working_directory,
         environment,
         effect,
+        resource_targets: GitSourceSnapshotResourceTargets {
+            executable_path: &resolved_executable.canonical_path,
+            source_root: canonical_working_directory,
+            isolated_index_file: index_file,
+        },
         stdout_ceiling_bytes,
         instrument_limits: spec.limits,
     })
@@ -288,11 +319,38 @@ pub fn validate_git_source_snapshot_admission(
         || intent.executable() != profile.resolved_executable.canonical_path.as_str()
         || intent.executable_sha256() != profile.resolved_executable.content_digest.as_str()
         || intent.working_directory() != profile.canonical_working_directory
+        || profile.resource_targets.executable_path
+            != profile.resolved_executable.canonical_path.as_str()
+        || profile.resource_targets.source_root != profile.canonical_working_directory
+        || profile
+            .environment
+            .non_secret()
+            .get("GIT_INDEX_FILE")
+            .map(String::as_str)
+            != Some(profile.resource_targets.isolated_index_file)
         || !profile.resolved_executable.binds_argv(intent.argv())
     {
         return Err(GitSourceSnapshotProfileError::AdmissionMismatch);
     }
     Ok(())
+}
+
+fn validate_isolated_index_binding<'a>(
+    isolated_index_file: &'a Path,
+    environment: &'a EnvironmentProjection,
+) -> Result<&'a str, GitSourceSnapshotProfileError> {
+    let index_file = isolated_index_file
+        .to_str()
+        .filter(|path| !path.is_empty() && isolated_index_file.is_absolute())
+        .ok_or(GitSourceSnapshotProfileError::ResourceTargetMismatch)?;
+    let environment_index = environment
+        .non_secret()
+        .get("GIT_INDEX_FILE")
+        .ok_or(GitSourceSnapshotProfileError::ResourceTargetMismatch)?;
+    if environment_index != index_file {
+        return Err(GitSourceSnapshotProfileError::ResourceTargetMismatch);
+    }
+    Ok(index_file)
 }
 
 fn validate_object_id(value: &str) -> Result<(), GitSourceSnapshotProfileError> {
@@ -432,6 +490,29 @@ mod tests {
         assert!(matches!(
             wrong_object.argv(),
             Err(GitSourceSnapshotProfileError::InvalidObjectId)
+        ));
+    }
+
+    #[test]
+    fn isolated_index_resource_requires_exact_original_environment_binding() {
+        let environment = EnvironmentProjection::new(
+            BTreeMap::from([("GIT_INDEX_FILE".to_owned(), "/tmp/eliot/index".to_owned())]),
+            Vec::new(),
+            EnvironmentInheritance::None,
+        )
+        .expect("environment");
+        assert_eq!(
+            validate_isolated_index_binding(Path::new("/tmp/eliot/index"), &environment)
+                .expect("exact owner-bound index"),
+            "/tmp/eliot/index"
+        );
+        assert!(matches!(
+            validate_isolated_index_binding(Path::new("/tmp/eliot/other-index"), &environment),
+            Err(GitSourceSnapshotProfileError::ResourceTargetMismatch)
+        ));
+        assert!(matches!(
+            validate_isolated_index_binding(Path::new("relative-index"), &environment),
+            Err(GitSourceSnapshotProfileError::ResourceTargetMismatch)
         ));
     }
 }
