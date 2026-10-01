@@ -203,6 +203,29 @@ impl<'a, P: ?Sized> GovernorFinishAttempt<'a, P> {
     }
 }
 
+fn validate_nominated_artifact_bytes(
+    verifier_fact: &CanonicalVerifierExecutionFact,
+    references: &[String],
+) -> Result<(), FinishAttemptError> {
+    for reference in references {
+        let artifact = verifier_fact
+            .raw_artifact_bindings
+            .iter()
+            .find(|artifact| artifact.handle == *reference)
+            .ok_or_else(|| {
+                FinishAttemptError::Composition(CompositionError::Recovery(format!(
+                    "artifact {reference:?} has no verified stored-byte binding in the current task/plan/fence-bound TestD receipt"
+                )))
+            })?;
+        if artifact.truncated {
+            return Err(FinishAttemptError::Composition(CompositionError::Recovery(
+                format!("artifact {reference:?} is truncated in the original TestD receipt"),
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Pure output of one canonical finish-evidence derivation. The snapshot is
 /// the next owner image; it is committed together with the durable decision.
 struct ProducedFinishEvidence {
@@ -627,8 +650,7 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
         task: &TaskRecord,
         fence: &StateFence,
         plan: &CanonicalPlanBinding,
-        nominated_artifact_refs: &[String],
-        nominated_observation_refs: &[String],
+        nominated_refs: (&[String], &[String]),
         contract_acceptance_set: &RehydratedContractAcceptanceSet,
     ) -> Result<ProducedFinishEvidence, FinishAttemptError> {
         let (frame_refs, finish_authority_ref) =
@@ -650,52 +672,14 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
         // an executed verifier outcome.
         let (verifier_fact, verifier_run_ref) =
             self.read_current_verifier_fact(task_id, task, plan, fence)?;
-        for reference in nominated_artifact_refs {
-            let Some(artifact) = verifier_fact
-                .raw_artifact_bindings
-                .iter()
-                .find(|artifact| artifact.handle == *reference)
-            else {
-                return Err(FinishAttemptError::Composition(CompositionError::Recovery(
-                    format!(
-                        "caller-nominated artifact {reference:?} has no exact binding in the current task/plan/fence-bound TestD receipt"
-                    ),
-                )));
-            };
-            if artifact.truncated {
-                return Err(FinishAttemptError::Composition(CompositionError::Recovery(
-                    format!(
-                        "caller-nominated artifact {reference:?} is truncated in the original TestD receipt"
-                    ),
-                )));
-            }
-        }
+        validate_nominated_artifact_bytes(&verifier_fact, nominated_refs.0)?;
         // This fact has already been rehydrated and validated against the
         // current task, plan, fence, and durable terminal TestD receipt. A
         // failed or partial verifier is still an executed run; its outcome is
         // represented per required test below, not mislabeled as stale.
 
         let coordination = self.read_current_finish_projection(task_id, fence)?;
-        for reference in &coordination.artifact_refs {
-            let Some(artifact) = verifier_fact
-                .raw_artifact_bindings
-                .iter()
-                .find(|artifact| artifact.handle == *reference)
-            else {
-                return Err(FinishAttemptError::Composition(CompositionError::Recovery(
-                    format!(
-                        "coordination artifact {reference:?} has no verified stored-byte binding in the current task/plan/fence-bound TestD receipt"
-                    ),
-                )));
-            };
-            if artifact.truncated {
-                return Err(FinishAttemptError::Composition(CompositionError::Recovery(
-                    format!(
-                        "coordination artifact {reference:?} is truncated in the original TestD receipt"
-                    ),
-                )));
-            }
-        }
+        validate_nominated_artifact_bytes(&verifier_fact, &coordination.artifact_refs)?;
 
         let mut observation_refs = BTreeSet::new();
         // The task-and-plan-bound observation receipts are joined here so their
@@ -709,7 +693,7 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
             task,
             plan,
             fence,
-            nominated_observation_refs,
+            nominated_refs.1,
             &mut observation_refs,
         )?;
         // The verifier requirement is unchanged: a plan the Task Controller has
@@ -1531,8 +1515,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
             task,
             &fence,
             &plan,
-            &draft.artifact_refs,
-            &draft.observation_refs,
+            (&draft.artifact_refs, &draft.observation_refs),
             contract_acceptance_set,
         )?;
         if self

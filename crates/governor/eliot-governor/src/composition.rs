@@ -2193,13 +2193,13 @@ pub struct CanonicalVerifierExecutionFact {
     pub terminal_binding: TerminalVerifierBinding,
     pub input_artifact_bindings: Vec<ArtifactId>,
     pub raw_artifact_bindings: Vec<CanonicalVerifierRawArtifactBinding>,
-    /// Exact original TestD row used to evaluate this fact. It is retained so
+    /// Exact original `TestD` row used to evaluate this fact. It is retained so
     /// Finish can revalidate raw bytes instead of treating a copied handle or
-    /// digest as a byte read. JSON preserves TestD's closed row shape without
+    /// digest as a byte read. JSON preserves `TestD`'s closed row shape without
     /// widening this type's dependency surface to the full job schema.
     #[serde(default)]
     pub retained_testd_job: Option<serde_json::Value>,
-    /// Exact original TestD receipt, including its immutable raw artifact
+    /// Exact original `TestD` receipt, including its immutable raw artifact
     /// bytes. Finish decodes and revalidates this receipt and reruns the
     /// existing verifier against its bytes and original plan denominator.
     #[serde(default)]
@@ -2307,7 +2307,7 @@ impl CanonicalVerifierExecutionFact {
         Ok(())
     }
 
-    /// Revalidates the original durable TestD row and its stored bytes against
+    /// Revalidates the original durable `TestD` row and its stored bytes against
     /// this exact task, plan and State Fence, then compares the existing
     /// verifier's result with the immutable fact. Missing retained bytes are a
     /// prerequisite gap and cannot be replaced by a digest or handle.
