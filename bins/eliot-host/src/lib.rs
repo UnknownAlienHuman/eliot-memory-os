@@ -92,6 +92,63 @@ fn host_lifecycle_observe_scm(boundary: &'static HostLifecycleBoundary) {
     );
 }
 
+/// Observes one SCM lifecycle boundary with the already-owned runtime-control
+/// request identity that the plain boundary event cannot carry.
+///
+/// This stays on the existing #889 bounded-detail facade. It projects the
+/// installation, Host plan generation, current process, typed operation name,
+/// and request digest without logging raw request payload or revalidating or
+/// re-evaluating the operation.
+fn host_lifecycle_observe_scm_with_runtime_control_request(
+    boundary: &'static HostLifecycleBoundary,
+    launch_options: &HostLaunchOptions,
+    request: &HostRuntimeControlRequest,
+) {
+    note_event_log_sink_status();
+    let installation = host_diagnostics::bound_field(launch_options.installation().as_str());
+    let request_digest = request.request_digest.as_str();
+    let request_digest_is_sha256 = request_digest.len() == 64
+        && request_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'));
+    let request_digest = if request_digest_is_sha256 {
+        request_digest
+    } else {
+        "missing"
+    };
+    let detail = format!(
+        "{} installation={} installation_truncated={} process={} generation={} operation={} request_digest={} request_digest_shape_valid={}",
+        host_lifecycle_frozen_event(boundary),
+        installation.text(),
+        installation.truncated(),
+        std::process::id(),
+        launch_options.transaction_plan_generation(),
+        host_runtime_control_operation_name(&request.operation),
+        request_digest,
+        request_digest_is_sha256,
+    );
+    host_diagnostics::observe_entrypoint_with_detail(
+        host_diagnostics::EntrypointStage::ScmDispatch,
+        &detail,
+    );
+}
+
+fn host_runtime_control_operation_name(operation: &HostRuntimeControlOperation) -> &'static str {
+    match operation {
+        HostRuntimeControlOperation::RestartKernel => "RestartKernel",
+        HostRuntimeControlOperation::ReconcileKernelRestart => "ReconcileKernelRestart",
+        HostRuntimeControlOperation::RecoverStore => "RecoverStore",
+        HostRuntimeControlOperation::ReconcileStoreRecovery => "ReconcileStoreRecovery",
+        HostRuntimeControlOperation::DeliverReactiveContext => "DeliverReactiveContext",
+        HostRuntimeControlOperation::AdmitUserAutomationOccurrence => {
+            "AdmitUserAutomationOccurrence"
+        }
+        HostRuntimeControlOperation::CancelUserAutomationPendingWakes => {
+            "CancelUserAutomationPendingWakes"
+        }
+    }
+}
+
 fn host_lifecycle_observe_drain(boundary: &'static HostLifecycleBoundary) {
     note_event_log_sink_status();
     host_diagnostics::observe_entrypoint_with_detail(
@@ -659,10 +716,10 @@ const HOST_LIFECYCLE_BOUNDARY_TABLE: &[HostLifecycleBoundary] = &[
     },
     HostLifecycleBoundary {
         name: "start.requested",
-        source_item: "HostComposition::start_approved_contour",
+        source_item: "HostComposition::start_approved_contour; start_approved_manifest_contour",
         owner_state: "approved generation/launch descriptor",
         event: "host.start requested",
-        caller: "none (exported API; no in-repo caller)",
+        caller: "HostComposition::open; exported HostComposition::start_approved_contour has no in-repo caller",
         test: "891/case-2",
     },
     HostLifecycleBoundary {
@@ -1544,6 +1601,179 @@ const _: () = assert!(
     propagated_exclusions_cover_table(),
     "propagated exclusion drift in HOST_LIFECYCLE_BOUNDARY_TABLE",
 );
+
+/// Case-1/22 fixture-consumption proof for the frozen boundary table (#891 W1).
+///
+/// The integration target pins facade behavior but never reads
+/// `fixture["boundary_table"]` or `fixture["allowed_diff"]`, so a duplicated
+/// name list in JSON could drift from the real table without failing a gate.
+/// These tests close that gap by consuming both keys against the actual
+/// [`HOST_LIFECYCLE_BOUNDARY_TABLE`]: names must match in source order, the
+/// emitting/propagated split and exclusions must match exactly, every emitting
+/// event must resolve through the same `boundary_by_event` binding the
+/// production `BOUNDARY_*` identifiers use, and every `allowed_diff` promise
+/// must hold against this source file. Unknown vocabulary cannot pass: an
+/// unlisted event fails `boundary_by_event` at build time, and any table
+/// drift fails the order-sensitive comparison here.
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "case-1/22 fixture proof reads tracked files like the integration probes"
+)]
+mod host_lifecycle_boundary_table_tests {
+    fn lifecycle_fixture() -> serde_json::Value {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/host_lifecycle_diagnostics.json");
+        let bytes = std::fs::read(&path).expect("lifecycle fixture must be readable");
+        serde_json::from_slice(&bytes).expect("lifecycle fixture must be valid JSON")
+    }
+
+    fn lib_source() -> String {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+        std::fs::read_to_string(&path).expect("tracked lib.rs must be readable")
+    }
+
+    // WORK_UNIT_CASE: 891/1
+    #[test]
+    fn case_1_frozen_table_binds_fixture() {
+        let fixture = lifecycle_fixture();
+        let table = super::HOST_LIFECYCLE_BOUNDARY_TABLE;
+        // The fixture names its source; the pointer must name this table.
+        assert_eq!(
+            fixture["boundary_table"]["source"].as_str(),
+            Some("bins/eliot-host/src/lib.rs::HOST_LIFECYCLE_BOUNDARY_TABLE"),
+            "fixture must point at the actual frozen table"
+        );
+        // Order-sensitive: the fixture consumes the actual table, it does not
+        // duplicate its names.
+        let source_names: Vec<&str> = table.iter().map(|row| row.name).collect();
+        let fixture_names: Vec<&str> = fixture["boundary_table"]["names"]
+            .as_array()
+            .expect("fixture must pin boundary_table.names")
+            .iter()
+            .map(|name| name.as_str().expect("boundary name must be a string"))
+            .collect();
+        assert_eq!(
+            source_names.len(),
+            fixture_names.len(),
+            "fixture must pin one name per table row"
+        );
+        let first_drift = source_names
+            .iter()
+            .zip(fixture_names.iter())
+            .position(|(source, pinned)| source != pinned);
+        assert!(
+            first_drift.is_none(),
+            "fixture names must equal the table in source order"
+        );
+        // Split and counts: propagated rows own no emission.
+        let propagated_names: Vec<&str> = table
+            .iter()
+            .filter(|row| row.event.starts_with("propagated:"))
+            .map(|row| row.name)
+            .collect();
+        let rows = u64::try_from(table.len()).expect("table fits u64");
+        let propagated = u64::try_from(propagated_names.len()).expect("table fits u64");
+        assert_eq!(
+            fixture["boundary_table"]["rows"].as_u64(),
+            Some(rows),
+            "fixture must pin the row count"
+        );
+        assert_eq!(
+            fixture["boundary_table"]["emitting"].as_u64(),
+            Some(rows - propagated),
+            "fixture must pin the emitting count"
+        );
+        assert_eq!(
+            fixture["boundary_table"]["propagated"].as_u64(),
+            Some(propagated),
+            "fixture must pin the propagated count"
+        );
+        let exclusions: Vec<&str> = fixture["boundary_table"]["propagated_exclusions"]
+            .as_array()
+            .expect("fixture must pin propagated exclusions")
+            .iter()
+            .map(|name| name.as_str().expect("exclusion must be a string"))
+            .collect();
+        for name in &propagated_names {
+            assert!(
+                exclusions.contains(name),
+                "propagated row {name:?} must be an explicit exclusion"
+            );
+        }
+        assert_eq!(
+            exclusions.len(),
+            propagated_names.len(),
+            "exclusions must cover every propagated row and nothing else"
+        );
+        // Every emitting event resolves through the production binding, and
+        // the resolved row is exactly the table row: unknown IDs cannot
+        // silently become new production vocabulary.
+        for row in table.iter().filter(|row| !row.event.starts_with("propagated:")) {
+            let resolved = super::boundary_by_event(row.event);
+            assert_eq!(
+                resolved.name, row.name,
+                "event {:?} must resolve to its exact table row",
+                row.event
+            );
+        }
+    }
+
+    // WORK_UNIT_CASE: 891/22
+    #[test]
+    fn case_22_allowed_diff_binds_source() {
+        let fixture = lifecycle_fixture();
+        let allowed = &fixture["allowed_diff"];
+        for key in [
+            "no_duplicate_evaluation",
+            "no_lifecycle_delta",
+            "no_new_visibility",
+            "no_mutable_global_dedup",
+            "single_terminal_per_failed_op",
+        ] {
+            assert_eq!(
+                allowed[key].as_bool(),
+                Some(true),
+                "allowed_diff[{key}] must stay pinned true"
+            );
+        }
+        let lib = lib_source();
+        // no_duplicate_evaluation: observation calls pass static BOUNDARY_*
+        // identifiers, never string literals that could bypass the table.
+        for helper in [
+            "host_lifecycle_observe_requested(\"",
+            "host_lifecycle_observe_scm(\"",
+            "host_lifecycle_observe_drain(\"",
+            "host_lifecycle_observe_terminal(\"",
+            "host_lifecycle_observe_identity(\"",
+        ] {
+            assert!(
+                !lib.contains(helper),
+                "observation calls must pass BOUNDARY_* identifiers, never string literals"
+            );
+        }
+        // no_new_visibility: no new public logging surface.
+        assert!(
+            !lib.contains("pub fn host_lifecycle_"),
+            "no new public logging surface may exist"
+        );
+        // no_mutable_global_dedup: one terminal per failed operation is
+        // enforced by the single outermost guard, never a dedup cache.
+        assert!(
+            !lib.contains("static DEDUP"),
+            "no mutable global dedup cache may exist"
+        );
+        // no_lifecycle_delta and single_terminal_per_failed_op: the exact
+        // table binding in case 1 is the guard — any new boundary, renamed
+        // event, or second terminal code breaks the order-sensitive table
+        // proof above before it can reach production vocabulary.
+        assert!(
+            lib.contains("struct HostTerminalGuard"),
+            "the single-terminal guard must remain the terminal mechanism"
+        );
+    }
+}
+
 /// Returns the frozen `event` spelling for the selected boundary row.
 ///
 /// Every production observation passes its static [`HOST_LIFECYCLE_BOUNDARY_TABLE`]
@@ -5789,6 +6019,9 @@ fn start_approved_manifest_contour<P: ApprovedHostStartupPort>(
     let (_, store_artifact) = manifest
         .host_child_artifact_digests()
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    // F-LOG-HOST-1: the approved start is requested here on the live startup
+    // path; manifest launch, process start, and readiness stay distinct.
+    host_lifecycle_observe_requested(BOUNDARY_START_REQUESTED);
     port.start_approved_manifest(
         manifest,
         branch,
@@ -8588,16 +8821,15 @@ impl HostComposition {
         // completion. Unsupported op stays typed Unknown, never false-success.
         // One terminal per Unknown outcome; inner `execute` shares correlation
         // and never emits its own terminal.
-        host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_REQUESTED);
-        // F-LOG-HOST-1 case 15: the restart sighting correlates on the
-        // installation and generation already held in `launch_options`, plus
-        // this process's own id from `std::process::id()` - the same
-        // `HostProcessBinding` identity the owner already records elsewhere,
-        // read here as a pure value (no probe, no handle, no lock). The
-        // `operation` slot stays explicitly missing: this dispatch is a
-        // runtime-control (SCM) action, and `AdmittedEvent` admits service
-        // start/stop/failure only, so no fitting taxonomy value exists here
-        // and none is guessed.
+        host_lifecycle_observe_scm_with_runtime_control_request(
+            BOUNDARY_KERNEL_RESTART_REQUESTED,
+            &self.launch_options,
+            request,
+        );
+        // The companion host.request projection still leaves its typed
+        // `AdmittedEvent` slot missing because RestartKernel is not a service
+        // start/stop Event Log category. The lifecycle record above carries
+        // this request's exact operation name and digest in bounded detail.
         host_lifecycle_observe_identity(
             &host_diagnostics::HostRequestProjection::observed(
                 host_diagnostics::EntrypointStage::ScmDispatch,
@@ -8607,7 +8839,11 @@ impl HostComposition {
         );
         if request.operation == HostRuntimeControlOperation::ReconcileKernelRestart {
             // Reconcile is query-only replay, not another restart commit.
-            host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECONCILE_DELEGATED_READBACK);
+            host_lifecycle_observe_scm_with_runtime_control_request(
+                BOUNDARY_KERNEL_RESTART_RECONCILE_DELEGATED_READBACK,
+                &self.launch_options,
+                request,
+            );
             return self.reconcile_kernel_restart_request(request);
         }
         if self
@@ -8616,7 +8852,11 @@ impl HostComposition {
             .live_guard()
             .is_err()
         {
-            host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_UNKNOWN_OWNER_FENCED);
+            host_lifecycle_observe_scm_with_runtime_control_request(
+                BOUNDARY_KERNEL_RESTART_UNKNOWN_OWNER_FENCED,
+                &self.launch_options,
+                request,
+            );
             host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_TERMINAL);
             return HostRuntimeControlResponse::unknown_for(
                 request,
@@ -8626,13 +8866,21 @@ impl HostComposition {
         let result = self.execute_kernel_restart(request);
         match result {
             Ok(receipt) => {
-                host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECEIPT_COMPLETION);
+                host_lifecycle_observe_scm_with_runtime_control_request(
+                    BOUNDARY_KERNEL_RESTART_RECEIPT_COMPLETION,
+                    &self.launch_options,
+                    request,
+                );
                 HostRuntimeControlResponse::restarted_for(request, receipt)
             }
             Err(_error) => {
                 // Unsupported op, pending/unknown, or failed restart all stay
                 // typed Unknown preserving identity; never false-success.
-                host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_UNKNOWN);
+                host_lifecycle_observe_scm_with_runtime_control_request(
+                    BOUNDARY_KERNEL_RESTART_UNKNOWN,
+                    &self.launch_options,
+                    request,
+                );
                 host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_TERMINAL);
                 HostRuntimeControlResponse::unknown_for(
                     request,
@@ -8652,14 +8900,22 @@ impl HostComposition {
         // false-success and never rewrites the durable receipt. Timeout or
         // possible state change stays Unknown until reconciliation evidence.
         // One terminal per Unknown outcome; success readback is replay.
-        host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECONCILE_REQUESTED);
+        host_lifecycle_observe_scm_with_runtime_control_request(
+            BOUNDARY_KERNEL_RESTART_RECONCILE_REQUESTED,
+            &self.launch_options,
+            request,
+        );
         if self
             .owner_lease
             .activation_capability()
             .live_guard()
             .is_err()
         {
-            host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_OWNER_FENCED);
+            host_lifecycle_observe_scm_with_runtime_control_request(
+                BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_OWNER_FENCED,
+                &self.launch_options,
+                request,
+            );
             host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL);
             return HostRuntimeControlResponse::unknown_for(
                 request,
@@ -8667,7 +8923,11 @@ impl HostComposition {
             );
         }
         if request.validate().is_err() {
-            host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_VALIDATION);
+            host_lifecycle_observe_scm_with_runtime_control_request(
+                BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_VALIDATION,
+                &self.launch_options,
+                request,
+            );
             host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL);
             return HostRuntimeControlResponse::unknown_for(
                 request,
@@ -8677,12 +8937,18 @@ impl HostComposition {
         let key = request.mutation_digest.as_str().to_owned();
         if let Some(receipt) = self.runtime_restarts.get(&key).cloned() {
             return if let Ok(receipt) = rebind_runtime_restart_receipt(&receipt, request) {
-                host_lifecycle_observe_scm(
+                host_lifecycle_observe_scm_with_runtime_control_request(
                     BOUNDARY_KERNEL_RESTART_RECONCILE_RECEIPT_READBACK_REPLAY,
+                    &self.launch_options,
+                    request,
                 );
                 HostRuntimeControlResponse::restarted_for(request, receipt)
             } else {
-                host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_CONFLICT);
+                host_lifecycle_observe_scm_with_runtime_control_request(
+                    BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_CONFLICT,
+                    &self.launch_options,
+                    request,
+                );
                 host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL);
                 HostRuntimeControlResponse::unknown_for(
                     request,
@@ -8694,7 +8960,11 @@ impl HostComposition {
             Ok(true) | Err(_) => {
                 // Pending or unreadable pending stays Unknown; a timeout is
                 // never proof of effect or non-effect.
-                host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_PENDING);
+                host_lifecycle_observe_scm_with_runtime_control_request(
+                    BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_PENDING,
+                    &self.launch_options,
+                    request,
+                );
                 host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL);
                 return HostRuntimeControlResponse::unknown_for(
                     request,
@@ -8706,7 +8976,11 @@ impl HostComposition {
         let snapshot = match self.journal.snapshot() {
             Ok(s) => s,
             Err(_e) => {
-                host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_SNAPSHOT);
+                host_lifecycle_observe_scm_with_runtime_control_request(
+                    BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_SNAPSHOT,
+                    &self.launch_options,
+                    request,
+                );
                 host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL);
                 return HostRuntimeControlResponse::unknown_for(
                     request,
@@ -8717,7 +8991,11 @@ impl HostComposition {
         if let Some(kernel) = snapshot.kernel.as_ref() {
             let _ = kernel;
         }
-        host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN);
+        host_lifecycle_observe_scm_with_runtime_control_request(
+            BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN,
+            &self.launch_options,
+            request,
+        );
         host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL);
         HostRuntimeControlResponse::unknown_for(
             request,
@@ -8778,7 +9056,11 @@ impl HostComposition {
     ) -> Result<HostKernelRestartReceipt, HostError> {
         // F-LOG-HOST-1: inner phase only; outer `handle_kernel_restart_request`
         // owns the single terminal. Unsupported op stays typed, never success.
-        host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_EXECUTE_REQUESTED);
+        host_lifecycle_observe_scm_with_runtime_control_request(
+            BOUNDARY_KERNEL_RESTART_EXECUTE_REQUESTED,
+            &self.launch_options,
+            request,
+        );
         request.validate().map_err(HostError::ProcessContour)?;
         if request.operation != HostRuntimeControlOperation::RestartKernel {
             return Err(HostError::ProcessContour(
@@ -9130,7 +9412,11 @@ impl HostComposition {
         self.runtime_restarts.insert(key, receipt.clone());
         self.readiness_gate.branch_degraded();
         // F-LOG-HOST-1: receipt (restart) is distinct from reconcile readback.
-        host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_EXECUTE_RECEIPT);
+        host_lifecycle_observe_scm_with_runtime_control_request(
+            BOUNDARY_KERNEL_RESTART_EXECUTE_RECEIPT,
+            &self.launch_options,
+            request,
+        );
         Ok(receipt)
     }
 
