@@ -3544,6 +3544,8 @@ const PROCESS_STREAM_RECOVERY_FAMILY_REVISION: &str = "process_stream_recovery_f
 /// cannot look like versioned-artifact movement and refuse an unrelated
 /// continuation.
 const VERSIONED_ARTIFACT_FAMILY_REVISION: &str = "versioned_artifact_family_revision";
+/// Revision of the cursor-paged initial setup authority forensic family.
+const INITIAL_SETUP_AUTHORITY_FAMILY_REVISION: &str = "initial_setup_authority_family_revision";
 
 struct ClosureRowPlan {
     key: String,
@@ -4911,6 +4913,7 @@ impl RedbRecoveryStore {
             });
         }
         let write = self.database.begin_write().map_err(storage)?;
+        let mut family_moved = false;
         let result = {
             let grants = write.open_table(OPERATIONAL_CURRENT).map_err(storage)?;
             let grant_key = Self::operational_key(
@@ -4962,10 +4965,14 @@ impl RedbRecoveryStore {
                 None => {
                     let payload = encode(prepared)?;
                     authorities.insert(key, payload.as_str()).map_err(storage)?;
+                    family_moved = true;
                     prepared.clone()
                 }
             }
         };
+        if family_moved {
+            Self::advance_initial_setup_authority_family_revision(&write)?;
+        }
         write.commit().map_err(storage)?;
         Ok(result)
     }
@@ -5045,6 +5052,7 @@ impl RedbRecoveryStore {
             }
             committed.clone()
         };
+        Self::advance_initial_setup_authority_family_revision(&write)?;
         write.commit().map_err(storage)?;
         Ok(result)
     }
@@ -5100,6 +5108,7 @@ impl RedbRecoveryStore {
                 .map_err(storage)?;
             prepared.clone()
         };
+        Self::advance_initial_setup_authority_family_revision(&write)?;
         write.commit().map_err(storage)?;
         Ok(result)
     }
@@ -5153,6 +5162,7 @@ impl RedbRecoveryStore {
                 .map_err(storage)?;
             committed.clone()
         };
+        Self::advance_initial_setup_authority_family_revision(&write)?;
         write.commit().map_err(storage)?;
         Ok(result)
     }
@@ -5309,6 +5319,17 @@ impl RedbRecoveryStore {
         backup_snapshot::open_backup_family(
             &self.database,
             crate::backup_snapshot::RowFamilyKind::VersionedArtifacts,
+        )
+    }
+
+    /// Opens the typed initial-setup authority forensic family cursor.
+    /// Exported rows are evidence only and have no restore-to-authority path.
+    pub fn open_backup_initial_setup_authority_family(
+        &self,
+    ) -> Result<crate::backup_snapshot::OrsFamilyCursor, OrsError> {
+        backup_snapshot::open_backup_family(
+            &self.database,
+            crate::backup_snapshot::RowFamilyKind::InitialSetupAuthority,
         )
     }
 
@@ -30407,6 +30428,53 @@ impl RedbRecoveryStore {
             })?
             .unwrap_or(0);
         Ok(revision)
+    }
+
+    /// Reads the revision of the initial setup authority forensic family.
+    pub(super) fn initial_setup_authority_family_revision(
+        read: &redb::ReadTransaction,
+    ) -> Result<u64, OrsError> {
+        let meta = read.open_table(META).map_err(storage)?;
+        let revision = meta
+            .get(INITIAL_SETUP_AUTHORITY_FAMILY_REVISION)
+            .map_err(storage)?
+            .map(|value| value.value().parse::<u64>())
+            .transpose()
+            .map_err(|error| OrsError::IntegrityProblem {
+                record_type: "ors_meta_v1",
+                reason: error.to_string(),
+            })?
+            .unwrap_or(0);
+        Ok(revision)
+    }
+
+    /// Advances the forensic family revision in the same transaction as each
+    /// setup-lineage row change. The rows remain export-only and are never
+    /// imported as authority.
+    fn advance_initial_setup_authority_family_revision(
+        write: &redb::WriteTransaction,
+    ) -> Result<u64, OrsError> {
+        let mut meta = write.open_table(META).map_err(storage)?;
+        let prior = meta
+            .get(INITIAL_SETUP_AUTHORITY_FAMILY_REVISION)
+            .map_err(storage)?
+            .map(|value| value.value().parse::<u64>())
+            .transpose()
+            .map_err(|error| OrsError::IntegrityProblem {
+                record_type: "ors_meta_v1",
+                reason: error.to_string(),
+            })?
+            .unwrap_or(0);
+        let next = prior.checked_add(1).ok_or_else(|| OrsError::IntegrityProblem {
+            record_type: "ors_meta_v1",
+            reason: "initial setup authority family revision counter exhausted".to_owned(),
+        })?;
+        meta.insert(
+            INITIAL_SETUP_AUTHORITY_FAMILY_REVISION,
+            next.to_string().as_str(),
+        )
+        .map_err(storage)?;
+        Ok(next)
     }
 
     /// Advances the versioned-artifact family revision in the caller's open
