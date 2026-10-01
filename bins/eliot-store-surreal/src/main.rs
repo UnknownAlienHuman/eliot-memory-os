@@ -412,18 +412,6 @@ async fn dispatch_blob_process_stream(
                 response: Box::new(response),
             }
         }
-        BlobProcessStreamOperationRequest::VerificationStageSource { request } => {
-            let request = *request;
-            let response = composition
-                .verification_stage_source(transport, identity, request.clone())
-                .await?;
-            response
-                .validate_for_request(&request)
-                .map_err(|error| error.to_string())?;
-            BlobProcessStreamOperationResponse::VerificationStageSource {
-                response: Box::new(response),
-            }
-        }
     };
     let response = BlobProcessStreamFrameResponse {
         wire_id: eliot_blob_api::wire::BLOB_PROCESS_STREAM_WIRE_ID.to_owned(),

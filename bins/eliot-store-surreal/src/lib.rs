@@ -162,7 +162,6 @@ pub use connection_manager::{
     StoreConnectionManager, UnknownWriteGate, classify_receipt_lookup, decide_replay,
     default_store_transaction_limit, default_store_transaction_limit_usize,
 };
-mod verification_stage_owner;
 mod adapter_materialization;
 pub use adapter_materialization::materialize_adapter_config;
 use adapter_materialization::{resolve_credential, resolve_provider_bootstrap_credential};

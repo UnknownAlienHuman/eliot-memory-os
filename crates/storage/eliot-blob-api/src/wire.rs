@@ -66,12 +66,6 @@ pub enum BlobProcessStreamOperationRequest {
         /// Exact closed source readback request.
         request: Box<ProcessStreamSourceReadbackRequest>,
     },
-    /// Distinct profile-stage source lifecycle delegated to the canonical
-    /// Store owner over the already authenticated EBP session.
-    VerificationStageSource {
-        /// Exact closed profile-stage source request.
-        request: Box<crate::verification_wire::VerificationStageSourceRequest>,
-    },
 }
 
 /// Closed semantic request on the dedicated Blob EBP path.
@@ -107,9 +101,6 @@ impl BlobProcessStreamFrameRequest {
         match &self.operation {
             BlobProcessStreamOperationRequest::Sink { request } => request.validate(),
             BlobProcessStreamOperationRequest::SourceReadback { request } => request.validate(),
-            BlobProcessStreamOperationRequest::VerificationStageSource { request } => {
-                request.validate()
-            }
         }
     }
 }
@@ -131,11 +122,6 @@ pub enum BlobProcessStreamOperationResponse {
     SourceReadback {
         /// Closed owner response.
         response: Box<ProcessStreamSourceReadbackResponse>,
-    },
-    /// Distinct profile-stage source lifecycle result.
-    VerificationStageSource {
-        /// Closed owner response.
-        response: Box<crate::verification_wire::VerificationStageSourceResponse>,
     },
 }
 
@@ -168,9 +154,6 @@ impl BlobProcessStreamFrameResponse {
         match &self.operation {
             BlobProcessStreamOperationResponse::Sink { response } => response.validate()?,
             BlobProcessStreamOperationResponse::SourceReadback { response } => {
-                response.validate()?;
-            }
-            BlobProcessStreamOperationResponse::VerificationStageSource { response } => {
                 response.validate()?;
             }
         }
