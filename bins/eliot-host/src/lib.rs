@@ -3331,17 +3331,21 @@ impl HostJobBranches {
             .kernel
             .as_ref()
             .ok_or_else(|| HostError::ProcessContour("Kernel process is missing".to_owned()))?;
-        let process = kernel.evidence().process();
+        let original_process = kernel.evidence().process();
         if !kernel
             .job_processes()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?
             .iter()
-            .any(|observed| observed == process)
+            .any(|observed| observed == original_process)
         {
             return Err(HostError::ProcessContour(
                 "Job observation does not contain the exact launched Kernel process".to_owned(),
             ));
         }
+        // The authenticated control transaction may compensate by mutating
+        // this owner. Retain the exact already-verified identity independently
+        // so the async exchange does not keep an immutable borrow of `self.kernel`.
+        let process = original_process.clone();
         match kernel
             .observe()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?
