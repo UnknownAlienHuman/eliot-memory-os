@@ -2039,6 +2039,58 @@ impl CoordinationOwner {
             event,
         })
     }
+
+    /// Routes a retained requested change through the normal owner, effect,
+    /// and verifier paths (issue #1823 W5; I10.18 anchored review items).
+    ///
+    /// A review item carrying [`ReviewKind::RequestedChange`] is a candidate
+    /// only: a comment/request grants no write, effect, goal, or acceptance
+    /// authority, so this entry admits the supplied draft through
+    /// [`Self::submit_integration_candidate`] — the same owner submission
+    /// seam every other change uses — and mutates nothing on the review
+    /// record itself (no lifecycle advance, no write conversion on the
+    /// review contract). Declared effects ride the draft's normal
+    /// `declared_read_effects`/`declared_write_effects` declaration and take
+    /// effect solely through the candidate lease/acceptance path behind the
+    /// admitted candidate; verifier handles ride `verification_refs` as
+    /// evidence the owner never decides. `RequestedChange` stays a candidate
+    /// kind: only a retained `RequestedChange` review in a live obligation
+    /// lifecycle (`PendingDelivery`/`Delivered`/`Answered`) routes, and every
+    /// refusal is a typed [`CoordinationError`].
+    /// STITCH (#1823 W5): the future live caller is the owner-side driver
+    /// that builds a real [`IntegrationCandidateDraft`] from admitted
+    /// work-item/session material for an answered `RequestedChange` review;
+    /// BLOCKED-BY the review-to-candidate driver (no live draft producer
+    /// exists). Forbidden: a draft built from fabricated or test-only input
+    /// to manufacture a caller.
+    pub fn route_review_requested_change(
+        &mut self,
+        review_id: &str,
+        draft: IntegrationCandidateDraft,
+    ) -> Result<IntegrationCandidateReceipt, CoordinationError> {
+        text(review_id, "review_id")?;
+        let (kind, lifecycle) = self
+            .peer_reviews
+            .get(review_id)
+            .map(|review| (review.kind, review.lifecycle))
+            .ok_or_else(|| CoordinationError::NotFound {
+                kind: "peer_review",
+                id: review_id.to_owned(),
+            })?;
+        if kind != ReviewKind::RequestedChange {
+            return Err(CoordinationError::InvalidState);
+        }
+        if !matches!(
+            lifecycle,
+            PeerReviewLifecycle::PendingDelivery
+                | PeerReviewLifecycle::Delivered
+                | PeerReviewLifecycle::Answered
+        ) {
+            return Err(CoordinationError::InvalidState);
+        }
+        self.submit_integration_candidate(draft)
+    }
+
     /// Acquires the single integration writer for a target scope.
     pub fn acquire_integration(
         &mut self,
