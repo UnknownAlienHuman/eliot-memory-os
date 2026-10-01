@@ -3536,8 +3536,8 @@ impl<'a, D: ?Sized, W: ?Sized, H: ?Sized, N: ?Sized>
     }
 }
 
-impl<'a, D: ?Sized, W: ?Sized, H: ?Sized, N: ?Sized> UserAutomationRuntimePort
-    for UserAutomationRuntimeComposition<'a, D, W, H, N>
+impl<D: ?Sized, W: ?Sized, H: ?Sized, N: ?Sized> UserAutomationRuntimePort
+    for UserAutomationRuntimeComposition<'_, D, W, H, N>
 where
     D: UserAutomationDurableJobPort,
     W: UserAutomationWakePort,
@@ -3634,7 +3634,7 @@ where
     }
 }
 
-impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
+impl<P: UserAutomationStorePort + ?Sized> UserAutomationService<'_, P> {
     /// Runs deterministic preflight and then joins one occurrence to the
     /// existing Durable Job/WakeIntent composition.
     ///

@@ -2627,11 +2627,11 @@ impl KernelStoreGateway {
         CanonicalUserAutomationStore::<EbpCanonicalStoreClient<NamedPipeTransport>>::project_owner_snapshot(
             lookup,
             &current_request,
-            current_response,
+            &current_response,
             &history_request,
-            history_response,
+            &history_response,
             &current_request,
-            current_after_response,
+            &current_after_response,
         )
         .map_err(|error| error.to_string())
     }
@@ -2659,7 +2659,7 @@ impl KernelStoreGateway {
             automation_id,
             occurrence_id,
             &request,
-            response,
+            &response,
         )
         .map_err(|error| error.to_string())
     }
