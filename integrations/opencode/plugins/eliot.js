@@ -355,6 +355,9 @@ async function compactEvent(kind, input = {}, output = {}, effectBinding = null)
     properties.sequence,
     properties.seq,
   )
+  // When the host exposes a sequence, preserve it in the envelope. Otherwise
+  // allocate only an ELIOT delivery sequence; `native_sequence` below stays
+  // null so this local order cannot be mistaken for host ordering.
   const sequence = nativeSequence ?? ++nextSequence
   const hostSessionId = firstString(
     input.sessionID,
@@ -382,9 +385,13 @@ async function compactEvent(kind, input = {}, output = {}, effectBinding = null)
   )
   const tool = firstString(input.tool, properties.tool)
   const changedPath = firstString(properties.file, properties.path)
-  const emittedAt =
-    firstString(event.emitted_at, event.timestamp, event.time, properties.emitted_at, properties.timestamp) ??
-    new Date().toISOString()
+  const nativeEmittedAt = firstString(
+    event.emitted_at,
+    event.timestamp,
+    event.time,
+    properties.emitted_at,
+    properties.timestamp,
+  )
   const argumentKeys = effectBinding?.descriptor.argument_keys ?? eventArgumentKeys(input, output)
   const identityMaterial = JSON.stringify({
     vendor_event_kind: vendorEventKind,
@@ -394,7 +401,7 @@ async function compactEvent(kind, input = {}, output = {}, effectBinding = null)
     tool,
     changed_path: changedPath,
     argument_keys: argumentKeys,
-    emitted_at: emittedAt,
+    native_emitted_at: nativeEmittedAt,
     fallback_sequence: nativeEventId || nativeSequence !== null ? null : sequence,
     effect_digest: effectBinding?.effectDigest ?? null,
   })
@@ -411,7 +418,9 @@ async function compactEvent(kind, input = {}, output = {}, effectBinding = null)
   const payload = {
     event_id: eventId,
     sequence,
-    emitted_at: emittedAt,
+    native_sequence: nativeSequence,
+    native_event_id: nativeEventId,
+    native_emitted_at: nativeEmittedAt,
     event_kind: kind,
     vendor_event_kind: vendorEventKind,
     host_session_id: hostSessionId,
@@ -421,6 +430,13 @@ async function compactEvent(kind, input = {}, output = {}, effectBinding = null)
     changed_path: changedPath,
     argument_keys: argumentKeys,
     attached_task: attachedTask(),
+  }
+  // Preserve the host callback's original native event separately from the
+  // bounded public summary. The authenticated Kernel privacy owner decides
+  // whether these bytes may be retained; the adapter never treats them as a
+  // public projection or decides their retention class.
+  if (input.event && typeof input.event === "object" && !Array.isArray(input.event)) {
+    payload.native_source = input.event
   }
   if (effectBinding !== null) {
     payload.effect_descriptor = effectBinding.descriptor

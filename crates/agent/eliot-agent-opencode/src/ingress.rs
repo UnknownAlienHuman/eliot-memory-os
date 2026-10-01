@@ -45,7 +45,11 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use eliot_contracts::EpochId;
+use eliot_agent_api::{
+    HOST_EVENT_DIGEST_ALGORITHM, QualifiedSourceDigest, RawSourceRecord,
+    RestrictedRawSourceHandle,
+};
+use eliot_contracts::{EpochId, LowercaseSha256, canonical_json_bytes};
 use eliot_process::SecretRef;
 use eliot_user_broker_core::{
     OPENCODE_BRIDGE_CAPABILITY_MUTATION_GATE, OPENCODE_BRIDGE_CAPABILITY_OBSERVATION_SUBMIT,
@@ -2018,6 +2022,7 @@ where
 }
 
 fn passive_envelope(
+    introduction: &OpenCodeBridgeIntroduction,
     event_id: &str,
     sequence: u64,
     body: &[u8],
@@ -2032,8 +2037,61 @@ fn passive_envelope(
         "sequence".to_owned(),
         serde_json::Value::Number(sequence.into()),
     );
+    // These bindings come from the authenticated User Broker introduction,
+    // not from the plugin payload. They identify the actual OpenCode process
+    // that submitted this source frame; they do not identify an adapter
+    // artifact, so the downstream native-adapter fingerprint remains
+    // unavailable until its installation owner admits one.
+    envelope.insert(
+        "opencode_process_binding".to_owned(),
+        serde_json::json!({
+            "executable_sha256": introduction.process_binding.executable_digest.as_str(),
+            "launch_nonce": introduction.process_binding.launch_nonce.as_str(),
+            "introduction_digest": introduction.introduction_digest.as_str(),
+        }),
+    );
+    // Keep the original native callback under the same durable privacy owner
+    // as the envelope. ORS will retain it only when the Kernel-resolved
+    // WorkScope disclosure verdict admits these exact bytes; otherwise its
+    // existing deterministic redaction path withholds both source and raw
+    // fields from the normalized projection.
+    if let Some(native_source) = object
+        .get("native_source")
+        .filter(|source| source.is_object())
+    {
+        envelope.insert("native_source".to_owned(), native_source.clone());
+        // The typed handle is minted from the actual immutable ORS row key,
+        // while the qualified semantic digest is recomputed over the native
+        // source object decoded from this authenticated request. It does not
+        // authorize retention: Kernel WorkScope disclosure remains the sole
+        // gate and a redacted ORS row exposes only the owner's redacted form.
+        if let (Ok(canonical), Ok(handle)) = (
+            canonical_json_bytes(native_source),
+            RestrictedRawSourceHandle::new(format!(
+                "bridge-event:{HOST_EVENTS_STREAM_ID}:{event_id}"
+            )),
+        ) {
+            let digest_hex = format!("{:x}", Sha256::digest(&canonical));
+            if let Ok(digest) = serde_json::from_value::<LowercaseSha256>(
+                serde_json::Value::String(digest_hex),
+            ) {
+                let record = RawSourceRecord {
+                    handle,
+                    digest: QualifiedSourceDigest {
+                        algorithm: HOST_EVENT_DIGEST_ALGORITHM.to_owned(),
+                        digest,
+                    },
+                };
+                if record.validate().is_ok()
+                    && let Ok(value) = serde_json::to_value(record)
+                {
+                    envelope.insert("raw_source_record".to_owned(), value);
+                }
+            }
+        }
+    }
     for field in [
-        "emitted_at",
+        "native_emitted_at",
         "event_kind",
         "vendor_event_kind",
         "host_session_id",
@@ -2045,6 +2103,20 @@ fn passive_envelope(
         if let Some(text) = object.get(field).and_then(serde_json::Value::as_str) {
             envelope.insert(field.to_owned(), serde_json::Value::String(text.to_owned()));
         }
+    }
+    for field in ["native_sequence"] {
+        if let Some(value) = object.get(field).filter(|value| value.is_u64()) {
+            envelope.insert(field.to_owned(), value.clone());
+        }
+    }
+    if let Some(native_event_id) = object
+        .get("native_event_id")
+        .and_then(serde_json::Value::as_str)
+    {
+        envelope.insert(
+            "native_event_id".to_owned(),
+            serde_json::Value::String(native_event_id.to_owned()),
+        );
     }
     if let Some(keys) = object
         .get("argument_keys")
@@ -2119,7 +2191,7 @@ where
             );
         }
     };
-    let envelope = passive_envelope(event_id, sequence, body, object);
+    let envelope = passive_envelope(introduction, event_id, sequence, body, object);
     let mut submission = base_submission(event_id, body, value);
     submission.sequence = sequence;
     submission.kind = HostEventKind::Passive(kind.to_owned());

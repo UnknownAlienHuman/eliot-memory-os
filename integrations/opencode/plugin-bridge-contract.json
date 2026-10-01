@@ -42,7 +42,9 @@
     "allowlisted_fields": [
       "event_id",
       "sequence",
-      "emitted_at",
+      "native_sequence",
+      "native_event_id",
+      "native_emitted_at",
       "event_kind",
       "vendor_event_kind",
       "host_session_id",
@@ -53,8 +55,18 @@
       "argument_keys",
       "attached_task",
       "effect_descriptor",
-      "effect_digest"
+      "effect_digest",
+      "opencode_process_binding"
     ],
+    "restricted_source_fields": {
+      "native_source": {
+        "source": "original OpenCode event callback object",
+        "disclosure_owner": "authenticated Kernel WorkScope privacy owner",
+        "retention": "only under owner admission for exact staged envelope bytes",
+        "normalized_projection": "never copied; owner redaction yields source-free projection",
+        "adapter_claims_authority": false
+      }
+    },
     "forbidden_classes": [
       "prompt_or_message_body",
       "model_output_or_reasoning",
@@ -130,7 +142,22 @@
   "passive_observation": {
     "failure_mode": "degraded_non_blocking",
     "queue": "bounded_serialized",
-    "overflow": "drop_with_coalesced_host_warning"
+    "overflow": "drop_with_coalesced_host_warning",
+    "native_event_classes": [
+      "session.created",
+      "session.compacted",
+      "session.error",
+      "session.idle",
+      "permission.asked",
+      "permission.replied",
+      "file.edited",
+      "todo.updated"
+    ],
+    "native_hook_classes": [
+      "tool.execute.before",
+      "tool.execute.after"
+    ],
+    "manifest_authority": "static adapter owner specification only; runtime denominator is unavailable until the User Broker observes and admits the exact installed plugin descriptor against the OpenCode executable"
   },
   "proof_ceiling": "Static and Node loopback tests prove client transport selection, bounds, idempotency, payload minimization, and fail-closed mutation behavior. They do not prove the server-side durable admission endpoint, current OpenCode hook coverage, Kernel ingress, or a completed AgentAttempt."
 }
