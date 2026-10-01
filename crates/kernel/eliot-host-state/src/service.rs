@@ -1,16 +1,16 @@
-use std::{path::Path, sync::Arc};
+use std::path::Path;
 
 use eliot_platform::PlatformHandle;
 
 use crate::{
     AppendReceipt, EpochRetirementObservation, EpochRetirementQuery, EpochRetirementQueryError,
-    HostInstallationEpoch, HostState, HostStateJournal, HostStateRecord, JournalBackend,
-    JournalError, PreparedAppend, ReactiveContextEnqueueReceipt, ReactiveContextOperationQuery,
-    ReactiveContextPrepareRequest, ReactiveContextPrepareResult, ReactiveContextPreparedEnqueue,
-    ReactiveContextQueueError, ReactiveContextQueuePort, ReactiveContextQueueQuery,
-    ReactiveContextQueueSnapshot, ReactiveContextReconcileOutcome, ReactiveContextReconcileRequest,
-    ReactiveContextTransition, ReactiveContextTransitionReceipt, ReconcileOutcome,
-    RedbJournalBackend,
+    HostInstallationEpoch, HostState, HostStateJournal, HostStateRecord, JournalAppendObserver,
+    JournalBackend, JournalError, PreparedAppend, ReactiveContextEnqueueReceipt,
+    ReactiveContextOperationQuery, ReactiveContextPrepareRequest, ReactiveContextPrepareResult,
+    ReactiveContextPreparedEnqueue, ReactiveContextQueueError, ReactiveContextQueuePort,
+    ReactiveContextQueueQuery, ReactiveContextQueueSnapshot, ReactiveContextReconcileOutcome,
+    ReactiveContextReconcileRequest, ReactiveContextTransition, ReactiveContextTransitionReceipt,
+    ReconcileOutcome, RedbJournalBackend,
 };
 
 /// Production-facing service boundary for the Host operational journal.
@@ -36,10 +36,7 @@ impl<B: JournalBackend> HostStateJournalService<B> {
     /// Registers the composition-owned non-authoritative observer for exact
     /// durable journal heads. The observer runs after journal locks are
     /// released and receives `None` whenever commit status is unknown.
-    pub fn set_append_observer(
-        &self,
-        observer: Arc<dyn Fn(Option<(u64, String)>) + Send + Sync>,
-    ) -> Result<(), JournalError> {
+    pub fn set_append_observer(&self, observer: JournalAppendObserver) -> Result<(), JournalError> {
         self.journal.set_append_observer(observer)
     }
 

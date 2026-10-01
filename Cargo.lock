@@ -2053,6 +2053,7 @@ dependencies = [
  "eliot-kernel-service",
  "eliot-notify",
  "eliot-notify-core",
+ "eliot-observability-runtime",
  "eliot-observation-contracts",
  "eliot-ors",
  "eliot-platform",
