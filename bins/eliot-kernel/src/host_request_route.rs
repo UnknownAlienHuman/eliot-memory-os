@@ -7027,8 +7027,27 @@ impl KernelComposition {
                         &event.event_id,
                     ));
                 }
-                OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge => {
-                    return Err(TransportError::Backpressure);
+                OrsError::ProjectionLimitExceeded => {
+                    // The handoff-table budget is the only reachable
+                    // capacity failure in this call (issue #2731): the
+                    // typed `PendingHandoffs` pressure above already
+                    // answers a full table, so this residual names the
+                    // same handoff-rows dimension instead of the generic
+                    // dispatch dimension. The admitted session is still
+                    // retained by the front-door backpressure arm.
+                    return Err(TransportError::AttributedBackpressure(
+                        eliot_ipc::BACKPRESSURE_BRIDGE_HANDOFF_ROWS,
+                    ));
+                }
+                OrsError::PayloadTooLarge => {
+                    // Defensive-only: the handoff request carries no
+                    // envelope bytes and handoff-row validation never
+                    // emits this error, whose single documented
+                    // dimension is the envelope-bytes ceiling (same
+                    // signal as the stage arm above).
+                    return Err(TransportError::AttributedBackpressure(
+                        eliot_ipc::BACKPRESSURE_BRIDGE_ENVELOPE_BYTES,
+                    ));
                 }
                 _ => return Err(TransportError::SessionFenced),
             }
@@ -7730,8 +7749,25 @@ impl KernelComposition {
                     }));
                     continue;
                 }
-                Err(OrsError::ProjectionLimitExceeded | OrsError::PayloadTooLarge) => {
-                    return Err(TransportError::Backpressure);
+                Err(OrsError::ProjectionLimitExceeded) => {
+                    // Repair inserts handoff rows for retained events;
+                    // its reachable budget is the pending-handoff table
+                    // (the typed `PendingHandoffs` pressure above is
+                    // already answered precisely), so this residual
+                    // names the same handoff-rows dimension instead of
+                    // the generic dispatch dimension (issue #2731).
+                    return Err(TransportError::AttributedBackpressure(
+                        eliot_ipc::BACKPRESSURE_BRIDGE_HANDOFF_ROWS,
+                    ));
+                }
+                Err(OrsError::PayloadTooLarge) => {
+                    // Defensive-only: repair stages no envelope, and the
+                    // only documented meaning of this error is the
+                    // envelope-bytes ceiling the stored-row validation
+                    // enforces (same signal as the stage arm).
+                    return Err(TransportError::AttributedBackpressure(
+                        eliot_ipc::BACKPRESSURE_BRIDGE_ENVELOPE_BYTES,
+                    ));
                 }
                 Err(_) => return Err(TransportError::SessionFenced),
             };
