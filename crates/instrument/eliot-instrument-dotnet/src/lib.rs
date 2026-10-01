@@ -49,6 +49,24 @@ pub struct DotnetBuildReport {
     pub error_count: u64,
     /// Whether MSBuild emitted its terminal success or failure summary.
     pub summary: DotnetBuildSummary,
+    /// Optional VSTest summary emitted by `dotnet test`.
+    /// A build summary by itself does not prove that tests ran.
+    pub test_summary: Option<DotnetTestSummary>,
+}
+
+/// Standard VSTest outcome totals from a `dotnet test` console summary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DotnetTestSummary {
+    /// Whether VSTest printed `Passed!` rather than `Failed!`.
+    pub succeeded: bool,
+    /// Number of failed tests.
+    pub failed: u64,
+    /// Number of passed tests.
+    pub passed: u64,
+    /// Number of skipped tests.
+    pub skipped: u64,
+    /// Total tests reported by VSTest.
+    pub total: u64,
 }
 
 /// Terminal summary emitted by MSBuild's console logger.
@@ -88,6 +106,25 @@ impl DotnetBuildReport {
             VerificationOutcome::Unknown
         }
     }
+
+    /// Evaluates a test run only when VSTest reports a complete nonempty set.
+    #[must_use]
+    pub fn test_outcome(&self) -> VerificationOutcome {
+        let Some(summary) = &self.test_summary else {
+            return VerificationOutcome::Unknown;
+        };
+        if summary.failed > 0 || !summary.succeeded {
+            return VerificationOutcome::Fail;
+        }
+        if summary.total > 0
+            && summary.passed.saturating_add(summary.skipped) == summary.total
+            && summary.failed == 0
+        {
+            VerificationOutcome::Pass
+        } else {
+            VerificationOutcome::Unknown
+        }
+    }
 }
 
 /// Fail-closed errors while parsing MSBuild's standard console summary.
@@ -102,6 +139,12 @@ pub enum DotnetOutputError {
     /// Output does not contain exactly one warning and error total.
     #[error("MSBuild output has no unique warning/error totals")]
     MissingOrDuplicateTotals,
+    /// A VSTest summary appeared more than once.
+    #[error("MSBuild output has duplicate VSTest summaries")]
+    DuplicateTestSummary,
+    /// A VSTest summary is malformed or has missing/invalid totals.
+    #[error("MSBuild output has a malformed VSTest summary")]
+    MalformedTestSummary,
     /// A numeric total overflowed the owning counter.
     #[error("MSBuild diagnostic total is outside the supported range")]
     CounterOverflow,
@@ -122,8 +165,15 @@ pub fn parse_build_output(bytes: &[u8]) -> Result<DotnetBuildReport, DotnetOutpu
     let mut summary = None;
     let mut warning_count = None;
     let mut error_count = None;
+    let mut test_summary = None;
     for line in output.lines() {
         let line = line.trim();
+        if line.starts_with("Passed! - ") || line.starts_with("Failed! - ") {
+            if test_summary.replace(parse_test_summary(line)?).is_some() {
+                return Err(DotnetOutputError::DuplicateTestSummary);
+            }
+            continue;
+        }
         match line {
             "Build succeeded." => {
                 if summary.replace(DotnetBuildSummary::Succeeded).is_some() {
@@ -161,9 +211,52 @@ pub fn parse_build_output(bytes: &[u8]) -> Result<DotnetBuildReport, DotnetOutpu
             warning_count,
             error_count,
             summary,
+            test_summary,
         }),
         _ => Err(DotnetOutputError::MissingOrDuplicateSummary),
     }
+}
+
+fn parse_test_summary(line: &str) -> Result<DotnetTestSummary, DotnetOutputError> {
+    let succeeded = line.starts_with("Passed! - ");
+    let totals = line
+        .split_once(" - ")
+        .map(|(_, values)| values)
+        .ok_or(DotnetOutputError::MalformedTestSummary)?;
+    let mut fields = totals.split(", ");
+    let failed = parse_test_total(fields.next(), "Failed:")?;
+    let passed = parse_test_total(fields.next(), "Passed:")?;
+    let skipped = parse_test_total(fields.next(), "Skipped:")?;
+    let total = parse_test_total(fields.next(), "Total:")?;
+    if let Some(duration) = fields.next() {
+        if !duration
+            .strip_prefix("Duration:")
+            .is_some_and(|value| !value.trim().is_empty())
+            || fields.next().is_some()
+        {
+            return Err(DotnetOutputError::MalformedTestSummary);
+        }
+    }
+    Ok(DotnetTestSummary {
+        succeeded,
+        failed,
+        passed,
+        skipped,
+        total,
+    })
+}
+
+fn parse_test_total(field: Option<&str>, label: &str) -> Result<u64, DotnetOutputError> {
+    let value = field
+        .and_then(|field| field.strip_prefix(label))
+        .map(str::trim)
+        .ok_or(DotnetOutputError::MalformedTestSummary)?;
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(DotnetOutputError::MalformedTestSummary);
+    }
+    value
+        .parse::<u64>()
+        .map_err(|_| DotnetOutputError::CounterOverflow)
 }
 
 fn parse_summary_count(line: &str, suffix: &str) -> Result<Option<u64>, DotnetOutputError> {
