@@ -11,11 +11,11 @@ use eliot_agent_api::{AttemptId, RouteFingerprint};
 use serde::de::Error as SerdeError;
 use serde::{Deserialize, Deserializer, Serialize};
 
-pub use eliot_agent_contracts::{
-    BillingClass, HumanModelPreferencePolicy, ModelControlError, ModelRole, ModelSelector,
-    RoleModelPreference, MODEL_PREFERENCE_SCHEMA_VERSION,
-};
 pub(crate) use eliot_agent_contracts::preference_policy_digest;
+pub use eliot_agent_contracts::{
+    BillingClass, HumanModelPreferencePolicy, MODEL_PREFERENCE_SCHEMA_VERSION, ModelControlError,
+    ModelRole, ModelSelector, RoleModelPreference,
+};
 
 use crate::CoordinatedAttemptState;
 
@@ -756,7 +756,10 @@ pub(crate) fn model_selector_matches(
     selector: &ModelSelector,
     entry: &ModelCatalogueEntry,
 ) -> bool {
-    selector.host_family.as_deref().is_none_or(|value| value == entry.host_family)
+    selector
+        .host_family
+        .as_deref()
+        .is_none_or(|value| value == entry.host_family)
         && selector
             .provider_id
             .as_deref()
