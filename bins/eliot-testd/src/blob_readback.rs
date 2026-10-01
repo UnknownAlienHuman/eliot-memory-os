@@ -198,6 +198,8 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
                 generation_admission_sha256,
                 process_source_admission_readback_json,
                 process_source_admission_readback_sha256,
+                source_admission_write_receipt_json,
+                source_admission_write_receipt_sha256,
             ) = match response {
                 BlobResponse::Ready {
                     bytes,
@@ -219,6 +221,8 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
                     generation_admission_sha256,
                     process_source_admission_readback_json,
                     process_source_admission_readback_sha256,
+                    source_admission_write_receipt_json,
+                    source_admission_write_receipt_sha256,
                 } => (
                     bytes,
                     whole_source_sha256,
@@ -239,6 +243,8 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
                     generation_admission_sha256,
                     process_source_admission_readback_json,
                     process_source_admission_readback_sha256,
+                    source_admission_write_receipt_json,
+                    source_admission_write_receipt_sha256,
                 ),
                 BlobResponse::Unknown => {
                     return Err(TestdEvidenceError::SourceUnknownOutcome {
@@ -253,6 +259,10 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
                     });
                 }
             };
+            let source_admission_write_receipt_json = source_admission_write_receipt_json
+                .ok_or_else(|| integrity_error(stream))?;
+            let source_admission_write_receipt_sha256 = source_admission_write_receipt_sha256
+                .ok_or_else(|| integrity_error(stream))?;
             if chunk_offset != offset
                 || whole_source_sha256 != request.expected_sha256
                 || whole_source_byte_length != request.expected_byte_length
@@ -279,6 +289,8 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
             let current_owner_readback = TestdReplayOwnerReadback {
                 process_source_admission_readback_json,
                 process_source_admission_readback_sha256,
+                source_admission_write_receipt_json,
+                source_admission_write_receipt_sha256,
                 owner_facts_json,
                 owner_facts_sha256,
                 module_catalog_owner_readback_json,
