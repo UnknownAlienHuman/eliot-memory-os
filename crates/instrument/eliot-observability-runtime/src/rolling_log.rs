@@ -319,8 +319,9 @@ fn run_writer(
         if write_allowed {
             if active.file.write_all(payload.as_bytes()).is_ok() {
                 active.written = active.written.saturating_add(size);
-                if retention_failed || outcome == RollingLogAppendOutcome::Written
-                    && active.written > policy.max_bytes_per_generation
+                if retention_failed
+                    || outcome == RollingLogAppendOutcome::Written
+                        && active.written > policy.max_bytes_per_generation
                 {
                     outcome = RollingLogAppendOutcome::RetentionFailure;
                 }
@@ -339,10 +340,7 @@ fn run_writer(
     reject_queued(receiver, RollingLogAppendOutcome::StorageFailure)
 }
 
-fn reject_queued(
-    receiver: &Receiver<RollingLogRecord>,
-    outcome: RollingLogAppendOutcome,
-) -> u64 {
+fn reject_queued(receiver: &Receiver<RollingLogRecord>, outcome: RollingLogAppendOutcome) -> u64 {
     let mut unsent = 0_u64;
     loop {
         match receiver.try_recv() {

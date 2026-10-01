@@ -494,6 +494,7 @@ pub use eliot_kernel_service::{
     NATIVE_WORKER_CLAIM_WIRE_ID, NATIVE_WORKER_CLAIM_WIRE_VERSION, NativeWorkerClaimReceipt,
     NativeWorkerClaimRequest, NativeWorkerClaimResponse,
 };
+use eliot_observability_runtime::CrashReporterHandle;
 #[cfg(test)]
 use eliot_ors::CanonicalEvidenceProvider;
 use eliot_ors::{AuthorityHandoffBegin, AuthorityHandoffRecord, AuthorityHandoffState, OrsError};
@@ -549,7 +550,6 @@ use eliot_protocol::{
     EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, RequestIdentity,
 };
 use eliot_runtime::{Runtime, RuntimeConfig, ShutdownOutcome};
-use eliot_observability_runtime::CrashReporterHandle;
 #[cfg(test)]
 pub use eliot_runtime_contracts::SupervisionLeasePredecessorIdentity;
 #[cfg(windows)]

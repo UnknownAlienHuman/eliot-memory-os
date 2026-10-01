@@ -4,8 +4,8 @@
 //! owner-supplied bounded context. It performs no environment, executable, or
 //! sibling-symbol lookup of its own.
 
-use eliot_installation::{AdmittedSymbolBinding, SymbolExecutableRole};
 use eliot_host::HostComposition;
+use eliot_installation::{AdmittedSymbolBinding, SymbolExecutableRole};
 use eliot_observability_runtime::{
     CrashExecutableRole, CrashReportError, CrashReporterHandle, CrashRuntimeContext,
     RollingLogPolicy, SymbolArtifact,

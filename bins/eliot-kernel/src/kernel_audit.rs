@@ -3036,21 +3036,24 @@ impl crate::KernelComposition {
             Ok(binding) => binding.is_some(),
             Err(_) => {
                 handle.invalidate_runtime_context();
-                return Err(eliot_observability_runtime::CrashReportError::InvalidMetadata(
-                    "crash_reporter.binding_poisoned",
-                ));
+                return Err(
+                    eliot_observability_runtime::CrashReportError::InvalidMetadata(
+                        "crash_reporter.binding_poisoned",
+                    ),
+                );
             }
         };
         if attached {
             handle.invalidate_runtime_context();
-            return Err(eliot_observability_runtime::CrashReportError::InvalidMetadata(
-                "crash_reporter.already_attached",
-            ));
+            return Err(
+                eliot_observability_runtime::CrashReportError::InvalidMetadata(
+                    "crash_reporter.already_attached",
+                ),
+            );
         }
-        if let Err(error) = handle.update_context(self.crash_runtime_context(
-            kernel_process_generation.as_deref(),
-            false,
-        )) {
+        if let Err(error) = handle
+            .update_context(self.crash_runtime_context(kernel_process_generation.as_deref(), false))
+        {
             handle.invalidate_runtime_context();
             return Err(error);
         }
@@ -3058,16 +3061,20 @@ impl crate::KernelComposition {
             Ok(binding) => binding,
             Err(_) => {
                 handle.invalidate_runtime_context();
-                return Err(eliot_observability_runtime::CrashReportError::InvalidMetadata(
-                    "crash_reporter.binding_poisoned",
-                ));
+                return Err(
+                    eliot_observability_runtime::CrashReportError::InvalidMetadata(
+                        "crash_reporter.binding_poisoned",
+                    ),
+                );
             }
         };
         if binding.is_some() {
             handle.invalidate_runtime_context();
-            return Err(eliot_observability_runtime::CrashReportError::InvalidMetadata(
-                "crash_reporter.already_attached",
-            ));
+            return Err(
+                eliot_observability_runtime::CrashReportError::InvalidMetadata(
+                    "crash_reporter.already_attached",
+                ),
+            );
         }
         *binding = Some(crate::CrashReporterBinding {
             handle,
@@ -3108,22 +3115,25 @@ impl crate::KernelComposition {
         });
         let state_fence = policy.map(|policy| policy.module_generation.state_fence.clone());
         let head = if try_only {
-            self.kernel_audit.try_lock().ok().map(|chain| {
-                (chain.head_seq(), chain.head_hash().to_owned())
-            })
+            self.kernel_audit
+                .try_lock()
+                .ok()
+                .map(|chain| (chain.head_seq(), chain.head_hash().to_owned()))
         } else {
-            self.kernel_audit.lock().ok().map(|chain| {
-                (chain.head_seq(), chain.head_hash().to_owned())
-            })
+            self.kernel_audit
+                .lock()
+                .ok()
+                .map(|chain| (chain.head_seq(), chain.head_hash().to_owned()))
         };
-        let audit_head = head.map(|(sequence, digest)| {
-            eliot_observability_runtime::CrashOwnerHead {
-                kind: eliot_observability_runtime::CrashOwnerHeadKind::KernelAuditChain,
-                algorithm: eliot_observability_runtime::CrashDigestAlgorithm::Blake3,
-                sequence,
-                digest,
-            }
-        });
+        let audit_head =
+            head.map(
+                |(sequence, digest)| eliot_observability_runtime::CrashOwnerHead {
+                    kind: eliot_observability_runtime::CrashOwnerHeadKind::KernelAuditChain,
+                    algorithm: eliot_observability_runtime::CrashDigestAlgorithm::Blake3,
+                    sequence,
+                    digest,
+                },
+            );
         eliot_observability_runtime::CrashRuntimeContext::from_observations(
             module_generation_ref,
             kernel_process_generation.map(str::to_owned),
@@ -3147,10 +3157,9 @@ impl crate::KernelComposition {
         });
         if let Some((handle, kernel_process_generation)) = binding {
             if handle
-                .update_context(self.crash_runtime_context(
-                    kernel_process_generation.as_deref(),
-                    true,
-                ))
+                .update_context(
+                    self.crash_runtime_context(kernel_process_generation.as_deref(), true),
+                )
                 .is_err()
             {
                 tracing::warn!(
@@ -3423,7 +3432,8 @@ impl crate::KernelComposition {
     /// retained chain does not verify.
     pub fn audit_chain_records(&self) -> Result<Vec<AuditRecord>, KernelAuditError> {
         self.reconcile_pending_result_bindings();
-        let records = self.kernel_audit
+        let records = self
+            .kernel_audit
             .lock()
             .map_err(|_| KernelAuditError::LockPoisoned)?
             .records()?;

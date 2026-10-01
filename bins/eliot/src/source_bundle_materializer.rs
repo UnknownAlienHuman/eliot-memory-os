@@ -10,13 +10,12 @@ use eliot_governor::{GovernorLaunchConfig, KernelGenerationExpectation};
 use eliot_installation::{
     AdmittedSymbolBinding, AgentBridgeSourceMaterializationFactory,
     AgentBridgeSourceMaterializationPlan, GenerationPackagePlanner, InstallationEpoch,
-    InstallationError, InstallationProfile,
-    InstallationRecoveryStage, LOCAL_SERVICE_SID, PHASE_B_PENDING_MARKER, PackageArtifactDigest,
-    PlatformHandle, ProfileSelectionInput, ProfileSelectionResolution,
-    RedbInstallationTransactionStore, ResourceGeneration, RuntimeLaunchDescriptor,
-    SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION, SourceBundlePublicationJournal,
-    SourceBundlePublicationJournalState, SourceBundlePublicationRole, StateFence,
-    SupervisionAuthorityBinding, SymbolExecutableRole,
+    InstallationError, InstallationProfile, InstallationRecoveryStage, LOCAL_SERVICE_SID,
+    PHASE_B_PENDING_MARKER, PackageArtifactDigest, PlatformHandle, ProfileSelectionInput,
+    ProfileSelectionResolution, RedbInstallationTransactionStore, ResourceGeneration,
+    RuntimeLaunchDescriptor, SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION,
+    SourceBundlePublicationJournal, SourceBundlePublicationJournalState,
+    SourceBundlePublicationRole, StateFence, SupervisionAuthorityBinding, SymbolExecutableRole,
     agent_bridge_source_plan_from_observed_kernel,
     provider_bootstrap_credential_target_for_store_target, source_bundle_publication_operation_id,
 };
@@ -250,13 +249,18 @@ impl CanarySourceBundleReceipt {
                     .to_owned(),
             ));
         }
-        let roles = phase_a_roles(
-            self.files.len() == REQUIRED_ROLES.len() + RELEASE_SYMBOL_ROLES.len(),
-        );
+        let roles =
+            phase_a_roles(self.files.len() == REQUIRED_ROLES.len() + RELEASE_SYMBOL_ROLES.len());
         validate_role_inventory(&roles)?;
-        if self.files.iter().zip(&roles).any(|(file, (role, _))| file.relative_path != *role) {
+        if self
+            .files
+            .iter()
+            .zip(&roles)
+            .any(|(file, (role, _))| file.relative_path != *role)
+        {
             return Err(MaterializeError::Invalid(
-                "published source receipt role order differs from the canonical inventory".to_owned(),
+                "published source receipt role order differs from the canonical inventory"
+                    .to_owned(),
             ));
         }
         let files = self
@@ -572,14 +576,13 @@ fn validate_executable(
     })
 }
 
-fn json_string<'a>(
-    value: &'a serde_json::Value,
-    field: &str,
-) -> Result<&'a str, MaterializeError> {
+fn json_string<'a>(value: &'a serde_json::Value, field: &str) -> Result<&'a str, MaterializeError> {
     value
         .get(field)
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| MaterializeError::Invalid(format!("release receipt field {field} is missing")))
+        .ok_or_else(|| {
+            MaterializeError::Invalid(format!("release receipt field {field} is missing"))
+        })
 }
 
 fn json_array<'a>(
@@ -590,7 +593,9 @@ fn json_array<'a>(
         .get(field)
         .and_then(serde_json::Value::as_array)
         .map(Vec::as_slice)
-        .ok_or_else(|| MaterializeError::Invalid(format!("release receipt array {field} is missing")))
+        .ok_or_else(|| {
+            MaterializeError::Invalid(format!("release receipt array {field} is missing"))
+        })
 }
 
 fn read_release_file(
@@ -708,7 +713,10 @@ fn validate_release_symbols(
         (Some(release_symbols), Some(runtime_symbols))
             if release_symbols.len() == 2
                 && runtime_symbols.len() == 2
-                && release_symbols == runtime_symbols => runtime_symbols,
+                && release_symbols == runtime_symbols =>
+        {
+            runtime_symbols
+        }
         _ => {
             return Err(MaterializeError::Invalid(
                 "release symbol receipts are absent, incomplete, or not exact repeats".to_owned(),
@@ -734,7 +742,8 @@ fn validate_release_symbols(
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
         return Err(MaterializeError::Invalid(
-            "release source_commit is not the original lowercase 40-hex build fingerprint".to_owned(),
+            "release source_commit is not the original lowercase 40-hex build fingerprint"
+                .to_owned(),
         ));
     }
     let runtime_artifacts = json_array(&runtime, "artifacts")?;
@@ -772,8 +781,7 @@ fn validate_release_symbols(
                 item.get("path").and_then(serde_json::Value::as_str)
                     == Some(executable_path.as_str())
                     && item.get("package").and_then(serde_json::Value::as_str) == Some(package)
-                    && item.get("binary").and_then(serde_json::Value::as_str)
-                        == Some(package)
+                    && item.get("binary").and_then(serde_json::Value::as_str) == Some(package)
                     && item.get("role").and_then(serde_json::Value::as_str) == Some(role)
             })
             .collect::<Vec<_>>();
@@ -816,7 +824,9 @@ fn validate_release_symbols(
         }
         let checksum_entry = checksum_file(&checksum, reference)?;
         if json_string(checksum_entry, "sha256")? != symbol_sha
-            || checksum_entry.get("bytes").and_then(serde_json::Value::as_u64)
+            || checksum_entry
+                .get("bytes")
+                .and_then(serde_json::Value::as_u64)
                 != Some(symbol_bytes)
         {
             return Err(MaterializeError::Invalid(format!(
@@ -2232,7 +2242,12 @@ fn materialize_with_resolved_selection(
     let temp = publication.temporary_path().to_path_buf();
     let mut source_identities = BTreeMap::<String, FileIdentity>::new();
     for (role, executable) in roles.iter().copied() {
-        let bytes = role_bytes(role, executables, &typed.json_roles, &typed.symbol_artifacts)?;
+        let bytes = role_bytes(
+            role,
+            executables,
+            &typed.json_roles,
+            &typed.symbol_artifacts,
+        )?;
         let destination = temp.join(role);
         write_create_new(&destination, bytes)?;
         let identity =

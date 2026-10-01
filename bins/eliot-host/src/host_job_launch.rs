@@ -20,8 +20,7 @@ use eliot_host_state::HostInstallationEpoch;
 #[cfg(windows)]
 use eliot_installation::{
     AdmittedSymbolBinding, InstallationProfile, RuntimeLaunchDescriptor,
-    verify_file_digest_with_lease,
-    verify_file_digest_with_user_lease,
+    verify_file_digest_with_lease, verify_file_digest_with_user_lease,
 };
 #[cfg(windows)]
 use eliot_kernel_service::semantic_store_config_hash_from_json;

@@ -51,9 +51,9 @@ use eliot_observability_runtime::{
     ObservabilityConfig, RollingLogPolicy, RuntimeProfile, SpoolPolicy,
 };
 
+mod crash_context;
 #[cfg(windows)]
 mod front_door_driver;
-mod crash_context;
 mod startup_binding;
 
 /// Stable operational-log stem for this process. The generation name carries
@@ -203,8 +203,7 @@ async fn main() {
         &authority_contour,
     );
     #[cfg(windows)]
-    let _observability =
-        eliot_observability_runtime::install(&kernel_observability_config);
+    let _observability = eliot_observability_runtime::install(&kernel_observability_config);
     #[cfg(windows)]
     let mut reporter_binding_incomplete = false;
     #[cfg(windows)]
@@ -403,12 +402,11 @@ async fn main() {
     observe_entrypoint(EntrypointStage::Composition);
     #[cfg(windows)]
     if let Some(reporter) = crash_reporter {
-        let retention_result = reporter.update_retention_policy(
-            crash_context::incident_retention_policy(
+        let retention_result =
+            reporter.update_retention_policy(crash_context::incident_retention_policy(
                 kernel_observability_config.rolling_log.clone(),
                 &startup_binding.receipt_root,
-            ),
-        );
+            ));
         if retention_result.is_err() {
             reporter.invalidate_runtime_context();
         }
@@ -425,10 +423,7 @@ async fn main() {
         if attachment_failed {
             reporter.invalidate_runtime_context();
         }
-        if retention_result.is_err()
-            || reporter_binding_incomplete
-            || attachment_failed
-        {
+        if retention_result.is_err() || reporter_binding_incomplete || attachment_failed {
             tracing::warn!(
                 target: "eliot::crash_reporter",
                 event = "kernel_reporter_attachment_incomplete",

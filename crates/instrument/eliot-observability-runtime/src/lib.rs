@@ -46,8 +46,8 @@ pub use config::{
 pub use crash::{
     CrashDigestAlgorithm, CrashExecutableRole, CrashOwnerHead, CrashOwnerHeadKind, CrashReport,
     CrashReportError, CrashReportMetadata, CrashReporterConfig, CrashReporterHandle,
-    CrashRuntimeContext, CrashTelemetryGapReason, CrashTelemetryOutcome,
-    MissingCrashContextField, RedactedEvidenceHandle, SymbolArtifact, install_crash_reporter,
+    CrashRuntimeContext, CrashTelemetryGapReason, CrashTelemetryOutcome, MissingCrashContextField,
+    RedactedEvidenceHandle, SymbolArtifact, install_crash_reporter,
 };
 pub use critical_path::{
     CriticalEventError, CriticalEventRecord, CriticalEventSinks, CriticalEventSinksEntry,

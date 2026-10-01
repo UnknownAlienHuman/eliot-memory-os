@@ -1661,12 +1661,12 @@ use eliot_kernel_service::{
     StoreRebindHandoff, StoreRebindQuery, StoreRebindReceipt, control_request_frame,
     decode_control_response_frame, semantic_store_config_hash_from_json,
 };
-use eliot_observation_contracts::{
-    CoverageGap, GapDisposition, ObservationRecordEnvelope, ObservationRecordKind,
-};
 use eliot_observability_runtime::{
     CrashDigestAlgorithm, CrashOwnerHead, CrashOwnerHeadKind, CrashReportError,
     CrashReporterHandle, CrashRuntimeContext,
+};
+use eliot_observation_contracts::{
+    CoverageGap, GapDisposition, ObservationRecordEnvelope, ObservationRecordKind,
 };
 #[cfg(windows)]
 use eliot_ors::{
@@ -9222,8 +9222,14 @@ impl HostComposition {
         } else {
             None
         };
-        let module_generation_ref = active
-            .map(|generation| generation.manifest.runtime_launch.generation.as_str().to_owned());
+        let module_generation_ref = active.map(|generation| {
+            generation
+                .manifest
+                .runtime_launch
+                .generation
+                .as_str()
+                .to_owned()
+        });
         // Host has no retained self-process start receipt. Its activation
         // epoch identifies the admitted Host lifecycle contour, not the
         // operating-system process incarnation, so process generation stays
@@ -9291,7 +9297,10 @@ impl HostComposition {
             && let Err(error) = append_reconciled(&self.journal, pending.clone())
         {
             self.pending_record = Some(pending);
-            if matches!(&error, HostError::Journal(JournalError::OutcomeUnknown { .. })) {
+            if matches!(
+                &error,
+                HostError::Journal(JournalError::OutcomeUnknown { .. })
+            ) {
                 self.publish_crash_context(false);
             }
             return Err(error);
