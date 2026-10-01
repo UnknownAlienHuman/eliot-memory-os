@@ -966,7 +966,9 @@ impl HostRequestProjection {
     /// authority bytes, paths, SIDs, or error text).
     #[must_use]
     pub fn with_transaction_handle(mut self, transaction: &str) -> Self {
-        self.transaction = Some(bound_field(transaction));
+        if !transaction.is_empty() {
+            self.transaction = Some(bound_field(transaction));
+        }
         self
     }
 
@@ -977,7 +979,9 @@ impl HostRequestProjection {
     /// [`Self::with_transaction_handle`].
     #[must_use]
     pub fn with_effect_handle(mut self, effect: &str) -> Self {
-        self.effect = Some(bound_field(effect));
+        if !effect.is_empty() {
+            self.effect = Some(bound_field(effect));
+        }
         self
     }
 
@@ -993,7 +997,9 @@ impl HostRequestProjection {
     /// [`Self::with_transaction_handle`].
     #[must_use]
     pub fn with_request_digest(mut self, request_digest: &str) -> Self {
-        self.request_digest = Some(bound_field(request_digest));
+        if !request_digest.is_empty() {
+            self.request_digest = Some(bound_field(request_digest));
+        }
         self
     }
 
@@ -1004,7 +1010,9 @@ impl HostRequestProjection {
     /// [`Self::with_transaction_handle`].
     #[must_use]
     pub fn with_fence_handle(mut self, fence: &str) -> Self {
-        self.fence = Some(bound_field(fence));
+        if !fence.is_empty() {
+            self.fence = Some(bound_field(fence));
+        }
         self
     }
 

@@ -644,9 +644,47 @@ fn projection_missing_slots_render_missing_never_guessed() {
     }
 }
 
-// WORK_UNIT_CASE: 889/8
+// WORK_UNIT_CASE: 889/9
 #[test]
-fn terminal_projection_shares_phase_identity() {
+fn empty_handle_input_renders_missing() {
+    // Refusal: an empty handle is not-held input and must render missing,
+    // never an empty present value a reader could mistake for identity.
+    let projection = eliot_host::host_diagnostics::HostRequestProjection::observed(
+        EntrypointStage::ConsoleLoop,
+    )
+    .with_transaction_handle("")
+    .with_effect_handle("")
+    .with_request_digest("")
+    .with_fence_handle("");
+    let sink = CaptureSink::default();
+    let writer_sink = sink.clone();
+    let captured = {
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer_sink.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            eliot_host::host_diagnostics::observe_phase_projection(&projection);
+        });
+        sink.bytes.lock().unwrap().clone()
+    };
+    let text = String::from_utf8_lossy(&captured);
+    for flag in [
+        "transaction_missing=true",
+        "effect_missing=true",
+        "request_digest_missing=true",
+        "fence_missing=true",
+    ] {
+        assert!(
+            text.contains(flag),
+            "empty handle must render missing ({flag}): {text}"
+        );
+    }
+    assert!(
+        !text.contains("transaction=\"\""),
+        "empty handle must not render present: {text}"
+    );
+}
     // Positive: the terminal record for an operation carries the same
     // identity tuple as its phase records, so one failure correlates to
     // its operation under concurrency.
