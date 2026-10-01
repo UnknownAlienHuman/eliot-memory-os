@@ -838,6 +838,7 @@ impl KernelComposition {
                     successor_of: successor_of.clone(),
                     successor_ticket_id: None,
                     terminal_reason: None,
+                    initial_discovery_lease: None,
                 },
                 enqueue_now,
                 &pending.entries.keys().cloned().collect::<BTreeSet<_>>(),

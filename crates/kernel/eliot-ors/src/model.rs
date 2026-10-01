@@ -4331,7 +4331,16 @@ pub struct ActivationLifecycleRecord {
     pub successor_ticket_id: Option<String>,
     #[serde(default)]
     pub terminal_reason: Option<String>,
+    /// Opaque JSON carrying the first discovery lease admitted for the
+    /// original activation ticket. This is retained in the existing ticket
+    /// row before the first scope bind; ORS bounds and preserves it without
+    /// interpreting its semantic fields or deriving a replacement digest.
+    #[serde(default)]
+    pub initial_discovery_lease: Option<String>,
 }
+
+/// Maximum serialized initial discovery-lease carrier retained on a ticket.
+pub const MAX_INITIAL_DISCOVERY_LEASE_BYTES: usize = 16 * 1024;
 
 impl ActivationLifecycleRecord {
     /// Validates one incoming or persisted activation lifecycle row.
@@ -4378,6 +4387,18 @@ impl ActivationLifecycleRecord {
         }
         if let Some(reason) = &self.terminal_reason {
             validate_text(reason, "activation_lifecycle_terminal_reason")?;
+        }
+        if let Some(lease) = &self.initial_discovery_lease {
+            if lease.len() > MAX_INITIAL_DISCOVERY_LEASE_BYTES {
+                return Err(OrsError::InvalidField {
+                    field: "activation_lifecycle_initial_discovery_lease",
+                    reason: "initial discovery lease exceeds the per-record bound",
+                });
+            }
+            serde_json::from_str::<Value>(lease).map_err(|_| OrsError::InvalidField {
+                field: "activation_lifecycle_initial_discovery_lease",
+                reason: "initial discovery lease must be valid JSON",
+            })?;
         }
         let claim_fields_match =
             self.claim_owner.is_some() == self.claim_expires_at_unix_ms.is_some();
@@ -9882,6 +9903,135 @@ impl ScanDisclosureOrsRecord {
         Ok(())
     }
 }
+
+/// Hard byte bound for one quarantined legacy loose scan capture.
+pub const MAX_SCAN_DISCLOSURE_QUARANTINE_BYTES: usize = 64 * 1024;
+/// Maximum retained untrusted legacy captures per installation.
+pub const MAX_SCAN_DISCLOSURE_QUARANTINE_RECORDS: usize = 256;
+
+/// Durable quarantine-only carrier for one legacy loose scan file.
+///
+/// It is intentionally a separate row family from `ScanDisclosureOrsRecord`:
+/// original bytes remain opaque and can never be read back as a scan receipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScanDisclosureQuarantineRecord {
+    pub contract_version: u16,
+    pub quarantine_key: String,
+    pub request_hash: String,
+    pub installation_id: String,
+    pub ors_generation: u64,
+    pub file_name: String,
+    pub original_bytes: Vec<u8>,
+    pub content_sha256: String,
+    /// Owner receipt binds the retained quarantine to its installation
+    /// contour. It does not attest to historical producer provenance.
+    pub writer_receipt: String,
+}
+
+impl ScanDisclosureQuarantineRecord {
+    /// Recomputes the stable key derived from installation and basename.
+    pub fn expected_key(&self) -> Result<String, OrsError> {
+        let bytes = canonical_json_bytes(&ScanDisclosureQuarantineKeyPreimage {
+            installation_id: &self.installation_id,
+            file_name: &self.file_name,
+        })
+        .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        Ok(format!(
+            "scan-disclosure-quarantine:{}:{}",
+            self.installation_id,
+            sha256_hex(&bytes)
+        ))
+    }
+
+    /// Recomputes the immutable bytes/binding request hash.
+    pub fn expected_request_hash(&self) -> Result<String, OrsError> {
+        let bytes = canonical_json_bytes(&ScanDisclosureQuarantineRequestPreimage {
+            contract_version: self.contract_version,
+            installation_id: &self.installation_id,
+            ors_generation: self.ors_generation,
+            file_name: &self.file_name,
+            content_sha256: &self.content_sha256,
+        })
+        .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        Ok(sha256_hex(&bytes))
+    }
+
+    /// Validates owner identity, exact preserved bytes, and immutable key.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != crate::CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        validate_text(&self.quarantine_key, "scan_disclosure_quarantine_key")?;
+        validate_digest(&self.request_hash, "scan_disclosure_quarantine_request_hash")?;
+        validate_text(
+            &self.installation_id,
+            "scan_disclosure_quarantine_installation_id",
+        )?;
+        if self.ors_generation == 0 {
+            return Err(OrsError::InvalidField {
+                field: "scan_disclosure_quarantine_generation",
+                reason: "ORS generation must be non-zero",
+            });
+        }
+        validate_text(&self.file_name, "scan_disclosure_quarantine_file_name")?;
+        if self.original_bytes.len() > MAX_SCAN_DISCLOSURE_QUARANTINE_BYTES {
+            return Err(OrsError::InvalidField {
+                field: "scan_disclosure_quarantine_bytes",
+                reason: "legacy capture exceeds the per-file bound",
+            });
+        }
+        validate_digest(&self.content_sha256, "scan_disclosure_quarantine_content_sha256")?;
+        if sha256_hex(&self.original_bytes) != self.content_sha256 {
+            return Err(OrsError::PayloadIntegrityMismatch);
+        }
+        if self.expected_key()? != self.quarantine_key
+            || self.expected_request_hash()? != self.request_hash
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: SCAN_DISCLOSURE_QUARANTINE_RECORD_TYPE,
+                reason: "quarantine key or request hash does not match exact source bytes"
+                    .to_owned(),
+            });
+        }
+        validate_text(
+            &self.writer_receipt,
+            "scan_disclosure_quarantine_writer_receipt",
+        )?;
+        Ok(())
+    }
+
+    /// Compares immutable provenance-neutral capture binding.
+    #[must_use]
+    pub fn same_binding(&self, other: &Self) -> bool {
+        self.quarantine_key == other.quarantine_key
+            && self.request_hash == other.request_hash
+            && self.installation_id == other.installation_id
+            && self.ors_generation == other.ors_generation
+            && self.file_name == other.file_name
+            && self.original_bytes == other.original_bytes
+            && self.content_sha256 == other.content_sha256
+            && self.writer_receipt == other.writer_receipt
+    }
+}
+
+#[derive(Serialize)]
+struct ScanDisclosureQuarantineKeyPreimage<'a> {
+    installation_id: &'a str,
+    file_name: &'a str,
+}
+
+#[derive(Serialize)]
+struct ScanDisclosureQuarantineRequestPreimage<'a> {
+    contract_version: u16,
+    installation_id: &'a str,
+    ors_generation: u64,
+    file_name: &'a str,
+    content_sha256: &'a str,
+}
+
+/// Stable ORS record type for quarantined legacy scan files.
+pub const SCAN_DISCLOSURE_QUARANTINE_RECORD_TYPE: &str = "scan_disclosure_quarantine";
 
 /// Stable ORS record-type name for durable cold-start readiness ownership.
 pub const COLD_START_READINESS_RECORD_TYPE: &str = "cold_start_readiness";

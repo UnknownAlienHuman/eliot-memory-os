@@ -272,6 +272,11 @@ const UNKNOWN_COMMIT_RECOVERY: TableDefinition<&str, &str> =
 /// canonical ordering write attempt.
 const SCAN_DISCLOSURE_RECORDS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_scan_disclosure_v1");
+/// Immutable quarantine-only rows for retired loose scan captures. This is
+/// another table owned by the same ORS database, never a scan-receipt row or
+/// a second file-backed store.
+const SCAN_DISCLOSURE_QUARANTINE: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_scan_disclosure_quarantine_v1");
 /// Durable cold-start lease and terminal readiness rows (issue #1790). These
 /// three tables share one readiness owner: immutable revision rows preserve
 /// terminal receipts, the base-identity head allocates the next revision, and
@@ -440,6 +445,21 @@ fn validate_scan_disclosure_installation(
             record_type: crate::SCAN_DISCLOSURE_RECORD_TYPE,
             reason: "scan disclosure installation does not match the durable ORS binding"
                 .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_scan_disclosure_quarantine_installation(
+    record: &crate::ScanDisclosureQuarantineRecord,
+    identity: &OrsStoreIdentity,
+) -> Result<(), OrsError> {
+    if record.installation_id != identity.installation_id
+        || record.ors_generation != identity.ors_generation
+    {
+        return Err(OrsError::IntegrityProblem {
+            record_type: crate::SCAN_DISCLOSURE_QUARANTINE_RECORD_TYPE,
+            reason: "quarantined capture does not match the durable ORS binding".to_owned(),
         });
     }
     Ok(())
@@ -4426,6 +4446,15 @@ pub trait OperationalRecoveryStore: Send + Sync {
         reason: &str,
         now_unix_ms: u64,
     ) -> Result<Option<ActivationLifecycleRecord>, OrsError>;
+    /// Retains the opaque first discovery lease on the existing original
+    /// activation lifecycle row. Exact repeats return the retained row;
+    /// changed bytes under the same ticket conflict.
+    fn retain_initial_discovery_lease(
+        &self,
+        ticket_id: &str,
+        ticket_sha256: &str,
+        lease_json: &str,
+    ) -> Result<ActivationLifecycleRecord, OrsError>;
     /// Loads one activation lifecycle row by exact ticket identity.
     fn load_activation_lifecycle(
         &self,
@@ -4772,6 +4801,20 @@ pub trait ScanDisclosureRecordOwner: Send + Sync {
         installation_id: &str,
         limit: u16,
     ) -> Result<Vec<crate::ScanDisclosureOrsRecord>, OrsError>;
+
+    /// Atomically retains exact legacy bytes in the distinct quarantine row
+    /// family. Exact replay returns the stored row; changed bytes under the
+    /// same installation/name key conflict. This never creates scan evidence.
+    fn retain_scan_disclosure_quarantine(
+        &self,
+        record: &crate::ScanDisclosureQuarantineRecord,
+    ) -> Result<crate::ScanDisclosureQuarantineRecord, OrsError>;
+
+    /// Authenticated readback of one exact quarantine row.
+    fn load_scan_disclosure_quarantine(
+        &self,
+        quarantine_key: &str,
+    ) -> Result<Option<crate::ScanDisclosureQuarantineRecord>, OrsError>;
 }
 
 impl ScanDisclosureRecordOwner for RedbRecoveryStore {
@@ -4820,6 +4863,20 @@ impl ScanDisclosureRecordOwner for RedbRecoveryStore {
         limit: u16,
     ) -> Result<Vec<crate::ScanDisclosureOrsRecord>, OrsError> {
         RedbRecoveryStore::list_scan_disclosures(self, installation_id, limit)
+    }
+
+    fn retain_scan_disclosure_quarantine(
+        &self,
+        record: &crate::ScanDisclosureQuarantineRecord,
+    ) -> Result<crate::ScanDisclosureQuarantineRecord, OrsError> {
+        RedbRecoveryStore::retain_scan_disclosure_quarantine(self, record)
+    }
+
+    fn load_scan_disclosure_quarantine(
+        &self,
+        quarantine_key: &str,
+    ) -> Result<Option<crate::ScanDisclosureQuarantineRecord>, OrsError> {
+        RedbRecoveryStore::load_scan_disclosure_quarantine(self, quarantine_key)
     }
 }
 
@@ -7088,6 +7145,106 @@ impl RedbRecoveryStore {
         }
         records.sort_by(|left, right| left.operation_key.cmp(&right.operation_key));
         Ok(records)
+    }
+
+    /// Retains one legacy loose capture as opaque, quarantine-only bytes.
+    ///
+    /// The immutable row is written atomically in the existing ORS database.
+    /// A lost response reconciles by installation/name key and exact request
+    /// hash; changed bytes conflict. Retention is bounded and never evicts an
+    /// older capture. Filename/content agreement proves only byte consistency,
+    /// never historical producer ownership.
+    pub fn retain_scan_disclosure_quarantine(
+        &self,
+        record: &crate::ScanDisclosureQuarantineRecord,
+    ) -> Result<crate::ScanDisclosureQuarantineRecord, OrsError> {
+        record.validate()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let store_identity = {
+            let meta = write.open_table(META).map_err(storage)?;
+            read_store_object_identity(&meta)?.installed_identity()?
+        };
+        validate_scan_disclosure_quarantine_installation(record, &store_identity)?;
+        let mut table = write
+            .open_table(SCAN_DISCLOSURE_QUARANTINE)
+            .map_err(storage)?;
+        if let Some(raw) = table
+            .get(record.quarantine_key.as_str())
+            .map_err(storage)?
+        {
+            let existing: crate::ScanDisclosureQuarantineRecord = decode(raw.value())?;
+            existing.validate()?;
+            validate_scan_disclosure_quarantine_installation(&existing, &store_identity)?;
+            if existing.quarantine_key != record.quarantine_key
+                || !existing.same_binding(record)
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: crate::SCAN_DISCLOSURE_QUARANTINE_RECORD_TYPE,
+                    reason: "existing quarantine key binds different source bytes".to_owned(),
+                });
+            }
+            drop(table);
+            write.commit().map_err(storage)?;
+            return Ok(existing);
+        }
+
+        let mut retained = 0_usize;
+        for entry in table.iter().map_err(storage)? {
+            let (key, raw) = entry.map_err(storage)?;
+            let existing: crate::ScanDisclosureQuarantineRecord = decode(raw.value())?;
+            existing.validate()?;
+            validate_scan_disclosure_quarantine_installation(&existing, &store_identity)?;
+            if key.value() != existing.quarantine_key {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: crate::SCAN_DISCLOSURE_QUARANTINE_RECORD_TYPE,
+                    reason: "quarantine table key does not match its row".to_owned(),
+                });
+            }
+            retained = retained.saturating_add(1);
+        }
+        if retained >= crate::MAX_SCAN_DISCLOSURE_QUARANTINE_RECORDS {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        let encoded = encode(record)?;
+        table
+            .insert(record.quarantine_key.as_str(), encoded.as_str())
+            .map_err(storage)?;
+        drop(table);
+        write.commit().map_err(storage)?;
+        Ok(record.clone())
+    }
+
+    /// Reads one quarantine-only row and revalidates its key, installation,
+    /// generation, and exact original bytes after restart.
+    pub fn load_scan_disclosure_quarantine(
+        &self,
+        quarantine_key: &str,
+    ) -> Result<Option<crate::ScanDisclosureQuarantineRecord>, OrsError> {
+        crate::model::validate_text(quarantine_key, "scan_disclosure_quarantine_key")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let store_identity = {
+            let meta = read.open_table(META).map_err(storage)?;
+            read_store_object_identity(&meta)?.installed_identity()?
+        };
+        let table = read
+            .open_table(SCAN_DISCLOSURE_QUARANTINE)
+            .map_err(storage)?;
+        table
+            .get(quarantine_key)
+            .map_err(storage)?
+            .map(|raw| {
+                let record: crate::ScanDisclosureQuarantineRecord = decode(raw.value())?;
+                record.validate()?;
+                validate_scan_disclosure_quarantine_installation(&record, &store_identity)?;
+                if record.quarantine_key != quarantine_key {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: crate::SCAN_DISCLOSURE_QUARANTINE_RECORD_TYPE,
+                        reason: "quarantine table key does not match its row".to_owned(),
+                    });
+                }
+                Ok(record)
+            })
+            .transpose()
     }
 
     /// Loads one durable `backup.verify` result by exact idempotency key
@@ -9700,6 +9857,105 @@ impl RedbRecoveryStore {
                 Ok(record)
             })
             .transpose()
+    }
+
+    /// Atomically retains the original ticket's initial discovery lease.
+    ///
+    /// This is a one-time carrier update on the activation lifecycle row,
+    /// before semantic scope binding. ORS validates only JSON syntax and the
+    /// hard byte bound; Kernel owns all lease semantics. It does not alter the
+    /// ticket/result digest, lifecycle state, lifecycle order, or any other
+    /// retained field.
+    pub fn retain_initial_discovery_lease(
+        &self,
+        ticket_id: &str,
+        ticket_sha256: &str,
+        lease_json: &str,
+    ) -> Result<ActivationLifecycleRecord, OrsError> {
+        crate::model::validate_text(ticket_id, "activation_lifecycle_ticket_id")?;
+        crate::model::validate_digest(ticket_sha256, "activation_lifecycle_ticket_sha256")?;
+        if lease_json.len() > crate::MAX_INITIAL_DISCOVERY_LEASE_BYTES {
+            return Err(OrsError::InvalidField {
+                field: "activation_lifecycle_initial_discovery_lease",
+                reason: "initial discovery lease exceeds the per-record bound",
+            });
+        }
+        serde_json::from_str::<Value>(lease_json).map_err(|_| OrsError::InvalidField {
+            field: "activation_lifecycle_initial_discovery_lease",
+            reason: "initial discovery lease must be valid JSON",
+        })?;
+
+        let write = self.database.begin_write().map_err(storage)?;
+        let mut table = write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?;
+        let Some(raw) = table
+            .get(ticket_id)
+            .map_err(storage)?
+            .map(|value| value.value().to_owned())
+        else {
+            return Err(OrsError::ActivationLifecycleIdentityConflict {
+                ticket_id: ticket_id.to_owned(),
+            });
+        };
+        let mut record: ActivationLifecycleRecord = decode(&raw)?;
+        record.validate()?;
+        if record.ticket_id != ticket_id || record.ticket_sha256 != ticket_sha256 {
+            return Err(OrsError::ActivationLifecycleIdentityConflict {
+                ticket_id: ticket_id.to_owned(),
+            });
+        }
+        if record.state != ActivationLifecycleState::ResultAccepted {
+            return Err(OrsError::ActivationLifecycleIdentityConflict {
+                ticket_id: ticket_id.to_owned(),
+            });
+        }
+        let result_sha256 = record.result_sha256.as_deref().ok_or_else(|| {
+            OrsError::ActivationLifecycleIdentityConflict {
+                ticket_id: ticket_id.to_owned(),
+            }
+        })?;
+        let retained_result: Option<ActivationResultRetentionRecord> = write
+            .open_table(ACTIVATION_RESULT_RETENTION)
+            .map_err(storage)?
+            .get(ticket_id)
+            .map_err(storage)?
+            .map(|value| decode(value.value()))
+            .transpose()?;
+        let Some(retained_result) = retained_result else {
+            return Err(OrsError::ActivationLifecycleIdentityConflict {
+                ticket_id: ticket_id.to_owned(),
+            });
+        };
+        retained_result.validate()?;
+        if retained_result.ticket_id != record.ticket_id
+            || retained_result.ticket_sha256 != record.ticket_sha256
+            || retained_result.ticket_payload != record.ticket_payload
+            || retained_result.result_sha256 != result_sha256
+            || retained_result.connection_id != record.connection_id
+            || retained_result.state_fence != record.state_fence
+        {
+            return Err(OrsError::ActivationLifecycleIdentityConflict {
+                ticket_id: ticket_id.to_owned(),
+            });
+        }
+        match record.initial_discovery_lease.as_deref() {
+            Some(existing) if existing == lease_json => {
+                drop(table);
+                write.commit().map_err(storage)?;
+                Ok(record)
+            }
+            Some(_) => Err(OrsError::ActivationLifecycleIdentityConflict {
+                ticket_id: ticket_id.to_owned(),
+            }),
+            None => {
+                record.initial_discovery_lease = Some(lease_json.to_owned());
+                record.validate()?;
+                let encoded = encode(&record)?;
+                table.insert(ticket_id, encoded.as_str()).map_err(storage)?;
+                drop(table);
+                write.commit().map_err(storage)?;
+                Ok(record)
+            }
+        }
     }
 
     /// Loads one retained activation result by exact ticket and result identity.
@@ -27825,6 +28081,16 @@ impl RedbRecoveryStore {
         // helper as every other base table, so a fresh store materializes it
         // before `validate_activation_lifecycle_table` reads it.
         drop(write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?);
+        drop(
+            write
+                .open_table(SCAN_DISCLOSURE_RECORDS)
+                .map_err(storage)?,
+        );
+        drop(
+            write
+                .open_table(SCAN_DISCLOSURE_QUARANTINE)
+                .map_err(storage)?,
+        );
         drop(write.open_table(REPLAY_STREAMS).map_err(storage)?);
         drop(write.open_table(REPLAY_REQUESTS).map_err(storage)?);
         drop(write.open_table(REPLAY_EVENTS).map_err(storage)?);
@@ -35451,6 +35717,20 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         ticket_id: &str,
     ) -> Result<Option<ActivationLifecycleRecord>, OrsError> {
         RedbRecoveryStore::load_activation_lifecycle(self, ticket_id)
+    }
+
+    fn retain_initial_discovery_lease(
+        &self,
+        ticket_id: &str,
+        ticket_sha256: &str,
+        lease_json: &str,
+    ) -> Result<ActivationLifecycleRecord, OrsError> {
+        RedbRecoveryStore::retain_initial_discovery_lease(
+            self,
+            ticket_id,
+            ticket_sha256,
+            lease_json,
+        )
     }
 
     fn load_activation_result(

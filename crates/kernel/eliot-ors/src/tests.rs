@@ -205,6 +205,7 @@ fn activation_lifecycle_record(
         successor_of: None,
         successor_ticket_id: None,
         terminal_reason: None,
+        initial_discovery_lease: None,
     }
 }
 

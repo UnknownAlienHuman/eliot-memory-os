@@ -423,6 +423,7 @@ fn activation_kernel_with_ticket(
                 successor_of: entry.successor_of.clone(),
                 successor_ticket_id: None,
                 terminal_reason: None,
+                initial_discovery_lease: None,
             },
             1,
         )
@@ -805,6 +806,7 @@ fn activation_kernel_with_live_bridge_ticket(
                 successor_of: entry.successor_of.clone(),
                 successor_ticket_id: None,
                 terminal_reason: None,
+                initial_discovery_lease: None,
             },
             1,
         )
@@ -874,6 +876,7 @@ fn retain_test_activation_result(
             successor_of: None,
             successor_ticket_id: None,
             terminal_reason: None,
+            initial_discovery_lease: None,
         },
         1,
     )
