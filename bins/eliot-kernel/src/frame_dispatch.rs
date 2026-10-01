@@ -16,6 +16,8 @@ use super::daemon_request_dispatch::{
     DAEMON_STARTUP_EVIDENCE_OPERATION, NOTIFICATION_STATE_MUTATION_OPERATION,
     NOTIFICATION_STATE_READ_OPERATION, USER_AUTOMATION_OPERATOR_OPERATION,
     USER_AUTOMATION_PREFLIGHT_SELECTOR, USER_AUTOMATION_RUNTIME_OPERATION,
+    INSTRUMENT_REGISTRY_REGISTRATION_OPERATOR_OPERATION,
+    INSTRUMENT_REGISTRY_REGISTRATION_STATUS_OPERATION,
 };
 use super::daemon_request_dispatch::{
     STORAGE_REPLACEMENT_OPERATION, STORAGE_REPLACEMENT_RESUME_OPERATION,
@@ -917,6 +919,8 @@ impl KernelComposition {
             }
             if is_user_automation_operator_operation(&operation)
                 || operation == USER_AUTOMATION_PREFLIGHT_SELECTOR
+                || operation == INSTRUMENT_REGISTRY_REGISTRATION_OPERATOR_OPERATION
+                || operation == INSTRUMENT_REGISTRY_REGISTRATION_STATUS_OPERATION
             {
                 // The authenticated `UserAutomation` operator selector is not a
                 // daemon-module operation: the closed

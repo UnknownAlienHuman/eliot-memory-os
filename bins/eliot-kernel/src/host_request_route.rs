@@ -80,7 +80,8 @@ use eliot_protocol::{
     HostRequestEnvelope, HostRequestIdentity,
     HostRequestAuthenticatedSource, HostRequestInvokeReadPayload, HostRequestKind,
     HostRequestResultBody, InstrumentRegistryRegistrationInvocation,
-    InstrumentRegistryRegistrationOperatorRequest, LocalReadAttempt, RequestIdentity,
+    InstrumentRegistryRegistrationOperatorRequest, InstrumentRegistryRegistrationStatusRequest,
+    LocalReadAttempt, RequestIdentity,
     WatchdogIntentKind, WatchdogSpoolEntryKind, WatchdogSpoolEntryOutcome,
     WatchdogSpoolExportBatchPayload, WatchdogSpoolExportOutcomeSubmission,
     WatchdogSpoolExportResultPayload, WatchdogSpoolExportSubmission,
@@ -316,6 +317,7 @@ impl KernelComposition {
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
         if request_identity.request.metadata.request_id.as_str().trim().is_empty()
+            || request_identity.request.metadata.task_id.is_none()
             || request_identity.request.state_fence != session.module_generation.state_fence
         {
             return Err(TransportError::SessionFenced);
@@ -324,6 +326,7 @@ impl KernelComposition {
             wire_id: InstrumentRegistryRegistrationInvocation::WIRE_ID.to_owned(),
             wire_version: InstrumentRegistryRegistrationInvocation::WIRE_VERSION,
             request_identity: request_identity.clone(),
+            authenticated_principal_sha256: authenticated_operator_principal_sha256(session)?,
             snapshot_json: candidate.snapshot_json.clone(),
         };
         let identity = HostRequestIdentity {
@@ -384,6 +387,121 @@ impl KernelComposition {
         )?;
         Ok(host_request_admitted_response(&receipt, &record))
     }
+
+    /// Reads one original operator registration result through the durable
+    /// HostRequest owner. The query is a fresh authenticated Read identity;
+    /// target authority comes from the retained original admission payload,
+    /// current peer principal, exact task/scope/fence joins, and the durable
+    /// ORS row—not the opaque handle by itself.
+    pub(crate) fn read_operator_registry_registration_status(
+        &self,
+        session: &Session,
+        query: &InstrumentRegistryRegistrationStatusRequest,
+        current_identity: &RequestIdentity,
+    ) -> Result<serde_json::Value, TransportError> {
+        query.validate().map_err(|_| TransportError::SessionFenced)?;
+        current_identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if !session.accepts(&session.authority_epoch, session.session_epoch)
+            || current_identity.request.state_fence != session.module_generation.state_fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let operation = OperationIdentity::new(query.operation_id.clone())
+            .map_err(|_| TransportError::UnknownRequest)?;
+        let stored = self
+            .generation_gateway
+            .ors
+            .load_host_request(&operation, &query.request_digest)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::UnknownRequest)?;
+        let durable_scope = stored.scope_ref.as_ref().map(ToString::to_string);
+        if stored.kind != OrsHostRequestKind::InstrumentRegistryRegistration
+            || stored.capability_ref.as_str() != "instrument_registry.register"
+            || stored.operation_id.as_str() != query.operation_id
+            || stored.request_digest != query.request_digest
+            || durable_scope.as_deref() != Some(query.work_scope_id.as_str())
+        {
+            return Err(TransportError::UnknownRequest);
+        }
+        let invocation: InstrumentRegistryRegistrationInvocation = serde_json::from_value(
+            stored
+                .payload_body
+                .clone()
+                .ok_or(TransportError::UnknownRequest)?,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        let original_identity = &invocation.request_identity;
+        let original_task = original_identity
+            .request
+            .metadata
+            .task_id
+            .as_ref()
+            .map(ToString::to_string);
+        let durable_task = stored.task_ref.as_ref().map(ToString::to_string);
+        let current_principal = authenticated_operator_principal_sha256(session)?;
+        if !operator_registration_status_matches_owner(
+            original_identity,
+            current_identity,
+            original_task.as_deref(),
+            durable_task.as_deref(),
+            &query.work_scope_id,
+            durable_scope.as_deref(),
+            &invocation.authenticated_principal_sha256,
+            &current_principal,
+        )
+            || original_identity.request.state_fence != session.module_generation.state_fence
+            || stored.fence_digest
+                != sha256_json(&original_identity.request.state_fence)
+                    .map_err(|_| TransportError::SessionFenced)?
+            || stored.payload_digest
+                != invocation
+                    .action_payload_sha256()
+                    .map_err(|_| TransportError::SessionFenced)?
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        original_identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let original_identity = original_identity.clone();
+        let registration_result = stored.result_response.clone();
+        Ok(serde_json::json!({
+            "status": "known",
+            "value": {
+                "record": stored,
+                "original_request_identity": original_identity,
+                "registration_result": registration_result,
+            },
+            "recovery": null,
+        }))
+    }
+}
+
+/// Returns the stable authenticated OS principal/session binding used to
+/// authorize a later operator readback after the original connection closes.
+/// Process identity is deliberately excluded so reconnecting from another CLI
+/// process under the same authenticated user/session remains possible.
+fn authenticated_operator_principal_sha256(
+    session: &Session,
+) -> Result<String, TransportError> {
+    session
+        .peer
+        .validate()
+        .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+    let eliot_ipc::PeerIdentity::Authenticated {
+        user_identity,
+        session_identity,
+        ..
+    } = &session.peer
+    else {
+        return Err(TransportError::PeerIdentityUnavailable);
+    };
+    sha256_json(&serde_json::json!({
+        "user_identity": user_identity,
+        "session_identity": session_identity,
+    }))
 }
 
 /// Returns whether the operation string selects the closed agent-bridge
@@ -444,7 +562,9 @@ pub(crate) fn is_watchdog_export_operation(operation: &str) -> bool {
 /// (`generation == 0`), claimed by fencing generation at poll time, and
 /// retired or fenced away on completion, expiry, disconnect, restart, epoch
 /// rotation, or revocation. Removal from this index IS invalidation: submit
-/// requires a live record, so a dropped pair can never complete again.
+/// requires a live record, so a dropped pair can never complete again. The
+/// accepted operator registry carrier is retained across ordinary caller
+/// disconnect because its owner authorization is independently revalidated.
 #[derive(Clone, Debug)]
 pub(crate) struct HostRequestOperationRef {
     pub(crate) operation_id: String,
@@ -511,6 +631,83 @@ pub(crate) struct HostRequestOperationRef {
         Option<eliot_protocol::InstrumentRegistryRegistrationInvocation>,
     pub(crate) instrument_registry_registration_identity: Option<eliot_protocol::RequestIdentity>,
     pub(crate) instrument_registry_registration_attempt: LocalReadAttemptState,
+}
+
+/// Returns true only for the exact authenticated operator registration
+/// carrier retained by the existing bounded queue. This identity check is
+/// shared by disconnect retention and daemon claim so an operator tag cannot
+/// be used to keep a substituted envelope alive or bypass bridge source
+/// checks.
+fn is_exact_operator_registration_carrier(
+    operation_ref: &HostRequestOperationRef,
+) -> bool {
+    let (Some(envelope), Some(invocation), Some(identity)) = (
+        operation_ref.instrument_registry_registration_envelope.as_ref(),
+        operation_ref.instrument_registry_registration_invocation.as_ref(),
+        operation_ref.instrument_registry_registration_identity.as_ref(),
+    ) else {
+        return false;
+    };
+    envelope.kind == HostRequestKind::InstrumentRegistryRegistration
+        && operation_ref.operation_id == host_request_operation_id(envelope)
+        && operation_ref.request_digest == envelope.envelope_sha256
+        && invocation.request_identity == *identity
+        && matches!(
+            envelope.authenticated_source.as_ref(),
+            Some(HostRequestAuthenticatedSource::Operator { request_identity })
+                if request_identity == identity
+        )
+        && invocation.validate_for_envelope(envelope).is_ok()
+}
+
+/// Matches a repeated submission to the exact already-persisted terminal
+/// result. The submit path uses this before deadline and live-attempt checks so
+/// an exact replay is a readback; changed bytes or digest continue through the
+/// normal current-attempt gate and are refused.
+fn exact_terminal_result_replay(
+    stored: &HostRequestRecord,
+    body: &HostRequestResultBody,
+) -> bool {
+    stored.state == HostRequestState::ResultReceived
+        && stored.result_digest.as_deref() == Some(body.result_digest.as_str())
+        && stored.result_response.as_ref() == Some(&body.response)
+}
+
+/// Joins a fresh operator Read identity to the original target owner after a
+/// caller reconnect. The OS principal may persist across CLI process/session
+/// IDs, while task, scope and State Fence remain exactly the same.
+fn operator_registration_status_matches_owner(
+    original_identity: &RequestIdentity,
+    current_identity: &RequestIdentity,
+    original_task: Option<&str>,
+    durable_task: Option<&str>,
+    current_scope: &str,
+    durable_scope: Option<&str>,
+    original_principal_sha256: &str,
+    current_principal_sha256: &str,
+) -> bool {
+    let original_task_from_identity = original_identity
+        .request
+        .metadata
+        .task_id
+        .as_ref()
+        .map(ToString::to_string);
+    let current_task_from_identity = current_identity
+        .request
+        .metadata
+        .task_id
+        .as_ref()
+        .map(ToString::to_string);
+        original_identity.request.metadata.request_id
+            != current_identity.request.metadata.request_id
+        && original_task.is_some()
+        && current_task_from_identity.is_some()
+        && original_task_from_identity.as_deref() == original_task
+        && current_task_from_identity.as_deref() == original_task
+        && durable_task == original_task
+        && durable_scope == Some(current_scope)
+        && original_identity.request.state_fence == current_identity.request.state_fence
+        && original_principal_sha256 == current_principal_sha256
 }
 
 /// Governed attempt ownership record for one queued local-read pair.
@@ -2320,18 +2517,42 @@ impl KernelComposition {
     /// Called from disconnect revocation. Non-terminal records staged through
     /// the lost connection advance to `Unknown` so a later exact replay or
     /// reconciliation observes the disconnect instead of retrying blindly.
+    /// An admitted operator registration remains queued under its exact
+    /// original carrier: closing the short-lived CLI transport is not the
+    /// original owner's cancellation or a task/fence transition.
     /// Terminal records, and records that may already have produced effects
     /// beyond the pre-effect fence, stay under their owner's continuation
     /// rules. Revocation never fails: every store error is contained because
     /// fencing must hold even when the store is unavailable.
     pub(super) fn fence_host_requests_for_connection(&self, connection_id: &str) {
-        let outstanding = match self.host_request_connection_index.lock() {
+        let indexed = match self.host_request_connection_index.lock() {
             Ok(mut index) => index.remove(connection_id).unwrap_or_default(),
             Err(poisoned) => {
                 let mut index = poisoned.into_inner();
                 index.remove(connection_id).unwrap_or_default()
             }
         };
+        // An operator registration has already crossed the durable
+        // `Admitted` boundary. Its caller may close the short-lived CLI
+        // connection while Governor is processing the retained original
+        // RequestIdentity; that transport close is not a cancellation or a
+        // revocation of the independently revalidated owner admission. Keep
+        // its exact bounded queue pair claimable and fence only bridge-owned
+        // work whose activation session was actually revoked.
+        let (outstanding, accepted_operator_registrations): (Vec<_>, Vec<_>) =
+            indexed.into_iter().partition(|operation_ref| {
+                !is_exact_operator_registration_carrier(operation_ref)
+            });
+        if !accepted_operator_registrations.is_empty() {
+            let mut index = match self.host_request_connection_index.lock() {
+                Ok(index) => index,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            index
+                .entry(connection_id.to_owned())
+                .or_default()
+                .extend(accepted_operator_registrations);
+        }
         // I12.14 step 5: fencing removes these pairs from the index, so their
         // admission charges are returned here from the byte counts recorded at
         // admission. Without this the ledger would keep charging for pairs the
@@ -4136,10 +4357,7 @@ impl KernelComposition {
         // Exact replay is idempotent even across deadline expiry: a retained
         // terminal result never takes the expiry path, and serving it is
         // canonical readback rather than a second completion.
-        if stored.state == HostRequestState::ResultReceived
-            && stored.result_digest.as_deref() == Some(body.result_digest.as_str())
-            && stored.result_response.as_ref() == Some(&body.response)
-        {
+        if exact_terminal_result_replay(&stored, body) {
             return Ok(LocalReadSubmitDisposition::Persisted(Box::new(stored)));
         }
         // Issue #1839: record the adapter-produced native presentation
@@ -10779,6 +10997,230 @@ mod invoke_read_tool_tests {
                 instrument_registry_registration_identity: None,
                 instrument_registry_registration_attempt: LocalReadAttemptState::default(),
         }
+    }
+
+    #[cfg(windows)]
+    fn operator_registration_queue_row() -> HostRequestOperationRef {
+        let mut envelope = test_envelope("instrument_registry.register", &"0".repeat(64));
+        let request_identity = RequestIdentity {
+            request: eliot_receipts::RequestBinding {
+                metadata: eliot_contracts::RequestMetadata {
+                    request_id: envelope.identity.request_id.clone(),
+                    session_id: None,
+                    task_id: None,
+                    product_id: eliot_contracts::ProductId::new("eliot-test")
+                        .expect("product id"),
+                    source_id: eliot_contracts::SourceId::new("eliot-test-operator")
+                        .expect("source id"),
+                    state_fence: envelope.state_fence.clone(),
+                    clock: eliot_contracts::ClockReading::default(),
+                },
+                state_fence: envelope.state_fence.clone(),
+            },
+            idempotency_key: envelope.identity.idempotency_key.clone(),
+            deadline_unix_ms: envelope.identity.deadline_unix_ms,
+            cancellation_id: envelope.identity.cancellation_id.clone(),
+        };
+        let invocation = InstrumentRegistryRegistrationInvocation {
+            wire_id: InstrumentRegistryRegistrationInvocation::WIRE_ID.to_owned(),
+            wire_version: InstrumentRegistryRegistrationInvocation::WIRE_VERSION,
+            request_identity: request_identity.clone(),
+            authenticated_principal_sha256: "a".repeat(64),
+            snapshot_json: "{}".to_owned(),
+        };
+        envelope.kind = HostRequestKind::InstrumentRegistryRegistration;
+        envelope.identity.session_id = None;
+        envelope.identity.task_id = None;
+        envelope.identity.work_scope_id = Some("scope-test".to_owned());
+        envelope.identity.payload_schema_id =
+            InstrumentRegistryRegistrationInvocation::PAYLOAD_SCHEMA_ID.to_owned();
+        envelope.identity.payload_sha256 = invocation
+            .action_payload_sha256()
+            .expect("registration action digest");
+        envelope.descriptor_sha256.clear();
+        envelope.peer_admission_receipt_sha256.clear();
+        envelope.authenticated_source = Some(HostRequestAuthenticatedSource::Operator {
+            request_identity: request_identity.clone(),
+        });
+        envelope.envelope_sha256.clear();
+        envelope = envelope
+            .with_computed_digest()
+            .expect("operator registration envelope digest");
+        invocation
+            .validate_for_envelope(&envelope)
+            .expect("operator carrier validates");
+        let mut operation_ref = queue_row(
+            &host_request_operation_id(&envelope),
+            &envelope.envelope_sha256,
+        );
+        operation_ref.instrument_registry_registration_envelope = Some(envelope);
+        operation_ref.instrument_registry_registration_invocation = Some(invocation);
+        operation_ref.instrument_registry_registration_identity = Some(request_identity);
+        operation_ref
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn issue_1814_disconnect_retains_only_exact_operator_registration_carrier() {
+        let (kernel, root) = queue_fixture("operator-disconnect");
+        let accepted = operator_registration_queue_row();
+        assert!(is_exact_operator_registration_carrier(&accepted));
+        let mut substituted = accepted.clone();
+        substituted
+            .instrument_registry_registration_identity
+            .as_mut()
+            .expect("retained identity")
+            .cancellation_id = "substituted-cancellation".to_owned();
+        assert!(!is_exact_operator_registration_carrier(&substituted));
+        *kernel.host_request_connection_index.lock().expect("index") =
+            BTreeMap::from([("operator-conn".to_owned(), vec![accepted, substituted])]);
+
+        kernel.fence_host_requests_for_connection("operator-conn");
+
+        let index = kernel.host_request_connection_index.lock().expect("index");
+        let retained = index.get("operator-conn").expect("accepted carrier remains");
+        assert_eq!(retained.len(), 1, "only the exact admitted carrier survives close");
+        assert!(is_exact_operator_registration_carrier(&retained[0]));
+        drop(index);
+        drop(kernel);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn issue_1814_owner_fence_retires_registration_claim_and_refuses_later_use() {
+        let (kernel, root) = queue_fixture("operator-fence");
+        let accepted = operator_registration_queue_row();
+        let operation_id = accepted.operation_id.clone();
+        let request_digest = accepted.request_digest.clone();
+        *kernel.host_request_connection_index.lock().expect("index") =
+            BTreeMap::from([("operator-conn".to_owned(), vec![accepted])]);
+
+        kernel
+            .fence_all_host_requests()
+            .expect("owner fence retires queued operation");
+
+        assert!(kernel
+            .host_request_connection_index
+            .lock()
+            .expect("index")
+            .values()
+            .all(Vec::is_empty));
+        assert_eq!(
+            kernel
+                .live_instrument_registry_registration_attempt_under_transition(
+                    &operation_id,
+                    &request_digest,
+                )
+                .expect("attempt lookup"),
+            None,
+            "a fenced operation cannot be claimed or submitted afterward"
+        );
+        drop(kernel);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn issue_1814_registration_status_reads_after_disconnect_for_same_owner_only() {
+        let queued = operator_registration_queue_row();
+        let original = queued
+            .instrument_registry_registration_identity
+            .as_ref()
+            .expect("original identity");
+        let mut original = original.clone();
+        let task = eliot_contracts::TaskId::new("task-original").expect("task id");
+        original.request.metadata.task_id = Some(task.clone());
+        let mut current_read = original.clone();
+        current_read.request.metadata.request_id =
+            eliot_contracts::RequestId::new("status-read-request").expect("read request id");
+        current_read.request.metadata.session_id = Some(
+            eliot_contracts::SessionId::new("reconnected-session").expect("session id"),
+        );
+        current_read.idempotency_key = "status-read-idempotency".to_owned();
+        current_read.cancellation_id = "status-read-cancellation".to_owned();
+
+        assert!(operator_registration_status_matches_owner(
+            &original,
+            &current_read,
+            Some(task.as_str()),
+            Some(task.as_str()),
+            "scope-test",
+            Some("scope-test"),
+            &"a".repeat(64),
+            &"a".repeat(64),
+        ));
+        let mut foreign_task = current_read.clone();
+        foreign_task.request.metadata.task_id = Some(
+            eliot_contracts::TaskId::new("task-foreign").expect("foreign task id"),
+        );
+        assert!(!operator_registration_status_matches_owner(
+            &original,
+            &foreign_task,
+            Some(task.as_str()),
+            Some(task.as_str()),
+            "scope-test",
+            Some("scope-test"),
+            &"a".repeat(64),
+            &"a".repeat(64),
+        ));
+        assert!(!operator_registration_status_matches_owner(
+            &original,
+            &current_read,
+            Some(task.as_str()),
+            Some(task.as_str()),
+            "scope-foreign",
+            Some("scope-test"),
+            &"a".repeat(64),
+            &"a".repeat(64),
+        ));
+        assert!(!operator_registration_status_matches_owner(
+            &original,
+            &current_read,
+            Some(task.as_str()),
+            Some(task.as_str()),
+            "scope-test",
+            Some("scope-test"),
+            &"a".repeat(64),
+            &"b".repeat(64),
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn issue_1814_terminal_registration_replays_exact_result_and_refuses_substitution() {
+        use eliot_contracts::{canonical_json_bytes, sha256_hex};
+
+        let queued = operator_registration_queue_row();
+        let envelope = queued
+            .instrument_registry_registration_envelope
+            .as_ref()
+            .expect("registration envelope");
+        let mut stored = requested_host_request_record(envelope).expect("durable row shape");
+        let response = serde_json::json!({"status":"registered","receipt":"original"});
+        let digest = sha256_hex(&canonical_json_bytes(&response).expect("canonical response"));
+        stored.state = HostRequestState::ResultReceived;
+        stored.result_digest = Some(digest.clone());
+        stored.result_response = Some(response.clone());
+        let body = HostRequestResultBody {
+            wire_id: HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
+            wire_version: HostRequestResultBody::CONTRACT_VERSION,
+            operation_id: queued.operation_id.clone(),
+            request_sha256: queued.request_digest.clone(),
+            result_digest: digest.clone(),
+            response: response.clone(),
+            lineage: None,
+            attempt: None,
+            evidence: None,
+        };
+
+        assert!(exact_terminal_result_replay(&stored, &body));
+        let mut changed_digest = body.clone();
+        changed_digest.result_digest = "a".repeat(64);
+        assert!(!exact_terminal_result_replay(&stored, &changed_digest));
+        let mut changed_bytes = body;
+        changed_bytes.response["receipt"] = serde_json::json!("substituted");
+        assert!(!exact_terminal_result_replay(&stored, &changed_bytes));
     }
 
     #[cfg(windows)]

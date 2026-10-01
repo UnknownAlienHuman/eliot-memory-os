@@ -58,6 +58,7 @@ pub enum CommandId {
     DevPulse,
     InstrumentRun,
     InstrumentRegistryRegister,
+    InstrumentRegistryRegistrationStatus,
     ModuleValidate,
     ModuleTest,
     ModuleContractTest,
@@ -91,6 +92,7 @@ impl CommandId {
             Self::DevPulse => "dev-pulse",
             Self::InstrumentRun => "instrument-run",
             Self::InstrumentRegistryRegister => "instrument-registry-register",
+            Self::InstrumentRegistryRegistrationStatus => "instrument-registry-registration-status",
             Self::ModuleValidate => "module-validate",
             Self::ModuleTest => "module-test",
             Self::ModuleContractTest => "module-contract-test",
@@ -148,6 +150,13 @@ pub enum CommandArguments {
     InstrumentRegistryRegister {
         work_scope_id: String,
         snapshot_json: String,
+    },
+    /// Read one registration's durable result through the same authenticated
+    /// operator owner after reconnecting with a fresh Read identity.
+    InstrumentRegistryRegistrationStatus {
+        operation_id: String,
+        request_digest: String,
+        work_scope_id: String,
     },
     ModuleValidate {
         module_id: String,
@@ -242,6 +251,9 @@ impl CommandArguments {
             Self::DevPulse { .. } => CommandId::DevPulse,
             Self::InstrumentRun { .. } => CommandId::InstrumentRun,
             Self::InstrumentRegistryRegister { .. } => CommandId::InstrumentRegistryRegister,
+            Self::InstrumentRegistryRegistrationStatus { .. } => {
+                CommandId::InstrumentRegistryRegistrationStatus
+            }
             Self::ModuleValidate { .. } => CommandId::ModuleValidate,
             Self::ModuleTest { .. } => CommandId::ModuleTest,
             Self::ModuleContractTest { .. } => CommandId::ModuleContractTest,
@@ -311,6 +323,25 @@ impl CommandArguments {
                 {
                     return Err(CliError::InvalidArgument {
                         field: "snapshot_json",
+                    });
+                }
+                Ok(())
+            }
+            Self::InstrumentRegistryRegistrationStatus {
+                operation_id,
+                request_digest,
+                work_scope_id,
+            } => {
+                Self::validate_text(operation_id, "operation_id")?;
+                Self::validate_text(work_scope_id, "work_scope_id")?;
+                if request_digest.len() != 64
+                    || !request_digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                    || operation_id != &format!("hostreq:{request_digest}")
+                {
+                    return Err(CliError::InvalidArgument {
+                        field: "request_digest",
                     });
                 }
                 Ok(())
@@ -1512,6 +1543,7 @@ pub enum ArgumentKind {
     Profile,
     ProfileScope,
     RegistryCandidate,
+    RegistryStatus,
     Module,
     ModuleAgainst,
     Edge,
@@ -1696,6 +1728,17 @@ static COMMANDS: &[CommandSpec] = &[
         required_work_id: "W1.2",
         argument_kind: ArgumentKind::RegistryCandidate,
         effect: EffectClass::ReversibleMutation,
+        proof_ceiling: ProofCeiling::CandidateArtifact,
+        availability: CommandAvailability::Admitted,
+    },
+    CommandSpec {
+        id: CommandId::InstrumentRegistryRegistrationStatus,
+        usage: "eliot instrument registry status --operation-id <id> --request-digest <sha256> --work-scope <scope>",
+        summary: "read the original durable registry registration result",
+        owner: "eliot-cli",
+        required_work_id: "W1.2",
+        argument_kind: ArgumentKind::RegistryStatus,
+        effect: EffectClass::Read,
         proof_ceiling: ProofCeiling::CandidateArtifact,
         availability: CommandAvailability::Admitted,
     },
@@ -3054,6 +3097,33 @@ mod tests {
                 })
             ));
         }
+    }
+
+    #[test]
+    fn issue_1814_registry_status_accepts_original_handle_and_refuses_foreign_shape() {
+        let digest = "a".repeat(64);
+        let args = CommandArguments::InstrumentRegistryRegistrationStatus {
+            operation_id: format!("hostreq:{digest}"),
+            request_digest: digest,
+            work_scope_id: "scope-1814".to_owned(),
+        };
+        assert!(args.validate().is_ok());
+        assert_eq!(
+            args.command_id(),
+            CommandId::InstrumentRegistryRegistrationStatus
+        );
+
+        let forged = CommandArguments::InstrumentRegistryRegistrationStatus {
+            operation_id: "hostreq:substituted".to_owned(),
+            request_digest: "a".repeat(64),
+            work_scope_id: "scope-1814".to_owned(),
+        };
+        assert!(matches!(
+            forged.validate(),
+            Err(CliError::InvalidArgument {
+                field: "request_digest"
+            })
+        ));
     }
 
     #[test]

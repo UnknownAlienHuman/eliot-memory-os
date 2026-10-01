@@ -42,6 +42,7 @@ use super::{
     LOCAL_READ_ENQUEUE_SALT, LocalReadAdmission, LocalReadAttemptState, LocalReadSubmitDisposition,
     MAX_QUEUED_LOCAL_READS, StaleLocalReadObservation, StaleLocalReadReason,
     check_local_read_admission,
+    is_exact_operator_registration_carrier,
 };
 
 /// Refuses a campaign-packet staging candidate that repeats retained work.
@@ -550,18 +551,11 @@ impl KernelComposition {
                 ) else {
                     continue;
                 };
-                invocation
-                    .validate_for_envelope(envelope)
-                    .map_err(|_| TransportError::SessionFenced)?;
                 let source_is_live = match envelope.authenticated_source.as_ref() {
-                    Some(eliot_protocol::HostRequestAuthenticatedSource::Operator {
-                        request_identity,
-                    }) => {
-                        envelope.kind == eliot_protocol::HostRequestKind::InstrumentRegistryRegistration
-                            && request_identity == identity
+                    Some(eliot_protocol::HostRequestAuthenticatedSource::Operator { .. }) => {
+                        is_exact_operator_registration_carrier(candidate)
                             && session.module_generation.state_fence == envelope.state_fence
-                            && session
-                                .accepts(&session.authority_epoch, session.session_epoch)
+                            && session.accepts(&session.authority_epoch, session.session_epoch)
                     }
                     None => self.application_binding_live_for_claim(
                         envelope,
@@ -570,6 +564,7 @@ impl KernelComposition {
                     )?,
                 };
                 if &invocation.request_identity != identity
+                    || invocation.validate_for_envelope(envelope).is_err()
                     || activation_deadline_expired(unix_ms(), envelope.identity.deadline_unix_ms)
                     || !source_is_live
                 {

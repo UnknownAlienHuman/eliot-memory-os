@@ -234,6 +234,9 @@ pub(crate) const USER_AUTOMATION_OPERATOR_OPERATION: &str = "eliot_user_automati
 /// Authenticated `eliot` operator ingress for an inert registry candidate.
 pub(crate) const INSTRUMENT_REGISTRY_REGISTRATION_OPERATOR_OPERATION: &str =
     eliot_protocol::INSTRUMENT_REGISTRY_REGISTRATION_OPERATOR_OPERATION;
+/// Authenticated operator readback for one original registry registration.
+pub(crate) const INSTRUMENT_REGISTRY_REGISTRATION_STATUS_OPERATION: &str =
+    eliot_protocol::INSTRUMENT_REGISTRY_REGISTRATION_STATUS_OPERATION;
 
 /// Authenticated named-read selector serving the complete owner-issued
 /// `UserAutomation` preflight projection (issue #1779, I11.12).
@@ -666,6 +669,9 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         }
         INSTRUMENT_REGISTRY_REGISTRATION_OPERATOR_OPERATION => {
             INSTRUMENT_REGISTRY_REGISTRATION_OPERATOR_OPERATION
+        }
+        INSTRUMENT_REGISTRY_REGISTRATION_STATUS_OPERATION => {
+            INSTRUMENT_REGISTRY_REGISTRATION_STATUS_OPERATION
         }
         #[cfg(windows)]
         process_execution::current_source_executable::OPERATION => {
@@ -3170,6 +3176,27 @@ impl KernelComposition {
                 serde_json::from_value(without_daemon_routing_key(payload.clone())?)
                     .map_err(|_| TransportError::SessionFenced)?;
             let value = self.submit_operator_registry_registration(session, &body, identity)?;
+            let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
+            frame.request_id = Some(request_id);
+            frame.validate()?;
+            return Ok(frame);
+        }
+        #[cfg(windows)]
+        if operation == INSTRUMENT_REGISTRY_REGISTRATION_STATUS_OPERATION {
+            session
+                .peer
+                .validate()
+                .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+            let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+            if identity.request.metadata.request_id != request_id
+                || identity.request.state_fence != session.module_generation.state_fence
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            let body: eliot_protocol::InstrumentRegistryRegistrationStatusRequest =
+                serde_json::from_value(without_daemon_routing_key(payload.clone())?)
+                    .map_err(|_| TransportError::SessionFenced)?;
+            let value = self.read_operator_registry_registration_status(session, &body, identity)?;
             let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
             frame.request_id = Some(request_id);
             frame.validate()?;

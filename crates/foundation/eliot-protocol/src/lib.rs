@@ -3839,6 +3839,11 @@ pub struct InstrumentRegistryRegistrationInvocation {
     /// frame. Kernel binds this byte-for-byte before queueing so the daemon
     /// does not reconstruct original request metadata from the envelope.
     pub request_identity: RequestIdentity,
+    /// Opaque stable principal binding derived by Kernel from the authenticated
+    /// operator peer (user and OS-session identity, excluding process ID).
+    /// It permits same-owner result readback after the short-lived caller
+    /// connection closes; it is never supplied by the operator request.
+    pub authenticated_principal_sha256: String,
     /// Exact InstrumentRegistry snapshot bytes to register.
     pub snapshot_json: String,
 }
@@ -3860,10 +3865,31 @@ pub struct InstrumentRegistryRegistrationOperatorRequest {
     pub snapshot_json: String,
 }
 
+/// Closed operator query for the durable result of one admitted registry
+/// registration. The query's outer EBP frame carries a fresh Read identity;
+/// this body contains only the opaque original target and scope selector.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InstrumentRegistryRegistrationStatusRequest {
+    /// Stable request wire identity.
+    pub wire_id: String,
+    /// Request contract version.
+    pub wire_version: u16,
+    /// Opaque Kernel HostRequest operation handle returned at admission.
+    pub operation_id: String,
+    /// Exact original admitted envelope digest.
+    pub request_digest: String,
+    /// WorkScope selector, rechecked against the current owner binding.
+    pub work_scope_id: String,
+}
+
 /// Closed authenticated operator route for the inert registry registration
 /// candidate. The outer EBP frame supplies the original RequestIdentity.
 pub const INSTRUMENT_REGISTRY_REGISTRATION_OPERATOR_OPERATION: &str =
     "instrument_registry_registration.operator";
+/// Authenticated operator readback of one durable registry registration.
+pub const INSTRUMENT_REGISTRY_REGISTRATION_STATUS_OPERATION: &str =
+    "instrument_registry_registration.status";
 
 impl InstrumentRegistryRegistrationOperatorRequest {
     /// Stable closed request wire identity.
@@ -3902,6 +3928,43 @@ impl InstrumentRegistryRegistrationOperatorRequest {
     }
 }
 
+impl InstrumentRegistryRegistrationStatusRequest {
+    /// Stable request wire identity.
+    pub const WIRE_ID: &'static str = "eliot.instrument-registry-registration.status";
+    /// Current request contract version.
+    pub const WIRE_VERSION: u16 = 1;
+
+    /// Validates the closed target selector without granting read authority.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_id != Self::WIRE_ID || self.wire_version != Self::WIRE_VERSION {
+            return Err(ProtocolError::InvalidField {
+                field: "instrument_registry_registration_status.wire",
+                reason: "unsupported operator registration status request",
+            });
+        }
+        bounded_text(
+            &self.operation_id,
+            "instrument_registry_registration_status.operation_id",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        lowercase_sha256(
+            &self.request_digest,
+            "instrument_registry_registration_status.request_digest",
+        )?;
+        if self.operation_id != format!("hostreq:{}", self.request_digest) {
+            return Err(ProtocolError::InvalidField {
+                field: "instrument_registry_registration_status.operation_id",
+                reason: "must be the opaque handle for the exact request digest",
+            });
+        }
+        bounded_text(
+            &self.work_scope_id,
+            "instrument_registry_registration_status.work_scope_id",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )
+    }
+}
+
 impl InstrumentRegistryRegistrationInvocation {
     /// Stable closed payload wire identity.
     pub const WIRE_ID: &'static str = "eliot.instrument-registry-registration";
@@ -3930,6 +3993,10 @@ impl InstrumentRegistryRegistrationInvocation {
                 reason: "snapshot bytes are empty or exceed the registration bound",
             });
         }
+        lowercase_sha256(
+            &self.authenticated_principal_sha256,
+            "instrument_registry_registration.authenticated_principal_sha256",
+        )?;
         let _: serde_json::Value = serde_json::from_str(&self.snapshot_json).map_err(|_| {
             ProtocolError::InvalidField {
                 field: "instrument_registry_registration.snapshot_json",
@@ -3983,6 +4050,7 @@ impl InstrumentRegistryRegistrationInvocation {
             "wire_id": Self::WIRE_ID,
             "wire_version": Self::WIRE_VERSION,
             "request_identity": self.request_identity,
+            "authenticated_principal_sha256": self.authenticated_principal_sha256,
             "snapshot_json": self.snapshot_json,
         });
         let bytes = eliot_contracts::canonical_json_bytes(&payload)
@@ -8068,6 +8136,25 @@ mod tests {
     }
 
     #[test]
+    fn issue_1814_registration_status_accepts_exact_target_and_refuses_substitution() {
+        let request_digest = "a".repeat(64);
+        let mut request = InstrumentRegistryRegistrationStatusRequest {
+            wire_id: InstrumentRegistryRegistrationStatusRequest::WIRE_ID.to_owned(),
+            wire_version: InstrumentRegistryRegistrationStatusRequest::WIRE_VERSION,
+            operation_id: format!("hostreq:{request_digest}"),
+            request_digest,
+            work_scope_id: "scope-1814".to_owned(),
+        };
+        assert!(request.validate().is_ok());
+
+        request.operation_id = "hostreq:substituted".to_owned();
+        assert!(request.validate().is_err());
+        request.operation_id = format!("hostreq:{}", "a".repeat(64));
+        request.work_scope_id.clear();
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
     fn issue_1814_registration_carrier_preserves_original_operator_identity() {
         let state_fence = fence();
         let request_id = RequestId::new("issue-1814-registration-request").expect("request id");
@@ -8092,6 +8179,7 @@ mod tests {
             wire_id: InstrumentRegistryRegistrationInvocation::WIRE_ID.to_owned(),
             wire_version: InstrumentRegistryRegistrationInvocation::WIRE_VERSION,
             request_identity: request_identity.clone(),
+            authenticated_principal_sha256: "a".repeat(64),
             snapshot_json: "{}".to_owned(),
         };
         let envelope = HostRequestEnvelope {

@@ -5184,6 +5184,59 @@ impl CommandPort for AuthenticatedKernelPort {
                 result: eliot_cli::CommandResult::Forwarded { payload: routed },
             });
         }
+        if request.command == eliot_cli::CommandId::InstrumentRegistryRegistrationStatus {
+            let eliot_cli::CommandArguments::InstrumentRegistryRegistrationStatus {
+                operation_id,
+                request_digest,
+                work_scope_id,
+            } = &request.arguments
+            else {
+                return Err(CommandPortError::Rejected(
+                    "registry status command has mismatched arguments".to_owned(),
+                ));
+            };
+            let operation = eliot_protocol::InstrumentRegistryRegistrationStatusRequest {
+                wire_id: eliot_protocol::InstrumentRegistryRegistrationStatusRequest::WIRE_ID
+                    .to_owned(),
+                wire_version:
+                    eliot_protocol::InstrumentRegistryRegistrationStatusRequest::WIRE_VERSION,
+                operation_id: operation_id.clone(),
+                request_digest: request_digest.clone(),
+                work_scope_id: work_scope_id.clone(),
+            };
+            operation
+                .validate()
+                .map_err(|error| CommandPortError::Rejected(error.to_string()))?;
+            let routed = self
+                .client
+                .transact_json(
+                    eliot_protocol::INSTRUMENT_REGISTRY_REGISTRATION_STATUS_OPERATION,
+                    serde_json::to_value(operation)
+                        .map_err(|error| CommandPortError::Rejected(error.to_string()))?,
+                )
+                .map_err(|error| match error {
+                    eliot_cli::kernel_client::KernelClientError::FrontDoorClosed(contract) => {
+                        CommandPortError::FrontDoorClosed { contract }
+                    }
+                    other => CommandPortError::Rejected(other.to_string()),
+                })?;
+            let spec = CommandCatalogue::current()
+                .commands()
+                .iter()
+                .find(|spec| spec.id == request.command)
+                .ok_or_else(|| {
+                    CommandPortError::Rejected(
+                        "registry status command is not catalogued".to_owned(),
+                    )
+                })?;
+            return Ok(eliot_cli::CommandResponse {
+                request: request.request.clone(),
+                command: request.command,
+                effect: spec.effect,
+                proof_ceiling: spec.proof_ceiling,
+                result: eliot_cli::CommandResult::Forwarded { payload: routed },
+            });
+        }
         // The three advertised backup command IDs map one-to-one onto the
         // three closed Kernel backup operations. They never travel as a
         // generic `eliot.cli.command`: a payload that selects another
