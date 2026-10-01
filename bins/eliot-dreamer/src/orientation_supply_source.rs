@@ -6,8 +6,19 @@
 //! wires it, and
 //! [`AuthenticatedKernelJobPort::submit`](crate::AuthenticatedKernelJobPort::submit)
 //! consults it for admitted `JobClass::Orientation` jobs through the existing
-//! `resolve_orientation_supply` seam. `submit` is the single production caller
-//! of [`OrientationSupplySource::resolve_supply`].
+//! `resolve_orientation_supply` seam at lib.rs:791.
+//!
+//! # Reachability, measured rather than assumed
+//!
+//! `submit` is the only production caller of
+//! [`OrientationSupplySource::resolve_supply`], but on the current tree it
+//! never *reaches* that call. Two gates run first and both refuse
+//! unconditionally: `controller::resolve_cycle_inputs` (controller.rs:78-82)
+//! and `bundle_stage::resolve_bundle_request` (bundle_stage.rs:31-35) each end
+//! in a bare `Err`. So this implementation is presently reachable only from the
+//! crate's unit-level pipeline proofs, not from `main.rs`. That is a property of
+//! the tree, stated here so the next attempt measures it rather than assuming
+//! the seam is live.
 //!
 //! # What this source reads
 //!
@@ -26,8 +37,11 @@
 //! bins/eliot-kernel/src/dreamer_job_dispatch.rs publishes it, the durable owner
 //! projects it, and `kernel_port::validate_owner_response_binding`
 //! re-proves the ORIGINAL recorded digest and byte length without recomputing
-//! them). This process records that record's presence, digest and byte length
-//! and does not decode it.
+//! them). That record is an `OpaqueContentRef`: a digest, a byte length and an
+//! artifact handle, with no member in it. This binary holds no capability that
+//! could resolve one — there is no blob or artifact read anywhere under
+//! `bins/eliot-dreamer/src` — so the record is an address this process cannot
+//! dereference, not a value it can supply.
 //!
 //! # What it does not publish
 //!
@@ -105,7 +119,8 @@ pub(crate) static KERNEL_STAGED_OWNER_RECORD_SOURCE: KernelStagedOwnerRecordSour
     KernelStagedOwnerRecordSource;
 
 impl OrientationSupplySource for KernelStagedOwnerRecordSource {
-    /// Reads the owner records the Kernel staged for this admitted job.
+    /// Reports the mandatory-member absence this admitted job's owner channel
+    /// actually has.
     ///
     /// The claim already proved the presented pair: the staged bytes matched the
     /// owner's `semantic_input` digest, and `job_id`, `scope_id`, and
@@ -116,11 +131,12 @@ impl OrientationSupplySource for KernelStagedOwnerRecordSource {
     /// under this claim.
     ///
     /// It then reports the measured absence of the carrier's mandatory member
-    /// set. That is still the only honest answer after the owner record opened
-    /// the channel: the record proves the channel carries an owner-published
-    /// reference, not that the reference names a typed member this binary can
-    /// supply. See the module documentation for the measured record-by-record
-    /// reason and for why no present-channel arm exists.
+    /// set. That is the only honest answer here: the owner record proves the
+    /// channel carries an owner-published *reference*, not that the reference
+    /// names a typed member this binary can supply — and this binary has no
+    /// content-retrieval capability that could turn one into the other. See the
+    /// module documentation for the measured reason and for why no
+    /// present-channel arm exists.
     fn resolve_supply<'s>(
         &'s self,
         admission: &KernelJobAdmission,
