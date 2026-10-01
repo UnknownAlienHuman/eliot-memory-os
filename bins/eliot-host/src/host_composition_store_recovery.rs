@@ -4,7 +4,7 @@ use super::*;
 //
 // Through the #889 facade only
 // (`crate::host_diagnostics::observe_entrypoint_with_detail`,
-// `observe_terminal_error`); the Event Log seam stays typed-Unavailable
+// `observe_terminal_error_with_request_identity`); the Event Log seam stays typed-Unavailable
 // (`crate::windows_event_log::event_log_sink_status`), never implemented here
 // (#984 still open).
 //
@@ -19,13 +19,24 @@ use super::*;
 // never alters result/order/status/cleanup. There is no mutable global dedup
 // cache: one terminal emission per failed recovery operation is enforced by
 // the single outermost guard per operation (`handle_store_recovery_request`
-// and `reconcile_store_recovery_request` each own theirs), while inner
-// attempt/reconcile/execute phases correlate by stage order only. Exact
-// replay is observed as readback, never as a duplicate commit; changed
-// content stays a preserved conflict. This mirrors the `HostTerminalGuard`
-// model in `lib.rs` (F-LOG-HOST-1, #891) without touching it. The single
-// pre-request mark (`scm requested`) keeps its frozen label only: no
-// operation identity exists yet at that boundary.
+// and `reconcile_store_recovery_request` each own theirs).
+//
+// F-LOG-HOST-2 (#893 D2) terminal correlation. Each of those two outermost
+// guards is armed with the immutable
+// `HostRequestIdentityCorrelation` of the very request it is handling, so the
+// one terminal it emits on an `Unknown` return carries the exact
+// `req_id`/`mutation`/`req` handles the subordinate records of the SAME
+// request already render (`StoreRecoveryObservation::for_request`). Two
+// interleaved `RecoverStore`/`ReconcileStoreRecovery` attempts both ending
+// Unknown therefore emit two distinguishable terminals instead of two
+// byte-identical frozen codes that only record order could pair (I13.11:
+// timeline and correlation, not adjacency inference). Inner
+// attempt/reconcile/execute phases are not duplicate failure claims and
+// emit no terminal of their own. Exact replay is observed as readback, never
+// as a duplicate commit; changed content stays a preserved conflict. This
+// mirrors the `HostTerminalGuard` model in `lib.rs` (F-LOG-HOST-1, #891)
+// without touching it. The single pre-request mark (`scm requested`) keeps
+// its frozen label only: no operation identity exists yet at that boundary.
 fn store_recovery_note_event_log_unavailable() {
     let _ = crate::windows_event_log::event_log_sink_status();
 }
@@ -38,9 +49,38 @@ fn store_recovery_observe(detail: &str) {
     );
 }
 
-fn store_recovery_observe_terminal(code: &str) {
+/// Records the single terminal for one Store-recovery request together with
+/// that request's immutable owner-issued identity (F-LOG-HOST-2, #893 D2).
+///
+/// Still exactly one `host.terminal_error` record per failed operation, now
+/// carrying the exact shared `req_id`/`mutation`/`req` token its subordinate
+/// records already render: never a second terminal, never a dedup ledger, and
+/// never a second evaluation of an effectful argument.
+fn store_recovery_observe_terminal_with_request_identity(
+    code: &str,
+    correlation: &crate::host_diagnostics::HostRequestIdentityCorrelation,
+) {
     store_recovery_note_event_log_unavailable();
-    crate::host_diagnostics::observe_terminal_error(code);
+    crate::host_diagnostics::observe_terminal_error_with_request_identity(code, correlation);
+}
+
+/// Projects the owner-issued identity of one live runtime-control request into
+/// the immutable terminal correlation (F-LOG-HOST-2, #893 D2).
+///
+/// The exact three handles [`StoreRecoveryObservation::for_request`] renders
+/// for this request as the `req_id`/`mutation`/`req` keys, taken straight from
+/// the request the authenticated pipe delivered. Pure projection of handles
+/// the owner already holds — nothing is probed, synthesized, cached, or hashed
+/// here — and nonsecret digests only, never a Store payload, process identity,
+/// path, or arbitrary error text (I15.4).
+fn store_recovery_request_terminal_correlation(
+    request: &HostRuntimeControlRequest,
+) -> crate::host_diagnostics::HostRequestIdentityCorrelation {
+    crate::host_diagnostics::HostRequestIdentityCorrelation::bound(
+        request.request_id.as_str(),
+        request.mutation_digest.as_str(),
+        request.request_digest.as_str(),
+    )
 }
 
 /// Stable diagnostic label for one runtime-control operation (F-LOG-HOST-2
@@ -153,20 +193,32 @@ fn store_recovery_observe_bound(observation: &StoreRecoveryObservation) {
 
 /// Single-terminal guard for one Store-recovery request operation.
 ///
-/// Armed on entry; the single outermost boundary disarms on success or on
-/// delegation to another terminal-owning boundary. Any `Unknown` return drops
-/// armed and emits exactly one terminal record with the operation's frozen
-/// code. Emitting here never changes the `Response`: the guard only observes
-/// the already-produced outcome. No dedup cache, no lock, no second
-/// evaluation.
+/// Armed on entry, already holding the immutable owner-issued request identity
+/// of the request it guards; the single outermost boundary disarms on success
+/// or on delegation to another terminal-owning boundary. Any `Unknown` return
+/// drops armed and emits exactly one terminal record with the operation's
+/// frozen code and that request's `req_id`/`mutation`/`req` token, so the
+/// terminal is joinable to the subordinate records of the SAME request rather
+/// than to a byte-identical code only record order could pair (I13.11).
+/// Emitting here never changes the `Response`: the guard only observes the
+/// already-produced outcome. No dedup cache, no lock, no second evaluation.
+/// Mirrors the `HostTerminalGuard` model in `lib.rs` (F-LOG-HOST-2, #893 D1).
 struct StoreRecoveryTerminalGuard<'a> {
     code: &'a str,
+    correlation: crate::host_diagnostics::HostRequestIdentityCorrelation,
     armed: bool,
 }
 
 impl<'a> StoreRecoveryTerminalGuard<'a> {
-    fn armed(code: &'a str) -> Self {
-        Self { code, armed: true }
+    fn armed(
+        code: &'a str,
+        correlation: crate::host_diagnostics::HostRequestIdentityCorrelation,
+    ) -> Self {
+        Self {
+            code,
+            correlation,
+            armed: true,
+        }
     }
 
     fn disarm(&mut self) {
@@ -177,7 +229,7 @@ impl<'a> StoreRecoveryTerminalGuard<'a> {
 impl Drop for StoreRecoveryTerminalGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
-            store_recovery_observe_terminal(self.code);
+            store_recovery_observe_terminal_with_request_identity(self.code, &self.correlation);
         }
     }
 }
@@ -189,14 +241,17 @@ impl HostComposition {
         request: &HostRuntimeControlRequest,
     ) -> HostRuntimeControlResponse {
         // F-LOG-HOST-2 (#893): recovery requested/attempted/succeeded/failed/
-        // unknown stay distinct. Single terminal via guard; the delegated
-        // reconcile path owns its own terminal, so this guard disarms before
-        // delegating.
+        // unknown stay distinct. Single terminal via guard, correlated to this
+        // request's `req_id`/`mutation`/`req`; the delegated reconcile path
+        // owns its own terminal, so this guard disarms before delegating.
         store_recovery_observe_bound(&StoreRecoveryObservation::for_request(
             "host.store-recovery requested",
             request,
         ));
-        let mut handle_terminal = StoreRecoveryTerminalGuard::armed("host-store-recovery-unknown");
+        let mut handle_terminal = StoreRecoveryTerminalGuard::armed(
+            "host-store-recovery-unknown",
+            store_recovery_request_terminal_correlation(request),
+        );
         if request.operation == HostRuntimeControlOperation::ReconcileStoreRecovery {
             handle_terminal.disarm();
             return self.reconcile_store_recovery_request(request);
@@ -754,16 +809,20 @@ impl HostComposition {
         request: &HostRuntimeControlRequest,
     ) -> HostRuntimeControlResponse {
         // F-LOG-HOST-2 (#893): reconcile requested/attempted/receipt/
-        // readback/unknown stay distinct. Single terminal via guard; inner
-        // compare/persist phases correlate by stage order only. An exact
-        // durable receipt rebind is a readback replay, never a duplicate
-        // commit; changed content stays a preserved conflict.
+        // readback/unknown stay distinct. Single terminal via guard, correlated
+        // to this request's `req_id`/`mutation`/`req`; the inner
+        // compare/persist phases are not duplicate failure claims and emit no
+        // terminal of their own. An exact durable receipt rebind is a readback
+        // replay, never a duplicate commit; changed content stays a preserved
+        // conflict.
         store_recovery_observe_bound(&StoreRecoveryObservation::for_request(
             "host.store-recovery reconcile requested",
             request,
         ));
-        let mut reconcile_terminal =
-            StoreRecoveryTerminalGuard::armed("host-store-recovery-reconcile-unknown");
+        let mut reconcile_terminal = StoreRecoveryTerminalGuard::armed(
+            "host-store-recovery-reconcile-unknown",
+            store_recovery_request_terminal_correlation(request),
+        );
         if self
             .owner_lease
             .activation_capability()

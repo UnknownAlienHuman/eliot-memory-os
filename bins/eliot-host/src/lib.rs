@@ -86,7 +86,20 @@ pub mod windows_event_log;
 // frozen code stay distinguishable by a shared field rather than by record
 // order (I13.11: timeline and correlation, not adjacency inference). Where no
 // operation subject exists yet, the terminal says correlation is explicitly
-// unavailable rather than relying on stage order. Bounded nonsecret handles
+// unavailable rather than relying on stage order.
+//
+// F-LOG-HOST-2 (#893 D2/D3) runtime-control terminal correlation. A recovery
+// or kernel-restart boundary's owner-issued subject is the runtime-control
+// REQUEST, not a Phase-B transaction, so those terminals carry the request's
+// own `req_id`/`mutation`/`req` handles through the distinct
+// `HostRequestIdentityCorrelation` (`runtime_control_request_terminal_correlation`
+// here, `store_recovery_request_terminal_correlation` in the recovery module,
+// emitted through `observe_terminal_error_with_request_identity`). This is a
+// second typed projection, NOT a reuse of the `tx`/`effect`/`req` slot names:
+// a recovery request issued no transaction and no materialization effect, so
+// those names would assert an identity the owner never issued. Both projections
+// bound through the same `BoundedField` mechanism and both feed the same single
+// terminal emission. Bounded nonsecret handles
 // only — never a credential value, payload, path, or error text (I15.4).
 pub use host_diagnostics::note_event_log_sink_status;
 
@@ -150,6 +163,51 @@ fn host_lifecycle_observe_terminal_with_correlation(
         host_lifecycle_frozen_event(boundary),
         correlation,
     );
+}
+
+/// Records the single terminal for a boundary together with the immutable
+/// nonsecret identity of the runtime-control request it is handling
+/// (F-LOG-HOST-2, #893 D3).
+///
+/// Exactly one `host.terminal_error` record, exactly as
+/// [`host_lifecycle_observe_terminal`] emits it: this only adds the request
+/// identity the owner already holds, never a second terminal, never a dedup
+/// ledger, and never a second evaluation of an effectful argument. Sibling of
+/// [`host_lifecycle_observe_terminal_with_correlation`]: both project an
+/// owner-issued identity through the same single terminal emission, they differ
+/// only in WHICH identity vocabulary the owner's records use — Phase-B
+/// transaction/effect/request there, runtime-control request id / mutation /
+/// request digest here.
+fn host_lifecycle_observe_terminal_with_request_identity(
+    boundary: &'static HostLifecycleBoundary,
+    correlation: &host_diagnostics::HostRequestIdentityCorrelation,
+) {
+    note_event_log_sink_status();
+    host_diagnostics::observe_terminal_error_with_request_identity(
+        host_lifecycle_frozen_event(boundary),
+        correlation,
+    );
+}
+
+/// Projects the owner-issued identity of one live runtime-control request into
+/// the immutable terminal correlation (F-LOG-HOST-2, #893 D3).
+///
+/// The exact three handles the runtime-control owner's records render as the
+/// `req_id`/`mutation`/`req` keys
+/// (`StoreRecoveryObservation::for_request` in
+/// `host_composition_store_recovery.rs` carries the same three for the sibling
+/// recovery boundaries), taken straight from the request the authenticated
+/// pipe delivered. Pure projection of already-owned handles — nothing is
+/// probed, synthesized, cached, or hashed here. Nonsecret digests only, never
+/// a credential value, payload, path, or arbitrary error text (I15.4).
+fn runtime_control_request_terminal_correlation(
+    request: &HostRuntimeControlRequest,
+) -> host_diagnostics::HostRequestIdentityCorrelation {
+    host_diagnostics::HostRequestIdentityCorrelation::bound(
+        request.request_id.as_str(),
+        request.mutation_digest.as_str(),
+        request.request_digest.as_str(),
+    )
 }
 
 /// Projects the owner-issued Phase-B operation identity of one live request
@@ -8790,8 +8848,11 @@ impl HostComposition {
     ) -> HostRuntimeControlResponse {
         // F-LOG-HOST-1: SCM receipt vs Unknown; control receipt distinct from
         // completion. Unsupported op stays typed Unknown, never false-success.
-        // One terminal per Unknown outcome; inner `execute` shares correlation
-        // and never emits its own terminal.
+        // One terminal per Unknown outcome, carrying this request's
+        // `req_id`/`mutation`/`req` so two interleaved restarts ending in this
+        // same frozen code stay distinguishable (F-LOG-HOST-2, #893 D3); inner
+        // `execute` is not a duplicate failure claim and emits no terminal of
+        // its own.
         host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_REQUESTED);
         // F-LOG-HOST-1 case 15: the restart sighting correlates on the
         // installation and generation already held in `launch_options`, plus
@@ -8813,10 +8874,13 @@ impl HostComposition {
         // response). Named missing links, never filled: `request` (no
         // console-request value fits an SCM dispatch); `reason` (no
         // `HostError` in hand at an entry sighting - failure attribution
-        // stays with the terminal boundary); request/mutation digests and
-        // fence/recovery (held by `request` and the store-recovery/phase-b
-        // owners, but this projection has no digest/fence slot on main -
-        // wire the #889 Package-D tx/effect/req/fence slots when they land).
+        // stays with the terminal boundary). The request's `req_id`/
+        // `mutation`/`req` digests are held by `request` and are absent from
+        // THIS projection by design — it has no digest slot — so they are not
+        // projected onto this entry sighting. They are bound instead where the
+        // owner actually uses them: the terminals below carry them through
+        // `runtime_control_request_terminal_correlation` (F-LOG-HOST-2, #893
+        // D3). Fence/recovery stays with the store-recovery/Phase-B owners.
         host_lifecycle_observe_identity(
             &host_diagnostics::HostRequestProjection::observed(
                 host_diagnostics::EntrypointStage::ScmDispatch,
@@ -8836,7 +8900,10 @@ impl HostComposition {
             .is_err()
         {
             host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_UNKNOWN_OWNER_FENCED);
-            host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_TERMINAL);
+            host_lifecycle_observe_terminal_with_request_identity(
+                BOUNDARY_KERNEL_RESTART_TERMINAL,
+                &runtime_control_request_terminal_correlation(request),
+            );
             return HostRuntimeControlResponse::unknown_for(
                 request,
                 runtime_control_unknown_ref("kernel-restart", request),
@@ -8852,7 +8919,10 @@ impl HostComposition {
                 // Unsupported op, pending/unknown, or failed restart all stay
                 // typed Unknown preserving identity; never false-success.
                 host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_UNKNOWN);
-                host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_TERMINAL);
+                host_lifecycle_observe_terminal_with_request_identity(
+                    BOUNDARY_KERNEL_RESTART_TERMINAL,
+                    &runtime_control_request_terminal_correlation(request),
+                );
                 HostRuntimeControlResponse::unknown_for(
                     request,
                     runtime_control_unknown_ref("kernel-restart", request),
@@ -8870,7 +8940,9 @@ impl HostComposition {
         // F-LOG-HOST-1: reconcile is query-only replay; Unknown never
         // false-success and never rewrites the durable receipt. Timeout or
         // possible state change stays Unknown until reconciliation evidence.
-        // One terminal per Unknown outcome; success readback is replay.
+        // One terminal per Unknown outcome, carrying this reconcile query's
+        // `req_id`/`mutation`/`req` (F-LOG-HOST-2, #893 D3); success readback
+        // is replay.
         host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECONCILE_REQUESTED);
         if self
             .owner_lease
@@ -8879,7 +8951,10 @@ impl HostComposition {
             .is_err()
         {
             host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_OWNER_FENCED);
-            host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL);
+            host_lifecycle_observe_terminal_with_request_identity(
+                BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL,
+                &runtime_control_request_terminal_correlation(request),
+            );
             return HostRuntimeControlResponse::unknown_for(
                 request,
                 runtime_control_unknown_ref("kernel-restart-reconcile", request),
@@ -8887,7 +8962,10 @@ impl HostComposition {
         }
         if request.validate().is_err() {
             host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_VALIDATION);
-            host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL);
+            host_lifecycle_observe_terminal_with_request_identity(
+                BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL,
+                &runtime_control_request_terminal_correlation(request),
+            );
             return HostRuntimeControlResponse::unknown_for(
                 request,
                 runtime_control_unknown_ref("kernel-restart-reconcile", request),
@@ -8902,7 +8980,10 @@ impl HostComposition {
                 HostRuntimeControlResponse::restarted_for(request, receipt)
             } else {
                 host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_CONFLICT);
-                host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL);
+                host_lifecycle_observe_terminal_with_request_identity(
+                    BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL,
+                    &runtime_control_request_terminal_correlation(request),
+                );
                 HostRuntimeControlResponse::unknown_for(
                     request,
                     runtime_control_unknown_ref("kernel-restart-reconcile-conflict", request),
@@ -8914,7 +8995,10 @@ impl HostComposition {
                 // Pending or unreadable pending stays Unknown; a timeout is
                 // never proof of effect or non-effect.
                 host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_PENDING);
-                host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL);
+                host_lifecycle_observe_terminal_with_request_identity(
+                    BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL,
+                    &runtime_control_request_terminal_correlation(request),
+                );
                 return HostRuntimeControlResponse::unknown_for(
                     request,
                     runtime_control_unknown_ref("kernel-restart-pending", request),
@@ -8926,7 +9010,10 @@ impl HostComposition {
             Ok(s) => s,
             Err(_e) => {
                 host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_SNAPSHOT);
-                host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL);
+                host_lifecycle_observe_terminal_with_request_identity(
+                    BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL,
+                    &runtime_control_request_terminal_correlation(request),
+                );
                 return HostRuntimeControlResponse::unknown_for(
                     request,
                     runtime_control_unknown_ref("kernel-restart-reconcile-snapshot", request),
@@ -8937,7 +9024,10 @@ impl HostComposition {
             let _ = kernel;
         }
         host_lifecycle_observe_scm(BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN);
-        host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL);
+        host_lifecycle_observe_terminal_with_request_identity(
+            BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL,
+            &runtime_control_request_terminal_correlation(request),
+        );
         HostRuntimeControlResponse::unknown_for(
             request,
             runtime_control_unknown_ref("kernel-restart-reconcile-unknown", request),
