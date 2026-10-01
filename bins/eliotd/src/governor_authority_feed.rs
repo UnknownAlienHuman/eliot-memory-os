@@ -10,24 +10,28 @@
 //!
 //! This module owns the daemon side of that path: it feeds the single live
 //! Governor-owned derivation instance held by the daemon composition root
-//! ([`DaemonComposition`](super::DaemonComposition)) from threaded runtime
-//! observation and projects the result across the authenticated
-//! `publish_governor_authority` boundary. The Kernel maps the exact
+//! ([`DaemonComposition`](super::DaemonComposition)) from the authenticated
+//! Kernel readback of retained source observations and projects the result
+//! across the `publish_governor_authority` boundary. The Kernel maps the exact
 //! revision, exact active fingerprint, and exact authorization axes to its
 //! existing three-axis profile under its strictly-advancing revision rule,
 //! so a newer degraded projection revokes everything issued under the old
 //! one. Until the first publish records, every Material/Critical gate
 //! refuses closed.
 //!
-//! Forbidden boundary: no coverage synthesis (inputs arrive threaded from
-//! live host/Watchdog/trace observation, never built here), no second
-//! derivation instance, no third profile vocabulary, and no success claim
-//! without the Kernel receipt proving the exact published bytes.
+//! Forbidden boundary: this daemon adapter never classifies event payloads or
+//! fabricates coverage, Watchdog, or trace facts. It forwards the exact
+//! authenticated Kernel readback to the Governor's source-observation builder,
+//! never creates a second derivation instance or profile vocabulary, and
+//! claims publication only after the Kernel acknowledges the exact revision.
 
 use std::sync::Arc;
 
 use eliot_governor::CompositionError;
-use eliot_integration_coverage::{IntegrationCoverageProfile, TraceFreshness, WatchdogEvidence};
+pub use eliot_integration_coverage::GovernorAuthorityObservation;
+use eliot_integration_coverage::{
+    AdapterAdmissionIdentity, EvidenceAvailability, SourceReadback,
+};
 
 use super::daemon_kernel_client::DaemonKernelClient;
 use super::{DaemonComposition, DaemonError, kind_value};
@@ -36,8 +40,15 @@ use super::{DaemonComposition, DaemonError, kind_value};
 /// exact arm the Kernel dispatcher serves. The transport injects this name
 /// into the payload object, so it is not duplicated there.
 const PUBLISH_GOVERNOR_AUTHORITY_OPERATION: &str = "publish_governor_authority";
+/// Authenticated Kernel readback operation for original admitted bridge rows.
+const READ_GOVERNOR_AUTHORITY_OBSERVATION_OPERATION: &str =
+    "read_governor_authority_observation";
 /// Typed receipt kind answered by the publish arm.
 const GOVERNOR_AUTHORITY_RECEIPT_KIND: &str = "governor_authority_receipt";
+/// Typed observation kind answered by the authenticated owner read.
+const GOVERNOR_AUTHORITY_OBSERVATION_KIND: &str = "governor_authority_observation";
+/// Bounded owner/event page size sent on every observation read.
+const GOVERNOR_AUTHORITY_OBSERVATION_PAGE_LIMIT: u32 = 128;
 /// Only an acknowledged `recorded` receipt counts as published.
 const GOVERNOR_AUTHORITY_RECORDED_STATUS: &str = "recorded";
 
@@ -51,30 +62,46 @@ struct GovernorAuthorityReceiptWire {
     status: String,
 }
 
-/// Derives the current Governor profile from the threaded runtime coverage,
-/// Watchdog evidence, and trace freshness, and publishes its exact revision,
-/// fingerprint, and authorization axes to the Kernel (`#1935` AUD1
-/// designated driver).
+/// Exact Kernel request accepted by the owner-scoped observation read. These
+/// cursors are continuation only: principal, producer, stream, and active
+/// adapter identity are always resolved by Kernel from authenticated owner
+/// state.
+#[derive(serde::Serialize)]
+struct GovernorAuthorityObservationRequestWire {
+    after_owner_sequence: u64,
+    after_event_sequence: u64,
+    page_limit: u32,
+}
+
+/// Strict outer response envelope returned by the Kernel owner read. Nested
+/// original rows are decoded by the Governor observation DTO, which rejects
+/// unknown fields in each retained owner/page/record structure.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GovernorAuthorityObservationResponseWire {
+    schema_version: u16,
+    admission: Option<AdapterAdmissionIdentity>,
+    source_status: String,
+    source_snapshot: Option<serde_json::Value>,
+    source_reason: Option<String>,
+    watchdog: serde_json::Value,
+    trace: serde_json::Value,
+}
+
+/// Derives and publishes from the authenticated Kernel readback of original
+/// admitted bridge observations. The Governor owns classification and
+/// degradation: this daemon adapter only binds the closed Kernel response to
+/// the source DTO and forwards it to the one live derivation owner.
 ///
-/// The derivation instance is the single one owned by the composition root,
-/// so a degraded re-derivation publishes a new revision that revokes
-/// everything issued under the old one. Returns the recorded revision the
-/// Kernel acknowledged. The daemon runtime drives this when live host
-/// observation arrives; coverage is never synthesized here.
-///
-/// # Errors
-///
-/// Returns [`CompositionError::Owner`] when the coverage is not verified
-/// production observation or an input is invalid, and
-/// [`CompositionError::Recovery`] on transport failure or when the receipt
-/// disagrees with the projected revision.
-pub async fn maintain_governor_authority_feed(
+/// `Ok(None)` means there is no active admitted profile and no prior Governor
+/// baseline to degrade. An unavailable source with a prior profile is still
+/// passed through `refresh_observation`, so it advances a degraded revision
+/// instead of leaving stale authority in place.
+pub async fn maintain_governor_authority_observation(
     composition: &mut DaemonComposition,
     kernel: &Arc<DaemonKernelClient>,
-    coverage: &IntegrationCoverageProfile,
-    watchdog: &WatchdogEvidence,
-    trace: TraceFreshness,
-) -> Result<u64, CompositionError> {
+    observation: &GovernorAuthorityObservation,
+) -> Result<Option<u64>, CompositionError> {
     let authority = composition
         .governor_authority_mut()
         .map_err(|error| match error {
@@ -82,188 +109,224 @@ pub async fn maintain_governor_authority_feed(
             error => CompositionError::Recovery(error.to_string()),
         })?;
     let projection = authority
-        .refresh(coverage, watchdog, trace)
+        .refresh_observation(observation)
         .map_err(|error| CompositionError::Owner(error.to_string()))?;
-    publish_projection(kernel, &projection).await
+    let Some(projection) = projection else {
+        return Ok(None);
+    };
+    let source_selectors = match &observation.source {
+        SourceReadback::Available { selectors, .. } => Some(serde_json::json!({
+            "after_owner_sequence": selectors.after_owner_sequence,
+            "after_event_sequence": selectors.after_event_sequence,
+            "page_limit": u32::from(selectors.page_limit),
+        })),
+        SourceReadback::Unavailable { .. } => None,
+    };
+    let revision = publish_projection(kernel, &projection, source_selectors).await?;
+    Ok(Some(revision))
 }
 
-/// Publishes the degraded Governor revision for an observed route mismatch
-/// (`#1935` AUD1 designated driver).
-///
-/// Returns the recorded revision plus the capability ids the owner revoked
-/// with it. The daemon runtime drives this when the active route proves to
-/// be no longer the profile fingerprint.
-///
-/// # Errors
-///
-/// Returns [`CompositionError::Owner`] when either fingerprint is blank,
-/// control-carrying, or the pair names no mismatch, and
-/// [`CompositionError::Recovery`] on transport failure or when the receipt
-/// disagrees with the projected revision.
-pub async fn maintain_governor_authority_route_mismatch(
-    composition: &mut DaemonComposition,
+/// Reads one owner-scoped page using only bounded continuation fields and
+/// decodes the exact original source DTO. Any transport or decoding failure
+/// becomes a typed unavailable observation; it cannot create or restore an
+/// adapter identity, and the Governor can use it only to degrade its retained
+/// profile.
+async fn read_governor_authority_observation(
     kernel: &Arc<DaemonKernelClient>,
-    expected_fingerprint: &str,
-    observed_fingerprint: &str,
-) -> Result<(u64, Vec<String>), CompositionError> {
-    let authority = composition
-        .governor_authority_mut()
-        .map_err(|error| match error {
-            DaemonError::Composition(error) => error,
-            error => CompositionError::Recovery(error.to_string()),
-        })?;
-    let (projection, revoked) = authority
-        .report_route_mismatch(expected_fingerprint, observed_fingerprint)
-        .map_err(|error| CompositionError::Owner(error.to_string()))?;
-    let revision = publish_projection(kernel, &projection).await?;
-    Ok((revision, revoked))
-}
-
-/// Owner-issued observation bundle for one Governor authority feed pass
-/// (issue #1935 AUD1, I7.16).
-///
-/// The three inputs arrive as one named bundle threaded from live
-/// host/adapter, Watchdog, and trace observation owners; they are never
-/// synthesized here. On this base no production owner issues the bundle yet
-/// (STITCH: a verified [`IntegrationCoverageProfile`] for the exact active
-/// host/adapter fingerprint, typed [`WatchdogEvidence`], and
-/// [`TraceFreshness`] each need a production observation owner — the coverage
-/// crate's `candidate`/`verify` constructors are reached only by tests), so
-/// the daemon driver presents `None` and the first publish stays pending
-/// while every Material/Critical gate refuses closed.
-pub struct GovernorAuthorityObservation<'a> {
-    /// Exact active-fingerprint coverage as verified production observation.
-    pub coverage: &'a IntegrationCoverageProfile,
-    /// Watchdog supervision evidence: an input, never a substitute grade.
-    pub watchdog: &'a WatchdogEvidence,
-    /// Trace freshness at derivation time.
-    pub trace: TraceFreshness,
+    after_owner_sequence: u64,
+    after_event_sequence: u64,
+) -> GovernorAuthorityObservation {
+    let request = GovernorAuthorityObservationRequestWire {
+        after_owner_sequence,
+        after_event_sequence,
+        page_limit: GOVERNOR_AUTHORITY_OBSERVATION_PAGE_LIMIT,
+    };
+    let unavailable = |adapter: Option<AdapterAdmissionIdentity>, reason: &str| GovernorAuthorityObservation {
+        adapter,
+        source: SourceReadback::Unavailable {
+            reason: reason.to_owned(),
+        },
+        watchdog: EvidenceAvailability::Unavailable {
+            reason: reason.to_owned(),
+        },
+        trace: EvidenceAvailability::Unavailable {
+            reason: reason.to_owned(),
+        },
+    };
+    let response = match kernel
+        .transact_async(
+            READ_GOVERNOR_AUTHORITY_OBSERVATION_OPERATION,
+            serde_json::json!({
+                "after_owner_sequence": request.after_owner_sequence,
+                "after_event_sequence": request.after_event_sequence,
+                "page_limit": request.page_limit,
+            }),
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(_) => {
+            return unavailable(None, "authenticated Kernel observation read failed");
+        }
+    };
+    let value = match kind_value(&response, GOVERNOR_AUTHORITY_OBSERVATION_KIND) {
+        Ok(value) => value,
+        Err(_) => return unavailable(None, "Kernel observation response kind was invalid"),
+    };
+    let wire: GovernorAuthorityObservationResponseWire = match serde_json::from_value(value) {
+        Ok(wire) if wire.schema_version == 1 => wire,
+        _ => return unavailable(None, "Kernel observation response schema was invalid"),
+    };
+    let reason = wire
+        .source_reason
+        .clone()
+        .unwrap_or_else(|| "Kernel source observation unavailable".to_owned());
+    let source = match (
+        wire.source_status.as_str(),
+        wire.source_snapshot,
+        wire.source_reason.as_deref(),
+    ) {
+        ("available", Some(snapshot), None) => match snapshot.as_object() {
+            Some(snapshot) if !snapshot.contains_key("status") => {
+                let mut source = snapshot.clone();
+                source.insert(
+                    "status".to_owned(),
+                    serde_json::Value::String("available".to_owned()),
+                );
+                serde_json::Value::Object(source)
+            }
+            Some(_) | None => {
+                return unavailable(
+                    wire.admission.clone(),
+                    "Kernel observation source page carried an unexpected shape",
+                );
+            }
+        },
+        ("unavailable", None, Some(_)) => serde_json::json!({
+            "status": "unavailable",
+            "reason": reason,
+        }),
+        _ => {
+            return unavailable(
+                wire.admission.clone(),
+                "Kernel observation status and source page disagreed",
+            );
+        }
+    };
+    let observation = serde_json::json!({
+        "adapter": wire.admission.clone(),
+        "source": source,
+        "watchdog": wire.watchdog,
+        "trace": wire.trace,
+    });
+    match serde_json::from_value::<GovernorAuthorityObservation>(observation) {
+        Ok(observation) => match &observation.source {
+            SourceReadback::Available { selectors, .. }
+                if selectors.after_owner_sequence == after_owner_sequence
+                    && selectors.after_event_sequence == after_event_sequence
+                    && u32::from(selectors.page_limit)
+                        == GOVERNOR_AUTHORITY_OBSERVATION_PAGE_LIMIT =>
+            {
+                observation
+            }
+            SourceReadback::Available { .. } => unavailable(
+                observation.adapter.clone(),
+                "Kernel observation selectors did not match the request",
+            ),
+            SourceReadback::Unavailable { .. } => observation,
+        },
+        Err(_) => unavailable(wire.admission, "Kernel observation source DTO was invalid"),
+    }
 }
 
 /// Typed outcome of one daemon-side Governor authority drive pass (issue
 /// #1935 AUD1).
 ///
-/// Skips are normal steady-state results, never errors: with no
-/// owner-issued observation there is nothing to publish, with no recorded
-/// baseline there is no route to compare, and an unchanged route
-/// re-publishes nothing. Only a Kernel-recorded publish advances the
-/// revision the gates read.
+/// A pass either records the Governor's source-derived revision or skips when
+/// neither an active admitted descriptor nor a prior baseline exists.
+/// Unavailable or incomplete source pages still reach the Governor and can
+/// publish a narrower revision that revokes prior authority.
 pub enum GovernorAuthorityDriveOutcome {
     /// The feed derived and the Kernel recorded `revision`.
     FeedPublished { revision: u64 },
-    /// The route mismatch derived and the Kernel recorded `revision`,
-    /// revoking every capability id in `revoked`.
-    RouteMismatchPublished { revision: u64, revoked: Vec<String> },
     /// No owner-issued observation exists, so nothing was published.
     SkippedNoObservation,
-    /// No revision was recorded yet, so there is no route to compare.
-    SkippedNoBaseline,
-    /// The live route still names the recorded fingerprint.
-    SkippedNoChange,
 }
 
 /// Daemon-side driver for the single live Governor-owned derivation instance
 /// (issue #1935 AUD1, I7.16).
 ///
-/// Retains the exact fingerprint and revision of the last Kernel-recorded
-/// publish, so a later live route observation that no longer names that
-/// fingerprint drives the degraded mismatch revision that revokes everything
-/// issued under the old one. The driver holds no observation of its own: the
-/// feed arm publishes only caller-presented owner-issued observation, and the
-/// mismatch arm compares only the recorded baseline against the
-/// caller-presented live route. Constructed once per daemon run loop and
-/// travels with its drive flight, exactly like the owner-feed trigger.
+/// Retains only bounded source continuation cursors. The current profile,
+/// original owner rows, and every derivation input remain in their owners.
+/// Constructed once per daemon run loop and travels with its drive flight.
 #[derive(Default)]
 pub struct GovernorAuthorityDriver {
-    last_published: Option<(String, u64)>,
+    after_owner_sequence: u64,
+    after_event_sequence: u64,
+    last_adapter_descriptor: Option<String>,
 }
 
 impl GovernorAuthorityDriver {
-    /// Starts with no recorded publish: nothing is authorized until the first
-    /// feed publish records, and no route comparison runs until then.
+    /// Starts at the first bounded owner/event page.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Drives one feed pass through the designated
-    /// [`maintain_governor_authority_feed`] driver and records its baseline.
-    ///
-    /// With no owner-issued observation the pass skips without touching the
-    /// composition or the Kernel: the first publish stays pending and the
-    /// gates keep refusing closed. On a recorded publish the baseline becomes
-    /// the presented coverage fingerprint at the recorded revision.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CompositionError::Owner`] when the presented coverage is not
-    /// verified production observation or an input is invalid, and
-    /// [`CompositionError::Recovery`] on transport failure or when the
-    /// receipt disagrees with the projected revision.
-    pub async fn drive_feed(
+    /// Fetches one authenticated Kernel source page and drives the Governor
+    /// from that owner-issued DTO. Continuations are retained only as bounded
+    /// sequence cursors; owner identities, source rows, and evidence are never
+    /// cached or reconstructed in the daemon.
+    pub async fn drive_kernel_observation(
         &mut self,
         composition: &mut DaemonComposition,
         kernel: &Arc<DaemonKernelClient>,
-        observation: Option<GovernorAuthorityObservation<'_>>,
     ) -> Result<GovernorAuthorityDriveOutcome, CompositionError> {
-        let Some(observation) = observation else {
-            return Ok(GovernorAuthorityDriveOutcome::SkippedNoObservation);
-        };
-        let revision = maintain_governor_authority_feed(
-            composition,
+        let observation = read_governor_authority_observation(
             kernel,
-            observation.coverage,
-            observation.watchdog,
-            observation.trace,
+            self.after_owner_sequence,
+            self.after_event_sequence,
         )
-        .await?;
-        self.last_published = Some((observation.coverage.fingerprint.clone(), revision));
-        Ok(GovernorAuthorityDriveOutcome::FeedPublished { revision })
-    }
-
-    /// Drives one route-mismatch pass through the designated
-    /// [`maintain_governor_authority_route_mismatch`] driver and records its
-    /// baseline.
-    ///
-    /// `live_route` is the caller-observed active route identity; the daemon
-    /// runtime presents the validated Kernel-issued owner session binding
-    /// (`DaemonKernelClient::owner_session_facts`), never a minted value.
-    /// With no live route the pass skips; with no recorded baseline there is
-    /// nothing to compare; with the live route still naming the recorded
-    /// fingerprint nothing re-publishes. Otherwise the degraded revision
-    /// publishes and the baseline advances to the observed route at the new
-    /// revision, so the lost guarantee revokes dependent authority.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CompositionError::Owner`] when either fingerprint is blank,
-    /// control-carrying, or the pair names no mismatch, and
-    /// [`CompositionError::Recovery`] on transport failure or when the
-    /// receipt disagrees with the projected revision.
-    pub async fn drive_route_mismatch(
-        &mut self,
-        composition: &mut DaemonComposition,
-        kernel: &Arc<DaemonKernelClient>,
-        live_route: Option<&str>,
-    ) -> Result<GovernorAuthorityDriveOutcome, CompositionError> {
-        let Some(live_route) = live_route else {
-            return Ok(GovernorAuthorityDriveOutcome::SkippedNoObservation);
-        };
-        let Some((baseline_fingerprint, _)) = self.last_published.clone() else {
-            return Ok(GovernorAuthorityDriveOutcome::SkippedNoBaseline);
-        };
-        if live_route == baseline_fingerprint {
-            return Ok(GovernorAuthorityDriveOutcome::SkippedNoChange);
+        .await;
+        let adapter_descriptor = observation
+            .adapter
+            .as_ref()
+            .map(|adapter| adapter.descriptor_sha256.clone());
+        let adapter_changed = adapter_descriptor.as_ref().is_some_and(|descriptor| {
+            self.last_adapter_descriptor
+                .as_ref()
+                .is_some_and(|previous| previous != descriptor)
+        });
+        if adapter_changed {
+            self.after_owner_sequence = 0;
+            self.after_event_sequence = 0;
         }
-        let (revision, revoked) = maintain_governor_authority_route_mismatch(
-            composition,
-            kernel,
-            &baseline_fingerprint,
-            live_route,
-        )
-        .await?;
-        self.last_published = Some((live_route.to_owned(), revision));
-        Ok(GovernorAuthorityDriveOutcome::RouteMismatchPublished { revision, revoked })
+        if let Some(descriptor) = adapter_descriptor {
+            self.last_adapter_descriptor = Some(descriptor);
+        }
+        match &observation.source {
+            SourceReadback::Available { next, .. } => {
+                if !adapter_changed {
+                    if let Some(next) = next {
+                        self.after_owner_sequence = next.after_owner_sequence;
+                        self.after_event_sequence = next.after_event_sequence;
+                    } else {
+                        self.after_owner_sequence = 0;
+                        self.after_event_sequence = 0;
+                    }
+                }
+            }
+            SourceReadback::Unavailable { .. } => {
+                self.after_owner_sequence = 0;
+                self.after_event_sequence = 0;
+            }
+        }
+        let Some(revision) =
+            maintain_governor_authority_observation(composition, kernel, &observation).await?
+        else {
+            return Ok(GovernorAuthorityDriveOutcome::SkippedNoObservation);
+        };
+        Ok(GovernorAuthorityDriveOutcome::FeedPublished { revision })
     }
 }
 
@@ -272,6 +335,7 @@ impl GovernorAuthorityDriver {
 async fn publish_projection(
     kernel: &Arc<DaemonKernelClient>,
     projection: &eliot_governor::GovernorAuthorityProjection,
+    source_selectors: Option<serde_json::Value>,
 ) -> Result<u64, CompositionError> {
     let payload = serde_json::json!({
         "revision": projection.revision(),
@@ -279,6 +343,7 @@ async fn publish_projection(
         "verified": projection.verified(),
         "authorizes_enforcement": projection.authorizes_enforcement(),
         "authorizes_complete_coverage_ops": projection.authorizes_complete_coverage_ops(),
+        "source_selectors": source_selectors,
     });
     let value = kernel
         .transact_async(PUBLISH_GOVERNOR_AUTHORITY_OPERATION, payload)
