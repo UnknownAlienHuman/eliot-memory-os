@@ -18,11 +18,10 @@
 //! observation, authorize an effect, or promote liveness into
 //! readiness/completion.
 //!
-//! Delivery is workspace `tracing` only, written to stderr so protocol
-//! stdout framing is never contaminated. The Windows Event Log sink is an
-//! explicitly absent seam (see [`DiagnosticSink`]): issue #984 (safe Windows
-//! Event Log port) is still open and unlanded, so this facade must neither
-//! acquire Event Log FFI nor fake delivery through another sink.
+//! General diagnostic delivery is workspace `tracing`, written to stderr so
+//! protocol stdout framing is never contaminated. The separately admitted
+//! Kernel Event Log profile uses one bounded queue and worker; this facade
+//! owns only its capability status and never acquires Event Log FFI.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -67,9 +66,7 @@ pub enum KernelDiagnosticsError {
     /// Repeat installation is bounded and non-panicking: the first install
     /// stands and no second owner is created.
     AlreadyOwned,
-    /// Windows Event Log delivery was requested but is unavailable: issue
-    /// #984 (safe Windows Event Log port) is still open and unlanded, so
-    /// this facade has no Event Log sink and must not fake one.
+    /// The fixed Kernel Event Log queue has not been started or is unavailable.
     EventLogUnavailable,
 }
 
@@ -78,7 +75,7 @@ impl fmt::Display for KernelDiagnosticsError {
         match self {
             Self::AlreadyOwned => write!(f, "kernel diagnostics subscriber already owned"),
             Self::EventLogUnavailable => {
-                write!(f, "windows event log sink unavailable (see issue #984)")
+                write!(f, "kernel event log queue unavailable")
             }
         }
     }
@@ -91,19 +88,20 @@ impl std::error::Error for KernelDiagnosticsError {}
 pub enum DiagnosticSink {
     /// Workspace `tracing` subscriber writing to stderr. Available.
     TracingStderr,
-    /// Windows Event Log. Explicitly absent until #984 lands: requesting it
-    /// is a typed error, never silent delivery elsewhere and never FFI
-    /// acquired inside this facade.
+    /// The admitted Kernel Event Log queue. This reports queue capability,
+    /// never delivery; FFI remains on its single worker thread.
     WindowsEventLog,
 }
 
 /// Reports whether a sink can carry Kernel diagnostics.
 ///
-/// The Event Log arm always answers [`KernelDiagnosticsError::EventLogUnavailable`];
-/// absence of evidence remains missing, never a faked delivery.
+/// The Event Log arm answers successfully only after the bounded Kernel queue
+/// was initialized. That is not proof that the worker remains live or that
+/// any event was accepted or delivered.
 pub fn sink_status(sink: DiagnosticSink) -> Result<(), KernelDiagnosticsError> {
     match sink {
         DiagnosticSink::TracingStderr => Ok(()),
+        DiagnosticSink::WindowsEventLog if crate::windows_event_log::queue_initialized() => Ok(()),
         DiagnosticSink::WindowsEventLog => Err(KernelDiagnosticsError::EventLogUnavailable),
     }
 }
@@ -469,19 +467,70 @@ pub fn observe_entrypoint_with_detail(stage: EntrypointStage, detail: &str) {
     );
 }
 
+/// Builds an operation span from the safe identities already held by its owner.
+///
+/// Missing or not-yet-validated identities remain unavailable. This projection
+/// never reads an owner, manufactures authority, or logs signed fence material.
+/// Callers may record validated tree, lease and receipt references in the
+/// declared fields after screening them through [`bound_field`].
+#[must_use]
+pub fn operation_context(
+    operation: Option<&str>,
+    generation: Option<&str>,
+    state_fence: Option<&str>,
+    authority_epoch: Option<&str>,
+) -> tracing::Span {
+    let operation = bound_field(operation.unwrap_or("unavailable"));
+    let generation = bound_field(generation.unwrap_or("unavailable"));
+    let state_fence = bound_field(state_fence.unwrap_or("unavailable"));
+    let authority_epoch = bound_field(authority_epoch.unwrap_or("unavailable"));
+    tracing::info_span!(
+        target: KERNEL_DIAGNOSTICS_TARGET,
+        "kernel.operation",
+        request_id = "unavailable",
+        request_id_redaction = "none",
+        operation = operation.text(),
+        operation_redaction = operation.redaction_status().unwrap_or("none"),
+        generation = generation.text(),
+        generation_redaction = generation.redaction_status().unwrap_or("none"),
+        state_fence = state_fence.text(),
+        state_fence_redaction = state_fence.redaction_status().unwrap_or("none"),
+        authority_epoch = authority_epoch.text(),
+        authority_epoch_redaction = authority_epoch.redaction_status().unwrap_or("none"),
+        process_tree = "unavailable",
+        process_id = "unavailable",
+        process_start_100ns = "unavailable",
+        image_sha256 = "unavailable",
+        lease = "unavailable",
+        lease_operation = "unavailable",
+        receipt = "unavailable",
+    )
+}
+
 /// Records the single terminal error boundary (the `exit_error` funnel)
 /// with its exact typed code.
 ///
 /// One underlying failed operation yields exactly one terminal record here;
-/// lower-phase entrypoint observations correlate by stage order, not by a
-/// dedup cache. The code is screened against the shared telemetry field policy
+/// the current span is preserved for existing callers. Operation owners pass
+/// their explicit span to [`observe_terminal_error_in_context`] so concurrent
+/// operations never rely on stage order for correlation. No dedup cache is used.
+/// The code is screened against the shared telemetry field policy
 /// and bounded defensively; every current call site passes a `&'static str`
 /// typed code owned by its failure path (I07.20). Terminal receipt framing
 /// (`write_error`) is untouched and still owns the process exit.
 pub fn observe_terminal_error(code: &str) {
+    observe_terminal_error_in_context(code, &tracing::Span::current());
+}
+
+/// Emits the terminal assigned to this owner under its operation's exact span.
+///
+/// Subordinate owner reads must propagate their error without emitting another
+/// terminal; choosing that boundary remains the caller's responsibility.
+pub fn observe_terminal_error_in_context(code: &str, context: &tracing::Span) {
     let bounded = bound_field(code);
     tracing::error!(
         target: KERNEL_DIAGNOSTICS_TARGET,
+        parent: context,
         event = "kernel.terminal_error",
         code = bounded.text(),
         code_bytes = bounded.original_bytes(),

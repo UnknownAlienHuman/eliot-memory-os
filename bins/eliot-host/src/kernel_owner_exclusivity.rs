@@ -17,7 +17,7 @@
 //! Neither observation is a shape or name check: both are attempts to create
 //! the same operating-system object the Kernel itself had to create.
 
-use eliot_host_state::{PriorKernelDisposition, PriorKernelSource};
+use eliot_host_state::{KernelRecord, PriorKernelDisposition, PriorKernelSource};
 use eliot_platform_windows::{KernelOwnerLease, KernelOwnerLeaseError, kernel_owner_mutex_name};
 
 use super::{HostError, HostKernelCandidateBinding, PlatformHandle};
@@ -69,6 +69,37 @@ impl KernelHandoffReceipt {
     /// this one.
     pub(super) fn matches_disposition(&self, disposition: &PriorKernelDisposition) -> bool {
         matches!(disposition, PriorKernelDisposition::Terminated(prior) if *prior == self.prior)
+    }
+
+    /// Recovers the handoff boundary this activation already retained in its
+    /// durable `KernelRecord`, after a restart dropped the in-memory copy.
+    ///
+    /// I14.16 step 6 (issue #1953, map item 3): the candidate manifest/pipe,
+    /// the old-Kernel handoff, the exact old PID/start/Job identity, the
+    /// observed termination flags and the owner-lock acquisition target join
+    /// ONE retained activation record. `resume()` restores only that record,
+    /// so without this the retained `HandoffPrepared` boundary would be
+    /// unreachable and the commit could never run under the original Host
+    /// activation. Recovery rebuilds the receipt from the record's own prior
+    /// disposition and admits it only when the record's
+    /// `disposition_evidence` already carries this exact receipt's evidence
+    /// reference - the durable proof that this activation prepared this
+    /// handoff. A `Running`/`Unknown` disposition, or a terminated contour
+    /// with no retained handoff evidence, stops activation with
+    /// `RecoveryRequired`; the journal record itself is untouched and stays
+    /// queryable.
+    pub(super) fn recover_retained(current: &KernelRecord) -> Result<Option<Self>, HostError> {
+        let Some(receipt) = Self::for_disposition(&current.prior_kernel_disposition)? else {
+            return Ok(None);
+        };
+        let evidence = receipt.evidence_ref()?;
+        if !current.disposition_evidence.contains(&evidence) {
+            return Err(HostError::RecoveryRequired(
+                "retained Kernel record carries no prepared handoff boundary for its prior contour"
+                    .to_owned(),
+            ));
+        }
+        Ok(Some(receipt))
     }
 
     /// Proves the retired contour actually released its exclusive owner

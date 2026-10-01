@@ -101,6 +101,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::SERVICE_NAME;
+use crate::cue_activation_route::{CueActivationDisposition, evaluate_cue_activation};
 use crate::daemon_kernel_client::{DaemonKernelClient, OwnerSessionFacts};
 use crate::kernel_context_read_client::KernelContextReadClient;
 
@@ -338,7 +339,12 @@ pub async fn serve_context_reconstruction(
             ));
         }
     };
-    context_reconstruction_result_body(envelope, attempt, &scope, task_id, &seven)
+    // Issue #1720 A12: the fire-side cue activation drive evaluates the
+    // reconstructed cue role with the R5 activation owner. It never fails the
+    // reconstruction: every refusal travels as an explicit skip disposition in
+    // the same replay-exact response body.
+    let cue_activation = evaluate_cue_activation(&seven);
+    context_reconstruction_result_body(envelope, attempt, &scope, task_id, &seven, &cue_activation)
 }
 
 /// Settles one claimed reconstruction pair whose read closure was DEGRADED.
@@ -959,6 +965,7 @@ fn context_reconstruction_result_body(
     scope: &ScopeId,
     task_id: &str,
     seven: &SevenRoleInputs,
+    cue_activation: &CueActivationDisposition,
 ) -> Result<HostRequestResultBody, ReconstructionPrerequisite> {
     let closure = serde_json::to_value(seven)
         .map_err(|error| ReconstructionPrerequisite::ReconstructionRefused(error.to_string()))?;
@@ -967,6 +974,7 @@ fn context_reconstruction_result_body(
         "task_id": task_id,
         "scope_id": scope.as_str(),
         "context_reconstruction": closure,
+        "cue_activation": cue_activation.response_value(),
     });
     let bytes = canonical_json_bytes(&response)
         .map_err(|error| ReconstructionPrerequisite::ReconstructionRefused(error.to_string()))?;

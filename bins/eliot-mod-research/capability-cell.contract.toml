@@ -1,0 +1,75 @@
+# Authoritative #13 contract source for the `mod-research-provider` functional
+# capability cell, declared by `bins/eliot-mod-research`.
+#
+# Package metadata supplies the cell identity, owner and proof entrypoint; the
+# generator rejects disagreement between these sources. This is the same shape as
+# `crates/modules/eliot-native-worker-core/capability-cell.contract.toml`, and it
+# is the record that makes the `CapabilityCellId` `ProviderAdmission` seals a
+# catalogued cell rather than free text.
+schema = "eliot.capability-cell-contract-v1"
+cell = "mod-research-provider"
+contract_revision = "1.0.0"
+source_package = "eliot-mod-research"
+source_manifest = "bins/eliot-mod-research/Cargo.toml"
+# The cell executes inline in the `eliot-mod-research` process module, so that
+# process is both the hosting runtime bundle and the source crate. There is no
+# second host process and no second bundle.
+worker_bundle_package = "eliot-mod-research"
+worker_bundle_manifest = "bins/eliot-mod-research/Cargo.toml"
+
+# Owner vocabulary is the issue work unit, taken from `bins/AGENTS.md`
+# ("eliot-mod-research | governed provider acquisition; candidate-only output,
+# #24"), `workstreams/core-daemons/AGENTS.md` ("#24 | governed Researcher
+# provider process bridge") and
+# `workstreams/core-daemons/assignments/024-research-provider-runtime.toml`
+# (`issue = 24`). No architecture item id names the research plane, so no `A-nn`
+# id is claimed here.
+lifecycle_owner = "issue-24"
+maintenance_owner = "issue-24"
+semantic_owner = "issue-24"
+generation_owner = "issue-24"
+
+# The cell owns exactly the per-operation, in-process lifecycle of one admitted
+# provider acquisition: its sealed admission, the submitted envelope, the raw
+# stdout/stderr/exit/lineage evidence, the provider job reference, the classified
+# terminal outcome and the cancellation receipt. It owns no durable research
+# Job/Attempt row and no source-portfolio / coverage-denominator state; those are
+# admitted to ORS by #15/#18 and are explicitly absent, so this cell neither
+# claims nor writes them.
+owned_state = "Per-operation admitted research-provider lifecycle: sealed admission, submitted envelope, raw provider evidence, provider job reference, terminal outcome, and cancellation receipt (in-process, per operation; no durable research Job/Attempt or coverage-denominator state)"
+state_owner = "issue-24"
+stateless = false
+
+# The governed bridge runs inline in the `eliot-mod-research` process module
+# under that module's own ownership. It is not delegated to a separate runtime
+# bundle, so no `runtime_bundle` is declared: naming one here would claim a
+# delegated-bundle execution contour this cell does not have, and would make
+# the registry read the Module generation the Kernel admitted
+# (`ProviderAdmission::module_generation_id`) as if it were a bundle identity.
+# Those are different namespaces and the record keeps them apart.
+execution_contour = "HOST_INLINE"
+# The bridge is candidate-only: it performs the physical acquisition the Kernel
+# admitted and returns evidence material. It admits nothing, stores nothing
+# canonically, and holds no synthesis, policy, authority, or finish ownership, so
+# no ELIOT effect class is claimed here.
+allowed_effect_classes = []
+replacement_class = "keep"
+removal_boundary = "Stop admitting research-provider dispatches, drain and cancel the exact eliot-mod-research process generation through Kernel, then remove the provider bridge; the Kernel research route answers CAPABILITY_UNAVAILABLE once the admitted material is no longer delivered."
+
+# The package declares a test command, and this cell's proof surface is bounded by
+# it: the honest ceiling is the static contract level, exactly as for the
+# native-worker cell. `proof_entrypoint` itself is carried by
+# `package.metadata.eliot.proof_entrypoint` and is re-derived from the
+# ModuleTestCapsule; it is not restated here.
+proof_ceiling = "STATIC_FIELD_AND_MIGRATION_CONTRACT_ONLY"
+proof_entrypoint_source = "package.metadata.eliot.proof_entrypoint"
+
+product_pulse_not_applicable_reason = "This provider bridge process is candidate-only research acquisition: a completed provider run proves process custody and evidence lineage, not research correctness, coverage, or product behavior. Product evidence is measured at the Kernel research route and the installed operational spine (#11)."
+current_support = "CURRENT_UNVERIFIED"
+invalidation = []
+
+[manifest]
+owner = "issue-24"
+contract_kit = "docs/code-navigation/capsules/mod-research-provider/contract_kit.json"
+context_capsule = "docs/code-navigation/capsules/mod-research-provider/context_capsule.json"
+test_capsule = "docs/code-navigation/capsules/mod-research-provider/test_capsule.json"

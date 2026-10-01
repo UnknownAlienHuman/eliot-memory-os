@@ -1170,6 +1170,7 @@ dependencies = [
  "eliot-learning-contracts",
  "eliot-observation-contracts",
  "eliot-receipts",
+ "eliot-store-api",
  "serde",
  "thiserror",
 ]
@@ -3588,6 +3589,8 @@ dependencies = [
  "eliot-context-contracts",
  "eliot-contracts",
  "eliot-controlboard",
+ "eliot-cue-activation",
+ "eliot-cue-contracts",
  "eliot-doctor-core",
  "eliot-dreamer-contracts",
  "eliot-dreamer-failure",

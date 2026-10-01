@@ -1595,7 +1595,12 @@ pub struct BootstrapDiscoveryInputs {
 /// both an admitted owner binding and the installation-bound `store`, then
 /// runs [`BootstrapScanner::scan`], which verifies the lease key, runs the
 /// forbidden-operation guard, charges the lease, and durably writes the
-/// receipt before reporting completion. The caller never chooses storage.
+/// receipt before reporting completion. A completed outcome is additionally
+/// replayed through the same owner before return: the persisted handle is
+/// read back under the same binding and its receipt identity is compared
+/// against this operation's receipt, so a missing, inaccessible, corrupt,
+/// replaced, stale, invalidated or unknown-commit record surfaces its typed
+/// cause instead of a completed outcome. The caller never chooses storage.
 ///
 /// Exclusion holds by construction: the intake types have no fields for
 /// command lines, recent output, neighboring roots, or raw secret literals,
@@ -1606,8 +1611,9 @@ pub struct BootstrapDiscoveryInputs {
 /// Returns an error when the owner binding disagrees with the lease or the
 /// privacy boundary, when observations, policy, evidence, or references are
 /// malformed, when evidence names nothing observed, or when the scan itself
-/// fails (see [`BootstrapScanner::scan`]), or when a fully specified scan
-/// lacks its installation-bound owner binding/store.
+/// fails (see [`BootstrapScanner::scan`]), when a fully specified scan
+/// lacks its installation-bound owner binding/store, or when the persisted
+/// receipt cannot be read back through the owner with its exact identity.
 pub fn run_bootstrap_discovery(
     store: Option<&mut (dyn ScanDisclosureStore + '_)>,
     binding: Option<&ScanDisclosureOwnerBinding>,
@@ -1693,11 +1699,11 @@ pub fn run_bootstrap_discovery(
     let Some(store) = store else {
         return Err(WorkScopeError::ScanReceiptInaccessible);
     };
-    BootstrapScanner::scan(
+    let outcome = BootstrapScanner::scan(
         discovery.scan_ref.clone(),
         lease,
         key,
-        store,
+        &mut *store,
         binding,
         candidate_privacy,
         Some(boundary),
@@ -1707,7 +1713,41 @@ pub fn run_bootstrap_discovery(
         &policy.verifier_refs,
         discovery.governing_source_refs.clone(),
         discovery.now,
-    )
+    )?;
+    complete_with_replay(store, binding, outcome)
+}
+
+/// Replays a completed scan's persisted receipt through the same owner before
+/// return (issue #1788 W5): the persisted handle is read back under the same
+/// binding and its receipt identity is compared against this operation's
+/// receipt, so a missing, inaccessible, corrupt, replaced, stale,
+/// invalidated or unknown-commit record surfaces its typed cause instead of
+/// a completed outcome.
+fn complete_with_replay(
+    store: &mut (dyn ScanDisclosureStore + '_),
+    binding: &ScanDisclosureOwnerBinding,
+    outcome: BootstrapScanOutcome,
+) -> Result<BootstrapScanOutcome, WorkScopeError> {
+    match outcome {
+        BootstrapScanOutcome::Completed {
+            profile,
+            receipt,
+            persisted,
+            resolver_inputs,
+        } => {
+            let replayed = store.readback(&persisted, binding)?;
+            if replayed.scan_ref != persisted.receipt_ref {
+                return Err(WorkScopeError::ScanReceiptReplaced);
+            }
+            Ok(BootstrapScanOutcome::Completed {
+                profile,
+                receipt,
+                persisted,
+                resolver_inputs,
+            })
+        }
+        question @ BootstrapScanOutcome::PrivacyBoundaryRequired { .. } => Ok(question),
+    }
 }
 
 /// Privacy boundary admitted for one scan: the privacy profile plus the

@@ -48,12 +48,14 @@ mod finish_attempt;
 mod governor_authority_projection;
 pub use attention_evaluation_commit::{
     ATTENTION_EVALUATION_OPERATION_PREFIX, AttentionEvaluationCommitError,
-    AttentionEvaluationCommitIdentity, AttentionEvaluationOperation,
-    AttentionEvaluationOperatorRequest, AttentionEvaluationProducedRecord,
-    AttentionEvaluationValidity, AttentionMetricGroupStatus, AttentionUnknownSummary,
+    AttentionEvaluationCommitIdentity, AttentionEvaluationInvalidatedRecord,
+    AttentionEvaluationOperation, AttentionEvaluationOperatorRequest,
+    AttentionEvaluationProducedRecord, AttentionEvaluationValidity, AttentionEvaluationViewContext,
+    AttentionMetricGroupStatus, AttentionUnknownSummary, admit_attention_invalidation,
     attention_evaluation_idempotency_key, attention_evaluation_operation_id,
-    attention_evaluation_validity, attention_evidence_commitment, attention_record_digest,
-    attention_unknown_summary, check_attention_commit_receipt, collect_attention_evidence_refs,
+    attention_evaluation_validity, attention_evaluation_view_context,
+    attention_evidence_commitment, attention_record_digest, attention_unknown_summary,
+    check_attention_commit_receipt, collect_attention_evidence_refs,
     produce_and_commit_attention_evaluation, resolve_attention_lost_acknowledgement,
     validate_attention_evaluation_request, verify_attention_evaluation_readback,
 };

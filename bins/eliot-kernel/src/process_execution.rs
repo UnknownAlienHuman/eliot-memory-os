@@ -58,26 +58,182 @@ use serde::{Deserialize, Serialize};
 /// F-LOG-KERNEL-3 (#901): process-execution boundary observations.
 ///
 /// Observation only, via #895's facade: fixed `kernel.process.*` event names
-/// plus a bounded stable outcome. Never carries operation identities,
-/// digests, paths, command material, receipts, or owner error strings
+/// plus a bounded stable outcome. The event payload carries no operation
+/// identities, paths, command material, receipts, or owner error strings; a
+/// separate explicit span carries only validated, policy-screened references
 /// (I15.4, I07.20).
 fn observe_process(event: &'static str, outcome: &'static str) {
+    let context = super::kernel_diagnostics::operation_context(None, None, None, None);
+    observe_process_in_context(&context, event, outcome);
+}
+
+/// Emits one process observation under its explicitly propagated operation
+/// context. The unscoped wrapper above uses an explicit all-unavailable span;
+/// neither path inherits whichever span happens to be current on this task.
+pub(crate) fn observe_process_in_context(
+    context: &tracing::Span,
+    event: &'static str,
+    outcome: &'static str,
+) {
     use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
     let event_bound = bound_field(event);
     let outcome_bound = bound_field(outcome);
     tracing::info!(
         target: KERNEL_DIAGNOSTICS_TARGET,
+        parent: context,
         event = event_bound.text(),
         outcome = outcome_bound.text(),
         "process execution observation"
     );
 }
 
+/// Builds a safe operation context from existing typed process identities.
+/// Fence correlation uses the process contract's lineage-bound canonical epoch
+/// digest; it intentionally does not include the fencing nonce or claim to
+/// identify the full signed fence token.
+fn process_operation_context(
+    operation_id: Option<&eliot_process::OperationId>,
+    generation: Option<Generation>,
+    state_fence: Option<&FencingToken>,
+    authority_epoch: Option<&eliot_contracts::EpochId>,
+) -> tracing::Span {
+    let operation_id = operation_id.map(eliot_process::OperationId::as_str);
+    let generation = generation.map(|value| value.get().to_string());
+    let state_fence = state_fence.and_then(FencingToken::canonical_epoch_digest);
+    let authority_epoch = authority_epoch.and_then(|value| {
+        eliot_contracts::StateFence::canonical_epoch_digest(value)
+            .ok()
+            .map(|digest| digest.as_str().to_owned())
+    });
+    super::kernel_diagnostics::operation_context(
+        operation_id,
+        generation.as_deref(),
+        state_fence.as_deref(),
+        authority_epoch.as_deref(),
+    )
+}
+
+/// Updates one of the optional correlation fields declared by the shared
+/// operation span. Inputs are existing owner references and still pass through
+/// the shared diagnostic policy before being recorded.
+fn record_process_context_field(context: &tracing::Span, field: &str, value: Option<&str>) {
+    if let Some(value) = value {
+        let bounded = super::kernel_diagnostics::bound_field(value);
+        context.record(field, bounded.text());
+    }
+}
+
+fn record_process_owner_operation_context(
+    context: &tracing::Span,
+    owner: &ProcessOwnerBinding,
+    operation_id: &eliot_process::OperationId,
+) {
+    let generation = owner.generation().get().to_string();
+    let authority_epoch =
+        eliot_contracts::StateFence::canonical_epoch_digest(owner.authority_epoch()).ok();
+    record_process_context_field(context, "operation", Some(operation_id.as_str()));
+    record_process_context_field(context, "generation", Some(generation.as_str()));
+    record_process_context_field(
+        context,
+        "authority_epoch",
+        authority_epoch
+            .as_ref()
+            .map(eliot_contracts::LowercaseSha256::as_str),
+    );
+}
+
+fn record_process_start_request_context(
+    context: &tracing::Span,
+    admission: &ProcessExecutionAdmissionRequest,
+    owner: &ProcessOwnerBinding,
+) {
+    let owner_generation = owner.generation().get().to_string();
+    let owner_authority_epoch =
+        eliot_contracts::StateFence::canonical_epoch_digest(owner.authority_epoch()).ok();
+    record_process_context_field(context, "generation", Some(owner_generation.as_str()));
+    record_process_context_field(
+        context,
+        "authority_epoch",
+        owner_authority_epoch
+            .as_ref()
+            .map(eliot_contracts::LowercaseSha256::as_str),
+    );
+    if admission.validate().is_err() {
+        return;
+    }
+    let generation = admission.intent().generation().get().to_string();
+    let state_fence = admission.state_fence().canonical_epoch_digest();
+    record_process_context_field(
+        context,
+        "operation",
+        Some(admission.intent().operation_id().as_str()),
+    );
+    record_process_context_field(context, "generation", Some(generation.as_str()));
+    record_process_context_field(context, "state_fence", state_fence.as_deref());
+    record_process_context_field(
+        context,
+        "process_tree",
+        Some(admission.intent().process_tree_id().as_str()),
+    );
+    record_process_context_field(
+        context,
+        "lease",
+        Some(admission.action_lease_ref().as_str()),
+    );
+}
+
+/// Projects the physical identity already validated into a successful start
+/// receipt onto the same bounded operation span.
+fn record_process_start_receipt_identity(context: &tracing::Span, receipt: &ProcessStartReceipt) {
+    let identity = receipt.identity();
+    let physical = identity.physical();
+    let process_id = physical.process_id().to_string();
+    let start_time_100ns = physical.start_time_100ns().to_string();
+    record_process_context_field(context, "process_id", Some(process_id.as_str()));
+    record_process_context_field(
+        context,
+        "process_start_100ns",
+        Some(start_time_100ns.as_str()),
+    );
+    record_process_context_field(context, "image_sha256", Some(identity.executable_sha256()));
+    observe_process_in_context(
+        context,
+        "kernel.process.start_identity_observed",
+        "validated_receipt",
+    );
+}
+
+fn process_start_request_context(
+    admission: &ProcessExecutionAdmissionRequest,
+    owner: &ProcessOwnerBinding,
+) -> tracing::Span {
+    let context = super::kernel_diagnostics::operation_context(None, None, None, None);
+    record_process_start_request_context(&context, admission, owner);
+    context
+}
+
+fn record_process_request_context(
+    context: &tracing::Span,
+    request: &ProcessExecutionRequest,
+    owner: &ProcessOwnerBinding,
+) {
+    match request {
+        ProcessExecutionRequest::Start(admission) => {
+            record_process_start_request_context(context, admission, owner);
+        }
+        ProcessExecutionRequest::Inspect { operation_id }
+        | ProcessExecutionRequest::Cancel { operation_id }
+        | ProcessExecutionRequest::Reconcile { operation_id } => {
+            record_process_owner_operation_context(context, owner, operation_id);
+        }
+    }
+}
+
 /// Maps one process-execution failure to its stable diagnostic code.
 ///
 /// Only the variant is emitted; any `String` payload (executor detail, sink
 /// message, contract field/reason) is never logged.
-fn process_terminal_code(error: &ProcessExecutionError) -> &'static str {
+pub(crate) fn process_terminal_code(error: &ProcessExecutionError) -> &'static str {
     match error {
         ProcessExecutionError::Contract(_) => "process_contract",
         ProcessExecutionError::NotFound => "process_not_found",
@@ -203,9 +359,10 @@ impl GovernedProcessEffectBaseline {
 ///
 /// The Kernel-owned effect port constructs one entry per baseline target
 /// from two further independent opens plus the terminal evidence's own
-/// State Fence. A target that cannot be read back is omitted here; only
-/// agreeing real reads become evidence. A receipt without targets proves
-/// nothing and ingests nothing.
+/// State Fence. A target that cannot be read back is omitted here, unless
+/// two agreeing not-found observations prove deletion (I10.21 AUD5), which
+/// crosses as deletion evidence; only agreeing real reads otherwise become
+/// evidence. A receipt without targets proves nothing and ingests nothing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GovernedProcessChangeReceipt {
     targets: Vec<EffectTargetReceipt>,
@@ -215,13 +372,16 @@ pub(crate) struct GovernedProcessChangeReceipt {
 /// One declared target's terminal state, joined to its baseline entry by
 /// absolute declared path. Only the agreeing terminal reads cross into
 /// evidence; ledger identity (resource, lane path, target digest) is read
-/// from the baseline entry the path joins to.
+/// from the baseline entry the path joins to. An after-state of all-`None`
+/// is proven deletion (two agreeing not-found reads against the baseline),
+/// never a read glitch: it admits an immutable `Absent` observation at
+/// ingest instead of an unobserved gap.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct EffectTargetReceipt {
     path: PathBuf,
-    after_bytes: Vec<u8>,
-    after_first_digest: String,
-    after_reread_digest: String,
+    after_bytes: Option<Vec<u8>>,
+    after_first_digest: Option<String>,
+    after_reread_digest: Option<String>,
 }
 
 impl GovernedProcessChangeReceipt {
@@ -230,16 +390,23 @@ impl GovernedProcessChangeReceipt {
     }
 }
 
-/// Stable categories for a missing or malformed independent source observation.
+/// Typed `ChangeMonitor` ingress failures the effect port reports instead
+/// of swallowing (I10.21 AUD4).
 ///
-/// The Kernel-owned port below reports I/O and binding outcomes through
-/// the baseline/receipt `observed` flags instead of failing: an unreadable
-/// image or a mismatched operation runs unobserved, never fenced. The type
-/// is retained so a future fallible adapter can introduce one variant per
-/// failure it can actually report; Kernel only forwards the value to the
-/// stable observation.
+/// Per-target evidence outcomes still report through the baseline/receipt
+/// `observed` flags instead of failing: an unreadable image or a
+/// mismatched operation runs unobserved, never fenced. A poisoned ledger
+/// is not an evidence outcome: no hint, record, or confirmation below can
+/// be admitted or read back, so the observation is refused with a typed
+/// error instead of recorded as unobserved. The gateway observes the typed
+/// outcome and continues the operation; the poisoned ledger itself keeps
+/// governed acceptance blocked, so reporting never fences an unrelated
+/// module.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum GovernedProcessEffectPortError {}
+pub(crate) enum GovernedProcessEffectPortError {
+    /// The `ChangeMonitor` ledger lock is poisoned.
+    LedgerPoisoned,
+}
 
 /// Kernel-owned readback and `ChangeMonitor` ingress for process tools.
 ///
@@ -312,27 +479,77 @@ pub(crate) struct GovernedProcessEffectSource {
 /// past evidence the ledger never admitted.
 /// Per-artifact last-observed
 /// digests are retained here under one mutex (atomic publish); the ledger
-/// itself stays the only acceptance gate.
+/// itself stays the only acceptance gate. After a restart the map starts
+/// empty and each capture falls back to the ledger-retained tip
+/// ([`change_monitor::resource_tip`], rebuilt from the durable sidecar at
+/// construction), so a restart never silently establishes a fresh baseline
+/// over an unreconciled mutation.
 pub(crate) struct KernelGovernedProcessEffectPort {
     last_observed: Mutex<BTreeMap<String, String>>,
 }
 
+/// What two opens of one tracked source prove: agreeing present bytes are
+/// a stable observation; two agreeing not-found observations prove absence
+/// (I10.21 AUD5: the deletion evidence the reconcile path admits as an
+/// immutable `Absent` observation). Any other failure — permissions,
+/// transient I/O, or disagreeing reads — proves nothing about stability or
+/// absence and is `None` from the reader below, never a deletion claim.
+enum TrackedSourceRead {
+    Present {
+        bytes: Vec<u8>,
+        first_digest: String,
+        reread_digest: String,
+    },
+    Absent,
+}
+
 impl KernelGovernedProcessEffectPort {
     pub(crate) fn new() -> Self {
-        Self {
+        let port = Self {
             last_observed: Mutex::new(BTreeMap::new()),
+        };
+        // I10.21 durability (AUD3): rebuild the ledger from its durable
+        // sidecar when this process started fresh, so ledger-retained tips
+        // keep detecting external transitions below. A missing sidecar is
+        // a clean boot; a corrupt or unreadable sidecar is reported here
+        // and stays fail-closed at the finish-acceptance gate, which
+        // rehydrates (and refuses) before consulting it.
+        if change_monitor::hydrate_ledger_sidecar_if_empty().is_err() {
+            observe_process(
+                "kernel.process.effect_baseline_unavailable",
+                "hydrate_failed",
+            );
         }
+        port
     }
 
     /// Opens the tracked path twice and hashes both reads. The digests
     /// must agree: a single read proves nothing about stability, and two
     /// reads that disagree prove the path is changing under observation.
-    fn read_tracked_source(path: &Path) -> Option<(Vec<u8>, String, String)> {
-        let first_bytes = std::fs::read(path).ok()?;
-        let second_bytes = std::fs::read(path).ok()?;
-        let first = super::sha256_hex(&first_bytes);
-        let second = super::sha256_hex(&second_bytes);
-        (first == second).then_some((first_bytes, first, second))
+    fn read_tracked_source(path: &Path) -> Option<TrackedSourceRead> {
+        let first = match std::fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return None,
+        };
+        let second = match std::fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return None,
+        };
+        match (first, second) {
+            (Some(first_bytes), Some(second_bytes)) => {
+                let first_digest = super::sha256_hex(&first_bytes);
+                let reread_digest = super::sha256_hex(&second_bytes);
+                (first_digest == reread_digest).then_some(TrackedSourceRead::Present {
+                    bytes: first_bytes,
+                    first_digest,
+                    reread_digest,
+                })
+            }
+            (None, None) => Some(TrackedSourceRead::Absent),
+            (Some(_), None) | (None, Some(_)) => None,
+        }
     }
 
     /// Lane-stable locator for one tracked resource: the content-bound
@@ -351,7 +568,9 @@ impl KernelGovernedProcessEffectPort {
     /// ([`change_monitor::observe_filesystem_notification`]): the retained
     /// previous digest against actual Git-substrate plus content re-read
     /// evidence the adapter collects itself, admitted through the existing
-    /// ingest-plus-confirm path. The adapter takes the real hinted source —
+    /// ingest-plus-confirm path as a poll-reconciled transition (audit
+    /// 5910747803 defect 2: inferred, never labeled an OS notification).
+    /// The adapter takes the real hinted source —
     /// the lease-owned file the capture reads just proved moved, named
     /// relative to the lease-owned working directory — never a synthesized
     /// OS event: a source that cannot be named under that root has no valid
@@ -379,7 +598,144 @@ impl KernelGovernedProcessEffectPort {
             workspace_root,
             &notification,
             Some(before_digest),
+            change_monitor::HintOrigin::PollReconcile,
         )
+    }
+
+    /// Checks one retained previous digest against fresh reads through the
+    /// filesystem/Git observation adapter (I10.21 A2): the retained previous
+    /// digest against two fresh agreeing reads is evidence no admission
+    /// explains by itself, so the transition is external and uncorrelated
+    /// until a recorded governed change reconciles it. Sets `observed` when
+    /// the adapter admits the transition and returns `false`; returns `true`
+    /// when the caller must skip the target (the transition stays
+    /// unrecorded and a blocking gap marker pins the retained digest so the
+    /// next capture re-detects it instead of advancing past evidence the
+    /// ledger never admitted). Ledger contention fences the tool instead.
+    fn check_retained_external_transition(
+        workspace_root: &Path,
+        hinted_source: &Path,
+        resource: &str,
+        event_ref: &str,
+        previous: &str,
+        operation: &str,
+        observed: &mut bool,
+    ) -> Result<bool, GovernedProcessEffectPortError> {
+        match Self::observe_external_filesystem_transition(
+            workspace_root,
+            hinted_source,
+            resource,
+            event_ref,
+            previous,
+        ) {
+            Ok(confirmation) => {
+                *observed = true;
+                observe_process(
+                    "kernel.process.effect_external_transition",
+                    match confirmation {
+                        change_monitor::HintConfirmation::VerifiedImmaterial => "immaterial",
+                        change_monitor::HintConfirmation::MaterialRecorded {
+                            reconciled, ..
+                        } => {
+                            if reconciled {
+                                "reconciled"
+                            } else {
+                                "material"
+                            }
+                        }
+                    },
+                );
+                Ok(false)
+            }
+            Err(error) => {
+                let outcome = if error == change_monitor::ChangeMonitorError::UnstableReadback {
+                    "unstable"
+                } else {
+                    "unobserved"
+                };
+                // I10.21 AUD4: the retained previous digest proves
+                // a real transition, but the ledger could not
+                // record it. The target leaves the baseline with a
+                // blocking gap marker pinned to the retained digest
+                // instead of advancing past evidence the ledger
+                // never admitted; the next capture re-detects it.
+                match change_monitor::note_unresolved_transition(
+                    resource,
+                    operation,
+                    Some(previous.to_owned()),
+                ) {
+                    Ok(_) => {
+                        observe_process("kernel.process.effect_external_transition", "unresolved");
+                    }
+                    Err(change_monitor::ChangeMonitorError::LedgerPoisoned) => {
+                        return Err(GovernedProcessEffectPortError::LedgerPoisoned);
+                    }
+                    Err(_) => observe_process("kernel.process.effect_external_transition", outcome),
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    /// Admits one host-event hint for a declared target (I10.21 A1). A
+    /// conflicting identity under the same hint reuses an operation handle
+    /// for different content: evidence is ambiguous, so nothing is recorded
+    /// or confirmed for it. Ledger failures are typed, never swallowed
+    /// (I10.21 AUD4): a poisoned ledger refuses the observation instead of
+    /// recording it as unobserved, and any other ingest refusal pins a
+    /// blocking gap marker on the retained baseline instead of leaving the
+    /// resource unblocked. Returns the admitted hint identity plus whether
+    /// the caller must skip the target (`true`: the hint was refused and
+    /// the caller must continue ingest for the next target).
+    ///
+    /// Correlation (I10.21 W3): the hint carries the producing lane's
+    /// claimed Session, `ActionLease`, tool operation, attempt receipt, and
+    /// State-Fence generation — the claimant's identity for this re-check,
+    /// never proof of who wrote the bytes. The fence is the binding's
+    /// admission fence, which capture clones as the capture fence.
+    fn admit_host_event_hint(
+        binding: &GovernedProcessEffectBinding,
+        attempt_receipt: &str,
+        target_digest: &str,
+        resource: &str,
+        lane_path: &str,
+        before_digest: &str,
+    ) -> Result<(String, bool), GovernedProcessEffectPortError> {
+        let operation = binding.operation_id.as_str().to_owned();
+        let hint_id = change_monitor::host_hint_id(&operation, target_digest);
+        let hint = change_monitor::KernelChangeHint {
+            hint_id: hint_id.clone(),
+            resource: resource.to_owned(),
+            path: lane_path.to_owned(),
+            origin: change_monitor::HintOrigin::HostEvent,
+            origin_ref: Some(binding.owner.module_id().to_owned()),
+            session: Some(binding.session_id.as_str().to_owned()),
+            action_lease: Some(binding.action_lease_ref.as_str().to_owned()),
+            operation: Some(operation.clone()),
+            attempt_receipt: Some(attempt_receipt.to_owned()),
+            fence_generation: Some(binding.state_fence.generation().get()),
+        };
+        match change_monitor::ingest_hint(hint) {
+            Ok(_) => Ok((hint_id, false)),
+            Err(change_monitor::ChangeMonitorError::LedgerPoisoned) => {
+                Err(GovernedProcessEffectPortError::LedgerPoisoned)
+            }
+            Err(_) => {
+                let outcome = match change_monitor::note_unresolved_transition(
+                    resource,
+                    operation.as_str(),
+                    Some(before_digest.to_owned()),
+                ) {
+                    Ok(_) => "unresolved",
+                    Err(change_monitor::ChangeMonitorError::LedgerPoisoned) => {
+                        return Err(GovernedProcessEffectPortError::LedgerPoisoned);
+                    }
+                    Err(_) => "unobserved",
+                };
+                observe_process("kernel.process.effect_observed", outcome);
+                Ok((hint_id, true))
+            }
+        }
     }
 }
 
@@ -438,14 +794,17 @@ fn declared_target_paths(argv: &[String], working_directory: &Path) -> Vec<PathB
     targets
 }
 
-// I10.21 A1: only a proven transition with real bytes on both
-// sides becomes a governed record. The ledger hashes the supplied
-// bytes itself and the diff handle is the ledger's own transition
-// binder, so the handle resolves to the recorded transition by
-// construction. The record is written before confirmation so the
-// confirmation can reconcile against this exact evidence. The
+// I10.21 A1: only a proven transition becomes a governed record. The
+// ledger hashes the supplied bytes itself and the diff handle is the
+// ledger's own transition binder, so the handle resolves to the recorded
+// transition by construction. The record is written before confirmation so
+// the confirmation can reconcile against this exact evidence. The
 // change identity scopes the record to this operation's exact
-// target, so one operation's targets never share one record.
+// target, so one operation's targets never share one record. A proven
+// deletion (agreeing terminal absence against a present baseline, I10.21
+// AUD5) records with no after side, so a tool that unlinked its declared
+// target reconciles the exact deletion instead of leaving an
+// unreconciled unknown no later observation can explain.
 fn record_proven_target_transition(
     operation: &str,
     base: &EffectTargetBaseline,
@@ -454,15 +813,18 @@ fn record_proven_target_transition(
     receipt: &GovernedProcessChangeReceipt,
 ) -> Option<String> {
     let mut recorded_transition: Option<String> = None;
-    if back.after_first_digest == back.after_reread_digest
-        && back.after_first_digest != base.before_digest
-    {
+    let present_transition = match (&back.after_first_digest, &back.after_reread_digest) {
+        (Some(first), Some(reread)) => first == reread && first != &base.before_digest,
+        _ => false,
+    };
+    let deletion = back.after_first_digest.is_none() && back.after_reread_digest.is_none();
+    if present_transition || deletion {
         let target_digest = base.target_digest.as_str();
         let change_id = format!("{operation}:{target_digest}");
         let (_, transition) = change_monitor::material_transition_ids(
             &change_id,
             Some(base.before_digest.as_str()),
-            Some(back.after_first_digest.as_str()),
+            back.after_first_digest.as_deref(),
         );
         let change = change_monitor::GovernedToolChange {
             change_id,
@@ -471,8 +833,8 @@ fn record_proven_target_transition(
             before_path: None,
             before_revision: Some(base.before_digest.clone()),
             before_bytes: Some(base.before_bytes.clone()),
-            after_revision: Some(back.after_first_digest.clone()),
-            after_bytes: Some(back.after_bytes.clone()),
+            after_revision: back.after_first_digest.clone(),
+            after_bytes: back.after_bytes.clone(),
             session: baseline.binding.session_id.as_str().to_owned(),
             action_lease: baseline.binding.action_lease_ref.as_str().to_owned(),
             operation: operation.to_owned(),
@@ -523,27 +885,42 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
             return Ok(unobserved());
         }
         let mut targets = Vec::new();
+        let mut mutated = false;
         for target_path in &source.declared_targets {
             let resource = target_path.to_string_lossy().into_owned();
             if resource.trim().is_empty() || resource.chars().any(char::is_control) {
                 continue;
             }
             let (target_digest, lane_path) = Self::lane_path_for(&resource);
-            let Some((before_bytes, first_digest, _reread_digest)) =
-                Self::read_tracked_source(target_path)
+            let Some(TrackedSourceRead::Present {
+                bytes: before_bytes,
+                first_digest,
+                ..
+            }) = Self::read_tracked_source(target_path)
             else {
                 // No evidence for this target: it stays out of the baseline
-                // instead of inventing bytes. (Deletion readback is a
-                // separate lane; an absent declared path is not a proven
-                // absence here.)
+                // instead of inventing bytes. An absent declared path is
+                // not a proven absence here: at capture a missing path may
+                // be a creation the tool is about to perform, so absence
+                // becomes ledger evidence only as a readback deletion
+                // against a retained baseline (see `read_after`, I10.21
+                // AUD5).
                 continue;
             };
             let previous = self
                 .last_observed
                 .lock()
                 .ok()
-                .and_then(|last| last.get(&resource).cloned());
-            let mut transition_unrecorded = false;
+                .and_then(|last| last.get(&resource).cloned())
+                .or_else(|| {
+                    // I10.21 durability (AUD3): after a restart this map
+                    // starts empty while the ledger-retained tip survived
+                    // in the durable sidecar, so the tip is the previous
+                    // digest instead of silently establishing a fresh
+                    // baseline over an unreconciled mutation.
+                    change_monitor::resource_tip(&resource).and_then(|tip| tip.digest)
+                });
+            let operation = binding.operation_id().as_str().to_owned();
             if let Some(previous) = previous
                 && previous != first_digest
             {
@@ -559,47 +936,19 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
                 // refusal keeps the retained digest so the next capture
                 // retries instead of advancing past evidence the ledger
                 // never admitted.
-                match Self::observe_external_filesystem_transition(
+                if Self::check_retained_external_transition(
                     &source.working_directory,
                     target_path,
                     &resource,
                     binding.owner.module_id(),
                     &previous,
-                ) {
-                    Ok(confirmation) => {
-                        observe_process(
-                            "kernel.process.effect_external_transition",
-                            match confirmation {
-                                change_monitor::HintConfirmation::VerifiedImmaterial => {
-                                    "immaterial"
-                                }
-                                change_monitor::HintConfirmation::MaterialRecorded {
-                                    reconciled,
-                                    ..
-                                } => {
-                                    if reconciled {
-                                        "reconciled"
-                                    } else {
-                                        "material"
-                                    }
-                                }
-                            },
-                        );
-                    }
-                    Err(error) => {
-                        transition_unrecorded = true;
-                        observe_process(
-                            "kernel.process.effect_external_transition",
-                            if error == change_monitor::ChangeMonitorError::UnstableReadback {
-                                "unstable"
-                            } else {
-                                "unobserved"
-                            },
-                        );
-                    }
+                    &operation,
+                    &mut mutated,
+                )? {
+                    continue;
                 }
             }
-            if !transition_unrecorded && let Ok(mut last) = self.last_observed.lock() {
+            if let Ok(mut last) = self.last_observed.lock() {
                 last.insert(resource.clone(), first_digest.clone());
             }
             targets.push(EffectTargetBaseline {
@@ -613,6 +962,21 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
         }
         if targets.is_empty() {
             observe_process("kernel.process.effect_baseline_unavailable", "unobserved");
+        }
+        // I10.21 durability (AUD3): capture-time ledger mutations
+        // (external-transition confirmations) are observations in their
+        // own right: persist them best-effort so a crash before reconcile
+        // still retains them. The observation stands regardless; only
+        // durability is best-effort, and it stays visible instead of
+        // silent.
+        if mutated && change_monitor::persist_ledger_sidecar().is_err() {
+            observe_process("kernel.process.effect_observed", "persist_failed");
+        }
+        // I10.21 W4 durability: the shared Governor projection travels
+        // beside the sidecar, so the owner the Governor seam hydrates
+        // survives a Kernel restart exactly like the ledger does.
+        if mutated && change_monitor::persist_observation_transfer().is_err() {
+            observe_process("kernel.process.effect_observed", "transfer_persist_failed");
         }
         Ok(GovernedProcessEffectBaseline {
             binding: binding.clone(),
@@ -637,25 +1001,71 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
             observe_process("kernel.process.effect_readback_failed", "unobserved");
             return Ok(unobserved());
         }
+        let operation = baseline.binding.operation_id().as_str().to_owned();
         let mut targets = Vec::new();
         for base in &baseline.targets {
-            let Some((after_bytes, first_digest, reread_digest)) =
-                Self::read_tracked_source(&base.path)
-            else {
-                // No evidence for this declared target: it proves nothing
-                // for this operation and ingests nothing.
-                observe_process("kernel.process.effect_readback_failed", "unobserved");
-                continue;
-            };
-            if let Ok(mut last) = self.last_observed.lock() {
-                last.insert(base.resource.clone(), first_digest.clone());
+            match Self::read_tracked_source(&base.path) {
+                Some(TrackedSourceRead::Present {
+                    bytes: after_bytes,
+                    first_digest,
+                    reread_digest,
+                }) => targets.push(EffectTargetReceipt {
+                    path: base.path.clone(),
+                    after_bytes: Some(after_bytes),
+                    after_first_digest: Some(first_digest),
+                    after_reread_digest: Some(reread_digest),
+                }),
+                Some(TrackedSourceRead::Absent) => {
+                    // I10.21 AUD5: two agreeing not-found observations
+                    // against this operation's own retained baseline prove
+                    // the declared target was deleted during the run. The
+                    // target crosses into the receipt as deletion evidence
+                    // so ingest admits an immutable `Absent` observation:
+                    // a tool that unlinked its declared target reconciles
+                    // the exact deletion, while anything else stays
+                    // blocked as an unreconciled unknown-origin deletion.
+                    targets.push(EffectTargetReceipt {
+                        path: base.path.clone(),
+                        after_bytes: None,
+                        after_first_digest: None,
+                        after_reread_digest: None,
+                    });
+                    observe_process("kernel.process.effect_readback_deleted", "deleted");
+                }
+                None => {
+                    // No evidence for this declared target: it proves
+                    // nothing for this operation and ingests nothing. The
+                    // retained digest is kept for the next capture instead
+                    // of advancing past evidence the ledger never admitted
+                    // (I10.21 AUD4): a previously observed target that can
+                    // no longer be read gains a blocking gap marker, while
+                    // a never-observed path simply stays out of the
+                    // receipt.
+                    let previous = self
+                        .last_observed
+                        .lock()
+                        .ok()
+                        .and_then(|last| last.get(&base.resource).cloned())
+                        .or_else(|| {
+                            change_monitor::resource_tip(&base.resource).and_then(|tip| tip.digest)
+                        });
+                    let outcome = match previous {
+                        Some(digest) => match change_monitor::note_unresolved_transition(
+                            &base.resource,
+                            &operation,
+                            Some(digest),
+                        ) {
+                            Ok(_) => "unresolved",
+                            Err(change_monitor::ChangeMonitorError::LedgerPoisoned) => {
+                                return Err(GovernedProcessEffectPortError::LedgerPoisoned);
+                            }
+                            Err(_) => "unobserved",
+                        },
+                        None => "unobserved",
+                    };
+                    observe_process("kernel.process.effect_readback_failed", outcome);
+                }
             }
-            targets.push(EffectTargetReceipt {
-                path: base.path.clone(),
-                after_bytes,
-                after_first_digest: first_digest,
-                after_reread_digest: reread_digest,
-            });
         }
         Ok(GovernedProcessChangeReceipt {
             targets,
@@ -673,6 +1083,7 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
             return Ok(());
         }
         let operation = baseline.binding.operation_id().as_str().to_owned();
+        let mut admitted_any = false;
         for base in &baseline.targets {
             let Some(back) = receipt
                 .targets
@@ -685,37 +1096,40 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
                 continue;
             };
             let target_digest = base.target_digest.as_str();
-            let hint_id = change_monitor::host_hint_id(&operation, target_digest);
-            let hint = change_monitor::KernelChangeHint {
-                hint_id: hint_id.clone(),
-                resource: base.resource.clone(),
-                path: base.lane_path.clone(),
-                origin: change_monitor::HintOrigin::HostEvent,
-                origin_ref: Some(baseline.binding.owner.module_id().to_owned()),
-            };
-            // A conflicting identity under the same hint reuses an operation
-            // handle for different content: evidence is ambiguous, so nothing
-            // is recorded or confirmed for it.
-            if let Err(change_monitor::ChangeMonitorError::HintConflict) =
-                change_monitor::ingest_hint(hint)
-            {
-                observe_process("kernel.process.effect_observed", "unobserved");
+            let (hint_id, skip_target) = Self::admit_host_event_hint(
+                &baseline.binding,
+                baseline.effect_digest.as_str(),
+                target_digest,
+                &base.resource,
+                &base.lane_path,
+                &base.before_digest,
+            )?;
+            if skip_target {
                 continue;
             }
+            admitted_any = true;
             let recorded_transition =
                 record_proven_target_transition(&operation, base, back, &baseline, &receipt);
+            // I10.21 AUD5: a proven terminal absence confirms as an
+            // immutable `Absent` observation, never as invented bytes. A
+            // mixed present/absent pair cannot have come from agreeing
+            // readback and is refused below as `UnstableReadback`, which
+            // keeps the hint pending and the resource blocked.
+            let to_read = |digest: &Option<String>| match digest {
+                Some(sha256) => change_monitor::ContentRead::Present {
+                    sha256: sha256.clone(),
+                },
+                None => change_monitor::ContentRead::Absent,
+            };
             let verification = change_monitor::HintVerification {
                 before_digest: Some(base.before_digest.clone()),
-                first_read: change_monitor::ContentRead::Present {
-                    sha256: back.after_first_digest.clone(),
-                },
-                reread: change_monitor::ContentRead::Present {
-                    sha256: back.after_reread_digest.clone(),
-                },
+                first_read: to_read(&back.after_first_digest),
+                reread: to_read(&back.after_reread_digest),
                 git: None,
             };
             match change_monitor::confirm_hint(&hint_id, &verification) {
                 Ok(change_monitor::HintConfirmation::VerifiedImmaterial) => {
+                    admitted_any = true;
                     observe_process("kernel.process.effect_observed", "immaterial");
                 }
                 Ok(change_monitor::HintConfirmation::MaterialRecorded {
@@ -734,7 +1148,28 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
                     {
                         outcome = "reconciled";
                     }
+                    // I10.21 AUD4: the retained map advances only past a
+                    // ledger-recorded transition, never past unadmitted
+                    // evidence. A ledger-recorded deletion retires the
+                    // retained digest instead (I10.21 AUD5): the next
+                    // capture falls back to the ledger tip (proved absent)
+                    // instead of comparing fresh reads against bytes the
+                    // ledger proved gone.
+                    if let Ok(mut last) = self.last_observed.lock() {
+                        match &back.after_first_digest {
+                            Some(digest) => {
+                                last.insert(base.resource.clone(), digest.clone());
+                            }
+                            None => {
+                                last.remove(base.resource.as_str());
+                            }
+                        }
+                    }
+                    admitted_any = true;
                     observe_process("kernel.process.effect_observed", outcome);
+                }
+                Err(change_monitor::ChangeMonitorError::LedgerPoisoned) => {
+                    return Err(GovernedProcessEffectPortError::LedgerPoisoned);
                 }
                 Err(change_monitor::ChangeMonitorError::UnstableReadback) => {
                     observe_process("kernel.process.effect_observed", "unstable");
@@ -743,6 +1178,20 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
                     observe_process("kernel.process.effect_observed", "unobserved");
                 }
             }
+        }
+        // I10.21 durability (AUD3): ingest-time ledger mutations (hint
+        // admissions, governed records, confirmations) are observations in
+        // their own right: persist them best-effort so a crash before the
+        // next mutation still retains them. The observation stands
+        // regardless; only durability is best-effort, and it stays visible
+        // instead of silent.
+        if admitted_any && change_monitor::persist_ledger_sidecar().is_err() {
+            observe_process("kernel.process.effect_observed", "persist_failed");
+        }
+        // I10.21 W4 durability: the shared Governor projection travels
+        // beside the sidecar (see the capture leg above).
+        if admitted_any && change_monitor::persist_observation_transfer().is_err() {
+            observe_process("kernel.process.effect_observed", "transfer_persist_failed");
         }
         Ok(())
     }
@@ -1385,7 +1834,10 @@ pub(crate) trait ProcessStartPorts {
         &self,
         owner: &ProcessOwnerBinding,
         operation_id: &eliot_process::OperationId,
+        context: &tracing::Span,
     ) -> Result<(), ProcessExecutionError>;
+    /// Returns a completed receipt only after its durable contract and exact
+    /// live running-process binding have been validated by the owner.
     async fn completed_receipt(
         &self,
         record: ProcessExecutionReplayRecord,
@@ -1789,48 +2241,80 @@ impl ProcessExecutionGateway {
         operation_id: &eliot_process::OperationId,
         request_nonce: &str,
     ) -> Result<eliot_process::CancellationReceipt, ProcessExecutionError> {
-        observe_process("kernel.process.grant_reconcile_requested", "attempt");
-        if let Err(error) = self.authorize_operation(owner, operation_id) {
-            observe_process("kernel.process.grant_reconcile_rejected", "fenced");
-            super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
-            return Err(error);
+        let context = process_operation_context(
+            Some(operation_id),
+            Some(owner.generation()),
+            None,
+            Some(owner.authority_epoch()),
+        );
+        observe_process_in_context(
+            &context,
+            "kernel.process.grant_reconcile_requested",
+            "attempt",
+        );
+        let mut rejected = false;
+        let mut unknown = false;
+        let result = (|| {
+            rejected = true;
+            self.authorize_operation(owner, operation_id, &context)?;
+            rejected = false;
+            let source = self
+                .controller
+                .lock()
+                .map_err(|_| {
+                    ProcessExecutionError::Unavailable("process authority lock poisoned".to_owned())
+                })?
+                .origin_grant_reconciliation_source(request_nonce, &self.snapshot_binding)
+                .map_err(Self::origin_contract_error)?;
+            if source.operation_id() != operation_id {
+                rejected = true;
+                return Err(ProcessExecutionError::Contract(
+                    eliot_process::ContractError::DispatchBindingMismatch,
+                ));
+            }
+            if source.installation_id() != Self::live_origin_installation_id()? {
+                rejected = true;
+                return Err(ProcessExecutionError::Contract(
+                    eliot_process::ContractError::IdentityMismatch,
+                ));
+            }
+            if source.operation() != OriginControlOperation::Kill {
+                rejected = true;
+                return Err(ProcessExecutionError::Contract(
+                    eliot_process::ContractError::DispatchBindingMismatch,
+                ));
+            }
+            if source.effect_outcome() == OriginGrantEffectOutcome::Unknown {
+                unknown = true;
+                return Err(ProcessExecutionError::UnknownOutcome);
+            }
+            self.origin_grant_effect_receipt(request_nonce)
+        })();
+        match result {
+            Ok(receipt) => {
+                observe_process_in_context(
+                    &context,
+                    "kernel.process.grant_reconcile_replayed",
+                    "success",
+                );
+                Ok(receipt)
+            }
+            Err(error) => {
+                let (event, outcome) = if unknown {
+                    ("kernel.process.grant_reconcile_unknown", "unknown")
+                } else if rejected {
+                    ("kernel.process.grant_reconcile_rejected", "fenced")
+                } else {
+                    ("kernel.process.grant_reconcile_failed", "unknown")
+                };
+                observe_process_in_context(&context, event, outcome);
+                super::kernel_diagnostics::observe_terminal_error_in_context(
+                    process_terminal_code(&error),
+                    &context,
+                );
+                Err(error)
+            }
         }
-        let source = self
-            .controller
-            .lock()
-            .map_err(|_| {
-                ProcessExecutionError::Unavailable("process authority lock poisoned".to_owned())
-            })?
-            .origin_grant_reconciliation_source(request_nonce, &self.snapshot_binding)
-            .map_err(Self::origin_contract_error)?;
-        if source.operation_id() != operation_id {
-            observe_process("kernel.process.grant_reconcile_rejected", "fenced");
-            return Err(ProcessExecutionError::Contract(
-                eliot_process::ContractError::DispatchBindingMismatch,
-            ));
-        }
-        if source.installation_id() != Self::live_origin_installation_id()? {
-            observe_process("kernel.process.grant_reconcile_rejected", "fenced");
-            return Err(ProcessExecutionError::Contract(
-                eliot_process::ContractError::IdentityMismatch,
-            ));
-        }
-        if source.operation() != OriginControlOperation::Kill {
-            observe_process("kernel.process.grant_reconcile_rejected", "fenced");
-            return Err(ProcessExecutionError::Contract(
-                eliot_process::ContractError::DispatchBindingMismatch,
-            ));
-        }
-        if source.effect_outcome() == OriginGrantEffectOutcome::Unknown {
-            observe_process("kernel.process.grant_reconcile_unknown", "unknown");
-            super::kernel_diagnostics::observe_terminal_error(process_terminal_code(
-                &ProcessExecutionError::UnknownOutcome,
-            ));
-            return Err(ProcessExecutionError::UnknownOutcome);
-        }
-        let receipt = self.origin_grant_effect_receipt(request_nonce)?;
-        observe_process("kernel.process.grant_reconcile_replayed", "success");
-        Ok(receipt)
     }
 
     #[cfg(windows)]
@@ -1925,7 +2409,9 @@ impl ProcessExecutionGateway {
     /// Only the variant is emitted; no receipt, handle, or owner string
     /// crosses into diagnostics.
     fn effect_port_outcome(error: GovernedProcessEffectPortError) -> &'static str {
-        match error {}
+        match error {
+            GovernedProcessEffectPortError::LedgerPoisoned => "ledger_poisoned",
+        }
     }
 
     /// Captures the pre-effect tracked-source baseline for one admitted
@@ -1947,6 +2433,7 @@ impl ProcessExecutionGateway {
         owner: &ProcessOwnerBinding,
         admission: &ProcessExecutionAdmissionRequest,
         path_proof: &ProcessPathProof,
+        context: &tracing::Span,
     ) -> Result<(), ProcessExecutionError> {
         let port = self
             .effect_port
@@ -1989,7 +2476,8 @@ impl ProcessExecutionGateway {
                 Ok(())
             }
             Err(error) => {
-                observe_process(
+                observe_process_in_context(
+                    context,
                     "kernel.process.effect_baseline_unavailable",
                     Self::effect_port_outcome(error),
                 );
@@ -2040,6 +2528,7 @@ impl ProcessExecutionGateway {
         &self,
         operation_id: &eliot_process::OperationId,
         evidence: &ProcessEvidence,
+        context: &tracing::Span,
     ) {
         let baseline = match self.effect_baselines.lock() {
             Ok(mut baselines) => baselines.remove(operation_id),
@@ -2049,7 +2538,7 @@ impl ProcessExecutionGateway {
             return;
         };
         if baseline.binding().operation_id() != operation_id {
-            observe_process("kernel.process.effect_observed", "unobserved");
+            observe_process_in_context(context, "kernel.process.effect_observed", "unobserved");
             return;
         }
         let port = match self.effect_port.lock() {
@@ -2061,13 +2550,21 @@ impl ProcessExecutionGateway {
         };
         match port.read_after(&baseline, evidence) {
             Ok(receipt) => match port.ingest(baseline, receipt) {
-                Ok(()) => observe_process("kernel.process.effect_observed", "success"),
-                Err(error) => observe_process(
+                Ok(()) => {
+                    observe_process_in_context(
+                        context,
+                        "kernel.process.effect_observed",
+                        "success",
+                    );
+                }
+                Err(error) => observe_process_in_context(
+                    context,
                     "kernel.process.effect_ingest_failed",
                     Self::effect_port_outcome(error),
                 ),
             },
-            Err(error) => observe_process(
+            Err(error) => observe_process_in_context(
+                context,
                 "kernel.process.effect_readback_failed",
                 Self::effect_port_outcome(error),
             ),
@@ -2108,6 +2605,7 @@ impl ProcessExecutionGateway {
         &self,
         owner: &ProcessOwnerBinding,
         operation_id: &eliot_process::OperationId,
+        context: &tracing::Span,
     ) -> Result<(), ProcessExecutionError> {
         // The store resolves the lease by this operation's own recorded
         // `operation_id`, so no lease key is derived here from the operation
@@ -2135,12 +2633,42 @@ impl ProcessExecutionGateway {
         if decision.authority.authorized_lease().is_some() {
             return Ok(());
         }
-        observe_process("kernel.process.effect_replay_denied", "shadow_only");
+        observe_process_in_context(
+            context,
+            "kernel.process.effect_replay_denied",
+            "shadow_only",
+        );
         // The denial's reconciliation kind is already persisted durably by the
         // store query above; it is not logged as a payload here.
         Err(ProcessExecutionError::Contract(
             eliot_process::ContractError::DispatchBindingMismatch,
         ))
+    }
+
+    /// Creates the one safe context used by an owner-bound process operation.
+    /// The operation handle is already a validated `OperationId`; absent
+    /// fence and tree evidence remains unavailable until an owner supplies it.
+    pub(crate) fn operation_context_for(
+        owner: &ProcessOwnerBinding,
+        operation_id: &eliot_process::OperationId,
+    ) -> tracing::Span {
+        process_operation_context(
+            Some(operation_id),
+            Some(owner.generation()),
+            None,
+            Some(owner.authority_epoch()),
+        )
+    }
+
+    /// Creates the start span once from the contract-valid request identity
+    /// and authenticated caller owner. A malformed admission leaves its
+    /// request fields unavailable while retaining the caller's known owner
+    /// generation and authority epoch.
+    pub(crate) fn start_context_for(
+        owner: &ProcessOwnerBinding,
+        admission: &ProcessExecutionAdmissionRequest,
+    ) -> tracing::Span {
+        process_start_request_context(admission, owner)
     }
 
     pub(crate) async fn start(
@@ -2150,34 +2678,82 @@ impl ProcessExecutionGateway {
         path_proof: ProcessPathProof,
         outer_binding: HostKernelCandidateBinding,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
+        let context = Self::start_context_for(owner, &admission);
+        self.start_in_context(owner, admission, path_proof, outer_binding, &context)
+            .await
+    }
+
+    /// Starts one governed process under the caller's existing operation
+    /// span. Launch wrappers use this entry point so their request, gateway
+    /// observations and terminal share one correlation context.
+    pub(crate) async fn start_in_context(
+        &self,
+        owner: &ProcessOwnerBinding,
+        admission: ProcessExecutionAdmissionRequest,
+        path_proof: ProcessPathProof,
+        outer_binding: HostKernelCandidateBinding,
+        context: &tracing::Span,
+    ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
+        if admission.validate().is_ok() && self.validate_admission(&admission, owner).is_ok() {
+            record_process_context_field(
+                context,
+                "process_tree",
+                Some(admission.intent().process_tree_id().as_str()),
+            );
+            record_process_context_field(
+                context,
+                "lease",
+                Some(admission.action_lease_ref().as_str()),
+            );
+        }
         // F-LOG-KERNEL-3 (#901): admitted-launch boundary. Reservation,
         // replay, fence, and executor handoff stay inside
         // `run_process_start`; exactly one terminal is emitted per failed
         // start, and an `UnknownOutcome` (possible launch/response loss)
         // keeps its unknown code instead of a committed-start claim.
-        observe_process("kernel.process.start_requested", "attempt");
+        observe_process_in_context(context, "kernel.process.start_requested", "attempt");
         // #1824 (I10.21 A1): capture the pre-effect tracked-source baseline
         // before the reservation/executor handoff below. This is the closest
         // pre-effect point that still carries the admission the binding is
         // formed from, and the retained path proof whose lease owns the
         // image the port opens.
-        if let Err(error) = self.capture_governed_effect_baseline(owner, &admission, &path_proof) {
-            observe_process("kernel.process.start_failed", "rejected");
-            super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
+        if let Err(error) =
+            self.capture_governed_effect_baseline(owner, &admission, &path_proof, context)
+        {
+            observe_process_in_context(context, "kernel.process.start_failed", "rejected");
+            super::kernel_diagnostics::observe_terminal_error_in_context(
+                process_terminal_code(&error),
+                context,
+            );
             return Err(error);
         }
         let effect_operation_id = admission.intent().operation_id().clone();
+        let mut replayed = false;
         match Box::pin(run_process_start(
             self,
             owner,
             admission,
             path_proof,
             Some(outer_binding),
+            context,
+            &mut replayed,
         ))
         .await
         {
             Ok(receipt) => {
-                observe_process("kernel.process.start_committed", "success");
+                record_process_start_receipt_identity(context, &receipt);
+                record_process_context_field(
+                    context,
+                    "process_tree",
+                    Some(receipt.binding().process_tree_id().as_str()),
+                );
+                if !replayed {
+                    observe_process_in_context(
+                        context,
+                        "kernel.process.start_committed",
+                        "success",
+                    );
+                }
                 Ok(receipt)
             }
             Err(error) => {
@@ -2185,8 +2761,11 @@ impl ProcessExecutionGateway {
                 // any baseline captured above so a later retry captures fresh
                 // pre-effect state.
                 self.release_governed_effect_baseline(&effect_operation_id);
-                observe_process("kernel.process.start_failed", "rejected");
-                super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
+                observe_process_in_context(context, "kernel.process.start_failed", "rejected");
+                super::kernel_diagnostics::observe_terminal_error_in_context(
+                    process_terminal_code(&error),
+                    context,
+                );
                 Err(error)
             }
         }
@@ -2257,31 +2836,95 @@ impl ProcessExecutionGateway {
         owner: &ProcessOwnerBinding,
         operation_id: eliot_process::OperationId,
     ) -> Result<eliot_process::ProcessExecutionView, ProcessExecutionError> {
-        observe_process("kernel.process.inspect_requested", "attempt");
-        if let Err(error) = self.authorize_operation(owner, &operation_id) {
-            observe_process("kernel.process.inspect_rejected", "fenced");
-            super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
-            return Err(error);
-        }
-        match self.executor.inspect(operation_id).await {
+        let context = Self::operation_context_for(owner, &operation_id);
+        self.inspect_in_context(owner, operation_id, &context).await
+    }
+
+    /// Inspects one operation under its caller's already established safe
+    /// context. This method owns the single terminal for a failed inspect.
+    pub(crate) async fn inspect_in_context(
+        &self,
+        owner: &ProcessOwnerBinding,
+        operation_id: eliot_process::OperationId,
+        context: &tracing::Span,
+    ) -> Result<eliot_process::ProcessExecutionView, ProcessExecutionError> {
+        match self.inspect_inner(owner, operation_id, context).await {
             Ok(view) => {
-                observe_process("kernel.process.inspect_reported", "success");
+                record_process_context_field(
+                    context,
+                    "process_tree",
+                    Some(view.binding().process_tree_id().as_str()),
+                );
+                record_process_context_field(
+                    context,
+                    "state_fence",
+                    view.binding()
+                        .state_fence()
+                        .canonical_epoch_digest()
+                        .as_deref(),
+                );
                 Ok(view)
             }
             Err(error) => {
-                observe_process("kernel.process.inspect_failed", "unknown");
-                super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
+                super::kernel_diagnostics::observe_terminal_error_in_context(
+                    process_terminal_code(&error),
+                    context,
+                );
                 Err(error)
             }
         }
     }
 
+    /// Reads one operation without assigning a terminal. Higher-level owners
+    /// use this for composed boundaries such as descendant closure and live
+    /// receipt validation, so exactly one outer owner reports the failure.
+    pub(crate) async fn inspect_inner(
+        &self,
+        owner: &ProcessOwnerBinding,
+        operation_id: eliot_process::OperationId,
+        context: &tracing::Span,
+    ) -> Result<eliot_process::ProcessExecutionView, ProcessExecutionError> {
+        observe_process_in_context(context, "kernel.process.inspect_requested", "attempt");
+        if let Err(error) = self.authorize_operation(owner, &operation_id, context) {
+            observe_process_in_context(context, "kernel.process.inspect_rejected", "fenced");
+            return Err(error);
+        }
+        match self.executor.inspect(operation_id).await {
+            Ok(view) => {
+                observe_process_in_context(context, "kernel.process.inspect_reported", "success");
+                Ok(view)
+            }
+            Err(error) => {
+                observe_process_in_context(context, "kernel.process.inspect_failed", "unknown");
+                Err(error)
+            }
+        }
+    }
+
+    /// Validates a live receipt under its caller's operation span without
+    /// assigning a terminal. The live-receipt owner remains responsible for
+    /// the one terminal covering both receipt validation and physical inspect.
     #[cfg(windows)]
-    pub(crate) async fn inspect_exact_running_receipt(
+    pub(crate) async fn inspect_exact_running_receipt_in_context(
         &self,
         receipt: &ProcessStartReceipt,
+        context: &tracing::Span,
     ) -> Result<(), ProcessExecutionError> {
         receipt.validate()?;
+        record_process_context_field(
+            context,
+            "process_tree",
+            Some(receipt.binding().process_tree_id().as_str()),
+        );
+        record_process_context_field(
+            context,
+            "state_fence",
+            receipt
+                .binding()
+                .state_fence()
+                .canonical_epoch_digest()
+                .as_deref(),
+        );
         let record = self
             .replay_store
             .load_process_start(receipt.operation_id())
@@ -2293,7 +2936,7 @@ impl ProcessExecutionGateway {
             return Err(ProcessExecutionError::UnknownOutcome);
         }
         let view = match self
-            .inspect(&record.owner, receipt.operation_id().clone())
+            .inspect_inner(&record.owner, receipt.operation_id().clone(), context)
             .await
         {
             Ok(view) => view,
@@ -2316,22 +2959,45 @@ impl ProcessExecutionGateway {
         owner: &ProcessOwnerBinding,
         operation_id: eliot_process::OperationId,
     ) -> Result<eliot_process::CancellationReceipt, ProcessExecutionError> {
-        self.cancel_with_origin_grant_inner(owner, operation_id, None)
-            .await
+        let context = Self::operation_context_for(owner, &operation_id);
+        self.cancel_in_context(owner, operation_id, &context).await
     }
 
-    pub(crate) async fn cancel_with_origin_grant(
+    /// Cancels one operation under its caller's already established safe
+    /// context. This method owns the single terminal for a failed cancel.
+    pub(crate) async fn cancel_in_context(
         &self,
         owner: &ProcessOwnerBinding,
         operation_id: eliot_process::OperationId,
-        grant: &OriginControlGrant,
+        context: &tracing::Span,
     ) -> Result<eliot_process::CancellationReceipt, ProcessExecutionError> {
-        if grant.operation() != OriginControlOperation::Kill {
-            return Err(ProcessExecutionError::Contract(
+        self.cancel_with_origin_grant_in_context(owner, operation_id, None, context)
+            .await
+    }
+
+    /// Cancels or replays one already decided origin grant under the supplied
+    /// operation context. The gateway remains the terminal owner for failure.
+    pub(crate) async fn cancel_with_origin_grant_in_context(
+        &self,
+        owner: &ProcessOwnerBinding,
+        operation_id: eliot_process::OperationId,
+        grant: Option<&OriginControlGrant>,
+        context: &tracing::Span,
+    ) -> Result<eliot_process::CancellationReceipt, ProcessExecutionError> {
+        if let Some(grant) = grant
+            && grant.operation() != OriginControlOperation::Kill
+        {
+            let error = ProcessExecutionError::Contract(
                 eliot_process::ContractError::DispatchBindingMismatch,
-            ));
+            );
+            observe_process_in_context(context, "kernel.process.cancel_rejected", "fenced");
+            super::kernel_diagnostics::observe_terminal_error_in_context(
+                process_terminal_code(&error),
+                context,
+            );
+            return Err(error);
         }
-        self.cancel_with_origin_grant_inner(owner, operation_id, Some(grant))
+        self.cancel_with_origin_grant_inner(owner, operation_id, grant, context)
             .await
     }
 
@@ -2340,24 +3006,35 @@ impl ProcessExecutionGateway {
         owner: &ProcessOwnerBinding,
         operation_id: eliot_process::OperationId,
         grant: Option<&OriginControlGrant>,
+        context: &tracing::Span,
     ) -> Result<eliot_process::CancellationReceipt, ProcessExecutionError> {
         // F-LOG-KERNEL-3 (#901): cancellation boundary. The returned receipt
         // is delivery acknowledgement, not terminal cancellation; exactly one
         // terminal is emitted per failed cancel.
-        observe_process("kernel.process.cancel_requested", "attempt");
+        observe_process_in_context(context, "kernel.process.cancel_requested", "attempt");
         if grant.is_some_and(|value| value.operation() != OriginControlOperation::Kill) {
-            return Err(ProcessExecutionError::Contract(
+            let error = ProcessExecutionError::Contract(
                 eliot_process::ContractError::DispatchBindingMismatch,
-            ));
+            );
+            observe_process_in_context(context, "kernel.process.cancel_rejected", "fenced");
+            super::kernel_diagnostics::observe_terminal_error_in_context(
+                process_terminal_code(&error),
+                context,
+            );
+            return Err(error);
         }
         if let Err(error) = self.authorize_effect_with_grant(
             owner,
             &operation_id,
             grant,
             OriginControlOperation::Kill,
+            context,
         ) {
-            observe_process("kernel.process.cancel_rejected", "fenced");
-            super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
+            observe_process_in_context(context, "kernel.process.cancel_rejected", "fenced");
+            super::kernel_diagnostics::observe_terminal_error_in_context(
+                process_terminal_code(&error),
+                context,
+            );
             return Err(error);
         }
         // Issue #1775 W6: one-shot effect journal. The durable journal keeps
@@ -2373,23 +3050,49 @@ impl ProcessExecutionGateway {
                 .binds_operation(&operation_id)
                 .map_err(ProcessExecutionError::Contract)
             {
-                observe_process("kernel.process.cancel_rejected", "fenced");
-                super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
+                observe_process_in_context(context, "kernel.process.cancel_rejected", "fenced");
+                super::kernel_diagnostics::observe_terminal_error_in_context(
+                    process_terminal_code(&error),
+                    context,
+                );
                 return Err(error);
             }
             match self.origin_grant_effect_state(granted.request_nonce()) {
                 Ok(OriginGrantEffectOutcome::Effected) => {
-                    observe_process("kernel.process.cancel_replayed", "unknown");
-                    let receipt = self.origin_grant_effect_receipt(granted.request_nonce())?;
-                    observe_process("kernel.process.cancel_acknowledged", "success");
+                    observe_process_in_context(
+                        context,
+                        "kernel.process.cancel_replayed",
+                        "unknown",
+                    );
+                    let receipt = match self.origin_grant_effect_receipt(granted.request_nonce()) {
+                        Ok(receipt) => receipt,
+                        Err(error) => {
+                            observe_process_in_context(
+                                context,
+                                "kernel.process.cancel_failed",
+                                "unknown",
+                            );
+                            super::kernel_diagnostics::observe_terminal_error_in_context(
+                                process_terminal_code(&error),
+                                context,
+                            );
+                            return Err(error);
+                        }
+                    };
+                    observe_process_in_context(
+                        context,
+                        "kernel.process.cancel_acknowledged",
+                        "success",
+                    );
                     return Ok(receipt);
                 }
                 Ok(OriginGrantEffectOutcome::Unknown) => {}
                 Err(error) => {
-                    observe_process("kernel.process.cancel_rejected", "fenced");
-                    super::kernel_diagnostics::observe_terminal_error(process_terminal_code(
-                        &error,
-                    ));
+                    observe_process_in_context(context, "kernel.process.cancel_rejected", "fenced");
+                    super::kernel_diagnostics::observe_terminal_error_in_context(
+                        process_terminal_code(&error),
+                        context,
+                    );
                     return Err(error);
                 }
             }
@@ -2402,10 +3105,11 @@ impl ProcessExecutionGateway {
             // target/operation through the retained owner binding and
             // handles — never a downgrade to name/PID control and never
             // a blind re-execution.
-            observe_process("kernel.process.cancel_failed", "unknown");
-            super::kernel_diagnostics::observe_terminal_error(process_terminal_code(
-                &ProcessExecutionError::UnknownOutcome,
-            ));
+            observe_process_in_context(context, "kernel.process.cancel_failed", "unknown");
+            super::kernel_diagnostics::observe_terminal_error_in_context(
+                process_terminal_code(&ProcessExecutionError::UnknownOutcome),
+                context,
+            );
             return Err(ProcessExecutionError::UnknownOutcome);
         };
         // The receipt is observed: journal the proven effect with
@@ -2415,11 +3119,14 @@ impl ProcessExecutionGateway {
         if let Some(granted) = grant
             && let Err(error) = self.record_origin_grant_effect(granted.request_nonce(), &receipt)
         {
-            observe_process("kernel.process.cancel_unrecorded", "unknown");
-            super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
+            observe_process_in_context(context, "kernel.process.cancel_unrecorded", "unknown");
+            super::kernel_diagnostics::observe_terminal_error_in_context(
+                process_terminal_code(&error),
+                context,
+            );
             return Err(error);
         }
-        observe_process("kernel.process.cancel_acknowledged", "success");
+        observe_process_in_context(context, "kernel.process.cancel_acknowledged", "success");
         Ok(receipt)
     }
 
@@ -2429,62 +3136,106 @@ impl ProcessExecutionGateway {
     /// registration is removed only when the receipt proves closure; an
     /// open receipt retains it, so no running descendant silently leaves
     /// the registry.
-    pub(crate) async fn close_registered_descendant(
+    /// Closes one registered descendant under its caller's existing operation
+    /// span. This composed boundary owns exactly one terminal for any failure.
+    pub(crate) async fn close_registered_descendant_in_context(
         &self,
         owner: &ProcessOwnerBinding,
         operation_id: eliot_process::OperationId,
+        context: &tracing::Span,
     ) -> Result<DescendantClosureReceipt, ProcessExecutionError> {
         // F-LOG-KERNEL-3 (#901): descendant-close boundary. The receipt is
         // an observation of the exact current view, never a success claim;
         // exactly one terminal is emitted per failed close.
-        observe_process("kernel.process.descendant_close_requested", "attempt");
-        if let Err(error) = self.authorize_operation(owner, &operation_id) {
-            observe_process("kernel.process.descendant_close_rejected", "fenced");
-            super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
+        observe_process_in_context(
+            context,
+            "kernel.process.descendant_close_requested",
+            "attempt",
+        );
+        if let Err(error) = self.authorize_operation(owner, &operation_id, context) {
+            observe_process_in_context(
+                context,
+                "kernel.process.descendant_close_rejected",
+                "fenced",
+            );
+            super::kernel_diagnostics::observe_terminal_error_in_context(
+                process_terminal_code(&error),
+                context,
+            );
             return Err(error);
         }
-        let registration = self
-            .descendants
-            .lock()
-            .map_err(|_| {
-                ProcessExecutionError::Unavailable("descendant registry lock poisoned".to_owned())
-            })?
-            .get(&operation_id)
-            .cloned()
-            .ok_or(ProcessExecutionError::NotFound)?;
-        let view = match self.inspect(owner, operation_id.clone()).await {
-            Ok(view) => view,
-            Err(error) => {
-                observe_process("kernel.process.descendant_close_failed", "unknown");
-                super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
-                return Err(error);
-            }
-        };
-        let receipt = DescendantClosureReceipt::close(&registration, &view);
-        if let Err(error) = receipt.validate().map_err(ProcessExecutionError::Contract) {
-            observe_process("kernel.process.descendant_close_failed", "unknown");
-            super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
-            return Err(error);
-        }
-        if receipt.all_closed() {
-            self.descendants
+        let result = async {
+            let registration = self
+                .descendants
                 .lock()
                 .map_err(|_| {
                     ProcessExecutionError::Unavailable(
                         "descendant registry lock poisoned".to_owned(),
                     )
                 })?
-                .remove(&operation_id);
-        }
-        observe_process(
-            "kernel.process.descendant_close_observed",
+                .get(&operation_id)
+                .cloned()
+                .ok_or(ProcessExecutionError::NotFound)?;
+            let view = self
+                .inspect_inner(owner, operation_id.clone(), context)
+                .await?;
+            let receipt = DescendantClosureReceipt::close(&registration, &view);
+            receipt
+                .validate()
+                .map_err(ProcessExecutionError::Contract)?;
+            record_process_context_field(
+                context,
+                "process_tree",
+                Some(view.binding().process_tree_id().as_str()),
+            );
+            record_process_context_field(
+                context,
+                "state_fence",
+                view.binding()
+                    .state_fence()
+                    .canonical_epoch_digest()
+                    .as_deref(),
+            );
+            record_process_context_field(context, "receipt", receipt.evidence_ref());
             if receipt.all_closed() {
-                "closed"
-            } else {
-                "open"
-            },
-        );
-        Ok(receipt)
+                self.descendants
+                    .lock()
+                    .map_err(|_| {
+                        ProcessExecutionError::Unavailable(
+                            "descendant registry lock poisoned".to_owned(),
+                        )
+                    })?
+                    .remove(&operation_id);
+            }
+            Ok(receipt)
+        }
+        .await;
+        match result {
+            Ok(receipt) => {
+                observe_process_in_context(
+                    context,
+                    "kernel.process.descendant_close_observed",
+                    if receipt.all_closed() {
+                        "closed"
+                    } else {
+                        "open"
+                    },
+                );
+                Ok(receipt)
+            }
+            Err(error) => {
+                observe_process_in_context(
+                    context,
+                    "kernel.process.descendant_close_failed",
+                    "unknown",
+                );
+                super::kernel_diagnostics::observe_terminal_error_in_context(
+                    process_terminal_code(&error),
+                    context,
+                );
+                Err(error)
+            }
+        }
     }
 
     /// Closes every still-registered descendant during shutdown (#1918). Each
@@ -2497,29 +3248,63 @@ impl ProcessExecutionGateway {
         eliot_process::OperationId,
         Result<DescendantClosureReceipt, ProcessExecutionError>,
     )> {
-        let registered = self.descendants.lock().map_or_else(
-            |_| Vec::new(),
-            |registry| registry.registered_operation_ids(),
-        );
+        let registered = if let Ok(registry) = self.descendants.lock() {
+            registry.registered_operation_ids()
+        } else {
+            let context = super::kernel_diagnostics::operation_context(None, None, None, None);
+            let error =
+                ProcessExecutionError::Unavailable("descendant registry lock poisoned".to_owned());
+            observe_process_in_context(
+                &context,
+                "kernel.process.descendant_close_failed",
+                "unavailable",
+            );
+            super::kernel_diagnostics::observe_terminal_error_in_context(
+                process_terminal_code(&error),
+                &context,
+            );
+            return Vec::new();
+        };
         let mut outcomes = Vec::with_capacity(registered.len());
         for operation_id in registered {
             let owner = match self.replay_store.load_process_start(&operation_id) {
                 Ok(Some(record)) => record.owner,
                 Ok(None) => {
-                    outcomes.push((operation_id, Err(ProcessExecutionError::NotFound)));
+                    let context = process_operation_context(Some(&operation_id), None, None, None);
+                    let error = ProcessExecutionError::NotFound;
+                    observe_process_in_context(
+                        &context,
+                        "kernel.process.descendant_close_failed",
+                        "unknown",
+                    );
+                    super::kernel_diagnostics::observe_terminal_error_in_context(
+                        process_terminal_code(&error),
+                        &context,
+                    );
+                    outcomes.push((operation_id, Err(error)));
                     continue;
                 }
                 Err(error) => {
-                    outcomes.push((
-                        operation_id,
-                        Err(ProcessExecutionError::Unavailable(error.to_string())),
-                    ));
+                    let context = process_operation_context(Some(&operation_id), None, None, None);
+                    let error = ProcessExecutionError::Unavailable(error.to_string());
+                    observe_process_in_context(
+                        &context,
+                        "kernel.process.descendant_close_failed",
+                        "unknown",
+                    );
+                    super::kernel_diagnostics::observe_terminal_error_in_context(
+                        process_terminal_code(&error),
+                        &context,
+                    );
+                    outcomes.push((operation_id, Err(error)));
                     continue;
                 }
             };
+            let context = Self::operation_context_for(&owner, &operation_id);
             outcomes.push((
                 operation_id.clone(),
-                self.close_registered_descendant(&owner, operation_id).await,
+                self.close_registered_descendant_in_context(&owner, operation_id, &context)
+                    .await,
             ));
         }
         outcomes
@@ -2530,14 +3315,30 @@ impl ProcessExecutionGateway {
         owner: &ProcessOwnerBinding,
         operation_id: eliot_process::OperationId,
     ) -> Result<ProcessEvidence, ProcessExecutionError> {
+        let context = Self::operation_context_for(owner, &operation_id);
+        self.reconcile_in_context(owner, operation_id, &context)
+            .await
+    }
+
+    /// Reconciles one operation under its caller's already established safe
+    /// context. This method owns the single terminal for a failed reconcile.
+    pub(crate) async fn reconcile_in_context(
+        &self,
+        owner: &ProcessOwnerBinding,
+        operation_id: eliot_process::OperationId,
+        context: &tracing::Span,
+    ) -> Result<ProcessEvidence, ProcessExecutionError> {
         // F-LOG-KERNEL-3 (#901): exit/evidence reconciliation boundary. Exit
         // zero and provider success never imply semantic completion; the
         // reported evidence stays the owner's, and exactly one terminal is
         // emitted per failed reconcile.
-        observe_process("kernel.process.reconcile_requested", "attempt");
-        if let Err(error) = self.authorize_operation(owner, &operation_id) {
-            observe_process("kernel.process.reconcile_rejected", "fenced");
-            super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
+        observe_process_in_context(context, "kernel.process.reconcile_requested", "attempt");
+        if let Err(error) = self.authorize_operation(owner, &operation_id, context) {
+            observe_process_in_context(context, "kernel.process.reconcile_rejected", "fenced");
+            super::kernel_diagnostics::observe_terminal_error_in_context(
+                process_terminal_code(&error),
+                context,
+            );
             return Err(error);
         }
         let effect_operation_id = operation_id.clone();
@@ -2546,13 +3347,30 @@ impl ProcessExecutionGateway {
                 // #1824 (I10.21 A1/W2): read the terminal source state against
                 // the retained pre-effect baseline and ingest the validated
                 // receipt. Monitor-path failure never fails the reconcile.
-                self.ingest_governed_effect_observation(&effect_operation_id, &evidence);
-                observe_process("kernel.process.reconcile_reported", "success");
+                self.ingest_governed_effect_observation(&effect_operation_id, &evidence, context);
+                let view = evidence.view();
+                record_process_context_field(
+                    context,
+                    "process_tree",
+                    Some(view.binding().process_tree_id().as_str()),
+                );
+                record_process_context_field(
+                    context,
+                    "state_fence",
+                    view.binding()
+                        .state_fence()
+                        .canonical_epoch_digest()
+                        .as_deref(),
+                );
+                observe_process_in_context(context, "kernel.process.reconcile_reported", "success");
                 Ok(evidence)
             }
             Err(error) => {
-                observe_process("kernel.process.reconcile_unknown", "unknown");
-                super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
+                observe_process_in_context(context, "kernel.process.reconcile_unknown", "unknown");
+                super::kernel_diagnostics::observe_terminal_error_in_context(
+                    process_terminal_code(&error),
+                    context,
+                );
                 Err(error)
             }
         }
@@ -2562,13 +3380,14 @@ impl ProcessExecutionGateway {
         &self,
         owner: &ProcessOwnerBinding,
         operation_id: &eliot_process::OperationId,
+        context: &tracing::Span,
     ) -> Result<(), ProcessExecutionError> {
         let record = self
             .replay_store
             .load_process_start(operation_id)
             .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?
             .ok_or(ProcessExecutionError::NotFound)?;
-        authorize_process_owner(&record.owner, owner)
+        authorize_process_owner_in_context(&record.owner, owner, context)
     }
 
     /// Authorizes the owner for the exact operation and, when an origin
@@ -2600,13 +3419,14 @@ impl ProcessExecutionGateway {
         operation_id: &eliot_process::OperationId,
         grant: Option<&OriginControlGrant>,
         expected_operation: OriginControlOperation,
+        context: &tracing::Span,
     ) -> Result<(), ProcessExecutionError> {
         let record = self
             .replay_store
             .load_process_start(operation_id)
             .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?
             .ok_or(ProcessExecutionError::NotFound)?;
-        authorize_process_owner(&record.owner, owner)?;
+        authorize_process_owner_in_context(&record.owner, owner, context)?;
         let Some(grant) = grant else {
             return Ok(());
         };
@@ -2643,13 +3463,20 @@ impl ProcessExecutionGateway {
     clippy::too_many_lines,
     reason = "reservation, canonical projection, authority issue, executor handoff, and replay linearization are one ordered operation"
 )]
+/// Executes one admitted process start in its existing effect order.
+///
+/// The operation span is supplied by the caller and `replayed` is set only
+/// after the owner validates the stored receipt against the live process.
 pub(crate) async fn run_process_start<P: ProcessStartPorts>(
     ports: &P,
     owner: &ProcessOwnerBinding,
     admission: ProcessExecutionAdmissionRequest,
     path_proof: P::PathProof,
     outer_binding: Option<HostKernelCandidateBinding>,
+    diagnostic_context: &tracing::Span,
+    replayed: &mut bool,
 ) -> Result<P::Receipt, ProcessExecutionError> {
+    *replayed = false;
     admission.validate()?;
     ports.validate_path(&admission, &path_proof)?;
     ports.validate_admission(&admission, owner)?;
@@ -2661,15 +3488,38 @@ pub(crate) async fn run_process_start<P: ProcessStartPorts>(
             eliot_process::ContractError::ExpiredDispatchPermit,
         ));
     }
-    let mut reservation = match ports.begin(admission.intent().operation_id(), &digest, owner)? {
-        ProcessExecutionReplayBegin::Acquired => ProcessStartReservation {
-            ports,
-            operation_id: admission.intent().operation_id().clone(),
-            admission_digest: digest.clone(),
-            owner: owner.clone(),
-            active: true,
-        },
+    let begin = match ports.begin(admission.intent().operation_id(), &digest, owner) {
+        Ok(begin) => begin,
+        Err(error) => {
+            observe_process_in_context(
+                diagnostic_context,
+                "kernel.process.start_registration",
+                "unavailable",
+            );
+            return Err(error);
+        }
+    };
+    let mut reservation = match begin {
+        ProcessExecutionReplayBegin::Acquired => {
+            observe_process_in_context(
+                diagnostic_context,
+                "kernel.process.start_registration",
+                "acquired",
+            );
+            ProcessStartReservation {
+                ports,
+                operation_id: admission.intent().operation_id().clone(),
+                admission_digest: digest.clone(),
+                owner: owner.clone(),
+                active: true,
+            }
+        }
         ProcessExecutionReplayBegin::Existing(record) => {
+            observe_process_in_context(
+                diagnostic_context,
+                "kernel.process.start_registration",
+                "existing",
+            );
             if record.admission_digest != digest || record.owner != *owner {
                 return Err(ProcessExecutionError::Contract(
                     eliot_process::ContractError::DispatchBindingMismatch,
@@ -2687,12 +3537,22 @@ pub(crate) async fn run_process_start<P: ProcessStartPorts>(
             ports.require_effect_replay_authority(
                 owner,
                 &admission.intent().operation_id().clone(),
+                diagnostic_context,
             )?;
             return match record.state {
-                ProcessExecutionReplayState::Completed => ports
-                    .completed_receipt(record)
-                    .await?
-                    .ok_or(ProcessExecutionError::UnknownOutcome),
+                ProcessExecutionReplayState::Completed => {
+                    let receipt = ports
+                        .completed_receipt(record)
+                        .await?
+                        .ok_or(ProcessExecutionError::UnknownOutcome)?;
+                    observe_process_in_context(
+                        diagnostic_context,
+                        "kernel.process.start_replay_observed",
+                        "confirmed",
+                    );
+                    *replayed = true;
+                    Ok(receipt)
+                }
                 ProcessExecutionReplayState::Reserved | ProcessExecutionReplayState::Unknown => {
                     Err(ProcessExecutionError::UnknownOutcome)
                 }
@@ -2794,6 +3654,11 @@ pub(crate) async fn run_process_start<P: ProcessStartPorts>(
             });
         }
     };
+    observe_process_in_context(
+        diagnostic_context,
+        "kernel.process.start_handoff",
+        "attempt",
+    );
     let receipt = match ports.execute(owner, request, outer_binding.as_ref()).await {
         Ok(receipt) => receipt,
         Err(error) => {
@@ -2893,8 +3758,9 @@ impl ProcessStartPorts for ProcessExecutionGateway {
         &self,
         owner: &ProcessOwnerBinding,
         operation_id: &eliot_process::OperationId,
+        context: &tracing::Span,
     ) -> Result<(), ProcessExecutionError> {
-        ProcessExecutionGateway::require_effect_replay_authority(self, owner, operation_id)
+        ProcessExecutionGateway::require_effect_replay_authority(self, owner, operation_id, context)
     }
 
     async fn completed_receipt(
@@ -3144,19 +4010,20 @@ impl ProcessStartPorts for ProcessExecutionGateway {
     }
 }
 
-pub(crate) fn authorize_process_owner(
+pub(crate) fn authorize_process_owner_in_context(
     expected: &ProcessOwnerBinding,
     presented: &ProcessOwnerBinding,
+    context: &tracing::Span,
 ) -> Result<(), ProcessExecutionError> {
     if expected != presented {
         // F-LOG-KERNEL-3 (#901): subordinate observation only; the calling
         // gateway boundary owns the single terminal for the failed operation.
-        observe_process("kernel.process.owner_rejected", "fenced");
+        observe_process_in_context(context, "kernel.process.owner_rejected", "fenced");
         return Err(ProcessExecutionError::Contract(
             eliot_process::ContractError::DispatchBindingMismatch,
         ));
     }
-    observe_process("kernel.process.owner_admitted", "success");
+    observe_process_in_context(context, "kernel.process.owner_admitted", "success");
     Ok(())
 }
 
@@ -3199,42 +4066,56 @@ impl KernelComposition {
     /// malformed presented generation is an invalid request, not a coverage
     /// observation, and keeps its own stable code.
     ///
-    /// Crate-visible so the production front-door process start
-    /// ([`GatewayProcessStarter`](crate::process_execution_client) is built
-    /// from the same composition) runs this one guard instead of a parallel
-    /// fence reconstruction: the decision, the refusal projection, and the
-    /// `kernel.process.request_rejected` observation then have exactly one
-    /// owner on every start path.
-    pub(crate) fn reject_process_start_without_material_coverage(
+    /// Applies the existing material-coverage guard under its caller's start
+    /// span so a pre-launch refusal stays correlated with the exact request.
+    /// This guard owns the one typed terminal for its refusal; callers only
+    /// project the returned rejection and do not add another terminal.
+    pub(crate) fn reject_process_start_without_material_coverage_in_context(
         &self,
         admission: &eliot_process::ProcessExecutionAdmissionRequest,
+        context: &tracing::Span,
     ) -> Result<HostKernelCandidateBinding, eliot_kernel_service::ProcessExecutionRejection> {
         match self.admit_material_process_start(admission) {
             Ok(candidate) => Ok(candidate),
             Err(error) => {
-                observe_process("kernel.process.request_rejected", "watchdog_coverage");
+                let code =
+                    eliot_kernel_service::ProcessExecutionRejection::WATCHDOG_COVERAGE_UNAVAILABLE;
+                observe_process_in_context(
+                    context,
+                    "kernel.process.request_rejected",
+                    "watchdog_coverage",
+                );
+                super::kernel_diagnostics::observe_terminal_error_in_context(code, context);
                 Err(eliot_kernel_service::ProcessExecutionRejection {
-                    code: eliot_kernel_service::ProcessExecutionRejection::WATCHDOG_COVERAGE_UNAVAILABLE
-                        .to_owned(),
+                    code: code.to_owned(),
                     detail: error.to_string().chars().take(512).collect(),
                 })
             }
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the compatibility request entry keeps admission, dispatch, and response projection in one ordered boundary"
+    )]
     pub async fn execute_process_request(
         &self,
         session: &Session,
         session_binding: ProcessSessionBinding,
         request: ProcessExecutionRequest,
     ) -> ProcessExecutionResponse {
+        let context = super::kernel_diagnostics::operation_context(None, None, None, None);
         // F-LOG-KERNEL-3 (#901): process front-door boundary. Receipt is an
         // observation of the gateway outcome; rejections below are typed
         // responses (subordinate infos), while a failed gateway operation
         // emits exactly one terminal through its own boundary.
-        observe_process("kernel.process.request_received", "attempt");
+        observe_process_in_context(&context, "kernel.process.request_received", "attempt");
         let Ok((owner, expected_session_binding)) = super::caller_binding(session) else {
-            observe_process("kernel.process.request_rejected", "caller_unavailable");
+            observe_process_in_context(
+                &context,
+                "kernel.process.request_rejected",
+                "caller_unavailable",
+            );
             return ProcessExecutionResponse::Rejected(
                 eliot_kernel_service::ProcessExecutionRejection {
                     code: "AUTHENTICATED_CALLER_REQUIRED".to_owned(),
@@ -3249,7 +4130,11 @@ impl KernelComposition {
         )
         .is_err()
         {
-            observe_process("kernel.process.request_rejected", "session_mismatch");
+            observe_process_in_context(
+                &context,
+                "kernel.process.request_rejected",
+                "session_mismatch",
+            );
             return ProcessExecutionResponse::Rejected(
                 eliot_kernel_service::ProcessExecutionRejection {
                     code: "SESSION_BINDING_MISMATCH".to_owned(),
@@ -3268,7 +4153,11 @@ impl KernelComposition {
             let caller = match self.admitted_process_caller_session(session) {
                 Ok(caller) => caller,
                 Err(error) => {
-                    observe_process("kernel.process.request_rejected", "caller_session");
+                    observe_process_in_context(
+                        &context,
+                        "kernel.process.request_rejected",
+                        "caller_session",
+                    );
                     return ProcessExecutionResponse::Rejected(
                         eliot_kernel_service::ProcessExecutionRejection {
                             code: "ADMITTED_CALLER_SESSION_REQUIRED".to_owned(),
@@ -3283,12 +4172,21 @@ impl KernelComposition {
                 &owner,
                 admission.state_fence(),
             ) {
-                observe_process("kernel.process.request_rejected", "intent_session");
+                observe_process_in_context(
+                    &context,
+                    "kernel.process.request_rejected",
+                    "intent_session",
+                );
                 return ProcessExecutionResponse::Rejected(process_session_rejection(error));
             }
         }
+        record_process_request_context(&context, &request, &owner);
         let Some(gateway) = &self.process_gateway else {
-            observe_process("kernel.process.request_rejected", "authority_unavailable");
+            observe_process_in_context(
+                &context,
+                "kernel.process.request_rejected",
+                "authority_unavailable",
+            );
             return ProcessExecutionResponse::Rejected(
                 eliot_kernel_service::ProcessExecutionRejection {
                     code: "PROCESS_AUTHORITY_CONFIGURATION_REQUIRED".to_owned(),
@@ -3296,40 +4194,45 @@ impl KernelComposition {
                 },
             );
         };
-        observe_process("kernel.process.request_admitted", "success");
+        observe_process_in_context(&context, "kernel.process.request_admitted", "success");
         let result = match request {
             ProcessExecutionRequest::Start(admission) => {
                 // Material/Critical process start is fail-closed on the exact
                 // target fence before any external effect owner is entered.
-                let outer_binding =
-                    match self.reject_process_start_without_material_coverage(&admission) {
-                        Ok(outer_binding) => outer_binding,
-                        Err(rejection) => return ProcessExecutionResponse::Rejected(rejection),
-                    };
+                let outer_binding = match self
+                    .reject_process_start_without_material_coverage_in_context(&admission, &context)
+                {
+                    Ok(outer_binding) => outer_binding,
+                    Err(rejection) => return ProcessExecutionResponse::Rejected(rejection),
+                };
                 let proof = match self.retain_process_path_proof(&admission) {
                     Ok(proof) => proof,
                     Err(error) => {
-                        observe_process("kernel.process.request_rejected", "path_proof");
+                        observe_process_in_context(
+                            &context,
+                            "kernel.process.request_rejected",
+                            "path_proof",
+                        );
                         return ProcessExecutionResponse::Rejected(
                             eliot_kernel_service::ProcessExecutionRejection::from_error(&error),
                         );
                     }
                 };
                 gateway
-                    .start(&owner, admission, proof, outer_binding)
+                    .start_in_context(&owner, admission, proof, outer_binding, &context)
                     .await
                     .map(ProcessExecutionResponse::Started)
             }
             ProcessExecutionRequest::Inspect { operation_id } => gateway
-                .inspect(&owner, operation_id)
+                .inspect_in_context(&owner, operation_id, &context)
                 .await
                 .map(ProcessExecutionResponse::Status),
             ProcessExecutionRequest::Cancel { operation_id } => gateway
-                .cancel(&owner, operation_id)
+                .cancel_in_context(&owner, operation_id, &context)
                 .await
                 .map(ProcessExecutionResponse::Cancelled),
             ProcessExecutionRequest::Reconcile { operation_id } => gateway
-                .reconcile(&owner, operation_id)
+                .reconcile_in_context(&owner, operation_id, &context)
                 .await
                 .map(ProcessExecutionResponse::Reconciled),
         };
@@ -3337,7 +4240,7 @@ impl KernelComposition {
             // F-LOG-KERNEL-3 (#901): subordinate observation only; the
             // gateway boundary above owns the single terminal for the failed
             // operation (case 25 across propagation).
-            observe_process("kernel.process.request_failed", "rejected");
+            observe_process_in_context(&context, "kernel.process.request_failed", "rejected");
             ProcessExecutionResponse::Rejected(
                 eliot_kernel_service::ProcessExecutionRejection::from_error(&error),
             )
@@ -3502,8 +4405,9 @@ mod process_execution_diagnostics_tests {
         // foreign owner rejects with the exact contract error.
         let owner = test_owner(&"a".repeat(64));
         let foreign = test_owner(&"b".repeat(64));
-        assert!(authorize_process_owner(&owner, &owner).is_ok());
-        let rejected = authorize_process_owner(&owner, &foreign);
+        let context = crate::kernel_diagnostics::operation_context(None, None, None, None);
+        assert!(authorize_process_owner_in_context(&owner, &owner, &context).is_ok());
+        let rejected = authorize_process_owner_in_context(&owner, &foreign, &context);
         assert!(matches!(
             rejected,
             Err(ProcessExecutionError::Contract(

@@ -304,6 +304,39 @@
 //! by `improvement_intake_dispatch::enforce_advisory_class_gate` on the artifact
 //! this function is given, so it is not duplicated here.
 //!
+//! # Both terminal dispositions are handled, and which one is reachable
+//!
+//! The durable decision added here handles EVERY variant of
+//! [`eliot_maintenance::ImprovementTerminalDisposition`] — the admitted branch
+//! and every refused branch — through one producer, one commit, and one
+//! re-proving reader, with no branch-specific shortcut. Both arms this issue
+//! names are therefore live code and neither is unreachable by construction.
+//!
+//! Which of them can FIRE on today's tree is a separate fact, and it is stated
+//! here rather than left to a reader to infer:
+//!
+//! - `ImprovementTerminalDisposition::CanaryAdmitted` is produced ONLY by
+//!   `run_improvement_candidate_pipeline` reaching `check_evaluation_shape`, which
+//!   refuses every status but [`ImprovementEvidenceExecution::Executed`]. The
+//!   exact symbol that would produce that status on this path is
+//!   `route_activation_evidence`'s `execution` field
+//!   ([`ImprovementEvidenceExecution`]), and the owner that must fill it is the
+//!   Instrument verifier family `#20`/`#1111` — the crate whose evaluator
+//!   `eliot_verifier::evaluate_current` is. Filling it from this daemon would be
+//!   the party grading its own experiment.
+//! - `ImprovementTerminalDisposition::Rejected` is produced by
+//!   `admit_improvement_candidate_without_execution_evidence`, whose FIRST
+//!   refusal on this path is `PipelineError::MissingField("privacy_class")` from
+//!   `check_commitment_profile`. The exact symbol that would clear it is
+//!   `route_proposal`'s `privacy_class` field
+//!   ([`eliot_maintenance::ImprovementProposal::privacy_class`]), and the value
+//!   has to be an owner-issued classification of this proposal's inputs: the three
+//!   measured candidates are named above, and none of them is one.
+//!
+//! So the record this module commits is wired and exercised by BOTH dispositions
+//! the moment either prerequisite exists, and neither arm is stubbed to make that
+//! true. Neither prerequisite is fabricated here.
+//!
 //! # The daemon CONSUMES the handoff, so the daemon checks it
 //!
 //! The Governor crate checks the handoff's recorded wire revision where it
@@ -344,10 +377,12 @@
 //! - A `Candidate` row is read back EXHAUSTIVELY by
 //!   `improvement_dedup_read::read_candidate_scope`, whose `classify_row`
 //!   re-proves every document shape it accepts and REFUSES any other row of that
-//!   kind. The obligation is therefore the FOURTH shape that reader re-proves
-//!   (`classify_reconciliation_obligation`), in the same `DEDUP_SCOPE` the other
-//!   three land in. Writing it as an untaught fourth shape would have traded a
-//!   named debt for a pass whose deduplication read fails closed.
+//!   kind. The obligation is therefore one of the shapes that reader re-proves
+//!   (`classify_reconciliation_obligation`), in the same `DEDUP_SCOPE` the others
+//!   land in, and so is the terminal decision this module commits
+//!   (`classify_terminal_decision`). Writing either as an untaught shape would
+//!   have traded a named debt, or a recorded decision, for a pass whose
+//!   deduplication read fails closed.
 //! - Inventing a record kind, or opening a second read or write path for the
 //!   obligation, is exactly the second owner this module does not add.
 //!
@@ -355,6 +390,55 @@
 //! effect outcome, no receipt, no permit and no authority, because this daemon
 //! holds none. The effect OWNER is still the absent half, and that — not a
 //! missing call — is what keeps the debt open.
+//!
+//! # Every terminal disposition is now durable, and that is what was missing
+//!
+//! Until this module existed, ONE terminal outcome had a durable record:
+//! `UnknownRequiresReconciliation`, through [`commit_unknown_effect_obligation`].
+//! A `Rejected`, `CanaryAdmitted`, `Inconclusive`, `RegressionRejected`,
+//! `NoProgress` or `Blocked` decision left no trace once the pass ended, so
+//! "this candidate was refused" and "this candidate was admitted for one bounded
+//! canary handoff" were both unrecorded facts about the live system.
+//!
+//! [`commit_improvement_terminal_decision`] closes that. The record is the
+//! Governor OWNER's own [`eliot_maintenance::ImprovementTerminalDecision`],
+//! built by the owner's own [`eliot_maintenance::improvement_terminal_decision`]
+//! from the same proposal, plan, activation evidence and disposition this module
+//! already assembled, so the durable bytes and the decision the pass reported are
+//! one record rather than two shapes that could drift apart.
+//!
+//! What it binds is the point: the candidate identity AND the candidate revision
+//! the decision was made on, the exact bounded experiment, the exact committed
+//! proposal bytes when the run reached the admitted branch, and the independent
+//! evaluation record the verdict was made against. Both terminal dispositions
+//! this issue names are bound the same way, by the same code, with no
+//! branch-specific shortcut — there is one arm per disposition variant and both
+//! named arms are live.
+//!
+//! # The refusals this seam adds are refusals, and they are typed
+//!
+//! Four things must never degrade into a decision here, and each one is a typed
+//! [`eliot_maintenance::UnboundDecisionRecord`] that writes nothing:
+//!
+//! 1. a MISSING EXPERIMENT RECORD — a disposition whose bounded experiment is
+//!    absent, or whose evaluation is bound to a different candidate or
+//!    experiment, is not a decision about this candidate's experiment;
+//! 2. a VERDICT WITHOUT ITS EVALUATION RECORD — the admitted branch arriving with
+//!    no evaluation record, or with one that never executed, is not independent,
+//!    or did not pass, cannot be a canary admission, and is refused rather than
+//!    downgraded to a rejection or treated as a canary;
+//! 3. A VERDICT THAT DISAGREES WITH THE RECORDED EVIDENCE — a refused branch
+//!    carrying committed proposal bytes, or an admitted handoff that disagrees
+//!    with the record about the candidate, the experiment, the operation, or the
+//!    commitment, is a spliced document;
+//! 4. a STALE CANDIDATE REVISION — a decision whose revision is no longer the
+//!    candidate's own revision was made about content that has since moved, and
+//!    it is refused rather than re-stamped onto the live revision.
+//!
+//! None of the four is a default, a skip, or a "treat as canary". The last one
+//! is checked against the live artifact at the commit seam because that is the
+//! only point where this daemon holds both the decision and the candidate record
+//! the revision is compared against.
 //!
 //! # No second owner, store, digest or write path
 //!
@@ -364,18 +448,20 @@
 //! and starts no flight. It adds no scheduler, no maintenance owner and no
 //! dependency, and it has no blocking `attach_*` call.
 //!
-//! The ONE write it performs is [`commit_unknown_effect_obligation`], and it
-//! writes through the same single Governor-owned seam every other durable
+//! The writes it performs are [`commit_unknown_effect_obligation`] and
+//! [`commit_improvement_terminal_decision`], and they write through the same
+//! single Governor-owned seam every other durable
 //! improvement record uses — [`crate::DaemonComposition::commit_learning_record`]
 //! over the closed `RecordLearningRecord` mutation, in the same Governor scope
 //! and the same closed `candidate` record kind as the candidate artifact, the
 //! archive receipts and the lineage-merge receipts
 //! (`improvement_intake_dispatch`). No store client is opened here and no
-//! operation is invented. It exists because an unresolved external effect is
-//! otherwise a debt that lives only in this pass: the record it writes is the
-//! named debt's durable, reviewable form, and it carries no permit, no outcome,
-//! and no authority — nothing about it promotes, activates, installs,
-//! completes, or issues authority.
+//! operation is invented. The obligation record exists because an unresolved
+//! external effect is otherwise a debt that lives only in this pass, and the
+//! terminal-decision record exists because a decision nobody can read back is not
+//! a reviewable decision; both carry no permit, no outcome, and no authority —
+//! nothing about either promotes, activates, installs, completes, or issues
+//! authority.
 //!
 //! Durability of the artifact the route reads stays with the existing
 //! [`crate::DaemonComposition::commit_learning_record`] seam in
@@ -490,8 +576,9 @@ use eliot_maintenance::{
     IMPROVEMENT_RISK_CEILING_BOUNDED, ImprovementAdmissionPolicy, ImprovementCandidateView,
     ImprovementEvidenceExecution, ImprovementEvidenceView, ImprovementOperation,
     ImprovementProposal, ImprovementPulseOutcome, ImprovementReplayAssessment,
-    ImprovementTerminalDisposition, MechanismDeclaration, PipelineError, RollbackContract,
-    admit_improvement_candidate_without_execution_evidence,
+    ImprovementTerminalDecision, ImprovementTerminalDisposition, MechanismDeclaration,
+    PipelineError, RollbackContract, admit_improvement_candidate_without_execution_evidence,
+    improvement_terminal_decision,
 };
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::RequestBinding;
@@ -608,6 +695,23 @@ pub struct ImprovementRouteOutcome {
     /// recorded or retried: nothing here attaches an owner outcome, and nothing
     /// decides a retry this daemon is not already told about.
     pub effect: ImprovementEffectState,
+    /// The durable identity of THIS disposition, built by the Governor owner from
+    /// the same checked records the disposition came from.
+    ///
+    /// This is the record a later pass reads after this process is gone, and it is
+    /// the only place the terminal decision is bound to the candidate identity
+    /// AND the candidate revision it was made on. It is produced by
+    /// [`eliot_maintenance::improvement_terminal_decision`] — the owner's own
+    /// producer — from the proposal, the plan, the activation evidence and the
+    /// disposition this same call produced, so a decision can never be recorded
+    /// against records other than the ones it was made from.
+    ///
+    /// The build is a checked seam, not an assignment: a missing bounded
+    /// experiment, a verdict with no evaluation record behind it, or a verdict
+    /// that disagrees with the evidence this run recorded is a typed
+    /// [`eliot_maintenance::UnboundDecisionRecord`] that refuses the whole route,
+    /// so a record is never written for a decision this daemon cannot re-prove.
+    pub decision: ImprovementTerminalDecision,
     /// The ADMITTING pipeline's own typed refusal, when it refused.
     ///
     /// `run_improvement_candidate_pipeline` is the only path that can reach
@@ -802,13 +906,19 @@ pub fn dispatch_improvement_candidate_route(
         dispatch.retained,
         dispatch.observed_closure,
     );
+    // The activation evidence is bound ONCE, for the same reason the other four
+    // records are: the durable decision this pass produces has to name the very
+    // evaluation the pipeline judged, and a second construction could disagree
+    // with the one the pipeline actually read. Binding it here makes the request,
+    // the decision record, and the committed bytes one value.
+    let activation_evidence = route_activation_evidence(candidate, &owners);
     // The ADMITTING path runs first and stays the primary one: it is the only
     // call that can reach `CanaryAdmitted`, and its typed refusal is a fact
     // about this pass rather than something to be resolved away.
     let admitting = route_improvement_candidate(ImprovementRouteRequest {
         proposal: &proposal,
         experiment: &experiment,
-        evidence: &route_activation_evidence(candidate, &owners),
+        evidence: &activation_evidence,
         rollback: &route_rollback_contract(candidate, &owners),
         candidate: &candidate_view,
         admission_evidence: &admission_evidence,
@@ -873,12 +983,32 @@ pub fn dispatch_improvement_candidate_route(
     // owner-settled receipt exists; recording it is what makes that denial
     // visible on the live pass instead of an unexamined omission.
     let effect = read_improvement_effect_state(&disposition);
+    // The durable identity of the decision this pass actually produced. It is
+    // built AFTER the effect read so it names the disposition this call returned
+    // rather than an intermediate one, and it is built from the checked current
+    // record this same call read out of the handoff — so `proposal_commitment` is
+    // present exactly when the pipeline published one.
+    //
+    // A refusal here refuses the ROUTE: the disposition is not returned, no record
+    // is committed for it, and nothing downstream reads it as an admission. That
+    // is the fail-closed direction, and it is a typed owner refusal rather than a
+    // default disposition, a skipped commit, or a treated-as-canary.
+    let decision = improvement_terminal_decision(
+        candidate.candidate_id.as_str(),
+        candidate.revision,
+        &proposal,
+        &experiment,
+        &activation_evidence,
+        current.as_ref(),
+        &disposition,
+    )?;
     Ok(ImprovementRouteOutcome {
         disposition,
         experiment,
         repeat,
         retained_next,
         effect,
+        decision,
         admitting_pipeline_refusal,
     })
 }
@@ -989,6 +1119,162 @@ pub async fn commit_unknown_effect_obligation(
             ))
         })?;
     Ok(Some(receipt))
+}
+
+/// Makes one terminal disposition durable, bound to its candidate identity and
+/// candidate revision.
+///
+/// # Why this commit exists
+///
+/// Until it existed, exactly ONE terminal outcome on this route had a durable
+/// record: `UnknownRequiresReconciliation`, through
+/// [`commit_unknown_effect_obligation`]. A `Rejected`, `CanaryAdmitted`,
+/// `Inconclusive`, `RegressionRejected`, `NoProgress` or `Blocked` decision — the
+/// ordinary outcomes, including the two this issue names — left no trace at all
+/// once the pass ended. A path that cannot say what it decided is a path whose
+/// rejection cannot be reviewed, and whose admission cannot be handed on.
+///
+/// # The record is the OWNER's, not a daemon-local restatement
+///
+/// The committed document is the Governor owner's own
+/// [`eliot_maintenance::ImprovementTerminalDecision`], built by
+/// [`eliot_maintenance::improvement_terminal_decision`] in
+/// [`dispatch_improvement_candidate_route`] from the proposal, the bounded plan,
+/// the activation evidence and the disposition that call returned, and re-proved
+/// by that same owner's [`ImprovementTerminalDecision::validate`]. The disposition
+/// travels inside it verbatim, so the durable bytes and the decision the pass
+/// reported are one record rather than two that could disagree.
+///
+/// # The stale candidate revision is a refusal, not a skip
+///
+/// The candidate revision advances when the deduplication registry merges a new
+/// evidence lineage into this candidate. A decision whose revision is no longer
+/// the candidate's own revision was made about content that has since moved, so
+/// this seam REFUSES it: it commits nothing, and the disposition it belonged to
+/// is never recorded as a current decision. Nothing is re-spelled to the live
+/// revision, because a decision re-stamped onto content it did not judge is
+/// precisely the silent substitution this seam exists to prevent.
+///
+/// # What the record does NOT carry
+///
+/// No permit, no authority, no effect outcome, no receipt, and no activation. A
+/// `CanaryAdmitted` decision in this record still carries
+/// `execution_authorized == false` and still names the Kernel `#11` owner that
+/// must authorize and execute activation independently; it is a handoff, not an
+/// activation. The retry and completion booleans are the Governor owner's own
+/// answers, and the owner outcome behind them stays private to the owner crate.
+pub async fn commit_improvement_terminal_decision(
+    composition: &mut DaemonComposition,
+    artifact: &ImprovementArtifact,
+    decision: &ImprovementTerminalDecision,
+    state_fence: &StateFence,
+) -> Result<Option<WriteReceipt>, ImprovementDispatchError> {
+    // Re-proved here as well as at the producer: the record crosses a process
+    // boundary on its way into the store, and this is the last point at which a
+    // refusal can still mean "nothing was written".
+    decision.validate()?;
+    if decision.candidate_revision != artifact.candidate.revision {
+        return Err(ImprovementDispatchError::Decision(
+            eliot_maintenance::UnboundDecisionRecord::UnverifiableVerdict {
+                relation: "decision-record: candidate-revision-is-stale",
+            },
+        ));
+    }
+    // The Governor owner's OWN two answers about this disposition, read back through
+    // the single projection every dispatched route step uses, so the committed
+    // record and the pass's own view cannot drift apart silently.
+    let effect = read_improvement_effect_state(&decision.disposition);
+    let record = serde_json::json!({
+        "improvement_terminal_decision": decision,
+        "retry_permitted": effect.retry_permitted,
+        "completion_retained": effect.completion_retained,
+    });
+    let record_bytes = canonical_json_bytes(&record)
+        .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))?;
+    let record_json = String::from_utf8(record_bytes)
+        .map_err(|_| ImprovementDispatchError::Contract("record is not utf-8".to_owned()))?;
+    let record_digest = eliot_contracts::sha256_hex(record_json.as_bytes());
+    let scope_digest = eliot_contracts::sha256_hex(RECONCILIATION_SCOPE.as_bytes());
+    let fence_digest = eliot_contracts::sha256_hex(format!("{state_fence:?}").as_bytes());
+    let record_key = terminal_decision_record_key(decision)?;
+    let request = learning_record_mutation_request(learning_record_commit_params(
+        LearningRecordKind::Candidate,
+        record_key.clone(),
+        record_json,
+        record_digest,
+        scope_digest,
+        fence_digest,
+        record_key.clone(),
+    ));
+    let identity = reconciliation_commit_identity(&record_key, state_fence)?;
+    let scope = ScopeId::new(RECONCILIATION_SCOPE)
+        .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))?;
+    let (receipt, _effective) = composition
+        .commit_learning_record(
+            &identity,
+            request,
+            scope,
+            artifact.candidate.evidence_refs.clone(),
+            None,
+            false,
+            false,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .map_err(|error| {
+            ImprovementDispatchError::Commit(format!(
+                "the terminal improvement decision on candidate {} revision {} could not be made \
+                 durable: {error}",
+                decision.candidate_id, decision.candidate_revision
+            ))
+        })?;
+    Ok(Some(receipt))
+}
+
+/// Derives the closed store handle of one durable terminal decision.
+///
+/// # The key names the DECISION, on the candidate revision it was made on
+///
+/// The candidate id and its revision are in the clear prefix, so a reader — and
+/// the dedup read that re-proves these rows — can tell at a glance which
+/// candidate revision a decision belongs to, and two decisions on two revisions
+/// of one candidate never collide.
+///
+/// The rest folds the WHOLE Governor-owned decision record. That makes an exact
+/// replay of the same decision on the same revision converge on one durable
+/// record instead of appending a duplicate, exactly as folding the unknown-effect
+/// obligation does. It also means a DIFFERENT decision on the same revision — a
+/// different disposition, a different committed commitment, a different
+/// evaluation — is its own record rather than a second document that reuses the
+/// first decision's bindings, because the store arbitrates by idempotency key
+/// first and refuses changed content under a retained key.
+///
+/// # Why a digest rather than the identity spelled inline
+///
+/// The store bounds this handle and the idempotency key it doubles as at
+/// `MAX_LEARNING_HANDLE_BYTES`, and a decision carries a whole
+/// [`eliot_maintenance::ImprovementTerminalDisposition`] — including a
+/// [`eliot_maintenance::ImprovementCanaryHandoff`] on the admitted branch — whose
+/// references are unbounded owner text. Spelling them inline could push an honest
+/// record's key past the bound. A canonical digest is deterministic, adds no
+/// nonce, clock read or counter, and is the same derivation this commit already
+/// performs for its `scope_digest` and `fence_digest`.
+fn terminal_decision_record_key(
+    decision: &ImprovementTerminalDecision,
+) -> Result<String, ImprovementDispatchError> {
+    let identity = serde_json::json!({
+        "improvement_terminal_decision": decision,
+    });
+    let decision_digest = eliot_contracts::sha256_hex(
+        &canonical_json_bytes(&identity)
+            .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))?,
+    );
+    let candidate_id = decision.candidate_id.trim();
+    Ok(format!(
+        "improvement-decision:{candidate_id}:r{}:{decision_digest}",
+        decision.candidate_revision
+    ))
 }
 
 /// The closed store handle and idempotency key of one reconciliation record.

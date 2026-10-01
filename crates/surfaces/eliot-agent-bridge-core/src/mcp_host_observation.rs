@@ -42,6 +42,20 @@
 //! #2899 item 4) to the event. A host integration that mints its scope from
 //! anything else closes nothing, which is the intended fail-closed direction:
 //! the correlation stays pending rather than borrowing a foreign observation.
+//!
+//! The correlation's OWNER-ISSUED operation values — the owner's operation
+//! handle, the owner's commitment to the request's identity, and the owner's
+//! effect class (see `crate::mcp_correlation::CorrelationIdentity`) — are
+//! deliberately neither read from nor matched against a host event here. A host
+//! integration observes an invocation, not a canonical operation: it never sees
+//! the owner's `operation_id`, its idempotency key, its bound state fence, or
+//! its effect class, so a host event could only ever restate them by accident or
+//! by copying. Those three values are therefore owner-side only, bound from the
+//! owner's own receipt by
+//! `crate::mcp_correlation::OwnerValidatedOperationBinding::from_owner_receipt`
+//! and verified against the correlation's own record by
+//! `crate::mcp_correlation::identity_commits_to_operation`; this adapter attests
+//! host terminal state and nothing about canonical operation identity.
 
 use crate::host_event::ToolOutcomeClass;
 use crate::{HostEventEnvelope, NormalizedHostEventPayload, ProviderObservationLineage};

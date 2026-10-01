@@ -21,8 +21,10 @@ use eliot_instrument_api::{
     BuildClass, InstrumentAdmissionGrant, InstrumentAdmissionRequest, InstrumentKind,
 };
 use eliot_instrument_cargo::CONTRACT_NAME as CARGO_CONTRACT_NAME;
-use eliot_instrument_nextest::{MAX_NEXTEST_OUTPUT_BYTES, NEXTEST_INSTRUMENT};
-use eliot_instrument_rustc::{MAX_RUSTC_OUTPUT_BYTES, RUSTC_EXECUTABLE, RUSTC_INSTRUMENT};
+use eliot_instrument_nextest::{
+    MAX_NEXTEST_OUTPUT_BYTES, NEXTEST_INSTRUMENT, NEXTEST_LIBTEST_JSON_FORMAT_VERSION,
+};
+use eliot_instrument_rustc::{MAX_RUSTC_OUTPUT_BYTES, RUSTC_INSTRUMENT};
 use eliot_instrument_rustfmt::{MAX_RUSTFMT_OUTPUT_BYTES, RUSTFMT_INSTRUMENT};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -78,6 +80,15 @@ pub const ISOLATED_NETWORK_POLICY: &str = "eliot.policy.network.isolated-process
 /// it with its own semaphore and circuit state. A system-wide pool never
 /// overrides the module limit, so no global pool exists here.
 pub const BUILTIN_MAX_CONCURRENCY: u32 = 1;
+/// Environment variable naming the tool's executable search path.
+///
+/// A real verification command locates its own companion tools (the `rustc`
+/// a `cargo` build drives, a build script's interpreter) through this value,
+/// so it is declared explicitly on the projection rather than inherited from
+/// the ambient process: I18.21:10 makes every environment difference an
+/// explicit declared dependency instead of an invisible ambient fact, and
+/// `EnvironmentInheritance::None` is kept so no other variable leaks in.
+pub const TOOLCHAIN_PATH_ENV: &str = "PATH";
 /// Stable schema name of the canonical registry snapshot.
 pub const REGISTRY_SNAPSHOT_SCHEMA: &str = "eliot.instrument.registry-snapshot";
 /// Exact schema wire version of the canonical registry snapshot.
@@ -413,6 +424,17 @@ pub struct InstrumentSpecParams {
     /// Fixed command template; empty when the manifest declares none, in
     /// which case only the empty argument vector is admitted.
     pub argument_template: Vec<String>,
+    /// The real verification argv this kind runs, declared by the spec that
+    /// owns it.
+    ///
+    /// `argument_template` bounds what a CALLER may request; it admits only
+    /// the empty vector for every builtin. This field is the complementary
+    /// half: the argv the admitted profile revision actually executes. It is
+    /// declared here, on the one admitted-spec registry that both a local
+    /// entrypoint and CI resolve, rather than in a second command list beside
+    /// it, and it is bound into [`InstrumentSpec::digest`] like every other
+    /// admitted field.
+    pub verification_command: Vec<String>,
     /// Admitted credential policy identity.
     pub credential_policy: ContractId,
     /// Admitted network policy identity.
@@ -456,6 +478,16 @@ pub struct InstrumentSpec {
     pub schema: ContractId,
     /// Fixed command template; empty admits only the empty argument vector.
     pub argument_template: Vec<String>,
+    /// The real verification argv this kind runs, declared by this spec.
+    ///
+    /// The admitted argv a launched stage runs, as opposed to
+    /// [`Self::argument_template`], which is the fixed template a caller's
+    /// own arguments must equal. An empty verification command is refused at
+    /// construction rather than shipped: a kind that performs real package
+    /// verification runs its tool with the arguments that ARE the
+    /// verification, and a tool invoked with none is help/version output, not
+    /// a compilation.
+    pub verification_command: Vec<String>,
     /// Admitted credential policy identity.
     pub credential_policy: ContractId,
     /// Admitted network policy identity.
@@ -483,6 +515,14 @@ impl InstrumentSpec {
         for argument in &params.argument_template {
             validate_text(argument, "argument_template")?;
         }
+        for argument in &params.verification_command {
+            validate_text(argument, "verification_command")?;
+        }
+        if params.verification_command.is_empty() {
+            return Err(ProfileError::InvalidText {
+                field: "verification_command",
+            });
+        }
         Ok(Self {
             kind: params.kind,
             class: params.class,
@@ -494,6 +534,7 @@ impl InstrumentSpec {
             environment_profile: params.environment_profile,
             schema: params.schema,
             argument_template: params.argument_template,
+            verification_command: params.verification_command,
             credential_policy: params.credential_policy,
             network_policy: params.network_policy,
             limits: params.limits,
@@ -509,7 +550,7 @@ impl InstrumentSpec {
     /// Deterministic identity over every spec field.
     pub fn digest(&self) -> String {
         let material = format!(
-            "{}\0{:?}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            "{}\0{:?}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
             self.kind.digest(),
             self.class,
             self.revision,
@@ -520,6 +561,7 @@ impl InstrumentSpec {
             self.environment_profile,
             self.schema.as_str(),
             self.argument_template.join("\0"),
+            self.verification_command.join("\0"),
             self.credential_policy.as_str(),
             self.network_policy.as_str(),
             self.limits.digest(),
@@ -889,15 +931,53 @@ impl InstrumentProfile {
 /// authority, the isolated-process environment/credential/network classes,
 /// and the adapter's real capture bound where the adapter defines one (the
 /// cargo adapter defines none, so its ceiling stays with the
-/// composition-root port). No fixed command template is declared, so the
-/// shared gate admits only the empty invocation argument vector for
-/// builtins; a manifest that needs further arguments admits them as an
-/// exact fixed template. No machine observation exists at registry
-/// construction, so builtins ship no supply-chain receipt and pin no tool
-/// version.
+/// composition-root port). Each spec ALSO declares its
+/// [`InstrumentSpec::verification_command`]: the real verification argv the
+/// profile revision executes. That declaration is what an empty
+/// `argument_template` no longer costs a stage. `argument_template` stays
+/// empty for every builtin, so a CALLER still can contribute only the empty
+/// argument vector; what changed is that the registry itself now names the
+/// command, on the same admitted spec both a local entrypoint and CI resolve
+/// (I18.21:11), instead of the execution path inventing one beside the
+/// registry.
+///
+/// The declared commands are each admitted kind's real verification
+/// projection, taken from the crate that owns that instrument rather than
+/// restated here, and each is an argument vector FOR the executable the same
+/// spec admits, so a sealed request is always `<declared executable> +
+/// <declared command>`:
+///
+/// - cargo: `cargo build --message-format=json ...`, the Cargo
+///   `--message-format=json` stream the admitted parser projects;
+/// - rustc: `cargo clippy --message-format=json ...`, the Clippy stream
+///   [`eliot_instrument_rustc::parse_clippy_jsonl`] is the admitted parser
+///   for, matching the Clippy-performs-the-compilation rule `dev-fast` states;
+/// - nextest: `cargo nextest run --message-format libtest-json-plus ...`,
+///   the exact argument spine [`eliot_instrument_nextest::NextestCommand`]
+///   renders;
+/// - rustfmt: `cargo fmt --all -- --check`, the exact command
+///   [`eliot_instrument_rustfmt::RustfmtCommand::check`] renders.
+///
+/// `--locked` is on every Cargo invocation because I18.21 and I2.22 make a
+/// locked resolution the precondition for a verification result, and
+/// `--all-targets` is on the two builds and the test run because the
+/// `MergeCompile` ceiling compiles every target. No machine observation exists
+/// at registry construction, so builtins ship no supply-chain receipt and
+/// pin no tool version.
 pub fn builtin_specs() -> Result<Vec<InstrumentSpec>, ProfileError> {
     let credential = ContractId::new(ISOLATED_CREDENTIAL_POLICY)?;
     let network = ContractId::new(ISOLATED_NETWORK_POLICY)?;
+    // The two compilation projections share one locked all-target build spine;
+    // only the JSON message format and the subcommand differ, because those
+    // are what select the admitted parser.
+    let build_spine = |subcommand: &str| {
+        vec![
+            subcommand.to_owned(),
+            "--message-format=json".to_owned(),
+            "--locked".to_owned(),
+            "--all-targets".to_owned(),
+        ]
+    };
     Ok(vec![
         InstrumentSpec::new(InstrumentSpecParams {
             kind: InstrumentKindId::new(
@@ -913,6 +993,7 @@ pub fn builtin_specs() -> Result<Vec<InstrumentSpec>, ProfileError> {
             environment_profile: ISOLATED_PROCESS_CLASS.to_owned(),
             schema: ContractId::new(CARGO_CONTRACT_NAME)?,
             argument_template: Vec::new(),
+            verification_command: build_spine("build"),
             credential_policy: credential.clone(),
             network_policy: network.clone(),
             limits: ResourceLimits::new(None, None),
@@ -922,13 +1003,23 @@ pub fn builtin_specs() -> Result<Vec<InstrumentSpec>, ProfileError> {
             kind: InstrumentKindId::new(ContractId::new(RUSTC_INSTRUMENT)?, BUILTIN_KIND_VERSION)?,
             class: InstrumentClass::Compiler,
             revision: BUILTIN_SPEC_VERSION,
-            executable: RUSTC_EXECUTABLE.to_owned(),
+            // The compilation runs through the cargo subcommand surface of the
+            // same toolchain whose `rustc` is the semantic subject: I18.6 says
+            // "Clippy performs the same compilation" and I18.33 names
+            // "exact-package Cargo check or Clippy". Naming `rustc` here while
+            // declaring a cargo subcommand would seal `rustc clippy ...`, which
+            // is not a compilation, so the admitted executable is the one the
+            // declared command is an argument vector for.
+            executable: "cargo".to_owned(),
             executable_version: None,
             parser: ContractId::new(RUSTC_INSTRUMENT)?,
             parser_generation: BUILTIN_PARSER_GENERATION,
             environment_profile: ISOLATED_PROCESS_CLASS.to_owned(),
             schema: ContractId::new(RUSTC_INSTRUMENT)?,
             argument_template: Vec::new(),
+            // The admitted parser is the Clippy JSON stream, and this is the
+            // one command that produces it.
+            verification_command: build_spine("clippy"),
             credential_policy: credential.clone(),
             network_policy: network.clone(),
             limits: ResourceLimits::new(None, Some(MAX_RUSTC_OUTPUT_BYTES as u64)),
@@ -948,31 +1039,66 @@ pub fn builtin_specs() -> Result<Vec<InstrumentSpec>, ProfileError> {
             environment_profile: ISOLATED_PROCESS_CLASS.to_owned(),
             schema: ContractId::new(NEXTEST_INSTRUMENT)?,
             argument_template: Vec::new(),
+            // `cargo nextest` is the admitted executable's subcommand surface,
+            // and the argument spine is the one
+            // `eliot_instrument_nextest::NextestCommand` renders, so the
+            // libtest-json-plus stream the admitted nextest parser reads is
+            // the one this command produces.
+            verification_command: vec![
+                "nextest".to_owned(),
+                "run".to_owned(),
+                "--message-format".to_owned(),
+                "libtest-json-plus".to_owned(),
+                // The admitted parser reads exactly this message-format version.
+                "--message-format-version".to_owned(),
+                NEXTEST_LIBTEST_JSON_FORMAT_VERSION.to_owned(),
+                "--locked".to_owned(),
+                "--all-targets".to_owned(),
+            ],
             credential_policy: credential.clone(),
             network_policy: network.clone(),
             limits: ResourceLimits::new(None, Some(MAX_NEXTEST_OUTPUT_BYTES as u64)),
             max_concurrency: BUILTIN_MAX_CONCURRENCY,
         })?,
-        InstrumentSpec::new(InstrumentSpecParams {
-            kind: InstrumentKindId::new(
-                ContractId::new(RUSTFMT_INSTRUMENT)?,
-                BUILTIN_KIND_VERSION,
-            )?,
-            class: InstrumentClass::Formatter,
-            revision: BUILTIN_SPEC_VERSION,
-            executable: "cargo".to_owned(),
-            executable_version: None,
-            parser: ContractId::new(RUSTFMT_INSTRUMENT)?,
-            parser_generation: BUILTIN_PARSER_GENERATION,
-            environment_profile: ISOLATED_PROCESS_CLASS.to_owned(),
-            schema: ContractId::new(RUSTFMT_INSTRUMENT)?,
-            argument_template: Vec::new(),
-            credential_policy: credential.clone(),
-            network_policy: network.clone(),
-            limits: ResourceLimits::new(None, Some(MAX_RUSTFMT_OUTPUT_BYTES as u64)),
-            max_concurrency: BUILTIN_MAX_CONCURRENCY,
-        })?,
+        builtin_rustfmt_spec(&credential, &network)?,
     ])
+}
+
+/// The builtin `formatter` profile: metadata plus exactly the command
+/// [`eliot_instrument_rustfmt::RustfmtCommand::check`] renders.
+///
+/// Kept beside the registry rather than inline in it so the declared argv and
+/// the ceiling that bounds its output are read together.
+///
+/// # Errors
+///
+/// Returns the profile error when a contract id or resource limit is invalid.
+fn builtin_rustfmt_spec(
+    credential: &ContractId,
+    network: &ContractId,
+) -> Result<InstrumentSpec, ProfileError> {
+    InstrumentSpec::new(InstrumentSpecParams {
+        kind: InstrumentKindId::new(ContractId::new(RUSTFMT_INSTRUMENT)?, BUILTIN_KIND_VERSION)?,
+        class: InstrumentClass::Formatter,
+        revision: BUILTIN_SPEC_VERSION,
+        executable: "cargo".to_owned(),
+        executable_version: None,
+        parser: ContractId::new(RUSTFMT_INSTRUMENT)?,
+        parser_generation: BUILTIN_PARSER_GENERATION,
+        environment_profile: ISOLATED_PROCESS_CLASS.to_owned(),
+        schema: ContractId::new(RUSTFMT_INSTRUMENT)?,
+        argument_template: Vec::new(),
+        verification_command: vec![
+            "fmt".to_owned(),
+            "--all".to_owned(),
+            "--".to_owned(),
+            "--check".to_owned(),
+        ],
+        credential_policy: credential.clone(),
+        network_policy: network.clone(),
+        limits: ResourceLimits::new(None, Some(MAX_RUSTFMT_OUTPUT_BYTES as u64)),
+        max_concurrency: BUILTIN_MAX_CONCURRENCY,
+    })
 }
 
 /// Builds the builtin `compiler` profile: metadata, then the exact build.
@@ -1636,6 +1762,7 @@ fn rebuild_spec(spec: InstrumentSpec) -> Result<InstrumentSpec, ProfileError> {
         environment_profile: spec.environment_profile,
         schema: spec.schema,
         argument_template: spec.argument_template,
+        verification_command: spec.verification_command,
         credential_policy: spec.credential_policy,
         network_policy: spec.network_policy,
         limits: spec.limits,
@@ -2019,6 +2146,13 @@ pub struct AdmittedStage {
     pub supply_receipt: Option<SupplyChainReceipt>,
     /// Fixed command template; empty admits only the empty argument vector.
     pub argument_template: Vec<String>,
+    /// The real verification argv this stage runs, carried from the bound
+    /// spec's [`InstrumentSpec::verification_command`].
+    ///
+    /// This is the argv the process grant seals, so it is compiled into the
+    /// stage exactly as `argument_template` is: a stage cannot be launched
+    /// under an argv the admitted spec did not declare.
+    pub verification_command: Vec<String>,
     /// Invocation schema authority.
     pub schema: ContractId,
     /// Admitted environment class.
@@ -2590,6 +2724,7 @@ impl<'a> ProfileCompiler<'a> {
                 executable_version: spec.executable_version.clone(),
                 supply_receipt,
                 argument_template: spec.argument_template.clone(),
+                verification_command: spec.verification_command.clone(),
                 schema: spec.schema.clone(),
                 environment_class: spec.environment_profile.clone(),
                 credential_policy: spec.credential_policy.clone(),

@@ -1905,16 +1905,26 @@ fn test_eliotd_live_receipt(
 #[cfg(windows)]
 #[test]
 fn eliotd_receipt_replay_and_renewal_require_exact_operation_lineage() {
+    let context = crate::kernel_diagnostics::operation_context(None, None, None, None);
     let first = test_eliotd_live_receipt(1, &"b".repeat(64), "daemon-ready-1");
     assert_eq!(
-        classify_eliotd_live_receipt_transition(&first, &first, false, None, None)
-            .expect("exact response-loss replay"),
+        crate::daemon_supervision::classify_eliotd_live_receipt_transition_in_context(
+            &context, &first, &first, false, None, None,
+        )
+        .expect("exact response-loss replay"),
         EliotdLiveReceiptDisposition::ExactReplay
     );
     let foreign_request = test_eliotd_live_receipt(1, &"b".repeat(64), "daemon-ready-foreign");
     assert!(
-        classify_eliotd_live_receipt_transition(&first, &foreign_request, false, None, None,)
-            .is_err()
+        crate::daemon_supervision::classify_eliotd_live_receipt_transition_in_context(
+            &context,
+            &first,
+            &foreign_request,
+            false,
+            None,
+            None,
+        )
+        .is_err()
     );
 
     let renewed = test_eliotd_live_receipt(2, &"c".repeat(64), "daemon-ready-1");
@@ -1927,15 +1937,29 @@ fn eliotd_receipt_replay_and_renewal_require_exact_operation_lineage() {
         previous_receipt_sha256: Some(first.supervision.receipt_sha256.clone()),
     };
     assert_eq!(
-        classify_eliotd_live_receipt_transition(&first, &renewed, true, None, Some(&successor),)
-            .expect("exact ORS renewal predecessor"),
+        crate::daemon_supervision::classify_eliotd_live_receipt_transition_in_context(
+            &context,
+            &first,
+            &renewed,
+            true,
+            None,
+            Some(&successor),
+        )
+        .expect("exact ORS renewal predecessor"),
         EliotdLiveReceiptDisposition::ReplaceRenewalPredecessor
     );
     let mut substituted = successor;
     substituted.previous_receipt_sha256 = Some("d".repeat(64));
     assert!(
-        classify_eliotd_live_receipt_transition(&first, &renewed, true, None, Some(&substituted),)
-            .is_err()
+        crate::daemon_supervision::classify_eliotd_live_receipt_transition_in_context(
+            &context,
+            &first,
+            &renewed,
+            true,
+            None,
+            Some(&substituted),
+        )
+        .is_err()
     );
 }
 
@@ -2347,7 +2371,11 @@ async fn authenticated_handshake_fences_ready_without_production_supervision_dep
     let wait_receipt = receipt.clone();
     let waiter = tokio::spawn(async move {
         wait_kernel
-            .await_daemon_ready(&wait_receipt, Duration::from_millis(50))
+            .await_daemon_ready(
+                &wait_receipt,
+                Duration::from_millis(50),
+                &tracing::Span::none(),
+            )
             .await
     });
     tokio::task::yield_now().await;
@@ -3132,13 +3160,25 @@ async fn daemon_readiness_requires_fresh_running_executor_receipt() {
         state.receipt = Some(receipt.clone());
     }
 
-    let inspection = gateway.inspect_exact_running_receipt(&receipt).await;
+    let context = ProcessExecutionGateway::operation_context_for(&owner, receipt.operation_id());
+    let inspection = gateway
+        .inspect_exact_running_receipt_in_context(&receipt, &context)
+        .await;
     assert!(
         inspection.is_ok(),
         "gateway exact inspection must accept the live receipt: {inspection:?}"
     );
+    // #901 renamed this boundary to `validate_daemon_process_readiness_in_context`
+    // and gave it the operation span plus an explicit terminal-ownership flag.
+    // `context` above is the operation context production derives for this exact
+    // owner and operation. `true` declares that THIS call site owns the single
+    // terminal for a rejection, which is what the assertions below require: the
+    // rejected leg proves the rejection is terminal (`!daemon_ready()` and a
+    // `Failed` runtime status). That is the same contract
+    // `validated_authenticated_daemon_ready_inputs` asserts in production, so
+    // this is the production-owned value, not a placeholder.
     kernel
-        .validate_daemon_process_readiness(&launch, &receipt)
+        .validate_daemon_process_readiness_in_context(&launch, &receipt, &context, true)
         .await
         .expect("live exact process accepted");
     assert!(kernel.daemon_ready());
@@ -3149,7 +3189,7 @@ async fn daemon_readiness_requires_fresh_running_executor_receipt() {
         .expect("terminate executor child");
     assert!(
         kernel
-            .validate_daemon_process_readiness(&launch, &receipt)
+            .validate_daemon_process_readiness_in_context(&launch, &receipt, &context, true)
             .await
             .is_err(),
         "terminal executor inspection must reject readiness"
@@ -3251,10 +3291,31 @@ async fn daemon_recovery_closes_exact_prior_tree_and_rejects_stale_receipt() {
         state.status = DaemonRuntimeStatus::Failed("daemon timeout".to_owned());
         state.receipt = Some(receipt.clone());
     }
+    // #901 gave the recovery closure the operation span it records under and an
+    // out-parameter naming whether this call took ownership of the single child
+    // terminal. The span is the owner-bound operation context production derives
+    // for this exact owner and operation (`operation_context_for`), read off this
+    // fixture's own owner binding and receipt operation. The flag starts `false`
+    // because this caller has not yet emitted a terminal; production asserts the
+    // same invariant at `recover_eliotd_in_context`. A proven closure owns no
+    // terminal (every `child_terminal_owned = true` in the callee is on an error
+    // path), which the assertion below now pins instead of leaving unobserved.
+    let closure_context =
+        ProcessExecutionGateway::operation_context_for(&owner, receipt.operation_id());
+    let mut closure_terminal_owned = false;
     kernel
-        .close_previous_daemon_process(&launch, &receipt)
+        .close_previous_daemon_process(
+            &launch,
+            &receipt,
+            &closure_context,
+            &mut closure_terminal_owned,
+        )
         .await
         .expect("exact prior process tree closure");
+    assert!(
+        !closure_terminal_owned,
+        "a proven exact closure is not a terminal; the recovery owner keeps it"
+    );
     let closed = gateway
         .inspect(&owner, receipt.operation_id().clone())
         .await
@@ -3262,12 +3323,26 @@ async fn daemon_recovery_closes_exact_prior_tree_and_rejects_stale_receipt() {
     assert_eq!(closed.lifecycle(), ProcessLifecycle::Exited);
 
     let stale = test_process_start_receipt(41_002);
+    // The stale leg inspects a different operation, so it carries that
+    // operation's own owner-bound span rather than the closure leg's.
+    let stale_context =
+        ProcessExecutionGateway::operation_context_for(&owner, stale.operation_id());
+    let mut stale_terminal_owned = false;
     assert!(
         kernel
-            .close_previous_daemon_process(&launch, &stale)
+            .close_previous_daemon_process(
+                &launch,
+                &stale,
+                &stale_context,
+                &mut stale_terminal_owned,
+            )
             .await
             .is_err(),
         "a stale completed receipt must not be adopted for recovery"
+    );
+    assert!(
+        !stale_terminal_owned,
+        "a stale receipt is refused as a validation error before any child terminal is taken"
     );
     gateway
         .executor
@@ -3603,7 +3678,15 @@ fn process_owner_survives_reconnect_but_rejects_cross_owner() {
         .expect("owner");
     let reconnected = ProcessOwnerBinding::new("testd", "a".repeat(64), test_epoch(3), generation)
         .expect("owner");
-    assert!(authorize_process_owner(&owner, &reconnected).is_ok());
+    let context = crate::kernel_diagnostics::operation_context(None, None, None, None);
+    assert!(
+        crate::process_execution::authorize_process_owner_in_context(
+            &owner,
+            &reconnected,
+            &context,
+        )
+        .is_ok()
+    );
 
     let wrong_module =
         ProcessOwnerBinding::new("native", "a".repeat(64), test_epoch(3), generation)
@@ -3619,7 +3702,12 @@ fn process_owner_survives_reconnect_but_rejects_cross_owner() {
     )
     .expect("owner");
     for candidate in [wrong_module, wrong_principal, wrong_generation] {
-        assert!(authorize_process_owner(&owner, &candidate).is_err());
+        assert!(
+            crate::process_execution::authorize_process_owner_in_context(
+                &owner, &candidate, &context,
+            )
+            .is_err()
+        );
     }
 }
 
@@ -4202,7 +4290,16 @@ fn physical_supervision_signer_unseals_only_with_exact_eliot_host_service_sid_to
         eliot_runtime_contracts::SUPERVISION_AUTHORITY_HOST_SERVICE,
     )
     .expect("resolve exact EliotHost service SID");
-    assert_eq!(live_sid, authority.key_reference.host_service_sid);
+    assert_eq!(
+        live_sid,
+        authority
+            .key_reference
+            .as_system_service()
+            .expect(
+                "the SystemService profile authority must carry the service-SID-bound sealed key"
+            )
+            .host_service_sid
+    );
     let signer = ProtectedSupervisionLeaseSigner::new_for_profile(
         kernel_root,
         eliot_installation::InstallationProfile::SystemService,
@@ -4234,7 +4331,11 @@ fn stable_sid_owner_digest_ignores_process_and_session_replacement() {
     let first_session = ProcessSessionBinding::new("connection-a", 1).expect("session");
     let restarted_session = ProcessSessionBinding::new("connection-b", 2).expect("session");
     assert_ne!(first_session, restarted_session);
-    assert!(authorize_process_owner(&first, &restarted).is_ok());
+    let context = crate::kernel_diagnostics::operation_context(None, None, None, None);
+    assert!(
+        crate::process_execution::authorize_process_owner_in_context(&first, &restarted, &context,)
+            .is_ok()
+    );
 
     for (sid, module, authority, candidate_generation) in [
         ("S-1-5-19", "testd", test_epoch(3), generation),
@@ -4250,7 +4351,12 @@ fn stable_sid_owner_digest_ignores_process_and_session_replacement() {
         let digest = stable_owner_principal_digest(sid, module, &authority, candidate_generation);
         let candidate = ProcessOwnerBinding::new(module, digest, authority, candidate_generation)
             .expect("owner");
-        assert!(authorize_process_owner(&first, &candidate).is_err());
+        assert!(
+            crate::process_execution::authorize_process_owner_in_context(
+                &first, &candidate, &context,
+            )
+            .is_err()
+        );
     }
 }
 
@@ -5778,10 +5884,26 @@ async fn daemon_close_reconciles_by_original_identity_with_ors_readback() {
         state.status = DaemonRuntimeStatus::Failed("daemon timeout".to_owned());
         state.receipt = Some(receipt.clone());
     }
+    // #901 signature: the owner-bound operation span plus the child-terminal
+    // out-parameter. Both values are read off this fixture's own owner binding
+    // and receipt operation, exactly as production derives them; `false` is the
+    // entry state production uses before it has emitted any terminal.
+    let closure_context =
+        ProcessExecutionGateway::operation_context_for(&owner, receipt.operation_id());
+    let mut closure_terminal_owned = false;
     kernel
-        .close_previous_daemon_process(&launch, &receipt)
+        .close_previous_daemon_process(
+            &launch,
+            &receipt,
+            &closure_context,
+            &mut closure_terminal_owned,
+        )
         .await
         .expect("exact prior supervised generation closes with reconcile and ORS readback");
+    assert!(
+        !closure_terminal_owned,
+        "a proven reconcile closure owns no child terminal; the recovery owner keeps it"
+    );
     let closed = gateway
         .inspect(&owner, receipt.operation_id().clone())
         .await
@@ -5833,12 +5955,25 @@ async fn daemon_close_reconciles_by_original_identity_with_ors_readback() {
     // same identity instead of a fresh launch.
     let stale = test_process_start_receipt(41_002);
     assert_ne!(stale.operation_id(), receipt.operation_id());
+    // Distinct operation, so distinct owner-bound span for the refusal leg.
+    let stale_context =
+        ProcessExecutionGateway::operation_context_for(&owner, stale.operation_id());
+    let mut stale_terminal_owned = false;
     assert!(
         kernel
-            .close_previous_daemon_process(&launch, &stale)
+            .close_previous_daemon_process(
+                &launch,
+                &stale,
+                &stale_context,
+                &mut stale_terminal_owned,
+            )
             .await
             .is_err(),
         "a stale completed receipt must not be adopted for recovery"
+    );
+    assert!(
+        !stale_terminal_owned,
+        "a stale receipt is refused as a validation error before any child terminal is taken"
     );
     assert!(
         gateway
@@ -6010,6 +6145,7 @@ fn supervision_lease_renews_from_observed_progress_not_store_health() {
         &mut progress,
         &SUPERVISION_LEASE_RENEWAL_POLICY,
         DUE_MS,
+        &tracing::Span::none(),
     )
     .expect("healthy progress renews");
     assert_eq!(decision.outcome, DaemonSupervisionRenewalOutcome::Renewed);
@@ -6020,7 +6156,8 @@ fn supervision_lease_renews_from_observed_progress_not_store_health() {
     assert_eq!(progress.boot_id.as_deref(), Some("boot-88-w2"));
     let recorded = test_observation("obs-88-w2-1");
     let recorded_sha256 = recorded.digest().expect("recorded observation digest");
-    progress.record_renewed(&recorded, recorded_sha256.clone(), 8, DUE_MS);
+    let context = crate::kernel_diagnostics::operation_context(None, None, None, None);
+    progress.record_renewed_in_context(&context, &recorded, recorded_sha256.clone(), 8, DUE_MS);
     assert!(progress.accepted_cursors.contains(&DaemonChannelCursor {
         channel: DaemonProgressChannel::Claim,
         cursor: 8,
@@ -6066,6 +6203,7 @@ fn supervision_lease_renews_from_observed_progress_not_store_health() {
         &mut replay_progress,
         &SUPERVISION_LEASE_RENEWAL_POLICY,
         DUE_MS,
+        &tracing::Span::none(),
     )
     .expect("exact replay echoes the recorded successor");
     assert_eq!(replay.outcome, DaemonSupervisionRenewalOutcome::ExactReplay);
@@ -6081,6 +6219,7 @@ fn supervision_lease_renews_from_observed_progress_not_store_health() {
             &mut conflict_progress,
             &SUPERVISION_LEASE_RENEWAL_POLICY,
             DUE_MS,
+            &tracing::Span::none(),
         ),
         Err(SupervisionProgressRenewalError::Heartbeat(
             DaemonSupervisionHeartbeatError::IdentityConflict { .. }
@@ -6105,6 +6244,7 @@ fn supervision_lease_renews_from_observed_progress_not_store_health() {
             &mut degraded_progress,
             &SUPERVISION_LEASE_RENEWAL_POLICY,
             DUE_MS,
+            &tracing::Span::none(),
         );
         if attempt < 2 {
             let blocked_decision = blocked.expect("degraded progress is reported, not renewed");
@@ -6141,6 +6281,7 @@ fn supervision_lease_renews_from_observed_progress_not_store_health() {
             &mut degraded_progress,
             &SUPERVISION_LEASE_RENEWAL_POLICY,
             DUE_MS,
+            &tracing::Span::none(),
         ),
         Err(SupervisionProgressRenewalError::Heartbeat(
             DaemonSupervisionHeartbeatError::SupervisionLeaseExpired

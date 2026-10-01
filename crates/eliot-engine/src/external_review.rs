@@ -1,3 +1,4 @@
+use crate::provider_invocation::ProviderOutputCapture;
 use crate::{
     AdapterObservationBridge, AdapterSupervisor, EngineError, WorkState, WriteAdmissionService,
     WriterHandle,
@@ -50,16 +51,26 @@ const MAX_RAW_EXTERNAL_REVIEW_BYTES: usize = 1024 * 1024 + 64 * 1024;
 
 /// One lexically validated external-review raw provider document.
 ///
-/// The exact bytes and the duplicate-clean `Value` decoded from *those same
-/// bytes* are bound to one value, so a `Value` cannot reach
+/// The exact bytes, the duplicate-clean `Value` decoded from *those same bytes*,
+/// and the content-addressed handle that addresses those bytes are bound into
+/// one value, so a `Value` cannot reach
 /// [`ExternalReviewNormalizer::normalize`] except through one of the two named
-/// constructors below. It owns no schema, authority, scoring or persistence:
-/// it only records which bytes the normalizer read.
+/// construction paths below, and the strict path is reachable only from an
+/// adapter-owned provider capture. It owns no schema, authority, scoring or
+/// persistence: it only records which bytes the normalizer read and which
+/// handle addresses them.
 #[derive(Clone, Debug)]
 pub struct ValidatedExternalReviewDocument {
     origin: ExternalReviewDocumentOrigin,
     bytes: Vec<u8>,
     value: Value,
+    /// The adapter-owned spool path of the capture these bytes came from.
+    ///
+    /// Present only for [`ExternalReviewDocumentOrigin::StrictProviderBytes`],
+    /// where the path is the one the capture itself wrote. It is carried inside
+    /// the document so the digest, the size and the location all describe the
+    /// same bytes, rather than three values a caller may mix.
+    retained_relative_path: Option<String>,
 }
 
 impl ValidatedExternalReviewDocument {
@@ -157,20 +168,132 @@ impl ExternalReviewEvidenceStanding {
     }
 }
 
+/// Decode one exact external provider byte string through the single
+/// duplicate-rejecting boundary.
+///
+/// This is the one helper owner for external provider raw JSON: the size bound
+/// is applied before parsing, and the duplicate check happens inside the decoder
+/// while members are still distinguishable, so no `Value` can exist that has
+/// already lost a duplicate. It owns lexical integrity only — no schema,
+/// authority, scoring, provider policy or persistence.
+///
+/// `context` names the adapter seam for the rejection reason. No input byte,
+/// offset or member value is returned or echoed.
+pub fn decode_external_provider_json(bytes: &[u8], context: &str) -> Result<Value, EngineError> {
+    strict_json_value(bytes, MAX_RAW_EXTERNAL_REVIEW_BYTES)
+        .map_err(|error| rejected("external-review-document", &format!("{context}: {error}")))
+}
+
 impl ValidatedExternalReviewDocument {
     /// Binds one exact provider byte string to the duplicate-clean value decoded
     /// from those same bytes.
     ///
+    /// This is crate-private on purpose. Provenance must be *owner-issued*, not
+    /// caller-selected: an arbitrary caller cannot name these bytes "provider
+    /// bytes" and thereby claim lexical-integrity proof. The only production
+    /// producer is [`Self::from_provider_capture`], which accepts only an
+    /// adapter-owned [`ProviderOutputCapture`] whose content address provably
+    /// addresses the same bytes it decoded.
+    ///
     /// A duplicate object member at any depth, malformed or trailing input, or a
     /// document above [`MAX_RAW_EXTERNAL_REVIEW_BYTES`] is one bounded, redacted
     /// rejection. No input byte, offset or member value is returned or echoed.
-    pub fn strict_from_provider_bytes(bytes: &[u8]) -> Result<Self, StrictJsonError> {
+    fn strict_from_provider_bytes(bytes: &[u8]) -> Result<Self, StrictJsonError> {
         let value = strict_json_value(bytes, MAX_RAW_EXTERNAL_REVIEW_BYTES)?;
         Ok(Self {
             origin: ExternalReviewDocumentOrigin::StrictProviderBytes,
             bytes: bytes.to_vec(),
             value,
+            retained_relative_path: None,
         })
+    }
+
+    /// The owner-issued entry point for a real external provider byte capture.
+    ///
+    /// This is the production ingress this issue asks for. It accepts the exact
+    /// bytes observed at the external transport boundary, decodes them once
+    /// through the duplicate-rejecting decoder, and *requires* that the
+    /// capture's content-addressed handle addresses those same bytes. A capture
+    /// whose `blob_ref` does not address its own bytes, or whose stream was
+    /// truncated or did not close cleanly, is rejected before any `Value` or
+    /// partial trusted result exists.
+    pub fn from_provider_capture(capture: &ProviderOutputCapture) -> Result<Self, EngineError> {
+        if !capture.addresses_exact_bytes() {
+            return Err(rejected(
+                "external-review-document",
+                "provider capture handle does not address the exact captured bytes",
+            ));
+        }
+        if !capture.stream_closed_cleanly || capture.truncation_detected {
+            return Err(rejected(
+                "external-review-document",
+                "provider capture was truncated or did not close cleanly",
+            ));
+        }
+        Self::strict_from_provider_bytes(&capture.captured_bytes)
+            .map(|mut document| {
+                // The path is the one this capture actually wrote; the digest and
+                // size above were computed over exactly these bytes.
+                document.retained_relative_path = Some(capture.blob_ref.relative_path.clone());
+                document
+            })
+            .map_err(|error| {
+                rejected(
+                    "external-review-document",
+                    &format!("external provider raw output failed strict JSON decode: {error}"),
+                )
+            })
+    }
+
+    /// The content-addressed handle that provably addresses
+    /// [`Self::bytes`], or `None` when this document has no external origin.
+    ///
+    /// Unlike a separately-stored `Some(BlobRef)`, this handle is derived from
+    /// the document's own bytes, so it cannot name unrelated content.
+    #[must_use]
+    pub fn retained_blob_ref(&self) -> Option<BlobRef> {
+        match self.origin {
+            ExternalReviewDocumentOrigin::StrictProviderBytes => Some(BlobRef {
+                algorithm: "blake3".to_owned(),
+                digest_hex: blake3::hash(&self.bytes).to_hex().to_string(),
+                size_bytes: u64::try_from(self.bytes.len()).unwrap_or(u64::MAX),
+                relative_path: self.retained_relative_path.clone()?,
+            }),
+            ExternalReviewDocumentOrigin::InternalConstructed => None,
+        }
+    }
+
+    /// Whether `candidate` addresses exactly the bytes this document was decoded
+    /// from.
+    ///
+    /// This is the binding between retained evidence and the operation: the
+    /// digest and the size are recomputed from [`Self::bytes`] and compared
+    /// against the stored handle, so a handle for different content fails even
+    /// though it is well-shaped and content-addressed in its own right.
+    #[must_use]
+    fn addresses_exact_bytes(&self, candidate: &BlobRef) -> bool {
+        candidate.algorithm == "blake3"
+            && candidate.digest_hex == blake3::hash(&self.bytes).to_hex().to_string()
+            && candidate.size_bytes == u64::try_from(self.bytes.len()).unwrap_or(u64::MAX)
+    }
+
+    /// The retained handle, admitted only when it addresses this document's
+    /// exact bytes and matches the handle the document itself derived.
+    ///
+    /// Existence or shape proves nothing, so both the algorithm/digest/size
+    /// comparison over the live bytes and the document's own handle are
+    /// required. Anything else yields `None`, which downgrades the evidence to
+    /// explicitly unqualified rather than over-claiming byte proof.
+    #[must_use]
+    fn verified_retained_handle(&self, candidate: Option<&BlobRef>) -> Option<BlobRef> {
+        let candidate = candidate?;
+        let derived = self.retained_blob_ref()?;
+        if self.addresses_exact_bytes(candidate) && candidate.relative_path == derived.relative_path
+        {
+            Some(derived)
+        } else {
+            None
+        }
     }
 
     /// Binds a trusted, already-constructed in-process value to a self-consistent
@@ -194,6 +317,7 @@ impl ValidatedExternalReviewDocument {
             origin: ExternalReviewDocumentOrigin::InternalConstructed,
             bytes,
             value: strict,
+            retained_relative_path: None,
         })
     }
 }
@@ -581,22 +705,16 @@ impl ExternalReviewJobService {
         let adapter_result = supervisor
             .execute("test-echo", adapter_request.clone(), Some(blob_store))
             .await?;
-        // The byte string is the source of truth: serialize first, then decode
-        // exactly those bytes through the shared duplicate-rejecting decoder, and
-        // retain those same bytes as the raw evidence. Before this inversion the
-        // retained evidence was a re-serialization of an already-collapsed
-        // `Value`, so a duplicate member could never be observed here.
-        let raw_output_bytes = serde_json::to_vec(&mock_raw_output(request, provider, packet))?;
-        let raw_output =
-            ValidatedExternalReviewDocument::strict_from_provider_bytes(&raw_output_bytes)
-                .map_err(|error| {
-                    rejected(
-                        "external-review-job-service",
-                        &format!(
-                            "mock external review raw output failed strict JSON decode: {error}"
-                        ),
-                    )
-                })?;
+        // This call site never holds external provider bytes: `mock_raw_output`
+        // builds an in-process `serde_json::Value`, so any duplicate member was
+        // already collapsed before these bytes existed. It is therefore
+        // `internal_constructed`, and the document is permanently
+        // `InternalConstructed`: the retained blob stays explicitly unqualified
+        // legacy evidence and can never be cited as proof that an external
+        // raw-byte ingress is closed.
+        let raw_output = ValidatedExternalReviewDocument::internal_constructed(&mock_raw_output(
+            request, provider, packet,
+        ))?;
         let raw_output_blob_ref = Some(blob_store.put_bytes(raw_output.bytes())?);
         let job = ExternalReviewJob {
             job_id: queued_job.job_id,
@@ -645,17 +763,22 @@ impl ExternalReviewNormalizer {
         let standing = ExternalReviewEvidenceStanding::of_document(raw_output);
         let (raw_output_blob_ref, standing_reason) = match standing {
             ExternalReviewEvidenceStanding::StrictProviderBytes => {
-                // The sole Strict producer retains the exact decoded bytes, so a
-                // Strict document without a retained handle is a caller bug that
-                // would over-claim byte proof; fail loudly in debug/test builds.
-                debug_assert!(
-                    job.raw_output_blob_ref.is_some(),
-                    "strict provider document paired with a job lacking the retained byte handle"
-                );
-                (
-                    job.raw_output_blob_ref.clone(),
-                    "raw evidence qualified: exact provider bytes strictly decoded and retained",
-                )
+                // Byte identity, not presence. The document carries the handle it
+                // derived from its own bytes; the job's separately-stored handle
+                // is admitted only when algorithm, digest and exact size all
+                // address `raw_output.bytes()`. A strict document paired with an
+                // unrelated handle, or with none, cannot be reported as
+                // qualified evidence.
+                match raw_output.verified_retained_handle(job.raw_output_blob_ref.as_ref()) {
+                    Some(handle) => (
+                        Some(handle),
+                        "raw evidence qualified: exact provider bytes strictly decoded and retained",
+                    ),
+                    None => (
+                        None,
+                        "raw evidence unqualified legacy: retained handle does not address the exact validated provider bytes",
+                    ),
+                }
             }
             ExternalReviewEvidenceStanding::UnqualifiedLegacy => {
                 let (_, reason) = ExternalReviewEvidenceStanding::read_back_historical(

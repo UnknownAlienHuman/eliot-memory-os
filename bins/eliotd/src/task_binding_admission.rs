@@ -116,6 +116,18 @@
 //!   from the request; captures and non-task-relative writes stay on the
 //!   receipt-only [`admit_canonical_write`] leg, so the cold path never needs
 //!   a retained terminal.
+//! - [`refuse_ready_string_without_evidence`] has **one** production call site:
+//!   [`admit_canonical_write`] for its task-relative leg (after
+//!   [`refuse_task_identity_conflict`], before [`admit_task_bound`]), reached
+//!   through [`admit_canonical_write_with_activation`] from
+//!   [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition).
+//!   A READY string, handshake, or DTO shape alone never passes: without owner
+//!   evidence the write fails closed with `TASK_SELECTION_REQUIRED`, and the
+//!   READY token is never even read.
+//! - [`require_material_bootstrap_for_task_bound`] has **zero call sites**: the
+//!   designated caller is the same composition, between the admission
+//!   projection and the #1742 material gate, passing the bootstrap admitted
+//!   for the same lease at the write fence.
 //! - `DaemonComposition::commit_canonical_and_refresh` itself has **zero**
 //!   production call sites — its only in-tree mentions are documentation and a
 //!   source-string assertion in `bins/eliotd/tests/agent_fabric_wiring.rs`. It
@@ -131,6 +143,18 @@
 //!   finish legs.
 //! - [`observe_and_admit_task`] has **zero call sites**, so
 //!   [`admit_task_bound_with_observed_scope`] is transitively dead with it.
+//! - [`admit_bootstrap_context`] has **zero call sites** as well. Both of its
+//!   designated callers are themselves uncalled —
+//!   `DaemonComposition::read_cold_start_surface_for_attach` (`caller: STITCH`)
+//!   and [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition)
+//!   (zero production call sites, above) — so no live path carries an admitted
+//!   bootstrap toward the #1742 Material gate.
+//! - [`revalidate_dispatched_binding`] has **zero call sites** — stronger than
+//!   the "no live caller passes that retained/observed pair" recorded under
+//!   [`revalidate_task_bound_for_effect`] below, which describes why no caller
+//!   can supply the pair. Its designated caller is the same uncalled
+//!   `commit_canonical_and_refresh`, so its private `material_effect_guard_detail`
+//!   helper is dead with it too.
 //! - [`revalidate_task_bound_for_effect`] **is** live: its one production call
 //!   site is the pre-commit effect gate in
 //!   [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition),
@@ -1302,6 +1326,20 @@ pub fn correlate_activation_result(
 /// absence, and no cold capture is retroactively attached here.
 ///
 /// Called by [`admit_canonical_write`] to derive its selection legs.
+///
+/// # Not yet reached (issue #1929)
+///
+/// That named caller is not live either. Measured on this tree by symbol,
+/// this constructor has **two** code references, both of them inside entries
+/// with no live caller: [`admit_bootstrap_context`] (zero call sites, disclosed
+/// on its own entry) and [`admit_canonical_write`], whose only two callers are
+/// [`admit_canonical_write_with_activation`] and
+/// `DaemonComposition::commit_canonical_and_refresh`, and that composition entry
+/// has zero production call sites. So this answer constructor is transitively
+/// dead at depth three and no typed selection leg is derived on any live daemon
+/// path. The blocking symbol is the compiled readiness receipt named in this
+/// module's "Measured reachability" section; a production caller needs that owner
+/// to exist first, and none was invented to close the gap.
 pub fn selection_response_for_receipt(
     receipt: &OnboardingReadinessReceipt,
 ) -> Result<TaskSelectionResponse, TaskBindingError> {
@@ -1461,6 +1499,21 @@ pub fn admit_task_bound(
 /// with `TASK_SELECTION_REQUIRED`. Neither arm changes a task. Called by
 /// [`admit_canonical_write`] for its task-relative leg, so the wrong
 /// workspace/task case rejects before any selection evidence is consulted.
+///
+/// # Not yet reached (issue #1929)
+///
+/// That named caller is itself unreachable. Measured on this tree by symbol,
+/// this refusal has exactly **one** code reference: the task-relative leg
+/// inside [`admit_canonical_write`], whose only callers are
+/// [`admit_canonical_write_with_activation`] and
+/// `DaemonComposition::commit_canonical_and_refresh`, and that composition entry
+/// has zero production call sites. So the wrong-workspace/wrong-task case is
+/// not rejected by this entry on any live daemon path — the ordering sentence
+/// above describes the code as written, not a behaviour production enforces
+/// today. The two stable codes stay enforced on the real write path by
+/// `eliot_store_surreal::task_binding_gate::gate_apply`, which re-derives them
+/// from the opaque proof handles the transition actually carries. No caller was
+/// invented to close the gap.
 pub fn refuse_task_identity_conflict(
     context_task_ref: Option<&str>,
     envelope_task_ref: Option<&str>,
@@ -1496,6 +1549,20 @@ pub fn refuse_task_identity_conflict(
 /// effect is withheld with `TASK_SCOPE_INCOMPATIBLE`. Called by
 /// [`admit_canonical_write`] for its task-relative leg before
 /// [`admit_task_bound`].
+///
+/// # Not yet reached (issue #1929)
+///
+/// That named caller is itself unreachable, exactly as for
+/// [`refuse_task_identity_conflict`] on the preceding leg. Measured on this
+/// tree by symbol, this refusal has exactly **one** code reference: the
+/// task-relative leg inside [`admit_canonical_write`], whose only callers are
+/// [`admit_canonical_write_with_activation`] and
+/// `DaemonComposition::commit_canonical_and_refresh`, and that composition entry
+/// has zero production call sites. So this entry is transitively dead and the
+/// "never even read the READY token" property above is a property of the code as
+/// written, not a behaviour a live daemon path currently applies. The module's
+/// "Measured reachability" section records the same fact from the caller side;
+/// no caller was invented to close the gap.
 pub fn refuse_ready_string_without_evidence(
     receipt: &OnboardingReadinessReceipt,
     has_owner_evidence: bool,
@@ -1551,6 +1618,16 @@ pub fn refuse_ready_string_without_evidence(
 /// binding.
 ///
 /// Called by [`admit_task_bound_with_observed_scope`].
+///
+/// # Not yet reached (issue #1929)
+///
+/// That is the whole caller set, so this entry is dead transitively: its only
+/// caller has one caller of its own, [`observe_and_admit_task`], which has zero
+/// call sites (see this module's "Measured reachability" section). The next
+/// live `check_at_trigger` owner leg is
+/// `GovernorComposition::check_canonical_write_work_scope`, joined in
+/// `DaemonComposition::commit_canonical_and_refresh`; this composition-level
+/// disposition mapper is the unwired observation-derived duplicate of it.
 pub fn scope_guard_disposition(
     expected: &ScopeBinding,
     observed: &ObservedScopeResources,
@@ -1995,6 +2072,24 @@ pub struct MaterialBootstrap {
 /// freshness instead of re-deriving it, so an expired receipt or lease fails
 /// closed here before any owner field is compared. This entry
 /// mints no profile, receipt, or lease of its own.
+///
+/// # Not yet reached (issue #1929)
+///
+/// Measured on this tree, this entry has **zero call sites**: no code in any
+/// crate names it other than its defining line; every other mention in the tree
+/// is a [`admit_bootstrap_context`] prose back-link. Both designated callers
+/// above are themselves uncalled —
+/// `DaemonComposition::read_cold_start_surface_for_attach` has zero call sites
+/// (`caller: STITCH`), and
+/// [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition)
+/// has zero production call sites (see this module's "Measured reachability"
+/// section) — so the #1742 Material gate has no live bootstrap to carry even
+/// once that composition entry is wired. Nothing reads
+/// [`BootstrapAdmission::Material`] from here, and the retention route this
+/// admission feeds is already held behind the same blocking symbol (the
+/// compiled readiness receipt). A production caller therefore needs the
+/// receipt owner named in that section to exist first; none was invented to
+/// close the gap.
 #[allow(
     clippy::too_many_arguments,
     reason = "bootstrap joins the receipt, surface, both profiles, the live fence, and the freshness clock in one edge"
@@ -2563,8 +2658,11 @@ pub fn admit_canonical_write(
 /// [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition),
 /// for task-relative envelopes (see [`envelope_is_task_relative`]): it
 /// resolves the snapshot from the presented readiness lease through
-/// `GovernorComposition::current_task_selection` and passes it here at the
-/// write fence. Captures and non-task-relative writes stay on the
+/// `GovernorComposition::current_task_selection` and passes it here with the
+/// presented write fence for admission and the live Governor kernel-snapshot
+/// fence for the applicability recheck — the recheck never compares the
+/// presentation to itself (I4.2.1: `MATCHED` is required again after any
+/// generation change). Captures and non-task-relative writes stay on the
 /// receipt-only [`admit_canonical_write`] leg, so the cold path never needs a
 /// retained terminal. That routing is enforced in-function as well as by the
 /// caller: a task-free non-task-relative envelope takes the receipt-only leg
@@ -2576,6 +2674,7 @@ pub fn admit_canonical_write_with_activation(
     envelope: &CanonicalWriteEnvelope,
     receipt: &OnboardingReadinessReceipt,
     write_fence: &StateFence,
+    live_fence: &StateFence,
     activation: Option<&eliot_governor::GovernorActivationSnapshot>,
 ) -> Result<TaskBindingAdmission, TaskBindingError> {
     // A task-free non-task-relative envelope can only ever admit `ColdUnbound`
@@ -2588,7 +2687,12 @@ pub fn admit_canonical_write_with_activation(
     if !envelope_is_task_relative(envelope) && context.task_id.is_none() {
         return admit_canonical_write(candidate_id, context, envelope, receipt, write_fence);
     }
-    bind_current_task_selection(activation, receipt, write_fence)?;
+    // Issue #1746, W4/A5: the applicability recheck runs against the live
+    // owner fence, never the caller-presented write fence — `write_fence`
+    // stays the admission-time comparison inside `admit_canonical_write`, so
+    // a generation move between bootstrap and dispatch still fails closed
+    // here (I4.2.1) instead of comparing the presentation to itself.
+    bind_current_task_selection(activation, receipt, live_fence)?;
     admit_canonical_write(candidate_id, context, envelope, receipt, write_fence)
 }
 
@@ -2778,6 +2882,26 @@ fn material_effect_guard_detail(report: &eliot_workscope::TriggerReport) -> Stri
 /// receipt revision, governance profile reference, projection generation (the
 /// live receipt's own `projection_generation`, alongside its revision), and
 /// kernel-snapshot fence.
+///
+/// # Not yet reached (issue #1929)
+///
+/// Measured on this tree, this entry has **zero call sites**: no code in any
+/// crate names it other than its defining line; every other mention in the tree
+/// is a [`revalidate_dispatched_binding`] prose back-link. The designated
+/// caller above is itself uncalled (zero production call sites — see this
+/// module's "Measured reachability" section).
+/// The daemon holds no retained `ScopeBinding` — that requires the uncalled,
+/// circular `DaemonComposition::admit_scope_attach` — so no live gate can pass
+/// this entry's `retained`/`observed` pair even if it were called. One
+/// second-order consequence is named here because a name-level scan cannot see
+/// it: the private [`material_effect_guard_detail`] is called only from this
+/// entry and is therefore dead with it. This entry is also *not* the route by
+/// which the
+/// fence leg [`revalidate_task_bound_for_effect`] runs: that function's only
+/// other caller is `DaemonComposition::commit_canonical_and_refresh`, which
+/// itself has zero production call sites (see this module's "Measured
+/// reachability" section), so nothing here substitutes for it. No caller was
+/// invented to close the gap.
 #[allow(
     clippy::too_many_arguments,
     reason = "revalidation joins the sealed identity against every live owner value that can invalidate it in one fail-closed edge"

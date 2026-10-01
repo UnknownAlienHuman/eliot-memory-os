@@ -1909,9 +1909,9 @@ fn host_request_observe_submit_frame(
 ///
 /// | tool | bridge entry | Kernel operation | completion boundary |
 /// |---|---|---|---|
-/// | `eliot.state` | submit frame (digest-only) | `agent_host_request_submit` | admission handle only; projection-owner readback join missing |
+/// | `eliot.state` | submit frame (digest-only, dispatch-time revalidated) | `agent_host_request_submit` | admission handle only; bridge revalidates session/fence/connection/payload linkage at dispatch and the Kernel submit gate revalidates the state dispatch binding pre-staging; projection-owner readback (Kernel pair + daemon flight + task/scope projection owner) is the remaining join |
 /// | `eliot.packet` | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | exact bounded compiler result with revision via Governor read owner |
-/// | `eliot.observe` | submit frame (tool bytes, dispatch-time revalidated) | `agent_host_request_submit` | daemon observe flight claims the retained pair, decodes the closed vocabulary and routes to the Governor observation owner; retained result via the governed submit leg |
+/// | `eliot.observe` | submit frame (tool bytes, dispatch-time revalidated) | `agent_host_request_submit` | daemon observe flight claims the retained pair, decodes the closed vocabulary and routes to the Governor observation owner; retained result via the governed submit leg; the bridge answers completed only with the owner-retained receipt |
 /// | `eliot.query` | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | exact bounded read result with revision via Governor read owner |
 /// | `eliot.act` | submit frame (digest-only, dispatch-time revalidated) | `agent_host_request_submit` | admission handle only; bridge revalidates session/fence/connection/payload linkage at dispatch and the Kernel submit gate revalidates the act dispatch binding pre-staging; the daemon-side `admit_material_decision` invocation over owner-resolved inputs with dispatch-time revalidation through a live act claim/flight is the remaining join (#1742 W4) |
 /// | `eliot.verify` | submit frame (digest-only) | `agent_host_request_submit` | admission handle only; verifier-owner invocation + evidence preservation missing |
@@ -1921,9 +1921,12 @@ fn host_request_observe_submit_frame(
 /// | `skill.inject` / `skill.display` (non-hot) | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | Hotset intake served through the linkage-checked leg; never advertised |
 ///
 /// An `Accepted` submit reply is an operation handle, not completed work; only
-/// the row's named owner execution plus a retained result completes it. The
-/// `completion_join` / `missing_route` strings name that exact missing
-/// interface per unresolved row instead of claiming seven tools do not exist.
+/// the row's named owner execution plus a retained result completes it. A
+/// submit-leg row answers completed only with the owner-retained receipt
+/// ([`require_submit_completion_receipt`]); invoke-read rows keep the
+/// digest-chain receipt. The `completion_join` / `missing_route` strings
+/// name that exact missing interface per unresolved row instead of claiming
+/// seven tools do not exist.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CanonicalDispatchEntry {
     /// Linkage-checked invoke-read: the Kernel checks capability and
@@ -1961,6 +1964,19 @@ enum CanonicalDispatchEntry {
     /// tool bytes are retained here. The Accepted reply stays an operation
     /// handle until the fabric owner completes it.
     SubmitCoordinateGated { completion_join: &'static str },
+    /// State projection dispatch with dispatch-time revalidation (issue
+    /// #1739 W5; projection-owner readback join still open).
+    ///
+    /// The bridge revalidates only what it owns at dispatch time (state
+    /// shape, live session/fence/connection binding, exact payload-digest
+    /// linkage) and rides the same `agent_host_request_submit` entry; the
+    /// Kernel submit entry revalidates the state dispatch binding
+    /// pre-staging (`check_state_submit_binding`). The current authorized
+    /// task/scope/attention/health projection stays the projection owner's
+    /// to serve at the future live state claim/flight, not here; no tool
+    /// bytes are retained here. The Accepted reply stays an operation
+    /// handle until the projection owner completes it.
+    SubmitStateGated { completion_join: &'static str },
     /// Observe submit carrying the exact canonical tool bytes (issue #2565).
     /// Rides the same `agent_host_request_submit` entry as the digest-only
     /// submits; the bridge revalidates the observe dispatch binding
@@ -1984,7 +2000,7 @@ enum CanonicalDispatchEntry {
 /// above. Behavior is byte-identical to the previous scattered predicates.
 fn canonical_dispatch_entry(tool: &ToolRequest) -> CanonicalDispatchEntry {
     match tool {
-        ToolRequest::State(_) => CanonicalDispatchEntry::SubmitAdmitOnly {
+        ToolRequest::State(_) => CanonicalDispatchEntry::SubmitStateGated {
             completion_join: "projection-owner readback: submit-record execution (Kernel pair + daemon flight + task/scope projection owner)",
         },
         ToolRequest::Packet(_)
@@ -2113,6 +2129,60 @@ fn revalidate_coordinate_dispatch(
         return Err(PortFailure::TransportBindingRejected {
             reason: "coordinate dispatch payload does not match the admitted payload digest"
                 .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Dispatch-time revalidation for one `eliot.state` projection dispatch
+/// (issue #1739 W5; projection-owner readback join still open).
+///
+/// Re-checks at dispatch, against live Kernel-issued facts, only what the
+/// bridge owns: the tool is still the exact `eliot.state` request admitted,
+/// the envelope still names the live session/fence/connection, and the
+/// canonical payload digest still binds the exact tool bytes. A swapped
+/// packet, forged binding, or stale fence fails closed here before any
+/// submit frame is built; the current authorized task/scope/attention/
+/// health projection stays the future live state claim/flight's to serve,
+/// and the durable operation identity stays the Kernel admission owner's
+/// to mint — this seam neither interprets projection semantics nor
+/// synthesizes a projection (I01-08 read path; I07-08 step 9). Failures are
+/// typed (I07-20): fence mismatch stays `FenceMismatch`, binding mismatches
+/// stay `TransportBindingRejected`, a missing session stays `PlanGap`.
+fn revalidate_state_dispatch(
+    request: &HostInvocationRequest,
+    envelope: &HostRequestEnvelope,
+    facts: &TransportFacts,
+) -> Result<(), PortFailure> {
+    if !matches!(request.tool, ToolRequest::State(_)) {
+        return Err(request_failure());
+    }
+    if request.tool.canonical_name() != "eliot.state"
+        || envelope.identity.capability != request.tool.canonical_name()
+    {
+        return Err(PortFailure::TransportBindingRejected {
+            reason: "state dispatch capability does not match the admitted tool".to_owned(),
+        });
+    }
+    let live_session = facts.session.clone().ok_or_else(plan_gap_no_session)?;
+    if envelope.identity.session_id.as_deref() != Some(live_session.as_str()) {
+        return Err(PortFailure::TransportBindingRejected {
+            reason: "state dispatch session does not match the live attach session".to_owned(),
+        });
+    }
+    if envelope.state_fence != facts.state_fence {
+        return Err(PortFailure::FenceMismatch);
+    }
+    if envelope.connection_id != facts.connection_id {
+        return Err(PortFailure::TransportBindingRejected {
+            reason: "state dispatch connection does not match the live admitted connection"
+                .to_owned(),
+        });
+    }
+    let expected_payload = canonical_payload_digest(&request.tool)?;
+    if expected_payload != envelope.identity.payload_sha256 {
+        return Err(PortFailure::TransportBindingRejected {
+            reason: "state dispatch payload does not match the admitted payload digest".to_owned(),
         });
     }
     Ok(())
@@ -3059,9 +3129,50 @@ fn invalid_result(detail: &str) -> PortFailure {
     }
 }
 
+/// Requires the owner-retained receipt before one submit-leg outcome
+/// answers as completed (issue #1739 W4: the retained-outcome rule extended
+/// beyond `eliot.observe` to every other operation the bridge wires on the
+/// shared submit carrier).
+///
+/// The governed submit leg retains a submit-leg outcome only with the
+/// producer's explicit result lineage (the submission-side receipt gate);
+/// the lineage is the actual owner receipt, bound to the exact result
+/// digest. The readback leg ([`decode_record_view`]) already refuses a
+/// present-but-invalid lineage through the shared retained rule, so this
+/// gate adds only the missing half: an ABSENT lineage cannot be the
+/// retained outcome. Invoke-read rows (`eliot.packet`, `eliot.query`,
+/// `eliot.finish`, skill carriers) keep their existing receipt (admission
+/// receipt plus the retained digest chain): their producer mints no
+/// lineage, so absence there is the established contract, never a missing
+/// receipt. The non-hot operator carrier keeps its own leg's contract and
+/// is never subject to this gate.
+///
+/// A receiptless submit-leg result fails closed as a transport binding
+/// rejection (the same family as a bodyless result), never as a bare
+/// admission that would lose the answer and never as a completed response
+/// for bytes the owner never retained. A stale or foreign attempt's result
+/// therefore cannot satisfy this waiter: without the owner receipt bound
+/// to this exact result, there is no completed answer to serve.
+fn require_submit_completion_receipt(
+    record: &AdmittedReplyView,
+    tool_name: &str,
+) -> Result<(), PortFailure> {
+    let submit_leg = matches!(
+        tool_name,
+        "eliot.state" | "eliot.observe" | "eliot.act" | "eliot.verify" | "eliot.coordinate"
+    );
+    if submit_leg && record.result_lineage.is_none() {
+        return Err(invalid_result(
+            "submit-leg completion requires the owner-retained result receipt",
+        ));
+    }
+    Ok(())
+}
+
 /// Decodes one stored bounded response and checks it against the admitted
 /// request (Implements #18: local read result; #2564 item 5: the canonical
-/// request digest binds the actual expected request).
+/// request digest binds the actual expected request; #1739 W4: a submit-leg
+/// result additionally requires its owner-retained receipt).
 ///
 /// Mirrors `host_gateway.rs:406-436` (bounded size, tool binding) plus the
 /// `check_response_binding` semantics (request/idempotency/tool/digest joins
@@ -3109,11 +3220,14 @@ fn decode_stored_response(
     if sha256_hex(&bytes) != digest {
         return Err(invalid_result("digest does not bind the exact body"));
     }
+    require_submit_completion_receipt(record, request.tool.canonical_name())?;
     Ok(response)
 }
 
 /// Decodes one owner-resolved stored result against the original admission
-/// (issue #2571).
+/// (issue #2571; #1739 W4: a submit-leg result additionally requires its
+/// owner-retained receipt, so replay serves the same retained result only
+/// with the same owner receipt).
 ///
 /// Mirrors [`decode_stored_response`] with a different trust root: the
 /// presenting resolve envelope is current transport, so the request
@@ -3162,6 +3276,7 @@ fn decode_resolved_response(
     if sha256_hex(&bytes) != digest {
         return Err(invalid_result("digest does not bind the exact body"));
     }
+    require_submit_completion_receipt(record, tool_name)?;
     Ok(response)
 }
 
@@ -3369,6 +3484,10 @@ fn map_parent_cancellation_disposition(
 }
 
 impl KernelHostRequestPort for KernelHostRequestClient {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the eight canonical entries must dispatch serially on the same carrier (issue #1739 W5); splitting the match would scatter the single dispatch order"
+    )]
     fn invoke(
         &mut self,
         request: &HostInvocationRequest,
@@ -3443,6 +3562,14 @@ impl KernelHostRequestPort for KernelHostRequestClient {
             }
             CanonicalDispatchEntry::SubmitCoordinateGated { .. } => {
                 revalidate_coordinate_dispatch(request, &envelope, &facts)?;
+                host_request_frame_for_envelope(
+                    AGENT_HOST_REQUEST_SUBMIT_OPERATION,
+                    &envelope,
+                    &facts,
+                )?
+            }
+            CanonicalDispatchEntry::SubmitStateGated { .. } => {
+                revalidate_state_dispatch(request, &envelope, &facts)?;
                 host_request_frame_for_envelope(
                     AGENT_HOST_REQUEST_SUBMIT_OPERATION,
                     &envelope,

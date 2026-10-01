@@ -57,12 +57,15 @@
 //!   *where* such a request must go. Today it resolves to
 //!   [`MaintenanceRoute::DurableJobRequest`] or
 //!   [`MaintenanceRoute::Blocked`] for every family, and neither admits a
-//!   start, because the maintenance Durable Job admission itself is unreachable
-//!   from `eliotd`: see [`DURABLE_JOB_ADMISSION_BLOCKERS`], which names each
-//!   missing symbol exactly. A [`MaintenanceRoute::Blocked`] route additionally
-//!   never admits a start no matter how that shared list changes, so clearing
-//!   the common blockers in a later integration cannot make an unavailable
-//!   family look startable. Families are registered and deterministically
+//!   start on its own, because the maintenance Durable Job admission itself is
+//!   unreachable from `eliotd`: see [`DURABLE_JOB_ADMISSION_BLOCKERS`], which
+//!   names each missing symbol exactly. A [`MaintenanceRoute::Blocked`] route
+//!   never admits a start, and a [`MaintenanceRoute::DurableJobRequest`] route
+//!   admits one only together with a per-evaluation
+//!   [`ResolvedMaintenanceCapability`] carrying the Governor owner's current
+//!   policy/lease/budget/owner admission — clearing the common blockers in a
+//!   later integration therefore cannot make any family look startable, least
+//!   of all an unavailable one. Families are registered and deterministically
 //!   blocked with that reason; none is omitted and none is silently ignored.
 
 #![forbid(unsafe_code)]
@@ -517,22 +520,24 @@ impl MaintenanceRoute {
         DURABLE_JOB_ADMISSION_BLOCKERS
     }
 
-    /// Whether this route admits a start today.
+    /// Whether this route admits a start under one evaluated capability.
     ///
-    /// It admits none yet, and a `Blocked` route admits none ever through this
-    /// function however the shared list below changes. I14.22 routes every
-    /// start through a Durable Job request, and
-    /// [`DURABLE_JOB_ADMISSION_BLOCKERS`] names every symbol missing from
-    /// that request's path out of `eliotd`. Clearing that list is necessary
-    /// but not sufficient: the route must also be an implemented family route,
-    /// so removing the common blockers in a later integration cannot make an
-    /// unavailable family look startable. Per-evaluation admission (the
-    /// Governor owner's current decision) is resolved separately in
-    /// [`ResolvedMaintenanceCapability`]; the catalog itself grants neither.
+    /// The route alone grants nothing: it only says where a start must go. A
+    /// start additionally requires the Governor owner's current
+    /// policy/lease/budget/owner admission, which travels in `resolved` (see
+    /// [`ResolvedMaintenanceCapability`]) and is never derived from the
+    /// catalog. A `Blocked` route therefore never admits a start however the
+    /// shared wiring below changes, and a `DurableJobRequest` route admits one
+    /// only while the shared wiring is clear *and* the Governor owner admits a
+    /// job from the evaluation the resolution was built from. The runtime
+    /// lease itself is admitted at adopt time by the narrow Governor
+    /// maintenance admission, not here.
     #[must_use]
-    pub const fn admits_start(&self) -> bool {
+    pub const fn admits_start(&self, resolved: ResolvedMaintenanceCapability) -> bool {
         match self {
-            Self::DurableJobRequest { .. } => self.admission_blockers().is_empty(),
+            Self::DurableJobRequest { .. } => {
+                resolved.shared_wiring_clear && resolved.governor_admits_job
+            }
             Self::Blocked { .. } => false,
         }
     }
@@ -593,16 +598,20 @@ impl ResolvedMaintenanceCapability {
         }
     }
 
-    /// Whether a start is admitted today for this route under this resolution.
+    /// The resolution for a context where no Governor evaluation ran.
     ///
-    /// Requires all three at once: an implemented family route, the Governor
-    /// owner's current admission, and clear shared wiring. The catalog grants
-    /// none of them.
+    /// There is no per-evaluation admission to carry here, so the Governor
+    /// half denies while the wiring half reports the shared static state. A
+    /// catalog row resolved through this value therefore never admits a
+    /// start — the catalog grants nothing — while still showing the wiring
+    /// state beside the route. Only [`resolve`](Self::resolve), built from a
+    /// real Governor decision, can carry an admission.
     #[must_use]
-    pub fn admits_start(&self, route: &MaintenanceRoute) -> bool {
-        matches!(route, MaintenanceRoute::DurableJobRequest { .. })
-            && self.governor_admits_job
-            && self.shared_wiring_clear
+    pub const fn unevaluated() -> Self {
+        Self {
+            governor_admits_job: false,
+            shared_wiring_clear: DURABLE_JOB_ADMISSION_BLOCKERS.is_empty(),
+        }
     }
 }
 
@@ -968,6 +977,12 @@ impl MaintenanceFamilyEntry {
     /// resolved route admits a start today, and the deduplication scope that
     /// coalesces repeated triggers of it. Nothing else is rendered, so a row
     /// cannot drift from the entry it is rendered from.
+    ///
+    /// A row is not an evaluation — no Governor decision ran to produce it —
+    /// so it resolves through [`ResolvedMaintenanceCapability::unevaluated`]:
+    /// the Governor half denies and the row never admits a start. The catalog
+    /// grants nothing; only [`MaintenanceFamilyEntry::decide`], built from a
+    /// real Governor decision, can carry an admission.
     #[must_use]
     pub fn catalog_row(&self) -> String {
         let route = self.start_route();
@@ -976,7 +991,7 @@ impl MaintenanceFamilyEntry {
             family = self.family,
             mode = selected_mode_name(self.mode),
             execution = self.execution_or_dependency(),
-            admits_start = route.admits_start(),
+            admits_start = route.admits_start(ResolvedMaintenanceCapability::unevaluated()),
             dedup = self.dedup.scope_name(),
         )
     }
@@ -1070,7 +1085,7 @@ impl MaintenanceFamilyEntry {
             eligibility: self.eligibility,
             conditions: self.conditions,
             dedup: self.dedup,
-            admits_start: resolved_capability.admits_start(&route),
+            admits_start: route.admits_start(resolved_capability),
             resolved_capability,
             admission_blockers: route.admission_blockers(),
             route,

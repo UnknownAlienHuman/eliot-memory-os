@@ -45,7 +45,8 @@ use std::collections::BTreeMap;
 
 use eliot_contracts::{ArtifactId, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_coordination::{
-    AnchorResolution, CoordinationOwner, PeerReviewLifecycle, PeerReviewStanding,
+    AnchorResolution, CoordinationOwner, PeerReviewLifecycle, PeerReviewStanding, ReviewKind,
+    ReviewRecommendation, ReviewTargetKind,
 };
 use eliot_evaluation_contracts::HumanAttentionEvaluation;
 use eliot_observation::ObservationJournal;
@@ -113,6 +114,13 @@ pub struct ControlBoardReviewBatch {
     /// each obligation's own `artifact_revision`, so a review of an older
     /// revision cannot be read as approving the head.
     pub current_artifact_revision: Option<u64>,
+    /// Digest bound at the currently admitted head revision, absent when none
+    /// was admitted. The current target is the (`current_artifact_revision`,
+    /// `current_artifact_digest`) pair: an unchanged digest across a head move
+    /// is not new content, and a changed digest never inherits the old
+    /// approval. Both live in the coordination artifact-revision space, not in
+    /// `ViewRevision` or source-commit space.
+    pub current_artifact_digest: Option<String>,
     /// Owner-recorded expected-review count, absent when unrecorded.
     pub expected: Option<u64>,
     /// Retained obligation count.
@@ -127,16 +135,39 @@ pub struct ControlBoardReviewBatch {
 }
 
 /// One retained anchored-review obligation as the owner holds it.
+///
+/// Every field reproduces an owner-retained fact verbatim: the stable
+/// review/request identity, the immutable reviewed revision and digest, the
+/// author session, the submitted anchor, this item's own lifecycle, standing
+/// and recommendation, the retained rejection reason and conflict linkage,
+/// the carried evidence, and the record fence the obligation was admitted
+/// under. No visibility,
+/// privacy, role, or recipient fact is carried because the owner retains
+/// none; none is invented here.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ControlBoardReviewBatchObligation {
     /// Stable review identity.
     pub review_id: String,
+    /// Stable request identity this review answers, so the item stays
+    /// joinable to its review request.
+    pub request_id: String,
     /// Exact reviewed artifact revision; never rewritten by a later head.
     pub artifact_revision: u64,
     /// Exact reviewed artifact digest at that revision.
     pub artifact_digest: String,
     /// Author of this obligation.
     pub reviewer_session_id: String,
+    /// Reviewed operation identity exactly as the owner retains it. This is
+    /// the only operation/`WorkScope`-adjacent fact the owner retains; no
+    /// recipient, role, `WorkScope`, or task fact is carried because the owner
+    /// retains none, and none is invented here (I11.8).
+    pub operation: String,
+    /// What kind of target this obligation reviews; one item's kind never
+    /// stands in for another item's.
+    pub target_kind: ReviewTargetKind,
+    /// What kind of review this obligation is; an answer to a question never
+    /// disposes an objection.
+    pub kind: ReviewKind,
     /// Historical anchor selector exactly as submitted.
     pub anchor_field: String,
     /// Anchor resolution claimed at submit.
@@ -145,10 +176,25 @@ pub struct ControlBoardReviewBatchObligation {
     pub lifecycle: PeerReviewLifecycle,
     /// This obligation's own standing.
     pub standing: PeerReviewStanding,
+    /// This obligation's own recommendation; one item's recommendation never
+    /// disposes another item.
+    pub recommendation: ReviewRecommendation,
     /// Reason retained when this obligation was rejected.
     pub rejection_reason: Option<String>,
+    /// Conflict this obligation's recommendation is contested under, when the
+    /// owner retained one. A contested item keeps its own outcome; no other
+    /// item's answer discharges it.
+    pub conflict_id: Option<String>,
     /// Evidence references the obligation itself carries.
     pub evidence_refs: Vec<String>,
+    /// Proof references the obligation itself carries. A disposition without
+    /// the required proof cannot close the obligation (I11.10).
+    pub proof_refs: Vec<String>,
+    /// Owner timestamp that admitted this obligation, joining the item to
+    /// its delivery evidence in the owner's event chain.
+    pub created_at: u64,
+    /// Record fence the retained obligation was admitted under.
+    pub state_fence: StateFence,
 }
 
 /// Refresh-consistent `ControlBoard` snapshot assembled over Governor owners.
@@ -303,6 +349,7 @@ fn project_review_batches(coordination: &CoordinationOwner) -> Vec<ControlBoardR
         .map(|batch| ControlBoardReviewBatch {
             artifact_id: batch.artifact_id,
             current_artifact_revision: batch.current_artifact_revision,
+            current_artifact_digest: batch.current_artifact_digest,
             expected: batch.expected,
             submitted: batch.submitted,
             disposed: batch.disposed,
@@ -312,15 +359,24 @@ fn project_review_batches(coordination: &CoordinationOwner) -> Vec<ControlBoardR
                 .into_iter()
                 .map(|obligation| ControlBoardReviewBatchObligation {
                     review_id: obligation.review_id,
+                    request_id: obligation.request_id,
                     artifact_revision: obligation.artifact_revision,
                     artifact_digest: obligation.artifact_digest,
                     reviewer_session_id: obligation.reviewer_session_id,
+                    operation: obligation.operation,
+                    target_kind: obligation.target_kind,
+                    kind: obligation.kind,
                     anchor_field: obligation.anchor_field,
                     anchor_resolution: obligation.anchor_resolution,
                     lifecycle: obligation.lifecycle,
                     standing: obligation.standing,
+                    recommendation: obligation.recommendation,
                     rejection_reason: obligation.rejection_reason,
+                    conflict_id: obligation.conflict_id,
                     evidence_refs: obligation.evidence_refs,
+                    proof_refs: obligation.proof_refs,
+                    created_at: obligation.created_at,
+                    state_fence: obligation.state_fence,
                 })
                 .collect(),
         })

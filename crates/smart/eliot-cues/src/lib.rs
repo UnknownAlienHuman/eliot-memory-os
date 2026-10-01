@@ -66,6 +66,14 @@
 //! holding a slice of ids reads the same rule through
 //! [`validate_legacy_row_ids`]. This removed no public item and added none.
 //!
+//! Three further rules were written out at seven, two and five sites
+//! respectively and are now single owners too: the retained-bytes non-empty
+//! refusal ([`require_retained_bytes`]), the replay-surface duplicate row-id
+//! refusal ([`record_unique_row_id`]) and the A-11 re-observation refusal
+//! ([`require_normalizer_reobservation`]). Each owner keeps the stable `field`
+//! or `what` pointer its call sites already returned, so no caller observes a
+//! changed refusal path.
+//!
 //! Removed duplicates (compile-proof; see `tests/legacy_facade.rs`):
 //! local `CueKind`/`MatchMode`/`CueStrength`, all `normalize_value*`
 //! copies, `CueKey` constructors/comparison, `CueRecord` construction and
@@ -232,11 +240,7 @@ impl V1RowMigration {
     /// identity. This never authenticates a v2 identity or grants semantics.
     pub fn validate(&self) -> Result<(), FacadeError> {
         validate_legacy_identity(&self.legacy_row_id)?;
-        if self.legacy_bytes.is_empty() {
-            return Err(FacadeError::EnvelopeInvalid {
-                field: "legacy_bytes",
-            });
-        }
+        require_retained_bytes(&self.legacy_bytes, "legacy_bytes")?;
         let parsed = legacy_adapter::parse_bound_v1_row(&self.legacy_bytes, &self.legacy_row_id)?;
         parsed.validate_for_conversion()?;
         self.disposition.validate().map_err(FacadeError::Contract)?;
@@ -263,11 +267,7 @@ impl V1SnapshotMigration {
     /// Validates the complete snapshot envelope and every retained row.
     pub fn validate(&self) -> Result<(), FacadeError> {
         validate_legacy_identity(&self.legacy_snapshot_id)?;
-        if self.legacy_snapshot_bytes.is_empty() {
-            return Err(FacadeError::EnvelopeInvalid {
-                field: "legacy_snapshot_bytes",
-            });
-        }
+        require_retained_bytes(&self.legacy_snapshot_bytes, "legacy_snapshot_bytes")?;
         if self.ceiling != eliot_cue_contracts::ProofCeiling::CandidateArtifact {
             return Err(FacadeError::EnvelopeInvalid { field: "ceiling" });
         }
@@ -288,11 +288,7 @@ impl V1SnapshotMigration {
                     what: "migration.snapshot.row_payload",
                 });
             }
-            if !seen.insert(row.legacy_row_id.clone()) {
-                return Err(FacadeError::ResponseIdentityMismatch {
-                    what: "migration.duplicate_legacy_row_id",
-                });
-            }
+            record_unique_row_id(&mut seen, &row.legacy_row_id)?;
         }
         if parsed.len() != seen.len() || parsed.keys().any(|row_id| !seen.contains(row_id)) {
             return Err(FacadeError::ResponseIdentityMismatch {
@@ -354,6 +350,81 @@ fn validate_legacy_row_ids(row_ids: &[String]) -> Result<(), FacadeError> {
     Ok(())
 }
 
+/// The single owner of the retained-bytes non-empty refusal.
+///
+/// "The exact v1 bytes this record must preserve are empty" was written out
+/// at seven call sites across this crate and `legacy_adapter`:
+/// [`V1RowMigration::validate`], [`V1PreservedRow::new`],
+/// [`preserve_v1_row_bytes`] and [`reject_v1_row_conversion`] over
+/// `legacy_bytes`, plus [`V1SnapshotMigration::validate`],
+/// [`preserve_v1_snapshot_bytes`] and
+/// [`preserve_v1_snapshot_bytes_with_rows`] over `legacy_snapshot_bytes`, plus
+/// [`legacy_adapter::convert_v1_row`]. Seven copies of one preservation rule
+/// are seven validation owners that can drift into admitting an empty replay
+/// payload where another copy refuses it. Every site now reads the rule from
+/// here.
+///
+/// `field` stays a parameter because each site reports a stable wire-visible
+/// path naming its own bytes, so no refusal path changes the field a caller
+/// already receives. This owner asserts non-emptiness only; whether the bytes
+/// parse as a complete identity-bound envelope stays with
+/// `legacy_adapter::parse_bound_v1_row` / `parse_bound_v1_snapshot`.
+pub(crate) fn require_retained_bytes(bytes: &[u8], field: &'static str) -> Result<(), FacadeError> {
+    if bytes.is_empty() {
+        return Err(FacadeError::EnvelopeInvalid { field });
+    }
+    Ok(())
+}
+
+/// The single owner of the replay-surface duplicate row-id refusal.
+///
+/// "This row identity was already retained in this snapshot" was written out
+/// twice in this crate, once in [`V1SnapshotMigration::validate`] over the
+/// caller-supplied rows and once in
+/// [`preserve_v1_snapshot_bytes_with_rows`] over the records it just built.
+/// Two copies of one membership rule are two validation owners that can drift
+/// into rejecting a distinct set of rows, so both sites now read this one
+/// owner and both still report the same stable pointer
+/// `migration.duplicate_legacy_row_id`.
+///
+/// The seen-set is a parameter because the two sites track different inputs
+/// over the same rule: one records the caller's row ids, the other the ids of
+/// the records it has already admitted.
+fn record_unique_row_id(
+    seen: &mut std::collections::BTreeSet<String>,
+    legacy_row_id: &str,
+) -> Result<(), FacadeError> {
+    if !seen.insert(legacy_row_id.to_owned()) {
+        return Err(FacadeError::ResponseIdentityMismatch {
+            what: "migration.duplicate_legacy_row_id",
+        });
+    }
+    Ok(())
+}
+
+/// The single owner of the A-11 re-observation refusal.
+///
+/// `FacadeError::MigrationRequired { owner: "eliot-cue-normalizer",
+/// revision: A11_CONTRACT_REVISION }` — the typed refusal that names the
+/// admitted owner and its exact contract revision — was written out five times
+/// in `legacy_adapter`: in [`legacy_adapter::require_reobservation`],
+/// [`legacy_adapter::legacy_row_id_v2`], and three times inside
+/// [`legacy_adapter::legacy_row_id_v2_from_fresh_observation`]. Five copies of
+/// one refusal are five policy owners that can drift into naming a different
+/// owner, a different contract revision, or a different refusal type for the
+/// same condition. Every site now reads the rule from here.
+///
+/// This owner names A-11 and its revision only. The always-fails replay
+/// refusals (`legacy-v1-replay` / `raw-bytes-required`) are a different rule
+/// with a different owner pointer and stay at their own call sites, so this
+/// helper never over-generalizes to cover them.
+fn require_normalizer_reobservation() -> FacadeError {
+    FacadeError::MigrationRequired {
+        owner: "eliot-cue-normalizer",
+        revision: eliot_cue_normalizer::A11_CONTRACT_REVISION,
+    }
+}
+
 fn validate_legacy_identity(value: &str) -> Result<(), FacadeError> {
     if is_blank_or_control(value) {
         return Err(FacadeError::EnvelopeInvalid {
@@ -384,11 +455,7 @@ impl V1PreservedRow {
             legacy_bytes: legacy_bytes.into(),
         };
         validate_legacy_identity(&value.legacy_row_id)?;
-        if value.legacy_bytes.is_empty() {
-            return Err(FacadeError::EnvelopeInvalid {
-                field: "legacy_bytes",
-            });
-        }
+        require_retained_bytes(&value.legacy_bytes, "legacy_bytes")?;
         legacy_adapter::parse_bound_v1_row(&value.legacy_bytes, &value.legacy_row_id)?;
         Ok(value)
     }
@@ -451,11 +518,7 @@ pub fn preserve_v1_row_bytes(
     legacy_bytes: &[u8],
 ) -> Result<V1RowMigration, FacadeError> {
     validate_legacy_row_id(legacy_row_id)?;
-    if legacy_bytes.is_empty() {
-        return Err(FacadeError::EnvelopeInvalid {
-            field: "legacy_bytes",
-        });
-    }
+    require_retained_bytes(legacy_bytes, "legacy_bytes")?;
     let record = V1RowMigration {
         legacy_row_id: legacy_row_id.to_owned(),
         legacy_bytes: legacy_bytes.to_vec(),
@@ -491,11 +554,7 @@ pub fn preserve_v1_snapshot_bytes(
     row_ids: &[String],
 ) -> Result<V1SnapshotMigration, FacadeError> {
     validate_legacy_identity(legacy_snapshot_id)?;
-    if legacy_snapshot_bytes.is_empty() {
-        return Err(FacadeError::EnvelopeInvalid {
-            field: "legacy_snapshot_bytes",
-        });
-    }
+    require_retained_bytes(legacy_snapshot_bytes, "legacy_snapshot_bytes")?;
     validate_legacy_row_ids(row_ids)?;
     Err(FacadeError::MigrationRequired {
         owner: "legacy-v1-replay",
@@ -510,20 +569,12 @@ pub fn preserve_v1_snapshot_bytes_with_rows(
     rows: &[V1PreservedRow],
 ) -> Result<V1SnapshotMigration, FacadeError> {
     validate_legacy_identity(legacy_snapshot_id)?;
-    if legacy_snapshot_bytes.is_empty() {
-        return Err(FacadeError::EnvelopeInvalid {
-            field: "legacy_snapshot_bytes",
-        });
-    }
+    require_retained_bytes(legacy_snapshot_bytes, "legacy_snapshot_bytes")?;
     let mut retained = Vec::with_capacity(rows.len());
     let mut seen = std::collections::BTreeSet::new();
     for row in rows {
         let record = preserve_v1_row_bytes(&row.legacy_row_id, &row.legacy_bytes)?;
-        if !seen.insert(record.legacy_row_id.clone()) {
-            return Err(FacadeError::ResponseIdentityMismatch {
-                what: "migration.duplicate_legacy_row_id",
-            });
-        }
+        record_unique_row_id(&mut seen, &record.legacy_row_id)?;
         retained.push(record);
     }
     let snapshot = V1SnapshotMigration {
@@ -596,11 +647,7 @@ pub fn reject_v1_row_conversion(
     row.validate_for_conversion()?;
     bind_v1_row_payload(legacy_row_id, row, legacy_bytes)?;
     validate_legacy_identity(legacy_row_id)?;
-    if legacy_bytes.is_empty() {
-        return Err(FacadeError::EnvelopeInvalid {
-            field: "legacy_bytes",
-        });
-    }
+    require_retained_bytes(legacy_bytes, "legacy_bytes")?;
     let record = V1RowMigration {
         legacy_row_id: legacy_row_id.to_owned(),
         legacy_bytes: legacy_bytes.to_vec(),

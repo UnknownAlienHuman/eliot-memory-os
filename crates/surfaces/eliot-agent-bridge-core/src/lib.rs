@@ -85,6 +85,11 @@ pub use mcp_bridge_join::{
     TerminalReconcileRequest, read_host_coverage, reconcile_deadline_sweep,
     reconcile_terminal_event, submit_derived_fault,
 };
+// `OperationEffectClass` was removed from this list: the effect class on a
+// correlation record is now the OWNER's own `eliot_receipts::EffectClass`, read
+// out of the owner's receipt. A bridge-spelled effect class is exactly the
+// caller-asserted value issue #2899 item 1 refuses, so the vocabulary is not
+// re-declared here.
 pub use mcp_correlation::{
     Assessment, AssessmentEvidence, AssessmentInputs, AssessmentLog, AssessmentLogError,
     AssessmentRevision, AssessmentSummary, CORRELATION_IDENTITY_VERSION, CORRELATION_SCHEMA_ID,
@@ -92,9 +97,10 @@ pub use mcp_correlation::{
     CorrelationIdentityParts, CorrelationStage, CoverageIndeterminacy, CoverageProof,
     EliotEmissionObservation, EmissionCause, HandlerOutcome, HostObservationEvidence,
     HostTerminalObservation, HostTerminalState, MAX_ASSESSMENT_REVISIONS, MAX_SUMMARY_EVIDENCE,
-    ObservationWindow, OperationEffectClass, OperationIdentity, OwnerBindingError,
-    OwnerValidatedOperationBinding, PartialObservation, RecoveryAction, RouteDegradation,
-    RouteDegradationCode, StdioEmissionReceipt, assess_correlation, derive_recovery, sha256_hex,
+    ObservationWindow, OperationIdentity, OwnerBindingError, OwnerValidatedOperationBinding,
+    PartialObservation, RecoveryAction, RouteDegradation, RouteDegradationCode,
+    StdioEmissionReceipt, assess_correlation, derive_recovery, identity_commits_to_operation,
+    sha256_hex,
 };
 // `mcp_correlation::CoverageGap` and `mcp_correlation::RecoveryDirective` are
 // deliberately NOT re-exported here. The crate root already exports a

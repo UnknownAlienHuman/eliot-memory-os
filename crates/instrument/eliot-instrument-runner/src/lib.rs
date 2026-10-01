@@ -79,8 +79,9 @@ pub use profile::{
     PACKAGE_VERIFICATION_ALIAS, PACKAGE_VERIFICATION_ROUTE, PROFILE_ALIASES, ProfileAlias,
     ProfileCompiler, ProfileError, ProfileScopeClasses, REGISTRY_SNAPSHOT_SCHEMA,
     REGISTRY_SNAPSHOT_SCHEMA_VERSION, ResolvedProfile, ResolvedStage, ResourceLimits, StageDag,
-    StageDecl, StageEnvironment, TEST_PROFILE, TargetLayout, WorkScope, admitted_profile_for_alias,
-    bundle_verification_profile, compiler_profile, package_verification_profile, test_profile,
+    StageDecl, StageEnvironment, TEST_PROFILE, TOOLCHAIN_PATH_ENV, TargetLayout, WorkScope,
+    admitted_profile_for_alias, bundle_verification_profile, compiler_profile,
+    package_verification_profile, test_profile,
 };
 pub use profile_run::{
     AggregateStatus, InstrumentRun, MappedStageLauncher, PlannedStage, ProfileAggregate,

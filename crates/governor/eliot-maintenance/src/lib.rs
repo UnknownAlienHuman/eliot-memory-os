@@ -29,6 +29,7 @@ pub mod improvement_pipeline;
 mod outcome_observation;
 pub mod result_obligation;
 mod trigger_intake;
+mod trigger_retention;
 pub mod utility_evaluation;
 
 pub use outcome_observation::{
@@ -82,17 +83,19 @@ pub use improvement_pipeline::{
     IMPROVEMENT_PROPOSAL_COMMITMENT_DOMAIN, IMPROVEMENT_PROPOSAL_DIGEST_ALGORITHM,
     IMPROVEMENT_PROPOSAL_ENCODING_VERSION, IMPROVEMENT_RISK_CEILING_BOUNDED,
     IMPROVEMENT_RISK_CEILING_ENCODING_VERSION, ImprovementCanaryHandoff,
-    ImprovementCandidateIngress, ImprovementCurrentProposal, ImprovementEvidenceExecution,
-    ImprovementMaterialEquality, ImprovementOperation, ImprovementPipelineInputs,
-    ImprovementProposal, ImprovementProposalCommitmentEnvelope, ImprovementReplayAssessment,
-    ImprovementTerminalDisposition, ImprovementUnknownEffect, ImprovementUnknownEffectIdentity,
-    KERNEL_CANARY_OWNER, MechanismDeclaration, OP_ADMIT, OP_CANARY_ACTIVATE, OP_CANDIDATE_INGRESS,
-    OP_EVALUATE, OP_EXECUTE_EXPERIMENT, OP_MEASURE, OP_PROMOTE, OP_PROPOSE, OP_ROLLBACK,
-    PipelineError, ProposalCommitment, RetainedImprovementProposal, RollbackContract, TESTD_OWNER,
-    UnboundOwnerOutcome, UncheckedRecordIdentity, UncheckedWireRevision, UnestablishedPriorCause,
-    VERIFIER_OWNER_FAMILY, admit_improvement_candidate_without_execution_evidence,
-    assess_improvement_replay, check_checked_record_identity, check_handoff_wire_revision,
-    compare_improvement_commitments, improvement_retry_permitted, ingest_improvement_candidate,
+    ImprovementCandidateIngress, ImprovementCurrentProposal, ImprovementEvaluationBinding,
+    ImprovementEvidenceExecution, ImprovementMaterialEquality, ImprovementOperation,
+    ImprovementPipelineInputs, ImprovementProposal, ImprovementProposalCommitmentEnvelope,
+    ImprovementReplayAssessment, ImprovementTerminalDecision, ImprovementTerminalDisposition,
+    ImprovementUnknownEffect, ImprovementUnknownEffectIdentity, KERNEL_CANARY_OWNER,
+    MechanismDeclaration, OP_ADMIT, OP_CANARY_ACTIVATE, OP_CANDIDATE_INGRESS, OP_EVALUATE,
+    OP_EXECUTE_EXPERIMENT, OP_MEASURE, OP_PROMOTE, OP_PROPOSE, OP_ROLLBACK, PipelineError,
+    ProposalCommitment, RetainedImprovementProposal, RollbackContract, TESTD_OWNER,
+    UnboundDecisionRecord, UnboundOwnerOutcome, UncheckedRecordIdentity, UncheckedWireRevision,
+    UnestablishedPriorCause, VERIFIER_OWNER_FAMILY,
+    admit_improvement_candidate_without_execution_evidence, assess_improvement_replay,
+    check_checked_record_identity, check_handoff_wire_revision, compare_improvement_commitments,
+    improvement_retry_permitted, improvement_terminal_decision, ingest_improvement_candidate,
     proposal_digest, reconcile_retained_unknown_effect, reconcile_unknown_activation,
     retained_improvement_completion, run_improvement_candidate_pipeline,
 };
@@ -100,6 +103,10 @@ pub use trigger_intake::{
     MaintenanceTriggerIntake, TriggerIntakeClasses, TriggerIntakeOperation, TriggerIntakePayload,
     TriggerIntakePersistReceipt, TriggerIntakePosition, TriggerIntakeRequest, TriggerIntakeRouting,
     TriggerIntakeSourceEvent, TriggerIntakeWindow, derive_trigger_intake,
+};
+pub use trigger_retention::{
+    RetentionReleaseProof, RetentionSettlementClass, TriggerDamageGap, TriggerDamageKind,
+    TriggerRetentionDisposition, TriggerRetentionSuccessor,
 };
 
 /// Stable wire name for the maintenance governor contract.

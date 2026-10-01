@@ -32,12 +32,38 @@
 //! [`assess_correlation`] with competent evidence; retry authority arrives only
 //! through an owner-minted [`OwnerValidatedOperationBinding`].
 //!
+//! Where a real semantic operation exists, the correlation identity carries
+//! three OWNER-ISSUED values and nothing caller-asserted (issue #2899, item 1):
+//! the owner's operation handle, the owner's commitment to the request's
+//! identity, and the owner's own effect class. All three are read out of the
+//! owner's own immutable receipt ([`OwnerValidatedOperationBinding::from_owner_receipt`]):
+//! the handle is `eliot_receipts::OperationBinding::operation_id`, the effect
+//! class is `eliot_receipts::OperationBinding::effect` in the owner's own
+//! [`eliot_receipts::EffectClass`] vocabulary, and the commitment is a digest
+//! over exactly what the owner itself bound to that operation. An operation id
+//! the caller composed, a commitment recomputed from the caller's own payload,
+//! and an effect class this module spelled are all caller-asserted and bind
+//! nothing.
+//!
+//! The exact owner symbol for "which effect class is this operation" is
+//! `eliot_receipts::OperationBinding::effect`: it is a required field of the
+//! owner's own operation binding, so a semantic operation whose owner record
+//! carries no effect class is not a record this surface covers and none is
+//! defaulted for it. `ReceiptEnvelope::validate()` is the gate — a receipt that
+//! does not validate (a missing or absent effect class included) yields
+//! [`OwnerBindingError::OwnerRecordRejected`] and no binding at all.
+//!
 //! Carriers only: nothing here changes wire payloads, canonical write
 //! semantics, finish semantics, or host UI expectations. Structured events
 //! carry identifiers, digests, stages, counts, and outcome classes; they never
 //! carry tool payloads, host secrets, or private conversation content, per
-//! `docs/integrations/claude/CLAUDE_INTEGRATION_SECURITY.md`.
+//! `docs/integrations/claude/CLAUDE_INTEGRATION_SECURITY.md`. The request
+//! commitment is a fixed-width digest over identity fields only, so it cannot
+//! become a channel for a tool argument, a response body, conversation content,
+//! a credential, or host-controlled prose (issue #2899, item 12).
 
+use eliot_contracts::canonical_json_bytes;
+use eliot_receipts::{EffectClass, ReceiptEnvelope};
 use serde::{Deserialize, Serialize};
 
 use crate::TransportEdgeKind;
@@ -50,7 +76,11 @@ use crate::TransportEdgeKind;
 pub const CORRELATION_SCHEMA_ID: &str = "eliot.mcp-stdio-correlation.v2";
 
 /// Version of the logical correlation identity bound into every record.
-pub const CORRELATION_IDENTITY_VERSION: u32 = 1;
+///
+/// Version 2 binds the owner-issued operation handle, the owner-issued
+/// request commitment, and the owner's own effect class (issue #2899 W1.2);
+/// version 1 carried a bridge-spelled effect class and no request commitment.
+pub const CORRELATION_IDENTITY_VERSION: u32 = 2;
 
 /// Maximum assessment revisions retained on one correlation record.
 ///
@@ -73,8 +103,10 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 ///
 /// Binds the transport request, the exact method/tool, the serving host
 /// profile and session, and the route/process generation. Where the tool
-/// owner issued an operation handle, the binding joins it here; raw caller
-/// strings never enter this identity until the owner resolves them.
+/// owner admitted a real semantic operation, the binding joins the three
+/// owner-issued values here — the owner's operation handle, the owner's
+/// commitment to the request's identity, and the owner's own effect class;
+/// raw caller strings never enter this identity until the owner resolves them.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CorrelationIdentity {
     /// Identity schema version ([`CORRELATION_IDENTITY_VERSION`]).
@@ -93,10 +125,30 @@ pub struct CorrelationIdentity {
     pub runtime_id: Option<String>,
     /// Authority generation of the serving route/process, when observed.
     pub auth_generation: Option<String>,
-    /// Owner-issued retry-stable operation handle, when the tool owner bound one.
+    /// Owner-issued operation handle, when the tool owner admitted one.
+    ///
+    /// Exactly the owner's `operation_id` as its own receipt recorded it. A
+    /// caller-composed write id or idempotency key is not a handle and never
+    /// reaches this field; caller hints stay in [`OperationIdentity`].
     pub owner_operation_handle: Option<String>,
-    /// Owner-attested effect class, when the tool owner bound one.
-    pub effect_class: Option<OperationEffectClass>,
+    /// Owner-issued commitment to the request's IDENTITY, when the owner
+    /// admitted one.
+    ///
+    /// Covers the operation handle plus everything the owner itself bound to
+    /// that operation: its request identity, its idempotency key, its semantic
+    /// command kind, the bound-set revision (state fence) it was admitted at,
+    /// and its effect class. It commits to identity, never to content: no tool
+    /// argument, response body, conversation content, credential, or
+    /// host-controlled prose is an input, and the value is a fixed-width digest
+    /// so nothing can ride inside it. Content comparison is a different
+    /// question and is not answered here.
+    pub owner_request_commitment: Option<String>,
+    /// Owner-attested effect class, in the owner's own effect vocabulary.
+    ///
+    /// Carries [`eliot_receipts::EffectClass`] as the owner publishes it
+    /// rather than a class this surface spells, so the record cannot name an
+    /// effect the owner did not attest.
+    pub effect_class: Option<EffectClass>,
     /// Digest over the canonical identity fields above; the exact join key.
     pub identity_digest: String,
 }
@@ -125,6 +177,25 @@ pub struct CorrelationIdentityParts {
     /// Authority generation of the serving route the producer observed.
     pub auth_generation: Option<String>,
     /// Owner-validated operation binding, when a tool owner minted one.
+    ///
+    /// # Not supplied on the production emission path today
+    ///
+    /// The live emission producer passes `None` here, so on the production path
+    /// all three owner-issued values on the assembled identity are absent and
+    /// [`identity_commits_to_operation`] is never reached with a real binding.
+    /// The exact site that must change is
+    /// `bins/eliot-agent-bridge/src/mcp_correlation.rs:339` —
+    /// `observe_mcp_emission` builds its `CorrelationIdentityParts` with
+    /// `operation_binding: None`. That binary is owned by another lane, so this
+    /// crate does not and must not supply the binding itself.
+    ///
+    /// `None` here means ABSENT, never "matches". [`identity_commits_to_operation`]
+    /// compares each value as `Some(recorded) == Some(binding_value)`, so an
+    /// identity with no recorded operation matches no binding at all, and a
+    /// binding presented against it is refused by
+    /// `crate::mcp_bridge_join::reconcile_terminal_event` rather than accepted
+    /// as a match. No default binding and no default effect class is
+    /// substituted anywhere on this path.
     pub operation_binding: Option<OwnerValidatedOperationBinding>,
 }
 
@@ -135,12 +206,25 @@ impl CorrelationIdentity {
     /// fabricated default generation or profile. The digest is over the exact
     /// canonical segment sequence, so the same observed facts always produce
     /// the same join key and any changed fact produces a different one.
+    ///
+    /// An absent `operation_binding` yields three absent owner-issued values,
+    /// never a placeholder handle, a placeholder commitment, or a placeholder
+    /// effect class. The effect-class segment in particular is derived from the
+    /// owner's own type by a total expression (see
+    /// [`owner_effect_class_name`]), so it can never collapse to an empty
+    /// segment that would let two different owner effect classes share one
+    /// `identity_digest`.
     #[must_use]
     pub fn assemble(parts: &CorrelationIdentityParts) -> Self {
         let binding = parts.operation_binding.as_ref();
-        let owner_operation_handle = binding.map(|bound| bound.retry_identity.clone());
-        let effect_class = binding.map(|bound| bound.effect_class);
-        let mut canonical = String::from("eliot.mcp-correlation-identity.v1\0");
+        let owner_operation_handle = binding.map(|bound| bound.operation_handle().to_owned());
+        let owner_request_commitment = binding.map(|bound| bound.request_commitment().to_owned());
+        let effect_class = binding.map(OwnerValidatedOperationBinding::effect_class);
+        let effect_segment = effect_class.map(owner_effect_class_name);
+        // v2 adds the owner request-commitment segment (issue #2899 W1.2), so
+        // the domain separator moves with it: a v1 digest and a v2 digest are
+        // never the same join key even for otherwise identical facts.
+        let mut canonical = String::from("eliot.mcp-correlation-identity.v2\0");
         for segment in [
             parts.mcp_request_id.as_str(),
             parts.method.as_str(),
@@ -150,7 +234,8 @@ impl CorrelationIdentity {
             parts.runtime_id.as_deref().unwrap_or_default(),
             parts.auth_generation.as_deref().unwrap_or_default(),
             owner_operation_handle.as_deref().unwrap_or_default(),
-            effect_class.map_or("", OperationEffectClass::as_str),
+            owner_request_commitment.as_deref().unwrap_or_default(),
+            effect_segment.as_deref().unwrap_or_default(),
         ] {
             canonical.push_str(segment);
             canonical.push('\0');
@@ -165,10 +250,34 @@ impl CorrelationIdentity {
             runtime_id: parts.runtime_id.clone(),
             auth_generation: parts.auth_generation.clone(),
             owner_operation_handle,
+            owner_request_commitment,
             effect_class,
             identity_digest: sha256_hex(canonical.as_bytes()),
         }
     }
+}
+
+/// Whether this identity carries the same owner-issued operation as `binding`.
+///
+/// Compares the three owner-issued values by content, never by existence or by
+/// length: a binding that merely exists, or whose commitment is the same width,
+/// says nothing about which operation it commits to.
+///
+/// An identity that recorded no owner operation matches NOTHING. Each comparison
+/// is `Some(recorded) == Some(binding_value)`, so an absent recorded value can
+/// never equal a present binding value: absence is not a wildcard, and a binding
+/// cannot be adopted after the fact by an identity that never recorded one. This
+/// is the whole answer to "what if the binding is absent" — it is a refusal, not
+/// a default, and it holds on the live production path today where the producer
+/// supplies no binding at all.
+#[must_use]
+pub fn identity_commits_to_operation(
+    identity: &CorrelationIdentity,
+    binding: &OwnerValidatedOperationBinding,
+) -> bool {
+    identity.owner_operation_handle.as_deref() == Some(binding.operation_handle())
+        && identity.owner_request_commitment.as_deref() == Some(binding.request_commitment())
+        && identity.effect_class == Some(binding.effect_class())
 }
 
 /// Identity of the idempotent operation a `tools/call` request carries, if any.
@@ -323,6 +432,14 @@ pub struct StdioEmissionReceipt {
 /// coverage ceiling. A successful emission observation carries no
 /// route-degradation code and no recovery directive; those arrive only in
 /// later [`Assessment`] revisions derived from competent host evidence.
+///
+/// The embedded [`CorrelationIdentity`] is where a real semantic operation
+/// appears: the owner-issued operation handle, the owner-issued request
+/// commitment, and the owner's own effect class are present only when the tool
+/// owner's own receipt bound them, and are absent otherwise. The request
+/// commitment is a digest over request identity, so this record gains no channel
+/// for a tool argument, a response body, conversation content, a credential, or
+/// host-controlled prose.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EliotEmissionObservation {
     /// Versioned logical identity of the invocation.
@@ -345,6 +462,15 @@ impl EliotEmissionObservation {
     /// Takes the observed parts explicitly so this owner never depends on a
     /// producer's state machine. The coverage ceiling is always the honest
     /// stdio-boundary one: no producer can widen it by asserting more.
+    ///
+    /// The identity is frozen exactly as assembled, including an absence. On
+    /// the live production path the producer supplies no owner operation (see
+    /// [`CorrelationIdentityParts::operation_binding`]), so the frozen record
+    /// carries no owner handle, no owner request commitment, and no owner effect
+    /// class. That absence is the record's honest content and is never repaired
+    /// here: this constructor adds no default binding and no default effect
+    /// class, and a later join that is handed a binding finds an identity that
+    /// commits to no operation and refuses it.
     #[must_use]
     pub fn observe(
         identity: CorrelationIdentity,
@@ -676,44 +802,30 @@ impl ObservationWindow {
     }
 }
 
-/// Owner-attested effect class of one operation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OperationEffectClass {
-    /// The operation performs no mutation.
-    ReadOnly,
-    /// The operation may mutate and is safe to replay under its retry identity.
-    MutatingRetryStable,
-    /// The operation may mutate and must never be replayed as the same identity.
-    MutatingSingleShot,
-}
-
-impl OperationEffectClass {
-    /// Stable wire name for structured events.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::ReadOnly => "read_only",
-            Self::MutatingRetryStable => "mutating_retry_stable",
-            Self::MutatingSingleShot => "mutating_single_shot",
-        }
-    }
-}
-
-/// Typed operation binding minted by the tool handler/result owner.
+/// Typed operation binding read out of the tool handler/result owner's own
+/// receipt.
 ///
-/// This is the only retry authority in correlation: [`RecoveryAction::ResubmitSameOperationIdentity`]
-/// is derivable only when a binding exists and its owner-approved recovery
-/// options include resubmission. Caller `write_id`/`idempotency_key` strings
-/// can never mint this type; only the owning tool can, after proving the
-/// operation is retry-stable and safe to reconcile.
+/// This is the only retry authority in correlation:
+/// [`RecoveryAction::ResubmitSameOperationIdentity`] is derivable only when a
+/// binding exists and its owner-approved recovery options include
+/// resubmission. Caller `write_id`/`idempotency_key` strings can never mint this
+/// type; only the owning tool's own receipt can, after that receipt validates.
+///
+/// The three values this binding exists to carry are all read from the owner's
+/// record, never composed here: the operation handle is the owner's
+/// `operation_id`, the request commitment is a digest over what the owner bound
+/// to that operation, and the effect class is the owner's own
+/// [`eliot_receipts::EffectClass`]. The binding deliberately has no
+/// `Deserialize` implementation: it is minted from an owner record, never
+/// parsed from untrusted input.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OwnerValidatedOperationBinding {
-    /// Digest of the canonical operation/request the owner admitted.
-    operation_digest: String,
-    /// Owner-issued retry-stable identity for same-operation replay.
-    retry_identity: String,
-    /// Owner-attested effect class.
-    effect_class: OperationEffectClass,
+    /// Owner-issued operation handle (`operation_id` on the owner's record).
+    operation_handle: String,
+    /// Owner-issued commitment to the request's identity, never its content.
+    request_commitment: String,
+    /// Owner-attested effect class, in the owner's own vocabulary.
+    effect_class: EffectClass,
     /// Durable state handle carrying the operation disposition.
     durable_state_ref: String,
     /// Independent readback handle, when the owner holds one.
@@ -725,17 +837,19 @@ pub struct OwnerValidatedOperationBinding {
 /// Why an owner operation binding was rejected at mint time.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OwnerBindingError {
-    /// A required identity handle was blank.
-    BlankField(&'static str),
+    /// The owner's own record did not validate, so nothing may be read out of
+    /// it. The recorded value is rejected as it stands: no field is defaulted
+    /// and no effect class is inferred from a record that does not validate.
+    OwnerRecordRejected(String),
 }
 
 impl std::fmt::Display for OwnerBindingError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::BlankField(field) => {
+            Self::OwnerRecordRejected(reason) => {
                 write!(
                     formatter,
-                    "owner operation binding field {field} must not be blank"
+                    "owner operation record did not validate: {reason}"
                 )
             }
         }
@@ -745,47 +859,127 @@ impl std::fmt::Display for OwnerBindingError {
 impl std::error::Error for OwnerBindingError {}
 
 impl OwnerValidatedOperationBinding {
-    /// Mints the binding from owner-held evidence. Fails closed on blanks.
+    /// Mints the binding from the owner's own receipt record. Fails closed.
     ///
-    /// Callable only by the tool handler/result owner: the facade never
-    /// invokes this constructor, so no binding exists until an owner proves
-    /// retry stability. The binding deliberately has no `Deserialize`
-    /// implementation: it is minted, never parsed from untrusted input.
-    #[allow(
-        dead_code,
-        reason = "owner seam: minted only by tool owners; none mint yet so resubmit stays omitted (#2899)"
-    )]
-    pub fn bind(
-        operation_digest: &str,
-        retry_identity: &str,
-        effect_class: OperationEffectClass,
-        durable_state_ref: &str,
+    /// Callable only against a record the tool handler/result owner issued: the
+    /// facade holds no receipt, so it can never mint a binding for itself. The
+    /// owner's `validate()` runs first and gates everything below — an
+    /// operation whose owner record does not validate is not a semantic
+    /// operation this surface covers, and no effect class, handle or commitment
+    /// is derived from it.
+    ///
+    /// The three owner-issued values are read, not chosen:
+    ///
+    /// - the operation handle is `core.operation.operation_id` on the owner's
+    ///   own record (`eliot_receipts::OperationBinding::operation_id`);
+    /// - the request commitment is a digest over that handle plus what the owner
+    ///   itself bound to the same operation (its request identity, idempotency
+    ///   key, semantic command kind, admitted state fence, and effect class) —
+    ///   the request's identity, never its content;
+    /// - the effect class is `core.operation.effect`, the owner's own
+    ///   `eliot_receipts::EffectClass` value
+    ///   (`eliot_receipts::OperationBinding::effect`). There is no fallback
+    ///   class: a record without one does not validate and no binding is minted.
+    ///
+    /// `readback_ref` is the independent readback handle the owner holds, when
+    /// it holds one; `approved_recovery` is the owner's approved recovery
+    /// subset, so resubmission stays omitted unless the owner put it there.
+    pub fn from_owner_receipt(
+        receipt: &ReceiptEnvelope,
         readback_ref: Option<&str>,
         approved_recovery: Vec<RecoveryAction>,
     ) -> Result<Self, OwnerBindingError> {
-        for (field, value) in [
-            ("operation_digest", operation_digest),
-            ("retry_identity", retry_identity),
-            ("durable_state_ref", durable_state_ref),
-        ] {
-            if value.trim().is_empty() {
-                return Err(OwnerBindingError::BlankField(field));
-            }
-        }
+        receipt
+            .validate()
+            .map_err(|error| OwnerBindingError::OwnerRecordRejected(error.to_string()))?;
         Ok(Self {
-            operation_digest: operation_digest.to_owned(),
-            retry_identity: retry_identity.to_owned(),
-            effect_class,
-            durable_state_ref: durable_state_ref.to_owned(),
+            operation_handle: receipt.core.operation.operation_id.as_str().to_owned(),
+            request_commitment: owner_request_commitment(receipt)?,
+            effect_class: receipt.core.operation.effect,
+            durable_state_ref: receipt.identity.receipt_id.as_str().to_owned(),
             readback_ref: readback_ref.map(str::to_owned),
             approved_recovery,
         })
+    }
+
+    /// Owner-issued operation handle this binding commits to.
+    #[must_use]
+    pub fn operation_handle(&self) -> &str {
+        &self.operation_handle
+    }
+
+    /// Owner-issued commitment to the request's identity.
+    #[must_use]
+    pub fn request_commitment(&self) -> &str {
+        &self.request_commitment
+    }
+
+    /// Owner-attested effect class, in the owner's own vocabulary.
+    #[must_use]
+    pub const fn effect_class(&self) -> EffectClass {
+        self.effect_class
     }
 
     /// Whether the owner approved this recovery action for the operation.
     pub fn allows(&self, action: RecoveryAction) -> bool {
         self.approved_recovery.contains(&action)
     }
+}
+
+/// The effect class as the OWNER publishes it, for the identity digest.
+///
+/// The segment is derived from the owner's own type rather than spelled here,
+/// so a bridge-side renaming can never make this record attest an effect class
+/// the owner does not publish, and an owner-side rename moves the digest with
+/// the vocabulary instead of leaving it stale.
+///
+/// This is deliberately infallible. An earlier shape reached the name through
+/// `serde_json::to_string` and mapped a serialization failure to an EMPTY
+/// segment; that is a silent default, and on this record it is the worst
+/// available failure: an empty segment makes two invocations carrying DIFFERENT
+/// owner effect classes hash to the same `identity_digest`, so the join key
+/// stops committing to the class it exists to commit to. A closed fieldless enum
+/// cannot fail to format, and returning a plain `String` from a total expression
+/// makes the empty segment unrepresentable rather than merely unlikely — there
+/// is no `Err` arm left to default. `Option::unwrap_or_default` would have
+/// preserved that same silent collapse in fewer lines, which is why the
+/// fallible call is gone instead of being shortened.
+fn owner_effect_class_name(effect: EffectClass) -> String {
+    format!("{effect:?}")
+}
+
+/// Commits to the IDENTITY of the request the owner admitted, never its content.
+///
+/// The covered fields are exactly the ones the owner bound to this operation:
+/// the operation handle, the request identity, the idempotency key, the
+/// semantic command kind, the admitted state fence (the bound-set revision), and
+/// the effect class. Every input is an owner-issued field of the owner's own
+/// record, which is what separates this from a commitment recomputed over a
+/// caller's own payload; the owner's receipt is the only thing that can supply
+/// them. This is the I5.27 `CanonicalOperationIdentity` shape restricted to the
+/// fields the owner's operation binding actually carries: an operation id, an
+/// idempotency namespace key, a semantic command kind, and a principal/scope
+/// fence — no `canonical_request_hash`, because comparing the request's CONTENT
+/// is a different question and would drag arguments and bodies into the record.
+///
+/// The request's content is deliberately not an input, so no tool argument,
+/// response body, conversation content, credential, or host-controlled prose can
+/// reach the record through this commitment (issue #2899, item 12). Comparing two
+/// such commitments is a content comparison; comparing them by existence or by
+/// width would prove nothing.
+fn owner_request_commitment(receipt: &ReceiptEnvelope) -> Result<String, OwnerBindingError> {
+    let operation = &receipt.core.operation;
+    let identity = (
+        operation.operation_id.as_str(),
+        operation.request_id.as_str(),
+        operation.idempotency_key.as_str(),
+        operation.operation_kind.as_str(),
+        operation.effect,
+        &operation.state_fence,
+    );
+    let bytes = canonical_json_bytes(&identity)
+        .map_err(|error| OwnerBindingError::OwnerRecordRejected(error.to_string()))?;
+    Ok(sha256_hex(&bytes))
 }
 
 /// Canonical operation disposition, orthogonal to host completion.

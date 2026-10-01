@@ -6,9 +6,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use eliot_contracts::sha256_hex;
 use eliot_runtime::{
     ChildClass, Runtime, ShutdownOutcome, SupervisionOutcome, SupervisionStrategy, TaskFailure,
 };
+use eliot_watchdog_core::{CoverageGapExplanation, CoverageManifestProjection, EvidenceRef};
 
 use crate::AdmittedIsolatedDestination;
 use crate::CompositionError;
@@ -25,11 +27,12 @@ use crate::WatchdogRuntimeBinding;
 use crate::admission_gap_reason;
 use crate::backup_control::BackupControlRegistration;
 use crate::current_unix_ms;
+use crate::health_projection::{HealthProjectionCell, evaluate_interval_health};
 use crate::heartbeat_transport::{HeartbeatTransport, HeartbeatTransportError};
 use crate::kernel_gap_reason;
 use crate::observation_coverage::{
-    IntervalCoverageCell, IntervalCoveragePublication, ObservationChannel, ObservationClass,
-    RecordOutcome,
+    CoverageDisposition, IntervalCoverageCell, IntervalCoveragePublication, IntervalCoverageReport,
+    ObservationChannel, ObservationClass, RecordOutcome, channel_capability,
 };
 use crate::report_gap_nonfatal;
 use crate::watchdog_spool::WatchdogSpool;
@@ -154,6 +157,110 @@ fn publish_interval_coverage(publication: &IntervalCoveragePublication, interval
         channels = ?channels,
         "one supervision tick's per-channel I8.2 observation coverage published"
     );
+}
+
+/// Projects the actual #1755 interval manifest on one closed interval.
+///
+/// This is the A4 adapter's read of the owner's own record: the interval
+/// identity, the manifest evidence handle, and the gap verdict are all derived
+/// from the closed [`IntervalCoverageReport`] through its public claims only.
+/// A supplied coverage input built anywhere else — a restated
+/// label, a stale interval, or a verdict the manifest does not carry — cannot
+/// match this projection: supplied values are judged against the actual
+/// manifest record above, never against a restatement of the detector's input.
+///
+/// The verdict categories are the rule's own: an internally inconsistent
+/// manifest, or one no tick closed, establishes no verdict; a manifest whose
+/// every short channel is a measured missing adapter is explained; any other
+/// short wired channel is a gap this owner cannot account for. The evidence
+/// handle is this adapter's digest over the manifest's public record data —
+/// the manifest's own handle, not the detector's internal publication digest
+/// — so supplied values are judged against the actual manifest, never against
+/// a restatement of the detector's input.
+#[must_use]
+pub fn project_actual_coverage_manifest(
+    manifest: &IntervalCoverageReport,
+) -> CoverageManifestProjection {
+    CoverageManifestProjection {
+        interval_id: manifest_interval_identity(manifest),
+        evidence: EvidenceRef {
+            evidence_id: sha256_hex(manifest_evidence_fields(manifest).as_bytes()),
+        },
+        explanation: manifest_gap_verdict(manifest),
+    }
+}
+
+/// The actual manifest's own interval identity: the declared owner-clock
+/// bounds under the sensor map revision they were derived under.
+///
+/// Length-prefixed with the manifest's own tag, so it can never collide with
+/// the detector's internal source-event identity: the two name different
+/// things — the owner's published record versus one rule's comparison event.
+fn manifest_interval_identity(manifest: &IntervalCoverageReport) -> String {
+    let interval = manifest.interval();
+    crate::health_projection::encode_identity(&[
+        "watchdog_coverage_manifest".to_owned(),
+        interval.start_ms.to_string(),
+        interval.end_ms.to_string(),
+        manifest.sensor_map_revision().to_string(),
+    ])
+}
+
+/// The manifest's own evidence fields: every public record claim bound into
+/// one digest.
+///
+/// Map revision, declared bounds, and per record the channel, disposition,
+/// observed-class count, dropped samples, and every named gap reason. A
+/// supplied evidence handle matches only when it was built from this same
+/// record, so a stale or foreign manifest can never validate.
+fn manifest_evidence_fields(manifest: &IntervalCoverageReport) -> String {
+    let interval = manifest.interval();
+    let mut fields = vec![
+        "watchdog_coverage_manifest".to_owned(),
+        manifest.sensor_map_revision().to_string(),
+        interval.start_ms.to_string(),
+        interval.end_ms.to_string(),
+    ];
+    for record in manifest.records() {
+        fields.push(record.channel().as_str().to_owned());
+        fields.push(record.disposition().as_str().to_owned());
+        fields.push(record.observed_classes().len().to_string());
+        fields.push(record.dropped_samples().to_string());
+        for gap in record.gaps() {
+            fields.push(gap.reason.to_owned());
+        }
+    }
+    crate::health_projection::encode_identity(&fields)
+}
+
+/// The actual manifest's own gap verdict in the rule's vocabulary.
+///
+/// An inconsistent manifest, or one no tick closed, establishes no verdict. A
+/// channel the map says has no competent source is a measured structural
+/// limitation, not a gap that appeared between two intervals, so only a short
+/// wired channel is unexplained. These are the same categories the runtime
+/// projection derives, read here through the manifest's public claims, so the
+/// adapter can never contradict the projection about one interval.
+fn manifest_gap_verdict(manifest: &IntervalCoverageReport) -> CoverageGapExplanation {
+    if !manifest.valid()
+        || manifest
+            .records()
+            .iter()
+            .any(|record| !record.interval_closed())
+    {
+        return CoverageGapExplanation::Unknown;
+    }
+    let unexplained = manifest.records().iter().any(|record| {
+        matches!(
+            record.disposition(),
+            CoverageDisposition::Partial | CoverageDisposition::Unknown
+        ) && channel_capability(record.channel()).wiring.is_wired()
+    });
+    if unexplained {
+        CoverageGapExplanation::Unexplained
+    } else {
+        CoverageGapExplanation::Explained
+    }
 }
 
 /// Ends one supervision tick's coverage interval when the tick body is left.
@@ -338,6 +445,11 @@ impl WatchdogComposition {
             |port| Arc::clone(port.coverage()),
         );
         let task_coverage = Arc::clone(&coverage);
+        // I8.18 (#2381): one health-projection cell per composition, so the
+        // previous interval a rule compares against is always this owner's own
+        // last interval and never another composition's.
+        let health = Arc::new(HealthProjectionCell::default());
+        let task_health = Arc::clone(&health);
         let interval = config.tick_interval;
         let task = match runtime.supervisor(SupervisionStrategy::OneForOne).spawn(
             SERVICE_NAME,
@@ -351,11 +463,60 @@ impl WatchdogComposition {
                 let coverage = task_coverage.clone();
                 let intent_reconciliation_slot =
                     Arc::clone(&task_intent_reconciliation_slot);
+                let health = task_health.clone();
                 async move {
                     loop {
                         tokio::select! {
                             () = token.cancelled() => return Ok(()),
                             () = tokio::time::sleep(interval) => {}
+                        }
+                        // I8.18 (#2381): the five health rules run on the
+                        // interval the PREVIOUS tick closed, read before this
+                        // tick opens its own window — `begin_interval` clears
+                        // the published report, and an interval in progress
+                        // establishes no coverage at all. Reading it here is
+                        // therefore the only point at which a closed manifest
+                        // exists, and it is read against the retained
+                        // observation bank through the same owner handle every
+                        // heartbeat appends through. A port that owns no spool,
+                        // a sensor that has never held a lease, and the first
+                        // interval after start are each reported as unknown
+                        // evidence and open nothing; a rule that observes no
+                        // delta is traced with its own named reason.
+                        let now_ms = current_unix_ms().unwrap_or(0);
+                        if let Some(closed) = coverage.latest() {
+                            // I8.18 A4 (#2381): project the actual #1755
+                            // interval manifest the five rules are about to
+                            // run on, and publish its own interval identity,
+                            // evidence handle, and gap verdict as bounded
+                            // operator evidence on the same tick. The
+                            // coverage-gap rule derives its explanation from
+                            // these same public manifest claims, so the two
+                            // can never contradict each other about one
+                            // interval; the trace makes that agreement
+                            // checkable per interval. Read-only: no store is
+                            // touched beyond the closed report, and no effect
+                            // is authorized.
+                            let manifest = project_actual_coverage_manifest(&closed);
+                            let manifest_verdict = match manifest.explanation {
+                                CoverageGapExplanation::Explained => "explained",
+                                CoverageGapExplanation::Unexplained => "unexplained",
+                                CoverageGapExplanation::Unknown => "unknown",
+                            };
+                            tracing::debug!(
+                                event = "watchdog.health_manifest_projected",
+                                observation = "observed",
+                                manifest_interval_id = manifest.interval_id.as_str(),
+                                manifest_evidence = manifest.evidence.evidence_id.as_str(),
+                                manifest_verdict = manifest_verdict,
+                                "I8.18 health rules run against the owner-issued #1755 manifest on this interval"
+                            );
+                            evaluate_interval_health(
+                                health.as_ref(),
+                                &closed,
+                                &manifest,
+                                kernel.health_evidence(now_ms).as_ref(),
+                            );
                         }
                         // I8.2 (#1755 W5): one published coverage interval is
                         // exactly one tick. Opening it here also reports a
@@ -479,6 +640,21 @@ impl WatchdogComposition {
                                     admission.lease().lease().kernel_epoch.sequence.get();
                                 let watchdog_epoch = admission.watchdog_epoch().value();
                                 authority_state.publish_admitted(kernel_epoch, watchdog_epoch);
+                                // I8.18 (#2381): the health projection's signal
+                                // target and expected revisions come from the
+                                // same verified lease this tick supervises
+                                // through, on the admitted path only. A
+                                // degraded tick never admits a lease, so it
+                                // leaves the last admitted revisions in place
+                                // rather than substituting a placeholder scope.
+                                if let Some(installation_id) = kernel.installation_identity() {
+                                    health.observe_admitted(
+                                        installation_id,
+                                        admission.lease().lease().scope_ref.as_str(),
+                                        kernel_epoch,
+                                        watchdog_epoch,
+                                    );
+                                }
                                 emit_admitted_heartbeat_best_effort(
                                     heartbeat.as_ref(),
                                     kernel_epoch,

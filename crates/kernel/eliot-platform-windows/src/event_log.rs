@@ -6,7 +6,7 @@
 //! see a typed, bounded, local-only surface; raw handles, pointers, server
 //! names, log names, and Win32 details never escape this module.
 //!
-//! Admitted profile (mirrors the #889 consumer contract in
+//! Admitted profiles (the Host profile mirrors the #889 consumer contract in
 //! `bins/eliot-host/src/windows_event_log.rs`):
 //!
 //! ```text
@@ -16,13 +16,23 @@
 //!                    102/service_failure/error
 //! insertions:        exactly one already-redacted string,
 //!                    at most 1024 bytes and 1024 UTF-16 units, NUL-free
-//! in-flight bound:   64 records (owned by the Host queue; informational here)
+//! in-flight bound:   64 Host records (owned by the Host queue; informational here)
+//! ```
+//!
+//! ```text
+//! Kernel source:     EliotKernel (fixed; no fallback, no substitution)
+//! Kernel events:     200/kernel_startup/information,
+//!                    201/kernel_crash/error,
+//!                    202/kernel_recovery/information,
+//!                    203/kernel_restart_exhausted/error,
+//!                    204/kernel_quarantine/error
 //! ```
 //!
 //! Local-only: the server name passed to `RegisterEventSourceW` is always
 //! null (local machine). There is no remote-host, log-name, registry-path,
 //! command, or credential parameter, so the Security log cannot be selected
-//! and no other component can be impersonated.
+//! and no other component can be impersonated. Host and Kernel events use
+//! distinct closed enums and fixed source names through this same mechanism.
 //!
 //! Blocking: the underlying Win32 calls are synchronous and may block. No
 //! cancellable timeout is offered, and dropping a caller future does not
@@ -44,8 +54,8 @@
 //! approved installation policy, not to this writer.
 //!
 //! Non-goals: no logging framework, no remote collector, no lifecycle
-//! authority, no queue (Host owns admission/drop/shutdown in #889), no
-//! registry/SCM edits, no new thread or service.
+//! authority, no queue (callers own admission/drop/shutdown), no registry/SCM
+//! edits, no new thread or service.
 //!
 //! Normative anchors: Implementation I1.6 (Windows isolation boundary),
 //! I13.11 (diagnostics carry bounded evidence, not raw dumps), I15.4
@@ -57,8 +67,11 @@ use super::WindowsAdapterError;
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::HANDLE;
 
-/// Fixed Event Log source for this port. The only admitted name.
+/// Fixed Event Log source for the Host profile. The only admitted Host name.
 pub const EVENT_LOG_SOURCE: &str = "EliotHost";
+
+/// Fixed Event Log source for the admitted Kernel diagnostics profile.
+pub const KERNEL_EVENT_LOG_SOURCE: &str = "EliotKernel";
 
 /// Bound for one redacted insertion string, in bytes.
 pub const EVENT_LOG_MAX_INSERTION_BYTES: usize = 1024;
@@ -81,6 +94,21 @@ pub const EVENT_LOG_SERVICE_STOP_ID: u32 = 101;
 
 /// Admitted event identifier for Host service failure.
 pub const EVENT_LOG_SERVICE_FAILURE_ID: u32 = 102;
+
+/// Admitted event identifier for Kernel startup.
+pub const KERNEL_EVENT_LOG_STARTUP_ID: u32 = 200;
+
+/// Admitted event identifier for a Kernel crash.
+pub const KERNEL_EVENT_LOG_CRASH_ID: u32 = 201;
+
+/// Admitted event identifier for Kernel recovery.
+pub const KERNEL_EVENT_LOG_RECOVERY_ID: u32 = 202;
+
+/// Admitted event identifier for exhausted Kernel restarts.
+pub const KERNEL_EVENT_LOG_RESTART_EXHAUSTED_ID: u32 = 203;
+
+/// Admitted event identifier for Kernel quarantine.
+pub const KERNEL_EVENT_LOG_QUARANTINE_ID: u32 = 204;
 
 /// Severity admitted for one Event Log record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -188,14 +216,81 @@ impl AdmittedEventLogEvent {
     }
 }
 
+/// The only Kernel events admitted to the separate `EliotKernel` profile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdmittedKernelEventLogEvent {
+    /// Kernel startup.
+    Startup,
+    /// Kernel crash.
+    Crash,
+    /// Kernel recovery.
+    Recovery,
+    /// Kernel restart budget exhausted.
+    RestartExhausted,
+    /// Kernel entered quarantine.
+    Quarantine,
+}
+
+impl AdmittedKernelEventLogEvent {
+    /// Stable event name for the Kernel diagnostics contract.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Startup => "kernel_startup",
+            Self::Crash => "kernel_crash",
+            Self::Recovery => "kernel_recovery",
+            Self::RestartExhausted => "kernel_restart_exhausted",
+            Self::Quarantine => "kernel_quarantine",
+        }
+    }
+
+    /// Fixed event identifier for the Kernel diagnostics contract.
+    #[must_use]
+    pub const fn event_id(self) -> u32 {
+        match self {
+            Self::Startup => KERNEL_EVENT_LOG_STARTUP_ID,
+            Self::Crash => KERNEL_EVENT_LOG_CRASH_ID,
+            Self::Recovery => KERNEL_EVENT_LOG_RECOVERY_ID,
+            Self::RestartExhausted => KERNEL_EVENT_LOG_RESTART_EXHAUSTED_ID,
+            Self::Quarantine => KERNEL_EVENT_LOG_QUARANTINE_ID,
+        }
+    }
+
+    /// Fixed severity for the Kernel diagnostics contract.
+    #[must_use]
+    pub const fn severity(self) -> EventLogSeverity {
+        match self {
+            Self::Startup | Self::Recovery => EventLogSeverity::Information,
+            Self::Crash | Self::RestartExhausted | Self::Quarantine => EventLogSeverity::Error,
+        }
+    }
+
+    /// Classifies an event identifier without touching the OS.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EventLogError::InvalidInput`] for any unadmitted identifier.
+    pub fn from_event_id(event_id: u32) -> Result<Self, EventLogError> {
+        match event_id {
+            KERNEL_EVENT_LOG_STARTUP_ID => Ok(Self::Startup),
+            KERNEL_EVENT_LOG_CRASH_ID => Ok(Self::Crash),
+            KERNEL_EVENT_LOG_RECOVERY_ID => Ok(Self::Recovery),
+            KERNEL_EVENT_LOG_RESTART_EXHAUSTED_ID => Ok(Self::RestartExhausted),
+            KERNEL_EVENT_LOG_QUARANTINE_ID => Ok(Self::Quarantine),
+            _ => Err(EventLogError::InvalidInput),
+        }
+    }
+}
+
 /// Typed failure for the local Event Log port.
 ///
 /// Variants never carry insertion contents: bounding limits size, not
 /// sensitivity, and diagnostics must stay free of redacted material.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EventLogError {
-    /// Pre-FFI validation rejected the record (wrong profile, over-bound,
-    /// NUL, or protected marker). Nothing reached the OS.
+    /// Pre-FFI validation rejected the record (over-bound, NUL, or protected
+    /// marker), or an identifier could not be classified. Nothing reached
+    /// the OS.
     InvalidInput,
     /// The OS port is reachable but currently unavailable.
     Unavailable,
@@ -304,6 +399,86 @@ impl EventLogReceipt {
     }
 }
 
+/// Proof that the OS accepted one validated record under the Kernel profile.
+///
+/// OS acceptance only: not delivery, not registered-source proof, and not a
+/// Host semantic result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KernelEventLogReceipt {
+    event: AdmittedKernelEventLogEvent,
+    availability: EventLogSourceAvailability,
+}
+
+impl KernelEventLogReceipt {
+    const fn accepted(event: AdmittedKernelEventLogEvent) -> Self {
+        Self {
+            event,
+            availability: EventLogSourceAvailability::Unknown,
+        }
+    }
+
+    /// The admitted Kernel event that was accepted.
+    #[must_use]
+    pub const fn event(&self) -> AdmittedKernelEventLogEvent {
+        self.event
+    }
+
+    /// The fixed event identifier that was reported.
+    #[must_use]
+    pub const fn event_id(&self) -> u32 {
+        self.event.event_id()
+    }
+
+    /// The fixed severity that was reported.
+    #[must_use]
+    pub const fn severity(&self) -> EventLogSeverity {
+        self.event.severity()
+    }
+
+    /// The fixed Kernel source the record was reported under.
+    #[must_use]
+    pub const fn source(&self) -> &'static str {
+        KERNEL_EVENT_LOG_SOURCE
+    }
+
+    /// Registration knowledge for this acceptance (always unknown here).
+    #[must_use]
+    pub const fn source_availability(&self) -> EventLogSourceAvailability {
+        self.availability
+    }
+}
+
+/// Private union of the two admitted local profiles. Keeping source selection
+/// here prevents callers from supplying arbitrary Event Log source names.
+#[derive(Clone, Copy)]
+enum AdmittedLocalEventLogEvent {
+    Host(AdmittedEventLogEvent),
+    Kernel(AdmittedKernelEventLogEvent),
+}
+
+impl AdmittedLocalEventLogEvent {
+    const fn source(self) -> &'static str {
+        match self {
+            Self::Host(_) => EVENT_LOG_SOURCE,
+            Self::Kernel(_) => KERNEL_EVENT_LOG_SOURCE,
+        }
+    }
+
+    const fn event_id(self) -> u32 {
+        match self {
+            Self::Host(event) => event.event_id(),
+            Self::Kernel(event) => event.event_id(),
+        }
+    }
+
+    const fn severity(self) -> EventLogSeverity {
+        match self {
+            Self::Host(event) => event.severity(),
+            Self::Kernel(event) => event.severity(),
+        }
+    }
+}
+
 /// Reports whether this build carries the live OS port.
 #[must_use]
 pub const fn is_event_log_supported() -> bool {
@@ -391,6 +566,36 @@ pub fn report_local_event(
     event: AdmittedEventLogEvent,
     insertion: &str,
 ) -> Result<EventLogReceipt, EventLogError> {
+    report_admitted_local_event(AdmittedLocalEventLogEvent::Host(event), insertion)?;
+    Ok(EventLogReceipt::accepted(event))
+}
+
+/// Reports one admitted Kernel event with one redacted insertion to the local
+/// Event Log under the fixed `EliotKernel` source.
+///
+/// This call is synchronous and may block; there is no timeout, and
+/// abandoning the caller does not interrupt the OS work. The returned
+/// receipt proves OS acceptance only.
+///
+/// # Errors
+///
+/// Returns [`EventLogError::InvalidInput`] before any FFI when the bounds or
+/// redaction checks fail; [`EventLogError::UnsupportedPlatform`] off Windows;
+/// [`EventLogError::RegistrationFailed`] when no handle could be acquired
+/// (nothing submitted); [`EventLogError::ReportFailed`] when the OS refused
+/// the validated record.
+pub fn report_kernel_event(
+    event: AdmittedKernelEventLogEvent,
+    insertion: &str,
+) -> Result<KernelEventLogReceipt, EventLogError> {
+    report_admitted_local_event(AdmittedLocalEventLogEvent::Kernel(event), insertion)?;
+    Ok(KernelEventLogReceipt::accepted(event))
+}
+
+fn report_admitted_local_event(
+    event: AdmittedLocalEventLogEvent,
+    insertion: &str,
+) -> Result<(), EventLogError> {
     validate_event_log_insertion(insertion)?;
     submit_validated(event, insertion)
 }
@@ -465,7 +670,7 @@ impl Drop for RegisteredEventSource {
 #[cfg(windows)]
 fn report_validated(
     handle: HANDLE,
-    event: AdmittedEventLogEvent,
+    event: AdmittedLocalEventLogEvent,
     insertion_wide: &[u16],
 ) -> Result<(), EventLogError> {
     use windows_sys::Win32::Foundation::GetLastError;
@@ -509,21 +714,21 @@ fn report_validated(
 
 #[cfg(windows)]
 fn submit_validated(
-    event: AdmittedEventLogEvent,
+    event: AdmittedLocalEventLogEvent,
     insertion: &str,
-) -> Result<EventLogReceipt, EventLogError> {
-    let source_wide = encode_wide_nul(EVENT_LOG_SOURCE)?;
+) -> Result<(), EventLogError> {
+    let source_wide = encode_wide_nul(event.source())?;
     let insertion_wide = encode_wide_nul(insertion)?;
     let source = RegisteredEventSource::register_local(&source_wide)?;
     report_validated(source.handle, event, &insertion_wide)?;
-    Ok(EventLogReceipt::accepted(event))
+    Ok(())
 }
 
 #[cfg(not(windows))]
 fn submit_validated(
-    event: AdmittedEventLogEvent,
+    event: AdmittedLocalEventLogEvent,
     insertion: &str,
-) -> Result<EventLogReceipt, EventLogError> {
+) -> Result<(), EventLogError> {
     let _ = (event, insertion);
     Err(EventLogError::UnsupportedPlatform)
 }

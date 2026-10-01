@@ -142,7 +142,6 @@
 //! `improvement_candidate_dispatch::commit_unknown_effect_obligation` commits a
 //! named unresolved effect under the SAME closed `candidate` kind, as
 //! `{unknown_effect_obligation, retry_permitted, completion_retained}`.
-//!
 //! It is classified here for the same reason the merge receipt is: this read is
 //! exhaustive and fail-closed, so a document shape it does not recognise
 //! refuses the WHOLE enumeration. An effect owner could not settle a debt this
@@ -160,6 +159,36 @@
 //! self-binding record whose commitment identity is checked by the OWNER's own
 //! `ImprovementUnknownEffectIdentity::validate`, and dropped; see the
 //! `Reconciliation` row of `Row`.
+//!
+//! # A terminal improvement decision is the next row of the same closed kind
+//!
+//! `improvement_candidate_dispatch::commit_improvement_terminal_decision`
+//! commits the Governor owner's own `ImprovementTerminalDecision` as
+//! `{improvement_terminal_decision, retry_permitted, completion_retained}`: the
+//! pipeline's advisory-only disposition verbatim, bound to the candidate
+//! identity AND the candidate revision it was made on, to the exact bounded
+//! experiment, to the exact committed proposal bytes when the run reached the
+//! admitted branch, and to the independent evaluation record the verdict was made
+//! against.
+//!
+//! It arrives here for the same reason the obligation does — this read is
+//! exhaustive and fail-closed, so an untaught shape would refuse the WHOLE
+//! enumeration and stop every later pass from rebuilding its registry — and it is
+//! re-proved differently. Where the obligation re-proves itself, this one is
+//! checked through the OWNER's own
+//! `ImprovementTerminalDecision::validate`: that is the contract that produced the
+//! record, so it is the right place to decide whether a canary admission really
+//! arrived with an executed, independent, passing evaluation, whether a refusal
+//! really committed no proposal bytes, and whether an admitted handoff disagrees
+//! with the decision about its candidate, experiment, operation or commitment.
+//! A disposition that contradicts the evidence recorded beside it is refused, not
+//! read.
+//!
+//! Registry meaning it is not given either. It neither adds an active candidate
+//! nor removes one: withholding the candidate it names would let a refused
+//! candidate look unobserved, and restoring it as an entry would invent one.
+//! Whether that decision may be attempted again is the Governor owner's question
+//! through its own retry gate.
 //!
 //! # What is NOT claimed
 //!
@@ -509,6 +538,13 @@ pub async fn read_candidate_scope(
 /// [`BoundedBacklog::restored`], which re-proves each candidate and computes
 /// its lineage digest from its own canonical evidence lineage.
 ///
+/// Two row shapes are recognised, re-proved, and deliberately NOT turned into
+/// registry entries: a committed unresolved external-effect obligation, and a
+/// committed terminal improvement decision. Both are facts ABOUT a candidate
+/// rather than observations OF one, so neither adds an active candidate nor
+/// removes one — see the module documentation for why withholding the candidate
+/// either names would be the worse error.
+///
 /// `bound` is the bound this pass will enforce, read from the maintenance
 /// (`G-19`) owner's own decision record. It is passed in rather than invented
 /// here for the same reason the records are: the daemon spells no bound number
@@ -540,15 +576,22 @@ pub fn restored_registry(
             Row::Archived(candidate_id) => {
                 archived.insert(candidate_id);
             }
-            // A reconciliation obligation names a candidate whose EXTERNAL
-            // effect is unresolved, not a candidate that entered or left the
-            // registry. Excluding it here would be wrong for this read's own
-            // question — which is whether the same evidence lineage was already
-            // observed as a candidate — and the debt it records is settled by
-            // the effect owner through the Governor pipeline's own retry gate,
-            // not by the registry refusing to restore a candidate. So it is
-            // recognised and dropped, and the pass continues.
-            Row::Reconciliation => {}
+            // A reconciliation obligation names a candidate whose EXTERNAL effect
+            // is unresolved; a terminal DECISION names a candidate the pipeline
+            // already disposed of. Both are facts ABOUT a candidate rather than
+            // observations OF one, and both contribute no registry entry, which is
+            // why they share one arm: excluding either here would be wrong for this
+            // read's own question — whether the same evidence lineage was already
+            // observed as a candidate — and the debt and the decision each record
+            // are settled by their own owners (the effect owner's retry gate and the
+            // Governor admission gate), not by the registry refusing to restore a
+            // candidate. Both are recognised, re-proved, dropped, and the pass
+            // continues. They are re-proved differently before they get here: the
+            // obligation against `ImprovementUnknownEffectIdentity::validate`, the
+            // decision against `ImprovementTerminalDecision::validate`, so a
+            // decision whose disposition disagrees with the evidence it also
+            // carries is refused rather than read.
+            Row::Reconciliation | Row::Decision => {}
         }
     }
     records.retain(|record| {
@@ -584,6 +627,110 @@ enum Row {
     /// record instead of refusing the whole enumeration over it, and so the
     /// shape is stated here rather than defaulted past.
     Reconciliation,
+    /// A committed terminal improvement decision: the pipeline's own advisory-only
+    /// disposition, bound to the candidate identity and revision it was made on,
+    /// to the exact bounded experiment, and to the independent evaluation record
+    /// the verdict was made against.
+    ///
+    /// It is a DECISION about a candidate, not a candidate: it carries no
+    /// candidate, brief or owner decision, so there is nothing in it to re-prove
+    /// as a registry entry, and it neither adds an active candidate nor removes
+    /// one. The arm exists for the same reason the reconciliation arm does — this
+    /// read is exhaustive and fail-closed, so an untaught shape would refuse the
+    /// WHOLE enumeration and stop every later pass from rebuilding its registry —
+    /// and additionally because the decision is re-proved here against the
+    /// Governor OWNER's own contract rather than trusted. See
+    /// [`classify_terminal_decision`].
+    Decision,
+}
+
+/// A committed terminal improvement decision.
+///
+/// Exactly the shape `commit_improvement_terminal_decision` writes:
+/// `{improvement_terminal_decision, retry_permitted, completion_retained}`.
+///
+/// The inner record is the Governor owner's OWN
+/// [`eliot_maintenance::ImprovementTerminalDecision`], decoded with that crate's
+/// own `deny_unknown_fields` decoder and then re-proved by that same owner's
+/// `ImprovementTerminalDecision::validate`. The durable decision is therefore
+/// checked against the contract that produced it rather than against a second
+/// daemon-local shape that could drift away from it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TerminalDecisionDocument {
+    improvement_terminal_decision: eliot_maintenance::ImprovementTerminalDecision,
+    retry_permitted: bool,
+    completion_retained: bool,
+}
+
+/// Re-proves one committed terminal decision and accepts it as a decision record.
+///
+/// Split out of [`classify_row`] so each row shape's re-proof reads on its own.
+///
+/// Three checks, and the first is the OWNER's. Everything a later reader could
+/// otherwise have to take on trust about a durable decision — that it names a
+/// candidate, a proposal, a bounded experiment and an operation; that its
+/// disposition is the one its own bound records support; that a canary
+/// admission really arrived with an executed, independent, passing evaluation and
+/// with committed proposal bytes; that a refusal really committed none — is
+/// decided by `eliot_maintenance::ImprovementTerminalDecision::validate`, the
+/// owner's own method, over the ORIGINAL recorded values. Nothing is recomputed
+/// over what this process happens to hold, and no digest stands in for a record
+/// this build cannot read.
+///
+/// The second check is the same cross-check the reconciliation record uses: a
+/// record claiming both a permitted retry and a retained completion is mutually
+/// exclusive by construction in the owner, so a document claiming both is a
+/// spliced document and is refused.
+///
+/// The third check re-proves that an evaluation record, when the decision carries
+/// one, actually names its evidence identity and the content revision it
+/// observed. Those two are present on every evaluation record this path has ever
+/// produced, including the never-ran one, so an evaluation record that names
+/// neither is not a record of an evaluation and the decision is refused rather
+/// than read as one that was judged against something. The run reference is
+/// deliberately NOT required here: it is empty on exactly the decisions whose
+/// evaluation never ran, and requiring it would refuse the honest refusals while
+/// accepting nothing extra.
+///
+/// The decision is accepted for what it is and then DROPPED: it does not add or
+/// remove a candidate, so restoring it as a registry entry would invent one, and
+/// withholding the candidate it names would let a refused candidate look
+/// unobserved. Whether that decision may be attempted again is the Governor
+/// owner's own question through its own retry gate.
+fn classify_terminal_decision(
+    document: Value,
+    refused: &impl Fn(String) -> ImprovementDedupReadError,
+) -> Result<Row, ImprovementDedupReadError> {
+    let receipt: TerminalDecisionDocument = serde_json::from_value(document)
+        .map_err(|error| refused(format!("terminal decision does not decode: {error}")))?;
+    let decision = &receipt.improvement_terminal_decision;
+    decision.validate().map_err(|error| {
+        refused(format!(
+            "terminal decision is not a re-provable Governor-owned decision: {error}"
+        ))
+    })?;
+    if receipt.retry_permitted && receipt.completion_retained {
+        return Err(refused(
+            "terminal decision claims both a permitted retry and a retained completion".to_owned(),
+        ));
+    }
+    if let Some(evaluation) = decision.evaluation.as_ref() {
+        for (name, value) in [
+            ("evidence_id", evaluation.evidence_id.as_str()),
+            (
+                "content_revision_ref",
+                evaluation.content_revision_ref.as_str(),
+            ),
+        ] {
+            if value.trim().is_empty() {
+                return Err(refused(format!(
+                    "terminal decision's evaluation record names no {name}"
+                )));
+            }
+        }
+    }
+    Ok(Row::Decision)
 }
 
 /// Re-proves one lineage-merge receipt and returns what it merged.
@@ -856,10 +1003,22 @@ fn classify_row(row: &Value) -> Result<Row, ImprovementDedupReadError> {
         return classify_reconciliation_obligation(document, &refused);
     }
 
+    // A terminal improvement decision is the FOURTH legitimate row of the same
+    // closed kind, and the only one this read re-proves through the OWNER's own
+    // method rather than through local checks: `ImprovementTerminalDecision::
+    // validate` is the contract that produced the record, so it is the right place
+    // to decide whether a canary admission really arrived with an executed,
+    // independent, passing evaluation and whether a refusal really committed no
+    // proposal bytes. A disposition that disagrees with the evidence recorded
+    // beside it is refused here exactly as a spliced obligation is.
+    if document.get("improvement_terminal_decision").is_some() {
+        return classify_terminal_decision(document, &refused);
+    }
+
     let artifact: CandidateArtifactDocument =
         serde_json::from_value(document).map_err(|error| {
             refused(format!(
-                "record is neither a committed candidate artifact, nor an archive receipt, nor a lineage merge receipt, nor a reconciliation obligation: {error}"
+                "record is neither a committed candidate artifact, nor an archive receipt, nor a lineage merge receipt, nor a reconciliation obligation, nor a terminal improvement decision: {error}"
             ))
         })?;
     // The document must bind ITSELF. A brief or an owner decision that names a

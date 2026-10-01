@@ -706,9 +706,9 @@ impl WindowsUserModeSupervisionAuthorityCredentialProvider {
         Ok(signer)
     }
 
-    /// Loads a Kernel signer from the exact current-user reference retained in
-    /// the launch descriptor and verifies it against the original public
-    /// trust anchor.
+    /// Loads a Kernel signer from the caller-supplied current-user Credential
+    /// Manager reference and verifies it against the supplied public trust
+    /// anchor. No production path provisions one; Phase-B is service-only.
     pub fn load_signer_for_kernel(
         &self,
         reference: &UserModeSupervisionKeyReference,

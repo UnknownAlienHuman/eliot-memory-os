@@ -9,6 +9,46 @@
 //! no capability is advertised, no retry/cache/default policy is invented,
 //! and unknown genesis outcomes remain the EBP client's exact-operation
 //! reconciliation result.
+//!
+//! # Live status
+//!
+//! The maintenance-trigger owner surface of [`KernelStoreGateway`] below is
+//! **not** a live route, with exactly one exception.
+//!
+//! [`KernelStoreGateway::admit_maintenance_trigger`] is live: `eliotd` is not
+//! its only caller, and the Kernel front door reaches it through the
+//! `maintenance_trigger_intake` operation dispatched by
+//! `bins/eliot-kernel/src/daemon_request_dispatch.rs`.
+//!
+//! The other fourteen owner entries — `claim_maintenance_trigger`,
+//! `release_expired_maintenance_trigger_claim`,
+//! `maintenance_trigger_pending_page`,
+//! `record_maintenance_trigger_decision`, `acknowledge_maintenance_trigger`,
+//! `replay_maintenance_trigger_after_crash`,
+//! `recover_maintenance_trigger_commit`,
+//! `mark_maintenance_trigger_commit_ambiguous`,
+//! `revoke_maintenance_trigger_consumer`,
+//! `maintenance_trigger_replacement_pending_set`, `expire_maintenance_trigger`,
+//! `supersede_maintenance_trigger`, `record_maintenance_trigger_gap`, and
+//! `restore_maintenance_trigger_ledger` — have **no production caller**. Each
+//! one has exactly one code caller, and every such caller lives in the
+//! `#1694` W2–W7 route of `bins/eliotd/src/maintenance_dispatch.rs`, which is
+//! itself entirely unwired. Three of those callers are additionally
+//! *transitively* dead, so a name-level scan reports a call site where no live
+//! path exists.
+//!
+//! Because `KernelStoreGateway` is re-exported from this crate's root
+//! (`pub use store_gateway::KernelStoreGateway`), these entries are effectively
+//! publicly reachable and `rustc`'s `dead_code` lint will never report any of
+//! them, even though `mod store_gateway` is itself private. A reader therefore
+//! gets no compiler signal at all on this surface; each entry below states its
+//! own status under a `# Live status` heading instead.
+//!
+//! A source implementation is not evidence of a live edge, and nothing here
+//! promotes these entries to current support. Whether each is wired to a
+//! daemon maintenance route or retired is an owner decision for the Kernel
+//! and `eliotd` composition roots, not a documentation one. Nothing is wired,
+//! removed, or allow-listed to produce this status.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -970,6 +1010,130 @@ enum RunNowPreflightAssembly {
     Unavailable(String),
 }
 
+/// Typed refusal of the retained wake-horizon publication route, carrying the
+/// exact durable record that exists — or the exact fact that none does.
+///
+/// **The defect this type closes.** The route used to return a bare `String` on
+/// every failure, so a step that failed AFTER
+/// [`KernelStoreGateway::settle_wake_horizon_acknowledgement`] had already
+/// written the owner's answer as the record's retained body threw away the only
+/// handle to a durable record that provably existed. The caller could report a
+/// horizon it could not name, or name nothing at all while a record waited for a
+/// reconciliation nothing could reach. That is the same defect class this issue
+/// keeps producing: an answer that cannot be reached from the place the question
+/// is asked.
+///
+/// **No identity is minted here.** The carried obligation is the one
+/// `retained_user_automation_obligation` already derived from the EXISTING
+/// `runtime_obligation_operation_id(kind, parent, subject_ids)` and the route
+/// already settled. `Retained` is therefore reachable only from a failure site
+/// that holds that value; a step that fails before the identity exists reports
+/// [`Self::NothingRetained`] and must not construct one to look reportable.
+///
+/// **What a caller must do with each arm.**
+/// * [`Self::Retained`] — a durable record exists under
+///   `owner_operation_id`. Report that obligation beside the failure, never
+///   re-issue the slice, and reconcile under that ORIGINAL owner operation
+///   identity (I14.21: query by the original identity; no blind duplicate
+///   effect). The record is already answered when this arm is produced, so the
+///   reconciliation is a readback of the owner's retained body, not a resend.
+/// * [`Self::NothingRetained`] — no record was written and nothing was issued,
+///   so there is nothing to reconcile and the slice may still be issued later
+///   under the same identity. This arm must never be read as "the record was
+///   deleted": nothing was ever created.
+///
+/// **The two arms render differently, and that is load-bearing.** Before this
+/// type existed, both rendered as the same bare reason, so a caller that
+/// rendered the reason and dropped the payload produced a status line asserting
+/// "no obligation was retained" while a durable record sat behind it — the exact
+/// unreconcilable-loss defect this type exists to remove. A `Retained` rendering
+/// therefore ends with the owner operation identity the record lives under, so
+/// that a consumer which still renders only this text states the retained record
+/// rather than denying it.
+///
+/// [`Self::into_reason`] is the one projection that is byte-identical to the text
+/// this route produced before it was typed, on BOTH arms: the operator route
+/// calls it, its result is a bare reason, and no operator-visible message moves.
+/// [`Self::into_retained_obligation`] is the projection that closes the defect —
+/// it is what the due-wake consumer's call site must consume in place of a
+/// hand-written `None`.
+#[derive(Debug)]
+pub enum UserAutomationHorizonPublicationRefusal {
+    /// The route failed before the obligation identity existed, so no durable
+    /// record was written and no owner was asked.
+    NothingRetained {
+        /// Closed reason the slice could not even be bound and named coherently.
+        reason: String,
+    },
+    /// The owner operation identity was established and the durable record was
+    /// written, and a later step of the same route failed.
+    Retained {
+        /// The obligation that was actually written, under its original owner
+        /// operation identity. Boxed so a refusal value stays small enough to
+        /// return by value from every entry point.
+        obligation: Box<UserAutomationRuntimeObligation>,
+        /// Closed reason the projection failed after the record was written.
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for UserAutomationHorizonPublicationRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NothingRetained { reason } => formatter.write_str(reason),
+            Self::Retained { obligation, reason } => write!(
+                formatter,
+                "{reason}; this bounded slice IS durably retained under owner operation identity \
+                 {} and must be reported and reconciled under that original identity rather than \
+                 re-issued",
+                obligation.owner_operation_id
+            ),
+        }
+    }
+}
+
+impl std::error::Error for UserAutomationHorizonPublicationRefusal {}
+
+impl UserAutomationHorizonPublicationRefusal {
+    /// Arms the pre-retention arm from its closed reason.
+    pub fn nothing_retained(reason: String) -> Self {
+        Self::NothingRetained { reason }
+    }
+
+    /// Arms the post-retention arm from the obligation that was really written.
+    pub fn retained(obligation: UserAutomationRuntimeObligation, reason: String) -> Self {
+        Self::Retained {
+            obligation: Box::new(obligation),
+            reason,
+        }
+    }
+
+    /// Consumes the refusal and yields the retained obligation, for a caller that
+    /// reports it in place of a re-derived one.
+    ///
+    /// This hands back the EXACT record this route wrote. It never derives an
+    /// identity: a caller holding `NothingRetained` gets `None` and must say so
+    /// rather than construct a substitute.
+    #[must_use]
+    pub fn into_retained_obligation(self) -> Option<UserAutomationRuntimeObligation> {
+        match self {
+            Self::NothingRetained { .. } => None,
+            Self::Retained { obligation, .. } => Some(*obligation),
+        }
+    }
+
+    /// Consumes the refusal and yields its closed reason, which is what the
+    /// operator route reports in its `String` result.
+    ///
+    /// The reason is preserved verbatim, so typing this route changes no operator
+    /// visible text; only the typed arm the caller can now read changes.
+    pub fn into_reason(self) -> String {
+        match self {
+            Self::NothingRetained { reason } | Self::Retained { reason, .. } => reason,
+        }
+    }
+}
+
 impl KernelStoreGateway {
     /// Constructs the gateway from the Kernel-approved service and Store client.
     #[doc(hidden)]
@@ -1048,6 +1212,49 @@ impl KernelStoreGateway {
     /// The refusal is the crate's existing [`KernelServiceError::AdmissionClosed`]
     /// carrying the exact current state, flattened to this module's `String`
     /// error the way every other gateway refusal is.
+    ///
+    /// Finite shadow-denial map, gateway half (issue #1953, map item 2 —
+    /// classified by actual effects, not method names):
+    ///
+    /// Named `refuse_shadow_mutation` gates: [`Self::apply`],
+    /// [`Self::apply_reserved`], [`Self::cancel_reserved`] (ORS-reservation
+    /// cancellation is an ORS mutation), [`Self::reconcile_staged_writes`]
+    /// (startup reconciliation mutates staged envelopes),
+    /// [`Self::reconcile_reserved`] (exact-receipt reconciliation finalizes
+    /// ORS reservation scopes), [`Self::initialize_genesis`] (Store write),
+    /// [`Self::dreamer_job`] (ledger mutations; the permitted `Status` read
+    /// stays available through the operation-effect classification),
+    /// [`Self::backup_restore_batch`] (Store restore write),
+    /// [`Self::execute_user_automation_operation`] and
+    /// [`Self::due_wake_execution_join`] (their Store commits travel through
+    /// the borrowed client, which bypasses [`Self::apply`], so the entries
+    /// carry the named check with their own typed refusal).
+    ///
+    /// Intentionally available in shadow (no Store/ORS write, no issuance):
+    /// `recovery`, `receipt`, `execute_named`/`execute_named_with_error`,
+    /// the `read_user_automation_*` reads, `validate_user_automation_request`
+    /// (pure validation), `project_reserved_submission` (bounded local
+    /// projection only, never ORS or network work),
+    /// `maintenance_trigger_pending_page`,
+    /// `maintenance_trigger_replacement_pending_set`,
+    /// `replay_maintenance_trigger_after_crash`, and
+    /// `recover_maintenance_trigger_commit` (ledger reads whose sessions
+    /// cannot be bound in shadow anyway),
+    /// `restore_maintenance_trigger_ledger` (in-memory restore of already
+    /// persisted rows; inert while shadow because every serving path binds a
+    /// `Ready`-only session), `drain_reserved` (flight fence plus an ORS
+    /// recovery-page read; shutdown handling, no reservation write),
+    /// `validation_snapshot`, `health`, `paused_ordering_scopes`,
+    /// `available_control`, `is_fenced`, `fence`, and `fence_and_drain`
+    /// (observation and lifecycle fences, never authority effects).
+    ///
+    /// The mutating maintenance-trigger entries (`admit`, `claim`,
+    /// `release_expired`, `record_decision`, `acknowledge`,
+    /// `mark_ambiguous`, `revoke_consumer`, `expire`, `supersede`, `gap`)
+    /// all bind their session through the one
+    /// `AuthenticatedMaintenanceTriggerSession::bind` choke point, which
+    /// requires `Ready` and carries the named service-side check, so no
+    /// trigger claim, decision, or revocation can issue from a shadow.
     fn refuse_shadow_mutation(&self) -> Result<(), String> {
         let service = self
             .service
@@ -1541,6 +1748,10 @@ impl KernelStoreGateway {
         request: &ReservedWriteRequest,
         receipt: &WriteReceipt,
     ) -> Result<ReservationRecord, String> {
+        // I14.16 step 4 (issue #1953, map item 2): exact-receipt
+        // reconciliation finalizes ORS reservation scopes, so a
+        // `shadow_no_authority` candidate refuses before the delegate runs.
+        self.refuse_shadow_mutation()?;
         store_receipt_gateway::reconcile_reserved(self, token, request, receipt)
     }
 
@@ -1723,6 +1934,17 @@ impl KernelStoreGateway {
     /// this transition. `handle_maintenance_trigger_intake` stays the seam
     /// for guard-free front-door callers (STITCH): this owner entry proves
     /// staging first so no guard is ever held across the ORS read.
+    ///
+    /// # Live status
+    ///
+    /// This entry is the one **live** member of the maintenance-trigger owner
+    /// surface; the other fourteen entries in this cluster have no production
+    /// caller. It has two code callers, and only one of them is live: the
+    /// `eliotd` intake leg in `bins/eliotd/src/maintenance_dispatch.rs` is
+    /// itself uncalled, but the Kernel front door reaches this entry
+    /// independently through the `maintenance_trigger_intake` operation
+    /// dispatched by `bins/eliot-kernel/src/daemon_request_dispatch.rs`, which
+    /// runs under `main()` via `run_front_door_loop`.
     pub fn admit_maintenance_trigger(
         &self,
         principal_ref: &str,
@@ -1764,6 +1986,17 @@ impl KernelStoreGateway {
     /// the current compatible daemon generation/session, trigger revision,
     /// and delivery identity through the existing ledger seam. The returned
     /// rows are the durable snapshot after this transition.
+    ///
+    /// # Live status
+    ///
+    /// This entry currently has NO production caller. It is *transitively*
+    /// dead rather than name-level dead, so a scan for call sites reports
+    /// one: the single call is `claim_maintenance_trigger_for_daemon` in
+    /// `bins/eliotd/src/maintenance_dispatch.rs`, whose own only caller,
+    /// `redeliver_maintenance_trigger_after_timeout`, is itself uncalled.
+    /// No live daemon claim loop issues a claim through this entry today.
+    /// Whether a daemon claim loop is wired to it or the entry is retired is
+    /// an owner decision, not a documentation one.
     pub fn claim_maintenance_trigger(
         &self,
         principal_ref: &str,
@@ -1787,6 +2020,16 @@ impl KernelStoreGateway {
     /// receipt preserved. Redelivery always needs a fresh finite claim,
     /// never a new trigger ID. The returned rows are the durable snapshot
     /// after this transition.
+    ///
+    /// # Live status
+    ///
+    /// This entry currently has NO production caller. It is *transitively*
+    /// dead rather than name-level dead, so a scan for call sites reports
+    /// one: the single call is
+    /// `redeliver_maintenance_trigger_after_timeout` in
+    /// `bins/eliotd/src/maintenance_dispatch.rs`, which is itself uncalled.
+    /// Whether a timeout-redelivery loop is wired to it or the entry is
+    /// retired is an owner decision, not a documentation one.
     pub fn release_expired_maintenance_trigger_claim(
         &self,
         principal_ref: &str,
@@ -1812,6 +2055,14 @@ impl KernelStoreGateway {
     /// A read: no ledger transition, so no rows snapshot. A reconnect
     /// resumes from its cursor and never resets progress to a guessed
     /// complete-empty set.
+    ///
+    /// # Live status
+    ///
+    /// This entry currently has NO production caller: the single call is
+    /// `collect_pending_maintenance_triggers` in
+    /// `bins/eliotd/src/maintenance_dispatch.rs`, which is uncalled outright.
+    /// Whether a pending-set collector is wired to it or the entry is retired
+    /// is an owner decision, not a documentation one.
     pub fn maintenance_trigger_pending_page(
         &self,
         principal_ref: &str,
@@ -1833,19 +2084,31 @@ impl KernelStoreGateway {
     /// Records one daemon decision into the owned delivery ledger against
     /// its committed named Store transaction (issue #1694).
     ///
-    /// The authenticated daemon submits its decision through the Governor
-    /// `PreparedTransition` → Kernel → named Store transaction; that
-    /// transaction's committed [`WriteReceipt`] is the durability the
-    /// ledger row rides on. This owner entry re-reads the exact receipt
-    /// through the existing Store client, requires `Committed` status,
-    /// re-proves the canonical-bytes digest the decision receipt binds, and
-    /// requires the receipt fence to match live service authority — an
-    /// arbitrary receipt ID or transport `Ok(())` can never complete this
-    /// transition. Only then is the decision recorded; the returned rows
-    /// are the durable snapshot after the transition. A lost or ambiguous
-    /// commit stays pending/reconciling through
+    /// Were it reached, the authenticated daemon would submit its decision
+    /// through the Governor `PreparedTransition` → Kernel → named Store
+    /// transaction; that transaction's committed [`WriteReceipt`] is the
+    /// durability the ledger row rides on. This owner entry re-reads the
+    /// exact receipt through the existing Store client, requires `Committed`
+    /// status, re-proves the canonical-bytes digest the decision receipt
+    /// binds, and requires the receipt fence to match live service authority
+    /// — an arbitrary receipt ID or transport `Ok(())` can never complete
+    /// this transition. Only then is the decision recorded; the returned
+    /// rows are the durable snapshot after the transition. A lost or
+    /// ambiguous commit stays pending/reconciling through
     /// [`Self::mark_maintenance_trigger_commit_ambiguous`]: receipt absence
     /// here is never reported as proof of non-commit.
+    ///
+    /// # Live status
+    ///
+    /// This entry currently has NO production caller: the single call is
+    /// `record_committed_maintenance_decision` in
+    /// `bins/eliotd/src/maintenance_dispatch.rs`, which is itself uncalled.
+    /// The first paragraph above is therefore conditional on reachability,
+    /// not a report that a daemon decision currently travels this path. This
+    /// is the strongest claim in the maintenance-trigger surface and it is
+    /// not established by any live caller. The body, its receipt
+    /// re-validation, and its fence check are unchanged; wiring or retiring
+    /// the entry is an owner decision, not a documentation one.
     pub async fn record_maintenance_trigger_decision(
         &self,
         principal_ref: &str,
@@ -1918,6 +2181,14 @@ impl KernelStoreGateway {
     /// The ack must echo the live claim exactly and embed the committed
     /// receipt byte for byte; a stale consumer cannot ack after revocation.
     /// The returned rows are the durable snapshot after this transition.
+    ///
+    /// # Live status
+    ///
+    /// This entry currently has NO production caller: the single call is
+    /// `acknowledge_recovered_maintenance_commit` in
+    /// `bins/eliotd/src/maintenance_dispatch.rs`, which is itself uncalled.
+    /// Whether a post-recovery acknowledgement path is wired to it or the
+    /// entry is retired is an owner decision, not a documentation one.
     pub fn acknowledge_maintenance_trigger(
         &self,
         principal_ref: &str,
@@ -1942,8 +2213,18 @@ impl KernelStoreGateway {
     /// Replays one retained trigger after a pre-commit crash, without
     /// minting new state (issue #1694).
     ///
-    /// A read: the caller re-presents the exact retained record to the
+    /// A read: a caller would re-present the exact retained record to the
     /// evaluator under the same identity.
+    ///
+    /// # Live status
+    ///
+    /// This entry currently has NO production caller: the single call is
+    /// `recover_maintenance_trigger_handoff` in
+    /// `bins/eliotd/src/maintenance_dispatch.rs`, which is itself uncalled.
+    /// The `A read:` paragraph describes what the entry would do if reached;
+    /// no live path reaches it today. Whether a crash-recovery path is wired
+    /// to it or the entry is retired is an owner decision, not a
+    /// documentation one.
     pub fn replay_maintenance_trigger_after_crash(
         &self,
         principal_ref: &str,
@@ -1958,8 +2239,19 @@ impl KernelStoreGateway {
     /// Recovers one committed decision receipt after a post-commit crash
     /// (issue #1694).
     ///
-    /// A read: the caller acknowledges this exact receipt without a new
+    /// A read: a caller would acknowledge this exact receipt without a new
     /// job, recommendation, or wake.
+    ///
+    /// # Live status
+    ///
+    /// This entry currently has NO production caller: the single call is
+    /// `recover_maintenance_trigger_handoff` in
+    /// `bins/eliotd/src/maintenance_dispatch.rs`, which is itself uncalled.
+    /// Note that this entry is the one the sibling
+    /// `recover_maintenance_trigger_handoff` leg would use, so it shares that
+    /// leg's disposition; it is not independently live. Whether a
+    /// crash-recovery path is wired to it or the entry is retired is an owner
+    /// decision, not a documentation one.
     pub fn recover_maintenance_trigger_commit(
         &self,
         principal_ref: &str,
@@ -1977,6 +2269,17 @@ impl KernelStoreGateway {
     /// trigger stays open, gains an `AmbiguousCommit` gap record, and must
     /// be reconciled by receipt lookup before any further effect. The
     /// returned rows are the durable snapshot after this transition.
+    ///
+    /// # Live status
+    ///
+    /// This entry currently has NO production caller: the single call is
+    /// `mark_maintenance_trigger_commit_ambiguous_after_loss` in
+    /// `bins/eliotd/src/maintenance_dispatch.rs`, which is itself uncalled.
+    /// Because the sibling [`Self::record_maintenance_trigger_decision`] entry
+    /// that cross-references this one is also uncallered, the ambiguous-commit
+    /// reconciliation this describes is not currently reachable at all.
+    /// Whether that reconciliation is wired or the entry is retired is an
+    /// owner decision, not a documentation one.
     pub fn mark_maintenance_trigger_commit_ambiguous(
         &self,
         principal_ref: &str,
@@ -2003,6 +2306,18 @@ impl KernelStoreGateway {
     /// generation, committed rows move to `Reconciling` with receipts
     /// preserved, and every later old-generation claim or ack fails. The
     /// returned rows are the durable snapshot after this transition.
+    ///
+    /// # Live status
+    ///
+    /// This entry currently has NO production caller. It is *transitively*
+    /// dead rather than name-level dead, so a scan for call sites reports
+    /// one: the single call is
+    /// `revoke_lost_daemon_consumer_for_replacement` in
+    /// `bins/eliotd/src/maintenance_dispatch.rs`, whose own only caller,
+    /// `recover_replacement_generation`, is itself uncalled. The revocation
+    /// this describes therefore does not currently occur on any live path.
+    /// Whether a daemon generation-replacement path is wired to it or the
+    /// entry is retired is an owner decision, not a documentation one.
     pub fn revoke_maintenance_trigger_consumer(
         &self,
         principal_ref: &str,
@@ -2018,10 +2333,21 @@ impl KernelStoreGateway {
     /// Surfaces the bounded pending set to a replacement generation (issue
     /// #1694).
     ///
-    /// A read: after replacement authentication plus the required mirror
-    /// recovery, the replacement sees the bounded pending set before
-    /// reconciliation may be claimed complete. Ordinary pending debt
-    /// acquires no runtime lease here.
+    /// A read: were it reached, then after replacement authentication plus the
+    /// required mirror recovery the replacement would see the bounded pending
+    /// set before reconciliation could be claimed complete. Ordinary pending
+    /// debt acquires no runtime lease here.
+    ///
+    /// # Live status
+    ///
+    /// This entry currently has NO production caller. It is *transitively*
+    /// dead rather than name-level dead, so a scan for call sites reports
+    /// one: the single call is `surface_replacement_pending_set` in
+    /// `bins/eliotd/src/maintenance_dispatch.rs`, whose own only caller,
+    /// `recover_replacement_generation`, is itself uncalled. No replacement
+    /// generation currently enumerates this pending set. Whether a
+    /// generation-replacement path is wired to it or the entry is retired is
+    /// an owner decision, not a documentation one.
     pub fn maintenance_trigger_replacement_pending_set(
         &self,
         principal_ref: &str,
@@ -2047,6 +2373,15 @@ impl KernelStoreGateway {
     /// Expired eligibility blocks stale execution but never deletes the row,
     /// its record, or its evidence locators. The returned rows are the
     /// durable snapshot after this transition.
+    ///
+    /// # Live status
+    ///
+    /// This entry currently has NO production caller: the single call is
+    /// `expire_inapplicable_maintenance_trigger` in
+    /// `bins/eliotd/src/maintenance_dispatch.rs`, which is itself uncalled.
+    /// No live expiry path records terminal expiry through this entry.
+    /// Whether one is wired or the entry is retired is an owner decision,
+    /// not a documentation one.
     pub fn expire_maintenance_trigger(
         &self,
         principal_ref: &str,
@@ -2074,6 +2409,15 @@ impl KernelStoreGateway {
     /// The successor is named, both rows stay readable, and materially new
     /// evidence arrives as a new trigger rather than an overwrite. The
     /// returned rows are the durable snapshot after this transition.
+    ///
+    /// # Live status
+    ///
+    /// This entry currently has NO production caller: the single call is
+    /// `supersede_maintenance_trigger_with_successor` in
+    /// `bins/eliotd/src/maintenance_dispatch.rs`, which is itself uncalled.
+    /// No live path supersedes a trigger through this entry. Whether one is
+    /// wired or the entry is retired is an owner decision, not a
+    /// documentation one.
     pub fn supersede_maintenance_trigger(
         &self,
         principal_ref: &str,
@@ -2103,6 +2447,16 @@ impl KernelStoreGateway {
     /// enumeration produce this record — never a plaintext fallback and
     /// never silent deletion. The returned rows are the durable snapshot
     /// after this transition.
+    ///
+    /// # Live status
+    ///
+    /// This entry currently has NO production caller: the single call is
+    /// `record_maintenance_trigger_damage` in
+    /// `bins/eliotd/src/maintenance_dispatch.rs`, which is itself uncalled.
+    /// Because no live path records a gap here either, a maintenance-trigger
+    /// damage event is currently neither recorded nor recoverable through
+    /// this surface. Whether a damage recorder is wired or the entry is
+    /// retired is an owner decision, not a documentation one.
     pub fn record_maintenance_trigger_gap(
         &self,
         principal_ref: &str,
@@ -2129,14 +2483,28 @@ impl KernelStoreGateway {
     /// Restores the owned delivery ledger from previously persisted durable
     /// rows (issue #1694).
     ///
-    /// Runs once at startup before any claim is served: refuses when the
-    /// owner already holds rows, then every row is revalidated through the
-    /// existing validators before entering the ledger — a damaged row fails
-    /// the restore instead of entering as a guessed-complete entry. The
-    /// rows source is the startup composition's read-back of the persisted
-    /// rows through the Store-lane rows backend (STITCH): this entry owns
-    /// the restore, not the read-back. The returned rows are the restored
-    /// durable snapshot.
+    /// Were it reached, it would run once at startup before any claim is
+    /// served: refuses when the owner already holds rows, then every row is
+    /// revalidated through the existing validators before entering the
+    /// ledger — a damaged row fails the restore instead of entering as a
+    /// guessed-complete entry. The rows source is the startup composition's
+    /// read-back of the persisted rows through the Store-lane rows backend
+    /// (STITCH): this entry owns the restore, not the read-back. The
+    /// returned rows are the restored durable snapshot.
+    ///
+    /// # Live status
+    ///
+    /// This entry currently has NO production caller. It is *transitively*
+    /// dead rather than name-level dead, so a scan for call sites reports
+    /// one: the single call is
+    /// `restore_maintenance_trigger_ledger_at_startup` in
+    /// `bins/eliotd/src/maintenance_dispatch.rs`, which is itself uncalled.
+    /// The sentence above about running "once at startup" therefore describes
+    /// an intended startup order, not observed behaviour: no startup path
+    /// calls this entry, so the ledger is never restored from persisted rows.
+    /// The body is unchanged and still correct if reached; whether a startup
+    /// composition is wired to it or the entry is retired is an owner
+    /// decision, not a documentation one.
     pub fn restore_maintenance_trigger_ledger(
         &self,
         rows: Vec<MaintenanceTriggerDeliveryRow>,
@@ -2351,6 +2719,13 @@ impl KernelStoreGateway {
     where
         R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
     {
+        // I14.16 step 4 (issue #1953, map item 2): the Store commits below
+        // travel through the borrowed client, which bypasses `Self::apply`,
+        // so the entry refuses a `shadow_no_authority` candidate itself. The
+        // typed `Rejected` refusal proves nothing was admitted: no UnknownOutcome.
+        self.refuse_shadow_mutation().map_err(|error| {
+            UserAutomationExecutionError::Runtime(UserAutomationRuntimeError::Rejected(error))
+        })?;
         Self::validate_user_automation_request(&request)?;
         let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(self));
         // The sealed request is the one value this frame must keep across every
@@ -4009,6 +4384,12 @@ impl KernelStoreGateway {
     where
         R: UserAutomationRuntimePort + ?Sized,
     {
+        // I14.16 step 4 (issue #1953, map item 2): the occurrence execution
+        // below commits through the borrowed client, which bypasses
+        // `Self::apply`, so the join refuses a `shadow_no_authority`
+        // candidate itself. `Rejected` proves nothing was admitted.
+        self.refuse_shadow_mutation()
+            .map_err(UserAutomationRuntimeError::Rejected)?;
         // The owner read this leg issues under reuses the carrier's admitted
         // parent identity for a `Status` execution projection, so it mints no
         // canonical identity and issues no transition.
@@ -5598,8 +5979,8 @@ impl KernelStoreGateway {
         Ok(())
     }
 
-    /// Compiles and publishes the bounded recurring wake horizon this committed
-    /// operation owns, if any.
+    /// Retains, then publishes, the one bounded wake horizon a committed
+    /// operator operation owns, if any.
     ///
     /// `Create`, a `Resume` of the same immutable revision, and an `Edit` that
     /// committed a new `Active` revision each own exactly one publication
@@ -5618,16 +5999,10 @@ impl KernelStoreGateway {
     /// #2806: a committed configuration plus an explicit publication obligation,
     /// never a silent success.
     ///
-    /// The publication is retained in the composition-bound durable outbox under
-    /// its original owner operation identity before it is issued. The requested
-    /// occurrence identities are a deterministic function of the immutable
-    /// committed revision and the trigger, so a replay of the same parent
-    /// operation finds the same retained record: an answered publication serves
-    /// the owner's retained acknowledgement verbatim, and a publication whose
-    /// effect may already have been issued is reported as an unknown outcome
-    /// under its retained identity instead of being issued a second time. The
-    /// retry handle stays the derived name of the remaining set; the retained
-    /// record is what a restart actually resumes.
+    /// This entry point only decides whether a horizon exists and compiles it.
+    /// Retaining and publishing it is [`Self::retain_and_publish_wake_horizon`],
+    /// the single owner of that sequence, which the post-disposition slice a due
+    /// wake advances reaches through [`Self::publish_due_wake_horizon_advance`].
     async fn publish_schedule_horizon<R>(
         &self,
         sealed: &UserAutomationServiceRequest,
@@ -5664,10 +6039,85 @@ impl KernelStoreGateway {
             None,
         )
         .map_err(|error| error.to_string())?;
+        // The operator route reports a bare refusal reason and its result envelope is
+        // only composed on the success arm, so the typed arm is projected back to
+        // the identical text here. That mapping is the honest reading of the
+        // operator route's own contract — its caller receives a reason, not an
+        // obligation — and it is NAMED rather than left implicit: a
+        // post-retention refusal on this leg still drops the obligation, exactly
+        // as it did before, because `execute_user_automation_operation` returns
+        // `Err` here and never reaches the orchestration composition. Closing
+        // that leg means typing `execute_user_automation_operation`'s own error
+        // and giving the operator envelope a field for a retained-but-unprojectable
+        // obligation; that is a wider `crates/**` + `bins/**` contract change
+        // than this residual, and it is reported as such rather than half-done
+        // here. The arm is NOT dropped for the due-wake consumer, whose own entry
+        // point returns it unchanged.
+        let (obligation, phase) = self
+            .retain_and_publish_wake_horizon(sealed, revision, &publication, runtime)
+            .await
+            .map_err(UserAutomationHorizonPublicationRefusal::into_reason)?;
+        obligations.extend(obligation);
+        Ok(Some(phase))
+    }
+
+    /// Retains and then publishes one bounded wake horizon, for any caller that
+    /// already proved the slice belongs to an immutable revision it may publish.
+    ///
+    /// This is the ONLY implementation of the horizon obligation route, and both
+    /// of its entry points run it unchanged: [`Self::publish_schedule_horizon`]
+    /// for the horizon a committed `Create`/`Resume`/`Edit` owns, and
+    /// [`Self::publish_due_wake_horizon_advance`] for the post-disposition slice
+    /// a due wake advances. Neither may re-derive any part of it, so the
+    /// composition-bound durable outbox, the retained-obligation
+    /// classification, the possible-effect marking and the acknowledgement
+    /// settlement each have exactly one owner and there is no second durable
+    /// write path.
+    ///
+    /// The publication is an owner effect, so its intent is retained before
+    /// anything is handed to the schedule owner, in the composition-bound durable
+    /// outbox under its original owner operation identity. A record that could
+    /// not be retained is a named unavailability: nothing is issued, and the
+    /// horizon keeps its exact requested and remaining sets beside it.
+    ///
+    /// The returned obligation is present exactly when a durable record backs
+    /// this publication. `None` is a pre-retention answer — nothing was retained
+    /// and nothing was issued, so there is no record a reconciliation could read.
+    ///
+    /// The `Err` is typed rather than a bare reason, so a step that fails AFTER
+    /// the record was durably settled hands the caller the obligation that was
+    /// actually written instead of dropping the only handle to it. See
+    /// [`UserAutomationHorizonPublicationRefusal`]. The obligation in that arm is
+    /// the one `retained_user_automation_obligation` already derived from the
+    /// existing `runtime_obligation_operation_id(kind, parent, subject_ids)`; no
+    /// identity is minted on the error path, and a step that fails before that
+    /// identity exists reports
+    /// [`UserAutomationHorizonPublicationRefusal::NothingRetained`] instead of
+    /// constructing one to look reportable.
+    async fn retain_and_publish_wake_horizon<R>(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        revision: &UserAutomationRevision,
+        publication: &UserAutomationWakeHorizonPublication,
+        runtime: Option<&R>,
+    ) -> Result<
+        (
+            Option<UserAutomationRuntimeObligation>,
+            UserAutomationHorizonPhase,
+        ),
+        UserAutomationHorizonPublicationRefusal,
+    >
+    where
+        R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
+    {
+        // This is the first `?` of the route and it runs before the obligation
+        // identity exists, so it is a pre-retention refusal and is named as one.
         let requested_occurrence_ids = publication.requested_occurrence_ids();
         let retry_handle = publication
             .retry_handle(&requested_occurrence_ids)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| {
+                UserAutomationHorizonPublicationRefusal::nothing_retained(error.to_string())
+            })?;
         // Revalidate principal, revision, State Fence, and owner denominator
         // against the live owner before any owner call (issue #2806 item 2).
         // The committed document proves what this identity committed; only the
@@ -5675,23 +6125,21 @@ impl KernelStoreGateway {
         // this principal and fence. A revision that a concurrent pause,
         // remove, or superseding edit already moved is not published from a
         // stale commit: that leg owns the wake disposition instead.
-        if let Err(reason) = self
-            .revalidate_horizon_owner(sealed, revision, &publication)
+        if let Err((kind, reason)) = self
+            .revalidate_horizon_owner(sealed, revision, publication)
             .await
         {
-            let (kind, reason) = reason;
-            return Ok(Some(unreached_horizon_phase(
-                &publication,
-                &requested_occurrence_ids,
-                retry_handle,
-                kind,
-                &reason,
-            )));
+            return Ok((
+                None,
+                unreached_horizon_phase(
+                    publication,
+                    &requested_occurrence_ids,
+                    retry_handle,
+                    kind,
+                    &reason,
+                ),
+            ));
         }
-        // The publication is an owner effect, so its intent is retained before
-        // anything is handed to the schedule owner. A record that could not be
-        // retained is a named unavailability: nothing is issued, and the horizon
-        // keeps its exact requested and remaining sets beside it.
         let mut obligation = match retained_user_automation_obligation(
             UserAutomationRuntimeObligationKind::WakeHorizonPublication,
             &sealed.identity,
@@ -5702,12 +6150,15 @@ impl KernelStoreGateway {
         ) {
             Ok(obligation) => obligation,
             Err(error) => {
-                return Ok(Some(unretained_wake_horizon_phase(
-                    &publication,
-                    &requested_occurrence_ids,
-                    &retry_handle,
-                    error.to_string(),
-                )));
+                return Ok((
+                    None,
+                    unretained_wake_horizon_phase(
+                        publication,
+                        &requested_occurrence_ids,
+                        &retry_handle,
+                        error.to_string(),
+                    ),
+                ));
             }
         };
         // The retained record is consulted first, so an answered or reconciling
@@ -5732,37 +6183,210 @@ impl KernelStoreGateway {
             .reconcile_wake_horizon_possible_effect(
                 runtime,
                 &mut obligation,
-                &publication,
+                publication,
                 &requested_occurrence_ids,
                 &retry_handle,
             )
             .await?
         {
-            obligations.push(obligation);
-            return Ok(Some(phase));
+            return Ok((Some(obligation), phase));
         }
-        let retained = classify_retained_horizon_publication(&obligation, &publication, retained);
+        let retained = classify_retained_horizon_publication(&obligation, publication, retained);
         if let Some(phase) = retained_horizon_phase(
             retained,
             &mut obligation,
-            &publication,
+            publication,
             &requested_occurrence_ids,
             &retry_handle,
         ) {
-            obligations.push(obligation);
-            return Ok(Some(phase));
+            return Ok((Some(obligation), phase));
         }
-        let phase = self
+        let (settled, phase) = self
             .issue_wake_horizon(
                 &obligation,
                 runtime,
-                &publication,
+                publication,
                 &requested_occurrence_ids,
                 retry_handle,
             )
             .await?;
-        obligations.push(phase.0);
-        Ok(Some(phase.1))
+        Ok((Some(settled), phase))
+    }
+
+    /// Retains, then publishes, the one bounded recurring horizon slice a due
+    /// wake's post-disposition advance owns (issue #2806 items 6, W6 and W8, and
+    /// the lost-response half of A3).
+    ///
+    /// This is the entry point that makes the retention route reachable for that
+    /// advance. Until now [`Self::publish_schedule_horizon`] was the only caller
+    /// of the `retained_user_automation_obligation` →
+    /// [`Self::mark_wake_horizon_obligation_possible_effect`] →
+    /// [`Self::settle_wake_horizon_acknowledgement`] sequence, so the due-wake
+    /// consumer reached [`UserAutomationWakePort::publish_wake_horizon`]
+    /// directly and a lost response to its post-disposition slice had nothing to
+    /// resume from. This runs the SAME sequence, through the SAME
+    /// [`Self::retain_and_publish_wake_horizon`] the operator route runs, over the
+    /// SAME composition-bound outbox: no second durable write path, no second
+    /// copy of the retained-obligation classification, no process-local retry
+    /// ledger and no detached scheduler loop.
+    ///
+    /// **How a lost response resumes, and under which identity.** The obligation
+    /// key is `runtime_obligation_operation_id(kind, parent, subject_ids)` over
+    /// the admitted due-wake carrier's parent identity triple, the existing
+    /// `WakeHorizonPublication` kind, and this slice's exact requested occurrence
+    /// set. All three are immutable content — the revision is immutable, the
+    /// cursor is positional, and the consumed occurrence is excluded from its own
+    /// slice — so the key is byte-identical after a restart. A repeat delivery of
+    /// the same due wake therefore FINDS the same row: an answered row serves the
+    /// owner's retained acknowledgement verbatim instead of republishing, and a
+    /// row that already reached the monotonic `Routed` state is put to the
+    /// schedule owner as a possible effect under that same original owner
+    /// operation identity instead of being re-issued. A later calendar occurrence
+    /// advances a different set, so it keys a different record rather than
+    /// overwriting this one — which is I11.12's "a later calendar occurrence is a
+    /// different identity" held in the durable store and not only in the
+    /// compiler.
+    ///
+    /// The parent is the admitted due-wake carrier's identity, not an operator
+    /// commit's: the advance is not a committed operator operation and mints no
+    /// canonical identity of its own (see
+    /// [`Self::due_wake_horizon_parent_request`]).
+    ///
+    /// The returned obligation is present exactly when a durable record backs
+    /// this publication. `None` is a pre-retention answer — nothing was retained
+    /// and nothing was issued, so there is no record a reconciliation could read.
+    ///
+    /// **The returned `Err` distinguishes the two cases a bare reason string could
+    /// not.** The binding checks below fail before the obligation identity exists,
+    /// so they report [`UserAutomationHorizonPublicationRefusal::NothingRetained`]
+    /// and the caller may state that no record exists. A step that fails AFTER
+    /// [`Self::settle_wake_horizon_acknowledgement`] has written the owner's
+    /// answer reports [`UserAutomationHorizonPublicationRefusal::Retained`] and
+    /// hands back that exact obligation, so the caller can report and later
+    /// reconcile the record under its ORIGINAL owner operation identity instead
+    /// of dropping the only handle to it. The caller must still project either
+    /// arm as an unknown outcome rather than as a clean absence of work; what it
+    /// may no longer do is claim that nothing was retained while a record exists.
+    ///
+    /// No identity is minted on either arm. The retained obligation is the one
+    /// `retained_user_automation_obligation` already derived from the existing
+    /// `runtime_obligation_operation_id(kind, parent, subject_ids)`; a caller that
+    /// wants an identity for a `NothingRetained` refusal must say it has none
+    /// rather than construct one.
+    pub async fn publish_due_wake_horizon_advance<R>(
+        &self,
+        request: &UserAutomationRuntimeAdmission,
+        resolution: &UserAutomationDueWakeResolution,
+        publication: &UserAutomationWakeHorizonPublication,
+        runtime: &R,
+    ) -> Result<
+        (
+            Option<UserAutomationRuntimeObligation>,
+            UserAutomationHorizonPhase,
+        ),
+        UserAutomationHorizonPublicationRefusal,
+    >
+    where
+        R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
+    {
+        let sealed = Self::due_wake_horizon_parent_request(request, resolution);
+        // Every check in `validate_due_wake_horizon_advance` runs before the
+        // obligation identity is derived and before any durable write, so its
+        // refusals are named as pre-retention rather than left ambiguous.
+        Self::validate_due_wake_horizon_advance(&sealed, resolution, publication)
+            .map_err(UserAutomationHorizonPublicationRefusal::nothing_retained)?;
+        self.retain_and_publish_wake_horizon(
+            &sealed,
+            &resolution.revision,
+            publication,
+            Some(runtime),
+        )
+        .await
+    }
+
+    /// Composes the retained-parent request one due-wake horizon advance is
+    /// issued under.
+    ///
+    /// The advance follows an owner-acknowledged occurrence disposition; it is
+    /// not a committed operator operation, so it owns no sealed operator request
+    /// and must mint no canonical identity for one. It reuses the admitted
+    /// due-wake carrier's identity, principal and live request metadata — the
+    /// same triple [`Self::due_wake_execution_join`] reads — and names the
+    /// read-only `Status` view of the exact revision this advance publishes for,
+    /// so the retained record is bound to the occurrence's own parent operation
+    /// and this leg issues no transition.
+    fn due_wake_horizon_parent_request(
+        request: &UserAutomationRuntimeAdmission,
+        resolution: &UserAutomationDueWakeResolution,
+    ) -> UserAutomationServiceRequest {
+        UserAutomationServiceRequest {
+            context: request.context.clone(),
+            authenticated_principal: request.authenticated_principal.clone(),
+            identity: request.identity.clone(),
+            intent: UserAutomationOperatorIntent {
+                intent_id: format!(
+                    "{}:due-wake-horizon-advance",
+                    request.identity.operation_id.as_str()
+                ),
+                principal_ref: request.authenticated_principal.clone(),
+                state_fence: request.context.state_fence.clone(),
+                operation: UserAutomationOperation::Status {
+                    automation_id: resolution.revision.automation_id.clone(),
+                },
+            },
+        }
+    }
+
+    /// Binds one caller-supplied horizon slice to the due-wake carrier and the
+    /// resolved revision it must be retained under, before anything is retained
+    /// or issued.
+    ///
+    /// A horizon request carries its own context, identity, fence and revision
+    /// binding, so a caller could otherwise hand this boundary a slice that is
+    /// internally valid but belongs to a different carrier or a different
+    /// revision than the due wake actually resolved. The durable record is keyed
+    /// on the parent identity and the slice's own subject set, so accepting one
+    /// of those would retain a real obligation under a false parent. The
+    /// revision-relative proof itself is
+    /// [`UserAutomationWakeHorizonPublication::validate_against_revision`], the
+    /// same function `advance_wake_horizon` already ran; it is repeated here
+    /// because the caller, not this boundary, chose the value.
+    fn validate_due_wake_horizon_advance(
+        sealed: &UserAutomationServiceRequest,
+        resolution: &UserAutomationDueWakeResolution,
+        publication: &UserAutomationWakeHorizonPublication,
+    ) -> Result<(), String> {
+        // The retained row's fence digest, Authority Epoch, generation and
+        // retention instant all derive from the parent request, while every wake
+        // intent in this slice is bound to the publication's own fence. A slice
+        // whose two fences differ would retain a record under a fence its own
+        // entries were never compiled for, so no record is written at all.
+        if publication.state_fence != sealed.context.state_fence {
+            return Err(
+                "the bounded horizon slice after the admitted occurrence is issued under a \
+                 State Fence that is not the one its retained obligation would be recorded \
+                 under; nothing was retained and nothing was sent"
+                    .to_owned(),
+            );
+        }
+        if publication.trigger != UserAutomationHorizonTrigger::DispositionAdvance
+            || publication.revision_digest != resolution.revision_digest
+        {
+            return Err(
+                "the horizon slice handed to the due-wake advance is not the bounded advance of \
+                 the revision this due wake resolved; nothing was retained and nothing was sent"
+                    .to_owned(),
+            );
+        }
+        publication
+            .validate_against_revision(&resolution.revision)
+            .map_err(|error| {
+                format!(
+                    "the bounded horizon slice after the admitted occurrence is not a slice of \
+                     the resolved revision's own normalized contract: {error}; nothing was \
+                     retained and nothing was sent"
+                )
+            })
     }
 
     /// Makes one schedule owner's own acknowledgement the durable retained body
@@ -5837,6 +6461,12 @@ impl KernelStoreGateway {
     ///
     /// `None` means this obligation is not in the classification this reconciles
     /// and the caller must run the ordinary path.
+    ///
+    /// The only step here that can fail is the projection, and it runs AFTER
+    /// `settle_wake_horizon_acknowledgement` has written the owner's answer as the
+    /// row's durable retained body. That is why the refusal carries the settled
+    /// obligation: the row provably exists and is provably answered, so dropping
+    /// its handle here would leave a durable record that nothing can name.
     async fn reconcile_wake_horizon_possible_effect<R>(
         &self,
         runtime: Option<&R>,
@@ -5844,7 +6474,7 @@ impl KernelStoreGateway {
         publication: &UserAutomationWakeHorizonPublication,
         requested_occurrence_ids: &[String],
         retry_handle: &str,
-    ) -> Result<Option<UserAutomationHorizonPhase>, String>
+    ) -> Result<Option<UserAutomationHorizonPhase>, UserAutomationHorizonPublicationRefusal>
     where
         R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
     {
@@ -5908,11 +6538,26 @@ impl KernelStoreGateway {
             }
         };
         obligation.disposition = disposition;
-        Ok(Some(acknowledged_horizon_phase(
+        // The owner's answer is the row's durable retained body from here on, so a
+        // projection failure is a post-retention refusal that must hand back the
+        // obligation it settled. `obligation` is the very record that was written:
+        // its `Answered` disposition came from `settle_wake_horizon_acknowledgement`
+        // and its `owner_operation_id` came from
+        // `runtime_obligation_operation_id`, neither of which is recomputed here.
+        let phase = match acknowledged_horizon_phase(
             publication,
             requested_occurrence_ids,
             &acknowledgement,
-        )?))
+        ) {
+            Ok(phase) => phase,
+            Err(reason) => {
+                return Err(UserAutomationHorizonPublicationRefusal::retained(
+                    obligation.clone(),
+                    reason,
+                ));
+            }
+        };
+        Ok(Some(phase))
     }
 
     /// Issues one bounded wake horizon under a durably routed obligation and
@@ -5933,6 +6578,14 @@ impl KernelStoreGateway {
     /// The `Unavailable` arm is the one that pays for that rule with real
     /// availability, and it documents its own lumped producers rather than
     /// leaving a reader to assume a clean no-send.
+    ///
+    /// The only `Err` this reaches is the projection below, and it is reached
+    /// ONLY after `settle_wake_horizon_acknowledgement` wrote the owner's answer
+    /// as the record's durable retained body. The refusal therefore carries
+    /// `settled`: the obligation this route actually settled, under its original
+    /// owner operation identity. Every other outcome here is an `Ok` whose phase
+    /// names the exact remaining set and replay handle, including the arms where
+    /// the row is armed and stays reconciling.
     async fn issue_wake_horizon<R>(
         &self,
         obligation: &UserAutomationRuntimeObligation,
@@ -5940,7 +6593,10 @@ impl KernelStoreGateway {
         publication: &UserAutomationWakeHorizonPublication,
         requested_occurrence_ids: &[String],
         retry_handle: String,
-    ) -> Result<(UserAutomationRuntimeObligation, UserAutomationHorizonPhase), String>
+    ) -> Result<
+        (UserAutomationRuntimeObligation, UserAutomationHorizonPhase),
+        UserAutomationHorizonPublicationRefusal,
+    >
     where
         R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
     {
@@ -6001,14 +6657,25 @@ impl KernelStoreGateway {
                         ));
                     }
                 };
-                Ok((
-                    settled,
-                    acknowledged_horizon_phase(
-                        publication,
-                        requested_occurrence_ids,
-                        &acknowledgement,
-                    )?,
-                ))
+                // The owner's acknowledgement is now the row's durable retained
+                // body and `settled` carries that `Answered` disposition, so a
+                // projection failure below must hand the caller the record it
+                // wrote instead of a bare reason. `settled` is moved into the
+                // refusal on that arm and returned on this one, so it is consumed
+                // exactly once.
+                let phase = match acknowledged_horizon_phase(
+                    publication,
+                    requested_occurrence_ids,
+                    &acknowledgement,
+                ) {
+                    Ok(phase) => phase,
+                    Err(reason) => {
+                        return Err(UserAutomationHorizonPublicationRefusal::retained(
+                            settled, reason,
+                        ));
+                    }
+                };
+                Ok((settled, phase))
             }
             // `Unavailable` is a LUMPED owner answer, NOT a "nothing was sent"
             // proof, and this branch must not read it as one. It is produced
@@ -6192,9 +6859,20 @@ impl KernelStoreGateway {
             .await
         {
             Ok(projection) => projection,
-            Err(RunNowPreflightAssembly::Unknown(reason)) => return Err(reason),
-            Err(RunNowPreflightAssembly::Unavailable(reason)) => {
-                return Ok((wake, UserAutomationExecutionPhase::Unavailable { reason }));
+            // A preflight that could not be assembled is reported as the phase it
+            // is, beside the committed configuration, rather than as a route error
+            // that discards the committed `WriteReceipt` — the only carrier of that
+            // commit. Nothing is claimed about an admission here: the assembly
+            // stopped before the Durable Job owner was asked on this attempt, so the
+            // disposition stays unresolved under this exact occurrence identity and
+            // the caller reconciles it instead of being handed prose that names only
+            // the occurrence.
+            Err(assembly) => {
+                return Ok(Self::project_run_now_preflight_assembly(
+                    wake,
+                    &occurrence_id,
+                    assembly,
+                ));
             }
         };
         // The blocked fingerprint is retained before the execution join moves
@@ -6232,6 +6910,71 @@ impl KernelStoreGateway {
             blocked_fingerprint,
             &occurrence_id,
         )
+    }
+
+    /// Projects one preflight assembly this leg could not complete into the
+    /// execution phase it is, beside the already-resolved wake phase.
+    ///
+    /// The committed configuration is deliberately NOT dropped here. The
+    /// `WriteReceipt` it carries is the sole carrier of the committed run-now
+    /// invocation, so returning a route error instead would leave the caller
+    /// naming an occurrence it has no committed receipt for — which is the
+    /// `recovery=null`-shaped loss item 9 of issue #2806 refuses. Both arms
+    /// therefore return a phase the caller can act on, and `recovery()` still
+    /// reports the unresolved disposition because neither phase is `resolved()`.
+    ///
+    /// The two arms are NOT merged, because they are not the same claim.
+    /// [`RunNowPreflightAssembly::Unknown`] is an owner that could not be read:
+    /// the Durable Job owner may already hold an answer this leg cannot see, so
+    /// the honest phase is `UnknownOutcome` and the occurrence must be reconciled
+    /// under its own identity. [`RunNowPreflightAssembly::Unavailable`] is named
+    /// evidence with no issuer at this boundary, which proves nothing was sent,
+    /// so it stays `Unavailable`. Collapsing them would either fabricate a
+    /// possible effect that provably did not issue, or hide a possibly-issued
+    /// effect behind "unreachable" — and this vocabulary deliberately keeps the
+    /// two apart (see the `RunNowPreflightAssembly` contract).
+    ///
+    /// An unresolved wake changes what the execution phase may honestly say, and
+    /// the change is a strict narrowing rather than a substitution. When the wake
+    /// handoff is itself unresolved, the wake owner has already reported the
+    /// answer this leg cannot see, and
+    /// [`UserAutomationOperatorTransition::recovery`] returns that wake answer
+    /// ahead of the execution phase, so the unresolved owner fact is still the
+    /// caller's recovery directive. The execution phase then says only what is
+    /// true of itself: the handoff to the Durable Job owner was never attempted,
+    /// because the preflight stopped before the join. It claims no admission and
+    /// no refusal, and `is_known()` is still false, so nothing here converts an
+    /// unresolved answer into a decided one. This is also the only phase
+    /// `validate_phase_joins` will join beside an unresolved wake, which is why
+    /// the distinction is load-bearing rather than cosmetic.
+    fn project_run_now_preflight_assembly(
+        wake: UserAutomationWakePhase,
+        occurrence_id: &str,
+        assembly: RunNowPreflightAssembly,
+    ) -> (UserAutomationWakePhase, UserAutomationExecutionPhase) {
+        // A wake that names this occurrence — the owner's retained record or its
+        // complete negative — is what an unresolved execution may sit beside. An
+        // unresolved wake proves neither, so it is excluded here exactly as
+        // `validate_phase_joins` excludes it there.
+        let wake_proven = matches!(
+            &wake,
+            UserAutomationWakePhase::Published { .. }
+                | UserAutomationWakePhase::NotApplicable { .. }
+        );
+        let execution = match assembly {
+            RunNowPreflightAssembly::Unknown(reason) if wake_proven => {
+                UserAutomationExecutionPhase::UnknownOutcome {
+                    reason: unestablished_run_now_preflight_reason(occurrence_id, &reason),
+                }
+            }
+            RunNowPreflightAssembly::Unknown(reason) => UserAutomationExecutionPhase::Unavailable {
+                reason: unattempted_run_now_preflight_reason(occurrence_id, &reason),
+            },
+            RunNowPreflightAssembly::Unavailable(reason) => {
+                UserAutomationExecutionPhase::Unavailable { reason }
+            }
+        };
+        (wake, execution)
     }
 
     /// Resolves the wake phase of one committed `RunNow` occurrence over the
@@ -7676,6 +8419,11 @@ impl KernelStoreGateway {
             .flight
             .enter()
             .map_err(StoreApplyRefusal::GatewayRefusal)?;
+        // I14.16 step 4 (issue #1953, map item 2): a restore batch is a Store
+        // write, so a `shadow_no_authority` candidate refuses before the
+        // generation gate and the send.
+        self.refuse_shadow_mutation()
+            .map_err(StoreApplyRefusal::GatewayRefusal)?;
         self.require_active_store_generation()
             .map_err(|error| StoreApplyRefusal::GatewayRefusal(error.to_string()))?;
         self.store
@@ -8675,6 +9423,41 @@ fn unestablished_run_now_execution_reason(
         "the Durable Job owner did not establish an admission for committed occurrence \
          {occurrence_id}, so the occurrence stays unadmitted until that same occurrence is \
          reconciled: {detail}"
+    )
+}
+
+/// Execution phase reason for one committed occurrence whose owner preflight
+/// could not be assembled because an owner could not be read.
+///
+/// This is deliberately NOT a refusal and NOT an admission. The preflight never
+/// completed, so the leg has no decision to report in either direction: naming it
+/// `UnknownOutcome` alongside the committed `WriteReceipt` is what lets the caller
+/// reconcile this exact occurrence under its own Durable Job identity, instead of
+/// receiving a route error that discards the commit and names the occurrence in
+/// prose alone. Reporting it as a decided `Rejected` would claim the occurrence
+/// provably admitted nothing, which an unread owner does not prove — the reason
+/// text is therefore the owner's own failure and never a re-derived outcome.
+fn unestablished_run_now_preflight_reason(occurrence_id: &str, detail: &str) -> String {
+    format!(
+        "the owner preflight for committed occurrence {occurrence_id} could not be assembled, so \
+         this occurrence's execution disposition is unresolved and no admission or refusal is \
+         claimed for it until that same occurrence is reconciled: {detail}"
+    )
+}
+
+/// Execution phase reason for one committed occurrence whose preflight could not
+/// be assembled while the WAKE handoff was itself unresolved.
+///
+/// The unresolved owner fact is the wake phase's, and
+/// `UserAutomationOperatorTransition::recovery` reports it first, so this reason
+/// states only what is true of the execution handoff itself: the preflight never
+/// completed, so the Durable Job owner was never asked on this attempt. It claims
+/// no admission and no refusal, and the transition is still not `known`.
+fn unattempted_run_now_preflight_reason(occurrence_id: &str, detail: &str) -> String {
+    format!(
+        "the wake handoff of committed occurrence {occurrence_id} is itself unresolved, and its \
+         owner preflight could not be assembled either, so this occurrence was never handed to the \
+         Durable Job owner and no admission or refusal is claimed for it: {detail}"
     )
 }
 

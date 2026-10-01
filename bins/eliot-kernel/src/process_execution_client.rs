@@ -20,6 +20,7 @@ use eliot_process::{
 };
 
 use super::native_worker_lifecycle_route::{native_worker_json_str, native_worker_json_u64};
+use super::process_execution::{observe_process_in_context, process_terminal_code};
 use super::{KernelComposition, ProcessExecutionGateway, caller_binding};
 
 /// Operation port delegating to the gateway under one bound owner.
@@ -74,31 +75,49 @@ impl ProcessStarter for GatewayProcessStarter {
         let gateway = Arc::clone(&self.gateway);
         let owner = self.owner.clone();
         Box::pin(async move {
+            let context = ProcessExecutionGateway::start_context_for(&owner, &admission);
             // F-LOG-KERNEL-3 (#901 W12, case 4 "pre-launch refusal remains
             // not attempted"): the live front-door process start runs the one
             // process-execution material-coverage guard
-            // (`KernelComposition::reject_process_start_without_material_coverage`,
+            // (`KernelComposition::reject_process_start_without_material_coverage_in_context`,
             // owned by `process_execution`) instead of re-deriving the target
             // fence here. A missing independent Host-observed Watchdog
             // carrier, a non-current target generation, or a stale fence
             // therefore denies the start before any path proof is retained and
             // before `gateway.start` is reached, and the typed refusal keeps
             // the same `WATCHDOG_COVERAGE_UNAVAILABLE` projection it already
-            // had (see `ProcessExecutionRejection::from_error`, which recovers
-            // that code from the bounded detail prefix). The guard owns the
-            // single `kernel.process.request_rejected` observation.
-            let outer_binding =
-                match kernel.reject_process_start_without_material_coverage(&admission) {
-                    Ok(outer_binding) => outer_binding,
-                    Err(rejection) => {
-                        return Err(eliot_process::ProcessExecutionError::Unavailable(format!(
-                            "{}: {}",
-                            rejection.code, rejection.detail
-                        )));
-                    }
-                };
-            let proof = kernel.retain_process_path_proof(&admission)?;
-            gateway.start(&owner, admission, proof, outer_binding).await
+            // had. On refusal the guard owns both the contextual rejection
+            // observation and the one terminal; this caller only returns its
+            // typed rejection for the service client to project.
+            let outer_binding = match kernel
+                .reject_process_start_without_material_coverage_in_context(&admission, &context)
+            {
+                Ok(outer_binding) => outer_binding,
+                Err(rejection) => {
+                    return Err(eliot_process::ProcessExecutionError::Unavailable(format!(
+                        "{}: {}",
+                        rejection.code, rejection.detail
+                    )));
+                }
+            };
+            let proof = match kernel.retain_process_path_proof(&admission) {
+                Ok(proof) => proof,
+                Err(error) => {
+                    observe_process_in_context(
+                        &context,
+                        "kernel.process.request_rejected",
+                        "path_proof",
+                    );
+                    super::kernel_diagnostics::observe_terminal_error_in_context(
+                        process_terminal_code(&error),
+                        &context,
+                    );
+                    return Err(error);
+                }
+            };
+            gateway
+                .start_in_context(&owner, admission, proof, outer_binding, &context)
+                .await
         })
     }
 }
@@ -156,6 +175,24 @@ pub fn process_execution_client(
 /// projections (`eliot_kernel_service::protocol::native_worker_claim`,
 /// unreachable from this crate at this base; the integrator rebinds these
 /// parameters to `NativeWorkerClaimRequest`/`NativeWorkerClaimReceipt`).
+///
+/// # Live status
+///
+/// No production caller. Measured on this tree, no code in any crate names this
+/// function other than its defining line. The live process-start path is
+/// different and does not go through here: `frame_dispatch.rs` /
+/// `process_execution.rs` dispatch the generic `ProcessExecutionRequest::Start`
+/// arm, and the front-door client built by `process_execution_client` (called
+/// from `front_door_driver.rs`) wraps the same gateway in
+/// `GatewayProcessStarter`, whose `start` retains the path proof and starts.
+/// Neither route builds or checks a native-worker claim/receipt pair, because
+/// the projections this entry takes are unreachable from this crate at this
+/// base; the integrator rebinds them to
+/// `NativeWorkerClaimRequest`/`NativeWorkerClaimReceipt`. The
+/// `#[allow(dead_code)]` above is the compiler-side record of the same fact,
+/// not evidence of a caller. Whether the post-Ready starter binds this
+/// conversion or the entry is retired is an owner decision; no caller was added
+/// to close the gap.
 #[allow(clippy::too_many_lines)]
 #[allow(
     dead_code,

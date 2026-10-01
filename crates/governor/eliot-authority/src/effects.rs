@@ -532,7 +532,16 @@ impl EffectAuthorizer {
     /// original decision only when it names the full stored material identity
     /// and the presented lease is still current for that exact effect:
     /// historical replay never renews expired or revoked authority.
+    ///
+    /// A new admission additionally re-validates the proposal and the
+    /// lease's receipt obligations against the same retention rules the
+    /// recovery snapshot enforces, so only snapshot-retainable
+    /// authorizations are ever stored.
     #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the validated proposal is moved into the stored AuthorizedEffect; the shadow rebuild only re-checks its fields first"
+    )]
     pub fn authorize_with_revoked_roots(
         &mut self,
         lease: &mut ActionLease,
@@ -562,6 +571,27 @@ impl EffectAuthorizer {
             lease.still_current(&existing.proposal, current_work_scope, current_session, now)?;
             return Ok(existing.clone());
         }
+        // Persist before exposing executable admission (I6.6 seq 3): the
+        // ledger is the retention side of the semantic write path, and the
+        // recovery snapshot refuses records with incomplete input or without
+        // receipt obligations. Re-validate both here so a stored
+        // authorization is always snapshot-retainable: incomplete input or
+        // authorization refuses before the lease is charged and the ledger
+        // is touched, and can never become executable acceptance below. The
+        // durable write of the snapshot itself stays cross-process (STITCH).
+        let proposed = ProposedEffect::new(
+            proposed.action_id.clone(),
+            proposed.operation.clone(),
+            proposed.operation_name.clone(),
+            proposed.resource_ref.clone(),
+            proposed.canonical_payload_sha256.clone(),
+        )?;
+        if lease.receipt_obligations.is_empty() {
+            return Err(AuthorityError::InvalidField("receipt_obligations"));
+        }
+        for obligation in &lease.receipt_obligations {
+            obligation.validate()?;
+        }
         lease.authorize(&proposed, current_work_scope, current_session, now)?;
         let authorized = AuthorizedEffect {
             proposal: proposed,
@@ -573,6 +603,15 @@ impl EffectAuthorizer {
             authorized.proposal.operation.idempotency_key.clone(),
             authorized.clone(),
         );
+        // Persist-before-admission proof (I6.6 seq 3, I6.8): the stored
+        // authorization is proven retained in the exact snapshot payload the
+        // cross-process durable write persists before the authorization is
+        // returned. A ledger that cannot even serialize this record refuses
+        // here, so incomplete input or authorization can never become
+        // executable acceptance. The durable write of the snapshot itself
+        // stays cross-process (STITCH seam: the semantic write path owned
+        // outside this crate); per I6.10 no cross-store atomicity is claimed.
+        self.snapshot().map(|_| ())?;
         // I12.20 propagation on the production authorization path: contest
         // current dependent justifications/plans/pending effects without
         // touching history. Empty or absent revoked sets are a no-op.
@@ -596,6 +635,15 @@ impl EffectAuthorizer {
     /// The same logical request returns its original decision (idempotent
     /// replay). A changed payload, owner namespace, executor or incompatible
     /// binding conflicts rather than silently using the old record.
+    ///
+    /// Caller seam (issue #1793 A1): this is the Governor admission entry
+    /// point, so its production caller lives in the Governor admission lane
+    /// (outside this file) and its sealed output is consumed by the
+    /// reservation/dispatch lane (#1678/#1701). Every authorization it stores
+    /// is proven snapshot-retainable before return (see
+    /// [`Self::authorize_with_revoked_roots`]); the cross-process durable
+    /// write of that snapshot stays an explicit asymmetric handoff with no
+    /// claimed cross-store atomicity (I6.10).
     #[allow(clippy::too_many_arguments)]
     pub fn compile_effectful_action(
         &mut self,

@@ -1734,6 +1734,83 @@ pub struct HumanAttentionEvidenceGap {
     pub reason: String,
 }
 
+impl HumanAttentionEvidenceGap {
+    /// Renders this gap as a record-uncertainty limitation, so the Governor
+    /// producer can carry exact partial-evidence gaps into the persisted
+    /// revision's uncertainty instead of tuning policy from incomplete
+    /// evidence (issue #1784 items W3/W4). The statement names the closed
+    /// read and metric wire coordinates plus the caller-supplied reason; it
+    /// stays single-line because reasons admit no control characters.
+    pub fn limitation_statement(&self) -> String {
+        format!(
+            "partial evidence: {} unavailable for {}: {}",
+            self.read.wire_name(),
+            self.metric.wire_name(),
+            self.reason
+        )
+    }
+}
+
+impl HumanAttentionEvidenceRead {
+    /// Stable wire coordinate of the bounded read, mirroring the serde
+    /// representation. Kept beside the enum so a renamed variant fails
+    /// exhaustiveness here rather than drifting silently.
+    const fn wire_name(self) -> &'static str {
+        match self {
+            Self::NotificationDelivery => "NOTIFICATION_DELIVERY",
+            Self::NotificationDisposition => "NOTIFICATION_DISPOSITION",
+            Self::ExpiringApproval => "EXPIRING_APPROVAL",
+            Self::TaskOutcome => "TASK_OUTCOME",
+            Self::TaskVerifier => "TASK_VERIFIER",
+            Self::RiskEventOutcome => "RISK_EVENT_OUTCOME",
+            Self::HumanReport => "HUMAN_REPORT",
+            Self::InterruptionMeasurement => "INTERRUPTION_MEASUREMENT",
+            Self::PrivacyRecord => "PRIVACY_RECORD",
+            Self::PolicyProfile => "POLICY_PROFILE",
+            Self::TaskRiskProfile => "TASK_RISK_PROFILE",
+            Self::TelemetryCollection => "TELEMETRY_COLLECTION",
+        }
+    }
+}
+
+impl HumanAttentionMetric {
+    /// Stable wire coordinate of the metric, mirroring the serde
+    /// representation. Kept beside the enum so a renamed variant fails
+    /// exhaustiveness here rather than drifting silently.
+    const fn wire_name(self) -> &'static str {
+        use HumanAttentionMetric as M;
+        match self {
+            M::PolicyAndTaskRiskProfile => "POLICY_AND_TASK_RISK_PROFILE",
+            M::NotificationApprovalAndTelemetryProfile => {
+                "NOTIFICATION_APPROVAL_AND_TELEMETRY_PROFILE"
+            }
+            M::DeduplicatedInboxItems => "DEDUPLICATED_INBOX_ITEMS",
+            M::DeliveryAttempts => "DELIVERY_ATTEMPTS",
+            M::DistinctRiskEvents => "DISTINCT_RISK_EVENTS",
+            M::MissedCriticalRiskEvents => "MISSED_CRITICAL_RISK_EVENTS",
+            M::FalseCriticalRiskEvents => "FALSE_CRITICAL_RISK_EVENTS",
+            M::PreExposurePreventionEvents => "PRE_EXPOSURE_PREVENTION_EVENTS",
+            M::ConditionalInterventionEvents => "CONDITIONAL_INTERVENTION_EVENTS",
+            M::FinalHarmEvents => "FINAL_HARM_EVENTS",
+            M::ResidualRiskObservation => "RESIDUAL_RISK_OBSERVATION",
+            M::BenignFalseBlockTasks => "BENIGN_FALSE_BLOCK_TASKS",
+            M::AbandonedWorkTasks => "ABANDONED_WORK_TASKS",
+            M::InterruptionDuration => "INTERRUPTION_DURATION",
+            M::ResumptionLatency => "RESUMPTION_LATENCY",
+            M::ResumptionQualityObservation => "RESUMPTION_QUALITY_OBSERVATION",
+            M::TaskCorrectnessObservation => "TASK_CORRECTNESS_OBSERVATION",
+            M::ReworkEvents => "REWORK_EVENTS",
+            M::HumanAttentionObservation => "HUMAN_ATTENTION_OBSERVATION",
+            M::OvertrustObservation => "OVERTRUST_OBSERVATION",
+            M::UndertrustObservation => "UNDERTRUST_OBSERVATION",
+            M::RecoverabilityObservation => "RECOVERABILITY_OBSERVATION",
+            M::PrivacyPurposeCost => "PRIVACY_PURPOSE_COST",
+            M::PrivacyRetentionCost => "PRIVACY_RETENTION_COST",
+            M::PrivacyDisclosureCost => "PRIVACY_DISCLOSURE_COST",
+        }
+    }
+}
+
 /// The exact source revision bound for one named read used by an assembly.
 ///
 /// The same read may bind two revisions when two owners contribute (for

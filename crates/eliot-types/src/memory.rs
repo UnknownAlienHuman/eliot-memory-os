@@ -2170,9 +2170,6 @@ pub struct CodeCortexPacketView {
 #[serde(deny_unknown_fields)]
 pub struct TokenBudgetReport {
     pub max_tokens: usize,
-    /// Closed wire adapter identifies the value as unvalidated STU planning
-    /// evidence; it cannot encode an observed token count or measured fit.
-    #[serde(with = "crate::cognition::legacy_unvalidated_stu_projection")]
     pub estimated_tokens: usize,
     pub truncated: bool,
     pub sections_truncated: Vec<String>,

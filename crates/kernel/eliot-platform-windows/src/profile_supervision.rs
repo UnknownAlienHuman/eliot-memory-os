@@ -216,7 +216,14 @@ pub enum CurrentUserTaskObservation {
     },
 }
 
-/// Task Scheduler command-line mode used only by the `UserMode` task action.
+/// Command-line mode that admits the current-user profile supervisor, whose
+/// value selects which I3.1 profile the composing Host supervises.
+///
+/// The switch itself is unchanged and carries one value vocabulary, the I3.1
+/// profile table: `user_mode` for the `UserMode` task action the adapter
+/// encodes, and `portable_dev` for the repository-local disposable supervisor,
+/// which registers no task and therefore encodes its value nowhere in this
+/// adapter.
 pub const USER_MODE_SUPERVISOR_SWITCH: &str = "--eliot-profile-supervisor";
 
 /// Registration failure after task creation. If exact cleanup cannot be

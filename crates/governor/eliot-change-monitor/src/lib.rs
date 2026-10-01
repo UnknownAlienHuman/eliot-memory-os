@@ -1657,6 +1657,17 @@ impl ChangeMonitor {
             .observations
             .get(evidence_change_id)
             .ok_or(ChangeMonitorError::InvalidReconciliation)?;
+        // Reconciliation is explicitly per-resource: cross-resource evidence
+        // can never clear another resource's blocker, and an observation can
+        // never reconcile itself. Deleted transitions stay addressable via
+        // their before-state identity through `resource_ref`.
+        if unknown_change_id == evidence_change_id {
+            return Err(ChangeMonitorError::InvalidReconciliation);
+        }
+        let unknown_resource = unknown.observation.resource_ref();
+        if unknown_resource.is_empty() || evidence.observation.resource_ref() != unknown_resource {
+            return Err(ChangeMonitorError::InvalidReconciliation);
+        }
         if !unknown.observation.unknown_origin
             || !is_material_mutation(unknown.observation.kind)
             || !is_material_mutation(evidence.observation.kind)
@@ -1724,6 +1735,87 @@ impl ChangeMonitor {
         self.hints
             .values()
             .any(|record| record.verification.is_none())
+    }
+
+    /// Returns whether a host/filesystem hint for one tracked resource
+    /// still needs a verified content/Git readback.
+    pub fn has_pending_hint_for(&self, resource_ref: &str) -> bool {
+        self.hints
+            .values()
+            .any(|record| record.verification.is_none() && record.hint.resource_ref == resource_ref)
+    }
+
+    /// Returns whether an unreconciled unknown-origin Material change
+    /// touches one tracked resource. Reconciled changes and attributed
+    /// (non-unknown) observations never block; unknown stays unknown and
+    /// is never coerced to clean by this query.
+    pub fn has_unreconciled_unknown_change_for(&self, resource_ref: &str) -> bool {
+        self.observations.keys().any(|change_id| {
+            self.has_unresolved_unknown_change(change_id)
+                && self
+                    .observations
+                    .get(change_id)
+                    .is_some_and(|record| record.observation.resource_ref() == resource_ref)
+        })
+    }
+
+    /// Returns whether governed acceptance for one tracked resource is
+    /// currently blocked: a host/filesystem hint for that resource still
+    /// needs a verified readback, or an unreconciled unknown-origin
+    /// Material change touches that resource.
+    ///
+    /// Scoping is by the tracked source identity carried on the admitted
+    /// hint/observation. A candidate for an unrelated resource is
+    /// unaffected, so an out-of-lane re-pin of another source cannot wedge
+    /// its acceptance; a candidate touching a blocked resource still waits
+    /// for explicit reconciliation. The global
+    /// [`ChangeMonitor::blocks_acceptance`] gate is unchanged.
+    pub fn blocks_acceptance_for(&self, resource_ref: &str) -> bool {
+        self.has_pending_hint_for(resource_ref)
+            || self.has_unreconciled_unknown_change_for(resource_ref)
+    }
+
+    /// Returns the tracked resources currently blocking governed
+    /// acceptance — those with a still-unverified hint or an
+    /// unreconciled unknown-origin Material change — in deterministic
+    /// order.
+    pub fn blocked_resources(&self) -> Vec<String> {
+        let mut blocked = BTreeSet::new();
+        for record in self.hints.values() {
+            if record.verification.is_none() {
+                blocked.insert(record.hint.resource_ref.clone());
+            }
+        }
+        for (change_id, record) in &self.observations {
+            if self.has_unresolved_unknown_change(change_id) {
+                blocked.insert(record.observation.resource_ref().to_owned());
+            }
+        }
+        blocked.into_iter().collect()
+    }
+
+    /// Resolves one anchored-review anchor against explicit current
+    /// candidates over this projection (I10.18 anchored review, I10.21
+    /// A3/A4).
+    ///
+    /// Inputs are immutable: the original anchor and the candidate set the
+    /// review supplies, plus the owned snapshot of this monitor taken
+    /// above. Nothing here mutates the projection, re-derives history, or
+    /// auto-selects an ambiguous target: ties resolve `ambiguous` with
+    /// recorded evidence and no chosen target, and a target with a
+    /// matching immutable deletion observation resolves `deleted` while
+    /// staying historically addressable through its observation identity.
+    /// The returned observation carries the resolver algorithm/version,
+    /// the complete candidate and evidence inputs, and the confidence, so
+    /// the review route publishes exactly what was decided from what.
+    /// The anchored-review submit lane owns supplying candidates and
+    /// persisting this observation next to the review it justifies.
+    pub fn resolve_anchor(
+        &self,
+        original: &AnchorReference,
+        candidates: &[AnchorCandidate],
+    ) -> Result<AnchorResolutionObservation, ChangeMonitorError> {
+        EvolvingAnchorResolver.resolve_observed(original, candidates, &self.snapshot())
     }
 }
 

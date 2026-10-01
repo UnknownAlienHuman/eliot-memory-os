@@ -953,6 +953,29 @@ pub(super) async fn run_dogfood_blob_verifier(worktree: &Path, runtime_root: &Pa
     .await
 }
 
+/// The Cargo argv the registered workspace check runs.
+///
+/// I18.26 line 3 (issue #1902): this is a *parallel-agent* lane, so the
+/// unrestricted `cargo check --workspace` shape is not admissible here at all.
+/// The admission point ([`admit_agent_cargo_argv`]) refuses `--workspace`
+/// before anything spawns, so this function's package-selected `-p` form is the
+/// only argv it can ever launch. The check keeps `--all-targets` and
+/// `--offline`, which name a target set and a network policy, not a package
+/// selection.
+const REGISTERED_WORKSPACE_CHECK_ARGV: [&str; 11] = [
+    "check",
+    "--all-targets",
+    "--offline",
+    "-p",
+    "eliot-app",
+    "-p",
+    "eliot-engine",
+    "-p",
+    "eliot-instrument-runner",
+    "-p",
+    "eliot-build-test-graph",
+];
+
 pub(super) async fn run_cargo_workspace_check_verifier(
     worktree: &Path,
     runtime_root: &Path,
@@ -960,13 +983,7 @@ pub(super) async fn run_cargo_workspace_check_verifier(
     run_registered_cargo_verifier(
         worktree,
         runtime_root,
-        &[
-            "check",
-            "--workspace",
-            "--all-targets",
-            "--all-features",
-            "--offline",
-        ],
+        &REGISTERED_WORKSPACE_CHECK_ARGV,
         300,
         "workspace cargo check",
     )

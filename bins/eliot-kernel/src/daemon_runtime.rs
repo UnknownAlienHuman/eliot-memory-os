@@ -21,13 +21,15 @@ use eliot_process::{
     ProcessOwnerBinding, ProcessStartReceipt,
 };
 
+#[cfg(windows)]
+use super::DaemonRestartRefusal;
 use super::diagnostic_brief::DiagnosticTrigger;
 use super::kernel_audit::{AuditEventDraft, AuditEventKind};
 use super::{
-    ACTIVE_DAEMON_CALLER, DaemonRuntimeStatus, ELIOTD_MAX_RECOVERY_ATTEMPTS, KernelBuildError,
-    KernelComposition, daemon_class_withholds_replacement, daemon_refuses_replacement,
-    daemon_restart_refusal_reason, daemon_status_proves_ready, eliotd_launch_attempt_identity,
-    eliotd_operation_id, fresh_eliotd_launch_descriptor, probe_ready_state_admitted, sha256_hex,
+    ACTIVE_DAEMON_CALLER, DaemonRuntimeStatus, KernelBuildError, KernelComposition,
+    daemon_class_withholds_replacement, daemon_refuses_replacement, daemon_restart_refusal_reason,
+    daemon_status_proves_ready, eliotd_launch_attempt_identity, eliotd_operation_id,
+    fresh_eliotd_launch_descriptor, probe_ready_state_admitted, sha256_hex,
     stable_owner_principal_digest,
 };
 
@@ -38,11 +40,20 @@ use super::{
 /// receipts, digests, paths, supervision material, or owner error strings
 /// (I15.4, I07.20).
 fn observe_daemon_runtime(event: &'static str, outcome: &'static str) {
+    observe_daemon_runtime_in_context(event, outcome, &tracing::Span::current());
+}
+
+fn observe_daemon_runtime_in_context(
+    event: &'static str,
+    outcome: &'static str,
+    context: &tracing::Span,
+) {
     use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
     let event_bound = bound_field(event);
     let outcome_bound = bound_field(outcome);
     tracing::info!(
         target: KERNEL_DIAGNOSTICS_TARGET,
+        parent: context,
         event = event_bound.text(),
         outcome = outcome_bound.text(),
         "daemon runtime observation"
@@ -66,6 +77,49 @@ fn daemon_recovery_terminal_code(error: &KernelBuildError) -> &'static str {
         KernelBuildError::StoreBootstrapRequired => "RECOVERY_STORE_BOOTSTRAP_REQUIRED",
         KernelBuildError::StoreAlreadyConnected => "RECOVERY_STORE_ALREADY_CONNECTED",
         KernelBuildError::Principal(_) => "RECOVERY_PRINCIPAL",
+    }
+}
+
+#[cfg(windows)]
+fn record_daemon_recovery_operation_context(
+    context: &tracing::Span,
+    receipt: Option<&ProcessStartReceipt>,
+) {
+    let receipt = receipt.filter(|receipt| receipt.validate().is_ok());
+    let generation = receipt.map(|receipt| receipt.accepted_generation().get().to_string());
+    let epoch = receipt.and_then(|receipt| {
+        eliot_contracts::StateFence::canonical_epoch_digest(receipt.binding().authority_epoch())
+            .ok()
+    });
+    let state_fence = receipt.zip(epoch.as_ref()).map(|(receipt, epoch)| {
+        format!(
+            "epoch={};resource_generation={}",
+            epoch.as_str(),
+            receipt.binding().state_fence().generation().get()
+        )
+    });
+    for (field, original) in [
+        (
+            "operation",
+            receipt.map(|receipt| receipt.operation_id().as_str()),
+        ),
+        ("generation", generation.as_deref()),
+        ("state_fence", state_fence.as_deref()),
+        (
+            "authority_epoch",
+            epoch.as_ref().map(eliot_contracts::LowercaseSha256::as_str),
+        ),
+    ] {
+        if let Some(original) = original {
+            let value = super::kernel_diagnostics::bound_field(original);
+            context.record(field, value.text());
+        }
+    }
+    if let Some(receipt) = receipt {
+        super::daemon_live_receipt::record_process_receipt_context(context, receipt);
+        let process_tree =
+            super::kernel_diagnostics::bound_field(receipt.binding().process_tree_id().as_str());
+        context.record("process_tree", process_tree.text());
     }
 }
 
@@ -130,6 +184,7 @@ impl KernelComposition {
         &self,
         launched: &ProcessStartReceipt,
         timeout: Duration,
+        context: &tracing::Span,
     ) -> Result<(), KernelBuildError> {
         enum AwaitDecision {
             Ready,
@@ -142,7 +197,7 @@ impl KernelComposition {
         // (recovery, control request, or probe), so every outcome here is an
         // info; the owning operation emits the single terminal. Liveness
         // (a running process) is never logged as readiness.
-        observe_daemon_runtime("kernel.daemon.await_requested", "attempt");
+        observe_daemon_runtime_in_context("kernel.daemon.await_requested", "attempt", context);
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let changed = self.daemon_status_changed.notified();
@@ -187,17 +242,29 @@ impl KernelComposition {
             };
             match decision {
                 AwaitDecision::Ready => {
-                    observe_daemon_runtime("kernel.daemon.await_satisfied", "success");
+                    observe_daemon_runtime_in_context(
+                        "kernel.daemon.await_satisfied",
+                        "success",
+                        context,
+                    );
                     return Ok(());
                 }
                 AwaitDecision::Running => {}
                 AwaitDecision::Rejected(outcome, error) => {
-                    observe_daemon_runtime("kernel.daemon.await_rejected", outcome);
+                    observe_daemon_runtime_in_context(
+                        "kernel.daemon.await_rejected",
+                        outcome,
+                        context,
+                    );
                     return Err(error);
                 }
             }
             if tokio::time::timeout_at(deadline, changed).await.is_err() {
-                observe_daemon_runtime("kernel.daemon.await_rejected", "timeout");
+                observe_daemon_runtime_in_context(
+                    "kernel.daemon.await_rejected",
+                    "timeout",
+                    context,
+                );
                 let reason = format!(
                     "eliotd did not complete authenticated Governor recovery and report_ready within {} ms",
                     timeout.as_millis()
@@ -216,6 +283,8 @@ impl KernelComposition {
         &self,
         launch: &EliotdLaunchDescriptor,
         receipt: &ProcessStartReceipt,
+        context: &tracing::Span,
+        child_terminal_owned: &mut bool,
     ) -> Result<ProcessExecutionView, KernelBuildError> {
         let gateway = self.process_gateway.as_ref().ok_or_else(|| {
             KernelBuildError::Service(
@@ -272,16 +341,20 @@ impl KernelComposition {
         )
         .map_err(|error| KernelBuildError::Service(error.to_string()))?;
         let view = match gateway
-            .inspect(&owner, receipt.operation_id().clone())
+            .inspect_in_context(&owner, receipt.operation_id().clone(), context)
             .await
         {
             Ok(view) => view,
             Err(ProcessExecutionError::NotFound | ProcessExecutionError::UnknownOutcome) => {
+                *child_terminal_owned = true;
                 return Err(KernelBuildError::Service(
                     "eliotd previous process outcome is unknown; recovery is fenced".to_owned(),
                 ));
             }
-            Err(error) => return Err(KernelBuildError::Service(error.to_string())),
+            Err(error) => {
+                *child_terminal_owned = true;
+                return Err(KernelBuildError::Service(error.to_string()));
+            }
         };
         if view.binding() != receipt.binding() || view.identity() != Some(receipt.identity()) {
             return Err(KernelBuildError::Service(
@@ -291,26 +364,45 @@ impl KernelComposition {
         match view.lifecycle() {
             ProcessLifecycle::Exited | ProcessLifecycle::Failed | ProcessLifecycle::Reconciled => {
                 let closed = self
-                    .reconcile_closed_daemon_process(gateway, &owner, launch, receipt)
+                    .reconcile_closed_daemon_process(
+                        gateway,
+                        &owner,
+                        launch,
+                        receipt,
+                        context,
+                        child_terminal_owned,
+                    )
                     .await?;
-                self.close_restarted_daemon_descendant(gateway, &owner, receipt)
-                    .await?;
+                self.close_restarted_daemon_descendant(
+                    gateway,
+                    &owner,
+                    receipt,
+                    context,
+                    child_terminal_owned,
+                )
+                .await?;
                 Ok(closed)
             }
             ProcessLifecycle::Running => {
                 let cancellation = gateway
-                    .cancel(&owner, receipt.operation_id().clone())
+                    .cancel_in_context(&owner, receipt.operation_id().clone(), context)
                     .await
-                    .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+                    .map_err(|error| {
+                        *child_terminal_owned = true;
+                        KernelBuildError::Service(error.to_string())
+                    })?;
                 if cancellation.binding() != receipt.binding() {
                     return Err(KernelBuildError::Service(
                         "eliotd previous process cancellation binding changed".to_owned(),
                     ));
                 }
                 let cancelled = gateway
-                    .inspect(&owner, receipt.operation_id().clone())
+                    .inspect_in_context(&owner, receipt.operation_id().clone(), context)
                     .await
-                    .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+                    .map_err(|error| {
+                        *child_terminal_owned = true;
+                        KernelBuildError::Service(error.to_string())
+                    })?;
                 if cancelled.binding() != receipt.binding()
                     || cancelled.identity() != Some(receipt.identity())
                     || cancelled.lifecycle() != ProcessLifecycle::Exited
@@ -324,10 +416,23 @@ impl KernelComposition {
                     ));
                 }
                 let closed = self
-                    .reconcile_closed_daemon_process(gateway, &owner, launch, receipt)
+                    .reconcile_closed_daemon_process(
+                        gateway,
+                        &owner,
+                        launch,
+                        receipt,
+                        context,
+                        child_terminal_owned,
+                    )
                     .await?;
-                self.close_restarted_daemon_descendant(gateway, &owner, receipt)
-                    .await?;
+                self.close_restarted_daemon_descendant(
+                    gateway,
+                    &owner,
+                    receipt,
+                    context,
+                    child_terminal_owned,
+                )
+                .await?;
                 Ok(closed)
             }
             ProcessLifecycle::Quarantined => {
@@ -363,11 +468,16 @@ impl KernelComposition {
         gateway: &std::sync::Arc<super::process_execution::ProcessExecutionGateway>,
         owner: &ProcessOwnerBinding,
         receipt: &ProcessStartReceipt,
+        context: &tracing::Span,
+        child_terminal_owned: &mut bool,
     ) -> Result<(), KernelBuildError> {
         let closure = gateway
-            .close_registered_descendant(owner, receipt.operation_id().clone())
+            .close_registered_descendant_in_context(owner, receipt.operation_id().clone(), context)
             .await
-            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+            .map_err(|error| {
+                *child_terminal_owned = true;
+                KernelBuildError::Service(error.to_string())
+            })?;
         self.audit_observe(AuditEventDraft::descendant_closure(&closure));
         Ok(())
     }
@@ -391,18 +501,24 @@ impl KernelComposition {
         owner: &ProcessOwnerBinding,
         launch: &EliotdLaunchDescriptor,
         receipt: &ProcessStartReceipt,
+        context: &tracing::Span,
+        child_terminal_owned: &mut bool,
     ) -> Result<ProcessExecutionView, KernelBuildError> {
         let evidence = match gateway
-            .reconcile(owner, receipt.operation_id().clone())
+            .reconcile_in_context(owner, receipt.operation_id().clone(), context)
             .await
         {
             Ok(evidence) => evidence,
             Err(ProcessExecutionError::NotFound | ProcessExecutionError::UnknownOutcome) => {
+                *child_terminal_owned = true;
                 return Err(KernelBuildError::Service(
                     "eliotd previous process outcome is unknown; recovery is fenced".to_owned(),
                 ));
             }
-            Err(error) => return Err(KernelBuildError::Service(error.to_string())),
+            Err(error) => {
+                *child_terminal_owned = true;
+                return Err(KernelBuildError::Service(error.to_string()));
+            }
         };
         if evidence.operation_id() != receipt.operation_id()
             || evidence.binding() != receipt.binding()
@@ -466,29 +582,165 @@ impl KernelComposition {
         Ok(evidence.view().clone())
     }
 
+    /// Decides one automatic restart attempt against the owner's DURABLE
+    /// restart record and returns the refusal that withholds it, or `None`
+    /// when the attempt is admitted.
+    ///
+    /// `attempt` is the Kernel's restart ordinal for this process lifetime and
+    /// is NOT the budget: it names the replacement generation and is compared
+    /// against the threshold the admitted declaration itself declares. The
+    /// decision that must survive a daemon restart is the durable one, and it
+    /// is read from this owner's retained ORS restart record - keyed to the
+    /// supervised child's stable identity (`ACTIVE_DAEMON_CALLER`) and to the
+    /// admitted generation being replaced.
+    ///
+    /// Two refusals can arise here, and both are absences rather than
+    /// defaults:
+    ///
+    /// * no admitted restart policy means this child has no declared restart
+    ///   budget at all, so its replacement is refused as
+    ///   `DaemonRestartRefusal::PolicyNotAdmitted` BEFORE the previous
+    ///   generation is closed. That ordering matters: a withheld replacement
+    ///   must never destroy a child it cannot replace.
+    /// * a durable record that already exists under this child's identity and
+    ///   admitted generation means the restart disposition for this lineage was
+    ///   already decided durably, so the attempt is refused as
+    ///   `DaemonRestartRefusal::RestartBudgetExhausted` and no fresh window is
+    ///   opened. That record is what a recreated supervisor reads back.
+    ///
+    /// The third outcome is an unreadable or invalid durable record, which is
+    /// returned as a mechanical failure: an unreadable record is never read as
+    /// an absent one and never as permission.
+    #[cfg(windows)]
+    fn admit_daemon_restart_attempt(
+        &self,
+        launch: &EliotdLaunchDescriptor,
+        attempt: u64,
+        previous_receipt: Option<&ProcessStartReceipt>,
+    ) -> Result<Option<DaemonRestartRefusal>, KernelBuildError> {
+        let admitted_generation = launch.generation;
+        let admitted_state_fence =
+            eliot_contracts::StateFence::new(launch.authority_epoch.clone(), admitted_generation);
+        let Some(admitted) = self.daemon_restart_policy.as_ref() else {
+            return Ok(Some(DaemonRestartRefusal::PolicyNotAdmitted));
+        };
+        // The threshold is read only while the retained binding still proves
+        // the exact admitted generation and fence the caller observed. A
+        // binding that does not prove them is the same defect the class rule
+        // already names for this identity, so it is refused with that same
+        // reason instead of being reported as a budget of its own.
+        let Ok(declared_threshold) =
+            admitted.declared_attempt_threshold(admitted_generation, &admitted_state_fence)
+        else {
+            return Ok(Some(
+                DaemonRestartRefusal::PolicyNotBoundToAdmittedGeneration,
+            ));
+        };
+        let store = self.generation_gateway.ors.as_ref();
+        let recorded = store
+            .load_kernel_restart_reconciliation(ACTIVE_DAEMON_CALLER, admitted_generation.value())
+            .map_err(|error| {
+                KernelBuildError::Service(format!(
+                    "eliotd durable restart record is unreadable: {error}"
+                ))
+            })?;
+        // ANY durable row under this child's identity and generation means the
+        // restart disposition for this lineage was already decided and
+        // committed. It is therefore read back as the decision it is, and this
+        // boundary never rewrites a row it did not read as absent: an existing
+        // durable disposition is never treated as permission and never
+        // replaced by a locally recomputed one.
+        if recorded.is_some() {
+            return Ok(Some(DaemonRestartRefusal::RestartBudgetExhausted));
+        }
+        if attempt < u64::from(declared_threshold) {
+            return Ok(None);
+        }
+        let observed_at_ms = i64::try_from(super::unix_ms()).unwrap_or(i64::MAX);
+        store
+            .persist_kernel_restart_reconciliation(&eliot_ors::KernelReconciliationItem {
+                kind: eliot_ors::KernelReconciliationKind::ManifestRestartBudgetExhausted,
+                module_id: ACTIVE_DAEMON_CALLER.to_owned(),
+                generation: admitted_generation,
+                bound_manifest_sha256: None,
+                recorded_manifest_sha256: None,
+                lease_id: None,
+                operation_id: None,
+                observed_at_ms,
+            })
+            .map_err(|error| {
+                KernelBuildError::Service(format!(
+                    "eliotd durable restart record could not be persisted: {error}"
+                ))
+            })?;
+        // Issue #1839 (I16.4 restart-intensity exhaustion): the bounded
+        // recovery budget admitted no further restart for this child identity.
+        // The observation is subordinate; the refusal above owns the terminal.
+        self.audit_observe(AuditEventDraft::process_daemon_status(
+            AuditEventKind::PROCESS_RESTART_INTENSITY_EXHAUSTED,
+            previous_receipt,
+            "eliotd bounded restart budget is spent for this child identity",
+            self.current_state_fence().as_ref(),
+        ));
+        Ok(Some(DaemonRestartRefusal::RestartBudgetExhausted))
+    }
+
     /// Performs one Kernel-owned bounded recovery of a failed daemon
     /// attempt. The old process effect must be known terminal before the
     /// active descriptor, nonce, and operation identity are replaced.
     ///
-    /// Diagnostic wrapper (F-LOG-KERNEL-4, #903): exactly one terminal is
-    /// emitted per failed recovery with the recovery operation's own stable
-    /// code. Subordinate rendezvous/launch/readiness phases keep correlation
-    /// infos only; a failure already terminaled below arrives here
-    /// transformed into the recovery error, while the unchanged rendezvous
-    /// error is terminaled here for the first time.
+    /// Diagnostic wrapper (F-LOG-KERNEL-4, #903): each failed recovery has
+    /// one terminal owner. Recovery-owned failures use the recovery code;
+    /// launch, readiness, and process-gateway failures propagate their
+    /// already-owned terminal without emitting a second one here.
     #[cfg(windows)]
     pub async fn recover_eliotd(&self) -> Result<ProcessStartReceipt, KernelBuildError> {
-        observe_daemon_runtime("kernel.daemon.recovery_requested", "attempt");
-        match self.recover_eliotd_inner().await {
+        let parent = tracing::Span::current();
+        let parent = if parent.is_none() {
+            super::kernel_diagnostics::operation_context(None, None, None, None)
+        } else {
+            parent
+        };
+        let mut terminal_owned = false;
+        self.recover_eliotd_in_context(&parent, &mut terminal_owned)
+            .await
+    }
+
+    #[cfg(windows)]
+    async fn recover_eliotd_in_context(
+        &self,
+        parent: &tracing::Span,
+        terminal_owned: &mut bool,
+    ) -> Result<ProcessStartReceipt, KernelBuildError> {
+        let context = parent;
+        observe_daemon_runtime_in_context("kernel.daemon.recovery_requested", "attempt", context);
+        let mut child_terminal_owned = false;
+        match self
+            .recover_eliotd_inner(context, &mut child_terminal_owned)
+            .await
+        {
             Ok(receipt) => {
-                observe_daemon_runtime("kernel.daemon.recovery_committed", "success");
+                *terminal_owned = false;
+                observe_daemon_runtime_in_context(
+                    "kernel.daemon.recovery_committed",
+                    "success",
+                    context,
+                );
                 Ok(receipt)
             }
             Err(error) => {
-                observe_daemon_runtime("kernel.daemon.recovery_failed", "rejected");
-                super::kernel_diagnostics::observe_terminal_error(daemon_recovery_terminal_code(
-                    &error,
-                ));
+                observe_daemon_runtime_in_context(
+                    "kernel.daemon.recovery_failed",
+                    "rejected",
+                    context,
+                );
+                *terminal_owned = true;
+                if !child_terminal_owned {
+                    super::kernel_diagnostics::observe_terminal_error_in_context(
+                        daemon_recovery_terminal_code(&error),
+                        context,
+                    );
+                }
                 Err(error)
             }
         }
@@ -502,7 +754,11 @@ impl KernelComposition {
         clippy::too_many_lines,
         reason = "bounded recovery keeps disposition, fresh binding, and readiness rendezvous ordered"
     )]
-    async fn recover_eliotd_inner(&self) -> Result<ProcessStartReceipt, KernelBuildError> {
+    async fn recover_eliotd_inner(
+        &self,
+        context: &tracing::Span,
+        child_terminal_owned: &mut bool,
+    ) -> Result<ProcessStartReceipt, KernelBuildError> {
         let _recovery_gate = self.daemon_recovery_gate.lock().await;
         let service_state = self
             .service_state()
@@ -529,6 +785,7 @@ impl KernelComposition {
                 state.recovery_fenced,
             )
         };
+        record_daemon_recovery_operation_context(context, previous_receipt.as_ref());
         if recovery_fenced {
             return Err(KernelBuildError::Service(
                 "eliotd previous process start has an unknown outcome; recovery is fenced"
@@ -537,13 +794,16 @@ impl KernelComposition {
         }
         if matches!(status, DaemonRuntimeStatus::Ready) {
             if let Some(receipt) = previous_receipt {
-                self.validate_daemon_process_readiness(&launch, &receipt)
+                if self
+                    .validate_daemon_process_readiness_in_context(&launch, &receipt, context, true)
                     .await
-                    .map_err(|_| {
-                        KernelBuildError::Service(
-                            "eliotd Ready receipt is no longer physically proven".to_owned(),
-                        )
-                    })?;
+                    .is_err()
+                {
+                    *child_terminal_owned = true;
+                    return Err(KernelBuildError::Service(
+                        "eliotd Ready receipt is no longer physically proven".to_owned(),
+                    ));
+                }
                 return Ok(receipt);
             }
             return Err(KernelBuildError::Service(
@@ -556,20 +816,34 @@ impl KernelComposition {
             ));
         }
         let attempt = self.daemon_recovery_attempts.fetch_add(1, Ordering::AcqRel);
-        if attempt >= ELIOTD_MAX_RECOVERY_ATTEMPTS {
-            let reason = "eliotd bounded recovery budget is exhausted".to_owned();
-            // Issue #1839 (I16.4 restart-intensity exhaustion): the bounded
-            // recovery budget admitted no further restart for this lineage.
-            let detail = format!(
-                "recovery_budget_exhausted:attempt={attempt}:maximum={ELIOTD_MAX_RECOVERY_ATTEMPTS}"
-            );
-            self.audit_observe(AuditEventDraft::process_daemon_status(
-                AuditEventKind::PROCESS_RESTART_INTENSITY_EXHAUSTED,
-                previous_receipt.as_ref(),
-                &detail,
-                self.current_state_fence().as_ref(),
-            ));
-            return Err(self.daemon_failure_error(reason));
+        // I14.10 / I08.12 / #1682 W4: the bounded restart budget is a DURABLE
+        // operational fact of the supervised child, not process-local state.
+        // `attempt` above is only the ordinal that names the replacement
+        // generation; it is not a budget, and the budget is not recomputed from
+        // it. The decision below is read from this owner's retained ORS
+        // restart record, which is keyed to the child's stable identity
+        // (`ACTIVE_DAEMON_CALLER`, the very identity an admitted restart
+        // policy's `subject_id` must name) and to the admitted generation being
+        // replaced, and is written through that same ORS owner before the
+        // refusal is returned. A daemon restart therefore cannot hand out a
+        // fresh window: the record IS the window.
+        //
+        // Absence stays absence. `Ok(None)` means this child's declared budget
+        // was never recorded as spent, and it is never widened into an
+        // unlimited budget; an unreadable or invalid record is a mechanical
+        // failure, not a permission. The declared THRESHOLD is read only from
+        // an admitted policy, and a child with no admitted policy has no
+        // declared budget at all, so its replacement is refused as
+        // `PolicyNotAdmitted` rather than being given a synthesised default.
+        if previous_receipt.is_some() {
+            let refused =
+                self.admit_daemon_restart_attempt(&launch, attempt, previous_receipt.as_ref())?;
+            if let Some(refusal) = refused {
+                let reason = daemon_restart_refusal_reason(&refusal);
+                observe_daemon_runtime("kernel.daemon.restart_refused", reason);
+                return Err(self
+                    .daemon_failure_error(format!("eliotd automatic restart refused: {reason}")));
+            }
         }
         // The two refusals that no declared restart class may bypass (I14.10)
         // are decided here, on the exact reconciled evidence of the generation
@@ -585,13 +859,16 @@ impl KernelComposition {
         // the exit/health evidence. No policy means no class, and an absent
         // declaration is refused rather than widened into an unlimited budget.
         if let Some(receipt) = previous_receipt.as_ref() {
-            let closed = match self.close_previous_daemon_process(&launch, receipt).await {
+            let closed = match self
+                .close_previous_daemon_process(&launch, receipt, context, child_terminal_owned)
+                .await
+            {
                 Ok(closed) => closed,
                 Err(error) => return Err(self.daemon_failure_error(error.to_string())),
             };
             if let Some(refusal) = daemon_refuses_replacement(service_state, &closed) {
                 let reason = daemon_restart_refusal_reason(&refusal);
-                observe_daemon_runtime("kernel.daemon.restart_refused", reason);
+                observe_daemon_runtime_in_context("kernel.daemon.restart_refused", reason, context);
                 let reason = format!("eliotd automatic restart refused: {reason}");
                 return Err(self.daemon_failure_error(reason));
             }
@@ -618,7 +895,7 @@ impl KernelComposition {
                 &closed,
             ) {
                 let reason = daemon_restart_refusal_reason(&refusal);
-                observe_daemon_runtime("kernel.daemon.restart_refused", reason);
+                observe_daemon_runtime_in_context("kernel.daemon.restart_refused", reason, context);
                 let reason = format!("eliotd automatic restart refused: {reason}");
                 return Err(self.daemon_failure_error(reason));
             }
@@ -667,11 +944,14 @@ impl KernelComposition {
         }
         self.note_agent_bridge_peer_set_change();
         self.daemon_status_changed.notify_one();
-        let launched = match self.launch_eliotd().await {
+        let launched = match self.launch_eliotd_in_context(context).await {
             Ok(receipt) => receipt,
-            Err(error) => return Err(self.daemon_failure_error(error.to_string())),
+            Err(error) => {
+                *child_terminal_owned = true;
+                return Err(self.daemon_failure_error(error.to_string()));
+            }
         };
-        self.await_daemon_ready(&launched, self.ipc_limits().operation_timeout)
+        self.await_daemon_ready(&launched, self.ipc_limits().operation_timeout, context)
             .await?;
         // Issue #1839 (I16.4 restart): the recovered generation restarted
         // after its previous process closed; the launch commit itself stays
@@ -690,9 +970,12 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
-    pub(crate) async fn ensure_daemon_ready_for_probe(
+    pub(crate) async fn ensure_daemon_ready_for_probe_in_context(
         &self,
+        parent: &tracing::Span,
+        terminal_owned: &mut bool,
     ) -> Result<ProcessStartReceipt, KernelServiceError> {
+        *terminal_owned = false;
         let launch = self
             .active_daemon_launch()?
             .ok_or(KernelServiceError::ReadinessNotProven)?;
@@ -705,32 +988,51 @@ impl KernelComposition {
         if let Some(receipt) = receipt.as_ref() {
             if status == DaemonRuntimeStatus::Ready {
                 if self
-                    .validate_daemon_process_readiness(&launch, receipt)
+                    .validate_daemon_process_readiness_in_context(&launch, receipt, parent, false)
                     .await
                     .is_ok()
                 {
                     return Ok(receipt.clone());
                 }
+                // A rejected proof is a subordinate phase while bounded
+                // recovery may still complete this operation successfully.
             } else if status == DaemonRuntimeStatus::Running
                 && self
-                    .await_daemon_ready(receipt, self.ipc_limits().operation_timeout)
+                    .await_daemon_ready(receipt, self.ipc_limits().operation_timeout, parent)
                     .await
                     .is_ok()
             {
-                self.validate_daemon_process_readiness(&launch, receipt)
-                    .await?;
+                if self
+                    .validate_daemon_process_readiness_in_context(&launch, receipt, parent, true)
+                    .await
+                    .is_err()
+                {
+                    *terminal_owned = true;
+                    return Err(KernelServiceError::ReadinessNotProven);
+                }
                 return Ok(receipt.clone());
             }
         }
-        let recovered = self
-            .recover_eliotd()
+        let mut recovery_terminal_owned = false;
+        let Ok(recovered) = self
+            .recover_eliotd_in_context(parent, &mut recovery_terminal_owned)
             .await
-            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        else {
+            *terminal_owned = recovery_terminal_owned;
+            return Err(KernelServiceError::ReadinessNotProven);
+        };
+        *terminal_owned = false;
         let current_launch = self
             .active_daemon_launch()?
             .ok_or(KernelServiceError::ReadinessNotProven)?;
-        self.validate_daemon_process_readiness(&current_launch, &recovered)
-            .await?;
+        if self
+            .validate_daemon_process_readiness_in_context(&current_launch, &recovered, parent, true)
+            .await
+            .is_err()
+        {
+            *terminal_owned = true;
+            return Err(KernelServiceError::ReadinessNotProven);
+        }
         Ok(recovered)
     }
 

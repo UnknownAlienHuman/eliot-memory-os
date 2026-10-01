@@ -19,6 +19,11 @@ eliot-contracts.workspace = true
 eliot-observation-contracts.workspace = true
 eliot-process.workspace = true
 eliot-protocol.workspace = true
+# Issue #2899 W1.2: the owner-issued operation handle, request commitment and
+# effect class on an MCP correlation record are read out of the tool owner's own
+# canonical receipt (`eliot_receipts::ReceiptEnvelope`). The effect class is the
+# owner's own vocabulary, not a class this surface spells.
+eliot-receipts.workspace = true
 eliot-skill.workspace = true
 eliot-types.workspace = true
 serde.workspace = true
@@ -27,7 +32,6 @@ sha2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-eliot-receipts.workspace = true
 serde_json.workspace = true
 
 [lints]

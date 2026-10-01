@@ -17,6 +17,7 @@ use eliot_governor::{
     CompositionError, CompositionReadiness, FinishAttemptDraft, FinishAttemptError,
     GovernorActivationOutcome, GovernorComposition, GovernorLaunchConfig, KernelGenerationPort,
     KernelGenerationSnapshotProvider, PreparedFinishDecision, PreparedKernelExchange, QueueLimits,
+    RehydratedContractAcceptanceSet,
 };
 use eliot_kernel_core::Notification;
 use eliot_platform_windows::{ProtectedPathError, ProtectedRuntimePathLease};
@@ -62,6 +63,11 @@ pub mod cell_declaration_registry;
 /// Governor composition edge over `GovernorContextInputs`.
 pub mod context_reconstruction_route;
 mod controlboard_adapters;
+/// Issue #1720 A12: the fire-side cue activation drive. This composition root
+/// evaluates the Governor-reconstructed cue candidate with the R5
+/// `eliot-cue-activation` owner and attaches the deterministic summary to the
+/// reconstruction response.
+mod cue_activation_route;
 mod daemon_config;
 mod daemon_kernel_client;
 mod daemon_kernel_port_adapters;
@@ -195,8 +201,9 @@ pub use capability_admission::{
 };
 pub use capability_evidence_wiring::{
     CapabilityHydrationReport, EvidenceBridgeError, EvidenceRecordPage,
-    GovernorCapabilityAdmission, ObservedLifecycleSummary, ScopeChangeRestrictionReport,
-    commit_scope_change_restriction, drain_capability_evidence_records,
+    GovernorCapabilityAdmission, ObservedLifecycleSummary, ProductionObservationReport,
+    ScopeChangeRestrictionReport, commit_production_observation, commit_scope_change_restriction,
+    drain_capability_evidence_records, evidence_scope_for_observed_route,
 };
 pub use capability_outcome::{
     AttemptReceipt, CapabilityOutcome, CapabilityRegistryView, DegradationProjection,
@@ -211,6 +218,9 @@ pub use controlboard_adapters::{
     CONTROLBOARD_READ_CAPABILITY, ControlBoardReadOutcome, ControlBoardRefusal,
     controlboard_notification_refresh_refusal_body, controlboard_result_body,
     is_controlboard_read_tool, serve_controlboard_view,
+};
+pub use cue_activation_route::{
+    CueActivationDisposition, CueActivationSkip, CueActivationSummary, evaluate_cue_activation,
 };
 pub use daemon_config::{DaemonConfig, admit_daemon_module_manifest};
 pub(crate) use daemon_kernel_client::kernel_port_error;
@@ -1137,6 +1147,13 @@ impl DaemonComposition {
             eliot_workscope::RequestedEffect::CanonicalWrite,
         )
         .map_err(|error| DaemonError::Composition(CompositionError::Recovery(error.to_string())))?;
+        // Issue #1746 (W4/A5): the live Governor kernel-snapshot fence is read
+        // once for this gate. The activation applicability recheck and the
+        // effect-gate revalidation below both run against it, never against
+        // the caller-presented readiness fence (I4.2.1: "`MATCHED` is required
+        // again after any generation change that can alter the real target of
+        // the task").
+        let live_fence = self.governor.kernel_snapshot().state_fence();
         let admission = if crate::task_binding_admission::envelope_is_task_relative(&envelope) {
             // Issue #1746 (W4/A2): a task-relative write is admitted only
             // against the live Governor-resolved activation, never on the
@@ -1170,6 +1187,7 @@ impl DaemonComposition {
                 &envelope,
                 readiness.receipt,
                 readiness.fence,
+                &live_fence,
                 activation.as_ref(),
             )?
         } else {
@@ -1225,7 +1243,6 @@ impl DaemonComposition {
         // through untouched.
         if let crate::task_binding_admission::TaskBindingAdmission::TaskBound(binding) = &admission
         {
-            let live_fence = self.governor.kernel_snapshot().state_fence();
             crate::task_binding_admission::revalidate_task_bound_for_effect(
                 &binding.evidence,
                 Some(binding.admitted_task_ref.as_str()),
@@ -1605,7 +1622,11 @@ impl DaemonComposition {
     // re-checks the pre-commit fence before the receipt is admitted.
 
     /// Rehydrates the contract owner's acceptance-item enumeration for one finish
-    /// candidate at the exact task id and task revision (issue #1741, I7.9).
+    /// candidate at the exact task id (issue #1741, I7.9).
+    ///
+    /// The task revision is resolved by the Governor finish owner from its live
+    /// task-lifecycle owner record; this binary supplies only the task, so it
+    /// cannot hand the denominator read a revision of its own choosing.
     ///
     /// This is the single bounded read the finish path performs before it
     /// prepares anything, and it is the only route to the denominator. It holds
@@ -1618,21 +1639,50 @@ impl DaemonComposition {
     pub async fn rehydrate_task_contract_acceptance(
         &self,
         task_id: &eliot_contracts::TaskId,
-        task_revision: u64,
-    ) -> Result<eliot_store_api::TaskContractAcceptanceSet, FinishAttemptError> {
+    ) -> Result<RehydratedContractAcceptanceSet, FinishAttemptError> {
         if self.readiness() != CompositionReadiness::Ready {
             return Err(FinishAttemptError::Composition(CompositionError::NotReady));
         }
         self.governor
-            .rehydrate_task_contract_acceptance(task_id, task_revision)
+            .rehydrate_task_contract_acceptance(task_id)
             .await
+    }
+
+    /// Prepares the canonical owner leg that admits the Task Controller's
+    /// current plan revision for one task (issue #1741, I7.9).
+    ///
+    /// This is the production producer for the canonical owner's `current_plan`
+    /// dimension, which the all-absent genesis image leaves empty and which
+    /// every finish-path reader therefore refused. The plan identity is derived
+    /// by the Governor from its own Task-selection and task-lifecycle owners;
+    /// this binary supplies only the admitted identity, operation and task, so it
+    /// cannot assemble a plan of its own.
+    ///
+    /// `None` means the owner already holds exactly this plan, so no owner
+    /// revision is minted and no exchange is owed.
+    ///
+    /// This phase transports nothing: the caller holds the composition lock for
+    /// the call alone and releases it before the exchange.
+    pub fn prepare_current_plan_admission(
+        &self,
+        identity: &RequestIdentity,
+        operation_id: &OperationId,
+        task_id: &eliot_contracts::TaskId,
+    ) -> Result<Option<PreparedKernelExchange>, FinishAttemptError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
+        }
+        self.governor
+            .prepare_current_plan_admission(identity, operation_id, task_id)
     }
 
     /// Prepares the Governor-owned finish-evidence exchange without transporting it.
     ///
     /// `contract_acceptance` is the contract owner's rehydrated enumeration from
     /// [`Self::rehydrate_task_contract_acceptance`], passed in so this phase
-    /// stays synchronous and pure.
+    /// stays synchronous and pure. It is a `RehydratedContractAcceptanceSet`, so
+    /// this binary cannot assemble a denominator of its own to pass here even if
+    /// it wanted to.
     ///
     /// Runtime callers hold the composition lock only for this synchronous phase,
     /// then exchange the immutable plan through Kernel after releasing the lock.
@@ -1641,7 +1691,7 @@ impl DaemonComposition {
         identity: &RequestIdentity,
         operation_id: &OperationId,
         draft: &FinishAttemptDraft,
-        contract_acceptance: &eliot_store_api::TaskContractAcceptanceSet,
+        contract_acceptance: &RehydratedContractAcceptanceSet,
     ) -> Result<Option<PreparedKernelExchange>, FinishAttemptError> {
         if self.readiness() != CompositionReadiness::Ready {
             return Err(FinishAttemptError::Composition(CompositionError::NotReady));
@@ -2526,6 +2576,20 @@ impl DaemonComposition {
     /// Same seam discipline as [`Self::skill_install_package`]: only an
     /// applied ack for the exact receipt reaches the catalogue boundary.
     /// Receipt and ack travel by value, mirroring the owned display boundary.
+    ///
+    /// # Live status
+    ///
+    /// No production caller. Measured on this tree, no code in any crate names
+    /// this method other than its defining line. The live receiver-ack display
+    /// path is [`Self::skill_carry_receipt_to_display`], called from
+    /// `bins/eliotd/src/skill_dispatch.rs`, which reaches the *shared adapter's*
+    /// versioned entry (`skill_lifecycle_adapters.rs`) rather than this
+    /// composition wrapper. So the receipt/ack seam itself is exercised; this
+    /// unversioned composition-level accessor over it is not, and the two are
+    /// not interchangeable: the versioned leg also enforces the display-time
+    /// tool-owner drift gate. Whether a caller needs the unversioned leg or this
+    /// accessor is retired is an owner decision; no caller was added to close
+    /// the gap.
     #[allow(
         clippy::needless_pass_by_value,
         reason = "receipt/ack cross by value like the owned display boundary"
@@ -2550,6 +2614,20 @@ impl DaemonComposition {
     /// handle refuses the display when the live source drifted past the
     /// admitted definition version. Receipt and ack travel by value,
     /// mirroring the owned display boundary.
+    ///
+    /// # Live status
+    ///
+    /// No production caller. Measured on this tree, no code in any crate names
+    /// this method other than its defining line. The live equivalent is
+    /// [`Self::skill_carry_receipt_to_display`], called from
+    /// `bins/eliotd/src/skill_dispatch.rs`: it performs the same versioned
+    /// acknowledge against a freshly Governor-built canonical tool source and
+    /// calls the shared adapter's `acknowledge_and_display_versioned` directly,
+    /// bypassing this composition wrapper. So the versioned drift gate is
+    /// enforced on the live path — this entry is a second, unwired route to the
+    /// same adapter method, not a missing owner. Whether a caller needs this
+    /// route or the wrapper is retired is an owner decision; no caller was added
+    /// to close the gap.
     #[allow(
         clippy::needless_pass_by_value,
         reason = "receipt/ack cross by value like the owned display boundary"
@@ -3955,7 +4033,7 @@ impl DaemonComposition {
     /// Requires one production model route through the daemon route gate
     /// (#1957, I3.4).
     ///
-    /// This is the daemon's production call into
+    /// This is the daemon's route-gate entry into
     /// [`AgentFabric::require_model_route`]. Order is load-bearing: the
     /// caller-observed route scope is first applied as an I3.4 scope change, so
     /// a runtime, adapter, provider, or serializer change stops authorizing the
@@ -3981,6 +4059,24 @@ impl DaemonComposition {
     ///
     /// Returns [`DaemonError::Composition`] when the composition is not ready,
     /// or the gate's rejection unchanged.
+    ///
+    /// # Live status
+    ///
+    /// No production caller, and this is transitive rather than a bare
+    /// zero-call finding: the one code reference to this method is inside
+    /// `Self::drive_verified_agent_fabric`, which is itself `#[cfg(test)]`
+    /// and has no caller of its own. Measured on this tree, no code in any
+    /// crate names `drive_verified_agent_fabric` outside its own defining
+    /// line, so the route gate is exercised by the test driver only.
+    /// `bins/eliotd/src/capability_evidence_wiring.rs` records the same
+    /// measurement for this pair: the driver seam lives outside `bins/eliotd`
+    /// and the production `ProductionModelRegistryPort` reports
+    /// `PortBindingState::Missing`. So the summary sentence above is not true
+    /// of this tree — what is live is the *predicate*, reached through
+    /// [`GovernorCapabilityAdmission::admit_production_route`](crate::GovernorCapabilityAdmission::admit_production_route)
+    /// via the C1 join `gate_model_capability`, not through this rebind entry.
+    /// Whether a production caller is added here or this entry is retired is
+    /// an owner decision; no caller was invented to close the gap.
     pub fn require_admitted_model_route(
         &mut self,
         fabric: &mut AgentFabric,

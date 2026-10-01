@@ -285,7 +285,22 @@ impl DaemonComposition {
                 expires_at_ms: None,
                 active_job_id: None,
             };
-            (input, MaintenanceNotificationEvidence { policy, route })
+            // The trigger-site observed binding travels beside the owner
+            // evidence so the notification can bind it separately: the
+            // concrete evidence identities this evaluation actually saw, never
+            // the catalog's requirement list. The trigger event itself travels
+            // verbatim on the Governor decision, and the selected policy
+            // revision on the policy evidence, so only the observed identities
+            // are added here.
+            let observed_refs = input.evidence_refs.clone();
+            (
+                input,
+                MaintenanceNotificationEvidence {
+                    policy,
+                    route,
+                    observed_refs,
+                },
+            )
         };
         let decision = self
             .governor

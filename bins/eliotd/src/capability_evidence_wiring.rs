@@ -5,8 +5,9 @@
 //! daemon composition root's handle on that view. The single
 //! [`GovernorCapabilityAdmission`] is constructed empty at
 //! [`DaemonComposition::start`](super::DaemonComposition::start) and is
-//! mutated in production at exactly two sites, both non-test, and both reading
-//! DURABLE capability-evidence rows:
+//! mutated in production at four sites, all non-test. The first two read the
+//! DURABLE capability-evidence rows; the last two commit through the named
+//! `RecordCapabilityEvidenceRecord` leg:
 //!
 //! 1. [`drain_capability_evidence_records`], reached from the startup attach
 //!    (`daemon_runtime::hydrate_capability_evidence_view`), which drains the
@@ -24,6 +25,14 @@
 //!    about the daemon's own served bytes and COMMITS every record that change
 //!    limited, so a restriction a running process applied cannot be erased by a
 //!    restart and leave the stale evidence re-admissible.
+//! 4. [`commit_production_observation`], which mints one real `observed` /
+//!    `production_observation` record from a validated observed-route receipt
+//!    and COMMITS it through the same named leg, so a qualifying record
+//!    reaches the store while the daemon runs and the next drain re-serves it
+//!    with its store-issued revision. Its production caller is the live
+//!    model-invoke gate once a handshake/transport observation producer threads
+//!    the receipt it already takes; until then the leg is the contract seam,
+//!    not a second service.
 //!
 //! No semantic rule lives here; every admission decision is the Governor
 //! registry's.
@@ -133,10 +142,11 @@ use eliot_config::legacy_capability_import::{
     LegacyCapabilityDeclaration, LegacyScopeFingerprint, import_legacy_declaration,
 };
 use eliot_governor::{
-    CapabilityEvidenceRecord, CapabilityRegistry, GovernorComposition, KernelGenerationPort,
-    MAX_CAPABILITY_EVIDENCE_RECORDS, OwnerEvidenceRevision, RouteScopeFingerprint,
-    ScopeDependencySelector, SkillStanding, capability_evidence_idempotency_key,
-    capability_evidence_mutation_request_for_record, commit_capability_evidence_record,
+    CapabilityEvidenceRecord, CapabilityRegistry, CapabilitySource, CapabilityStatus,
+    GovernorComposition, KernelGenerationPort, MAX_CAPABILITY_EVIDENCE_RECORDS,
+    OwnerEvidenceRevision, RouteScopeFingerprint, ScopeDependencySelector, SkillStanding,
+    capability_evidence_idempotency_key, capability_evidence_mutation_request_for_record,
+    commit_capability_evidence_record,
 };
 use eliot_store_api::{
     EVIDENCE_PACK_MAX_RECORDS, MAX_CAPABILITY_EVIDENCE_PAGE_RECORDS,
@@ -146,6 +156,7 @@ use eliot_store_api::{
 use thiserror::Error;
 
 use super::SERVICE_NAME;
+use super::route_receipts::{RouteAdmissionVisibility, RouteReceiptError};
 
 /// Fail-closed errors for the daemon capability-evidence bridge.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -185,6 +196,15 @@ pub enum EvidenceBridgeError {
     /// the commit got so the residual in-process-only restriction is visible.
     #[error("capability evidence restriction commit leg refused: {0}")]
     RestrictionCommit(String),
+    /// A production observation receipt is not well formed, so no observed
+    /// record was built and nothing was committed.
+    #[error("production observation receipt is not well formed: {0}")]
+    Observation(RouteReceiptError),
+    /// A production-observation commit leg was refused before or by the
+    /// store, so nothing was recorded. The held view keeps its previous
+    /// contents and any production route it cannot evidence stays refused.
+    #[error("production observation commit leg refused: {0}")]
+    ObservationCommit(String),
 }
 
 /// Daemon-held Governor capability admission view.
@@ -1108,11 +1128,22 @@ where
     )
     .await
     .map_err(restriction_commit_refused)?;
-    // `insert` cannot refuse here and the reason is structural, not empirical:
-    // the key was located by `apply_scope_change` and is therefore already
-    // retained, and the revision presented now is exactly one greater than the
-    // revision retained for it, which is the only ordering `insert` accepts.
-    admission.insert(restricted.clone(), revision);
+    // The install is checked, not assumed: `insert` accepts only a strictly
+    // newer owner-issued revision, and the successor installed here is the
+    // store contract `expected + 1` re-derived locally rather than read back
+    // from the receipt (see `capability_evidence_commit`). A provider that
+    // issued anything else would make this refuse; surfacing that as a
+    // commit-leg refusal keeps the held revision from silently disagreeing
+    // with the store. The in-process restriction REMAINS either way —
+    // `apply_scope_change` already limited the retained record — so the
+    // failure direction is closed and the next startup drain re-reads the
+    // store revision and converges.
+    if !admission.insert(restricted.clone(), revision) {
+        return Err(EvidenceBridgeError::RestrictionCommit(format!(
+            "store-issued revision for {} was not installed into the held view",
+            restricted.skill_id
+        )));
+    }
     Ok(())
 }
 
@@ -1122,28 +1153,28 @@ fn restriction_commit_refused(error: impl std::fmt::Display) -> EvidenceBridgeEr
     EvidenceBridgeError::RestrictionCommit(error.to_string())
 }
 
-/// Builds the admitted ingress identity for one restriction commit leg.
+/// Builds the admitted ingress identity for one evidence commit leg.
 ///
-/// The idempotency key IS the deterministic evidence operation text, so a
-/// retried startup re-presents the same key and converges at the store. The
-/// request and cancellation identities are the house
-/// `{SERVICE_NAME}:{operation}` shape used by
-/// `improvement_intake_dispatch::improvement_commit_identity`; nothing here
-/// mints an authority the Kernel has not admitted.
-fn restriction_commit_identity(
+/// Shared by the restriction leg and the production-observation leg: the
+/// idempotency key IS the deterministic evidence operation text, so a retry
+/// re-presents the same key and converges at the store. The request and
+/// cancellation identities are the house `{SERVICE_NAME}:{operation}` shape
+/// used by `improvement_intake_dispatch::improvement_commit_identity`;
+/// nothing here mints an authority the Kernel has not admitted.
+fn commit_leg_identity(
     idempotency_key: &str,
     fence: &eliot_contracts::StateFence,
-) -> Result<eliot_protocol::RequestIdentity, EvidenceBridgeError> {
+) -> Result<eliot_protocol::RequestIdentity, String> {
     let now = crate::unix_ms_i64();
     let metadata = eliot_contracts::RequestMetadata {
         request_id: eliot_contracts::RequestId::new(format!("{SERVICE_NAME}:{idempotency_key}"))
-            .map_err(|error| EvidenceBridgeError::RestrictionCommit(error.to_string()))?,
+            .map_err(|error| error.to_string())?,
         session_id: None,
         task_id: None,
         product_id: eliot_contracts::ProductId::new(SERVICE_NAME)
-            .map_err(|error| EvidenceBridgeError::RestrictionCommit(error.to_string()))?,
+            .map_err(|error| error.to_string())?,
         source_id: eliot_contracts::SourceId::new(SERVICE_NAME)
-            .map_err(|error| EvidenceBridgeError::RestrictionCommit(error.to_string()))?,
+            .map_err(|error| error.to_string())?,
         state_fence: fence.clone(),
         clock: eliot_contracts::ClockReading {
             valid_time_ms: Some(now),
@@ -1152,9 +1183,7 @@ fn restriction_commit_identity(
             monotonic_ns: None,
         },
     };
-    metadata
-        .validate()
-        .map_err(|error| EvidenceBridgeError::RestrictionCommit(error.to_string()))?;
+    metadata.validate().map_err(|error| error.to_string())?;
     Ok(eliot_protocol::RequestIdentity {
         request: eliot_receipts::RequestBinding {
             metadata,
@@ -1164,6 +1193,14 @@ fn restriction_commit_identity(
         deadline_unix_ms: crate::unix_ms().saturating_add(CAPABILITY_EVIDENCE_COMMIT_DEADLINE_MS),
         cancellation_id: format!("{SERVICE_NAME}:{idempotency_key}:cancel"),
     })
+}
+
+/// Builds the admitted ingress identity for one restriction commit leg.
+fn restriction_commit_identity(
+    idempotency_key: &str,
+    fence: &eliot_contracts::StateFence,
+) -> Result<eliot_protocol::RequestIdentity, EvidenceBridgeError> {
+    commit_leg_identity(idempotency_key, fence).map_err(EvidenceBridgeError::RestrictionCommit)
 }
 
 /// What one applied-and-committed dependency change did.
@@ -1180,6 +1217,228 @@ pub struct ScopeChangeRestrictionReport {
     pub restricted: usize,
     /// How many of those limitations are now committed in the canonical store.
     pub committed: usize,
+}
+
+/// Projects one daemon-local observed-route receipt into the Governor evidence
+/// scope admission compares (issue #1773, I3.4, W1).
+///
+/// This is the explicit checked projection Implementation item 1 licenses for
+/// roles that differ: the receipt owner (`route_receipts`) separates the
+/// policy-selected requested route from the runtime-observed route, while the
+/// registry owner (`eliot-governor`) keys evidence on the complete effective
+/// scope. The projection carries the OBSERVED route only, never the requested
+/// one: the requested route is the planning reference, and capability evidence
+/// is qualified against the route the runtime actually executed. The receipt
+/// itself is not exported as a physical execution receipt; the Governor
+/// registry is the only consumer of the projected scope.
+///
+/// The ORIGINAL receipt is validated first with its existing
+/// [`RouteAdmissionVisibility::validate`](super::route_receipts::RouteAdmissionVisibility::validate),
+/// so a malformed receipt fails with its own typed [`RouteReceiptError`]
+/// before any scope is derived.
+///
+/// Dimensions the receipt does not observe stay unknown, never inferred
+/// (I3.4: "If runtime does not expose provider/model/billing evidence, the
+/// field is `unknown`, not inferred from UI selection or prompt text"):
+/// `os_architecture` and `auth_profile_class` have no observed source in the
+/// receipt and stay `None`, and `provider_model_route` is present only when
+/// the runtime exposed both provider and model. Billing never enters the
+/// scope, by the Governor registry's own rule that billing takes part in the
+/// requested-versus-observed comparison but must not silently become evidence
+/// scope. The composite joins (`provider|model`,
+/// `reasoning_mode|continuation_behavior`,
+/// `serializer_hash|feature_flags_hash` with the serializer first) are
+/// internal to exact-fingerprint equality: writer and reader use this same
+/// projection, so one scope changes exactly when the observed behavior does,
+/// and an adapter or serializer change still moves the key.
+///
+/// # Errors
+///
+/// Returns the receipt's typed [`RouteReceiptError`] when the ORIGINAL
+/// receipt is malformed.
+pub fn evidence_scope_for_observed_route(
+    receipt: &RouteAdmissionVisibility,
+) -> Result<RouteScopeFingerprint, RouteReceiptError> {
+    receipt.validate()?;
+    let observed = &receipt.observed_route;
+    let provider_model_route = if receipt.provider_unobserved() || receipt.model_unobserved() {
+        None
+    } else {
+        let provider = observed.provider.as_str();
+        let model = observed.model.as_str();
+        Some(format!("{provider}|{model}"))
+    };
+    let reasoning = observed.reasoning_mode.as_str();
+    let continuation = observed.continuation_behavior.as_str();
+    let serializer = observed.serializer_hash.as_str();
+    let flags = observed.feature_flags_hash.as_str();
+    Ok(RouteScopeFingerprint {
+        host_family: Some(observed.host_family.clone()),
+        adapter_id: Some(observed.adapter.clone()),
+        protocol_transport: Some(observed.protocol_transport.clone()),
+        runtime_hash: Some(observed.runtime_hash.as_str().to_owned()),
+        adapter_hash: Some(observed.adapter_hash.as_str().to_owned()),
+        // The receipt observes no OS architecture and no auth-profile class,
+        // so both stay unknown rather than inferred from the requested route.
+        os_architecture: None,
+        auth_profile_class: None,
+        provider_model_route,
+        tool_call_id_and_role_ordering: Some(observed.tool_semantics_hash.as_str().to_owned()),
+        reasoning_continuation_and_compaction: Some(format!("{reasoning}|{continuation}")),
+        feature_flags_and_serializer: Some(format!("{serializer}|{flags}")),
+    })
+}
+
+/// Mints one `observed` / `production_observation` record from a validated
+/// observed-route receipt and commits it through the named
+/// `RecordCapabilityEvidenceRecord` leg (issue #1773, I3.4, W1/AUD1).
+///
+/// # Why this mint is evidence, not fabrication
+///
+/// I3.4 admits production work only on "matching `probe_passed` or `observed`
+/// evidence", and a receipt built from runtime handshake/transport facts IS
+/// the production observation: [`RouteAdmissionVisibility::observe`](super::route_receipts::RouteAdmissionVisibility::observe)
+/// refuses receipts without at least one evidence-bearing reference, and this
+/// leg stores those same references on the record and passes them as the
+/// commit proof refs. No probe is minted, no lifecycle row count is promoted,
+/// and the scope is the observed-only projection above — never the requested
+/// route. The record carries no expiry the owner did not set: staleness still
+/// runs through scope change and invalidation, not through an invented
+/// duration.
+///
+/// # Requalification is structural
+///
+/// When the held view already invalidates this `(skill_id, scope_fingerprint)`
+/// key, the minted record names the retained blocking cause, so the commit —
+/// presented at the store-issued successor of the retained revision — clears
+/// exactly that cause on insert and nothing wider (I3.4: "A capability failure
+/// is scoped to the narrowest observed lifecycle"). A record for a key with no
+/// cause carries no requalification claim and clears nothing.
+///
+/// # Order and failures
+///
+/// Validate the receipt, project the observed scope, read the retained cause
+/// and CAS predecessor from the held view, build, commit, then insert at the
+/// store-issued revision. Any refusal before the store returns before the
+/// store is touched; a commit the bounded registry cannot retain returns
+/// [`EvidenceBridgeError::CapacityExceeded`] rather than claimed coverage.
+/// The write path is the existing Governor→Kernel→Store leg
+/// ([`commit_capability_evidence_record`]) — no second capability service,
+/// registry, or fingerprint type.
+///
+/// # Errors
+///
+/// Returns [`EvidenceBridgeError::Observation`] when the receipt is malformed,
+/// [`EvidenceBridgeError::BlankSkill`] for an invalid skill identity,
+/// [`EvidenceBridgeError::CapacityExceeded`] when a committed new key cannot
+/// be retained, and [`EvidenceBridgeError::ObservationCommit`] when a commit
+/// leg cannot be built or is refused by the store.
+pub async fn commit_production_observation<P>(
+    governor: &GovernorComposition<P>,
+    admission: &mut GovernorCapabilityAdmission,
+    skill_id: &str,
+    receipt: &RouteAdmissionVisibility,
+    observed_at: u64,
+    scope: &ScopeId,
+    fence: &eliot_contracts::StateFence,
+) -> Result<ProductionObservationReport, EvidenceBridgeError>
+where
+    P: KernelGenerationPort + ?Sized,
+{
+    receipt
+        .validate()
+        .map_err(EvidenceBridgeError::Observation)?;
+    if skill_id.trim().is_empty()
+        || skill_id.chars().any(char::is_control)
+        || skill_id.len() > MAX_CAPABILITY_EVIDENCE_SKILL_ID_BYTES
+    {
+        return Err(EvidenceBridgeError::BlankSkill);
+    }
+    let evidence_scope =
+        evidence_scope_for_observed_route(receipt).map_err(EvidenceBridgeError::Observation)?;
+    // The requalification this fresh evidence answers, when the held view
+    // already restricts this key: the retained cause's own reference, which
+    // the registry requires exactly before it clears.
+    let blocking = admission
+        .registry()
+        .invalidation_cause(skill_id, &evidence_scope)
+        .cloned();
+    let mut record = CapabilityEvidenceRecord::verified(
+        skill_id,
+        CapabilityStatus::Observed,
+        CapabilitySource::ProductionObservation,
+        evidence_scope,
+        observed_at,
+    )
+    .map_err(|error| EvidenceBridgeError::ObservationCommit(error.to_string()))?;
+    if let Some(cause) = blocking.as_ref() {
+        record = record
+            .requalifying(&cause.blocking_evidence_ref)
+            .map_err(|error| EvidenceBridgeError::ObservationCommit(error.to_string()))?;
+    }
+    // The receipt's own backing refs travel on the record and as the commit
+    // proof refs: the observation is evidenced, not declared.
+    record.evidence_refs = receipt.evidence_refs.clone();
+    // The presented predecessor is the store-issued revision the hydration
+    // read back for this exact key, or zero for a key the store never issued
+    // (the store issues one for the first write and refuses a stale
+    // predecessor after that). A delayed observation therefore cannot displace
+    // newer evidence before it can reach the registry.
+    let predecessor = admission
+        .registry()
+        .retained_revision(skill_id, &record.scope_fingerprint)
+        .map_or(0, |revision| revision.owner_revision);
+    let idempotency_key = capability_evidence_idempotency_key(&record)
+        .map_err(|error| EvidenceBridgeError::ObservationCommit(error.to_string()))?;
+    let request = capability_evidence_mutation_request_for_record(
+        &record,
+        predecessor,
+        idempotency_key.clone(),
+    )
+    .map_err(|error| EvidenceBridgeError::ObservationCommit(error.to_string()))?;
+    let identity = commit_leg_identity(&idempotency_key, fence)
+        .map_err(EvidenceBridgeError::ObservationCommit)?;
+    let (_receipt, revision) = commit_capability_evidence_record(
+        governor,
+        &identity,
+        request,
+        scope.clone(),
+        receipt.evidence_refs.clone(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .await
+    .map_err(|error| EvidenceBridgeError::ObservationCommit(error.to_string()))?;
+    // The store issued exactly predecessor + 1 under its own compare-and-set,
+    // so a same-key insert is strictly newer than the retained revision and a
+    // requalification carries the authority the registry requires. Only a new
+    // key past the bound is refused, and that refusal is reported rather than
+    // claimed as coverage: the row is durable and a later drain retains it.
+    if !admission.insert(record, revision.clone()) {
+        return Err(EvidenceBridgeError::CapacityExceeded);
+    }
+    Ok(ProductionObservationReport {
+        owner_revision: revision.owner_revision,
+        requalified: blocking.is_some(),
+        retained: admission.len(),
+    })
+}
+
+/// What one committed production observation did.
+///
+/// A returned report always describes a durable row the held view retains: the
+/// store-issued revision orders the key from here on, and the next complete
+/// drain re-serves the same row. A refusal is an error rather than a report,
+/// because an uncommitted observation must not be readable as evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductionObservationReport {
+    /// The store-issued owner revision the committed row now holds.
+    pub owner_revision: u64,
+    /// Whether the committed record named the retained blocking cause for
+    /// its key, requalifying exactly that restriction on insert.
+    pub requalified: bool,
+    /// Records the held view retains after the commit.
+    pub retained: usize,
 }
 
 /// One applied page of the capability-evidence record read.

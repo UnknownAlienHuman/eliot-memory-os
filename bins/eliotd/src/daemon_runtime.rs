@@ -6088,6 +6088,13 @@ async fn route_and_reconcile_improvement_candidate(
     // completes, or issues authority.
     if let Ok(outcome) = &routed {
         record_unknown_effect_obligation(composition, artifact, &outcome.effect, fence).await;
+        // The terminal decision itself, bound to the candidate identity and the
+        // candidate revision it was made on. This is what makes "this candidate
+        // was rejected" and "this candidate was admitted for one bounded canary
+        // handoff" reviewable after this pass ends, rather than a fact that lived
+        // only in the pass that observed it. A stale candidate revision is a typed
+        // refusal that commits nothing.
+        record_improvement_terminal_decision(composition, artifact, &outcome.decision, fence).await;
     }
     report_improvement_candidate_route(&artifact.candidate.candidate_id, routed, retained)
 }
@@ -6425,6 +6432,113 @@ async fn record_unknown_effect_obligation(
             let _ = eliotd::diagnostics::ErrorRecord::of(
                 eliotd::diagnostics::OwningComponent::DaemonRuntime,
                 "improvement-reconciliation-commit",
+                &error.to_string(),
+            )
+            .emit();
+        }
+    }
+}
+
+/// Records one routed disposition's own terminal decision for its candidate.
+///
+/// # What this step is
+///
+/// `ImprovementRouteOutcome::decision` is the Governor owner's own
+/// `ImprovementTerminalDecision`: the advisory-only disposition this pass
+/// produced, bound to the candidate identity AND the candidate revision it was
+/// made on, to the exact bounded experiment, to the exact committed proposal
+/// bytes when the run reached the admitted branch, and to the independent
+/// evaluation record the verdict was made against. Until this step existed only
+/// `UnknownRequiresReconciliation` left a durable trace, so a rejection and a
+/// canary admission were both unrecorded facts about the live system.
+///
+/// # Why it goes through the same seam
+///
+/// `improvement_candidate_dispatch::commit_improvement_terminal_decision`
+/// reaches [`eliotd::DaemonComposition::commit_learning_record`] in the same
+/// Governor scope and the same closed `candidate` record kind as the candidate
+/// artifact, the archive receipts, the lineage-merge receipts and the
+/// reconciliation obligations. No store client is opened, no operation is
+/// invented, and the lock is taken only for the commit itself. The fifth
+/// document shape that lands there is re-proved exhaustively by
+/// `improvement_dedup_read::classify_row`, which refuses any shape it has not
+/// been taught; the record records why that shape and no other.
+///
+/// # What this step is NOT
+///
+/// It is not an activation, a promotion, a permit or an authority. A
+/// `CanaryAdmitted` decision recorded here still carries
+/// `execution_authorized == false` and still names the Kernel `#11` owner that
+/// must authorize and execute canary activation independently. It does not
+/// decide a retry: the retry and completion booleans it carries are the Governor
+/// owner's own answers, read from the owner's gate.
+///
+/// A refusal to commit is this phase's own diagnostic under the same discipline
+/// as the other phases, never a loop failure, and never a silent drop: the
+/// decision is not durable, and the pass says so rather than pretending the
+/// record landed.
+async fn record_improvement_terminal_decision(
+    composition: &SharedComposition,
+    artifact: &eliotd::improvement_intake_dispatch::ImprovementArtifact,
+    decision: &eliot_maintenance::ImprovementTerminalDecision,
+    fence: &eliot_contracts::StateFence,
+) {
+    let committed = {
+        let mut guard = composition.lock().await;
+        eliotd::improvement_candidate_dispatch::commit_improvement_terminal_decision(
+            &mut guard, artifact, decision, fence,
+        )
+        .await
+    };
+    match committed {
+        Ok(Some(receipt)) => {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.improvement_terminal_decision_recorded",
+                candidate_id = %decision.candidate_id,
+                // The revision the decision was made ON, not the live revision:
+                // these two are equal because a stale decision is refused above,
+                // and naming the recorded one keeps the durable record and this
+                // line from reading as two different facts.
+                candidate_revision = decision.candidate_revision,
+                proposal_id = %decision.proposal_id,
+                experiment_id = %decision.experiment_id,
+                operation_ref = %decision.operation_ref,
+                idempotency_key = %decision.idempotency_key,
+                // The disposition verbatim, plus whether the run committed proposal
+                // bytes and whether an evaluation record backed the verdict. Both
+                // are `None`/`false` on every refused branch, and that is the
+                // honest live report rather than an omission.
+                disposition = ?decision.disposition,
+                proposal_committed = decision.proposal_commitment.is_some(),
+                evaluation = ?decision.evaluation.as_ref().map(|evaluation| (
+                    evaluation.evidence_id.as_str(),
+                    evaluation.verifier_id.as_str(),
+                    evaluation.execution.label(),
+                    evaluation.independent,
+                    evaluation.verifier_passed,
+                )),
+                operation_id = %receipt.operation_id,
+            );
+        }
+        // `Ok(None)` is unreachable for a decision that exists: the commit writes
+        // exactly one record and never invents a disposition to record. It is
+        // named rather than ignored so a future change cannot make it silent.
+        Ok(None) => {
+            let _ = eliotd::diagnostics::ErrorRecord::of(
+                eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                "improvement-decision-commit",
+                &format!(
+                    "candidate {} revision {} produced no durable terminal decision record",
+                    decision.candidate_id, decision.candidate_revision
+                ),
+            )
+            .emit();
+        }
+        Err(error) => {
+            let _ = eliotd::diagnostics::ErrorRecord::of(
+                eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                "improvement-decision-commit",
                 &error.to_string(),
             )
             .emit();

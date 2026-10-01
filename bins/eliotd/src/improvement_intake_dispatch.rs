@@ -464,13 +464,22 @@
 //! [`issue_cross_task_admission`](eliot_governor::LearningAdmissionPermit::issue_cross_task_admission)
 //! had no non-test caller, so no production code could mint or present a
 //! cross-task admission. [`issue_cross_task_carryover`] and
-//! [`verify_cross_task_carryover`] are that production path: the first issues
+//! [`verify_cross_task_carryover`] were added as that path: the first issues
 //! the SECOND, distinct admission for a foreign target task through the same
 //! live owner checks, the second re-verifies both permits against live owner
 //! state and constructs the owner-verified [`CrossTaskCarryover`] a consumer
-//! binds to. It uses the Governor-owned record — never the weaker
+//! would bind to. It uses the Governor-owned record — never the weaker
 //! string-typed `eliot_learning_contracts::activation::CrossTaskAdmission`
 //! that `candidate_bounds.rs` names as the shape being replaced.
+//!
+//! They are however NOT reached in production, and the gap above is NOT
+//! closed by them. `git grep -n "cross_task_carryover" -- bins crates` returns
+//! only these two definitions, their own doc comments, and the cross-references
+//! between them — the same dead seam measured a paragraph above, rebuilt one
+//! layer up rather than connected to an ingress. So the cross-task revalidation
+//! path is still absent: nothing mints or presents a cross-task admission at
+//! runtime. Both entries are annotated `# Live status` in place; wiring them is
+//! an owner decision.
 
 #![forbid(unsafe_code)]
 
@@ -626,6 +635,16 @@ pub enum ImprovementDispatchError {
     /// The durable learning-record commit was refused.
     #[error("improvement learning-record commit: {0}")]
     Commit(String),
+    /// The Governor owner refused to build the durable terminal decision record
+    /// for this route.
+    ///
+    /// The typed [`UnboundDecisionRecord`] travels unchanged, so a missing bounded
+    /// experiment, a verdict with no evaluation record behind it, and a verdict
+    /// that disagrees with its recorded evidence stay four distinguishable facts
+    /// across this boundary instead of collapsing into one reason string. None of
+    /// them produces a record, and none of them is read as an admission.
+    #[error("improvement terminal decision: {0}")]
+    Decision(#[from] eliot_maintenance::UnboundDecisionRecord),
     /// The store scope or record identity is not a valid contract value.
     #[error("improvement contract value: {0}")]
     Contract(String),
@@ -2407,8 +2426,8 @@ pub struct IssuedCrossTaskAdmission {
 
 /// Issue one distinct cross-task admission under a live Governor permit (W5).
 ///
-/// This is the issuance half of the production path I12.24:295 names: "Cross-
-/// task carryover requires a new governed admission that revalidates scope,
+/// This is the issuance half of the path I12.24:295 names — "Cross-task
+/// carryover requires a new governed admission that revalidates scope,
 /// authority, retention, evaluator, and rollback." It performs
 /// [`issue_cross_task_admission`](eliot_governor::LearningAdmissionPermit::issue_cross_task_admission),
 /// which mints the SECOND admission for the foreign target task through the
@@ -2429,6 +2448,18 @@ pub struct IssuedCrossTaskAdmission {
 /// The weaker string-typed `eliot_learning_contracts::activation::CrossTaskAdmission`
 /// that `candidate_bounds.rs` names as the shape being replaced is not
 /// touched, and no second cross-task scheme is introduced.
+///
+/// # Live status
+///
+/// `caller: NONE`. There is no production caller, so I12.24:295's
+/// revalidation requirement is not met at runtime by this entry:
+/// `git grep -n issue_cross_task_carryover -- bins crates` returns only this
+/// definition, the module doc above, and the intra-doc link from
+/// [`verify_cross_task_carryover`]. The nearest live thing is the local-task
+/// [`issue_learning_admission`]/[`verify_learning_admission`] pair this
+/// module already calls, which admits within one task and never mints the
+/// second cross-task permit. Whether an ingress is wired to call this entry or
+/// it is retired is an owner decision.
 pub fn issue_cross_task_carryover(
     governor: &eliot_governor::Governor,
     local: &LearningAdmissionPermit,
@@ -2491,6 +2522,19 @@ pub fn issue_cross_task_carryover(
 /// returned [`VerifiedCrossTaskCarryover`] holds only Governor-produced values:
 /// the `CrossTaskCarryover`'s fields are private, so it can exist only because
 /// it was built here from two verified permits and a re-checked record.
+///
+/// # Live status
+///
+/// `caller: NONE`. There is no production caller, so the no-consumer statement
+/// above is a property of the private fields, not evidence that any consumer
+/// binds to the returned carryover: `git grep -n verify_cross_task_carryover --
+/// bins crates` returns only this definition, the module doc above, the
+/// intra-doc links from [`issue_cross_task_carryover`] and
+/// [`IssuedCrossTaskAdmission`], and `CrossTaskCarryover::verify` inside this
+/// body. The nearest live thing is the single-task
+/// [`verify_learning_admission`] this module already calls, which verifies one
+/// permit and never reaches the cross-task record. Whether a consumer ingress
+/// is wired to call this entry or it is retired is an owner decision.
 pub fn verify_cross_task_carryover<'a>(
     governor: &eliot_governor::Governor,
     local_verified: &'a VerifiedLearningAdmission<'a>,

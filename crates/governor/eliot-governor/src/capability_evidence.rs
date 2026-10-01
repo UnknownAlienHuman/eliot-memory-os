@@ -93,10 +93,18 @@
 //! refused, the in-process restriction remains — the fail-closed direction — and
 //! only the un-committed leg is lost.
 //!
-//! The two admission predicates additionally read
-//! [`CapabilityEvidenceRecord::is_limited`] directly, so once a limitation IS
-//! committed, the restriction holds from the record's own served bytes and does
-//! not depend on the index having been rebuilt.
+//! The restriction is readable from the record's own served bytes as well as
+//! from the derived index. [`CapabilityEvidenceRecord::is_limited`] is true for a
+//! record that still carries a limitation its own `requalification` does not
+//! answer, and [`CapabilityEvidenceRecord::is_fresh_restriction_for`] consults it
+//! directly, so a committed restriction holds in a fresh process without anyone
+//! having to remember it. The positive arm
+//! ([`CapabilityEvidenceRecord::is_fresh_positive_for`]) reads the index, which
+//! [`CapabilityRegistry::rebuild_invalidation_index`] re-derives from the very
+//! same bytes after every insertion — so the two agree by construction, and a
+//! record that answers its blocking reference in its own bytes is requalified
+//! again after a restart for exactly the reason a committed restriction is
+//! re-derived after one.
 //!
 //! The registry never evicts a key's latest frontier: after the bound is
 //! reached, new keys are refused, and an unretained restriction fails
@@ -665,6 +673,17 @@ impl CapabilityEvidenceRecord {
     /// owner-issued revision to be strictly newer than the blocking revision;
     /// this builder records the causal claim, it does not grant the clear.
     ///
+    /// **The claim is what stops the clear from being erased, and that is why it
+    /// lives in the record's own bytes.** The claim is also what makes
+    /// [`blocking_limitation`](Self::blocking_limitation) stop reporting this
+    /// exact reference, so a requalification that carries the reference forward
+    /// (for example one built from the restricted record the applied change
+    /// returned) is requalified in this process and after a restart, while a
+    /// record that answers one applied change and not another stays restricted
+    /// by the one it does not answer. It is the mirror image of
+    /// [`limited_by`](Self::limited_by), which drops the claim because a
+    /// restricted record cannot also be the record that clears a restriction.
+    ///
     /// # Errors
     ///
     /// Returns [`EvidenceRevisionError::MalformedRequalificationRef`] when the
@@ -722,22 +741,51 @@ impl CapabilityEvidenceRecord {
         Ok(self)
     }
 
-    /// Returns the first limitation reference this record carries, which is the
-    /// blocking reference a requalification of this record has to name.
+    /// Returns the first limitation reference this record carries that its own
+    /// [`requalification`](Self::requalification) does **not** answer, which is
+    /// the outstanding blocking reference a requalification of this record still
+    /// has to name.
+    ///
+    /// A limitation the record itself answers is not outstanding: that record
+    /// IS the fresh evidence which resolved that exact reference, so reporting
+    /// it as still blocking contradicts the record's own persisted bytes. It also
+    /// made the clear unreachable, because this field is the only input
+    /// [`CapabilityRegistry::rebuild_invalidation_index`] re-publishes a cause
+    /// from, and that rebuild runs immediately after
+    /// [`CapabilityRegistry::clear_invalidation_by_requalification`] — so a
+    /// record that answered its cause was restricted again in the same
+    /// insertion. Reading the unanswered reference is what lets a committed
+    /// requalification restore admission in this process AND after a restart,
+    /// which is I3.4's `CapabilityOutcome.recovery_requalification_or_expiry`
+    /// actually recovering.
+    ///
+    /// A limitation the claim does not name is still outstanding: a record that
+    /// answers one applied change and not another stays restricted by the
+    /// unanswered one, and only the answered one may be cleared.
+    ///
+    /// `None` therefore means this record is not restricted by any dependency
+    /// change it has not itself answered. It never means the record was never
+    /// limited, and it is never an empty set standing in for an absent
+    /// measurement.
     #[must_use]
     pub fn blocking_limitation(&self) -> Option<&str> {
+        let answered = self.requalification.as_deref();
         self.limitations_and_negative_evidence
-            .first()
+            .iter()
+            .find(|reference| answered != Some(reference.as_str()))
             .map(String::as_str)
     }
 
     /// Returns true when this record's own persisted bytes already declare it
-    /// limited by an applied dependency change.
+    /// limited by an applied dependency change its requalification does not
+    /// answer.
     ///
     /// This is the restart-durable invalidation test: it reads only the record
-    /// the canonical store served, so a hydrated record that carries a
-    /// limitation is invalid again in a fresh process without anyone having to
-    /// remember it.
+    /// the canonical store served, so a hydrated record that carries an
+    /// outstanding limitation is invalid again in a fresh process without anyone
+    /// having to remember it — and a hydrated record that answered its
+    /// outstanding limitation in its own bytes is requalified again in a fresh
+    /// process, for the same reason.
     #[must_use]
     pub fn is_limited(&self) -> bool {
         self.blocking_limitation().is_some_and(is_evidence_ref)
@@ -1025,6 +1073,15 @@ impl CapabilityRegistry {
     /// [`CapabilityEvidenceRecord::is_fresh_positive_for`] therefore consults
     /// [`invalidation_for`] with the exact skill and never
     /// [`scope_has_any_invalidation`].
+    ///
+    /// The clear is also only real if the retained record's own bytes stop
+    /// reporting that reference, because [`Self::rebuild_invalidation_index`]
+    /// runs immediately afterwards in [`Self::insert`] and re-publishes every
+    /// cause it still finds in a retained record — so a clear that the record's
+    /// own limitation list contradicts is undone in the same insertion.
+    /// [`CapabilityEvidenceRecord::blocking_limitation`] is that read: a
+    /// limitation the record's own `requalification` answers is not outstanding,
+    /// so the rebuild agrees with the clear instead of silently reinstating it.
     fn clear_invalidation_by_requalification(
         &mut self,
         record: &CapabilityEvidenceRecord,

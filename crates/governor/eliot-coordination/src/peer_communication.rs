@@ -3777,6 +3777,14 @@ pub struct AnchoredReview {
     pub artifact_revision: u64,
     pub artifact_digest: String,
     pub reviewer_session_id: String,
+    /// Authenticated principal bound to the reviewer session at submit
+    /// (I11.8: state-changing review work carries an explicit principal).
+    /// Stable history: retained on the record and never re-resolved, so a
+    /// lapsed session never rewrites authorship. Empty for records admitted
+    /// before principal binding. The owner retains no role or capability
+    /// for the session, so none is recorded here and none may be inferred.
+    #[serde(default)]
+    pub reviewer_principal: String,
     pub operation: String,
     pub target_kind: ReviewTargetKind,
     pub kind: ReviewKind,
@@ -3800,6 +3808,12 @@ pub struct AnchoredReview {
     pub authority_epoch: EpochId,
     pub state_fence: StateFence,
     pub created_at: u64,
+    /// Owner-event sequence that admitted this review
+    /// (`ReviewItemSubmitted`). Joins the item to its delivery evidence in
+    /// the owner's event chain; zero for records admitted before sequence
+    /// binding. The current record fence is `state_fence`.
+    #[serde(default)]
+    pub submission_sequence: u64,
     pub durability: PeerDurability,
 }
 
@@ -3894,27 +3908,63 @@ pub struct PeerReviewObligation {
     /// Reviewed artifact identity the obligation is anchored to.
     pub artifact_id: String,
     /// Reviewed artifact revision observed at submit; a later head never
-    /// rewrites it.
+    /// rewrites it. This is the coordination artifact-revision space: not a
+    /// `ViewRevision` and not a source-code commit. Source-space identity
+    /// (canonical anchor target revision/digest, selector and provenance)
+    /// is not retained by this owner; binding it needs the resolver join.
     pub artifact_revision: u64,
     /// Reviewed artifact digest bound at that revision.
     pub artifact_digest: String,
     pub reviewer_session_id: String,
+    /// Authenticated principal bound to the reviewer session at submit,
+    /// copied from the retained record. Empty for records admitted before
+    /// principal binding. No role or capability is recorded: the owner
+    /// retains none (I11.8), so no role-gated filtering may be evaluated
+    /// on this read.
+    pub reviewer_principal_id: String,
+    /// Reviewed operation identity exactly as the retained record carries it.
+    /// This is the only operation/`WorkScope`-adjacent fact the owner retains:
+    /// no recipient, role, `WorkScope`, or task fact is retained on the record,
+    /// so none is reported here and none may be inferred (I11.8).
+    pub operation: String,
     pub target_kind: ReviewTargetKind,
     pub kind: ReviewKind,
     /// Historical anchor selector exactly as submitted.
     pub anchor_field: String,
     /// Anchor resolution claimed at submit; the owner records the claim and
-    /// never recomputes it from a moved target.
+    /// never recomputes it from a moved target. It is a historical claim,
+    /// never a current-target proof; see `current_resolution`.
     pub anchor_resolution: AnchorResolution,
+    /// Current-target identity derived from owner-retained facts only, kept
+    /// separate from the submit-time `anchor_resolution` claim.
+    /// `Some(Exact)` iff the admitted head still carries the reviewed
+    /// revision *and* digest: identical bytes, hence identical locations.
+    /// That is the only continuity this owner asserts. `None` in every
+    /// other case: without resolver-supplied candidates and resolution
+    /// evidence the owner cannot tell Moved from Modified from Ambiguous,
+    /// so it reports an incomplete current target instead of attaching to
+    /// a nearest match. A submit-time Modified claim behind the head
+    /// inherits no approval, and an unrun search stays incomplete.
+    /// Always `None` from `From<&AnchoredReview>`; `peer_review_batches`
+    /// binds it against the admitted head.
+    pub current_resolution: Option<AnchorResolution>,
     pub lifecycle: PeerReviewLifecycle,
     pub standing: PeerReviewStanding,
     pub recommendation: ReviewRecommendation,
     pub rejection_reason: Option<String>,
+    /// Conflict this obligation's recommendation is contested under, when the
+    /// owner retained one. Naming the conflict is part of the item's own
+    /// outcome: a contested item is never discharged by another item's answer.
+    pub conflict_id: Option<String>,
     pub evidence_refs: Vec<String>,
     pub proof_refs: Vec<String>,
     pub created_at: u64,
     /// Record fence the retained obligation was admitted under.
     pub state_fence: StateFence,
+    /// Owner-event sequence that admitted this review, copied from the
+    /// retained record. Joins the item to its delivery evidence; zero for
+    /// records admitted before sequence binding.
+    pub submission_sequence: u64,
 }
 
 impl PeerReviewObligation {
@@ -3941,18 +3991,23 @@ impl From<&AnchoredReview> for PeerReviewObligation {
             artifact_revision: review.artifact_revision,
             artifact_digest: review.artifact_digest.clone(),
             reviewer_session_id: review.reviewer_session_id.clone(),
+            reviewer_principal_id: review.reviewer_principal.clone(),
+            operation: review.operation.clone(),
             target_kind: review.target_kind,
             kind: review.kind,
             anchor_field: review.anchor_field.clone(),
             anchor_resolution: review.anchor_resolution,
+            current_resolution: None,
             lifecycle: review.lifecycle,
             standing: review.standing,
             recommendation: review.recommendation,
             rejection_reason: review.rejection_reason.clone(),
+            conflict_id: review.conflict_id.clone(),
             evidence_refs: review.evidence_refs.clone(),
             proof_refs: review.proof_refs.clone(),
             created_at: review.created_at,
             state_fence: review.state_fence.clone(),
+            submission_sequence: review.submission_sequence,
         }
     }
 }
@@ -3968,8 +4023,20 @@ impl From<&AnchoredReview> for PeerReviewObligation {
 pub struct PeerReviewBatch {
     pub artifact_id: String,
     /// Currently admitted artifact head revision, or `None` when no revision
-    /// has been admitted. This is the current target, not the reviewed one.
+    /// has been admitted. This is the current target, not the reviewed one:
+    /// it lives in the coordination artifact-revision space, exactly like each
+    /// obligation's `artifact_revision`, and is neither a `ViewRevision` nor a
+    /// source-code commit.
     pub current_artifact_revision: Option<u64>,
+    /// Digest bound at the currently admitted head revision, or `None` when no
+    /// revision has been admitted. Together with `current_artifact_revision`
+    /// this separates the current target from every obligation's own
+    /// historical `artifact_revision`/`artifact_digest`: a head that moved with
+    /// an unchanged digest is not new content, and a head with a changed
+    /// digest does not inherit approval of the old content. No resolver runs
+    /// here; current-target candidates and resolution evidence need a producer
+    /// the owner does not have.
+    pub current_artifact_digest: Option<String>,
     /// Owner-recorded expected-review count, or `None` when unrecorded.
     pub expected: Option<u64>,
     /// Number of retained obligations for this artifact.
@@ -3994,6 +4061,26 @@ fn recommendations_conflict(left: ReviewRecommendation, right: ReviewRecommendat
     approves(left) != approves(right)
         && !matches!(left, ReviewRecommendation::Abstain)
         && !matches!(right, ReviewRecommendation::Abstain)
+}
+
+/// Derives the digest-bound current identity of one reviewed revision
+/// against the admitted head. Returns `Some(Exact)` only when the head
+/// still carries the reviewed revision *and* digest: identical bytes, so
+/// identical locations, with no resolver involved. Every other case
+/// returns `None`: without resolver-supplied candidates and resolution
+/// evidence the owner cannot tell Moved from Modified from Ambiguous, and
+/// an incomplete current target must never read as a unique match.
+fn current_anchor_resolution(
+    head: Option<&PeerArtifactHead>,
+    artifact_revision: u64,
+    artifact_digest: &str,
+) -> Option<AnchorResolution> {
+    let head = head?;
+    if head.revision == artifact_revision && head.digest.as_str() == artifact_digest {
+        Some(AnchorResolution::Exact)
+    } else {
+        None
+    }
 }
 
 impl CoordinationOwner {
@@ -4091,6 +4178,8 @@ impl CoordinationOwner {
     /// The review binds the exact artifact digest at its revision; a stale
     /// revision is retained as stale and never satisfies a requirement.
     /// Conflicting recommendations on one revision retain a conflict set.
+    /// The retained record binds the reviewer's authenticated principal at
+    /// submit and its admission sequence on commit.
     // Single-function admission pipeline (#696): field validation, replay
     // short-circuit, anchor/standing derivation, conflict-set retention, and
     // commit share one fallible flow over `draft`. Splitting it would churn the
@@ -4195,6 +4284,11 @@ impl CoordinationOwner {
             }
         };
         let recorded = attest_peer_durability(durability)?;
+        let reviewer_principal = self
+            .sessions
+            .get(&draft.reviewer_session_id)
+            .map(|session| session.principal_id.clone())
+            .ok_or(CoordinationError::InvalidState)?;
         let mut review = AnchoredReview {
             review_id: draft.review_id.clone(),
             request_id: draft.request_id.clone(),
@@ -4202,6 +4296,7 @@ impl CoordinationOwner {
             artifact_revision: draft.artifact_revision,
             artifact_digest: bound_digest,
             reviewer_session_id: draft.reviewer_session_id.clone(),
+            reviewer_principal,
             operation: draft.operation.clone(),
             target_kind: draft.target_kind,
             kind: draft.kind,
@@ -4220,6 +4315,7 @@ impl CoordinationOwner {
             rejection_reason: None,
             expires_at: draft.expires_at,
             conflict_id: None,
+            submission_sequence: 0,
             authority_epoch: draft.authority_epoch.clone(),
             state_fence: draft.state_fence.clone(),
             created_at: now,
@@ -4299,6 +4395,7 @@ impl CoordinationOwner {
             empty_clock(),
         )?;
         let event = self.commit(&draft.request_id, event)?;
+        review.submission_sequence = event.sequence;
         self.peer_reviews
             .insert(draft.review_id.clone(), review.clone());
         self.peer_review_requests
@@ -4469,6 +4566,15 @@ impl CoordinationOwner {
     /// denominator distinct from a complete batch. Ordering is by artifact
     /// identity, and obligations are in `review_id` order, so two reads of the
     /// same owner state return identical bytes.
+    ///
+    /// Coverage is always the full owner set, never a partial page: the
+    /// batch set and every membership list derive from retained records, so
+    /// a required item cannot be dropped by omitting it from a request. No
+    /// role or visibility filtering is applied because the owner retains no
+    /// role, visibility, or privacy fact on reviews (I11.8): this is the
+    /// owner's view, and a caller must not present it as an authorized
+    /// per-reader view or disclose its counts and contents beyond the
+    /// reader's grant.
     #[must_use]
     pub fn peer_review_batches(&self) -> Vec<PeerReviewBatch> {
         let mut artifacts: BTreeSet<&str> = BTreeSet::new();
@@ -4482,12 +4588,20 @@ impl CoordinationOwner {
         artifacts
             .into_iter()
             .map(|artifact_id| {
-                let obligations: Vec<PeerReviewObligation> = self
+                let mut obligations: Vec<PeerReviewObligation> = self
                     .peer_reviews
                     .values()
                     .filter(|review| review.artifact_id == artifact_id)
                     .map(PeerReviewObligation::from)
                     .collect();
+                let head = self.peer_artifact_heads.get(artifact_id);
+                for obligation in &mut obligations {
+                    obligation.current_resolution = current_anchor_resolution(
+                        head,
+                        obligation.artifact_revision,
+                        obligation.artifact_digest.as_str(),
+                    );
+                }
                 let submitted = obligations.len() as u64;
                 let disposed = obligations
                     .iter()
@@ -4496,10 +4610,8 @@ impl CoordinationOwner {
                 let expected = self.peer_review_expectations.get(artifact_id).copied();
                 PeerReviewBatch {
                     artifact_id: artifact_id.to_owned(),
-                    current_artifact_revision: self
-                        .peer_artifact_heads
-                        .get(artifact_id)
-                        .map(|head| head.revision),
+                    current_artifact_revision: head.map(|head| head.revision),
+                    current_artifact_digest: head.map(|head| head.digest.clone()),
                     expected,
                     submitted,
                     disposed,
