@@ -1554,3 +1554,118 @@ pub async fn resolve_blob_owner_facts(
     };
     unavailable_blob_owner_facts(request, reason)
 }
+
+#[cfg(test)]
+mod source_admission_cas_tests {
+    use super::*;
+    use eliot_contracts::{
+        EpochId, EpochLineageId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
+    };
+    use eliot_store_api::blob_process_source_admission::{
+        BLOB_PROCESS_SOURCE_ADMISSION_SCHEMA, BlobProcessSourceAdmission,
+        BlobProcessSourceAdmissionIdentity, BlobProcessSourceAdmissionPhase,
+        BlobProcessSourceReadyCommitment, blob_process_source_admission_mutation,
+    };
+    use std::num::NonZeroU64;
+
+    fn fence() -> StateFence {
+        StateFence::new(
+            EpochId::new(
+                EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                    .expect("test lineage"),
+                NonZeroU64::new(1).expect("nonzero sequence"),
+            )
+            .expect("test epoch"),
+            ResourceGeneration::new(1).expect("test generation"),
+        )
+    }
+
+    fn object_json() -> String {
+        "{}".to_owned()
+    }
+
+    fn pending_admission() -> BlobProcessSourceAdmission {
+        let identity = BlobProcessSourceAdmissionIdentity {
+            work_scope_ref: "scope-test".to_owned(),
+            session_id: "session-test".to_owned(),
+            source_id: "source-test".to_owned(),
+            process_binding_sha256: sha256_hex(b"{}"),
+        };
+        BlobProcessSourceAdmission {
+            schema: BLOB_PROCESS_SOURCE_ADMISSION_SCHEMA.to_owned(),
+            phase: BlobProcessSourceAdmissionPhase::Pending,
+            owner_revision: 1,
+            state_fence: fence(),
+            identity,
+            pending_operation_id: "pending-operation-test".to_owned(),
+            pending_request_identity_json: object_json(),
+            pending_request_identity_sha256: sha256_hex(b"{}"),
+            process_binding_json: object_json(),
+            process_binding_sha256: sha256_hex(b"{}"),
+            open_request_json: object_json(),
+            open_request_sha256: sha256_hex(b"{}"),
+            work_scope_owner_revision: 1,
+            work_scope_owner_digest: sha256_hex(b"work-scope"),
+            owner_facts_json: object_json(),
+            owner_facts_sha256: sha256_hex(b"{}"),
+            ready: None,
+        }
+    }
+
+    #[test]
+    fn pending_to_ready_uses_exact_absence_and_pending_cas_bases() {
+        let pending = pending_admission();
+        let admission_ref = pending.admission_ref().expect("canonical source ref");
+        let pending_insert = blob_process_source_admission_mutation(
+            &pending,
+            0,
+            "absent",
+            &admission_ref,
+        );
+        assert!(pending_insert.is_ok(), "first Pending node must use exact absence CAS");
+
+        let pending_json = String::from_utf8(
+            canonical_json_bytes(&pending).expect("canonical Pending bytes"),
+        )
+        .expect("UTF-8 Pending JSON");
+        let pending_sha = sha256_hex(pending_json.as_bytes());
+        let mut ready = pending.clone();
+        ready.phase = BlobProcessSourceAdmissionPhase::Ready;
+        ready.owner_revision = 2;
+        ready.ready = Some(BlobProcessSourceReadyCommitment {
+            ready_operation_id: "ready-operation-test".to_owned(),
+            ready_request_identity_json: object_json(),
+            ready_request_identity_sha256: sha256_hex(b"{}"),
+            pending_admission_json: pending_json.clone(),
+            pending_admission_sha256: pending_sha.clone(),
+            whole_source_sha256: sha256_hex(b"stored source"),
+            whole_source_byte_length: 13,
+            blob_ready_receipt_json: object_json(),
+            blob_ready_receipt_sha256: sha256_hex(b"{}"),
+        });
+        assert!(
+            blob_process_source_admission_mutation(&ready, 1, &pending_sha, &admission_ref)
+                .is_ok(),
+            "Ready must CAS from the exact Pending record",
+        );
+        assert!(
+            blob_process_source_admission_mutation(&ready, 1, &sha256_hex(b"foreign"), &admission_ref)
+                .is_err(),
+            "a foreign Pending digest must not be accepted as the Ready predecessor",
+        );
+
+        let ready_commit = ready.ready.as_mut().expect("Ready commitment");
+        ready_commit.pending_admission_json = object_json();
+        ready_commit.pending_admission_sha256 = sha256_hex(b"substituted");
+        assert!(
+            blob_process_source_admission_mutation(&ready, 1, &pending_sha, &admission_ref)
+                .is_err(),
+            "substituted Pending bytes must refuse the Ready transition",
+        );
+        assert!(
+            blob_process_source_admission_mutation(&ready, 2, &pending_sha, &admission_ref)
+                .is_err(),
+            "an unexpected owner revision must refuse the Ready transition",
+        );
+    }
+}
