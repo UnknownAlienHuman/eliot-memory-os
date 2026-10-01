@@ -120,6 +120,22 @@ impl EpistemicRecord {
                 handle: self.handle.clone(),
             });
         }
+        // I12.12 filters by scope before deterministic resolution, so the
+        // evidence's own captured scope belongs to the same boundary as the
+        // record scope. They already agree with the requested scope above, so
+        // this is the one comparison that refuses the A/A/B counterexample: a
+        // caller cannot derive a position for A out of evidence that states it
+        // was captured for B. `EvidenceEnvelope::validate` cannot supply this
+        // check because it has no requested scope to compare against, and it
+        // stays provider-neutral: the request-to-record relationship belongs
+        // here, at the resolver boundary. The provenance bytes are never
+        // relabelled to agree - a mismatch is a refusal carrying the offending
+        // handle, not a rewrite of the evidence.
+        if self.evidence.provenance.scope != self.scope {
+            return Err(EpistemicError::ScopeMismatch {
+                handle: self.handle.clone(),
+            });
+        }
         if !self.evidence.state_fence.is_compatible_with(fence) {
             return Err(EpistemicError::FenceMismatch {
                 handle: self.handle.clone(),
@@ -202,6 +218,12 @@ impl PositionRequest {
     /// The text, record and edge ceilings are established here, before the
     /// handle index is built, so this method is the protection for a direct
     /// library caller and not merely a second check behind a wire boundary.
+    ///
+    /// Every supplied record is validated, including stale, rival and
+    /// superseded ones: [`EpistemicRecord::validate`] runs for the whole read
+    /// set before the lineage walk and before [`crate::resolve`] computes the
+    /// supersession union, so a wrong-scope record can neither suppress a
+    /// current record nor contribute to the aggregate provenance.
     pub fn validate(&self) -> Result<(), EpistemicError> {
         text(self.question.as_str(), "question", MAX_STATEMENT_TEXT)?;
         text(self.scope.as_str(), "scope", MAX_SHORT_TEXT)?;
@@ -374,4 +396,241 @@ pub struct CurrentEpistemicPosition {
     pub unknowns: Vec<String>,
     pub required_inquiry: Vec<String>,
     pub provenance: ProvenanceView,
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::resolve;
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, SourceId};
+    use eliot_evidence::{
+        Assertability, EpistemicStatus, EvidenceAuthority, EvidenceCoverage, EvidenceFreshness,
+        Provenance,
+    };
+    use std::num::NonZeroU64;
+
+    const SCOPE: &str = "scope-a";
+    const OTHER_SCOPE: &str = "scope-b";
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A");
+        EpochId::new(
+            lineage,
+            NonZeroU64::new(sequence).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
+
+    fn fence() -> StateFence {
+        StateFence::new(test_epoch(1), ResourceGeneration::genesis())
+    }
+
+    fn id(value: &str) -> ArtifactId {
+        ArtifactId::new(value).expect("valid fixture artifact id")
+    }
+
+    /// A record whose evidence carries its own `provenance_scope`, which is what
+    /// `candidate_adaptation::observed_candidate` builds: the record scope is
+    /// taken from the observation provenance, so a valid same-scope read set
+    /// stays valid.
+    fn record(
+        handle: &str,
+        scope: &str,
+        provenance_scope: &str,
+        status: EpistemicStatus,
+        freshness: EvidenceFreshness,
+        supersedes: Vec<ArtifactId>,
+    ) -> EpistemicRecord {
+        EpistemicRecord {
+            handle: id(handle),
+            subject: format!("subject:{handle}"),
+            scope: scope.to_owned(),
+            evidence: EvidenceEnvelope {
+                authority: EvidenceAuthority::SourceIdentity,
+                freshness,
+                coverage: EvidenceCoverage::CompleteForScope,
+                status,
+                assertability: Assertability::NonAssertableUnverified,
+                provenance: Provenance {
+                    source_id: SourceId::new(format!("source:{handle}"))
+                        .expect("valid fixture source id"),
+                    capture_route: "fixture.scope-binding".to_owned(),
+                    scope: provenance_scope.to_owned(),
+                    raw_handle: Some(format!("raw:{handle}")),
+                    revision: Some(format!("revision:{handle}")),
+                },
+                verification: None,
+                state_fence: fence(),
+            },
+            supersedes,
+            note: None,
+        }
+    }
+
+    fn request(records: Vec<EpistemicRecord>) -> PositionRequest {
+        PositionRequest {
+            question: "question".to_owned(),
+            scope: SCOPE.to_owned(),
+            state_fence: fence(),
+            records,
+        }
+    }
+
+    /// The positive case: a record whose evidence provenance is bound to the
+    /// request scope still resolves, and its original bytes are untouched.
+    #[test]
+    fn bound_provenance_scope_still_resolves_without_rewriting_evidence() {
+        let observed = record(
+            "observed",
+            SCOPE,
+            SCOPE,
+            EpistemicStatus::Observed,
+            EvidenceFreshness::ExactCandidate,
+            Vec::new(),
+        );
+        let supported = record(
+            "supported",
+            SCOPE,
+            SCOPE,
+            EpistemicStatus::Supported,
+            EvidenceFreshness::ExactCandidate,
+            Vec::new(),
+        );
+        let original = supported.evidence.clone();
+
+        let result = resolve(&request(vec![observed.clone(), supported.clone()]))
+            .expect("same-scope evidence still resolves");
+
+        assert_eq!(result.state, PositionState::Supported);
+        assert_eq!(result.direct_observations, vec![id("observed")]);
+        assert_eq!(result.supporting_records, vec![id("supported")]);
+        // The observed-candidate adapter's record shape (record scope taken from
+        // the observation provenance) is admitted, and the original evidence
+        // bytes are returned unchanged rather than relabelled.
+        assert_eq!(supported.evidence, original);
+        assert_eq!(supported.evidence.provenance.scope, SCOPE);
+    }
+
+    /// The audited counterexample: request A, record A, evidence captured for B.
+    #[test]
+    fn evidence_provenance_from_a_foreign_scope_is_refused_with_its_handle() {
+        let foreign = record(
+            "foreign",
+            SCOPE,
+            OTHER_SCOPE,
+            EpistemicStatus::Supported,
+            EvidenceFreshness::ExactCandidate,
+            Vec::new(),
+        );
+        let refusal = resolve(&request(vec![foreign]))
+            .expect_err("scope-mismatched evidence must not be admitted");
+
+        assert!(matches!(
+            refusal,
+            EpistemicError::ScopeMismatch { handle } if handle == id("foreign")
+        ));
+    }
+
+    /// The inverse relation: evidence bound to A inside a record claimed for B.
+    /// This one is refused by the record-vs-request check, which runs first.
+    #[test]
+    fn evidence_provenance_from_the_request_scope_is_refused_in_a_foreign_record() {
+        let foreign = record(
+            "foreign",
+            OTHER_SCOPE,
+            SCOPE,
+            EpistemicStatus::Supported,
+            EvidenceFreshness::ExactCandidate,
+            Vec::new(),
+        );
+
+        assert!(matches!(
+            resolve(&request(vec![foreign])),
+            Err(EpistemicError::ScopeMismatch { handle }) if handle == id("foreign")
+        ));
+    }
+
+    /// A wrong-scope stale record cannot influence suppression or provenance.
+    #[test]
+    fn stale_evidence_provenance_from_a_foreign_scope_is_refused() {
+        let stale_foreign = record(
+            "stale-foreign",
+            SCOPE,
+            OTHER_SCOPE,
+            EpistemicStatus::Stale,
+            EvidenceFreshness::KnownOlderSnapshot,
+            Vec::new(),
+        );
+        let current = record(
+            "current",
+            SCOPE,
+            SCOPE,
+            EpistemicStatus::Supported,
+            EvidenceFreshness::ExactCandidate,
+            Vec::new(),
+        );
+
+        assert!(matches!(
+            resolve(&request(vec![current, stale_foreign])),
+            Err(EpistemicError::ScopeMismatch { handle }) if handle == id("stale-foreign")
+        ));
+    }
+
+    /// A wrong-scope record named by another record's `supersedes` is refused
+    /// before the supersession union is computed, so it cannot vanish as
+    /// silently superseded.
+    #[test]
+    fn superseded_evidence_provenance_from_a_foreign_scope_is_refused() {
+        let foreign = record(
+            "foreign",
+            SCOPE,
+            OTHER_SCOPE,
+            EpistemicStatus::Supported,
+            EvidenceFreshness::ExactCandidate,
+            Vec::new(),
+        );
+        let successor = record(
+            "successor",
+            SCOPE,
+            SCOPE,
+            EpistemicStatus::Supported,
+            EvidenceFreshness::ExactCandidate,
+            vec![id("foreign")],
+        );
+
+        assert!(matches!(
+            resolve(&request(vec![successor, foreign])),
+            Err(EpistemicError::ScopeMismatch { handle }) if handle == id("foreign")
+        ));
+    }
+
+    /// Deterministic ordering is preserved for an equivalent permutation of the
+    /// same admitted read set.
+    #[test]
+    fn equivalent_read_set_permutation_is_identical() {
+        let first_record = record(
+            "first",
+            SCOPE,
+            SCOPE,
+            EpistemicStatus::Supported,
+            EvidenceFreshness::ExactCandidate,
+            Vec::new(),
+        );
+        let second_record = record(
+            "second",
+            SCOPE,
+            SCOPE,
+            EpistemicStatus::Supported,
+            EvidenceFreshness::ExactCandidate,
+            Vec::new(),
+        );
+
+        let first = resolve(&request(vec![first_record.clone(), second_record.clone()]))
+            .expect("valid read set");
+        let second = resolve(&request(vec![second_record, first_record])).expect("valid read set");
+
+        assert_eq!(first, second);
+    }
 }
