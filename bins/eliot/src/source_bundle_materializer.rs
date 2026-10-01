@@ -1797,10 +1797,14 @@ fn materialize_with_resolved_selection(
         .installation_epoch
         .validate()
         .map_err(|error| MaterializeError::Contract(error.to_string()))?;
-    if executables.len() != 11 {
-        return Err(MaterializeError::Invalid(
-            "exactly eleven validated executables are required".to_owned(),
-        ));
+    let expected_executables = REQUIRED_ROLES
+        .iter()
+        .filter(|(_, executable)| *executable)
+        .count();
+    if executables.len() != expected_executables {
+        return Err(MaterializeError::Invalid(format!(
+            "exactly {expected_executables} validated executables are required"
+        )));
     }
 
     validate_materializer_selection(input, selection)?;
@@ -2074,6 +2078,7 @@ mod tests {
             "eliot-testd.exe",
             "eliot-native-worker.exe",
             "eliot-wasm-host.exe",
+            "eliot-user-broker.exe",
             "eliot-notify.exe",
         ]
         .into_iter()
@@ -2326,7 +2331,7 @@ mod tests {
         let CanarySourceBundleMaterializeOutcome::Published(receipt) = outcome else {
             panic!("exact materializer publication unexpectedly requires reconciliation");
         };
-        assert_eq!(receipt.files.len(), 14);
+        assert_eq!(receipt.files.len(), REQUIRED_ROLES.len());
         assert_eq!(
             receipt.directory_publication.source_identity,
             receipt.directory_publication.destination_identity
@@ -2410,6 +2415,8 @@ mod tests {
             &input.eliot_testd_exe,
             &input.eliot_native_worker_exe,
             &input.eliot_wasm_host_exe,
+            &input.eliot_user_broker_exe,
+            &input.eliot_notify_exe,
         ] {
             assert!(
                 !source.exists(),
