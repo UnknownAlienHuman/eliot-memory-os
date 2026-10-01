@@ -140,16 +140,31 @@ fn production_call_chain_has_no_unbounded_bypass_or_cloned_decoder() {
         "stdin acquisition must stay on the bounded record reader"
     );
     // No unbounded acquisition API survives in the binary.
-    for forbidden in [".lines()", "read_line", "read_to_end", "set_read_timeout"] {
+    for forbidden in [".lines()", "read_line", "read_to_end"] {
         assert!(
             !main.contains(forbidden),
-            "binary must not contain unbounded/blocking-deadline API {forbidden}"
+            "binary must not contain unbounded input API {forbidden}"
         );
         assert!(
             !decoder.contains(forbidden),
-            "decoder must not contain unbounded/blocking-deadline API {forbidden}"
+            "decoder must not contain unbounded input API {forbidden}"
         );
     }
+    // The private stdin profile does not claim a blocking-read deadline, but
+    // the distinct loopback HTTP transport has an independently enforced,
+    // finite read deadline. Keep both scopes explicit in the source proof.
+    assert!(
+        main.contains("const HTTP_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);"),
+        "loopback HTTP must keep its finite thirty-second read deadline"
+    );
+    let http_connection = main
+        .split_once("fn serve_loopback_http_connection(")
+        .expect("loopback HTTP connection handler must exist")
+        .1;
+    assert!(
+        http_connection.contains(".set_read_timeout(Some(HTTP_REQUEST_READ_TIMEOUT))"),
+        "loopback HTTP handler must apply its declared read deadline"
+    );
     // No cloned or test-only decoder: typed `Request` construction happens
     // exactly once, inside the bounded entry point, and the pre-scan never
     // converts raw input into an untrusted `Value` tree before the

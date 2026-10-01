@@ -4294,9 +4294,222 @@ fn bound_mcp_method(method: &str) -> String {
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use eliot_agent_bridge::ScopeLevel;
+    use eliot_agent_bridge::{GovernanceEvidence, ReadinessDisposition, ScopeLevel};
+    use eliot_agent_bridge_core::{
+        ClockReading, EventCursor, EventId, HOST_EVENT_CONTRACT_VERSION,
+        HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition,
+        HostEventNormalizationReceipt, HostEventPrivacyClass, LowercaseSha256,
+        NativeSession, NativeSessionLocator, NormalizationCoverage,
+        NormalizedHostEventEnvelope, NormalizedHostEventPayload,
+        ProviderObservationLineage, QualifiedSourceDigest, RawSourceRecord,
+        RestrictedRawSourceHandle, SessionLifecycleObservation,
+        SessionLifecycleTransition, SessionObservation, UnsupportedDisposition,
+    };
+    use eliot_integration_coverage::{
+        ALL_EVENTS, DispatchOrdering, EventCompleteness, EventCoverage,
+        EventDisposition, GovernorCoverageDerivation, IntegrationCoverageProfile,
+        LogicalEvent, TraceFreshness, WatchdogEvidence,
+    };
     use serde_json::Value;
     use std::fmt::Write as _;
+
+    // I7.16 / #1746 W5
+    // (`13f3223dcda61585ad8cc9757c8ffcf5931374d7`): preserve both the typed
+    // coverage owner profile and derived governance profile in this fixture.
+    fn fixture_governance() -> GovernanceEvidence {
+        let coverage_profile = IntegrationCoverageProfile {
+            fingerprint: "governance-profile-1".to_owned(),
+            verified: true,
+            events: ALL_EVENTS
+                .iter()
+                .map(|event| EventCoverage {
+                    event: *event,
+                    disposition: if *event == LogicalEvent::PreToolUse {
+                        EventDisposition::Observed
+                    } else {
+                        EventDisposition::Enforced
+                    },
+                    ordering: DispatchOrdering::PreDispatch,
+                    completeness: EventCompleteness::Complete,
+                    proof_ceiling: "read-only".to_owned(),
+                    source: "owner-observation".to_owned(),
+                    gaps: Vec::new(),
+                })
+                .collect(),
+            completeness: EventCompleteness::Unknown,
+            proof_ceiling: "read-only".to_owned(),
+            source: "integration-owner".to_owned(),
+            gaps: vec!["coverage-gap:source-freshness".to_owned()],
+        };
+        let mut derivation = GovernorCoverageDerivation::new();
+        let governance_profile = derivation
+            .derive(
+                &coverage_profile,
+                &WatchdogEvidence {
+                    supervisor_id: "watchdog:fixture".to_owned(),
+                    fresh: true,
+                    summary: "test fixture supervision".to_owned(),
+                },
+                TraceFreshness::Fresh,
+            )
+            .expect("verified owner coverage derives a governance profile");
+        GovernanceEvidence {
+            profile_ref: "governance-profile-1".to_owned(),
+            profile_revision: "1".to_owned(),
+            governance_profile,
+            limiting_integration_evidence: coverage_profile.gaps.clone(),
+            coverage_profile,
+        }
+    }
+
+    fn fixture_bootstrap_context() -> BootstrapContext {
+        BootstrapContext {
+            principal_ref: "principal-1".to_owned(),
+            profile_ref: "SPINE_FUNCTIONAL".to_owned(),
+            workscope_ref: "workscope-1".to_owned(),
+            onboarding_readiness_ref: "readiness-receipt-1".to_owned(),
+            onboarding_disposition: ReadinessDisposition::ReadyMaterial,
+            smallest_missing_question: Some("task_ref".to_owned()),
+            lease_deadline: 10,
+            receipt_revision: 1,
+            revision_refs: vec!["source-gen-9".to_owned()],
+            orientation_handles: vec!["orientation:project".to_owned()],
+            attention_handles: vec!["attention:conflict-1".to_owned()],
+            problem_handles: vec!["problem:stale-proof".to_owned()],
+            role_lease_ref: "role-lease-1".to_owned(),
+            state_fence_ref: "fence-epoch-3-gen-7".to_owned(),
+            governance: fixture_governance(),
+            route_profile_ref: "route-profile-constrained-1".to_owned(),
+            serializer_id: "serializer-1".to_owned(),
+            serializer_version: "serializer-version-1".to_owned(),
+            serializer_options_digest: "serializer-options-1".to_owned(),
+            tokenizer_id: "tokenizer-1".to_owned(),
+            tokenizer_version: "tokenizer-version-1".to_owned(),
+            tokenizer_hash: "tokenizer-hash-1".to_owned(),
+            decision_safety_floor_refs: vec![
+                "floor:goal-scope-authority".to_owned(),
+                "floor:task-selection-proof".to_owned(),
+            ],
+            workspace_instance_ref: "instance:a".to_owned(),
+            projection_source_ref: "projection-source-1".to_owned(),
+            projection_generation: 9,
+            supported_count: 4,
+            verified_count: 3,
+            candidate_count: 1,
+            conflicts_unknowns: Vec::new(),
+            next_safe_expansion: "bind task before material effects".to_owned(),
+            boot_delta: None,
+        }
+    }
+
+    // I7.23 / #228 and #3481
+    // (`fb1948d6d4ebfb6a6c1027d379bd9cead2b86268`): the legacy hook wire
+    // carries the normalized observation contract alongside its outer identity.
+    fn fixture_normalized_hook() -> NormalizedHostEventEnvelope {
+        fn digest(bytes: &[u8]) -> LowercaseSha256 {
+            serde_json::from_value(serde_json::json!(eliot_contracts::sha256_hex(bytes)))
+                .expect("fixture digest must be lowercase SHA-256")
+        }
+
+        let source_bytes = b"bridge-decoder-fixture-event-1";
+        let raw_source = RawSourceRecord {
+            handle: RestrictedRawSourceHandle::new("restricted:event-1".to_owned())
+                .expect("fixture source handle is valid"),
+            digest: QualifiedSourceDigest {
+                algorithm: HOST_EVENT_DIGEST_ALGORITHM.to_owned(),
+                digest: digest(source_bytes),
+            },
+        };
+        let mut envelope = NormalizedHostEventEnvelope {
+            schema_version: HOST_EVENT_CONTRACT_VERSION.to_owned(),
+            event_id: EventId::new("event-1").expect("fixture event id is valid"),
+            cursor: EventCursor::new("cursor-1").expect("fixture cursor is valid"),
+            lineage: ProviderObservationLineage::SessionObservation(SessionObservation {
+                session_id: None,
+                native: NativeSession::Native(
+                    NativeSessionLocator::new("thread-event-1".to_owned())
+                        .expect("fixture native session is valid"),
+                ),
+            }),
+            producer_adapter_identity: "bridge-fixture".to_owned(),
+            adapter_contract_version: "bridge-fixture/v1".to_owned(),
+            sequence: 1,
+            causal_predecessors: Vec::new(),
+            payload: NormalizedHostEventPayload::SessionLifecycle(
+                SessionLifecycleObservation {
+                    transition: SessionLifecycleTransition::Started,
+                    detail_ref: None,
+                },
+            ),
+            admitted_route_digest: None,
+            raw_source: raw_source.clone(),
+            normalization: HostEventNormalizationReceipt {
+                normalizer_identity: "bridge-fixture".to_owned(),
+                normalizer_version: "bridge-fixture/v1".to_owned(),
+                input_handle: raw_source.handle.clone(),
+                input_digest: raw_source.digest.clone(),
+                output_schema_version: HOST_EVENT_CONTRACT_VERSION.to_owned(),
+                output_digest: digest(b"bridge-decoder-fixture-seal-placeholder"),
+                omitted_fields: Vec::new(),
+                warnings: Vec::new(),
+                unsupported_disposition: UnsupportedDisposition::None,
+                privacy_class: HostEventPrivacyClass::RedactedSummary,
+                coverage: NormalizationCoverage::Complete,
+                proof_ceiling: eliot_receipts::ProofCeiling::Observation,
+            },
+            observed_at: ClockReading {
+                valid_time_ms: Some(1_700_000_000_000),
+                known_time_ms: Some(1_700_000_000_000),
+                transaction_sequence: None,
+                monotonic_ns: Some(1_000),
+            },
+            delivery: HostEventDeliveryDisposition::BestEffortOrdered,
+        };
+        envelope.seal().expect("normalized fixture must seal");
+        envelope
+    }
+
+    fn generated_valid_forward_hook() -> String {
+        let mut event = serde_json::json!({
+            "event_id": "event-1",
+            "attempt_id": "attempt-1",
+            "sequence": 1,
+            "cursor": "cursor-1",
+            "kind": "tool_result",
+            "route": {
+                "host_family": "test-host",
+                "adapter": "test-adapter",
+                "protocol_transport": "stdio",
+                "runtime_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "adapter_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "provider": "test-provider",
+                "model": "test-model",
+                "auth_billing": "none",
+                "serializer_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "tool_semantics_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                "reasoning_mode": "direct",
+                "continuation_behavior": "stop",
+                "feature_flags_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+            },
+            "raw_payload_digest": "digest-1",
+            "normalized_payload": {},
+            "parent_event_id": null,
+            "observed_at": "2026-09-21T00:00:00Z"
+        });
+        event["normalized"] = serde_json::to_value(fixture_normalized_hook())
+            .expect("normalized fixture serializes");
+        serde_json::json!({"op": "forward_hook", "event": event}).to_string()
+    }
+
+    fn generated_bootstrap_op() -> String {
+        serde_json::json!({
+            "op": "bootstrap",
+            "context": fixture_bootstrap_context(),
+            "tasks": {"scope_level": "session"},
+            "requested_assessment": "READY"
+        })
+        .to_string()
+    }
 
     const INVOKE: &str = r#"{
         "op":"invoke",
@@ -5036,6 +5249,7 @@ mod tests {
                     "generated-long-string-600k" => {
                         format!("{{\"s\":\"{}\"}}", "x".repeat(600_000))
                     }
+                    "generated-valid-forward-hook" => generated_valid_forward_hook(),
                     _ => panic!("case {id} names an unknown generator"),
                 }
             } else {
@@ -5146,58 +5360,6 @@ mod tests {
         );
     }
 
-    const BOOTSTRAP_OP: &str = r#"{
-        "op":"bootstrap",
-        "context":{
-            "principal_ref":"principal-1",
-            "profile_ref":"SPINE_FUNCTIONAL",
-            "workscope_ref":"workscope-1",
-            "onboarding_readiness_ref":"readiness-receipt-1",
-            "onboarding_disposition":"READY_MATERIAL",
-            "revision_refs":["source-gen-9"],
-            "orientation_handles":[],
-            "attention_handles":[],
-            "problem_handles":[],
-            "role_lease_ref":"role-lease-1",
-            "state_fence_ref":"fence-epoch-3-gen-7",
-            "governance":{
-                "profile_ref":"governance-profile-1",
-                "profile_revision":"rev-7",
-                "limiting_integration_evidence":["coverage:PreToolUse:ENFORCED"]
-            },
-            "supported_count":4,
-            "verified_count":3,
-            "candidate_count":1,
-            "conflicts_unknowns":[],
-            "next_safe_expansion":"bind task before material effects"
-        },
-        "tasks":{"scope_level":"session"},
-        "requested_assessment":"READY"
-    }"#;
-
-    const BOOTSTRAP_CONTEXT_JSON: &str = r#"{        "principal_ref":"principal-1",
-        "profile_ref":"SPINE_FUNCTIONAL",
-        "workscope_ref":"workscope-1",
-        "onboarding_readiness_ref":"readiness-receipt-1",
-        "onboarding_disposition":"READY_MATERIAL",
-        "revision_refs":["source-gen-9"],
-        "orientation_handles":[],
-        "attention_handles":[],
-        "problem_handles":[],
-        "role_lease_ref":"role-lease-1",
-        "state_fence_ref":"fence-epoch-3-gen-7",
-        "governance":{
-            "profile_ref":"governance-profile-1",
-            "profile_revision":"rev-7",
-            "limiting_integration_evidence":["coverage:PreToolUse:ENFORCED"]
-        },
-        "supported_count":4,
-        "verified_count":3,
-        "candidate_count":1,
-        "conflicts_unknowns":[],
-        "next_safe_expansion":"bind task before material effects"
-    }"#;
-
     fn empty_tasks() -> BootstrapTaskInputs {
         BootstrapTaskInputs {
             scope_level: ScopeLevel::Session,
@@ -5218,6 +5380,29 @@ mod tests {
     }
 
     #[test]
+    fn loopback_http_idle_peer_times_out_without_a_request() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("test listener binds loopback");
+        let client = std::net::TcpStream::connect(
+            listener.local_addr().expect("listener has a local address"),
+        )
+        .expect("test client connects");
+        let (mut server, _) = listener.accept().expect("test server accepts");
+        server
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("test read deadline is installed");
+
+        assert!(
+            matches!(
+                read_loopback_http_request(&mut server),
+                LoopbackHttpRead::Eof
+            ),
+            "an idle peer must be closed when its finite read deadline elapses"
+        );
+        drop(client);
+    }
+
+    #[test]
     fn merged_decode_path_and_first_response_bootstrap_composition() {
         // Main-side bounded decode dispatches known operations — including
         // the bridge-side bootstrap op through the admitted envelope shape —
@@ -5227,8 +5412,9 @@ mod tests {
             matches!(decoded, Request::Status),
             "status op must decode to its own request"
         );
-        let bootstrap_decoded =
-            decode_bounded_request(BOOTSTRAP_OP).expect("valid bootstrap op must decode");
+        let bootstrap_op = generated_bootstrap_op();
+        let bootstrap_decoded = decode_bounded_request(&bootstrap_op)
+            .expect("valid bootstrap op must decode");
         assert!(
             matches!(bootstrap_decoded, Request::Bootstrap { .. }),
             "explicit bootstrap retrieval must survive the envelope gate"
@@ -5245,7 +5431,7 @@ mod tests {
             "unknown operations must reject"
         );
         assert!(
-            decode_bounded_request(&BOOTSTRAP_OP.replace(
+            decode_bounded_request(&bootstrap_op.replace(
                 "\"requested_assessment\":\"READY\"",
                 "\"requested_assessment\":\"READY\",\"extra\":1"
             ))
@@ -5253,7 +5439,7 @@ mod tests {
             "extra envelope members must reject"
         );
         assert!(
-            decode_bounded_request(&BOOTSTRAP_OP.replace("source-gen-9", &"g".repeat(600_000)))
+            decode_bounded_request(&bootstrap_op.replace("source-gen-9", &"g".repeat(600_000)))
                 .is_err(),
             "oversized records must reject"
         );
@@ -5262,7 +5448,7 @@ mod tests {
         // evidence; the second carries none, while explicit retrieval
         // stays available (including via the admitted stdio op above).
         let mut runner = fixture_runner();
-        let context: BootstrapContext = serde_json::from_str(BOOTSTRAP_CONTEXT_JSON).unwrap();
+        let context = fixture_bootstrap_context();
         runner
             .note_bootstrap_context(context)
             .expect("valid context must note");
