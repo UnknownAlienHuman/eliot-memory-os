@@ -6740,31 +6740,113 @@ mod tests {
         ));
     }
 
-    // WORK_UNIT_CASE: 673/3
-    #[test]
-    fn case_03_empty_and_single_position_are_not_conflicts() {
-        let receipt = test_receipt();
-        let owners = BTreeSet::from([SourceId::new("source-a").expect("valid source")]);
-        let empty = ConflictSet::new(ConflictSetParams {
-            conflict_id: "conflict-empty".to_owned(),
+    /// The shared parameters every leg of `case_03` builds on: one conflict in
+    /// `scope-1` with an open lifecycle, a contested acceptability and the same
+    /// unresolved residue. Only the positions, the unresolved owners and the
+    /// conflict id differ between the legs, so those are the only fields a leg
+    /// states.
+    fn missing_rival_params(
+        conflict_id: &str,
+        positions: Vec<ConflictPosition>,
+        unresolved_owners: BTreeSet<SourceId>,
+        receipt_digest: &str,
+    ) -> ConflictSetParams {
+        ConflictSetParams {
+            conflict_id: conflict_id.to_owned(),
             kind: ConflictKind::Epistemic,
             scope: "scope-1".to_owned(),
             task_id: None,
-            positions: Vec::new(),
+            positions,
             evidence_refs: BTreeSet::new(),
-            owners: owners.clone(),
+            owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
             common_lineage: BTreeSet::new(),
             resolved_parts: BTreeSet::new(),
             unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
-            unresolved_owners: owners.clone(),
+            unresolved_owners,
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
             decision_owner: SourceId::new("source-a").expect("valid source"),
             affected_actions: vec!["decide-cache".to_owned()],
             lifecycle: ConflictLifecycle::Open,
-            receipt_digest: receipt.bundle_digest.clone(),
-        });
+            receipt_digest: receipt_digest.to_owned(),
+        }
+    }
+
+    /// The single carried position of the two-member denominator: source-a.
+    fn missing_rival_carried_position() -> Vec<ConflictPosition> {
+        vec![test_position("source-a", "cache helps tail latency", false)]
+    }
+
+    /// The residue owners of the two-member denominator: the carried owner plus
+    /// the declared-but-absent rival.
+    fn missing_rival_two_owner_residue() -> BTreeSet<SourceId> {
+        BTreeSet::from([
+            SourceId::new("source-a").expect("valid source"),
+            SourceId::new("source-b").expect("valid source"),
+        ])
+    }
+
+    /// One declared-but-absent rival, named by its owner and its owner-issued
+    /// outcome.
+    fn missing_rival_record(
+        owner: &str,
+        disposition: MemberDisposition,
+        reason: &str,
+    ) -> MissingConflictPosition {
+        MissingConflictPosition::new(
+            SourceId::new(owner).expect("valid source"),
+            disposition,
+            reason,
+        )
+        .expect("valid missing position")
+    }
+
+    // WORK_UNIT_CASE: 673/3
+    #[test]
+    fn case_03_empty_and_single_position_are_not_conflicts() {
+        let receipt = test_receipt();
+        let digest = receipt.bundle_digest.clone();
+
+        missing_rival_unqualified_legs_are_refused(&digest);
+        missing_rival_qualified_leg_is_admitted_incomplete(&digest);
+        missing_rival_closed_outcome_is_not_a_rival(&digest);
+        missing_rival_one_absent_member_cannot_be_declared_twice(&digest);
+
+        // Refusal: the same member cannot be both carried and absent.
+        let both = ConflictSet::new_with_missing_positions(
+            missing_rival_params(
+                "conflict-missing-rival-both",
+                missing_rival_carried_position(),
+                missing_rival_two_owner_residue(),
+                &digest,
+            ),
+            vec![missing_rival_record(
+                "source-a",
+                MemberDisposition::Unavailable,
+                "the carried position is also declared absent",
+            )],
+        );
+        assert!(
+            matches!(
+                both,
+                Err(ContractError::Duplicate { field })
+                if field == "conflict.missing_positions"
+            ),
+            "a carried position cannot also be declared absent"
+        );
+    }
+
+    /// Leg one: neither an empty set nor a single position with no declaration is
+    /// a conflict.
+    fn missing_rival_unqualified_legs_are_refused(receipt_digest: &str) {
+        let owners = BTreeSet::from([SourceId::new("source-a").expect("valid source")]);
+        let empty = ConflictSet::new(missing_rival_params(
+            "conflict-empty",
+            Vec::new(),
+            owners.clone(),
+            receipt_digest,
+        ));
         assert!(
             matches!(
                 empty,
@@ -6773,26 +6855,12 @@ mod tests {
             ),
             "empty positions are rejected before analysis"
         );
-        let single = ConflictSet::new(ConflictSetParams {
-            conflict_id: "conflict-single".to_owned(),
-            kind: ConflictKind::Epistemic,
-            scope: "scope-1".to_owned(),
-            task_id: None,
-            positions: vec![test_position("source-a", "cache helps tail latency", false)],
-            evidence_refs: BTreeSet::new(),
-            owners: owners.clone(),
-            common_lineage: BTreeSet::new(),
-            resolved_parts: BTreeSet::new(),
-            unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
-            unresolved_owners: owners.clone(),
-            acceptability: ArgumentAcceptability::Contested,
-            defeated_refs: BTreeSet::new(),
-            probe: None,
-            decision_owner: SourceId::new("source-a").expect("valid source"),
-            affected_actions: vec!["decide-cache".to_owned()],
-            lifecycle: ConflictLifecycle::Open,
-            receipt_digest: receipt.bundle_digest.clone(),
-        });
+        let single = ConflictSet::new(missing_rival_params(
+            "conflict-single",
+            missing_rival_carried_position(),
+            owners,
+            receipt_digest,
+        ));
         assert!(
             matches!(
                 single,
@@ -6801,41 +6869,25 @@ mod tests {
             ),
             "one position without a qualified missing-rival denominator is not a conflict"
         );
+    }
 
-        // Leg two: the SAME one position plus a declared-but-absent rival whose
-        // owner-issued outcome is still open. The set is a real two-member
-        // denominator, so it constructs, the absent member is counted, and the
-        // analysis runs over the one carried position with the gap preserved.
+    /// Leg two: the SAME one position plus a declared-but-absent rival whose
+    /// owner-issued outcome is still open. The set is a real two-member
+    /// denominator, so it constructs, the absent member is counted, and the
+    /// analysis runs over the one carried position with the gap preserved.
+    fn missing_rival_qualified_leg_is_admitted_incomplete(receipt_digest: &str) {
         let qualified = ConflictSet::new_with_missing_positions(
-            ConflictSetParams {
-                conflict_id: "conflict-missing-rival".to_owned(),
-                kind: ConflictKind::Epistemic,
-                scope: "scope-1".to_owned(),
-                task_id: None,
-                positions: vec![test_position("source-a", "cache helps tail latency", false)],
-                evidence_refs: BTreeSet::new(),
-                owners: owners.clone(),
-                common_lineage: BTreeSet::new(),
-                resolved_parts: BTreeSet::new(),
-                unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
-                unresolved_owners: BTreeSet::from([
-                    SourceId::new("source-a").expect("valid source"),
-                    SourceId::new("source-b").expect("valid source"),
-                ]),
-                acceptability: ArgumentAcceptability::Contested,
-                defeated_refs: BTreeSet::new(),
-                probe: None,
-                decision_owner: SourceId::new("source-a").expect("valid source"),
-                affected_actions: vec!["decide-cache".to_owned()],
-                lifecycle: ConflictLifecycle::Open,
-                receipt_digest: receipt.bundle_digest.clone(),
-            },
-            vec![MissingConflictPosition::new(
-                SourceId::new("source-b").expect("valid source"),
+            missing_rival_params(
+                "conflict-missing-rival",
+                missing_rival_carried_position(),
+                missing_rival_two_owner_residue(),
+                receipt_digest,
+            ),
+            vec![missing_rival_record(
+                "source-b",
                 MemberDisposition::Unavailable,
                 "the rival's owner has not released its stance yet",
-            )
-            .expect("valid missing position")],
+            )],
         )
         .expect("a declared-but-absent open rival is a two-member denominator");
         assert_eq!(qualified.positions.len(), 1);
@@ -6848,8 +6900,12 @@ mod tests {
         // The absent member has no position, so the supplied lineage and
         // objection naming it are outside this denominator and are withdrawn
         // rather than left to describe a member the set does not carry.
-        supplements.lineage.retain(|entry| entry.source_handle == "source-a");
-        supplements.objections.retain(|objection| objection.target_source == "source-a");
+        supplements
+            .lineage
+            .retain(|entry| entry.source_handle == "source-a");
+        supplements
+            .objections
+            .retain(|objection| objection.target_source == "source-a");
         let mut policy = test_policy();
         policy.allow_partial = true;
         let candidate = match analyze_conflict(
@@ -6895,39 +6951,23 @@ mod tests {
             Err(err) => panic!("qualified missing-rival analysis: {err:?}"),
         };
         assert_eq!(withheld.outcome, ConflictOutcome::Abstention);
+    }
 
-        // Refusal: the absent member's own outcome CLOSED the question, so it is
-        // not a rival of this conflict and cannot widen the denominator.
+    /// Refusal: the absent member's own outcome CLOSED the question, so it is
+    /// not a rival of this conflict and cannot widen the denominator.
+    fn missing_rival_closed_outcome_is_not_a_rival(receipt_digest: &str) {
         let closed = ConflictSet::new_with_missing_positions(
-            ConflictSetParams {
-                conflict_id: "conflict-missing-rival-closed".to_owned(),
-                kind: ConflictKind::Epistemic,
-                scope: "scope-1".to_owned(),
-                task_id: None,
-                positions: vec![test_position("source-a", "cache helps tail latency", false)],
-                evidence_refs: BTreeSet::new(),
-                owners: owners.clone(),
-                common_lineage: BTreeSet::new(),
-                resolved_parts: BTreeSet::new(),
-                unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
-                unresolved_owners: BTreeSet::from([
-                    SourceId::new("source-a").expect("valid source"),
-                    SourceId::new("source-b").expect("valid source"),
-                ]),
-                acceptability: ArgumentAcceptability::Contested,
-                defeated_refs: BTreeSet::new(),
-                probe: None,
-                decision_owner: SourceId::new("source-a").expect("valid source"),
-                affected_actions: vec!["decide-cache".to_owned()],
-                lifecycle: ConflictLifecycle::Open,
-                receipt_digest: receipt.bundle_digest.clone(),
-            },
-            vec![MissingConflictPosition::new(
-                SourceId::new("source-b").expect("valid source"),
+            missing_rival_params(
+                "conflict-missing-rival-closed",
+                missing_rival_carried_position(),
+                missing_rival_two_owner_residue(),
+                receipt_digest,
+            ),
+            vec![missing_rival_record(
+                "source-b",
                 MemberDisposition::AuthoritativeAbsence,
                 "the rival's owner states no such position exists",
-            )
-            .expect("valid missing position")],
+            )],
         );
         assert!(
             matches!(
@@ -6937,46 +6977,29 @@ mod tests {
             ),
             "a closed outcome is not a live rival and cannot admit a one-position set"
         );
+    }
 
-        // Refusal: the absent member is named twice, so the denominator would
-        // count one member as two.
+    /// Refusal: the absent member is named twice, so the denominator would count
+    /// one member as two.
+    fn missing_rival_one_absent_member_cannot_be_declared_twice(receipt_digest: &str) {
         let overlapping = ConflictSet::new_with_missing_positions(
-            ConflictSetParams {
-                conflict_id: "conflict-missing-rival-overlap".to_owned(),
-                kind: ConflictKind::Epistemic,
-                scope: "scope-1".to_owned(),
-                task_id: None,
-                positions: vec![test_position("source-a", "cache helps tail latency", false)],
-                evidence_refs: BTreeSet::new(),
-                owners: owners.clone(),
-                common_lineage: BTreeSet::new(),
-                resolved_parts: BTreeSet::new(),
-                unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
-                unresolved_owners: BTreeSet::from([
-                    SourceId::new("source-a").expect("valid source"),
-                    SourceId::new("source-b").expect("valid source"),
-                ]),
-                acceptability: ArgumentAcceptability::Contested,
-                defeated_refs: BTreeSet::new(),
-                probe: None,
-                decision_owner: SourceId::new("source-a").expect("valid source"),
-                affected_actions: vec!["decide-cache".to_owned()],
-                lifecycle: ConflictLifecycle::Open,
-                receipt_digest: receipt.bundle_digest.clone(),
-            },
+            missing_rival_params(
+                "conflict-missing-rival-overlap",
+                missing_rival_carried_position(),
+                missing_rival_two_owner_residue(),
+                receipt_digest,
+            ),
             vec![
-                MissingConflictPosition::new(
-                    SourceId::new("source-b").expect("valid source"),
+                missing_rival_record(
+                    "source-b",
                     MemberDisposition::Unavailable,
                     "first account of the absent rival",
-                )
-                .expect("valid missing position"),
-                MissingConflictPosition::new(
-                    SourceId::new("source-b").expect("valid source"),
+                ),
+                missing_rival_record(
+                    "source-b",
                     MemberDisposition::Blocked,
                     "second account of the same absent rival",
-                )
-                .expect("valid missing position"),
+                ),
             ],
         );
         assert!(
@@ -6986,44 +7009,6 @@ mod tests {
                 if field == "conflict.missing_positions"
             ),
             "one absent member cannot be declared twice"
-        );
-
-        // Refusal: the same member cannot be both carried and absent.
-        let both = ConflictSet::new_with_missing_positions(
-            ConflictSetParams {
-                conflict_id: "conflict-missing-rival-both".to_owned(),
-                kind: ConflictKind::Epistemic,
-                scope: "scope-1".to_owned(),
-                task_id: None,
-                positions: vec![test_position("source-a", "cache helps tail latency", false)],
-                evidence_refs: BTreeSet::new(),
-                owners: owners.clone(),
-                common_lineage: BTreeSet::new(),
-                resolved_parts: BTreeSet::new(),
-                unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
-                unresolved_owners: owners.clone(),
-                acceptability: ArgumentAcceptability::Contested,
-                defeated_refs: BTreeSet::new(),
-                probe: None,
-                decision_owner: SourceId::new("source-a").expect("valid source"),
-                affected_actions: vec!["decide-cache".to_owned()],
-                lifecycle: ConflictLifecycle::Open,
-                receipt_digest: receipt.bundle_digest.clone(),
-            },
-            vec![MissingConflictPosition::new(
-                SourceId::new("source-a").expect("valid source"),
-                MemberDisposition::Unavailable,
-                "the carried position is also declared absent",
-            )
-            .expect("valid missing position")],
-        );
-        assert!(
-            matches!(
-                both,
-                Err(ContractError::Duplicate { field })
-                if field == "conflict.missing_positions"
-            ),
-            "a carried position cannot also be declared absent"
         );
     }
 
