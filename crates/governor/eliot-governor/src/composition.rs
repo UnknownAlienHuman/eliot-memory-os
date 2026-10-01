@@ -6314,28 +6314,36 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             })
     }
 
-    /// Resolves one historical anchor against the live Governor
-    /// change-monitor owner and returns the published evidence-bearing
-    /// observation (issue #1824, I10.21 AUD6).
+    /// Resolves one anchored-review item's current location against the
+    /// live Governor change-monitor owner and returns the published
+    /// evidence-bearing observation (issue #1823 W3; resolver from issue
+    /// #1824, I10.21 AUD6).
     ///
-    /// Candidates are constructed from the owner's own admitted
-    /// after-states for the original target through
+    /// This is the production review caller: the item resolves exclusively
+    /// through `EvolvingAnchorResolver::resolve_anchored_review`, never
+    /// through a parallel scheme. Candidates are constructed from the
+    /// owner's own admitted after-states for the item's original target
+    /// through
     /// [`AnchorCandidate::from_admitted_after_state`](eliot_change_monitor::AnchorCandidate::from_admitted_after_state),
     /// in snapshot insertion order, with caller-supplied extra candidates
     /// (VCS/content/code-intelligence adapters own that discovery)
     /// appended; the resolution itself runs the existing deterministic
     /// order over the live snapshot. The returned observation records the
-    /// algorithm version, every input, the matching evidence tier, and
-    /// confidence, and is serializable through the contract identity
-    /// schema set. `ambiguous` carries no chosen target, `deleted` stays
-    /// historically addressable through admitted deletion evidence, and
-    /// neither is ever auto-attached here: attachment stays with the
-    /// anchored-review route, which I10.18 forbids from creating a second
-    /// store. The daemon review trigger that supplies the original anchor
-    /// is the remaining caller.
+    /// item's seven-status result (`exact`/`moved`/`modified`/`ambiguous`/
+    /// `stale`/`deleted`/`unavailable`) with the algorithm version, every
+    /// input, the matching evidence tier, and confidence, and is
+    /// serializable through the contract identity schema set. `ambiguous`
+    /// stays explicit with no chosen target, `deleted` stays historically
+    /// addressable through admitted deletion evidence, and no status is
+    /// ever auto-attached or refused silently here: attachment stays with
+    /// the anchored-review route through
+    /// `AnchoredReviewItem::validate_resolution`, which I10.18 forbids from
+    /// creating a second store. The daemon review trigger that supplies the
+    /// review item and persists the returned observation next to the review
+    /// it justifies is the remaining caller.
     pub fn resolve_anchored_review(
         &self,
-        original: &eliot_change_monitor::AnchorReference,
+        item: &eliot_change_monitor::AnchoredReviewItem,
         extra_candidates: &[eliot_change_monitor::AnchorCandidate],
     ) -> Result<eliot_change_monitor::AnchorResolutionObservation, CompositionError> {
         let snapshot = self.owners.change_monitor.snapshot();
@@ -6344,11 +6352,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             let Some(after) = record.observation.after.as_ref() else {
                 continue;
             };
-            if after.resource_ref != original.target.id.as_str() {
+            if after.resource_ref != item.original_target.target.id.as_str() {
                 continue;
             }
             let candidate = eliot_change_monitor::AnchorCandidate::from_admitted_after_state(
-                original, after, None, false,
+                &item.original_target,
+                after,
+                None,
+                false,
             )
             .map_err(|error| {
                 CompositionError::Recovery(format!(
@@ -6365,7 +6376,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             }
         }
         eliot_change_monitor::EvolvingAnchorResolver
-            .resolve_observed(original, &candidates, &snapshot)
+            .resolve_anchored_review(item, &candidates, &snapshot)
             .map_err(|error| {
                 CompositionError::Recovery(format!("governor anchor resolution refused: {error}"))
             })
