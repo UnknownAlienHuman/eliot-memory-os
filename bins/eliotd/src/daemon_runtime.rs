@@ -5521,7 +5521,7 @@ async fn read_current_observe_binding(
     let binding = current_observation_owner_binding(
         &guard,
         &retained.policy_origin,
-        unix_ms(SystemTime::now())?,
+        &retained.state_fence,
     )?;
     let value = binding
         .canonical_value()
@@ -5572,6 +5572,7 @@ async fn resolve_initial_observe_selection(
         Ok(pending) => pending,
         Err(
             eliot_governor::CompositionError::ActivationTaskSelectionRequired
+            | eliot_governor::CompositionError::ActivationScopeSelectionRequired
             | eliot_governor::CompositionError::ActivationScopeAmbiguous { .. },
         ) => return Ok(None),
         Err(error) => return Err(format!("Observe task selection request: {error}")),
@@ -5627,11 +5628,12 @@ fn build_observe_identity(
         .map(|(_, session)| eliot_contracts::SessionId::new(session.to_owned()))
         .transpose()
         .map_err(|error| format!("Observe owner session id is invalid: {error}"))?;
-    identity.request.metadata.task_id = selection
-        .as_ref()
-        .map(|owner| eliot_contracts::TaskId::new(owner.task_ref().to_owned()))
-        .transpose()
-        .map_err(|error| format!("selected Observe task id is invalid: {error}"))?;
+    if let Some(owner) = selection.as_ref() {
+        identity.request.metadata.task_id = Some(
+            eliot_contracts::TaskId::new(owner.task_ref().to_owned())
+                .map_err(|error| format!("selected Observe task id is invalid: {error}"))?,
+        );
+    }
     identity.request.metadata.state_fence = retained.state_fence.clone();
     identity.request.state_fence = retained.state_fence.clone();
     if binding.authenticated_scope_ref.is_empty() {
@@ -5657,7 +5659,7 @@ async fn observe_host_workspace(
         let current = current_observation_owner_binding(
             &guard,
             &retained.policy_origin,
-            unix_ms(SystemTime::now())?,
+            &retained.state_fence,
         )?;
         require_same_observe_owner_binding(&current, binding, "before")?;
         let scope = &binding.work_scope_binding;
@@ -5723,7 +5725,7 @@ async fn observe_host_workspace(
         let current = current_observation_owner_binding(
             &guard,
             &retained.policy_origin,
-            unix_ms(SystemTime::now())?,
+            &retained.state_fence,
         )?;
         require_same_observe_owner_binding(&current, binding, "during")?;
     }
@@ -5853,7 +5855,7 @@ async fn prepare_governed_capture(
     let current = current_observation_owner_binding(
         &guard,
         &retained.policy_origin,
-        unix_ms(SystemTime::now())?,
+        &retained.state_fence,
     )?;
     let current_value = current
         .canonical_value()
@@ -6039,11 +6041,19 @@ fn render_observe_completion(
 fn current_observation_owner_binding(
     composition: &DaemonComposition,
     origin: &ObservationCaptureOwnerOrigin,
-    now: u64,
+    state_fence: &eliot_contracts::StateFence,
 ) -> Result<ObservationCaptureOwnerBinding, String> {
     match origin {
-        ObservationCaptureOwnerOrigin::ApplicationSession { .. } => composition
-            .current_activation_observation_owner_binding(now)
+        ObservationCaptureOwnerOrigin::ApplicationSession {
+            authenticated_principal_ref,
+            authenticated_session_ref,
+            ..
+        } => composition
+            .current_cold_observation_owner_binding(
+                authenticated_principal_ref,
+                authenticated_session_ref,
+                state_fence,
+            )
             .map_err(|error| format!("current app observation owner: {error}")),
         ObservationCaptureOwnerOrigin::HostPeer {
             peer_admission_receipt,
