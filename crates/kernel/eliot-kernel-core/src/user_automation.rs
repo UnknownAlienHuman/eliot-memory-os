@@ -1177,7 +1177,12 @@ fn parse_utc_instant(value: &str, field: &'static str) -> Result<i64, UserAutoma
     if value.len() != UTC_INSTANT_BYTES || !value.ends_with('Z') {
         return Err(UserAutomationError::Invalid(field));
     }
-    Ok(parse_civil_wall_clock(&value[..CIVIL_WALL_CLOCK_BYTES], field)?.unix_seconds())
+    // `str::get` refuses a split inside a multibyte character with `None`
+    // instead of panicking, so a non-ASCII instant is a typed refusal.
+    let civil = value
+        .get(..CIVIL_WALL_CLOCK_BYTES)
+        .ok_or(UserAutomationError::Invalid(field))?;
+    Ok(parse_civil_wall_clock(civil, field)?.unix_seconds())
 }
 
 /// Parses one owner-normalized RFC 3339 instant as absolute seconds.
@@ -1189,8 +1194,16 @@ fn parse_civil_instant(value: &str, field: &'static str) -> Result<i64, UserAuto
     if value.len() < CIVIL_WALL_CLOCK_BYTES + 1 {
         return Err(UserAutomationError::Invalid(field));
     }
-    let civil = parse_civil_wall_clock(&value[..CIVIL_WALL_CLOCK_BYTES], field)?;
-    let offset = &value[CIVIL_WALL_CLOCK_BYTES..];
+    // `str::get` refuses a split inside a multibyte character with `None`
+    // instead of panicking, so a non-ASCII instant is a typed refusal and the
+    // civil and offset range checks below still run unchanged.
+    let civil = value
+        .get(..CIVIL_WALL_CLOCK_BYTES)
+        .ok_or(UserAutomationError::Invalid(field))?;
+    let civil = parse_civil_wall_clock(civil, field)?;
+    let offset = value
+        .get(CIVIL_WALL_CLOCK_BYTES..)
+        .ok_or(UserAutomationError::Invalid(field))?;
     let offset_minutes = if offset == "Z" {
         0
     } else {
