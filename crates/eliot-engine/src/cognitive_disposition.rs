@@ -1,5 +1,8 @@
 use crate::EngineError;
 use eliot_store::{CanonicalClaimCard, CanonicalRecord, CanonicalStore};
+use eliot_types::cognitive_run::{
+    CognitiveRunSchemaVersioned, require_current_cognitive_run_schema,
+};
 use eliot_types::{
     AgentResultDispositionKind, AgentRole, AgentSessionId, CanonicalCaseDisposition, ClaimId,
     CognitiveRawVerifierEvidence, CognitiveRunAttempt, CognitiveRunCallPlan,
@@ -13,6 +16,22 @@ use time::OffsetDateTime;
 
 fn rejected(reason: impl Into<String>) -> EngineError {
     EngineError::WriteRejected(reason.into())
+}
+
+/// Owner version-selection step for a decoded cognitive-run record.
+///
+/// `CanonicalStore::canonical_record_by_write_id` / `canonical_records_by_subject_ref`
+/// only deserialize `T`, so a decoded record can carry any `schema_version` string.
+/// This is the single owner validation step, applied at each real decoding boundary
+/// here, before the record's `Succeeded`, receipt-chain, verifier-count, shared-gate or
+/// candidate facts can be consumed as current data. Typed: the mismatch keeps its own
+/// type across the layer boundary and is reported as a disposition rejection.
+fn require_current_cognitive_record<T: CognitiveRunSchemaVersioned>(
+    record: &T,
+) -> Result<(), EngineError> {
+    require_current_cognitive_run_schema(record)
+        .map(|_| ())
+        .map_err(|mismatch| rejected(mismatch.to_string()))
 }
 
 fn string_list(value: Option<&Value>, field: &str) -> Result<Vec<String>, EngineError> {
@@ -183,6 +202,7 @@ async fn require_raw_verifiers(
             )
             .await?
             .ok_or_else(|| rejected("canonical raw verifier record is absent"))?;
+        require_current_cognitive_record(&verifier.receipt_body)?;
         if verifier.canonical_receipt != *verifier_receipt
             || !verifier.receipt_body.passed
             || verifier.receipt_body.run_id != contract.run_id
@@ -226,6 +246,7 @@ async fn canonical_source_candidate(
         )
         .await?
         .ok_or_else(|| rejected("source attempt is absent"))?;
+    require_current_cognitive_record(&attempt.receipt_body)?;
     if attempt.canonical_receipt != terminal.receipt_body.attempt_receipt
         || attempt.receipt_body.run_id != contract.run_id
         || attempt.receipt_body.call_id != call.call_id
@@ -436,6 +457,9 @@ pub async fn resolve_canonical_case_dispositions(
         )
         .await?;
     terminals.retain(|record| record.receipt_body.run_id == contract.run_id);
+    for terminal in &terminals {
+        require_current_cognitive_record(&terminal.receipt_body)?;
+    }
     let mut dispositions = Vec::with_capacity(2);
     for source_call in [5_u8, 7_u8] {
         let terminal = terminals
@@ -478,4 +502,73 @@ pub async fn resolve_canonical_case_dispositions(
         });
     }
     Ok(dispositions)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn terminal_body(version: &str) -> CognitiveRunTerminal {
+        serde_json::from_value(serde_json::json!({
+            "schema_version": version,
+            "run_id": "run-fixture-001",
+            "call_id": "LC-01-source-opencode",
+            "call_number": 5,
+            "run_revision": 10,
+            "expected_previous_revision": 9,
+            "attempt_receipt": {
+                "receipt_id": "33333333-3333-3333-3333-333333333333",
+                "write_id": "44444444-4444-4444-4444-444444444444"
+            },
+            "status": "succeeded",
+            "execution": {
+                "executable_sha256": "seal-executable-fixture",
+                "provider_executable_sha256": "seal-provider-fixture",
+                "argv_sha256": "seal-argv-fixture",
+                "environment_sha256": "seal-environment-fixture",
+                "cwd_sha256": "seal-cwd-fixture",
+                "bundle_sha256": "seal-bundle-fixture",
+                "prompt_sha256": "seal-prompt-fixture"
+            },
+            "process_sha256": null,
+            "stdout_sha256": null,
+            "stderr_sha256": null,
+            "provider_output_sha256": null,
+            "candidate_write_id": null,
+            "candidate_receipt": null,
+            "host_observation": null,
+            "tool_observation_receipts": [],
+            "raw_verifier_receipts": [],
+            "reason": "provider exited zero",
+            "no_redispatch": true,
+            "finished_at": "2026-09-30T11:42:12Z"
+        }))
+        .expect("terminal fixture must decode")
+    }
+
+    // #935 owner version-selection at the disposition decoding boundary: a
+    // current-schema terminal passes before its Succeeded/receipt-chain facts
+    // may be consumed.
+    #[test]
+    fn current_terminal_schema_passes_owner_selection() {
+        require_current_cognitive_record(&terminal_body("eliot-cognitive-run-v2"))
+            .expect("current schema is admitted");
+    }
+
+    // #935 owner version-selection: a foreign-version terminal decodes
+    // structurally but is reported as a disposition rejection, never as data.
+    #[test]
+    fn foreign_terminal_schema_is_rejected_as_disposition() {
+        let error = require_current_cognitive_record(&terminal_body("eliot-cognitive-run-v1"))
+            .expect_err("foreign schema must be refused");
+        assert!(
+            matches!(error, EngineError::WriteRejected(_)),
+            "version refusal must be a disposition rejection"
+        );
+        assert!(
+            error.to_string().contains("cognitive_run_terminal"),
+            "refusal must name the refused record kind: {error}"
+        );
+    }
 }

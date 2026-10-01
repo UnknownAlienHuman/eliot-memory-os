@@ -1419,3 +1419,73 @@ async fn cognitive_state_machine_db_inner() -> Result<()> {
     .await?;
     Ok(())
 }
+
+fn versioned_attempt_record(version: &str) -> Result<CanonicalRecord<CognitiveRunAttempt>> {
+    let receipt_body: CognitiveRunAttempt = serde_json::from_value(serde_json::json!({
+        "schema_version": version,
+        "run_id": "run-fixture-001",
+        "call_id": "LC-01-source-opencode",
+        "call_number": 5,
+        "run_revision": 9,
+        "expected_previous_revision": 8,
+        "contract_receipt": {
+            "receipt_id": "11111111-1111-1111-1111-111111111111",
+            "write_id": "22222222-2222-2222-2222-222222222222"
+        },
+        "invocation_id": "invocation-fixture-001",
+        "candidate_write_id": null,
+        "provider_calls_consumed": 4,
+        "hard_provider_call_cap": 18,
+        "status": "attempting",
+        "execution": {
+            "executable_sha256": "seal-executable-fixture",
+            "provider_executable_sha256": "seal-provider-fixture",
+            "argv_sha256": "seal-argv-fixture",
+            "environment_sha256": "seal-environment-fixture",
+            "cwd_sha256": "seal-cwd-fixture",
+            "bundle_sha256": "seal-bundle-fixture",
+            "prompt_sha256": "seal-prompt-fixture"
+        },
+        "capability": null,
+        "shared_gate": null,
+        "created_at": "2026-09-30T11:41:12Z"
+    }))?;
+    Ok(CanonicalRecord {
+        record_id: "record-fixture-001".to_owned(),
+        receipt_kind: "cognitive_run_attempt".to_owned(),
+        project_id: ProjectId::from_uuid(uuid::Uuid::from_u128(1)),
+        task_id: Some(TaskId::from_uuid(uuid::Uuid::from_u128(2))),
+        subject_ref: "subject-fixture-001".to_owned(),
+        receipt_body,
+        canonical_receipt: WriteReceiptRef {
+            receipt_id: ReceiptId::from_uuid(uuid::Uuid::from_u128(3)),
+            write_id: WriteId::from_uuid(uuid::Uuid::from_u128(4)),
+        },
+        memory_revision: None,
+        project_sequence: None,
+    })
+}
+
+// #935 owner version-selection on the candidate-submit decode path: the attempt
+// that authorizes submission must name the current schema before its status,
+// capability or write linkage may be consumed.
+#[test]
+fn cognitive_record_version_check_admits_current_attempt_schema() -> Result<()> {
+    let record = versioned_attempt_record(COGNITIVE_RUN_SCHEMA_VERSION)?;
+    require_cognitive_record_version(&record)?;
+    Ok(())
+}
+
+// #935 owner version-selection: a foreign-version attempt decodes structurally
+// but the decode wrapper refuses it, so it can never reach the submit checks.
+#[test]
+fn cognitive_record_version_check_refuses_foreign_attempt_schema() {
+    let record =
+        versioned_attempt_record("eliot-cognitive-run-v1").expect("fixture must decode");
+    let error =
+        require_cognitive_record_version(&record).expect_err("foreign version must be refused");
+    assert!(
+        error.to_string().contains("cognitive_run_attempt"),
+        "refusal must name the refused record kind: {error}"
+    );
+}

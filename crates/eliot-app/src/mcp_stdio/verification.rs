@@ -382,7 +382,7 @@ pub(super) async fn dispatch_agent_candidate_submit(
             anyhow::bail!("candidate submission differs from its cognitive capability binding");
         }
         let attempt_revision = u64::from(capability.call_number) * 2 - 1;
-        let attempt = cognitive_record_by_revision::<CognitiveRunAttempt>(
+        let attempt = cognitive_run_record_by_revision::<CognitiveRunAttempt>(
             state,
             project_id,
             task_id,
@@ -399,7 +399,7 @@ pub(super) async fn dispatch_agent_candidate_submit(
         {
             anyhow::bail!("cognitive candidate capability is stale or differs from its attempt");
         }
-        if cognitive_record_by_revision::<CognitiveRunTerminal>(
+        if cognitive_run_record_by_revision::<CognitiveRunTerminal>(
             state,
             project_id,
             task_id,

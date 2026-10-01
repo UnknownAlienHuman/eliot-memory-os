@@ -150,6 +150,9 @@ use eliot_types::{
     WorktreeLeaseRequestId, WorktreeLeaseState, WriteId, WriteReceipt, WriteReceiptRef,
     WriteStatus, operator_contract_hash,
 };
+use eliot_types::cognitive_run::{
+    CognitiveRunSchemaVersioned, require_current_cognitive_run_schema,
+};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -2651,7 +2654,7 @@ impl McpDaemon {
             anyhow::bail!("cognitive capability call_number is outside the exact plan");
         }
         let attempt_revision = u64::from(capability.call_number) * 2 - 1;
-        let attempt = cognitive_record_by_revision::<CognitiveRunAttempt>(
+        let attempt = cognitive_run_record_by_revision::<CognitiveRunAttempt>(
             &self.cognitive_child,
             capability.project_id,
             capability.task_id,
@@ -2667,7 +2670,7 @@ impl McpDaemon {
         {
             anyhow::bail!("cognitive capability differs from the canonical attempting call");
         }
-        if cognitive_record_by_revision::<CognitiveRunTerminal>(
+        if cognitive_run_record_by_revision::<CognitiveRunTerminal>(
             &self.cognitive_child,
             capability.project_id,
             capability.task_id,
