@@ -9438,6 +9438,20 @@ impl KernelComposition {
         // enumerates, revalidates by the envelope's recorded hash, and reconciles
         // by operation identity into either the canonical receipt or a durable
         // Recovery Problem whenever ORS does hold one.
+        // A ReadyAttach pull, when present, retains the exact prepared
+        // transition and canonical request hash before this normal apply
+        // reaches the Store. This is only an expected-request commitment; it
+        // does not claim the W3 reserved-write protocol ran.
+        if let Err(error) = self.p07_ors.bind_blob_process_stream_ready_write(
+            operation.transition.identity.operation_id.as_str(),
+            &operation.transition,
+        ) {
+            return Ok(Self::store_staging_refusal_response(
+                "write_receipt",
+                operation.transition.identity.operation_id.as_str(),
+                &error.to_string(),
+            ));
+        }
         match gateway
             .apply(
                 &operation.context,

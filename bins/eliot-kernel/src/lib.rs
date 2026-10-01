@@ -1721,6 +1721,9 @@ impl KernelComposition {
             state: BlobProcessStreamOwnerFactsPullState::Pending,
             response_json: None,
             response_sha256: None,
+            prepared_write_transition_json: None,
+            prepared_write_transition_sha256: None,
+            prepared_write_canonical_request_hash: None,
         };
         self.p07_ors
             .persist_blob_process_stream_owner_facts_pull(&pull_record)
@@ -1971,6 +1974,9 @@ impl KernelComposition {
             state: BlobProcessStreamOwnerFactsPullState::Pending,
             response_json: None,
             response_sha256: None,
+            prepared_write_transition_json: None,
+            prepared_write_transition_sha256: None,
+            prepared_write_canonical_request_hash: None,
         };
         self.p07_ors
             .persist_blob_process_stream_owner_facts_pull(&record)

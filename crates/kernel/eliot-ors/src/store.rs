@@ -5881,6 +5881,106 @@ impl RedbRecoveryStore {
             .transpose()
     }
 
+    /// Retains the exact normal prepared transition for a matching pending
+    /// ReadyAttach pull before its canonical Store effect is dispatched.
+    /// This records the expected canonical request commitment only; it does
+    /// not claim that a reserved-write protocol was used.
+    pub fn bind_blob_process_stream_ready_write(
+        &self,
+        operation_id: &str,
+        prepared: &eliot_store_api::PreparedTransition,
+    ) -> Result<Option<BlobProcessStreamOwnerFactsPullRecord>, OrsError> {
+        crate::model::validate_text(operation_id, "blob_ready_operation_id")?;
+        prepared.validate().map_err(|error| OrsError::Contract(format!(
+            "ReadyAttach prepared transition is invalid: {error}"
+        )))?;
+        if prepared.identity.operation_id.as_str() != operation_id {
+            return Err(OrsError::InvalidField {
+                field: "blob_ready_operation_id",
+                reason: "must equal the prepared transition operation identity",
+            });
+        }
+        let prepared_json = serde_json::to_string(prepared)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let prepared_sha256 = sha256_hex(prepared_json.as_bytes());
+        let request_hash = prepared.identity.canonical_request_hash.clone();
+        let write = self.database.begin_write().map_err(storage)?;
+        let result = {
+            let mut table = write
+                .open_table(BLOB_PROCESS_STREAM_OWNER_FACTS_PULLS)
+                .map_err(storage)?;
+            let mut matching: Option<BlobProcessStreamOwnerFactsPullRecord> = None;
+            for row in table.iter().map_err(storage)? {
+                let (key, value) = row.map_err(storage)?;
+                let record: BlobProcessStreamOwnerFactsPullRecord = decode(value.value())?;
+                record.validate()?;
+                if key.value() != record.pull_ref {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "blob_process_stream_owner_facts_pull",
+                        reason: "pull reference does not match its table key".to_owned(),
+                    });
+                }
+                let request: serde_json::Value = serde_json::from_str(&record.request_json)
+                    .map_err(|_| OrsError::InvalidField {
+                        field: "blob_process_stream_pull_request_json",
+                        reason: "must remain a typed object",
+                    })?;
+                let is_match = request.get("purpose").and_then(serde_json::Value::as_str)
+                    == Some("READY_ATTACH")
+                    && request
+                        .get("ready_operation_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(operation_id);
+                if is_match {
+                    if matching.replace(record).is_some() {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: "blob_process_stream_owner_facts_pull",
+                            reason: "ReadyAttach operation matches more than one pull".to_owned(),
+                        });
+                    }
+                }
+            }
+            let Some(mut record) = matching else {
+                return Ok(None);
+            };
+            if record.state != BlobProcessStreamOwnerFactsPullState::Pending {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "blob_process_stream_owner_facts_pull",
+                    reason: "ReadyAttach write cannot be bound after pull completion".to_owned(),
+                });
+            }
+            match (
+                &record.prepared_write_transition_json,
+                &record.prepared_write_transition_sha256,
+                &record.prepared_write_canonical_request_hash,
+            ) {
+                (None, None, None) => {
+                    record.prepared_write_transition_json = Some(prepared_json);
+                    record.prepared_write_transition_sha256 = Some(prepared_sha256);
+                    record.prepared_write_canonical_request_hash = Some(request_hash);
+                    record.validate()?;
+                    let payload = encode(&record)?;
+                    table
+                        .insert(record.pull_ref.as_str(), payload.as_str())
+                        .map_err(storage)?;
+                }
+                (Some(existing_json), Some(existing_sha256), Some(existing_hash))
+                    if existing_json == &prepared_json
+                        && existing_sha256 == &prepared_sha256
+                        && existing_hash == &request_hash => {}
+                _ => {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "blob_process_stream_owner_facts_pull",
+                        reason: "ReadyAttach prepared request changed during replay".to_owned(),
+                    });
+                }
+            }
+            record
+        };
+        write.commit().map_err(storage)?;
+        Ok(Some(result))
+    }
+
     /// Completes one pending owner-facts pull with the exact bounded typed
     /// response JSON. Idempotent same-response acknowledgement is safe.
     pub fn complete_blob_process_stream_owner_facts_pull(

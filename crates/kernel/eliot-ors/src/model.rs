@@ -1311,6 +1311,17 @@ pub struct BlobProcessStreamOwnerFactsPullRecord {
     pub response_json: Option<String>,
     /// SHA-256 of `response_json`.
     pub response_sha256: Option<String>,
+    /// Exact normal prepared transition retained before a matching ReadyAttach
+    /// effect is sent to the Store. This is an expected-request commitment,
+    /// not evidence that a reserved-write protocol was used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_write_transition_json: Option<String>,
+    /// SHA-256 of the exact canonical prepared transition above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_write_transition_sha256: Option<String>,
+    /// Canonical request hash carried by that exact prepared transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_write_canonical_request_hash: Option<String>,
 }
 
 impl BlobProcessStreamOwnerFactsPullRecord {
@@ -1332,6 +1343,72 @@ impl BlobProcessStreamOwnerFactsPullRecord {
                 field: "blob_process_stream_pull_request_sha256",
                 reason: "request digest does not match exact request JSON",
             });
+        }
+        match (
+            &self.prepared_write_transition_json,
+            &self.prepared_write_transition_sha256,
+            &self.prepared_write_canonical_request_hash,
+        ) {
+            (None, None, None) => {}
+            (Some(transition), Some(transition_sha256), Some(request_hash)) => {
+                validate_digest(
+                    transition_sha256,
+                    "blob_process_stream_prepared_write_transition_sha256",
+                )?;
+                validate_digest(
+                    request_hash,
+                    "blob_process_stream_prepared_write_canonical_request_hash",
+                )?;
+                validate_bounded_canonical_json(
+                    transition,
+                    MAX_BLOB_PROCESS_STREAM_OWNER_FACTS_JSON_BYTES,
+                    "blob_process_stream_prepared_write_transition_json",
+                )?;
+                if sha256_hex(transition.as_bytes()) != transition_sha256 {
+                    return Err(OrsError::InvalidField {
+                        field: "blob_process_stream_prepared_write_transition_sha256",
+                        reason: "transition digest does not match exact JSON",
+                    });
+                }
+                let prepared: eliot_store_api::PreparedTransition =
+                    serde_json::from_str(transition).map_err(|_| OrsError::InvalidField {
+                        field: "blob_process_stream_prepared_write_transition_json",
+                        reason: "must decode as a prepared transition",
+                    })?;
+                prepared.validate().map_err(|_| OrsError::InvalidField {
+                    field: "blob_process_stream_prepared_write_transition_json",
+                    reason: "prepared transition must validate",
+                })?;
+                if prepared.identity.canonical_request_hash != *request_hash {
+                    return Err(OrsError::InvalidField {
+                        field: "blob_process_stream_prepared_write_canonical_request_hash",
+                        reason: "does not match prepared transition identity",
+                    });
+                }
+                let request: serde_json::Value = serde_json::from_str(&self.request_json)
+                    .map_err(|_| OrsError::InvalidField {
+                        field: "blob_process_stream_pull_request_json",
+                        reason: "must remain a typed object",
+                    })?;
+                if request.get("purpose").and_then(serde_json::Value::as_str)
+                    != Some("READY_ATTACH")
+                    || request
+                        .get("ready_operation_id")
+                        .and_then(serde_json::Value::as_str)
+                        != Some(prepared.identity.operation_id.as_str())
+                {
+                    return Err(OrsError::InvalidField {
+                        field: "blob_process_stream_prepared_write_transition_json",
+                        reason: "must bind the ReadyAttach pull's exact operation identity",
+                    });
+                }
+            }
+            _ => {
+                return Err(OrsError::InvalidField {
+                    field: "blob_process_stream_prepared_write_transition_json",
+                    reason: "prepared write commitment fields must be present together",
+                });
+            }
         }
         match (&self.state, &self.response_json, &self.response_sha256) {
             (BlobProcessStreamOwnerFactsPullState::Pending, None, None) => {}
