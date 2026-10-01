@@ -86,6 +86,42 @@ impl UserAutomationServiceRequest {
         Ok(())
     }
 
+    /// Validates the authenticated, pre-seal schedule-normalization request.
+    ///
+    /// Normalization is a read-only owner operation, so it has no canonical
+    /// Store transition from which to derive `canonical_request_hash`. Its
+    /// retry identity is still validated and the hash must remain empty until a
+    /// later Create/Edit transition seals the exact returned receipt bytes.
+    pub fn validate_for_schedule_normalization(
+        &self,
+    ) -> Result<(), UserAutomationError> {
+        self.context
+            .validate()
+            .map_err(|_| UserAutomationError::Invalid("request.context"))?;
+        self.intent.validate_for_normalization_submission()?;
+        if self.identity.idempotency_key.trim().is_empty()
+            || self.identity.idempotency_key.len() > 256
+            || self.identity.idempotency_key.chars().any(char::is_control)
+            || self.identity.operation_id.as_str().trim().is_empty()
+            || !self.identity.canonical_request_hash.is_empty()
+        {
+            return Err(UserAutomationError::Invalid(
+                "request.schedule_normalization.identity",
+            ));
+        }
+        if self.intent.state_fence != self.context.state_fence {
+            return Err(UserAutomationError::Invalid(
+                "request.schedule_normalization.state_fence",
+            ));
+        }
+        if self.intent.principal_ref != self.authenticated_principal {
+            return Err(UserAutomationError::Invalid(
+                "request.schedule_normalization.principal",
+            ));
+        }
+        Ok(())
+    }
+
     fn store_request(&self) -> UserAutomationStoreRequest {
         UserAutomationStoreRequest {
             context: self.context.clone(),
@@ -429,7 +465,10 @@ fn validate_mutation_result(
 ) -> Result<(), UserAutomationServiceError> {
     match (operation, result) {
         (
-            UserAutomationOperation::Create { revision: expected },
+            UserAutomationOperation::Create {
+                revision: expected,
+                ..
+            },
             UserAutomationMutationResult::Revision {
                 revision,
                 cancelled_wake_ids,
@@ -439,6 +478,7 @@ fn validate_mutation_result(
             UserAutomationOperation::Edit {
                 previous_revision,
                 revision: expected,
+                ..
             },
             UserAutomationMutationResult::Revision {
                 revision,
