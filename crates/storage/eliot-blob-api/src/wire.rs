@@ -551,6 +551,82 @@ pub struct BlobProcessStreamOwnerFactsPullResponse {
     pub outcome: BlobProcessStreamOwnerFactsPullOutcome,
 }
 
+/// Exact owner-provided metadata needed to mint Blob contexts at the retained
+/// Store owner. Each nested value is canonical JSON from its named owner and
+/// is re-decoded by that owner into its closed contract type before use.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobProcessStreamVerifiedOwnerFacts {
+    /// Current WorkScope binding snapshot JSON.
+    pub work_scope_binding_json: String,
+    /// SHA-256 of the exact WorkScope binding snapshot JSON.
+    pub work_scope_binding_sha256: String,
+    /// Matched WorkScope guard receipt JSON.
+    pub matched_guard_receipt_json: String,
+    /// SHA-256 of the exact matched guard receipt JSON.
+    pub matched_guard_receipt_sha256: String,
+    /// Independently resolved canonical source receipt JSON.
+    pub canonical_source_receipt_json: String,
+    /// SHA-256 of the exact canonical source receipt JSON.
+    pub canonical_source_receipt_sha256: String,
+    /// Selected policy contract JSON.
+    pub policy_json: String,
+    /// SHA-256 of the exact policy contract JSON.
+    pub policy_sha256: String,
+    /// Full residency selection JSON.
+    pub residency_json: String,
+    /// SHA-256 of the exact residency selection JSON.
+    pub residency_sha256: String,
+    /// Existing causal parent or named genesis JSON.
+    pub causal_binding_json: String,
+    /// SHA-256 of the exact causal binding JSON.
+    pub causal_binding_sha256: String,
+    /// Current Authority binding JSON.
+    pub authority_binding_json: String,
+    /// SHA-256 of the exact authority binding JSON.
+    pub authority_binding_sha256: String,
+    /// Owner-computed digest over the exact currentness input set.
+    pub currentness_sha256: String,
+}
+
+impl BlobProcessStreamVerifiedOwnerFacts {
+    /// Validates canonical bounded values and every exact content digest.
+    pub fn validate(&self) -> Result<(), WireValidationError> {
+        for (name, json, digest) in [
+            (
+                "work_scope_binding",
+                &self.work_scope_binding_json,
+                &self.work_scope_binding_sha256,
+            ),
+            (
+                "matched_guard_receipt",
+                &self.matched_guard_receipt_json,
+                &self.matched_guard_receipt_sha256,
+            ),
+            (
+                "canonical_source_receipt",
+                &self.canonical_source_receipt_json,
+                &self.canonical_source_receipt_sha256,
+            ),
+            ("policy", &self.policy_json, &self.policy_sha256),
+            ("residency", &self.residency_json, &self.residency_sha256),
+            (
+                "causal_binding",
+                &self.causal_binding_json,
+                &self.causal_binding_sha256,
+            ),
+            (
+                "authority_binding",
+                &self.authority_binding_json,
+                &self.authority_binding_sha256,
+            ),
+        ] {
+            validate_canonical_owner_json(name, json, digest)?;
+        }
+        validate_digest("currentness_sha256", &self.currentness_sha256)
+    }
+}
+
 /// Closed owner-facts pull disposition.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
@@ -586,6 +662,17 @@ pub enum BlobProcessStreamOwnerFactsPullOutcome {
         authority_sha256: String,
         /// Owner-compiled currentness digest over all facts above.
         currentness_sha256: String,
+        /// Canonical typed owner-facts material, digest-bound by
+        /// `owner_facts_sha256`.
+        owner_facts_json: String,
+        /// Fresh independently read ModuleCatalog owner readback JSON.
+        module_catalog_owner_readback_json: String,
+        /// SHA-256 of the exact ModuleCatalog owner readback JSON.
+        module_catalog_owner_readback_sha256: String,
+        /// Exact selected accepted GenerationAdmission JSON.
+        generation_admission_json: String,
+        /// SHA-256 of the exact GenerationAdmission JSON.
+        generation_admission_sha256: String,
     },
     /// The owner lacks one or more independent facts or the exact binding is stale.
     Unavailable {
@@ -646,6 +733,11 @@ impl BlobProcessStreamOwnerFactsPullResponse {
             authority_ref,
             authority_sha256,
             currentness_sha256,
+            owner_facts_json,
+            module_catalog_owner_readback_json,
+            module_catalog_owner_readback_sha256,
+            generation_admission_json,
+            generation_admission_sha256,
         } = &self.outcome
         {
             for (field, value) in [
@@ -670,8 +762,40 @@ impl BlobProcessStreamOwnerFactsPullResponse {
                 ("causal_receipt_sha256", causal_receipt_sha256),
                 ("authority_sha256", authority_sha256),
                 ("currentness_sha256", currentness_sha256),
+                ("module_catalog_owner_readback_sha256", module_catalog_owner_readback_sha256),
+                ("generation_admission_sha256", generation_admission_sha256),
             ] {
                 validate_digest(field, value)?;
+            }
+            validate_canonical_owner_json(
+                "module_catalog_owner_readback",
+                module_catalog_owner_readback_json,
+                module_catalog_owner_readback_sha256,
+            )?;
+            validate_canonical_owner_json(
+                "generation_admission",
+                generation_admission_json,
+                generation_admission_sha256,
+            )?;
+            let owner_facts: BlobProcessStreamVerifiedOwnerFacts = serde_json::from_str(
+                owner_facts_json,
+            )
+            .map_err(|_| WireValidationError::InvalidField("owner_facts_json"))?;
+            owner_facts.validate()?;
+            if serde_json::to_string(&owner_facts).ok().as_deref()
+                != Some(owner_facts_json.as_str())
+                || owner_facts_json.len() > 128 * 1024
+                || sha256_hex(owner_facts_json.as_bytes()) != *owner_facts_sha256
+                || owner_facts.work_scope_binding_sha256 != *work_scope_snapshot_sha256
+                || owner_facts.matched_guard_receipt_sha256 != *matched_guard_receipt_sha256
+                || owner_facts.canonical_source_receipt_sha256 != *canonical_source_receipt_sha256
+                || owner_facts.policy_sha256 != *policy_sha256
+                || owner_facts.residency_sha256 != *residency_sha256
+                || owner_facts.causal_binding_sha256 != *causal_receipt_sha256
+                || owner_facts.authority_binding_sha256 != *authority_sha256
+                || owner_facts.currentness_sha256 != *currentness_sha256
+            {
+                return Err(WireValidationError::InvalidField("owner_facts_commitment"));
             }
         }
         let encoded = serde_json::to_vec(self)
@@ -1421,6 +1545,24 @@ fn validate_digest(field: &'static str, value: &str) -> Result<(), WireValidatio
     } else {
         Ok(())
     }
+}
+
+fn validate_canonical_owner_json(
+    field: &'static str,
+    json: &str,
+    digest: &str,
+) -> Result<(), WireValidationError> {
+    validate_digest(field, digest)?;
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|_| WireValidationError::InvalidField(field))?;
+    if json.len() > 16 * 1024
+        || !matches!(&value, serde_json::Value::Object(_))
+        || serde_json::to_string(&value).as_bytes() != json.as_bytes()
+        || sha256_hex(json.as_bytes()) != digest
+    {
+        return Err(WireValidationError::InvalidField(field));
+    }
+    Ok(())
 }
 
 fn json_object(value: &str) -> bool {
