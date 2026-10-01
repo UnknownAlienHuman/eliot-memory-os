@@ -596,7 +596,7 @@ fn request(
         key.clone(),
         format!("opaque-{operation_id}").into_bytes(),
     )?;
-    let envelope = envelope.with_write_binding(RecoveryWriteBinding {
+    let write_binding = RecoveryWriteBinding {
         write_envelope_protocol_version: 1,
         recovery_envelope_contract_version: envelope.contract_version,
         recovery_access_class,
@@ -616,7 +616,8 @@ fn request(
         protected_payload_sha256: envelope.payload_sha256.clone(),
         protected_payload_length: envelope.payload_length,
         payload_key_reference: key,
-    })?;
+    };
+    let envelope = envelope.with_write_binding(write_binding)?;
     Ok(ReservationRequest {
         reservation_id: label(reservation_id)?,
         envelope,
