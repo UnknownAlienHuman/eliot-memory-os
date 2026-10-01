@@ -102,6 +102,22 @@ pub async fn maintain_governor_authority_observation(
     kernel: &Arc<DaemonKernelClient>,
     observation: &GovernorAuthorityObservation,
 ) -> Result<Option<u64>, CompositionError> {
+    Ok(maintain_governor_authority_observation_inner(
+        composition,
+        kernel,
+        observation,
+        None,
+    )
+    .await?
+    .map(|(revision, _, _)| revision))
+}
+
+async fn maintain_governor_authority_observation_inner(
+    composition: &mut DaemonComposition,
+    kernel: &Arc<DaemonKernelClient>,
+    observation: &GovernorAuthorityObservation,
+    last_acknowledged: Option<&AcknowledgedProjection>,
+) -> Result<Option<(u64, bool, String)>, CompositionError> {
     let authority = composition
         .governor_authority_mut()
         .map_err(|error| match error {
@@ -114,6 +130,13 @@ pub async fn maintain_governor_authority_observation(
     let Some(projection) = projection else {
         return Ok(None);
     };
+    let revision = projection.revision();
+    let fingerprint = projection.fingerprint().to_owned();
+    if last_acknowledged.is_some_and(|acknowledged| {
+        acknowledged.revision == revision && acknowledged.fingerprint == fingerprint
+    }) {
+        return Ok(Some((revision, false, fingerprint)));
+    }
     let source_selectors = match &observation.source {
         SourceReadback::Available { selectors, .. } => Some(serde_json::json!({
             "after_owner_sequence": selectors.after_owner_sequence,
@@ -123,7 +146,7 @@ pub async fn maintain_governor_authority_observation(
         SourceReadback::Unavailable { .. } => None,
     };
     let revision = publish_projection(kernel, &projection, source_selectors).await?;
-    Ok(Some(revision))
+    Ok(Some((revision, true, fingerprint)))
 }
 
 /// Reads one owner-scoped page using only bounded continuation fields and
@@ -249,6 +272,9 @@ async fn read_governor_authority_observation(
 pub enum GovernorAuthorityDriveOutcome {
     /// The feed derived and the Kernel recorded `revision`.
     FeedPublished { revision: u64 },
+    /// The source page derived the already acknowledged exact projection, so
+    /// strict Kernel revision ordering requires no duplicate publish.
+    FeedUnchanged { revision: u64 },
     /// No owner-issued observation exists, so nothing was published.
     SkippedNoObservation,
 }
@@ -264,6 +290,13 @@ pub struct GovernorAuthorityDriver {
     after_owner_sequence: u64,
     after_event_sequence: u64,
     last_adapter_descriptor: Option<String>,
+    last_acknowledged: Option<AcknowledgedProjection>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AcknowledgedProjection {
+    revision: u64,
+    fingerprint: String,
 }
 
 impl GovernorAuthorityDriver {
@@ -282,7 +315,7 @@ impl GovernorAuthorityDriver {
         composition: &mut DaemonComposition,
         kernel: &Arc<DaemonKernelClient>,
     ) -> Result<GovernorAuthorityDriveOutcome, CompositionError> {
-        let observation = read_governor_authority_observation(
+        let mut observation = read_governor_authority_observation(
             kernel,
             self.after_owner_sequence,
             self.after_event_sequence,
@@ -300,33 +333,53 @@ impl GovernorAuthorityDriver {
         if adapter_changed {
             self.after_owner_sequence = 0;
             self.after_event_sequence = 0;
+            observation = read_governor_authority_observation(kernel, 0, 0).await;
         }
+        let adapter_descriptor = observation
+            .adapter
+            .as_ref()
+            .map(|adapter| adapter.descriptor_sha256.clone());
         if let Some(descriptor) = adapter_descriptor {
             self.last_adapter_descriptor = Some(descriptor);
         }
-        match &observation.source {
+        let (next_owner_sequence, next_event_sequence) = match &observation.source {
             SourceReadback::Available { next, .. } => {
-                if !adapter_changed {
-                    if let Some(next) = next {
-                        self.after_owner_sequence = next.after_owner_sequence;
-                        self.after_event_sequence = next.after_event_sequence;
-                    } else {
-                        self.after_owner_sequence = 0;
-                        self.after_event_sequence = 0;
-                    }
-                }
+                next.as_ref().map_or((0, 0), |next| {
+                    (next.after_owner_sequence, next.after_event_sequence)
+                })
             }
-            SourceReadback::Unavailable { .. } => {
+            SourceReadback::Unavailable { .. } => (0, 0),
+        };
+        let result = maintain_governor_authority_observation_inner(
+            composition,
+            kernel,
+            &observation,
+            self.last_acknowledged.as_ref(),
+        )
+        .await;
+        let Some((revision, published, fingerprint)) = match result {
+            Ok(result) => result,
+            Err(error) => {
                 self.after_owner_sequence = 0;
                 self.after_event_sequence = 0;
+                return Err(error);
             }
-        }
-        let Some(revision) =
-            maintain_governor_authority_observation(composition, kernel, &observation).await?
-        else {
+        } else {
+            self.after_owner_sequence = 0;
+            self.after_event_sequence = 0;
             return Ok(GovernorAuthorityDriveOutcome::SkippedNoObservation);
         };
-        Ok(GovernorAuthorityDriveOutcome::FeedPublished { revision })
+        self.after_owner_sequence = next_owner_sequence;
+        self.after_event_sequence = next_event_sequence;
+        if published {
+            self.last_acknowledged = Some(AcknowledgedProjection {
+                revision,
+                fingerprint,
+            });
+            Ok(GovernorAuthorityDriveOutcome::FeedPublished { revision })
+        } else {
+            Ok(GovernorAuthorityDriveOutcome::FeedUnchanged { revision })
+        }
     }
 }
 
