@@ -26,14 +26,13 @@ use eliot_store_api::epistemic_revision::{EpistemicCommit, position_key};
 use eliot_store_api::{
     AUTOMATION_QUERY_CURRENT, AUTOMATION_QUERY_FAILURE, AUTOMATION_QUERY_HISTORY,
     AUTOMATION_QUERY_INVOCATIONS, AUTOMATION_QUERY_LIST, AUTOMATION_QUERY_NORMALIZATION,
-    AUTOMATION_STATE_RETIRED,
-    CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, CommitId,
-    DecodedAutomationMutation, DecodedNotificationMutation, DecodedReactiveMutation,
-    ERASURE_PARAM_DEADLINE_UNIX_MS, ERASURE_PARAM_ENCRYPTION_KEY_REF, ERASURE_PARAM_OPERATION_ID,
-    ERASURE_PARAM_PAYLOAD_REF, ERASURE_PARAM_SUBJECT, ERASURE_PARAM_SURFACES,
-    EVIDENCE_PACK_MAX_RECORDS, EventId, EventProjectionRelationIntents, MAX_RECOVERY_RECORD_BYTES,
-    NamedMutationOperation, NamedReadOperation, NamedReadRequest, NamedReadResponse,
-    OWNER_SNAPSHOT_SCHEMA, OperationId, OperationManifestDigest, OrderingHead,
+    AUTOMATION_STATE_RETIRED, CanonicalRequestView, CanonicalStoreClient,
+    CanonicalValidationSnapshot, CommitId, DecodedAutomationMutation, DecodedNotificationMutation,
+    DecodedReactiveMutation, ERASURE_PARAM_DEADLINE_UNIX_MS, ERASURE_PARAM_ENCRYPTION_KEY_REF,
+    ERASURE_PARAM_OPERATION_ID, ERASURE_PARAM_PAYLOAD_REF, ERASURE_PARAM_SUBJECT,
+    ERASURE_PARAM_SURFACES, EVIDENCE_PACK_MAX_RECORDS, EventId, EventProjectionRelationIntents,
+    MAX_RECOVERY_RECORD_BYTES, NamedMutationOperation, NamedReadOperation, NamedReadRequest,
+    NamedReadResponse, OWNER_SNAPSHOT_SCHEMA, OperationId, OperationManifestDigest, OrderingHead,
     OrderingHeadExpectation, OrderingScopeId, OutboxId, OutboxIntent, OutboxState,
     PreparedTransition, ProjectionMode, ProjectionPublicationId, ProjectionPublicationRecord,
     ProjectionStatus, RecoveryRecord, RecoveryRecordKey, RequestMeta, Resubmission, RevisionDelta,
@@ -1514,10 +1513,9 @@ fn retain_automation_normalization(
     normalization_request_json: String,
     normalization_receipt_json: Value,
 ) -> Result<Value, StoreError> {
-    let normalization_receipt_json = validate_automation_normalization_envelope(Some(
-        normalization_receipt_json,
-    ))?
-    .ok_or(StoreError::InvalidReceipt)?;
+    let normalization_receipt_json =
+        validate_automation_normalization_envelope(Some(normalization_receipt_json))?
+            .ok_or(StoreError::InvalidReceipt)?;
     let row = AutomationNormalizationRow {
         automation_id,
         revision,
@@ -2773,9 +2771,7 @@ fn automation_state_payload(
         let entries = state
             .automation_normalizations
             .get(&automation_revision_key(automation_id, revision))
-            .filter(|row| {
-                row.state_fence == *fence && row.scope_id == scope_id.as_str()
-            })
+            .filter(|row| row.state_fence == *fence && row.scope_id == scope_id.as_str())
             .map(|row| {
                 json!({
                     "automation_id": row.automation_id,

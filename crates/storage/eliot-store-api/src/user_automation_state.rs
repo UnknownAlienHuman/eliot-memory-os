@@ -1291,9 +1291,7 @@ pub fn decode_automation_mutation(
                 revision: text_of(AUTOMATION_PARAM_REVISION)?,
                 revision_json: text_of(AUTOMATION_PARAM_REVISION_JSON)?,
                 normalization_receipt_json,
-                normalization_request_json: text_of(
-                    AUTOMATION_PARAM_NORMALIZATION_REQUEST_JSON,
-                )?,
+                normalization_request_json: text_of(AUTOMATION_PARAM_NORMALIZATION_REQUEST_JSON)?,
             })
         }
         AUTOMATION_OPERATION_CREATE => Ok(DecodedAutomationMutation::Create {
