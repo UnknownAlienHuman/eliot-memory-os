@@ -11,13 +11,23 @@
 //!
 //! # What this source reads
 //!
-//! The only owner record this process holds is the one the Kernel staged and the
-//! claim already proved: the closed semantic input, presented as the admitted
-//! [`DreamJobInput`](crate::DreamJobInput) beside the Kernel-issued
+//! Two owner records reach this process, and both are proved rather than
+//! assumed.
+//!
+//! The first is the closed semantic input the Kernel staged, presented as the
+//! admitted [`DreamJobInput`](crate::DreamJobInput) beside the Kernel-issued
 //! [`KernelJobAdmission`](crate::KernelJobAdmission). `staged_job_input`
 //! digest-verifies those bytes against the owner's own `semantic_input`
-//! reference at claim time, so what reaches this source is a real owner record
-//! rather than a locally built lookalike.
+//! reference at claim time.
+//!
+//! The second is the opaque, content-addressed owner record the Kernel
+//! published with the job
+//! (`KernelComposition::execute_dreamer_request` in
+//! bins/eliot-kernel/src/dreamer_job_dispatch.rs publishes it, the durable owner
+//! projects it, and `kernel_port::validate_owner_response_binding`
+//! re-proves the ORIGINAL recorded digest and byte length without recomputing
+//! them). This process records that record's presence, digest and byte length
+//! and does not decode it.
 //!
 //! # What it does not publish
 //!
@@ -28,10 +38,16 @@
 //! the requester, the identity and fence, the five evidence handle families,
 //! the declared conflicts and unknowns, the privacy profile, the allowed tools
 //! and model routes, the budget units, the deadline, the output schema, and the
-//! forbidden effects. It publishes no canonical projection set, no epistemic
-//! handle, and no stage-owner record: those are separate owner records, each
-//! published by its own owner through its own entry, and the Kernel hands this
-//! worker only the semantic input.
+//! forbidden effects.
+//!
+//! The opaque owner record publishes no member either. It is a content
+//! ADDRESS, not a typed value: `eliot-protocol` deliberately carries it without
+//! a dependency on the crate that types the CC-004 projection set, so nothing in
+//! this binary can decode it into a `CanonicalProjectionSet`, an epistemic
+//! handle, or a stage-owner record. Until a typed seam exists, the record's
+//! presence is a fact about the channel and not about any member — and treating
+//! it as one would be exactly the fabricated member this channel refuses to
+//! produce.
 //!
 //! # Consequence, stated rather than papered over
 //!
@@ -100,9 +116,11 @@ impl OrientationSupplySource for KernelStagedOwnerRecordSource {
     /// under this claim.
     ///
     /// It then reports the measured absence of the carrier's mandatory member
-    /// set, which is the only honest answer for the closed semantic input; see
-    /// the module documentation for the measured record-by-record reason and
-    /// for why no present-channel arm exists.
+    /// set. That is still the only honest answer after the owner record opened
+    /// the channel: the record proves the channel carries an owner-published
+    /// reference, not that the reference names a typed member this binary can
+    /// supply. See the module documentation for the measured record-by-record
+    /// reason and for why no present-channel arm exists.
     fn resolve_supply<'s>(
         &'s self,
         admission: &KernelJobAdmission,
