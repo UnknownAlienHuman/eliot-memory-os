@@ -39,7 +39,7 @@ use eliot_kernel_service::{
 use eliot_platform::PlatformHandle;
 #[cfg(windows)]
 use eliot_platform_windows::profile_supervision::USER_MODE_SUPERVISOR_SWITCH;
-use host_console_protocol::{Request, Response, write_response};
+use host_console_protocol::{Request, Response, console_run_ok, write_response};
 
 static PROCESS_BOOTSTRAP: OnceLock<Result<HostLaunchOptions, String>> = OnceLock::new();
 
@@ -598,8 +598,12 @@ fn run_console() -> (bool, Option<HostLaunchOptions>) {
         service: SERVICE_NAME,
         protocol: PROTOCOL_VERSION,
     }) {
+        // Audit 5910117501 item 1 (cases 9, 11): the Ready write is the
+        // primary console outcome. Drain exactly once, but the failure stays
+        // failure even when cleanup succeeds, so `main` still emits the
+        // existing `console_failed` terminal/capsule/exit.
         let drained = finish_console_shutdown(&mut host, "ready response failed", &launch_options);
-        return (drained, Some(launch_options));
+        return (console_run_ok(false, drained), Some(launch_options));
     }
     // F-LOG-HOST-7 B7 (issue #982): Ready bytes unchanged; this record never
     // promotes Ready into durable/global readiness (I01.10).
@@ -608,6 +612,10 @@ fn run_console() -> (bool, Option<HostLaunchOptions>) {
         "ready_written",
     );
     observe_console_ready(&host, &launch_options);
+    // Audit 5910117501 item 1 (cases 8, 9, 11): the primary console outcome
+    // tracked separately from the single drain below. A read/write/protocol
+    // failure sets this; the run then stays failed even if cleanup succeeds.
+    let mut primary_failed = false;
     for line in io::stdin().lock().lines() {
         let (response, terminate, served) = match line {
             // Blank input still skips silently by design: not a failure, so
@@ -615,6 +623,7 @@ fn run_console() -> (bool, Option<HostLaunchOptions>) {
             Ok(line) if line.trim().is_empty() => continue,
             Ok(line) => dispatch(&mut host, &line, &launch_options),
             Err(error) => {
+                primary_failed = true;
                 // F-LOG-HOST-7 B8 (issue #982): read failure keeps Error plus
                 // terminate; the raw error text stays out of diagnostics.
                 eliot_host::host_diagnostics::observe_entrypoint_with_detail(
@@ -640,8 +649,10 @@ fn run_console() -> (bool, Option<HostLaunchOptions>) {
         };
         // F-LOG-HOST-7 B10 (issue #982): write failure breaks to the identical
         // shutdown path; the condition is split only to observe it, preserving
-        // evaluation order and outcome.
+        // evaluation order and outcome. The failure flag keeps this primary
+        // failure failed even when the drain below succeeds (item 1).
         if !write_response(&response) {
+            primary_failed = true;
             eliot_host::host_diagnostics::observe_entrypoint_with_detail(
                 eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
                 "response_write_failed",
@@ -662,7 +673,7 @@ fn run_console() -> (bool, Option<HostLaunchOptions>) {
         }
     }
     let drained = finish_console_shutdown(&mut host, "console input ended", &launch_options);
-    (drained, Some(launch_options))
+    (console_run_ok(!primary_failed, drained), Some(launch_options))
 }
 
 /// Runs the one admitted current-user profile supervisor.
