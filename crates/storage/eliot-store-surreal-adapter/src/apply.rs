@@ -55,6 +55,7 @@ pub(crate) mod surreal_notification;
 pub(crate) mod surreal_reactive;
 pub(crate) mod surreal_swarm;
 pub(crate) mod surreal_task_acceptance;
+pub(crate) mod surreal_proposed_attempt;
 use atomic_write::{
     ErasureInTx, TxLane, erasure_in_tx_parts, read_sealed_erasure_outcomes, to_value,
     write_canonical_transaction_with_expected_heads,
