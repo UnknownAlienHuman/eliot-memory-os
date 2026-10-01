@@ -2,7 +2,9 @@
 //!
 //! Per-operation `validate → service-gate → ORS-stage → receipt` handlers for
 //! registration, claim, ready, heartbeat, checkpoint, result submission, and
-//! cancellation observation. Ordering mirrors
+//! cancellation observation, plus the read-only provider-capability
+//! claim-row projection (`native_worker.provider_capability.claim_row.read`,
+//! issue #1108). Ordering mirrors
 //! [`crate::KernelComposition::admit_host_request_envelope`] (admit, cancel,
 //! reconcile, rehydrate): the durable record is staged before any receipt is
 //! returned, an exact replay returns the same receipt, and a changed binding
@@ -56,6 +58,7 @@ use eliot_kernel_service::{
     KernelServiceError, NATIVE_WORKER_CLAIM_WIRE_ID, NATIVE_WORKER_CLAIM_WIRE_VERSION,
     NATIVE_WORKER_CLAIM_WIRE_VERSION_V1, NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION,
     NATIVE_WORKER_EXECUTION_UNIT_SCHEMA_VERSION, NATIVE_WORKER_PROTOCOL_VERSION,
+    PROVIDER_CAPABILITY_WIRE_VERSION,
     NativeWorkerClaimBudget, NativeWorkerClaimRequest, NativeWorkerClaimResponse,
     NativeWorkerExecutableBinding, NativeWorkerExecutableExpectation,
 };
@@ -90,10 +93,22 @@ pub(crate) const NATIVE_WORKER_CHECKPOINT_OPERATION: &str = "native_worker.check
 pub(crate) const NATIVE_WORKER_RESULT_SUBMIT_OPERATION: &str = "native_worker.result_submit";
 /// Observes cancellation for one exact attempt and fences it.
 pub(crate) const NATIVE_WORKER_CANCEL_OBSERVE_OPERATION: &str = "native_worker.cancel_observe";
+/// Reads the sealed durable claim-row projection bound to one exact claim
+/// identity (issue #1108, A4/A5 daemon row source).
+///
+/// Daemon-target operation issued by
+/// `bins/eliotd/src/daemon_kernel_client.rs::DaemonKernelClient::load_provider_claim_row_async`:
+/// the request carries only `wire_version` plus `claim_id`, and every
+/// projected field is loaded from the Kernel-held ORS row, never echoed from
+/// presented values. Read-only: mints no row, admits nothing.
+pub(crate) const NATIVE_WORKER_PROVIDER_CAPABILITY_CLAIM_ROW_READ_OPERATION: &str =
+    "native_worker.provider_capability.claim_row.read";
+/// Expected `kind` of the sealed claim-row read reply body (issue #1108).
+const PROVIDER_CAPABILITY_CLAIM_ROW_KIND: &str = "native_worker_provider_capability_claim_row";
 
-/// Returns true for the eight native-worker operations (seven lifecycle
-/// operations owned here plus reconciliation owned by the sibling
-/// `native_worker_reconcile_route` module).
+/// Returns true for the nine native-worker operations (seven lifecycle
+/// operations plus the claim-row read owned here, plus reconciliation owned
+/// by the sibling `native_worker_reconcile_route` module).
 ///
 /// Paired with the worker-side operation constants in
 /// `bins/eliot-native-worker/src/kernel_admission_client.rs`; both lists must
@@ -108,6 +123,7 @@ pub(crate) fn is_native_worker_operation(operation: &str) -> bool {
             | NATIVE_WORKER_CHECKPOINT_OPERATION
             | NATIVE_WORKER_RESULT_SUBMIT_OPERATION
             | NATIVE_WORKER_CANCEL_OBSERVE_OPERATION
+            | NATIVE_WORKER_PROVIDER_CAPABILITY_CLAIM_ROW_READ_OPERATION
             | NATIVE_WORKER_RECONCILE_OPERATION
     )
 }
@@ -986,6 +1002,7 @@ fn native_worker_operation_allows_degraded(operation: &str, payload: &serde_json
             | NATIVE_WORKER_CANCEL_OBSERVE_OPERATION
             | NATIVE_WORKER_RECONCILE_OPERATION
             | NATIVE_WORKER_RESULT_SUBMIT_OPERATION
+            | NATIVE_WORKER_PROVIDER_CAPABILITY_CLAIM_ROW_READ_OPERATION
     ) {
         return true;
     }
@@ -1067,6 +1084,23 @@ impl KernelComposition {
         frame: &Frame,
     ) -> Result<KernelFrameAction, TransportError> {
         let context = self.native_worker_frame_context(session, frame)?;
+        if context.operation == NATIVE_WORKER_PROVIDER_CAPABILITY_CLAIM_ROW_READ_OPERATION {
+            // The daemon row read carries no worker binding, generation, or
+            // process receipt, so the cell-currentness proof below cannot run
+            // for it (the daemon peer holds no process binding). The reply is
+            // sealed by digest instead; session/fence gates already ran in the
+            // frame context above.
+            let receipt = self
+                .handle_provider_capability_claim_row_read(&context.payload)
+                .map_err(NativeWorkerRouteError::into_transport)?;
+            let mut frame =
+                status_frame(session, FrameKind::Response, MessageType::Result, receipt)?;
+            frame.request_id = Some(context.request_id);
+            frame
+                .validate()
+                .map_err(|_| TransportError::SessionFenced)?;
+            return Ok(KernelFrameAction::Reply(frame));
+        }
         let current_proof = self
             .native_worker_cell_current_proof(
                 session,
@@ -3236,6 +3270,78 @@ impl KernelComposition {
         )
         .map_err(|_| NativeWorkerRouteError::Shape { field: "receipt" })?;
         Ok(receipt)
+    }
+
+    /// Reads the sealed durable claim-row projection for one exact claim
+    /// identity (issue #1108, A4/A5 daemon row source).
+    ///
+    /// The request carries only `wire_version` plus `claim_id`: every
+    /// projected field is loaded from the Kernel-held ORS row through the
+    /// existing [`KernelComposition::load_claim_record`] owner path, never
+    /// echoed from presented values. The retained row is re-validated with
+    /// the ORS owner's own `validate()` (shape plus state/receipt
+    /// coherence), and a row carrying no admission evidence — still
+    /// `Requested`, or without its immutable receipt — is refused as
+    /// unadmitted: the downstream factory row carries no state of its own,
+    /// so projecting a never-admitted row would let matching presented
+    /// halves mint admission without the Kernel ever admitting the claim.
+    /// Unknown identities stay `Unknown` (`UnknownRequest`); malformed
+    /// wire/identity, incoherent rows, unadmitted rows, and store failures
+    /// fail closed as `SessionFenced`. Read-only: mints no row, admits
+    /// nothing.
+    ///
+    /// Reply contract (shaped for `OwnerLoadedClaimRow::new`, sealed with
+    /// `receipt_digest` by [`seal_route_receipt`]): `kind` is
+    /// `native_worker_provider_capability_claim_row`, `wire_version` is the
+    /// capability wire version, then the exact durable fields `claim_id`,
+    /// `attempt_id`, `operation_id`, `binding_digest`,
+    /// `executable_binding_digest` (verbatim, empty where the staged row
+    /// predates the column), `worker_generation`, and `fence_digest`, plus
+    /// `read_at_unix_ms`.
+    fn handle_provider_capability_claim_row_read(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, NativeWorkerRouteError> {
+        let wire_version = payload
+            .get("wire_version")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(NativeWorkerRouteError::Shape {
+                field: "wire_version",
+            })?;
+        if wire_version != PROVIDER_CAPABILITY_WIRE_VERSION {
+            return Err(NativeWorkerRouteError::Shape {
+                field: "wire_version",
+            });
+        }
+        let claim_id = require_op_id(payload, "claim_id")?;
+        let row = self.load_claim_record(&claim_id)?;
+        row.validate()
+            .map_err(|_| NativeWorkerRouteError::Fence {
+                field: "durable_claim",
+            })?;
+        // Same admission-evidence rule as the ORS owner's
+        // `verified_executable_binding_digest`: an unadmitted intent verifies
+        // nothing. Terminal rows keep their admission evidence and project
+        // verbatim; revocation is enforced per proof downstream.
+        if row.state == NativeWorkerClaimState::Requested
+            || row.receipt_digest.is_none()
+            || row.admitted_at_unix_ms.is_none()
+        {
+            return Err(NativeWorkerRouteError::Fence { field: "admission" });
+        }
+        seal_route_receipt(serde_json::json!({
+            "kind": PROVIDER_CAPABILITY_CLAIM_ROW_KIND,
+            "wire_version": PROVIDER_CAPABILITY_WIRE_VERSION,
+            "claim_id": row.claim_id.as_str(),
+            "attempt_id": row.attempt_id.as_str(),
+            "operation_id": row.operation_id.as_str(),
+            "binding_digest": row.binding_digest.as_str(),
+            "executable_binding_digest": row.executable_binding_digest.as_str(),
+            "worker_generation": row.worker_generation,
+            "fence_digest": row.fence_digest.as_str(),
+            "read_at_unix_ms": unix_ms(),
+        }))
+        .map_err(|_| NativeWorkerRouteError::Shape { field: "receipt" })
     }
 
     /// Stores one checkpoint: validate, bind, advance to active, receipt.
