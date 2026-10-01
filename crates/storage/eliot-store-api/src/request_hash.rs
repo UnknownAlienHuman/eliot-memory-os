@@ -93,6 +93,18 @@
 //! fails before any content is interpreted). Genesis keeps its separately
 //! defined request identity (`StoreGenesisRequest` digest and validation);
 //! this family adds no genesis branch.
+//!
+//! Issue #1925 (write-intent carry) extends the hashed input with the two
+//! write-intent identity members `write_intent_id` and
+//! `write_envelope_protocol_version`, under exactly the discipline stated
+//! above: the pinned golden vector below is re-pinned once to the new bytes,
+//! and no retained pre-carry digest is reinterpreted under them. Neither
+//! member is derived from `operation_id` or `idempotency_key` — they are a
+//! third, distinct identity (see
+//! [`crate::PreparedTransition::write_intent_id`]) — and neither has a
+//! default, an `Option`, or a serde default, so a missing owner value is a
+//! compile error at every construction site and a typed refusal at every
+//! validating gate rather than a manufactured value.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -128,6 +140,20 @@ pub struct CanonicalRequestView {
     pub request: RequestMeta,
     /// Stable logical retry identity.
     pub idempotency_key: String,
+    /// Stable user/agent write intent of the admitted submission.
+    ///
+    /// The third, distinct write identity beside `operation_id` (per attempt)
+    /// and `idempotency_key` (per typed correction); see
+    /// [`crate::PreparedTransition::write_intent_id`]. It is hash-bound
+    /// request identity, so a post-admission edit of the admitted intent
+    /// forks the recomputed digest into the typed mismatch at every gate.
+    pub write_intent_id: String,
+    /// Write-envelope protocol version of the admitted submission.
+    ///
+    /// Hash-bound beside the intent it was admitted under, so the exact
+    /// protocol revision cannot be swapped after admission without forking the
+    /// digest. See [`crate::PreparedTransition::write_envelope_protocol_version`].
+    pub write_envelope_protocol_version: u32,
     /// Scope addressed by the transition.
     pub scope_id: ScopeId,
     /// Optional task binding; unbound capture remains cold evidence.
@@ -207,6 +233,8 @@ impl CanonicalRequestView {
             operation_id: transition.identity.operation_id.clone(),
             request: context.clone(),
             idempotency_key: transition.identity.idempotency_key.clone(),
+            write_intent_id: transition.write_intent_id.clone(),
+            write_envelope_protocol_version: transition.write_envelope_protocol_version,
             scope_id: transition.scope_id.clone(),
             task_id: transition.task_id.clone(),
             transition_class: transition.transition_class,
@@ -580,6 +608,8 @@ mod tests {
             operation_id: OperationId::new("op-golden-1").expect("operation id"),
             request: context(),
             idempotency_key: "idem-golden-1".to_owned(),
+            write_intent_id: "intent-golden-1".to_owned(),
+            write_envelope_protocol_version: 1,
             scope_id: ScopeId::new("scope-golden").expect("scope"),
             task_id: Some("task-golden-1".to_owned()),
             transition_class: TransitionClass::CaptureCandidate,
@@ -618,6 +648,10 @@ mod tests {
             // Multi-element and already sorted, so the pinned bytes also
             // cover the set-like ordering rule.
             semantic_source_revisions: vec!["revision-a@1".to_owned(), "revision-b@2".to_owned()],
+            // Carried ordering scopes mirror the Governor derivation: the same
+            // scope set the admitted expected ordering heads render. The field
+            // is hash-bound set-like input, so the golden bytes cover it.
+            ordering_scopes: vec![OrderingScopeId::new("scope-golden").expect("ordering scope")],
             expected_revision_heads: vec![
                 RevisionHeadExpectation {
                     key: RevisionKey::new("revision-a").expect("key"),
@@ -764,6 +798,8 @@ mod tests {
                 idempotency_key: view.idempotency_key.clone(),
                 canonical_request_hash: "d".repeat(64),
             },
+            write_intent_id: view.write_intent_id.clone(),
+            write_envelope_protocol_version: view.write_envelope_protocol_version,
             state_fence: fence(),
             scope_id: view.scope_id.clone(),
             task_id: view.task_id.clone(),
@@ -798,6 +834,8 @@ mod tests {
                 idempotency_key: view.idempotency_key.clone(),
                 canonical_request_hash: "d".repeat(64),
             },
+            write_intent_id: view.write_intent_id.clone(),
+            write_envelope_protocol_version: view.write_envelope_protocol_version,
             state_fence: fence(),
             scope_id: view.scope_id.clone(),
             task_id: view.task_id.clone(),

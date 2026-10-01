@@ -1135,6 +1135,12 @@ mod tests {
                 clock: eliot_contracts::ClockReading::default(),
             },
             idempotency_key: idem.to_owned(),
+            // A refused attempt is per operation, but its declared intent is
+            // a fixture-owned value distinct from both identities: I6.8
+            // requires the corrected attempt to reuse it, never to derive it
+            // from the rejected operation identity or the idempotency key.
+            write_intent_id: "intent-1796".to_owned(),
+            write_envelope_protocol_version: crate::write_envelope::WRITE_ENVELOPE_PROTOCOL_VERSION,
             scope_id: ScopeId::new("scope-1796").expect("scope"),
             task_id: None,
             transition_class: TransitionClass::CaptureCandidate,
