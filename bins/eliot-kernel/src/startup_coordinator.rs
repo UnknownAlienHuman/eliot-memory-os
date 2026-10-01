@@ -1079,6 +1079,7 @@ impl StartupCoordinator {
         observation: WatchdogSupervisionObservation,
         local_deadline: Instant,
     ) -> Result<bool, String> {
+        Self::validate_supervision_observation_window(&observation, local_deadline)?;
         let WatchdogSupervisionObservation {
             incarnation,
             candidate_digest,
@@ -1089,17 +1090,6 @@ impl StartupCoordinator {
             progress_frontier: _,
             valid_for_ms,
         } = observation;
-        if valid_for_ms == 0 {
-            return Err(
-                "a Watchdog supervision observation needs a non-zero validity interval".to_owned(),
-            );
-        }
-        if Instant::now() >= local_deadline {
-            return Err(
-                "the original Watchdog heartbeat window expired before Kernel admission".to_owned(),
-            );
-        }
-        crate::verify_scm_watchdog_observation_shape(&incarnation).map_err(str::to_owned)?;
         let has_current = self.current_supervision_observation.is_some();
         let kernel_epoch = state_fence.authority_epoch.clone();
         if !has_current
@@ -1193,6 +1183,25 @@ impl StartupCoordinator {
         });
         self.current_supervision_deadline = Some(local_deadline);
         Ok(true)
+    }
+
+    fn validate_supervision_observation_window(
+        observation: &WatchdogSupervisionObservation,
+        local_deadline: Instant,
+    ) -> Result<(), String> {
+        if observation.valid_for_ms == 0 {
+            return Err(
+                "a Watchdog supervision observation needs a non-zero validity interval".to_owned(),
+            );
+        }
+        if Instant::now() >= local_deadline {
+            return Err(
+                "the original Watchdog heartbeat window expired before Kernel admission".to_owned(),
+            );
+        }
+        crate::verify_scm_watchdog_observation_shape(&observation.incarnation)
+            .map_err(str::to_owned)?;
+        Ok(())
     }
 
     /// Revokes the recorded independent-supervision evidence.
