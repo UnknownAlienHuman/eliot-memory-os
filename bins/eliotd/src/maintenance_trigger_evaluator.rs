@@ -35,7 +35,8 @@
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use eliot_contracts::{OperationId, canonical_json_bytes, sha256_hex};
+use eliot_authority::{AuthorityError, GrantId, GrantRevocationRequest, SnapshotId};
+use eliot_contracts::{OperationId, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_governor::{CompositionError, KernelPortError, KernelTransitionPort};
 use eliot_maintenance::{
     AutomationTriggerDecision, CONTRACT_NAME, CONTRACT_VERSION, MaintenanceBrokerEvidence,
@@ -49,6 +50,7 @@ use eliot_protocol::{
     MAINTENANCE_TRIGGER_DECISION_RECEIPT_WIRE_VERSION, MaintenanceTriggerClaim,
     MaintenanceTriggerDecisionReceipt, MaintenanceTriggerRecord, ProtocolError,
 };
+use eliot_receipts::{GrantClosureReceipt, GrantClosureState};
 use eliot_store_api::{StoreError, WriteReceiptStatus};
 use thiserror::Error;
 
@@ -1102,4 +1104,183 @@ fn policy_revision(policy: &MaintenancePolicyEvidence) -> String {
 /// submitting a receipt that cannot validate.
 fn is_commit_ref_text(value: &str) -> bool {
     !value.trim().is_empty() && value.trim() == value && !value.chars().any(char::is_control)
+}
+
+/// One owner-admitted grant-revocation decision for a committed closure whose
+/// canonical second phase is still pending (issue #2100, audit 5924750035).
+///
+/// This is the `AdmittedMaintenanceRevocation` the daemon's
+/// authority-revocation ingress names as its missing owner: the authenticated
+/// Human/Policy maintenance-request ingress re-admits the exact committed
+/// revocation operation — target grant, owner snapshot, `AuthorityBinding`,
+/// State Fence and operation identity — so the pending-second-phase pass can
+/// hand the obligation to an owner instead of merely diagnosing it.
+///
+/// Provenance, and what it is not:
+///
+/// * Every field comes from the Kernel P-07 owner's own committed
+///   [`GrantClosureReceipt`] bytes, served over the authenticated front-door
+///   read and re-validated under the receipt's own contract here, plus the
+///   live admitted State Fence the caller observed. The signature takes no
+///   restored-graph snapshot and no diagnostic row, so the request cannot be
+///   derived from either: a recovered `GrantStatus`, a candidate list, or a
+///   `PendingCanonicalSecondPhase` row can never become revocation authority.
+/// * No fresh Human decision is fabricated. While #1692 holds
+///   `explicit_request = false` (no authenticated Human UI/CLI ingress exists),
+///   this owner originates no new revocation; it re-admits the exact operation
+///   the owners already committed, under the registered
+///   `GRANT_DISCLOSURE_CLOSURE` family whose origins include Human and Policy.
+/// * The admitted value is a second-phase-resume handoff only. It must be
+///   consumed exclusively by the Governor public second-phase-only resume
+///   entry; presenting it to `apply_admitted_authority_revocation`,
+///   `revoke_grant`, or any fresh Kernel-first saga is forbidden — the target
+///   is already fenced and the Kernel refuses a re-struck revoke with
+///   `NotAdmitted` (boundary item 8: no second graph, no daemon ORS access,
+///   and the refusal to re-admit an already fenced grant into a fresh revoke
+///   is preserved).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdmittedMaintenanceRevocation {
+    /// Exact revocation request rebuilt from the committed closure bytes.
+    request: GrantRevocationRequest,
+    /// Immutable first-phase closure operation identity, as committed. A
+    /// [`GrantRevocationRequest`] carries no operation-identity coordinate of
+    /// its own, so the identity travels beside the request and is what the
+    /// Governor resume entry reconciles the canonical write under.
+    closure_operation_id: String,
+    /// Exact canonical grant-graph revision the closure enumerated at, as
+    /// committed. The resume continues the already-committed operation at its
+    /// own revision; the live-generation binding is the State Fence, which the
+    /// admission proves separately.
+    graph_revision: u64,
+}
+
+/// Fail-closed refusals of the maintenance-request revocation admission.
+///
+/// Every variant keeps its owner's own typed failure: the closure receipt
+/// contract refusal stays a [`eliot_receipts::ReceiptError`], and the grant or
+/// snapshot identity refusal stays an [`AuthorityError`]. The three closed
+/// refusals name an exact owner-proven fact. No refusal is reported as an
+/// admission, and a refused closure stays pending/recovery-required — never
+/// complete.
+#[derive(Debug, Error)]
+pub enum AdmitMaintenanceRevocationError {
+    /// The committed closure bytes fail their own receipt contract.
+    #[error("maintenance revocation admission receipt: {0}")]
+    Receipt(#[from] eliot_receipts::ReceiptError),
+    /// The committed target grant or owner snapshot identity is not a valid
+    /// contract value.
+    #[error("maintenance revocation admission identity: {0}")]
+    Identity(#[from] AuthorityError),
+    /// The committed closure is not a revoked revocation obligation (for
+    /// example an `Active` activation closure): admitting it would mint a
+    /// revocation nobody committed.
+    #[error(
+        "maintenance revocation admission refused: committed closure is not a revoked revocation obligation"
+    )]
+    NotRevokedClosure,
+    /// The canonical second phase is already linked: nothing is pending, so
+    /// admitting a duplicate obligation would fabricate work.
+    #[error(
+        "maintenance revocation admission refused: canonical second phase is already linked"
+    )]
+    SecondPhaseComplete,
+    /// The committed closure is bound to a different State Fence than the live
+    /// admitted one: the operation belongs to a superseded generation and must
+    /// fail closed rather than resume under the wrong fence (A00-03).
+    #[error(
+        "maintenance revocation admission refused: committed closure is not bound to the live composition State Fence"
+    )]
+    StaleFence,
+}
+
+impl AdmitMaintenanceRevocationError {
+    /// Closed, stable refusal reason for diagnostics that must stay
+    /// non-authoritative. A diagnostic tick alone never admits, so the reason
+    /// travels as fixed text rather than as authority.
+    #[must_use]
+    pub fn refusal_reason(&self) -> &'static str {
+        match self {
+            Self::Receipt(_) => "committed closure fails its own receipt contract",
+            Self::Identity(_) => "committed closure names an invalid grant or snapshot identity",
+            Self::NotRevokedClosure => {
+                "committed closure is not a revoked revocation obligation"
+            }
+            Self::SecondPhaseComplete => "canonical second phase is already linked",
+            Self::StaleFence => {
+                "committed closure is not bound to the live composition State Fence"
+            }
+        }
+    }
+}
+
+impl AdmittedMaintenanceRevocation {
+    /// Re-admits the exact committed revocation operation named by one
+    /// Kernel-committed closure receipt.
+    ///
+    /// `live_fence` must be the live admitted State Fence the caller observed
+    /// (the daemon pass supplies the composition-observed, kernel-revalidated
+    /// fence it already bound the whole pass to); `closure` must be the
+    /// owner's committed bytes served over the authenticated closure-receipt
+    /// read. The owner re-proves both here instead of trusting the pass: the
+    /// receipt revalidates under its own contract, the fence is compared
+    /// again, and only a `Revoked` closure with no linked canonical receipt
+    /// is admittable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdmitMaintenanceRevocationError`] when the committed bytes
+    /// fail their own contract, name an invalid identity, are not a pending
+    /// revoked revocation, or belong to a superseded generation.
+    pub fn readmit_pending_closure(
+        live_fence: &StateFence,
+        closure: &GrantClosureReceipt,
+    ) -> Result<Self, AdmitMaintenanceRevocationError> {
+        // The ORIGINAL recorded value revalidates under its own receipt
+        // contract. Nothing is recomputed, so served bytes that fail here are
+        // a contract failure rather than an admittable operation.
+        closure.validate()?;
+        if closure.state != GrantClosureState::Revoked {
+            return Err(AdmitMaintenanceRevocationError::NotRevokedClosure);
+        }
+        if closure.canonical_receipt.is_some() {
+            return Err(AdmitMaintenanceRevocationError::SecondPhaseComplete);
+        }
+        if closure.authority.state_fence != *live_fence {
+            return Err(AdmitMaintenanceRevocationError::StaleFence);
+        }
+        // Every identity below is the owner's committed text re-admitted
+        // through the authority identity owner: a blank or malformed
+        // committed identity fails closed here instead of becoming a request.
+        let grant_id = GrantId::new(closure.declaration.target_grant_id.clone())?;
+        let snapshot_id = SnapshotId::new(closure.authority_receipt.snapshot_id.clone())?;
+        Ok(Self {
+            request: GrantRevocationRequest {
+                grant_id,
+                snapshot_id,
+                binding: closure.authority.clone(),
+            },
+            closure_operation_id: closure.operation_id.clone(),
+            graph_revision: closure.declaration.grant_graph_revision,
+        })
+    }
+
+    /// Returns the exact revocation request the owner admitted.
+    #[must_use]
+    pub const fn request(&self) -> &GrantRevocationRequest {
+        &self.request
+    }
+
+    /// Returns the immutable first-phase closure operation identity, as
+    /// committed.
+    #[must_use]
+    pub fn closure_operation_id(&self) -> &str {
+        &self.closure_operation_id
+    }
+
+    /// Returns the exact canonical grant-graph revision the admitted closure
+    /// enumerated at, as committed.
+    #[must_use]
+    pub const fn graph_revision(&self) -> u64 {
+        self.graph_revision
+    }
 }
