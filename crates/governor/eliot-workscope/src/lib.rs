@@ -3494,7 +3494,7 @@ impl WorkScopeBindingOwner {
     /// The supplied closure is revalidated against the admitted snapshot
     /// before it is retained in the serializable owner snapshot.
     pub fn new_with_source_closure(
-        snapshot: WorkScopeBindingSnapshot,
+        mut snapshot: WorkScopeBindingSnapshot,
         sources: &GoverningSourceSet,
         privacy: &PrivacyProfile,
     ) -> Result<Self, WorkScopeError> {
