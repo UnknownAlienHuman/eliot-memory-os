@@ -548,7 +548,7 @@ impl DaemonKernelClient {
         self.write_work_scope_owner(claimed, request).await
     }
 
-    pub(super) async fn read_work_scope_owner(
+    pub(crate) async fn read_work_scope_owner(
         &self,
         state_fence: &StateFence,
         protected_snapshot_digest: &str,

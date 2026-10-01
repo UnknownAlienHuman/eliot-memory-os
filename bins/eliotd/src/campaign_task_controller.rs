@@ -30,8 +30,6 @@ use eliot_store_api::{
 use eliot_workscope::ObservedScopeResources;
 use serde::Deserialize;
 use serde_json::json;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use crate::{
     DaemonComposition, KernelContextReadClient,
     daemon_kernel_client::{DaemonKernelClient, TaskControllerClaimedInvocation},
@@ -953,7 +951,7 @@ pub async fn commit_task_controller_transition(
     {
         return task_controller_rejection(&claimed, "transition_identity_mismatch");
     }
-    let now = unix_ms(SystemTime::now())?;
+    let now = unix_ms();
     let principal_ref = claimed.authenticated_principal.as_str();
     let session_ref = claimed.attempt.session_id.as_str();
     let scope_ref = claimed.invocation.work_scope_id.as_str();

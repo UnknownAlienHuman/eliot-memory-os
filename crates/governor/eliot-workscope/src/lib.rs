@@ -2976,7 +2976,16 @@ fn verify_ready_scan_receipt(
     if receipt.scan_receipt_ref.as_deref() != Some(handle.record_commitment.as_str()) {
         return Err(WorkScopeError::ScanReceiptReplaced);
     }
-    store.readback(handle, binding)?;
+    let replayed = store.readback(handle, binding)?;
+    replayed.validate()?;
+    if replayed.scan_ref != handle.receipt_ref {
+        return Err(WorkScopeError::ScanReceiptReplaced);
+    }
+    let canonical = eliot_contracts::canonical_json_bytes(&replayed)
+        .map_err(|_| WorkScopeError::ScanReceiptInaccessible)?;
+    if eliot_contracts::sha256_hex(&canonical) != handle.receipt_digest {
+        return Err(WorkScopeError::ScanReceiptCorrupt);
+    }
     Ok(())
 }
 
@@ -3510,14 +3519,16 @@ impl ColdStartOwnerInputs {
         }
         if let Some(boundary) = &self.privacy_boundary {
             boundary.validate()?;
-            if boundary.boundary_ref != self.privacy.boundary_ref
-                || !boundary.admits(self.privacy_class)
-            {
+            if !boundary.admits(self.privacy_class) {
                 return Err(WorkScopeError::PrivacyDenied);
             }
         }
         if let Some(discovery) = &self.bootstrap_discovery_inputs {
             if discovery.privacy_boundary != self.privacy_boundary
+                || self
+                    .privacy_boundary
+                    .as_ref()
+                    .is_none_or(|boundary| !boundary.admits(self.privacy_class))
                 || discovery.evidence.canonical_root_ref != self.explicit_root_identity
                 || discovery.candidate_privacy != Some(self.privacy_class)
                 || discovery.proposed_kind != self.descriptor.kind
@@ -3549,9 +3560,9 @@ impl ColdStartOwnerInputs {
                 evidence.validate()?;
                 binding.admit()?;
                 handle.validate()?;
-                let fence_bytes = canonical_json_bytes(&self.state_fence)
+                let fence_bytes = eliot_contracts::canonical_json_bytes(&self.state_fence)
                     .map_err(|_| WorkScopeError::InvalidStateFence)?;
-                let fence_ref = sha256_hex(&fence_bytes);
+                let fence_ref = eliot_contracts::sha256_hex(&fence_bytes);
                 if evidence.canonical_root_ref != self.explicit_root_identity
                     || evidence.filesystem_identity_ref != lease.candidate_root_ref
                     || original_discovery.evidence != *evidence
@@ -3623,7 +3634,7 @@ impl WorkScopeBindingOwner {
     /// The supplied closure is revalidated against the admitted snapshot
     /// before it is retained in the serializable owner snapshot.
     pub fn new_with_source_closure(
-        snapshot: WorkScopeBindingSnapshot,
+        mut snapshot: WorkScopeBindingSnapshot,
         sources: &GoverningSourceSet,
         privacy: &PrivacyProfile,
     ) -> Result<Self, WorkScopeError> {
@@ -3903,9 +3914,9 @@ impl WorkScopeBindingOwner {
         evidence.validate()?;
         binding.admit()?;
         receipt_handle.validate()?;
-        let fence_bytes = canonical_json_bytes(&self.snapshot.state_fence)
+        let fence_bytes = eliot_contracts::canonical_json_bytes(&self.snapshot.state_fence)
             .map_err(|_| WorkScopeError::InvalidStateFence)?;
-        let fence_ref = sha256_hex(&fence_bytes);
+        let fence_ref = eliot_contracts::sha256_hex(&fence_bytes);
         let mut snapshot = self.read_current(&self.snapshot.state_fence)?;
         let existing = snapshot
             .cold_start_inputs
