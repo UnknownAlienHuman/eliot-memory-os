@@ -1664,7 +1664,7 @@ public static class UserAutomationOutcomeClassifier
                 && JsonElement.DeepEquals(pair.Value, value));
     }
 
-    private static bool HasUniqueObjectPropertiesRecursively(JsonElement value)
+    internal static bool HasUniqueObjectPropertiesRecursively(JsonElement value)
     {
         if (value.ValueKind == JsonValueKind.Object)
         {
