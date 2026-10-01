@@ -95,7 +95,7 @@ pub enum TaskControllerAction {
     Propose,
     /// Apply an exact command to an existing task.
     Apply,
-    /// Bind an observed explicit workspace to the retained task's WorkScope.
+    /// Bind an observed explicit workspace to the retained task's `WorkScope`.
     /// The daemon validates this action through the authenticated initial
     /// owner-admission path; the caller supplies no owner receipt or binding.
     BindScope,
@@ -179,18 +179,7 @@ pub struct TaskControllerInvocation {
 }
 
 impl TaskControllerInvocation {
-    /// Validates the transport envelope and bounded JSON object fields.
-    /// Semantic field/identity validation remains with the daemon owners.
-    pub fn validate(&self) -> Result<(), ProtocolError> {
-        if self.wire_id != TASK_CONTROLLER_INVOCATION_WIRE_ID
-            || self.wire_version != TASK_CONTROLLER_INVOCATION_WIRE_VERSION
-        {
-            return Err(ProtocolError::InvalidField {
-                field: "task_controller_invocation.wire",
-                reason: "unsupported Task Controller invocation",
-            });
-        }
-        structured_object(&self.task_input, "task_controller_invocation.task_input")?;
+    fn validate_action_specific_fields(&self) -> Result<(), ProtocolError> {
         match self.action {
             TaskControllerAction::BindScope => {
                 if self.task_id.is_some()
@@ -228,18 +217,49 @@ impl TaskControllerInvocation {
                     "task_controller_invocation.work_scope_id",
                 )?;
                 for (value, field) in [
-                    (&self.learning_state_view_recipe, "task_controller_invocation.learning_state_view_recipe"),
-                    (&self.context_campaign_recipe_catalogue, "task_controller_invocation.context_campaign_recipe_catalogue"),
-                    (&self.context_campaign_recipe, "task_controller_invocation.context_campaign_recipe"),
-                    (&self.context_input, "task_controller_invocation.context_input"),
+                    (
+                        &self.learning_state_view_recipe,
+                        "task_controller_invocation.learning_state_view_recipe",
+                    ),
+                    (
+                        &self.context_campaign_recipe_catalogue,
+                        "task_controller_invocation.context_campaign_recipe_catalogue",
+                    ),
+                    (
+                        &self.context_campaign_recipe,
+                        "task_controller_invocation.context_campaign_recipe",
+                    ),
+                    (
+                        &self.context_input,
+                        "task_controller_invocation.context_input",
+                    ),
                 ] {
-                    structured_object(value.as_ref().ok_or(ProtocolError::InvalidField {
+                    structured_object(
+                        value.as_ref().ok_or(ProtocolError::InvalidField {
+                            field,
+                            reason: "is required for PROPOSE and APPLY",
+                        })?,
                         field,
-                        reason: "is required for PROPOSE and APPLY",
-                    })?, field)?;
+                    )?;
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Validates the transport envelope and bounded JSON object fields.
+    /// Semantic field/identity validation remains with the daemon owners.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_id != TASK_CONTROLLER_INVOCATION_WIRE_ID
+            || self.wire_version != TASK_CONTROLLER_INVOCATION_WIRE_VERSION
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "task_controller_invocation.wire",
+                reason: "unsupported Task Controller invocation",
+            });
+        }
+        structured_object(&self.task_input, "task_controller_invocation.task_input")?;
+        self.validate_action_specific_fields()?;
         if let Some(selector) = &self.prior_delivery_selector {
             structured_object(
                 selector,
