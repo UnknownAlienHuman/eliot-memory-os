@@ -1486,12 +1486,7 @@ pub fn admit_prepared_isolated_destination(
         ));
     }
 
-    build_admission_record(
-        input,
-        &destination_key,
-        &derived,
-        approved_target_build,
-    )
+    build_admission_record(input, &destination_key, &derived, approved_target_build)
 }
 
 /// Builds and self-validates the isolation evidence for
@@ -2065,16 +2060,16 @@ fn reprove_created_destination_root(
     derived_destination_root: &str,
     published_identity: FileIdentity,
 ) -> Result<FileIdentity, IsolatedDestinationError> {
-    let created_lease =
-        ProtectedRootLease::open_existing(std::path::Path::new(derived_destination_root)).map_err(
-            |_| {
-                IsolatedDestinationError::Installation(InstallationError::IncompleteObservation(
+    let created_lease = ProtectedRootLease::open_existing(std::path::Path::new(
+        derived_destination_root,
+    ))
+    .map_err(|_| {
+        IsolatedDestinationError::Installation(InstallationError::IncompleteObservation(
         "the created isolated destination could not be re-proved through a protected-root lease, \
          so its ownership is not established"
             .to_owned(),
     ))
-            },
-        )?;
+    })?;
     created_lease.verify_stable_identity().map_err(|_| {
         IsolatedDestinationError::Installation(InstallationError::IncompleteObservation(
             "the created isolated destination root did not keep its retained identity".to_owned(),
