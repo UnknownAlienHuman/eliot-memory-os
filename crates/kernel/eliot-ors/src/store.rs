@@ -7472,6 +7472,73 @@ impl RedbRecoveryStore {
         Ok(disposition)
     }
 
+    /// Spends the owner-issued succession grant on one stored verification row,
+    /// exactly once (#2883 instruction 4).
+    ///
+    /// The read, the marker and the write are ONE redb transaction, which is the
+    /// whole point: two concurrent successors that both observe an open grant
+    /// cannot both spend it, because the second write transaction begins after
+    /// the first has committed and re-reads the consumed marker. There is no
+    /// check-then-act window.
+    ///
+    /// It returns `Ok(false)` — and writes nothing — when the key is absent,
+    /// when the row carries no grant at all, or when the grant is already
+    /// consumed. Every one of those is the caller's own fail-closed answer, not
+    /// an error: the successor path refuses all three identically, and none of
+    /// them may mint a replacement.
+    ///
+    /// The window is NOT checked here. ORS holds no clock it may compare
+    /// against an owner-issued window, and the caller is the owner seam that
+    /// does; this method's only decision is the one only the store can make
+    /// atomically, which is "has this grant already been spent".
+    ///
+    /// `consumed_at_unix_ms` is the caller's own clock reading, which the
+    /// caller must take from the same owner seam that issued the grant. It is
+    /// range-checked by
+    /// [`BackupVerifySuccessionGrant::validate`] against the grant's own window
+    /// before the row is written, so a caller cannot consume a grant with a
+    /// marker outside the window it was issued under.
+    pub fn consume_backup_verification_succession_grant(
+        &self,
+        key: &str,
+        consumed_at_unix_ms: u64,
+    ) -> Result<bool, OrsError> {
+        let write = self.database.begin_write().map_err(storage)?;
+        let consumed = {
+            let mut table = write
+                .open_table(BACKUP_VERIFICATION_RESULTS)
+                .map_err(storage)?;
+            let Some(bytes) = table.get(key).map_err(storage)?.map(|value| value.value().to_owned())
+            else {
+                return Ok(false);
+            };
+            let mut record: BackupVerificationResultRecord = decode(&bytes)?;
+            record.validate()?;
+            if record.record_key()? != key {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: BACKUP_VERIFICATION_RESULT_RECORD_TYPE,
+                    reason: "table key does not match the row's own namespace digest".to_owned(),
+                });
+            }
+            let Some(grant) = record.succession_grant.as_mut() else {
+                return Ok(false);
+            };
+            if grant.is_consumed() {
+                return Ok(false);
+            }
+            grant.consumed_at_unix_ms = Some(consumed_at_unix_ms);
+            // The consumed row must itself still be a valid row, so a marker the
+            // grant's own window forbids is refused before anything is written
+            // rather than persisted into an unreadable row.
+            record.validate()?;
+            let payload = encode(&record)?;
+            table.insert(key, payload.as_str()).map_err(storage)?;
+            true
+        };
+        write.commit().map_err(storage)?;
+        Ok(consumed)
+    }
+
     /// Stages one P-04 host-request operation before any acknowledgement.
     ///
     /// Persist-before-ack: the `Requested` record is durably inserted before
