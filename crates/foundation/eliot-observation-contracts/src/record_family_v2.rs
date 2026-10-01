@@ -330,13 +330,17 @@ impl ObservationRecordEnvelopeV2 {
 /// Binds v1 `kind`, `journal_control_event`, `coverage_gap` presence and
 /// `parent_record_id` / `record_id` to v2 `exact_family()`, `is_journal_control()`,
 /// payload identity and envelope parent.  `JournalControlAudit` maps to `Audit`
-/// where the contract requires it.  Used at both submission and receipt/
+/// where the contract requires it.  The same facts the v2 payload carries as
+/// `core`/`event`/`gap` are additionally bound to the v1 `event` /
+/// `coverage_gap` they duplicate, so one record cannot be described twice with
+/// disagreeing content.  Used at both submission and receipt/
 /// persisted-replay validation; any contradiction fails closed before admission
 /// or rebuild.
 pub fn check_v1_v2_coherence(
     v1: &ObservationRecordEnvelope,
     v2: &ObservationRecordEnvelopeV2,
 ) -> Result<(), RecordFamilyContractError> {
+    v1.validate()?;
     v2.validate()?;
     if v1.record_id != v2.record_id() {
         return Err(RecordFamilyContractError::ShapeConflict {
@@ -373,6 +377,47 @@ pub fn check_v1_v2_coherence(
             if v1.kind == ObservationRecordKind::CoverageGap {
                 return Err(RecordFamilyContractError::ShapeConflict {
                     reason: "v1 coverage gap cannot be ambiguous",
+                });
+            }
+        }
+    }
+    // The v2 payload and the v1 envelope are two representations of one record.
+    // Equal labels are not proof: the observation body they both carry must be
+    // the same typed value on both sides. Every variant is compared directly to
+    // the v1 field that duplicates it, never through a digest, a stringify
+    // roundtrip, or a selected list of strings, and neither side is rewritten to
+    // match the other. v2-only family fields stay additional evidence.
+    let v2_body: Result<&ObservationEventCore, &CoverageGap> = match &v2.payload {
+        RecordFamilyPayloadV2::Audit(value) => Ok(&value.core),
+        RecordFamilyPayloadV2::Telemetry(value) => Ok(&value.core),
+        RecordFamilyPayloadV2::Change(value) => Ok(&value.core),
+        RecordFamilyPayloadV2::Maintenance(value) => Ok(&value.core),
+        RecordFamilyPayloadV2::JournalControlAudit(value) => Ok(&value.event),
+        RecordFamilyPayloadV2::AmbiguousOrdinary(value) => Ok(&value.event),
+        RecordFamilyPayloadV2::CoverageGap(value) => Err(&value.gap),
+    };
+    match v2_body {
+        Ok(v2_event) => {
+            let Some(v1_event) = v1.event.as_ref() else {
+                return Err(RecordFamilyContractError::ShapeConflict {
+                    reason: "v1 record has no event for the v2 family payload",
+                });
+            };
+            if v1_event != v2_event {
+                return Err(RecordFamilyContractError::ShapeConflict {
+                    reason: "v1/v2 event mismatch",
+                });
+            }
+        }
+        Err(v2_gap) => {
+            let Some(v1_gap) = v1.coverage_gap.as_ref() else {
+                return Err(RecordFamilyContractError::ShapeConflict {
+                    reason: "v1 record has no coverage gap for the v2 gap payload",
+                });
+            };
+            if v1_gap != v2_gap {
+                return Err(RecordFamilyContractError::ShapeConflict {
+                    reason: "v1/v2 coverage gap mismatch",
                 });
             }
         }
