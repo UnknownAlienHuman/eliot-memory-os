@@ -695,9 +695,15 @@ impl<'a, P: KernelGovernorPort + ?Sized> KernelHostRequestBinder<'a, P> {
 
     /// Builds the Kernel-owned application request for one admitted envelope.
     ///
-    /// Every identity comes from the envelope or the authenticated session.
-    /// The host DTO contributes only the validated tool payload and
-    /// presentation-only client capabilities.
+    /// Every identity comes from the envelope or the authenticated session,
+    /// except the absolute deadline, which the Kernel derives at admission:
+    /// the validated host preference is clamped to
+    /// `MAX_HOST_DEADLINE_PREFERENCE_MS` and added to the Kernel admission
+    /// clock (`now_ms`), never copied from the Bridge-stamped envelope sum.
+    /// An absent preference keeps the admitted envelope absolute capped at
+    /// the same Kernel-owned ceiling. The host DTO otherwise contributes
+    /// only the validated tool payload and presentation-only client
+    /// capabilities.
     fn build_application(
         &self,
         request: &HostInvocationRequest,
@@ -734,13 +740,30 @@ impl<'a, P: KernelGovernorPort + ?Sized> KernelHostRequestBinder<'a, P> {
             .map_err(|_| PortFailure::TransportBindingRejected {
                 reason: "kernel request metadata is invalid; re-attach".to_owned(),
             })?;
+        // Issue #77 W2: the absolute deadline is Kernel-owned. The admitted
+        // preference is clamped to the Kernel-admitted maximum and added to
+        // the Kernel admission clock, never copied from the Bridge-stamped
+        // envelope sum. An absent preference (e.g. the read leg, which
+        // presents no new preference) keeps the admitted envelope absolute
+        // capped at the same Kernel-owned ceiling, so repeated invokes can
+        // never hold an operation open beyond Kernel policy.
+        let kernel_deadline_unix_ms = match request.deadline_preference_ms {
+            Some(preference) => {
+                check_deadline_preference(Some(preference))?;
+                now_ms.saturating_add(preference.min(MAX_HOST_DEADLINE_PREFERENCE_MS))
+            }
+            None => envelope
+                .identity
+                .deadline_unix_ms
+                .min(now_ms.saturating_add(MAX_HOST_DEADLINE_PREFERENCE_MS)),
+        };
         let identity = RequestIdentity {
             request: RequestBinding {
                 metadata,
                 state_fence: self.session.state_fence().clone(),
             },
             idempotency_key: envelope.identity.idempotency_key.clone(),
-            deadline_unix_ms: envelope.identity.deadline_unix_ms,
+            deadline_unix_ms: kernel_deadline_unix_ms,
             cancellation_id: envelope.identity.cancellation_id.clone(),
         };
         identity
