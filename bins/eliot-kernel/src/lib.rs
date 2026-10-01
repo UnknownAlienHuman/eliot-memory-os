@@ -334,6 +334,7 @@ mod host_request_route;
 #[cfg(windows)]
 mod hot_path_runtime;
 pub mod kernel_unavailability;
+mod native_worker_execution_admission_read;
 mod native_worker_lifecycle_route;
 mod native_worker_reconcile_route;
 mod native_worker_replay_route;

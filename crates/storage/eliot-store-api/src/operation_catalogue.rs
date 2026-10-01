@@ -483,19 +483,21 @@ struct ActivatedMutationDescriptor {
 /// owner-separated swarm definition/admission/execution revisions with
 /// separate owner Ordering Scopes, admitted only when the owner-specific
 /// authorization evidence travels with the write and is verified at this
-/// boundary â€” the record's own owner lease, the transition's authority epoch
+/// boundary — the record's own owner lease, the transition's authority epoch
 /// and the authenticated request source; committing a revision grants no
 /// admission, dispatch or lifecycle change to anyone);
 /// `RecordTaskContractAcceptanceSet` persists `ReversibleMutation` through
 /// the `TaskControl` family (issue #325 P1, I7.9: the create-only durable owner
 /// record of one `TaskContract` revision's acceptance obligations, keyed by
-/// `(task_id, task_revision)` â€” committing it asserts only what the contract
+/// `(task_id, task_revision)` — committing it asserts only what the contract
 /// owner already required and grants no coverage, support, admission or
-/// completion). All
-/// activated mutation rows address no store scope, mirroring the scope-free read
-/// descriptors. Every
-/// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 22] = [
+/// completion); `RecordOrientationOwnerSources` persists the exact independent
+/// classification, admission, and cue-binding owner source set through the
+/// candidate-only family, with immutable source rows and predecessor-head CAS
+/// in the canonical transaction. All activated mutation rows address no store
+/// scope, mirroring the scope-free read descriptors. Every other mutation stays
+/// known-but-unsupported.
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 23] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
@@ -660,6 +662,12 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 22] = [
         // and the enclosing structure without loosening the record's own
         // closed validator.
         max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::RecordOrientationOwnerSources,
+        transition_classes: &[TransitionClass::CaptureCandidate],
+        maximum_effect: EffectClass::Candidate,
+        max_input_bytes: READ_MAX_OUTPUT_BYTES,
     },
 ];
 
@@ -888,6 +896,7 @@ pub fn validate_read_against_catalogue(
 /// `ApplyReactiveInjectionState`, `ApplyResourceSnapshot`,
 /// `CommitExperienceBank`, `CommitAgentFeedback`,
 /// `RecordLearningRecord`, `RecordCapabilityEvidenceRecord`,
+/// `RecordOrientationOwnerSources`,
 /// `ApplyProblemOwnerState`, and
 /// `RecordModuleCatalogSnapshot` have activated
 /// mutation entries; any other named
@@ -991,6 +1000,9 @@ pub fn validate_transition_against_catalogue(
             NamedMutationOperation::RecordTaskContractAcceptanceSet => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
                 validate_task_contract_acceptance_transition(transition, &command.parameters)?;
+            }
+            NamedMutationOperation::RecordOrientationOwnerSources => {
+                crate::decode_orientation_owner_sources(&command.parameters).map(|_| ())?;
             }
             NamedMutationOperation::RecordAuthorityRevocation => {
                 return Err(StoreError::UnknownOperation);

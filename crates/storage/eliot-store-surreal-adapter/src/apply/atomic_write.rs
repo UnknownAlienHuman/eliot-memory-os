@@ -163,6 +163,7 @@ const SEMANTIC_CONFLICT_MARKERS: &[&str] = &[
     "experience_bank_conflict",
     "experience_feedback_conflict",
     "learning_record_conflict",
+    "orientation_owner_source_conflict",
 ];
 
 /// Reports whether a provider statement error carries the exact closed
@@ -952,6 +953,9 @@ fn build_apply_statements(
     // #1814 W1.2 instrument-registry head writes commit atomically beside
     // the learning rows under the same fenced compare-and-set contract.
     append_instrument_registry_statements(&mut sql, &mut bindings, instrument_registry)?;
+    // Orientation owner records and all three source-head CAS operations
+    // share this canonical transaction with the receipt and outbox.
+    append_orientation_owner_source_statements(&mut sql, &mut bindings, transition)?;
     // #1773 capability-evidence rows commit atomically beside the learning
     // rows under the same fenced compare-and-set contract.
     append_capability_evidence_owner_statements(&mut sql, &mut bindings, transition)?;
@@ -1605,10 +1609,8 @@ fn append_learning_statements(
 
 /// Appends canonical instrument-registry head writes (issue #1814 W1.2).
 ///
-/// Same atomicity contract as the reactive fragment above: the singleton
-/// head compare-and-set commits in the same transaction as the receipt and
-/// outbox rows. Binding collisions fail closed instead of silently
-/// overwriting a canonical binding.
+/// The singleton head compare-and-set commits in the same transaction as the
+/// receipt and outbox rows. Binding collisions fail closed.
 fn append_instrument_registry_statements(
     sql: &mut String,
     bindings: &mut Map<String, Value>,
@@ -1626,6 +1628,25 @@ fn append_instrument_registry_statements(
     Ok(())
 }
 
+/// Appends Orientation source revisions and predecessor-head CAS to the same
+/// canonical transaction as the receipt and outbox.
+fn append_orientation_owner_source_statements(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    transition: &eliot_store_api::PreparedTransition,
+) -> Result<(), AdapterError> {
+    let (fragment, fragment_bindings) =
+        super::surreal_orientation_sources::orientation_owner_source_write_statements(transition)?;
+    sql.push_str(&fragment);
+    for (name, value) in fragment_bindings {
+        if bindings.insert(name.clone(), value).is_some() {
+            return Err(AdapterError::Serialization(
+                "Orientation source binding collided with a canonical binding".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
 /// Appends canonical reactive row writes (issue #1941 C4).
 ///
 /// Same atomicity contract as the notification fragment above: session

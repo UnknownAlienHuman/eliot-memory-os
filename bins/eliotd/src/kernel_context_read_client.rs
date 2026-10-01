@@ -86,6 +86,7 @@ use eliot_context_candidates::{
 };
 use eliot_context_contracts::{
     AdmissionDisposition, AdmissionInput, AdmissionMeasurement, AdmissionRuleIdentity,
+    AdmissionResult,
     AdmittedContextSet, CONTEXT_CONTRACT_VERSION, ContextBinding, ContextError, ContextOutcome,
     ContextRecipe, DecisionContextIncomplete, DownstreamHeadroomRequest, DownstreamHeadroomResult,
     HeadroomAllocationLedger, HeadroomDimension, MeasurementCompositionProfile,
@@ -132,6 +133,53 @@ use super::{DaemonKernelClient, SERVICE_NAME};
 /// fence fails closed after transport.
 pub struct KernelContextReadClient {
     kernel: Arc<DaemonKernelClient>,
+}
+
+/// Original outputs and inputs retained from one native Context compilation.
+///
+/// Borrowed request, recipe, policy, assembly policy and role inputs remain the
+/// exact values supplied by their owners. Candidate and admission owner values
+/// are retained as typed records, including the candidate omission records,
+/// admission omissions, full denominator and any incomplete outcome. An
+/// incomplete admission is a readback result, not a reason to discard its
+/// original decision.
+pub struct ContextCompilationOwnerReadback<'a> {
+    /// Exact candidate request admitted for this compilation.
+    pub request: &'a CandidateRequest,
+    /// Exact native policy recipe consumed by the candidate/admission owners.
+    pub recipe: &'a ContextRecipe,
+    /// Exact candidate policy supplied by its owner.
+    pub candidate_policy: &'a CandidatePolicy,
+    /// Exact assembly policy supplied by its owner.
+    pub assembly_policy: &'a AssemblyPolicy,
+    /// Original seven-role read closure with per-role owner payloads/receipts.
+    pub role_inputs: &'a SevenRoleInputs,
+    /// Original scorecard consumed by the assembly owner.
+    pub quality: Option<QualityScorecard>,
+    /// Exact mapper result, including native candidate-stage omissions.
+    pub candidates: ContextCandidateSetResult,
+    /// Exact validated input passed to the admission owner.
+    pub admission_input: AdmissionInput,
+    /// Exact admission decision, including its original incomplete state and
+    /// evidence omissions when applicable.
+    pub admission: AdmissionResult,
+    /// Owner-authored per-material decision traces.
+    pub rank_trace_delivery: MaterialRankTraceDelivery,
+    /// Terminal native owner disposition.
+    pub outcome: ContextCompilationOwnerOutcome,
+}
+
+/// Terminal result of candidate, admission and assembly owners.
+pub enum ContextCompilationOwnerOutcome {
+    /// Admission completed and the native assembly output passed boundary and
+    /// delivered-trace conservation.
+    Complete(ActiveUnderstandingViewResult),
+    /// Admission returned its typed incomplete result; no assembly was run.
+    Incomplete(Box<DecisionContextIncomplete>),
+    /// Admission completed, but a native assembly/output acceptance owner
+    /// refused the result. The original candidate/admission readback remains
+    /// available beside this typed refusal.
+    Refused(Box<PacketCompositionError>),
 }
 
 /// Closed local-read selectors for one admitted `eliot.query` pair.
@@ -1855,25 +1903,13 @@ pub struct PacketAdmissionBundle {
 
 /// The owner-minted admission pieces that cannot exist before the candidate set.
 ///
-/// The protected floor is deliberately absent: it is the one admission-closure
-/// identity the Context owner publishes from the recipe body alone, so it is
-/// resolved before the candidate stage and is a separate input to
-/// [`KernelContextReadClient::compile_context_packet`]. Everything below is
-/// keyed by candidate atom identity, so it is supplied by
-/// [`PacketAdmissionParts`]'s owner at the point the candidate stage has
-/// produced the exact atom set these records must cover — not before it.
-pub struct PacketAdmissionParts {
-    /// Owner-minted priority policy identity.
-    pub priority: PriorityPolicyIdentity,
-    /// Owner-minted admission rule identity.
-    pub rule: AdmissionRuleIdentity,
-    /// Owner-minted measurement composition profile.
-    pub measurement_profile: MeasurementCompositionProfile,
-    /// Caller-supplied omission bindings the decision must close over.
-    pub supplied_omissions: Vec<SuppliedOmissionBinding>,
-    /// Caller-supplied measurements the decision must close over.
-    pub measurements: Vec<AdmissionMeasurement>,
-}
+/// The future suppliers (Decision Safety Floor owner, candidate-policy
+/// owner, quality scorecard owner, route capacity/measurement owner) hand
+/// these pieces to [`PacketAdmissionBundle::build`], which validates each
+/// through its owner's own `validate` and proves closure over one
+/// compilation. Grouped so the builder takes an owner-pieces value instead
+/// of a long argument list.
+pub use eliot_context_contracts::PacketAdmissionParts;
 
 impl PacketAdmissionBundle {
     /// Builds the one validated admission closure for a packet compilation
@@ -2071,12 +2107,12 @@ impl KernelContextReadClient {
     /// `construct_context_candidates`, `quality` after the admitted set. The
     /// pieces are closed into the one admission bundle by
     /// [`PacketAdmissionBundle::build`], so an unvalidated or foreign piece
-    /// fails before any candidate is admitted. An explicit admission gap fails as
-    /// [`PacketCompositionError::AdmissionIncomplete`] with the owner's gaps,
-    /// never as a silently cut view. The packet dispatch invokes this edge with
-    /// the admitted pair's binding, recipe, and owner evidence; large output
-    /// cannot pass `policy.max_serialized_bytes`, and genuinely deferred
-    /// compilation uses a durable job, never an unconsumed handle.
+    /// fails before any candidate is admitted. An explicit admission gap is
+    /// retained as the owner's typed incomplete `AdmissionResult` in the
+    /// returned [`ContextCompilationOwnerReadback`]; no assembly is run for a
+    /// partial floor. Large output cannot pass
+    /// `policy.max_serialized_bytes`, and genuinely deferred compilation uses
+    /// a durable job, never an unconsumed handle.
     ///
     /// STITCH-2564-PACKET-SUPPLY, re-measured for #1862: this edge is now
     /// callable in principle rather than uncallable by construction. The two
@@ -2193,28 +2229,27 @@ impl KernelContextReadClient {
     /// taken after the selection, so the revalidation is an observation rather
     /// than a restatement of the pre-selection one.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-    pub fn compile_context_packet(
-        seven: &SevenRoleInputs,
-        request: &CandidateRequest,
-        recipe: &ContextRecipe,
-        policy: &CandidatePolicy,
-        campaign_view: &CampaignLearningStateView,
-        context_recipe_record_digest: &str,
-        floor: &SafetyFloorIdentity,
+    pub fn compile_context_packet<'a>(
+        seven: &'a SevenRoleInputs,
+        request: &'a CandidateRequest,
+        recipe: &'a ContextRecipe,
+        policy: &'a CandidatePolicy,
+        campaign_view: &'a CampaignLearningStateView,
+        context_recipe_record_digest: &'a str,
+        floor: &'a SafetyFloorIdentity,
         headroom_join: PacketHeadroomJoin<'_>,
-        headroom_request: &DownstreamHeadroomRequest,
-        headroom_result: &DownstreamHeadroomResult,
-        headroom_ledger: &HeadroomAllocationLedger,
+        headroom_request: &'a DownstreamHeadroomRequest,
+        headroom_result: &'a DownstreamHeadroomResult,
+        headroom_ledger: &'a HeadroomAllocationLedger,
         observed_now_ms: u64,
         headroom_recheck_now_ms: u64,
         admission_parts: impl FnOnce(
             &ContextCandidateSetResult,
         ) -> Result<PacketAdmissionParts, PacketCompositionError>,
         quality: impl FnOnce(&AdmittedContextSet) -> Result<QualityScorecard, PacketCompositionError>,
-        assembly: &AssemblyPolicy,
+        assembly: &'a AssemblyPolicy,
         measure: impl FnOnce(&[u8]) -> Result<SerializedContextMeasurement, ContextError>,
-    ) -> Result<(ActiveUnderstandingViewResult, MaterialRankTraceDelivery), PacketCompositionError>
-    {
+    ) -> Result<ContextCompilationOwnerReadback<'a>, PacketCompositionError> {
         if seven.scope_id.as_str() != request.binding.scope_id.as_str()
             || seven.state_fence != request.binding.state_fence
         {
@@ -2320,7 +2355,7 @@ impl KernelContextReadClient {
         input
             .validate()
             .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
-        let (admitted, delivery) = admit_packet_candidates(&input, &headroom)?;
+        let (admission_result, delivery) = admit_packet_candidates(&input, &headroom)?;
         // The selection happened under the reservation. Re-read the live owner
         // now, with the second clock reading, so a reservation the owner has
         // since fenced or expired cannot carry the assembled packet.
@@ -2330,30 +2365,60 @@ impl KernelContextReadClient {
                 attempted_recipe_digest: recipe.recipe_sha256.clone(),
                 refusal: Box::new(refusal),
             })?;
-        Self::require_campaign_view_for_assembly(
-            &admitted,
-            campaign_view,
-            context_recipe_record_digest,
-        )?;
-        // The admitted set now exists, so the scorecard owner is asked for the
-        // card that grades exactly this admitted set and its rendered output.
-        let quality = quality(&admitted)?;
-        let assembled = assemble_active_view(&admitted, recipe, quality, assembly, measure)
-            .map_err(|error| composition_failure(error, recipe, &request.binding))?;
-        check_delivered_traces(&delivery, &assembled)
-            .map_err(PacketCompositionError::TraceDelivery)?;
-        assembled
-            .verify_boundaries()
-            .map_err(|error| PacketCompositionError::Assembly(Box::new(error)))?;
-        recheck_packet_headroom(&assembled, recipe, &headroom)?;
-        // Release through the owner's own port. The evidence is DISCARDED here
-        // for the same pre-existing reason the Context-side release
-        // instructions are: no production caller of this composition consumes a
-        // release record yet. Discarding the record does not discard the
-        // release — the owner's own release path has already returned every
-        // slot — and the capacity is returned through its issuer either way.
+        let mut retained_quality = None;
+        let outcome = match admission_result.outcome.clone() {
+            ContextOutcome::Incomplete(gaps) => {
+                ContextCompilationOwnerOutcome::Incomplete(Box::new(gaps))
+            }
+            ContextOutcome::Complete(admitted) => {
+                Self::require_campaign_view_for_assembly(
+                    &admitted,
+                    campaign_view,
+                    context_recipe_record_digest,
+                )?;
+                // The admitted set now exists, so the scorecard owner is asked
+                // for the card that grades exactly this admitted set.
+                let quality = quality(&admitted)?;
+                retained_quality = Some(quality.clone());
+                match assemble_active_view(&admitted, recipe, quality.clone(), assembly, measure) {
+                    Err(error) => ContextCompilationOwnerOutcome::Refused(Box::new(
+                        composition_failure(error, recipe, &request.binding),
+                    )),
+                    Ok(assembled) => {
+                        if let Err(error) = check_delivered_traces(&delivery, &assembled) {
+                            ContextCompilationOwnerOutcome::Refused(Box::new(
+                                PacketCompositionError::TraceDelivery(error),
+                            ))
+                        } else if let Err(error) = assembled.verify_boundaries() {
+                            ContextCompilationOwnerOutcome::Refused(Box::new(
+                                PacketCompositionError::Assembly(Box::new(error)),
+                            ))
+                        } else if let Err(error) = recheck_packet_headroom(&assembled, recipe, &headroom) {
+                            ContextCompilationOwnerOutcome::Refused(Box::new(error))
+                        } else {
+                            ContextCompilationOwnerOutcome::Complete(assembled)
+                        }
+                    }
+                }
+            }
+        };
+        // Owner release is explicit on the normal path; early `?` exits and
+        // cancellation drop the held non-clone permits, whose Drop returns
+        // each slot through the issuing FrontDoor.
         let _released_by_owner = headroom_join.release();
-        Ok((assembled, delivery))
+        Ok(ContextCompilationOwnerReadback {
+            request,
+            recipe,
+            candidate_policy: policy,
+            assembly_policy: assembly,
+            role_inputs: seven,
+            quality: retained_quality,
+            candidates,
+            admission_input: input,
+            admission: admission_result,
+            rank_trace_delivery: delivery,
+            outcome,
+        })
     }
 }
 
@@ -2550,7 +2615,7 @@ fn composition_failure(
 fn admit_packet_candidates(
     input: &AdmissionInput,
     headroom: &HeadroomContext<'_>,
-) -> Result<(AdmittedContextSet, MaterialRankTraceDelivery), PacketCompositionError> {
+) -> Result<(AdmissionResult, MaterialRankTraceDelivery), PacketCompositionError> {
     require_composed_learning_guard(input)?;
     let (result, traces) = match admit_context_traced_with_headroom(input, headroom)
         .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?
@@ -2565,13 +2630,7 @@ fn admit_packet_candidates(
         .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
     let delivery = MaterialRankTraceDelivery::new(&result, traces)
         .map_err(PacketCompositionError::TraceDelivery)?;
-    let admitted = match result.outcome {
-        ContextOutcome::Complete(admitted) => admitted,
-        ContextOutcome::Incomplete(gaps) => {
-            return Err(PacketCompositionError::AdmissionIncomplete(Box::new(gaps)));
-        }
-    };
-    Ok((admitted, delivery))
+    Ok((result, delivery))
 }
 
 /// Refuses learning-marked or ticketed input before any selection runs.

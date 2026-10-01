@@ -13,6 +13,7 @@ mod taxonomy;
 
 pub use input::{
     AdmittedTargetRef, ClassificationInput, ExternalGradeRef, FeatureObservation, NamedEvidence,
+    ORIENTATION_CLASSIFICATION_PROFILE_SCHEMA_VERSION, OrientationClassificationProfile,
     PriorAssignmentRef, classification_input_digest, preflight_classification_acceptance,
     seal_classification, validate_classification, validate_classification_acceptance,
 };

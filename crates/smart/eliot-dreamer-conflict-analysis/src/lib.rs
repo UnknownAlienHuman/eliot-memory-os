@@ -292,6 +292,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use eliot_contracts::{StateFence, canonical_json_bytes, fences_match_exact, sha256_hex};
+use eliot_dreamer_contracts::grounding::GroundedDreamDraft as StructuredGroundedDreamDraft;
+use eliot_dreamer_contracts::validation::ValidatedGroundingCandidate;
 use eliot_dreamer_contracts::{
     CurationRejectionCode, FailureCausalStatus, GroundedDreamDraft, PossibleResultSchema,
     PreservationDimension, ProbeObjective, ResultTarget, ResultUpdate, ValidatedCurationItem,
@@ -581,7 +583,7 @@ pub const KIND_PRECEDENCE: [ConflictKind; 8] = [
 ];
 
 /// Closed policy governing one conflict analysis.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct ConflictAnalysisPolicy {
     /// Governing policy identity; must equal the receipt validator policy.
     pub policy_id: String,
@@ -608,7 +610,7 @@ pub struct ConflictAnalysisPolicy {
 }
 
 /// One source-to-lineage-root attribution supplied by the caller.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct LineageAttribution {
     /// Source handle attributed to a lineage root.
     pub source_handle: String,
@@ -619,7 +621,7 @@ pub struct LineageAttribution {
 }
 
 /// One preserved objection supplied by the caller.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct SuppliedObjection {
     /// Stable objection identity.
     pub objection_id: String,
@@ -632,7 +634,7 @@ pub struct SuppliedObjection {
 }
 
 /// One supplied structured probe candidate (declaration only, never executed).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct SuppliedProbe {
     /// Stable probe identity.
     pub probe_id: String,
@@ -659,7 +661,7 @@ pub struct SuppliedProbe {
 }
 
 /// Separately supplied external resolution status (retained, never reissued).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct ExternalResolution {
     /// Digest of the external decision receipt.
     pub decision_digest: String,
@@ -673,7 +675,7 @@ pub struct ExternalResolution {
 /// order. Two claims are compared only over these typed fields; no other
 /// difference is normalized, and a field that cannot be normalized stays
 /// ambiguous rather than being smoothed into agreement or difference.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub enum ComparisonDimension {
     /// Canonical subject or entity under discussion.
     SubjectEntity,
@@ -735,7 +737,7 @@ const CONDITION_DIMENSIONS: [ComparisonDimension; 3] = [
 ];
 
 /// Legacy caller-declared outcome for one canonical comparison dimension.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum DimensionOutcome {
     /// The legacy caller declares the same value for both positions. This is
     /// not an owner-bound observation and cannot establish equality.
@@ -760,7 +762,7 @@ pub enum DimensionOutcome {
 }
 
 /// One legacy caller-declared outcome for a canonical comparison dimension.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct DimensionComparison {
     /// Which canonical dimension this entry compares.
     pub dimension: ComparisonDimension,
@@ -773,7 +775,7 @@ pub struct DimensionComparison {
 /// dimension records accompany this shape, so declarations are never
 /// qualified as equality or difference. Rust callers may continue constructing
 /// it for compatibility; this crate does not deserialize legacy bytes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct SuppliedComparison {
     /// Source handle of the left position.
     pub left_source: String,
@@ -810,7 +812,7 @@ pub struct SuppliedComparison {
 /// digest is refused rather than admitted as merely well-formed. This cell
 /// acquires nothing; it only checks that the record it was handed is
 /// self-consistent and bound to the exact position it names.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct SourceMemberRecord {
     /// `ConflictSet` position source handle this member is bound to.
     pub position_source: String,
@@ -877,7 +879,7 @@ impl SourceMemberRecord {
 }
 
 /// How an owner-issued profile records a dimension it cannot resolve.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum DispositionKind {
     /// The owner records the field as unnormalizable under this profile.
     Unnormalizable,
@@ -904,7 +906,7 @@ impl DispositionKind {
 /// both a missing and an unsupported dimension. A caller cannot submit an
 /// `Equal`/`Differing` verdict as authority; the profile only says how a value
 /// is read, and [`OwnerComparison`] carries the observed values it read.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct OwnerComparisonProfile {
     /// Profile identity as issued by its owner.
     pub profile_id: String,
@@ -992,7 +994,7 @@ impl OwnerComparisonProfile {
 /// cannot be re-attached to a different position, and it names the canonical
 /// descriptor it answers, so a value cannot answer a dimension it was not read
 /// under. It is a single-source value, never a verdict about a pair.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct DimensionObservation {
     /// Source handle whose member this value was read from.
     pub source: String,
@@ -1041,7 +1043,7 @@ impl DimensionObservation {
 /// [`SourceMemberRecord::validate`] already applies to a source member and
 /// [`MechanismBinding::validate`] to a declaration; a receipt identity matching
 /// no retained receipt is a string, not a receipt.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct EvidenceRecord {
     /// Evidence identity as issued by its owner.
     pub evidence_id: String,
@@ -1147,7 +1149,7 @@ impl EvidenceRecord {
 /// that pairing the claim's verbatim text rides along as a 64-character string
 /// that could stand for any text at all, and the source's own declared claim
 /// would not be the claim this cell preserves.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct MechanismBinding {
     /// Mechanism claim identity as issued by its owner.
     pub claim_id: String,
@@ -1191,7 +1193,7 @@ impl MechanismBinding {
 }
 
 /// Observed status of an owner-issued falsifier.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum FalsifierStatus {
     /// The falsifier was specified but not observed.
     Unobserved,
@@ -1214,7 +1216,7 @@ impl FalsifierStatus {
 }
 
 /// Owner-issued falsifier specification plus its observed status.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct FalsifierBinding {
     /// Bounded falsifier specification.
     pub specification: String,
@@ -1225,7 +1227,7 @@ pub struct FalsifierBinding {
 }
 
 /// Result a competent evaluator or verifier returned for a matched control.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum EvaluatorResult {
     /// A competent evaluator/verifier returned a usable result.
     Competent,
@@ -1248,7 +1250,7 @@ impl EvaluatorResult {
 }
 
 /// Owner-issued matched control and the evaluator/verifier result for it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct ControlBinding {
     /// Matched control identity.
     pub control_id: String,
@@ -1270,7 +1272,7 @@ pub struct ControlBinding {
 /// both joins an intervention would be supportable on any well-formed
 /// 64-character digest, which is precisely the "two hashes look right"
 /// substitution the owner contract exists to prevent.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct InterventionBinding {
     /// Execution identity of the intervention.
     pub execution_id: String,
@@ -1284,7 +1286,7 @@ pub struct InterventionBinding {
 /// a second copy of the caller's own expected list: every expected rival must
 /// appear in `observed`, no member may be both observed and omitted, and
 /// [`EvidenceCoverage::CompleteForScope`] cannot coexist with an omission.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct RivalDenominator {
     /// Rival/confounder handles the owner set out to cover.
     pub expected: Vec<String>,
@@ -1400,7 +1402,7 @@ impl RivalDenominator {
 /// claimed — is joined to a retained envelope, the control's verdict belongs to
 /// the control owner that issued it, and no envelope may join material or
 /// receipt it does not name.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct CausalEvidenceRecord {
     /// Source handle holding the claim.
     pub source_handle: String,
@@ -1581,7 +1583,7 @@ impl CausalEvidenceRecord {
 /// The pair carries its source commitments and the observed values for both
 /// sources; the relation itself is DERIVED here from those values. A caller
 /// supplies no verdict.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct OwnerComparison {
     /// Lexicographically lesser source handle of the pair.
     pub first_source: String,
@@ -1725,7 +1727,7 @@ impl OwnerComparison {
 /// exactly as it consumes legacy declarations: it validates them against the
 /// item's own task/scope/fence and the retained bytes, derives the strongest
 /// state they support, and never acquires or upgrades one.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct OwnerRecords {
     /// Versioned source members, one per admitted position.
     pub source_members: Vec<SourceMemberRecord>,
@@ -1752,7 +1754,7 @@ pub struct OwnerRecords {
 /// The commitment carries the handle it is issued for, so it cannot be detached
 /// from its source and re-attached to another. Normalizing a comparison pair
 /// moves a source and its commitment as one unit.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct SourceRecordCommitment {
     source: String,
     record_digest: String,
@@ -2239,7 +2241,7 @@ impl SupplementVersion {
 
 /// Distinct states a causal or predictive claim may hold (algorithm step 7).
 /// These never collapse into one another and never imply a winner.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum CausalClaimState {
     /// Topology or structure only; no causal claim is made.
     Structural,
@@ -2313,7 +2315,7 @@ impl CausalClaimState {
 /// causal or intervention state. This compatibility shape has no owner-issued
 /// observation, verification receipt, or coverage denominator and is never
 /// deserialized from old bytes into a stronger contract.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct SuppliedCausalClaim {
     /// Source handle holding the claim.
     pub source_handle: String,
@@ -2406,7 +2408,7 @@ pub struct CausalClaimRecord {
 ///
 /// This type has no byte deserializer that could silently fill defaults while
 /// upgrading old serialized values into a stronger schema.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct ConflictSupplements {
     /// Expected A-05 receipt the item and draft receipts bind against.
     pub expected_receipt: ValidationReceipt,
@@ -3756,11 +3758,48 @@ fn receipt_err(detail: &str) -> ConflictAnalysisError {
     }
 }
 
+/// Intrinsic owner view without converting or replacing a grounding record.
+trait ConflictGrounding {
+    fn validate_grounding(&self) -> Result<(), ConflictAnalysisError>;
+    fn job_id(&self) -> &str;
+    fn draft_digest(&self) -> &str;
+}
+
+impl ConflictGrounding for GroundedDreamDraft {
+    fn validate_grounding(&self) -> Result<(), ConflictAnalysisError> {
+        self.validate()
+            .map_err(|error| receipt_err(&error.to_string()))
+    }
+
+    fn job_id(&self) -> &str {
+        &self.job_id
+    }
+
+    fn draft_digest(&self) -> &str {
+        &self.draft_digest
+    }
+}
+
+impl ConflictGrounding for StructuredGroundedDreamDraft {
+    fn validate_grounding(&self) -> Result<(), ConflictAnalysisError> {
+        self.validate()
+            .map_err(|error| receipt_err(&error.to_string()))
+    }
+
+    fn job_id(&self) -> &str {
+        &self.job_id
+    }
+
+    fn draft_digest(&self) -> &str {
+        &self.draft_digest
+    }
+}
+
 /// Checks the A-05 receipts intrinsically plus item, draft, and grounding.
 fn intrinsic_receipt_checks(
     item: &ValidatedCurationItem,
     draft: &ValidatedDreamDraft,
-    grounded: &GroundedDreamDraft,
+    grounded: &impl ConflictGrounding,
     supplements: &ConflictSupplements,
 ) -> Result<(), ConflictAnalysisError> {
     item.receipt
@@ -3786,9 +3825,7 @@ fn intrinsic_receipt_checks(
         .map_err(|err| receipt_err(&err.to_string()))?;
     item.validate()
         .map_err(|err| receipt_err(&err.to_string()))?;
-    grounded
-        .validate()
-        .map_err(|err| receipt_err(&err.to_string()))?;
+    grounded.validate_grounding()?;
     if item.receipt.terminal_disposition != "accepted"
         && item.receipt.terminal_disposition != "partial"
     {
@@ -3805,7 +3842,7 @@ fn intrinsic_receipt_checks(
 fn intrinsic_binding_checks(
     item: &ValidatedCurationItem,
     draft: &ValidatedDreamDraft,
-    grounded: &GroundedDreamDraft,
+    grounded: &impl ConflictGrounding,
     conflict_set: &ConflictSet,
     supplements: &ConflictSupplements,
 ) -> Result<(), ConflictAnalysisError> {
@@ -3821,13 +3858,13 @@ fn intrinsic_binding_checks(
             detail: "frozen manifest digest drifts from the receipt binding".to_owned(),
         });
     }
-    if item.receipt.draft_digest != grounded.draft_digest {
+    if item.receipt.draft_digest != grounded.draft_digest() {
         return Err(ConflictAnalysisError::Binding {
             field: "draft_digest".to_owned(),
             detail: "grounded draft digest drifts from the receipt binding".to_owned(),
         });
     }
-    if grounded.job_id != item.receipt.job_id {
+    if grounded.job_id() != item.receipt.job_id {
         return Err(ConflictAnalysisError::Binding {
             field: "job_id".to_owned(),
             detail: "grounded job drifts from the receipt binding".to_owned(),
@@ -5930,11 +5967,63 @@ fn emit_candidate(
 /// Returns [`ConflictAnalysisError`] on any blank, controlled, overlong,
 /// unordered-where-required, duplicated, misshapen, mismatched, stale,
 /// over-budget, past-deadline, or unbound field.
-#[allow(clippy::too_many_lines)]
 pub fn analyze_conflict(
     item: &ValidatedCurationItem,
     draft: &ValidatedDreamDraft,
     grounded: &GroundedDreamDraft,
+    conflict_set: &ConflictSet,
+    supplements: &ConflictSupplements,
+    policy: &ConflictAnalysisPolicy,
+) -> Result<ConflictAnalysisCandidate, ConflictAnalysisError> {
+    analyze_conflict_bound(item, draft, grounded, conflict_set, supplements, policy)
+}
+
+/// Analyzes conflict using the original structured A03/A05 grounding handoff.
+///
+/// The original recorded A05 receipt is validated against its retained
+/// structured preimage. The item and supplements must carry that same receipt;
+/// a legacy grounding residue or a receipt for another draft cannot substitute.
+/// This remains candidate-only and does not qualify external owner proof gaps.
+///
+/// # Errors
+/// Returns the existing typed refusal for invalid structured receipt binding,
+/// mismatched owner records, or any boundary refused by [`analyze_conflict`].
+pub fn analyze_grounded_conflict(
+    item: &ValidatedCurationItem,
+    candidate: &ValidatedGroundingCandidate,
+    conflict_set: &ConflictSet,
+    supplements: &ConflictSupplements,
+    policy: &ConflictAnalysisPolicy,
+) -> Result<ConflictAnalysisCandidate, ConflictAnalysisError> {
+    candidate
+        .validate_binding()
+        .map_err(|error| receipt_err(&error.to_string()))?;
+    let job = &candidate.input.grounded.input.job;
+    let job_bytes = eliot_dreamer_contracts::encoding::canonical_bytes(job)
+        .map_err(|error| receipt_err(&error.to_string()))?;
+    if item.job_digest != eliot_dreamer_contracts::encoding::digest_hex(&job_bytes)
+        || item.requester != job.requester
+    {
+        return Err(ConflictAnalysisError::Binding {
+            field: "item.job".to_owned(),
+            detail: "curation item does not bind the retained structured grounding job".to_owned(),
+        });
+    }
+    analyze_conflict_bound(
+        item,
+        &candidate.validated,
+        candidate.input.grounded.as_ref(),
+        conflict_set,
+        supplements,
+        policy,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn analyze_conflict_bound(
+    item: &ValidatedCurationItem,
+    draft: &ValidatedDreamDraft,
+    grounded: &impl ConflictGrounding,
     conflict_set: &ConflictSet,
     supplements: &ConflictSupplements,
     policy: &ConflictAnalysisPolicy,

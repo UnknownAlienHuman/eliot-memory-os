@@ -43,8 +43,8 @@ pub const MAX_DREAMER_JOB_TEXT_BYTES: usize = 16 * 1024;
 ///
 /// The mapping preserves typed identity, CAS, lease, checkpoint, receipt,
 /// coverage, cancellation, unknown-commit, semantic-input availability,
-/// owner-record identity, and internal error classes without echoing supplied
-/// payloads.
+/// owner-record identity, runtime-owner/orientation input availability, and
+/// internal error classes without echoing supplied payloads.
 #[must_use]
 pub fn map_durable_error(error: DurableJobError) -> StoreError {
     match error {
@@ -56,26 +56,22 @@ pub fn map_durable_error(error: DurableJobError) -> StoreError {
         DurableJobError::LimitExceeded(_) => StoreError::PayloadTooLarge,
         DurableJobError::Serialization(reason) => StoreError::Serialization(reason),
         DurableJobError::FenceMismatch => StoreError::FenceMismatch,
-        // `SemanticInputMismatch` and `OwnerRecordMismatch` are the same class
-        // of bind, raised from the same arm of `DurableJobResponse::validate_for`:
-        // the store's answer echoes an owner-issued reference that is not the one
-        // the request carried. Both therefore take the identical disposition —
-        // `IdentityConflict`, which `store_failure` renders as a `Conflict` with
-        // mutation disposition `NotAttempted`, so the refusal is raised BEFORE
-        // any write and the stored owner record is preserved exactly as it was.
-        // The caller sees `IDENTITY_CONFLICT` with retry
-        // `NewIdentityAfterCondition`: the owner must reissue under a new
-        // identity rather than have the store accept, drop, or overwrite the
-        // record that is already there.
-        //
-        // This is deliberately NOT `SemanticInputUnavailable`'s `Empty`: absence
-        // of a reference is a different fact from disagreement about one, and
-        // collapsing them would report a missing owner record as an empty field.
+        // Owner-issued reference mismatches are identity conflicts, distinct
+        // from unavailable references; refusal preserves the stored record and
+        // requires a new identity after the owner resolves the mismatch.
         DurableJobError::OperationMismatch
         | DurableJobError::SemanticInputMismatch
-        | DurableJobError::OwnerRecordMismatch => StoreError::IdentityConflict,
+        | DurableJobError::OwnerRecordMismatch
+        | DurableJobError::RuntimeOwnerExecutionInputMismatch
+        | DurableJobError::OutputContractMismatch => StoreError::IdentityConflict,
         DurableJobError::SemanticInputUnavailable => StoreError::Empty {
             field: "semantic_input",
+        },
+        DurableJobError::RuntimeOwnerExecutionInputUnavailable => StoreError::Empty {
+            field: "runtime_owner_execution_input",
+        },
+        DurableJobError::OutputContractUnavailable => StoreError::Empty {
+            field: "output_contract",
         },
         DurableJobError::CapabilityDenied => StoreError::UnknownOperation,
         DurableJobError::LeaseInvalid | DurableJobError::TerminalImmutable => {
@@ -676,6 +672,39 @@ fn validate_bundle_identities(
     }
     if response.scope != record.record.submission.work_scope {
         return Err(StoreError::FenceMismatch);
+    }
+    match (
+        record
+            .record
+            .submission
+            .runtime_owner_execution_input
+            .as_ref(),
+        record
+            .record
+            .submission
+            .runtime_owner_execution_input_bytes
+            .as_ref(),
+        response.runtime_owner_execution_input.as_ref(),
+        response.runtime_owner_execution_input_bytes.as_ref(),
+    ) {
+        (None, None, None, None) => {}
+        (Some(expected_ref), Some(expected_bytes), Some(observed_ref), Some(observed_bytes))
+            if expected_ref == observed_ref && expected_bytes == observed_bytes => {}
+        (Some(_), Some(_), None, None) => {
+            return Err(StoreError::Empty {
+                field: "runtime_owner_execution_input",
+            });
+        }
+        _ => return Err(StoreError::IdentityConflict),
+    }
+    match response.output_contract.as_ref() {
+        Some(output_contract) if output_contract == &record.record.submission.output_contract => {}
+        None => {
+            return Err(StoreError::Empty {
+                field: "output_contract",
+            });
+        }
+        Some(_) => return Err(StoreError::IdentityConflict),
     }
     let request_fence = &request.request_identity.operation.state_fence;
     if let JobOperation::RecordApplicability { update } = &request.operation {

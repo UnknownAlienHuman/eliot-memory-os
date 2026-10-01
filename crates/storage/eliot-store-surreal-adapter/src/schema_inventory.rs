@@ -126,7 +126,7 @@ impl EmbeddedSchemaBody {
 /// order: the executable graph first (v1 baseline, the v1-to-v2 additive
 /// delta, the v2 fresh-database baseline), then the bodies this owner
 /// declares but does not admit.
-pub(crate) static EMBEDDED_SCHEMA_BODIES: [EmbeddedSchemaBody; 10] = [
+pub(crate) static EMBEDDED_SCHEMA_BODIES: [EmbeddedSchemaBody; 11] = [
     EmbeddedSchemaBody {
         const_name: "SCHEMA_DDL",
         migration_id: Some(schema::MIGRATION_ID_V1),
@@ -225,6 +225,16 @@ pub(crate) static EMBEDDED_SCHEMA_BODIES: [EmbeddedSchemaBody; 10] = [
         ddl: schema::LEARNING_TABLES_DDL,
         disposition: BodyDisposition::DeclaredNotAdmitted,
         note: "learning body; the learning_record table is created by the closed learning ensure-tables operation, so this body is declared but has no migration identity",
+        pinned_sha256: None,
+    },
+    EmbeddedSchemaBody {
+        const_name: "ORIENTATION_OWNER_SOURCE_TABLES_DDL",
+        migration_id: None,
+        generation: None,
+        predecessor_generation: None,
+        ddl: schema::ORIENTATION_OWNER_SOURCE_TABLES_DDL,
+        disposition: BodyDisposition::DeclaredNotAdmitted,
+        note: "the campaign_source table is created only by the closed Orientation owner-source publication operation and has no migration identity",
         pinned_sha256: None,
     },
 ];
@@ -570,6 +580,7 @@ pub(crate) static RESTORE_SCHEMA_DEPENDENCIES: [RestoreSchemaDependency; 4] = [
             schema::table::AUTOMATION_INVOCATION,
             schema::table::AUTOMATION_LAST_FAILURE,
             schema::table::AUTOMATION_REVISION,
+            schema::table::CAMPAIGN_SOURCE,
             schema::table::CANONICAL_EVENT,
             schema::table::CANONICAL_FENCE,
             schema::table::ERASURE_INTENT,

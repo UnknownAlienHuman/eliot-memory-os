@@ -30,7 +30,6 @@ mod boundary;
 mod bounds;
 mod campaign_view;
 mod cite;
-mod error;
 #[cfg(not(target_arch = "wasm32"))]
 mod handoff_rebuild;
 #[cfg(not(target_arch = "wasm32"))]
@@ -42,7 +41,7 @@ mod readback;
 mod render;
 
 pub use assemble::{
-    ASSEMBLY_ORDERING_REVISION, ActiveUnderstandingViewResult, AssemblyPolicy,
+    ASSEMBLY_ORDERING_REVISION, AssemblyPolicy,
     HeadroomHandoffRefusal, RenderedOutputIdentity, assemble_active_view, recheck_headroom_handoff,
     rendered_output_identity,
 };
@@ -53,7 +52,6 @@ pub use boundary::{
 };
 pub use campaign_view::check_campaign_view_for_assembly;
 pub use cite::project_citation;
-pub use error::AssemblyError;
 #[cfg(not(target_arch = "wasm32"))]
 pub use handoff_rebuild::{
     HandoffRebuildCurrent, HandoffRebuildDiagnostic, HandoffRebuildError, HandoffRebuildOutcome,
@@ -67,7 +65,8 @@ pub use measurement::assemble_active_view_with_measurement;
 pub use readback::{ReopenedSource, gate_citation};
 
 pub use eliot_context_contracts::{
-    ActiveUnderstandingView, AdmittedContextSet, BoundaryMetadataSet, ContextError, ContextOutcome,
+    ActiveUnderstandingView, ActiveUnderstandingViewResult, AdmittedContextSet, AssemblyError,
+    BoundaryMetadataSet, ContextError, ContextOutcome,
     DownstreamHeadroomRequest, DownstreamHeadroomResult, HeadroomAllocationLedger, HeadroomAttempt,
     HeadroomConsumer, HeadroomDecision, HeadroomDemand, HeadroomDimension, HeadroomOutcome,
     HeadroomPurpose, HeadroomQuantity, HeadroomRefusal, HeadroomReleaseCondition,

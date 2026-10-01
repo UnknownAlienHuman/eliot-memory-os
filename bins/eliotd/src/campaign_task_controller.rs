@@ -4,10 +4,14 @@
 //! This adapter only decodes the owner-native task payload, delegates the
 //! semantic transition to the single Governor task owner, and submits the
 //! exact typed result through Kernel. The Governor transition constructs the
-//! Task Controller's native campaign rows; this adapter never writes a source
-//! record or reconstructs a missing owner publication.
+//! Task Controller's native campaign rows. Explicit Context compiler supplier
+//! inputs are owner-validated here and join the same canonical TaskPlan/source
+//! transition; this adapter never writes outside that transition or fills an
+//! unrelated missing owner publication.
 
-use eliot_context::campaign_publication::ContextCampaignRecipeBody;
+use eliot_context::campaign_publication::{
+    ContextCampaignRecipeBody, ContextCompilerSupplierProfileV1,
+};
 use eliot_context_contracts::SessionDeliverySnapshot;
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_governor::{
@@ -18,7 +22,9 @@ use eliot_learning_contracts::{
     CampaignSourceBinding, CampaignSourceRevisionRef, CampaignSourceRole, LearningStateViewRecipe,
 };
 use eliot_protocol::{
-    TaskControllerAction, TaskControllerCampaignOwnerMaterials, TaskControllerResultBody,
+    TaskControllerAction, TaskControllerCampaignOwnerMaterials, TaskControllerOrientationInput,
+    TaskControllerResultBody,
+    dreamer_job::{JobOperation, JobRole},
 };
 use eliot_store_api::{
     CampaignSourceDocumentSchema, CampaignSourceHead, CampaignSourcePublication,
@@ -48,11 +54,20 @@ enum PreparedTaskControllerAction {
     Apply(GuardedTaskCommand),
 }
 
+/// Already-sealed Orientation submit carried by an authentic Task Controller
+/// claim. The runtime resolves its original named source and submits the exact
+/// retained request through K0/K1/K2.
+pub struct PreparedTaskControllerOrientation {
+    pub(crate) claimed: TaskControllerClaimedInvocation,
+    pub(crate) input: TaskControllerOrientationInput,
+}
+
 /// Either a bounded rejection body or an owned claim ready for guarded
 /// semantic preparation.
 pub enum TaskControllerClaimPreparation {
     Rejected(Box<TaskControllerResultBody>),
     Ready(Box<PreparedTaskControllerClaim>),
+    Orientation(Box<PreparedTaskControllerOrientation>),
 }
 
 /// Canonical task plan plus the exact claim which will carry its result.
@@ -107,18 +122,49 @@ fn validate_authenticated_context_recipe(
     Ok(())
 }
 
+fn bind_context_supplier_profile_from_current_read(
+    candidate: &ContextCampaignRecipeBody,
+    recipe: &LearningStateViewRecipe,
+    authenticated_publications: &[CampaignSourcePublication],
+    state_fence: &StateFence,
+) -> Result<ContextCampaignRecipeBody, String> {
+    let source_read = context_owner_read_for_role(
+        recipe,
+        authenticated_publications,
+        state_fence,
+        CampaignSourceRole::ContextRecipe,
+        true,
+    )?
+    .ok_or_else(|| "authenticated ContextRecipe read is missing".to_owned())?;
+    let current: ContextCampaignRecipeBody =
+        serde_json::from_value(source_read.record.document.body.clone())
+            .map_err(|_| "authenticated ContextRecipe body is invalid".to_owned())?;
+    let mut expected = candidate.clone();
+    expected.compiler_suppliers = current.compiler_suppliers.clone();
+    if expected != current {
+        return Err("Task Controller Context input differs from its current owner row".to_owned());
+    }
+    Ok(current)
+}
+
 fn validate_invocation_context_recipe(
     context_campaign_recipe_catalogue: &serde_json::Value,
     context_campaign_recipe: &serde_json::Value,
     context_input: &serde_json::Value,
+    context_compilation_input: Option<&serde_json::Value>,
     task_id: &str,
     work_scope_id: &str,
     state_fence: &StateFence,
 ) -> Result<ContextCampaignRecipeBody, String> {
+    let compiler_suppliers: Option<ContextCompilerSupplierProfileV1> = context_compilation_input
+        .map(|input| serde_json::from_value(input.clone()))
+        .transpose()
+        .map_err(|_| "Task Controller Context compiler supplier profile is invalid".to_owned())?;
     let body: ContextCampaignRecipeBody = serde_json::from_value(json!({
         "catalogue": context_campaign_recipe_catalogue.clone(),
         "recipe": context_campaign_recipe.clone(),
         "compiler_input": context_input.clone(),
+        "compiler_suppliers": compiler_suppliers,
     }))
     .map_err(|_| "Task Controller Context recipe body is invalid".to_owned())?;
     if body.recipe.binding.task_id.as_str() != task_id
@@ -129,6 +175,115 @@ fn validate_invocation_context_recipe(
     }
     crate::campaign_context_owner::derive_context_recipe_record(&body)?;
     Ok(body)
+}
+
+fn replace_context_source_reference(
+    recipe: &mut LearningStateViewRecipe,
+    publication: &CampaignSourcePublication,
+) -> Result<(), String> {
+    let role = publication.record.role;
+    if !matches!(
+        role,
+        CampaignSourceRole::ContextRecipe
+            | CampaignSourceRole::ContextToolPolicy
+            | CampaignSourceRole::ContextDelivery
+    ) {
+        return Err("Context publisher returned a non-Context owner row".to_owned());
+    }
+    let mut requirements = recipe
+        .source_requirements
+        .iter_mut()
+        .filter(|requirement| requirement.role == role);
+    let requirement = requirements
+        .next()
+        .ok_or_else(|| "TaskPlan omits a Context source requirement".to_owned())?;
+    if requirements.next().is_some() || requirement.owner != publication.record.owner_id {
+        return Err("TaskPlan Context source owner or denominator is inconsistent".to_owned());
+    }
+    requirement.source_binding = CampaignSourceBinding::ExactReference;
+    requirement.expected_reference = Some(source_reference_from_record(&publication.record));
+    Ok(())
+}
+
+fn publish_context_compiler_suppliers(
+    candidate: &ContextCampaignRecipeBody,
+    recipe: &mut LearningStateViewRecipe,
+    current_owner_publications: Vec<CampaignSourcePublication>,
+    state_fence: &StateFence,
+) -> Result<Vec<CampaignSourcePublication>, String> {
+    if candidate.compiler_suppliers.is_none() {
+        return Err("Context compiler supplier profile is missing".to_owned());
+    }
+    let recipe_read = context_owner_read_for_role(
+        recipe,
+        &current_owner_publications,
+        state_fence,
+        CampaignSourceRole::ContextRecipe,
+        false,
+    )?;
+    let tool_policy_read = context_owner_read_for_role(
+        recipe,
+        &current_owner_publications,
+        state_fence,
+        CampaignSourceRole::ContextToolPolicy,
+        false,
+    )?;
+    let delivery_read = context_owner_read_for_role(
+        recipe,
+        &current_owner_publications,
+        state_fence,
+        CampaignSourceRole::ContextDelivery,
+        false,
+    )?;
+    let expected_recipe_head = recipe_read.map(|read| read.current_head.clone());
+    let expected_tool_policy_head = tool_policy_read.map(|read| read.current_head.clone());
+    let new_context_publications = if let Some(delivery_read) = delivery_read {
+        let prior_delivery: SessionDeliverySnapshot =
+            serde_json::from_value(delivery_read.record.document.body.clone())
+                .map_err(|_| "authenticated ContextDelivery body is invalid".to_owned())?;
+        crate::campaign_context_owner::build_context_owner_publications(
+            candidate,
+            &prior_delivery,
+            expected_recipe_head,
+            expected_tool_policy_head,
+            Some(delivery_read.current_head.clone()),
+            state_fence,
+        )
+    } else {
+        crate::campaign_context_owner::build_context_recipe_and_tool_policy_publications(
+            candidate,
+            expected_recipe_head,
+            expected_tool_policy_head,
+            state_fence,
+        )
+    }
+    .map_err(|error| format!("Context compiler owner publication is invalid: {error}"))?;
+
+    let mut next_recipe = recipe.clone();
+    for publication in &new_context_publications {
+        replace_context_source_reference(&mut next_recipe, publication)?;
+    }
+    next_recipe
+        .seal()
+        .map_err(|error| format!("updated TaskPlan recipe cannot be sealed: {error}"))?;
+    next_recipe
+        .validate()
+        .map_err(|error| format!("updated TaskPlan recipe is invalid: {error}"))?;
+
+    let mut complete_owner_publications = current_owner_publications
+        .into_iter()
+        .filter(|publication| {
+            !matches!(
+                publication.record.role,
+                CampaignSourceRole::ContextRecipe
+                    | CampaignSourceRole::ContextToolPolicy
+                    | CampaignSourceRole::ContextDelivery
+            )
+        })
+        .collect::<Vec<_>>();
+    complete_owner_publications.extend(new_context_publications);
+    *recipe = next_recipe;
+    Ok(complete_owner_publications)
 }
 
 fn source_reference_from_record(
@@ -374,7 +529,7 @@ async fn read_authenticated_owner_publications(
     Ok(publications)
 }
 
-fn task_controller_result_body(
+pub(crate) fn task_controller_result_body(
     claimed: &TaskControllerClaimedInvocation,
     response: serde_json::Value,
 ) -> Result<TaskControllerResultBody, String> {
@@ -392,6 +547,111 @@ fn task_controller_result_body(
     body.validate()
         .map_err(|error| format!("Task Controller result validation failed: {error}"))?;
     Ok(body)
+}
+
+async fn prepare_task_controller_owner_publications(
+    reads: &KernelContextReadClient,
+    claimed: &TaskControllerClaimedInvocation,
+    recipe: &mut LearningStateViewRecipe,
+) -> Result<Option<Vec<CampaignSourcePublication>>, &'static str> {
+    let invocation = &claimed.invocation;
+    if invocation.campaign_owner_materials.is_none()
+        && invocation.context_compilation_input.is_none()
+    {
+        return Ok(None);
+    }
+    if invocation
+        .campaign_owner_materials
+        .as_ref()
+        .is_some_and(|materials| reject_caller_owner_material(materials).is_err())
+    {
+        return Err("invalid_owner_materials");
+    }
+    let candidate = validate_invocation_context_recipe(
+        &invocation.context_campaign_recipe_catalogue,
+        &invocation.context_campaign_recipe,
+        &invocation.context_input,
+        invocation.context_compilation_input.as_ref(),
+        invocation.task_id.as_str(),
+        &invocation.work_scope_id,
+        &claimed.envelope.state_fence,
+    )
+    .map_err(|_| "invalid_owner_materials")?;
+    let publications =
+        read_authenticated_owner_publications(reads, recipe, &claimed.envelope.state_fence)
+            .await
+            .map_err(|_| "owner_read_unavailable")?;
+    if invocation.context_compilation_input.is_some() {
+        return publish_context_compiler_suppliers(
+            &candidate,
+            recipe,
+            publications,
+            &claimed.envelope.state_fence,
+        )
+        .map(Some)
+        .map_err(|_| "context_compiler_source_unavailable");
+    }
+    let candidate = bind_context_supplier_profile_from_current_read(
+        &candidate,
+        recipe,
+        &publications,
+        &claimed.envelope.state_fence,
+    )
+    .map_err(|_| "owner_read_unavailable")?;
+    validate_authenticated_context_recipe(
+        &candidate,
+        recipe,
+        &publications,
+        &claimed.envelope.state_fence,
+    )
+    .map_err(|_| "owner_read_unavailable")?;
+    Ok(Some(publications))
+}
+
+fn validate_orientation_task_binding(
+    claimed: &TaskControllerClaimedInvocation,
+    input: &TaskControllerOrientationInput,
+) -> Result<(), &'static str> {
+    let invocation = &claimed.invocation;
+    input
+        .validate()
+        .map_err(|_| "invalid_orientation_request")?;
+    let JobOperation::Submit { submission } = &input.request.operation else {
+        return Err("invalid_orientation_request");
+    };
+    if input.request.role != JobRole::Requester {
+        return Err("invalid_orientation_request");
+    }
+    let request_identity = &input.request.request_identity;
+    if request_identity.request.metadata.task_id.as_ref() != Some(&invocation.task_id) {
+        return Err("orientation_task_mismatch");
+    }
+    if submission.work_scope.scope_id.as_str() != invocation.work_scope_id.as_str() {
+        return Err("orientation_scope_mismatch");
+    }
+    if request_identity.operation.state_fence != claimed.envelope.state_fence
+        || request_identity.request.state_fence != claimed.envelope.state_fence
+        || request_identity.request.metadata.state_fence != claimed.envelope.state_fence
+        || submission.work_scope.state_fence != claimed.envelope.state_fence
+    {
+        return Err("orientation_stale_fence");
+    }
+    if input.semantic_source.expected_digest.as_str() != submission.semantic_input.sha256.as_str()
+        || input.semantic_source.expected_byte_length != submission.semantic_input.byte_length
+    {
+        return Err("semantic_input_mismatch");
+    }
+    if submission.semantic_input_bytes.is_none() {
+        return Err("semantic_input_unavailable");
+    }
+    if input
+        .materials
+        .iter()
+        .any(|claim| claim.source_handle.as_str() == input.semantic_source.source_handle.as_str())
+    {
+        return Err("semantic_source_not_distinct");
+    }
+    Ok(())
 }
 
 fn task_controller_rejection(
@@ -416,7 +676,41 @@ pub async fn prepare_task_controller_claim(
     claimed: TaskControllerClaimedInvocation,
 ) -> Result<TaskControllerClaimPreparation, String> {
     let invocation = &claimed.invocation;
-    let recipe: LearningStateViewRecipe =
+    if invocation.context_compilation_input.is_some()
+        && invocation.wire_version != eliot_protocol::TASK_CONTROLLER_INVOCATION_WIRE_VERSION
+    {
+        return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
+            task_controller_rejection(&claimed, "compiler_supplier_profile_requires_current_wire")?,
+        )));
+    }
+    if invocation.action == TaskControllerAction::DreamerOrientation {
+        if invocation.context_compilation_input.is_some() {
+            return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
+                task_controller_rejection(&claimed, "orientation_source_already_published")?,
+            )));
+        }
+        let input: TaskControllerOrientationInput =
+            match serde_json::from_value(invocation.task_input.clone()) {
+                Ok(input) => input,
+                Err(_) => {
+                    return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
+                        task_controller_rejection(&claimed, "invalid_orientation_input")?,
+                    )));
+                }
+            };
+        if let Err(reason) = validate_orientation_task_binding(&claimed, &input) {
+            return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
+                task_controller_result_body(
+                    &claimed,
+                    json!({ "status": "blocked", "reason": reason }),
+                )?,
+            )));
+        }
+        return Ok(TaskControllerClaimPreparation::Orientation(Box::new(
+            PreparedTaskControllerOrientation { claimed, input },
+        )));
+    }
+    let mut recipe: LearningStateViewRecipe =
         match serde_json::from_value(invocation.learning_state_view_recipe.clone()) {
             Ok(recipe) => recipe,
             Err(_) => {
@@ -434,52 +728,15 @@ pub async fn prepare_task_controller_claim(
             task_controller_rejection(&claimed, "invalid_recipe")?,
         )));
     }
-    let complete_owner_publications = match invocation.campaign_owner_materials.as_ref() {
-        Some(materials) => {
-            if reject_caller_owner_material(materials).is_err() {
+    let complete_owner_publications =
+        match prepare_task_controller_owner_publications(reads, &claimed, &mut recipe).await {
+            Ok(publications) => publications,
+            Err(reason) => {
                 return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
-                    task_controller_rejection(&claimed, "invalid_owner_materials")?,
+                    task_controller_rejection(&claimed, reason)?,
                 )));
             }
-            let Ok(candidate_context_recipe) = validate_invocation_context_recipe(
-                &invocation.context_campaign_recipe_catalogue,
-                &invocation.context_campaign_recipe,
-                &invocation.context_input,
-                invocation.task_id.as_str(),
-                &invocation.work_scope_id,
-                &claimed.envelope.state_fence,
-            ) else {
-                return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
-                    task_controller_rejection(&claimed, "invalid_owner_materials")?,
-                )));
-            };
-            let Ok(publications) = read_authenticated_owner_publications(
-                reads,
-                &recipe,
-                &claimed.envelope.state_fence,
-            )
-            .await
-            else {
-                return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
-                    task_controller_rejection(&claimed, "owner_read_unavailable")?,
-                )));
-            };
-            if validate_authenticated_context_recipe(
-                &candidate_context_recipe,
-                &recipe,
-                &publications,
-                &claimed.envelope.state_fence,
-            )
-            .is_err()
-            {
-                return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
-                    task_controller_rejection(&claimed, "owner_read_unavailable")?,
-                )));
-            }
-            Some(publications)
-        }
-        None => None,
-    };
+        };
 
     let Ok(action) = decode_task_controller_action(&claimed) else {
         return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
@@ -531,6 +788,7 @@ fn decode_task_controller_action(
                 command: input.command,
             }))
         }
+        TaskControllerAction::DreamerOrientation => Err(()),
     }
 }
 

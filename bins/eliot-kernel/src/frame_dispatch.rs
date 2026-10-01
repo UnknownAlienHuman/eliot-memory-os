@@ -1453,6 +1453,7 @@ fn is_daemon_operation(operation: &str) -> bool {
         operation,
         "snapshot"
             | "daemon_ready"
+            | super::native_worker_execution_admission_read::NATIVE_WORKER_EXECUTION_ADMISSION_READ_OPERATION
             | "origin_challenge_issue"
             | "origin_control_decide"
             | ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION

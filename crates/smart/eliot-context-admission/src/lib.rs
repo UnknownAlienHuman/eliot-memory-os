@@ -30,6 +30,7 @@
 pub mod campaign_view;
 pub mod closure;
 pub mod decision;
+pub mod unit_group;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod learning_gate;
 #[cfg(not(target_arch = "wasm32"))]
@@ -37,6 +38,7 @@ pub mod material_floor;
 
 pub use campaign_view::check_campaign_view_for_admission;
 pub use closure::{ClosureParts, assemble_closure};
+pub use unit_group::UnitGroupContext;
 
 pub use decision::{
     ClassificationEvidence, ClassifiedAdmission, MaterialRankTrace, RetrievalAdmissionDecision,
@@ -71,6 +73,7 @@ use eliot_context_contracts::{
     HeadroomRefusal, MeasurementRef, OmissionReason, OmissionRecord, RepresentationKind,
 };
 use eliot_receipts::ProofCeiling;
+use crate::unit_group::UnitGroupBinding;
 
 // Host-only owner evidence: the `wasm32` guest contour must never see Governor
 // state or the governed registries, so the presented-carriage arm of
@@ -475,7 +478,20 @@ pub(crate) fn admit_context_composed<'a>(
     learning: &LearningGovernance<'a>,
     reservation: &DownstreamReservation<'a>,
 ) -> Result<ComposedAdmission, ContextError> {
+    admit_context_composed_with_units(input, learning, reservation, None)
+}
+
+/// One composed admission decision with owner-issued indivisible-unit evidence.
+/// The evidence is bound before the one selector runs alongside the existing
+/// learning and headroom gates; this function performs no owner I/O.
+pub(crate) fn admit_context_composed_with_units<'a>(
+    input: &AdmissionInput,
+    learning: &LearningGovernance<'a>,
+    reservation: &DownstreamReservation<'a>,
+    unit_context: Option<&UnitGroupContext<'_>>,
+) -> Result<ComposedAdmission, ContextError> {
     check_learning_carriage(input, learning)?;
+    let units = unit_context.map(|context| UnitGroupBinding::bind(input, context)).transpose()?;
     let headroom = match reservation {
         DownstreamReservation::NotReserved => None,
         DownstreamReservation::Reserved(headroom) => Some(*headroom),
@@ -498,7 +514,7 @@ pub(crate) fn admit_context_composed<'a>(
         },
         None => HeadroomCheck::NotReserved,
     };
-    match admit_context_inner_with_headroom(input, headroom) {
+    match admit_context_inner_with_headroom(input, headroom, units.as_ref()) {
         Ok(result) => Ok(ComposedAdmission::Admitted {
             result: Box::new(result),
             check,
@@ -573,6 +589,26 @@ pub fn admit_context_governed<'a>(
     }
 }
 
+/// Governed admission with exact owner unit metadata and section budgets.
+///
+/// This reuses the same learning/headroom composition and one selector as the
+/// ordinary governed entrypoint. Callers must supply the boundaries and
+/// budgets resolved for this very input and approved recipe revision.
+pub fn admit_context_governed_with_units<'a>(
+    input: &AdmissionInput,
+    learning: &LearningGovernance<'a>,
+    reservation: &DownstreamReservation<'a>,
+    units: &UnitGroupContext<'_>,
+) -> Result<HeadroomAdmissionOutcome, ContextError> {
+    match admit_context_composed_with_units(input, learning, reservation, Some(units))? {
+        ComposedAdmission::Admitted { result, check } => {
+            let traces = trace_material(input, &result)?;
+            Ok(HeadroomAdmissionOutcome::Admitted { result, traces, check })
+        }
+        ComposedAdmission::Refused(refusal) => Ok(HeadroomAdmissionOutcome::Refused(refusal)),
+    }
+}
+
 /// Admit one candidate set under one granted downstream reservation.
 ///
 /// I12.13: "Before filling optional context, Context Compiler requests the
@@ -615,6 +651,7 @@ pub fn admit_context_traced_with_headroom(
 fn admit_context_inner_with_headroom(
     input: &AdmissionInput,
     headroom: Option<&HeadroomContext<'_>>,
+    units: Option<&UnitGroupBinding<'_>>,
 ) -> Result<AdmissionResult, ContextError> {
     // I12.26 stale-projection fence arm, enforced before exact cue firing: a
     // candidate closure compiled under another fence must refresh the packet
@@ -652,7 +689,7 @@ fn admit_context_inner_with_headroom(
 
     // Capacity validation is deliberately before any candidate selection.
     input.recipe.capacity.validate()?;
-    let floor_ids = match prepare_floor(input, &candidates, &supplied)? {
+    let floor_ids = match prepare_floor(input, &candidates, &supplied, units)? {
         Ok(floor_ids) => floor_ids,
         Err(incomplete) => {
             return incomplete_result(input, input_digest, profile_digest, &incomplete);
@@ -683,6 +720,7 @@ fn admit_context_inner_with_headroom(
         admitted: &mut admitted,
         fixed,
         required_cost,
+        units,
     })?;
     let omissions = build_omissions(
         input,
@@ -703,6 +741,15 @@ fn admit_context_inner_with_headroom(
         required_cost,
         optional_cost,
         fixed,
+    })
+    .and_then(|result| {
+        let Some(units) = units else { return Ok(result); };
+        if let ContextOutcome::Complete(admitted) = &result.outcome {
+            for budget in units.section_budgets {
+                budget.validate_admitted_section(admitted)?;
+            }
+        }
+        Ok(result)
     })
 }
 
@@ -892,7 +939,8 @@ pub fn admit_context_traced_with_warnings(
 /// to the delivered trace set. No provider reasoning is stored here or in the
 /// traces it carries: only the permitted selection evidence and reasons the
 /// admission owner already bound.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MaterialRankTraceDelivery {
     /// Decision anchor every delivered trace is bound to.
     pub decision_id: eliot_contracts::DecisionId,
@@ -915,7 +963,8 @@ pub struct MaterialRankTraceDelivery {
 }
 
 /// Reverse association from one selected material dependency to its trace.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MaterialTraceDependencyBinding {
     /// Material whose selection recorded this dependency.
     pub atom_id: eliot_contracts::ArtifactId,
@@ -926,7 +975,8 @@ pub struct MaterialTraceDependencyBinding {
 }
 
 /// Reverse association from one selected material invalidation to its trace.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MaterialTraceInvalidationBinding {
     /// Material whose selection recorded this invalidation.
     pub atom_id: eliot_contracts::ArtifactId,
@@ -1341,6 +1391,7 @@ struct OptionalSelectionInput<'a> {
     admitted: &'a mut BTreeMap<eliot_contracts::ArtifactId, AdmittedAtom>,
     fixed: u64,
     required_cost: u64,
+    units: Option<&'a UnitGroupBinding<'a>>,
 }
 
 enum OptionalDecision {
@@ -1370,6 +1421,7 @@ fn select_optional(
         admitted,
         fixed,
         required_cost,
+        units,
     } = selection;
     let mut failure_causes = BTreeMap::new();
     let mut optional_ids: Vec<_> = candidates
@@ -1401,6 +1453,7 @@ fn select_optional(
         admitted,
         available,
         optional_cost: 0,
+        units,
     };
     for atom_id in optional_ids {
         if selection.admitted.contains_key(&atom_id) {
@@ -1433,6 +1486,7 @@ struct OptionalSelection<'a> {
     admitted: &'a mut BTreeMap<eliot_contracts::ArtifactId, AdmittedAtom>,
     available: u64,
     optional_cost: u64,
+    units: Option<&'a UnitGroupBinding<'a>>,
 }
 
 impl OptionalSelection<'_> {
@@ -1444,7 +1498,10 @@ impl OptionalSelection<'_> {
             .candidates
             .get(atom_id)
             .ok_or(ContextError::DenominatorMismatch)?;
-        let closure = optional_closure(atom_id, self.floor_ids, self.candidates)?;
+        let mut closure = optional_closure(atom_id, self.floor_ids, self.candidates)?;
+        if let Some(units) = self.units {
+            closure = units.group_closure(&closure)?;
+        }
         let closure_candidates = closure
             .iter()
             .filter_map(|id| self.candidates.get(id).copied())
@@ -1466,8 +1523,12 @@ impl OptionalSelection<'_> {
         let closure_current = closure_candidates
             .iter()
             .all(|item| item.availability == AtomAvailability::PresentCurrent);
+        let closure_established = self.units.is_none_or(|units| {
+            closure_candidates.iter().all(|item| units.admits_representation(item))
+        });
         let fits = !closure_missing
             && closure_current
+            && closure_established
             && candidate.availability == AtomAvailability::PresentCurrent
             && cost.is_some()
             && closure_cost.as_ref().is_ok_and(|value| {
@@ -1495,14 +1556,28 @@ impl OptionalSelection<'_> {
             }
             Ok(OptionalDecision::Include(value))
         } else {
-            let failure = optional_failure_cause(
+            let unestablished = self.units.and_then(|units| {
+                closure_candidates
+                    .iter()
+                    .find(|item| !units.admits_representation(item))
+                    .map(|item| {
+                        (
+                            OmissionReason::Policy,
+                            format!(
+                                "candidate {} has no owner-issued complete unit metadata or owner-named exact handle",
+                                item.atom_id
+                            ),
+                        )
+                    })
+            });
+            let failure = unestablished.or(optional_failure_cause(
                 self.input,
                 atom_id,
                 &closure,
                 self.candidates,
                 &closure_candidates,
                 closure_missing,
-            )?;
+            )?);
             Ok(OptionalDecision::Omit(failure.unwrap_or((
                 OmissionReason::Capacity,
                 "optional allocation exceeds remaining capacity".to_owned(),
@@ -1518,9 +1593,13 @@ fn prepare_floor(
         eliot_contracts::ArtifactId,
         &eliot_context_contracts::SuppliedOmissionBinding,
     >,
+    units: Option<&UnitGroupBinding<'_>>,
 ) -> Result<Result<BTreeSet<eliot_contracts::ArtifactId>, DecisionContextIncomplete>, ContextError>
 {
-    let floor_ids = floor_closure(input, candidates)?;
+    let mut floor_ids = floor_closure(input, candidates)?;
+    if let Some(units) = units {
+        floor_ids = units.group_closure(&floor_ids)?;
+    }
     for candidate in candidates.values() {
         if !floor_ids.contains(&candidate.atom_id)
             && (candidate.protected
@@ -1534,6 +1613,11 @@ fn prepare_floor(
             supplied,
             floor_ids.contains(&candidate.atom_id),
         )?;
+        if let Some(units) = units
+            && !units.admits_representation(candidate)
+        {
+            return Err(ContextError::WholeUnitRequired);
+        }
     }
     if let Some(incomplete) = floor_gap(input, candidates, &floor_ids)? {
         return Ok(Err(incomplete));

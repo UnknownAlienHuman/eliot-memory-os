@@ -38,6 +38,10 @@ pub use native_worker_claim::{
     NativeWorkerClaimBudget, NativeWorkerClaimConflict, NativeWorkerClaimReceipt,
     NativeWorkerClaimRejection, NativeWorkerClaimRejectionReason, NativeWorkerClaimRequest,
     NativeWorkerClaimResponse, NativeWorkerExecutableBinding, NativeWorkerExecutableExpectation,
+    NativeWorkerExecutionAdmissionEvidence, NativeWorkerExecutionAdmissionPhase,
+    NativeWorkerExecutionAdmissionReadRequest, NativeWorkerExecutionAdmissionReadResponse,
+    NATIVE_WORKER_EXECUTION_ADMISSION_READ_WIRE_ID,
+    NATIVE_WORKER_EXECUTION_ADMISSION_READ_WIRE_VERSION,
 };
 pub use native_worker_replay::{
     NATIVE_WORKER_REPLAY_MAX_EVENT_BYTES, NATIVE_WORKER_REPLAY_MAX_EVENT_REFS,

@@ -44,6 +44,8 @@
 use eliot_contracts::{
     CapabilityCellId, EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
 };
+use eliot_ors::NativeWorkerClaimRecord;
+use eliot_protocol::TaskControllerAttempt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -1113,6 +1115,212 @@ impl NativeWorkerClaimReceipt {
                 reason: "receipt digest mismatch",
             });
         }
+        Ok(())
+    }
+}
+
+/// Read-only projection of the original Kernel-admitted worker execution
+/// material for an authenticated process-start proof.
+///
+/// This is not another receipt or lifecycle. It carries the original claim
+/// request, the original Kernel admission receipt, the exact current ORS
+/// record, and the executable binding already present in that request. The
+/// owner validator compares all four and refuses legacy or partial evidence;
+/// consumers must still apply their own operation-specific policy.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeWorkerExecutionAdmissionEvidence {
+    /// Original validated request retained by the process-start owner.
+    pub request: NativeWorkerClaimRequest,
+    /// Original Kernel-issued claim admission receipt.
+    pub claim_receipt: NativeWorkerClaimReceipt,
+    /// Exact current owner-loaded ORS row for this claim identity.
+    pub durable_record: NativeWorkerClaimRecord,
+    /// Full executable binding already committed inside the original request.
+    pub executable_binding: NativeWorkerExecutableBinding,
+}
+
+/// Current Kernel dispatch-owner phase for the original admitted claim.
+/// This is observational metadata and does not change the claim's authority.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum NativeWorkerExecutionAdmissionPhase {
+    Reserved,
+    Launched,
+    Unreconciled,
+    Reconciled,
+}
+
+/// Existing native-worker claim admitted before launch, read by the
+/// authenticated daemon that owns the exact live Task Controller attempt.
+/// The identifiers are selectors only; the Kernel resolves and returns the
+/// original launch-owner records and refuses any task/scope/fence mismatch.
+pub const NATIVE_WORKER_EXECUTION_ADMISSION_READ_WIRE_ID: &str =
+    "eliot.kernel.native-worker-execution-admission-read";
+/// Wire revision for the read-only original-record handoff.
+pub const NATIVE_WORKER_EXECUTION_ADMISSION_READ_WIRE_VERSION: u16 = 1;
+
+/// Lookup request for one previously admitted native-worker claim.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeWorkerExecutionAdmissionReadRequest {
+    pub wire_id: String,
+    pub wire_version: u16,
+    /// Kernel-issued live Task Controller capability being exercised by the
+    /// authenticated daemon. The Kernel resolves it against its claim owner.
+    pub task_controller_attempt: TaskControllerAttempt,
+    /// Original native-worker claim identity; lookup only, never derived.
+    pub native_worker_claim_id: String,
+}
+
+impl NativeWorkerExecutionAdmissionReadRequest {
+    /// Validates the closed read request shape.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        if self.wire_id != NATIVE_WORKER_EXECUTION_ADMISSION_READ_WIRE_ID
+            || self.wire_version != NATIVE_WORKER_EXECUTION_ADMISSION_READ_WIRE_VERSION
+        {
+            return Err(KernelServiceError::InvalidField {
+                field: "native_worker_execution_admission_read.wire",
+                reason: "unsupported execution-admission read request",
+            });
+        }
+        self.task_controller_attempt
+            .validate()
+            .map_err(|_| KernelServiceError::InvalidField {
+                field: "native_worker_execution_admission_read.task_controller_attempt",
+                reason: "Task Controller attempt is invalid",
+            })?;
+        validate_wire_text(
+            &self.native_worker_claim_id,
+            "native_worker_execution_admission_read.native_worker_claim_id",
+        )
+    }
+}
+
+/// Authenticated daemon handoff of the original Kernel claim admission and
+/// durable record. This is a transport response, not a new authority receipt.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeWorkerExecutionAdmissionReadResponse {
+    pub wire_id: String,
+    pub wire_version: u16,
+    pub task_controller_attempt: TaskControllerAttempt,
+    pub execution_admission: NativeWorkerExecutionAdmissionEvidence,
+    pub launch_phase: NativeWorkerExecutionAdmissionPhase,
+}
+
+impl NativeWorkerExecutionAdmissionReadResponse {
+    /// Validates original owner evidence and exact Task/WorkScope/fence
+    /// agreement with the Kernel-issued Task Controller attempt.
+    pub fn validate_against(
+        &self,
+        request: &NativeWorkerExecutionAdmissionReadRequest,
+    ) -> Result<(), KernelServiceError> {
+        if self.wire_id != NATIVE_WORKER_EXECUTION_ADMISSION_READ_WIRE_ID
+            || self.wire_version != NATIVE_WORKER_EXECUTION_ADMISSION_READ_WIRE_VERSION
+            || self.task_controller_attempt != request.task_controller_attempt
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "native_worker_execution_admission_read.response",
+            });
+        }
+        request.validate()?;
+        self.execution_admission.validate()?;
+        let attempt = &request.task_controller_attempt;
+        let native = &self.execution_admission.request;
+        if native.claim_id != request.native_worker_claim_id
+            || native.task_id != attempt.task_id.as_str()
+            || native.work_scope_id != attempt.scope_id
+            || native.state_fence != attempt.state_fence
+            || !native
+                .authority_epoch
+                .is_same_authority(&attempt.authority_epoch)
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "native_worker_execution_admission_read.task_scope",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl NativeWorkerExecutionAdmissionEvidence {
+    /// Projects and validates one original request/receipt/current-record
+    /// tuple. No claim identity, receipt digest, or executable binding is
+    /// minted or repaired here.
+    pub fn from_owner_records(
+        request: &NativeWorkerClaimRequest,
+        claim_receipt: &NativeWorkerClaimReceipt,
+        durable_record: &NativeWorkerClaimRecord,
+    ) -> Result<Self, KernelServiceError> {
+        let executable_binding = request
+            .executable_binding
+            .clone()
+            .ok_or(KernelServiceError::InvalidField {
+                field: "native_worker_execution_admission.executable_binding",
+                reason: "legacy or incomplete claim has no original executable binding",
+            })?;
+        let evidence = Self {
+            request: request.clone(),
+            claim_receipt: claim_receipt.clone(),
+            durable_record: durable_record.clone(),
+            executable_binding,
+        };
+        evidence.validate()?;
+        Ok(evidence)
+    }
+
+    /// Revalidates the original admission chain without replacing any
+    /// recorded digest or evidence value.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        self.request.validate()?;
+        self.request.validate_canonical_digest()?;
+        self.claim_receipt.validate()?;
+        self.durable_record
+            .validate()
+            .map_err(|_| KernelServiceError::InvalidField {
+                field: "native_worker_execution_admission.durable_record",
+                reason: "original durable claim record is invalid",
+            })?;
+        self.executable_binding.validate()?;
+
+        if self.request.executable_binding.as_ref() != Some(&self.executable_binding) {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "native_worker_execution_admission.executable_binding",
+            });
+        }
+
+        let expected_record = crate::lifecycle::native_worker_claim_staged_record(&self.request)?;
+        if !self.durable_record.same_binding(&expected_record)
+            || self.durable_record.state == eliot_ors::NativeWorkerClaimState::Requested
+            || self.durable_record.receipt_digest.as_deref()
+                != Some(self.claim_receipt.receipt_digest.as_str())
+            || self.durable_record.admitted_at_unix_ms
+                != Some(self.claim_receipt.admitted_at_unix_ms)
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "native_worker_execution_admission.durable_record",
+            });
+        }
+
+        let receipt = &self.claim_receipt;
+        let request = &self.request;
+        if receipt.claim_id != request.claim_id
+            || receipt.registration_id != request.registration_id
+            || receipt.attempt_id != request.attempt_id
+            || receipt.operation_id != request.operation_id
+            || receipt.worker_generation != request.worker_generation
+            || !receipt
+                .authority_epoch
+                .is_same_authority(&request.authority_epoch)
+            || receipt.state_fence != request.state_fence
+            || receipt.binding_digest != request.binding_digest
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "native_worker_execution_admission.claim_receipt",
+            });
+        }
+
         Ok(())
     }
 }

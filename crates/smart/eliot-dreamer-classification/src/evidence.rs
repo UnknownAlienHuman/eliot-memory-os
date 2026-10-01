@@ -13,6 +13,7 @@ use eliot_evidence::{
 };
 
 use crate::policy::ClassificationPolicy;
+use crate::semantics::ClassificationSemantics;
 
 /// The reason a supplied evidence item cannot establish a semantic feature.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -36,10 +37,10 @@ pub struct EvidenceTrace {
 
 /// Validates C1 grade bindings and foundation evidence before selection.
 pub fn validate_evidence(
-    input: &ClassificationInput,
+    input: &ClassificationSemantics<'_>,
     policy: &ClassificationPolicy,
 ) -> Result<(), ContractViolation> {
-    for evidence in &input.evidence {
+    for evidence in input.evidence {
         let Some(binding) = policy
             .grade_bindings
             .iter()
@@ -123,7 +124,7 @@ pub fn validate_evidence(
 
 /// Classifies one evidence reference without changing the supplied envelope.
 pub fn quality(
-    input: &ClassificationInput,
+    input: &ClassificationSemantics<'_>,
     policy: &ClassificationPolicy,
     evidence_id: &ArtifactId,
 ) -> Result<EvidenceQuality, ContractViolation> {
@@ -220,7 +221,7 @@ pub fn quality(
 
 /// Builds a deterministic trace while deduplicating dependent source groups.
 pub fn trace_for(
-    input: &ClassificationInput,
+    input: &ClassificationSemantics<'_>,
     policy: &ClassificationPolicy,
     refs: &[ArtifactId],
     counter_refs: &[ArtifactId],
@@ -296,6 +297,11 @@ pub fn trace_for(
 
 /// Returns the set of source/dependence identities that are actually retained.
 pub fn retained_source_set(input: &ClassificationInput) -> BTreeSet<String> {
+    let semantic = ClassificationSemantics::from_curation(input);
+    retained_source_set_for(&semantic)
+}
+
+pub(crate) fn retained_source_set_for(input: &ClassificationSemantics<'_>) -> BTreeSet<String> {
     input
         .target
         .source_handles

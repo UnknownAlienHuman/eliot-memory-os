@@ -18,8 +18,8 @@
 //! named operations stay with their catalogue owners (MGR04, #19).
 
 use eliot_contracts::{RequestMetadata, StateFence, canonical_json_bytes, sha256_hex};
-use eliot_read::{LocalReadPort, ReadError};
-use eliot_store_api::ScopeId;
+use eliot_read::{LocalReadPort, QueryResult, ReadError};
+use eliot_store_api::{NamedReadOperation, ScopeId};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -85,6 +85,9 @@ pub enum DreamerMaterialsError {
     /// The fence does not equal the admitted fence.
     #[error("orientation material fence does not match the admitted fence")]
     FenceMismatch,
+    /// The named-read response does not identify the exact requested subject and scope.
+    #[error("orientation source readback does not match its requested selector")]
+    SelectorMismatch,
     /// Byte accounting overflowed.
     #[error("orientation material byte accounting overflowed")]
     Overflow,
@@ -115,6 +118,25 @@ pub struct AdmittedSourceClaim {
     pub privacy_class: String,
     /// Closed route membership; see [`ORIENTATION_MATERIAL_ROUTE_ADMITTED`].
     pub route_class: String,
+}
+
+/// Original named-read result and the exact canonical payload bytes verified for one source.
+///
+/// This preserves the read boundary's owner result without treating the caller-supplied claim as
+/// authority. `source_read` is the unmodified `QueryResult` returned by `LocalReadPort`; that
+/// boundary does not expose the underlying `ReadIdentity`, so this value does not invent one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedOrientationSource {
+    /// Caller-supplied claim whose expected length and digest were verified against this read.
+    pub claim: AdmittedSourceClaim,
+    /// Exact request metadata supplied to the named-read boundary.
+    pub request_metadata: RequestMetadata,
+    /// Exact scope supplied to the named-read boundary.
+    pub scope_id: ScopeId,
+    /// Unmodified result returned by the existing Governor named-read operation.
+    pub source_read: QueryResult,
+    /// Canonical JSON bytes of `source_read.payload`, checked against `claim`.
+    pub canonical_payload: Vec<u8>,
 }
 
 impl AdmittedSourceClaim {
@@ -338,6 +360,22 @@ pub async fn resolve_source_claim(
     scope: &ScopeId,
     claim: &AdmittedSourceClaim,
 ) -> Result<Vec<u8>, DreamerMaterialsError> {
+    Ok(resolve_source_claim_with_readback(reads, ctx, scope, claim)
+        .await?
+        .canonical_payload)
+}
+
+/// Resolves and retains the original named-read result together with the exact verified bytes.
+///
+/// This is the same live read, fence check, canonicalization, and claim verification as
+/// [`resolve_source_claim`]. Callers that need source provenance should retain this value instead
+/// of resolving the claim again or reconstructing metadata from its payload.
+pub async fn resolve_source_claim_with_readback(
+    reads: &impl LocalReadPort,
+    ctx: &RequestMetadata,
+    scope: &ScopeId,
+    claim: &AdmittedSourceClaim,
+) -> Result<ResolvedOrientationSource, DreamerMaterialsError> {
     claim.validate()?;
     let result = reads
         .evidence_query(
@@ -350,10 +388,30 @@ pub async fn resolve_source_claim(
     if result.state_fence != ctx.state_fence {
         return Err(DreamerMaterialsError::FenceMismatch);
     }
+    if result.operation != NamedReadOperation::GetEvidencePack
+        || result
+            .payload
+            .get("subject")
+            .and_then(serde_json::Value::as_str)
+            != Some(claim.source_handle.as_str())
+        || result
+            .payload
+            .get("scope_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(scope.as_str())
+    {
+        return Err(DreamerMaterialsError::SelectorMismatch);
+    }
     let bytes = canonical_json_bytes(&result.payload)
         .map_err(|_| DreamerMaterialsError::ManifestEncoding)?;
     verify_resolved_bytes(claim, &bytes)?;
-    Ok(bytes)
+    Ok(ResolvedOrientationSource {
+        claim: claim.clone(),
+        request_metadata: ctx.clone(),
+        scope_id: scope.clone(),
+        source_read: result,
+        canonical_payload: bytes,
+    })
 }
 
 fn validate_scope(value: &str) -> Result<(), DreamerMaterialsError> {
@@ -660,8 +718,11 @@ mod tests {
     async fn resolution_verifies_fence_and_digest_over_live_port()
     -> Result<(), Box<dyn std::error::Error>> {
         let fence = test_fence()?;
-        let payload =
-            serde_json::json!({"records": [{"capture_index": 0}], "subject": "evidence-a"});
+        let payload = serde_json::json!({
+            "records": [{"capture_index": 0}],
+            "subject": "evidence-a",
+            "scope_id": "scope-one"
+        });
         let bytes = canonical_json_bytes(&payload)?;
         let claim = test_claim("evidence-a", &bytes);
         let scope = ScopeId::new("scope-one")?;

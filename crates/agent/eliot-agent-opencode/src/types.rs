@@ -1593,6 +1593,93 @@ pub struct UsageTelemetry {
     pub extra: UnknownFields,
 }
 
+/// Exact malformed assistant payload retained by the admitted route owner.
+/// Its payload is boxed by `OpenCodeRunError` so a large provider response
+/// does not inflate every error value.
+#[derive(Debug, thiserror::Error)]
+#[error("OpenCode assistant returned malformed structured output: {reason}")]
+pub struct MalformedProviderOutput {
+    /// Exact provider message identity when the host exposed it.
+    pub message_id: Option<String>,
+    /// Provider/model identity observed in the assistant message.
+    pub observed_model: ModelSelection,
+    /// Exact UTF-8 assistant output text returned by the provider.
+    pub raw_output: String,
+    /// Provider-reported usage telemetry, including partial fields.
+    pub usage: Option<UsageTelemetry>,
+    /// Bounded parser or output-schema reason.
+    pub reason: String,
+}
+
+/// Provider evidence already observed by the route owner when later route
+/// reconciliation cannot complete. `raw_output` is populated only from the
+/// exact assistant message text; `events` retain typed stream observations
+/// when the message body was not available. Route receipts are copied only
+/// after their respective owner validators have produced them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProviderOutputObservation {
+    /// Provider/model identity observed on an assistant message, if valid.
+    pub observed_model: Option<ModelSelection>,
+    /// Exact UTF-8 assistant text read from the owner message surface.
+    pub raw_output: Option<String>,
+    /// Provider-reported token/cost values, including partial telemetry.
+    pub usage: Option<UsageTelemetry>,
+    /// Exact availability wrapper when the owner result reached this shape.
+    pub usage_availability: Option<UsageAvailability>,
+    /// Whether the observed assistant message has a terminal stop attestation.
+    pub terminal: bool,
+    /// Exact typed SSE observations retained when message text was not read.
+    pub events: Vec<OpenCodeEvent>,
+    /// Original validated wire route receipt, if success projection created it.
+    pub actual_route: Option<OpenCodeWireRouteReceipt>,
+    /// Original physical receipt, only if the route-observation owner created it.
+    pub physical_route: Option<PhysicalRouteObservationReceipt>,
+    /// Separate exact assistant-message observations. A committed execution
+    /// unit can expose more than one assistant message; those messages and
+    /// their payload/usage are not one output and must not replace or be
+    /// concatenated into a last-message summary.
+    pub assistant_messages: Vec<ProviderAssistantMessageObservation>,
+}
+
+/// One exact assistant-message observation retained by the route owner.
+///
+/// Event-only observations carry message identity, model and usage when
+/// exposed, but have no raw payload unless the owner actually read the
+/// message body. Partial message snapshots remain separate entries even when
+/// they share a message ID.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProviderAssistantMessageObservation {
+    /// Provider message identity exactly as exposed, or `None` if absent.
+    pub message_id: Option<String>,
+    /// Provider/model identity observed on this message, if valid.
+    pub observed_model: Option<ModelSelection>,
+    /// Exact UTF-8 assistant text from this message, if the message body was read.
+    pub raw_output: Option<String>,
+    /// Usage reported on this exact message, including partial telemetry.
+    pub usage: Option<UsageTelemetry>,
+    /// Whether this exact message carried the owner's terminal attestation.
+    pub terminal: bool,
+    /// Wire route identity attached to this observed message, when available.
+    pub actual_route: Option<OpenCodeWireRouteReceipt>,
+    /// Validated physical route receipt attached to this observation, when available.
+    pub physical_route: Option<PhysicalRouteObservationReceipt>,
+}
+
+impl ProviderOutputObservation {
+    /// Returns whether this observation carries provider output or route data.
+    #[must_use]
+    pub fn has_evidence(&self) -> bool {
+        self.observed_model.is_some()
+            || self.raw_output.is_some()
+            || self.usage.is_some()
+            || self.usage_availability.is_some()
+            || !self.assistant_messages.is_empty()
+            || !self.events.is_empty()
+            || self.actual_route.is_some()
+            || self.physical_route.is_some()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct UsageAvailability {
     pub state: AvailabilityState,
@@ -1698,6 +1785,12 @@ pub struct NoAuthorityRunResult {
     #[serde(flatten)]
     pub extra: UnknownFields,
 }
+
+/// Key in [`NoAuthorityRunResult::extra`] containing the exact UTF-8
+/// assistant text from a successfully reconciled provider response. The
+/// structured `output` remains a convenience projection and never replaces
+/// this retained provider payload.
+pub const OPENCODE_PROVIDER_RAW_OUTPUT_UTF8_KEY: &str = "provider_raw_output_utf8";
 
 pub type ActualRouteResult = NoAuthorityRunResult;
 pub type OpenCodeRunResult = NoAuthorityRunResult;
@@ -2409,8 +2502,25 @@ pub enum AdmittedAttemptError {
     SealRejected { reason: &'static str },
     #[error("admitted attempt digest failed: {0}")]
     DigestFailed(String),
+    #[error("admitted candidate sealing failed after route-owner output was observed")]
+    ObservedOutputFailure(Box<AdmittedAttemptOutputFailure>),
     #[error(transparent)]
     Run(#[from] crate::OpenCodeRunError),
+}
+
+/// Original typed failure plus the exact run evidence already available when
+/// a later candidate-seal phase refused. The candidate is retained only if
+/// its original seal had already been created; no replacement seal is made.
+#[derive(Debug)]
+pub struct AdmittedAttemptOutputFailure {
+    /// Exact owner failure that stopped the admitted attempt.
+    pub cause: Box<AdmittedAttemptError>,
+    /// Output, usage, and route evidence already observed by the owner.
+    pub observation: Box<ProviderOutputObservation>,
+    /// Original candidate seal when a later phase failed after sealing.
+    pub candidate: Option<Box<AdmittedAttemptCandidate>>,
+    /// Boundary that refused after provider output had been observed.
+    pub reconciliation: String,
 }
 
 impl AdmittedOpenCodeAttempt {
@@ -3212,6 +3322,91 @@ impl AdmittedAttemptCandidate {
         admitted: &AdmittedOpenCodeAttempt,
         result: &NoAuthorityRunResult,
     ) -> Result<Self, AdmittedAttemptError> {
+        Self::validate_run_for_admission(admitted, result)?;
+        let result_digest = Self::result_digest_for(result)?;
+        Ok(Self {
+            attempt_id: admitted.attempt().id.clone(),
+            admitted_route_digest: admitted.admitted_route_digest().clone(),
+            result_digest,
+            authority: AuthorityCeiling::CandidateOnly,
+            status: RunStatus::Succeeded,
+            // The route disposition is attached by the sealer
+            // (`seal_admitted_outcome`) immediately after sealing: it is
+            // computed from the wire receipt against this run, never from the
+            // candidate fields, so it cannot be derived here.
+            route_disposition: None,
+        })
+    }
+
+    /// Validates the original recorded candidate digest against the exact
+    /// preimage used when it was sealed, without minting or replacing a
+    /// candidate. The terminal observation is the only run field added after
+    /// the digest was recorded; it is removed from a cloned preimage and then
+    /// independently checked against this candidate's existing digest.
+    pub fn validate_for_run(
+        &self,
+        admitted: &AdmittedOpenCodeAttempt,
+        result: &NoAuthorityRunResult,
+        route: &SealedRouteDisposition,
+    ) -> Result<(), AdmittedAttemptError> {
+        if self.attempt_id != admitted.attempt().id
+            || self.admitted_route_digest != *admitted.admitted_route_digest()
+            || self.authority != AuthorityCeiling::CandidateOnly
+            || self.status != RunStatus::Succeeded
+            || self.status != result.status
+            || self.route_disposition.as_ref() != Some(route)
+        {
+            return Err(AdmittedAttemptError::SealRejected {
+                reason: "candidate identity, authority, or status differs from its admitted run",
+            });
+        }
+
+        let route_summary = route.summary_value(admitted.admission())?;
+        if result.extra.get("route_disposition") != Some(&route_summary)
+            || result.extra.get("edge").and_then(Value::as_str)
+                != Some(OPENCODE_ADMITTED_ATTEMPT_EDGE_CANDIDATE)
+        {
+            return Err(AdmittedAttemptError::SealRejected {
+                reason: "route disposition or candidate edge is not bound to the run digest",
+            });
+        }
+
+        let terminal_value = result.extra.get("admitted_terminal_observation").ok_or(
+            AdmittedAttemptError::SealRejected {
+                reason: "sealed run has no terminal observation",
+            },
+        )?;
+        let mut original_preimage = result.clone();
+        original_preimage
+            .extra
+            .remove("admitted_terminal_observation");
+        Self::validate_run_for_admission(admitted, &original_preimage)?;
+        let expected_result_digest = Self::result_digest_for(&original_preimage)?;
+        if self.result_digest != expected_result_digest {
+            return Err(AdmittedAttemptError::SealRejected {
+                reason: "recorded result digest does not match its original run preimage",
+            });
+        }
+
+        let expected_terminal = AdmittedObservation::new(
+            admitted,
+            AdmittedObservationKind::Terminal,
+            format!("sealed candidate {}", self.compute_digest()?.as_str()),
+        );
+        let expected_terminal_value = serde_json::to_value(expected_terminal)
+            .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))?;
+        if terminal_value != &expected_terminal_value {
+            return Err(AdmittedAttemptError::SealRejected {
+                reason: "terminal observation does not reference the recorded candidate",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_run_for_admission(
+        admitted: &AdmittedOpenCodeAttempt,
+        result: &NoAuthorityRunResult,
+    ) -> Result<(), AdmittedAttemptError> {
         if !result.candidate_only || result.authority != AuthorityCeiling::CandidateOnly {
             return Err(AdmittedAttemptError::SealRejected {
                 reason: "run result claims authority beyond candidate-only",
@@ -3246,23 +3441,16 @@ impl AdmittedAttemptCandidate {
         {
             return Err(AdmittedAttemptError::SessionMismatch);
         }
+        Ok(())
+    }
+
+    fn result_digest_for(
+        result: &NoAuthorityRunResult,
+    ) -> Result<LowercaseSha256, AdmittedAttemptError> {
         let bytes = canonical_json_bytes(result)
             .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))?;
-        let result_digest: LowercaseSha256 =
-            serde_json::from_value(Value::String(sha256_hex(&bytes)))
-                .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))?;
-        Ok(Self {
-            attempt_id: admitted.attempt().id.clone(),
-            admitted_route_digest: admitted.admitted_route_digest().clone(),
-            result_digest,
-            authority: AuthorityCeiling::CandidateOnly,
-            status: RunStatus::Succeeded,
-            // The route disposition is attached by the sealer
-            // (`seal_admitted_outcome`) immediately after sealing: it is
-            // computed from the wire receipt against this run, never from the
-            // candidate fields, so it cannot be derived here.
-            route_disposition: None,
-        })
+        serde_json::from_value(Value::String(sha256_hex(&bytes)))
+            .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))
     }
 
     /// Recomputes the canonical digest of this sealed candidate. Re-sealing

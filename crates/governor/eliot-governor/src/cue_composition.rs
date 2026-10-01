@@ -36,12 +36,13 @@ use eliot_cue_contracts::{
     AdmittedCueBindingProjection, CueProjectionDenominator, CueSnapshotBuildCandidate,
     NormalizationProfile, SnapshotId, WorkScopeId,
 };
+use eliot_read::{DeclaredResultSelector, ReadCoverage};
 use eliot_store_api::{NamedReadOperation, ReadConsistency, RevisionHead, RevisionKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::context_inputs::SevenRoleInputs;
+use crate::context_inputs::{ContextReconstructionRequest, SevenRoleInputs};
 
 /// Bound on retained derived cue reconstructions per cache owner.
 ///
@@ -60,6 +61,15 @@ pub enum CueCompositionError {
     /// The cue payload is not the closed admitted-binding array.
     #[error("cue payload is not a closed admitted-binding array: {0}")]
     UnexpectedPayload(String),
+    /// The original store envelope does not bind this context selector/read.
+    #[error("native cue read envelope mismatch at {field}")]
+    NativeEnvelopeMismatch { field: &'static str },
+    /// The retained context request is malformed.
+    #[error("cue context request is invalid: {0}")]
+    RequestInvalid(String),
+    /// Native cue-source rows carry no original A-12 admission record.
+    #[error("native cue read has {records} rows but no retained cue admission record")]
+    MissingAdmittedBindings { records: usize },
     /// One admitted binding fails receipt/shape/source-closure checks.
     #[error("admitted cue binding {index} fails the source closure: {reason}")]
     BindingRejected {
@@ -181,6 +191,16 @@ pub fn reconstruct_cue_snapshot(
     profile: &NormalizationProfile,
     cache: &mut CueReconstructionCache,
 ) -> Result<CueReconstruction, CueCompositionError> {
+    reconstruct_cue_snapshot_with_request(inputs, snapshot_id, profile, cache, None)
+}
+
+fn reconstruct_cue_snapshot_with_request(
+    inputs: &SevenRoleInputs,
+    snapshot_id: &SnapshotId,
+    profile: &NormalizationProfile,
+    cache: &mut CueReconstructionCache,
+    request: Option<&ContextReconstructionRequest>,
+) -> Result<CueReconstruction, CueCompositionError> {
     let bindings = decoded_bindings(inputs)?;
     let scope = WorkScopeId::new(inputs.scope_id.as_str())
         .map_err(|error| CueCompositionError::ScopeMismatch(error.to_string()))?;
@@ -199,6 +219,7 @@ pub fn reconstruct_cue_snapshot(
         snapshot_id,
         profile,
         source_revision,
+        request,
     )?;
     if let Some(retained) = cache.get(&key) {
         if retained.scope_id != scope
@@ -253,6 +274,180 @@ pub fn reconstruct_cue_snapshot(
     })
 }
 
+/// Reconstructs a cue snapshot only from the exact original context request
+/// and its Governor-acquired cue role.
+///
+/// The named store read returns admitted-operation envelopes, not
+/// `AdmittedCueBindingProjection` values. An empty complete envelope can
+/// therefore feed the existing authoritative empty build; non-empty envelopes
+/// remain unadmitted until a native cue-binding owner retains the original
+/// admission record.
+pub fn reconstruct_cue_snapshot_for_request(
+    request: &ContextReconstructionRequest,
+    inputs: &SevenRoleInputs,
+    snapshot_id: &SnapshotId,
+    profile: &NormalizationProfile,
+    cache: &mut CueReconstructionCache,
+) -> Result<CueReconstruction, CueCompositionError> {
+    request
+        .validate()
+        .map_err(|error| CueCompositionError::RequestInvalid(error.to_string()))?;
+    match &inputs.cue.state {
+        ProjectionState::KnownEmpty | ProjectionState::Complete => {}
+        ProjectionState::Partial { reason }
+        | ProjectionState::Stale { reason }
+        | ProjectionState::Unavailable { reason }
+        | ProjectionState::Blocked { reason }
+        | ProjectionState::Unknown { reason } => {
+            return Err(CueCompositionError::CueRoleNotComplete(reason.clone()));
+        }
+        ProjectionState::Missing => {
+            return Err(CueCompositionError::CueRoleNotComplete(
+                "cue role is missing".to_owned(),
+            ));
+        }
+    }
+    validate_cue_request_binding(request, inputs)?;
+    let row_count = validate_cue_read_envelope(request, inputs)?;
+    match &inputs.cue.state {
+        ProjectionState::KnownEmpty if row_count == 0 => {}
+        ProjectionState::Complete if row_count > 0 => {
+            return Err(CueCompositionError::MissingAdmittedBindings { records: row_count });
+        }
+        ProjectionState::Partial { reason } => {
+            return Err(CueCompositionError::CueRoleNotComplete(reason.clone()));
+        }
+        _ => {
+            return Err(CueCompositionError::NativeEnvelopeMismatch {
+                field: if row_count == 0 {
+                    "empty_role_disposition"
+                } else {
+                    "complete_role_disposition"
+                },
+            });
+        }
+    }
+    reconstruct_cue_snapshot_with_request(inputs, snapshot_id, profile, cache, Some(request))
+}
+
+fn validate_cue_request_binding(
+    request: &ContextReconstructionRequest,
+    inputs: &SevenRoleInputs,
+) -> Result<(), CueCompositionError> {
+    let mismatch = |field| CueCompositionError::NativeEnvelopeMismatch { field };
+    if inputs.scope_id != request.scope_id {
+        return Err(mismatch("scope_id"));
+    }
+    if inputs.heads_before != inputs.heads_after
+        || inputs.heads_before.scope_id != request.scope_id
+        || inputs.heads_before.state_fence != inputs.state_fence
+        || inputs.heads_after.scope_id != request.scope_id
+        || inputs.heads_after.state_fence != inputs.state_fence
+    {
+        return Err(mismatch("scope_head_closure"));
+    }
+    let identity = inputs
+        .cue
+        .identity
+        .as_ref()
+        .ok_or(mismatch("read_identity"))?;
+    if inputs.cue.operation != NamedReadOperation::GetUnderstandingProjectionInputs
+        || identity.operation() != NamedReadOperation::GetUnderstandingProjectionInputs
+        || identity.source().operation != NamedReadOperation::GetUnderstandingProjectionInputs
+        || identity.scope_id() != Some(&request.scope_id)
+        || identity.state_fence() != &inputs.state_fence
+        || identity.consistency() != ReadConsistency::ExactFence
+        || identity.declared_dependency_revisions() != &request.dependency_revisions
+        || identity.coverage()
+            != (ReadCoverage::BoundedByDeclaredSelector {
+                selector: DeclaredResultSelector::MaxRecords,
+                declared_bound: request.projection_max_records,
+            })
+        || inputs.cue.revision_heads.as_slice() != identity.observed_revision_heads()
+    {
+        return Err(mismatch("read_identity"));
+    }
+    let invalidation = identity.invalidation();
+    if invalidation.state_fence() != &inputs.state_fence
+        || invalidation.scope_id() != Some(&request.scope_id)
+        || invalidation.revision_heads() != identity.observed_revision_heads()
+        || invalidation.ordering_heads() != identity.ordering().heads()
+        || invalidation.source() != identity.source()
+        || invalidation.schema() != identity.schema()
+    {
+        return Err(mismatch("read_invalidation_closure"));
+    }
+    if identity.ordering().heads() != inputs.heads_before.ordering_heads.as_slice()
+        || identity.observed_revision_heads() != inputs.heads_before.revision_heads.as_slice()
+    {
+        return Err(mismatch("request_head_dependencies"));
+    }
+    inputs
+        .heads_before
+        .validate()
+        .map_err(|_| mismatch("scope_head_closure"))?;
+    Ok(())
+}
+
+fn validate_cue_read_envelope(
+    request: &ContextReconstructionRequest,
+    inputs: &SevenRoleInputs,
+) -> Result<usize, CueCompositionError> {
+    const NATIVE_ROLE_ENVELOPE_VERSION: u64 = 1;
+    let mismatch = |field| CueCompositionError::NativeEnvelopeMismatch { field };
+    let payload = inputs.cue.payload.as_ref().ok_or(mismatch("payload"))?;
+    if payload.get("version").and_then(Value::as_u64) != Some(NATIVE_ROLE_ENVELOPE_VERSION) {
+        return Err(mismatch("payload.version"));
+    }
+    if payload.get("scope_id").and_then(Value::as_str) != Some(request.scope_id.as_str()) {
+        return Err(mismatch("payload.scope_id"));
+    }
+    if payload.get("selector").and_then(Value::as_str) != Some(request.projection_selector.as_str())
+    {
+        return Err(mismatch("payload.selector"));
+    }
+    let records = payload
+        .get("records")
+        .and_then(Value::as_array)
+        .ok_or(mismatch("payload.records"))?;
+    let provenance = payload
+        .get("provenance")
+        .and_then(Value::as_object)
+        .ok_or(mismatch("payload.provenance"))?;
+    let expected_fence = serde_json::to_value(&inputs.state_fence)
+        .map_err(|_| mismatch("payload.provenance.state_fence"))?;
+    if provenance.get("state_fence") != Some(&expected_fence)
+        || provenance.get("max_records").and_then(Value::as_u64)
+            != Some(u64::from(request.projection_max_records))
+    {
+        return Err(mismatch("payload.provenance"));
+    }
+    let (Some(matched_total), Some(returned), Some(truncated)) = (
+        provenance.get("matched_total").and_then(Value::as_u64),
+        provenance.get("returned").and_then(Value::as_u64),
+        provenance.get("truncated").and_then(Value::as_bool),
+    ) else {
+        return Err(mismatch("payload.provenance.extent"));
+    };
+    let actual_returned = u64::try_from(records.len()).unwrap_or(u64::MAX);
+    if returned != actual_returned
+        || matched_total < returned
+        || truncated != (matched_total > returned)
+    {
+        return Err(mismatch("payload.provenance.extent"));
+    }
+    let disposition_matches = match &inputs.cue.state {
+        ProjectionState::KnownEmpty => matched_total == 0 && returned == 0 && !truncated,
+        ProjectionState::Complete => matched_total == returned && returned != 0 && !truncated,
+        ProjectionState::Partial { .. } => truncated && matched_total > returned,
+        _ => false,
+    };
+    if !disposition_matches {
+        return Err(mismatch("role_disposition"));
+    }
+    Ok(records.len())
+}
+
 /// Canonical shape of one cache-key preimage.
 #[derive(Serialize)]
 struct KeyShape<'a> {
@@ -265,6 +460,9 @@ struct KeyShape<'a> {
     profile_digest: &'a str,
     snapshot_id: &'a str,
     fence_sha256: String,
+    cue_selector: Option<&'a str>,
+    cue_max_records: Option<u32>,
+    cue_request_identity_sha256: Option<String>,
 }
 
 /// Derives the cache key from the exact source closure.
@@ -275,6 +473,7 @@ fn cache_key(
     snapshot_id: &SnapshotId,
     profile: &NormalizationProfile,
     source_revision: u64,
+    request: Option<&ContextReconstructionRequest>,
 ) -> Result<CueCacheKey, CueCompositionError> {
     let refused = |detail: &str| CueCompositionError::ClosureMismatch(detail.to_owned());
     let heads_bytes = canonical_json_bytes(&inputs.heads_after)
@@ -288,6 +487,23 @@ fn cache_key(
         .map_err(|_| refused("bindings are not canonical"))?;
     let fence_bytes =
         canonical_json_bytes(&inputs.state_fence).map_err(|_| refused("fence is not canonical"))?;
+    let (cue_selector, cue_max_records, cue_request_identity_sha256) =
+        if let Some(request) = request {
+            let identity = inputs
+                .cue
+                .identity
+                .as_ref()
+                .ok_or_else(|| refused("request-bound cue read has no identity"))?;
+            let request_identity_bytes = canonical_json_bytes(&(request, identity))
+                .map_err(|_| refused("cue request identity is not canonical"))?;
+            (
+                Some(request.projection_selector.as_str()),
+                Some(request.projection_max_records),
+                Some(sha256_hex(&request_identity_bytes)),
+            )
+        } else {
+            (None, None, None)
+        };
     let shape = KeyShape {
         scope: scope.as_str(),
         heads_sha256: sha256_hex(&heads_bytes),
@@ -298,6 +514,9 @@ fn cache_key(
         profile_digest: profile.digest.as_str(),
         snapshot_id: snapshot_id.as_str(),
         fence_sha256: sha256_hex(&fence_bytes),
+        cue_selector,
+        cue_max_records,
+        cue_request_identity_sha256,
     };
     let bytes = canonical_json_bytes(&shape).map_err(|_| refused("key is not canonical"))?;
     Ok(CueCacheKey(sha256_hex(&bytes)))
@@ -414,13 +633,12 @@ fn exact_revision_head<'a>(
 /// JSON array of `AdmittedCueBindingProjection`. Any other disposition fails
 /// closed: degraded or unreadable roles never fold into an index.
 ///
-/// Integration note: the store's `GetUnderstandingProjectionInputs` read (T11.3
-/// store activation) returns a versioned understanding-inputs envelope
-/// (`{version, selector, scope_id, records, provenance}`), not the
-/// admitted-binding array, so that envelope fails closed here with
-/// [`CueCompositionError::UnexpectedPayload`]. Binding envelope records to
-/// the typed cue families is a follow-up slice; until then only the
-/// authoritative empty builds through this composition.
+/// The request-aware entry point above validates the store's versioned
+/// understanding-inputs envelope (`{version, selector, scope_id, records,
+/// provenance}`) before it reaches this typed decoder. Since those native rows
+/// do not carry original A-12 admissions, complete non-empty envelopes stop
+/// with [`CueCompositionError::MissingAdmittedBindings`]; only an authoritative
+/// empty result can build until the cue owner retains those admissions.
 fn decoded_bindings(
     inputs: &SevenRoleInputs,
 ) -> Result<Vec<AdmittedCueBindingProjection>, CueCompositionError> {
@@ -730,6 +948,10 @@ mod cue_composition_tests {
             payload: None,
             revision_heads: Vec::new(),
             identity: None,
+            source_request: None,
+            retained_capability_records: None,
+            retained_negative_memory_records: None,
+            retained_negative_memory_policies: None,
         };
         let cue_payload = match &cue_state {
             ProjectionState::KnownEmpty => Some(Value::Null),
@@ -753,6 +975,10 @@ mod cue_composition_tests {
                 payload: cue_payload,
                 revision_heads: Vec::new(),
                 identity: None,
+                source_request: None,
+                retained_capability_records: None,
+                retained_negative_memory_records: None,
+                retained_negative_memory_policies: None,
             },
             negative_memory: unavailable(),
             evidence: unavailable(),

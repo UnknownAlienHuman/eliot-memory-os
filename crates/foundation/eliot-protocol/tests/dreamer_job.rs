@@ -389,6 +389,22 @@ fn base_response(request: &DurableJobRequest, bound_scope: WorkScopeBinding) -> 
             JobOperation::Submit { submission } => submission.owner_record.clone(),
             _ => None,
         },
+        runtime_owner_execution_input: match &request.operation {
+            JobOperation::Submit { submission } => {
+                submission.runtime_owner_execution_input.clone()
+            }
+            _ => None,
+        },
+        runtime_owner_execution_input_bytes: match &request.operation {
+            JobOperation::Submit { submission } => {
+                submission.runtime_owner_execution_input_bytes.clone()
+            }
+            _ => None,
+        },
+        output_contract: match &request.operation {
+            JobOperation::Submit { submission } => Some(submission.output_contract.clone()),
+            _ => None,
+        },
         revision: 1,
         state: JobState::Queued,
         disposition: None,
@@ -398,6 +414,7 @@ fn base_response(request: &DurableJobRequest, bound_scope: WorkScopeBinding) -> 
         result_under_verification: None,
         outcome: None,
         applicability_history: Vec::new(),
+        admission_history: Vec::new(),
         selection_coverage: Vec::new(),
         selection_frontier: None,
     }

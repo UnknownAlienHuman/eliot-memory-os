@@ -23,7 +23,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    CanonicalAdmissionOwner, CompositionError, CompositionReadiness, KernelTransitionPort,
+    CanonicalAdmissionOwner, CompositionError, CompositionReadiness, ContextReconstructionRequest,
+    KernelTransitionPort, SevenRoleInputs,
 };
 
 #[cfg(test)]
@@ -402,11 +403,44 @@ impl<P: KernelTransitionPort + ?Sized, R: CanonicalReadClient + ?Sized>
         self.read_committed(proposal, &receipt).await
     }
 
+    /// Retains the original admitted candidate and exact source observation
+    /// from the existing Governor context-input read closure.
+    ///
+    /// The original context request and `SevenRoleInputs` are passed through
+    /// from acquisition. This method validates their named read identities,
+    /// dependencies, fence, exact evidence selector, retained rows, and
+    /// candidate proof; it performs no write and constructs no capture
+    /// envelope or receipt.
+    pub fn read_orientation_source<'a>(
+        &self,
+        request: &'a ContextReconstructionRequest,
+        role_inputs: &'a SevenRoleInputs,
+    ) -> Result<crate::EpistemicOrientationRead<'a>, crate::EpistemicOrientationReadError> {
+        crate::EpistemicOrientationRead::from_context_readback(request, role_inputs)
+    }
+
     fn validate_semantics(
         proposal: &ObservedEpistemicProposal,
         before: Option<&EpistemicPositionReadback>,
         observation: &ObservationRecord,
     ) -> Result<(), CompositionError> {
+        let candidate = Self::validate_source_candidate(proposal, observation)?;
+        proposal
+            .transition
+            .validate_closed(
+                &proposal.request,
+                &candidate,
+                before.map_or(&[], |value| value.candidate.support.as_slice()),
+                &candidate.support,
+            )
+            .map_err(refused)?;
+        Ok(())
+    }
+
+    fn validate_source_candidate(
+        proposal: &ObservedEpistemicProposal,
+        observation: &ObservationRecord,
+    ) -> Result<EpistemicPositionCandidate, CompositionError> {
         let candidate = eliot_epistemic::propose_observed_candidate(
             &proposal.request,
             observation,
@@ -437,16 +471,7 @@ impl<P: KernelTransitionPort + ?Sized, R: CanonicalReadClient + ?Sized>
         {
             return Err(refused("coverage does not name the acquired evidence"));
         }
-        proposal
-            .transition
-            .validate_closed(
-                &proposal.request,
-                &candidate,
-                before.map_or(&[], |value| value.candidate.support.as_slice()),
-                &candidate.support,
-            )
-            .map_err(refused)?;
-        Ok(())
+        Ok(candidate)
     }
 
     async fn check_heads(

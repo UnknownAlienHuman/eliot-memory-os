@@ -12,82 +12,12 @@
 //!
 //! | Responsibility | Actual runtime owner | Status |
 //! |---|---|---|
-//! | Construct/admit `ModelRouteRequest` | `model_stage::model_route_request` over the admitted pair | wired |
-//! | Execute the admitted provider route, return `ModelRouteOutcome` | `model_stage::model_route_outcome` over the measured local call | wired |
-//! | Build the `GroundingRequest` | `grounding_stage::resolve_grounding_inputs` over the same admitted pair | wired |
-//! | Ground the admitted draft | `grounding_stage::ground_admitted_draft` | wired |
-//! | Validate the grounded draft | `validation_stage::validate_admitted_draft` (`ValidatedGroundingCandidate`) | wired |
-//! | Read/build the exact `CanonicalProjectionSet` from Governor/canonical owners | `eliot_governor::canonical_projections::emit_canonical_projection_set`, delivered over [`OrientationSupply`] | NOT REACHABLE IN PRODUCTION: the producer has no production caller, and the supply seam itself sits behind two upstream gates that refuse unconditionally |
-//! | Acquire the remaining mandatory stages' owner input/receipt | Governor owner records over the same [`OrientationSupply`] channel | NOT REACHABLE IN PRODUCTION: no owner publishes these records to this binary, and the seam that would read them is unreachable |
+//! | Construct/admit `ModelRouteRequest` | none in-repo: no producer exists outside the contract owner and its tests | named implementation work |
+//! | Execute the admitted provider route, return `ModelRouteOutcome` | none: provider text lives outside the dreamer binary | named implementation work |
+//! | Read/build the exact `CanonicalProjectionSet` from Governor/canonical owners | none in-binary: no Governor orientation-supply channel exists | named implementation work |
+//! | Acquire each mandatory stage's owner input/receipt | caller-supplied through `ProductionOrientationSupply`; no production producer is wired in-binary | consumer wired; producer absent |
 //! | Invoke the pure composer | [`compose_production_result`] below (this module) | wired |
 //! | Publish the typed result | `dispatch_stage::dispatch_orientation` as `DreamResult::Orientation` | wired |
-//!
-//! The two records the admitted pipeline itself produces — the grounding
-//! request and the structured A-05 validated grounding candidate — are NOT owner
-//! channel members. They are outputs of stages that run after the channel is
-//! resolved, so no source could ever supply them; they enter the carrier as
-//! `dispatch_stage::PipelineOrientationRecords` parameters. The coherent v1
-//! hypothesis pair enters beside them as explicit parameters, because
-//! `dispatch_orientation` is what derived and validated that pair. Only values
-//! a Governor/canonical owner publishes travel over [`OrientationSupply`].
-//!
-//! The last two owner-channel rows are measured, not aspirational, and the
-//! measurement is stronger than "the owner published nothing". Three separate
-//! facts each independently keep this carrier unfilled in production, and each
-//! is a property of the tree rather than of a missing adapter.
-//!
-//! **1. The Governor's producer has no production caller.**
-//! `eliot_governor::composition::GovernorComposition::canonical_projections`
-//! (crates/governor/eliot-governor/src/composition.rs:6166) is the documented
-//! producer, and it composes the real owner set from the retained `task`,
-//! `session`, `work_scope` and `observation` owners. It has zero callers
-//! tree-wide: `git grep "canonical_projections("` matches only its own
-//! definition and the internal `compose_canonical_projections` call. Nothing in
-//! `eliotd` ever asks the composition for a projection set.
-//!
-//! **2. The supply seam is unreachable from the production `submit` path.**
-//! [`AuthenticatedKernelJobPort::submit`](crate::AuthenticatedKernelJobPort::submit)
-//! calls [`resolve_orientation_supply`](crate::AuthenticatedKernelJobPort::resolve_orientation_supply)
-//! at lib.rs:791, but only after two gates that refuse unconditionally:
-//! `controller::resolve_cycle_inputs` (controller.rs:78-82) and
-//! `bundle_stage::resolve_bundle_request` (bundle_stage.rs:31-35) both end in a
-//! bare `Err`. An `Ok(None)` from the owner channel is therefore not merely the
-//! current answer — on today's tree `resolve_supply` is never called at all on
-//! any production path. The crate's own
-//! `submit_orientation_stops_at_controller_gate` proof
-//! (`pipeline_e2e.rs:806`) asserts exactly this: an Orientation `submit` stops at
-//! the controller gate. The blocked disposition published downstream is reached
-//! today only from the unit-level pipeline proofs, not from `main.rs`.
-//!
-//! **3. The record that does travel is an address, not the member.**
-//! The opaque owner record channel is real: `KernelComposition::execute_dreamer_request`
-//! publishes the content-addressed reference on
-//! `JobSubmission::owner_record`, the durable owner projects it onto
-//! `DurableJobResponse::owner_record`, and
-//! `kernel_port::validate_owner_response_binding` re-proves the ORIGINAL
-//! recorded digest and byte length against the owner's own reference rather
-//! than recomputing them. But `owner_record` is an [`OpaqueContentRef`] — a
-//! digest, a byte length and an artifact handle. It carries no member, and this
-//! binary holds no capability that could resolve one: there is no blob/artifact
-//! read anywhere under `bins/eliot-dreamer/src` (`git grep -i blob` over that
-//! tree returns nothing). So even a fully published record could not fill the
-//! carrier here without a new content-retrieval capability.
-//!
-//! [`resolve_production_inputs`] therefore keeps returning the
-//! [`OrientationDisposition::Blocked`] result from [`supply_missing_blocked`]
-//! whenever it is reached at all, carrying no packet, `CC004_MISSING` on the
-//! CC-004 boundary record, and `missing_owners` naming the canonical projection
-//! owner plus every stage owner. The carrier is not relaxed, no member is
-//! defaulted, no lookalike value is synthesized, and no check is skipped to make
-//! a stage fire.
-//!
-//! What a future attempt must supply is therefore not one adapter but all three
-//! of: a production caller for the Governor producer, Governor-resolved
-//! controller and bundle material so `submit` reaches this seam at all, and a
-//! content-retrieval capability that turns the record's address into a typed
-//! member. Naming the missing dependency edge is the honest deliverable here;
-//! manufacturing a value to cross it would be the self-issued authority the
-//! carrier's own contract refuses.
 //!
 //! A missing adapter is implementation work, never substituted with local
 //! data: the v1 hypothesis pair derived in dispatch is reported only as the
@@ -109,14 +39,13 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use eliot_context_assembly::AssemblyPolicy;
 use eliot_context_candidates::{
     AttentionInput, CandidatePolicy, CandidateRequest, CueInput, EpistemicInput, EvidenceInput,
     MemberMeasurement,
 };
+use eliot_context_contracts::{ActiveUnderstandingViewResult, AssemblyPolicy};
 use eliot_context_contracts::{
-    AdmittedContextSet, CanonicalProjectionSet, ContextError, ContextRecipe, QualityScorecard,
-    SerializedContextMeasurement,
+    AdmittedContextSet, CanonicalProjectionSet, ContextRecipe, QualityScorecard,
 };
 use eliot_contracts::StateFence;
 use eliot_cue_activation::ActivationProfile;
@@ -125,37 +54,41 @@ use eliot_dreamer_claim_grounding::GroundingRequest;
 use eliot_dreamer_classification::ClassificationPolicy;
 use eliot_dreamer_conflict_analysis::{ConflictAnalysisPolicy, ConflictSupplements};
 use eliot_dreamer_contracts::{
-    ClassificationInput, CurationAcceptanceCtx, DreamInputBundle, JobClass, ModelRouteDisposition,
-    ModelRouteOutcome, ModelRouteRequest, ValidatedCandidate, ValidatedCurationItem,
-    bundle_digest_of,
+    DreamInputBundle, DreamJobAdmission, JobClass, ModelRouteDisposition, ModelRouteOutcome,
+    ModelRouteRequest, OrientationClassificationProfile, ValidatedCandidate, ValidatedCurationItem,
+    ValidatedGroundingCandidate, bundle_digest_of,
 };
 use eliot_dreamer_orientation::{
     AdmittedOrientationJob, CurrentEpistemicPositionHandle, OrientationDisposition,
     OrientationError, OrientationPolicy,
-    projection::{OrientationPacketCandidate, build_projection},
+    projection::{
+        OrientationOwnerProjection, OrientationPacketCandidate, build_projection_with_owners,
+    },
 };
 use eliot_dreamer_probe_plan::ProbePlanParams;
 use eliot_dreamer_rival_model::RivalPolicy;
-use eliot_epistemic::PositionRequest;
-use eliot_epistemic_contracts::{ConflictSet, CurrentEpistemicPosition as AdmittedPosition};
-
-use crate::dispatch_stage::PipelineOrientationRecords;
-use crate::pulse::{
-    CEILING_BLOCKED, CEILING_CANDIDATE_ONLY, CONFLICT_OUTPUT_QUALIFIED, CandidateStage,
-    ClassificationStage, ConflictStage, CueActivationStage, MANDATORY_DENOMINATOR, PulseError,
-    PulseStage, PulseStageId, RivalStage, UnderstandingStage, check_model_boundary,
-    check_projection_boundary, fences_compatible, output_digest, run_candidate_stage,
-    run_classification_stage, run_conflict_stage, run_cue_stage, run_epistemic_stage,
-    run_grounding_stage, run_probe_stage, run_rival_stage, run_understanding_stage,
+use eliot_epistemic::{ObservationRecord, PositionRequest};
+use eliot_epistemic_contracts::{
+    ConflictSet, CurrentEpistemicPosition as AdmittedPosition, EpistemicPositionCandidate,
 };
+
 use crate::{
     DreamJobInput, KernelJobAdmission, ORIENTATION_PULSE_RESULT_SCHEMA_VERSION,
     OrientationAdmittedPrefix, OrientationBoundaryRecord, OrientationPulseResult,
     OrientationStageDisposition, OrientationStageRecord,
 };
+use eliot_dreamer_orientation::orientation_owner_inputs::{
+    OrientationOwnerInputs, run_mandatory_stages,
+};
+use eliot_dreamer_orientation::pulse::{
+    CEILING_BLOCKED, CEILING_CANDIDATE_ONLY, CONFLICT_OUTPUT_QUALIFIED, CandidateStage,
+    ClassificationStage, ConflictStage, CueActivationStage, MANDATORY_DENOMINATOR, PulseError,
+    PulseStage, PulseStageId, RivalStage, UnderstandingStage, check_projection_boundary,
+    fences_compatible, output_digest,
+};
 
 /// Exact schema version accepted by [`ProductionOrientationInputs`].
-pub(crate) const PRODUCTION_ORIENTATION_INPUTS_SCHEMA_VERSION: u32 = 1;
+pub(crate) const PRODUCTION_ORIENTATION_INPUTS_SCHEMA_VERSION: u32 = 2;
 /// Blocked reason when the CC-004 projection set is absent.
 pub(crate) const CC004_MISSING: &str = "production orientation requires a canonical projection set";
 /// Blocked reason naming the absent Governor supply channel.
@@ -169,17 +102,10 @@ pub(crate) const MODEL_OUTCOME_CANCELLED: &str = "admitted model-route outcome i
 pub(crate) const MODEL_OUTCOME_TIMEOUT: &str = "admitted model-route outcome timed out";
 /// Partial qualification while the conflict proof gap is open.
 pub(crate) const CONFLICT_UNQUALIFIED: &str = "conflict output unqualified until #2869/#2870";
-/// Fallback commitment when canonical serialization fails.
-const DIGEST_UNAVAILABLE: &str = "digest unavailable";
 /// Missing-owner identity for the CC-004 projection owner and the stage owners.
 const OWNER_PROJECTIONS: &str = "governor canonical projection owner";
-
-/// Immutable route-measurement function supplied with the understanding record.
-///
-/// A plain `fn` item keeps the carrier non-generic: the Governor channel
-/// supplies the measurement with the admitted set, and the composer invokes it
-/// at most once through the understanding owner entry.
-pub type MeasureFn = fn(&[u8]) -> Result<SerializedContextMeasurement, ContextError>;
+/// Blocked reason when a caller reports that its owner snapshot is stale.
+pub(crate) const ORIENTATION_SUPPLY_STALE: &str = "governor orientation owner snapshot is stale";
 
 /// Versioned runtime-owned production carrier: everything one complete
 /// Orientation pulse must consume, with no optional mandatory member.
@@ -191,7 +117,7 @@ pub type MeasureFn = fn(&[u8]) -> Result<SerializedContextMeasurement, ContextEr
 /// stage runs. Budget travels on the admitted job; deadline and cancellation
 /// travel as scalars observed before composition.
 pub(crate) struct ProductionOrientationInputs<'a> {
-    /// Exact schema version; must be 1.
+    /// Exact schema version; must be 2.
     pub schema_version: u32,
     /// Admitted Orientation job with frame, evidence, and denominator.
     pub admitted_job: &'a AdmittedOrientationJob,
@@ -207,26 +133,12 @@ pub(crate) struct ProductionOrientationInputs<'a> {
     pub model_outcome: &'a ModelRouteOutcome,
     /// CC-004 canonical projection set (mandatory boundary).
     pub projections: &'a CanonicalProjectionSet,
+    /// Exact original submitted runtime owner publication, retained whole.
+    pub runtime_owner_input: &'a eliot_protocol::dreamer_job::DurableJobRuntimeOwnerExecutionInput,
     /// Governor-resolved epistemic-position handles for the packet.
     pub cep_handles: &'a [CurrentEpistemicPositionHandle],
-    /// Classification stage inputs.
-    pub classification: ClassificationStage<'a>,
-    /// Cue-activation stage inputs.
-    pub cue_activation: CueActivationStage<'a>,
-    /// Epistemic resolution request over admitted records.
-    pub epistemic: &'a PositionRequest,
-    /// Understanding stage inputs with the route measurement.
-    pub understanding: UnderstandingStage<'a, MeasureFn>,
-    /// Claim-grounding request this binary's own grounding stage admitted.
-    pub grounding: &'a GroundingRequest,
-    /// Rival-structuring stage inputs.
-    pub rivals: RivalStage<'a>,
-    /// Conflict-analysis stage inputs.
-    pub conflict: ConflictStage<'a>,
-    /// Discriminative probe-plan parameters.
-    pub probes: ProbePlanParams<'a>,
-    /// Context-candidate stage inputs.
-    pub candidates: CandidateStage<'a>,
+    /// All mandatory native owner inputs, retained under this carrier's exact closure.
+    pub owner_stages: OrientationOwnerInputs<'a>,
     /// Declared shared operation identity.
     pub operation_id: String,
     /// Declared shared task identity.
@@ -241,30 +153,24 @@ pub(crate) struct ProductionOrientationInputs<'a> {
     pub cancelled: bool,
 }
 
-/// Governor-supplied records for the CC-004 projections and the mandatory
-/// stage members whose owners sit outside this binary.
-///
-/// This is the Owner channel, not a second contract and not a state machine: it
-/// carries the exact owner records by reference, adds no semantic recomputation,
-/// and performs no effect. Every member is a value the Governor already produced
-/// through its own owner entry, so the carrier below joins existing records
-/// rather than deriving canonical state in this binary. Nothing is defaulted:
-/// a member the Governor has not published leaves the channel incomplete, and
-/// the caller supplies the whole channel or none of it.
-///
-/// The grounding request, the grounded draft, the receipt-bound v1 draft, and
-/// the validated grounding candidate are deliberately absent: they are outputs
-/// of stages this binary already runs, so no owner channel can supply them.
-/// They travel as explicit [`ProductionOrientationInputs`] parameters instead.
+/// Exact Governor-supplied native records for one admitted Orientation pulse.
 pub struct OrientationSupply<'a> {
+    /// Original request admitted by the model runtime owner.
+    pub model_request: &'a ModelRouteRequest,
+    /// Original outcome returned by the admitted model runtime owner.
+    pub model_outcome: &'a ModelRouteOutcome,
+    /// Original owner-observed cancellation state for this frozen pulse.
+    pub cancelled: bool,
+    /// Frozen deadline of the supplied owner snapshot.
+    pub deadline_unix_ms: u64,
     /// CC-004 canonical projection set emitted by the Governor's own producer.
     pub projections: &'a CanonicalProjectionSet,
+    /// Exact original submitted runtime owner publication, retained whole.
+    pub runtime_owner_input: &'a eliot_protocol::dreamer_job::DurableJobRuntimeOwnerExecutionInput,
     /// Governor-issued Current Epistemic Position handles for the packet.
     pub cep_handles: &'a [CurrentEpistemicPositionHandle],
     /// Owner classification input (classification stage).
-    pub classification_input: &'a ClassificationInput,
-    /// Governor acceptance context the classification selector runs under.
-    pub classification_context: &'a CurationAcceptanceCtx<'a>,
+    pub classification_input: &'a OrientationClassificationProfile,
     /// Execution policy the classification input digest binds.
     pub classification_policy: &'a ClassificationPolicy,
     /// Immutable cue-snapshot build candidate (cue-activation stage).
@@ -275,6 +181,10 @@ pub struct OrientationSupply<'a> {
     pub cue_profile: &'a ActivationProfile,
     /// Epistemic resolver request over admitted records.
     pub epistemic: &'a PositionRequest,
+    /// Original candidate retained by the Governor readback owner.
+    pub admitted_candidate: &'a EpistemicPositionCandidate,
+    /// Original source observation retained by that same owner.
+    pub source_observation: &'a ObservationRecord,
     /// Exact admitted context set to project (understanding stage).
     pub admitted_context_set: &'a AdmittedContextSet,
     /// Recipe the admitted set must satisfy (understanding stage).
@@ -283,8 +193,12 @@ pub struct OrientationSupply<'a> {
     pub quality: &'a QualityScorecard,
     /// Caller-owned immutable assembly parameters (understanding stage).
     pub assembly_policy: &'a AssemblyPolicy,
-    /// Route measurement invoked once over the canonical payload bytes.
-    pub measure: MeasureFn,
+    /// Original complete Context assembly output acquired before composition.
+    pub understanding_output: &'a ActiveUnderstandingViewResult,
+    /// Owner grounding request (claim-grounding stage).
+    pub grounding: &'a GroundingRequest,
+    /// Validated grounding candidate carrying the rival declarations.
+    pub validated_draft: &'a ValidatedGroundingCandidate,
     /// Admitted current position the rivals bind against.
     pub current_position: &'a AdmittedPosition,
     /// Rival-structuring policy.
@@ -317,92 +231,87 @@ pub struct OrientationSupply<'a> {
     pub candidate_policy: &'a CandidatePolicy,
 }
 
-/// Resolves the production carrier from admitted dispatch artifacts.
-///
-/// The CC-002 request/outcome are produced by this binary's own model stage from
-/// admitted material and proved against the admitted bundle, so that boundary
-/// is present on every admitted Orientation job. The grounding request and the
-/// structured A-05 validated grounding candidate arrive as `pipeline`, and the
-/// coherent v1 hypothesis pair as `v1_grounded`/`v1_draft`; all four come from
-/// this binary's own admitted stage entries, never from the owner channel. The
-/// CC-004 projection set and the remaining stage-owner records are
-/// Governor-published values supplied through [`OrientationSupply`]; without
-/// that channel the carrier cannot be filled honestly and this returns the typed
-/// blocked result naming the missing owner supply. With a supplied channel the
-/// same composer below produces complete/partial results with no dispatch
-/// change.
-///
-/// No member is synthesized here: absent Governor records are a refusal, never
-/// a default, an empty set, or a locally built lookalike, all of which would be
-/// self-issued authority.
-/// The admitted Orientation material this carrier is resolved against.
-///
-/// These five references are one admitted job's identity, its derived inputs and
-/// its sealed policy, so they travel together: a caller cannot supply a bundle
-/// from one admission with a policy from another.
-pub(crate) struct AdmittedOrientationRefs<'a> {
-    /// The admitted kernel job this pulse answers.
-    pub admission: &'a KernelJobAdmission,
-    /// The admitted Orientation job with frame, evidence and denominator.
-    pub admitted_job: &'a AdmittedOrientationJob,
-    /// The receipt-bound v1 validated candidate.
-    pub candidate: &'a ValidatedCandidate,
-    /// The bounded bundle this pulse binds.
-    pub bundle: &'a DreamInputBundle,
-    /// The sealed orientation policy.
-    pub policy: &'a OrientationPolicy,
+/// Owner-produced members of a production pulse. Dispatch fills the admitted
+/// job, bundle, validated candidate, and sealed policy from the exact inputs
+/// it just checked; this type carries only values that must arrive from their
+/// real model, Governor, and stage owners.
+pub(crate) struct ProductionOrientationOwnerInputs<'a> {
+    /// CC-002 admitted model-route request (denominator, timeout, privacy).
+    pub model_request: &'a ModelRouteRequest,
+    /// CC-002 outcome returned by the admitted model route.
+    pub model_outcome: &'a ModelRouteOutcome,
+    /// CC-004 set returned by the canonical projection owner.
+    pub projections: &'a CanonicalProjectionSet,
+    /// Exact original submitted runtime owner publication, retained whole.
+    pub runtime_owner_input: &'a eliot_protocol::dreamer_job::DurableJobRuntimeOwnerExecutionInput,
+    /// Governor-resolved epistemic-position handles for the packet.
+    pub cep_handles: &'a [CurrentEpistemicPositionHandle],
+    /// Classification stage inputs.
+    pub classification: ClassificationStage<'a>,
+    /// Cue-activation stage inputs.
+    pub cue_activation: CueActivationStage<'a>,
+    /// Epistemic resolution request over admitted records.
+    pub epistemic: &'a PositionRequest,
+    /// Original candidate retained by the Governor readback owner.
+    pub admitted_candidate: &'a EpistemicPositionCandidate,
+    /// Original source observation retained by that same owner.
+    pub source_observation: &'a ObservationRecord,
+    /// Understanding stage inputs with the route measurement.
+    pub understanding: UnderstandingStage<'a>,
+    /// Claim-grounding request (the owner takes an owned clone).
+    pub grounding: &'a GroundingRequest,
+    /// Rival-structuring stage inputs.
+    pub rivals: RivalStage<'a>,
+    /// Conflict-analysis stage inputs.
+    pub conflict: ConflictStage<'a>,
+    /// Discriminative probe-plan parameters.
+    pub probes: ProbePlanParams<'a>,
+    /// Context-candidate stage inputs.
+    pub candidates: CandidateStage<'a>,
+    /// Owner-declared shared operation identity.
+    pub operation_id: String,
+    /// Owner-declared shared task identity.
+    pub task_id: String,
+    /// Owner-declared shared scope identity.
+    pub scope_id: String,
+    /// Owner-declared shared state fence.
+    pub state_fence: StateFence,
+    /// Owner snapshot deadline in Unix milliseconds.
+    pub deadline_unix_ms: u64,
+    /// True when the owner observed cancellation before composition.
+    pub cancelled: bool,
 }
-pub(crate) fn resolve_production_inputs<'a>(
-    admitted: &AdmittedOrientationRefs<'a>,
-    route: Option<(&'a ModelRouteRequest, &'a ModelRouteOutcome)>,
-    supply: Option<&'a OrientationSupply<'a>>,
-    pipeline: &PipelineOrientationRecords<'a>,
-) -> Result<ProductionOrientationInputs<'a>, Box<OrientationPulseResult>> {
-    let AdmittedOrientationRefs {
-        admission,
-        admitted_job,
-        candidate,
-        bundle,
-        policy,
-    } = *admitted;
-    let PipelineOrientationRecords {
-        grounding,
-        validated_draft,
-        v1: Some(v1),
-    } = *pipeline
-    else {
-        return Err(Box::new(supply_missing_blocked(
-            admission,
-            admitted_job,
-            candidate,
-            bundle,
-            policy,
-            route,
-        )));
-    };
-    let (Some(supply), Some((model_request, model_outcome))) = (supply, route) else {
-        return Err(Box::new(supply_missing_blocked(
-            admission,
-            admitted_job,
-            candidate,
-            bundle,
-            policy,
-            route,
-        )));
-    };
-    Ok(ProductionOrientationInputs {
-        schema_version: PRODUCTION_ORIENTATION_INPUTS_SCHEMA_VERSION,
-        admitted_job,
-        bundle,
-        validated_candidate: candidate,
-        policy,
-        model_request,
-        model_outcome,
+
+/// Caller-supplied owner-channel result for one admitted Orientation call.
+///
+/// Ready must contain actual owner-produced records. Missing and Stale
+/// preserve the live fail-closed result without fabricating any boundary or
+/// stage values.
+pub(crate) enum ProductionOrientationSupply<'a> {
+    /// The caller has all mandatory, owner-produced pulse inputs.
+    Ready(Box<ProductionOrientationOwnerInputs<'a>>),
+    /// At least one mandatory producer is not available to this caller.
+    Missing,
+    /// An owner returned inputs for a prior or otherwise stale snapshot.
+    Stale,
+}
+
+/// Borrows the exact published owner records without changing their contents.
+pub(crate) fn borrow_governor_supply<'a>(
+    admission: &KernelJobAdmission,
+    supply: &'a OrientationSupply<'a>,
+) -> ProductionOrientationSupply<'a> {
+    if supply.projections.binding.state_fence != admission.state_fence {
+        return ProductionOrientationSupply::Stale;
+    }
+    ProductionOrientationSupply::Ready(Box::new(ProductionOrientationOwnerInputs {
+        model_request: supply.model_request,
+        model_outcome: supply.model_outcome,
         projections: supply.projections,
+        runtime_owner_input: supply.runtime_owner_input,
         cep_handles: supply.cep_handles,
         classification: ClassificationStage {
             input: supply.classification_input,
-            context: supply.classification_context,
             policy: supply.classification_policy,
         },
         cue_activation: CueActivationStage {
@@ -411,24 +320,24 @@ pub(crate) fn resolve_production_inputs<'a>(
             profile: supply.cue_profile,
         },
         epistemic: supply.epistemic,
+        admitted_candidate: supply.admitted_candidate,
+        source_observation: supply.source_observation,
         understanding: UnderstandingStage {
             admitted: supply.admitted_context_set,
             recipe: supply.recipe,
-            quality: supply.quality.clone(),
+            quality: supply.quality,
             policy: supply.assembly_policy,
-            measure: supply.measure,
+            output: supply.understanding_output,
         },
-        grounding,
+        grounding: supply.grounding,
         rivals: RivalStage {
-            bundle,
-            validated_draft,
+            bundle: &supply.grounding.bundle,
+            validated_draft: supply.validated_draft,
             current_position: supply.current_position,
             policy: supply.rival_policy,
         },
         conflict: ConflictStage {
             item: supply.curation_item,
-            draft: v1.draft,
-            grounded: v1.grounded,
             conflict_set: supply.conflict_set,
             supplements: supply.supplements,
             policy: supply.conflict_policy,
@@ -444,13 +353,90 @@ pub(crate) fn resolve_production_inputs<'a>(
             evidence: supply.evidence,
             policy: supply.candidate_policy,
         },
-        operation_id: admitted_job.job.operation_id.clone(),
-        task_id: admitted_job.job.task_id.clone(),
-        scope_id: admitted_job.job.scope_id.clone(),
+        operation_id: admission.request_id.clone(),
+        task_id: supply.projections.binding.task_id.as_str().to_owned(),
+        scope_id: admission.scope_id.clone(),
         state_fence: admission.state_fence.clone(),
-        deadline_unix_ms: admission.deadline_unix_ms,
-        cancelled: false,
-    })
+        deadline_unix_ms: supply.deadline_unix_ms,
+        cancelled: supply.cancelled,
+    }))
+}
+
+/// Resolves the production carrier from admitted dispatch artifacts and one
+/// explicit owner-channel result.
+///
+/// Missing and stale supply remain typed blocked results. Ready supply is
+/// retained as borrowed owner records, then checked against the admitted job,
+/// bundle, model request/outcome, canonical projection set, CEP handles, and
+/// shared operation/task/scope/fence identity before the carrier is returned.
+pub(crate) fn resolve_production_inputs<'a>(
+    admission: &'a KernelJobAdmission,
+    semantic_job: &DreamJobInput,
+    admitted_job: &'a AdmittedOrientationJob,
+    candidate: &'a ValidatedCandidate,
+    bundle: &'a DreamInputBundle,
+    policy: &'a OrientationPolicy,
+    supply: ProductionOrientationSupply<'a>,
+) -> Result<ProductionOrientationInputs<'a>, Box<OrientationPulseResult>> {
+    let owner = match supply {
+        ProductionOrientationSupply::Missing => {
+            return Err(Box::new(missing_prerequisites_blocked(
+                admission,
+                &admitted_job.job,
+                output_digest(candidate),
+                bundle,
+                policy,
+                false,
+            )));
+        }
+        ProductionOrientationSupply::Stale => {
+            return Err(Box::new(missing_prerequisites_blocked(
+                admission,
+                &admitted_job.job,
+                output_digest(candidate),
+                bundle,
+                policy,
+                true,
+            )));
+        }
+        ProductionOrientationSupply::Ready(owner) => owner,
+    };
+    let inputs = ProductionOrientationInputs {
+        schema_version: PRODUCTION_ORIENTATION_INPUTS_SCHEMA_VERSION,
+        admitted_job,
+        bundle,
+        validated_candidate: candidate,
+        policy,
+        model_request: owner.model_request,
+        model_outcome: owner.model_outcome,
+        projections: owner.projections,
+        runtime_owner_input: owner.runtime_owner_input,
+        cep_handles: owner.cep_handles,
+        owner_stages: OrientationOwnerInputs {
+            classification: owner.classification,
+            cue_activation: owner.cue_activation,
+            epistemic: owner.epistemic,
+            admitted_candidate: owner.admitted_candidate,
+            source_observation: owner.source_observation,
+            understanding: owner.understanding,
+            grounding: owner.grounding,
+            rivals: owner.rivals,
+            conflict: owner.conflict,
+            probes: owner.probes,
+            candidates: owner.candidates,
+        },
+        operation_id: owner.operation_id,
+        task_id: owner.task_id,
+        scope_id: owner.scope_id,
+        state_fence: owner.state_fence,
+        deadline_unix_ms: owner.deadline_unix_ms,
+        cancelled: owner.cancelled,
+    };
+    if let Err(field) = validate_identity_closure(&inputs, semantic_job) {
+        let admitted = admitted_prefix(&inputs);
+        return Err(Box::new(closure_blocked(&inputs, &admitted, field)));
+    }
+    Ok(inputs)
 }
 
 /// Composes one typed production pulse from the versioned carrier.
@@ -459,92 +445,195 @@ pub(crate) fn resolve_production_inputs<'a>(
 /// pulse), then the identity closure, then the model-disposition gate, then
 /// all nine stages with refusals collected into blocked records, and finally
 /// the packet from the same joined closure. Cancellation, deadline expiry,
-/// and packet-owner refusal surface as [`PulseError`]; missing, incoherent,
-/// unusable, or refused prerequisites surface as a blocked result.
+/// stage refusal, and packet-owner refusal retain their typed terminal
+/// dispositions in the pulse result.
 pub(crate) fn compose_production_result(
-    inputs: ProductionOrientationInputs<'_>,
+    inputs: &ProductionOrientationInputs<'_>,
     semantic_job: &DreamJobInput,
-) -> Result<OrientationPulseResult, PulseError> {
-    if inputs.cancelled {
-        return Err(PulseError::Cancelled);
-    }
-    check_carrier_deadline(inputs.deadline_unix_ms)?;
-    if inputs.schema_version != PRODUCTION_ORIENTATION_INPUTS_SCHEMA_VERSION {
-        return Err(PulseError::Boundary("production inputs version"));
-    }
-    let admitted = admitted_prefix(&inputs);
-    if let Err(field) = validate_identity_closure(&inputs, semantic_job) {
-        return Ok(closure_blocked(&inputs, &admitted, field));
-    }
-    if let Some(reason) = unusable_model_reason(inputs.model_outcome.disposition) {
-        return Ok(unusable_model_blocked(&inputs, &admitted, reason));
-    }
-    let identity = BlockedIdentity::of(&inputs);
-    let model_boundary = present_model_boundary(inputs.model_outcome);
-    let projections_boundary = present_projections_boundary(inputs.projections);
-
-    let mut records = Vec::with_capacity(MANDATORY_DENOMINATOR.members.len());
-    let mut refused: Vec<String> = Vec::new();
-    collect_ref_stages(&inputs, &mut records, &mut refused);
-    collect_stage(
-        &mut records,
-        &mut refused,
-        PulseStageId::Understanding,
-        run_understanding_stage(Some(inputs.understanding)),
+) -> OrientationPulseResult {
+    let (admitted, model_draft) = match preflight_production(inputs, semantic_job) {
+        Ok(ready) => ready,
+        Err(blocked) => return *blocked,
+    };
+    let prefix = ProductionPulsePrefix {
+        identity: BlockedIdentity::of(&inputs),
+        admitted,
+        model_outcome: present_model_boundary(inputs.model_outcome),
+        projections: present_projections_boundary(inputs.projections),
+    };
+    let stage_run = run_mandatory_stages(
+        &inputs.owner_stages,
+        model_draft,
+        inputs.bundle,
+        inputs.model_outcome,
+        inputs.projections,
     );
-    collect_stage(
-        &mut records,
-        &mut refused,
-        PulseStageId::Probes,
-        run_probe_stage(Some(inputs.probes)),
-    );
-    order_stage_records(&mut records);
-    if !refused.is_empty() {
-        return Ok(refused_stages_blocked(
-            identity,
-            admitted,
-            model_boundary,
-            projections_boundary,
+    let mut records: Vec<_> = stage_run.stages.iter().map(stage_record).collect();
+    if let Some(failure) = stage_run.failure.as_ref() {
+        let (disposition, failure_reason) = pulse_error_terminal(failure);
+        let refused = records
+            .iter()
+            .filter(|record| record.disposition != OrientationStageDisposition::Executed)
+            .filter_map(|record| record.reason.clone())
+            .collect::<Vec<_>>();
+        let refused = if refused.is_empty() {
+            vec![failure_reason.to_owned()]
+        } else {
+            refused
+        };
+        return refused_stages_blocked(
+            prefix,
             records,
             refused,
-        ));
+            PulseStageId::Packet.missing_reason(),
+            disposition,
+        );
     }
-
-    let packet = build_projection(
+    let Some(semantics) = stage_run.outputs.projection_view() else {
+        return refused_stages_blocked(
+            prefix,
+            records,
+            vec!["native stage output set incomplete".to_owned()],
+            "native stage output set incomplete",
+            OrientationDisposition::Blocked,
+        );
+    };
+    let owners = OrientationOwnerProjection {
+        model_request: inputs.model_request,
+        model_outcome: inputs.model_outcome,
+        projections: inputs.projections,
+        runtime_owner_input: inputs.runtime_owner_input,
+        semantics,
+    };
+    let packet = match build_projection_with_owners(
         inputs.admitted_job,
         inputs.validated_candidate,
         inputs.bundle,
         inputs.cep_handles,
         inputs.policy,
-    )?;
-    records.push(packet_stage_record(&packet)?);
-    let dream_packet = crate::dispatch_stage::map_orientation_packet(&packet, semantic_job);
-    let (disposition, omissions) = if CONFLICT_OUTPUT_QUALIFIED {
-        (OrientationDisposition::Complete, Vec::new())
-    } else {
-        (
-            OrientationDisposition::Partial,
-            vec![CONFLICT_UNQUALIFIED.to_owned()],
-        )
+        &owners,
+    ) {
+        Ok(packet) => packet,
+        Err(error) => {
+            let (disposition, reason) = packet_error_terminal(&error);
+            return refused_stages_blocked(
+                prefix,
+                records,
+                vec![reason.to_owned()],
+                reason,
+                disposition,
+            );
+        }
     };
-    Ok(OrientationPulseResult {
+    if let Err(error) = packet_stage_record(&packet).map(|record| records.push(record)) {
+        let (disposition, reason) = pulse_error_terminal(&error);
+        return refused_stages_blocked(
+            prefix,
+            records,
+            vec![reason.to_owned()],
+            reason,
+            disposition,
+        );
+    }
+    finish_projection_result(
+        prefix,
+        inputs.model_outcome,
+        inputs.projections,
+        semantic_job,
+        packet,
+        records,
+    )
+}
+
+fn preflight_production<'a>(
+    inputs: &'a ProductionOrientationInputs<'_>,
+    semantic_job: &DreamJobInput,
+) -> Result<
+    (
+        OrientationAdmittedPrefix,
+        &'a eliot_dreamer_contracts::ModelDraft,
+    ),
+    Box<OrientationPulseResult>,
+> {
+    if inputs.cancelled {
+        return Err(Box::new(carrier_failure_result(
+            inputs,
+            &PulseError::Cancelled,
+        )));
+    }
+    if let Err(error) = check_carrier_deadline(inputs.deadline_unix_ms) {
+        return Err(Box::new(carrier_failure_result(inputs, &error)));
+    }
+    if inputs.schema_version != PRODUCTION_ORIENTATION_INPUTS_SCHEMA_VERSION {
+        return Err(Box::new(carrier_failure_result(
+            inputs,
+            &PulseError::Boundary("production inputs version"),
+        )));
+    }
+    let admitted = admitted_prefix(inputs);
+    if let Err(field) = validate_identity_closure(inputs, semantic_job) {
+        return Err(Box::new(closure_blocked(inputs, &admitted, field)));
+    }
+    if let Some(reason) = unusable_model_reason(inputs.model_outcome.disposition) {
+        return Err(Box::new(unusable_model_blocked(inputs, &admitted, reason)));
+    }
+    let Some(model_draft) = inputs.model_outcome.draft.as_ref() else {
+        return Err(Box::new(unusable_model_blocked(
+            inputs,
+            &admitted,
+            MODEL_OUTCOME_MALFORMED,
+        )));
+    };
+    Ok((admitted, model_draft))
+}
+
+fn finish_projection_result(
+    prefix: ProductionPulsePrefix,
+    model_outcome: &ModelRouteOutcome,
+    projections: &CanonicalProjectionSet,
+    semantic_job: &DreamJobInput,
+    mut packet: OrientationPacketCandidate,
+    records: Vec<OrientationStageRecord>,
+) -> OrientationPulseResult {
+    let dream_packet = crate::dispatch_stage::map_orientation_packet(&packet, semantic_job);
+    let mut omissions = Vec::new();
+    if !CONFLICT_OUTPUT_QUALIFIED {
+        omissions.push(CONFLICT_UNQUALIFIED.to_owned());
+    }
+    if model_outcome.disposition != ModelRouteDisposition::Completed {
+        omissions.push("model route outcome partial".to_owned());
+    }
+    if !projections.omissions.is_empty() {
+        omissions.push("canonical projection set incomplete".to_owned());
+    }
+    if packet.disposition == OrientationDisposition::Partial && omissions.is_empty() {
+        omissions.push("joined owner packet partial".to_owned());
+    }
+    let disposition =
+        if packet.disposition == OrientationDisposition::Partial || !CONFLICT_OUTPUT_QUALIFIED {
+            OrientationDisposition::Partial
+        } else {
+            OrientationDisposition::Complete
+        };
+    OrientationPulseResult {
         schema_version: ORIENTATION_PULSE_RESULT_SCHEMA_VERSION,
         disposition,
         proof_ceiling: CEILING_CANDIDATE_ONLY.to_owned(),
-        job_id: identity.job_id,
-        task_id: identity.task_id,
-        scope_id: identity.scope_id,
-        operation_id: identity.operation_id,
-        state_fence: identity.fence,
+        job_id: prefix.identity.job_id,
+        task_id: prefix.identity.task_id,
+        scope_id: prefix.identity.scope_id,
+        operation_id: prefix.identity.operation_id,
+        state_fence: prefix.identity.fence,
         denominator: MANDATORY_DENOMINATOR.identity.to_owned(),
         stages: records,
-        model_outcome: model_boundary,
-        projections: projections_boundary,
-        admitted,
+        model_outcome: prefix.model_outcome,
+        projections: prefix.projections,
+        admitted: prefix.admitted,
         packet: Some(dream_packet),
+        owner_closure: packet.owner_closure.take(),
         omissions,
         missing_owners: Vec::new(),
-    })
+    }
 }
 
 /// Rejects a carrier whose deadline passed or whose clock is unavailable.
@@ -582,7 +671,7 @@ fn validate_identity_closure(
     if semantic_job.job_class != JobClass::Orientation {
         return Err("production job class");
     }
-    if semantic_job.job_id != inputs.bundle.job_id {
+    if inputs.admitted_job.job.canonical_id() != inputs.bundle.job_id {
         return Err("production job binding");
     }
     if semantic_job.scope_id != inputs.scope_id {
@@ -634,14 +723,33 @@ fn validate_identity_closure(
     if inputs.model_request.privacy.as_str() != admitted.privacy_profile {
         return Err("model privacy binding");
     }
-    check_model_boundary(inputs.model_outcome, bundle).map_err(|error| match error {
-        PulseError::Boundary(field) => field,
-        _ => "model outcome",
-    })?;
+    if inputs.model_request.cancelled != inputs.cancelled {
+        return Err("model cancellation binding");
+    }
     inputs
         .model_outcome
         .validate_binding(inputs.model_request)
         .map_err(|_| "model outcome binding")?;
+    inputs
+        .validated_candidate
+        .validate_binding()
+        .map_err(|_| "validated model candidate receipt")?;
+    if &inputs.validated_candidate.job != admitted
+        || &inputs.validated_candidate.bundle != bundle
+        || inputs.model_outcome.draft.as_ref() != Some(&inputs.validated_candidate.model)
+        || inputs.validated_candidate.usage.input_bytes != inputs.model_outcome.receipt.input_bytes
+        || inputs.validated_candidate.usage.output_bytes
+            != inputs.model_outcome.receipt.output_bytes
+        || inputs.validated_candidate.usage.model_calls != inputs.model_outcome.receipt.model_calls
+        || inputs.validated_candidate.usage.wall_ms != inputs.model_outcome.receipt.wall_ms
+    {
+        return Err("owner model candidate binding");
+    }
+    validate_projection_closure(inputs)
+}
+
+fn validate_projection_closure(inputs: &ProductionOrientationInputs) -> Result<(), &'static str> {
+    let bundle = inputs.bundle;
     check_projection_boundary(inputs.projections, bundle).map_err(|error| match error {
         PulseError::Boundary(field) => field,
         _ => "canonical projections",
@@ -652,8 +760,13 @@ fn validate_identity_closure(
     if inputs.projections.binding.scope_id.as_str() != inputs.scope_id {
         return Err("projection scope binding");
     }
-    if let Some(operation) = &inputs.projections.binding.operation_id
-        && operation.as_str() != inputs.operation_id
+    if inputs
+        .projections
+        .binding
+        .operation_id
+        .as_ref()
+        .map(eliot_contracts::OperationId::as_str)
+        != Some(inputs.operation_id.as_str())
     {
         return Err("projection operation binding");
     }
@@ -682,108 +795,139 @@ fn unusable_model_reason(disposition: ModelRouteDisposition) -> Option<&'static 
     }
 }
 
-/// Collects one stage outcome into the ledger, recording refusals as blocked.
-fn collect_stage(
-    records: &mut Vec<OrientationStageRecord>,
-    refused: &mut Vec<String>,
-    id: PulseStageId,
-    outcome: Result<PulseStage, PulseError>,
-) {
-    if let Ok(stage) = outcome {
-        records.push(stage_record(&stage));
-    } else {
-        records.push(blocked_stage_record(id, id.refusal_reason()));
-        refused.push(id.refusal_reason().to_owned());
-    }
-}
-
-/// Collects the stages borrowed from the carrier; the understanding and probe
-/// stages move their inputs and are collected by the caller.
-fn collect_ref_stages(
-    inputs: &ProductionOrientationInputs,
-    records: &mut Vec<OrientationStageRecord>,
-    refused: &mut Vec<String>,
-) {
-    collect_stage(
-        records,
-        refused,
-        PulseStageId::Classification,
-        run_classification_stage(Some(&inputs.classification)),
-    );
-    collect_stage(
-        records,
-        refused,
-        PulseStageId::CueActivation,
-        run_cue_stage(Some(&inputs.cue_activation)),
-    );
-    collect_stage(
-        records,
-        refused,
-        PulseStageId::EpistemicPosition,
-        run_epistemic_stage(Some(inputs.epistemic)),
-    );
-    collect_stage(
-        records,
-        refused,
-        PulseStageId::Grounding,
-        run_grounding_stage(Some(inputs.grounding)),
-    );
-    collect_stage(
-        records,
-        refused,
-        PulseStageId::Rivals,
-        run_rival_stage(Some(&inputs.rivals)),
-    );
-    collect_stage(
-        records,
-        refused,
-        PulseStageId::Conflict,
-        run_conflict_stage(Some(&inputs.conflict)),
-    );
-    collect_stage(
-        records,
-        refused,
-        PulseStageId::Candidates,
-        run_candidate_stage(Some(inputs.projections), Some(&inputs.candidates)),
-    );
-}
-
-/// Sorts ledger records into denominator order.
-fn order_stage_records(records: &mut [OrientationStageRecord]) {
-    records.sort_by_key(|record| stage_order(&record.stage));
-}
-
-/// Denominator position of one ledger record; unknown stages sort last.
-fn stage_order(stage: &str) -> usize {
-    PulseStageId::ORDER
-        .iter()
-        .position(|id| id.as_str() == stage)
-        .unwrap_or(usize::MAX)
-}
-
 /// Builds the blocked result for refused stages: executed members keep their
 /// commitments, refused members name their owner, and no packet projects.
-fn refused_stages_blocked(
+struct ProductionPulsePrefix {
     identity: BlockedIdentity,
     admitted: OrientationAdmittedPrefix,
     model_outcome: OrientationBoundaryRecord,
     projections: OrientationBoundaryRecord,
+}
+
+fn refused_stages_blocked(
+    prefix: ProductionPulsePrefix,
     mut records: Vec<OrientationStageRecord>,
     refused: Vec<String>,
+    packet_reason: &'static str,
+    disposition: OrientationDisposition,
 ) -> OrientationPulseResult {
-    records.push(blocked_stage_record(
-        PulseStageId::Packet,
-        PulseStageId::Packet.missing_reason(),
-    ));
-    blocked_result(BlockedParts {
-        identity,
-        admitted,
-        model_outcome,
-        projections,
+    records.push(blocked_stage_record(PulseStageId::Packet, packet_reason));
+    terminal_pulse_result(BlockedParts {
+        disposition,
+        identity: prefix.identity,
+        admitted: prefix.admitted,
+        model_outcome: prefix.model_outcome,
+        projections: prefix.projections,
         stages: records,
         omissions: refused,
         missing_owners: Vec::new(),
     })
+}
+
+/// Converts the packet owner's closed error taxonomy into a stable pulse
+/// terminal and reason without losing the failed owner category.
+fn packet_error_terminal(error: &OrientationError) -> (OrientationDisposition, &'static str) {
+    match error {
+        OrientationError::WrongJobClass => (
+            OrientationDisposition::Unsupported,
+            "packet owner received unsupported job class",
+        ),
+        OrientationError::Invalid(field) | OrientationError::Encoding(field) => {
+            (OrientationDisposition::Invalid, field)
+        }
+        OrientationError::Unsupported(field) => (OrientationDisposition::Unsupported, field),
+        OrientationError::Binding(field) | OrientationError::Bounded(field) => {
+            (OrientationDisposition::Bound, field)
+        }
+        OrientationError::Bound => (OrientationDisposition::Bound, "packet owner bound exceeded"),
+        OrientationError::RevalidationRequired => (
+            OrientationDisposition::RevalidationRequired,
+            "packet owner requires revalidation",
+        ),
+        OrientationError::Cancelled => {
+            (OrientationDisposition::Cancelled, "packet owner cancelled")
+        }
+        OrientationError::Internal => (
+            OrientationDisposition::Blocked,
+            "packet owner internal failure",
+        ),
+    }
+}
+
+/// Converts a pulse-level gate or mandatory owner refusal to its existing
+/// typed terminal. Native runner stage records carry the stage-specific reason.
+fn pulse_error_terminal(error: &PulseError) -> (OrientationDisposition, &'static str) {
+    match error {
+        PulseError::Boundary(field) => (OrientationDisposition::Bound, field),
+        PulseError::Classification => (
+            OrientationDisposition::Blocked,
+            PulseStageId::Classification.refusal_reason(),
+        ),
+        PulseError::CueActivation => (
+            OrientationDisposition::Blocked,
+            PulseStageId::CueActivation.refusal_reason(),
+        ),
+        PulseError::Epistemic => (
+            OrientationDisposition::Blocked,
+            PulseStageId::EpistemicPosition.refusal_reason(),
+        ),
+        PulseError::EpistemicBinding(eliot_epistemic::AdmittedBindingError::Mismatch { field }) => {
+            (OrientationDisposition::Bound, field)
+        }
+        PulseError::EpistemicBinding(eliot_epistemic::AdmittedBindingError::Unsupported {
+            field,
+        }) => (OrientationDisposition::Unsupported, field),
+        PulseError::EpistemicBinding(eliot_epistemic::AdmittedBindingError::CandidateContract) => (
+            OrientationDisposition::Invalid,
+            "original epistemic candidate contract",
+        ),
+        PulseError::EpistemicBinding(eliot_epistemic::AdmittedBindingError::PositionContract) => (
+            OrientationDisposition::Invalid,
+            "original admitted position contract",
+        ),
+        PulseError::EpistemicBinding(eliot_epistemic::AdmittedBindingError::ResolverRequest) => (
+            OrientationDisposition::Invalid,
+            "native epistemic resolver request",
+        ),
+        PulseError::EpistemicBinding(eliot_epistemic::AdmittedBindingError::Observation) => (
+            OrientationDisposition::Invalid,
+            "original source observation contract",
+        ),
+        PulseError::EpistemicBinding(eliot_epistemic::AdmittedBindingError::Canonicalization) => (
+            OrientationDisposition::Invalid,
+            "epistemic source canonicalization",
+        ),
+        PulseError::Understanding => (
+            OrientationDisposition::Blocked,
+            PulseStageId::Understanding.refusal_reason(),
+        ),
+        PulseError::Grounding => (
+            OrientationDisposition::Blocked,
+            PulseStageId::Grounding.refusal_reason(),
+        ),
+        PulseError::Rivals => (
+            OrientationDisposition::Blocked,
+            PulseStageId::Rivals.refusal_reason(),
+        ),
+        PulseError::Conflict => (
+            OrientationDisposition::Blocked,
+            PulseStageId::Conflict.refusal_reason(),
+        ),
+        PulseError::Probes => (
+            OrientationDisposition::Blocked,
+            PulseStageId::Probes.refusal_reason(),
+        ),
+        PulseError::Candidates => (
+            OrientationDisposition::Blocked,
+            PulseStageId::Candidates.refusal_reason(),
+        ),
+        PulseError::Cancelled => (OrientationDisposition::Cancelled, "pulse cancelled"),
+        PulseError::DeadlineExceeded => (
+            OrientationDisposition::RevalidationRequired,
+            "pulse deadline exceeded",
+        ),
+        PulseError::Packet(error) => packet_error_terminal(error),
+    }
 }
 
 /// Maps one internal stage outcome onto its public ledger record.
@@ -828,7 +972,7 @@ fn packet_stage_record(
         required: true,
         disposition: OrientationStageDisposition::Executed,
         expected_input: PulseStageId::Packet.expected_input().to_owned(),
-        input_commitment: Some(PulseStageId::Packet.expected_input().to_owned()),
+        input_commitment: Some(packet.input_digest.clone()),
         output_commitment: Some(commitment),
         proof_ceiling: CEILING_CANDIDATE_ONLY.to_owned(),
         reason: None,
@@ -839,12 +983,9 @@ fn packet_stage_record(
 /// Commits the admitted-material prefix: v1 candidate, sealed policy, bundle.
 fn admitted_prefix(inputs: &ProductionOrientationInputs) -> OrientationAdmittedPrefix {
     OrientationAdmittedPrefix {
-        candidate_digest: output_digest(inputs.validated_candidate)
-            .unwrap_or_else(|| DIGEST_UNAVAILABLE.to_owned()),
-        policy_digest: output_digest(inputs.policy)
-            .unwrap_or_else(|| DIGEST_UNAVAILABLE.to_owned()),
-        bundle_digest: bundle_digest_of(inputs.bundle)
-            .unwrap_or_else(|_| DIGEST_UNAVAILABLE.to_owned()),
+        candidate_digest: output_digest(inputs.validated_candidate),
+        policy_digest: output_digest(inputs.policy),
+        bundle_digest: bundle_digest_of(inputs.bundle).ok(),
     }
 }
 
@@ -870,6 +1011,29 @@ fn present_projections_boundary(projections: &CanonicalProjectionSet) -> Orienta
     }
 }
 
+/// Makes a typed no-packet result for a carrier gate that fires before native
+/// stage execution. All denominator members remain explicit and blocked.
+fn carrier_failure_result(
+    inputs: &ProductionOrientationInputs,
+    error: &PulseError,
+) -> OrientationPulseResult {
+    let (disposition, reason) = pulse_error_terminal(error);
+    let stages = PulseStageId::ORDER
+        .iter()
+        .map(|id| blocked_stage_record(*id, reason))
+        .collect();
+    terminal_pulse_result(BlockedParts {
+        disposition,
+        identity: BlockedIdentity::of(inputs),
+        admitted: admitted_prefix(inputs),
+        model_outcome: present_model_boundary(inputs.model_outcome),
+        projections: present_projections_boundary(inputs.projections),
+        stages,
+        omissions: vec![reason.to_owned()],
+        missing_owners: Vec::new(),
+    })
+}
+
 /// Owned identity half shared by the blocked-result builders.
 struct BlockedIdentity {
     job_id: String,
@@ -881,18 +1045,23 @@ struct BlockedIdentity {
 
 impl BlockedIdentity {
     fn of(inputs: &ProductionOrientationInputs) -> Self {
+        Self::of_job(&inputs.admitted_job.job)
+    }
+
+    fn of_job(admitted: &eliot_dreamer_contracts::DreamJobAdmission) -> Self {
         Self {
-            job_id: inputs.bundle.job_id.clone(),
-            task_id: inputs.task_id.clone(),
-            scope_id: inputs.scope_id.clone(),
-            operation_id: inputs.operation_id.clone(),
-            fence: inputs.state_fence.clone(),
+            job_id: admitted.canonical_id(),
+            task_id: admitted.task_id.clone(),
+            scope_id: admitted.scope_id.clone(),
+            operation_id: admitted.operation_id.clone(),
+            fence: admitted.state_fence.clone(),
         }
     }
 }
 
 /// Owned parts of one blocked result.
 struct BlockedParts {
+    disposition: OrientationDisposition,
     identity: BlockedIdentity,
     admitted: OrientationAdmittedPrefix,
     model_outcome: OrientationBoundaryRecord,
@@ -902,12 +1071,12 @@ struct BlockedParts {
     missing_owners: Vec<String>,
 }
 
-/// Assembles one blocked result: full denominator, no packet.
-fn blocked_result(parts: BlockedParts) -> OrientationPulseResult {
+/// Assembles one typed no-packet terminal result with a full denominator.
+fn terminal_pulse_result(parts: BlockedParts) -> OrientationPulseResult {
     debug_assert_eq!(parts.stages.len(), MANDATORY_DENOMINATOR.members.len());
     OrientationPulseResult {
         schema_version: ORIENTATION_PULSE_RESULT_SCHEMA_VERSION,
-        disposition: OrientationDisposition::Blocked,
+        disposition: parts.disposition,
         proof_ceiling: CEILING_BLOCKED.to_owned(),
         job_id: parts.identity.job_id,
         task_id: parts.identity.task_id,
@@ -920,6 +1089,7 @@ fn blocked_result(parts: BlockedParts) -> OrientationPulseResult {
         projections: parts.projections,
         admitted: parts.admitted,
         packet: None,
+        owner_closure: None,
         omissions: parts.omissions,
         missing_owners: parts.missing_owners,
     }
@@ -928,17 +1098,29 @@ fn blocked_result(parts: BlockedParts) -> OrientationPulseResult {
 /// Builds the blocked result for the absent Governor supply channel: the
 /// CC-002 boundary is present and committed, the CC-004 boundary and every
 /// stage-owner record are absent, and no packet projects.
-fn supply_missing_blocked(
+fn missing_prerequisites_blocked(
     admission: &KernelJobAdmission,
-    admitted_job: &AdmittedOrientationJob,
-    candidate: &ValidatedCandidate,
+    admitted: &DreamJobAdmission,
+    candidate_digest: Option<String>,
     bundle: &DreamInputBundle,
     policy: &OrientationPolicy,
-    route: Option<(&ModelRouteRequest, &ModelRouteOutcome)>,
+    stale: bool,
 ) -> OrientationPulseResult {
+    let reason = if stale {
+        ORIENTATION_SUPPLY_STALE
+    } else {
+        ORIENTATION_SUPPLY_MISSING
+    };
     let stages = PulseStageId::ORDER
         .iter()
-        .map(|id| blocked_stage_record(*id, id.missing_reason()))
+        .map(|id| {
+            let stage_reason = if stale { reason } else { id.missing_reason() };
+            let mut record = blocked_stage_record(*id, stage_reason);
+            if stale {
+                record.disposition = OrientationStageDisposition::Stale;
+            }
+            record
+        })
         .collect();
     let mut missing_owners = vec![OWNER_PROJECTIONS.to_owned()];
     missing_owners.extend(
@@ -947,41 +1129,194 @@ fn supply_missing_blocked(
             .filter(|id| **id != PulseStageId::Packet)
             .map(|id| id.owner_entry().to_owned()),
     );
-    blocked_result(BlockedParts {
+    terminal_pulse_result(BlockedParts {
+        disposition: OrientationDisposition::Blocked,
         identity: BlockedIdentity {
             job_id: admission.job_id.clone(),
-            task_id: admitted_job.job.task_id.clone(),
-            scope_id: admitted_job.job.scope_id.clone(),
-            operation_id: admitted_job.job.operation_id.clone(),
+            task_id: admitted.task_id.clone(),
+            scope_id: admitted.scope_id.clone(),
+            operation_id: admitted.operation_id.clone(),
             fence: admission.state_fence.clone(),
         },
         admitted: OrientationAdmittedPrefix {
-            candidate_digest: output_digest(candidate)
-                .unwrap_or_else(|| DIGEST_UNAVAILABLE.to_owned()),
-            policy_digest: output_digest(policy).unwrap_or_else(|| DIGEST_UNAVAILABLE.to_owned()),
-            bundle_digest: bundle_digest_of(bundle)
-                .unwrap_or_else(|_| DIGEST_UNAVAILABLE.to_owned()),
+            candidate_digest,
+            policy_digest: output_digest(policy),
+            bundle_digest: bundle_digest_of(bundle).ok(),
         },
         model_outcome: OrientationBoundaryRecord {
             boundary: "cc002_model_route".to_owned(),
-            present: route.is_some(),
-            commitment: route.and_then(|(request, _)| output_digest(request)),
-            disposition: route.map(|(_, outcome)| outcome.disposition.as_str().to_owned()),
-            reason: (route.is_none()).then(|| MODEL_OUTCOME_MISSING.to_owned()),
+            present: false,
+            commitment: None,
+            disposition: None,
+            reason: Some(if stale {
+                ORIENTATION_SUPPLY_STALE.to_owned()
+            } else {
+                MODEL_OUTCOME_MISSING.to_owned()
+            }),
         },
         projections: OrientationBoundaryRecord {
             boundary: "cc004_canonical_projections".to_owned(),
             present: false,
             commitment: None,
             disposition: None,
-            reason: Some(CC004_MISSING.to_owned()),
+            reason: Some(if stale {
+                ORIENTATION_SUPPLY_STALE.to_owned()
+            } else {
+                CC004_MISSING.to_owned()
+            }),
         },
         stages,
-        omissions: vec![
-            CC004_MISSING.to_owned(),
-            ORIENTATION_SUPPLY_MISSING.to_owned(),
-        ],
+        omissions: if stale {
+            vec![ORIENTATION_SUPPLY_STALE.to_owned()]
+        } else {
+            vec![
+                MODEL_OUTCOME_MISSING.to_owned(),
+                CC004_MISSING.to_owned(),
+                ORIENTATION_SUPPLY_MISSING.to_owned(),
+            ]
+        },
         missing_owners,
+    })
+}
+
+/// Produces the typed, fail-closed result for an absent or stale owner channel
+/// without deriving any candidate, policy, or bundle commitment.
+pub(crate) fn absent_owner_supply(
+    admission: &KernelJobAdmission,
+    job: &DreamJobInput,
+    stale: bool,
+) -> OrientationPulseResult {
+    let reason = if stale {
+        ORIENTATION_SUPPLY_STALE
+    } else {
+        ORIENTATION_SUPPLY_MISSING
+    };
+    let boundary = |name: &str| OrientationBoundaryRecord {
+        boundary: name.to_owned(),
+        present: false,
+        commitment: None,
+        disposition: None,
+        reason: Some(reason.to_owned()),
+    };
+    let stages = PulseStageId::ORDER
+        .iter()
+        .map(|id| {
+            let mut record = blocked_stage_record(*id, reason);
+            if stale {
+                record.disposition = OrientationStageDisposition::Stale;
+            }
+            record
+        })
+        .collect();
+    terminal_pulse_result(BlockedParts {
+        disposition: OrientationDisposition::Blocked,
+        identity: BlockedIdentity {
+            job_id: admission.job_id.clone(),
+            task_id: job.task_id.clone().unwrap_or_else(|| job.job_id.clone()),
+            scope_id: admission.scope_id.clone(),
+            operation_id: admission.request_id.clone(),
+            fence: admission.state_fence.clone(),
+        },
+        admitted: OrientationAdmittedPrefix {
+            candidate_digest: None,
+            policy_digest: None,
+            bundle_digest: None,
+        },
+        model_outcome: boundary("cc002_model_route"),
+        projections: boundary("cc004_canonical_projections"),
+        stages,
+        omissions: vec![reason.to_owned()],
+        missing_owners: std::iter::once(OWNER_PROJECTIONS.to_owned())
+            .chain(
+                PulseStageId::ORDER
+                    .iter()
+                    .filter(|id| **id != PulseStageId::Packet)
+                    .map(|id| id.owner_entry().to_owned()),
+            )
+            .collect(),
+    })
+}
+
+/// Produces the typed, fail-closed result for an absent or stale owner channel
+/// before any local model text or candidate is derived. The supplied digest
+/// is the unchanged upstream validation receipt, so the result never needs a
+/// locally invented candidate to name its admitted prefix.
+pub(crate) fn owner_supply_blocked(
+    admission: &KernelJobAdmission,
+    admitted: &DreamJobAdmission,
+    original_receipt_digest: &str,
+    bundle: &DreamInputBundle,
+    policy: &OrientationPolicy,
+    stale: bool,
+) -> OrientationPulseResult {
+    missing_prerequisites_blocked(
+        admission,
+        admitted,
+        Some(original_receipt_digest.to_owned()),
+        bundle,
+        policy,
+        stale,
+    )
+}
+
+/// Records a real owner boundary that cannot proceed into candidate
+/// validation. This keeps its boundary commitments visible while every pulse
+/// stage remains blocked; no substitute candidate or owner output is made.
+pub(crate) fn owner_boundary_blocked(
+    admitted_job: &AdmittedOrientationJob,
+    original_receipt_digest: &str,
+    bundle: &DreamInputBundle,
+    policy: &OrientationPolicy,
+    outcome: &ModelRouteOutcome,
+    projections: &CanonicalProjectionSet,
+    reason: &'static str,
+) -> OrientationPulseResult {
+    owner_boundary_terminal(
+        admitted_job,
+        original_receipt_digest,
+        bundle,
+        policy,
+        outcome,
+        projections,
+        (OrientationDisposition::Blocked, reason),
+    )
+}
+
+/// Records a terminal gate over present model/projection owner values without
+/// deriving a candidate or running any native pulse stage.
+pub(crate) fn owner_boundary_terminal(
+    admitted_job: &AdmittedOrientationJob,
+    original_receipt_digest: &str,
+    bundle: &DreamInputBundle,
+    policy: &OrientationPolicy,
+    outcome: &ModelRouteOutcome,
+    projections: &CanonicalProjectionSet,
+    terminal: (OrientationDisposition, &'static str),
+) -> OrientationPulseResult {
+    let (disposition, reason) = terminal;
+    let stages = PulseStageId::ORDER
+        .iter()
+        .map(|id| blocked_stage_record(*id, reason))
+        .collect();
+    terminal_pulse_result(BlockedParts {
+        disposition,
+        identity: BlockedIdentity::of_job(&admitted_job.job),
+        admitted: OrientationAdmittedPrefix {
+            candidate_digest: Some(original_receipt_digest.to_owned()),
+            policy_digest: output_digest(policy),
+            bundle_digest: bundle_digest_of(bundle).ok(),
+        },
+        model_outcome: OrientationBoundaryRecord {
+            boundary: "cc002_model_route".to_owned(),
+            present: true,
+            commitment: output_digest(outcome),
+            disposition: Some(outcome.disposition.as_str().to_owned()),
+            reason: Some(reason.to_owned()),
+        },
+        projections: present_projections_boundary(projections),
+        stages,
+        omissions: vec![reason.to_owned()],
+        missing_owners: Vec::new(),
     })
 }
 
@@ -996,7 +1331,8 @@ fn closure_blocked(
         .iter()
         .map(|id| blocked_stage_record(*id, field))
         .collect();
-    blocked_result(BlockedParts {
+    terminal_pulse_result(BlockedParts {
+        disposition: OrientationDisposition::Blocked,
         identity: BlockedIdentity::of(inputs),
         admitted: admitted.clone(),
         model_outcome: OrientationBoundaryRecord {
@@ -1030,7 +1366,8 @@ fn unusable_model_blocked(
         .iter()
         .map(|id| blocked_stage_record(*id, reason))
         .collect();
-    blocked_result(BlockedParts {
+    terminal_pulse_result(BlockedParts {
+        disposition: OrientationDisposition::Blocked,
         identity: BlockedIdentity::of(inputs),
         admitted: admitted.clone(),
         model_outcome: OrientationBoundaryRecord {

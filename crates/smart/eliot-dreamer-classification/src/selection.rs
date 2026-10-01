@@ -3,13 +3,14 @@
 use eliot_contracts::ArtifactId;
 use eliot_dreamer_contracts::{
     ClassificationCriterionRole, ClassificationInput, CriterionApplicability, CriterionStatus,
-    PriorAssignmentRef, TaxonomyAlternative, TaxonomyCoverage,
+    OrientationClassificationProfile, PriorAssignmentRef, TaxonomyAlternative, TaxonomyCoverage,
 };
 use eliot_epistemic_contracts::{EvidenceGrade, GradeAssignment};
 use serde::{Deserialize, Serialize};
 
 use crate::evidence::{EvidenceQuality, quality};
 use crate::policy::ClassificationPolicy;
+use crate::semantics::ClassificationSemantics;
 
 /// Resolution of one criterion, preserving unknown and contradiction states.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,6 +81,26 @@ pub fn select(
 ) -> Result<SelectionReport, eliot_dreamer_contracts::ContractViolation> {
     input.validate()?;
     policy.preflight(input)?;
+    let semantics = ClassificationSemantics::from_curation(input);
+    select_validated(&semantics, policy)
+}
+
+/// Selects from the original Orientation profile without requiring or
+/// manufacturing a Curation item or acceptance context.
+pub(crate) fn select_orientation(
+    input: &OrientationClassificationProfile,
+    policy: &ClassificationPolicy,
+) -> Result<SelectionReport, eliot_dreamer_contracts::ContractViolation> {
+    input.validate()?;
+    policy.preflight_orientation(input)?;
+    let semantics = ClassificationSemantics::from_orientation(input);
+    select_validated(&semantics, policy)
+}
+
+fn select_validated(
+    input: &ClassificationSemantics<'_>,
+    policy: &ClassificationPolicy,
+) -> Result<SelectionReport, eliot_dreamer_contracts::ContractViolation> {
     crate::evidence::validate_evidence(input, policy)?;
     if input.taxonomy.coverage != TaxonomyCoverage::Complete {
         return Ok(SelectionReport {
@@ -121,7 +142,7 @@ pub fn select(
 /// Resolves the at-most-one eligible alternative into its final report,
 /// including the known-subtype owner handoff and prior-position handling.
 fn finish_single_selection(
-    input: &ClassificationInput,
+    input: &ClassificationSemantics<'_>,
     eligible: &[ArtifactId],
     unresolved_rival: bool,
     traces: Vec<AlternativeTrace>,
@@ -208,7 +229,7 @@ fn finish_single_selection(
 }
 
 fn traces(
-    input: &ClassificationInput,
+    input: &ClassificationSemantics<'_>,
     policy: &ClassificationPolicy,
 ) -> Result<Vec<AlternativeTrace>, eliot_dreamer_contracts::ContractViolation> {
     input
@@ -221,7 +242,7 @@ fn traces(
 
 fn evaluate(
     alternative: &TaxonomyAlternative,
-    input: &ClassificationInput,
+    input: &ClassificationSemantics<'_>,
     policy: &ClassificationPolicy,
 ) -> Result<(AlternativeTrace, AlternativeState), eliot_dreamer_contracts::ContractViolation> {
     let mut state = EvalState::default();
@@ -309,7 +330,7 @@ impl EvalState {
 fn inspect_criterion(
     criterion_id: &ArtifactId,
     criterion: &eliot_dreamer_contracts::GroundedCriterion,
-    input: &ClassificationInput,
+    input: &ClassificationSemantics<'_>,
     policy: &ClassificationPolicy,
     state: &mut EvalState,
 ) -> Result<(), eliot_dreamer_contracts::ContractViolation> {
@@ -411,7 +432,7 @@ fn push_unique(values: &mut Vec<ArtifactId>, value: &ArtifactId) {
 }
 
 fn resolve_criterion(
-    input: &ClassificationInput,
+    input: &ClassificationSemantics<'_>,
     policy: &ClassificationPolicy,
     criterion_id: &ArtifactId,
 ) -> Result<CriterionResolution, eliot_dreamer_contracts::ContractViolation> {
@@ -462,7 +483,10 @@ fn resolve_criterion(
     Ok(observed.unwrap_or(CriterionResolution::Unknown))
 }
 
-fn unique_refs(input: &ClassificationInput, alternative: &TaxonomyAlternative) -> Vec<ArtifactId> {
+fn unique_refs(
+    input: &ClassificationSemantics<'_>,
+    alternative: &TaxonomyAlternative,
+) -> Vec<ArtifactId> {
     let mut refs = alternative.evidence_refs.clone();
     for criterion_id in &alternative.criterion_refs {
         if let Some(criterion) = input
@@ -487,7 +511,7 @@ fn unique_refs(input: &ClassificationInput, alternative: &TaxonomyAlternative) -
 }
 
 fn alternative<'a>(
-    input: &'a ClassificationInput,
+    input: &'a ClassificationSemantics<'_>,
     id: &ArtifactId,
 ) -> Option<&'a TaxonomyAlternative> {
     input
@@ -500,7 +524,7 @@ fn alternative<'a>(
 fn is_refinement(
     prior: &PriorAssignmentRef,
     selected: &ArtifactId,
-    input: &ClassificationInput,
+    input: &ClassificationSemantics<'_>,
 ) -> bool {
     let Some(previous) = prior.selected_alternative_id.as_ref() else {
         return false;

@@ -43,6 +43,7 @@ mod composition;
 mod context_inputs;
 mod cue_composition;
 mod epistemic_composition;
+mod epistemic_orientation_read;
 mod experience_commit;
 mod finish_attempt;
 mod governor_authority_projection;
@@ -59,6 +60,8 @@ pub use attention_evaluation_commit::{
     produce_and_commit_attention_evaluation, resolve_attention_lost_acknowledgement,
     validate_attention_evaluation_request, verify_attention_evaluation_readback,
 };
+pub mod orientation_projection_owner;
+pub mod orientation_stage_sources;
 pub use context_inputs::{
     ContextInputsError, ContextReconstructionRequest, GovernorContextInputs, ROLE_AFFORDANCES,
     ROLE_ATTENTION_CONFLICT, ROLE_CUE_ACTIVATION, ROLE_EPISTEMIC_POSITION, ROLE_EVIDENCE_ASSURANCE,
@@ -67,8 +70,10 @@ pub use context_inputs::{
 pub use cue_composition::{
     CueCacheKey, CueCompositionError, CueReconstruction, CueReconstructionCache,
     MAX_CACHED_CUE_RECONSTRUCTIONS, evidence_projection_payload, reconstruct_cue_snapshot,
+    reconstruct_cue_snapshot_for_request,
 };
 pub use epistemic_composition::{GovernorEpistemicComposition, ObservedEpistemicProposal};
+pub use epistemic_orientation_read::{EpistemicOrientationRead, EpistemicOrientationReadError};
 pub use experience_commit::{commit_experience_bank, commit_experience_feedback};
 pub use finish_attempt::{
     FinishAttemptError, GOVERNOR_SCOPE_ID, GovernorFinishAttempt, PreparedFinishDecision,
@@ -107,6 +112,11 @@ pub use negative_memory_probe::{
 pub use negative_memory_read::{
     NegativeMemoryReadRefusal, ResolvedNegativeMemoryRuleSet, plan_negative_memory_rule_read,
     resolve_negative_memory_rule_read,
+};
+pub use orientation_projection_owner::{
+    OrientationProjectionMemberStates, OrientationProjectionOwnerInput,
+    OrientationProjectionOwnerOutput, OrientationProjectionSourceClosure,
+    bind_orientation_projections,
 };
 mod controlboard_projection;
 mod learning_admission;
@@ -819,3 +829,10 @@ pub const fn degraded_health() -> HealthVector {
         capacity: HealthDimension::Unknown,
     }
 }
+
+pub use orientation_stage_sources::{
+    OrientationClassificationSourceError, OrientationClassificationSourceReadback,
+    OrientationCueAdmissionError, OrientationCueAdmissionInput, OrientationCueAdmissionValuesV1,
+    OrientationCueBindingsSourceError, OrientationCueBindingsSourceReadback,
+    admit_orientation_cue_bindings, admit_orientation_cue_bindings_from_values,
+};

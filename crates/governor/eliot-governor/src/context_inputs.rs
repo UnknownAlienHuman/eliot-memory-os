@@ -14,25 +14,19 @@
 //! | `CriticalAttention`/`Conflict` | `GetAttentionAndProblems` | `ReadApi::state` |
 //! | `CurrentEpistemicPosition` | `GetCurrentEpistemicPosition` | `ReadApi::query` with `QueryMode::ContextReconstruction` (reuses the T11.2 readback shape) |
 //! | Cue activation | `GetUnderstandingProjectionInputs` | `ReadApi::query` with `QueryMode::ContextReconstruction` |
-//! | Negative memory | `GetUnderstandingProjectionInputs` (negative-memory interpretation) | same query |
+//! | Negative memory | `GetLearningRecordRange` (`ActivationReceipt`) | `ReadApi::query` with the existing negative-memory resolver |
 //! | Evidence/source assurance | `GetEvidencePack` | `ReadApi::query` with `QueryMode::ContextReconstruction` |
-//! | Affordances | `GetCapabilityEvidenceState` | `ReadApi::state` |
+//! | Affordances | `GetCapabilityEvidenceRecordRange` | `ReadApi::query` with `QueryMode::ContextReconstruction` |
 //!
-//! The query facade only admits `GetEvidencePack`,
-//! `GetUnderstandingProjectionInputs`, and `GetCurrentEpistemicPosition` for
-//! `QueryMode::ContextReconstruction` (`eliot_read` intent table); the three
-//! state-only roles go through `ReadApi::state` under the same fence and
-//! dependency closure instead of failing the intent gate. Every read uses
+//! The query facade admits every query role listed above for
+//! `QueryMode::ContextReconstruction` (`eliot_read` intent table). Every read uses
 //! `ReadConsistency::ExactFence` with caller-supplied dependency revisions.
 //!
 //! Selector discipline: every role carries the exact closed selector set the
-//! store catalogue declares for its read (issue #2563). The four task-bound
-//! reads are activated in both owner adapters
-//! (`eliot_store_memory::{task_state_payload, attention_problems_payload,
-//! understanding_inputs_payload, capability_evidence_payload}` and their
-//! Surreal twins), so the three repaired reads and the affordances role now
-//! reach real handlers instead of resolving to per-role `Unavailable`. The
-//! request carries no caller-selected scope override, no fabricated `all`
+//! store catalogue declares for its read (issue #2563). Task, attention, and
+//! cue roles use their versioned owner envelopes; negative-memory and
+//! affordance roles retain native record-range rows and original revisions.
+//! The request carries no caller-selected scope override, no fabricated `all`
 //! selector and no empty default: a missing required selector is refused by
 //! [`ContextInputsError::RequestInvalid`] before any read is planned.
 //!
@@ -40,9 +34,8 @@
 //! are captured before acquisition and re-read afterwards; bounded churn
 //! fails closed as [`ContextInputsError::SourceHeadsChanged`] rather than
 //! exposing a silently mixed snapshot. The whole reconstruction is bounded to
-//! one read per role slot (six physical reads, seven slots when the cue and
-//! negative-memory slots deliberately share one source snapshot); there is no
-//! retry loop and no continuation field here — #1729 owns broader coherent
+//! one read per role slot (seven physical reads); there is no retry loop and
+//! no continuation drain here — #1729 owns broader coherent
 //! assembly.
 //!
 //! Disposition discipline (`eliot_context_candidates::ProjectionState`):
@@ -55,14 +48,11 @@
 //! different task/problem/skill is never adopted just because its operation
 //! and fence match.
 //!
-//! Page-provenance discipline (#2857): one shared rule
-//! ([`classify_role_page`]) judges every role page's declared extent, so a
-//! bounded partial page is only ever `Partial` when its three declared counts
-//! are present, correctly typed, and coherent with the records that travelled
-//! (`returned == records.len()`, `matched_total >= returned`, and
-//! `truncated == (matched_total > returned)`). Absent or contradictory counts
-//! are `Unknown` — a truncation flag on its own is a claim about the other two
-//! counts and never promotes a page on its own.
+//! Page-provenance discipline (#2857): the shared rule
+//! ([`classify_role_page`]) judges the versioned context-envelope pages. The
+//! capability range owner has separate keyset semantics: its `matched_total`
+//! is the returned count, and a partial page is retained only with its real
+//! fence-bound continuation cursor.
 //!
 //! Downstream limit, kept explicit: a successful retrieval of a versioned
 //! source envelope is NOT proof of Cue admission, capability qualification or
@@ -83,18 +73,22 @@
 //! Problem's ordered committed history is a typed
 //! [`ContextInputsError::AttentionPageUndecodable`], never a partial readback.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_context_candidates::ProjectionState;
 use eliot_contracts::{ClockReading, RequestMetadata};
+use eliot_dreamer_failure::{NegativeMemoryActionPolicy, NegativeMemoryFingerprint};
 use eliot_read::{
     BranchEnvironmentScope, FreshnessPolicy, NamedParameters, QueryIntent, QueryMode, QueryRequest,
     ReadApi, ReadError, ReadIdentity, ReadOrderingBinding, ReadOutcome, RequiredAssurance,
     StateRequest, TimeScope,
 };
 use eliot_store_api::{
-    EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation, ReadConsistency, RevisionHead, RevisionKey,
-    ScopeId, ScopeRevisionView, WriteReceiptStatus, epistemic_revision::EpistemicPositionReadback,
+    EVIDENCE_PACK_MAX_RECORDS, LearningRecordKind, MAX_CAPABILITY_EVIDENCE_PAGE_RECORDS,
+    MAX_LEARNING_PAGE_RECORDS, NamedReadOperation, NamedReadRequest, NamedReadResponse,
+    ReadConsistency, RevisionHead, RevisionKey, ScopeId, ScopeRevisionView, WriteReceiptStatus,
+    capability_evidence_read_request, epistemic_revision::EpistemicPositionReadback,
+    learning_record_read_request,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -183,8 +177,8 @@ pub enum ContextInputsError {
 /// | `task_id`, `task_max_records` | `GetTaskState` | `task_id`, `max_records` |
 /// | `attention_problem_id`, `attention_max_records` | `GetAttentionAndProblems` | `problem_id` (omitted when no specific problem is requested), `max_records` |
 /// | `projection_selector`, `projection_max_records` | `GetUnderstandingProjectionInputs` (cue activation) | `selector`, `max_records` |
-/// | `negative_memory_selector`, `negative_memory_max_records` | `GetUnderstandingProjectionInputs` (negative memory) | `selector`, `max_records` |
-/// | `affordance_skill_id`, `affordance_max_records` | `GetCapabilityEvidenceState` | `skill_id`, `max_records` |
+/// | `negative_memory_selector`, `negative_memory_max_records` | `GetLearningRecordRange` | `record_kind` (`activation_receipt`), `max_records` |
+/// | `affordance_skill_id`, `affordance_max_records` | `GetCapabilityEvidenceRecordRange` | `skill_id`, `max_records` |
 ///
 /// Each `max_records` is the explicit owner bound
 /// `1..=EVIDENCE_PACK_MAX_RECORDS` and travels as its decimal **string**,
@@ -234,20 +228,18 @@ pub struct ContextReconstructionRequest {
     pub projection_selector: String,
     /// Explicit cue-projection bound (`1..=EVIDENCE_PACK_MAX_RECORDS`).
     pub projection_max_records: u32,
-    /// Exact source selector for the negative-memory projection (`selector`).
+    /// Exact native negative-memory selector (`activation_receipt`).
     ///
-    /// Resolved separately from the cue selector because the two roles may
-    /// address different source sets. It is a required member, never a
-    /// default: when it equals the cue selector (and the cue bound) both roles
-    /// deliberately address one exact source snapshot and a single response may
-    /// serve both slots.
+    /// Only the fixed activation-receipt source is admitted; this remains a
+    /// required member so a caller cannot omit the named native source.
     pub negative_memory_selector: String,
-    /// Explicit negative-memory-projection bound
-    /// (`1..=EVIDENCE_PACK_MAX_RECORDS`).
+    /// Explicit negative-memory page bound
+    /// (`1..=MAX_LEARNING_PAGE_RECORDS`).
     pub negative_memory_max_records: u32,
-    /// Exact skill identity for the affordances read (`skill_id`).
+    /// Exact skill identity for the capability evidence range (`skill_id`).
     pub affordance_skill_id: String,
-    /// Explicit capability-evidence bound (`1..=EVIDENCE_PACK_MAX_RECORDS`).
+    /// Explicit capability-evidence page bound
+    /// (`1..=MAX_CAPABILITY_EVIDENCE_PAGE_RECORDS`).
     pub affordance_max_records: u32,
 }
 
@@ -270,25 +262,35 @@ impl ContextReconstructionRequest {
                 "dependency revisions must be non-zero".to_owned(),
             ));
         }
+        self.validate_selectors()?;
+        self.validate_page_bounds()
+    }
+
+    fn validate_selectors(&self) -> Result<(), ContextInputsError> {
         check_text_selector("epistemic_position", &self.epistemic_position)?;
         check_text_selector("evidence_subject", &self.evidence_subject)?;
         check_text_selector("task_id", &self.task_id)?;
         check_text_selector("projection_selector", &self.projection_selector)?;
         check_text_selector("negative_memory_selector", &self.negative_memory_selector)?;
+        if self.negative_memory_selector != LearningRecordKind::ActivationReceipt.as_str() {
+            return Err(ContextInputsError::RequestInvalid(
+                "negative_memory_selector must name the native activation_receipt source"
+                    .to_owned(),
+            ));
+        }
         check_text_selector("affordance_skill_id", &self.affordance_skill_id)?;
         if let Some(problem_id) = &self.attention_problem_id {
             check_text_selector("attention_problem_id", problem_id)?;
         }
+        Ok(())
+    }
+
+    fn validate_page_bounds(&self) -> Result<(), ContextInputsError> {
         for (field, bound) in [
             ("evidence_max_records", self.evidence_max_records),
             ("task_max_records", self.task_max_records),
             ("attention_max_records", self.attention_max_records),
             ("projection_max_records", self.projection_max_records),
-            (
-                "negative_memory_max_records",
-                self.negative_memory_max_records,
-            ),
-            ("affordance_max_records", self.affordance_max_records),
         ] {
             if bound == 0 || bound > EVIDENCE_PACK_MAX_RECORDS {
                 return Err(ContextInputsError::RequestInvalid(format!(
@@ -296,15 +298,26 @@ impl ContextReconstructionRequest {
                 )));
             }
         }
+        if self.negative_memory_max_records == 0
+            || self.negative_memory_max_records > u32::from(MAX_LEARNING_PAGE_RECORDS)
+        {
+            return Err(ContextInputsError::RequestInvalid(
+                "negative_memory_max_records must fit the native learning page bound".to_owned(),
+            ));
+        }
+        if self.affordance_max_records == 0
+            || self.affordance_max_records > u32::from(MAX_CAPABILITY_EVIDENCE_PAGE_RECORDS)
+        {
+            return Err(ContextInputsError::RequestInvalid(
+                "affordance_max_records must fit the native capability evidence page bound"
+                    .to_owned(),
+            ));
+        }
         Ok(())
     }
 }
 
-/// One acquired role: its disposition, raw payload, and observed heads.
-///
-/// Payloads stay opaque here; the candidate stage (T11.4) binds them to the
-/// seven typed input families. A `None` payload always pairs with a
-/// non-`Complete` disposition.
+/// One acquired role: its disposition, original payload, and observed heads.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoleAcquisition {
@@ -312,17 +325,222 @@ pub struct RoleAcquisition {
     pub operation: NamedReadOperation,
     /// Completeness state of this role (`inputs.rs:188-282` vocabulary).
     pub state: ProjectionState,
-    /// Opaque payload for a completed role; `None` otherwise.
+    /// Original owner payload when a response was returned.
     pub payload: Option<Value>,
     /// Revision heads observed with this role's read.
     pub revision_heads: Vec<RevisionHead>,
     /// Exact read identity this role is bound to (`#1144` retained-read
     /// binding): principal, scope, fence, consistency, declared and observed
     /// heads, order heads, source, projection schema, coverage and the exact
-    /// invalidation conditions. `None` exactly when the role is not `Complete`
-    /// or `KnownEmpty`, so a retained role can always be revalidated from its
-    /// own record instead of re-deriving freshness from the payload.
+    /// invalidation conditions. Partial or malformed returned pages retain
+    /// this identity too; absence means no read identity was returned.
     pub identity: Option<ReadIdentity>,
+    /// Exact named request sent for native paged owner reads. `ReadIdentity`
+    /// retains the operation/source/coverage closure; this request preserves
+    /// the original selectors the read identity intentionally does not repeat.
+    pub source_request: Option<NamedReadRequest>,
+    /// Typed capability records parsed from the original range-read rows.
+    /// The raw documents and their owner-issued digest/revision remain in
+    /// `payload`; this typed view does not recompute those identities.
+    pub retained_capability_records: Option<Vec<RetainedCapabilityEvidenceRecord>>,
+    /// Original native negative-memory records accepted by the existing
+    /// activation-receipt resolver.
+    pub retained_negative_memory_records: Option<Vec<NegativeMemoryFingerprint>>,
+    /// Owner-admitted action policies bound to the retained negative-memory
+    /// records by that same resolver.
+    pub retained_negative_memory_policies: Option<Vec<NegativeMemoryActionPolicy>>,
+}
+
+/// Typed view of one row returned by `GetCapabilityEvidenceRecordRange`.
+///
+/// `scope_key`, record bytes, record digest, and store revision are retained
+/// from the exact response. `revision.evidence_ref` is the original digest;
+/// this type does not mint or recompute it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedCapabilityEvidenceRecord {
+    /// Parsed original record document.
+    pub record: crate::CapabilityEvidenceRecord,
+    /// Original store row key for the route fingerprint.
+    pub scope_key: String,
+    /// Original store-issued revision and record digest.
+    pub revision: crate::OwnerEvidenceRevision,
+}
+
+fn failed_role(operation: NamedReadOperation, state: ProjectionState) -> RoleAcquisition {
+    RoleAcquisition {
+        operation,
+        state,
+        payload: None,
+        revision_heads: Vec::new(),
+        identity: None,
+        source_request: None,
+        retained_capability_records: None,
+        retained_negative_memory_records: None,
+        retained_negative_memory_policies: None,
+    }
+}
+
+/// Checks a capability evidence page against its original Store fields and
+/// returns typed rows only when every row agrees with its owner-issued key and
+/// revision. The exact record digest is carried through without recomputation.
+fn classify_capability_evidence_payload(
+    payload: &Value,
+    scope: &ScopeId,
+    fence: &eliot_contracts::StateFence,
+    skill_id: &str,
+    max_records: u16,
+) -> (
+    ProjectionState,
+    Option<Vec<RetainedCapabilityEvidenceRecord>>,
+) {
+    if let Err(state) = validate_capability_range_payload(payload, scope, fence) {
+        return (state, None);
+    }
+    let (rows, truncated) = match capability_range_rows(payload, max_records) {
+        Ok(page) => page,
+        Err(state) => return (state, None),
+    };
+    let retained = match decode_capability_rows(rows, skill_id) {
+        Ok(retained) => retained,
+        Err(state) => return (state, None),
+    };
+    if truncated {
+        (
+            ProjectionState::Partial {
+                reason: "capability evidence range has an owner-issued continuation cursor"
+                    .to_owned(),
+            },
+            Some(retained),
+        )
+    } else if retained.is_empty() {
+        (ProjectionState::KnownEmpty, Some(retained))
+    } else {
+        (ProjectionState::Complete, Some(retained))
+    }
+}
+
+fn validate_capability_range_payload(
+    payload: &Value,
+    scope: &ScopeId,
+    fence: &eliot_contracts::StateFence,
+) -> Result<(), ProjectionState> {
+    let unavailable = |detail: &str| ProjectionState::Unavailable {
+        reason: bounded_reason("capability evidence page fails its contract", detail),
+    };
+    if payload.get("version").and_then(Value::as_u64) != Some(1) {
+        return Err(unavailable("unsupported range payload version"));
+    }
+    if payload.get("scope_id").and_then(Value::as_str) != Some(scope.as_str()) {
+        return Err(unavailable("range scope mismatch"));
+    }
+    let Some(observed_fence) = payload.get("state_fence").cloned() else {
+        return Err(ProjectionState::Unknown {
+            reason: "range payload omits the Store-reported StateFence".to_owned(),
+        });
+    };
+    let Ok(observed_fence) = serde_json::from_value::<eliot_contracts::StateFence>(observed_fence)
+    else {
+        return Err(ProjectionState::Unknown {
+            reason: "range payload carries a malformed StateFence".to_owned(),
+        });
+    };
+    if !eliot_contracts::fences_match_exact(&observed_fence, fence) {
+        return Err(ProjectionState::Stale {
+            reason: "range payload belongs to a different StateFence".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn capability_range_rows(
+    payload: &Value,
+    max_records: u16,
+) -> Result<(&[Value], bool), ProjectionState> {
+    let Some(rows) = payload.get("records").and_then(Value::as_array) else {
+        return Err(ProjectionState::Unavailable {
+            reason: bounded_reason(
+                "capability evidence page fails its contract",
+                "range payload has no records array",
+            ),
+        });
+    };
+    let count = u64::try_from(rows.len()).unwrap_or(u64::MAX);
+    let Some(matched_total) = payload.get("matched_total").and_then(Value::as_u64) else {
+        return Err(ProjectionState::Unknown {
+            reason: "range payload omits its page denominator".to_owned(),
+        });
+    };
+    let Some(truncated) = payload.get("truncated").and_then(Value::as_bool) else {
+        return Err(ProjectionState::Unknown {
+            reason: "range payload omits its truncation disposition".to_owned(),
+        });
+    };
+    let cursor_matches = match (truncated, payload.get("next_cursor")) {
+        (true, Some(Value::String(value))) => !value.is_empty(),
+        (false, None | Some(Value::Null)) => true,
+        _ => false,
+    };
+    if !cursor_matches || matched_total != count || rows.len() > usize::from(max_records) {
+        return Err(ProjectionState::Unknown {
+            reason: "range page denominator, cursor, or bound is incoherent".to_owned(),
+        });
+    }
+    Ok((rows, truncated))
+}
+
+fn decode_capability_rows(
+    rows: &[Value],
+    skill_id: &str,
+) -> Result<Vec<RetainedCapabilityEvidenceRecord>, ProjectionState> {
+    let unavailable = |detail: &str| ProjectionState::Unavailable {
+        reason: bounded_reason("capability evidence page fails its contract", detail),
+    };
+    let mut seen = BTreeSet::new();
+    let mut retained = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(row_skill_id) = row.get("skill_id").and_then(Value::as_str) else {
+            return Err(unavailable("record row omits skill identity"));
+        };
+        let Some(scope_key) = row.get("scope_key").and_then(Value::as_str) else {
+            return Err(unavailable("record row omits route-scope key"));
+        };
+        let Some(record_digest) = row.get("record_digest").and_then(Value::as_str) else {
+            return Err(unavailable("record row omits original digest"));
+        };
+        let Some(record_json) = row.get("record_json").and_then(Value::as_str) else {
+            return Err(unavailable("record row omits original document"));
+        };
+        let Some(owner_revision) = row.get("revision").and_then(Value::as_u64) else {
+            return Err(unavailable("record row omits owner revision"));
+        };
+        if row_skill_id != skill_id
+            || !crate::is_evidence_ref(scope_key)
+            || !crate::is_evidence_ref(record_digest)
+            || owner_revision == 0
+        {
+            return Err(unavailable(
+                "record row identity is malformed or substituted",
+            ));
+        }
+        let record: crate::CapabilityEvidenceRecord = serde_json::from_str(record_json)
+            .map_err(|_| unavailable("original record does not decode"))?;
+        if record.skill_id != row_skill_id
+            || !seen.insert((row_skill_id.to_owned(), scope_key.to_owned()))
+        {
+            return Err(unavailable(
+                "typed record differs from its original row key",
+            ));
+        }
+        let revision = crate::OwnerEvidenceRevision::issued(owner_revision, record_digest)
+            .map_err(|_| unavailable("owner revision or original digest is invalid"))?;
+        retained.push(RetainedCapabilityEvidenceRecord {
+            record,
+            scope_key: scope_key.to_owned(),
+            revision,
+        });
+    }
+    Ok(retained)
 }
 
 /// The reconstructed seven-role input closure.
@@ -376,7 +594,7 @@ pub struct SevenRoleInputs {
     pub negative_memory: RoleAcquisition,
     /// Evidence/source-assurance role (`GetEvidencePack`).
     pub evidence: RoleAcquisition,
-    /// Affordances role (`GetCapabilityEvidenceState`).
+    /// Affordances role (`GetCapabilityEvidenceRecordRange`).
     pub affordances: RoleAcquisition,
 }
 
@@ -447,10 +665,8 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
     /// request, a missing closure, or observed churn fails the whole call.
     ///
     /// The whole request is bounded: one read per role slot, no retry loop and
-    /// no continuation field. Seven role slots are served by six physical reads
-    /// only when the cue and negative-memory slots deliberately address one
-    /// exact source snapshot; a differing selector gets its own read so one
-    /// unrelated result is never relabelled into both roles.
+    /// no continuation field. Seven role slots are served by seven physical
+    /// reads so each owner source retains its own operation identity.
     pub async fn reconstruct(
         &self,
         ctx: &RequestMetadata,
@@ -516,17 +732,7 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
             .await?;
         let evidence = self.acquire_evidence(ctx, request, &ordering).await?;
         let affordances = self
-            .acquire_state(
-                ctx,
-                request,
-                &ordering,
-                NamedReadOperation::GetCapabilityEvidenceState,
-                affordance_parameters(request)?,
-                SelectorBinding {
-                    key: "skill_id",
-                    expected: Some(&request.affordance_skill_id),
-                },
-            )
+            .acquire_capability_evidence(ctx, request, &ordering)
             .await?;
         let heads_after = self.scope_heads(ctx, request).await?;
         if heads_after != heads_before {
@@ -641,24 +847,19 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
                 payload: Some(response.view.payload),
                 revision_heads: response.view.revision_heads,
                 identity: Some(response.identity),
+                source_request: None,
+                retained_capability_records: None,
+                retained_negative_memory_records: None,
+                retained_negative_memory_policies: None,
             }),
-            Err(error) => Ok(RoleAcquisition {
-                operation,
-                state: classify_read_error(error)?,
-                payload: None,
-                revision_heads: Vec::new(),
-                identity: None,
-            }),
+            Err(error) => Ok(failed_role(operation, classify_read_error(error)?)),
         }
     }
 
-    /// Acquires one `GetUnderstandingProjectionInputs` role through the
-    /// admitted `ContextReconstruction` query intent.
-    ///
-    /// The cue-activation and negative-memory slots call this separately with
-    /// their own owner-resolved source selector; only a deliberately identical
-    /// selector is served from one physical read. The echoed `selector` binds
-    /// the response to the exact source snapshot it was asked for.
+    /// Acquires the cue-activation role through the admitted
+    /// `ContextReconstruction` query intent. Negative memory uses a distinct
+    /// native activation-receipt read. The echoed `selector` binds this cue
+    /// response to the exact source snapshot requested.
     async fn acquire_projection_inputs(
         &self,
         ctx: &RequestMetadata,
@@ -700,25 +901,17 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
                 payload: Some(response.view.payload),
                 revision_heads: response.view.revision_heads,
                 identity: Some(response.identity),
+                source_request: None,
+                retained_capability_records: None,
+                retained_negative_memory_records: None,
+                retained_negative_memory_policies: None,
             }),
-            Err(error) => Ok(RoleAcquisition {
-                operation,
-                state: classify_read_error(error)?,
-                payload: None,
-                revision_heads: Vec::new(),
-                identity: None,
-            }),
+            Err(error) => Ok(failed_role(operation, classify_read_error(error)?)),
         }
     }
 
-    /// Acquires the negative-memory role, reusing the cue acquisition only when
-    /// the request deliberately addresses the same exact source snapshot.
-    ///
-    /// Negative memory reuses the cue read only when it deliberately addresses
-    /// the SAME exact source snapshot — identical selector and bound. A
-    /// different source set is read separately, so the two slots stay separately
-    /// identified (inputs.rs:1-13) without one unrelated result being relabelled
-    /// into both roles.
+    /// Acquires the original negative-memory activation-receipt source using
+    /// its native bounded Store read and the existing authenticated resolver.
     async fn acquire_negative_memory(
         &self,
         ctx: &RequestMetadata,
@@ -731,17 +924,144 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
         {
             return Ok(cue.clone());
         }
-        self.acquire_projection_inputs(
-            ctx,
-            request,
-            ordering,
-            ROLE_NEGATIVE_MEMORY,
-            &request.negative_memory_selector,
-            request.negative_memory_max_records,
-        )
-        .await
+        let max_records = u16::try_from(request.negative_memory_max_records).map_err(|_| {
+            ContextInputsError::RequestRejected(
+                "negative-memory page bound does not fit the Store contract".to_owned(),
+            )
+        })?;
+        let named_request = learning_record_read_request(
+            request.scope_id.clone(),
+            Some(LearningRecordKind::ActivationReceipt),
+            max_records,
+            ctx.state_fence.clone(),
+        );
+        named_request.validate().map_err(|error| {
+            ContextInputsError::RequestRejected(bounded_reason(
+                "invalid negative-memory read",
+                error,
+            ))
+        })?;
+        let operation = NamedReadOperation::GetLearningRecordRange;
+        let parameters =
+            NamedParameters::from_map(named_request.parameters.clone()).map_err(|error| {
+                ContextInputsError::RequestRejected(bounded_reason(
+                    "invalid negative-memory selectors",
+                    error,
+                ))
+            })?;
+        let response = match self
+            .reads
+            .bound_query(
+                ctx,
+                QueryRequest {
+                    intent: reconstruction_intent(),
+                    operation,
+                    scope_id: Some(request.scope_id.clone()),
+                    consistency: ReadConsistency::ExactFence,
+                    dependency_revisions: request.dependency_revisions.clone(),
+                    ordering: ordering.clone(),
+                    parameters,
+                    provenance_handles: Vec::new(),
+                },
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return Ok(failed_role(operation, classify_read_error(error)?));
+            }
+        };
+        let named_response = NamedReadResponse {
+            operation: response.view.operation,
+            state_fence: response.view.state_fence,
+            revision_heads: response.view.revision_heads.clone(),
+            payload: response.view.payload.clone(),
+        };
+        Ok(retain_negative_memory_response(
+            named_request,
+            &named_response,
+            response.identity,
+            &request.scope_id,
+            &ctx.state_fence,
+        ))
     }
 
+    /// Acquires the original paged capability-evidence records. The read proves
+    /// which records the Store retained; the projection owner still needs the
+    /// exact observed route before it can call any record an authorized
+    /// affordance.
+    async fn acquire_capability_evidence(
+        &self,
+        ctx: &RequestMetadata,
+        request: &ContextReconstructionRequest,
+        ordering: &ReadOrderingBinding,
+    ) -> Result<RoleAcquisition, ContextInputsError> {
+        let max_records = u16::try_from(request.affordance_max_records).map_err(|_| {
+            ContextInputsError::RequestRejected(
+                "capability evidence page bound does not fit the Store contract".to_owned(),
+            )
+        })?;
+        let named_request = capability_evidence_read_request(
+            request.scope_id.clone(),
+            Some(request.affordance_skill_id.clone()),
+            max_records,
+            None,
+            ctx.state_fence.clone(),
+        );
+        named_request.validate().map_err(|error| {
+            ContextInputsError::RequestRejected(bounded_reason(
+                "invalid capability evidence read",
+                error,
+            ))
+        })?;
+        let operation = NamedReadOperation::GetCapabilityEvidenceRecordRange;
+        let parameters =
+            NamedParameters::from_map(named_request.parameters.clone()).map_err(|error| {
+                ContextInputsError::RequestRejected(bounded_reason(
+                    "invalid capability evidence selectors",
+                    error,
+                ))
+            })?;
+        let response = match self
+            .reads
+            .bound_query(
+                ctx,
+                QueryRequest {
+                    intent: reconstruction_intent(),
+                    operation,
+                    scope_id: Some(request.scope_id.clone()),
+                    consistency: ReadConsistency::ExactFence,
+                    dependency_revisions: request.dependency_revisions.clone(),
+                    ordering: ordering.clone(),
+                    parameters,
+                    provenance_handles: Vec::new(),
+                },
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return Ok(failed_role(operation, classify_read_error(error)?));
+            }
+        };
+        let (state, records) = classify_capability_evidence_payload(
+            &response.view.payload,
+            &request.scope_id,
+            &ctx.state_fence,
+            &request.affordance_skill_id,
+            max_records,
+        );
+        Ok(RoleAcquisition {
+            operation: response.view.operation,
+            state,
+            payload: Some(response.view.payload),
+            revision_heads: response.view.revision_heads,
+            identity: Some(response.identity),
+            source_request: Some(named_request),
+            retained_capability_records: records,
+            retained_negative_memory_records: None,
+            retained_negative_memory_policies: None,
+        })
     async fn acquire_epistemic(
         &self,
         ctx: &RequestMetadata,
@@ -777,16 +1097,7 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
         {
             Ok(response) => response,
             Err(error) => {
-                return Ok((
-                    RoleAcquisition {
-                        operation,
-                        state: classify_read_error(error)?,
-                        payload: None,
-                        revision_heads: Vec::new(),
-                        identity: None,
-                    },
-                    None,
-                ));
+                return Ok((failed_role(operation, classify_read_error(error)?), None));
             }
         };
         let (state, readback) = decode_epistemic_payload(&response.view.payload);
@@ -798,6 +1109,10 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
                 payload,
                 revision_heads: response.view.revision_heads,
                 identity: Some(response.identity),
+                source_request: None,
+                retained_capability_records: None,
+                retained_negative_memory_records: None,
+                retained_negative_memory_policies: None,
             },
             readback,
         ))
@@ -844,13 +1159,7 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
         {
             Ok(response) => response,
             Err(error) => {
-                return Ok(RoleAcquisition {
-                    operation,
-                    state: classify_read_error(error)?,
-                    payload: None,
-                    revision_heads: Vec::new(),
-                    identity: None,
-                });
+                return Ok(failed_role(operation, classify_read_error(error)?));
             }
         };
         let state = classify_evidence_payload(
@@ -864,7 +1173,70 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
             payload: Some(response.view.payload),
             revision_heads: response.view.revision_heads,
             identity: Some(response.identity),
+            source_request: None,
+            retained_capability_records: None,
+            retained_negative_memory_records: None,
+            retained_negative_memory_policies: None,
         })
+    }
+}
+
+fn retain_negative_memory_response(
+    named_request: NamedReadRequest,
+    named_response: &NamedReadResponse,
+    identity: ReadIdentity,
+    expected_scope: &ScopeId,
+    expected_fence: &eliot_contracts::StateFence,
+) -> RoleAcquisition {
+    let operation = named_response.operation;
+    let (state, records, policies) =
+        match crate::resolve_negative_memory_rule_read(&named_request, &named_response) {
+            Ok(resolved)
+                if resolved.scope_id() == expected_scope
+                    && eliot_contracts::fences_match_exact(
+                        resolved.store_observed_fence(),
+                        expected_fence,
+                    ) =>
+            {
+                let records = Some(resolved.records().to_vec());
+                let policies = Some(resolved.policies().to_vec());
+                let state = if !resolved.enumeration_complete() {
+                    ProjectionState::Partial {
+                        reason: "native negative-memory page reports more retained records"
+                            .to_owned(),
+                    }
+                } else if resolved.records().is_empty() {
+                    ProjectionState::KnownEmpty
+                } else {
+                    ProjectionState::Complete
+                };
+                (state, records, policies)
+            }
+            Ok(_) => (
+                ProjectionState::Stale {
+                    reason: "negative-memory source changed scope or StateFence".to_owned(),
+                },
+                None,
+                None,
+            ),
+            Err(error) => (
+                ProjectionState::Unknown {
+                    reason: bounded_reason("negative-memory owner rejected its source page", error),
+                },
+                None,
+                None,
+            ),
+        };
+    RoleAcquisition {
+        operation,
+        state,
+        payload: Some(named_response.payload.clone()),
+        revision_heads: named_response.revision_heads.clone(),
+        identity: Some(identity),
+        source_request: Some(named_request),
+        retained_capability_records: None,
+        retained_negative_memory_records: records,
+        retained_negative_memory_policies: policies,
     }
 }
 
@@ -884,12 +1256,9 @@ struct SelectorBinding<'a> {
     expected: Option<&'a str>,
 }
 
-/// The single versioned source-envelope version the four task-bound read
-/// handlers emit (`TASK_STATE_PAYLOAD_VERSION`,
-/// `ATTENTION_PROBLEMS_PAYLOAD_VERSION`,
-/// `UNDERSTANDING_INPUTS_PAYLOAD_VERSION` and
-/// `CAPABILITY_EVIDENCE_PAYLOAD_VERSION` in both the memory and Surreal owner
-/// adapters). A different version is `Unavailable`, never coerced.
+/// Version used by Task, Attention, and Understanding owner envelopes in the
+/// memory and Surreal adapters. A different version is `Unavailable`, never
+/// coerced.
 const ROLE_ENVELOPE_VERSION: u64 = 1;
 
 /// Renders one explicit bound as the decimal string every owner handler parses.
@@ -961,26 +1330,6 @@ fn projection_parameters(
         BTreeMap::from([
             ("selector".to_owned(), Value::String(selector.to_owned())),
             ("max_records".to_owned(), decimal_bound(max_records)),
-        ]),
-    )
-}
-
-/// Builds the exact `GetCapabilityEvidenceState` selector map (`skill_id`,
-/// `max_records`) that the Kernel capability-evidence check already validates.
-fn affordance_parameters(
-    request: &ContextReconstructionRequest,
-) -> Result<NamedParameters, ContextInputsError> {
-    closed_parameters(
-        "invalid affordance selectors",
-        BTreeMap::from([
-            (
-                "skill_id".to_owned(),
-                Value::String(request.affordance_skill_id.clone()),
-            ),
-            (
-                "max_records".to_owned(),
-                decimal_bound(request.affordance_max_records),
-            ),
         ]),
     )
 }
@@ -1235,7 +1584,7 @@ fn classify_role_page(records: &[Value], provenance: Option<&Value>) -> RolePage
 
 /// Classifies one task-bound role payload against the exact selector it answers.
 ///
-/// The four activated handlers return a versioned source envelope
+/// The three activated handlers return a versioned source envelope
 /// (`{version, <selector>, scope_id, records, provenance}`) over retained
 /// authority records — not an admitted Cue array, a qualified capability view or
 /// a ready packet. A successful retrieval is therefore bound but not promoted.
@@ -1467,18 +1816,26 @@ mod reconstruction_tests {
                 payload: Some(Value::Null),
                 revision_heads: Vec::new(),
                 identity: None,
+                source_request: None,
+                retained_capability_records: None,
+                retained_negative_memory_records: None,
+                retained_negative_memory_policies: None,
             },
             epistemic_readback: None,
             cue: unavailable_role(NamedReadOperation::GetUnderstandingProjectionInputs),
-            negative_memory: unavailable_role(NamedReadOperation::GetUnderstandingProjectionInputs),
+            negative_memory: unavailable_role(NamedReadOperation::GetLearningRecordRange),
             evidence: RoleAcquisition {
                 operation: NamedReadOperation::GetEvidencePack,
                 state: ProjectionState::Complete,
                 payload: Some(serde_json::json!({"records": []})),
                 revision_heads: Vec::new(),
                 identity: None,
+                source_request: None,
+                retained_capability_records: None,
+                retained_negative_memory_records: None,
+                retained_negative_memory_policies: None,
             },
-            affordances: unavailable_role(NamedReadOperation::GetCapabilityEvidenceState),
+            affordances: unavailable_role(NamedReadOperation::GetCapabilityEvidenceRecordRange),
         };
         let unsupported = inputs.unsupported_role_names();
         assert!(unsupported.contains(&ROLE_TASK_FRAME));
@@ -1505,7 +1862,7 @@ mod reconstruction_tests {
             attention_max_records: 8,
             projection_selector: "selector-a".to_owned(),
             projection_max_records: 8,
-            negative_memory_selector: "selector-a".to_owned(),
+            negative_memory_selector: LearningRecordKind::ActivationReceipt.as_str().to_owned(),
             negative_memory_max_records: 8,
             affordance_skill_id: "skill-a".to_owned(),
             affordance_max_records: 8,
@@ -1521,6 +1878,10 @@ mod reconstruction_tests {
             payload: None,
             revision_heads: Vec::new(),
             identity: None,
+            source_request: None,
+            retained_capability_records: None,
+            retained_negative_memory_records: None,
+            retained_negative_memory_policies: None,
         }
     }
 

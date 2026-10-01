@@ -9,6 +9,7 @@
 
 mod admission;
 mod admission_input;
+mod assembly_output;
 mod atom;
 mod boundary;
 mod canonical_projections;
@@ -30,6 +31,11 @@ mod recipe;
 mod render_serializer;
 mod view;
 
+pub use assembly_output::{
+    ActiveUnderstandingViewResult, AssemblyError, AssemblyPolicy, assembly_boundary_limits,
+    boundary_binding_digest, read_back_boundaries, verify_boundary_binding,
+};
+
 pub use admission::{
     AdmissionRecord, AdmittedContextSet, ContextCandidateSet, DecisionSafetyFloor,
     SafetyFloorMember,
@@ -38,7 +44,7 @@ pub use admission_input::{
     AdmissionDecisionEvidence, AdmissionInput, AdmissionMeasuredCost, AdmissionMeasurement,
     AdmissionMeasurementBinding, AdmissionPriorityClass, AdmissionResult, AdmissionRuleIdentity,
     CandidatePriority, MeasurementAggregationMode, MeasurementCompositionProfile, MeasurementUnit,
-    PriorityPolicyIdentity, SafetyFloorIdentity, SuppliedOmissionBinding,
+    PacketAdmissionParts, PriorityPolicyIdentity, SafetyFloorIdentity, SuppliedOmissionBinding,
 };
 pub use atom::{
     AdmissionDisposition, AdmittedAtom, AtomAvailability, AtomRepresentation, AuthorityClass,

@@ -58,6 +58,7 @@ use eliot_kernel_service::{
     NATIVE_WORKER_EXECUTION_UNIT_SCHEMA_VERSION, NATIVE_WORKER_PROTOCOL_VERSION,
     NativeWorkerClaimBudget, NativeWorkerClaimRequest, NativeWorkerClaimResponse,
     NativeWorkerExecutableBinding, NativeWorkerExecutableExpectation,
+    NativeWorkerExecutionAdmissionEvidence,
 };
 use eliot_ors::{
     AdmissionReservationClaimRef, AdmissionReservationClaims, AdmissionReservationIdentityInput,
@@ -465,7 +466,7 @@ fn native_worker_catalog_binding(
 
 /// Resolves a worker cell against Kernel's independently generated #13
 /// registry before claim admission and returns the validated source digest.
-fn native_worker_registry_digest(
+pub(crate) fn native_worker_registry_digest(
     cell: &CapabilityCellId,
 ) -> Result<String, NativeWorkerRouteError> {
     super::composition_bootstrap::native_worker_cell_registry_digest(cell)
@@ -902,6 +903,69 @@ impl NativeWorkerBindingView {
 // ---------------------------------------------------------------------------
 
 impl KernelComposition {
+    /// Revalidates a retained prelaunch admission against current Kernel
+    /// activation and capability-cell registry owners. The request and
+    /// receipt remain their original values; this check only decides whether
+    /// that same admission is still current enough to project.
+    pub(crate) fn validate_prelaunch_native_worker_execution_admission(
+        &self,
+        evidence: &NativeWorkerExecutionAdmissionEvidence,
+    ) -> Result<(), NativeWorkerRouteError> {
+        evidence
+            .validate()
+            .map_err(|_| NativeWorkerRouteError::Fence {
+                field: "execution_admission",
+            })?;
+        let request = &evidence.request;
+        let binding = &evidence.executable_binding;
+        let now = unix_ms();
+        if request.deadline_unix_ms <= now
+            || binding.deadline_unix_ms <= now
+            || binding.expires_at_unix_ms <= now
+            || binding.state_fence != request.state_fence
+            || binding.generation != request.state_fence.resource_generation
+            || !binding
+                .authority_epoch
+                .is_same_authority(&request.authority_epoch)
+        {
+            return Err(NativeWorkerRouteError::Fence {
+                field: "execution_admission_currentness",
+            });
+        }
+        let current_registry_digest = native_worker_registry_digest(&binding.capability_cell)?;
+        if current_registry_digest != binding.capability_cell_registry_digest {
+            return Err(NativeWorkerRouteError::Fence {
+                field: "execution_admission_capability_registry",
+            });
+        }
+        let service = self.service_guard()?;
+        let activation = service.activation_receipt();
+        if service.state() != KernelServiceState::Ready
+            || !service
+                .authority_epoch()
+                .is_same_authority(&request.authority_epoch)
+            || activation.is_none_or(|receipt| {
+                receipt.generation != binding.generation
+                    || !receipt
+                        .authority_epoch
+                        .is_same_authority(&request.authority_epoch)
+            })
+        {
+            return Err(NativeWorkerRouteError::Fence {
+                field: "execution_admission_activation",
+            });
+        }
+        let durable = self.load_claim_record(&request.claim_id)?;
+        if !durable.same_binding(&evidence.durable_record)
+            || durable.state != NativeWorkerClaimState::Admitted
+        {
+            return Err(NativeWorkerRouteError::Fence {
+                field: "execution_admission_durable_record",
+            });
+        }
+        Ok(())
+    }
+
     /// Loads one claim record by exact identity. Unknown identities are
     /// `Unknown` (records are never invented here); storage or corruption
     /// failures fence the session fail-closed.
@@ -1230,13 +1294,14 @@ impl KernelComposition {
         .map_err(|_| NativeWorkerRouteError::Fence {
             field: "process_start_receipt",
         })?;
-        let (registry_digest, claim_fence_digest) = self.validate_native_worker_cell_currentness(
-            session,
-            &presented,
-            presented_fence,
-            &process_start,
-            peer,
-        )?;
+        let (registry_digest, claim_fence_digest, durable_record) = self
+            .validate_native_worker_cell_currentness(
+                session,
+                &presented,
+                presented_fence,
+                &process_start,
+                peer,
+            )?;
         let request = &process_start.request;
         let claim_receipt = &process_start.claim_receipt;
         let process_receipt = &process_start.receipt;
@@ -1249,6 +1314,14 @@ impl KernelComposition {
                 .ok_or(NativeWorkerRouteError::Fence {
                     field: "executable_binding",
                 })?;
+        let execution_admission = NativeWorkerExecutionAdmissionEvidence::from_owner_records(
+            request,
+            claim_receipt,
+            &durable_record,
+        )
+        .map_err(|_| NativeWorkerRouteError::Fence {
+            field: "execution_admission",
+        })?;
         let proof_body = serde_json::json!({
             "kind": "native_worker_capability_cell_process_proof",
             "operation": operation,
@@ -1278,6 +1351,7 @@ impl KernelComposition {
             "process_image_path": physical.image_path(),
             "launch_executable_file_identity": process_start.executable_file_identity,
             "peer_executable_file_identity": peer.executable_file_identity(),
+            "execution_admission": execution_admission,
         });
         let proof_digest = sha256_json(&proof_body).map_err(|_| NativeWorkerRouteError::Shape {
             field: "capability_cell_proof",
@@ -1294,7 +1368,7 @@ impl KernelComposition {
         presented_fence: &StateFence,
         process_start: &super::dispatch_launch::NativeWorkerProcessStartBinding,
         peer: &eliot_ipc::ProcessBinding,
-    ) -> Result<(String, String), NativeWorkerRouteError> {
+    ) -> Result<(String, String, NativeWorkerClaimRecord), NativeWorkerRouteError> {
         let request = &process_start.request;
         let claim_receipt = &process_start.claim_receipt;
         let process_receipt = &process_start.receipt;
@@ -1383,7 +1457,7 @@ impl KernelComposition {
                 });
             }
         }
-        Ok((registry_digest, claim_fence_digest))
+        Ok((registry_digest, claim_fence_digest, durable))
     }
 
     fn native_worker_cell_currentness_matches(check: &NativeWorkerCellProofCheck<'_>) -> bool {

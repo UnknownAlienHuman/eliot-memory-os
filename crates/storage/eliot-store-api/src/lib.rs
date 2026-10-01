@@ -339,6 +339,7 @@ pub use operation_catalogue::{
 };
 
 pub use operation_parameters::{
+    decode_orientation_owner_sources,
     ParameterDeclaration, ParameterSchemaField, ParameterShape, declared_read_parameters,
     decode_instrument_registry_mutation, named_mutation_operation_by_name,
     named_mutation_operation_name, named_read_operation_by_name, named_read_operation_name,
@@ -1026,6 +1027,9 @@ pub enum CampaignSourceDocumentSchema {
     AdaptationPosition,
     EvaluationPosition,
     EconomicsProgress,
+    OrientationClassificationProfile,
+    OrientationAdmissionRecord,
+    OrientationCueBindingsRecord,
     RetrievalPlan,
 }
 
@@ -1262,7 +1266,10 @@ impl CampaignSourceDocument {
             | D::ExperiencePosition
             | D::AdaptationPosition
             | D::EvaluationPosition
-            | D::EconomicsProgress => {
+            | D::EconomicsProgress
+            | D::OrientationClassificationProfile
+            | D::OrientationAdmissionRecord
+            | D::OrientationCueBindingsRecord => {
                 let body: CampaignOwnerProjectionBody =
                     serde_json::from_value(self.body.clone())
                         .map_err(|error| StoreError::Serialization(error.to_string()))?;
@@ -1623,7 +1630,10 @@ impl CampaignSourceDocument {
             | D::ExperiencePosition
             | D::AdaptationPosition
             | D::EvaluationPosition
-            | D::EconomicsProgress => {
+            | D::EconomicsProgress
+            | D::OrientationClassificationProfile
+            | D::OrientationAdmissionRecord
+            | D::OrientationCueBindingsRecord => {
                 let body: CampaignOwnerProjectionBody =
                     serde_json::from_value(self.body.clone())
                         .map_err(|error| StoreError::Serialization(error.to_string()))?;
@@ -2654,6 +2664,12 @@ pub enum CampaignSourcePublisher {
     EvaluationPosition,
     /// Economics progress-position row.
     EconomicsProgress,
+    /// Governor-owned Orientation classification profile.
+    OrientationClassification,
+    /// Governor-owned Orientation admission decision source.
+    OrientationAdmission,
+    /// Governor-owned Orientation cue-binding source and closed snapshot.
+    OrientationCueBindings,
 }
 
 impl CampaignSourcePublisher {
@@ -2687,6 +2703,9 @@ impl CampaignSourcePublisher {
             Self::AdaptationPosition => CampaignSourceRole::AdaptationPosition,
             Self::EvaluationPosition => CampaignSourceRole::EvaluationPosition,
             Self::EconomicsProgress => CampaignSourceRole::EconomicsProgress,
+            Self::OrientationClassification => CampaignSourceRole::OrientationClassification,
+            Self::OrientationAdmission => CampaignSourceRole::OrientationAdmission,
+            Self::OrientationCueBindings => CampaignSourceRole::OrientationCueBindings,
         }
     }
 
@@ -2720,6 +2739,9 @@ impl CampaignSourcePublisher {
             CampaignSourceRole::AdaptationPosition => Self::AdaptationPosition,
             CampaignSourceRole::EvaluationPosition => Self::EvaluationPosition,
             CampaignSourceRole::EconomicsProgress => Self::EconomicsProgress,
+            CampaignSourceRole::OrientationClassification => Self::OrientationClassification,
+            CampaignSourceRole::OrientationAdmission => Self::OrientationAdmission,
+            CampaignSourceRole::OrientationCueBindings => Self::OrientationCueBindings,
         })
     }
 }
@@ -3034,6 +3056,9 @@ pub const fn campaign_source_owner_id(role: CampaignSourceRole) -> &'static str 
         R::AdaptationPosition => ADAPTATION_POSITION_CAMPAIGN_OWNER_ID,
         R::EvaluationPosition => EVALUATION_POSITION_CAMPAIGN_OWNER_ID,
         R::EconomicsProgress => ECONOMICS_PROGRESS_CAMPAIGN_OWNER_ID,
+        R::OrientationClassification => "owner:eliot-governor/orientation-classification",
+        R::OrientationAdmission => "owner:eliot-governor/orientation-admission",
+        R::OrientationCueBindings => "owner:eliot-governor/orientation-cue-bindings",
     }
 }
 
@@ -3071,6 +3096,9 @@ pub const fn campaign_source_schema_for_role(
         R::AdaptationPosition => D::AdaptationPosition,
         R::EvaluationPosition => D::EvaluationPosition,
         R::EconomicsProgress => D::EconomicsProgress,
+        R::OrientationClassification => D::OrientationClassificationProfile,
+        R::OrientationAdmission => D::OrientationAdmissionRecord,
+        R::OrientationCueBindings => D::OrientationCueBindingsRecord,
     }
 }
 
@@ -3089,7 +3117,18 @@ fn campaign_source_identity_matches(
 ) -> bool {
     use CampaignSourceRole as R;
     match role {
-        R::TaskObjective | R::TaskAcceptance | R::TaskPlan | R::TaskOpenItems => matches!(
+        R::TaskObjective
+        | R::TaskAcceptance
+        | R::TaskPlan
+        | R::TaskOpenItems
+        | R::OrientationAdmission => matches!(
+            (record_id, revision),
+            (
+                CampaignOwnerRecordId::Task(_),
+                CampaignOwnerRevision::Task(_)
+            )
+        ),
+        R::OrientationCueBindings => matches!(
             (record_id, revision),
             (
                 CampaignOwnerRecordId::Task(_),
@@ -3116,6 +3155,13 @@ fn campaign_source_identity_matches(
             (
                 CampaignOwnerRecordId::Task(_),
                 CampaignOwnerRevision::Counter(_)
+            )
+        ),
+        R::OrientationClassification => matches!(
+            (record_id, revision),
+            (
+                CampaignOwnerRecordId::Artifact(_),
+                CampaignOwnerRevision::ResourceSnapshot(_)
             )
         ),
         R::GovernorEpoch => matches!(
@@ -3170,7 +3216,11 @@ fn campaign_owner_matches(record: &CampaignSourceRecord) -> bool {
 fn campaign_identity_matches(record: &CampaignSourceRecord) -> bool {
     use CampaignSourceRole as R;
     match record.role {
-        R::TaskObjective | R::TaskAcceptance | R::TaskPlan | R::TaskOpenItems => {
+        R::TaskObjective
+        | R::TaskAcceptance
+        | R::TaskPlan
+        | R::TaskOpenItems
+        | R::OrientationAdmission => {
             matches!(
                 (&record.record_id, &record.revision),
                 (
@@ -3179,6 +3229,13 @@ fn campaign_identity_matches(record: &CampaignSourceRecord) -> bool {
                 )
             )
         }
+        R::OrientationCueBindings => matches!(
+            (&record.record_id, &record.revision),
+            (
+                CampaignOwnerRecordId::Task(_),
+                CampaignOwnerRevision::Task(_)
+            )
+        ),
         R::AttemptLineageLatestOutcomes
         | R::MemoryProjection
         | R::ArtifactProjection
@@ -3199,6 +3256,13 @@ fn campaign_identity_matches(record: &CampaignSourceRecord) -> bool {
             (
                 CampaignOwnerRecordId::Task(_),
                 CampaignOwnerRevision::Counter(_)
+            )
+        ),
+        R::OrientationClassification => matches!(
+            (&record.record_id, &record.revision),
+            (
+                CampaignOwnerRecordId::Artifact(_),
+                CampaignOwnerRevision::ResourceSnapshot(_)
             )
         ),
         R::GovernorEpoch => matches!(
@@ -3722,6 +3786,18 @@ fn campaign_role_accepts_schema(
             | (R::AdaptationPosition, D::AdaptationPosition)
             | (R::EvaluationPosition, D::EvaluationPosition)
             | (R::EconomicsProgress, D::EconomicsProgress)
+            | (
+                R::OrientationClassification,
+                D::OrientationClassificationProfile
+            )
+            | (
+                R::OrientationAdmission,
+                D::OrientationAdmissionRecord
+            )
+            | (
+                R::OrientationCueBindings,
+                D::OrientationCueBindingsRecord
+            )
     )
 }
 
@@ -4162,6 +4238,9 @@ pub enum NamedMutationOperation {
     /// derives acceptance semantics, coverage, or completion from it. Committing
     /// the record asserts only what the contract owner already required.
     RecordTaskContractAcceptanceSet,
+    /// Persist the exact independently admitted Orientation owner sources
+    /// under the original task, scope, fence and predecessor heads.
+    RecordOrientationOwnerSources,
     /// Canonical problem owner-state transaction (issue #1759 I2, I13.9/I13.7).
     ///
     /// Durable Problem-registry ownership and lifecycle only: the prepared
@@ -4187,7 +4266,8 @@ impl NamedMutationOperation {
             | Self::CommitExperienceBank
             | Self::CommitAgentFeedback
             | Self::ApplyBlackboardItem
-            | Self::RecordCapabilityEvidenceRecord => TransitionClass::CaptureCandidate,
+            | Self::RecordCapabilityEvidenceRecord
+            | Self::RecordOrientationOwnerSources => TransitionClass::CaptureCandidate,
             Self::ApplyEpistemicRevision => TransitionClass::Epistemic,
             Self::UpdateTaskState
             | Self::ApplySwarmOwnerRevisions

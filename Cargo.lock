@@ -1127,6 +1127,7 @@ dependencies = [
  "eliot-context-assembly",
  "eliot-context-candidates",
  "eliot-context-contracts",
+ "eliot-context-measurement",
  "eliot-contracts",
  "eliot-cue-contracts",
  "eliot-evidence",
@@ -1223,6 +1224,8 @@ dependencies = [
  "eliot-contracts",
  "eliot-evidence",
  "eliot-receipts",
+ "schemars",
+ "serde",
 ]
 
 [[package]]
@@ -1542,6 +1545,7 @@ dependencies = [
  "eliot-dreamer-contracts",
  "eliot-epistemic-contracts",
  "eliot-evidence",
+ "serde",
 ]
 
 [[package]]
@@ -1699,10 +1703,21 @@ dependencies = [
 name = "eliot-dreamer-orientation"
 version = "0.1.0"
 dependencies = [
+ "eliot-context-candidates",
+ "eliot-context-contracts",
  "eliot-contracts",
+ "eliot-cue-activation",
+ "eliot-cue-contracts",
+ "eliot-dreamer-claim-grounding",
+ "eliot-dreamer-classification",
+ "eliot-dreamer-conflict-analysis",
  "eliot-dreamer-contracts",
+ "eliot-dreamer-probe-plan",
+ "eliot-dreamer-rival-model",
+ "eliot-epistemic",
  "eliot-epistemic-contracts",
  "eliot-evidence",
+ "eliot-protocol",
  "schemars",
  "serde",
  "serde_json",
@@ -1970,6 +1985,7 @@ dependencies = [
 name = "eliot-governor"
 version = "0.1.0"
 dependencies = [
+ "eliot-agent-api",
  "eliot-authority",
  "eliot-budget",
  "eliot-canonical",
@@ -1979,10 +1995,12 @@ dependencies = [
  "eliot-context-contracts",
  "eliot-contracts",
  "eliot-coordination",
+ "eliot-cue-binding",
  "eliot-cue-contracts",
  "eliot-cue-index",
  "eliot-diagnostic",
  "eliot-doctor-core",
+ "eliot-dreamer-contracts",
  "eliot-dreamer-failure",
  "eliot-epistemic",
  "eliot-epistemic-contracts",
@@ -3324,6 +3342,7 @@ name = "eliot-task"
 version = "0.1.0"
 dependencies = [
  "eliot-contracts",
+ "eliot-types",
  "schemars",
  "serde",
  "thiserror",
@@ -3578,6 +3597,7 @@ dependencies = [
  "eliot-agent-bridge-core",
  "eliot-agent-contracts",
  "eliot-agent-coordinator",
+ "eliot-agent-opencode",
  "eliot-authority",
  "eliot-bootstrap",
  "eliot-canonical",

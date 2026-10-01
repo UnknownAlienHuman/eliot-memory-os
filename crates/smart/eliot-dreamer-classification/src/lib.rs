@@ -14,10 +14,12 @@ mod evidence;
 mod policy;
 mod result;
 mod selection;
+mod semantics;
 
 pub use evidence::{EvidenceQuality, EvidenceTrace, grade_name, retained_source_set};
 pub use policy::{BudgetReceipt, ClassificationPolicy, EvidenceGradeBinding, grade_binding_digest};
 pub use result::{
-    ClassificationConflict, ClassificationDisposition, ClassificationResult, classify,
+    ClassificationConflict, ClassificationDisposition, ClassificationResult,
+    OrientationClassificationResult, classify, classify_orientation,
 };
 pub use selection::{AlternativeTrace, CriterionResolution, SelectionKind, SelectionReport};

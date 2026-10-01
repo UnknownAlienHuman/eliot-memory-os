@@ -625,6 +625,10 @@ fn task_envelope(
         serde_json::Value::String(expected_revision.to_string()),
     );
     parameters.insert(
+        "resulting_revision".to_owned(),
+        serde_json::Value::String(record.revision.to_string()),
+    );
+    parameters.insert(
         "actor_ref".to_owned(),
         serde_json::Value::String(event.actor_ref.clone()),
     );

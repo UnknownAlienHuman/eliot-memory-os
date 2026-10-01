@@ -28,7 +28,8 @@ use super::{
     FenceRecord, SchemaMetaRecord, ensure_ready, ensure_unique_ordering_scopes,
     ensure_unique_revision_keys, read_fence, read_ordering_heads_inner,
     read_projection_generations_inner, read_receipt_by_operation, read_revision_heads_inner,
-    take_schema_meta, take_vec, to_value, validate_fence_record, validate_schema_meta_record,
+    take_optional, take_schema_meta, take_vec, to_value, validate_fence_record,
+    validate_schema_meta_record,
 };
 
 pub(super) const READ_VALIDATION_SNAPSHOT: &str = "BEGIN TRANSACTION; SELECT * FROM ONLY schema_meta:current; SELECT VALUE { state_fence: state_fence, next_commit_sequence: next_commit_sequence, next_outbox_sequence: next_outbox_sequence } FROM ONLY canonical_fence:current; SELECT VALUE body FROM revision_head; COMMIT TRANSACTION;";
@@ -43,6 +44,10 @@ const EVIDENCE_PACK_PAYLOAD_VERSION: u32 = 1;
 /// Version of the T11.3 cognitive read payloads. Each must stay equal to its
 /// reference counterpart in `eliot-store-memory`.
 const TASK_STATE_PAYLOAD_VERSION: u32 = 1;
+/// Exact canonical-store task row selected beside the T11.3 task history.
+/// The independent memory revision, project sequence, and write id stay in
+/// the returned row; they are not inferred from sibling revision heads.
+const READ_TASK_CONTRACT_BY_ID: &str = "SELECT VALUE { task_id: task_id, project_id: project_id, title: title, status: status, acceptance_items: acceptance_items, action_lease_id: action_lease_id, understanding_proof_hash: understanding_proof_hash, action_provenance: action_provenance, memory_grant_redemptions: memory_grant_redemptions, observation_ids: observation_ids, verification_ids: verification_ids, verification_scopes: verification_scopes, completion_proof: completion_proof, completion_write_id: completion_write_id, memory_revision: memory_revision, project_sequence: project_sequence, write_id: write_id } FROM ONLY type::record('task_contract', $task_id);";
 const ATTENTION_PROBLEMS_PAYLOAD_VERSION: u32 = 1;
 const UNDERSTANDING_INPUTS_PAYLOAD_VERSION: u32 = 1;
 const CAPABILITY_EVIDENCE_PAYLOAD_VERSION: u32 = 1;
@@ -274,11 +279,25 @@ pub(crate) async fn execute_named(
     let db = super::client(adapter).await?;
     ensure_ready(adapter, db).await?;
 
-    let fence = read_fence(db, &adapter.config).await?;
-    let state_fence = resolve_state_fence(fence.as_ref(), &query.state_fence)?;
-
-    let revision_heads = read_all_revision_heads(db, &adapter.config).await?;
-    let payload = named_read_payload(adapter, db, &query, &state_fence, &revision_heads).await?;
+    let (state_fence, revision_heads, payload) =
+        if query.operation == NamedReadOperation::GetTaskState {
+            let snapshot = read_task_state_snapshot(db, &adapter.config, &query).await?;
+            let payload = task_state_payload_with_contract(
+                &query,
+                &snapshot.state_fence,
+                &snapshot.authority_rows,
+                snapshot.task_contract,
+            )
+            .map_err(AdapterError::Store)?;
+            (snapshot.state_fence, snapshot.revision_heads, payload)
+        } else {
+            let fence = read_fence(db, &adapter.config).await?;
+            let state_fence = resolve_state_fence(fence.as_ref(), &query.state_fence)?;
+            let revision_heads = read_all_revision_heads(db, &adapter.config).await?;
+            let payload =
+                named_read_payload(adapter, db, &query, &state_fence, &revision_heads).await?;
+            (state_fence, revision_heads, payload)
+        };
     let response = NamedReadResponse {
         operation: query.operation,
         state_fence,
@@ -287,6 +306,64 @@ pub(crate) async fn execute_named(
     };
     response.validate()?;
     Ok(response)
+}
+
+/// The task-history rows and native retained task contract are selected in
+/// one Surreal transaction with the exact response fence and revision heads.
+/// The independent contract revision fields remain in the row payload; this
+/// does not manufacture a head or borrow a sibling role's read identity.
+struct TaskStateSnapshot {
+    state_fence: StateFence,
+    revision_heads: Vec<RevisionHead>,
+    authority_rows: Vec<AuthorityReceiptRow>,
+    task_contract: Option<Value>,
+}
+
+async fn read_task_state_snapshot(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+) -> Result<TaskStateSnapshot, AdapterError> {
+    let task_id = task_state_task_id(query).map_err(AdapterError::Store)?;
+    let sql = format!(
+        "BEGIN TRANSACTION; {} {} {READ_AUTHORITY_RECORDS} {} {READ_TASK_CONTRACT_BY_ID} COMMIT TRANSACTION;",
+        schema::READ_FENCE,
+        schema::READ_ALL_REVISION_HEADS,
+        schema::READ_ALL_RECEIPTS,
+    );
+    let mut response = client::query(
+        db,
+        config,
+        "read.task_state_snapshot",
+        &sql,
+        Map::from([("task_id".to_owned(), json!(task_id))]),
+    )
+    .await?;
+    if !response.take_errors().is_empty() {
+        return Err(
+            StoreError::Serialization("task state snapshot query failed".to_owned()).into(),
+        );
+    }
+
+    // SurrealDB 3 retains the BEGIN result at index 0 (null).
+    let fence = take_optional::<FenceRecord>(&mut response, 1)?;
+    if let Some(fence) = &fence {
+        validate_fence_record(fence)?;
+    }
+    let state_fence = resolve_state_fence(fence.as_ref(), &query.state_fence)?;
+    let revision_heads = take_vec::<RevisionHead>(&mut response, 2)?;
+    validate_revision_heads(&revision_heads)?;
+    let mut authority_rows = take_vec::<AuthorityReceiptRow>(&mut response, 3)?;
+    let receipts = take_vec::<WriteReceipt>(&mut response, 4)?;
+    join_authority_receipts(&mut authority_rows, receipts)?;
+    let task_contract = take_optional::<Value>(&mut response, 5)?;
+
+    Ok(TaskStateSnapshot {
+        state_fence,
+        revision_heads,
+        authority_rows,
+        task_contract,
+    })
 }
 
 /// Resolves the read fence for one named read (pure, shared by all reads).
@@ -396,6 +473,15 @@ async fn named_read_payload(
         }
         NamedReadOperation::GetLearningRecordRange => {
             learning_record_range_payload(db, &adapter.config, query, state_fence).await
+        }
+        NamedReadOperation::GetCampaignSourceRevision => {
+            let read = super::surreal_orientation_sources::read_campaign_source_revision(
+                db,
+                &adapter.config,
+                query,
+            )
+            .await?;
+            Ok(json!({"campaign_source_revision": read}))
         }
         NamedReadOperation::GetCapabilityEvidenceRecordRange => {
             capability_evidence_record_range_payload(db, &adapter.config, query, state_fence).await
@@ -1343,6 +1429,14 @@ async fn read_authority_records(
     // SurrealDB 3 retains the BEGIN result at index 0 (null).
     let mut rows = take_vec::<AuthorityReceiptRow>(&mut response, 1)?;
     let receipts = take_vec::<WriteReceipt>(&mut response, 2)?;
+    join_authority_receipts(&mut rows, receipts)?;
+    Ok(rows)
+}
+
+fn join_authority_receipts(
+    rows: &mut [AuthorityReceiptRow],
+    receipts: Vec<WriteReceipt>,
+) -> Result<(), AdapterError> {
     let mut by_commit = BTreeMap::new();
     for receipt in receipts {
         if let Some(marker) = &receipt.committed_at
@@ -1356,7 +1450,7 @@ async fn read_authority_records(
             row.receipt = by_commit.remove(&format!("commit-sequence-{sequence:016}"));
         }
     }
-    Ok(rows)
+    Ok(())
 }
 
 /// Validates one persisted payload-authority record against its own provenance.
@@ -1464,11 +1558,17 @@ fn infer_authority_operation(
     }
 }
 
-struct IndexedAuthority {
+struct IndexedAuthority<'a> {
     capture_index: u64,
     operation: eliot_store_api::NamedMutationOperation,
+    operation_id: &'a OperationId,
+    receipt_state_fence: &'a StateFence,
+    /// The exact original receipt joined from the immutable receipt row.
+    /// Task-state consumers validate this retained value; it is not rebuilt
+    /// from the operation parameters or current fence.
+    receipt: &'a WriteReceipt,
     parameters: BTreeMap<String, Value>,
-    scope_id: String,
+    scope_id: &'a str,
 }
 
 /// Walks authority rows in durable commit order and returns indexed records
@@ -1485,7 +1585,9 @@ struct IndexedAuthority {
 ///
 /// Only `Committed` receipts contribute, so every record this returns is state
 /// the store actually committed.
-fn indexed_authorities(rows: &[AuthorityReceiptRow]) -> Result<Vec<IndexedAuthority>, StoreError> {
+fn indexed_authorities<'a>(
+    rows: &'a [AuthorityReceiptRow],
+) -> Result<Vec<IndexedAuthority<'a>>, StoreError> {
     let mut ordered: Vec<&AuthorityReceiptRow> = rows.iter().collect();
     ordered.sort_by_key(|row| row.commit_sequence.unwrap_or(0));
     let mut indexed = Vec::new();
@@ -1508,19 +1610,27 @@ fn indexed_authorities(rows: &[AuthorityReceiptRow]) -> Result<Vec<IndexedAuthor
             }
             Some((
                 receipt.transition_class,
-                binding.scope_id.as_str().to_owned(),
+                binding.scope_id.as_str(),
+                &receipt.operation_id,
+                &receipt.state_fence,
+                receipt,
             ))
         };
         for record in authorities {
             let parameters = validate_authority_record(row, record)?;
             let capture_index = operation_base.saturating_add(record.operation_index as u64);
-            if let Some((transition_class, scope_id)) = &in_scope_receipt {
+            if let Some((transition_class, scope_id, operation_id, receipt_state_fence, receipt)) =
+                &in_scope_receipt
+            {
                 let operation = infer_authority_operation(*transition_class, &parameters)?;
                 indexed.push(IndexedAuthority {
                     capture_index,
                     operation,
+                    operation_id: *operation_id,
+                    receipt_state_fence: *receipt_state_fence,
+                    receipt: *receipt,
                     parameters,
-                    scope_id: scope_id.clone(),
+                    scope_id: *scope_id,
                 });
             }
         }
@@ -1572,26 +1682,13 @@ fn task_state_payload(
         field: "scope_id",
         reason: "task state read requires scope_id",
     })?;
-    let task_id = query
-        .parameters
-        .get("task_id")
-        .and_then(Value::as_str)
-        .ok_or(StoreError::InvalidField {
-            field: "operation.parameter",
-            reason: "missing required parameter",
-        })?;
-    if task_id.trim().is_empty() || task_id.chars().any(char::is_control) {
-        return Err(StoreError::InvalidField {
-            field: "operation.parameter",
-            reason: "task_id must be a non-blank string",
-        });
-    }
+    let task_id = task_state_task_id(query)?;
     let (max_records, limit) = parse_max_records_param(query)?;
     if query.state_fence != *state_fence {
         return Err(StoreError::FenceMismatch);
     }
     let indexed = indexed_authorities(rows)?;
-    let matched: Vec<&IndexedAuthority> = indexed
+    let matched: Vec<&IndexedAuthority<'_>> = indexed
         .iter()
         .filter(|record| {
             record.scope_id == scope_id.as_str()
@@ -1600,7 +1697,19 @@ fn task_state_payload(
         })
         .collect();
     let matched_total = matched.len();
-    let current = matched.last().map(|record| record.parameters.clone());
+    let current = matched.last().map(|record| {
+        let mut current = Map::from_iter(record.parameters.clone());
+        current.insert(
+            "operation_id".to_owned(),
+            json!(record.operation_id.as_str()),
+        );
+        current.insert(
+            "receipt_state_fence".to_owned(),
+            json!(record.receipt_state_fence),
+        );
+        current.insert("write_receipt".to_owned(), json!(record.receipt));
+        Value::Object(current)
+    });
     let records: Vec<Value> = matched
         .into_iter()
         .take(limit)
@@ -1627,6 +1736,73 @@ fn task_state_payload(
             "truncated": matched_total > returned,
         },
     }))
+}
+
+/// Extends the T11.3 task-history payload with the exact retained native task
+/// row read in the same transaction. The tagged absence stays explicit; the
+/// payload never substitutes an empty contract or task-history record.
+fn task_state_payload_with_contract(
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+    rows: &[AuthorityReceiptRow],
+    task_contract: Option<Value>,
+) -> Result<Value, StoreError> {
+    let mut payload = task_state_payload(query, state_fence, rows)?;
+    let retained = match task_contract {
+        Some(record) => {
+            validate_native_task_contract_record(&record, task_state_task_id(query)?)?;
+            json!({"availability": "present", "record": record})
+        }
+        None => json!({"availability": "absent"}),
+    };
+    let object = payload.as_object_mut().ok_or_else(|| {
+        StoreError::Serialization("task state payload is not an object".to_owned())
+    })?;
+    object.insert("retained_task_contract".to_owned(), retained);
+    Ok(payload)
+}
+
+fn task_state_task_id(query: &NamedReadRequest) -> Result<&str, StoreError> {
+    let task_id = query
+        .parameters
+        .get("task_id")
+        .and_then(Value::as_str)
+        .ok_or(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "missing required parameter",
+        })?;
+    if task_id.trim().is_empty() || task_id.chars().any(char::is_control) {
+        return Err(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "task_id must be a non-blank string",
+        });
+    }
+    Ok(task_id)
+}
+
+fn validate_native_task_contract_record(record: &Value, task_id: &str) -> Result<(), StoreError> {
+    let object = record.as_object().ok_or_else(|| {
+        StoreError::Serialization("retained task contract is not an object".to_owned())
+    })?;
+    let record_task_id = object.get("task_id").and_then(Value::as_str);
+    let memory_revision = object.get("memory_revision").and_then(Value::as_u64);
+    let project_sequence = object.get("project_sequence").and_then(Value::as_u64);
+    let write_id = object.get("write_id").and_then(Value::as_str);
+    if record_task_id != Some(task_id)
+        || memory_revision.is_none()
+        || project_sequence.is_none()
+        || write_id.is_none_or(str::is_empty)
+        || object.get("title").and_then(Value::as_str).is_none()
+        || object
+            .get("acceptance_items")
+            .and_then(Value::as_array)
+            .is_none()
+    {
+        return Err(StoreError::Serialization(
+            "retained task contract identity or revision is malformed".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Builds the versioned `GetAttentionAndProblems` payload (T11.3, Surreal).
@@ -1662,7 +1838,7 @@ fn attention_problems_payload(
         return Err(StoreError::FenceMismatch);
     }
     let indexed = indexed_authorities(rows)?;
-    let matched: Vec<&IndexedAuthority> = indexed
+    let matched: Vec<&IndexedAuthority<'_>> = indexed
         .iter()
         .filter(|record| {
             record.scope_id == scope_id.as_str()
@@ -1733,7 +1909,7 @@ fn understanding_inputs_payload(
         return Err(StoreError::FenceMismatch);
     }
     let indexed = indexed_authorities(rows)?;
-    let matched: Vec<&IndexedAuthority> = indexed
+    let matched: Vec<&IndexedAuthority<'_>> = indexed
         .iter()
         .filter(|record| {
             record.scope_id == scope_id.as_str()
@@ -1817,7 +1993,7 @@ fn capability_evidence_payload(
         )?),
     };
     let indexed = indexed_authorities(rows)?;
-    let matched: Vec<&IndexedAuthority> = indexed
+    let matched: Vec<&IndexedAuthority<'_>> = indexed
         .iter()
         .filter(|record| {
             record.scope_id == scope_id.as_str()

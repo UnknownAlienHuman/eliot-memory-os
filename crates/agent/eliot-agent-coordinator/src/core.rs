@@ -2805,7 +2805,11 @@ impl AgentCoordinator {
     /// attribution checks. Only identity fields participate in
     /// `validate_execution_binding`; authority/continuity/cancellation
     /// crossings are inert carriers documented below.
-    pub(crate) fn binding_subject(
+    /// Projects one original admitted/running attempt into the execution
+    /// binding subject after checking its stored admission and lifecycle.
+    /// This is a read-only owner projection; callers cannot supply or replace
+    /// the route, lease, effect ceiling, provider binding, or cancellation.
+    pub fn binding_subject(
         &self,
         attempt_id: &AttemptId,
     ) -> Result<AgentAttempt, CoordinatorError> {

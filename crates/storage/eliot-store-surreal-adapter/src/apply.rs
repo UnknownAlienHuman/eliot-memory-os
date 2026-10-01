@@ -58,6 +58,7 @@ use atomic_write::{
     ErasureInTx, TxLane, erasure_in_tx_parts, read_sealed_erasure_outcomes, to_value,
     write_canonical_transaction_with_expected_heads,
 };
+pub(crate) mod surreal_orientation_sources;
 #[cfg(test)]
 use atomic_write::{ordering_write_template, revision_write_template, write_transaction};
 use empty_migration::handle_empty_migration;
@@ -1339,6 +1340,12 @@ async fn prepare_attempt_leg_writes(
     db: &client::RpcTransport,
     transition: &eliot_store_api::PreparedTransition,
 ) -> Result<AttemptLegWrites, AdapterError> {
+    surreal_orientation_sources::prepare_orientation_owner_source_writes(
+        db,
+        &adapter.config,
+        transition,
+    )
+    .await?;
     let notification_writes =
         surreal_notification::prepare_notification_writes(db, &adapter.config, transition).await?;
     let reactive_writes =

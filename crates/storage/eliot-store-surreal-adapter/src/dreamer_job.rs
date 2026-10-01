@@ -371,6 +371,9 @@ async fn submit(
         semantic_input: Some(submission.semantic_input.clone()),
         semantic_input_bytes: submission.semantic_input_bytes.clone(),
         owner_record: submission.owner_record.clone(),
+        runtime_owner_execution_input: submission.runtime_owner_execution_input.clone(),
+        runtime_owner_execution_input_bytes: submission.runtime_owner_execution_input_bytes.clone(),
+        output_contract: Some(submission.output_contract.clone()),
         revision: FIRST_OUTER_REVISION,
         state: JobState::Queued,
         disposition: Some(MutationDisposition::Committed),
@@ -625,6 +628,17 @@ async fn lease_exact(
         semantic_input: Some(ledger.record.submission.semantic_input.clone()),
         semantic_input_bytes: ledger.record.submission.semantic_input_bytes.clone(),
         owner_record: ledger.record.submission.owner_record.clone(),
+        runtime_owner_execution_input: ledger
+            .record
+            .submission
+            .runtime_owner_execution_input
+            .clone(),
+        runtime_owner_execution_input_bytes: ledger
+            .record
+            .submission
+            .runtime_owner_execution_input_bytes
+            .clone(),
+        output_contract: Some(ledger.record.submission.output_contract.clone()),
         revision: selector.expected_revision,
         state: JobState::Leased,
         disposition: Some(MutationDisposition::Committed),
@@ -900,6 +914,17 @@ fn prepare_applicability_mutation(
         semantic_input: Some(ledger.record.submission.semantic_input.clone()),
         semantic_input_bytes: ledger.record.submission.semantic_input_bytes.clone(),
         owner_record: ledger.record.submission.owner_record.clone(),
+        runtime_owner_execution_input: ledger
+            .record
+            .submission
+            .runtime_owner_execution_input
+            .clone(),
+        runtime_owner_execution_input_bytes: ledger
+            .record
+            .submission
+            .runtime_owner_execution_input_bytes
+            .clone(),
+        output_contract: Some(ledger.record.submission.output_contract.clone()),
         revision: ledger.record.revision,
         state: ledger.record.state,
         disposition: Some(MutationDisposition::Committed),
@@ -956,6 +981,17 @@ async fn status(
         semantic_input: Some(ledger.record.submission.semantic_input.clone()),
         semantic_input_bytes: ledger.record.submission.semantic_input_bytes.clone(),
         owner_record: ledger.record.submission.owner_record.clone(),
+        runtime_owner_execution_input: ledger
+            .record
+            .submission
+            .runtime_owner_execution_input
+            .clone(),
+        runtime_owner_execution_input_bytes: ledger
+            .record
+            .submission
+            .runtime_owner_execution_input_bytes
+            .clone(),
+        output_contract: Some(ledger.record.submission.output_contract.clone()),
         revision: ledger.record.revision,
         state: ledger.record.state,
         disposition: None,
@@ -1302,6 +1338,17 @@ async fn op_lease_next(
         semantic_input: Some(ledger.record.submission.semantic_input.clone()),
         semantic_input_bytes: ledger.record.submission.semantic_input_bytes.clone(),
         owner_record: ledger.record.submission.owner_record.clone(),
+        runtime_owner_execution_input: ledger
+            .record
+            .submission
+            .runtime_owner_execution_input
+            .clone(),
+        runtime_owner_execution_input_bytes: ledger
+            .record
+            .submission
+            .runtime_owner_execution_input_bytes
+            .clone(),
+        output_contract: Some(ledger.record.submission.output_contract.clone()),
         revision: selector.expected_revision,
         state: JobState::Leased,
         disposition: Some(MutationDisposition::Committed),
@@ -1415,6 +1462,17 @@ async fn op_renew(
         semantic_input: Some(ledger.record.submission.semantic_input.clone()),
         semantic_input_bytes: ledger.record.submission.semantic_input_bytes.clone(),
         owner_record: ledger.record.submission.owner_record.clone(),
+        runtime_owner_execution_input: ledger
+            .record
+            .submission
+            .runtime_owner_execution_input
+            .clone(),
+        runtime_owner_execution_input_bytes: ledger
+            .record
+            .submission
+            .runtime_owner_execution_input_bytes
+            .clone(),
+        output_contract: Some(ledger.record.submission.output_contract.clone()),
         revision: ledger.record.revision,
         state: ledger.record.state,
         disposition: Some(MutationDisposition::Committed),
@@ -1528,6 +1586,17 @@ async fn op_start(
         semantic_input: Some(ledger.record.submission.semantic_input.clone()),
         semantic_input_bytes: ledger.record.submission.semantic_input_bytes.clone(),
         owner_record: ledger.record.submission.owner_record.clone(),
+        runtime_owner_execution_input: ledger
+            .record
+            .submission
+            .runtime_owner_execution_input
+            .clone(),
+        runtime_owner_execution_input_bytes: ledger
+            .record
+            .submission
+            .runtime_owner_execution_input_bytes
+            .clone(),
+        output_contract: Some(ledger.record.submission.output_contract.clone()),
         revision: ledger.record.revision,
         state: JobState::Running,
         disposition: Some(MutationDisposition::Committed),
@@ -1692,6 +1761,17 @@ async fn op_checkpoint(
         semantic_input: Some(ledger.record.submission.semantic_input.clone()),
         semantic_input_bytes: ledger.record.submission.semantic_input_bytes.clone(),
         owner_record: ledger.record.submission.owner_record.clone(),
+        runtime_owner_execution_input: ledger
+            .record
+            .submission
+            .runtime_owner_execution_input
+            .clone(),
+        runtime_owner_execution_input_bytes: ledger
+            .record
+            .submission
+            .runtime_owner_execution_input_bytes
+            .clone(),
+        output_contract: Some(ledger.record.submission.output_contract.clone()),
         revision: ledger.record.revision,
         state: JobState::Checkpointed,
         disposition: Some(MutationDisposition::Committed),
@@ -1809,6 +1889,17 @@ async fn op_resume(
         semantic_input: Some(ledger.record.submission.semantic_input.clone()),
         semantic_input_bytes: ledger.record.submission.semantic_input_bytes.clone(),
         owner_record: ledger.record.submission.owner_record.clone(),
+        runtime_owner_execution_input: ledger
+            .record
+            .submission
+            .runtime_owner_execution_input
+            .clone(),
+        runtime_owner_execution_input_bytes: ledger
+            .record
+            .submission
+            .runtime_owner_execution_input_bytes
+            .clone(),
+        output_contract: Some(ledger.record.submission.output_contract.clone()),
         revision: ledger.record.revision,
         state: JobState::Running,
         disposition: Some(MutationDisposition::Committed),
@@ -1922,6 +2013,17 @@ async fn op_begin_verification(
         semantic_input: Some(ledger.record.submission.semantic_input.clone()),
         semantic_input_bytes: ledger.record.submission.semantic_input_bytes.clone(),
         owner_record: ledger.record.submission.owner_record.clone(),
+        runtime_owner_execution_input: ledger
+            .record
+            .submission
+            .runtime_owner_execution_input
+            .clone(),
+        runtime_owner_execution_input_bytes: ledger
+            .record
+            .submission
+            .runtime_owner_execution_input_bytes
+            .clone(),
+        output_contract: Some(ledger.record.submission.output_contract.clone()),
         revision: ledger.record.revision,
         state: JobState::Verifying,
         disposition: Some(MutationDisposition::Committed),
@@ -2044,6 +2146,17 @@ async fn op_publish(
         semantic_input: Some(ledger.record.submission.semantic_input.clone()),
         semantic_input_bytes: ledger.record.submission.semantic_input_bytes.clone(),
         owner_record: ledger.record.submission.owner_record.clone(),
+        runtime_owner_execution_input: ledger
+            .record
+            .submission
+            .runtime_owner_execution_input
+            .clone(),
+        runtime_owner_execution_input_bytes: ledger
+            .record
+            .submission
+            .runtime_owner_execution_input_bytes
+            .clone(),
+        output_contract: Some(ledger.record.submission.output_contract.clone()),
         revision: ledger.record.revision,
         state: outcome.state,
         disposition: Some(MutationDisposition::Committed),
@@ -2171,6 +2284,17 @@ async fn op_request_cancel(
         semantic_input: Some(ledger.record.submission.semantic_input.clone()),
         semantic_input_bytes: ledger.record.submission.semantic_input_bytes.clone(),
         owner_record: ledger.record.submission.owner_record.clone(),
+        runtime_owner_execution_input: ledger
+            .record
+            .submission
+            .runtime_owner_execution_input
+            .clone(),
+        runtime_owner_execution_input_bytes: ledger
+            .record
+            .submission
+            .runtime_owner_execution_input_bytes
+            .clone(),
+        output_contract: Some(ledger.record.submission.output_contract.clone()),
         revision: ledger.record.revision,
         state: prior_state,
         disposition: Some(MutationDisposition::Committed),
@@ -2324,6 +2448,17 @@ fn reconcile_response(
         semantic_input: Some(ledger.record.submission.semantic_input.clone()),
         semantic_input_bytes: ledger.record.submission.semantic_input_bytes.clone(),
         owner_record: ledger.record.submission.owner_record.clone(),
+        runtime_owner_execution_input: ledger
+            .record
+            .submission
+            .runtime_owner_execution_input
+            .clone(),
+        runtime_owner_execution_input_bytes: ledger
+            .record
+            .submission
+            .runtime_owner_execution_input_bytes
+            .clone(),
+        output_contract: Some(ledger.record.submission.output_contract.clone()),
         revision: ledger.record.revision,
         state: ledger.record.state,
         disposition: Some(disposition),

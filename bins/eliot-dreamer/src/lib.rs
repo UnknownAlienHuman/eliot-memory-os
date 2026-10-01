@@ -26,9 +26,7 @@ mod error;
 mod grounding_stage;
 pub(crate) mod kernel_port;
 mod model_stage;
-mod orientation_supply_source;
 mod production_orientation;
-mod pulse;
 mod result_stage;
 mod validation_stage;
 
@@ -44,7 +42,7 @@ pub use curation_screen_stage::{
     CurationProtection, CurationProtectionSet, ProtectionClass, ProtectionDecision,
 };
 pub use error::DreamerError;
-pub use production_orientation::{MeasureFn, OrientationSupply};
+pub use production_orientation::OrientationSupply;
 
 pub const SERVICE_NAME: &str = "eliot-dreamer";
 pub const PROTOCOL_VERSION: &str = "eliot.dreamer.v1";
@@ -166,40 +164,22 @@ pub trait CurationCarrierSource {
 /// Governor injection point for the Orientation production supply (CC-004).
 ///
 /// The CC-002 model-route request/outcome are produced in-binary by the model
-/// stage, and the grounding request, grounded draft, receipt-bound v1 draft,
-/// and validated grounding candidate are produced in-binary by this crate's
-/// own grounding and validation stages; none of those travels this channel.
-/// What arrives over [`OrientationSupply`] is what a Governor/canonical owner
-/// publishes and this binary must neither retrieve nor recompute: the canonical
-/// projection set, the Current Epistemic Position handles, and the owner record
-/// set of every remaining mandatory stage. Without a supplied channel the
+/// stage, but the canonical projection set and every mandatory stage record are
+/// Governor-published values that this binary neither retrieves nor recomputes.
+/// They arrive over [`OrientationSupply`]; without a supplied channel the
 /// production carrier stays refused rather than filling a member locally.
 ///
 /// The returned supply borrows the source (`'s`), so the caller must consume it
 /// before any `&mut` use of the port holding the source; `submit` complies by
 /// running the admitted pipeline to an owned [`DreamResult`] before observing the
 /// live view.
-///
-/// Resolution distinguishes two conditions the carrier must not collapse.
-/// `Ok(Some(supply))` means the owner published the whole mandatory member set
-/// and the carrier composes from it. `Ok(None)` means the owner published
-/// nothing for this job, which is honest absence rather than a failure: the
-/// carrier then publishes the typed blocked disposition it already carries
-/// (`OrientationDisposition::Blocked`, no packet, `CC004_MISSING`, and
-/// `missing_owners` naming the absent owners) instead of a fabricated member or
-/// a whole-job error. `Err` is reserved for a genuine refusal — a presented
-/// record that is not this claim's, or a channel reached under the wrong class —
-/// so a missing owner never masquerades as a malformed one or the reverse.
 pub trait OrientationSupplySource {
     /// Resolves the owner-supplied record set for one admitted Orientation job.
-    ///
-    /// Returns `Ok(None)` when the owner channel published no record for this
-    /// job, which leaves the mandatory carrier honestly absent.
     fn resolve_supply<'s>(
         &'s self,
         admission: &KernelJobAdmission,
         job: &DreamJobInput,
-    ) -> Result<Option<OrientationSupply<'s>>, DreamerError>;
+    ) -> Result<OrientationSupply<'s>, DreamerError>;
 }
 
 /// Authenticated production adapter over the installation-owned Kernel client.
@@ -227,17 +207,10 @@ pub struct AuthenticatedKernelJobPort<'a> {
     /// refuses at the carrier check); `Some` where the Governor wired one via
     /// [`AuthenticatedKernelJobPort::with_curation_source`].
     curation_source: Option<&'a dyn CurationCarrierSource>,
-    /// Owner channel for the mandatory Orientation carrier. `Some` in
-    /// production: `connect` wires
-    /// [`KernelStagedOwnerRecordSource`](crate::orientation_supply_source::KernelStagedOwnerRecordSource),
-    /// which reports the mandatory members the Kernel-staged owner record does
-    /// not publish. On the current tree that reports total absence, and it is
-    /// in any case reached only from the unit-level pipeline proofs: `submit`
-    /// consults it at lib.rs:791, after `resolve_cycle_inputs` and
-    /// `resolve_bundle_request`, both of which refuse unconditionally. The
-    /// carrier stays refused rather than synthesizing canonical state; the
-    /// channel itself is replaceable through
-    /// [`AuthenticatedKernelJobPort::with_orientation_source`].
+    /// Optional Governor-injected Orientation supply source. `None` in
+    /// production when no source is wired, so the production carrier stays
+    /// refused rather than synthesizing canonical state; `Some` where the
+    /// Governor wired one via [`AuthenticatedKernelJobPort::with_orientation_source`].
     orientation_source: Option<&'a dyn OrientationSupplySource>,
 }
 
@@ -286,15 +259,7 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
             handshake,
             transport: Box::new(transport),
             curation_source: None,
-            // The production owner channel is wired here, at the one place the
-            // service is constructed, so `submit` never runs the Orientation
-            // composition with an unconsulted channel. It reports the owner
-            // record it can actually read; the carrier's mandatory members it
-            // cannot read stay absent and the typed blocked disposition
-            // publishes, which is the same disposition the unwired channel
-            // produced but now reached through a real read rather than through
-            // a hardcoded absence.
-            orientation_source: Some(&orientation_supply_source::KERNEL_STAGED_OWNER_RECORD_SOURCE),
+            orientation_source: None,
         })
     }
 
@@ -311,15 +276,11 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
         }
     }
 
-    /// Replaces the Orientation owner channel with another implementor.
+    /// Wires a Governor-injected Orientation supply source into the port.
     ///
-    /// `connect` wires the production channel; this swaps in a different owner of
-    /// the same contract without a second code path. `submit` resolves the CC-004
-    /// projection set, the Current Epistemic Position handles, and the
-    /// owner record set of every mandatory stage this binary does not produce
-    /// itself through this source for admitted Orientation jobs only. Other
-    /// classes never consult it, and a source that measures no published record
-    /// leaves the carrier absent rather than filled.
+    /// The Governor calls this after `connect()`; `submit` resolves the CC-004
+    /// projection set and the mandatory stage-owner records through this source
+    /// for admitted Orientation jobs only. Other classes never consult it.
     #[must_use]
     pub fn with_orientation_source(self, source: &'a dyn OrientationSupplySource) -> Self {
         Self {
@@ -383,45 +344,6 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
         &self.admission
     }
 
-    /// Decodes the production semantic input from the Kernel-staged inline bytes.
-    ///
-    /// The claim port already proved these bytes: the staged envelope check
-    /// digest-verified `semantic_input_bytes` against the owner
-    /// `semantic_input` reference at claim time, so this performs no second
-    /// digest check and no transport. It only interprets the verified bytes
-    /// as the closed owner [`DreamJobInput`] shape: `deny_unknown_fields`
-    /// rejects any foreign encoding (including `UserAutomation` content, which
-    /// is never a Dreamer orientation payload), the owner
-    /// `DreamJobInput::validate` bounds run through the existing denial
-    /// mapping, and the decoded job is bound to this exact claim (`job_id`,
-    /// `scope_id`, and `state_fence` must match the staged material, mirroring
-    /// [`KernelSupervisedComposition::submit`]).
-    ///
-    /// Returns `Ok(None)` when the Kernel staged no inline bytes: a worker
-    /// launched without a job still reports its proved disposition through
-    /// `status` rather than inventing one. Every other absence is a typed
-    /// fail-closed refusal, never a fabricated value: undecodable bytes,
-    /// owner-invalid bounds, or a foreign identity refuse instead of
-    /// defaulting a single field.
-    pub fn staged_job_input(&self) -> Result<Option<DreamJobInput>, DreamerError> {
-        let Some(bytes) = self.material.semantic_input_bytes.as_ref() else {
-            return Ok(None);
-        };
-        let job: DreamJobInput = serde_json::from_slice(bytes).map_err(|_| {
-            DreamerError::InvalidAdmission("staged semantic input is not a closed dream job input")
-        })?;
-        job.validate().map_err(|error| job_denied(&error))?;
-        if job.job_id != self.material.job_id
-            || job.scope_id != self.material.scope_id
-            || job.state_fence != self.material.fence
-        {
-            return Err(DreamerError::KernelAdmissionRequired(
-                "staged semantic input is not bound to the claimed dreamer job".to_owned(),
-            ));
-        }
-        Ok(Some(job))
-    }
-
     /// Refuses any admission that is not the claimed dreamer job.
     fn check_claimed(&self, admission: &KernelJobAdmission) -> Result<(), DreamerError> {
         admission.validate()?;
@@ -462,18 +384,13 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
         }
     }
 
-    /// Resolves the owner-supplied Orientation records for one admitted job.
+    /// Resolves the Governor-supplied Orientation records for one admitted job.
     ///
-    /// `None` — whether because no source was wired or because the wired source
-    /// measured that the owner published no record for this job — leaves the
-    /// production carrier refused, because the canonical projection set and the
-    /// mandatory stage-owner records are owner-published values this binary must
-    /// not synthesize. The two cases are the same disposition for the carrier
-    /// and are deliberately not distinguished downstream: an absent owner is
-    /// absent, and inventing a second blocked shape to tell "no channel" from
-    /// "no record" would add a disposition the carrier does not own. The caller
-    /// must consume the supply before any `&mut` use of the port, exactly as
-    /// with the Curation carrier.
+    /// `None` when no source was wired: the production carrier then stays
+    /// refused, because the canonical projection set and the mandatory
+    /// stage-owner records are Governor-published values this binary must not
+    /// synthesize. The caller must consume the supply before any `&mut` use of
+    /// the port, exactly as with the Curation carrier.
     fn resolve_orientation_supply(
         &self,
         admission: &KernelJobAdmission,
@@ -482,7 +399,7 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
         let source = self.orientation_source;
         match source {
             None => Ok(None),
-            Some(source) => source.resolve_supply(admission, job),
+            Some(source) => source.resolve_supply(admission, job).map(Some),
         }
     }
 
@@ -671,11 +588,6 @@ fn dispatch_admission_with(
 /// wired A-31 path. Extracted as a free function so the chain is
 /// unit-provable without a live Kernel transport (`submit` adds only the
 /// claim check before it and the live view after it).
-///
-/// The grounding request and the validation receipt the model, grounding, and
-/// validation stages produced here are the records the Orientation carrier
-/// joins as `PipelineOrientationRecords`, so the pulse never asks the Governor
-/// channel for a value this pipeline had already committed.
 fn run_admitted_pipeline(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
@@ -705,13 +617,34 @@ fn run_admitted_pipeline(
         ))?;
         return dispatch_stage::dispatch_curation(binding, protection, carrier);
     }
+    if job.job_class == JobClass::Orientation {
+        let (validated, supply) = match orientation_supply {
+            Some(source) => (
+                Some(source.validated_draft),
+                production_orientation::borrow_governor_supply(admission, source),
+            ),
+            None => (
+                None,
+                production_orientation::ProductionOrientationSupply::Missing,
+            ),
+        };
+        return dispatch_stage::dispatch_admitted_with_orientation_supply(
+            admission,
+            job,
+            None,
+            None,
+            dispatch_stage::DispatchOwnerInputs {
+                curation: None,
+                orientation: supply,
+            },
+            job.job_class,
+            validated,
+        );
+    }
     let model_inputs = model_stage::resolve_model_inputs(admission, job)?;
     let draft = model_stage::run_admitted_model(model_inputs)?;
     let grounding_request = grounding_stage::resolve_grounding_inputs(admission, job, draft)?;
-    // The grounding owner takes its request by value; the same admitted request
-    // is retained here so the Orientation carrier joins the exact one this
-    // stage ran under instead of rebuilding a lookalike.
-    let grounded = grounding_stage::ground_admitted_draft(grounding_request.clone())?;
+    let grounded = grounding_stage::ground_admitted_draft(grounding_request)?;
     // Non-Curation classes pass the screen through with no binding to carry:
     // the resolve above already proved the pass-through.
     let screen_binding = None;
@@ -722,25 +655,17 @@ fn run_admitted_pipeline(
     // threads into dispatch, which proves its binding before any native
     // handler runs and never re-runs the owner validation.
     let validated = validation_stage::validate_admitted_draft(&validation_input)?;
-    dispatch_stage::dispatch_admitted(
+    dispatch_stage::dispatch_admitted_with_orientation_supply(
         admission,
         job,
-        dispatch_stage::OwnerCarriers {
+        screen_binding,
+        None,
+        dispatch_stage::DispatchOwnerInputs {
             curation: None,
-            orientation: orientation_supply,
-            screen: screen_binding,
-            curation_protection: None,
+            orientation: production_orientation::ProductionOrientationSupply::Missing,
         },
         job.job_class,
         Some(&validated),
-        // Non-Curation reached this line, so the pipeline genuinely ran and the
-        // record is the exact grounding request and validated draft this chain
-        // produced. Curation returns through `dispatch_curation` above and never
-        // reaches this call.
-        Some(dispatch_stage::PipelineOrientationRecords::new(
-            &grounding_request,
-            &validated,
-        )),
     )
 }
 
@@ -1003,27 +928,9 @@ pub struct CurationCandidate {
 }
 
 /// Exact schema version accepted by [`OrientationPulseResult`].
-pub const ORIENTATION_PULSE_RESULT_SCHEMA_VERSION: u32 = 1;
+pub const ORIENTATION_PULSE_RESULT_SCHEMA_VERSION: u32 = 3;
 
-/// Closed per-stage disposition for one Orientation pulse member (issue #2901).
-///
-/// The composer emits `Executed` for a stage whose owner entry ran,
-/// `Pending` for a compatibility-composition member whose owner inputs were
-/// absent, and `Blocked` for a production member that cannot proceed (missing
-/// prerequisite, incoherent closure, or owner refusal). `Stale`, `Unknown`,
-/// and `NotApplicable` are versioned contract states for owner-reported
-/// conditions; no current owner reports them, so the composer never emits
-/// them today.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OrientationStageDisposition {
-    Executed,
-    Pending,
-    Blocked,
-    Stale,
-    Unknown,
-    NotApplicable,
-}
+pub use eliot_dreamer_orientation::OrientationStageDisposition;
 
 /// One pulse-member ledger record: stage/owner identity, disposition, input
 /// and output commitments, proof ceiling, bounded reason, and reopen
@@ -1078,12 +985,12 @@ pub struct OrientationBoundaryRecord {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OrientationAdmittedPrefix {
-    /// Canonical digest of the v1 `ValidatedCandidate`.
-    pub candidate_digest: String,
-    /// Canonical digest of the sealed `OrientationPolicy`.
-    pub policy_digest: String,
-    /// Canonical digest of the `DreamInputBundle`.
-    pub bundle_digest: String,
+    /// Original candidate commitment, absent before candidate acquisition.
+    pub candidate_digest: Option<String>,
+    /// Policy commitment, absent before policy acquisition.
+    pub policy_digest: Option<String>,
+    /// Bundle commitment, absent before bundle acquisition.
+    pub bundle_digest: Option<String>,
 }
 
 /// Typed production Orientation pulse result (issue #2901).
@@ -1098,7 +1005,7 @@ pub struct OrientationAdmittedPrefix {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OrientationPulseResult {
-    /// Exact schema version; must be 1.
+    /// Exact schema version; must be 3.
     pub schema_version: u32,
     /// Overall pulse disposition (`Complete`, `Partial`, or `Blocked`).
     pub disposition: OrientationDisposition,
@@ -1126,6 +1033,9 @@ pub struct OrientationPulseResult {
     pub admitted: OrientationAdmittedPrefix,
     /// Projected packet; present exactly when the pulse composed one.
     pub packet: Option<DreamPacket>,
+    /// Exact native packet owner closure, retained without losing original boundary or stage records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_closure: Option<eliot_dreamer_orientation::projection::OrientationOwnerClosure>,
     /// Bounded static omission/qualification codes.
     pub omissions: Vec<String>,
     /// Static owner identities absent from this pulse.

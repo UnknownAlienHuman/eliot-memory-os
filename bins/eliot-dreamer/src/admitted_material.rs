@@ -455,42 +455,6 @@ pub(crate) fn validation_input_for(
     .map_err(|_| DreamerError::InvalidAdmission("validation input binding invalid"))
 }
 
-/// Derives the v1 hypothesis text from the admitted pair.
-///
-/// Carries the admitted question verbatim as the single hypothesis with the
-/// admitted evidence handles as its source set: no text is invented and no
-/// evidence is declared confirmed (the owner forbids confirmed carry in model
-/// text). Requires at least one evidence handle; a handle-only bundle with
-/// no evidence refuses naming the missing source set. Proved with the real
-/// v1 [`ModelDraft::validate`](eliot_dreamer_contracts::ModelDraft::validate).
-pub(crate) fn v1_model_of(
-    admission: &KernelJobAdmission,
-    job: &DreamJobInput,
-) -> Result<TextModelDraft, DreamerError> {
-    let admitted = admission_of(admission, job)?;
-    if job.evidence_handles.is_empty() {
-        return Err(DreamerError::InvalidAdmission("no admitted source handles"));
-    }
-    let model = TextModelDraft {
-        // `DRAFT_SCHEMA_VERSION` is private to the owner `draft` module and
-        // is exactly 1; the owner validation proves it.
-        schema_version: 1,
-        job_id: admitted.canonical_id(),
-        statement: job.exact_question.clone(),
-        source_handles: job.evidence_handles.clone(),
-        counterevidence: Vec::new(),
-        uncertainty: "candidate-only bounded bundle; single admitted bundle".to_owned(),
-        expected_benefit: "bounds the next Governor-admitted probe".to_owned(),
-        recommended_probes: Vec::new(),
-        invalidation_conditions: job.conflicts_and_unknowns.clone(),
-        declared_confirmed_handles: Vec::new(),
-    };
-    model
-        .validate()
-        .map_err(|_| DreamerError::InvalidAdmission("admitted hypothesis binding invalid"))?;
-    Ok(model)
-}
-
 /// Grounds the v1 hypothesis against the admitted (empty) manifest.
 ///
 /// Binds the owner-computed model digest with exactly one residue carrying

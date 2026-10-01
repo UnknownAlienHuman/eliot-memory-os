@@ -26,6 +26,7 @@ pub mod grounding;
 pub mod job;
 pub mod model_route;
 pub mod probe;
+pub mod provider_output;
 pub mod registry;
 pub mod rejection;
 pub mod relation;
@@ -65,7 +66,8 @@ pub use classification::{
     ClassificationPreservation, ClassificationPreservationDimension,
     ClassificationPreservationVerdict, ClassificationRecordFamily, ClassificationRollback,
     CriterionApplicability, CriterionStatus, ExternalGradeRef, FeatureObservation,
-    GroundedCriterion, NamedEvidence, PriorAssignmentRef, TaxonomyAliasMapping,
+    GroundedCriterion, NamedEvidence, ORIENTATION_CLASSIFICATION_PROFILE_SCHEMA_VERSION,
+    OrientationClassificationProfile, PriorAssignmentRef, TaxonomyAliasMapping,
     TaxonomyAlternative, TaxonomyCoverage, TaxonomyDenominator, classification_input_digest,
     preflight_classification_acceptance, seal_classification, validate_classification,
     validate_classification_acceptance,
@@ -117,8 +119,9 @@ pub use job::{
 };
 pub use model_route::{
     CostUsageReceipt, MAX_ALLOWED_ROUTES, MAX_NOTE_CHARS, MAX_ROUTE_CHARS,
-    MODEL_ROUTE_SCHEMA_VERSION, ModelRouteDisposition, ModelRouteOutcome, ModelRoutePrivacy,
-    ModelRouteRequest, bundle_digest_of,
+    MODEL_ROUTE_SCHEMA_VERSION, ModelRouteDisposition, ModelRouteExecutionIdentity,
+    ModelRouteOutcome, ModelRoutePrivacy, ModelRouteProviderUsage, ModelRouteRequest,
+    ModelRouteUsageState, bundle_digest_of,
 };
 pub use probe::{
     AffordanceKind, AffordanceTarget, AuthorityDimension, BranchEvidenceAcceptance,
@@ -136,6 +139,10 @@ pub use probe::{
     ProbeRepeatRef, ProbeSourceRef, ResourceDimension, ResultBranch, ResultBranchAcceptance,
     ResultTarget, ResultUpdate, ResultUpdateDiscriminability, ReversibilityDimension,
     RivalUpdateMeaning, update_sets_equal,
+};
+pub use provider_output::{
+    PROVIDER_OUTPUT_SCHEMA_VERSION, ProviderGroundingOutputV2, ProviderOutputV2,
+    provider_output_schema_v2,
 };
 pub use registry::{
     AtomicityMode, CURATION_FAMILIES, CurationFamily, CurationHandlerDescriptor,

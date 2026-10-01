@@ -4,8 +4,8 @@ use eliot_context_contracts::{
     ActiveUnderstandingView, AdmittedContextSet, ContextError, ContextExecutionIdentity,
     ContextRecipe, DownstreamHeadroomRequest, DownstreamHeadroomResult, HeadroomAttempt,
     HeadroomDimension, HeadroomRefusal, HeadroomReleaseInstruction, MeasurementStatus,
-    QualityOperation, QualityRefusal, QualityRefusalKind, QualityScorecard,
-    SerializedContextMeasurement,
+    ActiveUnderstandingViewResult, QualityOperation, QualityRefusal, QualityRefusalKind,
+    QualityScorecard, SerializedContextMeasurement,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -699,69 +699,4 @@ fn validate_recipe_membership(
         }
     }
     Ok(())
-}
-
-/// Complete projection result retaining the exact A-15 accounting evidence
-/// that the compact view schema represents only through omission identities.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ActiveUnderstandingViewResult {
-    /// Canonical rendered candidate view.
-    pub view: ActiveUnderstandingView,
-    /// Exact admitted records, admissions, floor and economy retained for reconstruction.
-    pub admitted: AdmittedContextSet,
-    /// Exact bytes handed to the measurement callback.
-    pub serialized_bytes: Vec<u8>,
-    /// Boundary metadata for every rendered unit, plus the exact member relation.
-    ///
-    /// This is the round-trip half of the assembly result: readback can compare the
-    /// declared source identities, per-unit scope/fence and admitted source order
-    /// against what it reconstructed, instead of trusting a concatenated string.
-    /// Its recorded digest is validated against the payload held, and
-    /// `boundary_binding` binds it into the output identity together with the
-    /// upstream admission receipt digest.
-    pub boundaries: eliot_context_contracts::BoundaryMetadataSet,
-    /// Exact digest binding the admission receipt, the rendered output identity,
-    /// and the boundary metadata into one output identity.
-    ///
-    /// A consumer re-checks it with `ActiveUnderstandingViewResult::verify_boundaries`
-    /// rather than trusting the field: it is recomputed from what the consumer holds.
-    pub boundary_binding: String,
-}
-
-impl ActiveUnderstandingViewResult {
-    /// Re-check this result's boundary binding against the values it holds.
-    ///
-    /// The digest is recomputed from the retained admission receipt, the rendered
-    /// output identity, and the boundary payload held here, so a substituted
-    /// envelope, a reordered member, or a foreign source revision fails even when
-    /// each object would still validate on its own.
-    pub fn verify_boundaries(&self) -> Result<(), AssemblyError> {
-        boundary::verify_boundary_binding(
-            &self.boundary_binding,
-            &self.admitted.economy.receipt_digest,
-            &self.view.output_digest,
-            &self.boundaries,
-        )?;
-        self.boundaries
-            .validate(&boundary::assembly_boundary_limits())?;
-        self.round_trip_boundary_bytes()
-    }
-
-    /// Round-trips the packed bytes against the binding recorded at production.
-    ///
-    /// `boundary_binding` was recorded before any transport and is bound to the
-    /// upstream admission receipt, so the comparison is against the value the
-    /// owner admitted - not against a digest derived from the bytes being read
-    /// back, which would agree with itself.
-    fn round_trip_boundary_bytes(&self) -> Result<(), AssemblyError> {
-        boundary::read_back_boundaries(
-            &self.boundaries.pack()?,
-            &self.boundary_binding,
-            &self.admitted.economy.receipt_digest,
-            &self.view.output_digest,
-            &self.view.rendered,
-        )
-        .map(|_| ())
-        .map_err(AssemblyError::Contract)
-    }
 }

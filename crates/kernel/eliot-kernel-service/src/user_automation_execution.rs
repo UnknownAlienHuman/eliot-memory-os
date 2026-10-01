@@ -485,6 +485,8 @@ impl UserAutomationDurableJobMaterial {
             // absence is explicit and typed: nothing downstream may read it as
             // an empty record or mint one in its place.
             owner_record: None,
+            runtime_owner_execution_input: None,
+            runtime_owner_execution_input_bytes: None,
             output_contract: output_envelope,
             admission: admitted_job_ref(admission, &work_scope, budget_units, deadline_unix_ms)?,
             cancellation_id: format!("user-automation:{occurrence_id}:cancellation"),

@@ -7,6 +7,7 @@ use eliot_epistemic_contracts::{
     AbsenceClaim, CausalClaim, CoverageDenominator, CoverageReceipt, PropositionId, SupportRecord,
     TemporalRecord,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{error::ContractViolation, registry::TargetDenominator, screen::ScreenBinding};
@@ -15,7 +16,9 @@ const MAX_TEXT: usize = 16_384;
 const MAX_SUPPORT_HANDLES: usize = 64;
 
 /// The eight precision distinctions in A-14b.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaimKind {
     NumericQuantified,
@@ -29,7 +32,7 @@ pub enum ClaimKind {
 }
 
 /// Typed precision payload; no generic JSON or prose-only claim escape hatch.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PrecisionPayload {
     NumericQuantified {
@@ -390,7 +393,7 @@ pub fn component_content_digest(
 }
 
 /// Exact screen and target denominator identity retained with a claim.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ScreenTargetBinding {
     pub screen: ScreenBinding,
@@ -450,7 +453,7 @@ impl ScreenTargetBinding {
 }
 
 /// One material claim with stable proposed support and counterevidence sets.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MaterialClaim {
     pub claim_id: String,
@@ -632,7 +635,7 @@ impl MaterialClaim {
 }
 
 /// Explicitly retained non-material residue; it cannot silently become a fact.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NonMaterialClaim {
     pub claim_id: String,

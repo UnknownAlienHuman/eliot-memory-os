@@ -75,6 +75,13 @@ pub mod diagnostics;
 mod dreamer_admission;
 mod dreamer_materials;
 mod dreamer_model_adapter;
+/// Joins original context reconstruction, compilation and canonical projection owners.
+pub mod dreamer_orientation_context;
+pub mod dreamer_orientation_model;
+/// Executes the admitted CC-002 worker from retained semantic source bytes.
+pub mod dreamer_orientation_model_worker;
+/// Acquires original runtime publications through authenticated Task Controller claims.
+pub mod dreamer_orientation_runtime;
 /// Execution-path `OpenMetrics` wiring (issue #1841, I16.1/I16.2/I16.5): the
 /// bounded schema, labels, registry and exporter stay owned by
 /// `eliot-observability-runtime`; this module only installs that stack and maps
@@ -244,7 +251,8 @@ pub use daemon_kernel_client::{
 pub(crate) use daemon_kernel_port_adapters::kind_value;
 pub use dreamer_admission::{
     DREAMER_JOB_WIRE_ID, DreamerJobQueue, GovernorDreamerAdapter, KernelDreamerJobQueue,
-    OrientationSubmitInput,
+    OrientationSemanticInputClaim, OrientationSemanticInputError,
+    OrientationSemanticInputPublication, OrientationSubmitError, OrientationSubmitInput,
 };
 pub use dreamer_materials::{
     AdmittedSourceClaim, DreamerMaterialsError, FrozenOrientationManifest,
@@ -255,8 +263,9 @@ pub use dreamer_materials::{
     verify_resolved_bytes,
 };
 pub use dreamer_model_adapter::{
-    DAEMON_GENERATION_PROJECTION_OPERATION, DreamerModelExecution, GovernedDreamerModelAdapter,
-    KernelGenerationProjection, ModelInvokeInput, query_kernel_generation,
+    ConfiguredDreamerOrientationModelOwner, DAEMON_GENERATION_PROJECTION_OPERATION,
+    DreamerModelExecution, GovernedDreamerModelAdapter, KernelGenerationProjection,
+    ModelInvokeInput, query_kernel_generation,
 };
 pub use experience_runtime::{
     CommonGroundEventInputs, ExperienceCommitOutput, ExperienceDriverError,

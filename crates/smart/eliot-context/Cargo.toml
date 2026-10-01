@@ -7,6 +7,7 @@ license.workspace = true
 description = "ELIOT Smart context admission, orientation and decision-local views"
 
 [dependencies]
+eliot-context-measurement = { path = "../eliot-context-measurement", version = "0.1.0" }
 eliot-context-admission = { path = "../eliot-context-admission", version = "0.1.0" }
 eliot-context-assembly = { path = "../eliot-context-assembly", version = "0.1.0" }
 eliot-context-candidates = { path = "../eliot-context-candidates", version = "0.1.0" }

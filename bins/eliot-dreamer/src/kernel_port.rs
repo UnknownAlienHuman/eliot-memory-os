@@ -182,11 +182,15 @@ pub(crate) struct DreamerDispatchedEnvelope {
     /// `UserAutomation` content as a Dreamer orientation payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) semantic_input_bytes: Option<Vec<u8>>,
-    /// Opaque, content-addressed owner record the Kernel published for this
-    /// job. The child records its presence, the owner's recorded digest and
-    /// the owner's recorded byte length, and never interprets its content.
+    /// Original runtime-owner publication reference, opaque to the mechanical boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) owner_record: Option<OpaqueContentRef>,
+    pub(crate) runtime_owner_execution_input: Option<OpaqueContentRef>,
+    /// Exact bytes retained with that original publication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) runtime_owner_execution_input_bytes: Option<Vec<u8>>,
+    /// Original output contract retained by the durable owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) output_contract: Option<OpaqueContentRef>,
     /// Scope the ledger bound to this job (never caller bytes).
     pub(crate) scope_id: String,
     /// Fence the ledger bound to this job (never caller bytes).
@@ -218,8 +222,12 @@ pub(crate) struct ValidatedDreamerMaterial {
     pub(crate) semantic_input: Option<OpaqueContentRef>,
     /// Exact original inline bytes, when supplied by the Store owner.
     pub(crate) semantic_input_bytes: Option<Vec<u8>>,
-    /// Opaque, content-addressed owner record the Kernel published.
-    pub(crate) owner_record: Option<OpaqueContentRef>,
+    /// Original runtime-owner publication reference, opaque to the mechanical boundary.
+    pub(crate) runtime_owner_execution_input: Option<OpaqueContentRef>,
+    /// Exact bytes retained with that original publication.
+    pub(crate) runtime_owner_execution_input_bytes: Option<Vec<u8>>,
+    /// Original output contract retained by the durable owner.
+    pub(crate) output_contract: Option<OpaqueContentRef>,
     /// Scope the ledger bound to this job.
     pub(crate) scope_id: String,
     /// Fence the ledger bound to this job.
@@ -292,12 +300,12 @@ pub(crate) enum KernelPortError {
     /// its exact inline bytes.
     #[error("dreamer Kernel reply semantic input reference or bytes are stale: {0}")]
     SemanticInputStale(String),
-    /// A Kernel reply carries an owner record whose recorded digest, byte
-    /// length or artifact handle does not hold. The record is opaque, so this
-    /// proves only that the owner's ORIGINAL recorded value is what travels —
-    /// it never interprets the record and never recomputes its digest here.
-    #[error("dreamer Kernel reply owner record is not the owner's recorded value: {0}")]
-    OwnerRecordStale(String),
+    /// Original execution metadata is absent on one side of the opaque byte binding.
+    #[error("dreamer runtime-owner execution publication is unavailable")]
+    RuntimeOwnerInputUnavailable,
+    /// Original execution publication or output contract changed across the claim handshake.
+    #[error("dreamer runtime-owner execution publication or output contract is stale: {0}")]
+    RuntimeOwnerInputStale(String),
     /// A claim/status reply changed the claimed job identity or fence.
     #[error("dreamer Kernel reply job, attempt, scope, or fence changed")]
     StaleClaimBinding,
@@ -466,14 +474,7 @@ fn validate_envelope(
             .validate_semantic_input_bytes(bytes)
             .map_err(|error| KernelPortError::SemanticInputStale(error.to_string()))?;
     }
-    // The owner record is opaque: the child re-proves the owner's ORIGINAL
-    // recorded digest, byte length and artifact handle through the existing
-    // `validate`, and never recomputes the digest or interprets the content.
-    if let Some(owner_record) = &envelope.owner_record {
-        owner_record
-            .validate("owner_record.sha256")
-            .map_err(|error| KernelPortError::OwnerRecordStale(error.to_string()))?;
-    }
+    validate_runtime_owner_material(envelope)?;
     envelope
         .fence
         .validate()
@@ -503,7 +504,9 @@ fn validate_envelope(
         revision: envelope.revision,
         semantic_input: envelope.semantic_input.clone(),
         semantic_input_bytes: envelope.semantic_input_bytes.clone(),
-        owner_record: envelope.owner_record.clone(),
+        runtime_owner_execution_input: envelope.runtime_owner_execution_input.clone(),
+        runtime_owner_execution_input_bytes: envelope.runtime_owner_execution_input_bytes.clone(),
+        output_contract: envelope.output_contract.clone(),
         scope_id: envelope.scope_id.clone(),
         fence: envelope.fence.clone(),
         epoch: envelope.epoch.clone(),
@@ -511,6 +514,33 @@ fn validate_envelope(
         nonce: envelope.nonce.clone(),
         grant: envelope.grant.clone(),
     })
+}
+
+/// Validates the original owner-issued reference and bytes without interpreting their semantics.
+fn validate_runtime_owner_material(
+    envelope: &DreamerDispatchedEnvelope,
+) -> Result<(), KernelPortError> {
+    match (
+        &envelope.runtime_owner_execution_input,
+        &envelope.runtime_owner_execution_input_bytes,
+    ) {
+        (Some(reference), Some(bytes)) => {
+            reference
+                .validate("runtime_owner_execution_input.sha256")
+                .map_err(|error| KernelPortError::RuntimeOwnerInputStale(error.to_string()))?;
+            reference
+                .validate_semantic_input_bytes(bytes)
+                .map_err(|error| KernelPortError::RuntimeOwnerInputStale(error.to_string()))?;
+        }
+        (None, None) => {}
+        _ => return Err(KernelPortError::RuntimeOwnerInputUnavailable),
+    }
+    if let Some(reference) = &envelope.output_contract {
+        reference
+            .validate("output_contract.sha256")
+            .map_err(|error| KernelPortError::RuntimeOwnerInputStale(error.to_string()))?;
+    }
+    Ok(())
 }
 
 /// Requires non-blank, control-free, bounded identity text, mirroring the
@@ -1285,15 +1315,6 @@ fn checked_response(
 /// semantic input and the exact claimed job/attempt/scope/fence. Lifecycle
 /// revisions may advance after `Start`, so operation-specific revision
 /// binding remains the responsibility of `validate_for` above.
-///
-/// The opaque owner record is bound here against the ORIGINAL value staged for
-/// this job: the Kernel reply must carry exactly the reference the dispatch
-/// material carries, and both sides' digest, byte length and artifact handle are
-/// re-proved through the existing `OpaqueContentRef::validate` rather than
-/// recomputed on this side. A record absent on both sides stays the typed
-/// absence `None`; a record present on one side only is a stale owner record,
-/// not an empty one. Nothing here decodes the record, so it can never stand in
-/// for a typed `OrientationSupply` member.
 fn validate_owner_response_binding(
     material: &ValidatedDreamerMaterial,
     response: &DurableJobResponse,
@@ -1319,31 +1340,13 @@ fn validate_owner_response_binding(
             "Kernel owner reply changed the original semantic input bytes".to_owned(),
         ));
     }
-    // The owner record is opaque. What is bound here is its presence, the
-    // owner's recorded digest and the owner's recorded byte length against the
-    // ORIGINAL value staged for this job — re-proved through the existing
-    // `validate` on both sides, never recomputed here, and never decoded. An
-    // absent record stays absent on both sides: a Kernel that published one and
-    // a staged material that carries one must agree exactly.
-    if let Some(owner_record) = &response.owner_record {
-        owner_record
-            .validate("owner_record.sha256")
-            .map_err(|error| KernelPortError::OwnerRecordStale(error.to_string()))?;
-        let staged = material
-            .owner_record
-            .as_ref()
-            .ok_or(KernelPortError::OwnerRecordStale(
-                "Kernel owner reply carries an owner record this claim was not staged with"
-                    .to_owned(),
-            ))?;
-        if owner_record != staged {
-            return Err(KernelPortError::OwnerRecordStale(
-                "Kernel owner reply changed the original owner record".to_owned(),
-            ));
-        }
-    } else if material.owner_record.is_some() {
-        return Err(KernelPortError::OwnerRecordStale(
-            "Kernel owner reply dropped the staged owner record".to_owned(),
+    if response.runtime_owner_execution_input != material.runtime_owner_execution_input
+        || response.runtime_owner_execution_input_bytes
+            != material.runtime_owner_execution_input_bytes
+        || response.output_contract != material.output_contract
+    {
+        return Err(KernelPortError::RuntimeOwnerInputStale(
+            "Kernel owner reply changed original execution metadata".to_owned(),
         ));
     }
     if response.job_id.as_str() != material.job_id
@@ -1941,7 +1944,8 @@ mod tests {
             KernelPortError::StaleGeneration { .. } => "StaleGeneration",
             KernelPortError::SemanticInputUnavailable => "SemanticInputUnavailable",
             KernelPortError::SemanticInputStale(_) => "SemanticInputStale",
-            KernelPortError::OwnerRecordStale(_) => "OwnerRecordStale",
+            KernelPortError::RuntimeOwnerInputUnavailable => "RuntimeOwnerInputUnavailable",
+            KernelPortError::RuntimeOwnerInputStale(_) => "RuntimeOwnerInputStale",
             KernelPortError::StaleClaimBinding => "StaleClaimBinding",
             KernelPortError::BadNonce => "BadNonce",
             KernelPortError::BadGrant(_) => "BadGrant",

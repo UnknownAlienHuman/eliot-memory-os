@@ -89,6 +89,9 @@ pub(crate) mod table {
     /// closed. The digest IS the immutable revision identity: a new
     /// digest is a new row, never an in-place rewrite.
     pub(crate) const LEARNING_RECORD: &str = "learning_record";
+    /// Immutable campaign-owner source revisions and their exact current
+    /// heads. Created by the closed Orientation source-publication operation.
+    pub(crate) const CAMPAIGN_SOURCE: &str = "campaign_source";
 
     /// Singleton instrument-registry snapshot head (issue #1814 W1.2). One
     /// row under the fixed `head` key carrying the verbatim opaque
@@ -153,6 +156,7 @@ pub(crate) mod table {
         EXPERIENCE_FEEDBACK,
         LEARNING_RECORD,
         INSTRUMENT_REGISTRY,
+        CAMPAIGN_SOURCE,
     ];
 }
 
@@ -412,6 +416,12 @@ DEFINE FIELD record_digest ON learning_record TYPE string;
 DEFINE FIELD state_fence ON learning_record TYPE object;
 DEFINE FIELD scope_id ON learning_record TYPE string;
 DEFINE FIELD task_id ON learning_record TYPE option<string>;
+";
+
+/// Campaign owner source revision/head rows are created by the closed
+/// owner-source publication operation; this body has no migration identity.
+pub(crate) const ORIENTATION_OWNER_SOURCE_TABLES_DDL: &str = r"
+DEFINE TABLE IF NOT EXISTS campaign_source SCHEMALESS;
 ";
 
 pub(crate) const SCHEMA_DDL_V2: &str = r"
