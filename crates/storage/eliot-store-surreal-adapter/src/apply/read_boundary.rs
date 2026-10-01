@@ -429,7 +429,7 @@ const READ_TASK_CONTRACT_ACCEPTANCE_RECORD: &str = "SELECT VALUE { namespace: na
 
 const READ_BLOB_PROCESS_SOURCE_ADMISSION: &str = "SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision, schema: schema, payload: payload, value_digest: value_digest } FROM recovery_owner WHERE namespace = $blob_process_source_namespace AND key = $blob_process_source_key LIMIT 1;";
 
-const READ_POLICY_OWNER_SNAPSHOT: &str = "SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision, schema: schema, payload: payload, value_digest: value_digest } FROM recovery_owner WHERE namespace = 'owner' AND key = 'policy' LIMIT 2;";
+const READ_POLICY_OWNER_SNAPSHOT: &str = "BEGIN TRANSACTION; SELECT VALUE { state_fence: state_fence, next_commit_sequence: next_commit_sequence, next_outbox_sequence: next_outbox_sequence } FROM ONLY canonical_fence:current; SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision, schema: schema, payload: payload, value_digest: value_digest } FROM recovery_owner WHERE namespace = 'owner' AND key = 'policy' LIMIT 2; COMMIT TRANSACTION;";
 
 async fn policy_owner_snapshot_payload(
     db: &client::RpcTransport,
@@ -444,7 +444,20 @@ async fn policy_owner_snapshot_payload(
         Map::new(),
     )
     .await?;
-    let rows = take_vec::<RecoveryRecord>(&mut response, 0)?;
+    // `RpcResults::take` intentionally preserves a result body even when its
+    // statement status is ERR. Check the owner response before interpreting an
+    // empty row vector as physical absence.
+    if !response.take_errors().is_empty() {
+        return Err(StoreError::Unavailable.into());
+    }
+    let current_fence = response
+        .take::<Option<FenceRecord>>(1)?
+        .ok_or(StoreError::Unavailable)?;
+    validate_fence_record(&current_fence)?;
+    if current_fence.state_fence != *state_fence {
+        return Err(StoreError::FenceMismatch.into());
+    }
+    let rows = take_vec::<RecoveryRecord>(&mut response, 2)?;
     let record_key = RecoveryRecordKey::new("owner", "policy").map_err(AdapterError::Store)?;
     let result = match rows.as_slice() {
         [] => PolicyOwnerSnapshotReadResult::Absent { record_key },
