@@ -309,6 +309,53 @@ pub struct ObservationContent {
     /// Source handles, when available.
     #[serde(default)]
     pub source_handles: Vec<String>,
+    /// Original write-submission values for this capture. Read-only Observe
+    /// suboperations do not carry this field.
+    pub write_submission: OriginalWriteSubmissionInput,
+}
+
+/// Explicit versioned write values supplied with an original Observation
+/// capture. These are preserved as source metadata through Governor admission.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OriginalWriteSubmissionInput {
+    /// Version of the submitted write envelope.
+    pub protocol_version: u32,
+    /// Stable user/agent intent across typed correction attempts.
+    pub write_intent_id: String,
+    /// Original response preference for this write.
+    pub response_mode: String,
+}
+
+impl OriginalWriteSubmissionInput {
+    fn validate(&self) -> Result<(), ContractViolation> {
+        if self.protocol_version != 1 {
+            return Err(ContractViolation::InvalidField {
+                field: "observe.write_submission.protocol_version",
+                reason: "unsupported write envelope version",
+            });
+        }
+        non_blank(
+            &self.write_intent_id,
+            "observe.write_submission.write_intent_id",
+        )?;
+        if self.write_intent_id.chars().any(char::is_control) {
+            return Err(ContractViolation::InvalidField {
+                field: "observe.write_submission.write_intent_id",
+                reason: "must contain no control characters",
+            });
+        }
+        if !matches!(
+            self.response_mode.as_str(),
+            "wait_for_commit" | "accept_after_stage"
+        ) {
+            return Err(ContractViolation::InvalidField {
+                field: "observe.write_submission.response_mode",
+                reason: "must be wait_for_commit or accept_after_stage",
+            });
+        }
+        Ok(())
+    }
 }
 
 impl ObservationContent {
@@ -320,7 +367,8 @@ impl ObservationContent {
             });
         }
         unique_non_blank(&self.affected_resources, "observe.affected_resources")?;
-        unique_non_blank(&self.source_handles, "observe.source_handles")
+        unique_non_blank(&self.source_handles, "observe.source_handles")?;
+        self.write_submission.validate()
     }
 }
 
