@@ -109,6 +109,10 @@ impl PresentedClaimMaterial {
         clippy::too_many_arguments,
         reason = "the presented claim is one flat ingress tuple: claim/attempt/operation identities, durable digests, presented revisions, claiming-worker generation, and operation fence; grouping them would invent a second contract beside the T9-04 owner request"
     )]
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the ingress tuple stays owned end to end so every daemon producer (agent_fabric, solo driver, factory) passes the same shape; the claimed attempt is shape-checked then proven via the factory agreement gate and witnessed row, not retained a third time"
+    )]
     pub fn new(
         claim_id: String,
         attempt_id: String,
