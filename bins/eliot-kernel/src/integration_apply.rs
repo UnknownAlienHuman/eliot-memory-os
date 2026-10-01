@@ -597,9 +597,7 @@ pub fn apply_integration_candidate(
             target_scope: request.target_scope.clone(),
         });
     }
-    if candidate.base_commit != request.current_base_commit
-        && request.candidate_depends_on_base
-    {
+    if candidate.base_commit != request.current_base_commit && request.candidate_depends_on_base {
         return Ok(ApplyOutcome::StaleRecorded {
             stale: Box::new(transition_candidate(
                 candidate,
@@ -671,14 +669,13 @@ pub fn apply_integration_candidate(
         });
     }
     if !request.pre_apply_verifier_passed {
-        let rollback =
-            request
-                .rollback
-                .clone()
-                .ok_or(IntegrationApplyError::InvalidField {
-                    field: "rollback",
-                    reason: "a verifier failure must record its rollback or compensation result",
-                })?;
+        let rollback = request
+            .rollback
+            .clone()
+            .ok_or(IntegrationApplyError::InvalidField {
+                field: "rollback",
+                reason: "a verifier failure must record its rollback or compensation result",
+            })?;
         let receipt = OutcomeReceipt {
             request_id: candidate.request_id.clone(),
             candidate_id: candidate.candidate_id.clone(),
@@ -715,15 +712,13 @@ pub fn apply_integration_candidate(
         });
     }
     if !request.post_apply_verifier_passed {
-        let rollback =
-            request
-                .rollback
-                .clone()
-                .ok_or(IntegrationApplyError::InvalidField {
-                    field: "rollback",
-                    reason:
-                        "a post-apply failure must record its rollback or compensation result",
-                })?;
+        let rollback = request
+            .rollback
+            .clone()
+            .ok_or(IntegrationApplyError::InvalidField {
+                field: "rollback",
+                reason: "a post-apply failure must record its rollback or compensation result",
+            })?;
         let receipt = OutcomeReceipt {
             request_id: candidate.request_id.clone(),
             candidate_id: candidate.candidate_id.clone(),
@@ -858,10 +853,7 @@ fn validate_apply_request(
         MAX_REF_LEN,
     )?;
     require_path_set(&request.applied_paths, "applied_paths")?;
-    require_path_set(
-        &request.preserved_dirty_paths,
-        "preserved_dirty_paths",
-    )?;
+    require_path_set(&request.preserved_dirty_paths, "preserved_dirty_paths")?;
     for path in request.preserved_dirty_paths.iter() {
         if request.applied_paths.contains(path) {
             return Err(IntegrationApplyError::InvalidField {
@@ -888,24 +880,17 @@ fn validate_apply_request(
             "conflict_work_refs",
             MAX_EVIDENCE_ENTRIES,
         )?;
-        require_time(
-            conflict.observed_at_unix_ms,
-            "conflict observed_at_unix_ms",
-        )?;
+        require_time(conflict.observed_at_unix_ms, "conflict observed_at_unix_ms")?;
     }
     if request.semantic_conflict.is_some() {
-        if request.post_apply_verifier_passed
-            || request.post_apply_verifier_receipt.is_some()
-        {
+        if request.post_apply_verifier_passed || request.post_apply_verifier_receipt.is_some() {
             return Err(IntegrationApplyError::InvalidField {
                 field: "post_apply_verifier_receipt",
                 reason: "no post-apply verifier runs on a conflict hold",
             });
         }
     } else if !request.pre_apply_verifier_passed {
-        if request.post_apply_verifier_passed
-            || request.post_apply_verifier_receipt.is_some()
-        {
+        if request.post_apply_verifier_passed || request.post_apply_verifier_receipt.is_some() {
             return Err(IntegrationApplyError::InvalidField {
                 field: "post_apply_verifier_receipt",
                 reason: "no post-apply verifier runs after a pre-apply failure",
@@ -926,10 +911,7 @@ fn validate_apply_request(
     }
     if let Some(rollback) = &request.rollback {
         require_text(&rollback.result_ref, "rollback result_ref", MAX_REF_LEN)?;
-        require_time(
-            rollback.observed_at_unix_ms,
-            "rollback observed_at_unix_ms",
-        )?;
+        require_time(rollback.observed_at_unix_ms, "rollback observed_at_unix_ms")?;
     }
     require_time(request.observed_at_unix_ms, "observed_at_unix_ms")?;
     Ok(())
@@ -1052,10 +1034,7 @@ fn require_ref_list(
 }
 
 /// Requires a caller-observed time that is never zero.
-fn require_time(
-    value: u64,
-    field: &'static str,
-) -> Result<(), IntegrationApplyError> {
+fn require_time(value: u64, field: &'static str) -> Result<(), IntegrationApplyError> {
     if value == 0 {
         return Err(IntegrationApplyError::InvalidField {
             field,
