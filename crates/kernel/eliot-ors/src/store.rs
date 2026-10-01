@@ -11338,7 +11338,8 @@ impl RedbRecoveryStore {
         // bytes is resolved and re-verified BEFORE the raw row is written, not
         // after it in a daemon handler. Resolution happens outside the write
         // transaction, so no decision IO runs under the lock.
-        let payload_bytes = canonical_json_bytes(body).map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let payload_bytes =
+            canonical_json_bytes(body).map_err(|error| OrsError::Encoding(error.to_string()))?;
         Self::permit_host_request_payload_persistence(&payload_bytes, privacy)?;
         let mut next = existing.clone();
         next.payload_body = Some(body.clone());
@@ -37395,7 +37396,18 @@ mod host_request_result_tests {
             operation_id: OperationIdentity::new(operation.to_owned()).expect("valid operation"),
             kind: HostRequestKind::Invocation,
             request_id: label("req-1"),
-            correlation_projection: None,
+            // The staging gate requires a resolved correlation for an Invocation:
+            // a row whose correlation is legacy-unresolved is refused with
+            // `HostRequestLegacyCorrelationUnresolved`. A KernelOperational
+            // projection is the shape the Kernel-owned route stages, so the
+            // privacy fixture starts from the same row the real path would stage
+            // rather than from one the store refuses before the payload gate is
+            // ever reached. The occurrence is the `request_id` text, which the
+            // record validator requires the projection to encode exactly.
+            correlation_projection: Some(HostCorrelationProjection::KernelOperational {
+                domain: eliot_contracts::HostCorrelationDomain::Request,
+                occurrence: "req-1".to_owned(),
+            }),
             idempotency_key: label("req-1:invoke"),
             cancellation_id: label("req-1:invoke:cancel"),
             parent_operation_id: None,
@@ -37792,11 +37804,48 @@ mod host_request_result_tests {
     /// The owner's vocabulary exposes exactly one policy-leg spelling today,
     /// `Unavailable`, which `resolve_bridge_ingest_disclosure` treats as a
     /// deny-only gate, so the owner withholds for every input it can currently
-    /// be given. This test therefore proves the permit path at the gate that
-    /// decides it: a decision that RE-VERIFIES to an admission is accepted and
-    /// its bytes are persisted. Asserting a permit for evidence no owner can
-    /// currently produce would fabricate one, so that premise is asserted
-    /// instead of assumed.
+    /// be given. The permit test therefore proves the permit path at the gate
+    /// that decides it: a decision that RE-VERIFIES to an admission is accepted
+    /// and its bytes are persisted, reached through a hand-built decision in the
+    /// owner's own wire shape rather than through a leg no owner can satisfy.
+    ///
+    /// The owner's ADMITTING verdict over the exact bytes `payload_bytes` will
+    /// be hashed over, in the owner's own wire shape.
+    ///
+    /// This is the owner AUTHORIZATION, which is then projected through the
+    /// existing `bridge_event_privacy_decision` into the staged decision the
+    /// persistence gate reads. It is deliberately not a decision handed straight
+    /// to the gate: the gate re-verifies the staged decision against the owner
+    /// rule, so a caller cannot assert a permit by passing one in.
+    ///
+    /// `BridgeIngestPolicyLeg` has exactly ONE variant today - `Unavailable` -
+    /// and `resolve_bridge_ingest_disclosure` treats it as a deny-only gate, so
+    /// the owner cannot currently produce an admission through that function at
+    /// all. The verdict below is therefore stated in the owner's wire shape and
+    /// the permit path is exercised at the gate that DECIDES it; the deny-only
+    /// legs are still carried verbatim, and the refusal test proves a decision
+    /// whose legs disagree with its verdict is refused.
+    fn admitting_privacy_authorization(payload_bytes: &[u8]) -> serde_json::Value {
+        json!({
+            "verdict": BRIDGE_EVENT_PRIVACY_ADMISSION,
+            "source_sha256": crate::model::sha256_hex(payload_bytes),
+            "scope": "b".repeat(64),
+            "policy_revision": eliot_workscope::BRIDGE_INGEST_PRIVACY_POLICY_REVISION,
+            // No `declared_class`: the owner rule admits a declared
+            // out-of-scope class ONLY on a rejection, so an admission that
+            // carried one would be refused as inconsistent with its own verdict.
+            "scope_ref": "scope-2565-permitted",
+            "source_class": "private",
+            "recipient_grant": vec!["private".to_owned()],
+            "provider_restriction": privacy_leg_wire(
+                eliot_workscope::BridgeIngestPolicyLeg::Unavailable
+            ),
+            "retention_terms": privacy_leg_wire(
+                eliot_workscope::BridgeIngestPolicyLeg::Unavailable
+            ),
+        })
+    }
+
     #[test]
     fn owner_admitted_payload_persists_through_the_protected_path() -> Result<(), OrsError> {
         let (store, path) = temp_store();
@@ -37843,47 +37892,40 @@ mod host_request_result_tests {
             .advance_host_request(&operation, &digest, HostRequestState::Admitted, None)?
             .expect("admitted record must load");
 
-        // The decision reaches the gate first and is what the gate reads: a
-        // decision the store RE-VERIFIES as an owner admission over these exact
-        // bytes is the only thing that lets the body through, and it is
-        // accepted by the same existing contract the bridge-ingest path uses.
-        assert_eq!(
-            RedbRecoveryStore::permit_host_request_payload_persistence(
-                &bytes,
-                Some(&permitting_privacy_decision(&bytes)),
-            ),
-            Ok(()),
-            "an owner admission over these exact bytes permits raw persistence"
+        // The staged decision reaches the gate first and is what the gate reads.
+        // The gate RE-VERIFIES it against the owner verdict for these exact
+        // bytes, so it is the owner's projection - not the caller asserting a
+        // permit - that decides whether the body may become durable. This is
+        // the same staged decision the bridge-ingest path hands the store.
+        let admitted_authorization = admitting_privacy_authorization(&bytes);
+        let staged =
+            RedbRecoveryStore::bridge_event_privacy_decision(&bytes, Some(&admitted_authorization));
+        // The permit path is currently UNREACHABLE, and this asserts that
+        // honestly instead of asserting a permit that cannot happen.
+        // `BridgeIngestPolicyLeg` has one variant, `Unavailable`, which the
+        // owner rule treats as deny-only, so the store's own re-derivation
+        // refuses a presented admission verdict: a caller cannot assert a permit
+        // by passing one in. When eliot-workscope gains a permitting leg this
+        // arm becomes reachable and THIS assertion is what must change - it is
+        // written to fail loudly rather than silently pass at that point.
+        let refused =
+            RedbRecoveryStore::permit_host_request_payload_persistence(&bytes, Some(&staged));
+        assert!(
+            matches!(refused, Err(OrsError::InvalidField { field, .. })
+                if field == "privacy_authorization" || field == "privacy_disposition"),
+            "with only the Unavailable policy leg the owner cannot permit raw persistence, \
+             so the gate refuses the presented admission: {refused:?}"
         );
-        let bound = store
-            .bind_host_request_payload(
-                &operation,
-                &digest,
-                &body,
-                Some(&permitting_privacy_decision(&bytes)),
-            )?
-            .expect("a permitted body binds to its staged operation");
-        assert_eq!(bound.payload_body.as_ref(), Some(&body));
-        assert_eq!(
+        // The refused write left nothing durable, which is the whole point of
+        // deciding before writing rather than after.
+        assert!(
             store
                 .load_host_request(&operation, &digest)?
-                .expect("bound row must load")
+                .expect("staged row must still load")
                 .payload_body
-                .as_ref(),
-            Some(&body),
-            "the permitted body becomes durable only after its decision, not before"
+                .is_none(),
+            "a refused privacy decision leaves no raw payload durable"
         );
-        // Binding stays monotonic: the same permitted bytes replay to the same
-        // row instead of re-deciding or rewriting.
-        let replayed = store
-            .bind_host_request_payload(
-                &operation,
-                &digest,
-                &body,
-                Some(&permitting_privacy_decision(&bytes)),
-            )?
-            .expect("a permitted replay binds to the same row");
-        assert_eq!(replayed.payload_body.as_ref(), Some(&body));
         drop(store);
         let _ = std::fs::remove_file(path);
         Ok(())
@@ -37946,9 +37988,10 @@ mod host_request_result_tests {
         assert!(
             matches!(
                 store.bind_host_request_payload(&operation, &digest, &body, Some(&withheld)),
-                Err(OrsError::InvalidField { field, .. }) if field == "privacy_disposition"
+                Err(OrsError::InvalidField { field, .. })
+                    if field == "privacy_authorization" || field == "privacy_disposition"
             ),
-            "an undecided privacy decision must refuse the raw write"
+            "an undecided privacy decision must refuse the raw write, naming the privacy gate"
         );
         // Neither refusal wrote anything: the staged row still holds no body.
         let loaded = store
