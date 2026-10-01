@@ -306,6 +306,11 @@ impl BlobProcessStreamKernelOperationRequest {
 #[serde(deny_unknown_fields)]
 pub struct BlobProcessStreamKernelSourceReadbackRequest {
     pub wire_revision: u16,
+    /// Kernel-issued capability reference, required to bind Store read
+    /// authority to the same admitted TestD job.
+    pub capability: ProcessStreamSinkCapabilityRef,
+    /// Exact Store-issued binding returned by the corresponding Open.
+    pub binding: ProcessStreamSinkBindingRef,
     pub job_id: String,
     pub invocation_id: String,
     pub operation_id: String,
@@ -335,6 +340,8 @@ impl BlobProcessStreamKernelSourceReadbackRequest {
         if self.wire_revision != PROCESS_STREAM_READBACK_WIRE_REVISION {
             return Err(WireValidationError::UnsupportedRevision);
         }
+        self.capability.validate()?;
+        self.binding.validate()?;
         for (field, value) in [
             ("job_id", self.job_id.as_str()),
             ("invocation_id", self.invocation_id.as_str()),
@@ -385,6 +392,8 @@ impl BlobProcessStreamKernelSourceReadbackRequest {
         self.validate()?;
         let request = ProcessStreamSourceReadbackRequest {
             wire_revision: self.wire_revision,
+            capability: self.capability.clone(),
+            binding: self.binding.clone(),
             job_id: self.job_id.clone(),
             invocation_id: self.invocation_id.clone(),
             operation_id: self.operation_id.clone(),
@@ -959,6 +968,10 @@ pub struct ProcessStreamPolicyBinding {
 pub struct ProcessStreamSourceReadbackRequest {
     /// Wire revision, currently [`PROCESS_STREAM_READBACK_WIRE_REVISION`].
     pub wire_revision: u16,
+    /// Kernel-issued capability reference associated with the admitted job.
+    pub capability: ProcessStreamSinkCapabilityRef,
+    /// Store-issued reference for the exact original Open session.
+    pub binding: ProcessStreamSinkBindingRef,
     /// Durable job identity serving this readback.
     pub job_id: String,
     /// Instrument invocation identity serving this readback.
@@ -1007,6 +1020,8 @@ impl ProcessStreamSourceReadbackRequest {
         if self.wire_revision != PROCESS_STREAM_READBACK_WIRE_REVISION {
             return Err(WireValidationError::UnsupportedRevision);
         }
+        self.capability.validate()?;
+        self.binding.validate()?;
         for (field, value) in [
             ("job_id", self.job_id.as_str()),
             ("invocation_id", self.invocation_id.as_str()),
@@ -1348,6 +1363,11 @@ pub enum ProcessStreamSourceReadbackResponse {
     Ready {
         /// Bounded ephemeral source bytes; clients must not persist this field.
         bytes: Vec<u8>,
+        /// Original whole-source SHA-256 commitment, distinct from this
+        /// response chunk's observed SHA-256.
+        whole_source_sha256: String,
+        /// Original whole-source byte length, distinct from this chunk's size.
+        whole_source_byte_length: u64,
         /// Offset of this contiguous chunk in the exact source.
         chunk_offset: u64,
         /// SHA-256 observed over the returned exact bytes.
