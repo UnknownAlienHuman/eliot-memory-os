@@ -90,6 +90,12 @@ pub(crate) const DAEMON_STARTUP_EVIDENCE_OPERATION: &str = "daemon_startup_evide
 /// through the single timing owner and always answers with its exact durable
 /// head so the producer converges after renewals on any path.
 pub(crate) const DAEMON_SUPERVISION_PROGRESS_OPERATION: &str = "daemon_supervision_progress";
+/// Authenticated eliotd poll for one pending Kernel-issued Blob owner-facts read.
+pub(crate) const TESTD_BLOB_OWNER_FACTS_PENDING_OPERATION: &str =
+    "testd_blob_owner_facts_pending";
+/// Authenticated eliotd completion for one exact Blob owner-facts pull.
+pub(crate) const TESTD_BLOB_OWNER_FACTS_COMPLETE_OPERATION: &str =
+    "testd_blob_owner_facts_complete";
 /// Authenticated Governor publish operation carrying one live-derivation
 /// projection (issue #1935 AUD1, I7.16). The Governor-owned derivation
 /// publishes its exact revision, exact active fingerprint, and exact
@@ -3162,6 +3168,96 @@ impl KernelComposition {
         #[cfg(windows)]
         self.require_current_daemon_session(session)?;
         let result = match operation {
+            #[cfg(windows)]
+            TESTD_BLOB_OWNER_FACTS_PENDING_OPERATION => {
+                let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+                identity
+                    .validate()
+                    .map_err(|_| TransportError::SessionFenced)?;
+                if identity.request.state_fence != session.module_generation.state_fence {
+                    return Err(TransportError::SessionFenced);
+                }
+                let pending = self
+                    .p07_ors
+                    .next_blob_process_stream_owner_facts_pull()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .map(|record| {
+                        serde_json::from_str::<
+                            eliot_blob_api::wire::BlobProcessStreamOwnerFactsPullRequest,
+                        >(&record.request_json)
+                        .map_err(|_| TransportError::SessionFenced)
+                    })
+                    .transpose()?;
+                Ok(serde_json::json!({
+                    "kind": TESTD_BLOB_OWNER_FACTS_PENDING_OPERATION,
+                    "request": pending,
+                }))
+            }
+            #[cfg(windows)]
+            TESTD_BLOB_OWNER_FACTS_COMPLETE_OPERATION => {
+                let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+                identity
+                    .validate()
+                    .map_err(|_| TransportError::SessionFenced)?;
+                if identity.request.state_fence != session.module_generation.state_fence {
+                    return Err(TransportError::SessionFenced);
+                }
+                let Some(fields) = payload.as_object() else {
+                    return Err(TransportError::SessionFenced);
+                };
+                if fields.len() != 2
+                    || fields.get("kind").and_then(serde_json::Value::as_str)
+                        != Some(TESTD_BLOB_OWNER_FACTS_COMPLETE_OPERATION)
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                let response: eliot_blob_api::wire::BlobProcessStreamOwnerFactsPullResponse =
+                    serde_json::from_value(
+                        fields
+                            .get("request")
+                            .cloned()
+                            .ok_or(TransportError::SessionFenced)?,
+                    )
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let pending = self
+                    .p07_ors
+                    .load_blob_process_stream_owner_facts_pull(&response.pull_ref)
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .ok_or(TransportError::SessionFenced)?;
+                let pull_request: eliot_blob_api::wire::BlobProcessStreamOwnerFactsPullRequest =
+                    serde_json::from_str(&pending.request_json)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                response
+                    .validate_for_request(&pull_request)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                if pending.state != eliot_ors::BlobProcessStreamOwnerFactsPullState::Pending
+                    || response.observed_state_fence
+                        != identity.request.state_fence
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                let response_json =
+                    serde_json::to_string(&response).map_err(|_| TransportError::SessionFenced)?;
+                let response_sha256 = sha256_hex(response_json.as_bytes());
+                let completed = eliot_ors::BlobProcessStreamOwnerFactsPullRecord {
+                    state: eliot_ors::BlobProcessStreamOwnerFactsPullState::Completed,
+                    response_json: Some(response_json),
+                    response_sha256: Some(response_sha256.clone()),
+                    ..pending
+                };
+                let retained = self
+                    .p07_ors
+                    .complete_blob_process_stream_owner_facts_pull(&completed)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let retained_sha256 = retained
+                    .response_sha256
+                    .ok_or(TransportError::SessionFenced)?;
+                Ok(serde_json::json!({
+                    "kind": TESTD_BLOB_OWNER_FACTS_COMPLETE_OPERATION,
+                    "pull_ref": retained.pull_ref,
+                    "response_sha256": retained_sha256,
+                }))
+            }
             #[cfg(windows)]
             scan_disclosure_route::OPERATION => {
                 self.scan_disclosure_owner_operation(session, payload)
