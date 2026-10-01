@@ -16,8 +16,10 @@
 //! ([`record_mailbox_delivery`], stable name
 //! [`COORDINATION_MAILBOX_DELIVER_NAME`]), the required control-message
 //! acknowledgement handling ([`acknowledge_mailbox_message`], stable name
-//! [`COORDINATION_MAILBOX_ACKNOWLEDGE_NAME`]), and the derived delivery-order
-//! projection ([`project_mailbox_queue`]). Durability stays with the canonical
+//! [`COORDINATION_MAILBOX_ACKNOWLEDGE_NAME`]), the derived delivery-order
+//! projection ([`project_mailbox_queue`]), and the rebuildable coordination
+//! map ([`rebuild_coordination_map_view`], stable name
+//! [`COORDINATION_MAP_VIEW_NAME`]). Durability stays with the canonical
 //! Store through the existing Store bridge; this module builds no scheduler,
 //! task graph, subscription engine, or routing authority, keeps no rows, and
 //! owns no lease.
@@ -31,17 +33,23 @@
 //! `replayed: true` instead of recording a second effect. The delivery path
 //! calls [`record_mailbox_delivery`] against the admitted record, and the
 //! control path calls [`acknowledge_mailbox_message`] for records admitted
-//! with `requires_acknowledgement`. The stable `*_NAME` and `*_SCHEMA_V1`
+//! with `requires_acknowledgement`. The route/delivery slice calls
+//! [`rebuild_coordination_map_view`] under [`COORDINATION_MAP_VIEW_NAME`]
+//! before resolving recipients: it rebuilds the map from the frozen plan/wave
+//! revision pair plus the current assignments, resolves the attempt/work-item
+//! recipient through [`CoordinationMapView::resolve_recipient`], and delivers
+//! through that entry's queue. Every entry queue is the
+//! [`project_mailbox_queue`] projection of the already-known records; the
+//! view carries no rows of its own. The stable `*_NAME` and `*_SCHEMA_V1`
 //! constants are the exact keys those slices register on the Store bridge;
 //! they are declared here so the names cannot drift between the Kernel surface
 //! and the bridge registration.
 //!
 //! # What this deliberately does not do
 //!
-//! No `CoordinationMapView`, no large-payload handles, no route capabilities,
-//! and no expiry/reassignment: those are later slices. A message admitted here
-//! starts undelivered; every later delivery step is owned by the slice that
-//! performs it.
+//! No large-payload handles, no route capabilities, and no expiry/reassignment:
+//! those are later slices. A message admitted here starts undelivered; every
+//! later delivery step is owned by the slice that performs it.
 //!
 //! # Relation to the coordination record
 //!
@@ -548,4 +556,198 @@ fn require_timestamp(value: u64, field: &'static str) -> Result<(), Coordination
         });
     }
     Ok(())
+}
+
+// ============================================================================
+// Derived coordination map view (issue #1820, map-view slice).
+//
+// The view is rebuilt strictly from one frozen plan/wave revision pair plus
+// the current assignments, over the already-known mailbox records: it admits
+// no rows, runs no scheduler, keeps no subscription state, and grants no
+// routing authority. Each entry pairs one assignment with the delivery-order
+// projection for its initial recipient (the assigned attempt when the work
+// item is currently assigned, else the work item itself), derived through
+// [`project_mailbox_queue`], so the queue a recipient routes to is exactly
+// the queue admission order already defines. Typed failures stay typed:
+// every rejection is a [`CoordinationMailboxError`].
+//
+// Out of scope here: large-payload handles, route capabilities, and
+// expiry/reassignment (later slices).
+// ============================================================================
+
+/// Schema identifier for a rebuilt coordination map. The route/delivery slice
+/// binds this exact key to the view it rebuilt; the Kernel surface never mints
+/// a second one.
+pub const COORDINATION_MAP_VIEW_SCHEMA_V1: &str = "eliot.coordination.map_view.v1";
+/// Stable named rebuild. The route/delivery slice calls
+/// [`rebuild_coordination_map_view`] under this exact name before resolving
+/// recipients.
+pub const COORDINATION_MAP_VIEW_NAME: &str = "RebuildCoordinationMapView";
+
+/// One current assignment the map is rebuilt from. `work_item_id` is the
+/// addressable work-item identity spelled by the producing owner;
+/// `assigned_attempt_id` names the attempt currently holding it, when any.
+/// Both spellings stay in the record's text-plus-`TaskId` scheme: no second
+/// identity scheme is introduced.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MapAssignment {
+    /// Addressable work-item identity spelled by the producing owner.
+    pub work_item_id: String,
+    /// Task that owns the coordination context.
+    pub task_id: TaskId,
+    /// Attempt currently holding the work item, if assigned.
+    pub assigned_attempt_id: Option<String>,
+}
+
+/// Addressable recipient from the rebuilt map: exactly one of an assigned
+/// attempt or an unassigned work item. This is the initial-routing spelling
+/// the route/delivery slice resolves before delivering.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MapRecipient {
+    /// Explicit attempt recipient, if assigned.
+    pub attempt_id: Option<String>,
+    /// Explicit work-item recipient, if not yet assigned.
+    pub work_item_id: Option<String>,
+}
+
+impl MapRecipient {
+    /// Creates an attempt recipient.
+    pub fn attempt(id: String) -> Self {
+        Self {
+            attempt_id: Some(id),
+            work_item_id: None,
+        }
+    }
+    /// Creates a work-item recipient.
+    pub fn work_item(id: String) -> Self {
+        Self {
+            attempt_id: None,
+            work_item_id: Some(id),
+        }
+    }
+    /// Requires exactly one of attempt or work item. Called by
+    /// [`CoordinationMapView::resolve_recipient`]; there is no other caller.
+    fn validate(&self) -> Result<(), CoordinationMailboxError> {
+        if self.attempt_id.is_none() == self.work_item_id.is_none() {
+            return Err(CoordinationMailboxError::InvalidField {
+                field: "recipient",
+                reason: "must name exactly one of attempt or work item",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// One entry in the rebuilt coordination map: one assignment plus the
+/// delivery-order projection for its initial recipient. The queue's
+/// `recipient_id` names that initial recipient (the assigned attempt when
+/// present, else the work item), so the routing decision is explicit in the
+/// derived data, never recomputed by the consumer.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoordinationMapEntry {
+    /// Work item this entry was rebuilt for.
+    pub work_item_id: String,
+    /// Task that owns the coordination context.
+    pub task_id: TaskId,
+    /// Attempt currently holding the work item, if assigned.
+    pub assigned_attempt_id: Option<String>,
+    /// Known records for the initial recipient ordered by
+    /// `(sequence, message_id)`.
+    pub queue: MailboxQueue,
+}
+
+/// Derived recipient-addressing view. It carries the frozen revision pair it
+/// was rebuilt from and owns no plan state: it cannot mutate assignments,
+/// grant routing authority, or schedule delivery.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoordinationMapView {
+    /// Frozen plan revision the view was rebuilt from.
+    pub plan_revision: String,
+    /// Frozen wave revision the view was rebuilt from.
+    pub wave_revision: String,
+    /// One entry per assignment, in assignment order.
+    pub entries: Vec<CoordinationMapEntry>,
+}
+
+impl CoordinationMapView {
+    /// Returns the exact entry for an attempt/work-item recipient, or a typed
+    /// failure. An attempt matches only the entry currently assigned to it; a
+    /// work item matches only its own entry. Anything else names a recipient
+    /// that is not present in this frozen map.
+    pub fn resolve_recipient(
+        &self,
+        recipient: &MapRecipient,
+    ) -> Result<&CoordinationMapEntry, CoordinationMailboxError> {
+        recipient.validate()?;
+        self.entries
+            .iter()
+            .find(|entry| {
+                let by_work_item = recipient
+                    .work_item_id
+                    .as_ref()
+                    .is_some_and(|id| *id == entry.work_item_id);
+                let by_attempt = recipient
+                    .attempt_id
+                    .as_ref()
+                    .is_some_and(|id| entry.assigned_attempt_id.as_ref() == Some(id));
+                by_work_item || by_attempt
+            })
+            .ok_or(CoordinationMailboxError::InvalidField {
+                field: "recipient",
+                reason: "not present in the frozen coordination map",
+            })
+    }
+}
+
+/// Named rebuild (`RebuildCoordinationMapView`).
+///
+/// Derives the view strictly from the frozen plan/wave revision pair plus the
+/// current assignments, over the caller-read-back records (the Store bridge
+/// readback in production); this function stores nothing itself. Each entry's
+/// queue is the [`project_mailbox_queue`] projection for the entry's initial
+/// recipient, so typed queue failures propagate unchanged. A repeated
+/// (work item, task) assignment is a typed rejection, never a silent
+/// first-match: the map must route every recipient explicitly.
+pub fn rebuild_coordination_map_view(
+    plan_revision: &str,
+    wave_revision: &str,
+    assignments: &[MapAssignment],
+    messages: &[CoordinationMailboxRecord],
+) -> Result<CoordinationMapView, CoordinationMailboxError> {
+    require_text(plan_revision, "plan_revision", MAX_IDENTITY_LEN)?;
+    require_text(wave_revision, "wave_revision", MAX_IDENTITY_LEN)?;
+    let mut entries = Vec::with_capacity(assignments.len());
+    for assignment in assignments {
+        require_text(&assignment.work_item_id, "work_item_id", MAX_IDENTITY_LEN)?;
+        if let Some(attempt_id) = assignment.assigned_attempt_id.as_deref() {
+            require_text(attempt_id, "assigned_attempt_id", MAX_IDENTITY_LEN)?;
+        }
+        if entries.iter().any(|entry| {
+            entry.work_item_id == assignment.work_item_id && entry.task_id == assignment.task_id
+        }) {
+            return Err(CoordinationMailboxError::InvalidField {
+                field: "assignments",
+                reason: "duplicate assignment",
+            });
+        }
+        let initial = assignment
+            .assigned_attempt_id
+            .as_deref()
+            .unwrap_or(assignment.work_item_id.as_str());
+        entries.push(CoordinationMapEntry {
+            work_item_id: assignment.work_item_id.clone(),
+            task_id: assignment.task_id.clone(),
+            assigned_attempt_id: assignment.assigned_attempt_id.clone(),
+            queue: project_mailbox_queue(messages, initial, &assignment.task_id)?,
+        });
+    }
+    Ok(CoordinationMapView {
+        plan_revision: plan_revision.to_owned(),
+        wave_revision: wave_revision.to_owned(),
+        entries,
+    })
 }
