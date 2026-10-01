@@ -569,31 +569,29 @@ where
                 // stopped through the original stop operation and a stop
                 // that cannot prove termination preserves the failure state
                 // and retries here instead of starting blindly over it.
-                let terminated =
-                    match self.observe_prior_kernel_terminated(context, &prior_service) {
-                        Ok(None) => {
-                            // Already-absent branch needs no stop effect,
-                            // but the start below still requires the
-                            // restart-normalized state a verified stop
-                            // establishes: DegradedRecovery admits
-                            // Starting, while Active/ControlReady do not.
-                            self.state = HostServiceState::DegradedRecovery;
-                            true
-                        }
-                        Ok(Some(_)) => {
-                            match self.stop_kernel_for_restart(context, &prior_service) {
-                                Ok(_) => true,
-                                Err(error) => {
-                                    last_error = Some(error.to_string());
-                                    false
-                                }
-                            }
-                        }
+                let terminated = match self.observe_prior_kernel_terminated(context, &prior_service)
+                {
+                    Ok(None) => {
+                        // Already-absent branch needs no stop effect,
+                        // but the start below still requires the
+                        // restart-normalized state a verified stop
+                        // establishes: DegradedRecovery admits
+                        // Starting, while Active/ControlReady do not.
+                        self.state = HostServiceState::DegradedRecovery;
+                        true
+                    }
+                    Ok(Some(_)) => match self.stop_kernel_for_restart(context, &prior_service) {
+                        Ok(_) => true,
                         Err(error) => {
                             last_error = Some(error.to_string());
                             false
                         }
-                    };
+                    },
+                    Err(error) => {
+                        last_error = Some(error.to_string());
+                        false
+                    }
+                };
                 if !terminated {
                     continue;
                 }
