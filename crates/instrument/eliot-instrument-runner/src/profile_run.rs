@@ -553,10 +553,66 @@ impl InstrumentRun {
         grant: &InstrumentAdmissionGrant,
         target_layout: Option<StageTargetLayout>,
     ) -> Self {
+        Self::launched_observed(
+            route,
+            operation_id,
+            grant,
+            grant.content_digest.as_str(),
+            target_layout,
+        )
+        .unwrap_or_else(|reason| Self::missing(route, reason))
+    }
+
+    /// Records a launched stage whose executable identity was OBSERVED by the
+    /// launching lane (issue #1914, external audit 5918718113 — see also
+    /// AUD4's "launched no admitted stage; no tool identity was observed").
+    ///
+    /// `observed_executable_digest` must be the digest this run measured over
+    /// the exact executable bytes it admitted and launched. That measurement
+    /// already exists upstream: `ExecutableObservation::observe_from_intent`
+    /// re-hashes the executable at
+    /// `Path::new(intent.executable())` and REFUSES unless the recomputed digest
+    /// equals `intent.executable_sha256()`, so the value reaching this
+    /// constructor is a machine observation of the bytes that ran, not a
+    /// declared, planned or requested identity.
+    ///
+    /// Why this constructor exists: the run's `executable_digest` used to be
+    /// taken from `grant.content_digest`, so whether a launched stage counted as
+    /// identified depended on the GRANT's shape rather than on anything this run
+    /// observed. `require_launched_stage` counts
+    /// `runs.iter().filter(|run| run.executable_digest.is_some())`, so a route
+    /// that genuinely launched every stage could still be refused as having
+    /// "launched no admitted stage". The identity is now bound to the launch
+    /// observation itself.
+    ///
+    /// The digest is still VALIDATED rather than trusted for its spelling, and a
+    /// malformed observation fails closed into an explicit missing proof instead
+    /// of a launched run claiming an identity no producer observed. The grant
+    /// remains recorded as `grant_digest`; a grant whose `content_digest`
+    /// disagrees with the observation is refused rather than preferred, because
+    /// the observation is the later, measured fact.
+    fn launched_observed(
+        route: &TestExecutionPlaneRoute,
+        operation_id: String,
+        grant: &InstrumentAdmissionGrant,
+        observed_executable_digest: &str,
+        target_layout: Option<StageTargetLayout>,
+    ) -> Result<Self, String> {
+        validate_digest(observed_executable_digest, "observed executable identity")
+            .map_err(|error| format!("launched stage identity is unverified: {error}"))?;
+        if !observed_executable_digest.is_empty()
+            && !grant.content_digest.is_empty()
+            && grant.content_digest != observed_executable_digest
+        {
+            return Err(
+                "launched stage identity differs from the sealed grant; the executable changed between admission and launch"
+                    .to_owned(),
+            );
+        }
         let Ok(stage) = route.stage().clone().bound(operation_id) else {
-            return Self::missing(route, "sealed operation identity is malformed");
+            return Err("sealed operation identity is malformed".to_owned());
         };
-        Self {
+        Ok(Self {
             stage,
             plane: TestExecutionPlaneRoute::plane(),
             testd_dispatchable: route.dispatchable_via_testd(),
@@ -565,15 +621,11 @@ impl InstrumentRun {
                 reason: "launched; terminal observation is owned by the supervising lane"
                     .to_owned(),
             },
-            executable_digest: if grant.content_digest.is_empty() {
-                None
-            } else {
-                Some(grant.content_digest.clone())
-            },
+            executable_digest: Some(observed_executable_digest.to_owned()),
             grant_digest: Some(grant.grant_digest.clone()),
             candidate_identity: None,
             target_layout,
-        }
+        })
     }
 
     /// Records a launched stage bound to its plan identity from birth (I10.8.4).
@@ -590,6 +642,7 @@ impl InstrumentRun {
         route: &TestExecutionPlaneRoute,
         operation_id: String,
         grant: &InstrumentAdmissionGrant,
+        observed_executable_digest: &str,
         target_layout: Option<StageTargetLayout>,
         plan: &StagePlan,
     ) -> Self {
@@ -601,7 +654,16 @@ impl InstrumentRun {
         if !belongs {
             return Self::missing(route, "launched stage does not belong to the bound plan");
         }
-        let mut run = Self::launched(route, operation_id, grant, target_layout);
+        let mut run = match Self::launched_observed(
+            route,
+            operation_id,
+            grant,
+            observed_executable_digest,
+            target_layout,
+        ) {
+            Ok(run) => run,
+            Err(reason) => return Self::missing(route, reason),
+        };
         run.candidate_identity.clone_from(&plan.candidate_identity);
         run
     }
@@ -1241,7 +1303,18 @@ impl StageOrchestrator {
             Ok(receipt) => {
                 let operation = receipt.process.operation_id().as_str().to_owned();
                 let target_layout = StageTargetLayout::sealed(planned, &receipt);
-                InstrumentRun::launched_in_plan(route, operation, &grant, Some(target_layout), plan)
+                // Issue #1914: the run's executable identity is the digest THIS
+                // lane observed over the exact bytes it admitted
+                // (`observe_from_intent` re-hashed the file and refused on
+                // mismatch), not a value copied from the request or the plan.
+                InstrumentRun::launched_in_plan(
+                    route,
+                    operation,
+                    &grant,
+                    identity.content_digest.as_str(),
+                    Some(target_layout),
+                    plan,
+                )
             }
             Err(error) => InstrumentRun::missing(route, format!("stage launch failed: {error}")),
         }
