@@ -632,6 +632,7 @@ struct ObserveInputSeal<'a> {
     projection: ObserveApplicationOwnerProjection,
 }
 
+#[derive(Clone, Copy)]
 struct HostOriginObserveRowSource<'a> {
     record: &'a HostRequestRecord,
     envelope: &'a HostRequestEnvelope,
@@ -2036,7 +2037,7 @@ impl KernelComposition {
     /// observation submission into the existing host-request readback.
     ///
     /// The stage is reconstructed only after the protected original
-    /// StoreApplyOperation and its ORS reservation pass the same full
+    /// `StoreApplyOperation` and its ORS reservation pass the same full
     /// validation used by the result-submit path. This is a read-only view:
     /// it does not advance the host-request row or imply a terminal receipt.
     pub(crate) fn validated_original_staged_observe_submission(
@@ -2126,6 +2127,228 @@ impl KernelComposition {
         eliot_store_api::WriteSubmission::staged(&admission)
             .map(Some)
             .map_err(|_| TransportError::SessionFenced)
+    }
+
+    /// Waits on the exact original Observe operation before returning its
+    /// bridge response. The wait is Kernel-runtime registered and observes
+    /// only the durable host-request and reservation rows for that original
+    /// operation; the response frame's correlation envelope is left intact.
+    pub(crate) async fn await_observe_host_request_reply(
+        self: &std::sync::Arc<Self>,
+        request: &Frame,
+        reply: &mut Frame,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), TransportError> {
+        use eliot_runtime::{SpawnDisposition, TaskFailure};
+
+        let ProtocolPayload::Json(request_payload) = &request.payload else {
+            return Ok(());
+        };
+        let Some(operation) = request_payload
+            .get("operation")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return Ok(());
+        };
+        if !matches!(
+            operation,
+            AGENT_HOST_REQUEST_SUBMIT_OPERATION
+                | AGENT_HOST_REQUEST_RECONCILE_OPERATION
+                | AGENT_HOST_REQUEST_REHYDRATE_OPERATION
+                | AGENT_HOST_REQUEST_RESOLVE_OPERATION
+        ) {
+            return Ok(());
+        }
+        let ProtocolPayload::Json(reply_payload) = &reply.payload else {
+            return Ok(());
+        };
+        if reply_payload.get("status").and_then(serde_json::Value::as_str) != Some("known")
+            || reply_payload
+                .get("value")
+                .and_then(|value| value.get("accepted"))
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+        {
+            return Ok(());
+        }
+        let record_value = reply_payload
+            .get("value")
+            .and_then(|value| value.get("record"))
+            .cloned()
+            .ok_or(TransportError::SessionFenced)?;
+        let record: HostRequestRecord =
+            serde_json::from_value(record_value).map_err(|_| TransportError::SessionFenced)?;
+        record
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if record.capability_ref.as_str() != OBSERVE_CAPABILITY
+            || record.kind != OrsHostRequestKind::Invocation
+        {
+            return Ok(());
+        }
+        let (_, tool_request) = self.read_observe_executable_input(&record)?;
+        let arguments = tool_request
+            .get("arguments")
+            .and_then(serde_json::Value::as_object);
+        if arguments
+            .and_then(|value| value.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            != Some("observation")
+            || !arguments.is_some_and(|value| value.contains_key("write_submission"))
+        {
+            return Ok(());
+        }
+        let original_submission = Self::original_write_submission_from_tool_request(&tool_request)?;
+        if !matches!(
+            original_submission.response_mode.as_str(),
+            "accept_after_stage" | "wait_for_commit"
+        ) {
+            return Err(TransportError::SessionFenced);
+        }
+
+        let owner = std::sync::Arc::clone(self);
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let initial_record = record.clone();
+        let response_mode = original_submission.response_mode;
+        let disposition = self.runtime.spawn_control(
+            "kernel.host-observe-response-wait",
+            move |cancellation| async move {
+                let result = owner
+                    .wait_for_original_observe_response(
+                        initial_record,
+                        response_mode,
+                        shutdown,
+                        cancellation,
+                    )
+                    .await;
+                let _ = sender.send(result);
+                Ok::<(), TaskFailure>(())
+            },
+        );
+        match disposition {
+            SpawnDisposition::DeniedShuttingDown => return Err(TransportError::SessionFenced),
+            SpawnDisposition::Admitted(handle) => drop(handle),
+        }
+        let (record, stage) = receiver.await.map_err(|_| TransportError::SessionFenced)??;
+        let ProtocolPayload::Json(reply_payload) = &mut reply.payload else {
+            return Err(TransportError::SessionFenced);
+        };
+        let value = reply_payload
+            .get_mut("value")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or(TransportError::SessionFenced)?;
+        value.insert(
+            "record".to_owned(),
+            serde_json::to_value(record).map_err(|_| TransportError::SessionFenced)?,
+        );
+        value.insert(
+            "stage".to_owned(),
+            serde_json::to_value(stage).map_err(|_| TransportError::SessionFenced)?,
+        );
+        reply
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(())
+    }
+
+    async fn wait_for_original_observe_response(
+        self: &std::sync::Arc<Self>,
+        original: HostRequestRecord,
+        response_mode: String,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+        cancellation: eliot_runtime::CancellationToken,
+    ) -> Result<(HostRequestRecord, Option<eliot_store_api::WriteSubmission>), TransportError> {
+        let operation_id = original.operation_id.clone();
+        let request_digest = original.request_digest.clone();
+        let mut current = self
+            .generation_gateway
+            .ors
+            .load_host_request(&operation_id, &request_digest)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::SessionFenced)?;
+        if current.operation_id != original.operation_id
+            || current.request_digest != original.request_digest
+            || current.deadline_unix_ms != original.deadline_unix_ms
+            || !current.same_binding(&original)
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        let mut reservation = self
+            .generation_gateway
+            .ors
+            .load_write_reservation_by_operation(&operation_id)
+            .map_err(|_| TransportError::SessionFenced)?;
+        loop {
+            if current.operation_id != original.operation_id
+                || current.request_digest != original.request_digest
+                || current.deadline_unix_ms != original.deadline_unix_ms
+                || !current.same_binding(&original)
+            {
+                return Err(TransportError::IdentityConflict);
+            }
+            let terminal = matches!(
+                current.state,
+                HostRequestState::ResultReceived
+                    | HostRequestState::Terminal
+                    | HostRequestState::Cancelled
+                    | HostRequestState::Expired
+                    | HostRequestState::Conflicted
+            );
+            if terminal {
+                return Ok((current, None));
+            }
+            let stage = self.validated_original_staged_observe_submission(&current)?;
+            if response_mode == "accept_after_stage" && stage.is_some() {
+                return Ok((current, stage));
+            }
+            let remaining_ms = current.deadline_unix_ms.saturating_sub(unix_ms());
+            if remaining_ms == 0 {
+                return Ok((current, stage));
+            }
+
+            let reservation_state = reservation.as_ref().map(|value| value.state);
+            let store = std::sync::Arc::clone(&self.generation_gateway.ors);
+            let wake = tokio::select! {
+                () = cancellation.cancelled() => return Err(TransportError::SessionFenced),
+                _ = async {
+                    loop {
+                        if *shutdown.borrow() || shutdown.changed().await.is_err() {
+                            return;
+                        }
+                    }
+                } => return Err(TransportError::SessionFenced),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(remaining_ms)) => None,
+                changed = store.wait_for_host_write_change(
+                    &operation_id,
+                    &request_digest,
+                    current.state,
+                    reservation_state,
+                ) => Some(changed.map_err(|_| TransportError::SessionFenced)?),
+            };
+            let Some((latest, latest_reservation)) = wake else {
+                current = self
+                    .generation_gateway
+                    .ors
+                    .load_host_request(&operation_id, &request_digest)
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .ok_or(TransportError::SessionFenced)?;
+                reservation = self
+                    .generation_gateway
+                    .ors
+                    .load_write_reservation_by_operation(&operation_id)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                continue;
+            };
+            if latest.operation_id != original.operation_id
+                || latest.request_digest != original.request_digest
+                || latest.deadline_unix_ms != original.deadline_unix_ms
+                || !latest.same_binding(&original)
+            {
+                return Err(TransportError::IdentityConflict);
+            }
+            current = latest;
+            reservation = latest_reservation;
+        }
     }
 
     fn staged_observe_admission_projection(
@@ -7857,7 +8080,7 @@ impl KernelComposition {
         if canonical_json_bytes(&operation).map_err(|_| TransportError::SessionFenced)? != bytes {
             return Err(TransportError::SessionFenced);
         }
-        let computed_prepared_transition_sha256 = self.validate_original_staged_operation_source(
+        let computed_prepared_transition_sha256 = Self::validate_original_staged_operation_source(
             record,
             input,
             &operation,
@@ -7877,7 +8100,6 @@ impl KernelComposition {
     }
 
     fn validate_original_staged_operation_source(
-        &self,
         record: &HostRequestRecord,
         input: &HostRequestExecutableInput,
         operation: &super::daemon_request_dispatch::StoreApplyOperation,
