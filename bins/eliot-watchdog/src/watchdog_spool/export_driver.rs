@@ -10,6 +10,7 @@
 //! exact export, acknowledgement, and compaction calls without adding
 //! transport, admission, canonical-store, or semantic authority. There is no
 //! process execution, executor, or child-launch path here by construction.
+//! Export performs no process execution: the sink only acknowledges entries.
 //!
 //! Spool-local intents are ordinary covered records of this window, not a
 //! parked boundary: the fenced Kernel `watchdog-spool-batch-v1` intent route
