@@ -874,6 +874,8 @@ async fn serve_admitted_bridge_host_requests(
                 tool,
                 admission_receipt,
                 record,
+                reconnect_envelope,
+                logical_key,
             } => {
                 let reply = match kernel
                     .finish_replay_reply(
@@ -884,6 +886,8 @@ async fn serve_admitted_bridge_host_requests(
                         tool,
                         admission_receipt,
                         record,
+                        reconnect_envelope,
+                        logical_key,
                     )
                     .await
                 {

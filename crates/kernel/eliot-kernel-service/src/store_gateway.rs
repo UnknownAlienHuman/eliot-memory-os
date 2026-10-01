@@ -3874,6 +3874,7 @@ impl KernelStoreGateway {
             payload_digest,
             payload_schema_id: None,
             payload_body: None,
+            finish_replay_binding: None,
             connection_ref: obligation_label(
                 obligation,
                 USER_AUTOMATION_RUNTIME_CHANNEL.to_owned(),

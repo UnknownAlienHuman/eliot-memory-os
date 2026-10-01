@@ -105,15 +105,41 @@ impl KernelComposition {
         tool: serde_json::Value,
         admission_receipt: eliot_protocol::HostRequestAdmissionReceipt,
         expected_record: HostRequestRecord,
+        reconnect_envelope: Option<HostRequestEnvelope>,
+        logical_key: Option<String>,
     ) -> Result<crate::Frame, TransportError> {
+        let persisted: super::PersistedFinishReplayBinding = serde_json::from_value(
+            expected_record
+                .finish_replay_binding
+                .clone()
+                .ok_or(TransportError::UnknownRequest)?,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        if persisted.envelope != envelope || persisted.tool != tool {
+            return Err(TransportError::IdentityConflict);
+        }
         let session_before = self.host_request_bridge_session(connection_id)?;
-        let (operation_id, owner_before) = self.validate_finish_replay_binding(
-            &session_before,
-            &envelope,
-            &tool,
-            &admission_receipt,
-            &expected_record,
-        )?;
+        let validate = |session: &Session| {
+            if let Some(current) = reconnect_envelope.as_ref() {
+                self.validate_finish_reconnect_binding(
+                    session,
+                    current,
+                    &persisted,
+                    &admission_receipt,
+                    &expected_record,
+                )
+            } else {
+                self.validate_finish_replay_binding(
+                    session,
+                    &envelope,
+                    &tool,
+                    &admission_receipt,
+                    &expected_record,
+                    &persisted.owner,
+                )
+            }
+        };
+        let (operation_id, owner_before) = validate(&session_before)?;
         let gateway = self.retained_store_gateway()?;
         let receipt = gateway
             .receipt(
@@ -131,13 +157,7 @@ impl KernelComposition {
         if session_before != session_after {
             return Err(TransportError::SessionFenced);
         }
-        let (operation_after, owner_after) = self.validate_finish_replay_binding(
-            &session_after,
-            &envelope,
-            &tool,
-            &admission_receipt,
-            &expected_record,
-        )?;
+        let (operation_after, owner_after) = validate(&session_after)?;
         if operation_after != operation_id || owner_after != owner_before {
             return Err(TransportError::SessionFenced);
         }
@@ -151,7 +171,13 @@ impl KernelComposition {
         ) {
             return Err(TransportError::IdentityConflict);
         }
-        let value = super::host_request_admitted_response(&admission_receipt, &expected_record);
+        let value = if let Some(key) = logical_key.as_deref() {
+            super::host_request_resolved_response(&expected_record, Some(key))
+        } else if reconnect_envelope.is_some() {
+            super::host_request_resolved_response(&expected_record, None)
+        } else {
+            super::host_request_admitted_response(&admission_receipt, &expected_record)
+        };
         super::KernelComposition::host_request_correlated_reply(
             &session_after,
             request_id,
@@ -171,6 +197,7 @@ impl KernelComposition {
         tool: &serde_json::Value,
         admission_receipt: &eliot_protocol::HostRequestAdmissionReceipt,
         expected_record: &HostRequestRecord,
+        original_owner: &super::super::ActivatedApplicationBinding,
     ) -> Result<(String, super::super::ActivatedApplicationBinding), TransportError> {
         envelope
             .validate_for_admission()
@@ -203,12 +230,25 @@ impl KernelComposition {
         expected_record
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
-        if expected_record.state != HostRequestState::ResultReceived
+        if !matches!(
+            expected_record.state,
+            HostRequestState::ResultReceived | HostRequestState::Terminal
+        )
             || expected_record.result_digest.is_none()
             || expected_record.result_response.is_none()
             || expected_record.payload_body.as_ref() != Some(tool)
         {
             return Err(TransportError::SessionFenced);
+        }
+        let persisted: super::PersistedFinishReplayBinding = serde_json::from_value(
+            expected_record
+                .finish_replay_binding
+                .clone()
+                .ok_or(TransportError::UnknownRequest)?,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        if persisted.envelope != *envelope || persisted.tool != *tool || persisted.owner != *original_owner {
+            return Err(TransportError::IdentityConflict);
         }
         let operation_id = host_request_operation_id(envelope);
         let operation = OperationIdentity::new(operation_id.clone())
@@ -226,39 +266,13 @@ impl KernelComposition {
         {
             return Err(TransportError::IdentityConflict);
         }
-        let expected = super::requested_host_request_record(envelope)?;
+        let mut expected = super::requested_host_request_record(envelope)?;
+        expected.finish_replay_binding = expected_record.finish_replay_binding.clone();
         if !stored.same_binding(&expected) {
             return Err(TransportError::IdentityConflict);
         }
-        let (queued_envelope, queued_tool) =
-            self.finish_pair_for_operation(&operation_id, &envelope.envelope_sha256)?;
-        if queued_envelope != *envelope || queued_tool != *tool {
-            return Err(TransportError::IdentityConflict);
-        }
-        let queue_attempt = {
-            let index = self
-                .host_request_connection_index
-                .lock()
-                .map_err(|_| TransportError::SessionFenced)?;
-            index
-                .values()
-                .flatten()
-                .find(|candidate| {
-                    candidate.operation_id == operation_id
-                        && candidate.request_digest == envelope.envelope_sha256
-                        && candidate.finish_envelope.as_ref() == Some(envelope)
-                        && candidate.finish_tool.as_ref() == Some(tool)
-                })
-                .map(|candidate| candidate.finish_attempt.clone())
-                .ok_or(TransportError::UnknownRequest)?
-        };
         let retained_attempt = stored.attempt.as_ref().ok_or(TransportError::SessionFenced)?;
-        if retained_attempt.phase != eliot_ors::HostRequestAttemptPhase::Claimed
-            || retained_attempt.attempt_id.as_str() != queue_attempt.attempt_id
-            || retained_attempt.generation != queue_attempt.generation
-            || retained_attempt.owner_connection_ref.as_str() != queue_attempt.owner_connection_id
-            || retained_attempt.owner_launch_nonce.as_str() != queue_attempt.owner_launch_nonce
-            || retained_attempt.owner_session_epoch != queue_attempt.owner_session_epoch
+        if retained_attempt.phase != eliot_ors::HostRequestAttemptPhase::ResponseReceived
         {
             return Err(TransportError::SessionFenced);
         }
@@ -272,7 +286,131 @@ impl KernelComposition {
         // completed decision into a new-work admission and strand legitimate
         // post-closure replay.
         let owner = self.finish_owner_binding_for_pair(envelope, tool, &admission_owner)?;
+        if &owner != original_owner {
+            return Err(TransportError::IdentityConflict);
+        }
         Ok((operation_id, owner))
+    }
+
+    fn validate_finish_reconnect_binding(
+        &self,
+        session: &Session,
+        reconnect_envelope: &HostRequestEnvelope,
+        persisted: &super::PersistedFinishReplayBinding,
+        admission_receipt: &eliot_protocol::HostRequestAdmissionReceipt,
+        expected_record: &HostRequestRecord,
+    ) -> Result<(String, super::super::ActivatedApplicationBinding), TransportError> {
+        reconnect_envelope
+            .validate_for_admission()
+            .map_err(|_| TransportError::SessionFenced)?;
+        persisted
+            .envelope
+            .validate_for_admission()
+            .map_err(|_| TransportError::SessionFenced)?;
+        super::check_finish_admission(&persisted.envelope, &persisted.tool)?;
+        eliot_protocol::HostRequestInvokeReadPayload {
+            wire_id: HOST_REQUEST_INVOKE_READ_WIRE_ID.to_owned(),
+            wire_version: HostRequestInvokeReadPayload::CONTRACT_VERSION,
+            envelope: persisted.envelope.clone(),
+            tool: persisted.tool.clone(),
+        }
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+        admission_receipt
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        expected_record
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let original = &persisted.owner;
+        if reconnect_envelope.kind != eliot_protocol::HostRequestKind::Status
+            || reconnect_envelope.connection_id != session.connection_id
+            || session.module_generation.state_fence != reconnect_envelope.state_fence
+            || !session
+                .authority_epoch
+                .is_same_authority(&reconnect_envelope.state_fence.authority_epoch)
+            || original.activation_generation != persisted.envelope.state_fence.resource_generation
+            || !original
+                .authority_epoch
+                .is_same_authority(&persisted.envelope.state_fence.authority_epoch)
+            || original.session_id != persisted.envelope.identity.session_id.as_deref().unwrap_or_default()
+            || original.task_id != persisted.envelope.identity.task_id.as_deref().unwrap_or_default()
+            || original.work_scope_id != persisted.envelope.identity.work_scope_id.as_deref().unwrap_or_default()
+            || original.principal_id.trim().is_empty()
+            || reconnect_envelope.identity.session_id.as_deref() != Some(original.session_id.as_str())
+            || reconnect_envelope.identity.task_id.as_deref() != Some(original.task_id.as_str())
+            || reconnect_envelope.identity.work_scope_id.as_deref() != Some(original.work_scope_id.as_str())
+            || HostRequestAdmissionReceipt::issue(&persisted.envelope)
+                .map_err(|_| TransportError::SessionFenced)?
+                != *admission_receipt
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let current = self
+            .agent_bridge_connections
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .get(&reconnect_envelope.connection_id)
+            .and_then(|state| state.activated_binding.clone())
+            .ok_or(TransportError::SessionFenced)?;
+        let pending = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let lifecycle = self
+            .generation_gateway
+            .ors
+            .load_activation_lifecycle(&original.activation_ticket_id)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::UnknownRequest)?;
+        if !KernelComposition::activation_result_still_retained_in(&pending, original)
+            || !self.activation_result_still_retained(
+                &pending,
+                original,
+                &lifecycle.connection_id,
+            )
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        if current.principal_id != original.principal_id
+            || current.session_id != original.session_id
+            || current.task_id != original.task_id
+            || current.work_scope_id != original.work_scope_id
+            || !current.authority_epoch.is_same_authority(&original.authority_epoch)
+            || current.activation_generation != original.activation_generation
+            || expected_record.operation_id.as_str()
+                != host_request_operation_id(&persisted.envelope)
+            || expected_record.request_digest != persisted.envelope.envelope_sha256
+            || expected_record.capability_ref.as_str() != "eliot.finish"
+            || expected_record.payload_body.as_ref() != Some(&persisted.tool)
+            || expected_record.finish_replay_binding.as_ref()
+                != serde_json::to_value(persisted).ok().as_ref()
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        let operation_id = host_request_operation_id(&persisted.envelope);
+        let operation = OperationIdentity::new(operation_id.clone())
+            .map_err(|_| TransportError::SessionFenced)?;
+        let stored = self
+            .generation_gateway
+            .ors
+            .load_host_request(&operation, &persisted.envelope.envelope_sha256)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::UnknownRequest)?;
+        let mut requested = super::requested_host_request_record(&persisted.envelope)?;
+        requested.finish_replay_binding = expected_record.finish_replay_binding.clone();
+        if stored != *expected_record
+            || !stored.same_binding(&requested)
+            || !matches!(stored.state, HostRequestState::ResultReceived | HostRequestState::Terminal)
+            || stored.result_digest.is_none()
+            || stored.result_response.is_none()
+            || stored.attempt.as_ref().is_none_or(|attempt| {
+                attempt.phase != eliot_ors::HostRequestAttemptPhase::ResponseReceived
+            })
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        Ok((operation_id, original.clone()))
     }
 
     pub(super) fn enqueue_campaign_packet_pair_under_transition(
@@ -816,7 +954,8 @@ impl KernelComposition {
                 {
                     return Err(TransportError::SessionFenced);
                 }
-                let expected = super::requested_host_request_record(envelope)?;
+                let mut expected = super::requested_host_request_record(envelope)?;
+                expected.finish_replay_binding = stored.finish_replay_binding.clone();
                 if !stored.same_binding(&expected)
                     || stored.payload_body.as_ref() != Some(tool)
                 {
@@ -1115,7 +1254,8 @@ impl KernelComposition {
             });
         }
         let (envelope, state, tool) = self.finish_queued_pair(body)?;
-        let expected = super::requested_host_request_record(&envelope)?;
+        let mut expected = super::requested_host_request_record(&envelope)?;
+        expected.finish_replay_binding = stored.finish_replay_binding.clone();
         if !stored.same_binding(&expected) || stored.payload_body.as_ref() != tool.as_ref() {
             return Err(TransportError::IdentityConflict);
         }
@@ -1330,7 +1470,8 @@ impl KernelComposition {
             parent_operation.as_str(),
             &parent_digest,
         )?;
-        let expected = super::requested_host_request_record(&envelope_before)?;
+        let mut expected = super::requested_host_request_record(&envelope_before)?;
+        expected.finish_replay_binding = parent.finish_replay_binding.clone();
         if !parent.same_binding(&expected) {
             return Err(TransportError::IdentityConflict);
         }

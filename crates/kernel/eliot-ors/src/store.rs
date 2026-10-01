@@ -37066,6 +37066,7 @@ mod host_request_result_tests {
             payload_digest: "b".repeat(64),
             payload_schema_id: None,
             payload_body: None,
+            finish_replay_binding: None,
             connection_ref: label("conn-1"),
             session_ref: Some(label("session-1")),
             task_ref: None,
