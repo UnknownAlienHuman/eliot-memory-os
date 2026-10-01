@@ -27598,9 +27598,21 @@ impl RedbRecoveryStore {
     pub fn open_for_installation_with_owner_evidence(
         path: impl AsRef<Path>,
         installation_id: &str,
-    ) -> Result<(Self, Arc<crate::OwnerOrderingHeadEvidence>, OrsStoreIdentity), OrsError> {
+    ) -> Result<
+        (
+            Self,
+            Arc<crate::OwnerOrderingHeadEvidence>,
+            OrsStoreIdentity,
+        ),
+        OrsError,
+    > {
         let evidence = Arc::new(crate::OwnerOrderingHeadEvidence::new());
-        let provider: Arc<dyn CanonicalEvidenceProvider> = Arc::clone(&evidence);
+        // The unsizing coercion needs an assignment that names the trait
+        // object: `Arc::clone` is generic over the pointee and coerces
+        // nothing. This bumps the strong count of the allocation above, so the
+        // handle returned here and the provider the store holds stay the same
+        // allocation.
+        let provider: Arc<dyn CanonicalEvidenceProvider> = evidence.clone();
         let (mut store, record) = Self::open_inner(path, provider, Some(installation_id))?;
         store.owner_evidence = Some(Arc::clone(&evidence));
         Ok((store, evidence, record.installed_identity()?))

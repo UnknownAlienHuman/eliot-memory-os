@@ -249,10 +249,7 @@ impl CanonicalEvidenceProvider for OwnerOrderingHeadEvidence {
     /// not follow an owner read, is refused. Absent evidence refuses; a scope
     /// the owner did not answer refuses unless it is at genesis; a claimed
     /// sequence that differs from the owner-observed committed sequence refuses.
-    fn verify_ordering_heads(
-        &self,
-        scopes: &[ScopeReservationRequest],
-    ) -> Result<(), OrsError> {
+    fn verify_ordering_heads(&self, scopes: &[ScopeReservationRequest]) -> Result<(), OrsError> {
         let observed = self
             .armed
             .lock()
@@ -282,7 +279,7 @@ impl CanonicalEvidenceProvider for OwnerOrderingHeadEvidence {
             let committed = observed.heads.get(scope.scope.as_str()).ok_or_else(|| {
                 OrsError::CanonicalEvidence(format!(
                     "canonical Store observation has no ordering head for scope {}",
-                    scope.scope
+                    scope.scope.as_str()
                 ))
             })?;
             let expected = scope.expected_head.sequence;
@@ -296,7 +293,7 @@ impl CanonicalEvidenceProvider for OwnerOrderingHeadEvidence {
             if !agrees {
                 return Err(OrsError::CanonicalEvidence(format!(
                     "requested ordering head for scope {} is not the committed canonical Store head",
-                    scope.scope
+                    scope.scope.as_str()
                 )));
             }
         }
@@ -380,7 +377,9 @@ impl RedbRecoveryStore {
             .map(|scope| OrderingScopeId::new(scope.scope.as_str()))
             .collect::<Result<Vec<_>, _>>()?;
 
-        let observed = evidence.observe_committed_heads(client, &requested, live_fence).await;
+        let observed = evidence
+            .observe_committed_heads(client, &requested, live_fence)
+            .await;
         let reserved = match observed {
             Ok(()) => {
                 <RedbRecoveryStore as OperationalRecoveryStore>::stage_and_reserve(self, request)
