@@ -406,7 +406,7 @@ pub(crate) struct AdmittedReplyView {
     /// as an admitted record.
     #[serde(default)]
     pub(crate) result_lineage: Option<HostRequestResultLineage>,
-    /// Owner-read original WriteSubmission projection. This is decoded only
+    /// Owner-read original `WriteSubmission` projection. This is decoded only
     /// from authenticated rehydrate/resolve replies and is never a host-request
     /// record field or a substitute for the result receipt path.
     #[serde(skip)]
@@ -2672,6 +2672,8 @@ fn decode_admitted_reply(
         receipt.operation_id.as_str(),
         &envelope.envelope_sha256,
     )?;
+    let mut record = record;
+    record.staged_write_submission = decode_stage_field(value).ok()?;
     Some((receipt, record))
 }
 
@@ -2783,7 +2785,7 @@ fn decode_rehydrated_reply(
     if !record_matches_original_envelope(&record, envelope) {
         return None;
     }
-    record.staged_write_submission = decode_stage_field(value)?;
+    record.staged_write_submission = decode_stage_field(value).ok()?;
     Some(record)
 }
 
@@ -2811,11 +2813,11 @@ fn record_matches_original_envelope(
 /// Reads the explicit stage projection carried beside an owner-resolved
 /// durable host request row. An absent field is a legacy readback with no
 /// stage proof; a present typed value is still validated before use.
-fn decode_stage_field(value: &serde_json::Value) -> Option<Option<WriteSubmission>> {
+fn decode_stage_field(value: &serde_json::Value) -> Result<Option<WriteSubmission>, ()> {
     match value.get("stage") {
-        None => Some(None),
-        Some(value) if value.is_null() => Some(None),
-        Some(value) => Some(Some(decode_staged_write_submission(value)?)),
+        None => Ok(None),
+        Some(value) if value.is_null() => Ok(None),
+        Some(value) => decode_staged_write_submission(value).map(Some).ok_or(()),
     }
 }
 
@@ -2946,11 +2948,11 @@ fn decode_resolve_value(value: &serde_json::Value, query: &ResolveQuery) -> Logi
         let coherence = coherence.to_owned();
         return match decode_record_view(value, operation_id, &coherence) {
             Some(mut record) => match decode_stage_field(value) {
-                Some(stage) => {
+                Ok(stage) => {
                     record.staged_write_submission = stage;
                     LogicalOwnerOutcome::Resolved(Box::new(record))
                 }
-                None => LogicalOwnerOutcome::Unavailable,
+                Err(()) => LogicalOwnerOutcome::Unavailable,
             },
             None => LogicalOwnerOutcome::Unavailable,
         };
@@ -3706,11 +3708,148 @@ fn map_parent_cancellation_disposition(
     }
 }
 
+fn observe_write_stage_due(
+    request: &HostInvocationRequest,
+    deadline_unix_ms: Option<u64>,
+    unknown: impl FnOnce() -> PortFailure,
+) -> Result<bool, PortFailure> {
+    if accepts_after_stage(request) {
+        return Ok(true);
+    }
+    if waits_for_commit(request) {
+        let deadline = deadline_unix_ms.ok_or_else(unknown)?;
+        return Ok(unix_ms()? >= deadline);
+    }
+    Ok(false)
+}
+
+fn resolved_invocation_outcome(
+    record: &AdmittedReplyView,
+    request: &HostInvocationRequest,
+    occurrence: &str,
+    logical_key: &str,
+) -> Result<HostInvocationPortOutcome, PortFailure> {
+    if is_nonterminal_request_state(record.state)
+        && (accepts_after_stage(request) || waits_for_commit(request))
+    {
+        let due = observe_write_stage_due(request, record.deadline_unix_ms, || {
+            unknown_resolve_outcome(logical_key)
+        })?;
+        if due {
+            if let Some(stage) = record.staged_write_submission.clone() {
+                return staged_resolved_observe_outcome(
+                    record,
+                    request,
+                    occurrence,
+                    stage,
+                    logical_key,
+                );
+            }
+        }
+        return Err(unknown_resolve_outcome(logical_key));
+    }
+    submit_outcome_for_resolved(
+        record,
+        occurrence,
+        request.tool.canonical_name(),
+        logical_key,
+    )
+}
+
+fn admitted_invocation_outcome(
+    client: &mut KernelHostRequestClient,
+    receipt: &HostRequestAdmissionReceipt,
+    record: AdmittedReplyView,
+    request: &HostInvocationRequest,
+    envelope: &HostRequestEnvelope,
+) -> Result<HostInvocationPortOutcome, PortFailure> {
+    let stage_mode = accepts_after_stage(request) || waits_for_commit(request);
+    let needs_rehydrate = (stage_mode
+        && is_nonterminal_request_state(record.state)
+        && record.staged_write_submission.is_none())
+        || matches!(
+            record.state,
+            HostRequestRecordState::PossiblyEffected
+                | HostRequestRecordState::Unknown
+                | HostRequestRecordState::Reconciling
+        );
+    let (record, stage) = if needs_rehydrate {
+        match client.rehydrate_operation(envelope, receipt) {
+            Ok(mut refreshed) => {
+                let stage = refreshed.staged_write_submission.take();
+                (refreshed, stage)
+            }
+            Err(error @ PortFailure::AgentResponse { .. }) => return Err(error),
+            Err(_) if stage_mode => return Err(unknown_outcome(&envelope.envelope_sha256)),
+            Err(_) => (record, None),
+        }
+    } else {
+        let stage = record.staged_write_submission.clone();
+        (record, stage)
+    };
+    if stage_mode && is_nonterminal_request_state(record.state) {
+        let due = observe_write_stage_due(request, record.deadline_unix_ms, || {
+            unknown_outcome(&envelope.envelope_sha256)
+        })?;
+        if due {
+            if let Some(stage) = stage {
+                let handle = HostOperationHandle::new(receipt.operation_id.clone())
+                    .map_err(|_| request_failure())?;
+                return staged_observe_outcome(handle, request, envelope, stage);
+            }
+        }
+        return Err(unknown_outcome(&envelope.envelope_sha256));
+    }
+    submit_outcome(receipt, &record, request, envelope)
+}
+
+fn invocation_frame(
+    request: &HostInvocationRequest,
+    envelope: &HostRequestEnvelope,
+    facts: &TransportFacts,
+) -> Result<Frame, PortFailure> {
+    match canonical_dispatch_entry(&request.tool) {
+        CanonicalDispatchEntry::InvokeRead => host_request_invoke_read_frame(request, envelope, facts),
+        CanonicalDispatchEntry::SubmitAdmitOnly { .. } => host_request_frame_for_envelope(
+            AGENT_HOST_REQUEST_SUBMIT_OPERATION,
+            envelope,
+            facts,
+        ),
+        CanonicalDispatchEntry::SubmitActGated { .. } => {
+            revalidate_act_dispatch(request, envelope, facts)?;
+            host_request_frame_for_envelope(
+                AGENT_HOST_REQUEST_SUBMIT_OPERATION,
+                envelope,
+                facts,
+            )
+        }
+        CanonicalDispatchEntry::SubmitCoordinateGated { .. } => {
+            revalidate_coordinate_dispatch(request, envelope, facts)?;
+            host_request_frame_for_envelope(
+                AGENT_HOST_REQUEST_SUBMIT_OPERATION,
+                envelope,
+                facts,
+            )
+        }
+        CanonicalDispatchEntry::SubmitStateGated { .. } => {
+            revalidate_state_dispatch(request, envelope, facts)?;
+            host_request_frame_for_envelope(
+                AGENT_HOST_REQUEST_SUBMIT_OPERATION,
+                envelope,
+                facts,
+            )
+        }
+        CanonicalDispatchEntry::SubmitCarryingBytes => {
+            host_request_user_automation_frame(request, envelope, facts)
+        }
+        CanonicalDispatchEntry::SubmitObservePair => {
+            revalidate_observe_dispatch(request, envelope, facts)?;
+            host_request_observe_submit_frame(request, envelope, facts)
+        }
+    }
+}
+
 impl KernelHostRequestPort for KernelHostRequestClient {
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the eight canonical entries must dispatch serially on the same carrier (issue #1739 W5); splitting the match would scatter the single dispatch order"
-    )]
     fn invoke(
         &mut self,
         request: &HostInvocationRequest,
@@ -3746,38 +3885,10 @@ impl KernelHostRequestPort for KernelHostRequestClient {
                     .request_id
                     .clone()
                     .unwrap_or_else(|| correlation.clone());
-                if is_nonterminal_request_state(record.state)
-                    && (accepts_after_stage(request) || waits_for_commit(request))
-                {
-                    let wait_deadline_reached = if waits_for_commit(request) {
-                        let now_after_owner_read = unix_ms()?;
-                        record
-                            .deadline_unix_ms
-                            .is_some_and(|deadline| now_after_owner_read >= deadline)
-                    } else {
-                        false
-                    };
-                    if let Some(stage) = record.staged_write_submission.clone() {
-                        if waits_for_commit(request) && record.deadline_unix_ms.is_none() {
-                            return Err(unknown_resolve_outcome(logical_key.as_str()));
-                        }
-                        if accepts_after_stage(request) || wait_deadline_reached {
-                            return staged_resolved_observe_outcome(
-                                &record,
-                                request,
-                                occurrence.as_str(),
-                                stage,
-                                logical_key.as_str(),
-                            );
-                        }
-                    } else if wait_deadline_reached {
-                        return Err(unknown_resolve_outcome(logical_key.as_str()));
-                    }
-                }
-                return submit_outcome_for_resolved(
+                return resolved_invocation_outcome(
                     &record,
+                    request,
                     occurrence.as_str(),
-                    request.tool.canonical_name(),
                     logical_key.as_str(),
                 );
             }
@@ -3794,47 +3905,7 @@ impl KernelHostRequestPort for KernelHostRequestClient {
             // record state maps to an owner timeout.
             return self.probe_settles_invocation(request, &facts, &session, &envelope, now_ms);
         }
-        let frame = match canonical_dispatch_entry(&request.tool) {
-            CanonicalDispatchEntry::InvokeRead => {
-                host_request_invoke_read_frame(request, &envelope, &facts)?
-            }
-            CanonicalDispatchEntry::SubmitAdmitOnly { .. } => host_request_frame_for_envelope(
-                AGENT_HOST_REQUEST_SUBMIT_OPERATION,
-                &envelope,
-                &facts,
-            )?,
-            CanonicalDispatchEntry::SubmitActGated { .. } => {
-                revalidate_act_dispatch(request, &envelope, &facts)?;
-                host_request_frame_for_envelope(
-                    AGENT_HOST_REQUEST_SUBMIT_OPERATION,
-                    &envelope,
-                    &facts,
-                )?
-            }
-            CanonicalDispatchEntry::SubmitCoordinateGated { .. } => {
-                revalidate_coordinate_dispatch(request, &envelope, &facts)?;
-                host_request_frame_for_envelope(
-                    AGENT_HOST_REQUEST_SUBMIT_OPERATION,
-                    &envelope,
-                    &facts,
-                )?
-            }
-            CanonicalDispatchEntry::SubmitStateGated { .. } => {
-                revalidate_state_dispatch(request, &envelope, &facts)?;
-                host_request_frame_for_envelope(
-                    AGENT_HOST_REQUEST_SUBMIT_OPERATION,
-                    &envelope,
-                    &facts,
-                )?
-            }
-            CanonicalDispatchEntry::SubmitCarryingBytes => {
-                host_request_user_automation_frame(request, &envelope, &facts)?
-            }
-            CanonicalDispatchEntry::SubmitObservePair => {
-                revalidate_observe_dispatch(request, &envelope, &facts)?;
-                host_request_observe_submit_frame(request, &envelope, &facts)?
-            }
-        };
+        let frame = invocation_frame(request, &envelope, &facts)?;
         let reply = match self.exchange(&frame) {
             Ok(reply) => reply,
             Err(error @ PortFailure::AgentResponse { .. }) => return Err(error),
@@ -3850,56 +3921,7 @@ impl KernelHostRequestPort for KernelHostRequestClient {
         }
         match decode_admitted_reply(&reply, &envelope) {
             Some((receipt, record)) => {
-                // Unresolved states are re-read as before. Both observe modes
-                // read the Kernel's separately validated durable stage when
-                // the operation remains nonterminal; `accept_after_stage` may
-                // return it immediately, while `wait_for_commit` waits for
-                // the retained original deadline. `Submitted` alone is never
-                // a stage ACK.
-                let needs_stage_view = (accepts_after_stage(request) || waits_for_commit(request))
-                    && is_nonterminal_request_state(record.state);
-                let (record, stage) = if needs_stage_view
-                    || matches!(
-                        record.state,
-                        HostRequestRecordState::PossiblyEffected
-                            | HostRequestRecordState::Unknown
-                            | HostRequestRecordState::Reconciling
-                    ) {
-                    match self.rehydrate_operation(&envelope, &receipt) {
-                        Ok(mut refreshed) => {
-                            let stage = refreshed.staged_write_submission.take();
-                            (refreshed, stage)
-                        }
-                        Err(error @ PortFailure::AgentResponse { .. }) => return Err(error),
-                        Err(_) if accepts_after_stage(request) => {
-                            return Err(unknown_outcome(&envelope.envelope_sha256));
-                        }
-                        Err(_) => (record, None),
-                    }
-                } else {
-                    (record, None)
-                };
-                let wait_deadline_reached =
-                    if waits_for_commit(request) && is_nonterminal_request_state(record.state) {
-                        let deadline = record
-                            .deadline_unix_ms
-                            .ok_or_else(|| unknown_outcome(&envelope.envelope_sha256))?;
-                        unix_ms()? >= deadline
-                    } else {
-                        false
-                    };
-                if (accepts_after_stage(request) || wait_deadline_reached)
-                    && is_nonterminal_request_state(record.state)
-                {
-                    if let Some(stage) = stage {
-                        let handle = HostOperationHandle::new(receipt.operation_id.clone())
-                            .map_err(|_| request_failure())?;
-                        return staged_observe_outcome(handle, request, &envelope, stage);
-                    } else if wait_deadline_reached {
-                        return Err(unknown_outcome(&envelope.envelope_sha256));
-                    }
-                }
-                submit_outcome(&receipt, &record, request, &envelope)
+                admitted_invocation_outcome(self, &receipt, record, request, &envelope)
             }
             None => self.probe_settles_invocation(request, &facts, &session, &envelope, now_ms),
         }
@@ -4191,47 +4213,27 @@ impl KernelHostRequestClient {
             .exchange(&frame)
             .map_err(|error| retain_agent_response(error, unknown_outcome(&digest)))?;
         match decode_admitted_reply(&reply, &probe) {
+            Some(_) if accepts_after_stage(request) || waits_for_commit(request) => {
+                let resolve_now_ms = unix_ms()?;
+                let record =
+                    self.resolve_original_invocation(envelope, facts, session_id, resolve_now_ms)?;
+                let occurrence = record
+                    .request_id
+                    .clone()
+                    .unwrap_or_else(|| request.correlation_id.as_str().to_owned());
+                let logical_key = request
+                    .correlation_projection
+                    .as_ref()
+                    .and_then(|projection| logical_invocation_key(projection, session_id).ok())
+                    .ok_or_else(|| unknown_outcome(&digest))?;
+                resolved_invocation_outcome(
+                    &record,
+                    request,
+                    occurrence.as_str(),
+                    logical_key.as_str(),
+                )
+            }
             Some(_) => {
-                let stage_is_due = accepts_after_stage(request)
-                    || (waits_for_commit(request)
-                        && unix_ms()? >= envelope.identity.deadline_unix_ms);
-                if stage_is_due {
-                    let record =
-                        self.resolve_original_invocation(envelope, facts, session_id, now_ms)?;
-                    let occurrence = record
-                        .request_id
-                        .clone()
-                        .unwrap_or_else(|| request.correlation_id.as_str().to_owned());
-                    let logical_key = request
-                        .correlation_projection
-                        .as_ref()
-                        .and_then(|projection| logical_invocation_key(projection, session_id).ok())
-                        .ok_or_else(|| unknown_outcome(&digest))?;
-                    if !is_nonterminal_request_state(record.state) {
-                        return submit_outcome_for_resolved(
-                            &record,
-                            occurrence.as_str(),
-                            request.tool.canonical_name(),
-                            logical_key.as_str(),
-                        );
-                    }
-                    if let Some(stage) = record.staged_write_submission.clone() {
-                        return staged_resolved_observe_outcome(
-                            &record,
-                            request,
-                            occurrence.as_str(),
-                            stage,
-                            logical_key.as_str(),
-                        );
-                    }
-                    if waits_for_commit(request) {
-                        return Err(unknown_outcome(&digest));
-                    }
-                    return Ok(HostInvocationPortOutcome::Accepted {
-                        operation_handle: HostOperationHandle::new(record.operation_id.clone())
-                            .map_err(|_| unknown_outcome(&digest))?,
-                    });
-                }
                 let handle = HostOperationHandle::new(host_request_operation_id(envelope))
                     .map_err(|_| request_failure())?;
                 Ok(HostInvocationPortOutcome::Accepted {
