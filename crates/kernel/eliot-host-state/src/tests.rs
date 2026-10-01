@@ -42,6 +42,26 @@ fn raw_frame(sequence: u64, payload: &[u8]) -> Vec<u8> {
     bytes
 }
 
+fn journal_frame_with_version(bytes: &[u8], version: u16) -> Vec<u8> {
+    let header_start = JOURNAL_MAGIC.len();
+    let header_end = bytes[header_start..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|offset| header_start + offset)
+        .unwrap_or_else(|| unreachable!());
+    let mut header: serde_json::Value = serde_json::from_slice(&bytes[header_start..header_end])
+        .unwrap_or_else(|_| unreachable!());
+    header["version"] = json!(version);
+
+    let mut rewritten = Vec::with_capacity(bytes.len());
+    rewritten.extend_from_slice(&bytes[..header_start]);
+    rewritten.extend_from_slice(
+        &serde_json::to_vec(&header).unwrap_or_else(|_| unreachable!()),
+    );
+    rewritten.extend_from_slice(&bytes[header_end..]);
+    rewritten
+}
+
 fn test_lineage_id(lineage: &str) -> EpochLineageId {
     // Deterministic test-only lineage namespace: distinct names map to
     // distinct canonical UUIDs, and the same name always maps to the same
@@ -678,7 +698,10 @@ fn wake(
     let intent: WakeIntent = serde_json::from_value(json!({
         "wake_id": wake_id,
         "reason": "observable use",
-        "state_fence": {"authority_epoch": 1, "resource_generation": 1},
+        "state_fence": eliot_contracts::StateFence::new(
+            host.epoch.current.clone(),
+            eliot_contracts::ResourceGeneration::genesis(),
+        ),
         "state": state
     }))
     .unwrap_or_else(|_| unreachable!());
@@ -1261,40 +1284,24 @@ fn replay_rejects_torn_checksum_version_and_sequence_frames() -> TestResult {
         Err(JournalError::Checksum { .. } | JournalError::Invalid(_))
     ));
 
-    let mut retired_wire = bytes.clone();
-    let retired_wire_field = retired_wire
-        .windows(11)
-        .position(|window| window == br#""version":3"#)
-        .map_or_else(|| unreachable!(), |offset| offset + 10);
-    retired_wire[retired_wire_field] = b'1';
+    let retired_wire_v1 = journal_frame_with_version(bytes, 1);
     assert!(matches!(
-        HostStateJournal::<MemoryBackend>::replay_bytes(&retired_wire, host.clone()),
+        HostStateJournal::<MemoryBackend>::replay_bytes(&retired_wire_v1, host.clone()),
         Err(JournalError::UnknownVersion { version: 1 })
     ));
 
     // The retired version 2 wire shape (Host-local lineage spelling) is
-    // rejected explicitly and never silently rewritten into a version 3
-    // journal.
-    let mut previous_wire = bytes.clone();
-    let previous_wire_field = previous_wire
-        .windows(11)
-        .position(|window| window == br#""version":3"#)
-        .map_or_else(|| unreachable!(), |offset| offset + 10);
-    previous_wire[previous_wire_field] = b'2';
+    // rejected explicitly rather than silently rewritten during replay.
+    let retired_wire_v2 = journal_frame_with_version(bytes, 2);
     assert!(matches!(
-        HostStateJournal::<MemoryBackend>::replay_bytes(&previous_wire, host.clone()),
+        HostStateJournal::<MemoryBackend>::replay_bytes(&retired_wire_v2, host.clone()),
         Err(JournalError::UnknownVersion { version: 2 })
     ));
 
-    let mut version = bytes.clone();
-    let version_field = version
-        .windows(11)
-        .position(|window| window == br#""version":3"#)
-        .map_or_else(|| unreachable!(), |offset| offset + 10);
-    version[version_field] = b'4';
+    let version = journal_frame_with_version(bytes, JOURNAL_VERSION + 1);
     assert!(matches!(
         HostStateJournal::<MemoryBackend>::replay_bytes(&version, host.clone()),
-        Err(JournalError::UnknownVersion { .. } | JournalError::Invalid(_))
+        Err(JournalError::UnknownVersion { version }) if version == JOURNAL_VERSION + 1
     ));
 
     let mut sequence = bytes.clone();
