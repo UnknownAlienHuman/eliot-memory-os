@@ -48,16 +48,20 @@ pub(super) fn append_work_scope_owner_statement(
             })
         })?;
     let expected_value_digest = text_param("expected_work_scope_digest")?;
-    let valid_digest = expected_value_digest.len() == 64
-        && expected_value_digest
+    if expected_revision == 0 {
+        return Err(AdapterError::Store(StoreError::InvalidField {
+            field: "work_scope.owner_revision",
+            reason: "initial binding must replace the exact named empty-owner revision",
+        }));
+    }
+    if expected_value_digest.len() != 64
+        || expected_value_digest
             .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
-    if (expected_revision == 0 && !expected_value_digest.is_empty())
-        || (expected_revision > 0 && !valid_digest)
+            .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
     {
         return Err(AdapterError::Store(StoreError::InvalidField {
             field: "work_scope.owner_digest",
-            reason: "initial insertion requires an empty absent-owner digest; CAS requires lowercase SHA-256",
+            reason: "expected digest must be lowercase SHA-256",
         }));
     }
     let snapshot_json = text_param("snapshot_json")?;

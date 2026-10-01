@@ -838,6 +838,20 @@ pub struct WorkScopeOwnerReadback {
     pub snapshot: WorkScopeBindingSnapshot,
 }
 
+/// Exact result of a fresh named WorkScope owner read. `Empty` is the durable
+/// empty snapshot row, not physical absence; its provider revision and digest
+/// remain available for the first binding CAS.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum WorkScopeOwnerSnapshotReadback {
+    Empty {
+        state_fence: StateFence,
+        owner_revision: u64,
+        value_digest: String,
+    },
+    Bound(WorkScopeOwnerReadback),
+}
+
 /// One service observation recovered from the Kernel-owned state/control
 /// route.  It is used to drive the existing Governor startup state machine;
 /// no local observation is fabricated by the daemon.
@@ -5621,6 +5635,19 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         &self,
         expected_state_fence: &StateFence,
     ) -> Result<Option<WorkScopeOwnerReadback>, CompositionError> {
+        match self.read_current_work_scope_owner_snapshot_with_provenance(expected_state_fence)? {
+            WorkScopeOwnerSnapshotReadback::Empty { .. } => Ok(None),
+            WorkScopeOwnerSnapshotReadback::Bound(readback) => Ok(Some(readback)),
+        }
+    }
+
+    /// Same fresh WorkScope named read while preserving the distinction
+    /// between a durable EmptyOwnerSnapshot and a bound owner. The empty
+    /// result carries the exact Store revision and digest required for CAS.
+    pub fn read_current_work_scope_owner_snapshot_with_provenance(
+        &self,
+        expected_state_fence: &StateFence,
+    ) -> Result<WorkScopeOwnerSnapshotReadback, CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
         }
@@ -5707,7 +5734,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             }
         };
         match (&self.owners.work_scope, &current) {
-            (None, None) => Ok(None),
+            (None, None) => Ok(WorkScopeOwnerSnapshotReadback::Empty {
+                state_fence: reply.state_fence,
+                owner_revision: reply.revision,
+                value_digest: reply.value_digest,
+            }),
             (Some(owner), Some(snapshot)) => {
                 let semantic = owner
                     .read_current(expected_state_fence)
@@ -5718,7 +5749,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                             .to_owned(),
                     ));
                 }
-                Ok(Some(WorkScopeOwnerReadback {
+                Ok(WorkScopeOwnerSnapshotReadback::Bound(WorkScopeOwnerReadback {
                     state_fence: reply.state_fence,
                     owner_revision: reply.revision,
                     value_digest: reply.value_digest,

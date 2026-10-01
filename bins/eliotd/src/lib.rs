@@ -2097,6 +2097,84 @@ impl DaemonComposition {
         Ok(Some(readback))
     }
 
+    /// Fresh named WorkScope read preserving the exact Empty-owner CAS
+    /// predecessor as well as a bound snapshot. Empty is a durable row, not
+    /// evidence that the owner record is physically absent.
+    pub fn current_testd_blob_work_scope_snapshot_readback(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<eliot_governor::WorkScopeOwnerSnapshotReadback, String> {
+        state_fence
+            .validate()
+            .map_err(|error| format!("invalid owner-facts fence: {error}"))?;
+        if self.governor.kernel_snapshot().state_fence() != *state_fence {
+            return Err("owner-facts fence is not the current Governor fence".to_owned());
+        }
+        let readback = self
+            .governor
+            .read_current_work_scope_owner_snapshot_with_provenance(state_fence)
+            .map_err(|error| format!("current WorkScope owner read failed: {error}"))?;
+        if let eliot_governor::WorkScopeOwnerSnapshotReadback::Bound(bound) = &readback {
+            bound
+                .snapshot
+                .validate()
+                .map_err(|error| format!("current WorkScope guard is invalid: {error}"))?;
+            if bound.snapshot.guard_receipt.disposition
+                != eliot_governor::ScopeBindingDisposition::Matched
+            {
+                return Err("current WorkScope guard is not matched".to_owned());
+            }
+        }
+        Ok(readback)
+    }
+
+    /// Builds the receipt contract's WorkScope leg only from the product
+    /// retained in the fresh, matched WorkScope source-admission owner.
+    /// `expected_product_id` is a selector check; it never supplies the value
+    /// serialized into the binding.
+    pub fn current_testd_blob_work_scope_receipt_binding(
+        &self,
+        state_fence: &StateFence,
+        expected_product_id: &eliot_contracts::ProductId,
+    ) -> Result<(eliot_receipts::WorkScopeBinding, String, String), String> {
+        let readback = self.current_testd_blob_work_scope_snapshot_readback(state_fence)?;
+        let eliot_governor::WorkScopeOwnerSnapshotReadback::Bound(readback) = readback else {
+            return Err("current WorkScope owner is durably empty".to_owned());
+        };
+        let snapshot = &readback.snapshot;
+        if snapshot.state_fence != *state_fence
+            || readback.state_fence != *state_fence
+            || snapshot.owner_revision != readback.owner_revision
+        {
+            return Err("current WorkScope snapshot provenance is inconsistent".to_owned());
+        }
+        let admission = snapshot
+            .source_admission()
+            .ok_or_else(|| "current WorkScope owner lacks admitted source provenance".to_owned())?;
+        let product_id = admission
+            .product_id
+            .as_ref()
+            .ok_or_else(|| "current WorkScope owner lacks its admitted product identity".to_owned())?;
+        if product_id != expected_product_id {
+            return Err("current WorkScope product differs from the authenticated selector".to_owned());
+        }
+        let work_scope = eliot_receipts::WorkScopeBinding {
+            scope_id: eliot_receipts::WorkScopeId::new(
+                snapshot.binding.scope.scope_ref.clone(),
+            )
+            .map_err(|error| format!("invalid current WorkScope identifier: {error}"))?,
+            product_id: product_id.clone(),
+            resource_generation: state_fence.resource_generation.clone(),
+            state_fence: state_fence.clone(),
+        };
+        let bytes = eliot_contracts::canonical_json_bytes(&work_scope)
+            .map_err(|error| format!("WorkScope binding cannot be canonically encoded: {error}"))?;
+        let digest = eliot_contracts::sha256_hex(&bytes);
+        let json = String::from_utf8(bytes)
+            .map_err(|error| format!("WorkScope binding JSON is not UTF-8: {error}"))?;
+        Ok((work_scope, json, digest))
+    }
+
     /// Resolves the exact TaskBinding revision from the retained canonical
     /// Task owner for one authenticated owner-facts pull. A task selector is
     /// never enough by itself: the TaskRecord must exist at the same current

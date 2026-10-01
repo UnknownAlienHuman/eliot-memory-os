@@ -118,9 +118,6 @@ pub enum ParameterShape {
     EpistemicRevision,
     /// A string that must parse as a store [`OperationId`].
     OperationId,
-    /// Prior owner digest for a CAS: either lowercase SHA-256 or the exact
-    /// empty string denoting an absent predecessor at expected revision zero.
-    OwnerCasDigest,
     /// A non-blank text string: the observation subject captured by
     /// `CaptureObservation`, reused for the non-`operation_id` receipt-bound
     /// `AppendAuditEvent` fields (`idempotency_key`, `session_id`,
@@ -198,7 +195,6 @@ impl ParameterShape {
         match self {
             Self::EpistemicRevision => "eliot.storage.epistemic-revision.v1",
             Self::OperationId => "operation-id",
-            Self::OwnerCasDigest => "eliot.storage.owner-cas-digest-or-absent.v1",
             Self::Subject => "subject-text",
             Self::NotificationState => "eliot.notify.state.v1",
             Self::CampaignSourceLookup => "eliot.learning.campaign-source-lookup.v1",
@@ -477,7 +473,7 @@ static RECORD_WORK_SCOPE_SNAPSHOT_PARAMETERS: [ParameterDeclaration; 3] = [
     },
     ParameterDeclaration {
         name: "expected_work_scope_digest",
-        shape: ParameterShape::OwnerCasDigest,
+        shape: ParameterShape::Subject,
         required: true,
     },
     ParameterDeclaration {
@@ -1763,7 +1759,6 @@ pub fn verify_declaration_holds_no_payload_encoding(
     let structured = match declaration.shape {
         ParameterShape::OperationId
         | ParameterShape::Subject
-        | ParameterShape::OwnerCasDigest
         | ParameterShape::BlackboardItemLookup => false,
         ParameterShape::EpistemicRevision
         | ParameterShape::NotificationState
@@ -1884,25 +1879,6 @@ fn check_declared_shape(
                 reason: "operation_id must be a valid operation identity",
             })?;
             Ok(())
-        }
-        ParameterShape::OwnerCasDigest => {
-            let text = value.as_str().ok_or(StoreError::InvalidField {
-                field: "operation.parameter",
-                reason: "owner CAS digest must be lowercase SHA-256 or the declared absent-owner marker",
-            })?;
-            let absent = text.is_empty();
-            let digest = text.len() == 64
-                && text
-                    .bytes()
-                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
-            if absent || digest {
-                Ok(())
-            } else {
-                Err(StoreError::InvalidField {
-                    field: "operation.parameter",
-                    reason: "owner CAS digest must be lowercase SHA-256 or the declared absent-owner marker",
-                })
-            }
         }
         ParameterShape::Subject => {
             let text = value.as_str().ok_or(StoreError::InvalidField {
