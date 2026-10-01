@@ -2006,6 +2006,27 @@ function Assert-IsolatedSourceTree([string]$Repo, [string]$SourceCommit, [string
     }
 }
 
+function Select-ReleaseIsolationFallback([string]$Boundary, [bool]$LocallyProven, [string]$Reason) {
+    # Issue #1923 W8: where the local environment cannot prove an isolation
+    # boundary, the release selects and records a VM/lab fallback rather than
+    # asserting local proof.  A locally proven boundary records the local
+    # runner with its evidence; anything else records the VM/lab isolated
+    # runner.  An empty boundary or a missing reason fails closed, so a
+    # selection can never be made silently.
+    if ([string]::IsNullOrWhiteSpace($Boundary)) {
+        throw 'release isolation fallback selection requires a non-empty boundary name'
+    }
+    if ([string]::IsNullOrWhiteSpace($Reason)) {
+        throw "release isolation fallback selection requires a recorded reason ($Boundary)"
+    }
+    [ordered]@{
+        boundary = $Boundary
+        locally_proven = $LocallyProven
+        selected_runner = if ($LocallyProven) { 'local' } else { 'VM/lab isolated runner' }
+        reason = $Reason
+    }
+}
+
 function Get-ExcludedDispositionReceiptPath([string]$Repo) {
     # Issue #1811: the gate receipt is a retained build output, never a tracked
     # source file. `.eliot/` is the repository's ignored evidence root.
@@ -4969,6 +4990,19 @@ try {
     $stagedPayloadManifest = Get-StagedPayloadManifest $sourceCommit $Version $runtimeArtifactPlan $codexPluginBaseVersion $verifiedPinnedSurreal $selectedSurrealPolicyReceipt $frontDoorBridgeStaged $moduleBuildProvenance $legacyGovernorPresent ([string]$plan.governor_disposition) $governorEvidence $governorApprovalReference $signingInventory $repo $bundle
     $stagedPayloadManifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Encoding utf8
     $stagedPayloadManifestHash = (Get-FileHash -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Algorithm SHA256).Hash.ToLowerInvariant()
+    # Issue #1923 W8: select and record the isolation disposition per boundary.
+    # Source-tree pinning is proven locally by Assert-IsolatedSourceTree
+    # (pre-build and post-build).  Descendant containment is claimed by the Job
+    # Object launch path but its removal measurement is executed by the release
+    # security suite, not by this flow.  Filesystem and network sandboxing have
+    # no local proof at all: per I18.44 a Job Object-only check cannot claim
+    # them, so both select the VM/lab isolated runner and are recorded as
+    # unproven rather than asserted.
+    $isolationFallback = @(
+        Select-ReleaseIsolationFallback 'source-tree-pinning' $true 'Assert-IsolatedSourceTree verified the pinned HEAD, a clean tree, and no local .cargo configuration pre-build and post-build'
+        Select-ReleaseIsolationFallback 'build-descendant-containment' $false 'every release cargo child is bound to a Job Object (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, created suspended then assigned before resume); the observed zero-survivor descendant measurement is executed by tests/release-security/build-sandbox-cache-tests.ps1 Measure-ReleaseLaunchDescendantRemoval, not by this release flow, so this flow records the claim as unmeasured here'
+        Select-ReleaseIsolationFallback 'build-filesystem-network-sandbox' $false 'per I18.44 a Job Object-only check cannot claim filesystem/network sandboxing; no local mechanism in this flow denies filesystem writes or network egress from the build'
+    )
     # Issue #1858 AUD6/W6: stage the installed-entrypoint readback PLAN beside
     # the manifest. -WhatIf plans every retained entrypoint invocation without
     # launching a process; the operator reruns
@@ -5096,6 +5130,7 @@ try {
             pre_build = $preBuildIsolation
             post_build = $postBuildIsolation
         }
+        isolation_fallback = $isolationFallback
         toolchain_build = $stageToolchain
         operator_build = [ordered]@{
             receipt_sha256 = $verifiedOperator.receipt_sha256
