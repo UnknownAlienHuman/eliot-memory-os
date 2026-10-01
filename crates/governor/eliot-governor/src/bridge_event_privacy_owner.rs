@@ -782,4 +782,12 @@ mod issue_1935_tests {
         .expect("owner refusal");
         assert_eq!(decision.disclosure.decision, DisclosureDecisionKind::Deny);
     }
+
+    #[test]
+    fn issue_1935_governor_owner_refuses_raw_without_provider_owner_term() {
+        let mut owner = owner(BridgeEventRetentionDisposition::RawAllowed);
+        owner.policy_privacy.terms.rules[0].provider_restriction =
+            BridgeProviderRestriction::Unavailable;
+        assert!(owner.validate().is_err());
+    }
 }
