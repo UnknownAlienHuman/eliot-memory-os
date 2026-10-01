@@ -330,9 +330,15 @@ pub fn readiness_names_known_to_source(
 /// change on the tool-owner side therefore blocks installation until the
 /// composition re-admits — the invalidation half of the frozen consumer rule
 /// ("any profile-version edit invalidates dependents before Material reuse")
-/// applied at the install boundary. On agreement, binds the presented
-/// materialization to its exact accepted candidate and then projects and
-/// inserts through [`install_package`] with the [`VersionBoundTools`]
+/// applied at the install boundary.
+///
+/// Before the gate, the observed source marks the presented Skill's standing
+/// entry through [`mark_standing_against_observed_source`]:
+/// a changed Tool Definition version or tool view marks the entry stale even
+/// when the install below refuses, so a refused install never leaves old pins
+/// looking current against the newly observed source. On agreement, binds the
+/// presented materialization to its exact accepted candidate and then projects
+/// and inserts through [`install_package`] with the [`VersionBoundTools`]
 /// projection, so install, delivery, and activation all share one versioned
 /// membership.
 // The install boundary carries every owner term explicitly (catalogue,
@@ -356,14 +362,65 @@ pub fn install_package_versioned(
     )?;
     let bound = source.definition_version();
     crate::text(bound, "tools.definition_version")?;
+    let tools = VersionBoundTools::new(source, aliases);
+    mark_standing_against_observed_source(
+        catalogue,
+        &package.registration.skill_id,
+        bound,
+        &tools,
+    )?;
     if bound != admitted_definition_version {
         return Err(SkillError::InvalidField {
             field: "tools.definition_version",
             reason: "the tool source binds a definition version the composition did not admit",
         });
     }
-    let tools = VersionBoundTools::new(source, aliases);
     install_package(catalogue, candidate, package, inputs, context, &tools)
+}
+
+/// Marks one standing entry stale against the actually observed canonical
+/// tool source (`I7.13`, issue #1882 A2).
+///
+/// Registration observes the live Tool Definition version and the live tool
+/// view. A standing entry pinned under an older definition version, or whose
+/// declared tool refs the live view no longer knows, is stale — even when the
+/// install below refuses (unadmitted version): a refused install must not
+/// leave old pins looking current against the newly observed source (same
+/// pre-action marking as [`install_package`]). Only the presented Skill is
+/// visited: the dependency set and host/profile legs have no observed terms
+/// at this boundary, so they stay with the full-world sweep
+/// (`SkillCatalogue::reconcile_staleness`) instead of invented versions. The
+/// mark binds standing pins against the observed source only and never
+/// depends on the presented package, so it also fires when the package below
+/// fails its own binding. Quarantined and already-stale entries report no
+/// change through the existing mark paths; recovery stays
+/// reinstall-revalidation (wholesale replace) or explicit scoped/provisional
+/// (`SkillCatalogue::revalidate_stale_to_provisional`).
+fn mark_standing_against_observed_source(
+    catalogue: &mut SkillCatalogue,
+    skill_id: &str,
+    live_definition_version: &str,
+    tools: &dyn KnownTools,
+) -> Result<(), SkillError> {
+    let (admitted, tool_refs) = match catalogue.get(skill_id) {
+        Some(standing) => (
+            standing.admitted_definition_version.clone(),
+            standing.body.tool_refs.clone(),
+        ),
+        None => return Ok(()),
+    };
+    if admitted != live_definition_version {
+        catalogue.mark_definition_drift_stale(skill_id, live_definition_version, &admitted)?;
+    }
+    let missing: Vec<String> = tool_refs
+        .iter()
+        .filter(|tool| !tools.knows_tool(tool))
+        .cloned()
+        .collect();
+    if !missing.is_empty() {
+        catalogue.mark_tool_basis_stale(skill_id, &missing)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
