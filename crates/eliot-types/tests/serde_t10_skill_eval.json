@@ -30,5 +30,133 @@
     "requested_route": "runtime artifact/effect observation",
     "acceptance_relation": "required criterion matches a measurement result",
     "oracle_owner": "eliot_engine::eval::EvalMeasurementService"
+  },
+  "nested_case_result_nine_field_accept": {
+    "result_id": "eval-case-result:01920000-0000-7000-8000-000000000002",
+    "eval_case_id": "01920000-0000-7000-8000-000000000003",
+    "family": "hallucination",
+    "status": "passed",
+    "measurements": [
+      {
+        "measurement_id": "measurement:01920000-0000-7000-8000-000000000004",
+        "passed": true,
+        "observed": "eliot-engine-eval-case-schema",
+        "evidence_refs": [
+          "artifact/eval/01920000-0000-7000-8000-000000000005"
+        ]
+      }
+    ],
+    "produced_refs": [
+      "artifact/eval/01920000-0000-7000-8000-000000000005"
+    ],
+    "errors": [],
+    "duration_ms": 42,
+    "integrity_fingerprints": {
+      "harness_fingerprint": "eliot-engine-eval-case-schema",
+      "evaluator_fingerprint": "eliot_engine::eval::EvalMeasurementService",
+      "environment_fingerprint": "not-captured:structural-evaluator-process",
+      "actual_route": "eliot_engine::eval::evaluate_case",
+      "requested_route": "runtime artifact/effect observation",
+      "acceptance_relation": "required criterion matches a measurement result",
+      "oracle_owner": "eliot_engine::eval::EvalMeasurementService",
+      "oracle_version": "0.1.0",
+      "product_identity": "eliot-memory-os/eliot-engine-eval:product:01920000-0000-7000-8000-000000000001"
+    }
+  },
+  "nested_case_result_unknown_identity_dimension_refuse": {
+    "result_id": "eval-case-result:01920000-0000-7000-8000-000000000002",
+    "eval_case_id": "01920000-0000-7000-8000-000000000003",
+    "family": "hallucination",
+    "status": "passed",
+    "measurements": [
+      {
+        "measurement_id": "measurement:01920000-0000-7000-8000-000000000004",
+        "passed": true,
+        "observed": "eliot-engine-eval-case-schema",
+        "evidence_refs": [
+          "artifact/eval/01920000-0000-7000-8000-000000000005"
+        ]
+      }
+    ],
+    "produced_refs": [
+      "artifact/eval/01920000-0000-7000-8000-000000000005"
+    ],
+    "errors": [],
+    "duration_ms": 42,
+    "integrity_fingerprints": {
+      "harness_fingerprint": "eliot-engine-eval-case-schema",
+      "evaluator_fingerprint": "eliot_engine::eval::EvalMeasurementService",
+      "environment_fingerprint": "not-captured:structural-evaluator-process",
+      "actual_route": "eliot_engine::eval::evaluate_case",
+      "requested_route": "runtime artifact/effect observation",
+      "acceptance_relation": "required criterion matches a measurement result",
+      "oracle_owner": "eliot_engine::eval::EvalMeasurementService",
+      "oracle_version": "0.1.0",
+      "product_identity": "eliot-memory-os/eliot-engine-eval:product:01920000-0000-7000-8000-000000000001",
+      "evaluator_tier": "gold"
+    }
+  },
+  "nested_baseline_nine_field_accept": {
+    "baseline_id": "eval-baseline:01920000-0000-7000-8000-000000000006",
+    "suite_id": "eval-suite:01920000-0000-7000-8000-000000000007",
+    "eval_run_id": "01920000-0000-7000-8000-000000000008",
+    "git_commit": "4eb7a9a9edde04f391b75d4c125bd589ecfbd389",
+    "manifest_ref": "eval-dataset-manifest:01920000-0000-7000-8000-000000000009",
+    "family_scores": [
+      {
+        "family": "hallucination",
+        "passed": 3,
+        "failed": 0,
+        "blocked": 0,
+        "total": 3,
+        "score_percent": 100
+      }
+    ],
+    "overall_status": "pass",
+    "approved_at": "2026-10-01T00:00:00Z",
+    "approved_by": "eval-baseline-approver",
+    "integrity_fingerprints": {
+      "harness_fingerprint": "eliot-engine-eval-case-schema",
+      "evaluator_fingerprint": "eliot_engine::eval::EvalMeasurementService",
+      "environment_fingerprint": "not-captured:structural-evaluator-process",
+      "actual_route": "eliot_engine::eval::evaluate_case",
+      "requested_route": "runtime artifact/effect observation",
+      "acceptance_relation": "required criterion matches a measurement result",
+      "oracle_owner": "eliot_engine::eval::EvalMeasurementService",
+      "oracle_version": "0.1.0",
+      "product_identity": "eliot-memory-os/eliot-engine-eval:product:01920000-0000-7000-8000-000000000001"
+    }
+  },
+  "nested_baseline_unknown_identity_dimension_refuse": {
+    "baseline_id": "eval-baseline:01920000-0000-7000-8000-000000000006",
+    "suite_id": "eval-suite:01920000-0000-7000-8000-000000000007",
+    "eval_run_id": "01920000-0000-7000-8000-000000000008",
+    "git_commit": "4eb7a9a9edde04f391b75d4c125bd589ecfbd389",
+    "manifest_ref": "eval-dataset-manifest:01920000-0000-7000-8000-000000000009",
+    "family_scores": [
+      {
+        "family": "hallucination",
+        "passed": 3,
+        "failed": 0,
+        "blocked": 0,
+        "total": 3,
+        "score_percent": 100
+      }
+    ],
+    "overall_status": "pass",
+    "approved_at": "2026-10-01T00:00:00Z",
+    "approved_by": "eval-baseline-approver",
+    "integrity_fingerprints": {
+      "harness_fingerprint": "eliot-engine-eval-case-schema",
+      "evaluator_fingerprint": "eliot_engine::eval::EvalMeasurementService",
+      "environment_fingerprint": "not-captured:structural-evaluator-process",
+      "actual_route": "eliot_engine::eval::evaluate_case",
+      "requested_route": "runtime artifact/effect observation",
+      "acceptance_relation": "required criterion matches a measurement result",
+      "oracle_owner": "eliot_engine::eval::EvalMeasurementService",
+      "oracle_version": "0.1.0",
+      "product_identity": "eliot-memory-os/eliot-engine-eval:product:01920000-0000-7000-8000-000000000001",
+      "evaluator_tier": "gold"
+    }
   }
 }
