@@ -125,6 +125,179 @@ pub enum TraceFreshness {
     Stale,
 }
 
+/// Exact admission identity retained by the active bridge descriptor.
+///
+/// This binds only the admitted adapter. It is not proof that the adapter
+/// conforms to the native host's lifecycle hooks.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterAdmissionIdentity {
+    pub descriptor_sha256: String,
+    pub profile_id: String,
+    pub profile_sha256: String,
+    pub executable_sha256: String,
+}
+
+/// A source selector echoed by Kernel for bounded ORS observation paging.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationSelectors {
+    pub after_owner_sequence: u64,
+    pub after_event_sequence: u64,
+    pub page_limit: u16,
+}
+
+/// Exact owner binding returned by the checked ORS observation roster.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationOwner {
+    pub owner_namespace: String,
+    pub owner_list_sequence: u64,
+    pub authority_lineage: String,
+    pub principal: String,
+    pub producer_id: String,
+    pub local_stream: String,
+    pub creating_connection: String,
+    pub creating_launch_nonce: String,
+    pub creating_session_epoch: u64,
+    pub revision: u64,
+    pub incarnation: u64,
+}
+
+/// One checked, independently bounded page of retained bridge stream owners.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationRosterPage {
+    pub authority_lineage: String,
+    pub principal: String,
+    pub owner_cutoff: u64,
+    pub owner_total: u64,
+    pub owners: Vec<ObservationOwner>,
+    pub continuation: Option<u64>,
+}
+
+/// Cursor bounds for a retained original event stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationCursorBounds {
+    pub durable_sequence: u64,
+    pub observed_sequence: u64,
+    pub acked_sequence: u64,
+    pub compacted_sequence: u64,
+}
+
+/// A source-owned gap row retained with the stream observation page.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationGap {
+    pub gap_id: String,
+    pub stream_id: String,
+    pub start_sequence: u64,
+    pub end_sequence: u64,
+    pub reason_ref: String,
+    pub staging_connection: String,
+    pub recorded_at_ms: u64,
+}
+
+/// Original retained ORS event row, including privacy and ingest provenance.
+///
+/// The Governor preserves these source-issued fields but deliberately does
+/// not infer an I7.16 native hook class from generic bridge payloads.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OriginalBridgeEventObservation {
+    pub event_id: String,
+    pub sequence: u64,
+    pub producer_generation: u64,
+    pub authority_epoch: String,
+    pub envelope_sha256: String,
+    pub transport_hash: String,
+    pub stored_envelope_bytes: String,
+    pub normalized_projection_bytes: String,
+    pub staging_connection: String,
+    pub staged_at_ms: u64,
+    pub phase: String,
+    pub redacted: bool,
+    pub redaction_reason: String,
+    pub redacted_classes: Vec<String>,
+    pub redaction_marker: String,
+    pub redaction_version: u16,
+    pub admitted_source: String,
+    pub admitted_scope: String,
+    pub admitted_policy_revision: u64,
+    pub adapter_version: String,
+    pub transformation_version: u16,
+    pub requested_route: String,
+    pub actual_route: String,
+    pub normalization_warnings: Vec<String>,
+}
+
+/// One checked page of original source rows and its independent cursor/gap
+/// bounds. `records.len()` is not an expected-event denominator.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationEventPage {
+    pub owner: ObservationOwner,
+    pub after_event_sequence: u64,
+    pub observed_through_sequence: u64,
+    pub cursor: ObservationCursorBounds,
+    pub records: Vec<OriginalBridgeEventObservation>,
+    pub gaps: Vec<ObservationGap>,
+    pub gap_total: u64,
+    pub continuation: Option<u64>,
+}
+
+/// One owner-bound stream readback as returned by Kernel.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationStreamReadback {
+    pub owner: ObservationOwner,
+    pub page: ObservationEventPage,
+}
+
+/// Continuation cursor returned by the bounded Kernel source query.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationContinuation {
+    pub after_owner_sequence: u64,
+    pub after_event_sequence: u64,
+}
+
+/// A bounded original ORS source snapshot, or a source-owned unavailable
+/// result. The unavailable form is still an input to Governor degradation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SourceReadback {
+    Available {
+        selectors: ObservationSelectors,
+        roster: ObservationRosterPage,
+        streams: Vec<ObservationStreamReadback>,
+        next: Option<ObservationContinuation>,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
+/// Source-owned evidence availability, with an explicit reason when absent.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum EvidenceAvailability<T> {
+    Available { evidence: T },
+    Unavailable { reason: String },
+}
+
+/// Authenticated Kernel readback inputs for the Governor's sole live
+/// coverage derivation owner.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GovernorAuthorityObservation {
+    pub adapter: Option<AdapterAdmissionIdentity>,
+    pub source: SourceReadback,
+    pub watchdog: EvidenceAvailability<WatchdogEvidence>,
+    pub trace: EvidenceAvailability<TraceFreshness>,
+}
+
 /// One event's runtime coverage: disposition, ordering, completeness, proof
 /// ceiling, source evidence and gap evidence.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -203,6 +376,195 @@ impl IntegrationCoverageProfile {
             proof_ceiling: proof_ceiling.into(),
             source: source.into(),
             gaps,
+        };
+        profile.validate()?;
+        Ok(profile)
+    }
+
+    /// Builds an unverified profile from one authenticated Kernel/ORS
+    /// observation. The fixed [`ALL_EVENTS`] set is independent of returned
+    /// rows. Since the current ORS bridge stream does not prove native
+    /// lifecycle classes or an expected-class denominator, every logical
+    /// event remains explicitly unavailable with unknown completeness.
+    pub fn from_authority_observation(
+        observation: &GovernorAuthorityObservation,
+        active_fingerprint: impl Into<String>,
+    ) -> Result<Self, CoverageError> {
+        let fingerprint = active_fingerprint.into();
+        validate_text(&fingerprint, "coverage.fingerprint")?;
+
+        let mut profile_gaps = vec![
+            "No source-issued native I7.16 event-class manifest or independent expected-event denominator was included in this observation.".to_owned(),
+        ];
+        let (mut source, source_gaps, source_record_count) = match &observation.source {
+            SourceReadback::Unavailable { reason } => {
+                validate_text(reason, "observation.source.reason")?;
+                (
+                    format!("Kernel ORS source readback unavailable: {reason}"),
+                    vec![format!("Original event source unavailable: {reason}")],
+                    0,
+                )
+            }
+            SourceReadback::Available {
+                selectors,
+                roster,
+                streams,
+                next,
+            } => {
+                validate_roster(roster)?;
+                if selectors.page_limit == 0 {
+                    return Err(CoverageError::InvalidField(
+                        "observation.source.selectors.page_limit",
+                    ));
+                }
+                let mut gaps = Vec::new();
+                let mut record_count = 0_usize;
+                let mut stream_bounds = Vec::new();
+                for stream in streams {
+                    if !roster.owners.contains(&stream.owner) {
+                        return Err(CoverageError::InvalidField(
+                            "observation.source.stream.owner_not_in_roster",
+                        ));
+                    }
+                    if stream.owner != stream.page.owner {
+                        return Err(CoverageError::InvalidField(
+                            "observation.source.stream.page_owner_mismatch",
+                        ));
+                    }
+                    validate_event_page(&stream.page)?;
+                    record_count = record_count.saturating_add(stream.page.records.len());
+                    stream_bounds.push(format!(
+                        "owner-seq={} stream={} observed-through={} durable={} observed={} acked={} compacted={}",
+                        stream.owner.owner_list_sequence,
+                        stream.owner.local_stream,
+                        stream.page.observed_through_sequence,
+                        stream.page.cursor.durable_sequence,
+                        stream.page.cursor.observed_sequence,
+                        stream.page.cursor.acked_sequence,
+                        stream.page.cursor.compacted_sequence,
+                    ));
+                    for gap in &stream.page.gaps {
+                        gaps.push(format!(
+                            "ORS retained gap {} on {} at sequences {}..{} ({})",
+                            gap.gap_id,
+                            gap.stream_id,
+                            gap.start_sequence,
+                            gap.end_sequence,
+                            gap.reason_ref,
+                        ));
+                    }
+                    if u64::try_from(stream.page.gaps.len()).unwrap_or(u64::MAX)
+                        < stream.page.gap_total
+                    {
+                        gaps.push(format!(
+                            "ORS reports {} total gaps for {} but this page retains only {}",
+                            stream.page.gap_total,
+                            stream.owner.local_stream,
+                            stream.page.gaps.len(),
+                        ));
+                    }
+                    if stream.page.continuation.is_some() {
+                        gaps.push(format!(
+                            "ORS event page for {} continues beyond this bounded readback",
+                            stream.owner.local_stream,
+                        ));
+                    }
+                }
+                if roster.owners.len() < usize::try_from(roster.owner_total).unwrap_or(usize::MAX)
+                    || roster.continuation.is_some()
+                {
+                    gaps.push(format!(
+                        "ORS roster page contains {} of {} retained owners",
+                        roster.owners.len(),
+                        roster.owner_total,
+                    ));
+                }
+                if next.is_some() {
+                    gaps.push(
+                        "Kernel source snapshot has a bounded continuation beyond this readback."
+                            .to_owned(),
+                    );
+                }
+                if streams.is_empty() || record_count == 0 {
+                    gaps.push(
+                        "No original retained bridge event row was available in this bounded readback."
+                            .to_owned(),
+                    );
+                }
+                let source = format!(
+                    "Kernel-authenticated ORS readback: {} retained owner rows of {}; {} original event rows; selectors owner={} event={} limit={}; roster cutoff={}; cursor and scoped-gap bounds retained [{}]; adapter admission is ADAPTER identity only.",
+                    roster.owners.len(),
+                    roster.owner_total,
+                    record_count,
+                    selectors.after_owner_sequence,
+                    selectors.after_event_sequence,
+                    selectors.page_limit,
+                    roster.owner_cutoff,
+                    stream_bounds.join("; "),
+                );
+                (source, gaps, record_count)
+            }
+        };
+        profile_gaps.extend(source_gaps);
+        if let Some(adapter) = &observation.adapter {
+            validate_adapter_identity(adapter)?;
+            if adapter.descriptor_sha256 != fingerprint {
+                return Err(CoverageError::FingerprintMismatch);
+            }
+            source.push_str(&format!(
+                "; admitted adapter tuple descriptor={} profile_id={} profile_sha256={} executable_sha256={}",
+                adapter.descriptor_sha256,
+                adapter.profile_id,
+                adapter.profile_sha256,
+                adapter.executable_sha256,
+            ));
+        } else {
+            profile_gaps.push(
+                "Current adapter admission is unavailable; the prior Governor fingerprint is retained only for degradation.".to_owned(),
+            );
+        }
+        match &observation.watchdog {
+            EvidenceAvailability::Available { evidence } => evidence.validate()?,
+            EvidenceAvailability::Unavailable { reason } => {
+                validate_text(reason, "observation.watchdog.reason")?;
+                profile_gaps.push(format!("Watchdog evidence unavailable: {reason}"));
+            }
+        }
+        match &observation.trace {
+            EvidenceAvailability::Available { .. } => {}
+            EvidenceAvailability::Unavailable { reason } => {
+                validate_text(reason, "observation.trace.reason")?;
+                profile_gaps.push(format!("Trace freshness unavailable: {reason}"));
+            }
+        }
+
+        let events = ALL_EVENTS
+            .into_iter()
+            .map(|event| EventCoverage {
+                event,
+                disposition: EventDisposition::Unavailable,
+                ordering: DispatchOrdering::Unknown,
+                completeness: EventCompleteness::Unknown,
+                proof_ceiling: "Original retained ORS envelope, owner, cursor, and gap evidence only; native hook class and pre-action application proof absent.".to_owned(),
+                source: format!(
+                    "{source} No explicitly typed original native event source was joined for {event:?}.",
+                ),
+                gaps: vec![format!(
+                    "No original retained row is proven to represent the {event:?} native lifecycle/effect event."
+                )],
+            })
+            .collect();
+
+        let profile = Self {
+            fingerprint,
+            verified: false,
+            events,
+            completeness: EventCompleteness::Unknown,
+            proof_ceiling: format!(
+                "Original Kernel/ORS source readback ({source_record_count} rows) only; no verified native-host conformance or independent ALL_EVENTS denominator."
+            ),
+            source,
+            gaps: profile_gaps,
         };
         profile.validate()?;
         Ok(profile)
@@ -367,6 +729,18 @@ pub struct GovernorCoverageDerivation {
     revision: u64,
     current: Option<GovernanceProfile>,
     capabilities: BTreeMap<String, IssuedCapability>,
+    observation_binding: Option<ObservationDerivationBinding>,
+}
+
+/// Minimal last-input binding used only for revision idempotency. It records
+/// source reasons and bounded coverage gaps, never caches event pages.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ObservationDerivationBinding {
+    fingerprint: String,
+    source: String,
+    gaps: Vec<String>,
+    watchdog: String,
+    trace: String,
 }
 
 impl GovernorCoverageDerivation {
@@ -377,6 +751,7 @@ impl GovernorCoverageDerivation {
             revision: 0,
             current: None,
             capabilities: BTreeMap::new(),
+            observation_binding: None,
         }
     }
 
@@ -443,8 +818,161 @@ impl GovernorCoverageDerivation {
         }
         self.revision = candidate.revision;
         self.current = Some(candidate.clone());
+        self.observation_binding = None;
         self.revoke_unauthorized();
         Ok(candidate)
+    }
+
+    /// Derives a profile from source readback even when some source classes,
+    /// watchdog evidence, or trace evidence are unavailable. Unknown inputs
+    /// produce a new unverified/degraded revision instead of preserving a
+    /// formerly healthy profile or fabricating missing evidence.
+    pub fn derive_observation(
+        &mut self,
+        observation: &GovernorAuthorityObservation,
+    ) -> Result<Option<GovernanceProfile>, CoverageError> {
+        let admitted_adapter = observation
+            .adapter
+            .as_ref()
+            .filter(|adapter| validate_adapter_identity(adapter).is_ok())
+            .cloned();
+        let fingerprint = admitted_adapter
+            .as_ref()
+            .map(|adapter| adapter.descriptor_sha256.clone())
+            .or_else(|| self.current.as_ref().map(|profile| profile.fingerprint.clone()));
+        let Some(fingerprint) = fingerprint else {
+            return Ok(None);
+        };
+        let adapter = admitted_adapter;
+        let validated_watchdog = match &observation.watchdog {
+            EvidenceAvailability::Available { evidence } if evidence.validate().is_ok() => {
+                EvidenceAvailability::Available {
+                    evidence: evidence.clone(),
+                }
+            }
+            EvidenceAvailability::Available { .. } => EvidenceAvailability::Unavailable {
+                reason: "Kernel watchdog evidence failed Governor validation".to_owned(),
+            },
+            EvidenceAvailability::Unavailable { reason }
+                if validate_optional_text(reason, "observation.watchdog.reason").is_ok()
+                    && !reason.trim().is_empty() =>
+            {
+                EvidenceAvailability::Unavailable {
+                    reason: reason.clone(),
+                }
+            }
+            EvidenceAvailability::Unavailable { .. } => EvidenceAvailability::Unavailable {
+                reason: "Kernel did not provide a valid watchdog unavailability reason".to_owned(),
+            },
+        };
+        let validated_trace = match &observation.trace {
+            EvidenceAvailability::Available { evidence } => EvidenceAvailability::Available {
+                evidence: *evidence,
+            },
+            EvidenceAvailability::Unavailable { reason }
+                if validate_optional_text(reason, "observation.trace.reason").is_ok()
+                    && !reason.trim().is_empty() =>
+            {
+                EvidenceAvailability::Unavailable {
+                    reason: reason.clone(),
+                }
+            }
+            EvidenceAvailability::Unavailable { .. } => EvidenceAvailability::Unavailable {
+                reason: "Kernel did not provide a valid trace unavailability reason".to_owned(),
+            },
+        };
+        let mut validated_observation = GovernorAuthorityObservation {
+            adapter,
+            source: observation.source.clone(),
+            watchdog: validated_watchdog,
+            trace: validated_trace,
+        };
+        let coverage = match IntegrationCoverageProfile::from_authority_observation(
+            &validated_observation,
+            fingerprint.clone(),
+        ) {
+            Ok(coverage) => coverage,
+            Err(error) => {
+                validated_observation.source = SourceReadback::Unavailable {
+                    reason: format!(
+                        "Governor rejected inconsistent Kernel source evidence: {error}"
+                    ),
+                };
+                validated_observation.watchdog = EvidenceAvailability::Unavailable {
+                    reason: "Governor rejected the combined Kernel source observation".to_owned(),
+                };
+                validated_observation.trace = EvidenceAvailability::Unavailable {
+                    reason: "Governor rejected the combined Kernel source observation".to_owned(),
+                };
+                IntegrationCoverageProfile::from_authority_observation(
+                    &validated_observation,
+                    fingerprint,
+                )?
+            }
+        };
+        let watchdog = match &validated_observation.watchdog {
+            EvidenceAvailability::Available { evidence } => {
+                format!("available:{}:{}", evidence.supervisor_id, evidence.fresh)
+            }
+            EvidenceAvailability::Unavailable { reason } => format!("unavailable:{reason}"),
+        };
+        let trace = match &validated_observation.trace {
+            EvidenceAvailability::Available { evidence } => format!("available:{evidence:?}"),
+            EvidenceAvailability::Unavailable { reason } => format!("unavailable:{reason}"),
+        };
+        let binding = ObservationDerivationBinding {
+            fingerprint: coverage.fingerprint.clone(),
+            source: coverage.source.clone(),
+            gaps: coverage.gaps.clone(),
+            watchdog,
+            trace,
+        };
+        let watchdog_fresh = matches!(
+            &validated_observation.watchdog,
+            EvidenceAvailability::Available { evidence } if evidence.fresh
+        );
+        let trace_fresh = matches!(
+            &validated_observation.trace,
+            EvidenceAvailability::Available {
+                evidence: TraceFreshness::Fresh
+            }
+        );
+        let pre_action_enforced = coverage.verified
+            && matches!(
+                coverage.disposition(LogicalEvent::PreToolUse),
+                Some(EventDisposition::Enforced)
+            )
+            && matches!(
+                coverage.disposition(LogicalEvent::PermissionRequest),
+                Some(EventDisposition::Enforced)
+            );
+        let candidate = GovernanceProfile {
+            revision: self.revision.saturating_add(1).max(1),
+            fingerprint: coverage.fingerprint.clone(),
+            verified: coverage.verified,
+            authorizes_enforcement: pre_action_enforced && watchdog_fresh && trace_fresh,
+            authorizes_complete_coverage_ops: coverage.verified
+                && coverage.completeness == EventCompleteness::Complete
+                && watchdog_fresh
+                && trace_fresh,
+            completeness: coverage.completeness,
+            watchdog_fresh,
+            trace_fresh,
+        };
+        if let Some(current) = self.current.as_ref()
+            && (GovernanceProfile {
+                revision: current.revision,
+                ..candidate.clone()
+            }) == *current
+            && self.observation_binding.as_ref() == Some(&binding)
+        {
+            return Ok(Some(current.clone()));
+        }
+        self.revision = candidate.revision;
+        self.current = Some(candidate.clone());
+        self.observation_binding = Some(binding);
+        self.revoke_unauthorized();
+        Ok(Some(candidate))
     }
 
     /// Reports an observed route mismatch: the active route is no longer the
@@ -592,6 +1120,124 @@ impl Default for GovernorCoverageDerivation {
 fn validate_text(value: &str, field: &'static str) -> Result<(), CoverageError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
         return Err(CoverageError::InvalidField(field));
+    }
+    Ok(())
+}
+
+fn validate_optional_text(value: &str, field: &'static str) -> Result<(), CoverageError> {
+    if value.chars().any(char::is_control) {
+        return Err(CoverageError::InvalidField(field));
+    }
+    Ok(())
+}
+
+fn validate_adapter_identity(identity: &AdapterAdmissionIdentity) -> Result<(), CoverageError> {
+    validate_text(&identity.descriptor_sha256, "adapter.descriptor_sha256")?;
+    validate_text(&identity.profile_id, "adapter.profile_id")?;
+    validate_text(&identity.profile_sha256, "adapter.profile_sha256")?;
+    validate_text(&identity.executable_sha256, "adapter.executable_sha256")?;
+    Ok(())
+}
+
+fn validate_roster(roster: &ObservationRosterPage) -> Result<(), CoverageError> {
+    validate_text(&roster.authority_lineage, "observation.roster.authority_lineage")?;
+    validate_text(&roster.principal, "observation.roster.principal")?;
+    if roster.owners.len() > usize::try_from(roster.owner_total).unwrap_or(usize::MAX) {
+        return Err(CoverageError::InvalidField(
+            "observation.roster.owners_exceed_total",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for owner in &roster.owners {
+        validate_owner(owner)?;
+        if owner.authority_lineage != roster.authority_lineage
+            || owner.principal != roster.principal
+            || !seen.insert((owner.owner_list_sequence, owner.owner_namespace.clone()))
+        {
+            return Err(CoverageError::InvalidField(
+                "observation.roster.owner_binding",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_owner(owner: &ObservationOwner) -> Result<(), CoverageError> {
+    validate_text(&owner.owner_namespace, "observation.owner.namespace")?;
+    validate_text(&owner.authority_lineage, "observation.owner.authority_lineage")?;
+    validate_text(&owner.principal, "observation.owner.principal")?;
+    validate_text(&owner.producer_id, "observation.owner.producer_id")?;
+    validate_text(&owner.local_stream, "observation.owner.local_stream")?;
+    validate_text(&owner.creating_connection, "observation.owner.creating_connection")?;
+    validate_text(
+        &owner.creating_launch_nonce,
+        "observation.owner.creating_launch_nonce",
+    )?;
+    Ok(())
+}
+
+fn validate_event_page(page: &ObservationEventPage) -> Result<(), CoverageError> {
+    if page.cursor.acked_sequence > page.cursor.observed_sequence
+        || page.cursor.compacted_sequence > page.cursor.durable_sequence
+        || page.observed_through_sequence > page.cursor.observed_sequence
+    {
+        return Err(CoverageError::InvalidField(
+            "observation.stream.cursor_bounds",
+        ));
+    }
+    for gap in &page.gaps {
+        validate_text(&gap.gap_id, "observation.gap.id")?;
+        validate_text(&gap.stream_id, "observation.gap.stream_id")?;
+        validate_text(&gap.reason_ref, "observation.gap.reason_ref")?;
+        validate_text(
+            &gap.staging_connection,
+            "observation.gap.staging_connection",
+        )?;
+        if gap.start_sequence > gap.end_sequence {
+            return Err(CoverageError::InvalidField(
+                "observation.gap.sequence_range",
+            ));
+        }
+    }
+    if u64::try_from(page.gaps.len()).unwrap_or(u64::MAX) > page.gap_total {
+        return Err(CoverageError::InvalidField(
+            "observation.gap.count_exceeds_total",
+        ));
+    }
+    for record in &page.records {
+        validate_text(&record.event_id, "observation.record.event_id")?;
+        validate_text(
+            &record.envelope_sha256,
+            "observation.record.envelope_sha256",
+        )?;
+        validate_text(&record.transport_hash, "observation.record.transport_hash")?;
+        validate_text(
+            &record.staging_connection,
+            "observation.record.staging_connection",
+        )?;
+        validate_text(&record.phase, "observation.record.phase")?;
+        validate_optional_text(&record.authority_epoch, "observation.record.authority_epoch")?;
+        validate_optional_text(&record.admitted_source, "observation.record.admitted_source")?;
+        validate_optional_text(&record.admitted_scope, "observation.record.admitted_scope")?;
+        validate_optional_text(&record.adapter_version, "observation.record.adapter_version")?;
+        validate_optional_text(
+            &record.stored_envelope_bytes,
+            "observation.record.stored_envelope_bytes",
+        )?;
+        validate_optional_text(
+            &record.normalized_projection_bytes,
+            "observation.record.normalized_projection_bytes",
+        )?;
+        validate_optional_text(&record.redaction_reason, "observation.record.redaction_reason")?;
+        validate_optional_text(&record.redaction_marker, "observation.record.redaction_marker")?;
+        for class in &record.redacted_classes {
+            validate_optional_text(class, "observation.record.redacted_classes.item")?;
+        }
+        for warning in &record.normalization_warnings {
+            validate_text(warning, "observation.record.normalization_warnings.item")?;
+        }
+        validate_optional_text(&record.requested_route, "observation.record.requested_route")?;
+        validate_optional_text(&record.actual_route, "observation.record.actual_route")?;
     }
     Ok(())
 }

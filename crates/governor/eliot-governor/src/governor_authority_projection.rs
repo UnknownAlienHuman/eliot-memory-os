@@ -13,8 +13,8 @@
 //! old one. Watchdog evidence stays an input, never a substitute grade.
 
 use eliot_integration_coverage::{
-    CoverageError, GovernorCoverageDerivation, IntegrationCoverageProfile, TraceFreshness,
-    WatchdogEvidence,
+    CoverageError, GovernorAuthorityObservation, GovernorCoverageDerivation,
+    IntegrationCoverageProfile, TraceFreshness, WatchdogEvidence,
 };
 
 /// Closed projection of one live Governor derivation across the
@@ -120,6 +120,22 @@ impl LiveGovernorAuthority {
     ) -> Result<GovernorAuthorityProjection, CoverageError> {
         let profile = self.derivation.derive(coverage, watchdog, trace)?;
         Ok(Self::project(&profile))
+    }
+
+    /// Derives from the authenticated Kernel source-observation response.
+    /// Missing source/watchdog/trace evidence is a typed degradation input;
+    /// it emits a newer reduced revision when a prior profile exists and
+    /// never fabricates an adapter fingerprint or supervisor identity.
+    ///
+    /// Returns `None` only when no profile has ever been derived and Kernel
+    /// supplies no current admission identity to bind the degraded result.
+    pub fn refresh_observation(
+        &mut self,
+        observation: &GovernorAuthorityObservation,
+    ) -> Result<Option<GovernorAuthorityProjection>, CoverageError> {
+        self.derivation
+            .derive_observation(observation)
+            .map(|profile| profile.as_ref().map(Self::project))
     }
 
     /// Reports an observed route mismatch: the active route is no longer the
