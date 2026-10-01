@@ -724,20 +724,7 @@ fn apply(
                     (current.state, next.state),
                     (DrainState::Requested, DrainState::Draining)
                 ) && current.expected_predecessor.is_some();
-                if rearm {
-                    let Some(predecessor) = next.expected_predecessor.as_deref() else {
-                        return Err(JournalError::IllegalTransition {
-                            machine: "drain",
-                            from: format!("{:?}", current.state),
-                            to: format!("{:?}::without-expected-predecessor", next.state),
-                        });
-                    };
-                    let current_checksum =
-                        record_checksum(&HostStateRecord::Drain(current.clone()))?;
-                    if predecessor != current_checksum {
-                        return Err(JournalError::IdempotencyConflict);
-                    }
-                } else if rearm_continuation {
+                if rearm || rearm_continuation {
                     let Some(predecessor) = next.expected_predecessor.as_deref() else {
                         return Err(JournalError::IllegalTransition {
                             machine: "drain",
