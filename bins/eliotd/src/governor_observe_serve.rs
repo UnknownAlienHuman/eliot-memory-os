@@ -19,28 +19,45 @@
 //! suboperation's typed payload into the Governor owner's capture record;
 //! [`observe_suboperation_owner`] is the single suboperation-to-owner map.
 //!
-//! W5 â€” outcomes are recorded at the layer that actually produced them:
+//! W5 Ã¢â‚¬â€ outcomes are recorded at the layer that actually produced them:
 //! [`OutcomeLayer`] keeps a canonical commit, an external effect, a durable
 //! child job and the final host response apart, and [`ObserveServeOutcome`]
 //! is exhaustive over them so a pending handle can never be read as a terminal
 //! success. A live pending handle is [`PendingObserveHandle`], whose read/wait
 //! resolve the exact owner operation through the owner's own receipt route and
-//! whose cancel is the admitted envelope's own cancellation identity â€” a handle
+//! whose cancel is the admitted envelope's own cancellation identity Ã¢â‚¬â€ a handle
 //! nothing can service is never constructed. When the owner's commit is real
 //! but persisting that response fails, the honest state is
 //! [`ObserveServeOutcome::EffectOccurrenceUnretained`]: the effect happened,
 //! the completion was not retained, and the committed operation stays the
 //! reconciliation reference.
 //!
+//! W2 â€” authority is resolved PER OPERATION, not by a blanket `task_id = None`.
+//! [`ObserveOperationAuthority`] is the single typed classifier over the closed
+//! carrier vocabulary: an operation that legitimately has no task contract and an
+//! operation that REQUIRES one are different variants, so a task-relative
+//! operation can never pass as an unbound cold capture.
+//! [`resolve_observe_operation_authority`] is the sole producer, and it resolves
+//! from the live #1746 activation/task-selection owner evidence
+//! ([`eliot_governor::GovernorActivationSnapshot`], read through
+//! `read_unique_agent_activation`) â€” never from `envelope.identity.task_id`,
+//! which is a claim to compare, not authority. The envelope's claimed task and
+//! scope are compared against the owner-resolved binding; a disagreement is a
+//! conflict, never a silent rebind. [`ObserveEffectCeiling`] is the effect
+//! ceiling an operation may act under, and it is derived from the accepted owner
+//! grant: an operation whose class has no owner grant stays
+//! [`ObserveEffectCeiling::NotGranted`], which refuses the operation rather than
+//! defaulting to a ceiling.
+//!
 //! `eliot.observe / observation` has a connected semantic owner: the existing
 //! Governor observation entry
 //! (`GovernorObservationReconciliation::admit_captured_observation`) prepares
 //! the real `CaptureCandidate` transition and the existing canonical
 //! admission owner returns the Store's own `WriteReceipt`, which is what the
-//! result leg carries back. The other four suboperations â€” `decision`,
-//! `failure`, `outcome` and `influence_ack` â€” stay on the explicit deferred
+//! result leg carries back. The other four suboperations Ã¢â‚¬â€ `decision`,
+//! `failure`, `outcome` and `influence_ack` Ã¢â‚¬â€ stay on the explicit deferred
 //! map with their named residual owners, because their own semantic owners
-//! have no connected admission on this path. A deferral is never completion â€”
+//! have no connected admission on this path. A deferral is never completion Ã¢â‚¬â€
 //! the pending handle stays live under the daemon owner, the
 //! status/resolve/rehydrate entries keep serving the live record, and
 //! resubmitting the same logical request once the owner connects re-enqueues
@@ -153,12 +170,199 @@ pub fn observe_suboperation_owner(suboperation: ObserveSuboperation) -> ObserveO
     }
 }
 
+/// The closed operation classes this carrier can admit.
+///
+/// Exhaustive over the carrier's operation space, so a new operation cannot be
+/// served without naming its own authority requirement: the authority resolver
+/// below matches on this enum, and a new variant is a compile error there until
+/// its task-contract requirement and effect ceiling are recorded. The cold
+/// unbound capture leg exists only as [`Self::ColdUnboundObservationCapture`],
+/// which is reachable by exactly the safe raw capture class â€” a task-relative
+/// class can never reach it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObserveOperationClass {
+    /// `eliot.observe / observation`: a safe raw capture that MAY retain an
+    /// explicitly unbound cold candidate under its existing policy. This is the
+    /// only class with a legitimately absent task contract.
+    ColdUnboundObservationCapture,
+    /// Task-relative promotion, actions, verification and Finish: these REQUIRE
+    /// the applicable actual task contract and can never be admitted unbound.
+    TaskRelative,
+}
+
+impl ObserveOperationClass {
+    /// Stable wire discriminator for the resolved operation class.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ColdUnboundObservationCapture => "cold_unbound_observation_capture",
+            Self::TaskRelative => "task_relative",
+        }
+    }
+}
+
+/// The effect ceiling one resolved operation may act under (issue #2565 W2).
+///
+/// The ceiling is derived from the accepted owner grant, never from a request
+/// field or a default. [`Self::NotGranted`] is a first-class variant meaning the
+/// owner granted no ceiling for this operation class; such an operation is
+/// refused or degraded visibly rather than executed under an assumed ceiling.
+/// There is deliberately no `Unbounded` variant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObserveEffectCeiling {
+    /// The owner grant admits a cold candidate only (safe raw capture).
+    CandidateOnly,
+    /// The owner grant admits a bounded reversible effect.
+    ReversibleMutation,
+    /// The owner granted no effect ceiling for this operation class. Absent
+    /// stays absent: the operation must be refused or degraded, never executed.
+    NotGranted,
+}
+
+impl ObserveEffectCeiling {
+    /// Stable wire discriminator for the effect ceiling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CandidateOnly => "candidate_only",
+            Self::ReversibleMutation => "reversible_mutation",
+            Self::NotGranted => "not_granted",
+        }
+    }
+
+    /// Whether a ceiling was actually granted. `NotGranted` is false, so a
+    /// caller cannot treat an absent grant as a permission.
+    #[must_use]
+    pub const fn is_granted(self) -> bool {
+        match self {
+            Self::CandidateOnly | Self::ReversibleMutation => true,
+            Self::NotGranted => false,
+        }
+    }
+}
+
+/// The exact applicable task contract one operation resolved against (issue
+/// #2565 W2).
+///
+/// Every field is the OWNER-resolved value from the #1746 activation /
+/// task-selection evidence, never the host's claimed identity text. The
+/// envelope's `task_id`/`work_scope_id` are compared against these values; a
+/// mismatch is [`Self::ConflictingClaim`], never a silent adoption of the host's
+/// text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObserveTaskContract {
+    /// Owner-resolved task identity from the live activation evidence.
+    pub task_id: String,
+    /// Owner-resolved task contract revision from the activation evidence.
+    pub task_revision: u64,
+    /// Owner-resolved `WorkScope` identity from the activation evidence.
+    pub work_scope_id: String,
+    /// Owner-resolved canonical owner revision the binding was read at.
+    pub owner_revision: u64,
+}
+
+/// The typed authority one carrier operation resolved to (issue #2565 W2).
+///
+/// The point of this enum is that the two former indistinguishable cases are now
+/// DIFFERENT VARIANTS: an operation that legitimately has no task contract
+/// ([`Self::ColdUnboundCapture`]) and an operation that requires a task contract
+/// but the owner has not resolved one ([`Self::TaskContractRequired`]) can no
+/// longer both appear on the wire as `task_id = None`. A task-relative operation
+/// that arrives without a resolvable task contract is refused into
+/// [`Self::TaskContractRequired`], which is not an admission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ObserveOperationAuthority {
+    /// A safe unbound cold capture under its existing policy: legitimately no
+    /// task contract, retained cold with no task effect. The effect ceiling is
+    /// the owner-granted candidate ceiling.
+    ColdUnboundCapture {
+        /// The operation class that reached the cold leg.
+        class: ObserveOperationClass,
+        /// The owner-granted effect ceiling for a safe raw capture.
+        effect_ceiling: ObserveEffectCeiling,
+    },
+    /// An operation bound to the applicable actual task contract. The effect
+    /// ceiling is the owner-granted ceiling for this operation class.
+    TaskBound {
+        /// The operation class that reached the task-relative leg.
+        class: ObserveOperationClass,
+        /// The exact owner-resolved task contract.
+        task_contract: ObserveTaskContract,
+        /// The owner-granted effect ceiling.
+        effect_ceiling: ObserveEffectCeiling,
+    },
+    /// A task-relative operation that REQUIRES a task contract but the owner
+    /// has not resolved one at the current fence. This is distinct from a cold
+    /// unbound capture and is NOT an admission: the operation is refused and
+    /// must not execute under an assumed or blanket-absent task.
+    TaskContractRequired {
+        /// The operation class that required a task contract.
+        class: ObserveOperationClass,
+        /// Stable refusal code; the caller reports it, never downgrades it.
+        code: &'static str,
+        /// Human-readable reason naming the missing owner authority.
+        reason: String,
+    },
+    /// The host's claimed task/scope disagreed with the owner-resolved binding.
+    /// This is a conflict, not a rebind: the operation is refused and the
+    /// owner's binding is never overwritten by the host's text.
+    ConflictingClaim {
+        /// The operation class whose claim conflicted.
+        class: ObserveOperationClass,
+        /// Stable refusal code for a claim that disagrees with owner authority.
+        code: &'static str,
+        /// Human-readable reason naming the exact disagreement.
+        reason: String,
+    },
+}
+
+impl ObserveOperationAuthority {
+    /// The effect ceiling this authority permits, or [`ObserveEffectCeiling::NotGranted`]
+    /// for every non-admitting arm. A refused or conflicting arm can never be
+    /// read as holding a ceiling.
+    #[must_use]
+    pub const fn effect_ceiling(&self) -> ObserveEffectCeiling {
+        match self {
+            Self::ColdUnboundCapture { effect_ceiling, .. }
+            | Self::TaskBound { effect_ceiling, .. } => *effect_ceiling,
+            Self::TaskContractRequired { .. } | Self::ConflictingClaim { .. } => {
+                ObserveEffectCeiling::NotGranted
+            }
+        }
+    }
+
+    /// The owner-resolved task contract this authority was bound to, if any. A
+    /// cold unbound capture has none by definition and returns `None`; a
+    /// task-relative operation without one never reaches here as `None`-and-
+    /// passing, because it is refused into [`Self::TaskContractRequired`].
+    #[must_use]
+    pub const fn task_contract(&self) -> Option<&ObserveTaskContract> {
+        match self {
+            Self::TaskBound { task_contract, .. } => Some(task_contract),
+            Self::ColdUnboundCapture { .. }
+            | Self::TaskContractRequired { .. }
+            | Self::ConflictingClaim { .. } => None,
+        }
+    }
+
+    /// Whether this authority admits execution. Only the two admitting arms do;
+    /// a task-relative operation missing its task contract or carrying a
+    /// conflicting claim is not admitted.
+    #[must_use]
+    pub const fn is_admitting(&self) -> bool {
+        match self {
+            Self::ColdUnboundCapture { .. } | Self::TaskBound { .. } => true,
+            Self::TaskContractRequired { .. } | Self::ConflictingClaim { .. } => false,
+        }
+    }
+}
+
 /// Decodes only the closed shared observe vocabulary from linked tool bytes.
 ///
 /// Returns the suboperation discriminator. The tool name must be the
 /// admitted capability and `arguments.kind` must name exactly one of the
 /// five I7.6 suboperations; anything else fails closed. No semantic field is
-/// interpreted here â€” routing only.
+/// interpreted here Ã¢â‚¬â€ routing only.
 pub fn decode_observe_suboperation(
     tool: &serde_json::Value,
 ) -> Result<ObserveSuboperation, String> {
@@ -198,7 +402,7 @@ pub fn decode_observe_suboperation(
 /// their semantic owners have no connected admission yet. Every identity on the
 /// returned record comes from the Kernel-admitted envelope and its minted
 /// attempt, and the observed content is the exact admitted payload the host
-/// submitted â€” the host's own `candidate_disposition` is carried as a claim
+/// submitted Ã¢â‚¬â€ the host's own `candidate_disposition` is carried as a claim
 /// for the owner to compare, never as authority.
 ///
 /// Bounded by the same shared text guard the MCP surface applies before
@@ -316,7 +520,7 @@ pub enum ObserveServeOutcome {
     /// but persisting that response against the host record failed. The effect
     /// happened; the completion was not retained. This is the honest
     /// `effect occurred / completion not retained` state: never reported as
-    /// success, never reported as a clean refusal, and never silently retried â€”
+    /// success, never reported as a clean refusal, and never silently retried Ã¢â‚¬â€
     /// the named owner operation stays the reconciliation reference.
     EffectOccurrenceUnretained {
         /// The committed store operation, kept as the reconciliation reference.
@@ -339,6 +543,25 @@ pub enum ObserveServeOutcome {
         /// Exact condition that resumes the deferred pair.
         resume: &'static str,
     },
+    /// The per-operation authority resolution refused to admit this operation
+    /// (issue #2565 W2).
+    ///
+    /// This arm exists so a task-relative operation that REQUIRES a task
+    /// contract, or whose host claim conflicts with the owner-resolved binding,
+    /// is reported as its own typed refusal instead of failing closed through an
+    /// opaque string or â€” worse â€” being admitted as an unbound cold capture.
+    /// Nothing executed, so this is not a commit, a refusal from an owner, a
+    /// pending handle or an unknown outcome.
+    AuthorityRefused {
+        /// Served suboperation.
+        suboperation: ObserveSuboperation,
+        /// The operation class whose authority was resolved and refused.
+        class: ObserveOperationClass,
+        /// Stable refusal code from the authority resolver.
+        code: &'static str,
+        /// Exact reason naming the missing or conflicting owner authority.
+        reason: String,
+    },
 }
 
 impl ObserveServeOutcome {
@@ -352,7 +575,9 @@ impl ObserveServeOutcome {
     /// A live pending handle reports [`OutcomeLayer::Pending`] and an
     /// unresolved commit outcome reports [`OutcomeLayer::PossiblyEffected`],
     /// because neither proved itself to be a commit, an external effect or a
-    /// child job.
+    /// child job. An authority refusal (issue #2565 W2) is its own
+    /// [`OutcomeLayer::AuthorityRefused`] layer: nothing was admitted and nothing
+    /// executed, so it is neither a canonical commit nor an unavailable owner.
     #[must_use]
     pub const fn outcome_layer(&self) -> OutcomeLayer {
         match self {
@@ -363,6 +588,7 @@ impl ObserveServeOutcome {
             Self::Pending { .. } => OutcomeLayer::Pending,
             Self::OutcomeUnknown { .. } => OutcomeLayer::PossiblyEffected,
             Self::Unavailable { .. } => OutcomeLayer::Unavailable,
+            Self::AuthorityRefused { .. } => OutcomeLayer::AuthorityRefused,
         }
     }
 
@@ -371,21 +597,205 @@ impl ObserveServeOutcome {
     ///
     /// A pending handle and an unresolved outcome are both non-terminal: they
     /// must never be reported to the host as a completion. An unretained effect
-    /// IS terminal at the domain layer â€” the commit happened â€” but it is
+    /// IS terminal at the domain layer Ã¢â‚¬â€ the commit happened Ã¢â‚¬â€ but it is
     /// terminal *without* retained completion, which is why it is reported
-    /// separately rather than folded into `Committed`.
+    /// separately rather than folded into `Committed`. An authority refusal is
+    /// terminal for THIS attempt â€” the operation was not admitted and nothing
+    /// ran â€” while explicitly never being a completion.
     #[must_use]
     pub const fn is_terminal(&self) -> bool {
         match self {
             Self::Committed { .. }
             | Self::Refused { .. }
-            | Self::EffectOccurrenceUnretained { .. } => true,
+            | Self::EffectOccurrenceUnretained { .. }
+            | Self::AuthorityRefused { .. } => true,
             Self::Pending { .. } | Self::OutcomeUnknown { .. } | Self::Unavailable { .. } => false,
         }
     }
 }
 
+/// Stable refusal code: a task-relative operation arrived with no resolvable
+/// owner task contract at the current fence.
+pub const OBSERVE_TASK_CONTRACT_REQUIRED: &str = "OBSERVE_TASK_CONTRACT_REQUIRED";
+
+/// Stable refusal code: the host's claimed task/scope disagreed with the
+/// owner-resolved binding.
+pub const OBSERVE_CLAIM_CONFLICTS_OWNER_AUTHORITY: &str = "OBSERVE_CLAIM_CONFLICTS_OWNER_AUTHORITY";
+
+/// Maps one served observe suboperation to its authority requirement class.
+///
+/// Exhaustive over [`ObserveSuboperation`], so the per-operation authority split
+/// cannot drift from the closed carrier vocabulary: a new suboperation is a
+/// compile error here until its requirement class is recorded. The mapping
+/// reuses the OWNER's frozen canonical requirement table
+/// ([`crate::task_binding_admission::classify_observe_suboperation`],
+/// issue #1746 W1) rather than restating it, so this carrier can never drift
+/// from the admission contract the store gate enforces.
+#[must_use = "a caller must record the resolved class; an unclassified operation carries no authority"]
+pub fn observe_operation_class(
+    suboperation: ObserveSuboperation,
+) -> Result<ObserveOperationClass, String> {
+    match crate::task_binding_admission::classify_observe_suboperation(suboperation.as_str()) {
+        Some(crate::task_binding_admission::CanonicalOperationRequirement::SafeRawCapture) => {
+            Ok(ObserveOperationClass::ColdUnboundObservationCapture)
+        }
+        Some(
+            crate::task_binding_admission::CanonicalOperationRequirement::TaskRelativeEffectful,
+        ) => Ok(ObserveOperationClass::TaskRelative),
+        Some(crate::task_binding_admission::CanonicalOperationRequirement::DiscoveryReadOnly) => {
+            Err("observe suboperation classified as a discovery read-only operation".to_owned())
+        }
+        None => Err("observe suboperation has no canonical requirement class".to_owned()),
+    }
+}
+
+/// Derives the effect ceiling an operation class may act under from the accepted
+/// owner grant (issue #2565 W2).
+///
+/// The ceiling is a property of the OWNER's accepted policy for that operation
+/// class, projected from the owner itself â€” never a request field and never a
+/// default. The connected Governor capture owner accepts exactly a
+/// `CaptureCandidate` transition, whose accepted ceiling is the store's
+/// `EffectClass::Candidate`; that owner-accepted ceiling is projected here as
+/// [`ObserveEffectCeiling::CandidateOnly`]. A task-relative class has NO
+/// connected owner grant on this carrier, so it resolves to
+/// [`ObserveEffectCeiling::NotGranted`]: absent stays absent, and the operation
+/// is refused rather than executed under an assumed ceiling.
+///
+/// A caller cannot widen this: the function takes no request argument at all, so
+/// there is no request field that could raise the ceiling.
+#[must_use]
+pub fn observe_effect_ceiling_for(class: ObserveOperationClass) -> ObserveEffectCeiling {
+    match class {
+        // The connected owner is `GovernorObservationReconciliation::admit_captured_observation`,
+        // which builds a `TransitionClass::CaptureCandidate` envelope with
+        // `requested_effect_ceiling: EffectClass::Candidate`. That is the
+        // ceiling the owner accepted, projected losslessly.
+        ObserveOperationClass::ColdUnboundObservationCapture => ObserveEffectCeiling::CandidateOnly,
+        // No task-relative owner is connected on this carrier, so there is no
+        // accepted grant to project. Not granted is not a small grant.
+        ObserveOperationClass::TaskRelative => ObserveEffectCeiling::NotGranted,
+    }
+}
+
+/// Resolves the applicable authority for ONE operation on this carrier (issue
+/// #2565 W2).
+///
+/// This is the single authority seam replacing the former blanket
+/// `task_id = envelope.identity.task_id` with a `None` fallback. It resolves
+/// from the live #1746 activation / task-selection owner evidence and NEVER
+/// from host-authored identity text. `activation` is `None` only when the
+/// semantic owner itself reports that no unique live activation exists (a
+/// `CompositionError` from `read_unique_agent_activation`); that is the owner's
+/// honest "no authority resolved" answer, not a default and not a fallback.
+///
+/// The envelope's `task_id` / `work_scope_id` are treated as CLAIMS to compare,
+/// never as authority to persist verbatim:
+///
+/// - a task-relative operation with no owner-resolved activation is refused into
+///   [`ObserveOperationAuthority::TaskContractRequired`] â€” it can never pass as
+///   an unbound cold capture;
+/// - a host claim that disagrees with the owner-resolved task or scope is
+///   refused into [`ObserveOperationAuthority::ConflictingClaim`] and is never
+///   written over the owner's binding;
+/// - only the safe raw capture class, which legitimately has no task contract,
+///   may resolve to [`ObserveOperationAuthority::ColdUnboundCapture`], and only
+///   under an owner-granted ceiling.
+///
+/// `live_fence` is the canonical owner's current fence. A resolved activation
+/// observed at a different fence is stale authority and is refused rather than
+/// applied.
+pub fn resolve_observe_operation_authority(
+    envelope: &HostRequestEnvelope,
+    suboperation: ObserveSuboperation,
+    activation: Option<&eliot_governor::GovernorActivationSnapshot>,
+    live_fence: &eliot_contracts::StateFence,
+) -> Result<ObserveOperationAuthority, String> {
+    let class = observe_operation_class(suboperation)?;
+    match activation {
+        // No owner-resolved activation. Only the safe raw capture class may
+        // proceed without one; a task-relative class is refused, which is the
+        // whole point of this typed split.
+        None => match class {
+            ObserveOperationClass::ColdUnboundObservationCapture => {
+                Ok(ObserveOperationAuthority::ColdUnboundCapture {
+                    class,
+                    effect_ceiling: observe_effect_ceiling_for(class),
+                })
+            }
+            ObserveOperationClass::TaskRelative => {
+                Ok(ObserveOperationAuthority::TaskContractRequired {
+                    class,
+                    code: OBSERVE_TASK_CONTRACT_REQUIRED,
+                    reason: "task-relative operation requires the applicable owner-resolved \
+                             TaskContract; the activation owner resolved no live task binding"
+                        .to_owned(),
+                })
+            }
+        },
+        Some(activation) => {
+            // Stale owner authority is refused, never applied under the live
+            // fence it was not observed at.
+            if !eliot_contracts::fences_match_exact(&activation.state_fence, live_fence) {
+                return Ok(ObserveOperationAuthority::ConflictingClaim {
+                    class,
+                    code: OBSERVE_CLAIM_CONFLICTS_OWNER_AUTHORITY,
+                    reason: "owner activation evidence was observed at another fence and is \
+                             not applicable to this admission"
+                        .to_owned(),
+                });
+            }
+            let task_contract = ObserveTaskContract {
+                task_id: activation.task_id.to_string(),
+                task_revision: activation.task_revision,
+                work_scope_id: activation.work_scope_id.clone(),
+                owner_revision: activation.owner_revision,
+            };
+            // Compare the host's claims against the owner-resolved binding. A
+            // disagreement is a conflict; the host text never wins.
+            for (claimed, resolved, field) in [
+                (
+                    envelope.identity.task_id.as_deref(),
+                    task_contract.task_id.as_str(),
+                    "task_id",
+                ),
+                (
+                    envelope.identity.work_scope_id.as_deref(),
+                    task_contract.work_scope_id.as_str(),
+                    "work_scope_id",
+                ),
+            ] {
+                if let Some(claimed) = claimed
+                    && claimed != resolved
+                {
+                    return Ok(ObserveOperationAuthority::ConflictingClaim {
+                        class,
+                        code: OBSERVE_CLAIM_CONFLICTS_OWNER_AUTHORITY,
+                        reason: format!(
+                            "envelope {field} claim does not match the owner-resolved \
+                                 activation binding"
+                        ),
+                    });
+                }
+            }
+            Ok(ObserveOperationAuthority::TaskBound {
+                class,
+                task_contract,
+                effect_ceiling: observe_effect_ceiling_for(class),
+            })
+        }
+    }
+}
+
 /// Builds the canonical-write request identity for one served capture.
+///
+/// The task identity written into the request metadata is taken from the RESOLVED
+/// authority, never from `envelope.identity.task_id`. For a cold unbound capture
+/// it stays `None` (a legitimate absent task contract). For a task-bound operation
+/// it is the owner-resolved task id, so a blanket `None` can no longer stand in
+/// for an operation that requires a task contract. A non-admitting authority
+/// (required-but-absent contract, or a conflicting claim) is refused here before
+/// any identity is built.
 ///
 /// The fence is the one the Kernel admitted on this exact envelope and read
 /// here from that envelope, never taken from the host or from a cached copy:
@@ -398,16 +808,47 @@ impl ObserveServeOutcome {
 pub fn observation_request_identity(
     envelope: &HostRequestEnvelope,
     capture: &CapturedObservation,
+    authority: &ObserveOperationAuthority,
     observed_unix_ms: i64,
 ) -> Result<eliot_protocol::RequestIdentity, String> {
+    let invalid = |field: &'static str| {
+        format!("observe capture identity is not a valid contract value: {field}")
+    };
+    // A task-relative operation whose task contract the owner did not resolve,
+    // or whose host claim conflicts with owner authority, must not receive an
+    // identity at all. Refusing here keeps the failure typed and upstream of the
+    // canonical commit rather than producing an unbound-looking identity.
+    let (task_id, effect_ceiling) = match authority {
+        ObserveOperationAuthority::ColdUnboundCapture { effect_ceiling, .. } => {
+            (None, *effect_ceiling)
+        }
+        ObserveOperationAuthority::TaskBound {
+            task_contract,
+            effect_ceiling,
+            ..
+        } => (Some(task_contract.task_id.as_str()), *effect_ceiling),
+        ObserveOperationAuthority::TaskContractRequired { code, reason, .. }
+        | ObserveOperationAuthority::ConflictingClaim { code, reason, .. } => {
+            return Err(format!(
+                "observe capture authority refused: {code}: {reason}"
+            ));
+        }
+    };
+    // The ceiling must actually be granted. An operation whose class has no
+    // accepted owner grant is refused here rather than executed under an
+    // assumed ceiling.
+    if !effect_ceiling.is_granted() {
+        return Err(format!(
+            "observe capture authority refused: {}: no owner-granted effect ceiling for this \
+             operation class",
+            ObserveEffectCeiling::NotGranted.as_str()
+        ));
+    }
     let operation_text = format!(
         "{}:mcp-observe:{}",
         crate::SERVICE_NAME,
         capture.operation_id
     );
-    let invalid = |field: &'static str| {
-        format!("observe capture identity is not a valid contract value: {field}")
-    };
     let metadata = eliot_contracts::RequestMetadata {
         request_id: eliot_contracts::RequestId::new(operation_text.clone())
             .map_err(|_| invalid("observe_capture.request_id"))?,
@@ -422,10 +863,9 @@ pub fn observation_request_identity(
             .map(eliot_contracts::SessionId::new)
             .transpose()
             .map_err(|_| invalid("observe_capture.session_id"))?,
-        task_id: envelope
-            .identity
-            .task_id
-            .as_deref()
+        // The owner-resolved task contract, or `None` for the one class that
+        // legitimately has no task. Never the host's claim.
+        task_id: task_id
             .map(eliot_contracts::TaskId::new)
             .transpose()
             .map_err(|_| invalid("observe_capture.task_id"))?,
@@ -493,8 +933,15 @@ pub enum OutcomeLayer {
     /// refusal would be asserting a rollback nobody observed.
     PossiblyEffected,
     /// No owner is connected for this arm, so the result is the explicit
-    /// unavailable disposition with its named residual owner â€” never a success.
+    /// unavailable disposition with its named residual owner Ã¢â‚¬â€ never a success.
     Unavailable,
+    /// The per-operation authority resolution refused to admit the operation
+    /// (issue #2565 W2): a task-relative operation required a task contract the
+    /// owner had not resolved, or the host's claim conflicted with the
+    /// owner-resolved binding. Nothing was admitted and nothing executed, so
+    /// this is deliberately distinct from both the canonical-commit refusal arm
+    /// and the unavailable-owner arm.
+    AuthorityRefused,
 }
 
 impl OutcomeLayer {
@@ -508,6 +955,7 @@ impl OutcomeLayer {
             Self::Pending => "pending",
             Self::PossiblyEffected => "possibly_effected",
             Self::Unavailable => "unavailable",
+            Self::AuthorityRefused => "authority_refused",
         }
     }
 }
@@ -585,8 +1033,8 @@ impl PendingObserveHandle {
     ///
     /// Returns the owner's actual classification on the first terminal
     /// receipt. A poll that reads nothing returns
-    /// [`ObserveServeOutcome::OutcomeUnknown`], and the caller â€” not this
-    /// module â€” decides how long to wait; nothing here asserts that the effect
+    /// [`ObserveServeOutcome::OutcomeUnknown`], and the caller Ã¢â‚¬â€ not this
+    /// module Ã¢â‚¬â€ decides how long to wait; nothing here asserts that the effect
     /// did or did not happen.
     pub async fn wait(
         &self,
@@ -606,7 +1054,7 @@ impl PendingObserveHandle {
     /// Returns the identity the caller must present to the owner, or `None`
     /// when the admitted envelope carried no cancellation identity. A `None` is
     /// the honest answer: the operation has no cancellation right, and no
-    /// caller may invent one. The handle never claims a cancel took effect â€”
+    /// caller may invent one. The handle never claims a cancel took effect Ã¢â‚¬â€
     /// the owner's disposition is still read through [`Self::read`].
     #[must_use]
     pub fn cancel(&self) -> Option<&str> {
@@ -783,6 +1231,24 @@ fn observe_response_document(outcome: &ObserveServeOutcome) -> serde_json::Value
             "residual_owner": residual_owner,
             "resume": resume,
         }),
+        // An authority refusal (issue #2565 W2) is reported as its own typed
+        // disposition: the operation was not admitted, nothing executed, and the
+        // exact operation class plus refusal code name WHY it was refused. It
+        // never borrows a commit status or an unavailable-owner status.
+        ObserveServeOutcome::AuthorityRefused {
+            suboperation,
+            class,
+            code,
+            reason,
+        } => serde_json::json!({
+            "status": "observation_authority_refused",
+            "record_kind": "observation_candidate",
+            "suboperation": suboperation.as_str(),
+            "capability": OBSERVE_CAPABILITY,
+            "operation_class": class.as_str(),
+            "authority_refusal_code": code,
+            "authority_refusal_reason": reason,
+        }),
     }
 }
 
@@ -817,11 +1283,15 @@ pub fn observation_result_body(
         ),
         // A refusal, an unknown outcome and an arm with no connected owner admit
         // no semantic record at all. `Unavailable` never reaches this leg in
-        // production â€” the carrier retires it through the defer leg â€” so it
+        // production Ã¢â‚¬â€ the carrier retires it through the defer leg Ã¢â‚¬â€ so it
         // carries no receipt reference rather than borrowing one from another arm.
         ObserveServeOutcome::Refused { .. }
         | ObserveServeOutcome::OutcomeUnknown { .. }
-        | ObserveServeOutcome::Unavailable { .. } => {
+        | ObserveServeOutcome::Unavailable { .. }
+        // An authority refusal (issue #2565 W2) is in this group for the same
+        // reason: nothing was committed, so it carries no receipt reference and is
+        // never classified as a canonical write receipt.
+        | ObserveServeOutcome::AuthorityRefused { .. } => {
             (eliot_protocol::HostRequestResultClass::Unclassified, None)
         }
     };
@@ -860,7 +1330,7 @@ pub fn observation_result_body(
 /// Honest deferral for one served observe pair.
 ///
 /// Names the exact owner admission that must connect, the residual program
-/// that owns it, and the resume condition â€” never a result, never a receipt.
+/// that owns it, and the resume condition Ã¢â‚¬â€ never a result, never a receipt.
 /// The daemon flight records this through the Kernel defer leg (pair
 /// retired, durable record `Routed`) and the waiter keeps the live pending
 /// handle.
@@ -906,7 +1376,7 @@ pub fn serve_admitted_observe(
     // Issue #1739 W3: the claim joins the Governor dispatch only through
     // the attempt minted for this admitted operation. A capability minted
     // for another facet never dispatches here, even when its shape
-    // validates â€” the defer leg would quarantine it, but the dispatch
+    // validates Ã¢â‚¬â€ the defer leg would quarantine it, but the dispatch
     // refuses it before any suboperation decodes.
     if attempt.facet_method != OBSERVE_CAPABILITY {
         return Err(

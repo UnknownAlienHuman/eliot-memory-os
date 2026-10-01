@@ -1626,7 +1626,13 @@ fn captured_observation_envelope(
             .map(|task| task.as_str().to_owned()),
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
-        admission_contract_set_digest: canonical_digest(submission)?,
+        // The admission-contract digest is the OWNER's, not this seam's: the envelope
+        // validator (eliot_canonical::CanonicalWriteEnvelope::validate) compares this
+        // field against `supported_admission_contract_set_digest()`, so deriving it
+        // locally would be a submission supplying its own proof. Every other
+        // envelope site in this crate uses the owner call, including the five
+        // pre-existing ones in this file.
+        admission_contract_set_digest: eliot_canonical::supported_admission_contract_set_digest()?,
         operation_manifest_digest: manifest_digest.clone(),
         semantic_commands: vec![NamedMutationRequest {
             operation: NamedMutationOperation::CaptureObservation,
