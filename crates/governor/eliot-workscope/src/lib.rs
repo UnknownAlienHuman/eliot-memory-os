@@ -4697,6 +4697,7 @@ mod tests {
             authority_epoch_ref: None,
             operation_id: "scan-op:one".into(),
             idempotency_key: "scan-idem:one".into(),
+            cancellation_ref: "activation-cancel:one".into(),
             lease_consumed: 0,
             policy_revision: 1,
             deadline: 10,

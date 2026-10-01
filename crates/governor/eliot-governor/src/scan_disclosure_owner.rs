@@ -333,16 +333,14 @@ impl InstallationScanDisclosureStore {
         if file_name.contains('/') || file_name.contains('\\') {
             return Err(WorkScopeError::ScanReceiptCorrupt);
         }
-        let valid_stem = file_name
+        let basename_stem = file_name
             .strip_prefix(LOOSE_SCAN_DISCLOSURE_PREFIX)
-            .and_then(|rest| rest.strip_suffix(LOOSE_SCAN_DISCLOSURE_SUFFIX))
-            .filter(|stem| {
-                !stem.is_empty()
-                    && stem.len() <= 200
-                    && stem.chars().all(|character| !character.is_control())
-            })
-            .is_some();
-        if !valid_stem {
+            .and_then(|rest| rest.strip_suffix(LOOSE_SCAN_DISCLOSURE_SUFFIX));
+        if !basename_stem.is_some_and(|stem| {
+            !stem.is_empty()
+                && stem.len() <= 200
+                && stem.chars().all(|character| !character.is_control())
+        }) {
             return Err(WorkScopeError::ScanReceiptCorrupt);
         }
         if bytes.len() > eliot_ors::MAX_SCAN_DISCLOSURE_QUARANTINE_BYTES {
@@ -553,6 +551,7 @@ impl ScanDisclosureStore for InstallationScanDisclosureStore {
             contract_version: eliot_ors::CONTRACT_VERSION,
             operation_key: operation_key.clone(),
             idempotency_key: binding.idempotency_key.clone(),
+            cancellation_ref: binding.cancellation_ref.clone(),
             request_hash: request_hash.clone(),
             installation_id: binding.installation_id.clone(),
             principal_ref: binding.principal_ref.clone(),

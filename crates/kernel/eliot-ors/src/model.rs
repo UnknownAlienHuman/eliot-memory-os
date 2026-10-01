@@ -9707,6 +9707,11 @@ pub struct ScanDisclosureOrsRecord {
     pub operation_key: String,
     /// Idempotency key admitted with this write.
     pub idempotency_key: String,
+    /// Exact cancellation identity copied from the original activation ticket.
+    /// Legacy rows deserialize as empty and fail validation as stale; ORS never
+    /// synthesizes cancellation authority for them.
+    #[serde(default)]
+    pub cancellation_ref: String,
     /// Canonical request hash binding the exact receipt bytes to this write
     /// identity (I5.27). Reusing the key with a different value is an
     /// identity conflict, never a silent overwrite of the bound row.
@@ -9764,6 +9769,7 @@ impl ScanDisclosureOrsRecord {
     pub fn same_binding(&self, other: &Self) -> bool {
         self.operation_key == other.operation_key
             && self.idempotency_key == other.idempotency_key
+            && self.cancellation_ref == other.cancellation_ref
             && self.request_hash == other.request_hash
             && self.installation_id == other.installation_id
             && self.principal_ref == other.principal_ref
@@ -9791,6 +9797,7 @@ impl ScanDisclosureOrsRecord {
         }
         validate_text(&self.operation_key, "scan_disclosure_operation_key")?;
         validate_text(&self.idempotency_key, "scan_disclosure_idempotency_key")?;
+        validate_text(&self.cancellation_ref, "scan_disclosure_cancellation_ref")?;
         validate_digest(&self.request_hash, "scan_disclosure_request_hash")?;
         validate_text(&self.installation_id, "scan_disclosure_installation_id")?;
         validate_text(&self.principal_ref, "scan_disclosure_principal_ref")?;

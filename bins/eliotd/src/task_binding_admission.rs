@@ -931,7 +931,6 @@ pub fn prepare_initial_bind_scope_discovery(
         || envelope.kind != eliot_protocol::HostRequestKind::Invocation
         || envelope.identity.capability != "eliot.task-controller"
         || envelope.connection_id.trim().is_empty()
-        || envelope.connection_id != evidence.session_id
         || envelope.identity.session_id.as_deref() != Some(evidence.session_id.as_str())
         || envelope.identity.task_id.as_deref() != Some(evidence.task_id.as_str())
         || envelope.identity.work_scope_id.as_deref() != Some(evidence.work_scope_id.as_str())
@@ -996,6 +995,12 @@ pub fn prepare_initial_bind_scope_discovery(
     if response.wire_version != SCAN_DISCLOSURE_OWNER_WIRE_VERSION {
         return Err(fail("BIND_SCOPE owner returned another wire version"));
     }
+    let observed_at = super::unix_ms();
+    if observed_at == 0 || observed_at > evidence.ticket_deadline_unix_ms {
+        return Err(TaskBindingError::selection_required(
+            "original activation ticket expired while its discovery lease was being retained",
+        ));
+    }
     let (ticket, lease) = match response.result {
         ScanDisclosureOwnerRpcResult::InitialBindScopeDiscovery { ticket, lease } => {
             (ticket, lease)
@@ -1027,8 +1032,8 @@ pub fn prepare_initial_bind_scope_discovery(
         || ticket.kernel_deadline_unix_ms != evidence.ticket_deadline_unix_ms
         || ticket.workspace_selector.as_deref() != Some(explicit_root)
         || lease.validate().is_err()
-        || lease.proposer_ref != ticket.activation_request_id.as_str()
-        || lease.session_ref != ticket.connection_id
+        || lease.proposer_ref != evidence.principal_id
+        || lease.session_ref != evidence.session_id
         || lease.host_ref != ticket.peer_admission_receipt_sha256
         || lease.deadline != ticket.kernel_deadline_unix_ms
         || lease.candidate_root_ref != instance.root_identity
@@ -1041,7 +1046,13 @@ pub fn prepare_initial_bind_scope_discovery(
     {
         return Err(fail("Kernel-retained discovery lease or BIND_SCOPE proposal identity conflicts"));
     }
-    let discovery = observe_cold_start_discovery(&ticket, &evidence.state_fence, now)?;
+    let discovery = observe_cold_start_discovery(
+        &ticket,
+        &evidence.principal_id,
+        &evidence.session_id,
+        &evidence.state_fence,
+        observed_at,
+    )?;
     if discovery.lease != lease
         || discovery.discovery.evidence != proposal.bootstrap_discovery.evidence
         || discovery.discovery.observed != proposal.bootstrap_discovery.observed
@@ -3907,13 +3918,17 @@ fn observe_explicit_workspace_facts(
 /// explicitly admits the source-candidate read. Known-format inspection stays
 /// unresolved. No privacy class, boundary, source closure, or task is inferred
 /// here; the scanner returns its smallest privacy question until the
-/// applicable owner supplies those inputs.
+/// applicable owner supplies those inputs. `principal_ref` and `session_ref`
+/// are exact semantic owner identities; transport connection and activation-
+/// request identities are distinct and are never substituted into the lease.
 #[allow(
     clippy::too_many_lines,
     reason = "bounded Host observations and the matching discovery lease are assembled in one auditable path"
 )]
 pub fn observe_cold_start_discovery(
     ticket: &eliot_protocol::AgentActivationResolutionTicket,
+    principal_ref: &str,
+    session_ref: &str,
     fence: &StateFence,
     now: u64,
 ) -> Result<ColdStartDiscoveryInput, TaskBindingError> {
@@ -3947,8 +3962,8 @@ pub fn observe_cold_start_discovery(
         )
     })?;
     let request = DiscoveryLeaseRequest {
-        proposer_ref: ticket.activation_request_id.as_str().to_owned(),
-        session_ref: ticket.connection_id.clone(),
+        proposer_ref: principal_ref.to_owned(),
+        session_ref: session_ref.to_owned(),
         host_ref: ticket.peer_admission_receipt_sha256.clone(),
         candidate_root_ref: root_identity.clone(),
         root_filesystem_identity_ref: root_identity.clone(),

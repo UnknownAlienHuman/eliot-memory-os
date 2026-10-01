@@ -167,6 +167,8 @@ pub(crate) struct ScanDisclosureOwnerBinding {
     pub authority_epoch_ref: Option<String>,
     pub operation_id: String,
     pub idempotency_key: String,
+    #[serde(default)]
+    pub cancellation_ref: String,
     pub lease_consumed: u64,
     pub policy_revision: u64,
     pub deadline: u64,
@@ -471,8 +473,8 @@ impl KernelComposition {
         let consumption_limit = u32::try_from(allowed_reads.len())
             .map_err(|_| TransportError::SessionFenced)?;
         let lease_request = DiscoveryLeaseRequest {
-            proposer_ref: ticket.activation_request_id.as_str().to_owned(),
-            session_ref: ticket.connection_id.clone(),
+            proposer_ref: evidence.principal_id.clone(),
+            session_ref: evidence.session_id.clone(),
             host_ref: ticket.peer_admission_receipt_sha256.clone(),
             candidate_root_ref: root_identity_ref.clone(),
             root_filesystem_identity_ref: root_identity_ref.clone(),
@@ -486,8 +488,8 @@ impl KernelComposition {
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
         if issued.deadline != evidence.ticket_deadline_unix_ms
-            || issued.proposer_ref != ticket.activation_request_id.as_str()
-            || issued.session_ref != request.application_connection_id
+            || issued.proposer_ref != evidence.principal_id
+            || issued.session_ref != evidence.session_id
             || issued.host_ref != ticket.peer_admission_receipt_sha256
             || issued.root_filesystem_identity_ref != *root_identity_ref
             || issued.candidate_root_ref != *root_identity_ref
@@ -543,6 +545,9 @@ impl KernelComposition {
         .map_err(|_| TransportError::SessionFenced)?;
         if retained_ticket != ticket || retained_lease != issued {
             return Err(TransportError::IdentityConflict);
+        }
+        if super::unix_ms() > ticket.kernel_deadline_unix_ms {
+            return Err(TransportError::Timeout);
         }
         Ok(ScanDisclosureOwnerValue::InitialBindScopeDiscovery {
             ticket: retained_ticket,
@@ -1038,11 +1043,53 @@ impl KernelComposition {
         let record = self
             .p07_ors
             .load_scan_disclosure(operation_key)
-            .map_err(|_| TransportError::SessionFenced)?;
+            .map_err(|error| {
+                ScanDisclosureOwnerActionError::ReceiptRead(
+                    Self::scan_disclosure_read_failure(error),
+                )
+            })?;
         if let Some(record) = record.as_ref() {
-            Self::validate_record_binding(current, binding, record)?;
+            if Self::validate_record_binding(current, binding, record).is_err() {
+                return Err(ScanDisclosureOwnerActionError::ReceiptRead(
+                    ScanDisclosureReadFailure::Replaced,
+                ));
+            }
         }
         Ok(ScanDisclosureOwnerValue::Record { record })
+    }
+
+    #[cfg(windows)]
+    fn scan_disclosure_read_failure(error: eliot_ors::OrsError) -> ScanDisclosureReadFailure {
+        match error {
+            eliot_ors::OrsError::ScanDisclosureReadFailure(failure) => failure,
+            eliot_ors::OrsError::IntegrityProblem { record_type, .. }
+                if record_type == eliot_ors::SCAN_DISCLOSURE_RECORD_TYPE =>
+            {
+                ScanDisclosureReadFailure::Corrupt
+            }
+            eliot_ors::OrsError::MigrationRequired { .. } => ScanDisclosureReadFailure::Stale,
+            eliot_ors::OrsError::InvalidField {
+                field: "scan_disclosure_cancellation_ref",
+                ..
+            } => ScanDisclosureReadFailure::Stale,
+            eliot_ors::OrsError::StagingCommitOutcomeUnknown { .. } => {
+                ScanDisclosureReadFailure::UnknownCommit
+            }
+            eliot_ors::OrsError::StoreContract(error) => match *error {
+                eliot_store_api::StoreError::Unavailable => ScanDisclosureReadFailure::Inaccessible,
+                eliot_store_api::StoreError::UnknownOutcome { .. }
+                | eliot_store_api::StoreError::MissingReceiptEnvelope => {
+                    ScanDisclosureReadFailure::UnknownCommit
+                }
+                _ => ScanDisclosureReadFailure::Corrupt,
+            },
+            eliot_ors::OrsError::Storage(_) => ScanDisclosureReadFailure::Inaccessible,
+            eliot_ors::OrsError::PayloadIntegrityMismatch
+            | eliot_ors::OrsError::UnsupportedContractVersion(_)
+            | eliot_ors::OrsError::InvalidField { .. }
+            | eliot_ors::OrsError::Encoding(_) => ScanDisclosureReadFailure::Corrupt,
+            _ => ScanDisclosureReadFailure::Inaccessible,
+        }
     }
 
     #[cfg(windows)]
@@ -1176,7 +1223,7 @@ impl KernelComposition {
             | eliot_ors::OrsError::DuplicateConflict => TransportError::IdentityConflict,
             _ => TransportError::SessionFenced,
         })?;
-        let digest = record
+        let basename_stem = record
             .file_name
             .strip_prefix(eliot_workscope::LOOSE_SCAN_DISCLOSURE_PREFIX)
             .and_then(|name| name.strip_suffix(eliot_workscope::LOOSE_SCAN_DISCLOSURE_SUFFIX));
@@ -1184,8 +1231,8 @@ impl KernelComposition {
             || record.ors_generation != contour.ors_generation
             || record.file_name.contains('/')
             || record.file_name.contains('\\')
-            || !digest.is_some_and(|value| {
-                value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !basename_stem.is_some_and(|value| {
+                !value.is_empty() && value.chars().count() <= 200
             })
             || eliot_workscope::quarantine_loose_scan_disclosure(&record.file_name).is_err()
         {
@@ -2119,6 +2166,7 @@ impl KernelComposition {
             authority_epoch_ref: binding.authority_epoch_ref.clone(),
             operation_id: binding.operation_id.clone(),
             idempotency_key: binding.idempotency_key.clone(),
+            cancellation_ref: binding.cancellation_ref.clone(),
             lease_consumed: binding.lease_consumed,
             policy_revision: binding.policy_revision,
             deadline: binding.deadline,
@@ -2141,6 +2189,7 @@ impl KernelComposition {
             authority_epoch_ref: binding.authority_epoch_ref.clone(),
             operation_id: binding.operation_id.clone(),
             idempotency_key: binding.idempotency_key.clone(),
+            cancellation_ref: binding.cancellation_ref.clone(),
             lease_consumed: binding.lease_consumed,
             policy_revision: binding.policy_revision,
             deadline: binding.deadline,
@@ -2230,6 +2279,7 @@ impl KernelComposition {
             authority_epoch_ref: Some(authority_epoch_ref),
             operation_id,
             idempotency_key,
+            cancellation_ref: current.ticket.cancellation_id.clone(),
             lease_consumed: u64::from(lease.consumed),
             policy_revision: inputs.policy_revision,
             deadline: lease.deadline,
@@ -2343,6 +2393,7 @@ impl KernelComposition {
                     .to_string()
             || binding.state_fence_ref.as_deref() != Some(state_fence_ref.as_str())
             || binding.authority_epoch_ref.as_deref() != Some(authority_epoch_ref.as_str())
+            || binding.cancellation_ref != current.ticket.cancellation_id
             || binding.lease_ref.trim().is_empty()
             || binding.privacy_boundary_ref.trim().is_empty()
             || binding.operation_id.trim().is_empty()
@@ -2407,6 +2458,12 @@ impl KernelComposition {
             }
             Err(eliot_ors::OrsError::IntegrityProblem { .. }) => {
                 return Err(ScanDisclosureReadFailure::Corrupt);
+            }
+            Err(eliot_ors::OrsError::InvalidField {
+                field: "scan_disclosure_cancellation_ref",
+                ..
+            }) => {
+                return Err(ScanDisclosureReadFailure::Stale);
             }
             Err(eliot_ors::OrsError::MigrationRequired { .. }) => {
                 return Err(ScanDisclosureReadFailure::Stale);
@@ -2548,6 +2605,7 @@ impl KernelComposition {
                 authority_epoch_ref: retained.authority_epoch_ref.clone(),
                 operation_id: retained.operation_id.clone(),
                 idempotency_key: retained.idempotency_key.clone(),
+                cancellation_ref: retained.cancellation_ref.clone(),
                 lease_consumed: retained.lease_consumed,
                 policy_revision: retained.policy_revision,
                 deadline: retained.deadline,
@@ -2625,6 +2683,7 @@ impl KernelComposition {
             || record.privacy_boundary_ref != binding.privacy_boundary_ref
             || record.state_fence_ref != binding.state_fence_ref
             || record.authority_epoch_ref != binding.authority_epoch_ref
+            || record.cancellation_ref != binding.cancellation_ref
             || record.idempotency_key != binding.idempotency_key
             || record.policy_revision != binding.policy_revision
             || record.deadline != binding.deadline
