@@ -141,11 +141,14 @@
 //! projects the rows of the one member batch it already read onto the store
 //! owners' own typed records — `RevisionHead`, `OrderingHead`, `CanonicalEvent`,
 //! `ProjectionPublicationRecord` and `WriteReceipt` — so the export fence can
-//! carry those owners' values instead of re-derived copies, and derives both
-//! its completeness and its evidence gaps from the admitted generation's
-//! baseline and this module's own census. A member the source store does not
-//! hold keeps its gap; nothing here fills a fence member with a default, a zero,
-//! an empty collection or a synthesized digest.
+//! carry those owners' values instead of re-derived copies, decides
+//! requested-scope MEMBERSHIP per captured class from those same rows (the
+//! tables are `SCHEMALESS`, so the baseline's column list cannot decide it), and
+//! derives both its completeness and its evidence gaps from what it read, from
+//! the admitted generation's baseline, and from this module's own census. A
+//! member the source store does not hold keeps its gap; nothing here fills a
+//! fence member with a default, a zero, an empty collection or a synthesized
+//! digest.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -164,6 +167,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::SurrealStoreAdapter;
+use crate::apply::schema_contract::{SchemaMetaRecord, validate_recorded_bridge_range};
 use crate::error::AdapterError;
 
 /// Closed named-operation label for binding one snapshot consistency point.
@@ -216,12 +220,40 @@ pub enum EcxfCaptureGap {
     /// only. `StateFence::resource_generation` is the generation relevant to one
     /// decision, not the store's own generation, so it cannot stand in for it.
     StoreResourceGenerationUnavailable,
-    /// The adapter declares no identity or version of its own, and a build
-    /// constant of the running binary is not an observation of the source store.
-    SourceAdapterIdentityUnavailable,
+    /// The adapter's own VERSION has no source at all: the store records which
+    /// adapter owns it (`schema_meta.compatible_bridge_range`, read inside the
+    /// capture transaction and validated by `apply::schema_contract`), but no
+    /// baseline declares a column carrying a version, and a crate version of the
+    /// running binary is a build constant rather than an observation.
+    SourceAdapterVersionUnavailable,
     /// No owner declares the compression or encryption profile this export
     /// applies; the emitted package's codecs are not read from the source store.
     ExportProfileUnavailable,
+}
+
+/// Requested-scope membership of one captured class, decided from its rows.
+///
+/// I4.5 keeps `ScopeId` out of [`StateFence`](eliot_store_api::StateFence) and
+/// names its owner: "WorkScope mints and revisions the scope identity, and each
+/// Context Compiler operation carries it on its own ContextBinding". So a scope
+/// id in the request is a CLAIM, and membership is a property of each row. This
+/// is that property, read per class out of the rows the census already returned,
+/// never out of the request and never out of the DDL: these tables are
+/// `SCHEMALESS`, so the absence of a `DEFINE FIELD` is not evidence that no row
+/// holds a scope, and a row that carries one proves membership whatever the
+/// baseline says.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ObservedScopeMembership {
+    /// Stable logical class token from the adapter's closed source-class list.
+    pub class_token: &'static str,
+    /// Whether EVERY observed row of this class carries the class's own
+    /// store-owned binding to the requested scope, read from the row.
+    ///
+    /// A class with no observed row is vacuously a member of every scope: it
+    /// contributes nothing to narrow. `false` means the class either recorded no
+    /// scope on some row or recorded a different one, and the closure is not
+    /// proven either way.
+    pub proven: bool,
 }
 
 /// Exact transaction observation available to the ECXF composition owner.
@@ -241,12 +273,28 @@ pub struct EcxfSourceCapture {
     pub state_fence: StateFence,
     /// Schema generation observed in that transaction.
     pub schema_generation: String,
+    /// Store adapter identity the SOURCE STORE recorded in its own
+    /// `schema_meta.compatible_bridge_range`, read in the same transaction and
+    /// validated by `apply::schema_contract::validate_recorded_bridge_range`.
+    ///
+    /// This is the observed identity half of the manifest's `source_adapter` /
+    /// `source_adapter_version` pair. It is deliberately NOT `crate::ADAPTER_NAME`
+    /// read out of the running binary: the exporter compares this value against
+    /// the observer it stamps on every fence observation, so a manifest that
+    /// named the build constant instead would let a binary describe a store it
+    /// never read. The VERSION half has no source at all and stays a declared
+    /// gap.
+    pub source_adapter: String,
     /// Next commit sequence observed in that transaction.
     pub next_commit_sequence: u64,
     /// Next outbox sequence observed in that transaction.
     pub next_outbox_sequence: u64,
     /// Provider rows retained as canonical JSON source bytes by logical class.
     pub source_classes: Vec<EcxfSourceClassCapture>,
+    /// Requested-scope membership of every captured class, decided from the rows
+    /// of this same transaction rather than from the request's scope id or from
+    /// the baseline's column list; see [`ObservedScopeMembership`].
+    pub scope_membership: Vec<ObservedScopeMembership>,
     /// Revision heads projected from the observed `revision_head` rows of the
     /// same transaction, in logical key order.
     ///
@@ -789,15 +837,106 @@ const SOURCE_PURGE_LEDGER_TABLES: &[&str] = &[
     crate::schema::table::ERASURE_OUTCOME,
 ];
 
-/// Reports whether the admitted baseline gives every captured member table a
-/// scope column.
+/// Reads the requested-scope membership of one observed row of one class, if the
+/// class's own owner records the requested `ScopeId` on that row at all.
 ///
-/// A scope-to-record closure needs a physical column to filter on. This is the
-/// same baseline text the census classifies against, so the answer changes with
-/// the generation the adapter admits and never with a hand-maintained list.
-fn captures_scope_column(ddl: &'static str) -> bool {
-    captured_member_tables()
-        .all(|table| ddl.contains(&format!("DEFINE FIELD scope_id ON {table} ")))
+/// Membership is READ FROM THE ROW. A scope id in the request is a claim about
+/// what the caller wants, never evidence of what the store holds, and these
+/// tables are `SCHEMALESS`, so the previous question — does the baseline
+/// `DEFINE FIELD scope_id` on this table — was answered on the wrong side of the
+/// seam in both directions: a declared column is not proof that any row holds a
+/// value, and a missing declaration is not proof that no row holds one. The
+/// member batch reads whole records (`SELECT *`), so a row's own binding is
+/// either there or it is not, and this reads it there.
+///
+/// Exactly one class records the admitted scope today, and it is the class whose
+/// owner mints it: `WriteReceipt::envelope` carries the store-issued
+/// `ReceiptEnvelope` whose `core.work_scope.scope_id` IS the `ScopeId` the write
+/// was admitted under (`eliot_store_api::issue_store_receipt_envelope` copies
+/// `transition.scope_id` into it verbatim). Every other admitted class records a
+/// DIFFERENT identity or none:
+///
+/// * `ordering_head.body.scope` and `canonical_event.body.ordering_links[*].ordering_scope`
+///   are `OrderingScopeId` — one ordering stream, not the work scope. I4.5 keeps
+///   those two identities separate, so reading one as the other would assert an
+///   equivalence no owner proved;
+/// * `revision_head.body.key` is a `RevisionKey` — one revision dependency;
+/// * `projection_record`, `relation_record`, `outbox_event`, `recovery_owner`
+///   and `recovery_job` carry no scope binding at all.
+///
+/// Those classes therefore return `None` and cannot be a PROVEN member. That is
+/// the honest verdict for a scope export, not a filter that quietly drops them:
+/// the export stays `Partial` and the exporter refuses, instead of publishing a
+/// closure over records nobody attributed to the scope.
+fn observed_row_scope<'row>(
+    class: &MemberClass,
+    row: &'row Map<String, Value>,
+) -> Option<&'row str> {
+    if class.table != crate::schema::table::WRITE_RECEIPT {
+        return None;
+    }
+    row.get(HEAD_BODY_FIELD)?
+        .get("envelope")?
+        .get("core")?
+        .get("work_scope")?
+        .get("scope_id")?
+        .as_str()
+}
+
+/// Per-class requested-scope membership of one observed census, in logical class
+/// order.
+///
+/// Every captured class appears exactly once, so a caller can see WHICH class is
+/// unproven rather than only that something is. The test is
+/// [`observed_row_scope`] against the request's own scope text, so a class whose
+/// rows record no `ScopeId` is reported `proven: false` instead of being
+/// silently treated as a member.
+fn observed_scope_membership(
+    class_rows: &[Vec<Map<String, Value>>],
+    scope_id: &ScopeId,
+) -> Vec<ObservedScopeMembership> {
+    captured_member_classes()
+        .zip(class_rows)
+        .map(|(class, rows)| {
+            let proven = rows.iter().all(|row| {
+                // A class with no observed row contributes nothing to narrow, so
+                // it is vacuously a member; `all` over an empty iterator is that
+                // statement and needs no separate arm.
+                observed_row_scope(class, row).is_some_and(|scope| scope == scope_id.as_str())
+            });
+            ObservedScopeMembership {
+                class_token: class.token,
+                proven,
+            }
+        })
+        .collect()
+}
+
+/// Whether the requested scope's closure over the observed census is PROVEN.
+///
+/// I05-10 admits a scope export only on exact scope evidence, and this is that
+/// test: EVERY captured class must have proven membership, because a single
+/// unattributed class means the export would carry records nobody placed inside
+/// the requested scope. It is `all` over the per-class verdicts and not a check
+/// of the request's scope against anything, which is the claim the previous
+/// baseline-column predicate made and could not support.
+fn scope_closure_proven(
+    class_rows: &[Vec<Map<String, Value>>],
+    scope_id: &ScopeId,
+) -> Result<bool, StoreError> {
+    // `captured_member_classes()` is the denominator: a census that returned
+    // fewer class result sets than the registry declares is not a complete
+    // observation, and a complete-looking verdict over a truncated one would
+    // prove nothing.
+    if class_rows.len() != captured_member_classes().count() {
+        return Err(StoreError::InvalidField {
+            field: SNAPSHOT_CLASS_FIELD,
+            reason: "captured class results do not cover the declared census",
+        });
+    }
+    Ok(observed_scope_membership(class_rows, scope_id)
+        .iter()
+        .all(|membership| membership.proven))
 }
 
 /// Reports whether the census captures any source erasure/purge ledger table.
@@ -805,38 +944,90 @@ fn captures_purge_ledger() -> bool {
     captured_member_tables().any(|table| SOURCE_PURGE_LEDGER_TABLES.contains(&table))
 }
 
-/// Reports whether the census captures any blob-residency member class.
+/// The blob-residency keys this census POSITIVELY observed as reachable.
 ///
 /// A fence's blob reachability set is derived from the residency keys of the
 /// blobs the export delivers, so it needs a captured class that *is* a blob
 /// member; a class that is only a record or a reference cannot supply one.
-fn captures_blob_residency() -> bool {
-    captured_member_classes().any(|class| class.member_type == SnapshotMemberType::Blob)
+///
+/// `None` means no live set was observed at all: no captured class is a blob
+/// member, so the census read no residency evidence and the store declared
+/// nothing. `Some` carries the observed set, which is empty when the census DID
+/// read a blob class and that class returned no rows.
+///
+/// Those two states are DIFFERENT observations and must not collapse into one
+/// value, which is why this returns `Option` rather than `Vec`. The distinction
+/// is load-bearing: `elift_ecxf::BlobReachabilityObservation` refuses an absent
+/// observation and accepts an observed empty one, so reporting "no blob class"
+/// as `Some(vec![])` would publish a fence asserting a complete live set that
+/// nobody observed — while reporting an observed empty set as `None` would throw
+/// away a real store statement about zero reachable blobs. Every key here is the
+/// row's OWN recorded residency digest, checked against the row's own recorded
+/// payload by `row_residency_digest` and never recomputed here: this crate is
+/// not the Blob-root owner, so no residency digest can be re-derived from it.
+fn observed_blob_reachability(
+    class_rows: &[Vec<Map<String, Value>>],
+) -> Result<Option<Vec<String>>, StoreError> {
+    let Some(class) = captured_member_classes()
+        .find(|class| class.member_type == SnapshotMemberType::Blob)
+    else {
+        return Ok(None);
+    };
+    let mut keys = Vec::new();
+    for row in observed_class_rows(class_rows, class.table) {
+        keys.push(row_residency_digest(
+            class,
+            row,
+            &row_content_digest(row)?,
+        )?);
+    }
+    Ok(Some(keys))
 }
 
 /// The evidence gaps of one ECXF capture, derived from what the capture can read.
 ///
-/// The first three entries are *predicates* over the admitted generation's own
-/// baseline and over the census this module ran, not fixed refusals: a baseline
-/// that gives the captured tables a scope column, a census that captures an
-/// erasure ledger, or a census that captures a blob member each close its gap
-/// with no second vocabulary and no edit to this list.
+/// Every entry is a *predicate* over something this call actually observed, over
+/// the admitted generation's own baseline, or over the census this module ran —
+/// never a fixed refusal. That is what makes the list honest in both directions:
+/// an entry cannot appear for evidence the capture read, and an owner that later
+/// supplies the evidence closes its entry with no edit here and no second
+/// vocabulary.
 ///
-/// The remaining entries are declared absences of *this owner*, and no baseline
-/// or census can close them:
+/// The first three are read from THIS transaction: the requested-scope closure
+/// from the observed rows ([`scope_closure_proven`]), and the purge ledger and
+/// the blob reachability from the census itself. The remaining five are
+/// predicates over the SAME baseline text, one entry per gap and one `eliot_ecxf`
+/// member name behind each, read through the schema owner's own
+/// `declares_column_name` so the two sides cannot disagree about which names are
+/// absent:
 ///
 /// * the Architecture source digest and the `NormativePair` identity receipt are
-///   sealed by owners outside the store, so they are not columns any baseline
-///   defines;
-/// * a source-side ECXF export receipt has no durable artifact anywhere;
-/// * the capture point reads the schema generation and the canonical fence, and
-///   `StateFence::resource_generation` is the generation relevant to one
-///   decision, not the store's own generation, so it cannot stand in for one;
-/// * this adapter declares no identity or version of its own, and a build
-///   constant of the running binary is not an observation of the source store;
-/// * no owner declares the compression or encryption profile this export
-///   applies, and the emitted package's codecs are not read from the store.
-fn observed_capture_gaps(generation: &str) -> Result<Vec<EcxfCaptureGap>, StoreError> {
+///   sealed by owners outside the store, so no baseline this owner ships defines
+///   a column for either and the point cannot read one;
+/// * a source-side ECXF export receipt has no durable artifact anywhere — the
+///   exporter mints the package receipt at emit time — so no baseline defines one;
+/// * the store's own aggregate generation is not a column: the two near-misses
+///   were examined and rejected, because `schema_meta.generation` is the SCHEMA
+///   generation and `StateFence::resource_generation` is the generation relevant
+///   to one decision;
+/// * the adapter's VERSION is not a column either. Its IDENTITY is observed: the
+///   capture point reads the store's own `schema_meta.compatible_bridge_range`
+///   in this same transaction and refuses the capture unless that row passes
+///   `apply::schema_contract::validate_recorded_bridge_range`, so the manifest's
+///   `source_adapter` is a value the source store recorded rather than a
+///   constant of the running binary, while `source_adapter_version` stays
+///   unobserved until some owner records one;
+/// * the compression and encryption profiles of the EMITTED package belong to
+///   the exporter's codec rather than to this store — but the SOURCE VIEW still
+///   owes the exporter a value for them and no owner has one, so the gap is
+///   asked over the same baseline instead of being asserted. The whole-name
+///   matching is the schema owner's, so `encryption` is never satisfied by
+///   `encryption_key_ref`.
+fn observed_capture_gaps(
+    generation: &str,
+    class_rows: &[Vec<Map<String, Value>>],
+    scope_id: &ScopeId,
+) -> Result<Vec<EcxfCaptureGap>, StoreError> {
     let Some(ddl) = admitted_generation_ddl(generation) else {
         return Err(StoreError::InvalidField {
             field: SNAPSHOT_CLASS_FIELD,
@@ -844,22 +1035,60 @@ fn observed_capture_gaps(generation: &str) -> Result<Vec<EcxfCaptureGap>, StoreE
         });
     };
     let mut gaps = Vec::new();
-    if !captures_scope_column(ddl) {
+    if !scope_closure_proven(class_rows, scope_id)? {
         gaps.push(EcxfCaptureGap::RequestedScopeClosureUnproven);
     }
     if !captures_purge_ledger() {
         gaps.push(EcxfCaptureGap::SourcePurgeLedgerUnavailable);
     }
-    if !captures_blob_residency() {
+    // Only a census that read a blob class AND observed zero blob rows has
+    // positively observed an empty live set. An ABSENT observation (`None` —
+    // no blob class was captured at all, so no residency evidence was read) is a
+    // DIFFERENT record and refuses here too, rather than being reported as zero
+    // reachable blobs.
+    if observed_blob_reachability(class_rows)?.is_none_or(Vec::is_empty) {
         gaps.push(EcxfCaptureGap::BlobStoreEvidenceUnavailable);
     }
-    gaps.extend([
-        EcxfCaptureGap::ExternalSourceIdentityEvidenceUnavailable,
-        EcxfCaptureGap::SourceExportReceiptUnavailable,
-        EcxfCaptureGap::StoreResourceGenerationUnavailable,
-        EcxfCaptureGap::SourceAdapterIdentityUnavailable,
-        EcxfCaptureGap::ExportProfileUnavailable,
-    ]);
+    for (gap, columns) in [
+        (
+            EcxfCaptureGap::ExternalSourceIdentityEvidenceUnavailable,
+            &["architecture_source_digest", "normative_pair_identity_receipt_digest"][..],
+        ),
+        (
+            EcxfCaptureGap::SourceExportReceiptUnavailable,
+            &["export_receipt"][..],
+        ),
+        (
+            EcxfCaptureGap::StoreResourceGenerationUnavailable,
+            &["store_generation"][..],
+        ),
+        (
+            EcxfCaptureGap::SourceAdapterVersionUnavailable,
+            &["source_adapter_version"][..],
+        ),
+        (
+            // The emitted package's codec profiles are the exporter's, not the
+            // source's, but the SOURCE VIEW still owes the exporter a value for
+            // them and no owner has one. So the gap is asked here over the same
+            // baseline rather than asserted: a generation that defines a column
+            // for it closes the gap, and no second vocabulary appears.
+            EcxfCaptureGap::ExportProfileUnavailable,
+            &["compression", "encryption"][..],
+        ),
+    ] {
+        // One entry per gap, not per column: the Architecture and `NormativePair`
+        // digests are two `eliot_ecxf` members behind ONE piece of evidence, and
+        // a list that repeated its own gap would report the same absence twice.
+        // The gap closes when the baseline defines what it would need. Whole-name
+        // matching is the schema owner's, so `encryption` is never satisfied by
+        // `encryption_key_ref`.
+        if columns
+            .iter()
+            .all(|column| !crate::schema::declares_column_name(ddl, column))
+        {
+            gaps.push(gap);
+        }
+    }
     Ok(gaps)
 }
 
@@ -983,10 +1212,19 @@ fn verify_canonical_source_classes(generation: &str) -> Result<(), StoreError> {
 }
 
 /// The schema-meta projection of the bound point.
-#[derive(Deserialize)]
-struct PointSchemaMeta {
-    generation: String,
-}
+///
+/// This is the adapter's own `SchemaMetaRecord` shape, decoded from the very
+/// statement `crate::schema::READ_SCHEMA_META` pins, so the capture point reads
+/// the store's durable record rather than a bespoke projection of it, and the
+/// recorded adapter identity it carries is the one the store actually wrote.
+///
+/// `compatible_bridge_range` is what makes that possible: `apply::schema_contract`
+/// writes it and refuses any row naming a different adapter, so
+/// `parse_capture_point` can hand the exporter an observed adapter identity for
+/// the manifest's `source_adapter` / `source_adapter_version` pair — whose
+/// `observed_by` must name something the source store itself recorded — without
+/// this module restating the rule or reaching for `crate::ADAPTER_NAME`.
+type PointSchemaMeta = SchemaMetaRecord;
 
 /// The canonical-fence projection of the bound point.
 #[derive(Deserialize)]
@@ -1009,6 +1247,9 @@ struct CapturePoint {
     next_commit_sequence: u64,
     next_outbox_sequence: u64,
     schema_generation: String,
+    /// Adapter identity the store itself recorded in `schema_meta`, read in the
+    /// same transaction as every other member of this point.
+    source_adapter: String,
 }
 
 /// Frozen per-capture state. No `Debug` impl by design: registry contents
@@ -1955,15 +2196,33 @@ async fn observe_capture_point(
     parse_capture_point(meta, fence)
 }
 
-/// Decodes one point observation, failing closed on a blank or control-bearing
-/// generation and on an absent fence. A half-observed point is never a usable
-/// consistency point, so neither half is defaulted.
+/// Decodes one point observation, failing closed on an unusable schema-meta row,
+/// on a blank or control-bearing generation and on an absent fence. A
+/// half-observed point is never a usable consistency point, so neither half is
+/// defaulted.
+///
+/// The recorded adapter identity is taken through its owner's own rule,
+/// `apply::schema_contract::validate_recorded_bridge_range`, rather than compared
+/// here: that is the single place this crate decides what the store's recorded
+/// bridge range means, and it returns the ORIGINAL RECORDED value so this point
+/// carries what the store wrote rather than a constant of the running binary. The
+/// narrower rule is used on purpose — the full `validate_schema_meta_record`
+/// additionally demands the applied state and the migration history, which this
+/// read has no use for and which would newly refuse a snapshot capture taken
+/// while a migration is in flight. Its failure maps to the typed
+/// [`StoreError::InvalidField`] this module uses for its own point defects, so no
+/// provider or serde text crosses.
 fn parse_capture_point(
     meta: Option<PointSchemaMeta>,
     fence: Option<PointFence>,
 ) -> Result<CapturePoint, StoreError> {
-    let generation = meta.map(|meta| meta.generation).unwrap_or_default();
-    if generation.is_empty() || generation.chars().any(char::is_control) {
+    let meta = meta.ok_or(StoreError::Unavailable)?;
+    let source_adapter =
+        validate_recorded_bridge_range(&meta).map_err(|_error| StoreError::InvalidField {
+            field: SNAPSHOT_CLASS_FIELD,
+            reason: "captured schema metadata does not record this adapter as its owner",
+        })?;
+    if meta.generation.is_empty() || meta.generation.chars().any(char::is_control) {
         return Err(StoreError::Unavailable);
     }
     let fence = fence.ok_or(StoreError::Unavailable)?;
@@ -1971,11 +2230,15 @@ fn parse_capture_point(
         .state_fence
         .validate()
         .map_err(StoreError::Foundation)?;
+    // Owned before the row is destructured below, so the borrow of the recorded
+    // value ends here and the two halves of this point cannot be entangled.
+    let source_adapter = source_adapter.to_owned();
     Ok(CapturePoint {
         state_fence: fence.state_fence,
         next_commit_sequence: fence.next_commit_sequence,
         next_outbox_sequence: fence.next_outbox_sequence,
-        schema_generation: generation,
+        schema_generation: meta.generation,
+        source_adapter,
     })
 }
 
@@ -2228,7 +2491,11 @@ pub async fn capture_ecxf_source(
     let events = observed_events(&class_rows)?;
     let projections = observed_projections(&class_rows)?;
     let receipts = observed_receipts(&class_rows)?;
-    let missing_evidence = observed_capture_gaps(generation)?;
+    // Requested-scope MEMBERSHIP, per captured class, read from those same rows.
+    // The scope the caller asked for is a claim until a row says so, and these
+    // tables are schemaless, so the verdict cannot come from the baseline.
+    let scope_membership = observed_scope_membership(&class_rows, &request.scope_id);
+    let missing_evidence = observed_capture_gaps(generation, &class_rows, &request.scope_id)?;
 
     let mut total_source_bytes = 0_u64;
     let source_classes = captured_member_classes()
@@ -2255,9 +2522,11 @@ pub async fn capture_ecxf_source(
         scope_id: request.scope_id.clone(),
         state_fence: point.state_fence,
         schema_generation: point.schema_generation,
+        source_adapter: point.source_adapter,
         next_commit_sequence: point.next_commit_sequence,
         next_outbox_sequence: point.next_outbox_sequence,
         source_classes,
+        scope_membership,
         revision_heads,
         ordering_heads,
         events,

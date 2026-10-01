@@ -45,7 +45,8 @@ pub use backup_restore::{
     validate_restore_batch,
 };
 pub use backup_snapshot::{
-    EcxfCaptureGap, EcxfSourceCapture, EcxfSourceClassCapture, capture_ecxf_source,
+    EcxfCaptureGap, EcxfSourceCapture, EcxfSourceClassCapture, ObservedScopeMembership,
+    capture_ecxf_source,
 };
 pub use config::{
     ADAPTER_NAME, ClientSetLimits, ConfigError, MAX_CLIENT_SET_SESSIONS_PER_ROLE,

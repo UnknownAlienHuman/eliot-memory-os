@@ -651,28 +651,40 @@ const fn is_identifier_byte(byte: u8) -> bool {
         || (byte >= b'A' && byte <= b'Z')
 }
 
-/// The five ECXF capture-evidence column groups this owner does **not** define,
-/// and the real owner of each value.
+/// The ECXF capture-evidence columns this owner does **not** define, and the
+/// real owner of each value.
 ///
 /// This is a *negative* inventory, and it is the schema owner's half of the
-/// answer to "why does the ECXF capture report five evidence gaps". Each entry
-/// is the exact field name `eliot_ecxf` already uses, so the vocabulary stays the
-/// consumer's own and this file introduces no second set of names. For each,
+/// answer to "why does the ECXF capture report evidence gaps". Each entry
+/// is the exact field name `eliot_ecxf` already uses, so the vocabulary stays
+/// the consumer's own and this file introduces no second set of names. For each,
 /// this module was checked for a *differently named* column that carries the same
 /// evidence; the const block below is the compiled proof that no such column
 /// exists in any baseline this owner ships, and the per-entry notes record which
 /// near-miss was examined and why it is a different quantity.
 ///
+/// The list has five entries, and it is this module's half of a two-sided
+/// statement: `backup_snapshot::observed_capture_gaps` asks `declares_column_name`
+/// about the same names against the admitted baseline, so a generation that
+/// defines one of them closes the corresponding capture gap with no edit there.
+/// That is why `source_adapter` is absent: the store already records the owning
+/// adapter under `compatible_bridge_range`, the capture point reads it in the
+/// same transaction, and `apply::schema_contract` validates it. The compression
+/// and encryption profiles of the EMITTED package are absent for a different
+/// reason — they are not source-store evidence at all, and the exporter reads
+/// them off the codec it hands to `eliot_ecxf::EcxfArchive::layout`.
+///
 /// No entry is a `DEFINE FIELD`, deliberately. A declared column that no write
 /// path populates is a certified no-op: it would make a reader believe an
 /// evidence value exists when every real row reads back `NONE`, which is the
 /// "claimed but unbacked" defect class rather than a fix for it. The adapter
-/// crate contains no writer for any of these names today (`git grep` finds zero
-/// occurrences of all seven identifiers under `crates/storage/eliot-store-surreal-adapter`),
-/// so adding the field would back a claim with nothing. Each value below is
-/// therefore owned by the component that actually mints it, and closing its gap
-/// means that owner supplies the evidence, not that this file declares an empty
-/// column.
+/// crate contains no WRITER for any of these names: they occur only as the
+/// consumer-side read of an absence (`backup_snapshot::observed_capture_gaps`
+/// asking `declares_column_name` about each one) and in this inventory, never in
+/// a `DEFINE FIELD`, an insert or an update. So adding the field would back a
+/// claim with nothing. Each value below is therefore owned by the component that
+/// actually mints it, and closing its gap means that owner supplies the
+/// evidence, not that this file declares an empty column.
 pub(crate) const ECXF_UNDEFINED_CAPTURE_EVIDENCE: &[(&str, &str)] = &[
     (
         "architecture_source_digest",
@@ -698,22 +710,12 @@ pub(crate) const ECXF_UNDEFINED_CAPTURE_EVIDENCE: &[(&str, &str)] = &[
          decision, not the store's aggregate",
     ),
     (
-        "source_adapter",
-        "this adapter's identity. `schema_meta.migration_id` names the \
-         *migration*, not the adapter, and `crate::ADAPTER_NAME` is a build \
-         constant of the running binary rather than an observation of the \
-         source store",
-    ),
-    (
         "source_adapter_version",
-        "same owner and same rejection as `source_adapter`; the adapter declares \
-         no version column of its own",
-    ),
-    (
-        "compression",
-        "the codec profile of the EMITTED package. The only encryption-adjacent \
-         field, `erasure_intent.encryption_key_ref`, is a key *reference* on a \
-         table the admitted generation does not define, not a package profile",
+        "the store records WHICH adapter owns it (`compatible_bridge_range`, \
+         read by `backup_snapshot`'s capture point and validated by \
+         `apply::schema_contract`), but no baseline declares a column carrying a \
+         version, and a crate version of the running binary is a build constant \
+         rather than an observation",
     ),
 ];
 

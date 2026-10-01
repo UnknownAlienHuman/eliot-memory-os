@@ -19,22 +19,22 @@ pub(super) struct FenceRecord {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct SchemaMetaRecord {
-    pub(super) generation: String,
-    pub(super) migrations: Vec<SchemaMigrationIdentity>,
-    pub(super) compatible_bridge_range: String,
-    pub(super) migration_state: String,
-    pub(super) migration_id: String,
-    pub(super) migration_checksum_sha256: String,
-    pub(super) updated_at: String,
+pub(crate) struct SchemaMetaRecord {
+    pub(crate) generation: String,
+    pub(crate) migrations: Vec<SchemaMigrationIdentity>,
+    pub(crate) compatible_bridge_range: String,
+    pub(crate) migration_state: String,
+    pub(crate) migration_id: String,
+    pub(crate) migration_checksum_sha256: String,
+    pub(crate) updated_at: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct SchemaMigrationIdentity {
-    pub(super) migration_id: String,
-    pub(super) migration_checksum_sha256: String,
-    pub(super) generation: String,
+pub(crate) struct SchemaMigrationIdentity {
+    pub(crate) migration_id: String,
+    pub(crate) migration_checksum_sha256: String,
+    pub(crate) generation: String,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -149,8 +149,38 @@ pub(super) fn applied_record_from_intent(intent: &SchemaMetaRecord) -> SchemaMet
     }
 }
 
-pub(super) fn validate_schema_meta_record(record: &SchemaMetaRecord) -> Result<(), AdapterError> {
+pub(crate) fn validate_schema_meta_record(record: &SchemaMetaRecord) -> Result<(), AdapterError> {
     validate_schema_meta_record_in_state(record, schema::MIGRATION_STATE_APPLIED)
+}
+
+/// Validates ONLY the recorded bridge range of a `schema_meta` row: that it is
+/// an admissible token and that it names this adapter.
+///
+/// This is the same rule `validate_schema_meta_record` applies to that one
+/// field, extracted so a reader that needs the recorded adapter IDENTITY and
+/// nothing else — the ECXF capture point in `backup_snapshot`, which reads this
+/// row to learn which adapter owns the store — does not have to also demand the
+/// migration-history and applied-state rules it has no use for. It deliberately
+/// does NOT widen what that record means: a row this accepts can still be
+/// refused by the full validator, and a row the full validator accepts can never
+/// fail this one.
+///
+/// The returned string is the ORIGINAL RECORDED value, borrowed from the row, so
+/// a caller that reports it reports what the store wrote rather than
+/// `crate::ADAPTER_NAME` out of the running binary.
+pub(crate) fn validate_recorded_bridge_range<'a>(
+    record: &'a SchemaMetaRecord,
+) -> Result<&'a str, AdapterError> {
+    let range = record.compatible_bridge_range.as_str();
+    if range.trim().is_empty() || range.chars().any(char::is_control) {
+        return Err(AdapterError::PartialOutcome);
+    }
+    if range != crate::ADAPTER_NAME {
+        return Err(AdapterError::Config(
+            "schema metadata belongs to an incompatible adapter".to_owned(),
+        ));
+    }
+    Ok(range)
 }
 
 /// Validates a recorded `schema_meta` row against the one state it is
