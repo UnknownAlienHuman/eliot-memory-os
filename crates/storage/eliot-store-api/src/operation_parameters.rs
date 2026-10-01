@@ -1889,9 +1889,7 @@ fn check_declared_shape(
                 .map_err(|error| StoreError::Serialization(error.to_string()))?;
             admission.validate()
         }
-        ParameterShape::MailboxItemLookup => {
-            validate_mailbox_lookup_selector(value)
-        }
+        ParameterShape::MailboxItemLookup => validate_mailbox_lookup_selector(value),
         ParameterShape::ProblemOwnerState => {
             // The candidate record's own bindings are compared by the
             // problem owner-state contract, which needs the whole parameter map

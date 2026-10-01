@@ -48,8 +48,10 @@ pub(crate) fn mailbox_message_read_request(
     state_fence
         .validate()
         .map_err(CoordinationMailboxError::Foundation)?;
-    let parameters =
-        BTreeMap::from([("message_id".to_owned(), Value::String(message_id.to_owned()))]);
+    let parameters = BTreeMap::from([(
+        "message_id".to_owned(),
+        Value::String(message_id.to_owned()),
+    )]);
     Ok(NamedReadRequest {
         operation: NamedReadOperation::GetMailboxMessage,
         scope_id: None::<ScopeId>,
@@ -84,12 +86,13 @@ pub(crate) fn serve_mailbox_message_read(
             message_id: message_id.to_owned(),
         });
     }
-    let retained: MailboxItemRecord = serde_json::from_value(response.payload.clone()).map_err(|_| {
-        CoordinationMailboxError::InvalidField {
-            field: "mailbox.record",
-            reason: "retained row is not a mailbox message",
-        }
-    })?;
+    let retained: MailboxItemRecord =
+        serde_json::from_value(response.payload.clone()).map_err(|_| {
+            CoordinationMailboxError::InvalidField {
+                field: "mailbox.record",
+                reason: "retained row is not a mailbox message",
+            }
+        })?;
     retained
         .validate()
         .map_err(|_| CoordinationMailboxError::InvalidField {
