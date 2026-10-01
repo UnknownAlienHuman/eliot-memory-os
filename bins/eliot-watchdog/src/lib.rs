@@ -216,12 +216,6 @@ pub use watchdog_composition::{
     WatchdogAuthorityState, WatchdogBackupPort, WatchdogComposition, WatchdogReadiness,
 };
 pub use watchdog_config::WatchdogConfig;
-#[cfg(windows)]
-pub use watchdog_signals_server::{
-    RECOGNIZED_WITHOUT_OWNER_METHOD, SignalsDestinationClaim, SignalsFenceIdentity,
-    SignalsRestoreReconcile, SignalsServiceBootstrapClaim, WatchdogSignalsError,
-    WatchdogSignalsOutcome, WatchdogSignalsServer, watchdog_signals_pipe,
-};
 pub use watchdog_fallback_composition::{
     ControlLossFallbackBinding, FallbackCompositionError, FallbackMintInput,
     FallbackPublishEffects, FallbackPublishReceipt, LiveFallbackEffects,
@@ -232,6 +226,12 @@ pub use watchdog_fallback_composition::{
 pub use watchdog_fallback_envelope::{
     WatchdogFallbackMintError, WatchdogFallbackMintInputs, mint_watchdog_fallback_envelope,
     publish_watchdog_fallback_envelope,
+};
+#[cfg(windows)]
+pub use watchdog_signals_server::{
+    RECOGNIZED_WITHOUT_OWNER_METHOD, SignalsDestinationClaim, SignalsFenceIdentity,
+    SignalsRestoreReconcile, SignalsServiceBootstrapClaim, WatchdogSignalsError,
+    WatchdogSignalsOutcome, WatchdogSignalsServer, watchdog_signals_pipe,
 };
 
 /// Canonical public admission template shared with Host/runtime-status.

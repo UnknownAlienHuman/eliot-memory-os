@@ -1733,11 +1733,12 @@ impl SpoolImportReplayLedger {
 /// digest for step zero), and the stable `operation_id` binding the admitted
 /// operation. Carries no content bytes and no authority material.
 ///
-/// The serde shape is the same four fields this owner already validates in
+/// The decoded shape is the same four fields this owner already validates in
 /// [`validate_restore_chain`]. It exists so this OWNER type crosses the
-/// canonical Watchdog signals transport directly: no second parallel step struct
-/// and no untyped JSON copy of its fields exist anywhere.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// canonical Watchdog signals transport directly, on the request side only: no
+/// second parallel step struct and no untyped JSON copy of its fields exist
+/// anywhere.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpoolRestoreStep {
     /// Zero-based step index within the admitted restore.

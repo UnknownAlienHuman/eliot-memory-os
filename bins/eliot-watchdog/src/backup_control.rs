@@ -83,10 +83,11 @@
 //! The transport peer is proved by the OS, not by this module. The canonical
 //! signals server module binds `EliotPipeName::watchdog_signals` through the
 //! existing `eliot-ipc` server, which authenticates the connected client from the
-//! live pipe handle — impersonated token, SID, session id, and process image with
-//! its no-follow file identity — against an expectation pinned to the
-//! installer-approved Kernel image, and refuses before a single frame is read when
-//! that proof does not hold. Only an authenticated frame from such a peer reaches
+//! live pipe handle — impersonated token, SID, session id, and the client's own
+//! process image — against this service's live token expectation; that module then
+//! compares the same OS-observed image and its no-follow file identity against
+//! this installation's own approved `eliot-kernel.exe`. Both refuse before a
+//! single frame is read. Only an authenticated frame from such a peer reaches
 //! this handle, so the gates below compare each request against this composition's
 //! retained admission state and against the `#954` owner's own tables, and never
 //! against a peer identity the request itself carried.

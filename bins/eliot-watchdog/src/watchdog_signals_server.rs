@@ -175,19 +175,21 @@ impl KernelPeerAdmission {
 
     /// Returns whether the OS-authenticated peer is exactly this approved Kernel.
     ///
-    /// Both halves are OS-observed: the image path comes from the connected
-    /// client's own process handle, and the file identity is the no-follow
-    /// identity of that same image path resolved by the platform adapter during
-    /// authentication. An unauthenticated peer never reaches here — the transport
-    /// refuses it first.
+    /// Both halves are OS-observed, and both are read through
+    /// [`PeerIdentity::process_binding`], the transport owner's own existing
+    /// public read-only accessor. It yields the handle-bound binding only after
+    /// the whole identity re-validates, so a peer that does not validate is
+    /// refused here instead of being compared. The image path comes from the
+    /// connected client's own process handle, and the file identity is the
+    /// no-follow identity of that same image path resolved by the platform
+    /// adapter during authentication. An unauthenticated peer never reaches here
+    /// — the transport refuses it first.
     fn admits(&self, peer: &PeerIdentity) -> bool {
-        let PeerIdentity::Authenticated { proof, .. } = peer else {
+        let Some(process) = peer.process_binding() else {
             return false;
         };
-        if proof.process.executable_file_identity() != Some(self.kernel_file) {
-            return false;
-        }
-        windows_paths_equal(Path::new(proof.process.image_path()), &self.kernel_image)
+        process.executable_file_identity() == Some(self.kernel_file)
+            && windows_paths_equal(Path::new(process.image_path()), &self.kernel_image)
     }
 }
 
@@ -420,16 +422,12 @@ impl WatchdogSignalsServer {
         let child = Arc::clone(&handle);
         let served = pipe.clone();
         let supervised: Supervisor = composition.signals_supervisor();
-        let admitted = supervised.spawn(
-            SERVICE_NAME,
-            ChildClass::Worker,
-            move |token| {
-                let peer = Arc::clone(&peer);
-                let handle = Arc::clone(&child);
-                let pipe = served.clone();
-                async move { run_signals_listener(pipe, peer, handle, token).await }
-            },
-        );
+        let admitted = supervised.spawn(SERVICE_NAME, ChildClass::Worker, move |token| {
+            let peer = Arc::clone(&peer);
+            let handle = Arc::clone(&child);
+            let pipe = served.clone();
+            async move { run_signals_listener(pipe, peer, handle, token).await }
+        });
         let running = match admitted {
             SpawnDisposition::Admitted(running) => running,
             SpawnDisposition::DeniedShuttingDown => {
@@ -487,21 +485,25 @@ impl WatchdogSignalsServer {
         tracing::info!(
             event = "watchdog.signals_listener_stopping",
             observation = cancellation_observation(disposition),
-            unresolved_operations = self
-                .handle
-                .unresolved_operations()
-                .unwrap_or(usize::MAX),
+            unresolved_operations = self.handle.unresolved_operations().unwrap_or(usize::MAX),
             "watchdog signals listener cancellation requested"
         );
     }
 }
 
 /// Names one cancellation disposition for a bounded trace field.
+///
+/// The names distinguish a cooperative request from a forced one on purpose:
+/// `abort_forced` means the still-running listener task was ABORTED, so any
+/// in-flight accept or frame was torn down rather than drained. It never reads as
+/// an orderly stop, and it is not a name a reader could mistake for
+/// `already_finished`.
 fn cancellation_observation(disposition: CancellationDisposition) -> &'static str {
     match disposition {
         CancellationDisposition::Requested => "requested",
         CancellationDisposition::AlreadyRequested => "already_requested",
         CancellationDisposition::AlreadyFinished => "already_finished",
+        CancellationDisposition::Forced => "abort_forced",
     }
 }
 
@@ -518,10 +520,9 @@ async fn run_signals_listener(
 ) -> Result<(), TaskFailure> {
     let limits = TransportLimits::default();
     loop {
-        let mut server =
-            NamedPipeServer::create(&pipe, &peer.expectation).map_err(|error| {
-                TaskFailure::Failed(format!("watchdog signals bind refused: {error}"))
-            })?;
+        let mut server = NamedPipeServer::create(&pipe, &peer.expectation).map_err(|error| {
+            TaskFailure::Failed(format!("watchdog signals bind refused: {error}"))
+        })?;
         // Cancellation closes the real handle here: the accept wait is dropped
         // together with the server, so a stopped listener leaves no live pipe.
         let authenticated = tokio::select! {
@@ -534,7 +535,10 @@ async fn run_signals_listener(
         match authenticated {
             Err(_) => continue,
             Ok(Err(error)) => {
-                observe_fenced_peer("peer failed OS authentication; no frame was read", &error.to_string());
+                observe_fenced_peer(
+                    "peer failed OS authentication; no frame was read",
+                    &error.to_string(),
+                );
                 continue;
             }
             Ok(Ok(())) => {}
@@ -579,12 +583,11 @@ async fn serve_one_connection(
     handle: &BackupControlHandle,
     limits: TransportLimits,
 ) {
-    let frame = match tokio::time::timeout(limits.operation_timeout, server.receive_frame(limits))
-        .await
-    {
-        Err(_) | Ok(Err(_)) => return,
-        Ok(Ok(frame)) => frame,
-    };
+    let frame =
+        match tokio::time::timeout(limits.operation_timeout, server.receive_frame(limits)).await {
+            Err(_) | Ok(Err(_)) => return,
+            Ok(Ok(frame)) => frame,
+        };
     let connection_id = frame.connection_id.clone();
     let request = match decode_signals_request(&frame) {
         Ok(request) => request,
@@ -613,9 +616,11 @@ async fn serve_one_connection(
             return;
         }
     };
-    let delivered =
-        tokio::time::timeout(limits.operation_timeout, server.send_frame(&response, limits))
-            .await;
+    let delivered = tokio::time::timeout(
+        limits.operation_timeout,
+        server.send_frame(&response, limits),
+    )
+    .await;
     match delivered {
         Ok(Ok(DeliveryOutcome::Delivered)) => {}
         Ok(Ok(DeliveryOutcome::UnknownOutcome)) => tracing::warn!(
@@ -699,9 +704,7 @@ fn decode_signals_request(
     let eliot_protocol::ProtocolPayload::Json(payload) = &frame.payload else {
         return Err(TransportError::SessionFenced.into());
     };
-    let object = payload
-        .as_object()
-        .ok_or(TransportError::SessionFenced)?;
+    let object = payload.as_object().ok_or(TransportError::SessionFenced)?;
     // A reconcile request carries the owner-side inputs its canonical type does
     // not, so it arrives inside an envelope; every other registered method is the
     // bare canonical object.
@@ -753,14 +756,18 @@ fn decode_json<T: serde::de::DeserializeOwned>(
 /// owner statement — a registered method this owner holds no method for — is
 /// published as [`WatchdogSignalsOutcome::RecognizedWithoutOwnerMethod`], taken from
 /// the owner's own registered/executable tables rather than from a second list here.
-fn dispatch(handle: &BackupControlHandle, request: SignalsRequest) -> Option<WatchdogSignalsOutcome> {
+fn dispatch(
+    handle: &BackupControlHandle,
+    request: SignalsRequest,
+) -> Option<WatchdogSignalsOutcome> {
     match request {
         SignalsRequest::SnapshotPage(read) => {
             dispatch_admitted(handle, WatchdogBackupRequest::SnapshotPageRead(&read))
         }
-        SignalsRequest::ArchiveVerification(verification) => {
-            dispatch_admitted(handle, WatchdogBackupRequest::ArchiveVerification(&verification))
-        }
+        SignalsRequest::ArchiveVerification(verification) => dispatch_admitted(
+            handle,
+            WatchdogBackupRequest::ArchiveVerification(&verification),
+        ),
         SignalsRequest::RestoreStatus(status) => {
             dispatch_admitted(handle, WatchdogBackupRequest::RestoreStatus(&status))
         }
