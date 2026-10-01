@@ -10728,7 +10728,10 @@ impl HostComposition {
         generation: &PlatformHandle,
         before: (u8, u8),
     ) -> Result<(), HostError> {
-        let after = (self.jobs.kernel_restart_attempts, self.jobs.store_restart_attempts);
+        let after = (
+            self.jobs.kernel_restart_attempts,
+            self.jobs.store_restart_attempts,
+        );
         if after != before {
             persist_restart_budget(
                 self.launch_options.host_state_root(),
