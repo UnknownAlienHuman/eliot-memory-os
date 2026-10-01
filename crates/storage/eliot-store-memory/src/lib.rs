@@ -4258,7 +4258,8 @@ fn commit_transaction(
             .insert(head.key.as_str().to_owned(), head);
     }
     for mut head in plan.next_ordering_heads {
-        head.committed_receipt_sha256 = committed_receipt_sha256.clone();
+        head.committed_receipt_sha256
+            .clone_from(&committed_receipt_sha256);
         state
             .ordering_heads
             .insert(head.scope.as_str().to_owned(), head);

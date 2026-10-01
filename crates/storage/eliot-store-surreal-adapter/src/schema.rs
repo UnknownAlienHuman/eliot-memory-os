@@ -988,8 +988,7 @@ pub(crate) const READ_REVISION_HEADS_BY_KEYS: &str =
 /// itself. `?? NONE` keeps a row written before per-scope receipt digests
 /// readable as "no recorded digest" instead of failing closed on a field the
 /// row never had.
-pub(crate) const READ_ORDERING_HEADS_BY_SCOPES: &str =
-    "SELECT VALUE { scope: body.scope, sequence: body.sequence, state_fence: body.state_fence, committed_receipt_sha256: committed_receipt_sha256 ?? NONE } FROM ordering_head WHERE ordering_scope IN $scopes;";
+pub(crate) const READ_ORDERING_HEADS_BY_SCOPES: &str = "SELECT VALUE { scope: body.scope, sequence: body.sequence, state_fence: body.state_fence, committed_receipt_sha256: committed_receipt_sha256 ?? NONE } FROM ordering_head WHERE ordering_scope IN $scopes;";
 
 /// Reads each Ordering Scope's own chain tip, the `previous_event_hash`/
 /// `event_hash` siblings the closed `SELECT VALUE body` head read cannot see
