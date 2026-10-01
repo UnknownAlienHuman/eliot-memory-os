@@ -5763,6 +5763,73 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         }
     }
 
+    /// Verifies that a just-committed initial WorkScope snapshot is the exact
+    /// current named Store value before its owner is installed in memory.
+    /// This deliberately does not compare against `owners.work_scope`, which
+    /// is still empty until the caller completes this readback.
+    pub fn verify_initial_work_scope_owner_readback(
+        &self,
+        expected: &WorkScopeBindingSnapshot,
+    ) -> Result<WorkScopeOwnerReadback, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        expected
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if self.snapshot.state_fence() != &expected.state_fence
+            || self.owners.work_scope.is_some()
+        {
+            return Err(CompositionError::Recovery(
+                "initial WorkScope readback requires the current fence and an unbound in-memory owner"
+                    .to_owned(),
+            ));
+        }
+        let reply = self
+            .kernel
+            .named_read(KernelNamedReadRequest {
+                owner: RecoveryOwner::WorkScope,
+                state_fence: expected.state_fence.clone(),
+                protected_snapshot_digest: self.snapshot.protected_snapshot_digest.clone(),
+            })
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "Kernel named read omitted the newly committed WorkScope owner".to_owned(),
+                )
+            })?;
+        if reply.owner != RecoveryOwner::WorkScope
+            || reply.state_fence != expected.state_fence
+            || reply.revision != expected.owner_revision
+            || reply.schema != OWNER_SNAPSHOT_SCHEMA
+            || reply.payload.len() > MAX_OWNER_SNAPSHOT_BYTES
+            || sha256_hex(&reply.payload) != reply.value_digest
+        {
+            return Err(CompositionError::Recovery(
+                "new WorkScope named read has an invalid owner, fence, revision, schema, or digest"
+                    .to_owned(),
+            ));
+        }
+        let snapshot: WorkScopeBindingSnapshot = serde_json::from_slice(&reply.payload)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        snapshot
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let canonical = canonical_json_bytes(&snapshot)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if canonical != reply.payload || snapshot != *expected {
+            return Err(CompositionError::Recovery(
+                "new WorkScope named read differs from the exact admitted snapshot".to_owned(),
+            ));
+        }
+        Ok(WorkScopeOwnerReadback {
+            state_fence: reply.state_fence,
+            owner_revision: reply.revision,
+            value_digest: reply.value_digest,
+            snapshot,
+        })
+    }
+
     /// Reads one independently persisted process-source admission through the
     /// authenticated generic Store named-read route and joins it to the fresh
     /// WorkScope row's original Store revision/digest. A source admission is
