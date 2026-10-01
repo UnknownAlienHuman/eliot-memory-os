@@ -1734,6 +1734,52 @@ impl DaemonComposition {
             .map_err(FinishAttemptError::Composition)
     }
 
+    /// Prepares canonical publication of the exact boundary retained by ORS.
+    /// Governor compares its complete binding with the current activation
+    /// owner before constructing the shared canonical CAS.
+    pub fn prepare_stop_boundary_publication(
+        &self,
+        identity: &RequestIdentity,
+        operation_id: &OperationId,
+        boundary: eliot_protocol::StopBoundaryRecord,
+        now: u64,
+    ) -> Result<Option<PreparedKernelExchange>, FinishAttemptError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
+        }
+        self.governor
+            .prepare_stop_boundary_publication(identity, operation_id, boundary, now)
+    }
+
+    /// Accepts one committed boundary receipt after Kernel has durably
+    /// persisted the canonical owner successor.
+    pub fn accept_prepared_stop_boundary_publication(
+        &self,
+        prepared: &PreparedKernelExchange,
+    ) -> Result<(), FinishAttemptError> {
+        self.governor
+            .accept_prepared_stop_boundary_publication(prepared)
+    }
+
+    /// Refreshes canonical owner state after a boundary publication and
+    /// returns the exact current-task stop records used by Finish evaluation.
+    pub fn refresh_stop_boundary_readback(
+        &mut self,
+        task_id: &eliot_contracts::TaskId,
+        task_revision: u64,
+        fence: &eliot_contracts::StateFence,
+    ) -> Result<Vec<eliot_protocol::StopBoundaryRecord>, FinishAttemptError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
+        }
+        self.governor.refresh_from_kernel()?;
+        self.governor
+            .owners()
+            .canonical
+            .read_stop_boundary_records(task_id, task_revision, fence)
+            .map_err(FinishAttemptError::Composition)
+    }
+
     /// Prepares the Governor-owned finish-evidence exchange without transporting it.
     ///
     /// `contract_acceptance` is the contract owner's rehydrated enumeration from

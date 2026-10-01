@@ -571,6 +571,13 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
         // represented per required test below, not mislabeled as stale.
 
         let coordination = self.read_current_finish_projection(task_id, fence)?;
+        // Stop observations are part of the Finish denominator only when the
+        // canonical Governor owner has accepted their exact owner receipt.
+        // Preserve all incompleteness on the stored boundary as unresolved
+        // evidence; a missing page or unknown cursor is never an empty result.
+        let stop_boundaries = self
+            .canonical
+            .read_stop_boundary_records(task_id, task.revision, fence)?;
 
         let mut observation_refs = BTreeSet::new();
         // The task-and-plan-bound observation receipts are joined here so their
@@ -640,6 +647,9 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
         let mut artifact_refs = coordination.artifact_refs.clone();
         artifact_refs.extend(frame_refs);
         artifact_refs.extend(observation_refs);
+        artifact_refs.extend(stop_boundaries.iter().map(|boundary| {
+            format!("governor-stop-boundary:{}:{}", task_id.as_str(), boundary.stop_id)
+        }));
         let descendant_receipt_ref = coordination.descendant_receipt_ref;
         if let Some(receipt_ref) = &descendant_receipt_ref {
             artifact_refs.push(receipt_ref.clone());
@@ -647,6 +657,9 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
         artifact_refs.sort();
         artifact_refs.dedup();
         let mut unresolved_effect_refs = coordination.unresolved_refs.clone();
+        for boundary in &stop_boundaries {
+            append_stop_boundary_unknowns(boundary, &mut unresolved_effect_refs);
+        }
         unresolved_effect_refs.sort();
         unresolved_effect_refs.dedup();
         let descendant_closure = match descendant_receipt_ref {
@@ -687,6 +700,77 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
             canonical,
             snapshot,
         })
+    }
+}
+
+/// Carries every stop-observed gap into canonical Finish evidence. A paged
+/// enumeration remains unresolved until its existing artifact owner has been
+/// read; absence of inline items never means an empty set.
+fn append_stop_boundary_unknowns(
+    boundary: &eliot_protocol::StopBoundaryRecord,
+    unresolved: &mut Vec<String>,
+) {
+    use eliot_protocol::{
+        StopBoundaryActionCoverage, StopBoundaryCursorState, StopBoundaryEffectDisposition,
+        StopBoundaryEnumeration, StopBoundaryPositionState, StopBoundarySourceContent,
+    };
+
+    let prefix = format!("stop-boundary:{}", boundary.stop_id);
+    if !matches!(
+        &boundary.operations.enumeration,
+        StopBoundaryEnumeration::CompleteInline
+    ) {
+        unresolved.push(format!("{prefix}:operations-coverage-unresolved"));
+    }
+    for operation in &boundary.operations.items {
+        if !matches!(
+            &operation.effect,
+            StopBoundaryEffectDisposition::ObservedCompleted
+                | StopBoundaryEffectDisposition::ObservedNoEffect
+        ) {
+            unresolved.push(format!(
+                "{prefix}:operation:{}:{:?}",
+                operation.operation_id, operation.effect
+            ));
+        }
+    }
+    if !matches!(
+        &boundary.descendants.enumeration,
+        StopBoundaryEnumeration::CompleteInline
+    ) {
+        unresolved.push(format!("{prefix}:descendant-coverage-unresolved"));
+    }
+    for descendant in &boundary.descendants.items {
+        if !matches!(
+            &descendant.effect,
+            StopBoundaryEffectDisposition::ObservedCompleted
+                | StopBoundaryEffectDisposition::ObservedNoEffect
+        ) {
+            unresolved.push(format!(
+                "{prefix}:descendant:{}:{:?}",
+                descendant.attempt_id, descendant.effect
+            ));
+        }
+    }
+    if boundary.action_plan.coverage == StopBoundaryActionCoverage::Unknown
+        || !boundary.action_plan.required_actions.is_empty()
+    {
+        unresolved.push(format!("{prefix}:required-follow-up-unresolved"));
+    }
+    if matches!(&boundary.source_cursor, StopBoundaryCursorState::Unknown { .. }) {
+        unresolved.push(format!("{prefix}:source-cursor-unknown"));
+    }
+    for (stage, position) in [
+        ("durable", &boundary.event_positions.last_durable),
+        ("normalized", &boundary.event_positions.last_normalized),
+        ("applied", &boundary.event_positions.last_applied),
+    ] {
+        if matches!(position, StopBoundaryPositionState::Unknown { .. }) {
+            unresolved.push(format!("{prefix}:event-position-{stage}-unknown"));
+        }
+    }
+    if matches!(&boundary.source_content, StopBoundarySourceContent::Unknown { .. }) {
+        unresolved.push(format!("{prefix}:source-content-unknown"));
     }
 }
 
@@ -967,6 +1051,20 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
     ) -> Result<PreparedKernelExchange, FinishAttemptError> {
         let envelope =
             stop_admission_binding_envelope(identity, operation_id, snapshot, binding)?;
+        prepare_exchange(self.canonical, identity, envelope)
+    }
+
+    /// Builds the shared-row canonical CAS for one exact Kernel-retained stop
+    /// observation. The observation identity is part of the content-bound
+    /// owner proof; it is not a Finish outcome or proof.
+    pub(crate) fn prepare_stop_boundary_record_exchange(
+        &self,
+        identity: &RequestIdentity,
+        operation_id: &OperationId,
+        snapshot: &CanonicalAdmissionSnapshot,
+        boundary: &eliot_protocol::StopBoundaryRecord,
+    ) -> Result<PreparedKernelExchange, FinishAttemptError> {
+        let envelope = stop_boundary_record_envelope(identity, operation_id, snapshot, boundary)?;
         prepare_exchange(self.canonical, identity, envelope)
     }
 
@@ -1759,6 +1857,38 @@ pub(crate) fn stop_admission_binding_envelope(
         snapshot,
         binding.task_id.as_str(),
         &format!("stop-admission-binding:{binding_digest}"),
+    )
+}
+
+/// Builds the same canonical shared-row CAS for one owner-checked stop
+/// observation. The protocol record remains evidence data and cannot express
+/// a task outcome.
+pub(crate) fn stop_boundary_record_envelope(
+    identity: &RequestIdentity,
+    operation_id: &OperationId,
+    snapshot: &CanonicalAdmissionSnapshot,
+    boundary: &eliot_protocol::StopBoundaryRecord,
+) -> Result<CanonicalWriteEnvelope, FinishAttemptError> {
+    if !snapshot.stop_boundary_records.contains(boundary)
+        || snapshot.stop_admission_binding.as_ref() != Some(&boundary.admission_binding)
+        || snapshot.state_fence != boundary.state_fence
+        || identity.request.metadata.task_id.as_ref() != Some(&boundary.task_id)
+    {
+        return Err(FinishAttemptError::Serialization(
+            "stop boundary snapshot does not match the admitted request and owner binding"
+                .to_owned(),
+        ));
+    }
+    let boundary_digest = sha256_hex(
+        &canonical_json_bytes(boundary)
+            .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?,
+    );
+    canonical_owner_snapshot_envelope(
+        identity,
+        operation_id.clone(),
+        snapshot,
+        boundary.task_id.as_str(),
+        &format!("stop-boundary:{}:{boundary_digest}", boundary.stop_id),
     )
 }
 

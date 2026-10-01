@@ -309,6 +309,8 @@ fn activation_canonical_snapshot(fence: &StateFence) -> CanonicalAdmissionSnapsh
         }),
         verifier_execution_fact: None,
         finish_evidence: None,
+        stop_admission_binding: None,
+        stop_boundary_records: Vec::new(),
     }
 }
 

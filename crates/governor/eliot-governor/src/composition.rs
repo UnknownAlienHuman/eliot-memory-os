@@ -3346,6 +3346,11 @@ pub struct CanonicalAdmissionSnapshot {
     /// not-admitted state; activation never derives this from task labels.
     #[serde(default)]
     pub stop_admission_binding: Option<eliot_protocol::StopBoundaryAdmissionBinding>,
+    /// Append-only owner-observed stop boundaries for the current admitted
+    /// attempt. These observations inform later Finish evaluation but never
+    /// create a task outcome or completion proof.
+    #[serde(default)]
+    pub stop_boundary_records: Vec<eliot_protocol::StopBoundaryRecord>,
 }
 
 /// The acceptance set the finish coverage was computed over, retained with the
@@ -3600,6 +3605,7 @@ impl CanonicalAdmissionSnapshot {
             verifier_execution_fact: None,
             finish_evidence: None,
             stop_admission_binding: None,
+            stop_boundary_records: Vec::new(),
         };
         snapshot.validate()?;
         Ok(snapshot)
@@ -3630,6 +3636,19 @@ impl CanonicalAdmissionSnapshot {
             if binding.task_id != plan.task_id || binding.state_fence != self.state_fence {
                 return Err(CompositionError::Recovery(
                     "stop admission binding differs from current task or State Fence".to_owned(),
+                ));
+            }
+        }
+        let mut stop_ids = BTreeSet::new();
+        for boundary in &self.stop_boundary_records {
+            boundary
+                .validate_shape()
+                .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+            if boundary.state_fence != self.state_fence
+                || !stop_ids.insert(boundary.stop_id.as_str())
+            {
+                return Err(CompositionError::Recovery(
+                    "stop boundary history contains a stale fence or repeated stop identity".to_owned(),
                 ));
             }
         }
@@ -3676,6 +3695,8 @@ struct CanonicalAdmissionSnapshotWire {
     finish_evidence: Option<CanonicalFinishEvidence>,
     #[serde(default)]
     stop_admission_binding: Option<eliot_protocol::StopBoundaryAdmissionBinding>,
+    #[serde(default)]
+    stop_boundary_records: Vec<eliot_protocol::StopBoundaryRecord>,
 }
 
 impl<'de> Deserialize<'de> for CanonicalAdmissionSnapshot {
@@ -3691,6 +3712,7 @@ impl<'de> Deserialize<'de> for CanonicalAdmissionSnapshot {
             verifier_execution_fact: wire.verifier_execution_fact,
             finish_evidence: wire.finish_evidence,
             stop_admission_binding: wire.stop_admission_binding,
+            stop_boundary_records: wire.stop_boundary_records,
         };
         snapshot
             .validate()
@@ -3920,6 +3942,7 @@ impl CanonicalAdmissionOwner {
             verifier_execution_fact: Some(fact),
             finish_evidence: self.snapshot.finish_evidence.clone(),
             stop_admission_binding: self.snapshot.stop_admission_binding.clone(),
+            stop_boundary_records: self.snapshot.stop_boundary_records.clone(),
         };
         snapshot.validate()?;
         Ok(snapshot)
@@ -4016,6 +4039,7 @@ impl CanonicalAdmissionOwner {
             verifier_execution_fact: self.snapshot.verifier_execution_fact.clone(),
             finish_evidence: self.snapshot.finish_evidence.clone(),
             stop_admission_binding,
+            stop_boundary_records: self.snapshot.stop_boundary_records.clone(),
         };
         snapshot.validate()?;
         Ok(snapshot)
@@ -4059,11 +4083,95 @@ impl CanonicalAdmissionOwner {
             owner_revision,
             current_plan: self.snapshot.current_plan.clone(),
             verifier_execution_fact: self.snapshot.verifier_execution_fact.clone(),
-            finish_evidence: self.snapshot.finish_evidence.clone(),
+            finish_evidence: None,
             stop_admission_binding: Some(binding),
+            stop_boundary_records: self.snapshot.stop_boundary_records.clone(),
         };
         snapshot.validate()?;
         Ok(Some(snapshot))
+    }
+
+    /// Appends one Governor-authenticated stop observation to this canonical
+    /// owner image. The caller must have compared the Kernel publication
+    /// receipt with the current admission binding before entering this owner.
+    /// Exact replay is idempotent; stop identities cannot be rewritten.
+    pub fn prepare_stop_boundary_record(
+        &self,
+        boundary: eliot_protocol::StopBoundaryRecord,
+    ) -> Result<Option<CanonicalAdmissionSnapshot>, CompositionError> {
+        boundary
+            .validate_shape()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let binding = self.snapshot.stop_admission_binding.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "stop boundary publication has no current admission binding".to_owned(),
+            )
+        })?;
+        let plan = self.read_current_plan(&boundary.state_fence)?;
+        if boundary.admission_binding != *binding
+            || boundary.task_id != binding.task_id
+            || boundary.task_id != plan.task_id
+            || boundary.state_fence != self.state_fence
+        {
+            return Err(CompositionError::Recovery(
+                "stop boundary publication is stale or foreign to the current Governor admission".to_owned(),
+            ));
+        }
+        if let Some(previous) = self
+            .snapshot
+            .stop_boundary_records
+            .iter()
+            .find(|previous| previous.stop_id == boundary.stop_id)
+        {
+            if previous == &boundary {
+                return Ok(None);
+            }
+            return Err(CompositionError::Recovery(
+                "stop identity was reused with changed observation bytes".to_owned(),
+            ));
+        }
+        let owner_revision = self.snapshot.owner_revision.checked_add(1).ok_or_else(|| {
+            CompositionError::Recovery("canonical owner revision overflow".to_owned())
+        })?;
+        let mut stop_boundary_records = self.snapshot.stop_boundary_records.clone();
+        stop_boundary_records.push(boundary);
+        let snapshot = CanonicalAdmissionSnapshot {
+            state_fence: self.state_fence.clone(),
+            owner_revision,
+            current_plan: self.snapshot.current_plan.clone(),
+            verifier_execution_fact: self.snapshot.verifier_execution_fact.clone(),
+            finish_evidence: None,
+            stop_admission_binding: self.snapshot.stop_admission_binding.clone(),
+            stop_boundary_records,
+        };
+        snapshot.validate()?;
+        Ok(Some(snapshot))
+    }
+
+    /// Returns exact stop records for this task and its live task revision.
+    /// The record itself preserves unknown coverage; this read never converts
+    /// an absent owner/page into an empty or complete enumeration.
+    pub fn read_stop_boundary_records(
+        &self,
+        task_id: &TaskId,
+        task_revision: u64,
+        state_fence: &StateFence,
+    ) -> Result<Vec<eliot_protocol::StopBoundaryRecord>, CompositionError> {
+        if self.state_fence != *state_fence || self.snapshot.state_fence != *state_fence {
+            return Err(CompositionError::Recovery(
+                "stop boundary read used a stale State Fence".to_owned(),
+            ));
+        }
+        Ok(self
+            .snapshot
+            .stop_boundary_records
+            .iter()
+            .filter(|record| {
+                &record.task_id == task_id
+                    && record.admission_binding.task_revision == task_revision.to_string()
+            })
+            .cloned()
+            .collect())
     }
 
     /// Builds the next canonical admission owner image after a Governor-owned
@@ -4091,6 +4199,7 @@ impl CanonicalAdmissionOwner {
             verifier_execution_fact: self.snapshot.verifier_execution_fact.clone(),
             finish_evidence: Some(evidence),
             stop_admission_binding: self.snapshot.stop_admission_binding.clone(),
+            stop_boundary_records: self.snapshot.stop_boundary_records.clone(),
         };
         snapshot.validate()?;
         Ok(snapshot)
@@ -6207,6 +6316,60 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             &snapshot,
             &binding,
         )?))
+    }
+
+    /// Publishes a Kernel-retained boundary into the existing canonical
+    /// admission snapshot. The caller supplies the exact ORS observation; the
+    /// Governor rechecks current task, attempt, revision, and full fence before
+    /// preparing the shared-row CAS.
+    pub fn prepare_stop_boundary_publication(
+        &self,
+        identity: &RequestIdentity,
+        operation_id: &OperationId,
+        boundary: eliot_protocol::StopBoundaryRecord,
+        now: u64,
+    ) -> Result<Option<PreparedKernelExchange>, FinishAttemptError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
+        }
+        identity
+            .validate()
+            .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?;
+        let activation = self.read_unique_agent_activation(now)?;
+        if activation.state_fence != boundary.state_fence
+            || activation.task_id != boundary.task_id
+            || activation.task_revision.to_string() != boundary.admission_binding.task_revision
+            || activation.stop_admission_binding.as_ref() != Some(&boundary.admission_binding)
+            || identity.request.metadata.task_id.as_ref() != Some(&boundary.task_id)
+            || identity.request.metadata.state_fence != boundary.state_fence
+        {
+            return Err(FinishAttemptError::Composition(
+                CompositionError::ActivationStaleFence,
+            ));
+        }
+        let Some(snapshot) = self
+            .owners
+            .canonical
+            .prepare_stop_boundary_record(boundary.clone())?
+        else {
+            return Ok(None);
+        };
+        let service = self.finish_attempt_service();
+        Ok(Some(service.prepare_stop_boundary_record_exchange(
+            identity,
+            operation_id,
+            &snapshot,
+            &boundary,
+        )?))
+    }
+
+    /// Revalidates the committed stop-boundary owner exchange before
+    /// accepting its canonical receipt.
+    pub fn accept_prepared_stop_boundary_publication(
+        &self,
+        prepared: &PreparedKernelExchange,
+    ) -> Result<(), FinishAttemptError> {
+        self.accept_prepared_exchange(prepared)
     }
 
     /// Returns the authenticated Kernel snapshot admitted at construction.
@@ -11754,6 +11917,7 @@ mod tests {
                 verifier_execution_fact: None,
                 finish_evidence: None,
                 stop_admission_binding: None,
+                stop_boundary_records: Vec::new(),
             }),
             RecoveryOwner::Task => serde_json::to_value(TaskLifecycleSnapshot {
                 next_sequence: 1,
@@ -11870,6 +12034,7 @@ mod tests {
             }),
             verifier_execution_fact: None,
             finish_evidence: None,
+            stop_boundary_records: Vec::new(),
             stop_admission_binding: None,
         }
     }
@@ -12769,6 +12934,7 @@ mod tests {
             }),
             verifier_execution_fact: None,
             finish_evidence: None,
+            stop_boundary_records: Vec::new(),
             stop_admission_binding: None,
         };
         mismatched_plan.validate().expect("plan shape");

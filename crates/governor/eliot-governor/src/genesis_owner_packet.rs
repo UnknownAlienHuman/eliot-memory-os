@@ -289,6 +289,8 @@ fn genesis_payload(
             current_plan: None,
             verifier_execution_fact: None,
             finish_evidence: None,
+            stop_admission_binding: None,
+            stop_boundary_records: Vec::new(),
         })
         .map_err(|e| CompositionError::Recovery(e.to_string()))?,
         RecoveryOwner::Task => serde_json::to_value(TaskLifecycleSnapshot {
