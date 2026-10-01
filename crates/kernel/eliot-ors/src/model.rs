@@ -8373,7 +8373,7 @@ pub struct HostRequestKernelRequestIdentity {
     pub canonical_json: String,
     /// SHA-256 of the exact canonical bytes.
     pub sha256: String,
-    /// Authenticated operating-system peer observed on the original Host
+    /// Authenticated operating-system peer observed on the original `Host`
     /// connection. This is retained alongside the semantic request identity
     /// so a task-free setup claim can be resolved after process restart
     /// without deriving a host identity from request payload fields.
@@ -8387,13 +8387,13 @@ pub struct HostRequestKernelRequestIdentity {
     pub authenticated_peer_sha256: Option<String>,
 }
 
-/// Bounded Kernel projection of the authenticated transport peer that
+/// Bounded `Kernel` projection of the authenticated transport peer that
 /// presented one Host request. It contains no process handle or credential;
 /// it preserves the identity values that the platform adapter verified.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostRequestKernelAuthenticatedPeer {
-    /// Original Host transport connection identifier.
+    /// Original `Host` transport connection identifier.
     pub connection_id: String,
     /// Platform-observed process id for the authenticated peer.
     pub process_id: u32,
@@ -8401,7 +8401,7 @@ pub struct HostRequestKernelAuthenticatedPeer {
     pub user_identity: String,
     /// Platform-observed operating-system session identity.
     pub session_identity: String,
-    /// Monotonic transport-session generation observed by Kernel.
+    /// Monotonic transport-session generation observed by `Kernel`.
     pub transport_session_epoch: u64,
     /// SHA-256 of the transport launch nonce. The nonce itself is not retained
     /// or exposed through the daemon claim.
