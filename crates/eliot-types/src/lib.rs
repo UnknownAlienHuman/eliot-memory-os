@@ -127,7 +127,9 @@ pub use cognitive_run::{
     CanonicalCaseDisposition, CognitiveCandidateCapability, CognitiveExecutionSeal,
     CognitiveHostObservation, CognitiveInvocationRole, CognitiveRawVerifierEvidence,
     CognitiveRunAttempt, CognitiveRunCallPlan, CognitiveRunCallStatus, CognitiveRunContract,
+    CognitiveRunSchemaMismatch, CognitiveRunSchemaSelection, CognitiveRunSchemaVersioned,
     CognitiveRunTerminal, CognitiveSharedGateBinding, CognitiveToolObservation,
+    cognitive_run_schema_selection, require_current_cognitive_run_schema,
 };
 pub use config::{
     BlobStoreConfig, ControlWalConfig, DbConfig, DbMode, DelegationCalibrationConfig,
@@ -310,7 +312,7 @@ pub use project_understanding::{
     CausalHopKind, CausalHopStatus, ContinuityAcceptanceState, ContinuityGitState,
     PROJECT_UNDERSTANDING_SCHEMA_VERSION, ProjectCausalHop, ProjectCausalModel,
     ProjectContinuityState, ProjectUnderstandingEvidence, ProjectUnderstandingIntent,
-    ProjectUnderstandingModel, ProjectUnderstandingSystem,
+    ProjectUnderstandingModel, ProjectUnderstandingSystem, project_understanding_schema_selection,
 };
 pub use provider_invocation::{
     ExternalResultCompletenessReceipt, ProviderDeclaredBudget, ProviderFailureIncident,

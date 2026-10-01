@@ -9,7 +9,7 @@ use eliot_types::{
     ObservabilityWriteReceipt, ObservabilityWriteStatus, OperationRestartWindow,
     OperationRuntimeCheckpoint, ProjectId, ProjectRevisionSummary, ProjectSequence,
     SealStagingCheckpoint, SessionId, TaskId, WriteId, WriteReceipt, WriteReceiptRef,
-    WriteRejectReason, WriteStatus,
+    WriteRejectReason, WriteStatus, require_current_cognitive_run_schema,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -1811,6 +1811,8 @@ impl WriterWorker {
                             "cognitive previous terminal disappeared".to_owned(),
                         )
                     })?;
+                require_current_cognitive_run_schema(&terminal.receipt_body)
+                    .map_err(|mismatch| EngineError::WriteRejected(mismatch.to_string()))?;
                 if terminal.canonical_receipt != *expected
                     || terminal.receipt_body.run_id != precondition.run_id
                     || terminal.receipt_body.call_number + 1 != call_number
@@ -1873,6 +1875,8 @@ impl WriterWorker {
                 .ok_or_else(|| {
                     EngineError::WriteRejected("cognitive gate terminal disappeared".to_owned())
                 })?;
+            require_current_cognitive_run_schema(&terminal.receipt_body)
+                .map_err(|mismatch| EngineError::WriteRejected(mismatch.to_string()))?;
             if terminal.canonical_receipt != *receipt
                 || terminal.receipt_body.run_id != precondition.run_id
                 || usize::from(terminal.receipt_body.call_number) != index + 1
@@ -1921,6 +1925,8 @@ impl WriterWorker {
                 .ok_or_else(|| {
                     EngineError::WriteRejected("source terminal disappeared".to_owned())
                 })?;
+            require_current_cognitive_run_schema(&source_terminal.receipt_body)
+                .map_err(|mismatch| EngineError::WriteRejected(mismatch.to_string()))?;
             let source_attempt = self
                 .store
                 .canonical_record_by_write_id::<eliot_types::CognitiveRunAttempt>(
@@ -1933,6 +1939,8 @@ impl WriterWorker {
                 .ok_or_else(|| {
                     EngineError::WriteRejected("source attempt disappeared".to_owned())
                 })?;
+            require_current_cognitive_run_schema(&source_attempt.receipt_body)
+                .map_err(|mismatch| EngineError::WriteRejected(mismatch.to_string()))?;
             let claim = self
                 .store
                 .claim_card_by_id(

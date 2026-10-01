@@ -93,19 +93,19 @@ use eliot_types::{
     CognitiveFailureLocalizationReport, CognitiveGateRequest, CognitiveHostObservation,
     CognitiveInvocationRole, CognitiveRawVerifierEvidence, CognitiveReaderAnswer,
     CognitiveRunAttempt, CognitiveRunCallPlan, CognitiveRunCallStatus, CognitiveRunContract,
-    CognitiveRunTerminal, CognitiveSharedGateBinding, CognitiveToolObservation, CommandContext,
-    CompilePacketL3Request, CompletionDecisionMemory, CompletionMemoryAdmission,
-    CompletionMemoryRequest, CompletionProof, CompletionStatus, ConfidenceLevel, ContextPacketL3,
-    ContrastiveAbstractionResult, ControlWalConfig, ControllerCommitHandoff, CostLedger,
-    CredentialPurpose, CurrentStateRequest, DashboardReport, DataRootMode, EpistemicStatus,
-    EvalBaseline, EvalCase, EvalDatasetManifest, EvalFailureCluster, EvalFamily, EvalRun,
-    EvalRunId, EvalRunProfile, EvalSuite, EvalVerdict, EvalVerdictStatus, EvidenceAtomInput,
-    EvidenceId, ExperienceBrief, ExperienceCase, ExperienceFormationResult, ExperiencePattern,
-    ExperienceRecallRequest, ExperimentalMetaPolicyPayload, ExperimentalMetaPolicyState,
-    ExternalOutputSchemaKind, ExternalProviderProfile, ExternalReviewBudget,
-    ExternalReviewGateDecisionKind, ExternalReviewPacket, ExternalReviewRequest,
-    ExternalReviewRole, FetchAtomsL2Request, FetchAtomsL2Response, ForgettingOperator,
-    ForgettingReason, InjectionReceipt, LatencyHistogram, LifecycleStatus,
+    CognitiveRunSchemaVersioned, CognitiveRunTerminal, CognitiveSharedGateBinding,
+    CognitiveToolObservation, CommandContext, CompilePacketL3Request, CompletionDecisionMemory,
+    CompletionMemoryAdmission, CompletionMemoryRequest, CompletionProof, CompletionStatus,
+    ConfidenceLevel, ContextPacketL3, ContrastiveAbstractionResult, ControlWalConfig,
+    ControllerCommitHandoff, CostLedger, CredentialPurpose, CurrentStateRequest, DashboardReport,
+    DataRootMode, EpistemicStatus, EvalBaseline, EvalCase, EvalDatasetManifest, EvalFailureCluster,
+    EvalFamily, EvalRun, EvalRunId, EvalRunProfile, EvalSuite, EvalVerdict, EvalVerdictStatus,
+    EvidenceAtomInput, EvidenceId, ExperienceBrief, ExperienceCase, ExperienceFormationResult,
+    ExperiencePattern, ExperienceRecallRequest, ExperimentalMetaPolicyPayload,
+    ExperimentalMetaPolicyState, ExternalOutputSchemaKind, ExternalProviderProfile,
+    ExternalReviewBudget, ExternalReviewGateDecisionKind, ExternalReviewPacket,
+    ExternalReviewRequest, ExternalReviewRole, FetchAtomsL2Request, FetchAtomsL2Response,
+    ForgettingOperator, ForgettingReason, InjectionReceipt, LatencyHistogram, LifecycleStatus,
     MEMORY_DELIVERY_GRANT_SCHEMA_VERSION, MailboxMessageId, MailboxMessageKind, MailboxRecipient,
     MaintenanceJobKind, MaterialPacketFrame, MemoryAdmissionDecision, MemoryCurationCandidate,
     MemoryCurationCorpusProfile, MemoryCurationFindingKind, MemoryCurationPreviewRequest,
@@ -144,7 +144,7 @@ use eliot_types::{
     WorkItemStatus, WorkLease, WorkLeaseDecision, WorkLeaseDecisionKind, WorkLeaseDecisionReason,
     WorkLeaseId, WorkLeaseState, WorktreeLease, WorktreeLeaseId, WorktreeLeaseRequest,
     WorktreeLeaseRequestId, WorktreeLeaseState, WriteId, WriteReceipt, WriteReceiptRef,
-    WriteStatus, operator_contract_hash,
+    WriteStatus, operator_contract_hash, require_current_cognitive_run_schema,
 };
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -2509,7 +2509,7 @@ impl McpDaemon {
             anyhow::bail!("cognitive capability call_number is outside the exact plan");
         }
         let attempt_revision = u64::from(capability.call_number) * 2 - 1;
-        let attempt = cognitive_record_by_revision::<CognitiveRunAttempt>(
+        let attempt = cognitive_run_record_by_revision::<CognitiveRunAttempt>(
             &self.cognitive_child,
             capability.project_id,
             capability.task_id,
@@ -2525,7 +2525,7 @@ impl McpDaemon {
         {
             anyhow::bail!("cognitive capability differs from the canonical attempting call");
         }
-        if cognitive_record_by_revision::<CognitiveRunTerminal>(
+        if cognitive_run_record_by_revision::<CognitiveRunTerminal>(
             &self.cognitive_child,
             capability.project_id,
             capability.task_id,

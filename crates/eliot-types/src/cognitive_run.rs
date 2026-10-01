@@ -282,3 +282,178 @@ pub struct CognitiveRawVerifierEvidence {
     #[serde(with = "time::serde::rfc3339")]
     pub verified_at: OffsetDateTime,
 }
+
+/// Owner version selection for the canonical cognitive-run records.
+///
+/// `COGNITIVE_RUN_SCHEMA_VERSION` is the only schema this build produces or reads:
+/// every producer above stamps `COGNITIVE_RUN_SCHEMA_VERSION`, and a repository-wide
+/// search finds no other `eliot-cognitive-run-v*` literal anywhere. There is therefore
+/// NO supported legacy revision and no named migration to fall back to, so version
+/// selection is a single named owner step applied at the real decoding boundary
+/// instead of being inferred from the presence of a `schema_version` string.
+///
+/// I5.5.22: "core schema is explicit and versioned". I5.16: absence of a closure or
+/// coverage record means `unknown`, not unrestricted/complete - a record whose
+/// version is not the current one is therefore `unknown`, never "close enough".
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CognitiveRunSchemaSelection {
+    /// The declared version is the schema this build reads and interprets.
+    Current,
+    /// The declared version is not one this build reads; the bytes are refused
+    /// rather than reinterpreted under current field meanings.
+    Unsupported,
+}
+
+impl CognitiveRunSchemaSelection {
+    /// Classify one declared `schema_version` against the current owner constant.
+    #[must_use]
+    pub fn for_version(version: &str) -> Self {
+        if version == COGNITIVE_RUN_SCHEMA_VERSION {
+            Self::Current
+        } else {
+            Self::Unsupported
+        }
+    }
+
+    /// The declared version that this selection admits, or `None` when it admits none.
+    #[must_use]
+    pub fn admitted_version(self) -> Option<&'static str> {
+        match self {
+            Self::Current => Some(COGNITIVE_RUN_SCHEMA_VERSION),
+            Self::Unsupported => None,
+        }
+    }
+}
+
+/// Version-selection owner step shared by every schema-bearing cognitive-run record.
+///
+/// Returns the admitted version, or `None` when the declared version is not one this
+/// build reads. `None` means the record carries no meaning as current data and the
+/// caller MUST NOT let it authorize candidate submission, terminal progression,
+/// shared-gate/disposition logic or tool evidence.
+#[must_use]
+pub fn cognitive_run_schema_selection(version: &str) -> Option<&'static str> {
+    CognitiveRunSchemaSelection::for_version(version).admitted_version()
+}
+
+/// A schema-bearing cognitive-run record whose `schema_version` is owner-checked.
+///
+/// Implemented by exactly the records this build reads back from the canonical store
+/// and acts on: the contract, the attempt, the terminal, the tool observation and the
+/// raw-verifier evidence.
+pub trait CognitiveRunSchemaVersioned {
+    /// The canonical-record kind this versioned record is stored under, used in the
+    /// refusal message so the operator sees which boundary rejected the bytes.
+    const COGNITIVE_RECORD_KIND: &'static str;
+
+    /// The version this record declares.
+    fn schema_version(&self) -> &str;
+
+    /// The admitted owner version, or `None` when the declared version is not one
+    /// this build reads.
+    fn schema_selection(&self) -> Option<&'static str>;
+}
+
+impl CognitiveRunSchemaVersioned for CognitiveRunContract {
+    const COGNITIVE_RECORD_KIND: &'static str = "cognitive_run_contract";
+
+    fn schema_version(&self) -> &str {
+        &self.schema_version
+    }
+
+    fn schema_selection(&self) -> Option<&'static str> {
+        cognitive_run_schema_selection(&self.schema_version)
+    }
+}
+
+impl CognitiveRunSchemaVersioned for CognitiveRunAttempt {
+    const COGNITIVE_RECORD_KIND: &'static str = "cognitive_run_attempt";
+
+    fn schema_version(&self) -> &str {
+        &self.schema_version
+    }
+
+    fn schema_selection(&self) -> Option<&'static str> {
+        cognitive_run_schema_selection(&self.schema_version)
+    }
+}
+
+impl CognitiveRunSchemaVersioned for CognitiveRunTerminal {
+    const COGNITIVE_RECORD_KIND: &'static str = "cognitive_run_terminal";
+
+    fn schema_version(&self) -> &str {
+        &self.schema_version
+    }
+
+    fn schema_selection(&self) -> Option<&'static str> {
+        cognitive_run_schema_selection(&self.schema_version)
+    }
+}
+
+impl CognitiveRunSchemaVersioned for CognitiveToolObservation {
+    const COGNITIVE_RECORD_KIND: &'static str = "cognitive_tool_observation";
+
+    fn schema_version(&self) -> &str {
+        &self.schema_version
+    }
+
+    fn schema_selection(&self) -> Option<&'static str> {
+        cognitive_run_schema_selection(&self.schema_version)
+    }
+}
+
+impl CognitiveRunSchemaVersioned for CognitiveRawVerifierEvidence {
+    const COGNITIVE_RECORD_KIND: &'static str = "cognitive_raw_verifier";
+
+    fn schema_version(&self) -> &str {
+        &self.schema_version
+    }
+
+    fn schema_selection(&self) -> Option<&'static str> {
+        cognitive_run_schema_selection(&self.schema_version)
+    }
+}
+
+/// A cognitive-run record whose declared `schema_version` this build does not read.
+///
+/// Refusing here means "no meaning as current data"; it never means "reinterpret these
+/// bytes under current field meanings".
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CognitiveRunSchemaMismatch {
+    /// The canonical-record kind that was refused.
+    pub record_kind: &'static str,
+    /// The version the decoded bytes declared.
+    pub declared_version: String,
+    /// The only version this build reads.
+    pub supported_version: &'static str,
+}
+
+impl std::fmt::Display for CognitiveRunSchemaMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} declares schema_version {:?}; this build reads only {:?}",
+            self.record_kind, self.declared_version, self.supported_version
+        )
+    }
+}
+
+impl std::error::Error for CognitiveRunSchemaMismatch {}
+
+/// The single owner validation step for schema-bearing cognitive-run records.
+///
+/// Applied at every real decoding boundary - the `eliot-app` cognitive decoders and the
+/// `eliot-engine` writer / cognitive-disposition loaders - before a record may authorize
+/// candidate submission, terminal progression, shared-gate/disposition logic or tool
+/// evidence. Typed, so the failure stays typed across the layer boundary.
+pub fn require_current_cognitive_run_schema<T: CognitiveRunSchemaVersioned>(
+    record: &T,
+) -> Result<&'static str, CognitiveRunSchemaMismatch> {
+    record
+        .schema_selection()
+        .ok_or_else(|| CognitiveRunSchemaMismatch {
+            record_kind: T::COGNITIVE_RECORD_KIND,
+            declared_version: record.schema_version().to_owned(),
+            supported_version: COGNITIVE_RUN_SCHEMA_VERSION,
+        })
+}

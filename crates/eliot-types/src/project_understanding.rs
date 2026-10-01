@@ -132,3 +132,74 @@ pub struct ProjectUnderstandingModel {
     pub verifier_ref: String,
     pub stop_condition: String,
 }
+
+impl ProjectUnderstandingModel {
+    /// Owner version-selection check applied at this model's real admission owner,
+    /// before the decoded model may be consumed as current project proof.
+    ///
+    /// `deny_unknown_fields` closes the shape but proves nothing about semantic
+    /// version selection: a foreign or future layout that happens to deserialize
+    /// into the current fields is still not this build's model. This is the step
+    /// that makes version selection explicit instead of inferred from the presence
+    /// of a `schema_version` string.
+    pub fn schema_selection(&self) -> Option<&'static str> {
+        project_understanding_schema_selection(&self.schema_version)
+    }
+
+    /// Owner admission check for the decoded model.
+    ///
+    /// Returns the admitted version when the model names the current schema AND its
+    /// acceptance/causal evidence cannot be read as satisfied proof it does not
+    /// carry. Returns `None` otherwise, which the caller MUST treat as "this model
+    /// is not current project understanding".
+    ///
+    /// I5.16: "Absence of a closure or coverage record means `unknown`, not
+    /// unrestricted/complete." An acceptance entry with an empty `acceptance_ref`
+    /// names no acceptance criterion, so `satisfied = true` beside it is the absence
+    /// of a record read as completeness. Likewise a causal hop claiming `Verified`
+    /// or `Supported` while carrying no `evidence_refs` is a coverage claim with no
+    /// evidence, which is `unknown`, not proven.
+    ///
+    /// An ABSENT list is not refused: `ProjectUnderstandingCompiler::compile` derives
+    /// `acceptance_refs` from the packet's own acceptance state, which is legitimately
+    /// empty when the packet declares no acceptance items, and a causal model with no
+    /// hops is a legitimate "no causal knowledge yet" reading. Absence of the list is
+    /// already `unknown` under I5.16 and is not read as completeness anywhere; what is
+    /// refused is a claim of satisfaction or verification carrying no record at all.
+    #[must_use]
+    pub fn admission(&self) -> Option<&'static str> {
+        let version = self.schema_selection()?;
+        let acceptance_named = self
+            .intent
+            .acceptance_refs
+            .iter()
+            .chain(std::iter::once(&self.verifier_ref))
+            .all(|reference| !reference.trim().is_empty());
+        let coverage_proven = self.causal_model.hops.iter().all(|hop| {
+            hop.evidence_refs.is_empty()
+                || !matches!(
+                    hop.status,
+                    CausalHopStatus::Assumed | CausalHopStatus::Unknown
+                )
+        });
+        acceptance_named
+            .then_some(())
+            .filter(|()| coverage_proven)
+            .map(|()| version)
+    }
+}
+
+/// Owner version selection for `ProjectUnderstandingModel`.
+///
+/// `PROJECT_UNDERSTANDING_SCHEMA_VERSION` is the only schema the engine constructs
+/// (`eliot-engine::project_understanding`), and a repository-wide search finds no
+/// other `project-understanding-v*` literal. There is no supported legacy revision,
+/// so every other version is refused rather than reinterpreted.
+#[must_use]
+pub fn project_understanding_schema_selection(version: &str) -> Option<&'static str> {
+    if version == PROJECT_UNDERSTANDING_SCHEMA_VERSION {
+        Some(PROJECT_UNDERSTANDING_SCHEMA_VERSION)
+    } else {
+        None
+    }
+}
