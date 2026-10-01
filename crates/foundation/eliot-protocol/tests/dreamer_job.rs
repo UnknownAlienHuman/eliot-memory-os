@@ -1067,7 +1067,7 @@ fn canonical_lifecycle_vocabulary_matches_i14_20() {
         identity.name,
         ContractId::new("eliot.foundation.protocol.durable-job").expect("contract")
     );
-    assert_eq!(identity.version, ContractVersion::new(1, 0, 0));
+    assert_eq!(identity.version, ContractVersion::new(1, 2, 0));
 }
 
 // WORK_UNIT_CASE: 769/2
