@@ -46,6 +46,7 @@ pub const CONTRACT_VERSION: &str = "s-04-v2";
 pub const BLOB_MAX_PLAINTEXT_BYTES: u64 = 32 * 1024 * 1024;
 
 pub mod backup_io;
+pub mod verification_wire;
 pub mod wire;
 pub use backup_io::{
     BLOB_BACKUP_GENESIS, BlobBackupCompletionReceipt, BlobBackupFence, BlobBackupPage,
