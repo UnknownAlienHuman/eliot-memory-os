@@ -470,6 +470,8 @@ pub struct ColdStartOwnerInputs {
     pub descriptor: WorkScopeDescriptor,
     /// Root identity independently observed by the Host during admission.
     pub explicit_root_identity: String,
+    /// Privacy class admitted by the original authenticated scope binding.
+    pub privacy_class: PrivacyClass,
     /// Authenticated principal that owned the original binding admission.
     pub principal_ref: String,
     /// Authenticated session that owned the original binding admission.
@@ -489,8 +491,10 @@ pub struct ColdStartOwnerInputs {
     pub policy_revision: u64,
     /// Current Policy record digest checked during admission.
     pub policy_digest: String,
-    /// The exact discovery lease bound to the observed root and caller.
-    pub discovery_lease: DiscoveryReadLease,
+    /// The exact discovery lease bound to the observed root and caller, once
+    /// Kernel issues it. Initial scope admission may precede that lease.
+    #[serde(default)]
+    pub discovery_lease: Option<DiscoveryReadLease>,
     /// Expiry of the source admission request.
     pub admission_deadline: u64,
 }
@@ -548,6 +552,8 @@ pub enum WorkScopeError {
     SourceSetMismatch,
     #[error("the retained WorkScope owner has no admitted governing-source closure")]
     SourceClosureUnavailable,
+    #[error("the retained WorkScope owner is awaiting its Kernel-issued discovery lease")]
+    DiscoveryLeaseMissing,
     #[error("governing sources are conflicted with no admitted winner")]
     UnresolvedSourceConflict,
     #[error("task promotion requires the decision owner or a delegated binding")]
@@ -1259,11 +1265,21 @@ pub struct OnboardingReadinessReceipt {
     pub serializer_id: String,
     pub serializer_version: String,
     pub serializer_options_digest: String,
-    pub tokenizer_id: String,
-    pub tokenizer_version: String,
-    pub tokenizer_hash: String,
-    pub projection_source_ref: String,
-    pub projection_generation: u64,
+    /// Optional tokenizer measurement. Cold-start readiness does not measure
+    /// serialized task context; absence stays explicit and never blocks the
+    /// independently guarded Level 0 decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokenizer_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokenizer_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokenizer_hash: Option<String>,
+    /// Optional projection measurement, absent until an owning projection
+    /// producer has issued one for this task and source generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_source_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_generation: Option<u64>,
     pub readiness: ReadinessLifecycle,
     pub memory_state: MemoryState,
     pub missing_inputs: Vec<String>,
@@ -1322,11 +1338,28 @@ impl OnboardingReadinessReceipt {
         text(&self.serializer_id, "serializer_id")?;
         text(&self.serializer_version, "serializer_version")?;
         text(&self.serializer_options_digest, "serializer_options_digest")?;
-        text(&self.tokenizer_id, "tokenizer_id")?;
-        text(&self.tokenizer_version, "tokenizer_version")?;
-        text(&self.tokenizer_hash, "tokenizer_hash")?;
-        text(&self.projection_source_ref, "projection_source_ref")?;
-        counter(self.projection_generation, "projection_generation")?;
+        match (
+            &self.tokenizer_id,
+            &self.tokenizer_version,
+            &self.tokenizer_hash,
+        ) {
+            (Some(id), Some(version), Some(hash)) => {
+                text(id, "tokenizer_id")?;
+                text(version, "tokenizer_version")?;
+                text(hash, "tokenizer_hash")?;
+                digest(hash, "tokenizer_hash")?;
+            }
+            (None, None, None) => (),
+            _ => return Err(WorkScopeError::BindingReceiptMismatch),
+        }
+        match (&self.projection_source_ref, self.projection_generation) {
+            (Some(source_ref), Some(generation)) => {
+                text(source_ref, "projection_source_ref")?;
+                counter(generation, "projection_generation")?;
+            }
+            (None, None) => (),
+            _ => return Err(WorkScopeError::BindingReceiptMismatch),
+        }
         text(&self.next_safe_action, "next_safe_action")?;
         counter(self.receipt_revision, "receipt_revision")?;
         self.scope.validate()?;
@@ -1347,9 +1380,7 @@ impl OnboardingReadinessReceipt {
             .map_err(|_| WorkScopeError::InvalidStateFence)?;
         self.validate_task_binding()?;
         self.validate_task_selection_evidence()?;
-        if self.limiting_integration_evidence.is_empty()
-            || self.limiting_integration_evidence.len() > 8
-        {
+        if self.limiting_integration_evidence.len() > 8 {
             return Err(WorkScopeError::EmptyCollection {
                 field: "limiting_integration_evidence",
             });
@@ -1720,11 +1751,11 @@ impl ColdStartController {
         serializer_id: impl Into<String>,
         serializer_version: impl Into<String>,
         serializer_options_digest: impl Into<String>,
-        tokenizer_id: impl Into<String>,
-        tokenizer_version: impl Into<String>,
-        tokenizer_hash: impl Into<String>,
-        projection_source_ref: impl Into<String>,
-        projection_generation: u64,
+        tokenizer_id: Option<String>,
+        tokenizer_version: Option<String>,
+        tokenizer_hash: Option<String>,
+        projection_source_ref: Option<String>,
+        projection_generation: Option<u64>,
         privacy: &PrivacyProfile,
         task: TaskBindingInput,
         scan_receipt: Option<&ScanReceiptHandle>,
@@ -1738,10 +1769,6 @@ impl ColdStartController {
         let serializer_id = serializer_id.into();
         let serializer_version = serializer_version.into();
         let serializer_options_digest = serializer_options_digest.into();
-        let tokenizer_id = tokenizer_id.into();
-        let tokenizer_version = tokenizer_version.into();
-        let tokenizer_hash = tokenizer_hash.into();
-        let projection_source_ref = projection_source_ref.into();
         Self::check_lease_and_identities(lease, scope, instance, lineage, candidate, sources, now)?;
         Self::check_fence_sources_privacy(state_fence, sources, scope, candidate, privacy, lease)?;
         let task_selection_evidence = match &task {
@@ -1865,11 +1892,11 @@ impl ColdStartController {
         serializer_id: impl Into<String>,
         serializer_version: impl Into<String>,
         serializer_options_digest: impl Into<String>,
-        tokenizer_id: impl Into<String>,
-        tokenizer_version: impl Into<String>,
-        tokenizer_hash: impl Into<String>,
-        projection_source_ref: impl Into<String>,
-        projection_generation: u64,
+        tokenizer_id: Option<String>,
+        tokenizer_version: Option<String>,
+        tokenizer_hash: Option<String>,
+        projection_source_ref: Option<String>,
+        projection_generation: Option<u64>,
         privacy: &PrivacyProfile,
         task: TaskBindingInput,
         scan_receipt: Option<&ScanReceiptHandle>,
@@ -2984,11 +3011,11 @@ impl OnboardingSingleFlight {
         serializer_id: impl Into<String>,
         serializer_version: impl Into<String>,
         serializer_options_digest: impl Into<String>,
-        tokenizer_id: impl Into<String>,
-        tokenizer_version: impl Into<String>,
-        tokenizer_hash: impl Into<String>,
-        projection_source_ref: impl Into<String>,
-        projection_generation: u64,
+        tokenizer_id: Option<String>,
+        tokenizer_version: Option<String>,
+        tokenizer_hash: Option<String>,
+        projection_source_ref: Option<String>,
+        projection_generation: Option<u64>,
         privacy: &PrivacyProfile,
         task: TaskBindingInput,
         scan_receipt: Option<&ScanReceiptHandle>,
@@ -3142,11 +3169,11 @@ impl OnboardingSingleFlight {
         serializer_id: impl Into<String>,
         serializer_version: impl Into<String>,
         serializer_options_digest: impl Into<String>,
-        tokenizer_id: impl Into<String>,
-        tokenizer_version: impl Into<String>,
-        tokenizer_hash: impl Into<String>,
-        projection_source_ref: impl Into<String>,
-        projection_generation: u64,
+        tokenizer_id: Option<String>,
+        tokenizer_version: Option<String>,
+        tokenizer_hash: Option<String>,
+        projection_source_ref: Option<String>,
+        projection_generation: Option<u64>,
         privacy: &PrivacyProfile,
         task: TaskBindingInput,
         scan_receipt: Option<&ScanReceiptHandle>,
@@ -3402,7 +3429,6 @@ impl ColdStartOwnerInputs {
         self.source_admission
             .validate()
             .map_err(|_| WorkScopeError::SourceSetMismatch)?;
-        self.discovery_lease.validate()?;
         text(&self.explicit_root_identity, "explicit_root_identity")?;
         text(&self.principal_ref, "principal_ref")?;
         text(&self.session_ref, "session_ref")?;
@@ -3423,13 +3449,13 @@ impl ColdStartOwnerInputs {
             || self.descriptor.scope_ref != snapshot.binding.scope.scope_ref
             || self.descriptor.privacy != self.privacy
             || self.privacy != *privacy
+            || self.privacy_class != snapshot.binding.privacy_class
             || self.governing_sources != *sources
             || !self
                 .descriptor
                 .root_identities
                 .contains(&self.explicit_root_identity)
             || snapshot.binding.scope.root_identity != self.explicit_root_identity
-            || self.discovery_lease.candidate_root_ref != self.explicit_root_identity
             || self.source_admission.admitted != self.governing_sources
             || self.source_admission.admitted.scope_ref != snapshot.binding.scope.scope_ref
             || self.source_admission.admitted.generation
@@ -3442,10 +3468,14 @@ impl ColdStartOwnerInputs {
         {
             return Err(WorkScopeError::BindingReceiptMismatch);
         }
-        if self.discovery_lease.proposer_ref != self.principal_ref
-            || self.discovery_lease.session_ref != self.session_ref
-        {
-            return Err(WorkScopeError::BindingReceiptMismatch);
+        if let Some(discovery_lease) = &self.discovery_lease {
+            discovery_lease.validate()?;
+            if discovery_lease.proposer_ref != self.principal_ref
+                || discovery_lease.session_ref != self.session_ref
+                || discovery_lease.candidate_root_ref != self.explicit_root_identity
+            {
+                return Err(WorkScopeError::BindingReceiptMismatch);
+            }
         }
         Ok(())
     }
@@ -3606,24 +3636,79 @@ impl WorkScopeBindingOwner {
             .ok_or(WorkScopeError::SourceClosureUnavailable)?;
         inputs.validate_for(&snapshot)?;
         discovery_lease.validate()?;
+        let retained_lease = inputs
+            .discovery_lease
+            .as_ref()
+            .ok_or(WorkScopeError::DiscoveryLeaseMissing)?;
         if now > inputs.admission_deadline
-            || now > inputs.discovery_lease.deadline
-            || discovery_lease.lease_ref != inputs.discovery_lease.lease_ref
-            || discovery_lease.proposer_ref != inputs.discovery_lease.proposer_ref
-            || discovery_lease.session_ref != inputs.discovery_lease.session_ref
-            || discovery_lease.host_ref != inputs.discovery_lease.host_ref
+            || now > retained_lease.deadline
+            || discovery_lease.lease_ref != retained_lease.lease_ref
+            || discovery_lease.proposer_ref != retained_lease.proposer_ref
+            || discovery_lease.session_ref != retained_lease.session_ref
+            || discovery_lease.host_ref != retained_lease.host_ref
             || discovery_lease.root_filesystem_identity_ref
-                != inputs.discovery_lease.root_filesystem_identity_ref
-            || discovery_lease.candidate_root_ref != inputs.discovery_lease.candidate_root_ref
-            || discovery_lease.allowed_reads != inputs.discovery_lease.allowed_reads
-            || discovery_lease.deadline != inputs.discovery_lease.deadline
-            || discovery_lease.consumption_limit != inputs.discovery_lease.consumption_limit
-            || discovery_lease.consumed < inputs.discovery_lease.consumed
+                != retained_lease.root_filesystem_identity_ref
+            || discovery_lease.candidate_root_ref != retained_lease.candidate_root_ref
+            || discovery_lease.allowed_reads != retained_lease.allowed_reads
+            || discovery_lease.deadline != retained_lease.deadline
+            || discovery_lease.consumption_limit != retained_lease.consumption_limit
+            || discovery_lease.consumed < retained_lease.consumed
         {
             return Err(WorkScopeError::BindingReceiptMismatch);
         }
         inputs.source_admission.require_live(now)?;
         Ok(inputs.clone())
+    }
+
+    /// Attaches the later Kernel-issued discovery lease to an already
+    /// admitted root/source/task owner snapshot. Initial scope authority is
+    /// preserved; only a lease for that exact principal, session and root may
+    /// complete the retained input set.
+    pub fn attach_discovery_lease(
+        &self,
+        lease: DiscoveryReadLease,
+        next_owner_revision: u64,
+        now: u64,
+    ) -> Result<Self, WorkScopeError> {
+        lease.validate()?;
+        let mut snapshot = self.read_current(&self.snapshot.state_fence)?;
+        let existing = snapshot
+            .cold_start_inputs
+            .as_ref()
+            .ok_or(WorkScopeError::SourceClosureUnavailable)?;
+        existing.validate_for(&snapshot)?;
+        if now > existing.admission_deadline
+            || now > lease.deadline
+            || lease.proposer_ref != existing.principal_ref
+            || lease.session_ref != existing.session_ref
+            || lease.candidate_root_ref != existing.explicit_root_identity
+        {
+            return Err(WorkScopeError::BindingReceiptMismatch);
+        }
+        if let Some(retained) = &existing.discovery_lease {
+            return if retained == &lease {
+                Ok(self.clone())
+            } else {
+                Err(WorkScopeError::BindingReceiptMismatch)
+            };
+        }
+        let required_revision = snapshot
+            .owner_revision
+            .checked_add(1)
+            .ok_or(WorkScopeError::InvalidCounter {
+                field: "cold_start.owner_revision",
+            })?;
+        if next_owner_revision != required_revision {
+            return Err(WorkScopeError::BindingReceiptMismatch);
+        }
+        snapshot.owner_revision = next_owner_revision;
+        let inputs = snapshot
+            .cold_start_inputs
+            .as_mut()
+            .ok_or(WorkScopeError::SourceClosureUnavailable)?;
+        inputs.owner_revision = next_owner_revision;
+        inputs.discovery_lease = Some(lease);
+        Self::new(snapshot)
     }
 }
 
@@ -4050,11 +4135,11 @@ mod tests {
             "serializer:test",
             "serializer-version:test",
             "serializer-options:test",
-            "tokenizer:test",
-            "tokenizer-version:test",
-            "tokenizer-hash:test",
-            "projection-source:test",
-            1,
+            Some("tokenizer:test".into()),
+            Some("tokenizer-version:test".into()),
+            Some("a".repeat(64)),
+            Some("projection-source:test".into()),
+            Some(1),
             &privacy,
             task,
             None,

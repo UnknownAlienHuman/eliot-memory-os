@@ -4717,9 +4717,10 @@ pub struct InitialScopeBindingAdmissionRequest<'a> {
     pub retained_snapshot: Option<&'a WorkScopeBindingSnapshot>,
     pub binding: &'a ScopeBinding,
     pub observed: &'a ObservedScopeResources,
-    /// Exact Host-issued discovery lease used for the independent root
-    /// observation that produced `observed`.
-    pub discovery_lease: &'a DiscoveryReadLease,
+    /// Kernel-issued discovery lease when one exists. Initial scope binding
+    /// may precede this lease; the exact source/root/task admission is retained
+    /// first, then the live scan lease is attached by a later owner revision.
+    pub discovery_lease: Option<&'a DiscoveryReadLease>,
     pub sources: &'a GoverningSourceSet,
     pub privacy: &'a PrivacyProfile,
     pub source_candidates: &'a [GoverningSourceCandidate],
@@ -5340,9 +5341,9 @@ pub struct ColdStartSurfaceView {
     pub serializer_id: String,
     pub serializer_version: String,
     pub serializer_options_digest: String,
-    pub tokenizer_id: String,
-    pub tokenizer_version: String,
-    pub tokenizer_hash: String,
+    pub tokenizer_id: Option<String>,
+    pub tokenizer_version: Option<String>,
+    pub tokenizer_hash: Option<String>,
     pub readiness: String,
     pub smallest_missing_question: Option<String>,
     pub lease_deadline: u64,
@@ -5356,8 +5357,40 @@ pub struct ColdStartSurfaceView {
     pub unavailable_source_refs: Vec<String>,
     pub scan_receipt_ref: Option<String>,
     pub workspace_instance_ref: String,
-    pub projection_source_ref: String,
-    pub projection_generation: u64,
+    pub projection_source_ref: Option<String>,
+    pub projection_generation: Option<u64>,
+}
+
+/// Authenticated material-readiness inputs reconstructed from the durable
+/// readiness terminal and the current original WorkScope owner.
+#[derive(Clone, Debug)]
+pub struct GuardedColdStartReadiness {
+    pub lease: OnboardingLease,
+    pub receipt: eliot_workscope::OnboardingReadinessReceipt,
+    pub descriptor: WorkScopeDescriptor,
+    pub coverage: eliot_workscope::GoverningCoverage,
+    pub original_binding_observation: ScopeBinding,
+    pub guard_receipt: eliot_workscope::ScopeBindingGuardReceipt,
+    pub source_set: GoverningSourceSet,
+    pub privacy: PrivacyProfile,
+    pub state_fence: StateFence,
+    pub observed_at: u64,
+}
+
+impl GuardedColdStartReadiness {
+    /// Borrows the exact values the shared Material readiness gate consumes.
+    #[must_use]
+    pub fn material_readiness_inputs(&self) -> MaterialReadinessInputs<'_> {
+        MaterialReadinessInputs {
+            receipt: &self.receipt,
+            descriptor: &self.descriptor,
+            coverage: &self.coverage,
+            guard_receipt: &self.guard_receipt,
+            lease: &self.lease,
+            fence: &self.state_fence,
+            now: self.observed_at,
+        }
+    }
 }
 
 /// Ephemeral capability held only by the composition invocation that won the
@@ -7319,21 +7352,26 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
         }
-        discovery_lease
-            .validate()
-            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         let fence = self.snapshot.state_fence();
         if !fences_match_exact(&fence, state_fence)
             || descriptor.state_fence != fence
             || descriptor.privacy != *privacy
             || descriptor.scope_ref != work_scope_ref
             || binding.scope.scope_ref != work_scope_ref
-            || discovery_lease.proposer_ref != authenticated_identity.0
-            || discovery_lease.session_ref != authenticated_identity.1
-            || discovery_lease.candidate_root_ref != binding.scope.root_identity
             || admission_deadline < now
         {
             return Err(CompositionError::ActivationStaleFence);
+        }
+        if let Some(discovery_lease) = discovery_lease {
+            discovery_lease
+                .validate()
+                .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+            if discovery_lease.proposer_ref != authenticated_identity.0
+                || discovery_lease.session_ref != authenticated_identity.1
+                || discovery_lease.candidate_root_ref != binding.scope.root_identity
+            {
+                return Err(CompositionError::ActivationStaleFence);
+            }
         }
 
         let replay_owner =
@@ -7549,6 +7587,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 owner_revision,
                 descriptor: descriptor.clone(),
                 explicit_root_identity: observed_instance.root_identity.clone(),
+                privacy_class: binding.privacy_class,
                 principal_ref: principal_ref.to_owned(),
                 session_ref: session_ref.to_owned(),
                 task_selection,
@@ -7558,7 +7597,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 policy_owner_ref: policy_snapshot.policy_owner.owner_ref.clone(),
                 policy_revision: policy_owner.revision(),
                 policy_digest: policy_owner.snapshot_digest().to_owned(),
-                discovery_lease: discovery_lease.clone(),
+                discovery_lease: discovery_lease.cloned(),
                 admission_deadline,
             })
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
@@ -7991,6 +8030,38 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         }
         self.owners.work_scope = Some(owner);
         Ok(snapshot)
+    }
+
+    /// Prepares the next immutable WorkScope owner revision that attaches the
+    /// Kernel-issued discovery lease to the original admitted root/source/task
+    /// evidence. The caller must persist and read back this exact owner
+    /// revision before scanning; no pre-scan lease is synthesized.
+    pub fn attach_cold_start_discovery_lease(
+        &self,
+        lease: DiscoveryReadLease,
+        now: u64,
+    ) -> Result<WorkScopeBindingOwner, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let fence = self.snapshot.state_fence();
+        let owner = self.owners.work_scope.as_ref().ok_or_else(|| {
+            CompositionError::ActivationScopeSelectionRequired
+        })?;
+        let snapshot = owner
+            .read_current(&fence)
+            .map_err(map_activation_scope_error)?;
+        ensure_snapshot_fresh(&snapshot, "attach cold-start discovery lease")?;
+        let revision = self.recovery.owner_read(RecoveryOwner::WorkScope)?.revision;
+        if revision != snapshot.owner_revision {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        let next_revision = revision.checked_add(1).ok_or_else(|| {
+            CompositionError::Recovery("WorkScope owner revision overflow".to_owned())
+        })?;
+        owner
+            .attach_discovery_lease(lease, next_revision, now)
+            .map_err(map_activation_scope_error)
     }
 
     /// Retains one scope-identity mismatch in the bounded in-process
@@ -8861,8 +8932,148 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         Ok(())
     }
 
-    /// Builds the exact durable readiness key from the admitted lease,
-    /// candidate, governing sources, scanner evidence, owner binding, and
+    /// Compiles cold-start readiness using the original retained admission as
+    /// the sole source of scope, source, privacy, task, policy and fence
+    /// values. The installation ORS owner issues the lease from the exact key;
+    /// the caller supplies no lease identifier, epoch, or receipt reference.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn compile_cold_start_from_owner_inputs(
+        &mut self,
+        trigger: ColdStartTrigger,
+        principal_ref: &str,
+        session_ref: &str,
+        explicit_root_identity: &str,
+        discovery_lease: &DiscoveryReadLease,
+        lease_deadline: u64,
+        scan: &BootstrapScanEvidence,
+        scan_store: &InstallationScanDisclosureStore,
+        scan_binding: &ScanDisclosureOwnerBinding,
+        scan_receipt: &ScanReceiptHandle,
+        now: u64,
+    ) -> Result<LeaseJoin, CompositionError> {
+        let fence = self.snapshot.state_fence();
+        let inputs = self
+            .read_cold_start_owner_inputs_for_root(
+                principal_ref,
+                session_ref,
+                explicit_root_identity,
+                &fence,
+                discovery_lease,
+                now,
+            )
+            .await?;
+        let descriptor = &inputs.descriptor;
+        let mut matching_instances = descriptor
+            .instances
+            .iter()
+            .filter(|instance| instance.root_identity == inputs.explicit_root_identity);
+        let instance = matching_instances
+            .next()
+            .cloned()
+            .ok_or(CompositionError::ActivationStaleFence)?;
+        if matching_instances.next().is_some() {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        let lineage = descriptor.lineage.clone();
+        let scope = ScopeIdentity {
+            scope_ref: descriptor.scope_ref.clone(),
+            kind: descriptor.kind,
+            lineage_ref: lineage.as_ref().map(|value| value.lineage_ref.clone()),
+            instance_ref: instance.instance_ref.clone(),
+            root_identity: instance.root_identity.clone(),
+            generation: inputs.state_fence.resource_generation.value(),
+        };
+        let candidate = WorkScopeCandidate {
+            scope: scope.clone(),
+            descriptor_revision: descriptor.descriptor_revision,
+            lineage: lineage.clone(),
+            instance: instance.clone(),
+            privacy_class: inputs.privacy_class,
+        };
+        let serializer = eliot_context_contracts::canonical_render_serializer()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let key = self.build_cold_start_readiness_key(
+            &candidate,
+            &inputs.governing_sources,
+            &inputs.privacy,
+            scan,
+            scan_store,
+            scan_binding,
+            scan_receipt,
+        )?;
+        let owner = self.cold_start_readiness_owner.as_ref().ok_or_else(|| {
+            CompositionError::Recovery("cold-start readiness ORS owner is not bound".to_owned())
+        })?;
+        let outcome = owner
+            .claim_cold_start_readiness(&key, lease_deadline, now)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let (record, created) = match outcome {
+            ColdStartReadinessStageOutcome::Stored { record } => (*record, true),
+            ColdStartReadinessStageOutcome::AlreadyBound { record } => (*record, false),
+        };
+        record
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if record.claim.key != key || now > record.claim.lease_deadline {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        if record.terminal.is_some() {
+            return Self::readiness_join_from_record(&record, now, false);
+        }
+        if !created {
+            return Err(CompositionError::Recovery(
+                "another composition owns the active cold-start readiness compilation".to_owned(),
+            ));
+        }
+        self.cold_start_readiness_claims.insert(
+            record.claim.binding_digest.clone(),
+            ColdStartReadinessOwnerClaim {
+                claim: record.claim.clone(),
+                record_key: record.record_key.clone(),
+            },
+        );
+        let proposed: OnboardingLease = serde_json::from_str(&record.claim.lease_bytes)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        proposed
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        self.compile_cold_start_at_trigger(
+            trigger,
+            discovery_lease,
+            &proposed,
+            &record.claim.lease_ref,
+            principal_ref,
+            session_ref,
+            &scope,
+            &instance,
+            lineage.as_ref(),
+            &candidate,
+            &inputs.governing_sources,
+            &inputs.state_fence,
+            &inputs.policy_owner_ref,
+            Vec::new(),
+            &scan_binding.privacy_boundary_ref,
+            serializer.serializer_id(),
+            serializer.serializer_version(),
+            serializer.serializer_options_digest(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &inputs.privacy,
+            TaskBindingInput::Selected(inputs.task_selection.clone()),
+            scan,
+            scan_store,
+            scan_binding,
+            scan_receipt,
+            now,
+        )
+        .await
+    }
+
+    /// Builds the exact durable readiness key from the admitted candidate,
+    /// governing sources, scanner evidence, owner binding, and
     /// retained installation contour. Candidate source names alone cannot
     /// construct this claim: the source set must validate against the
     /// admitted privacy profile and the scan receipt must read back through
@@ -8870,11 +9081,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     #[allow(
         clippy::too_many_arguments,
         clippy::too_many_lines,
-        reason = "the claim validates one complete lease, source set, scanner receipt, and installation contour before constructing its durable key"
+        reason = "the key validates one exact candidate, source set, scanner receipt, and installation contour before owner issuance"
     )]
-    pub fn build_cold_start_readiness_claim(
+    pub fn build_cold_start_readiness_key(
         &self,
-        proposed: &OnboardingLease,
         candidate: &WorkScopeCandidate,
         sources: &GoverningSourceSet,
         privacy: &PrivacyProfile,
@@ -8882,13 +9092,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         scan_store: &InstallationScanDisclosureStore,
         scan_binding: &ScanDisclosureOwnerBinding,
         scan_receipt: &ScanReceiptHandle,
-    ) -> Result<ColdStartReadinessClaim, CompositionError> {
+    ) -> Result<ColdStartReadinessOwnerKey, CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
         }
-        proposed
-            .validate()
-            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         candidate
             .scope
             .validate()
@@ -8916,15 +9123,17 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         })?;
         if contour != scan_store.contour()
             || scan_binding.installation_id != contour.installation_id()
-            || candidate.scope.lineage_ref.as_deref()
-                != Some(proposed.lineage_candidate_ref.as_str())
-            || candidate.scope.instance_ref != proposed.workspace_instance_candidate_ref
-            || candidate.instance.instance_ref != proposed.workspace_instance_candidate_ref
+            || candidate.scope.lineage_ref.is_none()
+            || candidate
+                .lineage
+                .as_ref()
+                .map(|lineage| lineage.lineage_ref.as_str())
+                != candidate.scope.lineage_ref.as_deref()
+            || candidate.scope.instance_ref != candidate.instance.instance_ref
             || candidate.instance.root_identity != candidate.scope.root_identity
-            || candidate.privacy_class != proposed.privacy_class
+            || candidate.instance.generation != candidate.scope.generation
             || !privacy.admits(candidate.privacy_class)
             || sources.scope_ref != candidate.scope.scope_ref
-            || sources.generation != proposed.governing_source_generation
             || scan.canonical_root_ref != candidate.scope.root_identity
             || scan.filesystem_identity_ref != candidate.instance.root_identity
             || scan_binding.candidate_root_ref != candidate.scope.root_identity
@@ -8963,8 +9172,12 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         governing_source_digests.dedup();
         let key = ColdStartReadinessOwnerKey {
             installation_id: contour.installation_id().to_owned(),
-            lineage_candidate_ref: proposed.lineage_candidate_ref.clone(),
-            workspace_instance_candidate_ref: proposed.workspace_instance_candidate_ref.clone(),
+            lineage_candidate_ref: candidate
+                .scope
+                .lineage_ref
+                .clone()
+                .ok_or(CompositionError::ActivationStaleFence)?,
+            workspace_instance_candidate_ref: candidate.instance.instance_ref.clone(),
             filesystem_identity_ref: candidate.instance.root_identity.clone(),
             vcs_identity_ref: candidate.instance.vcs_identity_ref.clone(),
             privacy_boundary_ref: scan_binding.privacy_boundary_ref.clone(),
@@ -8978,17 +9191,45 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             dirty_summary_ref: scan.vcs_dirty_summary_ref.clone(),
             state_fence: live_fence,
         };
+        Ok(key)
+    }
+
+    pub fn build_cold_start_readiness_claim(
+        &self,
+        proposed: &OnboardingLease,
+        candidate: &WorkScopeCandidate,
+        sources: &GoverningSourceSet,
+        privacy: &PrivacyProfile,
+        scan: &BootstrapScanEvidence,
+        scan_store: &InstallationScanDisclosureStore,
+        scan_binding: &ScanDisclosureOwnerBinding,
+        scan_receipt: &ScanReceiptHandle,
+    ) -> Result<ColdStartReadinessClaim, CompositionError> {
+        proposed
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let key = self.build_cold_start_readiness_key(
+            candidate,
+            sources,
+            privacy,
+            scan,
+            scan_store,
+            scan_binding,
+            scan_receipt,
+        )?;
+        if key.lineage_candidate_ref != proposed.lineage_candidate_ref
+            || key.workspace_instance_candidate_ref != proposed.workspace_instance_candidate_ref
+            || key.privacy_class != proposed.privacy_class
+            || key.governing_source_generation != proposed.governing_source_generation
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
         let lease_bytes = canonical_json_bytes(proposed)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         let lease_bytes = String::from_utf8(lease_bytes)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        ColdStartReadinessClaim::new(
-            key,
-            proposed.lease_ref.clone(),
-            proposed.deadline,
-            lease_bytes,
-        )
-        .map_err(|error| CompositionError::Recovery(error.to_string()))
+        ColdStartReadinessClaim::new(key, proposed.lease_ref.clone(), proposed.deadline, lease_bytes)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))
     }
 
     fn readiness_join_from_record(
@@ -9123,7 +9364,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             CompositionError::Recovery("cold-start readiness ORS owner is not bound".to_owned())
         })?;
         let outcome = owner
-            .claim_cold_start_readiness(&claim, now)
+            .claim_cold_start_readiness(&claim.key, claim.lease_deadline, now)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         let (record, created) = match outcome {
             ColdStartReadinessStageOutcome::Stored { record } => (*record, true),
@@ -9270,11 +9511,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         serializer_id: &str,
         serializer_version: &str,
         serializer_options_digest: &str,
-        tokenizer_id: &str,
-        tokenizer_version: &str,
-        tokenizer_hash: &str,
-        projection_source_ref: &str,
-        projection_generation: u64,
+        tokenizer_id: Option<&str>,
+        tokenizer_version: Option<&str>,
+        tokenizer_hash: Option<&str>,
+        projection_source_ref: Option<&str>,
+        projection_generation: Option<u64>,
         privacy: &PrivacyProfile,
         task: TaskBindingInput,
         scan: &BootstrapScanEvidence,
@@ -9433,10 +9674,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 serializer_id,
                 serializer_version,
                 serializer_options_digest,
-                tokenizer_id,
-                tokenizer_version,
-                tokenizer_hash,
-                projection_source_ref,
+                tokenizer_id.map(str::to_owned),
+                tokenizer_version.map(str::to_owned),
+                tokenizer_hash.map(str::to_owned),
+                projection_source_ref.map(str::to_owned),
                 projection_generation,
                 privacy,
                 task,
@@ -9554,6 +9795,141 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         Self::verify_ready_scan_readback(&receipt, scan_readback)?;
         let surface = Self::cold_start_surface_view(&lease, &receipt)?;
         Ok((lease, surface))
+    }
+
+    /// Reconstructs material-readiness inputs only after durable terminal,
+    /// scan receipt, task selection, Policy owner and original WorkScope
+    /// admission have all been revalidated against the current full fence.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn read_guarded_cold_start_readiness_for_claim(
+        &self,
+        claim: &ColdStartReadinessClaim,
+        principal_ref: &str,
+        session_ref: &str,
+        scope_ref: &str,
+        task_selection: &TaskSelectionEvidence,
+        state_fence: &StateFence,
+        discovery_lease: &DiscoveryReadLease,
+        scan_store: &InstallationScanDisclosureStore,
+        scan_receipt: &ScanReceiptHandle,
+        scan_binding: &ScanDisclosureOwnerBinding,
+        now: u64,
+    ) -> Result<GuardedColdStartReadiness, CompositionError> {
+        if !fences_match_exact(&self.snapshot.state_fence(), state_fence) {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        let (lease, receipt) = self.cold_start_readiness_terminal_for_claim(claim, now)?;
+        Self::verify_ready_scan_readback(
+            &receipt,
+            Some((scan_store, scan_receipt, scan_binding)),
+        )?;
+        if receipt.principal_ref != principal_ref
+            || receipt.session_ref != session_ref
+            || receipt.scope.scope_ref != scope_ref
+            || receipt.task_selection_evidence.as_ref() != Some(task_selection)
+            || receipt.state_fence != *state_fence
+            || scan_binding.principal_ref != principal_ref
+            || scan_binding.session_ref != session_ref
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+
+        let owner = self.owners.work_scope.as_ref().ok_or_else(|| {
+            CompositionError::ActivationScopeSelectionRequired
+        })?;
+        let owner_inputs = self
+            .read_cold_start_owner_inputs_for_root(
+                principal_ref,
+                session_ref,
+                &scan_binding.candidate_root_ref,
+                state_fence,
+                discovery_lease,
+                now,
+            )
+            .await?;
+        if owner_inputs.descriptor.scope_ref != scope_ref
+            || owner_inputs.task_selection != *task_selection
+            || owner_inputs.privacy_class != claim.key.privacy_class
+            || owner_inputs.governing_sources.generation != receipt.governing_source_generation
+            || owner_inputs.governing_sources.scope_ref != receipt.scope.scope_ref
+            || owner_inputs.explicit_root_identity != scan_binding.candidate_root_ref
+            || owner_inputs
+                .discovery_lease
+                .as_ref()
+                .map(|lease| lease.lease_ref.as_str())
+                != Some(scan_binding.lease_ref.as_str())
+            || owner_inputs.policy_revision != scan_binding.policy_revision
+            || claim.key.privacy_boundary_ref != scan_binding.privacy_boundary_ref
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        let fence_bytes = canonical_json_bytes(state_fence)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if scan_binding.state_fence_ref.as_deref() != Some(sha256_hex(&fence_bytes).as_str()) {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+
+        let snapshot = owner
+            .read_current(state_fence)
+            .map_err(map_activation_scope_error)?;
+        ensure_snapshot_fresh(
+            &snapshot,
+            "cold-start readiness WorkScope admission is not freshly matched",
+        )?;
+        let (source_set, privacy) = owner
+            .read_current_source_closure(state_fence)
+            .map_err(map_activation_scope_error)?;
+        if source_set != owner_inputs.governing_sources || privacy != owner_inputs.privacy {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        let guard = ScopeBindingGuard.check(
+            &snapshot.binding,
+            &snapshot.binding,
+            &source_set,
+            &privacy,
+        );
+        if guard != snapshot.guard_receipt
+            || guard.disposition != ScopeBindingDisposition::Matched
+            || snapshot.binding.scope != receipt.scope
+            || snapshot.binding.governing_source_generation != receipt.governing_source_generation
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        let coverage = match owner_inputs.source_admission.coverage {
+            eliot_workscope::SourceCoverage::ExplicitAbsence { ref reason_ref }
+                if source_set
+                    .sources
+                    .iter()
+                    .all(|source| source.status != eliot_workscope::SourceStatus::Admitted) =>
+            {
+                eliot_workscope::GoverningCoverage::ExplicitAbsence(
+                    eliot_workscope::ExplicitAbsenceRecord {
+                        scope_ref: source_set.scope_ref.clone(),
+                        generation: source_set.generation,
+                        absent_roles: eliot_workscope::candidate_source_roles(),
+                        reason_ref: reason_ref.clone(),
+                        evidence_refs: vec![scan_receipt.receipt_ref.clone()],
+                    },
+                )
+            }
+            _ => eliot_workscope::GoverningCoverage::AdmittedSources(source_set.clone()),
+        };
+        coverage
+            .validate()
+            .map_err(CompositionError::ScanDisclosure)?;
+
+        Ok(GuardedColdStartReadiness {
+            lease,
+            receipt,
+            descriptor: owner_inputs.descriptor,
+            coverage,
+            original_binding_observation: snapshot.binding,
+            guard_receipt: guard,
+            source_set,
+            privacy,
+            state_fence: state_fence.clone(),
+            observed_at: now,
+        })
     }
 
     pub(crate) fn cold_start_readiness_terminal_for_claim(
@@ -14501,11 +14877,11 @@ mod tests {
                 "serializer:test",
                 "serializer-version:test",
                 "serializer-options:test",
-                "tokenizer:test",
-                "tokenizer-version:test",
-                "tokenizer-hash:test",
-                "projection:test",
-                1,
+                Some("tokenizer:test".into()),
+                Some("tokenizer-version:test".into()),
+                Some("a".repeat(64)),
+                Some("projection:test"),
+                Some(1),
                 &privacy,
                 task,
                 None,
