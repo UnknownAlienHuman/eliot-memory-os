@@ -13,8 +13,9 @@
 //! `authority_epoch`, `budget`, `cancellation_policy_id`, `claim_id`,
 //! `deadline_unix_ms`, `decision_id`, `expected_result_schema`,
 //! `expected_result_schema_version`, `operation_id`, `parent_job_id`,
-//! `predecessor_revision`, `registration_id`, `route_class`, `state_fence`,
-//! `task_id`, `work_scope_id`, `worker_generation`, plus one nested
+//! `predecessor_revision`, `privacy_class`, `registration_id`,
+//! `route_class`, `state_fence`, `swarm_id`, `task_id`, `visibility`,
+//! `work_scope_id`, `worker_generation`, plus one nested
 //! `executable_binding` object carrying the T9-02 executable join. The nested
 //! object is JSON `null` for wire-v1 claims (which predate the join) and
 //! otherwise covers exactly the keys `adapter_id`, `adapter_revision`,
@@ -44,6 +45,7 @@
 use eliot_contracts::{
     CapabilityCellId, EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
 };
+use eliot_security_contracts::PrivacyClass;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -456,6 +458,19 @@ pub struct NativeWorkerClaimRequest {
     /// never carry executable authority; required on wire v2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable_binding: Option<NativeWorkerExecutableBinding>,
+    /// Harness-bound visibility label (A12.2). `None` until the harness
+    /// publishes the leg on the wire; validated shape-only when `Some`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<String>,
+    /// Canonical privacy class (A12.6). Reuses the canonical owner type,
+    /// so the shape is enforced at the Deserialize boundary; `None` until
+    /// the privacy owner publishes the leg.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privacy_class: Option<PrivacyClass>,
+    /// Swarm identity the unit is attributed to. `None` until the swarm
+    /// publisher publishes the leg; validated shape-only when `Some`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swarm_id: Option<String>,
     /// Canonical digest over every bound work field.
     pub binding_digest: String,
     /// Canonical digest over this request envelope.
@@ -488,11 +503,14 @@ impl NativeWorkerClaimRequest {
             "operation_id": self.operation_id,
             "parent_job_id": self.parent_job_id,
             "predecessor_revision": self.predecessor_revision,
+            "privacy_class": self.privacy_class,
             "registration_id": self.registration_id,
             "route_class": self.route_class,
             "state_fence": self.state_fence,
+            "swarm_id": self.swarm_id,
             "task_id": self.task_id,
             "work_scope_id": self.work_scope_id,
+            "visibility": self.visibility,
             "worker_generation": self.worker_generation,
         });
         canonical_json_bytes(&canonical)
@@ -533,6 +551,9 @@ impl NativeWorkerClaimRequest {
             authority_epoch: EpochId,
             state_fence: &'a StateFence,
             executable_binding: Option<&'a NativeWorkerExecutableBinding>,
+            visibility: Option<&'a str>,
+            privacy_class: Option<PrivacyClass>,
+            swarm_id: Option<&'a str>,
             binding_digest: &'a str,
         }
         let canonical = Canonical {
@@ -562,6 +583,9 @@ impl NativeWorkerClaimRequest {
             authority_epoch: self.authority_epoch.clone(),
             state_fence: &self.state_fence,
             executable_binding: self.executable_binding.as_ref(),
+            visibility: self.visibility.as_deref(),
+            privacy_class: self.privacy_class,
+            swarm_id: self.swarm_id.as_deref(),
             binding_digest: &self.binding_digest,
         };
         canonical_json_bytes(&canonical)
@@ -666,6 +690,21 @@ impl NativeWorkerClaimRequest {
             });
         }
         self.budget.validate()?;
+        // Harness/swarm legs are owner-published: `None` until the owner
+        // publishes them, shape-only text when present, never invented
+        // here. `privacy_class` is the canonical owner type, so its shape
+        // is enforced at the Deserialize boundary and needs no string arm.
+        for (leg, field) in [
+            (
+                self.visibility.as_deref(),
+                "native_worker_claim.visibility",
+            ),
+            (self.swarm_id.as_deref(), "native_worker_claim.swarm_id"),
+        ] {
+            if let Some(text) = leg {
+                validate_wire_text(text, field)?;
+            }
+        }
         self.state_fence
             .validate()
             .map_err(|_| KernelServiceError::HandshakeMismatch {
@@ -1390,6 +1429,9 @@ mod executable_binding_tests {
             authority_epoch: test_epoch(1),
             state_fence: live_fence(),
             executable_binding: Some(join.clone()),
+            visibility: None,
+            privacy_class: None,
+            swarm_id: None,
             binding_digest: String::new(),
             request_digest: String::new(),
         };
