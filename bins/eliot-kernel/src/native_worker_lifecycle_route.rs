@@ -2250,6 +2250,24 @@ impl KernelComposition {
             predecessor_revision: require_claim_text(claim, "predecessor_revision")?,
             authority_epoch,
             state_fence: fence,
+            semantic_admission_revision: claim
+                .get("semantic_admission_revision")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|_| NativeWorkerRouteError::Shape {
+                    field: "semantic_admission_revision",
+                })?,
+            semantic_admission_predecessor_revision: claim
+                .get("semantic_admission_predecessor_revision")
+                .map(|value| {
+                    value
+                        .as_u64()
+                        .ok_or(NativeWorkerRouteError::Shape {
+                            field: "semantic_admission_predecessor_revision",
+                        })
+                })
+                .transpose()?,
             executable_binding,
             // Owner-published legs project verbatim from the presented claim
             // (or `None` when the owner has not published them); never
@@ -2617,7 +2635,17 @@ impl KernelComposition {
                     field: "attempt_id",
                 }
             })?,
-            semantic_admission_revision: request.request_digest.clone(),
+            semantic_admission_revision: request
+                .semantic_admission_revision
+                .clone()
+                .ok_or(NativeWorkerRouteError::Shape {
+                    field: "semantic_admission_revision",
+                })?,
+            semantic_admission_predecessor_revision: request
+                .semantic_admission_predecessor_revision
+                .ok_or(NativeWorkerRouteError::Shape {
+                    field: "semantic_admission_predecessor_revision",
+                })?,
             claims: claims.clone(),
             state_fence: state_fence.clone(),
             authority_epoch: authority_epoch.clone(),
@@ -2645,6 +2673,9 @@ impl KernelComposition {
                 reservation_id: reservation_id.clone(),
                 work_item_id: identity_input.work_item_id.clone(),
                 proposed_attempt_id: identity_input.proposed_attempt_id.clone(),
+                semantic_admission_revision: identity_input.semantic_admission_revision.clone(),
+                semantic_admission_predecessor_revision: identity_input
+                    .semantic_admission_predecessor_revision,
                 operation_id,
                 claims,
                 authority_epoch,
