@@ -3212,11 +3212,21 @@ mod tests {
         evidence: &[u8],
     ) -> (SignedWatchdogFallbackEnvelope, NotificationRequest) {
         let evidence_digest = sha256_hex(evidence);
+        // The fallback verifier enforces the I11.6 spool freshness window
+        // (#1781/#2414, `validate_fallback_freshness`): mint the envelope at
+        // the current instant so the fixture is a valid fresh envelope. The
+        // previous fixed 1970 timestamp predates the freshness policy and is
+        // now correctly rejected as a stale replay.
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock is before the Unix epoch")
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
         let mut envelope = SignedWatchdogFallbackEnvelope {
             envelope: eliot_notify_core::WatchdogFallbackEnvelope {
                 incident_class: PlatformHandle::new("CONTROL_PLANE_LOSS").unwrap(),
                 installation_identity: PlatformHandle::new("installation-1").unwrap(),
-                timestamp_ms: 100,
+                timestamp_ms,
                 evidence_digest: evidence_digest.clone(),
                 recovery_instruction: eliot_notify_core::RecoveryInstruction::EliotRecoveryStatus,
             },
