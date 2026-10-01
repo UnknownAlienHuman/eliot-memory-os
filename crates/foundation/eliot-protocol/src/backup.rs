@@ -403,9 +403,27 @@ impl BackupRole {
                 BackupCapability::RestoreStatus,
                 BackupCapability::ReconcileRestore,
             ],
-            Self::StoreOwner | Self::OrsOwner | Self::SpoolOwner => &[
+            Self::StoreOwner | Self::OrsOwner => &[
                 BackupCapability::RestoreStep,
                 BackupCapability::RestoreStatus,
+                BackupCapability::ReconcileRestore,
+            ],
+            // The spool owner is the owner of one bounded spool, so reading a
+            // snapshot page of that spool and reconciling the isolated restore
+            // it imports are the two contours it can actually execute. It
+            // applies no restore step (that is Store/Ors owner work) and it
+            // holds no restore-status projection, so this arm is narrower than
+            // the two roles above and is deliberately NOT their shared set.
+            //
+            // The projection is the authority grant, not a description of what
+            // an endpoint would like to serve: A0.4 decides "what is currently
+            // permitted" from Authority FIRST and from actual integration
+            // capability second, and A0.3 makes hidden creation or expansion of
+            // authority a fail-closed Hard Boundary. A consumer that needs a
+            // contour its role does not carry must therefore narrow its own
+            // registered set, never widen the role to match itself.
+            Self::SpoolOwner => &[
+                BackupCapability::ReadSnapshotPage,
                 BackupCapability::ReconcileRestore,
             ],
             Self::Verifier => &[
