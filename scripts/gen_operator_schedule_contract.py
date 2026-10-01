@@ -1635,19 +1635,62 @@ def collect_functions(lines: list[str], name: str) -> RustFunction:
 
 
 def collect_dispositions(lines: list[str]) -> list[str]:
-    """The closed disposition vocabulary, in owner declaration order."""
+    """Read the owner's closed literal-to-disposition parser without guessing."""
     function = collect_functions(lines, DISPOSITION_FUNCTION)
-    arms = re.findall(
-        r'"([A-Z0-9_]+)"\s*=>\s*Ok\(' + re.escape(DISPOSITION_VARIANT_TYPE) + r"::",
-        function.body,
+    code = collapse(_strip_rust_comments_and_attributes(function.body))
+    function_shape = re.fullmatch(
+        r"fn\s+parse_occurrence_disposition\s*\(\s*"
+        r"value\s*:\s*&str\s*,\s*field\s*:\s*&'static\s+str\s*,?\s*"
+        r"\)\s*->\s*Result\s*<\s*OccurrenceDisposition\s*,\s*"
+        r"UserAutomationError\s*>\s*\{\s*match\s+value\s*\{(?P<arms>.*)\}\s*\}",
+        code,
     )
-    if not arms:
+    if function_shape is None:
         raise Refused(
-            f"{DISPOSITION_FUNCTION} carries no {DISPOSITION_VARIANT_TYPE} match arms"
+            f"{DISPOSITION_FUNCTION} changed its pinned closed parser shape"
         )
-    if len(set(arms)) != len(arms):
+
+    dispositions: list[str] = []
+    fallback_count = 0
+    for arm in _split_top_level(function_shape.group("arms"), ","):
+        arm = collapse(arm)
+        if not arm:
+            continue
+        if re.fullmatch(
+            r"_\s*=>\s*Err\(UserAutomationError::Invalid\(field\)\)", arm
+        ):
+            fallback_count += 1
+            continue
+        literal_arm = re.fullmatch(
+            r'("(?:\\.|[^"\\])*")\s*=>\s*Ok\(\s*'
+            + re.escape(DISPOSITION_VARIANT_TYPE)
+            + r"::([A-Za-z_][A-Za-z0-9_]*)\s*\)",
+            arm,
+        )
+        if literal_arm is None:
+            raise Refused(
+                f"{DISPOSITION_FUNCTION} contains an unpinned arm {arm!r}; "
+                "only direct literal mappings and the exact refusing fallback are supported"
+            )
+        wire_value = decode_rust_string(literal_arm.group(1))
+        if re.fullmatch(r"[A-Z0-9_]+", wire_value) is None:
+            raise Refused(
+                f"{DISPOSITION_FUNCTION} contains a non-canonical disposition "
+                f"spelling {wire_value!r}"
+            )
+        dispositions.append(wire_value)
+
+    if fallback_count != 1:
+        raise Refused(
+            f"{DISPOSITION_FUNCTION} must retain exactly one refusing fallback arm"
+        )
+    if not dispositions:
+        raise Refused(
+            f"{DISPOSITION_FUNCTION} carries no {DISPOSITION_VARIANT_TYPE} literal mappings"
+        )
+    if len(set(dispositions)) != len(dispositions):
         raise Refused(f"{DISPOSITION_FUNCTION} repeats a disposition spelling")
-    return arms
+    return dispositions
 
 
 def collect_refusals(lines: list[str]) -> list[RustRefusal]:
