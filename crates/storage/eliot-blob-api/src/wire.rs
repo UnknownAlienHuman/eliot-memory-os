@@ -27,11 +27,11 @@ pub const BLOB_PROCESS_STREAM_CAPABILITY: &str = "blob.process-stream";
 pub const BLOB_PROCESS_STREAM_WIRE_REVISION: u16 = 1;
 /// Bound for one encoded Blob process-stream JSON payload.
 pub const BLOB_PROCESS_STREAM_MAX_FRAME_BYTES: usize = 3 * 1024 * 1024;
-/// Narrow TestD-to-Kernel capability exchange selector. This frame is
+/// Narrow `TestD`-to-Kernel capability exchange selector. This frame is
 /// authenticated by the established Kernel session and is accepted before
-/// ordinary request-identity decoding only for the exact TestD peer role.
+/// ordinary request-identity decoding only for the exact `TestD` peer role.
 pub const BLOB_PROCESS_STREAM_KERNEL_WIRE_ID: &str = "eliot.kernel.blob-process-stream";
-/// Current revision for the narrow TestD-to-Kernel capability exchange.
+/// Current revision for the narrow `TestD`-to-Kernel capability exchange.
 pub const BLOB_PROCESS_STREAM_KERNEL_WIRE_REVISION: u16 = 1;
 /// Maximum encoded Kernel capability-exchange frame.
 pub const BLOB_PROCESS_STREAM_KERNEL_MAX_FRAME_BYTES: usize = 3 * 1024 * 1024;
@@ -168,10 +168,10 @@ impl BlobProcessStreamCallToken {
     }
 }
 
-/// Narrow authenticated TestD-to-Kernel request for one Blob process-stream
+/// Narrow authenticated `TestD`-to-Kernel request for one Blob process-stream
 /// operation. The established session supplies peer authentication; Kernel
 /// resolves both references against its retained job capability and issues
-/// the Store-facing RequestIdentity and StateFence internally. Its operation
+/// the Store-facing `RequestIdentity` and `StateFence` internally. Its operation
 /// projection deliberately does not reuse the Store-facing request type,
 /// because that type contains a fence which only Kernel may select.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -191,7 +191,7 @@ pub struct BlobProcessStreamKernelRequest {
     pub operation: BlobProcessStreamKernelOperationRequest,
 }
 
-/// One closed semantic operation accepted from TestD by Kernel.
+/// One closed semantic operation accepted from `TestD` by Kernel.
 ///
 /// The operation-specific `body` is decoded by Kernel into the exact named
 /// `eliot-process` type before grant lookup or owner dispatch. This API crate
@@ -203,7 +203,7 @@ pub enum BlobProcessStreamKernelOperationRequest {
     /// Open one stream using an admitted process binding.
     SinkOpen {
         /// Exact ProcessStreamSinkOpenRequest object.
-        body: serde_json::Value,
+        body: Box<serde_json::Value>,
         /// Absolute operation deadline.
         deadline_ms: u64,
     },
@@ -212,7 +212,7 @@ pub enum BlobProcessStreamKernelOperationRequest {
         /// Exact owner-retained stream identity.
         binding: ProcessStreamSinkBindingRef,
         /// Exact ProcessStreamSinkAppendRequest object.
-        body: serde_json::Value,
+        body: Box<serde_json::Value>,
         /// Absolute operation deadline.
         deadline_ms: u64,
     },
@@ -221,7 +221,7 @@ pub enum BlobProcessStreamKernelOperationRequest {
         /// Exact owner-retained stream identity.
         binding: ProcessStreamSinkBindingRef,
         /// Exact ProcessStreamSinkFinalizeRequest object.
-        body: serde_json::Value,
+        body: Box<serde_json::Value>,
         /// Absolute operation deadline.
         deadline_ms: u64,
     },
@@ -230,7 +230,7 @@ pub enum BlobProcessStreamKernelOperationRequest {
         /// Exact owner-retained stream identity.
         binding: ProcessStreamSinkBindingRef,
         /// Exact ProcessStreamSinkAbortRequest object.
-        body: serde_json::Value,
+        body: Box<serde_json::Value>,
         /// Absolute operation deadline.
         deadline_ms: u64,
     },
@@ -246,13 +246,13 @@ pub enum BlobProcessStreamKernelOperationRequest {
         /// Exact owner-retained stream identity.
         binding: ProcessStreamSinkBindingRef,
         /// Exact ProcessStreamSinkUnknownOutcome object.
-        body: serde_json::Value,
+        body: Box<serde_json::Value>,
         /// Absolute operation deadline.
         deadline_ms: u64,
     },
     /// Read one contiguous chunk from the original immutable source.
     SourceReadback {
-        /// Semantic request. Kernel supplies the Store-side StateFence.
+        /// Semantic request. Kernel supplies the Store-side `StateFence`.
         request: BlobProcessStreamKernelSourceReadbackRequest,
     },
 }
@@ -292,14 +292,14 @@ impl BlobProcessStreamKernelOperationRequest {
 }
 
 /// Kernel-side source-readback request projection, intentionally omitting the
-/// Store StateFence. Kernel derives that fence from the retained grant and its
+/// Store `StateFence`. Kernel derives that fence from the retained grant and its
 /// current authority snapshot when building the Store-facing request.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlobProcessStreamKernelSourceReadbackRequest {
     pub wire_revision: u16,
     /// Kernel-issued capability reference, required to bind Store read
-    /// authority to the same admitted TestD job.
+    /// authority to the same admitted `TestD` job.
     pub capability: ProcessStreamSinkCapabilityRef,
     /// Exact Store-issued binding returned by the corresponding Open.
     pub binding: ProcessStreamSinkBindingRef,
@@ -326,7 +326,7 @@ pub struct BlobProcessStreamKernelSourceReadbackRequest {
 
 impl BlobProcessStreamKernelSourceReadbackRequest {
     /// Validates all semantic fields that do not depend on Kernel's current
-    /// StateFence. The owning Kernel adapter validates again after inserting
+    /// `StateFence`. The owning Kernel adapter validates again after inserting
     /// the current fence into `ProcessStreamSourceReadbackRequest`.
     pub fn validate(&self) -> Result<(), WireValidationError> {
         if self.wire_revision != PROCESS_STREAM_READBACK_WIRE_REVISION {
@@ -422,7 +422,7 @@ fn validate_body(body: &serde_json::Value) -> Result<(), WireValidationError> {
 
 /// Exact Kernel request for a fresh owner-side WorkScope/source/policy facts
 /// read. The request uses only already admitted job/process identities and
-/// carries no candidate owner facts from TestD.
+/// carries no candidate owner facts from `TestD`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlobProcessStreamOwnerFactsPullRequest {
@@ -432,7 +432,7 @@ pub struct BlobProcessStreamOwnerFactsPullRequest {
     pub wire_revision: u16,
     /// Kernel-generated durable pull reference.
     pub pull_ref: String,
-    /// Exact durable TestD job identity.
+    /// Exact durable `TestD` job identity.
     pub job_id: String,
     /// Exact admitted invocation identity.
     pub invocation_id: String,
@@ -722,7 +722,7 @@ impl BlobProcessStreamKernelRequest {
     }
 }
 
-/// Result of one narrow authenticated TestD-to-Kernel capability operation.
+/// Result of one narrow authenticated `TestD`-to-Kernel capability operation.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub enum BlobProcessStreamKernelOutcome {
@@ -731,13 +731,13 @@ pub enum BlobProcessStreamKernelOutcome {
         /// Digest of the original operation body.
         operation_sha256: String,
         /// Exact closed Store/Blob result.
-        response: BlobProcessStreamFrameResponse,
+        response: Box<BlobProcessStreamFrameResponse>,
         /// Original terminal request, retained verbatim when this outcome
-        /// finalizes or aborts a stream. This lets a recovering TestD process
+        /// finalizes or aborts a stream. This lets a recovering `TestD` process
         /// reconstruct the owner-validated terminal against the exact
         /// command, rather than treating metadata readback as a terminal.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        original_terminal_request: Option<BlobProcessStreamKernelOperationRequest>,
+        original_terminal_request: Option<Box<BlobProcessStreamKernelOperationRequest>>,
         /// Digest of the retained original terminal request above.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         original_terminal_operation_sha256: Option<String>,
@@ -1123,7 +1123,7 @@ pub enum ProcessStreamSinkWireRequest {
         /// Kernel-issued admitted process capability reference.
         capability: ProcessStreamSinkCapabilityRef,
         /// Exact closed ProcessStreamSinkOpenRequest JSON object.
-        body: serde_json::Value,
+        body: Box<serde_json::Value>,
         /// Authenticated request fence.
         fence: StateFence,
         /// Absolute Unix-millisecond operation deadline.
@@ -1136,7 +1136,7 @@ pub enum ProcessStreamSinkWireRequest {
         /// Exact retained stream binding selected by this caller.
         binding: ProcessStreamSinkBindingRef,
         /// Exact closed ProcessStreamSinkAppend JSON object.
-        body: serde_json::Value,
+        body: Box<serde_json::Value>,
         /// Authenticated request fence.
         fence: StateFence,
         /// Absolute Unix-millisecond operation deadline.
@@ -1149,7 +1149,7 @@ pub enum ProcessStreamSinkWireRequest {
         /// Exact retained stream binding selected by this caller.
         binding: ProcessStreamSinkBindingRef,
         /// Exact closed ProcessStreamSinkFinalizeRequest JSON object.
-        body: serde_json::Value,
+        body: Box<serde_json::Value>,
         /// Authenticated request fence.
         fence: StateFence,
         /// Absolute Unix-millisecond operation deadline.
@@ -1162,7 +1162,7 @@ pub enum ProcessStreamSinkWireRequest {
         /// Exact retained stream binding selected by this caller.
         binding: ProcessStreamSinkBindingRef,
         /// Exact closed ProcessStreamSinkAbortRequest JSON object.
-        body: serde_json::Value,
+        body: Box<serde_json::Value>,
         /// Authenticated request fence.
         fence: StateFence,
         /// Absolute Unix-millisecond operation deadline.
@@ -1186,7 +1186,7 @@ pub enum ProcessStreamSinkWireRequest {
         /// Exact retained stream binding selected by this caller.
         binding: ProcessStreamSinkBindingRef,
         /// Exact closed ProcessStreamSinkUnknownOutcome JSON object.
-        body: serde_json::Value,
+        body: Box<serde_json::Value>,
         /// Authenticated request fence.
         fence: StateFence,
         /// Absolute Unix-millisecond operation deadline.
@@ -1271,22 +1271,22 @@ pub enum ProcessStreamSinkWireResponse {
     /// Append returned its exact typed disposition JSON.
     AppendDisposition {
         /// Closed ProcessStreamSinkAppendDisposition JSON.
-        body: serde_json::Value,
+        body: Box<serde_json::Value>,
     },
     /// Finalize returned owner-validated terminal evidence JSON.
     Finalized {
         /// Closed terminal projection JSON.
-        body: serde_json::Value,
+        body: Box<serde_json::Value>,
     },
     /// Abort returned owner-validated terminal evidence JSON.
     Aborted {
         /// Closed terminal projection JSON.
-        body: serde_json::Value,
+        body: Box<serde_json::Value>,
     },
     /// Readback returned the exact retained owner observation JSON.
     Readback {
         /// Closed ProcessStreamSinkReadback JSON.
-        body: serde_json::Value,
+        body: Box<serde_json::Value>,
     },
     /// Owner proved the exact original command never started.
     NotStarted,
