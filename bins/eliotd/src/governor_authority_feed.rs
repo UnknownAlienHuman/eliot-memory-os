@@ -209,6 +209,15 @@ async fn read_governor_authority_observation(
                 );
             }
         };
+    decode_governor_authority_observation(wire, after_owner_sequence, after_event_sequence)
+}
+
+/// Decodes the original owner page and checks its request continuation bindings.
+fn decode_governor_authority_observation(
+    wire: GovernorAuthorityObservationResponseWire,
+    after_owner_sequence: u64,
+    after_event_sequence: u64,
+) -> GovernorAuthorityObservation {
     let reason = wire
         .source_reason
         .clone()
