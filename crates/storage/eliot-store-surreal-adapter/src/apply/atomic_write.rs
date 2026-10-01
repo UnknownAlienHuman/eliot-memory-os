@@ -2352,7 +2352,9 @@ mod authority_binding_tests {
                 ordering_scopes: vec![OrderingScopeId::new("scope-1").expect("ordering")],
                 transition_class: TransitionClass::CaptureCandidate,
                 requested_effect_ceiling: EffectClass::Candidate,
-                admission_contract_set_digest: "b".repeat(64),
+                admission_contract_set_digest:
+                    eliot_store_api::supported_admission_contract_set_digest()
+                        .expect("admission contract set digest"),
                 operation_manifest_digest: OperationManifestDigest::new("manifest-1")
                     .expect("manifest"),
                 // Issue-#18 digests are derived, never defaulted; no semantic
@@ -2470,7 +2472,9 @@ mod allocation_classification_tests {
             ordering_scopes: vec![OrderingScopeId::new("scope-alloc").expect("ordering")],
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "b".repeat(64),
+            admission_contract_set_digest:
+                eliot_store_api::supported_admission_contract_set_digest()
+                    .expect("admission contract set digest"),
             operation_manifest_digest: OperationManifestDigest::new("manifest-1")
                 .expect("manifest"),
             // Issue-#18 digests are derived, never defaulted; no semantic

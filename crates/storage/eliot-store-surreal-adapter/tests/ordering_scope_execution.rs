@@ -105,7 +105,8 @@ fn transition(op: &str, scopes: &[&str]) -> PreparedTransition {
             .collect(),
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
-        admission_contract_set_digest: "b".repeat(64),
+        admission_contract_set_digest: eliot_store_api::supported_admission_contract_set_digest()
+            .expect("admission contract set digest"),
         operation_manifest_digest: OperationManifestDigest::new("manifest-993").unwrap(),
         // Issue-#18 digests are derived below via `bind_issue18_digests`,
         // never defaulted; this fixture leg binds no semantic source (`[]`).

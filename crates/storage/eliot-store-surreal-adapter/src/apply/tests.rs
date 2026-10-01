@@ -1038,7 +1038,8 @@ fn capture_plans_persist_full_recoverable_evidence_without_authority() {
         ordering_scopes: vec![OrderingScopeId::new("scope-1").expect("ordering")],
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
-        admission_contract_set_digest: "b".repeat(64),
+        admission_contract_set_digest: eliot_store_api::supported_admission_contract_set_digest()
+            .expect("admission contract set digest"),
         operation_manifest_digest: OperationManifestDigest::new("manifest-1").expect("manifest"),
         // Issue-#18 digests are derived, never defaulted; no semantic
         // source is bound here (`[]`).
@@ -1129,7 +1130,8 @@ fn non_capture_transitions_persist_no_evidence() {
         ordering_scopes: vec![OrderingScopeId::new("scope-1").expect("ordering")],
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
-        admission_contract_set_digest: "b".repeat(64),
+        admission_contract_set_digest: eliot_store_api::supported_admission_contract_set_digest()
+            .expect("admission contract set digest"),
         operation_manifest_digest: OperationManifestDigest::new("manifest-1").expect("manifest"),
         // Issue-#18 digests are derived, never defaulted; no semantic
         // source is bound here (`[]`).

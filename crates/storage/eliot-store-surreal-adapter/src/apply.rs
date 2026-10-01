@@ -2430,7 +2430,9 @@ mod admitted_operation_gate_tests {
             ordering_scopes: vec![OrderingScopeId::new("scope-gate").expect("ordering")],
             transition_class: class,
             requested_effect_ceiling: ceiling,
-            admission_contract_set_digest: "b".repeat(64),
+            admission_contract_set_digest:
+                eliot_store_api::supported_admission_contract_set_digest()
+                    .expect("admission contract set digest"),
             operation_manifest_digest: manifest_digest,
             // Issue-#18 digests are derived, never defaulted; no semantic
             // source is bound here (`[]`).
@@ -3130,7 +3132,9 @@ mod concurrent_allocation_tests {
                 ordering_scopes: vec![OrderingScopeId::new(scope).expect("ordering")],
                 transition_class: TransitionClass::CaptureCandidate,
                 requested_effect_ceiling: EffectClass::Candidate,
-                admission_contract_set_digest: "b".repeat(64),
+                admission_contract_set_digest:
+                    eliot_store_api::supported_admission_contract_set_digest()
+                        .expect("admission contract set digest"),
                 operation_manifest_digest: OperationManifestDigest::new("manifest-1")
                     .expect("manifest"),
                 // Issue-#18 digests are derived below via

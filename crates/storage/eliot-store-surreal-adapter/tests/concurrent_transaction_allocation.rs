@@ -144,7 +144,8 @@ fn admitted(operation: &str, scope: &str, subject: &str) -> (RequestMeta, Prepar
         ordering_scopes: vec![OrderingScopeId::new(scope).expect("ordering")],
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
-        admission_contract_set_digest: "b".repeat(64),
+        admission_contract_set_digest: eliot_store_api::supported_admission_contract_set_digest()
+            .expect("admission contract set digest"),
         operation_manifest_digest: OperationManifestDigest::new("manifest-1").expect("manifest"),
         // Issue-#18 digests are derived below via `bind_issue18_digests`,
         // never defaulted; no semantic source is bound here (`[]`).

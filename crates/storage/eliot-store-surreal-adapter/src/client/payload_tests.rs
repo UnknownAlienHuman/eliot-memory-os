@@ -248,7 +248,8 @@ fn transition(ctx: &RequestMeta, authority: &ExactJsonBytes) -> PreparedTransiti
         ordering_scopes: vec![OrderingScopeId::new("scope").expect("ordering")],
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
-        admission_contract_set_digest: "a".repeat(64),
+        admission_contract_set_digest: eliot_store_api::supported_admission_contract_set_digest()
+            .expect("admission contract set digest"),
         operation_manifest_digest: operation_manifest_set_digest(
             &generated_operation_manifests().expect("catalogue"),
         )
