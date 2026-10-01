@@ -1134,7 +1134,9 @@ pub enum FenceBridgeRefusal {
     },
     /// The source member holds residency identities where the kernel member is
     /// read as a content-digest bijection.
-    #[error("ecxf export fence blob_reachability_manifest holds residency-key digests, not the content digests the kernel ExportFence binds to BackupBlob::locator.hash")]
+    #[error(
+        "ecxf export fence blob_reachability_manifest holds residency-key digests, not the content digests the kernel ExportFence binds to BackupBlob::locator.hash"
+    )]
     ResidencyKeyIsNotContentIdentity,
     /// The carried ORIGINAL recorded values were refused by the kernel validator.
     #[error("the carried fence was refused by the kernel ExportFence::validate: {reason}")]
@@ -1156,18 +1158,15 @@ impl TryFrom<&eliot_ecxf::ExportFence> for super::ExportFence {
         // Shape gate over the source's own list: every entry is parsed by the
         // existing `BlobHash` constructor, so a malformed entry is refused by the
         // owner that defines the digest rather than by a local re-check of it.
-        let mut blob_reachability_manifest = Vec::with_capacity(
-            source.blob_reachability_manifest.len(),
-        );
+        let mut blob_reachability_manifest =
+            Vec::with_capacity(source.blob_reachability_manifest.len());
         for entry in &source.blob_reachability_manifest {
-            blob_reachability_manifest.push(
-                BlobHash::new(entry.clone()).map_err(|error| {
-                    FenceBridgeRefusal::MalformedResidencyKey {
-                        entry: entry.clone(),
-                        reason: error.to_string(),
-                    }
-                })?,
-            );
+            blob_reachability_manifest.push(BlobHash::new(entry.clone()).map_err(|error| {
+                FenceBridgeRefusal::MalformedResidencyKey {
+                    entry: entry.clone(),
+                    reason: error.to_string(),
+                }
+            })?);
         }
         // The source carries `schema_generation`; the kernel fence has no member
         // to carry it into and this crate may not add one (pinned row above).
@@ -1202,11 +1201,11 @@ impl TryFrom<&eliot_ecxf::ExportFence> for super::ExportFence {
         };
         // The carried ORIGINAL recorded values are proved by the existing
         // validator. It is not weakened, bypassed or re-implemented here.
-        fence.validate().map_err(|error| {
-            FenceBridgeRefusal::CarriedFenceRefused {
+        fence
+            .validate()
+            .map_err(|error| FenceBridgeRefusal::CarriedFenceRefused {
                 reason: error.to_string(),
-            }
-        })?;
+            })?;
         Ok(fence)
     }
 }
