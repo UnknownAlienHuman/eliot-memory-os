@@ -713,29 +713,7 @@ pub fn admit_material_decision(
     closure: &AdmissionInput,
     lineage: &DecisionExecutionLineageRefs,
 ) -> Result<AdmittedDecisionFloor, MaterialDecisionRefusal> {
-    if !fences_match_exact(&closure.binding.state_fence, owners.state_fence) {
-        return Err(MaterialDecisionRefusal::Boundary(
-            ContextError::InvalidFence,
-        ));
-    }
-    if closure.binding.decision_id != *owners.decision_id {
-        return Err(MaterialDecisionRefusal::Boundary(
-            ContextError::IdentityConflict,
-        ));
-    }
-    // The closure must be the closure of THIS operation: a packet compiled for
-    // another task, even at the same fence, is a substituted packet, not
-    // evidence for this decision.
-    if closure.binding.task_id.as_str() != owners.task_id.as_str() {
-        return Err(MaterialDecisionRefusal::Boundary(
-            ContextError::IdentityConflict,
-        ));
-    }
-    if closure.binding.state_fence.task_revision != Some(owners.acceptance_revision) {
-        return Err(MaterialDecisionRefusal::Boundary(
-            ContextError::InvalidField("closure.task_revision"),
-        ));
-    }
+    check_closure_is_this_operation(owners, closure).map_err(MaterialDecisionRefusal::Boundary)?;
     let floor = derive_applicable_floor(owners, policies, closure)?;
     let completeness = lineage
         .validate_for_phase(owners.phase)
@@ -827,6 +805,36 @@ fn prepared_floor_closure(closure: &AdmissionInput) -> Result<BTreeSet<ArtifactI
         .map(|candidate| (candidate.atom_id.clone(), candidate))
         .collect();
     crate::floor_closure(closure, &candidates)
+}
+
+/// Require that the prepared closure is the closure of THIS operation.
+///
+/// Every entry point that reads facts out of a caller-presented
+/// [`AdmissionInput`] runs this one predicate first, so a closure compiled for
+/// another decision, task or revision — even at the same fence, and even when
+/// the rest of its shape validates — can never contribute a bound fact to this
+/// operation. It is the same four identities the admission check requires, kept
+/// as one shared helper so the dispatch binder cannot drift from it.
+fn check_closure_is_this_operation(
+    owners: &OperationOwnerInputs<'_>,
+    closure: &AdmissionInput,
+) -> Result<(), ContextError> {
+    if !fences_match_exact(&closure.binding.state_fence, owners.state_fence) {
+        return Err(ContextError::InvalidFence);
+    }
+    if closure.binding.decision_id != *owners.decision_id {
+        return Err(ContextError::IdentityConflict);
+    }
+    // The closure must be the closure of THIS operation: a packet compiled for
+    // another task, even at the same fence, is a substituted packet, not
+    // evidence for this decision.
+    if closure.binding.task_id.as_str() != owners.task_id.as_str() {
+        return Err(ContextError::IdentityConflict);
+    }
+    if closure.binding.state_fence.task_revision != Some(owners.acceptance_revision) {
+        return Err(ContextError::InvalidField("closure.task_revision"));
+    }
+    Ok(())
 }
 
 /// Owner-required atoms the compiled delivery does not actually carry.
@@ -1425,8 +1433,9 @@ pub struct DispatchOwnerState<'a> {
 /// [`MaterialDecisionRefusal::Incomplete`] with
 /// [`FloorEvidenceStatus::LineageIncomplete`] when the presented lineage is not
 /// complete for the phase. [`MaterialDecisionRefusal::Boundary`] for an
-/// entrypoint/phase mismatch, an incoherent packet, floor or recipe, or a
-/// malformed owner input.
+/// entrypoint/phase mismatch, an incoherent packet, floor or recipe, a closure
+/// that is not this operation's own closure (fence, decision, task or task
+/// revision), or a malformed owner input.
 pub fn bind_material_dispatch(
     entrypoint: MaterialEntrypointKind,
     owners: &OperationOwnerInputs<'_>,
@@ -1469,6 +1478,14 @@ pub fn bind_material_dispatch(
     floor
         .validate()
         .map_err(MaterialDecisionRefusal::Boundary)?;
+    // The binding records `recipe_sha256` from the presented closure, so the
+    // closure must be this operation's own closure before its recipe is bound.
+    // Without this the binder would stamp a foreign or substituted closure's
+    // recipe revision into this operation's dispatch binding — a same-fence
+    // packet compiled under a different action/recipe would pass, which is
+    // exactly what the fence/decision/task/floor checks above exclude for every
+    // other bound fact. Same predicate as admission, one shared helper.
+    check_closure_is_this_operation(owners, closure).map_err(MaterialDecisionRefusal::Boundary)?;
     if !owner_text(&closure.recipe.recipe_sha256) {
         return Err(MaterialDecisionRefusal::Boundary(
             ContextError::InvalidField("dispatch.recipe"),
