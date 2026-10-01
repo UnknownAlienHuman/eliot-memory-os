@@ -10,6 +10,7 @@ use eliot_types::{
     OperationReconciliationState, OperationRuntimeCheckpoint, ProcessReapReceipt,
     ProviderDispatchState, ProviderTimeoutClass,
 };
+use eliot_types::runtime_supervision::ReapDisposition;
 use eliot_windows_ipc::{RecoverableJobObject, SuspendedJobChild};
 use sha2::{Digest as _, Sha256};
 use std::fs::File;
@@ -580,29 +581,36 @@ pub async fn recover_stale_job_objects(
                     descendants_at_root_exit,
                 };
                 checkpoint.active_process_count = process_count_after;
-                checkpoint.cancellation_state = if receipt.proves_complete_reap() {
+                // This recovery path has no live root process left to observe, so
+                // its descendant record is a `failed` capture by construction. The
+                // typed disposition keeps that honest: the receipt can no longer
+                // claim a proven complete reap on evidence it does not carry.
+                let reap_disposition = receipt.reap_disposition();
+                checkpoint.cancellation_state = if reap_disposition.is_complete() {
                     eliot_types::OperationCancellationState::Reaped
                 } else {
                     eliot_types::OperationCancellationState::Forced
                 };
                 let reconciliation_required =
                     checkpoint.dispatch_state != ProviderDispatchState::NotStarted;
-                checkpoint.phase = if reconciliation_required || !receipt.proves_complete_reap() {
+                checkpoint.phase = if reconciliation_required || !reap_disposition.is_complete() {
                     OperationPhase::Reconciling
                 } else {
                     OperationPhase::Failed
                 };
                 checkpoint.reconciliation_state = if reconciliation_required {
                     OperationReconciliationState::Pending
-                } else if receipt.proves_complete_reap() {
+                } else if reap_disposition.is_complete() {
                     OperationReconciliationState::NotRequired
                 } else {
                     OperationReconciliationState::Failed
                 };
-                checkpoint.last_error_class = Some(if receipt.proves_complete_reap() {
-                    "startup_reaped_stale_job".to_owned()
-                } else {
-                    "startup_job_reap_incomplete".to_owned()
+                checkpoint.last_error_class = Some(match reap_disposition {
+                    ReapDisposition::ProvenComplete => "startup_reaped_stale_job".to_owned(),
+                    ReapDisposition::ProvenIncomplete => "startup_job_reap_incomplete".to_owned(),
+                    ReapDisposition::UntrustedDescendantEvidence => {
+                        "startup_job_reap_descendant_evidence_untrusted".to_owned()
+                    }
                 });
                 checkpoint.last_progress_at = now;
                 runtime_store.put_checkpoint(checkpoint).await?;
@@ -942,16 +950,20 @@ async fn persist_terminal(
         return Ok(());
     };
     let now = OffsetDateTime::now_utc();
+    // Terminal state is derived from the typed reap disposition: a receipt whose
+    // descendant capture is failed or untrusted never yields `Completed`, even
+    // when every counter and stream flag looks clean.
+    let reap_disposition = output.reap_receipt.reap_disposition();
     checkpoint.phase = if output.exit_code == Some(0)
         && !output.timed_out
         && output.worker_error.is_none()
-        && output.reap_receipt.proves_complete_reap()
+        && reap_disposition.is_complete()
     {
         OperationPhase::Completed
     } else {
         OperationPhase::Failed
     };
-    checkpoint.cancellation_state = if output.reap_receipt.proves_complete_reap() {
+    checkpoint.cancellation_state = if reap_disposition.is_complete() {
         OperationCancellationState::Reaped
     } else if output.reap_receipt.forced_termination {
         OperationCancellationState::Forced
@@ -1388,10 +1400,14 @@ fn run_worker(
         terminal_error_codes,
         descendants_at_root_exit,
     };
-    if receipt.proves_complete_reap() {
+    let reap_disposition = receipt.reap_disposition();
+    if reap_disposition.is_complete() {
         cancellation.mark_reaped();
     } else if worker_error.is_none() {
-        worker_error = Some("process reap receipt is incomplete".to_owned());
+        // The disposition is reported rather than a bare "incomplete", because
+        // an untrusted descendant capture means the tree was never observed to
+        // be gone, which is a different failure from an observed survivor.
+        worker_error = Some(format!("process reap is {}", reap_disposition.as_str()));
     }
     let (first_output_at, last_output_at) =
         output_activity.lock().map_or((None, None), |activity| {

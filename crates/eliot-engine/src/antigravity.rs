@@ -2290,10 +2290,11 @@ impl AntigravityRunner {
                 return Err(error);
             }
         };
-        if !output.reap_receipt.proves_complete_reap() {
-            return Err(rejected(
-                "supervised Antigravity process returned an incomplete reap receipt",
-            ));
+        if !output.reap_receipt.reap_disposition().is_complete() {
+            return Err(rejected(&format!(
+                "supervised Antigravity process returned a reap receipt that is {}",
+                output.reap_receipt.reap_disposition().as_str()
+            )));
         }
         if let Some(violation) = inspect_secret_bytes(&output.stdout)
             .err()
@@ -2332,7 +2333,7 @@ impl AntigravityRunner {
             && !output.timed_out
             && !output.cancelled
             && output.worker_error.is_none()
-            && output.reap_receipt.proves_complete_reap()
+            && output.reap_receipt.reap_disposition().is_complete()
             && provider_response.is_ok()
             && model_observation.is_ok()
             && governed_log_capture_complete(log_capture.as_ref().ok());
@@ -2677,7 +2678,7 @@ impl AntigravityRunner {
             |capture| observe_selected_model_from_log(data_root, capture, &requested_model),
         );
         let exit_success = output.exit_code == Some(0);
-        let base_capture_complete = output.reap_receipt.proves_complete_reap()
+        let base_capture_complete = output.reap_receipt.reap_disposition().is_complete()
             && output.worker_error.is_none()
             && !output.timed_out
             && !output.cancelled
@@ -2772,28 +2773,32 @@ impl AntigravityRunner {
             AntigravityRunState::Failed
         };
         let completed_at = output.cleanup_completed_at;
-        let terminal_state =
-            if output.worker_error.is_some() || !output.reap_receipt.proves_complete_reap() {
-                ProviderInvocationState::CleanupFailedAfterComplete
-            } else if output.timed_out || stderr_text.contains("timeout waiting for response") {
-                ProviderInvocationState::TimeoutPendingReconciliation
-            } else if output.cancelled {
-                ProviderInvocationState::CancelledAfterDispatch
-            } else if !capture_complete {
-                ProviderInvocationState::LocalCaptureFailed
-            } else if exit_success {
-                ProviderInvocationState::CompletedCaptured
-            } else {
-                ProviderInvocationState::ProcessExitedNonzero
-            };
+        // The descendant evidence behind this receipt is load-bearing for the
+        // cleanup verdict, so the disposition is recorded rather than collapsed
+        // into a boolean: an untrusted capture is a different fact from a proven
+        // incomplete one.
+        let reap_disposition = output.reap_receipt.reap_disposition();
+        let terminal_state = if output.worker_error.is_some() || !reap_disposition.is_complete() {
+            ProviderInvocationState::CleanupFailedAfterComplete
+        } else if output.timed_out || stderr_text.contains("timeout waiting for response") {
+            ProviderInvocationState::TimeoutPendingReconciliation
+        } else if output.cancelled {
+            ProviderInvocationState::CancelledAfterDispatch
+        } else if !capture_complete {
+            ProviderInvocationState::LocalCaptureFailed
+        } else if exit_success {
+            ProviderInvocationState::CompletedCaptured
+        } else {
+            ProviderInvocationState::ProcessExitedNonzero
+        };
         journal.transition(
             attempt,
             terminal_state,
             vec![format!(
-                "exit_success={exit_success};timed_out={};timeout_class={:?};reap_complete={};worker_error={:?};stdout_truncated={};stderr_truncated={}",
+                "exit_success={exit_success};timed_out={};timeout_class={:?};reap_disposition={};worker_error={:?};stdout_truncated={};stderr_truncated={}",
                 output.timed_out,
                 output.timeout_class,
-                output.reap_receipt.proves_complete_reap(),
+                reap_disposition.as_str(),
                 output.worker_error,
                 output.stdout_truncated,
                 output.stderr_truncated
@@ -3445,10 +3450,11 @@ async fn run_supervised_provider_probe(
             &mut on_spawned,
         )
         .await?;
-    if !output.reap_receipt.proves_complete_reap() {
-        return Err(rejected(
-            "provider probe returned an incomplete reap receipt",
-        ));
+    if !output.reap_receipt.reap_disposition().is_complete() {
+        return Err(rejected(&format!(
+            "provider probe returned a reap receipt that is {}",
+            output.reap_receipt.reap_disposition().as_str()
+        )));
     }
     if let Some(error) = output.worker_error {
         return Err(rejected(&format!("provider probe cleanup failed: {error}")));
