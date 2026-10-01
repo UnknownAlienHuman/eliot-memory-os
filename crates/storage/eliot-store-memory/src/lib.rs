@@ -401,6 +401,7 @@ impl MemoryStore {
         // receipt, and the outbox intents still commit atomically below.
         dispatch_apply_capability_evidence(&mut state, &transition, &mut plan)?;
         dispatch_apply_module_registry_snapshot(&mut state, &transition)?;
+        dispatch_admit_proposed_attempt(&mut state, &transition)?;
         dispatch_apply_finish_evidence(&mut state, &transition)?;
         dispatch_apply_finish_decision(&mut state, &transition)?;
         let receipt = transaction_receipt(ctx, &transition, idempotency_key, recomputed, &plan)?;
@@ -423,6 +424,47 @@ impl MemoryStore {
             receipt,
         ))
     }
+}
+
+/// Commits one immutable ProposedAttempt into the canonical recovery-owner
+/// rows while the same state lock protects its terminal write receipt.
+fn dispatch_admit_proposed_attempt(
+    state: &mut MemoryState,
+    transition: &PreparedTransition,
+) -> Result<(), StoreError> {
+    let mut matching = transition.named_operations.iter().filter(|command| {
+        command.operation == NamedMutationOperation::AdmitProposedAttempt
+    });
+    let Some(command) = matching.next() else {
+        return Ok(());
+    };
+    if matching.next().is_some() {
+        return Err(StoreError::Duplicate {
+            field: "proposed_attempt.named_operations",
+        });
+    }
+    if transition.transition_class != TransitionClass::TaskControl {
+        return Err(StoreError::TransitionClassExceeded);
+    }
+    let record = eliot_store_api::decode_proposed_attempt_record(
+        command.operation,
+        &command.parameters,
+    )?;
+    if record.state_fence != transition.state_fence
+        || transition.task_id.as_deref() != Some(record.task_id.as_str())
+    {
+        return Err(StoreError::FenceMismatch);
+    }
+    let recovery = record.recovery_record()?;
+    let key = recovery.record_key();
+    if let Some(existing) = state.recovery_records.get(&key) {
+        if existing == &recovery {
+            return Ok(());
+        }
+        return Err(StoreError::IdentityConflict);
+    }
+    state.recovery_records.insert(key, recovery);
+    Ok(())
 }
 
 /// Records one erasure intent on already-locked state (688-B).

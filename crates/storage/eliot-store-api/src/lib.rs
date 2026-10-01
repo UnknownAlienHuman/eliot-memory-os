@@ -52,6 +52,7 @@ mod named_mutation_receipt;
 mod notification_state;
 mod payload_authority;
 mod problem_owner_state;
+mod proposed_attempt;
 mod reactive_state;
 mod request_hash;
 mod store_failure;
@@ -239,6 +240,11 @@ pub use task_contract_acceptance::{
     TaskContractAcceptanceRecord, decode_task_contract_acceptance_record,
     task_contract_acceptance_record_key, task_contract_acceptance_record_request,
     validate_acceptance_record_identity,
+};
+pub use proposed_attempt::{
+    ProposedAttemptRecord, PROPOSED_ATTEMPT_RECORD_NAMESPACE,
+    PROPOSED_ATTEMPT_RECORD_SCHEMA_V1, decode_proposed_attempt_record,
+    proposed_attempt_record_key, proposed_attempt_record_request,
 };
 
 pub use wire::{
@@ -4160,6 +4166,9 @@ pub enum NamedMutationOperation {
     /// derives acceptance semantics, coverage, or completion from it. Committing
     /// the record asserts only what the contract owner already required.
     RecordTaskContractAcceptanceSet,
+    /// Atomically commits one immutable source-capture ProposedAttempt under
+    /// its original WorkItem identity and the prepared transition fence.
+    AdmitProposedAttempt,
     /// Canonical problem owner-state transaction (issue #1759 I2, I13.9/I13.7).
     ///
     /// Durable Problem-registry ownership and lifecycle only: the prepared
@@ -4189,7 +4198,8 @@ impl NamedMutationOperation {
             Self::ApplyEpistemicRevision => TransitionClass::Epistemic,
             Self::UpdateTaskState
             | Self::ApplySwarmOwnerRevisions
-            | Self::RecordTaskContractAcceptanceSet => TransitionClass::TaskControl,
+            | Self::RecordTaskContractAcceptanceSet
+            | Self::AdmitProposedAttempt => TransitionClass::TaskControl,
             Self::ApplyLifecyclePolicy => TransitionClass::LifecyclePolicy,
             Self::ReconcileRecovery
             | Self::RecordFinishDecision
