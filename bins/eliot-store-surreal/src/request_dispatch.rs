@@ -18,6 +18,7 @@ use eliot_protocol::dreamer_job::DurableJobResponse;
 use eliot_store_api::CanonicalStoreClient;
 use eliot_store_api::MAX_STORE_FAILURE_REFERENCE_LEN;
 use eliot_store_api::NamedReadRequest;
+use eliot_store_api::OrderingScopeId;
 use eliot_store_api::ReadinessReceipt;
 use eliot_store_api::RequestMeta;
 use eliot_store_api::StoreBackupOperation;
@@ -463,6 +464,16 @@ fn compatibility_verdict_for(
     }
 }
 
+async fn dispatch_ordering_head_readbacks(
+    composition: &StoreComposition,
+    scopes: Vec<OrderingScopeId>,
+) -> Response {
+    match composition.ordering_head_readbacks(scopes).await {
+        Ok(heads) => Response::OrderingHeadReadbacks { heads },
+        Err(error) => map_store_error(error, StoreFailureIdentityContext::default()),
+    }
+}
+
 /// Refuses one mutation while the installation-visible I5.9 compatibility
 /// decision does not admit a canonical writer (issue #1932).
 ///
@@ -695,10 +706,7 @@ impl StoreDispatchBackend for StoreComposition {
                 Err(error) => map_store_error(error, StoreFailureIdentityContext::default()),
             },
             Request::OrderingHeadReadbacks { scopes } => {
-                match self.ordering_head_readbacks(scopes).await {
-                    Ok(heads) => Response::OrderingHeadReadbacks { heads },
-                    Err(error) => map_store_error(error, StoreFailureIdentityContext::default()),
-                }
+                dispatch_ordering_head_readbacks(self, scopes).await
             }
             Request::ValidationSnapshot => match self.validation_snapshot().await {
                 Ok(snapshot) => Response::ValidationSnapshot { snapshot },

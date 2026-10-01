@@ -1547,7 +1547,7 @@ impl StoreEbpSession {
         &self,
     ) -> Result<(ResourceGeneration, StateFence), String> {
         validate_session_peer_binding(self)?;
-        let generation = self.module_generation.generation.clone();
+        let generation = self.module_generation.generation;
         if generation != self.state_fence.resource_generation {
             return Err(
                 "authenticated Kernel generation does not match its full state fence".to_owned(),
