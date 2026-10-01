@@ -6988,6 +6988,19 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// [`Self::install_admitted_work_scope_owner`], which enforces
     /// generation-aligned installation at the same fence.
     ///
+    /// Live status: no production caller, and the "production caller" in the
+    /// summary line is aspirational rather than measured. Measured on this tree
+    /// by symbol, this rebind has exactly **one** code reference,
+    /// [`Self::admit_observed_scope_attach`]; that entry's only code reference
+    /// is the daemon's `DaemonComposition::admit_scope_attach`, which itself has
+    /// zero call sites. So the rebind is transitively dead at depth three and no
+    /// live path admits an authorized relocation. The daemon-side entry already
+    /// discloses why it is additionally circular — the Governor fails closed
+    /// unless a `WorkScope` owner is already retained, and that entry is the only
+    /// daemon path that installs one — so a caller cannot be added here without
+    /// inventing authority. Whether a caller is added or this entry is retired is
+    /// an owner decision.
+    ///
     /// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
     pub fn admit_scope_relocation(
         &self,
