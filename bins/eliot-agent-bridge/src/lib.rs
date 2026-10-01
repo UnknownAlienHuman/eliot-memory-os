@@ -5029,9 +5029,26 @@ impl BootstrapSnapshot {
     /// none is refused the same way. `AMBIGUOUS`/`NONE` selections never
     /// project readiness and need no agreement: they stay available as honest
     /// typed non-ready outcomes.
+    ///
+    /// The projected acceptance digest is bound to this check as well
+    /// (issue #8 P1). The acceptance digest is an owner-issued `TaskContract`
+    /// fact, but the live attach seal
+    /// (`eliot_agent_bridge_core::TaskBinding`, sealed by
+    /// `ActivationPortResult::authenticated` from the Kernel's
+    /// `AgentBridgeAuthenticatedBinding`) carries no acceptance digest at
+    /// all, so on the host-carried intake there is no owner-issued value to
+    /// compare against. A digest that cannot be checked against an owner
+    /// value is therefore refused rather than published verbatim under
+    /// `UNIQUE`/`BOUND`, which would present a host-authored string as an
+    /// owner-computed `TaskContract` fact. Owner-compiled snapshots are
+    /// already checked against the owner surface's own digest by
+    /// `validate_task_inputs_match_surface` before they reach this check, so
+    /// this refusal is the host-carried half of one guarantee: no acceptance
+    /// digest reaches an agent without an owner comparison behind it.
     fn selection_matches_sealed_task(
         bootstrap: &UnderstandingBootstrap,
         seal: &AttachBinding,
+        owner_compiled: bool,
     ) -> Result<(), BootstrapError> {
         let selected = match bootstrap.task_selection.disposition {
             TaskSelectionDisposition::Bound | TaskSelectionDisposition::Unique => {
@@ -5058,6 +5075,22 @@ impl BootstrapSnapshot {
                 code: "BOOTSTRAP_TASK_MISMATCH",
                 detail:
                     "composed task selection disagrees with the sealed attach task identity or revision; refusing to project"
+                        .to_owned(),
+            });
+        }
+        // The seal carries no owner-issued acceptance digest to check this
+        // one against. On an owner-compiled snapshot the digest was already
+        // compared against the owner surface's own digest by
+        // `validate_task_inputs_match_surface` at note time, so it is not
+        // host-authored; on the host-carried intake no such comparison exists,
+        // so refuse it here instead of publishing a host string under
+        // `UNIQUE`/`BOUND`, where the agent would read it as an
+        // owner-computed `TaskContract` fact.
+        if bootstrap.task_selection.acceptance_digest.is_some() && !owner_compiled {
+            return Err(BootstrapError {
+                code: "BOOTSTRAP_ACCEPTANCE_UNVERIFIED",
+                detail:
+                    "task selection carries an acceptance digest but the live attach seal carries no owner-issued digest to verify it against; refusing to project it as an owner-issued TaskContract fact"
                         .to_owned(),
             });
         }
@@ -5972,6 +6005,16 @@ impl BridgeRunner {
     /// through the Governor-compiled surface intake, so a client-named
     /// rendering identity fails closed with `BOOTSTRAP_RENDERING_UNBOUND`
     /// instead of being silently cleared or projected.
+    ///
+    /// A client-named task acceptance digest is refused here for the same
+    /// reason (issue #8 P1): the acceptance digest is an owner-issued
+    /// `TaskContract` fact, and the live attach seal carries no owner-issued
+    /// digest to check it against, so `selection_matches_sealed_task`
+    /// refuses any host-carried selection that carries one with
+    /// `BOOTSTRAP_ACCEPTANCE_UNVERIFIED` rather than delivering it under
+    /// `UNIQUE`/`BOUND`. Only the Governor-compiled surface intake, which
+    /// compares the digest against the owner surface's own value, can carry
+    /// an acceptance digest through to an agent.
     pub fn note_owner_snapshot(
         &mut self,
         context: BootstrapContext,
@@ -6024,7 +6067,7 @@ impl BridgeRunner {
         let binding = self.attach_view().map(|view| view.binding().clone());
         if let Some(seal) = &binding {
             BootstrapSnapshot::content_matches_binding(&context, seal)?;
-            BootstrapSnapshot::selection_matches_sealed_task(&composed, seal)?;
+            BootstrapSnapshot::selection_matches_sealed_task(&composed, seal, owner_compiled)?;
         }
         self.bootstrap_snapshot = Some(BootstrapSnapshot {
             context,
@@ -6197,7 +6240,11 @@ impl BridgeRunner {
         snapshot.delivery_tasks_match(tasks)?;
         let mut bootstrap =
             get_understanding_bootstrap(&snapshot.context, tasks, requested_assessment)?;
-        BootstrapSnapshot::selection_matches_sealed_task(&bootstrap, &sealed)?;
+        BootstrapSnapshot::selection_matches_sealed_task(
+            &bootstrap,
+            &sealed,
+            snapshot.owner_compiled,
+        )?;
         stamp_sealed_provenance(&mut bootstrap, snapshot.owner_compiled);
         attach_route_payload_measurement(&mut bootstrap);
         Ok(bootstrap)
@@ -6216,7 +6263,12 @@ impl BridgeRunner {
         snapshot.delivery_tasks_match(tasks).ok()?;
         let preview =
             get_understanding_bootstrap(&snapshot.context, tasks, requested_assessment).ok()?;
-        BootstrapSnapshot::selection_matches_sealed_task(&preview, &sealed).ok()?;
+        BootstrapSnapshot::selection_matches_sealed_task(
+            &preview,
+            &sealed,
+            snapshot.owner_compiled,
+        )
+        .ok()?;
         let mut session = self.bootstrap_session;
         session
             .take_auto_boot(&snapshot.context, tasks, requested_assessment)
@@ -6250,7 +6302,12 @@ impl BridgeRunner {
         snapshot.delivery_tasks_match(tasks).ok()?;
         let preview =
             get_understanding_bootstrap(&snapshot.context, tasks, requested_assessment).ok()?;
-        BootstrapSnapshot::selection_matches_sealed_task(&preview, &sealed).ok()?;
+        BootstrapSnapshot::selection_matches_sealed_task(
+            &preview,
+            &sealed,
+            snapshot.owner_compiled,
+        )
+        .ok()?;
         self.bootstrap_session
             .take_auto_boot(&snapshot.context, tasks, requested_assessment)
             .map(|mut bootstrap| {
