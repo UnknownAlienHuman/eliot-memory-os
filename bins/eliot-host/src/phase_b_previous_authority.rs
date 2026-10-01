@@ -48,6 +48,43 @@ fn phase_b_previous_authority_observe(detail: &str) {
     );
 }
 
+// F-LOG-HOST-5 (#980 defect 2) current-authority observation path.
+//
+// `phase_b_validate_authority` validates the current incoming
+// `input.authority_descriptor_bytes` for the new materialization, not a
+// recovered previous binding. It must never emit the historical
+// previous-binding labels above. This helper carries the separate
+// current-authority vocabulary with the same nonsecret identity model as
+// `host_composition_phase_b.rs` `PhaseBObservation` (`gen`/`config`, plus
+// `manifest` once computed): candidate generation and config digest already
+// available from the live `CandidateManifest`, never descriptor bytes,
+// digests over secret-bearing bytes, or error text (I15.4). I14.20 keeps
+// distinct typed machines and observations distinct ("Identical labels in
+// different typed machines are not interchangeable"); a prior receipt is
+// historical evidence only, never live authorization, and restore never
+// revives an activation record as current authority.
+#[cfg(windows)]
+fn phase_b_current_authority_observe(
+    manifest: &CandidateManifest,
+    manifest_digest: Option<&str>,
+    label: &'static str,
+) {
+    let mut detail = String::from(label);
+    detail.push_str(" gen=");
+    detail.push_str(manifest.generation.as_str());
+    detail.push_str(" config=");
+    detail.push_str(manifest.config_digest.as_str());
+    if let Some(digest) = manifest_digest {
+        detail.push_str(" manifest=");
+        detail.push_str(digest);
+    }
+    phase_b_previous_authority_note_event_log_unavailable();
+    crate::host_diagnostics::observe_entrypoint_with_detail(
+        crate::host_diagnostics::EntrypointStage::ScmDispatch,
+        &detail,
+    );
+}
+
 #[cfg(windows)]
 #[derive(Clone, Debug)]
 pub(super) struct PhaseBPreviousBinding {
@@ -226,19 +263,27 @@ pub(super) fn phase_b_validate_authority(
     ),
     HostError,
 > {
-    phase_b_previous_authority_observe("host.phase-b previous authority requested");
+    phase_b_current_authority_observe(
+        manifest,
+        None,
+        "host.phase-b current authority requested",
+    );
     let descriptor: ProcessAuthorityHandoffDescriptor =
         serde_json::from_slice(bytes).map_err(|error| {
-            phase_b_previous_authority_observe(
-                "host.phase-b previous authority no exact binding retained",
+            phase_b_current_authority_observe(
+                manifest,
+                None,
+                "host.phase-b current authority no current binding admitted",
             );
             HostError::RecoveryRequired(format!(
                 "Phase-B authority descriptor is not parseable: {error}"
             ))
         })?;
     descriptor.validate_structure().map_err(|error| {
-        phase_b_previous_authority_observe(
-            "host.phase-b previous authority no exact binding retained",
+        phase_b_current_authority_observe(
+            manifest,
+            None,
+            "host.phase-b current authority no current binding admitted",
         );
         HostError::RecoveryRequired(format!(
             "Phase-B authority descriptor failed exact ORS validation: {error}"
@@ -248,6 +293,11 @@ pub(super) fn phase_b_validate_authority(
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| {
+                phase_b_current_authority_observe(
+                    manifest,
+                    None,
+                    "host.phase-b current authority no current binding admitted",
+                );
                 HostError::RecoveryRequired(format!(
                     "Phase-B authority freshness clock is before UNIX epoch: {error}"
                 ))
@@ -255,11 +305,21 @@ pub(super) fn phase_b_validate_authority(
             .as_millis()
             .try_into()
             .map_err(|_| {
+                phase_b_current_authority_observe(
+                    manifest,
+                    None,
+                    "host.phase-b current authority no current binding admitted",
+                );
                 HostError::RecoveryRequired(
                     "Phase-B authority freshness clock is outside the supported range".to_owned(),
                 )
             })?;
         descriptor.validate(now_ms).map_err(|error| {
+            phase_b_current_authority_observe(
+                manifest,
+                None,
+                "host.phase-b current authority no current binding admitted",
+            );
             HostError::RecoveryRequired(format!(
                 "Phase-B authority descriptor is not fresh for admission: {error}"
             ))
@@ -271,24 +331,47 @@ pub(super) fn phase_b_validate_authority(
         .is_same_authority(&host.epoch.current)
         || descriptor.state_fence.resource_generation != descriptor.generation
     {
-        phase_b_previous_authority_observe(
-            "host.phase-b previous authority no exact binding retained",
+        phase_b_current_authority_observe(
+            manifest,
+            None,
+            "host.phase-b current authority no current binding admitted",
         );
         return Err(HostError::RecoveryRequired(
             "Phase-B authority descriptor is not bound to a consistent live generation and Host epoch"
                 .to_owned(),
         ));
     }
-    let manifest_digest = phase_b_manifest_digest(manifest)?;
-    let marker =
-        phase_b_authority_marker(&manifest_digest, host, activation_generation, &descriptor)?;
+    let manifest_digest = phase_b_manifest_digest(manifest).map_err(|error| {
+        phase_b_current_authority_observe(
+            manifest,
+            None,
+            "host.phase-b current authority no current binding admitted",
+        );
+        error
+    })?;
+    let marker = phase_b_authority_marker(
+        &manifest_digest,
+        host,
+        activation_generation,
+        &descriptor,
+    )
+    .map_err(|error| {
+        phase_b_current_authority_observe(
+            manifest,
+            Some(manifest_digest.as_str()),
+            "host.phase-b current authority no current binding admitted",
+        );
+        error
+    })?;
     if !descriptor
         .contour_refs
         .iter()
         .any(|reference| reference == &marker)
     {
-        phase_b_previous_authority_observe(
-            "host.phase-b previous authority no exact binding retained",
+        phase_b_current_authority_observe(
+            manifest,
+            Some(manifest_digest.as_str()),
+            "host.phase-b current authority no current binding admitted",
         );
         return Err(HostError::RecoveryRequired(
             "Phase-B authority descriptor is missing the exact Host/activation binding".to_owned(),
