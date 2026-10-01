@@ -70,6 +70,27 @@
       "transient_statuses": [408, 425, 429, 500, 502, 503, 504]
     }
   },
+  "serving_side": {
+    "process": "eliot-agent-bridge",
+    "front_door": "host-events",
+    "real_production_construction": true,
+    "attach": "ordinary_managed_attach_of_the_bridge_route_launch_path",
+    "introduction_projection_env": "ELIOT_OPENCODE_BRIDGE_INTRODUCTION",
+    "introduction_projection_fields": ["introduction", "session_facts"],
+    "credential_boundary": "user_broker_owned_live_route_credential_table_resolving_the_introductions_own_opaque_handle",
+    "listener": "owner_created_exclusively_pre_bound_loopback_socket_on_the_pinned_port__bind_conflict_refuses_the_route",
+    "live_owner_state_reproof_per_request": [
+      "introduction_issue_expiry_window",
+      "live_revocation_set",
+      "authority_epoch_against_the_live_attach_fence",
+      "state_fence_nonce_against_the_introduction",
+      "bridge_generation_against_the_live_attach_generation",
+      "pinned_port_against_this_listeners_own_port"
+    ],
+    "unintroduced_composition": "binds_no_port_and_refuses_closed",
+    "durable_decision_reconciliation": "the_routes_own_duplicate_answer_is_the_authority__an_in_process_map_is_only_a_cache",
+    "governor_profile": "none_in_this_composition__the_gate_fails_closed_to_a_recorded_observation_and_never_a_permit"
+  },
   "legacy_transport": {
     "kind": "bounded_one_shot_process",
     "status": "compatibility_fallback",

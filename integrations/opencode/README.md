@@ -66,6 +66,24 @@ Events are posted to `/v1/host-events` with
 After any HTTP attempt the plugin never falls through to the legacy process
 transport because the first request may already have reached durable admission.
 
+### Serving side
+
+The route is served by the real bridge process, not a Node fake: the
+`host-events` front door of `eliot-agent-bridge` attaches through the ordinary
+managed attach path, reads the User Broker's own minted introduction from the
+launch projection the physical owner materialized into that exact process
+(`ELIOT_OPENCODE_BRIDGE_INTRODUCTION`, carrying the versioned introduction and
+the broker-observed session facts it was minted under), resolves the
+introduction's own opaque credential handle through the owner's live
+`OpenCodeRouteCredentials` boundary, binds the reserved loopback port
+exclusively, and serves for the life of the process. The introduction is not
+ambient configuration: it is revalidated (version, shape, issue/expiry window,
+digest binding, and the introduction/facts join) before it is installed, and
+every admitted event and every committed decision re-proves its Authority
+Epoch, `StateFence` nonce and bridge generation against that process's live
+attach binding, which no environment entry can forge. A composition with no
+current projection binds no port and refuses closed.
+
 When the HTTP bridge is not configured, the existing bounded one-shot process
 bridge remains a compatibility fallback. The spawned process inherits only
 allowlisted environment variables (names and values, enumerated as

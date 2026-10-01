@@ -6,6 +6,14 @@ mod request_input;
 use eliot_agent_bridge::opencode_host_events::{
     BridgeIntroductionStore, HostEventsServiceError, serve_host_events,
 };
+use eliot_user_broker_core::{
+    MAX_OPENCODE_ROUTE_CREDENTIAL_BYTES, OPENCODE_BRIDGE_ENV_INTRODUCTION,
+    OpenCodeBridgeProcessProjection, OpenCodeRouteCredentials, OpenCodeSecretBoundary,
+    OpenCodeSessionFacts,
+};
+use secrecy::SecretString;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use eliot_agent_bridge::{
     AdmissionBasis, BootstrapContext, BootstrapTaskInputs, BridgeRunner, CliError,
     CurrentAssessment, DeliveryStatus, FiringEvidence, HotResourceView, InjectionReceipt,
@@ -3172,32 +3180,168 @@ fn run_mcp_front_door(
     }
 }
 
-/// Serves the supervised `POST /v1/host-events` route for the life of the
-/// bridge process (issue #332) through [`serve_host_events`].
+/// Owner-observed demand identity of the supervised host-events front door.
 ///
-/// This is the same scheduling shape as the sibling front doors: one
-/// process, one blocking serving loop owning `&mut BridgeRunner`, no
-/// supervisor thread and no second scheduler. The introduction store starts
-/// empty because no User Broker producer installs introductions in this
-/// process (issue #2898 owns minting), so an unintroduced composition
-/// refuses closed with [`HostEventsServiceError::Unintroduced`] without
-/// binding a port. The credential resolver offers no secret this process
-/// cannot own, so the credential join refuses as capability-unavailable
-/// rather than comparing against foreign material. The stop and generation
-/// senders are held for the whole serving life, so a dropped supervisor
-/// channel can never be mistaken for a supervised stop.
+/// The `host-events` ingress has no host-supplied attach request: the bridge
+/// itself is the demand, and the demand and connection identities below name
+/// exactly that one supervised route. They are stable across a process
+/// lifetime and distinct from every other front door, so a host-events
+/// incarnation can never be mistaken for the stdio or MCP one.
+const HOST_EVENTS_DEMAND_ID: &str = "eliot-agent-bridge:host-events";
+/// Owner-observed connection identity of the supervised host-events front
+/// door. See [`HOST_EVENTS_DEMAND_ID`].
+const HOST_EVENTS_CONNECTION_ID: &str = "eliot-agent-bridge:host-events:loopback";
+
+/// Exact child environment name carrying the short-lived `OpenCode` route
+/// credential the physical owner resolved for the exact approved processes.
+///
+/// The `OpenCode` plugin already reads this name, so the same owner-minted
+/// generation value reaches the serving bridge and the approved client without
+/// a second projection, and it never enters a durable registration, command
+/// line, log, route profile or model context.
+const HOST_EVENTS_CREDENTIAL_ENV: &str = "ELIOT_OPENCODE_BRIDGE_TOKEN";
+
+/// Reads the current Unix-millisecond clock observation.
+fn owner_now_ms() -> Result<u64, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())
+        .and_then(|elapsed| {
+            u64::try_from(elapsed.as_millis()).map_err(|error| error.to_string())
+        })
+}
+
+/// The current route composition this bridge process serves: the User
+/// Broker's own minted introduction, the broker-observed session facts it was
+/// minted under, and the physical owner's live credential table.
+///
+/// The introduction and its facts arrive as one closed launch projection
+/// ([`OPENCODE_BRIDGE_ENV_INTRODUCTION`]) that the physical owner materialized
+/// into this exact process, and the credential arrives under the handle the
+/// introduction already names. Nothing here is ambient configuration: the
+/// projection is revalidated (version, shape, window, digest binding, and the
+/// introduction/facts join) before it is installed, and every admitted request
+/// re-proves the introduction's Authority Epoch, `StateFence` nonce and bridge
+/// generation against this process's live attach binding, which no environment
+/// entry can forge.
+struct HostEventsRouteComposition {
+    projection: OpenCodeBridgeProcessProjection,
+    facts: OpenCodeSessionFacts,
+    credentials: Arc<OpenCodeRouteCredentials>,
+}
+
+/// Builds the current route composition from the owner-materialized launch
+/// projection.
+fn host_events_route_composition() -> Result<HostEventsRouteComposition, String> {
+    let now_ms = owner_now_ms()?;
+    let raw = std::env::var(OPENCODE_BRIDGE_ENV_INTRODUCTION).map_err(|_| {
+        format!("{OPENCODE_BRIDGE_ENV_INTRODUCTION} is not materialized by the owner")
+    })?;
+    let projection: OpenCodeBridgeProcessProjection = serde_json::from_str(&raw).map_err(
+        |error| {
+            format!(
+                "{OPENCODE_BRIDGE_ENV_INTRODUCTION} is not the owner's closed projection: {error}"
+            )
+        },
+    )?;
+    let facts = projection
+        .facts(now_ms)
+        .map_err(|error| format!("{OPENCODE_BRIDGE_ENV_INTRODUCTION} is not current: {error}"))?;
+    let credential = std::env::var(HOST_EVENTS_CREDENTIAL_ENV).map_err(|_| {
+        format!("{HOST_EVENTS_CREDENTIAL_ENV} is not materialized by the owner")
+    })?;
+    if credential.is_empty() || credential.len() > MAX_OPENCODE_ROUTE_CREDENTIAL_BYTES {
+        return Err(format!(
+            "{HOST_EVENTS_CREDENTIAL_ENV} is outside the owner's route-credential shape"
+        ));
+    }
+    // The handle is the introduction's own `SecretRef`: the physical owner
+    // resolved these bytes for exactly that generation, and this process never
+    // chooses a handle the introduction does not already bind.
+    let handle = projection.introduction.credential.clone();
+    let mut credentials = OpenCodeRouteCredentials::new();
+    let issued = credentials
+        .issue(
+            handle.provider(),
+            handle.key(),
+            credential.into_boxed_str(),
+        )
+        .map_err(|error| format!("route credential refused: {error}"))?;
+    if issued != handle {
+        return Err("route credential handle is not the introduction's own".to_owned());
+    }
+    Ok(HostEventsRouteComposition {
+        projection,
+        facts,
+        credentials: Arc::new(credentials),
+    })
+}
+
+/// Serves the supervised `POST /v1/host-events` route for the life of the
+/// bridge process (issue #2898, steps 1, 5 and 14) through
+/// [`serve_host_events`].
+///
+/// This is the same scheduling shape as the sibling front doors: one process,
+/// one blocking serving loop owning `&mut BridgeRunner`, no supervisor thread
+/// and no second scheduler. The route is admitted only from the User Broker's
+/// own minted introduction, read from the launch projection the physical owner
+/// materialized into this exact process and revalidated here; the credential
+/// join resolves the introduction's own handle through the owner's live
+/// credential table. A composition with no current projection never binds a
+/// port. The generation channel is seeded with this process's live attach
+/// generation, so an introduction minted for another incarnation is refused as
+/// [`HostEventsShutdown::Rotated`] before a socket is served, and every
+/// admitted request re-proves the live attach binding again. The stop and
+/// generation senders are held for the whole serving life, so a dropped
+/// supervisor channel can never be mistaken for a supervised stop.
 fn run_host_events_front_door(runner: &mut BridgeRunner) -> i32 {
-    let store = BridgeIntroductionStore::new();
+    let composition = match host_events_route_composition() {
+        Ok(composition) => composition,
+        Err(detail) => {
+            emit_error("HOST_EVENTS_INTRODUCTION_REFUSED", &detail);
+            return PROVIDER_PORT_EXIT;
+        }
+    };
+    // The live attach binding is the owner state every admitted event and
+    // decision is fenced against, so the ingress attaches before it serves.
+    if let Err(detail) = attach_host_events_front_door(runner) {
+        emit_error("HOST_EVENTS_ATTACH_REFUSED", &detail);
+        return PROVIDER_PORT_EXIT;
+    }
+    let live_generation = runner
+        .attach_view()
+        .map(|view| view.binding().state_fence().generation().get())
+        .unwrap_or_default();
+    let mut store = BridgeIntroductionStore::new();
+    store.install(composition.projection.introduction.clone());
+    store.observe_session(composition.facts);
+    let credentials = Arc::clone(&composition.credentials);
+    let resolve_credential = move |handle: &eliot_process::SecretRef| {
+        credentials
+            .resolve_secret(handle)
+            .ok()
+            .map(|secret| SecretString::from(secret.into_string()))
+    };
     let (_stop, stop) = tokio::sync::watch::channel(false);
-    let (_active_generation, active_generation) = tokio::sync::watch::channel(0_u64);
-    match serve_host_events(
+    let (_active_generation, active_generation) = tokio::sync::watch::channel(live_generation);
+    let outcome = serve_host_events(
         runner,
-        store,
+        store.clone(),
         None,
-        |_: &eliot_process::SecretRef| None,
+        resolve_credential,
         stop,
         active_generation,
-    ) {
+    );
+    // Every exit retires the route before this process can serve another
+    // generation: the installed introduction's revocation id is retired, the
+    // store is cleared, and the credential handle stops resolving, so a stale
+    // client holds neither an admissible introduction nor a usable secret.
+    store.revoke(&composition.projection.introduction.revocation_id);
+    store.clear();
+    composition
+        .credentials
+        .retire(&composition.projection.introduction.credential);
+    match outcome {
         Ok(HostEventsShutdown::Stopped) => 0,
         Ok(HostEventsShutdown::Rotated) => {
             emit_error(
@@ -3218,6 +3362,25 @@ fn run_host_events_front_door(runner: &mut BridgeRunner) -> i32 {
             PROVIDER_PORT_EXIT
         }
     }
+}
+
+/// Attaches the supervised ingress through the real bridge route launch path.
+///
+/// The `host-events` front door has no host to send an attach request, so the
+/// bridge composes the one managed demand that names this exact supervised
+/// route. The launch is admitted and receipted by the ordinary
+/// [`BridgeRunner::attach`] path, so the ingress runs against the same live
+/// binding, activation generation, and `StateFence` every other front door
+/// uses.
+fn attach_host_events_front_door(runner: &mut BridgeRunner) -> Result<(), String> {
+    let demand = DemandId::new(HOST_EVENTS_DEMAND_ID)
+        .map_err(|error| format!("host-events demand identity is unavailable: {error}"))?;
+    let connection = ConnectionId::new(HOST_EVENTS_CONNECTION_ID)
+        .map_err(|error| format!("host-events connection identity is unavailable: {error}"))?;
+    runner
+        .attach(AttachRequest::managed(demand, connection))
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 /// Bounded header bytes accepted for one loopback HTTP request.
