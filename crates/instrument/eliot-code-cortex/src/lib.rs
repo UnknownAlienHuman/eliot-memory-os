@@ -262,6 +262,36 @@ impl CodeCortexService {
     }
 }
 
+/// Composes one task-scoped semantic report from a caller-supplied index
+/// snapshot.
+///
+/// This is the pure composition step behind [`CodeCortexService::compose`]: it
+/// takes the already-captured [`IndexSnapshot`] rather than reaching for the
+/// index itself, so the projection is a function of its arguments alone.
+///
+/// # Live status
+///
+/// No production caller, and transitively rather than as a bare zero-call
+/// finding. Measured on this tree by symbol, this function has exactly **one**
+/// code reference in the workspace: the body of
+/// [`CodeCortexService::compose`] in this same file. That entry has no caller
+/// of its own — a repository-wide search for `.compose(` returns nothing, and
+/// the `CodeCortexService` values that do get constructed in
+/// `crates/eliot-app` and `crates/eliot-engine` are driven through `scan`,
+/// `health`, and `index`, never through this method. So the composition is
+/// dead at depth two and no live path in this workspace builds a
+/// `CodeCortexReport` through it. The returned [`CodeCortexReport`] type is
+/// itself live and widely consumed, so this is a gap in the *entry*, not in
+/// the report shape.
+///
+/// Two things this measurement cannot see, stated rather than assumed away:
+/// `eliot-code-cortex` is a library crate with `publish` unset, so an
+/// out-of-repository consumer could reach `compose_snapshot` directly and the
+/// claim would weaken to "dead within this workspace"; and this method takes
+/// `&self`, so an auto-deref or UFCS call such as
+/// `CodeCortexService::compose(&service, &request)` would also be a caller this
+/// search does not classify. Neither was assumed in either direction, and no
+/// caller was invented to close the gap.
 #[allow(clippy::too_many_lines)]
 pub fn compose_snapshot(
     request: &CompositionRequest,
