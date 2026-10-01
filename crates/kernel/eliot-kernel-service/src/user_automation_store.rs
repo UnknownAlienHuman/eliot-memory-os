@@ -1281,6 +1281,23 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
                 reason: "submitted revision or envelope differs from retained owner result",
             });
         }
+        if let UserAutomationOperation::Edit {
+            previous_revision, ..
+        } = &request.intent.operation
+        {
+            let retained_predecessor = self
+                .read_revision_predecessor_document(
+                    &request.context.state_fence,
+                    &previous_revision.automation_id,
+                    &previous_revision.revision,
+                )
+                .await?;
+            if retained_predecessor != **previous_revision
+                || retained_predecessor.owner_principal != request.authenticated_principal
+            {
+                return Err(StoreError::IdentityConflict);
+            }
+        }
         revision_with_owner_normalization_receipt(
             revision,
             &retained_envelope,
@@ -1607,6 +1624,68 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
                 field: "automation.revision",
                 reason: "stored revision identity mismatch",
             });
+        }
+        Ok(parsed)
+    }
+
+    /// Reads the exact stored predecessor used by an authenticated Edit.
+    ///
+    /// Legacy revisions are accepted only as Edit predecessors so the
+    /// explicit migration path can prove the real immutable source row. The
+    /// caller-supplied predecessor is never its own ownership proof.
+    pub async fn read_revision_predecessor_document(
+        &self,
+        fence: &StateFence,
+        automation_id: &str,
+        revision: &str,
+    ) -> Result<UserAutomationRevision, StoreError> {
+        let query = automation_revision_read_request(
+            QUERY_HISTORY.to_owned(),
+            automation_id.to_owned(),
+            revision.to_owned(),
+            false,
+            1,
+            fence.clone(),
+        )?;
+        let response = self.client.execute_named(query.clone()).await?;
+        validate_named_response(&query, &response)?;
+        let entries = response
+            .payload
+            .get(eliot_store_api::AUTOMATION_PAGE_REVISIONS)
+            .and_then(Value::as_array)
+            .ok_or(StoreError::InvalidField {
+                field: "automation.revisions",
+                reason: "store predecessor projection malformed",
+            })?;
+        if entries.len() != 1 {
+            return Err(StoreError::InvalidField {
+                field: "automation.revisions",
+                reason: "exact predecessor read is incomplete",
+            });
+        }
+        let entry = &entries[0];
+        let document = entry
+            .get("revision_json")
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "automation.revision_json",
+                reason: "stored predecessor document malformed",
+            })?;
+        let parsed: UserAutomationRevision = serde_json::from_str(document)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        if parsed.validate().is_err()
+            && parsed.validate_legacy_for_schedule_migration().is_err()
+        {
+            return Err(StoreError::InvalidField {
+                field: "automation.revision",
+                reason: "stored predecessor is neither current nor migratable legacy",
+            });
+        }
+        if entry.get("revision").and_then(Value::as_str) != Some(revision)
+            || parsed.automation_id != automation_id
+            || parsed.revision != revision
+        {
+            return Err(StoreError::IdentityConflict);
         }
         Ok(parsed)
     }

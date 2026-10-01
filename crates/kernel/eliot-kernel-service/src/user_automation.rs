@@ -83,6 +83,12 @@ impl UserAutomationServiceRequest {
         if self.intent.principal_ref != self.authenticated_principal {
             return Err(UserAutomationServiceError::PrincipalMismatch);
         }
+        if !operation_revisions_are_owned_by(
+            &self.intent.operation,
+            &self.authenticated_principal,
+        ) {
+            return Err(UserAutomationServiceError::PrincipalMismatch);
+        }
         Ok(())
     }
 
@@ -115,6 +121,14 @@ impl UserAutomationServiceRequest {
         if self.intent.principal_ref != self.authenticated_principal {
             return Err(UserAutomationError::Invalid(
                 "request.schedule_normalization.principal",
+            ));
+        }
+        if !operation_revisions_are_owned_by(
+            &self.intent.operation,
+            &self.authenticated_principal,
+        ) {
+            return Err(UserAutomationError::Invalid(
+                "request.schedule_normalization.owner_principal",
             ));
         }
         Ok(())
@@ -156,10 +170,44 @@ impl UserAutomationStoreRequest {
         if self.intent.principal_ref != self.authenticated_principal {
             return Err(UserAutomationServiceError::PrincipalMismatch);
         }
+        if !operation_revisions_are_owned_by(
+            &self.intent.operation,
+            &self.authenticated_principal,
+        ) {
+            return Err(UserAutomationServiceError::PrincipalMismatch);
+        }
         if self.intent.state_fence != self.context.state_fence {
             return Err(UserAutomationServiceError::FenceMismatch);
         }
         Ok(())
+    }
+}
+
+/// Keeps caller-supplied immutable revision ownership inside the authenticated
+/// principal that is about to normalize or mutate it. Both sides of an Edit
+/// lineage are checked because the predecessor is part of the admitted
+/// operator request too; a caller cannot relabel another owner's automation
+/// by supplying a matching revision identifier.
+fn operation_revisions_are_owned_by(operation: &UserAutomationOperation, principal: &str) -> bool {
+    let owned_by_principal = |revision: &UserAutomationRevision| {
+        revision.owner_principal.as_str() == principal
+    };
+    match operation {
+        UserAutomationOperation::Create { revision, .. }
+        | UserAutomationOperation::NormalizeSchedule { revision, .. } => {
+            owned_by_principal(revision)
+        }
+        UserAutomationOperation::Edit {
+            previous_revision,
+            revision,
+            ..
+        }
+        | UserAutomationOperation::MigrateLegacySchedule {
+            previous_revision,
+            revision,
+            ..
+        } => owned_by_principal(previous_revision) && owned_by_principal(revision),
+        _ => true,
     }
 }
 
