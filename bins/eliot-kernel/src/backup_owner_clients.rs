@@ -14,9 +14,14 @@
 //! Watchdog accepted methods .. ReadSnapshotPage / VerifyArchive /
 //!                              RestoreStatus / ReconcileRestore
 //!                              (bins/eliot-watchdog accepted table)
+//! Watchdog executable ......... ReadSnapshotPage / ReconcileRestore
+//!                              (bins/eliot-watchdog executable_owner_method)
+//! Watchdog owner roles ....... CaptureOwner / SpoolOwner
+//!                              (bins/eliot-watchdog WATCHDOG_OWNER_ROLES)
 //! Host accepted methods ...... PrepareIsolatedRestore / AdmitCutover /
 //!                              RestoreStatus / ReconcileRestore
 //!                              (eliot-host accepted table)
+//! Host executable ............ the same four (eliot-host accepted table)
 //! backup envelope bridge ..... runtime_control.rs envelope mapping
 //! backup dispatch ............ eliot-host register_backup_dispatch
 //! ```
@@ -31,15 +36,23 @@
 //! implementations, private databases, or new auth/transport.
 //!
 //! Role binding (#954): admission here is driven by the protocol's own
-//! role-bound contract, not by a local capability string. Each owner is
-//! bound exactly once to one [`eliot_protocol::backup::BackupRole`], that
-//! role must be an attesting role, the role's capability projection is a
-//! necessary condition for every admitted effect, and a transport
-//! acknowledgement is refused for every acknowledgement phase. The closed
-//! per-owner accepted tables stay as a *narrowing* constraint (they are a
-//! real owner fact from the Host/Watchdog accepted registrations); the
-//! protocol role matrix is a *necessary* condition on top of them, so a
-//! role can never fabricate another role's authority.
+//! role-bound contract, not by a local capability string. An owner channel
+//! carries the closed set of [`eliot_protocol::backup::BackupRole`] values
+//! that owner actually holds, at least one of them is an attesting role, the
+//! authorizing role for one admitted effect is read per operation out of the
+//! protocol's own `operation_for_phase` / `attesting_roles` matrix and must
+//! carry the capability, and a transport acknowledgement is refused for every
+//! acknowledgement phase. No role projection is ever widened here: a contour
+//! an owner cannot attest is refused at effect time, and the role that would
+//! have to carry it is a protocol decision its own owning issue makes.
+//!
+//! Recognition is not execution. The closed per-owner accepted tables stay as
+//! a *narrowing* constraint (they are a real owner fact from the Host and
+//! Watchdog accepted registrations) and the closed per-owner executable
+//! contour tables are a second, narrower real owner fact (what the endpoint
+//! can actually invoke). The protocol role matrix is a *necessary* condition
+//! on top of both, so a role can never fabricate another role's authority and
+//! a registered method can never be mistaken for a supported one.
 //!
 //! Fail-closed posture: production constructors bind the exact canonical
 //! pipe plus the exact peer expectation. Any fake, no-op, mock, default, or
@@ -107,12 +120,58 @@ pub const HOST_SUPPORTED_OPS: &[BackupOperationKind] = &[
 /// Mirrors the Watchdog accepted registration (`ReadSnapshotPage`,
 /// `VerifyArchive`, `RestoreStatus`, `ReconcileRestore`). Anything else refuses
 /// pre-effect with [`OwnerClientError::UnsupportedOperation`].
+///
+/// This table is a RECOGNITION set, never a capability claim: the four rows are
+/// the methods that reach the Watchdog registration, and two of them are
+/// registered precisely so an absent owner method answers with an explicit
+/// typed refusal instead of vanishing from the closed table. What the Watchdog
+/// can actually invoke is the narrower
+/// [`WATCHDOG_EXECUTABLE_CONTOURS`].
 pub const WATCHDOG_SUPPORTED_OPS: &[BackupOperationKind] = &[
     BackupOperationKind::ReadSnapshotPage,
     BackupOperationKind::VerifyArchive,
     BackupOperationKind::RestoreStatus,
     BackupOperationKind::ReconcileRestore,
 ];
+
+/// Closed per-owner executable owner contour table: Watchdog.
+///
+/// This is the Watchdog endpoint's own executable policy, the one
+/// `bins/eliot-watchdog/src/backup_control.rs` states about itself: the
+/// snapshot-page read of its own bounded spool snapshot and the reconciliation
+/// of the isolated restore it imports are the two owner contours it executes,
+/// and it "holds no archive verifier and never interprets archive bytes" and
+/// "holds no restore-status projection". `VerifyArchive` and `RestoreStatus`
+/// therefore stay RECOGNIZED and UNINVOKABLE, so their absence answers with an
+/// explicit typed refusal instead of vanishing from the closed table.
+///
+/// This is a narrowing of [`WATCHDOG_SUPPORTED_OPS`], never a second
+/// registration set: a recognized method outside this table refuses pre-effect
+/// with [`OwnerClientError::UnsupportedOperation`], and the registered table
+/// still decides which method names reach the owner at all.
+pub const WATCHDOG_EXECUTABLE_CONTOURS: &[BackupOperationKind] = &[
+    BackupOperationKind::ReadSnapshotPage,
+    BackupOperationKind::ReconcileRestore,
+];
+
+/// Closed per-owner executable owner contour table: Host.
+///
+/// The Host registers and dispatches every method it accepts
+/// (`eliot-host-control-endpoint`'s accepted table dispatches all four, and
+/// `ReconcileRestore` and `RestoreStatus` resolve to the same reconcile owner
+/// method), so this is the accepted table itself and not a second list: naming
+/// it makes the executable-policy read on both channels explicit without
+/// introducing a second literal table that could drift. The protocol role
+/// matrix is still applied on top of it, so a Host contour the installation
+/// authority does not carry — `ReconcileRestore` — refuses at effect time
+/// exactly as before.
+pub const HOST_EXECUTABLE_CONTOURS: &[BackupOperationKind] = HOST_SUPPORTED_OPS;
+
+/// The exact closed set of authenticated protocol roles one owner channel
+/// carries: the Host carries the installation authority alone, and the
+/// Watchdog carries the capture owner and the spool owner.
+const HOST_PROTOCOL_ROLES: &[BackupRole] = &[BackupRole::InstallationAuthority];
+const WATCHDOG_PROTOCOL_ROLES: &[BackupRole] = &[BackupRole::CaptureOwner, BackupRole::SpoolOwner];
 
 /// Bounded owner operations admitted per supervision round.
 ///
@@ -381,35 +440,68 @@ impl OwnerRole {
         }
     }
 
-    /// The exact authenticated protocol role this owner channel carries.
+    /// Closed executable owner contour table for this owner.
     ///
-    /// This is a closed two-entry table read off the protocol's own role
+    /// The accepted table above says which method NAMES reach an owner; this
+    /// one says which of them that owner can actually INVOKE. The two are
+    /// different owner facts and both are real: a method can be registered
+    /// precisely so it refuses explicitly instead of disappearing.
+    #[must_use]
+    pub const fn executable_contours(self) -> &'static [BackupOperationKind] {
+        match self {
+            Self::Host => HOST_EXECUTABLE_CONTOURS,
+            Self::Watchdog => WATCHDOG_EXECUTABLE_CONTOURS,
+        }
+    }
+
+    /// Whether this owner can actually invoke the operation, as distinct from
+    /// whether it recognizes it.
+    #[must_use]
+    pub fn is_executable_contour(self, operation: BackupOperationKind) -> bool {
+        self.executable_contours().contains(&operation)
+    }
+
+    /// The exact authenticated protocol roles this owner channel carries.
+    ///
+    /// This is a closed per-owner table read off the protocol's own role
     /// tables, never a capability search and never a payload claim. The
     /// binding is defined exactly once, here:
     ///
-    /// - Host carries the installation authority. I5.13 gives the Host the
-    ///   installation epoch and activation lineage, and
-    ///   `attesting_roles(CutoverAdmitted)` admits the installation
-    ///   authority alone — the only role whose closed capability projection
-    ///   carries `AdmitCutover` at all. The Host accepted table carries
+    /// - Host carries the installation authority alone. I5.13 gives the Host
+    ///   the installation epoch and activation lineage, and
+    ///   `attesting_roles(CutoverAdmitted)` admits the installation authority
+    ///   alone — the only role whose closed capability projection carries
+    ///   `AdmitCutover` at all. The Host accepted table carries
     ///   `AdmitCutover`, so the installation authority is the only role that
     ///   can be the Host channel's authenticated role.
-    /// - Watchdog carries the spool owner. I5.13 binds the unreconciled
-    ///   critical signal/intent spool to a `WatchdogSpoolFence`, so the
-    ///   Watchdog is the spool owner, and
-    ///   `attesting_roles(RestoreStepApplied | Reconciled)` admits the spool
-    ///   owner alongside the store and ORS owners. The Watchdog accepted
-    ///   table carries `ReconcileRestore`, whose establishing stage is
-    ///   `Reconciled`.
+    /// - Watchdog carries the capture owner AND the spool owner, which is
+    ///   exactly what the Watchdog owner says about itself
+    ///   (`bins/eliot-watchdog/src/backup_control.rs::WATCHDOG_OWNER_ROLES`):
+    ///   "the Watchdog is the capture owner for its own bounded spool snapshot
+    ///   and the spool owner for the isolated restore it imports". The
+    ///   protocol's own attester matrix splits the Watchdog's two executable
+    ///   contours across those two roles and admits no single role for both:
+    ///   `attesting_roles(Captured) = [CaptureOwner]` is the only attester of
+    ///   `ReadSnapshotPage`, and `attesting_roles(Reconciled) = [StoreOwner,
+    ///   OrsOwner, SpoolOwner]` is the attester set of `ReconcileRestore`.
     ///
-    /// The projection is deliberately not widened: an operation the mapped
-    /// role does not carry is refused at effect time even when the owner's
-    /// local accepted table lists it.
+    /// Binding the Watchdog channel to the spool owner ALONE was the defect
+    /// this table repairs: the channel then refused `ReadSnapshotPage` — the
+    /// one contour the Watchdog actually executes — because the spool owner's
+    /// projection carries no page read, while admitting `RestoreStatus`, which
+    /// the Watchdog explicitly refuses. No role projection is widened here;
+    /// the authorizing role for one effect is still read per operation out of
+    /// the protocol's own `attesting_roles` matrix and must carry the
+    /// capability.
+    ///
+    /// The projection is deliberately not widened: an operation no role this
+    /// channel carries authorizes is refused at effect time even when the
+    /// owner's local accepted table lists it.
     #[must_use]
-    pub const fn protocol_role(self) -> BackupRole {
+    pub const fn protocol_roles(self) -> &'static [BackupRole] {
         match self {
-            Self::Host => BackupRole::InstallationAuthority,
-            Self::Watchdog => BackupRole::SpoolOwner,
+            Self::Host => HOST_PROTOCOL_ROLES,
+            Self::Watchdog => WATCHDOG_PROTOCOL_ROLES,
         }
     }
 }
@@ -539,21 +631,83 @@ fn check_transport_ack_refusal() -> Result<(), OwnerClientError> {
     Ok(())
 }
 
-/// Binds one owner to its exact authenticated protocol role and proves the
+/// The exact authenticated protocol role that authorizes `operation` on this
+/// owner channel, read per operation out of the protocol's own tables.
+///
+/// A channel carries the closed role set from [`OwnerRole::protocol_roles`],
+/// and the authorizing role for one operation is the carried role that
+/// satisfies all three of the protocol's own conditions:
+///
+/// 1. it is an attesting role — the requester and the forensic role only
+///    request, observe and query, so neither may authorize an effect;
+/// 2. its closed capability projection carries the operation;
+/// 3. when the operation establishes a lifecycle stage, the protocol's own
+///    `attesting_roles` matrix admits it for that stage — one owner can never
+///    attest another owner's phase.
+///
+/// Condition 3 is read from `attesting_roles`, never from a local list, and it
+/// is what makes this per-operation rather than per-channel: the Watchdog's
+/// two executable contours are attested by two different carried roles
+/// (`ReadSnapshotPage` by the capture owner, `ReconcileRestore` by the spool
+/// owner), which is exactly why no single role binding could admit both.
+///
+/// `None` means no carried role authorizes the operation, which is the
+/// fail-closed answer: the capability denial is expressed in the protocol's own
+/// typed refusal class and mapped once, so it keeps exactly one owner-channel
+/// spelling end to end.
+fn authorizing_protocol_role(
+    role: OwnerRole,
+    operation: BackupOperationKind,
+) -> Option<BackupRole> {
+    for candidate in role.protocol_roles() {
+        if !candidate.is_attesting_role() || !candidate.permits(operation) {
+            continue;
+        }
+        if !attests_every_own_stage(*candidate, operation) {
+            continue;
+        }
+        return Some(*candidate);
+    }
+    None
+}
+
+/// Whether the role is an admitted attester for every lifecycle stage the
+/// operation establishes.
+///
+/// An operation that establishes no stage (a read such as `RestoreStatus`
+/// belongs to no `BackupStage`) establishes no phase, so there is nothing to
+/// attest and the role qualifies. The stage list and the attester sets are
+/// read from the protocol's own `operation_for_phase` / `attesting_roles`
+/// projections, so a stage the protocol adds later is simply not traversed
+/// here and can only narrow this qualification, never widen it.
+fn attests_every_own_stage(protocol_role: BackupRole, operation: BackupOperationKind) -> bool {
+    for stage in BACKUP_LIFECYCLE_STAGES {
+        if eliot_protocol::backup::operation_for_phase(*stage) != operation {
+            continue;
+        }
+        if !eliot_protocol::backup::attesting_roles(*stage).contains(&protocol_role) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Binds one owner to its exact authenticated protocol role set and proves the
 /// binding before any client exists.
 ///
-/// The role is the closed projection from
-/// [`OwnerRole::protocol_role`], and it must be an attesting role: the
-/// requester and the forensic Host role only request, observe, and query,
-/// so neither may own a channel that admits effects. Then the owner's local
-/// accepted table is checked against the protocol's own role projections:
-/// every table entry the role actually carries must be a stage the role is
-/// an admitted attester for, so a channel can never claim to advance a
-/// lifecycle phase its role may not attest. Table entries the role does not
-/// carry are not fatal here; they refuse individually at effect time.
+/// The roles are the closed projection from [`OwnerRole::protocol_roles`] and
+/// at least one of them must be an attesting role. Then the owner's local
+/// accepted table is checked against the protocol's own role projections: every
+/// table entry some carried role actually carries must be a stage one carried
+/// role is an admitted attester for, so a channel can never claim to advance a
+/// lifecycle phase none of its roles may attest. Table entries no carried role
+/// carries are not fatal here; they refuse individually at effect time.
 fn check_owner_role_admission(role: OwnerRole) -> Result<(), OwnerClientError> {
-    let protocol_role = role.protocol_role();
-    if !protocol_role.is_attesting_role() {
+    let carried = role.protocol_roles();
+    if !carried
+        .iter()
+        .any(|protocol_role| protocol_role.is_attesting_role())
+    {
         // The refusal is expressed in the protocol's own typed refusal class
         // and mapped once, so the capability denial has exactly one
         // owner-channel spelling and is never re-implemented here.
@@ -562,14 +716,20 @@ fn check_owner_role_admission(role: OwnerRole) -> Result<(), OwnerClientError> {
         ));
     }
     for operation in role.supported_ops() {
-        if !protocol_role.permits(*operation) {
+        if !carried
+            .iter()
+            .any(|protocol_role| protocol_role.permits(*operation))
+        {
             continue;
         }
         for stage in BACKUP_LIFECYCLE_STAGES {
             if eliot_protocol::backup::operation_for_phase(*stage) != *operation {
                 continue;
             }
-            if !eliot_protocol::backup::attesting_roles(*stage).contains(&protocol_role) {
+            if !eliot_protocol::backup::attesting_roles(*stage)
+                .iter()
+                .any(|attester| carried.contains(attester))
+            {
                 return Err(OwnerClientError::PhaseNotAttestedByOwner { stage: *stage });
             }
         }
@@ -577,20 +737,33 @@ fn check_owner_role_admission(role: OwnerRole) -> Result<(), OwnerClientError> {
     Ok(())
 }
 
-/// Requires, for one admitted effect, that the owner's authenticated
-/// protocol role is an attesting role and actually carries the operation.
+/// Requires, for one admitted effect, that the operation is one this owner
+/// channel can actually execute AND that a carried authenticated protocol role
+/// authorizes it.
 ///
-/// This is the necessary protocol condition for every admitted effect. The
-/// caller's own closed accepted table is a separate, additional narrowing.
-/// The refusal is expressed in the protocol's own typed refusal class and
-/// mapped once through [`map_protocol_backup_error`], so a capability denial
-/// keeps one spelling end to end and is never re-implemented here.
+/// Both halves are necessary and neither is derived from the other:
+///
+/// - the executable-contour table is the endpoint's own executable policy, and
+///   it is what stops a RECOGNIZED but UNINVOKABLE method from being admitted
+///   as an effect. A method registered only so it refuses explicitly never
+///   becomes an admitted effect;
+/// - the role check is the protocol's authority condition, and it is what
+///   stops a channel from exercising a contour its roles do not carry even if
+///   the endpoint claims to execute it.
+///
+/// The capability denial is expressed in the protocol's own typed refusal
+/// class and mapped once through [`map_protocol_backup_error`], so it keeps one
+/// spelling end to end and is never re-implemented here.
 fn check_role_permits_effect(
     role: OwnerRole,
     operation: BackupOperationKind,
 ) -> Result<(), OwnerClientError> {
-    let protocol_role = role.protocol_role();
-    if !protocol_role.is_attesting_role() || !protocol_role.permits(operation) {
+    if !role.is_executable_contour(operation) {
+        return Err(OwnerClientError::UnsupportedOperation {
+            op: operation.as_str(),
+        });
+    }
+    if authorizing_protocol_role(role, operation).is_none() {
         return Err(map_protocol_backup_error(
             eliot_protocol::backup::BackupError::CapabilityDenied,
         ));
@@ -630,6 +803,11 @@ pub struct HostBackupOwnerClient {
 
 /// Watchdog backup owner client: `ReadSnapshotPage` / `VerifyArchive` /
 /// `RestoreStatus` / `ReconcileRestore` over the canonical Watchdog pipe.
+///
+/// The four registered methods are a RECOGNITION set; the two this channel can
+/// actually invoke are [`WATCHDOG_EXECUTABLE_CONTOURS`], and the authority for
+/// each is resolved per operation from the protocol's own attester matrix over
+/// the closed role set in [`OwnerRole::protocol_roles`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WatchdogBackupOwnerClient {
     pipe: String,
@@ -713,13 +891,13 @@ impl HostBackupOwnerClient {
     /// Unsupported operations refuse pre-effect: no admission object can
     /// exist for them.
     ///
-    /// Admission is role-bound: the operation must also be carried by this
-    /// channel's authenticated protocol role
-    /// ([`OwnerRole::Host`] -> installation authority), and that role must
-    /// be an attesting role. The owner's accepted table and the protocol's
-    /// role matrix are both necessary conditions, so the Host can never
-    /// exercise an operation the installation authority does not carry, and
-    /// a non-attesting role can never produce an effect admission at all.
+    /// Admission is role-bound: the operation must be one this channel can
+    /// actually execute AND be authorized by this channel's authenticated
+    /// protocol role ([`OwnerRole::Host`] carries the installation authority
+    /// alone). The owner's accepted table, the executable-contour table and
+    /// the protocol's role matrix are all necessary conditions, so the Host can
+    /// never exercise an operation the installation authority does not carry,
+    /// and a non-attesting role can never produce an effect admission at all.
     pub fn admit_effect(op: BackupOperationKind) -> Result<EffectAdmission, OwnerClientError> {
         if !Self::is_supported(op) {
             return Err(OwnerClientError::UnsupportedOperation { op: op.as_str() });
@@ -856,12 +1034,18 @@ impl WatchdogBackupOwnerClient {
     /// Admits exactly one typed effect for a supported operation, failing
     /// pre-effect otherwise.
     ///
-    /// Admission is role-bound: the operation must also be carried by this
-    /// channel's authenticated protocol role
-    /// ([`OwnerRole::Watchdog`] -> spool owner), and that role must be an
-    /// attesting role. The spool owner never carries `AdmitCutover`, so
-    /// cutover authority is structurally unavailable on this channel
-    /// independently of the accepted table.
+    /// Admission is role-bound: the operation must be one this channel can
+    /// actually execute AND be authorized by a role this channel carries
+    /// ([`OwnerRole::Watchdog`] carries the capture owner and the spool owner,
+    /// the closed set the Watchdog owner states about itself). The Watchdog's
+    /// two executable contours are therefore admitted —
+    /// `ReadSnapshotPage` on the capture owner and `ReconcileRestore` on the
+    /// spool owner — while `VerifyArchive` and `RestoreStatus` are RECOGNIZED
+    /// and refused: no role this channel carries authorizes an archive
+    /// verification, and the executable-contour table states that the Watchdog
+    /// holds no restore-status projection. Neither carried role ever carries
+    /// `AdmitCutover`, so cutover authority is structurally unavailable on this
+    /// channel independently of the accepted table.
     pub fn admit_effect(op: BackupOperationKind) -> Result<EffectAdmission, OwnerClientError> {
         if !Self::is_supported(op) {
             return Err(OwnerClientError::UnsupportedOperation { op: op.as_str() });
