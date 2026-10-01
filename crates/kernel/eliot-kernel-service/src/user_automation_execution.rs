@@ -3046,9 +3046,9 @@ pub enum UserAutomationExecutionOutcome {
         /// Deterministic preflight receipt.
         receipt: UserAutomationPreflightReceipt,
         /// Revision-bound failure content.
-        failure: UserAutomationFailureProjection,
+        failure: Box<UserAutomationFailureProjection>,
         /// Canonical history/notification publication result.
-        publication: UserAutomationFailurePublication,
+        publication: Box<UserAutomationFailurePublication>,
     },
 }
 
@@ -3728,8 +3728,8 @@ impl<P: UserAutomationStorePort + ?Sized> UserAutomationService<'_, P> {
                 publication.validate_for(&failure_record)?;
                 Ok(UserAutomationExecutionOutcome::BlockedConfig {
                     receipt,
-                    failure,
-                    publication,
+                    failure: Box::new(failure),
+                    publication: Box::new(publication),
                 })
             }
         }
