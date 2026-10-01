@@ -391,7 +391,12 @@ fn fixture() -> Fixture {
             owner: OwnerId::from_artifact(aid("owner-add")),
             source_role: CampaignSourceRole::ArtifactProjection,
             target: targets[0].clone(),
-            requirement: SlotRequirement::Optional,
+            // The overlay composer admits only `CompleteForDeclaredRecipe`
+            // views, and an affirmatively empty (`KnownEmpty`) slot derives
+            // `CompleteForDeclaredRecipe` only when it is `Required` with an
+            // empty declared set and owner evidence. Under `Optional` the same
+            // view derives `Completeness::Partial`.
+            requirement: SlotRequirement::Required,
             declared_members: vec![],
             accepted_type: "verification/v1".to_owned(),
             schema_digest: digest("schema-add"),
@@ -2051,6 +2056,9 @@ fn case_22_missing_wrong_revision_cycle_partial_dependency_closure() {
         })
     ));
     let partial = resealed_view(&fixture.view, |view| {
+        let removed = view.slots.remove(1);
+        view.frontier.push(removed.slot_id);
+        view.denominator.observed = 2;
         view.completeness = Completeness::Partial;
     });
     let (add, add_inverse) = operation_add(&fixture.targets[0], "partial");
@@ -2465,6 +2473,9 @@ fn case_34_complete_and_partial_delta_surface_dependency_denominators() {
     let (_, complete) = full_candidate(&fixture);
     assert_eq!(complete.changes.len(), 3);
     let partial = resealed_view(&fixture.view, |view| {
+        let removed = view.slots.remove(1);
+        view.frontier.push(removed.slot_id);
+        view.denominator.observed = 2;
         view.completeness = Completeness::Partial;
     });
     let (add, add_inverse) = operation_add(&fixture.targets[0], "partial-denominator");
@@ -2501,7 +2512,7 @@ fn case_34_complete_and_partial_delta_surface_dependency_denominators() {
         Err(OverlayError::Contract(Contract::IncompleteCoverage))
     ));
     let omitted = resealed_view(&fixture.view, |view| {
-        let removed = view.slots.remove(0);
+        let removed = view.slots.remove(2);
         view.omissions.push(removed.slot_id);
         view.denominator.observed = 2;
     });
@@ -2613,9 +2624,10 @@ fn case_35_every_independent_item_output_work_bound_and_frontier() {
         })
     ));
     let unexplored = resealed_view(&fixture.view, |view| {
-        let removed = view.slots.remove(0);
+        let removed = view.slots.remove(2);
         view.frontier.push(removed.slot_id);
         view.denominator.observed = 2;
+        view.completeness = Completeness::Partial;
     });
     let (add, add_inverse) = operation_add(&fixture.targets[0], "unexplored");
     let unexplored_delta = delta(&unexplored, "unexplored", add, add_inverse);
