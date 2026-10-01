@@ -1621,11 +1621,17 @@ pub const USER_BROKER_RUNTIME_PROTOCOL: &str = "eliot.user-broker.v1";
 /// operation-identity issuer). They are three views of one installation-pinned
 /// set, not three sets: a broker presenting anything else is refused at session
 /// bind, which is the intended fail-closed outcome.
-pub const USER_BROKER_FRONT_DOOR_OPERATIONS: [&str; 4] = [
+///
+/// The Operator session token selector is the I11.8 short-lived Kernel
+/// challenge/session token the `WinUI` client redeems on its own binding; the
+/// Kernel mints it in `eliot_kernel_service::bind_operator_session_token` and
+/// this broker never mints one itself.
+pub const USER_BROKER_FRONT_DOOR_OPERATIONS: [&str; 5] = [
     "eliot.user-broker.register",
     "eliot.user-broker.heartbeat",
     "eliot.user-broker.fence",
     "eliot.user-broker.validate-native-resource-selection-current",
+    "eliot.user-broker.operator-session-token",
 ];
 
 /// Immutable protected client declaration for one installed User Broker
