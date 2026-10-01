@@ -146,13 +146,19 @@ fn resolved_applicability() -> QualityApplicability {
 
 /// Intrinsically well-formed output binding for a card that is only checked for
 /// structural integrity. A card bound to a real packet's exact output is built
-/// by its owner; these fixtures only need the field to be well formed.
+/// by that packet's owner; these fixtures only need the field to be well formed.
 ///
 /// The serializer and route identities are the ones the assembled-view fixture
 /// executes under, because `ActiveUnderstandingView::validate` compares the
 /// card's serializer/route binding against the view's own execution identity:
 /// a card naming a different serializer or route is not the grade of those
 /// bytes and is refused.
+///
+/// This binding is for shape-only fixtures. It must NOT be used to assemble an
+/// `ActiveUnderstandingView`: `ActiveUnderstandingView::validate` and
+/// `validate_against` re-derive `recipe_digest`, `fence_digest`,
+/// `rendered_digest` and `admitted_digest` and refuse a card that names
+/// anything else, so an assembled view needs `bound_output_binding` instead.
 fn fixture_output_binding() -> QualityOutputBinding {
     QualityOutputBinding {
         recipe_digest: digest(),
@@ -169,6 +175,41 @@ fn fixture_output_binding() -> QualityOutputBinding {
 }
 
 fn quality(context: &ContextBinding) -> QualityScorecard {
+    quality_with_output(context, fixture_output_binding())
+}
+
+/// The output binding of one exact assembled packet.
+///
+/// `ActiveUnderstandingView::validate` compares the card's `recipe_digest`,
+/// `fence_digest` and `rendered_digest` against the view's own re-derived
+/// values, and `validate_against` compares `admitted_digest` against the
+/// admitted set's own canonical payload digest and `omission_handles` against
+/// its displaced list. A placeholder binding therefore no longer names the
+/// output it graded, so an assembled-view fixture must bind the real
+/// re-derived values rather than a repeated `"a" * 64`.
+fn bound_output_binding(
+    recipe_digest: &str,
+    fence_digest: &str,
+    admitted: &AdmittedContextSet,
+    rendered_digest: &str,
+) -> QualityOutputBinding {
+    QualityOutputBinding {
+        recipe_digest: recipe_digest.to_owned(),
+        fence_digest: fence_digest.to_owned(),
+        admitted_digest: admitted
+            .canonical_payload_digest()
+            .expect("admitted payload digest"),
+        rendered_digest: rendered_digest.to_owned(),
+        serializer_id: "serde-json".to_owned(),
+        serializer_version: "1".to_owned(),
+        serializer_options_digest: digest(),
+        route_id: "route".to_owned(),
+        evidence_revisions: Vec::new(),
+        omission_handles: admitted.economy.displaced.clone(),
+    }
+}
+
+fn quality_with_output(context: &ContextBinding, output: QualityOutputBinding) -> QualityScorecard {
     let dimensions = [
         QualityDimension::AcceptanceDecisionCoverage,
         QualityDimension::CausalOperationalSufficiency,
@@ -186,7 +227,7 @@ fn quality(context: &ContextBinding) -> QualityScorecard {
     QualityScorecard {
         schema_version: QUALITY_SCORECARD_SCHEMA_VERSION,
         binding: context.clone(),
-        output: fixture_output_binding(),
+        output,
         applicability: resolved_applicability(),
         results: dimensions
             .into_iter()
@@ -775,9 +816,13 @@ fn admitted_view_preserves_protected_fields_and_rejects_injected_content() {
         model_id: measurement.model_id.clone(),
         measurement_status: measurement.status,
     };
+    let quality = quality_with_output(
+        &context,
+        bound_output_binding(&recipe_digest, &fence_digest, &admitted, &output_digest),
+    );
     let mut view = ActiveUnderstandingView::assemble(
         &admitted,
-        quality(&context),
+        quality,
         measurement,
         execution,
         output_digest.clone(),

@@ -2336,9 +2336,14 @@ fn passing_dimension_result(
 ///
 /// `QualityOutputBinding::validate` checks the intrinsic shape only - that each
 /// digest is a real digest and each revision field is distinct - so a fixture
-/// card that is graded for its twelve dimensions does not need to name one
-/// packet's exact output. A card bound to a real packet's output is built by
-/// that packet's owner.
+/// card that is only checked for structural integrity does not need to name one
+/// packet's exact output.
+///
+/// This binding is for shape-only fixtures. It must NOT be used to assemble an
+/// `ActiveUnderstandingView`: `ActiveUnderstandingView::validate` and
+/// `validate_against` re-derive `recipe_digest`, `fence_digest`,
+/// `rendered_digest` and `admitted_digest` and refuse a card that names
+/// anything else, so an assembled view needs `bound_output_binding` instead.
 ///
 /// The serializer and route identities are the ones the assembled-view fixtures
 /// execute under, because `ActiveUnderstandingView::validate` compares the
@@ -2361,6 +2366,13 @@ fn fixture_output_binding() -> QualityOutputBinding {
 }
 
 fn full_quality_scorecard(context: &ContextBinding) -> QualityScorecard {
+    full_quality_scorecard_with_output(context, fixture_output_binding())
+}
+
+fn full_quality_scorecard_with_output(
+    context: &ContextBinding,
+    output: QualityOutputBinding,
+) -> QualityScorecard {
     let dimensions = all_quality_dimensions();
     let results = dimensions
         .iter()
@@ -2372,15 +2384,45 @@ fn full_quality_scorecard(context: &ContextBinding) -> QualityScorecard {
     QualityScorecard {
         schema_version: QUALITY_SCORECARD_SCHEMA_VERSION,
         binding: context.clone(),
-        output: fixture_output_binding(),
+        output,
         applicability: resolved_applicability(),
         results,
     }
 }
 
+/// The output binding of one exact assembled packet.
+///
+/// `ActiveUnderstandingView::validate` compares the card's `recipe_digest`,
+/// `fence_digest` and `rendered_digest` against the view's own re-derived
+/// values, and `validate_against` compares `admitted_digest` against the
+/// admitted set's own canonical payload digest and `omission_handles` against
+/// its displaced list. A placeholder binding therefore no longer names the
+/// output it graded, so an assembled-view fixture must bind the real
+/// re-derived values rather than a repeated `"a" * 64`.
+fn bound_output_binding(
+    recipe_digest: &str,
+    fence_digest: &str,
+    admitted: &AdmittedContextSet,
+    rendered_digest: &str,
+) -> QualityOutputBinding {
+    QualityOutputBinding {
+        recipe_digest: recipe_digest.to_owned(),
+        fence_digest: fence_digest.to_owned(),
+        admitted_digest: admitted
+            .canonical_payload_digest()
+            .expect("admitted payload digest"),
+        rendered_digest: rendered_digest.to_owned(),
+        serializer_id: "serde-json".to_owned(),
+        serializer_version: "1".to_owned(),
+        serializer_options_digest: digest(),
+        route_id: "route".to_owned(),
+        evidence_revisions: Vec::new(),
+        omission_handles: admitted.economy.displaced.clone(),
+    }
+}
+
 fn assembled_view() -> (AdmittedContextSet, ActiveUnderstandingView) {
     let admitted = admitted_single();
-    let mut quality = full_quality_scorecard(&admitted.binding);
     let rendered: Vec<RenderedAtom> = admitted
         .records
         .iter()
@@ -2404,6 +2446,10 @@ fn assembled_view() -> (AdmittedContextSet, ActiveUnderstandingView) {
         &rendered,
     )
     .expect("view output bytes");
+    let quality = full_quality_scorecard_with_output(
+        &admitted.binding,
+        bound_output_binding(&recipe_digest, &fence_digest, &admitted, &output_digest),
+    );
     let mut measurement = exact_measurement(&admitted.binding);
     measurement.envelope_digest.clone_from(&output_digest);
     measurement.rendered_utf8_bytes = rendered_bytes;
@@ -2639,10 +2685,14 @@ fn no_scalar_weighted_or_average_quality_compensation_path() {
     assert!(!padded.all_pass().expect("padded evaluated"));
 
     // The closed wire surface carries no aggregate scalar to compensate with.
+    // The card names the exact output it graded, and the whole closed member
+    // set is enumerated, so there is no field left to hide a score in.
     let value = serde_json::to_value(&baseline).expect("scorecard value");
     let object = value.as_object().expect("scorecard object");
-    assert_eq!(object.len(), 3);
+    assert_eq!(object.len(), 5);
+    assert!(object.contains_key("schema_version"));
     assert!(object.contains_key("binding"));
+    assert!(object.contains_key("output"));
     assert!(object.contains_key("applicability"));
     assert!(object.contains_key("results"));
     for rejected in ["score", "average", "weighted", "total"] {
