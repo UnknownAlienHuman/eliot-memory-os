@@ -6644,6 +6644,10 @@ fn pending_phase_b_intent_is_durable_before_destination_publication_and_rejects_
         host_epoch_sequence: 1,
         activation_generation_lineage: test_handle("activation-lineage:prepared"),
         activation_generation_sequence: 1,
+        // #1954 (PR #3527) added the User Broker front-door record pair to the product struct. The test
+        // initializer predates it. This contour exercises the agent-bridge path, so the absent broker
+        // binding is the truthful value; no product code is changed to suit the old literal.
+        user_broker: None,
         authority_descriptor_digest: test_handle("3".repeat(64)),
         config_file_digest: test_handle("8".repeat(64)),
         store_bootstrap_descriptor_digest: test_handle("4".repeat(64)),
