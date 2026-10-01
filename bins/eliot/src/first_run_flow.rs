@@ -157,7 +157,7 @@ fn setup_state_path() -> Result<Option<PathBuf>> {
 /// Terminal receipt fragment describing where the decision lives: the
 /// configured state file when persistence is active, `projected-only`
 /// otherwise.
-fn state_receipt(state_path: &Option<PathBuf>) -> serde_json::Value {
+fn state_receipt(state_path: Option<&PathBuf>) -> serde_json::Value {
     match state_path {
         Some(path) => serde_json::json!({
             "source": "stored",
@@ -413,7 +413,7 @@ pub fn run_setup_apply(args: &SetupApplyArgs) -> Result<i32> {
             "routes": describe_defaults(&decision),
             "has_paid_route": decision.has_paid_route(),
             "settings": to_settings(&decision, owner_ref),
-            "state": state_receipt(&state_path),
+            "state": state_receipt(state_path.as_ref()),
         })
     );
     Ok(0)
@@ -439,7 +439,7 @@ pub fn run_setup_show() -> Result<i32> {
             "has_paid_route": decision.has_paid_route(),
             "source": source,
             "owner_ref": owner_ref,
-            "state": state_receipt(&state_path),
+            "state": state_receipt(state_path.as_ref()),
         })
     );
     Ok(0)
@@ -496,7 +496,7 @@ pub fn run_setup_set(args: &SetupSetArgs) -> Result<i32> {
             "routes": describe_defaults(&updated),
             "has_paid_route": updated.has_paid_route(),
             "settings": to_settings(&updated, owner_ref),
-            "state": state_receipt(&state_path),
+            "state": state_receipt(state_path.as_ref()),
         })
     );
     Ok(0)
