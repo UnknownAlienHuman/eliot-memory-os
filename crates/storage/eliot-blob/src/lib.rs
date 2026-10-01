@@ -79,7 +79,10 @@ pub use key_ports::{DpapiUserAeadPort, DpapiUserKeyPort, KEY_PORT_ALGORITHM, KEY
 pub use publication_owner::{BlobArchivePublicationBinding, BlobArchivePublicationOwner};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-pub use stream_sink::{BlobStoreStreamSink, BlobStreamSinkStoreBinding};
+pub use stream_sink::{
+    BlobStoreStreamSink, BlobStreamPublication, BlobStreamSinkStoreBinding,
+    BlobStreamUnavailableReason,
+};
 
 const FORMAT_ID: &str = "eliot-blob-envelope";
 const FORMAT_VERSION: u32 = 1;
