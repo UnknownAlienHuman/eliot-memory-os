@@ -3570,6 +3570,10 @@ fn invoke_request_frame(
             revalidate_coordinate_dispatch(request, envelope, facts)?;
             host_request_frame_for_envelope(AGENT_HOST_REQUEST_SUBMIT_OPERATION, envelope, facts)?
         }
+        CanonicalDispatchEntry::SubmitStateGated { .. } => {
+            revalidate_state_dispatch(request, envelope, facts)?;
+            host_request_frame_for_envelope(AGENT_HOST_REQUEST_SUBMIT_OPERATION, envelope, facts)?
+        }
         CanonicalDispatchEntry::SubmitCarryingBytes => {
             host_request_user_automation_frame(request, envelope, facts)?
         }
