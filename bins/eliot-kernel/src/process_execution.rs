@@ -312,6 +312,25 @@ impl GovernedProcessEffectBinding {
             && self.state_fence == *request.fence()
             && self.state_fence.generation() == request.generation()
     }
+
+    /// Builds the witness correlation for an unresolved-transition marker
+    /// (I10.21 W3): the observing lane's claimed Session, `ActionLease`,
+    /// tool operation, attempt receipt, and State-Fence generation.
+    /// `attempt_receipt` is the caller's effect digest for this
+    /// observation. The witness names who observed the failure, never who
+    /// wrote the bytes.
+    pub(crate) fn unresolved_witness(
+        &self,
+        attempt_receipt: &str,
+    ) -> change_monitor::UnresolvedTransitionWitness {
+        change_monitor::UnresolvedTransitionWitness {
+            session: Some(self.session_id.as_str().to_owned()),
+            action_lease: Some(self.action_lease_ref.as_str().to_owned()),
+            operation: self.operation_id.as_str().to_owned(),
+            attempt_receipt: Some(attempt_receipt.to_owned()),
+            fence_generation: Some(self.state_fence.generation().get()),
+        }
+    }
 }
 
 /// Complete tracked-source baseline captured before the admitted process effect.
@@ -611,14 +630,16 @@ impl KernelGovernedProcessEffectPort {
     /// when the caller must skip the target (the transition stays
     /// unrecorded and a blocking gap marker pins the retained digest so the
     /// next capture re-detects it instead of advancing past evidence the
-    /// ledger never admitted). Ledger contention fences the tool instead.
+    /// ledger never admitted). `witness` is the observing operation's
+    /// claimed correlation, recorded on the gap marker when the adapter
+    /// cannot confirm (I10.21 W3). Ledger contention fences the tool instead.
     fn check_retained_external_transition(
         workspace_root: &Path,
         hinted_source: &Path,
         resource: &str,
         event_ref: &str,
         previous: &str,
-        operation: &str,
+        witness: &change_monitor::UnresolvedTransitionWitness,
         observed: &mut bool,
     ) -> Result<bool, GovernedProcessEffectPortError> {
         match Self::observe_external_filesystem_transition(
@@ -659,9 +680,11 @@ impl KernelGovernedProcessEffectPort {
                 // blocking gap marker pinned to the retained digest
                 // instead of advancing past evidence the ledger
                 // never admitted; the next capture re-detects it.
+                // The marker keeps the observing operation's claimed
+                // correlation (I10.21 W3), never an authorship claim.
                 match change_monitor::note_unresolved_transition(
                     resource,
-                    operation,
+                    witness,
                     Some(previous.to_owned()),
                 ) {
                     Ok(_) => {
@@ -721,9 +744,14 @@ impl KernelGovernedProcessEffectPort {
                 Err(GovernedProcessEffectPortError::LedgerPoisoned)
             }
             Err(_) => {
+                // The refused hint carried this operation's claimed
+                // correlation; the blocking gap marker preserves it as
+                // the observing witness (I10.21 W3) instead of dropping
+                // every identity but the operation.
+                let witness = binding.unresolved_witness(attempt_receipt);
                 let outcome = match change_monitor::note_unresolved_transition(
                     resource,
-                    operation.as_str(),
+                    &witness,
                     Some(before_digest.to_owned()),
                 ) {
                     Ok(_) => "unresolved",
@@ -920,7 +948,7 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
                     // baseline over an unreconciled mutation.
                     change_monitor::resource_tip(&resource).and_then(|tip| tip.digest)
                 });
-            let operation = binding.operation_id().as_str().to_owned();
+            let witness = binding.unresolved_witness(source.effect_digest.as_str());
             if let Some(previous) = previous
                 && previous != first_digest
             {
@@ -942,7 +970,7 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
                     &resource,
                     binding.owner.module_id(),
                     &previous,
-                    &operation,
+                    &witness,
                     &mut mutated,
                 )? {
                     continue;
@@ -1001,7 +1029,9 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
             observe_process("kernel.process.effect_readback_failed", "unobserved");
             return Ok(unobserved());
         }
-        let operation = baseline.binding.operation_id().as_str().to_owned();
+        let witness = baseline
+            .binding
+            .unresolved_witness(baseline.effect_digest.as_str());
         let mut targets = Vec::new();
         for base in &baseline.targets {
             match Self::read_tracked_source(&base.path) {
@@ -1052,7 +1082,7 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
                     let outcome = match previous {
                         Some(digest) => match change_monitor::note_unresolved_transition(
                             &base.resource,
-                            &operation,
+                            &witness,
                             Some(digest),
                         ) {
                             Ok(_) => "unresolved",
