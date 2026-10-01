@@ -30,6 +30,53 @@
 //! edge (O1 registration hunk): this driver invents none of them. No
 //! policy, admission, or semantic rule lives here; fence agreement and
 //! response identity fail closed before any shaping.
+//!
+//! # Live status
+//!
+//! The whole of this module is currently **unreached from a run of this
+//! daemon**, so the "Daemon-side production edge" sentence above describes the
+//! intended contour rather than an executed one. Measured on this tree by
+//! symbol, with no `#[cfg(test)]` anywhere in this file:
+//!
+//! - `run_experience_quality_event_with_revision` and
+//!   `commit_experience_event_records` have **zero call sites**; every other
+//!   entry here is called only from inside this module or from the crate-root
+//!   `pub use` block in `lib.rs`. `read_current_position`,
+//!   `propose_memory_extinction_candidate` and `derive_commit_ingress` each
+//!   have exactly one in-file caller, and
+//!   `produce_journal_projection` is reached only from the uncalled
+//!   `run_experience_quality_event`.
+//! - `eliotd` declares **no reverse dependency** in any workspace
+//!   `Cargo.toml` and none in `Cargo.lock`, so nothing outside this crate can
+//!   call the re-exported surface either.
+//! - The two mentions of `run_experience_quality_event` outside this file are
+//!   **string literals** in `maintenance_family_catalog.rs` — an
+//!   `owned_by!("...run_experience_quality_event")` owner declaration and a
+//!   rationale sentence. Neither is a call.
+//!
+//! What would change this is one call site holding an admitted
+//! `ExperienceQualityEvent` (and, for the revision leg, an owner-issued
+//! `RevisionIntake`). No caller was invented to close the gap.
+//!
+//! # Three declared `eliot-dreamer` dependency edges reach only this module
+//!
+//! `bins/eliotd/Cargo.toml` declares `eliot-dreamer-contracts`,
+//! `eliot-dreamer-memory-revision` and `eliot-dreamer-failure`, and the
+//! `eliotd` row of `config/architecture-boundaries.toml` lists
+//! `eliot-dreamer` under `forbidden_prefix` (issue #18), so all three are
+//! reported as `runtime_root_forbidden_direct_dependency` HARD_VIOLATIONs by
+//! `scripts/audit-architecture-boundaries.py`. The first two are named only
+//! here; the third is named in `negative_memory_action_gate.rs`, which carries
+//! its own reachability note.
+//!
+//! This disclosure records **reachability only**. Whether the daemon should
+//! keep these three edges — by narrowing the `forbidden_prefix` row, by giving
+//! the entries above real callers, or by removing the edges — is an
+//! architecture decision that is **not settled here**, and the dependency
+//! declarations are left exactly as they are. The types are not wire types for
+//! this purpose: the three edges feed pure in-memory owner calls, and the only
+//! `Serialize`/`Deserialize` derives in the three donor crates annotate their
+//! own record types, not this module's signatures.
 
 #![forbid(unsafe_code)]
 
@@ -182,7 +229,7 @@ impl From<RevisionError> for ExperienceDriverError {
 /// Dreamer memory-revision consumer invocation: propose one advisory
 /// extinction candidate over admitted intake.
 ///
-/// Calls the released [`propose`](eliot_dreamer_memory_revision::propose)
+/// Calls the released `eliot_dreamer_memory_revision::propose`
 /// consumer with the edge-supplied owner intake (owner-neutral failure
 /// observation, revision evidence refs, admitted task/safety
 /// projections, frozen self-query/accepted-source refs, pose digest,
@@ -193,6 +240,10 @@ impl From<RevisionError> for ExperienceDriverError {
 /// the caller passes intake only when the trigger edge already holds
 /// every admitted member; nothing is synthesized from the quality
 /// event's bank/feedback envelopes.
+///
+/// Not reached from a run of this daemon. Its only call site is in
+/// `run_experience_quality_event_with_revision`, which has none; see this
+/// module's "Live status" section.
 pub fn propose_memory_extinction_candidate(
     intake: &RevisionIntake<'_>,
 ) -> Result<NegativeMemoryExtinctionCandidate, ExperienceDriverError> {
