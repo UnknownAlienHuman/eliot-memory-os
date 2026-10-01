@@ -21,7 +21,7 @@ use eliot_process::{DurableStreamLocatorKind, ProcessStreamKind};
 use eliot_testd_core::{
     AsyncProcessStreamSourceReadbackPort, ProcessStreamSourceReadbackFuture,
     ProcessStreamSourceReadbackObservation, ProcessStreamSourceReadbackRequest,
-    TestdEvidenceError, TestdStreamDisposition, sha256_hex,
+    TestdEvidenceError, TestdReplayOwnerReadback, TestdStreamDisposition, sha256_hex,
 };
 use crate::kernel_client::{KernelBlobStreamCallSequence, TestdIpcError};
 use serde::Serialize;
@@ -116,6 +116,7 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
         let mut readback_receipt_id: Option<String> = None;
         let mut observed_fence = None;
         let mut observed_at = None;
+        let mut replay_owner_readback: Option<TestdReplayOwnerReadback> = None;
 
         loop {
             let wire_request = KernelSourceRequest {
@@ -179,6 +180,8 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
             };
             let (
                 chunk,
+                whole_source_sha256,
+                whole_source_byte_length,
                 chunk_offset,
                 observed_sha256,
                 observed_byte_length,
@@ -187,6 +190,14 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
                 response_receipt,
                 response_fence,
                 observed_at_unix_ms,
+                owner_facts_json,
+                owner_facts_sha256,
+                module_catalog_owner_readback_json,
+                module_catalog_owner_readback_sha256,
+                generation_admission_json,
+                generation_admission_sha256,
+                process_source_admission_readback_json,
+                process_source_admission_readback_sha256,
             ) = match response {
                 BlobResponse::Ready {
                     bytes,
@@ -200,6 +211,14 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
                     readback_receipt_id,
                     observed_fence,
                     observed_at_unix_ms,
+                    owner_facts_json,
+                    owner_facts_sha256,
+                    module_catalog_owner_readback_json,
+                    module_catalog_owner_readback_sha256,
+                    generation_admission_json,
+                    generation_admission_sha256,
+                    process_source_admission_readback_json,
+                    process_source_admission_readback_sha256,
                 } => (
                     bytes,
                     whole_source_sha256,
@@ -212,6 +231,14 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
                     readback_receipt_id,
                     observed_fence,
                     observed_at_unix_ms,
+                    owner_facts_json,
+                    owner_facts_sha256,
+                    module_catalog_owner_readback_json,
+                    module_catalog_owner_readback_sha256,
+                    generation_admission_json,
+                    generation_admission_sha256,
+                    process_source_admission_readback_json,
+                    process_source_admission_readback_sha256,
                 ),
                 BlobResponse::Unknown => {
                     return Err(TestdEvidenceError::SourceUnknownOutcome {
@@ -249,6 +276,24 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
             {
                 return Err(integrity_error(stream));
             }
+            let current_owner_readback = TestdReplayOwnerReadback {
+                process_source_admission_readback_json,
+                process_source_admission_readback_sha256,
+                owner_facts_json,
+                owner_facts_sha256,
+                module_catalog_owner_readback_json,
+                module_catalog_owner_readback_sha256,
+                generation_admission_json,
+                generation_admission_sha256,
+            };
+            current_owner_readback.validate().map_err(|_| integrity_error(stream))?;
+            if replay_owner_readback
+                .as_ref()
+                .is_some_and(|existing| existing != &current_owner_readback)
+            {
+                return Err(integrity_error(stream));
+            }
+            replay_owner_readback = Some(current_owner_readback);
             owner_generation = Some(response_generation);
             readback_receipt_id = Some(response_receipt);
             observed_fence = Some(response_fence);
@@ -298,6 +343,9 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
                 monotonic_ns: None,
             },
             TestdStreamDisposition::CompleteSource,
+        )
+        .with_replay_owner_readback(
+            replay_owner_readback.ok_or_else(|| integrity_error(stream))?,
         ))
     }
 }

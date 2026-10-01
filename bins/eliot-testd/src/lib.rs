@@ -2489,12 +2489,13 @@ pub async fn drive_validated_dispatch_material_with_terminal_publisher(
     now_unix_ms: u64,
     client: &mut crate::kernel_client::KernelTestdIpcClient,
 ) -> Result<ValidatedDispatchDriveOutcome, TestdError> {
+    let replay = worker::KernelReadbackVerifiedReplay;
     drive_validated_dispatch_material_with_replay_port(
         material,
         source_root,
         now_unix_ms,
         client,
-        None,
+        Some(&replay),
     )
     .await
 }

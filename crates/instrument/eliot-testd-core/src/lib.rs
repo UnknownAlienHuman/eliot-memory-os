@@ -4282,7 +4282,7 @@ impl TestdStore {
         if let Some(existing) = &job.blob_process_stream_grant {
             if existing == &grant {
                 let head_key = blob_process_stream_token_head_key(job_id, &grant.capability_ref)?;
-                let heads = write
+                let mut heads = write
                     .open_table(BLOB_PROCESS_STREAM_TOKEN_HEADS)
                     .map_err(database)?;
                 if heads.get(head_key.as_str()).map_err(database)?.is_none() {
@@ -5988,7 +5988,8 @@ impl TestdStore {
             .into_iter()
             .filter(|candidate| {
                 !is_testd_executor_profile(&candidate.invocation.profile)
-                    || candidate.verifier_dispatch.is_some()
+                    || (candidate.verifier_dispatch.is_some()
+                        && candidate.blob_process_stream_grant.is_some())
             })
             .filter(|candidate| {
                 // A background job may not consume the capacity reserved for

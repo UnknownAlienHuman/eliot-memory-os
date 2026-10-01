@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 eliot-cli.workspace = true
 eliot-blob-api.workspace = true
+eliot-bootstrap.workspace = true
 eliot-contracts.workspace = true
 eliot-instrument-api.workspace = true
 eliot-instrument-runner = { path = "../../crates/instrument/eliot-instrument-runner" }
