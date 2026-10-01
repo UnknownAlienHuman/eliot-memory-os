@@ -23,9 +23,13 @@
 use eliot_contracts::{RequestMetadata, StateFence};
 use eliot_kernel_core::user_automation::{
     AutomationExecutionReference, AutomationOccurrenceIdentity, DstFoldPolicy, DstGapPolicy,
-    ScheduleKind, UserAutomationConfigurationState, UserAutomationDeferReason,
-    UserAutomationRevision, UserAutomationTrigger,
+    ScheduleKind, ScheduleNormalizationReceipt, UserAutomationConfigurationState,
+    UserAutomationDeferReason,
+    UserAutomationOperation, UserAutomationRevision, UserAutomationTrigger,
+    USER_AUTOMATION_LEGACY_MIGRATION_OPERATION_KIND,
+    USER_AUTOMATION_NORMALIZATION_OPERATION_KIND,
 };
+use eliot_receipts::ReceiptEnvelope;
 use eliot_runtime_contracts::WakeIntentState;
 use eliot_store_api::{OperationIdentity, WriteReceipt, WriteReceiptStatus};
 use schemars::JsonSchema;
@@ -104,6 +108,10 @@ pub enum UserAutomationOperatorResultRecovery {
 pub enum UserAutomationOperatorResultValue {
     /// Full canonical transition plus its deterministic inspection projection.
     Transition(Box<UserAutomationOperatorTransitionValue>),
+    /// Read-only authenticated context used to obtain a request-side fence witness.
+    Context(UserAutomationOperatorContextValue),
+    /// Owner-generated normalized immutable revision and its exact receipt bytes.
+    NormalizedSchedule(UserAutomationNormalizedScheduleValue),
     /// Typed refusal before the canonical Store was called.
     AttemptRefusal(Box<UserAutomationAttemptRefusalValue>),
     /// Proven absence in an owner readback.
@@ -139,6 +147,9 @@ impl<'de> Deserialize<'de> for UserAutomationOperatorResultValue {
         }
 
         let variant = match object.get("outcome").and_then(serde_json::Value::as_str) {
+            Some("context") => "context",
+            Some("schedule_normalized") => "schedule_normalized",
+            Some("legacy_schedule_migrated") => "legacy_schedule_migrated",
             Some("not_retained") => "not_retained",
             Some("unavailable") => "unavailable",
             Some("unknown_outcome") => "unknown_outcome",
@@ -154,6 +165,14 @@ impl<'de> Deserialize<'de> for UserAutomationOperatorResultValue {
         };
 
         match variant {
+            "context" => serde_json::from_value(value)
+                .map(Self::Context)
+                .map_err(D::Error::custom),
+            "schedule_normalized" | "legacy_schedule_migrated" => {
+                serde_json::from_value(value)
+                    .map(Self::NormalizedSchedule)
+                    .map_err(D::Error::custom)
+            }
             "transition" => serde_json::from_value(value)
                 .map(Box::new)
                 .map(Self::Transition)
@@ -181,6 +200,29 @@ impl<'de> Deserialize<'de> for UserAutomationOperatorResultValue {
             )),
         }
     }
+}
+
+/// Read-only value returned by the authenticated `get_context` handshake.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationOperatorContextValue {
+    /// Closed result discriminator.
+    pub outcome: String,
+    /// Exact authenticated live fence; duplicates the envelope field so the
+    /// caller can reject a structurally mismatched result.
+    pub state_fence: StateFence,
+}
+
+/// Owner normalization result returned before Create/Edit submission.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationNormalizedScheduleValue {
+    /// `schedule_normalized` or `legacy_schedule_migrated`.
+    pub outcome: String,
+    /// Exact immutable candidate revision containing the generated V4 keys.
+    pub revision: UserAutomationRevision,
+    /// Exact immutable receipt envelope retained by the later Create/Edit.
+    pub normalization_receipt_envelope: ReceiptEnvelope,
 }
 
 /// Versioned transition payload. The nested transition retains its own wire
@@ -366,6 +408,61 @@ impl UserAutomationOperatorResultEnvelope {
         Ok(envelope)
     }
 
+    /// Builds the read-only fence handshake response from the authenticated
+    /// request already admitted by the UserAutomation route.
+    pub fn from_context(request: &UserAutomationServiceRequest) -> Result<Self, String> {
+        if !matches!(&request.intent.operation, UserAutomationOperation::GetContext) {
+            return Err("get_context result was requested for another operation".to_owned());
+        }
+        let envelope = Self {
+            wire_id: USER_AUTOMATION_RESULT_WIRE_ID.to_owned(),
+            wire_version: USER_AUTOMATION_RESULT_WIRE_VERSION,
+            status: UserAutomationOperatorResultStatus::Known,
+            correlation: result_correlation(request),
+            state_fence: request.context.state_fence.clone(),
+            value: UserAutomationOperatorResultValue::Context(
+                UserAutomationOperatorContextValue {
+                    outcome: "context".to_owned(),
+                    state_fence: request.context.state_fence.clone(),
+                },
+            ),
+            recovery: None,
+        };
+        envelope.validate_for_request(request)?;
+        Ok(envelope)
+    }
+
+    /// Builds the read-only result returned by either owner normalization
+    /// operation. The exact receipt envelope is carried unchanged to Create/Edit.
+    pub fn from_normalized_schedule(
+        request: &UserAutomationServiceRequest,
+        revision: UserAutomationRevision,
+        normalization_receipt_envelope: ReceiptEnvelope,
+    ) -> Result<Self, String> {
+        let outcome = validate_normalization_result(
+            request,
+            &revision,
+            &normalization_receipt_envelope,
+        )?;
+        let envelope = Self {
+            wire_id: USER_AUTOMATION_RESULT_WIRE_ID.to_owned(),
+            wire_version: USER_AUTOMATION_RESULT_WIRE_VERSION,
+            status: UserAutomationOperatorResultStatus::Known,
+            correlation: result_correlation(request),
+            state_fence: request.context.state_fence.clone(),
+            value: UserAutomationOperatorResultValue::NormalizedSchedule(
+                UserAutomationNormalizedScheduleValue {
+                    outcome: outcome.to_owned(),
+                    revision,
+                    normalization_receipt_envelope,
+                },
+            ),
+            recovery: None,
+        };
+        envelope.validate_for_request(request)?;
+        Ok(envelope)
+    }
+
     /// Converts one legacy internal error projection into the same closed,
     /// versioned public envelope. Legacy JSON never crosses this boundary.
     pub fn bind_internal_response(
@@ -470,6 +567,30 @@ impl UserAutomationOperatorResultEnvelope {
                         "UserAutomation transition status/recovery does not join its phases"
                             .to_owned(),
                     );
+                }
+            }
+            UserAutomationOperatorResultValue::Context(value) => {
+                if self.status != UserAutomationOperatorResultStatus::Known
+                    || self.recovery.is_some()
+                    || value.outcome != "context"
+                    || value.state_fence != self.state_fence
+                    || !matches!(&request.intent.operation, UserAutomationOperation::GetContext)
+                {
+                    return Err("UserAutomation context result does not match its request".to_owned());
+                }
+            }
+            UserAutomationOperatorResultValue::NormalizedSchedule(value) => {
+                if self.status != UserAutomationOperatorResultStatus::Known || self.recovery.is_some()
+                {
+                    return Err("UserAutomation normalization result is unresolved".to_owned());
+                }
+                let expected_outcome = validate_normalization_result(
+                    request,
+                    &value.revision,
+                    &value.normalization_receipt_envelope,
+                )?;
+                if value.outcome != expected_outcome {
+                    return Err("UserAutomation normalization result outcome mismatches request".to_owned());
                 }
             }
             UserAutomationOperatorResultValue::AttemptRefusal(value) => {
@@ -658,6 +779,68 @@ fn result_correlation(request: &UserAutomationServiceRequest) -> UserAutomationR
     }
 }
 
+fn validate_normalization_result(
+    request: &UserAutomationServiceRequest,
+    revision: &UserAutomationRevision,
+    normalization_receipt_envelope: &ReceiptEnvelope,
+) -> Result<&'static str, String> {
+    let (draft, occurrence_count, outcome, operation_kind) = match &request.intent.operation {
+        UserAutomationOperation::NormalizeSchedule {
+            revision,
+            occurrence_count,
+        } => (
+            revision.as_ref(),
+            usize::from(*occurrence_count),
+            "schedule_normalized",
+            USER_AUTOMATION_NORMALIZATION_OPERATION_KIND,
+        ),
+        UserAutomationOperation::MigrateLegacySchedule {
+            revision,
+            occurrence_count,
+            ..
+        } => (
+            revision.as_ref(),
+            usize::from(*occurrence_count),
+            "legacy_schedule_migrated",
+            USER_AUTOMATION_LEGACY_MIGRATION_OPERATION_KIND,
+        ),
+        _ => return Err("normalization result was returned for another operation".to_owned()),
+    };
+
+    if revision.schedule.next_occurrences.len() != occurrence_count {
+        return Err("normalization result has an incomplete occurrence projection".to_owned());
+    }
+
+    let mut source_projection = revision.clone();
+    source_projection.schedule.next_occurrences.clear();
+    source_projection.schedule.normalization_receipt =
+        Box::new(ScheduleNormalizationReceipt::default());
+    if &source_projection != draft {
+        return Err("normalization result changed non-owner revision fields".to_owned());
+    }
+    revision.validate().map_err(|error| error.to_string())?;
+    revision
+        .schedule
+        .validate_normalization_receipt_envelope(
+            &revision.schedule.normalization_receipt,
+            normalization_receipt_envelope,
+            revision,
+        )
+        .map_err(|error| error.to_string())?;
+
+    let core = &normalization_receipt_envelope.core;
+    if core.operation.operation_kind != operation_kind
+        || core.operation.operation_id != request.identity.operation_id
+        || core.operation.idempotency_key != request.identity.idempotency_key
+        || core.operation.request_id != request.context.request_id
+        || core.request.metadata != request.context
+        || core.request.state_fence != request.context.state_fence
+    {
+        return Err("normalization receipt is not the original result for this request".to_owned());
+    }
+    Ok(outcome)
+}
+
 fn parse_result_value(
     value: serde_json::Value,
 ) -> Result<UserAutomationOperatorResultValue, String> {
@@ -679,6 +862,12 @@ fn parse_result_value(
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "UserAutomation outcome value has no closed discriminator".to_owned())?;
     match outcome {
+        "context" => serde_json::from_value(value)
+            .map(UserAutomationOperatorResultValue::Context)
+            .map_err(|_| "UserAutomation context result is not closed".to_owned()),
+        "schedule_normalized" | "legacy_schedule_migrated" => serde_json::from_value(value)
+            .map(UserAutomationOperatorResultValue::NormalizedSchedule)
+            .map_err(|_| "UserAutomation normalization result is not closed".to_owned()),
         "not_retained" => serde_json::from_value(value)
             .map(UserAutomationOperatorResultValue::NotRetained)
             .map_err(|_| "UserAutomation not-retained value is not closed".to_owned()),
