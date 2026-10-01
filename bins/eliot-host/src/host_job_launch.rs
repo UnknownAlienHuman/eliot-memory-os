@@ -47,39 +47,296 @@ use crate::launch_artifact::{
 };
 #[cfg(windows)]
 use crate::store_kernel_launch_sequence::{
-    StoreKernelLaunchError, StoreLivenessEvidence, launch_store_then_kernel,
+    StoreKernelLaunchError, StoreKernelLaunchIdentity, StoreLivenessEvidence,
+    launch_store_then_kernel,
 };
 
 // F-LOG-HOST-3 (#978) launch observation helpers.
 //
 // Through the #889 facade only
 // (`crate::host_diagnostics::observe_entrypoint_with_detail`,
-// `observe_terminal_error`); the Event Log seam stays typed-Unavailable
-// (`crate::windows_event_log::event_log_sink_status`), never implemented here
-// (#984 still open).
+// `observe_terminal_error`, `bound_field`); the Event Log seam stays
+// typed-Unavailable (`crate::windows_event_log::event_log_sink_status`), never
+// implemented here (#984 still open).
+//
+// Identity binding (audit #5910159678 defect 3): a static phase label can
+// classify a phase but cannot prove which owner operation, contour, or process
+// incarnation produced it, so concurrent and retried launch contours were
+// indistinguishable. Every record emitted from a site whose owner already holds
+// an identity now carries that identity through [`host_launch_observe_bound`]:
+// the installation, the Host authority epoch sequence, the approved
+// generation, the approved config/source digest, the approved artifact digest,
+// the Host-owned branch kill-domain Job name, and — where the platform has
+// already observed it — the process start identity (PID *and* creation time,
+// never a reusable PID alone). Nothing is probed, looked up, or re-derived to
+// fill a slot: the values are read from bindings the semantic owner already
+// holds at the emission site. A site that genuinely holds no identity keeps
+// the phase-only [`host_launch_observe`] record and says so in its own
+// comment; the enclosing identity-bound record correlates it.
+//
+// Never-logged (I15.4, I07.20): raw filesystem paths, image names, process
+// command lines, environment values, credential or nonce material, and
+// arbitrary `Debug`/`Display` of an error. The one exception is a digest or
+// opaque identity handle the owner already holds as an approved value; those
+// are identities, not secrets, and the issue requires them to be retained.
+//
+// This module also hosts the shared bounded identity-slot mechanism for the
+// #978 launch-side leaves (`scm_launch.rs`, `store_kernel_launch_sequence.rs`,
+// `kernel_activation_driver.rs`): the emission surface stays the single
+// `host_diagnostics` facade and the per-value bound stays the facade's own
+// `bound_field`, so this is a projection of owner-held values and not a second
+// observation scheme. A typed `HostLaunchIdentity` slot list on the shared
+// facade is the proper home for it and is reported to the manager rather than
+// added here, because the facade is owned by another writer this session.
 //
 // Observation-only contract: every helper projects facts already produced by
-// the semantic owner. Arguments are static literals only — never image names,
-// paths, digests, argv, env, handles, or arbitrary error text — so bounding
-// limits size, not sensitivity (I15.4). Sink outcome never alters
+// the semantic owner, so sink outcome never alters
 // result/order/count/handle/cleanup/timeout. There is no mutable global dedup
 // cache: one terminal emission per failed launch-owned operation is enforced
 // by the single outermost guard (`start_approved` owns `host-launch-failed`),
-// while inner phases correlate by stage order only. Typed rejections stay
+// while inner phases are subordinate records. Typed rejections stay
 // `HostError::ProcessContour`/`RecoveryRequired` (cases 978/2/978/3);
 // admitted launches are distinct from readiness (case 978/4 — admitted here
 // is never readiness, which stays with the readiness contour).
+
+/// Explicit marker for one identity the calling owner does not hold.
+///
+/// An unobtainable identity is reported as missing, never invented, defaulted,
+/// or implied by stage order (I07.20, I14.20).
+const LAUNCH_IDENTITY_UNAVAILABLE: &str = "unavailable";
+
+/// Preallocation for one rendered identity suffix; the facade's
+/// `bound_detail` remains the authority on the emitted bound.
+const LAUNCH_IDENTITY_CAPACITY: usize = 256;
+
+/// One bounded, non-secret identity slot in a launch-side record.
+///
+/// Deliberately small: a slot either carries a value the calling owner already
+/// holds, a non-secret counter/epoch/pid number, or the explicit
+/// [`LaunchIdentityField::Unavailable`] marker. There is no variant that could
+/// carry a path, a command line, an environment value, credential or nonce
+/// material, or an arbitrary error rendering.
+#[derive(Clone, Copy)]
+pub(super) enum LaunchIdentityField<'a> {
+    /// A non-secret identity handle or digest the calling owner holds in hand.
+    /// Bounded by the facade's own `bound_field`, never by a second local
+    /// limit.
+    Text(&'a str),
+    /// A non-secret numeric identity: epoch or generation sequence, PID,
+    /// process creation time, journal sequence, or evidence count.
+    Number(u64),
+    /// The calling owner holds no such identity at this site. Rendered
+    /// explicitly so the record can never be read as asserting a default.
+    Unavailable,
+}
+
+/// Renders one phase label plus its bounded identity suffix.
+///
+/// The label stays the first token so the frozen phase vocabulary remains
+/// greppable and every record still reads as `<phase> key=value ...`. Each
+/// value is bounded by `crate::host_diagnostics::bound_field` — the shared
+/// facade's own bounded-field helper, reused rather than reimplemented — and
+/// the composed string is bounded again by `bound_detail` inside
+/// `observe_entrypoint_with_detail`, so the facade's truncation honesty record
+/// covers the whole record. Callers pass at most a handful of slots, so the
+/// composed record stays far inside the facade's detail bound.
+pub(super) fn render_launch_identity(
+    label: &str,
+    fields: &[(&'static str, LaunchIdentityField<'_>)],
+) -> String {
+    let mut detail = String::with_capacity(LAUNCH_IDENTITY_CAPACITY);
+    detail.push_str(label);
+    for (key, field) in fields {
+        detail.push(' ');
+        detail.push_str(key);
+        detail.push('=');
+        match field {
+            LaunchIdentityField::Text(value) => {
+                detail.push_str(crate::host_diagnostics::bound_field(value).text());
+            }
+            LaunchIdentityField::Number(value) => {
+                detail.push_str(&value.to_string());
+            }
+            LaunchIdentityField::Unavailable => {
+                detail.push_str(LAUNCH_IDENTITY_UNAVAILABLE);
+            }
+        }
+    }
+    detail
+}
+
+/// The bounded, non-secret identity one physical launch contour's owner holds
+/// on entry to [`HostJobBranches::launch`].
+///
+/// Every field is a value the launch already carries as an approved binding:
+/// the installation identity and Host authority epoch from the
+/// [`HostInstallationEpoch`], the approved generation and the approved
+/// config/source and artifact digests, and the Host-owned branch kill-domain
+/// Job Object name that names this contour's containment. Nothing is inferred
+/// from a listener, an image, a port, or a stage position.
+#[cfg(windows)]
+struct LaunchContourIdentity<'a> {
+    installation: &'a str,
+    authority_epoch: u64,
+    generation: &'a str,
+    config_digest: &'a str,
+    artifact_digest: &'a str,
+    job: &'a str,
+}
+
+#[cfg(windows)]
+impl<'a> LaunchContourIdentity<'a> {
+    /// Slots every record from this launch contour carries: the six
+    /// owner-held identities above.
+    fn base(&self) -> [(&'static str, LaunchIdentityField<'a>); 6] {
+        [
+            ("installation", LaunchIdentityField::Text(self.installation)),
+            (
+                "authority_epoch",
+                LaunchIdentityField::Number(self.authority_epoch),
+            ),
+            ("generation", LaunchIdentityField::Text(self.generation)),
+            ("config_digest", LaunchIdentityField::Text(self.config_digest)),
+            (
+                "artifact_digest",
+                LaunchIdentityField::Text(self.artifact_digest),
+            ),
+            ("job", LaunchIdentityField::Text(self.job)),
+        ]
+    }
+
+    /// The base slots plus one already-rendered process start identity.
+    ///
+    /// The caller passes the `pid/creation-time` pair the platform owner has
+    /// already bound; this function never reads a process, never looks one up,
+    /// and marks the slot unavailable when the owner has not observed one.
+    fn with_process<'b>(
+        &'b self,
+        process: Option<&'b str>,
+    ) -> Vec<(&'static str, LaunchIdentityField<'b>)>
+    where
+        'a: 'b,
+    {
+        let mut fields = self.base().to_vec();
+        fields.push((
+            "process",
+            match process {
+                Some(process) => LaunchIdentityField::Text(process),
+                None => LaunchIdentityField::Unavailable,
+            },
+        ));
+        fields
+    }
+}
+
+/// The bounded, non-secret identity the approved two-branch start contour's
+/// owner holds on entry to [`HostJobBranches::start_approved`].
+///
+/// Same approved bindings as [`LaunchContourIdentity`], plus both branch
+/// artifact digests (the contour launches two images) and the authority fence
+/// copied from the approved handoff descriptor rather than derived here.
+#[cfg(windows)]
+struct LaunchStartIdentity<'a> {
+    installation: &'a str,
+    authority_epoch: u64,
+    generation: &'a str,
+    config_digest: &'a str,
+    kernel_artifact_digest: &'a str,
+    store_artifact_digest: &'a str,
+}
+
+#[cfg(windows)]
+impl<'a> LaunchStartIdentity<'a> {
+    fn base(&self) -> [(&'static str, LaunchIdentityField<'a>); 6] {
+        [
+            ("installation", LaunchIdentityField::Text(self.installation)),
+            (
+                "authority_epoch",
+                LaunchIdentityField::Number(self.authority_epoch),
+            ),
+            ("generation", LaunchIdentityField::Text(self.generation)),
+            ("config_digest", LaunchIdentityField::Text(self.config_digest)),
+            (
+                "kernel_artifact",
+                LaunchIdentityField::Text(self.kernel_artifact_digest),
+            ),
+            (
+                "store_artifact",
+                LaunchIdentityField::Text(self.store_artifact_digest),
+            ),
+        ]
+    }
+
+    /// The base slots plus both branch process start identities, each already
+    /// rendered by its owner as `pid/creation-time`.
+    fn with_processes<'b>(
+        &'b self,
+        store_process: Option<&'b str>,
+        kernel_process: Option<&'b str>,
+    ) -> Vec<(&'static str, LaunchIdentityField<'b>)>
+    where
+        'a: 'b,
+    {
+        let mut fields = self.base().to_vec();
+        fields.push((
+            "store_process",
+            match store_process {
+                Some(process) => LaunchIdentityField::Text(process),
+                None => LaunchIdentityField::Unavailable,
+            },
+        ));
+        fields.push((
+            "kernel_process",
+            match kernel_process {
+                Some(process) => LaunchIdentityField::Text(process),
+                None => LaunchIdentityField::Unavailable,
+            },
+        ));
+        fields
+    }
+}
+
+/// Renders one already-observed process start identity as `pid/creation-time`.
+///
+/// The pair is what distinguishes one process incarnation from a later process
+/// that reuses the same PID, so a record that carries only a PID cannot prove
+/// which incarnation produced it (case 978/5). The rendering is pure and total;
+/// it reads a value the platform owner has already bound and never opens,
+/// queries, or re-observes a process.
+#[cfg(windows)]
+fn render_process_start_identity(process: &eliot_platform_windows::ProcessIdentity) -> String {
+    format!("{}/{}", process.process_id, process.start_time_100ns)
+}
+
 #[cfg(windows)]
 fn host_launch_note_event_log_unavailable() {
     let _ = crate::windows_event_log::event_log_sink_status();
 }
 
+/// Phase-only record for a site that holds no owner identity.
+///
+/// Used only where the enclosing function's inputs are paths or process
+/// arguments, which are never logged; the identity-bound records of the
+/// enclosing contour correlate these phases.
 #[cfg(windows)]
 fn host_launch_observe(detail: &str) {
     host_launch_note_event_log_unavailable();
     crate::host_diagnostics::observe_entrypoint_with_detail(
         crate::host_diagnostics::EntrypointStage::Startup,
         detail,
+    );
+}
+
+/// Phase record bound to the identities the calling owner already holds.
+#[cfg(windows)]
+fn host_launch_observe_bound(
+    detail: &str,
+    fields: &[(&'static str, LaunchIdentityField<'_>)],
+) {
+    host_launch_note_event_log_unavailable();
+    crate::host_diagnostics::observe_entrypoint_with_detail(
+        crate::host_diagnostics::EntrypointStage::Startup,
+        &render_launch_identity(detail, fields),
     );
 }
 
@@ -133,6 +390,12 @@ impl Drop for HostLaunchTerminalGuard<'_> {
 /// lease verification stay with the caller: this check binds paths, not
 /// bytes. The future shared-executor adapter reuses this exact gate before
 /// resume; it never replaces it with a caller-supplied hash comparison.
+///
+/// Phase-only by construction: the only inputs are the executable and config
+/// locators and their approved path handles, and paths are never logged
+/// (I15.4). The enclosing `host.launch` records of the calling contour carry
+/// the installation, generation, digests, Job name, and observed process start
+/// identity that correlate these path-gate phases.
 #[cfg(windows)]
 fn approved_launch_paths(
     executable: &Path,
@@ -353,8 +616,44 @@ pub(super) fn ensure_store_endpoint_available_or_owned(
     retained_old_child_pid: Option<u32>,
     binding: &StoreEndpointOwnershipBinding<'_>,
 ) -> Result<(), HostError> {
+    // The approved endpoint ownership binding is the identity this site
+    // already holds: the installation that planned the endpoint, the managed
+    // generation that planned it, and the authority fence copied from the
+    // approved handoff descriptor. The planned socket address itself is a
+    // connection value and is never recorded.
+    let planned = [
+        (
+            "installation",
+            LaunchIdentityField::Text(binding.installation.as_str()),
+        ),
+        ("generation", LaunchIdentityField::Text(binding.generation.as_str())),
+        (
+            "authority_epoch",
+            LaunchIdentityField::Number(
+                binding.state_fence.authority_epoch.sequence.get(),
+            ),
+        ),
+        (
+            "resource_generation",
+            LaunchIdentityField::Number(binding.state_fence.resource_generation.value()),
+        ),
+    ];
+    // The same planned identity plus the owner PID the read actually observed,
+    // so two concurrent endpoint observations on one installation are
+    // distinguishable by which process each read saw.
+    let observed = |owner_process_id: u32| {
+        let mut fields = planned.to_vec();
+        fields.push((
+            "owner_process",
+            LaunchIdentityField::Number(u64::from(owner_process_id)),
+        ));
+        fields
+    };
     let endpoint = planned_store_endpoint(canonical_store_arguments).inspect_err(|_error| {
-        host_launch_observe("host.launch store endpoint configuration rejected");
+        host_launch_observe_bound(
+            "host.launch store endpoint configuration rejected",
+            &planned,
+        );
     })?;
 
     // Issue #1775: the directive records the operation this caller actually
@@ -378,7 +677,7 @@ pub(super) fn ensure_store_endpoint_available_or_owned(
     // reconnect caller refuses a zero PID before calling, so this fires only
     // on caller error, never on a genuine owned reconnect.
     if retained_old_child_pid == Some(0) {
-        host_launch_observe("host.launch retained child identity degenerate");
+        host_launch_observe_bound("host.launch retained child identity degenerate", &planned);
         return Err(HostError::ProcessContour(
             "retained owned child has no observable process identity".to_owned(),
         ));
@@ -393,7 +692,10 @@ pub(super) fn ensure_store_endpoint_available_or_owned(
         StoreEndpointObservation::Occupied {
             owner_process_id: 0,
         } => {
-            host_launch_observe("host.launch store endpoint owner unobservable");
+            host_launch_observe_bound(
+                "host.launch store endpoint owner unobservable",
+                &planned,
+            );
             Err(HostError::StoreEndpointOwnerUnreadable(format!(
                 "planned Store endpoint {endpoint} owner observation is not a real process; a corrupt read is not absence, so the start/reconnect defers until exact installation ownership is observable"
             )))
@@ -404,12 +706,20 @@ pub(super) fn ensure_store_endpoint_available_or_owned(
             // The caller proved this exact PID is the retained child of *this*
             // Job through committed predecessor binding, so the read agrees
             // with retained identity rather than contradicting it. It still
-            // grants no ownership beyond that retained child.
-            host_launch_observe("host.launch retained store endpoint owner observed");
+            // grants no ownership beyond that retained child. The observed
+            // owner PID is bound so two concurrent endpoint observations on
+            // one installation stay distinguishable.
+            host_launch_observe_bound(
+                "host.launch retained store endpoint owner observed",
+                &observed(owner_process_id),
+            );
             Ok(())
         }
         StoreEndpointObservation::Occupied { owner_process_id } => {
-            host_launch_observe("host.launch store endpoint collision observed");
+            host_launch_observe_bound(
+                "host.launch store endpoint collision observed",
+                &observed(owner_process_id),
+            );
             // #1775: the real detector now produces the typed directive from an
             // actual observation, not a prose string. `origin` is deliberately
             // `Unknown`: a listener PID on the planned endpoint proves
@@ -433,7 +743,7 @@ pub(super) fn ensure_store_endpoint_available_or_owned(
             )))
         }
         StoreEndpointObservation::Absent => {
-            host_launch_observe("host.launch store endpoint free");
+            host_launch_observe_bound("host.launch store endpoint free", &planned);
             Ok(())
         }
         StoreEndpointObservation::Unreadable { reason } => {
@@ -441,8 +751,12 @@ pub(super) fn ensure_store_endpoint_available_or_owned(
             // ANSWER. I3.3 requires verifying the owning lineage "before every
             // start/reconnect"; an unreadable owner leaves that unverified, so
             // the launch DEFERS rather than proceeding on a clean-absence
-            // reading that was never established.
-            host_launch_observe("host.launch store endpoint owner unreadable");
+            // reading that was never established. The provider's own reason
+            // text stays with the typed error and never enters a record.
+            host_launch_observe_bound(
+                "host.launch store endpoint owner unreadable",
+                &planned,
+            );
             Err(HostError::StoreEndpointOwnerUnreadable(format!(
                 "planned Store endpoint {endpoint} owner could not be read ({reason}); a failed read is not absence, so the start/reconnect defers until exact installation ownership is observable"
             )))
@@ -550,6 +864,12 @@ fn store_endpoint_collision_directive(
 /// empty path fails closed, never defaulted. An already-injected contour
 /// or a missing doctor digest also fails closed instead of replacing live
 /// authority.
+///
+/// Phase-only by construction: the only inputs here are the sealed contour
+/// (process arguments) and the Doctor executable path, and both are never
+/// logged (I15.4). The enclosing `host.launch` records of the calling contour
+/// carry the installation, generation, digests, Job name, and observed process
+/// start identity that correlate these anchor phases.
 #[cfg(windows)]
 pub(super) fn kernel_arguments_with_doctor_anchor(
     kernel_arguments: &[PlatformHandle],
@@ -643,12 +963,27 @@ impl HostJobBranches {
         installation_profile: Option<InstallationProfile>,
         profile_root_binding: Option<(&ProfileRootRequest, &ProfileSelectionReceipt)>,
     ) -> Result<RunningJobChild<PlatformHandle>, HostError> {
+        // The identity this contour's owner already holds on entry: the
+        // installation and Host authority epoch from the installation epoch,
+        // the approved generation and the approved config/source and artifact
+        // digests, and the Host-owned branch kill-domain Job Object name. Every
+        // record below binds these, so a Store launch, a Kernel launch, a
+        // relaunch, and a retried generation produce distinguishable records
+        // instead of one static label per phase.
+        let contour = LaunchContourIdentity {
+            installation: host.installation.as_str(),
+            authority_epoch: host.epoch.current.sequence.get(),
+            generation: generation.as_str(),
+            config_digest: config_digest.as_str(),
+            artifact_digest: artifact.as_str(),
+            job: identity.name(),
+        };
         // WORK_UNIT_CASE: 978/1 — launch requested, distinct from process/readiness.
         // WORK_UNIT_CASE: 978/4 — request precedes process identity and admitted launch.
-        host_launch_observe("host.launch requested");
+        host_launch_observe_bound("host.launch requested", &contour.base());
         if executable_lease.path() != executable || config_lease.path() != config_path {
             // WORK_UNIT_CASE: 978/3 — substitution preserved, retained identity only.
-            host_launch_observe("host.launch substitution preserved");
+            host_launch_observe_bound("host.launch substitution preserved", &contour.base());
             return Err(HostError::ProcessContour(
                 "launch locator is not bound to its retained protected file".to_owned(),
             ));
@@ -671,7 +1006,7 @@ impl HostJobBranches {
             })?;
         }
         // WORK_UNIT_CASE: 978/3 — retained lease bound, distinct from image name below.
-        host_launch_observe("host.launch retained lease bound");
+        host_launch_observe_bound("host.launch retained lease bound", &contour.base());
         approved_launch_paths(
             executable,
             approved_executable_path,
@@ -680,12 +1015,12 @@ impl HostJobBranches {
         )?;
         executable_lease.verify().map_err(|error| {
             // WORK_UNIT_CASE: 978/3 — substitution preserved, retained identity only.
-            host_launch_observe("host.launch substitution preserved");
+            host_launch_observe_bound("host.launch substitution preserved", &contour.base());
             HostError::ProcessContour(error)
         })?;
         config_lease.verify().map_err(|error| {
             // WORK_UNIT_CASE: 978/3 — substitution preserved, retained identity only.
-            host_launch_observe("host.launch substitution preserved");
+            host_launch_observe_bound("host.launch substitution preserved", &contour.base());
             HostError::ProcessContour(error)
         })?;
         match executable_lease {
@@ -698,7 +1033,7 @@ impl HostJobBranches {
         }
         .map_err(|error| {
             // WORK_UNIT_CASE: 978/3 — substitution preserved, retained identity only.
-            host_launch_observe("host.launch substitution preserved");
+            host_launch_observe_bound("host.launch substitution preserved", &contour.base());
             HostError::ProcessContour(error.to_string())
         })?;
         match config_lease {
@@ -711,7 +1046,7 @@ impl HostJobBranches {
         }
         .map_err(|error| {
             // WORK_UNIT_CASE: 978/3 — substitution preserved, retained identity only.
-            host_launch_observe("host.launch substitution preserved");
+            host_launch_observe_bound("host.launch substitution preserved", &contour.base());
             HostError::ProcessContour(error.to_string())
         })?;
         let mut environment = Self::environment(
@@ -806,7 +1141,7 @@ impl HostJobBranches {
         )
         .map_err(|error| {
             // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
-            host_launch_observe("host.launch typed rejection");
+            host_launch_observe_bound("host.launch typed rejection", &contour.base());
             HostError::ProcessContour(error.to_string())
         })?;
         // Issue #1888: this branch starts in its own Host-owned outer Job Object.
@@ -822,7 +1157,7 @@ impl HostJobBranches {
         // launch must not invent one.
         if !identity.is_host_outer_kill_domain_name() {
             // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
-            host_launch_observe("host.launch typed rejection");
+            host_launch_observe_bound("host.launch typed rejection", &contour.base());
             return Err(HostError::ProcessContour(
                 "branch Job Object is not a Host-owned outer kill domain".to_owned(),
             ));
@@ -840,7 +1175,7 @@ impl HostJobBranches {
         )
         .map_err(|error| {
             // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
-            host_launch_observe("host.launch typed rejection");
+            host_launch_observe_bound("host.launch typed rejection", &contour.base());
             HostError::ProcessContour(error.to_string())
         })?;
         let expected = executable;
@@ -856,7 +1191,7 @@ impl HostJobBranches {
                 // dependent resume below.
                 if evidence.job_identity() != identity {
                     // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
-                    host_launch_observe("host.launch typed rejection");
+                    host_launch_observe_bound("host.launch typed rejection", &contour.base());
                     return Err(
                         "suspended child is not contained in the approved branch Job".to_owned(),
                     );
@@ -878,18 +1213,31 @@ impl HostJobBranches {
                 // later ownership checks.
                 let observed_identity = evidence.process();
                 if observed_identity.process_id == 0 || observed_identity.start_time_100ns == 0 {
-                    host_launch_observe("host.launch process identity unobservable");
+                    host_launch_observe_bound(
+                        "host.launch process identity unobservable",
+                        &contour.base(),
+                    );
                     return Err(
                         "suspended child has no observable process identity before resume"
                             .to_owned(),
                     );
                 }
+                // The platform owner has already bound this child's exact
+                // process start identity (PID *and* creation time) on the
+                // retained evidence, so every pre-resume record below binds
+                // that pair. This is what distinguishes this process
+                // incarnation from a later process reusing the same PID; the
+                // image path itself stays out of the record.
+                let process_start = render_process_start_identity(observed_identity);
                 let observed = std::fs::canonicalize(&evidence.process().image_path)
                     .map_err(|error| error.to_string())?;
                 if observed != expected {
                     // WORK_UNIT_CASE: 978/3 — image identity preserved, distinct from retained path.
                     // WORK_UNIT_CASE: 978/4 — process identity distinct from launch request.
-                    host_launch_observe("host.launch image identity preserved");
+                    host_launch_observe_bound(
+                        "host.launch image identity preserved",
+                        &contour.with_process(Some(&process_start)),
+                    );
                     return Err("approved image identity changed before resume".to_owned());
                 }
                 let observed_executable =
@@ -901,7 +1249,10 @@ impl HostJobBranches {
                     || approved_executable_canonical != observed_executable
                 {
                     // WORK_UNIT_CASE: 978/3 — substitution preserved, retained identity only.
-                    host_launch_observe("host.launch substitution preserved");
+                    host_launch_observe_bound(
+                        "host.launch substitution preserved",
+                        &contour.with_process(Some(&process_start)),
+                    );
                     return Err("approved image path changed before resume".to_owned());
                 }
                 executable_lease.verify()?;
@@ -921,7 +1272,10 @@ impl HostJobBranches {
                         .map_err(|error| error.to_string())?;
                 if observed_config != config_path || approved_config_canonical != observed_config {
                     // WORK_UNIT_CASE: 978/3 — substitution preserved, retained identity only.
-                    host_launch_observe("host.launch substitution preserved");
+                    host_launch_observe_bound(
+                        "host.launch substitution preserved",
+                        &contour.with_process(Some(&process_start)),
+                    );
                     return Err("approved config path changed before resume".to_owned());
                 }
                 config_lease.verify()?;
@@ -938,18 +1292,30 @@ impl HostJobBranches {
             })
             .map_err(|error| {
                 // WORK_UNIT_CASE: 978/3 — substitution preserved, retained identity only.
-                host_launch_observe("host.launch substitution preserved");
+                // The validator's own error text stays inside the typed error;
+                // the record binds only the contour identity.
+                host_launch_observe_bound("host.launch substitution preserved", &contour.base());
                 HostError::ProcessContour(format!("validation failed: {error:?}"))
             })?;
+        // The validated child carries the same platform-observed process start
+        // identity the validator checked, so the admitted records bind the
+        // actual incarnation rather than a request.
+        let admitted_process = render_process_start_identity(validated.evidence().process());
         // WORK_UNIT_CASE: 978/4 — image identity admitted, distinct from request and readiness.
-        host_launch_observe("host.launch image identity admitted");
+        host_launch_observe_bound(
+            "host.launch image identity admitted",
+            &contour.with_process(Some(&admitted_process)),
+        );
         let running = validated.resume().map_err(|error| {
             // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
-            host_launch_observe("host.launch typed rejection");
+            host_launch_observe_bound("host.launch typed rejection", &contour.base());
             HostError::ProcessContour(error.to_string())
         })?;
         // WORK_UNIT_CASE: 978/1 — launch admitted, distinct from rejection; admitted is never readiness.
-        host_launch_observe("host.launch admitted");
+        host_launch_observe_bound(
+            "host.launch admitted",
+            &contour.with_process(Some(&admitted_process)),
+        );
         Ok(running)
     }
 
@@ -959,11 +1325,34 @@ impl HostJobBranches {
         portable_root: Option<&UserOwnedRootLease>,
         config_path: &Path,
     ) -> Result<(PathBuf, PathBuf), HostError> {
+        // The approved launch descriptor is the identity this site holds: the
+        // installation identity and epoch sequence, the approved generation,
+        // and the authority epoch copied from the approved handoff descriptor.
+        // The resolved directories themselves are paths and never enter a
+        // record.
+        let identity = [
+            (
+                "installation",
+                LaunchIdentityField::Text(launch.installation_epoch.installation.as_str()),
+            ),
+            (
+                "installation_epoch",
+                LaunchIdentityField::Number(launch.installation_epoch.sequence),
+            ),
+            (
+                "generation",
+                LaunchIdentityField::Text(launch.generation.as_str()),
+            ),
+            (
+                "authority_epoch",
+                LaunchIdentityField::Number(launch.authority_state_fence.authority_epoch.sequence.get()),
+            ),
+        ];
         // WORK_UNIT_CASE: 978/1 — working directories requested.
-        host_launch_observe("host.launch working directories requested");
+        host_launch_observe_bound("host.launch working directories requested", &identity);
         if launch.profile != InstallationProfile::PortableDev {
             // WORK_UNIT_CASE: 978/1 — working directories admitted.
-            host_launch_observe("host.launch working directories admitted");
+            host_launch_observe_bound("host.launch working directories admitted", &identity);
             return Ok((
                 PathBuf::from(launch.runtime_state_roots.kernel_work_root.as_str()),
                 PathBuf::from(launch.runtime_state_roots.store_work_root.as_str()),
@@ -972,23 +1361,26 @@ impl HostJobBranches {
         let root = portable_root
             .ok_or_else(|| {
                 // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
-                host_launch_observe("host.launch working directory typed rejection");
+                host_launch_observe_bound(
+                    "host.launch working directory typed rejection",
+                    &identity,
+                );
                 HostError::ProcessContour("portable root lease is missing".to_owned())
             })?
             .path();
         let root = std::fs::canonicalize(root).map_err(|error| {
             // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
-            host_launch_observe("host.launch working directory typed rejection");
+            host_launch_observe_bound("host.launch working directory typed rejection", &identity);
             HostError::ProcessContour(error.to_string())
         })?;
         let config_path = std::fs::canonicalize(config_path).map_err(|error| {
             // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
-            host_launch_observe("host.launch working directory typed rejection");
+            host_launch_observe_bound("host.launch working directory typed rejection", &identity);
             HostError::ProcessContour(error.to_string())
         })?;
         if !config_path.starts_with(&root) {
             // WORK_UNIT_CASE: 978/3 — substitution preserved, retained identity only.
-            host_launch_observe("host.launch substitution preserved");
+            host_launch_observe_bound("host.launch substitution preserved", &identity);
             return Err(HostError::ProcessContour(
                 "portable launch config is outside the retained root".to_owned(),
             ));
@@ -997,12 +1389,15 @@ impl HostJobBranches {
             let working_directory =
                 std::fs::canonicalize(Path::new(path.as_str())).map_err(|error| {
                     // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
-                    host_launch_observe("host.launch working directory typed rejection");
+                    host_launch_observe_bound(
+                        "host.launch working directory typed rejection",
+                        &identity,
+                    );
                     HostError::ProcessContour(error.to_string())
                 })?;
             if !working_directory.starts_with(&root) {
                 // WORK_UNIT_CASE: 978/3 — substitution preserved, retained identity only.
-                host_launch_observe("host.launch substitution preserved");
+                host_launch_observe_bound("host.launch substitution preserved", &identity);
                 return Err(HostError::ProcessContour(format!(
                     "portable {field} is outside the retained root"
                 )));
@@ -1021,7 +1416,7 @@ impl HostJobBranches {
         ));
         if result.is_ok() {
             // WORK_UNIT_CASE: 978/1 — working directories admitted.
-            host_launch_observe("host.launch working directories admitted");
+            host_launch_observe_bound("host.launch working directories admitted", &identity);
         }
         result
     }
@@ -1054,8 +1449,29 @@ impl HostJobBranches {
     ) -> Result<&Path, HostError> {
         let root = Path::new(launch.runtime_state_roots.watchdog_state_root.as_str());
         if !root.is_dir() {
-            // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
-            host_launch_observe("host.launch typed rejection");
+            // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted. The
+            // approved descriptor's installation identity, epoch sequence, and
+            // generation are bound; the anchor root itself is a path and stays
+            // out of the record.
+            host_launch_observe_bound(
+                "host.launch typed rejection",
+                &[
+                    (
+                        "installation",
+                        LaunchIdentityField::Text(
+                            launch.installation_epoch.installation.as_str(),
+                        ),
+                    ),
+                    (
+                        "installation_epoch",
+                        LaunchIdentityField::Number(launch.installation_epoch.sequence),
+                    ),
+                    (
+                        "generation",
+                        LaunchIdentityField::Text(launch.generation.as_str()),
+                    ),
+                ],
+            );
             return Err(HostError::ProcessContour(
                 "installer-owned Watchdog state root is not an existing directory".to_owned(),
             ));
@@ -1091,20 +1507,35 @@ impl HostJobBranches {
         host: &HostInstallationEpoch,
         launch: &RuntimeLaunchDescriptor,
     ) -> Result<(), HostError> {
+        // The identity this two-branch start contour's owner holds on entry:
+        // the installation identity and Host authority epoch from the
+        // installation epoch, the approved generation, the approved
+        // config/source digest, and both approved branch artifact digests. Each
+        // record below binds these, so a fresh start, a retried start, and a
+        // start of a different approved generation on the same installation
+        // stay distinguishable.
+        let start = LaunchStartIdentity {
+            installation: host.installation.as_str(),
+            authority_epoch: host.epoch.current.sequence.get(),
+            generation: generation.as_str(),
+            config_digest: config_digest.as_str(),
+            kernel_artifact_digest: kernel_artifact.as_str(),
+            store_artifact_digest: store_artifact.as_str(),
+        };
         // WORK_UNIT_CASE: 978/1 — start requested, outermost contour owns the single terminal.
         // WORK_UNIT_CASE: 978/4 — request distinct from process identity and readiness; admitted is never ready.
-        host_launch_observe("host.launch start requested");
+        host_launch_observe_bound("host.launch start requested", &start.base());
         let mut launch_terminal = HostLaunchTerminalGuard::armed("host-launch-failed");
         if self.kernel.is_some() || self.store.is_some() {
             // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
-            host_launch_observe("host.launch typed rejection");
+            host_launch_observe_bound("host.launch typed rejection", &start.base());
             return Err(HostError::ProcessContour(
                 "approved contour is already running".to_owned(),
             ));
         }
         launch.require_phase_b_live().map_err(|error| {
             // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
-            host_launch_observe("host.launch typed rejection");
+            host_launch_observe_bound("host.launch typed rejection", &start.base());
             HostError::RecoveryRequired(error.to_string())
         })?;
         launch
@@ -1112,14 +1543,14 @@ impl HostJobBranches {
                 &PlatformHandle::new(config_path.to_string_lossy().into_owned()).map_err(
                     |error| {
                         // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
-                        host_launch_observe("host.launch typed rejection");
+                        host_launch_observe_bound("host.launch typed rejection", &start.base());
                         HostError::ProcessContour(error.to_string())
                     },
                 )?,
             )
             .map_err(|error| {
                 // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
-                host_launch_observe("host.launch typed rejection");
+                host_launch_observe_bound("host.launch typed rejection", &start.base());
                 HostError::ProcessContour(error.to_string())
             })?;
         let profile_root_binding = if matches!(
@@ -1130,7 +1561,10 @@ impl HostJobBranches {
             let leases =
                 eliot_platform_windows::profile_supervision::open_profile_root_leases(&request)
                     .map_err(|error| {
-                        host_launch_observe("host.launch profile roots rejected");
+                        host_launch_observe_bound(
+                            "host.launch profile roots rejected",
+                            &start.base(),
+                        );
                         HostError::ProcessContour(format!(
                             "profile-governed roots could not be retained: {error}"
                         ))
@@ -1146,14 +1580,14 @@ impl HostJobBranches {
                     .as_ref()
                     .ok_or_else(|| {
                         // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
-                        host_launch_observe("host.launch typed rejection");
+                        host_launch_observe_bound("host.launch typed rejection", &start.base());
                         HostError::ProcessContour("portable root is missing".to_owned())
                     })?
                     .as_str(),
             );
             Some(UserOwnedRootLease::open_existing(&root).map_err(|error| {
                 // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
-                host_launch_observe("host.launch typed rejection");
+                host_launch_observe_bound("host.launch typed rejection", &start.base());
                 HostError::ProcessContour(error.to_string())
             })?)
         } else {
@@ -1272,7 +1706,19 @@ impl HostJobBranches {
                 state_fence: &launch.authority_state_fence,
             },
         )?;
+        // The Store-before-Kernel leaf holds no identity of its own, so the
+        // approved bindings this contour already holds are handed to it and
+        // projected on each of its phase records.
+        let sequence_identity = StoreKernelLaunchIdentity::new(
+            host.installation.as_str(),
+            host.epoch.current.sequence.get(),
+            generation.as_str(),
+            config_digest.as_str(),
+            store_artifact.as_str(),
+            kernel_artifact.as_str(),
+        );
         let launch_result = launch_store_then_kernel(
+            &sequence_identity,
             || {
                 Self::launch(
                     &store_bridge_executable,
@@ -1305,6 +1751,13 @@ impl HostJobBranches {
                         "Store process is not an exact member of its approved Job".to_owned(),
                     ));
                 }
+                // The retained child evidence already carries this child's exact
+                // process start identity (PID and creation time), and this
+                // closure has just compared that very value against the live Job
+                // membership. Recording it here binds the Store-before-Kernel
+                // barrier record to the exact incarnation that passed, instead
+                // of to a stage position. No new probe or lookup is performed.
+                sequence_identity.set_store_process(render_process_start_identity(process));
                 match store.observe() {
                     Ok(eliot_platform_windows::RunningJobObservation::Running {
                         active_processes,
@@ -1359,6 +1812,16 @@ impl HostJobBranches {
         );
         match launch_result {
             Ok((store, kernel)) => {
+                // Both retained children carry the exact process start identity
+                // their own launch validated before resume, and this site holds
+                // both, so the admitted record names the two real process
+                // incarnations rather than asserting liveness from a stage
+                // position. The values are read from the retained evidence
+                // already in hand; no probe or lookup is performed. They are
+                // rendered before the children move into `self` because the
+                // evidence travels with the child.
+                let store_process = render_process_start_identity(store.evidence().process());
+                let kernel_process = render_process_start_identity(kernel.evidence().process());
                 self.kernel_executable = Some(kernel_executable);
                 self.store_bridge_executable = Some(store_bridge_executable);
                 self.kernel_lease = Some(kernel_lease);
@@ -1393,7 +1856,10 @@ impl HostJobBranches {
                 match kernel_live {
                     Ok(()) => {
                         // WORK_UNIT_CASE: 978/1 — start admitted, distinct from rejection; admitted is never readiness.
-                        host_launch_observe("host.launch start admitted");
+                        host_launch_observe_bound(
+                            "host.launch start admitted",
+                            &start.with_processes(Some(&store_process), Some(&kernel_process)),
+                        );
                         launch_terminal.disarm();
                         Ok(())
                     }
