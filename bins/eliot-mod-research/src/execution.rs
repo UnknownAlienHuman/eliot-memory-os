@@ -1220,10 +1220,7 @@ mod tests {
                     fence,
                     BTreeMap::from([
                         ("research-dispatch".to_owned(), DIGEST_A.to_owned()),
-                        (
-                            "research-submit-binding".to_owned(),
-                            DIGEST_B.to_owned(),
-                        ),
+                        ("research-submit-binding".to_owned(), DIGEST_B.to_owned()),
                     ]),
                     100,
                     10_000,
