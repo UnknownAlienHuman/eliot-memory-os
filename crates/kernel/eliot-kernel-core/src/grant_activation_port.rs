@@ -2836,6 +2836,12 @@ impl GrantActivationPort {
                 reason: "the presented closure disagrees with the owner enumeration",
             });
         }
+        let closure_anchor = closure_anchor_grant(&request.enumeration)?;
+        validate_complete_owner_closure(
+            boundary,
+            &closure_anchor,
+            &request.enumeration,
+        )?;
         check_revision(
             &ledger,
             &request.enumeration.authority_root_ref,
@@ -3134,6 +3140,12 @@ impl GrantActivationPort {
                     .to_owned(),
             ));
         }
+        let closure_anchor = closure_anchor_grant(&request.enumeration)?;
+        validate_complete_owner_closure(
+            boundary,
+            &closure_anchor,
+            &request.enumeration,
+        )?;
         // I12.20 revocation fan-out (issue #1732): propagate durable
         // revocation into recovery before any durable write. The re-presented
         // affected set must carry no revoked support: the live revoked
@@ -4276,9 +4288,8 @@ fn closure_affected_set(enumeration: &GrantClosureEnumeration) -> Vec<String> {
 /// derives a fence set from process-local state.
 fn validate_complete_owner_closure(
     boundary: &DurableRootGrantBoundary,
-    request: &GrantClosureRevocationIntent,
+    target_grant_id: &str,
     enumeration: &GrantClosureEnumeration,
-    affected: &BTreeSet<&str>,
 ) -> Result<(), KernelError> {
     let hydrations = boundary
         .hydration
@@ -4299,6 +4310,8 @@ fn validate_complete_owner_closure(
         }
     }
 
+    let affected = closure_affected_set(enumeration);
+    let affected = affected.iter().map(String::as_str).collect::<BTreeSet<_>>();
     let preserved = enumeration
         .preserved
         .iter()
@@ -4310,11 +4323,9 @@ fn validate_complete_owner_closure(
                 "closure member is absent from the complete owner grant inventory".to_owned(),
             )
         })?;
-        if owner_member.intent.authority_root_ref != member.intent.authority_root_ref
-            || owner_member.intent.parent_grant_id != member.intent.parent_grant_id
-        {
+        if owner_member != member {
             return Err(KernelError::RecoveryUnavailable(
-                "closure member root or parent disagrees with its owner grant inventory".to_owned(),
+                "closure member disagrees with the complete owner grant inventory".to_owned(),
             ));
         }
     }
@@ -4324,11 +4335,18 @@ fn validate_complete_owner_closure(
                 "declared survivor is absent from the complete owner grant inventory".to_owned(),
             )
         })?;
-        if owner_member.intent.authority_root_ref != request.authority_root_ref {
+        if owner_member.intent.authority_root_ref != enumeration.authority_root_ref {
             return Err(KernelError::RecoveryUnavailable(
                 "declared survivor disagrees with the owner lineage root".to_owned(),
             ));
         }
+    }
+
+    if closure_anchor_grant(enumeration)? != target_grant_id {
+        return Err(KernelError::InvalidField {
+            field: "grant_id",
+            reason: "the complete owner closure is rooted at a different grant",
+        });
     }
 
     // Walk owner-admitted parent links only as a consistency check. The
@@ -4342,8 +4360,8 @@ fn validate_complete_owner_closure(
                     "owner grant inventory contains a parent cycle".to_owned(),
                 ));
             }
-            if cursor == request.grant_id {
-                if hydration.intent.authority_root_ref != request.authority_root_ref {
+            if cursor == target_grant_id {
+                if hydration.intent.authority_root_ref != enumeration.authority_root_ref {
                     return Err(KernelError::RecoveryUnavailable(
                         "cross-root descendant cannot be fenced by this closure".to_owned(),
                     ));
@@ -4352,6 +4370,12 @@ fn validate_complete_owner_closure(
                     return Err(KernelError::InvalidField {
                         field: "enumeration.members",
                         reason: "the owner closure omits an admitted descendant",
+                    });
+                }
+                if hydration.intent.grant_graph_revision != enumeration.grant_graph_revision {
+                    return Err(KernelError::InvalidField {
+                        field: "grant_graph_revision",
+                        reason: "an admitted descendant disagrees with the owner closure revision",
                     });
                 }
                 break;
@@ -4766,8 +4790,7 @@ fn derive_closure_fence(
         )?;
     }
     let affected = closure_affected_set(enumeration);
-    let affected_set: BTreeSet<&str> = affected.iter().map(String::as_str).collect();
-    validate_complete_owner_closure(boundary, request, enumeration, &affected_set)?;
+    validate_complete_owner_closure(boundary, &request.grant_id, enumeration)?;
     // Preserved-survivor membership (`#2100` C73-F1): every declared
     // survivor must prove covering authority at the current revision and
     // fence. A declaration from an older revision is never carried
@@ -9272,6 +9295,65 @@ pub(crate) mod tests {
                 "rejected enumeration must not commit ORS rows"
             );
         }
+
+        drop(port);
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn closure_activation_and_recovery_reject_omitted_owner_descendants()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::Arc;
+
+        let epoch = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 7)?;
+        let binding = restart_test_binding(&epoch)?;
+        let complete = chain_enumeration(&epoch, &binding, 5, Vec::new())?;
+        let path = std::env::temp_dir().join(format!(
+            "eliot-kernel-grant-closure-activation-incomplete-owner-{}-{}.redb",
+            std::process::id(),
+            epoch.sequence
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(eliot_ors::RedbRecoveryStore::open(&path)?);
+        let hydration_source = Arc::new(TestClosureHydration::new(complete.clone()));
+        let port = GrantActivationPort::with_durable_root_grant(
+            hydration_source.clone(),
+            store.clone(),
+        );
+
+        // The owner enumeration is structurally valid and agrees with what
+        // the owner returns for the requested activation. Its independent
+        // admitted inventory still contains the omitted descendants.
+        let mut incomplete = complete;
+        incomplete.members.truncate(1);
+        hydration_source.replace(incomplete.clone());
+        let request = GrantClosureActivationIntent {
+            operation_id: "op-incomplete-owner-activation".to_owned(),
+            enumeration: incomplete,
+        };
+        assert!(matches!(
+            port.activate_grant_closure(&request, &epoch),
+            Err(KernelError::InvalidField {
+                field: "enumeration.members",
+                reason: "the owner closure omits an admitted descendant",
+            })
+        ));
+        assert!(matches!(
+            port.recover_grant_closure_activation(&request, &epoch, 1_000),
+            Err(KernelError::InvalidField {
+                field: "enumeration.members",
+                reason: "the owner closure omits an admitted descendant",
+            })
+        ));
+
+        let root_subject =
+            eliot_ors::OperationIdentity::new("grant-chain-root").map_err(KernelError::RecoveryState)?;
+        let closure_operation = eliot_ors::OperationIdentity::new(&request.operation_id)?;
+        assert!(store.load_capability_grant(&root_subject)?.is_none());
+        assert!(store.load_grant_closure(&closure_operation)?.is_none());
+        assert!(port.committed_activation("grant-chain-root").is_none());
 
         drop(port);
         drop(store);
