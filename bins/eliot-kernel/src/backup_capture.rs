@@ -1087,20 +1087,26 @@ impl KernelBackupCapture {
     /// fail-closed direction: the row is then staged with no grant at all and
     /// every reconciliation of it is refused, rather than one being authorized
     /// by a value this owner could not actually draw.
-    #[allow(
-        clippy::unused_self,
-        reason = "governed owner seam keeps &self receivers; the work root binds composition"
-    )]
     pub fn issue_succession_grant(
+        &self,
         scope_id: &str,
         caller: &CaptureCallerAuth,
         kernel_fence: &StateFence,
     ) -> Result<eliot_ors::BackupVerifySuccessionGrant, KernelCaptureError> {
+        // The grant is issued BY this owner, so the owner's own work root is
+        // bound into the grant identifier. That is what makes the grant
+        // owner-issued rather than a value the caller could have presented: a
+        // caller replaying the same bundle under the same key on another
+        // installation cannot reproduce this owner's material.
+        let owner_work_root = self.work_root.to_string_lossy();
         let Ok(nonce) = fresh_activation_nonce_material() else {
             return Err(KernelCaptureError::Unsupported {
                 reason: "the owner succession-grant entropy seam is unavailable",
             });
         };
+        let grant_id = eliot_contracts::sha256_hex(
+            format!("{owner_work_root}\u{1f}{}", nonce.as_str()).as_bytes(),
+        );
         let issued_at_unix_ms = crate::unix_ms();
         // The window is opened at the NEXT millisecond so the route's own
         // `now >= not_before` comparison can never reject the grant on the very
@@ -1110,7 +1116,7 @@ impl KernelBackupCapture {
         let not_before_unix_ms = issued_at_unix_ms.saturating_add(1);
         let expires_at_unix_ms = not_before_unix_ms.saturating_add(SUCCESSION_GRANT_HORIZON_MS);
         Ok(eliot_ors::BackupVerifySuccessionGrant {
-            grant_id: nonce.as_str().to_owned(),
+            grant_id,
             principal: caller.principal.clone(),
             scope_id: scope_id.to_owned(),
             authority_lineage_id: kernel_fence.authority_epoch.lineage_id.to_string(),
