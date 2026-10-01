@@ -138,6 +138,8 @@ const SEMANTIC_CONFLICT_MARKERS: &[&str] = &[
     "ordering_head_create_conflict",
     "finish_owner_cas_conflict",
     "finish_owner_create_conflict",
+    "finish_task_owner_missing",
+    "finish_task_owner_stale",
     "canonical_owner_cas_conflict",
     "canonical_owner_create_conflict",
     "module_registry_owner_cas_conflict",
@@ -1167,6 +1169,8 @@ fn append_finish_evidence_owner_statement(
     if snapshot_json.len() > eliot_store_api::MAX_RECOVERY_RECORD_BYTES {
         return Err(AdapterError::Store(StoreError::PayloadTooLarge));
     }
+    let (task_id, task_revision) = finish_evidence_task_binding(snapshot_json)?;
+    append_finish_task_owner_guard(sql, bindings, transition, &task_id, task_revision)?;
 
     let canonical_key = eliot_store_api::RecoveryRecordKey::new("owner", "canonical")
         .map_err(AdapterError::Store)?;
@@ -1261,6 +1265,8 @@ fn append_finish_owner_statement(
     if receipt_json.len() > eliot_store_api::MAX_RECOVERY_RECORD_BYTES {
         return Err(AdapterError::Store(StoreError::PayloadTooLarge));
     }
+    let (task_id, task_revision) = finish_decision_task_binding(receipt_json)?;
+    append_finish_task_owner_guard(sql, bindings, transition, &task_id, task_revision)?;
 
     let finish_key =
         eliot_store_api::RecoveryRecordKey::new("owner", "finish").map_err(AdapterError::Store)?;
@@ -1309,6 +1315,138 @@ fn append_finish_owner_statement(
     // prevents a future caller from silently dropping the required parameter
     // while preserving Governor ownership of its interpretation.
     bindings.insert("finish_attempt_id".to_owned(), json!(attempt_id));
+    Ok(())
+}
+
+/// Extracts the task binding from the existing canonical Finish evidence
+/// owner image. These fields are owner-derived by Governor and already form
+/// part of the persisted snapshot; the adapter does not accept a new revision
+/// selector from transport.
+fn finish_evidence_task_binding(snapshot_json: &str) -> Result<(String, u64), AdapterError> {
+    let snapshot: Value = serde_json::from_str(snapshot_json).map_err(|_| {
+        AdapterError::Store(StoreError::InvalidField {
+            field: "canonical.finish_evidence_snapshot_json",
+            reason: "must contain the canonical Finish evidence owner image",
+        })
+    })?;
+    let evidence = snapshot
+        .get("finish_evidence")
+        .and_then(Value::as_object)
+        .and_then(|owner| owner.get("evidence"))
+        .ok_or(AdapterError::Store(StoreError::InvalidField {
+            field: "canonical.finish_evidence_snapshot_json",
+            reason: "missing owner-derived Finish evidence task binding",
+        }))?;
+    let task_id = evidence
+        .get("task_id")
+        .and_then(Value::as_str)
+        .filter(|task_id| !task_id.trim().is_empty())
+        .ok_or(AdapterError::Store(StoreError::InvalidField {
+            field: "canonical.finish_evidence_snapshot_json",
+            reason: "missing owner-derived Finish task id",
+        }))?;
+    let task_revision = evidence
+        .get("current_task_revision")
+        .and_then(Value::as_u64)
+        .filter(|revision| *revision > 0)
+        .ok_or(AdapterError::Store(StoreError::InvalidField {
+            field: "canonical.finish_evidence_snapshot_json",
+            reason: "missing owner-derived Finish task revision",
+        }))?;
+    Ok((task_id.to_owned(), task_revision))
+}
+
+/// Extracts one exact task/revision binding from the persisted decision
+/// receipts. Every receipt in the existing payload must agree; a mixed or
+/// empty image cannot authorize a task-currentness assertion.
+fn finish_decision_task_binding(receipt_json: &str) -> Result<(String, u64), AdapterError> {
+    let receipts: Vec<Value> = serde_json::from_str(receipt_json).map_err(|_| {
+        AdapterError::Store(StoreError::InvalidField {
+            field: "finish.receipt_json",
+            reason: "must contain canonical Finish decision receipts",
+        })
+    })?;
+    let mut binding: Option<(String, u64)> = None;
+    for receipt in receipts {
+        let task_id = receipt
+            .get("task_id")
+            .and_then(Value::as_str)
+            .filter(|task_id| !task_id.trim().is_empty())
+            .ok_or(AdapterError::Store(StoreError::InvalidField {
+                field: "finish.receipt_json",
+                reason: "missing Finish decision task id",
+            }))?;
+        let task_revision = receipt
+            .get("task_revision")
+            .and_then(Value::as_u64)
+            .filter(|revision| *revision > 0)
+            .ok_or(AdapterError::Store(StoreError::InvalidField {
+                field: "finish.receipt_json",
+                reason: "missing Finish decision task revision",
+            }))?;
+        let current = (task_id.to_owned(), task_revision);
+        if binding.as_ref().is_some_and(|previous| previous != &current) {
+            return Err(AdapterError::Store(StoreError::InvalidField {
+                field: "finish.receipt_json",
+                reason: "Finish decisions disagree on task identity or revision",
+            }));
+        }
+        binding = Some(current);
+    }
+    binding.ok_or(AdapterError::Store(StoreError::InvalidField {
+        field: "finish.receipt_json",
+        reason: "must contain at least one Finish decision receipt",
+    }))
+}
+
+/// Appends an atomic assertion against the same admitted TaskControl event
+/// history used by `GetTaskState`. Every canonical write first CASes the
+/// shared canonical fence, so a TaskControl commit that wins the race appears
+/// in this transaction's history; a later competing write cannot pass that
+/// fence CAS after this guard.
+fn append_finish_task_owner_guard(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    transition: &eliot_store_api::PreparedTransition,
+    task_id: &str,
+    task_revision: u64,
+) -> Result<(), AdapterError> {
+    if transition.task_id.as_deref() != Some(task_id) || task_revision == 0 {
+        return Err(AdapterError::Store(StoreError::InvalidField {
+            field: "finish.task_binding",
+            reason: "Finish owner payload does not match the admitted task",
+        }));
+    }
+    let prior_revision = task_revision.checked_sub(1).ok_or_else(|| {
+        AdapterError::Store(StoreError::InvalidField {
+            field: "finish.task_revision",
+            reason: "revision has no TaskControl predecessor",
+        })
+    })?;
+    let task_id_marker = format!(
+        "\"task_id\":{}",
+        serde_json::to_string(task_id).map_err(|error| {
+            AdapterError::Serialization(format!("Finish task id could not be encoded: {error}"))
+        })?
+    );
+    let task_revision_marker = format!(
+        "\"expected_revision\":{}",
+        serde_json::to_string(&prior_revision.to_string()).map_err(|error| {
+            AdapterError::Serialization(format!(
+                "Finish task revision could not be encoded: {error}"
+            ))
+        })?
+    );
+    bindings.insert(
+        "finish_task_scope".to_owned(),
+        json!(transition.scope_id.as_str()),
+    );
+    bindings.insert("finish_task_id_marker".to_owned(), json!(task_id_marker));
+    bindings.insert(
+        "finish_task_revision_marker".to_owned(),
+        json!(task_revision_marker),
+    );
+    sql.push_str(schema::TX_FINISH_TASK_OWNER_GUARD);
     Ok(())
 }
 
