@@ -404,7 +404,8 @@ impl SkillContextMeasurementProjection {
         // profile it was measured under and bind the exact bytes; an
         // unavailable projection carries no such evidence and is required to
         // carry none, so "not measured" cannot be dressed in a borrowed
-        // binding.
+        // binding. The identity of the Skill the measurement was requested
+        // for is carried either way and is never itself evidence.
         let expected_unit = match self.status {
             SkillContextMeasurementStatus::UnvalidatedStu => SkillContextMeasurementUnit::Stu,
             SkillContextMeasurementStatus::Unavailable => SkillContextMeasurementUnit::Unavailable,
@@ -501,6 +502,13 @@ impl SkillContextMeasurementProjection {
     /// compared against a budget, or persisted as an enormous cost. The
     /// unavailable projection still names the Skill it was asked about, so
     /// "not measured" is not the same record as "no Skill".
+    ///
+    /// The identity fields are named as measured - they are the Skill the
+    /// measurement was requested for - while no measurement evidence is
+    /// invented for it: value, byte length, serializer/profile and content
+    /// digest are all absent, and
+    /// [`SkillContextMeasurementError::EmptyField`] is what refuses the
+    /// binding of a projection whose measurement failed.
     #[must_use]
     pub fn unavailable(skill_ref: &SkillId, skill_version: &str) -> Self {
         Self::sealed(Self {

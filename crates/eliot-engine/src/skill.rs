@@ -5,12 +5,11 @@ use eliot_types::{
     AgentId, CommandContext, EpistemicStatus, ExperienceMaturityState, ExperiencePattern,
     ForgettingOperator, ForgettingPolicy, ForgettingReason, LifecycleStatus, MemoryEcologyDecision,
     MemoryLifecycleState, ProcedurePromotionOutcome, ProjectId, SemanticCommand,
-    SKILL_CONTEXT_MEASUREMENT_SCHEMA_VERSION, SkillActivationDecision, SkillActivationRecord,
-    SkillCardV2, SkillContextMeasurementProjection, SkillContextMeasurementStatus,
-    SkillContextMeasurementUnit, SkillDistractorFilter, SkillExecutionOutcome,
-    SkillExecutionProof, SkillId, SkillInfluenceReport, SkillInputSource, SkillLifecycleRecord,
-    SkillLifecycleState, SkillNeedEstimate, SkillNeedVerdict, TaintClass, TaskId,
-    ToolObservationRecordCommand, VerifierPlan, Visibility, WriteId, WriteReceiptRef,
+    SkillActivationDecision, SkillActivationRecord, SkillCardV2, SkillContextMeasurementProjection,
+    SkillContextMeasurementStatus, SkillContextMeasurementUnit, SkillDistractorFilter,
+    SkillExecutionOutcome, SkillExecutionProof, SkillId, SkillInfluenceReport, SkillInputSource,
+    SkillLifecycleRecord, SkillLifecycleState, SkillNeedEstimate, SkillNeedVerdict, TaintClass,
+    TaskId, ToolObservationRecordCommand, VerifierPlan, Visibility, WriteId, WriteReceiptRef,
     sum_skill_context_stu,
 };
 use serde::Serialize;
@@ -218,8 +217,11 @@ impl SkillLifecycleService {
             .flat_map(|rule| rule.required_evidence_refs.clone())
             .collect();
         // The canonical measurement identity travels with the record so the
-        // recorded `context_cost` is always traceable to exact Skill bytes,
-        // serializer/profile and content digest.
+        // recorded `context_measurement` is always traceable to exact Skill
+        // bytes, serializer/profile and content digest. The value itself is
+        // bound to that evidence by the projection's own seal, so this string
+        // is a readable index into the same evidence, not what makes the
+        // number trustworthy.
         local_check_refs.extend(
             measurement
                 .iter()
@@ -817,11 +819,16 @@ impl SkillInfluenceService {
             .first()
             .copied()
             .unwrap_or_else(SkillId::new_v7);
+        let unavailable_revision = input
+            .measured_skills
+            .as_ref()
+            .and_then(|skills| skills.first())
+            .map_or_else(String::new, |skill| skill.version.clone());
         let context_measurement = match input.canonical_context_cost() {
             Ok(Some(aggregate)) => aggregate,
             Ok(None) | Err(_) => SkillContextMeasurementProjection::unavailable(
                 &unavailable_skill_ref,
-                SKILL_CONTEXT_MEASUREMENT_SCHEMA_VERSION,
+                &unavailable_revision,
             ),
         };
         SkillInfluenceReport {
