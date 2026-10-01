@@ -3090,7 +3090,7 @@ impl HostJobBranches {
             }
             Some(HostSupervisionRevocationDisposition::Superseded {
                 current_observation_digest,
-            }) if had_expected_observation =>
+            }) if had_expected_observation && response.error.is_none() =>
             {
                 Ok(HostSupervisionRevocationDisposition::Superseded {
                     current_observation_digest,
@@ -3111,8 +3111,33 @@ impl HostJobBranches {
         &mut self,
         generation: &PlatformHandle,
     ) -> Result<(), HostError> {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let cleanup = self.terminate_kernel();
+                return Err(match cleanup {
+                    Ok(()) => HostError::RecoveryRequired(error.to_string()),
+                    Err(cleanup) => HostError::KernelSupervisionRevocationUncontained(
+                        format!(
+                            "could not create the authenticated revocation runtime ({error}); retained Kernel Job containment failed ({cleanup})"
+                        ),
+                    ),
+                });
+            }
+        };
+        runtime.block_on(self.revoke_host_supervision_evidence_async(generation))
+    }
+
+    #[cfg(windows)]
+    async fn revoke_host_supervision_evidence_async(
+        &mut self,
+        generation: &PlatformHandle,
+    ) -> Result<(), HostError> {
         let expected_selector = self.current_supervision_observation_digest.clone();
-        let result = (|| {
+        let result = async {
             let launch = self.launch.as_ref().ok_or_else(|| {
                 HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
             })?;
@@ -3128,7 +3153,7 @@ impl HostJobBranches {
                 .kernel
                 .as_ref()
                 .ok_or_else(|| HostError::ProcessContour("Kernel process is missing".to_owned()))?;
-            let process = kernel.evidence().process();
+            let process = kernel.evidence().process().clone();
             let expected_kernel_image = self
                 .kernel_executable
                 .as_ref()
@@ -3136,31 +3161,26 @@ impl HostJobBranches {
                 .clone();
             let candidate = candidate.clone();
             let authority_generation = launch.authority_generation;
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
-            runtime.block_on(async {
-                let mut transport = connect_authenticated_kernel_front_door(&candidate, process)
-                    .await
-                    .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
-                validate_authenticated_kernel_peer(
-                    transport.peer_identity(),
-                    process.process_id,
-                    process.start_time_100ns,
-                    &expected_kernel_image,
-                )
-                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
-                Self::send_bound_host_supervision_revocation(
-                    &mut transport,
-                    &candidate,
-                    authority_generation,
-                    expected_selector.clone(),
-                    1,
-                )
+            let mut transport = connect_authenticated_kernel_front_door(&candidate, &process)
                 .await
-            })
-        })();
+                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+            validate_authenticated_kernel_peer(
+                transport.peer_identity(),
+                process.process_id,
+                process.start_time_100ns,
+                &expected_kernel_image,
+            )
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+            Self::send_bound_host_supervision_revocation(
+                &mut transport,
+                &candidate,
+                authority_generation,
+                expected_selector.clone(),
+                1,
+            )
+            .await
+        }
+        .await;
         match result {
             Ok(HostSupervisionRevocationDisposition::Revoked)
             | Ok(HostSupervisionRevocationDisposition::AlreadyAbsent) => {
@@ -3181,13 +3201,13 @@ impl HostJobBranches {
                 ))
             }
             Err(error) => {
-            let cleanup = self.terminate_kernel();
-            Err(match cleanup {
-                Ok(()) => error,
-                Err(cleanup) => HostError::KernelSupervisionRevocationUncontained(format!(
-                    "uncontained host-supervision revocation: revoke failed ({error}); Kernel Job containment failed ({cleanup})"
-                )),
-            })
+                let cleanup = self.terminate_kernel();
+                Err(match cleanup {
+                    Ok(()) => error,
+                    Err(cleanup) => HostError::KernelSupervisionRevocationUncontained(format!(
+                        "uncontained host-supervision revocation: revoke failed ({error}); Kernel Job containment failed ({cleanup})"
+                    )),
+                })
             }
         }
     }
@@ -3845,10 +3865,19 @@ impl HostJobBranches {
                 .as_ref()
                 .map(kernel_heartbeat_observation_digest)
                 .transpose()?;
+            let heartbeat_proof = admitted_heartbeat
+                .as_ref()
+                .map(kernel_heartbeat_proof)
+                .transpose()?;
             // I1.11 steps 1, 2, 4 and 11: the combined report follows the
             // real SCM-bound continuous heartbeat, then ProbeReady consumes
             // the Kernel owner's admitted observation on the next sequence.
-            Self::send_host_startup_evidence(
+            // Retain the exact attempted original digest before sending. If
+            // Kernel commits the report but its ACK is lost, revoke by this
+            // exact CAS selector; this is not an acceptance claim.
+            self.current_supervision_observation_digest =
+                reported_observation_digest.clone();
+            if let Err(error) = Self::send_host_startup_evidence(
                 &mut transport,
                 journal,
                 active_manifest,
@@ -3857,14 +3886,19 @@ impl HostJobBranches {
                 launch.authority_generation,
                 Path::new(launch.runtime_state_roots.host_state_root.as_str()),
                 Path::new(launch.runtime_state_roots.store_data_root.as_str()),
-                admitted_heartbeat
-                    .as_ref()
-                    .map(kernel_heartbeat_proof)
-                    .transpose()?,
+                heartbeat_proof,
                 probe_sequence + 1,
             )
-            .await?;
-            self.current_supervision_observation_digest = reported_observation_digest;
+            .await
+            {
+                return match self
+                    .revoke_host_supervision_evidence_async(generation)
+                    .await
+                {
+                    Ok(()) => Err(error),
+                    Err(revocation_error) => Err(revocation_error),
+                };
+            }
             let probe_request = kernel_control_request(
                 &candidate,
                 launch.authority_generation,
@@ -3910,6 +3944,9 @@ impl HostJobBranches {
         let (activation_receipt, ready) = match ready {
             Ok(receipts) => receipts,
             Err(error) => {
+                if let Err(revocation_error) = self.revoke_host_supervision_evidence(generation) {
+                    return Err(revocation_error);
+                }
                 let failure = activation.fail("kernel-control-activation-failed");
                 return Err(match failure {
                     Ok(()) => error,
@@ -3920,6 +3957,9 @@ impl HostJobBranches {
             }
         };
         if let Err(error) = activation.active(&candidate, &activation_receipt, &ready) {
+            if let Err(revocation_error) = self.revoke_host_supervision_evidence(generation) {
+                return Err(revocation_error);
+            }
             let failure = activation.fail("kernel-active-commit-failed");
             return Err(match failure {
                 Ok(()) => error,
@@ -3930,13 +3970,18 @@ impl HostJobBranches {
         }
         self.kernel_candidate = Some(candidate);
         self.kernel_activation_receipt = Some(activation_receipt.clone());
-        self.reconcile_store_rebind_records(
+        if let Err(error) = self.reconcile_store_rebind_records(
             generation,
             journal,
             host,
             activation_id,
             activation_generation,
-        )?;
+        ) {
+            return match self.revoke_host_supervision_evidence(generation) {
+                Ok(()) => Err(error),
+                Err(revocation_error) => Err(revocation_error),
+            };
+        }
         Ok((activation_receipt, ready))
     }
 
@@ -4781,7 +4826,7 @@ impl HostJobBranches {
             .enable_all()
             .build()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-        let mut report_accepted = false;
+        let mut report_attempted = false;
         let result = runtime.block_on(async {
             let mut transport = connect_authenticated_kernel_front_door(candidate, process).await?;
             validate_authenticated_kernel_peer(
@@ -4802,6 +4847,12 @@ impl HostJobBranches {
             // admitted against the exact current owner lease. It occupies the
             // first command; ProbeReady follows on the strict connection
             // sequence and cannot bootstrap the heartbeat.
+            // Retain the exact attempted original digest before sending. A
+            // lost ACK may follow a committed report, so this is a CAS
+            // selector only and does not claim acceptance.
+            self.current_supervision_observation_digest =
+                reported_observation_digest.clone();
+            report_attempted = true;
             HostJobBranches::send_bound_host_startup_evidence(
                 &mut transport,
                 supervision_evidence,
@@ -4812,7 +4863,6 @@ impl HostJobBranches {
                 1,
             )
             .await?;
-            report_accepted = true;
             let request = KernelControlRequest {
                 wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
                 wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
@@ -4876,10 +4926,15 @@ impl HostJobBranches {
                 peer_evidence,
             })
         });
-        if report_accepted {
-            self.current_supervision_observation_digest = reported_observation_digest;
+        match result {
+            Err(error) if report_attempted => {
+                match self.revoke_host_supervision_evidence(approved_generation) {
+                    Ok(()) => Err(error),
+                    Err(revocation_error) => Err(revocation_error),
+                }
+            }
+            result => result,
         }
-        result
     }
 
     #[allow(
@@ -5561,6 +5616,13 @@ impl HostJobBranches {
         let kernel = self.terminate_kernel();
         match (store, kernel) {
             (Ok(()), Ok(())) => Ok(()),
+            (store, Err(kernel))
+                if self.current_supervision_observation_digest.is_some() =>
+            {
+                Err(HostError::KernelSupervisionRevocationUncontained(format!(
+                    "Store-first termination was incomplete while an attempted supervision proof may remain current: store={store:?}; kernel={kernel}"
+                )))
+            }
             (store, kernel) => Err(HostError::RecoveryRequired(format!(
                 "Store-first termination was incomplete: store={store:?}; kernel={kernel:?}"
             ))),
@@ -9388,10 +9450,20 @@ impl HostComposition {
                 }));
             }
             Err(e) => {
-                if !matches!(&e, HostError::KernelSupervisionRevocationSuperseded(_)) {
-                    let _ = self.jobs.terminate_kernel();
+                if matches!(&e, HostError::KernelSupervisionRevocationSuperseded(_)) {
+                    return Err(e);
                 }
-                return Err(e);
+                return Err(match self.jobs.terminate_kernel() {
+                    Ok(()) => e,
+                    Err(cleanup) if self.jobs.current_supervision_observation_digest.is_some() => {
+                        HostError::KernelSupervisionRevocationUncontained(format!(
+                            "Kernel activation failed ({e}); retained Kernel Job containment failed ({cleanup}) while an attempted supervision proof may remain current"
+                        ))
+                    }
+                    Err(cleanup) => HostError::RecoveryRequired(format!(
+                        "Kernel activation failed ({e}); Kernel cleanup failed ({cleanup})"
+                    )),
+                });
             }
         };
         let store_after =
@@ -10835,7 +10907,15 @@ impl HostComposition {
             manifest,
         ) {
             Ok(value) => value,
-            Err(error) => return self.cleanup_launched_contour(error),
+            Err(error) => {
+                if matches!(
+                    &error,
+                    HostError::KernelSupervisionRevocationSuperseded(_)
+                ) {
+                    return Err(error);
+                }
+                return self.cleanup_launched_contour(error);
+            }
         };
         if let Err(error) = self.accept_kernel_ready(&receipt) {
             return self.cleanup_active_kernel_contour(error, "kernel-ready-accept-failed");
@@ -11094,6 +11174,12 @@ impl HostComposition {
                     .authority_epoch
                     .clone(),
             ) {
+                if matches!(
+                    &error,
+                    HostError::KernelSupervisionRevocationSuperseded(_)
+                ) {
+                    return Err(error);
+                }
                 return self.cleanup_launched_contour(HostError::RecoveryRequired(format!(
                     "candidate launch failed ({candidate_error}); rollback activation failed ({error})"
                 )));
@@ -11125,7 +11211,27 @@ impl HostComposition {
                 .authority_epoch
                 .clone(),
         ) {
-            self.jobs.terminate_store_then_kernel()?;
+            if matches!(
+                &candidate_error,
+                HostError::KernelSupervisionRevocationSuperseded(_)
+            ) {
+                return Err(candidate_error);
+            }
+            if let Err(cleanup) = self.jobs.terminate_store_then_kernel() {
+                return Err(
+                    if self
+                        .jobs
+                        .current_supervision_observation_digest
+                        .is_some()
+                    {
+                        HostError::KernelSupervisionRevocationUncontained(format!(
+                            "candidate activation failed ({candidate_error}); retained Kernel Job containment failed ({cleanup}) while an attempted supervision proof may remain current"
+                        ))
+                    } else {
+                        cleanup
+                    },
+                );
+            }
             self.jobs.start_approved(
                 prior_kernel.as_ref(),
                 prior_store.as_ref(),
@@ -11149,6 +11255,12 @@ impl HostComposition {
                     .authority_epoch
                     .clone(),
             ) {
+                if matches!(
+                    &rollback_error,
+                    HostError::KernelSupervisionRevocationSuperseded(_)
+                ) {
+                    return Err(rollback_error);
+                }
                 return self.cleanup_launched_contour(HostError::RecoveryRequired(format!(
                     "candidate activation failed ({candidate_error}); rollback activation failed ({rollback_error})"
                 )));
@@ -11804,6 +11916,13 @@ impl HostComposition {
                 let cleanup = self.jobs.terminate_kernel();
                 return Err(match cleanup {
                     Ok(()) => error,
+                    Err(cleanup)
+                        if self.jobs.current_supervision_observation_digest.is_some() =>
+                    {
+                        HostError::KernelSupervisionRevocationUncontained(format!(
+                            "Kernel restart activation failed ({error}); retained Kernel Job containment failed ({cleanup}) while an attempted supervision proof may remain current"
+                        ))
+                    }
                     Err(cleanup) => HostError::RecoveryRequired(format!(
                         "Kernel restart activation failed ({error}); Kernel cleanup failed ({cleanup})"
                     )),
@@ -12018,15 +12137,27 @@ impl HostComposition {
         readiness_gate.branch_degraded();
         let mut watchdog_failure = false;
         let mut uncontained_kernel_revocation = None;
+        let mut superseded_kernel_revocation = None;
         let outcome = reconcile_authenticated_readiness(&mut readiness_gate, contour, now, || {
             let result = self.persist_fresh_authenticated_readiness(generation);
             watchdog_failure = matches!(&result, Err(HostError::WatchdogCoverageUnavailable(_)));
             if let Err(HostError::KernelSupervisionRevocationUncontained(reason)) = &result {
                 uncontained_kernel_revocation = Some(reason.clone());
             }
+            if let Err(HostError::KernelSupervisionRevocationSuperseded(reason)) = &result {
+                superseded_kernel_revocation = Some(reason.clone());
+            }
             result
         });
         self.readiness_gate = readiness_gate;
+        if let Some(reason) = superseded_kernel_revocation {
+            // A newer original proof B is still current. This stale attempt
+            // must not publish A-derived degradation or clean up the branch.
+            let error = HostError::KernelSupervisionRevocationSuperseded(reason);
+            self.readiness_gate
+                .fail(None, readiness_failure_kind(&error), now);
+            return Err(error);
+        }
         if let Some(reason) = uncontained_kernel_revocation {
             let error = HostError::KernelSupervisionRevocationUncontained(reason);
             self.readiness_gate
@@ -12611,66 +12742,86 @@ impl HostComposition {
                 .map(kernel_heartbeat_proof)
                 .transpose()?,
         )?;
-        // ProbeReady may renew the same owner lease. Publish that actual
-        // renewed head only after the heartbeat-bound step-11 report was
-        // accepted; this dependent publication cannot bootstrap the proof.
-        let published_supervision = publish_current_watchdog_supervision_bundle(
-            self.launch_options.host_state_root(),
-            &active.manifest,
-            &watchdog_template,
-            &registry_authority.watchdog_admission_template_digest,
-            &proof.supervision_lease,
-        )?;
-        require_exact_supervision_head(&proof.supervision_lease, || {
-            read_manifest_current_supervision_lease(
+        let post_probe = (|| -> Result<ReadinessContourIdentity, HostError> {
+            // ProbeReady may renew the same owner lease. Publish that actual
+            // renewed head only after the heartbeat-bound step-11 report was
+            // accepted; this dependent publication cannot bootstrap the proof.
+            let published_supervision = publish_current_watchdog_supervision_bundle(
+                self.launch_options.host_state_root(),
                 &active.manifest,
-                proof.supervision_lease.record.lease_id.as_str(),
-            )
-        })?;
-        // The admitted readiness stores the original heartbeat refs alongside
-        // Kernel readiness and Watchdog branch identity.
-        let heartbeat_refs = admitted_heartbeat
-            .as_ref()
-            .map(|admitted| admitted.evidence_refs.clone())
-            .unwrap_or_default();
-        if supervised_system_service && heartbeat_refs.is_empty() {
-            return Err(HostError::WatchdogCoverageUnavailable(
-                "fresh Watchdog heartbeat evidence is empty".to_owned(),
-            ));
+                &watchdog_template,
+                &registry_authority.watchdog_admission_template_digest,
+                &proof.supervision_lease,
+            )?;
+            require_exact_supervision_head(&proof.supervision_lease, || {
+                read_manifest_current_supervision_lease(
+                    &active.manifest,
+                    proof.supervision_lease.record.lease_id.as_str(),
+                )
+            })?;
+            // The admitted readiness stores the original heartbeat refs alongside
+            // Kernel readiness and Watchdog branch identity.
+            let heartbeat_refs = admitted_heartbeat
+                .as_ref()
+                .map(|admitted| admitted.evidence_refs.clone())
+                .unwrap_or_default();
+            if supervised_system_service && heartbeat_refs.is_empty() {
+                return Err(HostError::WatchdogCoverageUnavailable(
+                    "fresh Watchdog heartbeat evidence is empty".to_owned(),
+                ));
+            }
+            let (_, admitted_supervision) = append_authenticated_kernel_readiness_with_heartbeat(
+                &self.journal,
+                &proof,
+                kernel_artifact,
+                materialized_config_digest,
+                &watchdog_template,
+                &heartbeat_refs,
+            )?;
+            debug_assert_eq!(
+                published_supervision, admitted_supervision,
+                "single-snapshot supervision identity diverged between publication and journal admission"
+            );
+            let confirmed = self.current_readiness_contour(
+                generation,
+                kernel_artifact,
+                store_artifact,
+                materialized_config_digest,
+            )?;
+            if !confirmed.same_probe_input_contour(&contour)
+                || confirmed.store_proof_fence.as_ref() != Some(&proof.store_fence)
+                || confirmed.supervision_lease_id.as_ref() != Some(&admitted_supervision.lease_id)
+                || confirmed.supervision_ors_receipt_digest.as_ref()
+                    != Some(&admitted_supervision.ors_receipt_digest)
+                || confirmed.watchdog_publication_digest.as_ref()
+                    != Some(&admitted_supervision.publication_digest)
+            {
+                return Err(HostError::ProcessContour(
+                    "readiness contour changed while admitting the proof".to_owned(),
+                ));
+            }
+            // F-LOG-HOST-1: ready only now that the proof fence is confirmed.
+            host_lifecycle_observe_requested(BOUNDARY_READINESS_PROOF_READY);
+            Ok(confirmed)
+        })();
+        match post_probe {
+            Err(error)
+                if self
+                    .jobs
+                    .current_supervision_observation_digest
+                    .is_some() =>
+            {
+                // Every fallible post-Probe publication, ORS check, journal
+                // admission/readback, and final contour confirmation belongs
+                // to this attempt. Withdraw its exact original proof before
+                // an ordinary degraded return; CAS preserves a newer proof.
+                match self.jobs.revoke_host_supervision_evidence(generation) {
+                    Ok(()) => Err(error),
+                    Err(revocation_error) => Err(revocation_error),
+                }
+            }
+            result => result,
         }
-        let (_, admitted_supervision) = append_authenticated_kernel_readiness_with_heartbeat(
-            &self.journal,
-            &proof,
-            kernel_artifact,
-            materialized_config_digest,
-            &watchdog_template,
-            &heartbeat_refs,
-        )?;
-        debug_assert_eq!(
-            published_supervision, admitted_supervision,
-            "single-snapshot supervision identity diverged between publication and journal admission"
-        );
-        let confirmed = self.current_readiness_contour(
-            generation,
-            kernel_artifact,
-            store_artifact,
-            materialized_config_digest,
-        )?;
-        if !confirmed.same_probe_input_contour(&contour)
-            || confirmed.store_proof_fence.as_ref() != Some(&proof.store_fence)
-            || confirmed.supervision_lease_id.as_ref() != Some(&admitted_supervision.lease_id)
-            || confirmed.supervision_ors_receipt_digest.as_ref()
-                != Some(&admitted_supervision.ors_receipt_digest)
-            || confirmed.watchdog_publication_digest.as_ref()
-                != Some(&admitted_supervision.publication_digest)
-        {
-            return Err(HostError::ProcessContour(
-                "readiness contour changed while admitting the proof".to_owned(),
-            ));
-        }
-        // F-LOG-HOST-1: ready only now that the proof fence is confirmed.
-        host_lifecycle_observe_requested(BOUNDARY_READINESS_PROOF_READY);
-        Ok(confirmed)
     }
 
     #[cfg(windows)]
@@ -12876,9 +13027,21 @@ impl HostComposition {
                 self.jobs.clear_recorded_contour();
                 Err(error)
             }
-            (projection, watchdog, kernel, store) => Err(HostError::RecoveryRequired(format!(
-                "persistence failed ({error}); launched contour cleanup requires recovery: projection={projection:?}, watchdog={watchdog:?}, kernel={kernel:?}, store={store:?}"
-            ))),
+            (projection, watchdog, kernel, store) => {
+                let reason = format!(
+                    "persistence failed ({error}); launched contour cleanup requires recovery: projection={projection:?}, watchdog={watchdog:?}, kernel={kernel:?}, store={store:?}"
+                );
+                if kernel.is_err()
+                    && self
+                        .jobs
+                        .current_supervision_observation_digest
+                        .is_some()
+                {
+                    Err(HostError::KernelSupervisionRevocationUncontained(reason))
+                } else {
+                    Err(HostError::RecoveryRequired(reason))
+                }
+            }
         }
     }
 
@@ -13217,9 +13380,17 @@ impl HostComposition {
                 let kernel = self.jobs.terminate_kernel();
                 if store.is_err() || kernel.is_err() {
                     self.shutdown_failed = true;
-                    return Err(HostError::RecoveryRequired(format!(
-                        "Store-first stop requires recovery: store={store:?}; kernel={kernel:?}"
-                    )));
+                    return Err(if kernel.is_err()
+                        && self.jobs.current_supervision_observation_digest.is_some()
+                    {
+                        HostError::KernelSupervisionRevocationUncontained(format!(
+                            "Store-first stop requires recovery while an attempted supervision proof may remain current: store={store:?}; kernel={kernel:?}"
+                        ))
+                    } else {
+                        HostError::RecoveryRequired(format!(
+                            "Store-first stop requires recovery: store={store:?}; kernel={kernel:?}"
+                        ))
+                    });
                 }
             }
             if degraded_recovery_stop {
