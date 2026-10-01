@@ -23,13 +23,19 @@
 //!   `BackupArchiveValidityAttestation::validate_against`, with the
 //!   authenticated owner roles as the protocol requires them, passed separately —
 //!   and then binds each of them to this operation's exact archive, class, fence
-//!   and owner. A receipt for another archive, class, source, fence, owner or
-//!   revision is refused here, BEFORE any verdict is produced, so a
-//!   provenance-qualified verdict is structurally unreachable for it.
-//!   All three owner-evidence legs — handle, capture receipt and validity
-//!   attestation — REQUIRE the admitted protocol request and refuse without it,
-//!   so no leg's request-dependent joins can be skipped by presenting no request
-//!   at all.
+//!   and owner. A receipt for another archive, class, source, fence or owner is
+//!   refused here, BEFORE any verdict is produced, so a
+//!   provenance-qualified verdict is structurally unreachable for it. `revision`
+//!   is deliberately NOT in that list: no term of this gate reads
+//!   `source_revision`, which is bound by `BackupArtifactHandle::validate`'s
+//!   bound and by the I5.27 request hash — see "THE TWO TERMS WITH NO
+//!   OWNER-ISSUED COUNTERPART" below.
+//!   The rule the three owner-evidence legs — handle, capture receipt and
+//!   validity attestation — share is the DIRECTION they refuse in: owner
+//!   evidence PRESENT with the admitted protocol request ABSENT is refused,
+//!   and each leg says so in its own terms under its own field path. The
+//!   opposite pair — no owner evidence and no protocol request — is the inline
+//!   arm's own answer, and no leg invents a join for it.
 //!
 //! # WHAT THE THREE FACTS STAY (I5)
 //!
@@ -870,18 +876,31 @@ fn check_protocol_archive_binding(
 /// authenticated verifier role. The rule is one `is_some() != is_some()` per
 /// pair, so "some evidence arrived" can never mean "less was checked".
 ///
-/// A SECOND rule is uniform with the first and was the one gap in this gate: all
-/// THREE owner-evidence legs — handle, capture receipt and validity attestation —
-/// require the admitted protocol request, and a leg with no request refuses
-/// rather than passing on the values it can still see. That matters because each
-/// leg's request-dependent joins are load-bearing and are not duplicated
-/// elsewhere: only the handle leg binds the handle to the presented bytes, only
-/// the receipt leg binds the receipt's `snapshot_digest`/`member_digest` to this
-/// operation, and only the attestation leg binds the verdict to this operation's
-/// own identity. A leg that returned `Ok(())` on an absent request would have
-/// silently skipped exactly those joins, so "no request" would have read as
-/// "nothing left to check" instead of "there is no operation to belong to". The
-/// inline arm is unaffected: it carries no owner evidence, so no leg runs.
+/// A SECOND rule is uniform with the first in its SHAPE rather than in its
+/// reach: every owner-evidence leg that is handed a value with nothing to bind
+/// it to refuses, and no leg passes on the values it can still see. It is stated
+/// per leg rather than as one blanket rule, because the legs differ in what runs
+/// and what does not when the admitted protocol request is absent:
+///
+/// - the handle leg IS called on every arm, including the inline arm, and
+///   refuses when evidence and request DISAGREE — an owner-issued handle with no
+///   protocol request, or a protocol request naming no owner-issued handle. With
+///   neither present, as on the inline arm, its match falls through and it
+///   returns `Ok(())` having compared nothing;
+/// - the capture-receipt leg runs only when a receipt AND its capture operation
+///   are both present, and then requires the request, because its last two joins
+///   have no other counterpart;
+/// - the attestation leg likewise runs only when an attestation AND a verifier
+///   are both present, and its `validate_against` needs the request identity by
+///   construction.
+///
+/// What each leg's absence would skip is therefore NOT asserted to be unique
+/// here. Two of these joins are also reachable by another route: the handle's
+/// `content_sha256`/`byte_length` joins to the archive and the presented bytes
+/// are performed AGAIN by [`check_protocol_archive_binding`] against the same
+/// `report`/`presented_bytes`, and the receipt's own `snapshot_digest` and
+/// `member_digest` are bound to the capture operation's by leg two's
+/// [`BackupCaptureReceipt::validate_against`], which takes no request at all.
 ///
 /// # THE RELATIONS, AND THE OWNER FACT EACH IS CHECKED AGAINST
 ///
@@ -909,11 +928,14 @@ fn check_protocol_archive_binding(
 ///   `owner_contract` and `source_installation` against the archive the capture
 ///   owner just decoded, its `StateFence` against the COMPLETE archived fence
 ///   this archive was exported under, and its `snapshot_digest` and
-///   `member_digest` against the verification request that IS this operation. A
-///   receipt for another archive, another snapshot, another membership, another
-///   class, another fence or another source refuses here, before any verdict —
-///   and the snapshot and membership joins are performed rather than skipped,
-///   because they are the only terms that reach those two digests.
+///   `member_digest` against the verification request that IS this operation.
+///   Note what the last two joins read: the CAPTURE OPERATION's
+///   `snapshot_digest`/`member_digest`, not the receipt's. The receipt's own two
+///   digests were already tied to that operation by value in leg two, and the
+///   receipt reaches this verification operation only TRANSITIVELY, through the
+///   capture operation that leg two bound it to. A receipt for another archive,
+///   another snapshot, another membership, another class, another fence or
+///   another source refuses here, before any verdict.
 /// - receipt → owner: the receipt's `attesting_owner` equals the owner contract
 ///   the archive declares. A receipt issued by another owner refuses, and so
 ///   does one whose channel never authenticated as the capture owner.
@@ -1109,16 +1131,25 @@ fn check_capture_receipt_against_operation(
 ///
 /// `request` is the admitted protocol request and it is REQUIRED whenever this
 /// leg runs. It was once an early `return Ok(())` on its absence, which left the
-/// two digest joins below — the only terms tying a receipt's `snapshot_digest`
-/// and `member_digest` to anything — unperformed for a receipt presented without
-/// an operation. That was the single owner-evidence leg in this gate that absence
-/// could satisfy, and it made a receipt for another snapshot or another
-/// membership pass on the inline arm. It now refuses, exactly as
-/// [`check_validity_attestation_binding`] refuses for the attestation and
-/// [`check_handle_binding`] refuses for the handle, so all three owner-evidence
-/// legs require the protocol request and none is satisfiable by its absence.
-/// Nothing is weakened to get there: the inline arm carries no capture receipt
-/// at all, so the inline arm is unaffected.
+/// two digest joins below unperformed for a capture receipt presented without an
+/// operation. Those joins are between the CAPTURE OPERATION's `snapshot_digest`
+/// and `member_digest` and the VERIFICATION REQUEST's; they never read
+/// `receipt.snapshot_digest` or `receipt.member_digest`, because leg two already
+/// compared the receipt's own two digests against the capture operation's. What
+/// the early return skipped was therefore the reach from the capture operation —
+/// and so, transitively, from the receipt tied to it in leg two — into the
+/// operation actually being verified. That is what makes a receipt for another
+/// snapshot or another membership unable to reach a provenance-qualified verdict
+/// on the inline arm.
+///
+/// It now refuses, in the same shape as the other owner-evidence legs: evidence
+/// PRESENT with the protocol request ABSENT. That is stated per leg, not as one
+/// blanket rule, because [`check_handle_binding`] refuses on evidence and
+/// request DISAGREEING and returns `Ok(())` when both are absent. Each refusal
+/// names its own field path, so an operator can tell which leg refused; see the
+/// note on the `let Some(admitted)` below. Nothing is weakened to get here: the
+/// inline arm carries no capture receipt and no capture operation at all, so the
+/// inline arm never reaches this function.
 fn check_capture_operation_binding(
     capture_owner: &CaptureOwnerAttestation,
     request: Option<&BackupVerifyAdmittedRequest>,
@@ -1174,29 +1205,34 @@ fn check_capture_operation_binding(
         source,
     })?;
     // The capture operation → THIS operation, for the two digests the archive
-    // format does not carry. Leg two tied the receipt's copies to the capture
-    // operation's; these tie the capture operation's to the verification request
-    // that IS this operation, so the snapshot and membership the receipt attests
-    // are the ones this verification asked about.
+    // format does not carry. Leg two tied the RECEIPT's copies to the capture
+    // operation's; these tie the CAPTURE OPERATION's copies to the verification
+    // request that IS this operation, so the snapshot and membership the receipt
+    // attests — transitively, through the operation leg two bound it to — are the
+    // ones this verification asked about.
     //
     // A capture receipt with NO admitted protocol request REFUSES rather than
-    // returning early. That early `return Ok(())` was the one owner-evidence leg
-    // in this gate that could be satisfied with no operation behind it: the two
-    // digest joins are the ONLY terms that tie a receipt's `snapshot_digest` and
-    // `member_digest` to anything this operation asked about, and the archive
-    // format carries neither, so with no request they were left bound to nothing
-    // at all. I4 requires a receipt to be resolved against the archive/snapshot/
-    // member digests, and a receipt naming a different snapshot or a different
-    // membership has to fail before a provenance-qualified verdict. A present
-    // receipt with no operation to belong to has no operation to belong to, which
-    // is the same argument
-    // [`check_validity_attestation_binding`] already states for the attestation
-    // and [`check_handle_binding`] already states for the handle. Making this leg
-    // refuse is what makes the gate uniform: all three owner-evidence legs now
-    // require the protocol request, so none can be quietly satisfied by absence.
+    // returning early. That early `return Ok(())` left the two joins below
+    // unperformed, so the capture operation — and the receipt leg two bound to it
+    // — was never compared against the operation being verified. I4 requires a
+    // receipt to be resolved against the archive/snapshot/member digests, and a
+    // receipt naming a different snapshot or a different membership has to fail
+    // before a provenance-qualified verdict. Nothing is weakened to get here: the
+    // inline arm carries no capture receipt and no capture operation, so it never
+    // reaches this function.
+    //
+    // The field path is this leg's own, in the same `backup_verify.capture_operation.`
+    // family as every other refusal below. It is deliberately NOT
+    // `ARCHIVE_VERIFICATION_FIELD`: `NotBound::reason()` returns one constant
+    // string for every `NotBound`, and the route renders that reason beside
+    // `field()`, so a shared path would render this refusal identically on the
+    // wire to the handle leg's refusal for a handle with no protocol request
+    // (:1011) and to the attestation leg's refusal for an attestation with no
+    // protocol request (:1246), leaving the operator unable to tell which leg
+    // refused.
     let Some(admitted) = request else {
         return Err(BackupProvenanceError::NotBound {
-            field: ARCHIVE_VERIFICATION_FIELD,
+            field: "backup_verify.capture_operation.verification_request",
         });
     };
     if capture_owner.operation.identity.snapshot_digest
