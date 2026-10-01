@@ -5477,7 +5477,7 @@ struct LegacyUnscopedBackupVerificationRow {
 ///   `request_digest` and `operation_namespace`, so a replay of the pair is
 ///   possible, but it carries no grant id.
 /// - `principal` and `scope_id` are the authenticated owner values the grant
-///   was issued to. A grant is bound to ONE principal in ONE WorkScope.
+///   was issued to. A grant is bound to ONE principal in ONE `WorkScope`.
 /// - `authority_lineage_id` is the authority the grant was issued under. The
 ///   sequence is deliberately absent: a rotation is the same authority observed
 ///   later, exactly as on `successor_may_observe`, and a grant survives a
@@ -5539,10 +5539,7 @@ impl BackupVerifySuccessionGrant {
     /// them.
     pub fn validate(&self) -> Result<(), OrsError> {
         validate_digest(&self.grant_id, "backup_verify_succession_grant_id")?;
-        validate_text(
-            &self.principal,
-            "backup_verify_succession_grant_principal",
-        )?;
+        validate_text(&self.principal, "backup_verify_succession_grant_principal")?;
         validate_text(&self.scope_id, "backup_verify_succession_grant_scope_id")?;
         validate_text(
             &self.authority_lineage_id,
@@ -5560,13 +5557,13 @@ impl BackupVerifySuccessionGrant {
                 reason: "grant expiry must be strictly after its due time",
             });
         }
-        if let Some(consumed_at_unix_ms) = self.consumed_at_unix_ms {
-            if consumed_at_unix_ms < self.not_before_unix_ms {
-                return Err(OrsError::InvalidField {
-                    field: "backup_verify_succession_grant_consumed_at_unix_ms",
-                    reason: "grant consumption must fall inside its own authorization window",
-                });
-            }
+        if let Some(consumed_at_unix_ms) = self.consumed_at_unix_ms
+            && consumed_at_unix_ms < self.not_before_unix_ms
+        {
+            return Err(OrsError::InvalidField {
+                field: "backup_verify_succession_grant_consumed_at_unix_ms",
+                reason: "grant consumption must fall inside its own authorization window",
+            });
         }
         Ok(())
     }

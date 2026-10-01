@@ -7508,7 +7508,10 @@ impl RedbRecoveryStore {
             let mut table = write
                 .open_table(BACKUP_VERIFICATION_RESULTS)
                 .map_err(storage)?;
-            let Some(bytes) = table.get(key).map_err(storage)?.map(|value| value.value().to_owned())
+            let Some(bytes) = table
+                .get(key)
+                .map_err(storage)?
+                .map(|value| value.value().to_owned())
             else {
                 return Ok(false);
             };
