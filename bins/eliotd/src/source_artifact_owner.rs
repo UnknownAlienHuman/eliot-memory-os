@@ -18,8 +18,8 @@ use eliot_blob::{
     DpapiUserKeyPort, WindowsBlobPlatform, ZstdBlobCompression,
 };
 use eliot_blob_api::{
-    BlobError, BlobId, BlobPolicyBinding, BlobReadChunk, BlobReadRequest, BlobReadyReceipt,
-    BlobReceiptContext, ObjectResidencyKey, RetentionClass,
+    BlobError, BlobId, BlobLocator, BlobPolicyBinding, BlobReadChunk, BlobReadRequest,
+    BlobReadyReceipt, BlobReceiptContext, ObjectResidencyKey, RetentionClass,
 };
 use eliot_governor::{
     SourceArtifactAdmission, SourceArtifactBlobProfile, SourceArtifactBlobProfileError,
@@ -89,6 +89,35 @@ pub enum SourceArtifactOwnerError {
     LspObservationPayload(#[source] serde_json::Error),
     #[error("source artifact effect is not admitted for this operation")]
     WrongEffect,
+    #[error("source snapshot staging target differs from the current Blob owner, policy, or bytes")]
+    StagingTargetMismatch,
+}
+
+/// Sealed, non-Serde prospective S-04 locator for one exact source archive.
+///
+/// This is an inert target derived by the original Blob root owner and the
+/// currently read Policy scope before the Governor issues a distinct write
+/// admission. Its resource reference is the canonical existing Blob locator,
+/// not a second caller-selected resource namespace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SourceArtifactStagingTarget {
+    locator: BlobLocator,
+    resource_ref: String,
+    source_id: eliot_contracts::SourceId,
+    archive_sha256: String,
+    policy_snapshot_id: String,
+    policy_snapshot_digest: String,
+    state_fence: eliot_contracts::StateFence,
+}
+
+impl SourceArtifactStagingTarget {
+    pub(crate) fn locator(&self) -> &BlobLocator {
+        &self.locator
+    }
+
+    pub(crate) fn resource_ref(&self) -> &str {
+        &self.resource_ref
+    }
 }
 
 impl SourceArtifactOwner {
@@ -119,6 +148,83 @@ impl SourceArtifactOwner {
             key_generation,
         })
     }
+
+    /// Derives the exact prospective Blob locator from current original
+    /// Policy-owned residency domains, this owner's lifecycle generation,
+    /// and the exact captured plaintext. No lease, action, authority, or write
+    /// is created here.
+    pub(crate) fn prepare_source_snapshot_target(
+        &self,
+        policy_profile: &SourceArtifactBlobProfile,
+        source_id: &eliot_contracts::SourceId,
+        exact_archive_bytes: &[u8],
+    ) -> Result<SourceArtifactStagingTarget, SourceArtifactOwnerError> {
+        let state_fence = policy_profile.state_fence().clone();
+        let root_generation = self
+            .root_owner
+            .lifecycle_resource_generation()
+            .ok_or(SourceArtifactOwnerError::StagingTargetMismatch)?;
+        if state_fence.resource_generation.value() != root_generation
+            || root_generation != self.key_generation
+            || exact_archive_bytes.is_empty()
+        {
+            return Err(SourceArtifactOwnerError::StagingTargetMismatch);
+        }
+        let domains = blob_residency_domains(policy_profile)?;
+        // This method is supplied by the original Blob owner and reuses its
+        // S-04 BLAKE3/residency/path-generation derivation. Do not duplicate
+        // those rules in the daemon composition.
+        let locator = domains.locator_for_exact_bytes(exact_archive_bytes, root_generation)?;
+        locator.validate()?;
+        let resource_ref = String::from_utf8(eliot_contracts::canonical_json_bytes(&locator)?)
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        Ok(SourceArtifactStagingTarget {
+            locator,
+            resource_ref,
+            source_id: source_id.clone(),
+            archive_sha256: eliot_contracts::sha256_hex(exact_archive_bytes),
+            policy_snapshot_id: policy_profile.policy_snapshot_id().to_owned(),
+            policy_snapshot_digest: policy_profile.policy_snapshot_digest().to_owned(),
+            state_fence,
+        })
+    }
+
+    /// Stages exact bytes only when the distinct original mutation admission
+    /// targets the prospective locator derived before that admission.
+    pub(crate) fn stage_source_snapshot_at_target(
+        &self,
+        admission: &SourceArtifactAdmission,
+        profile: &SourceArtifactBlobProfile,
+        target: &SourceArtifactStagingTarget,
+        identity: ArtifactIdentity,
+        bytes: &[u8],
+    ) -> Result<ArtifactReference, SourceArtifactOwnerError> {
+        let current_target = self.prepare_source_snapshot_target(
+            profile,
+            &target.source_id,
+            bytes,
+        )?;
+        if target != &current_target
+            || admission.operation().effect != EffectClass::ReversibleMutation
+            || admission.resource_ref() != target.resource_ref
+            || admission.request().state_fence != target.state_fence
+            || admission.work_scope().state_fence != target.state_fence
+            || profile.policy_snapshot_id() != target.policy_snapshot_id
+            || profile.policy_snapshot_digest() != target.policy_snapshot_digest
+            || identity.source.as_ref().is_none_or(|source| {
+                source.source_id != target.source_id
+                    || source.integrity.as_deref() != Some(target.archive_sha256.as_str())
+            })
+        {
+            return Err(SourceArtifactOwnerError::StagingTargetMismatch);
+        }
+        let reference = self.stage_source_snapshot(admission, profile, identity, bytes)?;
+        if reference.locator != target.locator {
+            return Err(SourceArtifactOwnerError::StagingTargetMismatch);
+        }
+        Ok(reference)
+    }
+
 
     /// Stages exact archive bytes after the original `PolicyOwner` profile has
     /// been validated against this live source admission and the active Blob
