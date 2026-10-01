@@ -12310,12 +12310,10 @@ impl RedbRecoveryStore {
         field: &'static str,
     ) -> Result<eliot_workscope::BridgeIngestPolicyLeg, OrsError> {
         let spelling = bridge_text(value, field)?;
-        eliot_workscope::BridgeIngestPolicyLeg::from_wire(&spelling).ok_or(
-            OrsError::InvalidField {
-                field,
-                reason: "privacy owner policy leg must name owner-decided evidence availability",
-            },
-        )
+        eliot_workscope::BridgeIngestPolicyLeg::from_wire(&spelling).ok_or(OrsError::InvalidField {
+            field,
+            reason: "privacy owner policy leg must name owner-decided evidence availability",
+        })
     }
 
     /// Re-resolves the `WorkScope` privacy owner's verdict for the staged
@@ -37947,10 +37945,9 @@ mod host_request_result_tests {
         // presents withholds. The owner rule re-derives a rejection for exactly
         // this evidence, so the misstated verdict is refused.
         let mut authorization = admitting_privacy_authorization(&bytes);
-        authorization["provider_restriction"] =
-            serde_json::Value::String(privacy_leg_wire(
-                eliot_workscope::BridgeIngestPolicyLeg::Unavailable,
-            ));
+        authorization["provider_restriction"] = serde_json::Value::String(
+            privacy_leg_wire(eliot_workscope::BridgeIngestPolicyLeg::Unavailable).to_owned(),
+        );
         let withholding_scope = "c".repeat(64);
         assert_eq!(
             undecided_leg_privacy_authorization(&bytes, &withholding_scope)["declared_class"],
