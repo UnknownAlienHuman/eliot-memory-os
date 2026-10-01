@@ -3158,6 +3158,7 @@ impl CancellingCommit {
                 let eliot_kernel_core::UserAutomationOperation::Edit {
                     previous_revision,
                     revision,
+                    ..
                 } = &request.intent.operation
                 else {
                     return Err(UserAutomationExecutionError::OperationMismatch(

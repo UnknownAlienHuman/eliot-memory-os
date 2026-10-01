@@ -2679,6 +2679,24 @@ impl KernelStoreGateway {
             .map_err(UserAutomationExecutionError::Contract)
     }
 
+    /// Performs the authenticated, read-only schedule normalization operation
+    /// used by the Kernel operator route before any Create/Edit Store call.
+    pub fn normalize_user_automation_schedule(
+        request: &UserAutomationServiceRequest,
+    ) -> Result<
+        (
+            UserAutomationRevision,
+            eliot_receipts::ReceiptEnvelope,
+        ),
+        UserAutomationExecutionError,
+    > {
+        request
+            .validate_for_schedule_normalization()
+            .map_err(UserAutomationExecutionError::Contract)?;
+        super::user_automation_store::normalize_user_automation_operation(request)
+            .map_err(UserAutomationExecutionError::Contract)
+    }
+
     /// Executes one authenticated `UserAutomation` operator operation as one
     /// post-commit orchestration transition.
     ///
@@ -4995,6 +5013,7 @@ impl KernelStoreGateway {
         let UserAutomationOperation::Edit {
             previous_revision,
             revision,
+            ..
         } = &sealed.intent.operation
         else {
             return Err("the superseding-edit handoff requires edit".to_owned());
@@ -9250,6 +9269,9 @@ fn schedule_horizon_trigger(
         | UserAutomationOperation::RunNow { .. }
         | UserAutomationOperation::Remove { .. }
         | UserAutomationOperation::InspectLastFailure { .. }
+        | UserAutomationOperation::GetContext
+        | UserAutomationOperation::NormalizeSchedule { .. }
+        | UserAutomationOperation::MigrateLegacySchedule { .. }
         // A committed recurring wake horizon belongs to a committed AUTOMATION
         // configuration revision, and the closed reason above names the
         // revision transition that produced it. I12.24:65's decision-owner
