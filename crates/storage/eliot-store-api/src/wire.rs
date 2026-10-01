@@ -25,7 +25,8 @@ use crate::{
     RequestMeta, ReservedWriteRequest, RestoreValidationReceipt, RevisionHead,
     RevisionHeadExpectation, RevisionKey, ScopeId, SnapshotBeginRequest, SnapshotCursor,
     SnapshotEndReceipt, SnapshotHandle, SnapshotPage, StateFence, StoreError, StoreGenesisRequest,
-    StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, canonical_json_bytes,
+    StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, StoreWorkScopeOwnerRequest,
+    StoreWorkScopeOwnerResponse, WriteReceipt, canonical_json_bytes,
     dreamer_job::map_durable_error, json_shape_name, reconcile_same_operation, sha256_hex,
     verify_canonical_request_hash,
 };
@@ -61,6 +62,8 @@ pub const CAPABILITY_ORDERING_HEADS: &str = "store.ordering_heads";
 pub const CAPABILITY_VALIDATION_SNAPSHOT: &str = "store.validation_snapshot";
 pub const CAPABILITY_RECOVERY: &str = "store.recovery";
 pub const CAPABILITY_INITIALIZE_GENESIS: &str = "store.initialize_genesis";
+/// Capability for the authenticated post-genesis WorkScope owner CAS.
+pub const CAPABILITY_WORK_SCOPE_OWNER_WRITE: &str = "store.work_scope_owner.write";
 /// Intent capability gate for neutral erasure dispatch (issue #688).
 ///
 /// A store that cannot durably record intent must not advertise this
@@ -95,6 +98,7 @@ pub const CAPABILITIES: &[&str] = &[
     CAPABILITY_VALIDATION_SNAPSHOT,
     CAPABILITY_RECOVERY,
     CAPABILITY_INITIALIZE_GENESIS,
+    CAPABILITY_WORK_SCOPE_OWNER_WRITE,
     CAPABILITY_DREAMER_JOB_SUBMIT,
     CAPABILITY_DREAMER_JOB_LEASE_NEXT,
     CAPABILITY_DREAMER_JOB_LEASE_EXACT,
@@ -333,6 +337,10 @@ pub enum StoreRequest {
         context: RequestMeta,
         request: StoreGenesisRequest,
     },
+    WriteWorkScopeOwner {
+        context: RequestMeta,
+        request: StoreWorkScopeOwnerRequest,
+    },
     Receipt {
         operation_id: OperationId,
     },
@@ -368,6 +376,9 @@ impl StoreRequest {
                     return Err(StoreError::FenceMismatch);
                 }
                 Ok(())
+            }
+            Self::WriteWorkScopeOwner { context, request } => {
+                request.validate_for_context(context)
             }
             Self::Apply {
                 context,
@@ -436,6 +447,7 @@ impl StoreRequest {
             Self::ValidationSnapshot => CAPABILITY_VALIDATION_SNAPSHOT,
             Self::Recovery { .. } => CAPABILITY_RECOVERY,
             Self::InitializeGenesis { .. } => CAPABILITY_INITIALIZE_GENESIS,
+            Self::WriteWorkScopeOwner { .. } => CAPABILITY_WORK_SCOPE_OWNER_WRITE,
             Self::DreamerJob { request, .. } => dreamer_job_capability(&request.operation),
         }
     }
@@ -525,6 +537,20 @@ impl StoreRequest {
                 if request.state_fence != identity.request.state_fence {
                     return Err(StoreWireError::Identity(
                         "genesis request fence does not match request identity".to_owned(),
+                    ));
+                }
+                Ok(())
+            }
+            Self::WriteWorkScopeOwner { context, request } => {
+                if context != &identity.request.metadata {
+                    return Err(StoreWireError::Identity(
+                        "WorkScope owner context does not match request identity metadata"
+                            .to_owned(),
+                    ));
+                }
+                if request.state_fence != identity.request.state_fence {
+                    return Err(StoreWireError::Identity(
+                        "WorkScope owner fence does not match request identity".to_owned(),
                     ));
                 }
                 Ok(())
@@ -1188,6 +1214,9 @@ pub enum StoreResponse {
     Genesis {
         receipt: WriteReceipt,
     },
+    WorkScopeOwner {
+        response: StoreWorkScopeOwnerResponse,
+    },
     DreamerJob {
         response: DurableJobResponse,
     },
@@ -1333,6 +1362,10 @@ impl StoreResponse {
                     .map(|_| ())
                     .map_err(StoreWireError::Store)
             }
+            Self::WorkScopeOwner { response } => response
+                .record
+                .validate()
+                .map_err(StoreWireError::Store),
             Self::Failure { failure } => failure
                 .validate()
                 .map_err(|error| StoreWireError::Invalid(error.to_string())),
