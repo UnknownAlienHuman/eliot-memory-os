@@ -72,7 +72,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use eliot_context_admission::{
-    HeadroomAdmissionOutcome, HeadroomContext, HeadroomRefusalRecord, MaterialRankTraceDelivery,
+    DownstreamReservation, HeadroomAdmissionOutcome, HeadroomContext, HeadroomRefusalRecord,
+    LearningGovernance, MaterialRankTraceDelivery, admit_context_governed,
     admit_context_traced_with_headroom, check_campaign_view_for_admission,
 };
 use eliot_context_assembly::{
@@ -103,6 +104,7 @@ use eliot_governor::{
     ROLE_CUE_ACTIVATION, ROLE_EPISTEMIC_POSITION, ROLE_EVIDENCE_ASSURANCE, ROLE_NEGATIVE_MEMORY,
     ROLE_TASK_FRAME, SevenRoleInputs,
 };
+use eliot_improvement::PresentedLearning;
 use eliot_kernel_core::module::control_reserve_front_door::ControlReleaseEvidence;
 use eliot_kernel_core::{ControlPermit, FrontDoor};
 use eliot_learning_contracts::CampaignLearningStateView;
@@ -2096,6 +2098,17 @@ impl KernelContextReadClient {
     /// keeps its unbound-closure gap; the per-identity account is recorded on
     /// `bins/eliotd/src/campaign_packet.rs::CampaignPacketGapCode::AdmissionClosureUnbound`.
     ///
+    /// #1869: `presented` is the owner-issued learning authority for THIS
+    /// compilation, when the owner issued any. It is the Governor's live
+    /// verified admission handle, the wire ticket it minted from the same
+    /// issuance, the overlay and production backlog it issued against, the
+    /// requesting identity, and the distinct owner-issued cross-task carryover
+    /// when the compilation is for another task. It is never synthesised here
+    /// and never defaulted: `None` is the owner's own absence of a learning
+    /// admission for this packet, not a fallback the composition chose. Its
+    /// presence is what selects the composed guarded admission entry, because
+    /// the ticket it carries is the owner record the learning gate must verify.
+    ///
     /// #1862: `campaign_view` is the validated immutable
     /// `CampaignLearningStateView` this compilation is bound to, and
     /// `context_recipe_record_digest` is the Context owner's own re-derivation,
@@ -2211,6 +2224,7 @@ impl KernelContextReadClient {
         context_recipe_record_digest: &str,
         floor: &SafetyFloorIdentity,
         headroom_join: PacketHeadroomJoin<'_>,
+        presented: Option<PresentedLearning<'_>>,
         headroom_request: &DownstreamHeadroomRequest,
         headroom_result: &DownstreamHeadroomResult,
         headroom_ledger: &HeadroomAllocationLedger,
@@ -2325,11 +2339,11 @@ impl KernelContextReadClient {
             recipe,
             &request.binding,
         )?;
-        let input = packet_admission_input(request, recipe, &candidates, &admission);
+        let input = packet_admission_input(request, recipe, &candidates, &admission, presented);
         input
             .validate()
             .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
-        let (admitted, delivery) = admit_packet_candidates(&input, &headroom)?;
+        let (admitted, delivery) = admit_packet_candidates(&input, &headroom, presented)?;
         // The selection happened under the reservation. Re-read the live owner
         // now, with the second clock reading, so a reservation the owner has
         // since fenced or expired cannot carry the assembled packet.
@@ -2479,18 +2493,27 @@ fn recheck_packet_headroom(
 /// `candidates` is the candidate stage's own result and the floor, priority,
 /// rule, measurement profile, omissions and measurements are exactly what
 /// [`PacketAdmissionBundle::build`] admitted.
+///
+/// `learning_tickets` is the owner-issued wire ticket when the owner issued a
+/// learning admission for this compilation and empty when it did not, so the
+/// input carries the same owner record the learning gate will re-verify
+/// against. It is never populated from anything but `presented`, and it is
+/// never emptied to make a marked packet pass.
 fn packet_admission_input(
     request: &CandidateRequest,
     recipe: &ContextRecipe,
     candidates: &ContextCandidateSetResult,
     admission: &PacketAdmissionBundle,
+    presented: Option<PresentedLearning<'_>>,
 ) -> AdmissionInput {
     AdmissionInput {
         schema_version: CONTEXT_CONTRACT_VERSION,
         binding: request.binding.clone(),
         recipe: recipe.clone(),
         candidates: candidates.set.clone(),
-        learning_tickets: Vec::new(),
+        learning_tickets: presented
+            .map(|presented| vec![presented.ticket.clone()])
+            .unwrap_or_default(),
         floor: admission.floor.clone(),
         priority: admission.priority.clone(),
         rule: admission.rule.clone(),
@@ -2531,24 +2554,52 @@ fn composition_failure(
 /// Admits one packet candidate set through the admission owner under one
 /// granted downstream reservation.
 ///
-/// Runs the admission owner's reservation-aware traced join
-/// ([`admit_context_traced_with_headroom`]) over the caller-built
-/// [`AdmissionInput`] and the caller's owner-issued headroom evidence. The pure
-/// compiler reads the owner-issued permit bindings out of that evidence and
-/// performs no I/O; the reservation owner stays the only party that can release
-/// or reconcile them.
+/// Chooses the guarded admission entry from owner-issued evidence.
 ///
-/// A refused reservation returns [`PacketCompositionError::HeadroomRefused`]
-/// carrying the attempted recipe and binding, so no admitted set and no
-/// nominally complete view exist for a dependent operation to observe.
+/// The choice is made on the owner record that reached this route, never on a
+/// preference between two functions. `presented` is the owner's own learning
+/// authority for this compilation: `Some` exists only when the Governor issued
+/// a learning admission and the caller re-verified it live against the current
+/// owner epoch/generation/fence (`eliot_governor::VerifiedLearningAdmission`
+/// has no other constructor). That fact decides the entry:
+///
+/// - `Some` ⇒ `admit_context_governed` with `LearningGovernance::Presented`. The
+///   packet carries owner-issued learning authority, so BOTH guarantees apply
+///   at once:
+///   I12.24/#1869 requires the learning gate and I12.13/#1725 requires the
+///   reservation held back before optional filling. The composed entry runs
+///   both checks and then invokes the selector exactly ONCE, and returns the
+///   rank traces for that same selection. The single-check entry is not
+///   equivalent here: it runs the learning gate's refusal instead of its
+///   verification, so it would refuse this packet outright.
+/// - `None` ⇒ the owner issued no learning admission for this compilation, so
+///   there is no learning authority to verify and the reservation-only join
+///   [`admit_context_traced_with_headroom`] is the applicable one. It still
+///   refuses an input that carries learning marks or tickets (typed, as
+///   `learning.governed_path_required`), so a packet that needs governed
+///   learning cannot slip through this arm by arriving without the authority.
+///
+/// No arm falls back to the other. In particular the composed path's refusals
+/// stay refusals on this route: a learning failure keeps the admission owner's
+/// typed [`ContextError`] as [`PacketCompositionError::Admission`], and a
+/// withheld reservation keeps the typed
+/// [`PacketCompositionError::HeadroomRefused`] record. Neither is retried
+/// through `admit_context_traced_with_headroom`, which would silently downgrade
+/// a governed refusal into an ordinary headroom-only decision.
+///
+/// The pure compiler reads the owner-issued permit bindings out of that
+/// evidence and performs no I/O; the reservation owner stays the only party
+/// that can release or reconcile them.
 ///
 /// #1869: the path this function takes is chosen from owner-derived evidence
 /// about which policies apply, never assumed. For input with no learning marks
 /// and no tickets the learning refusal is vacuous and the reservation-aware
 /// entry is the correct guarded path. For learning-marked or ticketed input it
-/// is not, and [`require_composed_learning_guard`] refuses before any selection
-/// runs instead of admitting under an entry that skips the live learning
-/// checks.
+/// is not, and the composed entry now handles it: the caller selects
+/// `admit_context_governed` with `LearningGovernance::Presented`, which runs the
+/// carriage gate, the per-mark screen and the headroom check before one
+/// selection. `require_composed_learning_guard`, which used to refuse
+/// learning-marked input here, is gone.
 ///
 /// I12.26: the returned [`MaterialRankTraceDelivery`] is the delivery
 /// acceptance record for this packet. It carries one handle-bound
@@ -2560,9 +2611,30 @@ fn composition_failure(
 fn admit_packet_candidates(
     input: &AdmissionInput,
     headroom: &HeadroomContext<'_>,
+    presented: Option<PresentedLearning<'_>>,
 ) -> Result<(AdmittedContextSet, MaterialRankTraceDelivery), PacketCompositionError> {
-    require_composed_learning_guard(input)?;
-    let (result, traces) = match admit_context_traced_with_headroom(input, headroom)
+// #1725 AUD3: the entry is chosen from owner-derived evidence, never assumed.
+    // `Some` exists only when the Governor issued a learning admission AND the
+    // caller re-verified it live, and `VerifiedLearningAdmission` has a private
+    // field with no other constructor. `admit_context_governed` with
+    // `LearningGovernance::Presented` is the composed entry: it runs the
+    // owner-bound carriage gate and the per-mark screen AND the headroom check
+    // before exactly ONE selection. `admit_context_traced_with_headroom` is the
+    // same entry projected onto `LearningGovernance::Unpresented`.
+    //
+    // The previous `require_composed_learning_guard` call is GONE rather than
+    // left behind: it existed only because no entry ran both guarantees before
+    // one selection, so it REFUSED learning-marked input outright. Keeping it
+    // would have refused the exact input this item exists to admit.
+    let guarded = match presented {
+        Some(presented) => admit_context_governed(
+            input,
+            &LearningGovernance::Presented(presented),
+            &DownstreamReservation::Reserved(headroom),
+        ),
+        None => admit_context_traced_with_headroom(input, headroom),
+    };
+    let (result, traces) = guarded
         .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?
     {
         HeadroomAdmissionOutcome::Admitted { result, traces, .. } => (*result, traces),
@@ -2582,53 +2654,6 @@ fn admit_packet_candidates(
         }
     };
     Ok((admitted, delivery))
-}
-
-/// Refuses learning-marked or ticketed input before any selection runs.
-///
-/// #1869 (audit item 3): the caller must choose the admission entry that
-/// applies BOTH the governed learning checks and the headroom check before one
-/// selection. Two entries exist and neither does that:
-///
-/// - the reservation-aware traced entry applies `check_headroom` and then
-///   reaches the selector directly, so it applies none of
-///   `refuse_ungoverned_learning`, `check_governed_carriage` or
-///   `screen_admission_input_learning`;
-/// - the governed learning entry applies the carriage check and the per-mark
-///   screen and then reaches the selector with headroom `None`.
-///
-/// An [`AdmissionInput`] is ordinary data, not a proof that the live learning
-/// checks already ran, so for learning-marked or ticketed input neither entry
-/// preserves both guarantees. Calling the two selecting entries in sequence and
-/// comparing their outputs after admission is exactly what the audit forbids,
-/// and no entry is written here in their place, so this caller refuses. The
-/// selection below is reached only for input on which the learning policy does
-/// not apply, where the reservation-aware entry is the correct guarded path and
-/// the learning refusal is vacuous.
-///
-/// The evidence is owner-derived: the marks ride on the candidate atoms the
-/// candidate owner itself constructed, and the tickets ride on the admission
-/// input this composition built from that set. Nothing is read from a request
-/// envelope, and no mark or ticket is stripped, cleared or reclassified to make
-/// the ordinary path apply.
-///
-/// # Errors
-///
-/// Returns [`PacketCompositionError::ComposedAdmissionEntryMissing`] when the
-/// learning policy applies and no composed entry exists for it.
-fn require_composed_learning_guard(input: &AdmissionInput) -> Result<(), PacketCompositionError> {
-    let learning_applies = !input.learning_tickets.is_empty()
-        || input
-            .candidates
-            .candidates
-            .iter()
-            .any(|candidate| candidate.learning.is_some());
-    if learning_applies {
-        return Err(PacketCompositionError::ComposedAdmissionEntryMissing(
-            "learning-marked or ticketed input needs one entry that runs check_governed_carriage, screen_admission_input_learning and check_headroom before a single selection; neither existing entry preserves both guarantees",
-        ));
-    }
-    Ok(())
 }
 
 /// Binds one per-material rank-trace delivery record to the assembled packet.
