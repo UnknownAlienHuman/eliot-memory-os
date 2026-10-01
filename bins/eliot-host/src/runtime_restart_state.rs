@@ -109,6 +109,14 @@ pub(super) fn read_bounded_runtime_restart_file(
     Ok(bytes)
 }
 
+/// Reports whether a restart-store entry is the Host-managed episode budget
+/// file (issue #1801 W5): read by its own owner (`load_restart_budget`), it
+/// is never a restart receipt and therefore never adopted here.
+#[cfg(windows)]
+fn is_restart_budget_entry(file_name: &str) -> bool {
+    file_name == RESTART_BUDGET_FILE_NAME
+}
+
 #[cfg(windows)]
 pub(super) fn load_durable_runtime_restarts(
     host_state_root: &Path,
@@ -160,10 +168,7 @@ pub(super) fn load_durable_runtime_restarts(
                     "runtime restart store contains a non-text filename".to_owned(),
                 )
             })?;
-        if file_name == RESTART_BUDGET_FILE_NAME {
-            // The Host-managed episode budget is read by its own owner
-            // (`load_restart_budget`); it is never a restart receipt and is
-            // therefore never adopted here.
+        if is_restart_budget_entry(file_name) {
             host_restart_observe("host.restart budget not adopted observed");
             continue;
         }
@@ -487,37 +492,33 @@ pub(super) fn persist_restart_budget(
     // Publication failure stays primary across cleanup and its commit.
     let cleanup = std::fs::remove_file(&tmp);
     let sync_after_cleanup = sync_runtime_restart_store_dir(&dir);
-    match publication {
-        Err(publication_error) => {
-            host_restart_observe("host.restart budget publication failed observed");
-            Err(publication_error)
-        }
-        Ok(()) => {
-            match cleanup {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    host_restart_observe("host.restart budget cleanup failed observed");
-                    return Err(HostError::RecoveryRequired(format!(
-                        "restart budget temporary cleanup failed: {error}"
-                    )));
-                }
-            }
-            sync_after_cleanup?;
-            let reloaded = load_restart_budget(host_state_root)?.ok_or_else(|| {
-                HostError::RecoveryRequired(
-                    "restart budget record disappeared after publication".to_owned(),
-                )
-            })?;
-            if reloaded != *budget {
-                return Err(HostError::RecoveryRequired(
-                    "restart budget readback differs from the published record".to_owned(),
-                ));
-            }
-            host_restart_observe("host.restart budget persisted observed");
-            Ok(())
+    if let Err(publication_error) = publication {
+        host_restart_observe("host.restart budget publication failed observed");
+        return Err(publication_error);
+    }
+    match cleanup {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            host_restart_observe("host.restart budget cleanup failed observed");
+            return Err(HostError::RecoveryRequired(format!(
+                "restart budget temporary cleanup failed: {error}"
+            )));
         }
     }
+    sync_after_cleanup?;
+    let reloaded = load_restart_budget(host_state_root)?.ok_or_else(|| {
+        HostError::RecoveryRequired(
+            "restart budget record disappeared after publication".to_owned(),
+        )
+    })?;
+    if reloaded != *budget {
+        return Err(HostError::RecoveryRequired(
+            "restart budget readback differs from the published record".to_owned(),
+        ));
+    }
+    host_restart_observe("host.restart budget persisted observed");
+    Ok(())
 }
 
 #[cfg(windows)]

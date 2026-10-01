@@ -2504,8 +2504,7 @@ fn contour_restart_budget(
         {
             Ok(Some(budget))
         }
-        Some(_) => Ok(None),
-        None => Ok(None),
+        Some(_) | None => Ok(None),
     }
 }
 

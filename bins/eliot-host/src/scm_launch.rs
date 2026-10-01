@@ -682,32 +682,28 @@ pub fn publish_supervision_record_table(
     // cleanup and its commit.
     let cleanup = std::fs::remove_file(&tmp);
     let sync_after_cleanup = sync_dir(host_state_root);
-    match publication {
-        Err(publication_error) => {
-            scm_launch_observe("host.scm-launch supervision record publication failed");
-            Err(publication_error)
-        }
-        Ok(()) => {
-            match cleanup {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(HostError::RecoveryRequired(format!(
-                        "supervision record temporary cleanup failed: {error}"
-                    )));
-                }
-            }
-            sync_after_cleanup?;
-            let reloaded = read_supervision_record_table(host_state_root)?;
-            if reloaded != *table {
-                return Err(HostError::RecoveryRequired(
-                    "supervision record readback differs from the published table".to_owned(),
-                ));
-            }
-            scm_launch_observe("host.scm-launch supervision record published");
-            Ok(())
+    if let Err(publication_error) = publication {
+        scm_launch_observe("host.scm-launch supervision record publication failed");
+        return Err(publication_error);
+    }
+    match cleanup {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(HostError::RecoveryRequired(format!(
+                "supervision record temporary cleanup failed: {error}"
+            )));
         }
     }
+    sync_after_cleanup?;
+    let reloaded = read_supervision_record_table(host_state_root)?;
+    if reloaded != *table {
+        return Err(HostError::RecoveryRequired(
+            "supervision record readback differs from the published table".to_owned(),
+        ));
+    }
+    scm_launch_observe("host.scm-launch supervision record published");
+    Ok(())
 }
 
 /// Reads back the retained supervision record: the production read path for
@@ -829,7 +825,7 @@ pub struct InstalledCandidateReadback {
 ///
 /// TEST-PHASE (#11): this is the product code path for the
 /// first-install candidate contour; the installed-candidate RUN itself
-/// (install a disposable SystemService candidate, start it, assert exact
+/// (install a disposable `SystemService` candidate, start it, assert exact
 /// registration and process/Job readback demonstrate the supervision table)
 /// follows product assembly under #11 per the issue body sequencing. This
 /// function is therefore not invoked by `service_main` or `open`, and it
