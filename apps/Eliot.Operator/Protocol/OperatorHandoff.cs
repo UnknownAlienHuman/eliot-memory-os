@@ -91,6 +91,47 @@ public sealed record OperatorRoleBinding(
     public bool GrantsCommands => Grants(OperatorCapabilityNames.OperatorCommand);
 }
 
+/// The broker-issued Human principal this client retained when the User Broker
+/// redeemed the Operator handoff, on the very pipe that proved the OS-observed
+/// peer identity (I11.8). Every value is the broker's OWN `redeemed` response,
+/// read back after the redemption checks already proved it equal to this
+/// process's identity, session, token, role and exact capability set. Nothing
+/// here is composed, defaulted, derived, read from an environment value or a
+/// configuration file, or carried across processes.
+///
+/// It carries five of the six fields of the broker's `HumanStateAuthority`, and
+/// the sixth is deliberately ABSENT. `approval_hash` would be a claim with
+/// nothing to compare it against: I11.3 gives the Approver exactly one Critical
+/// action hash, and the broker holds no independently derived authority action
+/// digest, so it admits no Critical state change rather than admitting one on
+/// the strength of a 64-character string
+/// (`BrokerAdmissionRefusal::HumanApprovalActionDigestUnverifiable`). A digest
+/// this client has no recorded approval for is therefore not carried, and this
+/// client cannot yet present an approval at all: it proves WHO is asking and
+/// does not claim to prove WHAT was approved.
+///
+/// The Kernel session token is a binding proof, not a bearer credential, and it
+/// lives only in this process's memory: it is never persisted, never logged and
+/// never sent on another pipe. It is retained for the lifetime of the session
+/// that redeemed it and no longer: `GovernorPipeClient.DisposeAsync` calls
+/// `BrokerPipeClient.ReleaseOperatorBinding`, which takes the session out from
+/// under its gate and disposes it exactly once, and `RetainedPrincipal`
+/// reports null for any session that has been released or whose pipe no longer
+/// reports itself connected. That release is what this sentence claims, and it
+/// is a single call site: no other code path ends the hold, so a session that
+/// outlives its client would be a defect rather than a supported lifetime.
+///
+/// The consequence is stated plainly rather than as a guarantee about the
+/// process: a restarted UI retains nothing here and has to earn a fresh token
+/// through the whole exchange again, and while this process lives the retained
+/// copy is ordinary managed memory that is dropped, not scrubbed. Nothing here
+/// claims the bytes are zeroed on release, because no code zeroes them.
+internal sealed record OperatorHumanPrincipal(
+    string Principal,
+    string InteractiveSessionId,
+    string KernelSessionToken,
+    OperatorRoleBinding Grant);
+
 /// One owner-issued, single-use, expiring, generation-bound Operator handoff.
 ///
 /// The owner issues exactly six wire fields

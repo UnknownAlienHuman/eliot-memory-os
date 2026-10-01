@@ -14,12 +14,23 @@ namespace Eliot.Operator.Services;
 /// The authenticated binding's LIFETIME is the session, not this method. The
 /// bound pipe is the one that proved the OS-observed peer identity and that
 /// carried the Kernel-backed binding, so it is RETAINED after redemption
-/// rather than disposed with the call: a later request leg issues on that same
-/// bound handle and that same authenticated binding, reusing the existing
-/// handle and the existing binding object. No second pipe is opened, the
-/// challenge/redeem exchange is not repeated, no token is re-minted and no
-/// authority is copied into a cache - the only state retained is a live
-/// OS handle plus the object the broker already bound.
+/// rather than disposed with the call, and the broker's own answer for that
+/// binding is retained with it (see <see cref="OperatorHumanPrincipal"/>).
+/// No second pipe is opened, the challenge/redeem exchange is not repeated, no
+/// token is re-minted and no authority is copied into a cache: the retained
+/// state is the OS handle, the object the broker already bound, and the exact
+/// values the broker issued for that handle, which are the broker's own
+/// `redeemed` response rather than anything this client composed or remembered.
+///
+/// What the retained handle is NOT is a channel. No later request leg is
+/// written to it: this client reads the retained principal out of process
+/// memory and sends nothing back on that pipe. The broker's operator-pipe
+/// handler returns as soon as it has written `redeemed`, so the peer end is
+/// already gone by the time this method returns, and this client holds the
+/// handle to keep the binding's identity and lifetime - not to expect the peer
+/// to still be reading. That is why `RetainedPrincipal` decides liveness from
+/// this process's own release rather than from peer liveness: there is no
+/// observation of the broker here that a later request could rely on.
 ///
 /// Retention is process memory and is never persisted or carried across
 /// processes, so a restarted UI comes up with no retained session at all and
@@ -34,8 +45,10 @@ internal static class BrokerPipeClient
     private static readonly object BindingGate = new();
 
     /// The one bound pipe this process holds, or null when none is retained.
-    /// Cleared and disposed by <see cref="ReleaseOperatorBinding"/> when the
-    /// session ends or the binding is explicitly invalidated.
+    /// Cleared and disposed by <see cref="ReleaseOperatorBinding"/>, which
+    /// `GovernorPipeClient.DisposeAsync` calls as the deterministic end of the
+    /// session and which a later successful redemption also reaches by
+    /// superseding this session.
     private static BrokerPipeSession? _session;
 
     private static readonly string[] ChallengeProperties =
@@ -225,27 +238,84 @@ internal static class BrokerPipeClient
                 throw new OperatorRestartRequiredException(OperatorFaultReason.HandshakeRefused);
             }
 
+            // Every field of the retained principal is read back out of the
+            // broker's OWN `redeemed` object here, AFTER the checks above
+            // proved it, rather than from the endpoint and local process
+            // identity it was compared against: the retained value is the
+            // broker's answer, not this client's copy of what it asked for.
+            // Reading it after the checks also keeps the refusal precedence
+            // above unchanged - a malformed field in a response that was
+            // already refused is never read at all.
+            var redeemedRole = RequiredString(redeemed.RootElement, "role", "broker_redeem");
+            var principal = new OperatorHumanPrincipal(
+                RequiredString(redeemed.RootElement, "principal", "broker_redeem"),
+                RequiredString(redeemed.RootElement, "interactive_session_id", "broker_redeem"),
+                RequiredString(redeemed.RootElement, "kernel_session_token", "broker_redeem"),
+                // The capability list is copied into the grant rather than
+                // aliased, so a reader that casts this `IReadOnlyList` to its
+                // mutable materialised type cannot rewrite the granted set
+                // (the same alias break `GrantedBinding` applies).
+                new OperatorRoleBinding(redeemedRole, [.. RequiredCapabilities(redeemed.RootElement, "broker_redeem")]));
+
             // Redemption proved the peer and admitted the Kernel-backed
             // binding, so the handle becomes session state instead of going
             // out of scope with this call. Publishing is the last step: nothing
             // is retained unless every check above already passed.
-            return PublishSession(new BrokerPipeSession(pipe, reader, writer));
+            return PublishSession(new BrokerPipeSession(pipe, reader, writer, principal));
         }
         catch
         {
             // No partial binding survives a failed exchange, exactly as when
             // this handle was scoped to the method, and releasing it cannot
-            // replace the refusal with a close failure.
-            new BrokerPipeSession(pipe, reader, writer).Dispose();
+            // replace the refusal with a close failure. There is no retained
+            // principal to pass: this handle proved nothing.
+            new BrokerPipeSession(pipe, reader, writer, principal: null).Dispose();
             throw;
+        }
+    }
+
+    /// The broker-issued Human principal this process retained at redemption,
+    /// or null when no LIVE redeemed session is retained.
+    ///
+    /// Null is a refusal, never an authorization. It is returned whenever there
+    /// is nothing to report: no session retained, a session whose release has
+    /// run (see <see cref="ReleaseOperatorBinding"/>), or a session whose bound
+    /// pipe no longer reports itself connected. The read therefore fails closed
+    /// in the same direction as <see cref="GovernorPipeClient.GrantedBinding"/>,
+    /// which returns null rather than a grant it can no longer prove.
+    ///
+    /// The value is read off the retained session under the same gate that
+    /// publishes and clears it, so it is exactly the binding of the session
+    /// this process currently holds - never a remembered one from a superseded
+    /// session, and never one whose handle this process has already released.
+    internal static OperatorHumanPrincipal? RetainedPrincipal
+    {
+        get
+        {
+            lock (BindingGate)
+            {
+                var session = _session;
+                return session is not null && session.IsLive ? session.Principal : null;
+            }
         }
     }
 
     /// Releases the retained binding and closes its pipe. This is the
     /// deterministic end of the session's hold: after it returns, no bound pipe
-    /// remains and the next request has to run a fresh challenge/redeem
-    /// exchange for a new Kernel challenge/token. Calling it when nothing is
-    /// retained does nothing.
+    /// remains, `RetainedPrincipal` reports null, and the next request has to
+    /// run a fresh challenge/redeem exchange for a new Kernel challenge/token.
+    ///
+    /// It is idempotent and safe to race, because that is what its one
+    /// production caller needs: the session is taken out from under
+    /// <see cref="BindingGate"/> and the field cleared in the same critical
+    /// section, so exactly one caller ever receives a non-null session, a
+    /// concurrent or repeated call observes null and does nothing, and the
+    /// disposal happens outside the lock so closing a pipe can never be observed
+    /// as the retained session. It never propagates a close failure either,
+    /// because <see cref="BrokerPipeSession.Dispose"/> absorbs every one by the
+    /// same discipline that keeps a close failure out of the redemption that
+    /// published the handle - so releasing cannot replace a refusal that is
+    /// already being reported with a fault of its own.
     internal static void ReleaseOperatorBinding()
     {
         BrokerPipeSession? released;
@@ -490,7 +560,14 @@ internal static class BrokerPipeClient
     private static bool CapabilitiesMatch(
         JsonElement parent,
         IReadOnlyList<string> expected,
-        string shapeName)
+        string shapeName) =>
+        RequiredCapabilities(parent, shapeName).SequenceEqual(expected, StringComparer.Ordinal);
+
+    /// The broker's own capability array, in the order it sent it. Reading it
+    /// is separated from comparing it so the exact granted SET can be retained
+    /// from the same bytes the comparison proved, instead of being rebuilt from
+    /// the requested list afterwards.
+    private static IReadOnlyList<string> RequiredCapabilities(JsonElement parent, string shapeName)
     {
         if (!parent.TryGetProperty("capabilities", out var value)
             || value.ValueKind != JsonValueKind.Array)
@@ -506,7 +583,7 @@ internal static class BrokerPipeClient
             }
             capabilities.Add(capability);
         }
-        return capabilities.SequenceEqual(expected, StringComparer.Ordinal);
+        return capabilities;
     }
 
     private static void RequireBoundedText(string value, string shapeName, string fieldName)
@@ -525,10 +602,16 @@ internal static class BrokerPipeClient
 /// that handle carries. Holding the session rather than the authority is the
 /// point - the grant itself stays in the broker, so retaining this object
 /// grants nothing that a fresh challenge/redeem exchange would not also grant.
+/// The retained `Principal` is that same statement of fact: a record of what the
+/// broker already decided for this exchange, never a credential this client can
+/// present anywhere the broker does not check again.
 ///
 /// Disposal is deterministic and idempotent: it closes the pipe and is the
-/// only way the hold ends, so the session's end and explicit invalidation both
-/// release the handle exactly once. It never propagates a close failure. Every
+/// only way the hold ends. It is reached from exactly three places - the
+/// session's end via <see cref="BrokerPipeClient.ReleaseOperatorBinding"/>, a
+/// later redemption superseding it, and the failed-exchange path that disposes
+/// the handle it never published - so the handle is released exactly once on
+/// each of them. It never propagates a close failure. Every
 /// request line was already flushed by the writer's AutoFlush and nothing is
 /// read from here on, so a failure while releasing is not a lost request and
 /// must not escape into whoever ends the session - and above all must not
@@ -541,11 +624,57 @@ internal sealed class BrokerPipeSession : IDisposable
     private readonly StreamWriter _writer;
     private int _disposed;
 
-    internal BrokerPipeSession(NamedPipeClientStream pipe, StreamReader reader, StreamWriter writer)
+    /// The broker-issued Human principal redemption proved for THIS session,
+    /// or null for the handle a failed exchange disposes. It is set once, at
+    /// construction, and never recomputed or refreshed, so it always describes
+    /// the exchange that published this handle rather than a later one.
+    internal OperatorHumanPrincipal? Principal { get; }
+
+    /// Whether this session still holds a binding this process may report.
+    ///
+    /// This is the same fail-closed shape
+    /// <see cref="GovernorPipeClient.GrantedBinding"/> uses: a session that has
+    /// been disposed reports no binding, and a pipe that no longer reports
+    /// itself connected reports no binding. The disposal check is the one that
+    /// actually fires in production, because the broker's operator-pipe handler
+    /// returns and disposes its end as soon as it has written the `redeemed`
+    /// response, while `NamedPipeClientStream.IsConnected` keeps reporting true
+    /// until a client-side write observes the closure. So `IsConnected` is
+    /// reported as the bound-state fact it is and the disposed flag is what
+    /// makes the release deterministic; neither is treated as a proof of
+    /// continued broker liveness, because no such proof is retained.
+    internal bool IsLive
+    {
+        get
+        {
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                return false;
+            }
+            try
+            {
+                return _pipe.IsConnected;
+            }
+            catch (Exception error) when (error is ObjectDisposedException or IOException or InvalidOperationException)
+            {
+                // An unreadable transport reports no binding, exactly as a
+                // dropped one does. Refusing is the only safe reading of a
+                // handle whose state cannot be observed.
+                return false;
+            }
+        }
+    }
+
+    internal BrokerPipeSession(
+        NamedPipeClientStream pipe,
+        StreamReader reader,
+        StreamWriter writer,
+        OperatorHumanPrincipal? principal)
     {
         _pipe = pipe;
         _reader = reader;
         _writer = writer;
+        Principal = principal;
     }
 
     public void Dispose()
