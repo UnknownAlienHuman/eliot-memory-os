@@ -3870,6 +3870,7 @@ impl InitialSetupAuthorityRecord {
         if sha256_hex(self.policy_request_identity_json.as_bytes())
             != self.policy_request_identity_sha256
             || sha256_hex(self.policy_request_json.as_bytes()) != self.policy_request_sha256
+            || self.policy_operation.canonical_request_hash != self.policy_request_sha256
         {
             return Err(OrsError::InvalidField {
                 field: "initial_setup_policy_request_digest",
@@ -4039,6 +4040,7 @@ impl InitialSetupAuthorityRecord {
         validate_digest(request_digest, "initial_setup_work_scope_request_sha256")?;
         if sha256_hex(identity_json.as_bytes()) != identity_digest
             || sha256_hex(request_json.as_bytes()) != request_digest
+            || operation.canonical_request_hash != request_digest
         {
             return Err(OrsError::InvalidField {
                 field: "initial_setup_work_scope_request_digest",
