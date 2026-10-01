@@ -4,7 +4,7 @@
 //! stage context, filesystem path, or caller-issued receipt. The Store binds
 //! each request to the owner-retained stream session before consulting Blob.
 
-use eliot_contracts::StateFence;
+use eliot_contracts::{StateFence, canonical_json_bytes};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -31,8 +31,13 @@ pub const BLOB_PROCESS_STREAM_MAX_FRAME_BYTES: usize = 3 * 1024 * 1024;
 /// authenticated by the established Kernel session and is accepted before
 /// ordinary request-identity decoding only for the exact `TestD` peer role.
 pub const BLOB_PROCESS_STREAM_KERNEL_WIRE_ID: &str = "eliot.kernel.blob-process-stream";
+/// Dedicated no-effect selector for reconciling a consumed call token.
+pub const BLOB_PROCESS_STREAM_RECONCILE_WIRE_ID: &str =
+    "eliot.kernel.blob-process-stream-reconcile";
 /// Current revision for the narrow `TestD`-to-Kernel capability exchange.
 pub const BLOB_PROCESS_STREAM_KERNEL_WIRE_REVISION: u16 = 1;
+/// Current reconciliation selector revision.
+pub const BLOB_PROCESS_STREAM_RECONCILE_WIRE_REVISION: u16 = 1;
 /// Maximum encoded Kernel capability-exchange frame.
 pub const BLOB_PROCESS_STREAM_KERNEL_MAX_FRAME_BYTES: usize = 3 * 1024 * 1024;
 /// Closed daemon owner-facts exchange requested by Kernel over its authenticated
@@ -138,6 +143,10 @@ impl BlobProcessStreamFrameResponse {
         if encoded_len > BLOB_PROCESS_STREAM_MAX_FRAME_BYTES {
             return Err(WireValidationError::InvalidField("frame"));
         }
+        match &self.operation {
+            BlobProcessStreamOperationResponse::Sink { response } => response.validate()?,
+            BlobProcessStreamOperationResponse::SourceReadback { response } => response.validate()?,
+        }
         Ok(())
     }
 }
@@ -189,6 +198,37 @@ pub struct BlobProcessStreamKernelRequest {
     pub operation_sha256: String,
     /// Exact closed semantic operation, without Store RequestIdentity or fence.
     pub operation: BlobProcessStreamKernelOperationRequest,
+}
+
+/// Read-only request for the retained result of one already-consumed token.
+/// It can never authorize a Store exchange or mint an effect token.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobProcessStreamKernelReconcileRequest {
+    /// Dedicated read-only selector.
+    pub wire_id: String,
+    /// Closed selector revision.
+    pub wire_revision: u16,
+    /// Original Kernel-issued capability.
+    pub capability: ProcessStreamSinkCapabilityRef,
+    /// Exact already-consumed token reference and ordinal.
+    pub call_token: BlobProcessStreamCallToken,
+    /// Digest of the original closed operation.
+    pub operation_sha256: String,
+}
+
+impl BlobProcessStreamKernelReconcileRequest {
+    /// Validates exact selector, capability and original operation binding.
+    pub fn validate(&self) -> Result<(), WireValidationError> {
+        if self.wire_id != BLOB_PROCESS_STREAM_RECONCILE_WIRE_ID
+            || self.wire_revision != BLOB_PROCESS_STREAM_RECONCILE_WIRE_REVISION
+        {
+            return Err(WireValidationError::UnsupportedRevision);
+        }
+        self.capability.validate()?;
+        self.call_token.validate()?;
+        validate_digest("operation_sha256", &self.operation_sha256)
+    }
 }
 
 /// One closed semantic operation accepted from `TestD` by Kernel.
@@ -375,10 +415,12 @@ impl BlobProcessStreamKernelSourceReadbackRequest {
         fence: StateFence,
         capability: ProcessStreamSinkCapabilityRef,
         binding: ProcessStreamSinkBindingRef,
+        owner_facts: BlobProcessStreamVerifiedOwnerFacts,
     ) -> Result<ProcessStreamSourceReadbackRequest, WireValidationError> {
         self.validate()?;
         capability.validate()?;
         binding.validate()?;
+        owner_facts.validate()?;
         let request = ProcessStreamSourceReadbackRequest {
             wire_revision: self.wire_revision,
             capability,
@@ -398,6 +440,7 @@ impl BlobProcessStreamKernelSourceReadbackRequest {
             policy: self.policy.clone(),
             policy_json: self.policy_json.clone(),
             policy_sha256: self.policy_sha256.clone(),
+            owner_facts,
             fence,
             max_bytes: self.max_bytes,
             offset: self.offset,
@@ -420,6 +463,21 @@ fn validate_body(body: &serde_json::Value) -> Result<(), WireValidationError> {
 /// Exact Kernel request for a fresh owner-side WorkScope/source/policy facts
 /// read. The request uses only already admitted job/process identities and
 /// carries no candidate owner facts from `TestD`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BlobProcessStreamOwnerFactsPullPurpose {
+    /// Launch-time WorkScope/catalog/policy admission for an immutable grant.
+    LaunchGrant,
+    /// Before-Open source admission write and exact named readback.
+    OpenAdmission,
+    /// Fresh Store-open owner context chained after the Pending write receipt.
+    StoreOpen,
+    /// Attach an owner-issued finalized Blob receipt to the Pending source row.
+    ReadyAttach,
+    /// Fresh current owner/catalog/source admission read for replay bytes.
+    SourceReadback,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlobProcessStreamOwnerFactsPullRequest {
@@ -429,6 +487,8 @@ pub struct BlobProcessStreamOwnerFactsPullRequest {
     pub wire_revision: u16,
     /// Kernel-generated durable pull reference.
     pub pull_ref: String,
+    /// Separates launch admission from per-stream source admission/readback.
+    pub purpose: BlobProcessStreamOwnerFactsPullPurpose,
     /// Exact durable `TestD` job identity.
     pub job_id: String,
     /// Exact admitted invocation identity.
@@ -437,16 +497,114 @@ pub struct BlobProcessStreamOwnerFactsPullRequest {
     pub process_binding_json: String,
     /// SHA-256 of the exact process binding bytes.
     pub process_binding_sha256: String,
+    /// Canonical Kernel-issued operation-scoped AuthorityBinding JSON.
+    /// The daemon verifies these exact bytes against its authenticated
+    /// principal/fence; it never constructs or broadens this authority.
+    pub kernel_authority_binding_json: String,
+    /// SHA-256 of the exact Kernel AuthorityBinding JSON.
+    pub kernel_authority_binding_sha256: String,
+    /// Canonical Kernel-issued causal binding for this exact stage operation.
+    /// Genesis is legal only for the first durable node of the stage chain.
+    pub kernel_causal_binding_json: String,
+    /// SHA-256 of the exact Kernel causal binding JSON.
+    pub kernel_causal_binding_sha256: String,
     /// Digest of the authenticated outer Kernel request identity.
     pub outer_request_sha256: String,
-    /// WorkScope ID from the authenticated request metadata.
-    pub work_scope_ref: String,
-    /// Task ID from authenticated metadata, if selected.
-    pub task_ref: Option<String>,
-    /// Task revision from the authenticated StateFence, if selected.
-    pub task_revision: Option<u64>,
+    /// Product identity copied from the authenticated request metadata.
+    pub product_id: String,
+    /// Source identity copied from the authenticated request metadata.
+    pub source_id: String,
+    /// Caller session copied from authenticated request metadata, if present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Task copied from authenticated request metadata, if present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// Optional expected WorkScope identity, supplied only when Kernel already
+    /// retains a verified binding. Normally absent so the daemon owner resolves
+    /// the exact current scope from the authenticated submission context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_work_scope_ref: Option<String>,
+    /// Exact provider Module ID retained by the admitted TestD job, when the
+    /// submission carried verified catalog lifecycle provenance. It is only a
+    /// lookup expectation; the daemon must independently read the current
+    /// catalog and verify the generation admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_module_id: Option<String>,
+    /// Exact provider generation ID retained by the admitted TestD job, when
+    /// available. This is only a lookup expectation, never catalog authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_generation_id: Option<String>,
     /// Digest of the exact canonical source-root identity after Kernel checks it.
     pub source_root_identity_sha256: String,
+    /// Exact operation identity for the pre-Open source admission transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_admission_operation_id: Option<String>,
+    /// Exact canonical ProcessStreamSinkOpenRequest for OpenAdmission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_request_json: Option<String>,
+    /// SHA-256 of the canonical Open request bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_request_sha256: Option<String>,
+    /// Exact Kernel-created prepared-transition RequestIdentity for OpenAdmission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_update_identity_json: Option<String>,
+    /// SHA-256 of the exact owner-update RequestIdentity bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_update_identity_sha256: Option<String>,
+    /// Previously retained source-admission identity for a fresh readback pull.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_admission_json: Option<String>,
+    /// SHA-256 of the exact source-admission record bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_admission_sha256: Option<String>,
+    /// Exact committed WriteReceipt for the Pending source-admission write,
+    /// carried only when resolving the causally subsequent Store Open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_admission_write_receipt_json: Option<String>,
+    /// SHA-256 of the exact committed write receipt bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_admission_write_receipt_sha256: Option<String>,
+    /// Exact distinct operation identity for the Pending-to-Ready CAS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_operation_id: Option<String>,
+    /// Exact owner-issued BlobReadyReceipt returned by the Blob stage owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_ready_receipt_json: Option<String>,
+    /// SHA-256 of the exact BlobReadyReceipt JSON bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_ready_receipt_sha256: Option<String>,
+    /// Exact whole-source plaintext SHA-256 committed by the Blob owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whole_source_sha256: Option<String>,
+    /// Exact whole-source plaintext byte length committed by the Blob owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whole_source_byte_length: Option<u64>,
+    /// Exact owner-issued ready receipt reference selected for SourceReadback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_receipt_ref: Option<String>,
+    /// Exact Store open binding recovered from the Kernel's durable call log
+    /// for SourceReadback. It is a lookup selector, never source proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_stream_binding: Option<ProcessStreamSinkBindingRef>,
+    /// Exact stdout/stderr source selected for SourceReadback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_stream_kind: Option<ProcessStreamKind>,
+    /// Immutable locator kind selected for SourceReadback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_stream_locator_kind: Option<DurableStreamLocatorKind>,
+    /// Exact immutable locator selected for SourceReadback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_stream_locator: Option<String>,
+    /// Exact admitted policy tuple for SourceReadback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_stream_policy: Option<ProcessStreamPolicyBinding>,
+    /// Exact serialized policy bytes retained with the source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_stream_policy_json: Option<String>,
+    /// SHA-256 of the exact serialized policy bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_stream_policy_sha256: Option<String>,
     /// Authenticated outer request fence.
     pub state_fence: StateFence,
     /// Absolute Unix-millisecond deadline.
@@ -465,19 +623,282 @@ impl BlobProcessStreamOwnerFactsPullRequest {
             ("pull_ref", self.pull_ref.as_str()),
             ("job_id", self.job_id.as_str()),
             ("invocation_id", self.invocation_id.as_str()),
-            ("work_scope_ref", self.work_scope_ref.as_str()),
+            ("product_id", self.product_id.as_str()),
+            ("source_id", self.source_id.as_str()),
         ] {
             validate_text(field, value)?;
         }
-        if let Some(task_ref) = &self.task_ref {
-            validate_text("task_ref", task_ref)?;
+        match self.purpose {
+            BlobProcessStreamOwnerFactsPullPurpose::LaunchGrant
+                if self.source_admission_operation_id.is_none()
+                    && self.open_request_json.is_none()
+                    && self.open_request_sha256.is_none()
+                    && self.owner_update_identity_json.is_none()
+                    && self.owner_update_identity_sha256.is_none()
+                    && self.source_admission_json.is_none()
+                    && self.source_admission_sha256.is_none()
+                    && self.source_admission_write_receipt_json.is_none()
+                    && self.source_admission_write_receipt_sha256.is_none()
+                    && self.ready_operation_id.is_none()
+                    && self.blob_ready_receipt_json.is_none()
+                    && self.blob_ready_receipt_sha256.is_none()
+                    && self.whole_source_sha256.is_none()
+                    && self.whole_source_byte_length.is_none()
+                    && self.ready_receipt_ref.is_none()
+                    && self.process_stream_binding.is_none()
+                    && self.process_stream_kind.is_none()
+                    && self.process_stream_locator_kind.is_none()
+                    && self.process_stream_locator.is_none()
+                    && self.process_stream_policy.is_none()
+                    && self.process_stream_policy_json.is_none()
+                    && self.process_stream_policy_sha256.is_none() => {}
+            BlobProcessStreamOwnerFactsPullPurpose::OpenAdmission
+                if self.source_admission_operation_id.is_some()
+                    && self.open_request_json.is_some()
+                    && self.open_request_sha256.is_some()
+                    && self.owner_update_identity_json.is_some()
+                    && self.owner_update_identity_sha256.is_some()
+                    && self.source_admission_json.is_none()
+                    && self.source_admission_sha256.is_none()
+                    && self.source_admission_write_receipt_json.is_none()
+                    && self.source_admission_write_receipt_sha256.is_none()
+                    && self.ready_operation_id.is_none()
+                    && self.blob_ready_receipt_json.is_none()
+                    && self.blob_ready_receipt_sha256.is_none()
+                    && self.whole_source_sha256.is_none()
+                    && self.whole_source_byte_length.is_none()
+                    && self.ready_receipt_ref.is_none()
+                    && self.process_stream_binding.is_none()
+                    && self.process_stream_kind.is_none()
+                    && self.process_stream_locator_kind.is_none()
+                    && self.process_stream_locator.is_none()
+                    && self.process_stream_policy.is_none()
+                    && self.process_stream_policy_json.is_none()
+                    && self.process_stream_policy_sha256.is_none() =>
+            {
+                validate_text(
+                    "source_admission_operation_id",
+                    self.source_admission_operation_id.as_deref().unwrap_or_default(),
+                )?;
+                validate_canonical_owner_json(
+                    "open_request_json",
+                    self.open_request_json.as_deref().unwrap_or_default(),
+                    self.open_request_sha256.as_deref().unwrap_or_default(),
+                )?;
+                validate_canonical_owner_json(
+                    "owner_update_identity_json",
+                    self.owner_update_identity_json.as_deref().unwrap_or_default(),
+                    self.owner_update_identity_sha256.as_deref().unwrap_or_default(),
+                )?;
+            }
+            BlobProcessStreamOwnerFactsPullPurpose::SourceReadback
+                if self.source_admission_operation_id.is_some()
+                    && self.source_admission_json.is_none()
+                    && self.source_admission_sha256.is_none()
+                    && self.open_request_json.is_none()
+                    && self.open_request_sha256.is_none()
+                    && self.owner_update_identity_json.is_none()
+                    && self.owner_update_identity_sha256.is_none()
+                    && self.source_admission_write_receipt_json.is_none()
+                    && self.source_admission_write_receipt_sha256.is_none()
+                    && self.ready_operation_id.is_none()
+                    && self.blob_ready_receipt_json.is_none()
+                    && self.blob_ready_receipt_sha256.is_none()
+                    && self.whole_source_sha256.is_some()
+                    && self.whole_source_byte_length.is_some()
+                    && self.ready_receipt_ref.is_some()
+                    && self.process_stream_binding.is_some()
+                    && self.process_stream_kind.is_some()
+                    && self.process_stream_locator_kind.is_some()
+                    && self.process_stream_locator.is_some()
+                    && self.process_stream_policy.is_some()
+                    && self.process_stream_policy_json.is_some()
+                    && self.process_stream_policy_sha256.is_some() =>
+            {
+                validate_text(
+                    "source_admission_operation_id",
+                    self.source_admission_operation_id.as_deref().unwrap_or_default(),
+                )?;
+                self.process_stream_binding
+                    .as_ref()
+                    .ok_or(WireValidationError::InvalidField("process_stream_binding"))?
+                    .validate()?;
+                validate_text(
+                    "process_stream_locator",
+                    self.process_stream_locator.as_deref().unwrap_or_default(),
+                )?;
+                validate_text(
+                    "ready_receipt_ref",
+                    self.ready_receipt_ref.as_deref().unwrap_or_default(),
+                )?;
+                validate_digest(
+                    "whole_source_sha256",
+                    self.whole_source_sha256.as_deref().unwrap_or_default(),
+                )?;
+                let policy_json = self
+                    .process_stream_policy_json
+                    .as_deref()
+                    .unwrap_or_default();
+                let policy = self
+                    .process_stream_policy
+                    .as_ref()
+                    .ok_or(WireValidationError::InvalidField("process_stream_policy"))?;
+                let policy_sha256 = self
+                    .process_stream_policy_sha256
+                    .as_deref()
+                    .unwrap_or_default();
+                if serde_json::to_string(policy).ok().as_deref() != Some(policy_json)
+                    || sha256_hex(policy_json.as_bytes()) != policy_sha256
+                {
+                    return Err(WireValidationError::InvalidField("process_stream_policy"));
+                }
+                for (field, value) in [
+                    ("policy_ref", policy.policy_ref.as_str()),
+                    ("privacy_ref", policy.privacy_ref.as_str()),
+                    ("visibility_ref", policy.visibility_ref.as_str()),
+                    ("retention_ref", policy.retention_ref.as_str()),
+                    ("redaction_ref", policy.redaction_ref.as_str()),
+                ] {
+                    validate_text(field, value)?;
+                }
+            }
+            BlobProcessStreamOwnerFactsPullPurpose::StoreOpen
+                if self.source_admission_operation_id.is_some()
+                    && self.open_request_json.is_some()
+                    && self.open_request_sha256.is_some()
+                    && self.source_admission_json.is_some()
+                    && self.source_admission_sha256.is_some()
+                    && self.source_admission_write_receipt_json.is_some()
+                    && self.source_admission_write_receipt_sha256.is_some()
+                    && self.owner_update_identity_json.is_none()
+                    && self.owner_update_identity_sha256.is_none()
+                    && self.ready_operation_id.is_none()
+                    && self.blob_ready_receipt_json.is_none()
+                    && self.blob_ready_receipt_sha256.is_none()
+                    && self.whole_source_sha256.is_none()
+                    && self.whole_source_byte_length.is_none()
+                    && self.ready_receipt_ref.is_none()
+                    && self.process_stream_binding.is_none()
+                    && self.process_stream_kind.is_none()
+                    && self.process_stream_locator_kind.is_none()
+                    && self.process_stream_locator.is_none()
+                    && self.process_stream_policy.is_none()
+                    && self.process_stream_policy_json.is_none()
+                    && self.process_stream_policy_sha256.is_none() =>
+            {
+                validate_text(
+                    "source_admission_operation_id",
+                    self.source_admission_operation_id.as_deref().unwrap_or_default(),
+                )?;
+                validate_canonical_owner_json(
+                    "open_request_json",
+                    self.open_request_json.as_deref().unwrap_or_default(),
+                    self.open_request_sha256.as_deref().unwrap_or_default(),
+                )?;
+                validate_canonical_owner_json(
+                    "source_admission_json",
+                    self.source_admission_json.as_deref().unwrap_or_default(),
+                    self.source_admission_sha256.as_deref().unwrap_or_default(),
+                )?;
+                validate_canonical_owner_json(
+                    "source_admission_write_receipt",
+                    self.source_admission_write_receipt_json
+                        .as_deref()
+                        .unwrap_or_default(),
+                    self.source_admission_write_receipt_sha256
+                        .as_deref()
+                        .unwrap_or_default(),
+                )?;
+            }
+            BlobProcessStreamOwnerFactsPullPurpose::ReadyAttach
+                if self.source_admission_operation_id.is_some()
+                    && self.source_admission_json.is_some()
+                    && self.source_admission_sha256.is_some()
+                    && self.source_admission_write_receipt_json.is_some()
+                    && self.source_admission_write_receipt_sha256.is_some()
+                    && self.ready_operation_id.is_some()
+                    && self.owner_update_identity_json.is_some()
+                    && self.owner_update_identity_sha256.is_some()
+                    && self.blob_ready_receipt_json.is_some()
+                    && self.blob_ready_receipt_sha256.is_some()
+                    && self.whole_source_sha256.is_some()
+                    && self.whole_source_byte_length.is_some()
+                    && self.ready_receipt_ref.is_none()
+                    && self.open_request_json.is_none()
+                    && self.open_request_sha256.is_none()
+                    && self.process_stream_binding.is_none()
+                    && self.process_stream_kind.is_none()
+                    && self.process_stream_locator_kind.is_none()
+                    && self.process_stream_locator.is_none()
+                    && self.process_stream_policy.is_none()
+                    && self.process_stream_policy_json.is_none()
+                    && self.process_stream_policy_sha256.is_none() =>
+            {
+                validate_text(
+                    "source_admission_operation_id",
+                    self.source_admission_operation_id.as_deref().unwrap_or_default(),
+                )?;
+                validate_text(
+                    "ready_operation_id",
+                    self.ready_operation_id.as_deref().unwrap_or_default(),
+                )?;
+                validate_canonical_owner_json(
+                    "source_admission_json",
+                    self.source_admission_json.as_deref().unwrap_or_default(),
+                    self.source_admission_sha256.as_deref().unwrap_or_default(),
+                )?;
+                validate_canonical_owner_json(
+                    "source_admission_write_receipt",
+                    self.source_admission_write_receipt_json
+                        .as_deref()
+                        .unwrap_or_default(),
+                    self.source_admission_write_receipt_sha256
+                        .as_deref()
+                        .unwrap_or_default(),
+                )?;
+                validate_canonical_owner_json(
+                    "owner_update_identity_json",
+                    self.owner_update_identity_json.as_deref().unwrap_or_default(),
+                    self.owner_update_identity_sha256.as_deref().unwrap_or_default(),
+                )?;
+                validate_canonical_owner_json(
+                    "blob_ready_receipt",
+                    self.blob_ready_receipt_json.as_deref().unwrap_or_default(),
+                    self.blob_ready_receipt_sha256.as_deref().unwrap_or_default(),
+                )?;
+                validate_digest(
+                    "whole_source_sha256",
+                    self.whole_source_sha256.as_deref().unwrap_or_default(),
+                )?;
+            }
+            _ => return Err(WireValidationError::InvalidField("pull_purpose_fields")),
         }
-        if self.task_ref.is_some() != self.task_revision.is_some()
-            || self.task_revision.is_some_and(|revision| revision == 0)
-        {
-            return Err(WireValidationError::InvalidField("task_binding"));
+        if let Some(work_scope_ref) = &self.expected_work_scope_ref {
+            validate_text("expected_work_scope_ref", work_scope_ref)?;
+        }
+        if let Some(module_id) = &self.expected_module_id {
+            validate_text("expected_module_id", module_id)?;
+        }
+        if let Some(generation_id) = &self.expected_generation_id {
+            validate_text("expected_generation_id", generation_id)?;
+        }
+        if let Some(session_id) = &self.session_id {
+            validate_text("session_id", session_id)?;
+        }
+        if let Some(task_id) = &self.task_id {
+            validate_text("task_id", task_id)?;
         }
         validate_digest("process_binding_sha256", &self.process_binding_sha256)?;
+        validate_canonical_owner_json(
+            "kernel_authority_binding",
+            &self.kernel_authority_binding_json,
+            &self.kernel_authority_binding_sha256,
+        )?;
+        validate_canonical_owner_json(
+            "kernel_causal_binding",
+            &self.kernel_causal_binding_json,
+            &self.kernel_causal_binding_sha256,
+        )?;
         validate_digest("outer_request_sha256", &self.outer_request_sha256)?;
         validate_digest("source_root_identity_sha256", &self.source_root_identity_sha256)?;
         if self.process_binding_json.len() > 16 * 1024
@@ -509,6 +930,8 @@ pub struct BlobProcessStreamOwnerFactsPullResponse {
     pub wire_revision: u16,
     /// Exact pull reference answered by the daemon owner.
     pub pull_ref: String,
+    /// Purpose echoed from the exact pending request.
+    pub purpose: BlobProcessStreamOwnerFactsPullPurpose,
     /// Exact job identity answered.
     pub job_id: String,
     /// Exact invocation identity answered.
@@ -524,6 +947,82 @@ pub struct BlobProcessStreamOwnerFactsPullResponse {
     pub outcome: BlobProcessStreamOwnerFactsPullOutcome,
 }
 
+/// Exact owner-provided metadata needed to mint Blob contexts at the retained
+/// Store owner. Each nested value is canonical JSON from its named owner and
+/// is re-decoded by that owner into its closed contract type before use.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobProcessStreamVerifiedOwnerFacts {
+    /// Current WorkScope binding snapshot JSON.
+    pub work_scope_binding_json: String,
+    /// SHA-256 of the exact WorkScope binding snapshot JSON.
+    pub work_scope_binding_sha256: String,
+    /// Matched WorkScope guard receipt JSON.
+    pub matched_guard_receipt_json: String,
+    /// SHA-256 of the exact matched guard receipt JSON.
+    pub matched_guard_receipt_sha256: String,
+    /// Independently resolved canonical source receipt JSON.
+    pub canonical_source_receipt_json: String,
+    /// SHA-256 of the exact canonical source receipt JSON.
+    pub canonical_source_receipt_sha256: String,
+    /// Selected policy contract JSON.
+    pub policy_json: String,
+    /// SHA-256 of the exact policy contract JSON.
+    pub policy_sha256: String,
+    /// Full residency selection JSON.
+    pub residency_json: String,
+    /// SHA-256 of the exact residency selection JSON.
+    pub residency_sha256: String,
+    /// Existing causal parent or named genesis JSON.
+    pub causal_binding_json: String,
+    /// SHA-256 of the exact causal binding JSON.
+    pub causal_binding_sha256: String,
+    /// Current Authority binding JSON.
+    pub authority_binding_json: String,
+    /// SHA-256 of the exact authority binding JSON.
+    pub authority_binding_sha256: String,
+    /// Owner-computed digest over the exact currentness input set.
+    pub currentness_sha256: String,
+}
+
+impl BlobProcessStreamVerifiedOwnerFacts {
+    /// Validates canonical bounded values and every exact content digest.
+    pub fn validate(&self) -> Result<(), WireValidationError> {
+        for (name, json, digest) in [
+            (
+                "work_scope_binding",
+                &self.work_scope_binding_json,
+                &self.work_scope_binding_sha256,
+            ),
+            (
+                "matched_guard_receipt",
+                &self.matched_guard_receipt_json,
+                &self.matched_guard_receipt_sha256,
+            ),
+            (
+                "canonical_source_receipt",
+                &self.canonical_source_receipt_json,
+                &self.canonical_source_receipt_sha256,
+            ),
+            ("policy", &self.policy_json, &self.policy_sha256),
+            ("residency", &self.residency_json, &self.residency_sha256),
+            (
+                "causal_binding",
+                &self.causal_binding_json,
+                &self.causal_binding_sha256,
+            ),
+            (
+                "authority_binding",
+                &self.authority_binding_json,
+                &self.authority_binding_sha256,
+            ),
+        ] {
+            validate_canonical_owner_json(name, json, digest)?;
+        }
+        validate_digest("currentness_sha256", &self.currentness_sha256)
+    }
+}
+
 /// Closed owner-facts pull disposition.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
@@ -531,6 +1030,8 @@ pub enum BlobProcessStreamOwnerFactsPullOutcome {
     /// All independent verified owner facts needed by the Store resolver are
     /// current and refer to the exact WorkScope/source/process binding.
     Available {
+        /// Exact WorkScope binding selected by the daemon's independent lookup.
+        work_scope_ref: String,
         /// Opaque resolver lookup reference for the complete validated fact set.
         owner_facts_ref: String,
         /// Digest of the complete owner-facts record.
@@ -557,6 +1058,29 @@ pub enum BlobProcessStreamOwnerFactsPullOutcome {
         authority_sha256: String,
         /// Owner-compiled currentness digest over all facts above.
         currentness_sha256: String,
+        /// Canonical typed owner-facts material, digest-bound by
+        /// `owner_facts_sha256`.
+        owner_facts_json: String,
+        /// Fresh independently read ModuleCatalog owner readback JSON.
+        module_catalog_owner_readback_json: String,
+        /// SHA-256 of the exact ModuleCatalog owner readback JSON.
+        module_catalog_owner_readback_sha256: String,
+        /// Exact selected accepted GenerationAdmission JSON.
+        generation_admission_json: String,
+        /// SHA-256 of the exact GenerationAdmission JSON.
+        generation_admission_sha256: String,
+        /// Exact canonical ProcessSourceAdmission record for per-stream flows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        process_source_admission_json: Option<String>,
+        /// SHA-256 of the exact ProcessSourceAdmission bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        process_source_admission_sha256: Option<String>,
+        /// Exact WriteReceipt proving the pre-Open Pending CAS, if this is OpenAdmission.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_admission_write_receipt_json: Option<String>,
+        /// SHA-256 of the exact Pending WriteReceipt bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_admission_write_receipt_sha256: Option<String>,
     },
     /// The owner lacks one or more independent facts or the exact binding is stale.
     Unavailable {
@@ -617,9 +1141,19 @@ impl BlobProcessStreamOwnerFactsPullResponse {
             authority_ref,
             authority_sha256,
             currentness_sha256,
+            owner_facts_json,
+            module_catalog_owner_readback_json,
+            module_catalog_owner_readback_sha256,
+            generation_admission_json,
+            generation_admission_sha256,
+            process_source_admission_json,
+            process_source_admission_sha256,
+            source_admission_write_receipt_json,
+            source_admission_write_receipt_sha256,
         } = &self.outcome
         {
             for (field, value) in [
+                ("work_scope_ref", work_scope_ref),
                 ("owner_facts_ref", owner_facts_ref),
                 ("matched_guard_receipt_ref", matched_guard_receipt_ref),
                 ("canonical_source_receipt_ref", canonical_source_receipt_ref),
@@ -640,8 +1174,49 @@ impl BlobProcessStreamOwnerFactsPullResponse {
                 ("causal_receipt_sha256", causal_receipt_sha256),
                 ("authority_sha256", authority_sha256),
                 ("currentness_sha256", currentness_sha256),
+                ("module_catalog_owner_readback_sha256", module_catalog_owner_readback_sha256),
+                ("generation_admission_sha256", generation_admission_sha256),
             ] {
                 validate_digest(field, value)?;
+            }
+            validate_canonical_owner_json(
+                "module_catalog_owner_readback",
+                module_catalog_owner_readback_json,
+                module_catalog_owner_readback_sha256,
+            )?;
+            validate_canonical_owner_json(
+                "generation_admission",
+                generation_admission_json,
+                generation_admission_sha256,
+            )?;
+            let owner_facts: BlobProcessStreamVerifiedOwnerFacts = serde_json::from_str(
+                owner_facts_json,
+            )
+            .map_err(|_| WireValidationError::InvalidField("owner_facts_json"))?;
+            owner_facts.validate()?;
+            validate_optional_canonical_owner_json_pair(
+                "process_source_admission",
+                process_source_admission_json,
+                process_source_admission_sha256,
+            )?;
+            validate_optional_canonical_owner_json_pair(
+                "source_admission_write_receipt",
+                source_admission_write_receipt_json,
+                source_admission_write_receipt_sha256,
+            )?;
+            if serde_json::to_string(&owner_facts).ok().as_deref()
+                != Some(owner_facts_json.as_str())
+                || sha256_hex(owner_facts_json.as_bytes()) != *owner_facts_sha256
+                || owner_facts.work_scope_binding_sha256 != *work_scope_snapshot_sha256
+                || owner_facts.matched_guard_receipt_sha256 != *matched_guard_receipt_sha256
+                || owner_facts.canonical_source_receipt_sha256 != *canonical_source_receipt_sha256
+                || owner_facts.policy_sha256 != *policy_sha256
+                || owner_facts.residency_sha256 != *residency_sha256
+                || owner_facts.causal_binding_sha256 != *causal_receipt_sha256
+                || owner_facts.authority_binding_sha256 != *authority_sha256
+                || owner_facts.currentness_sha256 != *currentness_sha256
+            {
+                return Err(WireValidationError::InvalidField("owner_facts_commitment"));
             }
         }
         let encoded = serde_json::to_vec(self)
@@ -660,6 +1235,7 @@ impl BlobProcessStreamOwnerFactsPullResponse {
         request.validate()?;
         self.validate()?;
         if self.pull_ref != request.pull_ref
+            || self.purpose != request.purpose
             || self.job_id != request.job_id
             || self.invocation_id != request.invocation_id
             || self.process_binding_sha256 != request.process_binding_sha256
@@ -668,8 +1244,100 @@ impl BlobProcessStreamOwnerFactsPullResponse {
         {
             return Err(WireValidationError::InvalidField("owner_facts_binding"));
         }
+        if let BlobProcessStreamOwnerFactsPullOutcome::Available {
+            process_source_admission_json,
+            process_source_admission_sha256,
+            source_admission_write_receipt_json,
+            source_admission_write_receipt_sha256,
+            ..
+        } = &self.outcome
+        {
+            let has_admission = process_source_admission_json.is_some()
+                && process_source_admission_sha256.is_some();
+            let has_write_receipt = source_admission_write_receipt_json.is_some()
+                && source_admission_write_receipt_sha256.is_some();
+            let valid = match request.purpose {
+                BlobProcessStreamOwnerFactsPullPurpose::LaunchGrant => {
+                    !has_admission && !has_write_receipt
+                }
+                BlobProcessStreamOwnerFactsPullPurpose::OpenAdmission => {
+                    has_admission && has_write_receipt
+                }
+                BlobProcessStreamOwnerFactsPullPurpose::StoreOpen => {
+                    has_admission && has_write_receipt
+                }
+                BlobProcessStreamOwnerFactsPullPurpose::ReadyAttach => {
+                    has_admission && has_write_receipt
+                }
+                BlobProcessStreamOwnerFactsPullPurpose::SourceReadback => {
+                    has_admission && !has_write_receipt
+                }
+            };
+            if !valid {
+                return Err(WireValidationError::InvalidField("purpose_result"));
+            }
+            if request.purpose == BlobProcessStreamOwnerFactsPullPurpose::StoreOpen
+                && (process_source_admission_json
+                    != request.source_admission_json.as_ref()
+                    || process_source_admission_sha256
+                        != request.source_admission_sha256.as_ref()
+                    || source_admission_write_receipt_json
+                        != request.source_admission_write_receipt_json.as_ref()
+                    || source_admission_write_receipt_sha256
+                        != request.source_admission_write_receipt_sha256.as_ref())
+            {
+                return Err(WireValidationError::InvalidField(
+                    "store_open_source_admission_binding",
+                ));
+            }
+        }
+        if let BlobProcessStreamOwnerFactsPullOutcome::Available { work_scope_ref, .. } =
+            &self.outcome
+            && request
+                .expected_work_scope_ref
+                .as_deref()
+                .is_some_and(|expected| expected != work_scope_ref)
+        {
+            return Err(WireValidationError::InvalidField("work_scope_binding"));
+        }
+        if let BlobProcessStreamOwnerFactsPullOutcome::Available {
+            owner_facts_json,
+            ..
+        } = &self.outcome
+        {
+            let owner_facts: BlobProcessStreamVerifiedOwnerFacts = serde_json::from_str(
+                owner_facts_json,
+            )
+            .map_err(|_| WireValidationError::InvalidField("owner_facts_json"))?;
+            if owner_facts.causal_binding_json != request.kernel_causal_binding_json
+                || owner_facts.causal_binding_sha256 != request.kernel_causal_binding_sha256
+                || owner_facts.authority_binding_json != request.kernel_authority_binding_json
+                || owner_facts.authority_binding_sha256 != request.kernel_authority_binding_sha256
+            {
+                return Err(WireValidationError::InvalidField("owner_authority_binding"));
+            }
+            if request.purpose == BlobProcessStreamOwnerFactsPullPurpose::SourceReadback
+                && request
+                    .process_stream_policy_json
+                    .as_deref()
+                    .is_some_and(|policy_json| policy_json != owner_facts.policy_json)
+            {
+                return Err(WireValidationError::InvalidField("source_readback_policy"));
+            }
+        }
+        if matches!(
+            &self.outcome,
+            BlobProcessStreamOwnerFactsPullOutcome::Available { .. }
+        ) && (request.expected_module_id.is_none()
+            || request.expected_generation_id.is_none())
+        {
+            return Err(WireValidationError::InvalidField(
+                "provider_catalog_expectation",
+            ));
+        }
         Ok(())
     }
+
 }
 
 impl BlobProcessStreamKernelRequest {
@@ -681,7 +1349,7 @@ impl BlobProcessStreamKernelRequest {
         operation: BlobProcessStreamKernelOperationRequest,
     ) -> Result<Self, WireValidationError> {
         operation.validate()?;
-        let operation_bytes = serde_json::to_vec(&operation)
+        let operation_bytes = canonical_json_bytes(&operation)
             .map_err(|_| WireValidationError::InvalidField("operation"))?;
         let request = Self {
             wire_id: BLOB_PROCESS_STREAM_KERNEL_WIRE_ID.to_owned(),
@@ -706,7 +1374,7 @@ impl BlobProcessStreamKernelRequest {
         self.call_token.validate()?;
         self.operation.validate()?;
         validate_digest("operation_sha256", &self.operation_sha256)?;
-        let operation = serde_json::to_vec(&self.operation)
+        let operation = canonical_json_bytes(&self.operation)
             .map_err(|_| WireValidationError::InvalidField("operation"))?;
         if sha256_hex(&operation) != self.operation_sha256 {
             return Err(WireValidationError::InvalidField("operation_sha256"));
@@ -728,6 +1396,8 @@ pub enum BlobProcessStreamKernelOutcome {
     Completed {
         /// Digest of the original operation body.
         operation_sha256: String,
+        /// Opaque ORS key retaining this exact call and its outcome.
+        response_ref: String,
         /// Exact closed Store/Blob result.
         response: Box<BlobProcessStreamFrameResponse>,
         /// Original terminal request, retained verbatim when this outcome
@@ -814,7 +1484,7 @@ impl BlobProcessStreamKernelResponse {
                 &self.outcome,
                 BlobProcessStreamKernelOutcome::Completed { .. }
             )
-                || next_call_token.ordinal <= self.call_token.ordinal
+                || self.call_token.ordinal.checked_add(1) != Some(next_call_token.ordinal)
                 || next_call_token.reference == self.call_token.reference
             {
                 return Err(WireValidationError::InvalidField("next_call_token"));
@@ -823,11 +1493,13 @@ impl BlobProcessStreamKernelResponse {
         match &self.outcome {
             BlobProcessStreamKernelOutcome::Completed {
                 operation_sha256,
+                response_ref,
                 response,
                 original_terminal_request,
                 original_terminal_operation_sha256,
             } => {
                 validate_digest("operation_sha256", operation_sha256)?;
+                validate_text("response_ref", response_ref)?;
                 response.validate()?;
                 match (original_terminal_request, original_terminal_operation_sha256) {
                     (Some(request), Some(original_sha256)) => {
@@ -838,7 +1510,7 @@ impl BlobProcessStreamKernelResponse {
                             BlobProcessStreamKernelOperationRequest::SinkFinalize { .. }
                                 | BlobProcessStreamKernelOperationRequest::SinkAbort { .. }
                         ) || sha256_hex(
-                            &serde_json::to_vec(request)
+                            &canonical_json_bytes(request)
                                 .map_err(|_| WireValidationError::InvalidField(
                                     "original_terminal_request",
                                 ))?,
@@ -899,6 +1571,28 @@ impl BlobProcessStreamKernelResponse {
         };
         if operation_sha256 != &request.operation_sha256 {
             return Err(WireValidationError::InvalidField("response_operation_sha256"));
+        }
+        Ok(())
+    }
+
+    /// Validates a retained response against a read-only reconciliation.
+    pub fn validate_for_reconcile(
+        &self,
+        request: &BlobProcessStreamKernelReconcileRequest,
+    ) -> Result<(), WireValidationError> {
+        self.validate()?;
+        request.validate()?;
+        if self.capability != request.capability || self.call_token != request.call_token {
+            return Err(WireValidationError::InvalidField("reconcile_binding"));
+        }
+        let operation_sha256 = match &self.outcome {
+            BlobProcessStreamKernelOutcome::Completed { operation_sha256, .. }
+            | BlobProcessStreamKernelOutcome::NotStarted { operation_sha256 }
+            | BlobProcessStreamKernelOutcome::Unavailable { operation_sha256, .. }
+            | BlobProcessStreamKernelOutcome::Unknown { operation_sha256 } => operation_sha256,
+        };
+        if operation_sha256 != &request.operation_sha256 {
+            return Err(WireValidationError::InvalidField("reconcile_operation"));
         }
         Ok(())
     }
@@ -984,6 +1678,9 @@ pub struct ProcessStreamSourceReadbackRequest {
     pub policy_json: String,
     /// SHA-256 of the exact serialized policy bytes.
     pub policy_sha256: String,
+    /// Kernel-retained metadata-only owner facts independently checked by
+    /// Store against the current source authority.
+    pub owner_facts: BlobProcessStreamVerifiedOwnerFacts,
     /// Exact state fence under which readback is admitted.
     pub fence: StateFence,
     /// Maximum source size accepted by the caller.
@@ -1041,6 +1738,7 @@ impl ProcessStreamSourceReadbackRequest {
         self.fence
             .validate()
             .map_err(|_| WireValidationError::InvalidField("fence"))?;
+        self.owner_facts.validate()?;
         for (field, value) in [
             ("policy_ref", self.policy.policy_ref.as_str()),
             ("privacy_ref", self.policy.privacy_ref.as_str()),
@@ -1140,6 +1838,20 @@ pub enum ProcessStreamSinkWireRequest {
         capability: ProcessStreamSinkCapabilityRef,
         /// Exact closed ProcessStreamSinkOpenRequest JSON object.
         body: Box<serde_json::Value>,
+        /// Kernel-retained metadata-only owner facts independently checked by
+        /// Store at the source and policy authority boundary.
+        owner_facts: BlobProcessStreamVerifiedOwnerFacts,
+        /// Exact fresh named-read envelope for the Pending process-source
+        /// admission written before this Open. Store independently reads and
+        /// compares the row before permitting the Blob effect.
+        process_source_admission_readback_json: String,
+        /// SHA-256 of the exact canonical named-read envelope bytes.
+        process_source_admission_readback_sha256: String,
+        /// Exact committed PreparedTransition receipt that parents the Blob
+        /// stage causal node; Store independently validates this proof.
+        source_admission_write_receipt_json: String,
+        /// SHA-256 of the exact committed WriteReceipt bytes.
+        source_admission_write_receipt_sha256: String,
         /// Authenticated request fence.
         fence: StateFence,
         /// Absolute Unix-millisecond operation deadline.
@@ -1217,9 +1929,27 @@ impl ProcessStreamSinkWireRequest {
             Self::Open {
                 capability,
                 body,
+                owner_facts,
+                process_source_admission_readback_json,
+                process_source_admission_readback_sha256,
+                source_admission_write_receipt_json,
+                source_admission_write_receipt_sha256,
                 fence,
                 deadline_ms,
-            } => (capability, None, Some(body), fence, *deadline_ms),
+            } => {
+                owner_facts.validate()?;
+                validate_canonical_owner_json(
+                    "process_source_admission_readback",
+                    process_source_admission_readback_json,
+                    process_source_admission_readback_sha256,
+                )?;
+                validate_canonical_owner_json(
+                    "source_admission_write_receipt",
+                    source_admission_write_receipt_json,
+                    source_admission_write_receipt_sha256,
+                )?;
+                (capability, None, Some(body), fence, *deadline_ms)
+            }
             Self::Append {
                 capability,
                 binding,
@@ -1293,6 +2023,13 @@ pub enum ProcessStreamSinkWireResponse {
     Finalized {
         /// Closed terminal projection JSON.
         body: Box<serde_json::Value>,
+        /// Exact owner-issued BlobReadyReceipt JSON for CompleteSource.
+        /// These fields are absent for other terminal states.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blob_ready_receipt_json: Option<String>,
+        /// SHA-256 of the exact BlobReadyReceipt JSON bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blob_ready_receipt_sha256: Option<String>,
     },
     /// Abort returned owner-validated terminal evidence JSON.
     Aborted {
@@ -1313,6 +2050,36 @@ pub enum ProcessStreamSinkWireResponse {
         /// Closed pre-effect refusal category.
         reason: ProcessStreamSinkUnavailableReason,
     },
+}
+
+impl ProcessStreamSinkWireResponse {
+    /// Validates owner-generated operation evidence before Kernel retains it.
+    pub fn validate(&self) -> Result<(), WireValidationError> {
+        match self {
+            Self::Opened { binding } => binding.validate(),
+            Self::AppendDisposition { body }
+            | Self::Finalized { body, .. }
+            | Self::Aborted { body }
+            | Self::Readback { body } => {
+                validate_body(body)?;
+                if let Self::Finalized {
+                    blob_ready_receipt_json,
+                    blob_ready_receipt_sha256,
+                    ..
+                } = self
+                {
+                    validate_optional_canonical_owner_json_pair(
+                        "blob_ready_receipt",
+                        blob_ready_receipt_json.as_ref(),
+                        blob_ready_receipt_sha256.as_ref(),
+                    )?;
+                }
+                Ok(())
+            }
+            Self::NotStarted | Self::Unknown => Ok(()),
+            Self::Unavailable { .. } => Ok(()),
+        }
+    }
 }
 
 /// Closed process-stream sink refusal category. It carries no provider prose.
@@ -1354,11 +2121,103 @@ pub enum ProcessStreamSourceReadbackResponse {
         observed_fence: StateFence,
         /// Unix-millisecond time observed by the owner.
         observed_at_unix_ms: u64,
+        /// Fresh canonical owner-facts envelope used to authorize this read.
+        owner_facts_json: String,
+        /// SHA-256 of the exact owner-facts bytes above.
+        owner_facts_sha256: String,
+        /// Fresh canonical ModuleCatalog owner readback at the same fence.
+        module_catalog_owner_readback_json: String,
+        /// SHA-256 of the exact ModuleCatalog owner readback.
+        module_catalog_owner_readback_sha256: String,
+        /// Exact selected accepted GenerationAdmission at the same fence.
+        generation_admission_json: String,
+        /// SHA-256 of the exact GenerationAdmission bytes above.
+        generation_admission_sha256: String,
+        /// Fresh named readback of the exact durable source-admission row.
+        process_source_admission_readback_json: String,
+        /// SHA-256 of the exact source-admission readback bytes.
+        process_source_admission_readback_sha256: String,
     },
     /// Exact original intent is durably reserved and no stage effect began.
     NotStarted,
     /// The original operation result cannot be determined safely.
     Unknown,
+}
+
+impl ProcessStreamSourceReadbackResponse {
+    /// Validates chunk integrity and the fresh owner-context commitments.
+    pub fn validate(&self) -> Result<(), WireValidationError> {
+        let Self::Ready {
+            bytes,
+            whole_source_sha256,
+            whole_source_byte_length,
+            chunk_offset,
+            observed_sha256,
+            observed_byte_length,
+            ready_receipt_ref,
+            source_owner_generation,
+            readback_receipt_id,
+            observed_fence,
+            observed_at_unix_ms,
+            owner_facts_json,
+            owner_facts_sha256,
+            module_catalog_owner_readback_json,
+            module_catalog_owner_readback_sha256,
+            generation_admission_json,
+            generation_admission_sha256,
+            process_source_admission_readback_json,
+            process_source_admission_readback_sha256,
+        } = self else {
+            return Ok(());
+        };
+        validate_digest("whole_source_sha256", whole_source_sha256)?;
+        validate_digest("observed_sha256", observed_sha256)?;
+        validate_digest("owner_facts_sha256", owner_facts_sha256)?;
+        validate_digest(
+            "module_catalog_owner_readback_sha256",
+            module_catalog_owner_readback_sha256,
+        )?;
+        validate_digest("generation_admission_sha256", generation_admission_sha256)?;
+        validate_digest(
+            "process_source_admission_readback_sha256",
+            process_source_admission_readback_sha256,
+        )?;
+        for (field, value) in [
+            ("ready_receipt_ref", ready_receipt_ref.as_str()),
+            ("readback_receipt_id", readback_receipt_id.as_str()),
+        ] {
+            validate_text(field, value)?;
+        }
+        observed_fence
+            .validate()
+            .map_err(|_| WireValidationError::InvalidField("observed_fence"))?;
+        if bytes.len() > PROCESS_STREAM_READBACK_MAX_CHUNK_BYTES as usize
+            || *observed_byte_length != bytes.len() as u64
+            || sha256_hex(bytes) != *observed_sha256
+            || chunk_offset.saturating_add(*observed_byte_length) > *whole_source_byte_length
+            || *source_owner_generation == 0
+            || *observed_at_unix_ms == 0
+        {
+            return Err(WireValidationError::InvalidField("readback_chunk"));
+        }
+        validate_canonical_owner_json("owner_facts_json", owner_facts_json, owner_facts_sha256)?;
+        validate_canonical_owner_json(
+            "module_catalog_owner_readback_json",
+            module_catalog_owner_readback_json,
+            module_catalog_owner_readback_sha256,
+        )?;
+        validate_canonical_owner_json(
+            "generation_admission_json",
+            generation_admission_json,
+            generation_admission_sha256,
+        )?;
+        validate_canonical_owner_json(
+            "process_source_admission_readback_json",
+            process_source_admission_readback_json,
+            process_source_admission_readback_sha256,
+        )?;
+        Ok(())
+    }
 }
 
 /// Shape and bounded-text error for this closed wire contract.
@@ -1389,6 +2248,37 @@ fn validate_digest(field: &'static str, value: &str) -> Result<(), WireValidatio
         Err(WireValidationError::InvalidField(field))
     } else {
         Ok(())
+    }
+}
+
+fn validate_canonical_owner_json(
+    field: &'static str,
+    json: &str,
+    digest: &str,
+) -> Result<(), WireValidationError> {
+    validate_digest(field, digest)?;
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|_| WireValidationError::InvalidField(field))?;
+    let canonical = serde_json::to_string(&value)
+        .map_err(|_| WireValidationError::InvalidField(field))?;
+    if !matches!(&value, serde_json::Value::Object(_))
+        || canonical.as_bytes() != json.as_bytes()
+        || sha256_hex(json.as_bytes()) != digest
+    {
+        return Err(WireValidationError::InvalidField(field));
+    }
+    Ok(())
+}
+
+fn validate_optional_canonical_owner_json_pair(
+    field: &'static str,
+    json: &Option<String>,
+    digest: &Option<String>,
+) -> Result<(), WireValidationError> {
+    match (json, digest) {
+        (Some(json), Some(digest)) => validate_canonical_owner_json(field, json, digest),
+        (None, None) => Ok(()),
+        _ => Err(WireValidationError::InvalidField(field)),
     }
 }
 
