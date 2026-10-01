@@ -32,8 +32,10 @@ use crate::HostError;
 // (`crate::windows_event_log::event_log_sink_status`), never implemented here
 // (#984 still open). No terminal is owned here: the single terminal for a
 // failed launch stays with the outermost #891 contour (`host-start-failed` in
-// `lib.rs`); this sequence correlates Store-ready vs Kernel-ready by stage
-// order only.
+// `lib.rs`); this sequence correlates Store-live vs Kernel-launched by stage
+// order only. Readiness is never emitted here: Store semantic readiness stays
+// with its owner, and Kernel readiness only in `kernel_activation_driver::active`
+// on owner evidence.
 //
 // Observation-only contract: every helper projects facts already produced by
 // the semantic owner. Arguments are static literals only — never process
@@ -106,10 +108,10 @@ where
             }
         };
     }
-    // WORK_UNIT_CASE: 978/6 — Store-ready observed; Kernel is invoked only
+    // WORK_UNIT_CASE: 978/6 — Store-live observed; Kernel is invoked only
     // after this barrier.
-    store_kernel_observe("host.store-launch store-ready observed");
-    // WORK_UNIT_CASE: 978/6 — Kernel launch requested only after Store-ready.
+    store_kernel_observe("host.store-launch store-live observed");
+    // WORK_UNIT_CASE: 978/6 — Kernel launch requested only after Store-live.
     store_kernel_observe("host.kernel-launch requested");
     let kernel = match launch_kernel() {
         Ok(kernel) => kernel,
@@ -128,8 +130,10 @@ where
             };
         }
     };
-    // WORK_UNIT_CASE: 978/6 — Kernel-ready observed distinctly from
-    // Store-ready; readiness still requires its own owner proof downstream.
-    store_kernel_observe("host.kernel-launch kernel-ready observed");
+    // WORK_UNIT_CASE: 978/6 — Kernel-launched observed distinctly from
+    // Store-live: launch success only. Readiness still requires its own owner
+    // proof downstream (`kernel_activation_driver::active` alone emits Kernel
+    // readiness).
+    store_kernel_observe("host.kernel-launch kernel-launched observed");
     Ok((store, kernel))
 }
