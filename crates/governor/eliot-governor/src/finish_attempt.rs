@@ -442,17 +442,16 @@ fn hydrate_transfer_governed(
             )));
         }
         match monitor.ingest_governed_tool_mutation(observation) {
-            Ok(_) => {}
-            // Only the missing-baseline refusal defers: the narrow entry
-            // cannot project a first mutation until this owner has admitted
-            // a verified baseline ("The first mutation of a resource cannot
-            // pass until that owner has admitted a verified baseline"), and
-            // governed evidence never blocks the gate, so the row is
-            // skipped for the next hydration retry instead of wedging
+            // Admitted rows merge; only the missing-baseline refusal defers:
+            // the narrow entry cannot project a first mutation until this
+            // owner has admitted a verified baseline ("The first mutation of
+            // a resource cannot pass until that owner has admitted a verified
+            // baseline"), and governed evidence never blocks the gate, so the
+            // row is skipped for the next hydration retry instead of wedging
             // finish. Every other typed failure refuses: conflicting or
             // otherwise unprojectable evidence must not merge silently
             // (audit 5910747803 defect #4).
-            Err(ChangeMonitorError::InvalidGovernedMutationReceipt) => {}
+            Ok(_) | Err(ChangeMonitorError::InvalidGovernedMutationReceipt) => {}
             Err(error) => {
                 let change_id = original.change_id.as_str();
                 return Err(recovery_refusal(format!(
@@ -466,7 +465,7 @@ fn hydrate_transfer_governed(
 
 /// Builds the Governor projection row for one transferred governed
 /// original: the exact operation/diff identity plus the before/after
-/// revisions the ledger hashed, correlated to Session, ActionLease, tool
+/// revisions the ledger hashed, correlated to Session, `ActionLease`, tool
 /// operation, attempt receipt, and diff handle (I10.21 W3/W5).
 fn governed_transfer_observation(
     fence: &StateFence,
