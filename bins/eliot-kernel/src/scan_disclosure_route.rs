@@ -2294,6 +2294,39 @@ impl KernelComposition {
         let (record, owner, snapshot, inputs) =
             self.load_retained_work_scope_owner(current, false).await?;
         self.recheck_scan_disclosure_activation(current)?;
+        // During first BIND_SCOPE the WorkScope projection may not yet have a
+        // discovery lease. That permits exactly one operation: attach the
+        // immutable lease already accepted for this activation attempt. Do
+        // not let a valid initial proof become authority to attach a caller-
+        // constructed lease with merely matching principal/root-shaped data.
+        if let Some(proof) = &current.initial_bind_scope_proof {
+            let lifecycle = self
+                .generation_gateway
+                .ors
+                .load_activation_lifecycle(&current.ticket.ticket_id)
+                .map_err(|_| TransportError::SessionFenced)?
+                .ok_or(TransportError::SessionFenced)?;
+            let retained_lease = lifecycle
+                .initial_discovery_lease
+                .as_deref()
+                .ok_or(TransportError::SessionFenced)?;
+            let original_lease = serde_json::from_str::<DiscoveryReadLease>(retained_lease)
+                .map_err(|_| TransportError::SessionFenced)?;
+            original_lease
+                .validate()
+                .map_err(|_| TransportError::SessionFenced)?;
+            if lifecycle.state != eliot_ors::ActivationLifecycleState::ResultAccepted
+                || lifecycle.ticket_id != current.ticket.ticket_id
+                || lifecycle.ticket_sha256 != current.ticket.ticket_sha256
+                || lifecycle.connection_id != current.ticket.connection_id
+                || lifecycle.result_sha256.as_deref()
+                    != Some(current.result.result_sha256.as_str())
+                || lifecycle.kernel_deadline_unix_ms != proof.evidence.ticket_deadline_unix_ms
+                || original_lease != *lease
+            {
+                return Err(TransportError::IdentityConflict.into());
+            }
+        }
         if record.revision > expected_owner_revision
             && record.revision - expected_owner_revision == 1
             && snapshot.owner_revision == record.revision
