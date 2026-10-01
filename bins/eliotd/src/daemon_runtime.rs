@@ -655,12 +655,15 @@ impl ProductProofStatusWire {
                 .as_ref()
                 .map(|build| build.evidence.evidence_id.clone()),
             installed_route_observed: status.retained.installed_route_observed(),
-            attempt: status.attempt.as_ref().map(|attempt| ProductProofAttemptWire {
-                run_id: attempt.run_id.clone(),
-                execution: attempt.execution,
-                failure_class: attempt.failure_class,
-                reason: attempt.reason.clone(),
-            }),
+            attempt: status
+                .attempt
+                .as_ref()
+                .map(|attempt| ProductProofAttemptWire {
+                    run_id: attempt.run_id.clone(),
+                    execution: attempt.execution,
+                    failure_class: attempt.failure_class,
+                    reason: attempt.reason.clone(),
+                }),
             raw_log_refs: status.retained.raw_log_refs.clone(),
             executable: status.retained.executable.as_ref().map(|executable| {
                 ProductProofExecutableWire {
@@ -5588,9 +5591,9 @@ async fn publish_finish_product_proof_status(
         // admitted, rather than the one it held before the attempt. A refresh
         // failure is reported: publishing the pre-attempt record here would look
         // exactly like an attempt that never happened.
-        guard
-            .refresh_testd_terminal_owner()
-            .map_err(|error| format!("product proof owner refresh after finish attempt: {error}"))?;
+        guard.refresh_testd_terminal_owner().map_err(|error| {
+            format!("product proof owner refresh after finish attempt: {error}")
+        })?;
         (guard.status(), product_proof_wire(&guard))
     };
     publish_product_proof_status(&status, product_proof)
@@ -7399,9 +7402,7 @@ fn activation_deadline_expired(now: u64, deadline: u64) -> bool {
 /// state. It is logged at warn level so a reader can tell an absent field from
 /// a lost owner, and it never changes readiness, protocol framing, or exit
 /// behavior.
-fn product_proof_wire(
-    composition: &DaemonComposition,
-) -> Option<ProductProofStatusWire> {
+fn product_proof_wire(composition: &DaemonComposition) -> Option<ProductProofStatusWire> {
     match composition.product_proof_status() {
         Ok((record, rollup)) => Some(ProductProofStatusWire::project(&record, &rollup)),
         Err(error) => {

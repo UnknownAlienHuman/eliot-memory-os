@@ -6426,8 +6426,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         // recorded as `Blocked`, not as a product `PASS` the record's own
         // `validate()` would refuse. This is the same fail-closed rule stated
         // at its source rather than left to a later refusal.
-        let outcome =
-            eliot_finish::product_proof::outcome_of_decision(&receipt.decision, observed);
+        let outcome = eliot_finish::product_proof::outcome_of_decision(&receipt.decision, observed);
         let attempt = match eliot_finish::product_proof::failure_class_of_execution(execution) {
             Some(failure_class) => {
                 eliot_reports::product_proof::ProductProofRunAttempt::incomplete(
@@ -6468,7 +6467,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         // union is sorted and deduplicated so an attempt that cites an
         // already-retained handle cannot create a duplicate.
         let mut raw_log_refs = previous.retained.raw_log_refs.clone();
-        raw_log_refs.extend(receipt.decision.proof.artifact_and_verifier_bindings.iter().cloned());
+        raw_log_refs.extend(
+            receipt
+                .decision
+                .proof
+                .artifact_and_verifier_bindings
+                .iter()
+                .cloned(),
+        );
         raw_log_refs.sort();
         raw_log_refs.dedup();
         let retained = eliot_reports::product_proof::ProductProofRetainedEvidence {
