@@ -1032,6 +1032,10 @@ fn capture_plans_persist_full_recoverable_evidence_without_authority() {
             idempotency_key: "idem-evidence-write".to_owned(),
             canonical_request_hash: "a".repeat(64),
         },
+        // The fixture's own stable intent, distinct from the per-attempt
+        // operation identity and the per-correction idempotency key.
+        write_intent_id: "intent-evidence-write".to_owned(),
+        write_envelope_protocol_version: 1,
         state_fence: fence,
         scope_id: ScopeId::new("scope-1").expect("scope"),
         task_id: None,
@@ -1123,6 +1127,10 @@ fn non_capture_transitions_persist_no_evidence() {
             idempotency_key: "idem-audit-write".to_owned(),
             canonical_request_hash: "a".repeat(64),
         },
+        // The fixture's own stable intent, distinct from the per-attempt
+        // operation identity and the per-correction idempotency key.
+        write_intent_id: "intent-audit-write".to_owned(),
+        write_envelope_protocol_version: 1,
         state_fence: fence,
         scope_id: ScopeId::new("scope-1").expect("scope"),
         task_id: None,

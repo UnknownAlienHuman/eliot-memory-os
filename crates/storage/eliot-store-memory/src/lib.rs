@@ -6139,6 +6139,10 @@ mod tests {
                 idempotency_key: format!("idem-{operation}"),
                 canonical_request_hash: "a".repeat(64),
             },
+            // The fixture's own stable intent, distinct from the per-attempt
+            // operation identity and the per-correction idempotency key.
+            write_intent_id: format!("intent-{operation}"),
+            write_envelope_protocol_version: 1,
             state_fence: state_fence.clone(),
             scope_id: ScopeId::new("scope-1")?,
             task_id: None,
@@ -6990,9 +6994,18 @@ mod tests {
     #[test]
     fn exact_replay_binds_recomputed_digest_and_is_byte_identical() -> Result<(), StoreError> {
         // Proves cross-crate stability: the store recompute uses the same
-        // shared helper as Slice A (golden vector
-        // `21b8b2be1415dae7f905e202725e0eb02c953d06afef64a946db7d2a19bd601c`
-        // is produced by `canonical_request_hash` in `eliot-store-api`).
+// shared helper as Slice A. The golden vector that
+        // `canonical_request_hash` produces in `eliot-store-api` is pinned in
+        // `request_hash.rs::golden_request_hash_is_stable_across_crates`.
+        //
+        // #1925: no digest literal is restated here. `55e62e40…` was already
+        // stale on `main` (commit `2c22f4b45` added `ordering_scopes` to the
+        // hashed input without re-pinning), #3977 re-pinned the owning
+        // assertion, and #1925 adds the two write-intent identity members on
+        // top, moving it again. The digest is emitted by the owner function,
+        // not derived by reading this file, so this cross-reference names the
+        // owning assertion — the one place to pin — and stays correct across
+        // re-pins instead of drifting a second literal out of date.
         // Here the memory path binds its own recomputed digest and replays
         // byte-identically.
         let state_fence = fence();
@@ -7028,8 +7041,14 @@ mod tests {
 
     /// Pinned digest of the Governor chain envelope, asserted independently
     /// by `eliot-canonical` (see its `golden_chain_envelope` test).
-    const ISSUE_63_GOLDEN_CHAIN_DIGEST: &str =
-        "32d9235499c0e63f72509808c0b1439cd7e879c754fbc1bc5e965bb6af4d6a36";
+    ///
+    /// #1925 RE-PIN REQUIRED — this literal is the SAME deliberate fail-closed
+    /// sentinel `eliot-canonical` carries, NOT a digest. It was stale on
+    /// `main` even before #1925 (commit `2c22f4b45` added `ordering_scopes`
+    /// to the hashed request input without re-pinning), and #1925 adds the
+    /// two write-intent identity members on top. Replace BOTH copies with the
+    /// one value the shared owner function emits over the current fixture.
+    const ISSUE_63_GOLDEN_CHAIN_DIGEST: &str = "REPIN-REQUIRED-1925-NOT-A-DIGEST";
 
     #[test]
     fn governor_envelope_store_view_and_receipt_share_one_golden_digest() -> Result<(), StoreError>
@@ -7069,6 +7088,11 @@ mod tests {
                 },
             },
             idempotency_key: "idem-golden-chain-63".to_owned(),
+            // Byte-identical to the `eliot-canonical` golden chain fixture:
+            // the same fixture-owned stable write intent, distinct from the
+            // operation identity and the idempotency key.
+            write_intent_id: "intent-golden-chain-63".to_owned(),
+            write_envelope_protocol_version: 1,
             scope_id: ScopeId::new("scope-golden-chain-63")?,
             task_id: None,
             transition_class: TransitionClass::CaptureCandidate,
@@ -7711,6 +7735,10 @@ mod tests {
                 idempotency_key: idempotency_key.to_owned(),
                 canonical_request_hash: "c".repeat(64),
             },
+            // The fixture's own stable intent, distinct from the per-attempt
+            // operation identity and the per-correction idempotency key.
+            write_intent_id: format!("intent-{subject}"),
+            write_envelope_protocol_version: 1,
             scope_id: ScopeId::new("scope-1")?,
             ordering_scope: OrderingScopeId::new("scope-1")?,
             state_fence: state_fence.clone(),
@@ -7990,6 +8018,10 @@ mod tests {
                 idempotency_key: format!("idem-{operation}"),
                 canonical_request_hash: "a".repeat(64),
             },
+            // The fixture's own stable intent, distinct from the per-attempt
+            // operation identity and the per-correction idempotency key.
+            write_intent_id: format!("intent-{operation}"),
+            write_envelope_protocol_version: 1,
             state_fence: state_fence.clone(),
             scope_id: ScopeId::new("scope-1")?,
             task_id: None,

@@ -96,6 +96,10 @@ fn transition(
             idempotency_key: format!("idem-{operation}"),
             canonical_request_hash: "a".repeat(64),
         },
+        // The fixture's own stable intent, distinct from the per-attempt
+        // operation identity and the per-correction idempotency key.
+        write_intent_id: format!("intent-{operation}"),
+        write_envelope_protocol_version: 1,
         state_fence: fence.clone(),
         scope_id: ScopeId::new("scope-1")?,
         task_id: None,

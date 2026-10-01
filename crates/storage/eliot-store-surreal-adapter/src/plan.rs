@@ -1275,6 +1275,10 @@ mod tests {
                 idempotency_key: format!("idem-{operation}"),
                 canonical_request_hash: "a".repeat(64),
             },
+            // The fixture's own stable intent, distinct from the per-attempt
+            // operation identity and the per-correction idempotency key.
+            write_intent_id: format!("intent-{operation}"),
+            write_envelope_protocol_version: 1,
             state_fence,
             scope_id: ScopeId::new("scope-1")?,
             task_id: None,
@@ -1410,9 +1414,18 @@ mod tests {
         // `"a".repeat(64)` is a placeholder (proof below: it never equals the
         // recomputed digest), so the new validators bind the recomputed value.
         // Cross-crate stability: this uses the same `canonical_request_hash`
-        // that yields the Slice A golden
-        // `21b8b2be1415dae7f905e202725e0eb02c953d06afef64a946db7d2a19bd601c`
-        // in `eliot-store-api`.
+// whose Slice A golden vector is pinned in
+        // `eliot-store-api`'s `request_hash.rs`
+        // (`golden_request_hash_is_stable_across_crates`).
+        //
+        // #1925: no digest literal is restated here. `55e62e40…` was already
+        // stale on `main` (commit `2c22f4b45` added `ordering_scopes` to the
+        // hashed input without re-pinning), #3977 re-pinned the owning
+        // assertion, and #1925 adds the two write-intent identity members on
+        // top, moving it again. The digest is emitted by the owner function,
+        // not derived by reading this file, so this cross-reference names the
+        // owning assertion — the one place to pin — and stays correct across
+        // re-pins instead of drifting a second literal out of date.
         let (context, mut transition) = fixture()?;
         let recomputed = recomputed_canonical_request_hash(&context, &transition, &[], &[])?;
         assert_ne!(

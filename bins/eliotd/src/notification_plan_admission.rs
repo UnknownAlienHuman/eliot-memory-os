@@ -281,10 +281,41 @@ pub fn admit_notification_transition(
     // against the very slice its own digest was taken from would be comparing
     // a value with itself.
     let authorizing_manifests = generated_operation_manifests()?;
+    // #1925: this leg's stable intent is the owner-issued notification record
+    // it commits, addressed by that record's durable dedup key. The dedup key
+    // is the notification row identity, so a typed correction of the same
+    // record redeclares the same intent while the per-attempt operation
+    // identity and the per-correction idempotency key still rotate. A parameter
+    // set that does not carry one is REFUSED here: this leg has no other
+    // owner-issued subject, and substituting the operation identity or the
+    // idempotency key would collapse the third identity into one of them.
+    let notification_subject = admission
+        .parameters
+        .get(eliot_store_api::NOTIFY_PARAM_DEDUP_KEY)
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| {
+            NotificationEmitError::Store(StoreError::InvalidField {
+                field: "notification.dedup_key",
+                reason: "the admitted notification record has no owner-issued subject",
+            })
+        })?
+        .to_owned();
     let envelope = CanonicalWriteEnvelope {
         operation_id: OperationId::new(admission.operation_text).map_err(StoreError::Foundation)?,
         request: admission.identity.request.metadata.clone(),
         idempotency_key: admission.identity.idempotency_key.clone(),
+        write_intent_id: eliot_governor::admission_write_intent(
+            "notification-state-transition",
+            &notification_subject,
+        )
+        .ok_or_else(|| {
+            NotificationEmitError::Store(StoreError::InvalidField {
+                field: "notification.dedup_key",
+                reason: "the admitted notification record has no owner-issued subject",
+            })
+        })?,
+        write_envelope_protocol_version:
+            eliot_governor::GOVERNOR_ADMISSION_WRITE_ENVELOPE_PROTOCOL_VERSION,
         // The fixed notification scope: a contract constant, never a value
         // this leg chooses.
         scope_id: ScopeId::new(NOTIFICATION_STATE_SCOPE)?,

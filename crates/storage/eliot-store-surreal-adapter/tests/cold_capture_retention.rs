@@ -85,6 +85,10 @@ fn capture_transition(tag: &str) -> (RequestMeta, PreparedTransition) {
             idempotency_key: format!("idem-cold-live-{tag}"),
             canonical_request_hash: "0".repeat(64),
         },
+        // The fixture's own stable intent, distinct from the per-attempt
+        // operation identity and the per-correction idempotency key.
+        write_intent_id: format!("intent-cold-live-{tag}"),
+        write_envelope_protocol_version: 1,
         state_fence: fence(),
         scope_id: ScopeId::new(SCOPE).expect("scope"),
         task_id: None,

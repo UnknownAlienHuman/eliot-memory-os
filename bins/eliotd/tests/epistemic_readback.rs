@@ -174,6 +174,10 @@ fn revision_write_is_admitted_while_revocation_stays_unactivated() -> TestResult
             idempotency_key: "retry-1".to_owned(),
             canonical_request_hash: "a".repeat(64),
         },
+        // The fixture's own stable intent, distinct from the per-attempt
+        // operation identity and the per-correction idempotency key.
+        write_intent_id: format!("intent-{scope_id}"),
+        write_envelope_protocol_version: 1,
         state_fence: test_fence()?,
         scope_id,
         task_id: None,
