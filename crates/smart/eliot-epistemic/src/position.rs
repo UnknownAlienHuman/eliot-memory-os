@@ -131,6 +131,30 @@ impl EpistemicRecord {
                 handle: self.handle.clone(),
                 reason: source.to_string(),
             })?;
+        // `ProvenanceView` publishes these two provenance strings verbatim, so
+        // `resolver.rs` returns them without re-deriving or re-bounding them.
+        // `EvidenceEnvelope::validate` rejects only blank and control
+        // characters, which leaves the returned position carrying unbounded
+        // caller text. The ceiling is the owner crate's: its canonical
+        // provenance closure bounds the same two shapes
+        // (`raw_handles`/`revisions`) at `MAX_SHORT_TEXT` in
+        // `provenance.rs::check_handle_bounds`. Reused here rather than
+        // invented. `source_id` is deliberately not bounded here: no accepted
+        // limit exists for it in that crate, so adding one would invent a bound.
+        if let Some(raw_handle) = &self.evidence.provenance.raw_handle {
+            text(
+                raw_handle.as_str(),
+                "evidence.provenance.raw_handle",
+                MAX_SHORT_TEXT,
+            )?;
+        }
+        if let Some(revision) = &self.evidence.provenance.revision {
+            text(
+                revision.as_str(),
+                "evidence.provenance.revision",
+                MAX_SHORT_TEXT,
+            )?;
+        }
         let mut predecessors = BTreeSet::new();
         for predecessor in &self.supersedes {
             if predecessor == &self.handle {
