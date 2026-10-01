@@ -398,7 +398,11 @@ fn admitted_receipt(
     response: &NativeWorkerClaimResponse,
 ) -> eliot_kernel_service::NativeWorkerClaimReceipt {
     match response {
-        NativeWorkerClaimResponse::Admitted(receipt) => receipt.clone(),
+        // The `Admitted` arm carries a boxed receipt (the 312-byte payload is
+        // boxed to keep the enum's `Conflict` arm small). This helper returns
+        // the plain receipt, mirroring the one unbox the dispatch launcher
+        // performs at its own match, so callers read fields directly.
+        NativeWorkerClaimResponse::Admitted(receipt) => receipt.as_ref().clone(),
         other => panic!("expected Admitted, got {other:?}"),
     }
 }
@@ -477,7 +481,9 @@ fn typed_cross_binding_and_fail_closed_gates() {
     }
     .with_computed_digest()
     .expect("receipt digest");
-    let admitted = NativeWorkerClaimResponse::Admitted(receipt);
+    // The `Admitted` arm carries a boxed receipt; the value itself is the exact
+    // one just digested above, never a re-mint under a new identity.
+    let admitted = NativeWorkerClaimResponse::Admitted(Box::new(receipt));
     let x2 = admitted
         .require_canonical_activation()
         .expect_err("X2 must fail closed");
@@ -730,7 +736,7 @@ fn claim_join_mints_no_process_request_or_permit() {
     }
     .with_computed_digest()
     .expect("receipt digest");
-    let response = NativeWorkerClaimResponse::Admitted(receipt);
+    let response = NativeWorkerClaimResponse::Admitted(Box::new(receipt));
     assert!(response.require_canonical_activation().is_err());
 }
 
