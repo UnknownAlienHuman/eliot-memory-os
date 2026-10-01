@@ -41,6 +41,11 @@ pub const INITIAL_SNAPSHOT_SIGNATURE_BYTES: usize = 64;
 pub const INITIAL_SNAPSHOT_WIRE_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
 /// Setting key carrying the confirmed privacy mode selection.
 pub const PRIVACY_MODE_KEY: &str = "privacy.mode";
+/// Setting key retaining the signed governing-source approval in Policy.
+pub const GOVERNING_SOURCE_APPROVAL_KEY: &str = "governing_source.approval";
+/// Versioned literal prefix for the canonical governing-source approval.
+pub const GOVERNING_SOURCE_APPROVAL_LITERAL_PREFIX: &str =
+    "literal:eliot.governing-source-approval.v1:";
 
 /// The privacy mode selected during deterministic setup (I3.2 milestone 5).
 ///
@@ -165,7 +170,7 @@ pub fn prepare_initial_snapshot_payload(
     privacy: PrivacyChoice,
     first_run: &FirstRunDecision,
 ) -> Result<InitialSnapshotPayload, InitialSnapshotError> {
-    prepare_initial_snapshot_payload_inner(identity, privacy, first_run, None)
+    prepare_initial_snapshot_payload_inner(identity, privacy, first_run, None, None)
 }
 
 /// Builds the first signed configuration payload with an explicit
@@ -178,7 +183,32 @@ pub fn prepare_initial_snapshot_payload_with_blob_policy(
     first_run: &FirstRunDecision,
     blob_process_policy: &BlobProcessPolicyValue,
 ) -> Result<InitialSnapshotPayload, InitialSnapshotError> {
-    prepare_initial_snapshot_payload_inner(identity, privacy, first_run, Some(blob_process_policy))
+    prepare_initial_snapshot_payload_inner(
+        identity,
+        privacy,
+        first_run,
+        Some(blob_process_policy),
+        None,
+    )
+}
+
+/// Builds the first signed Config payload with the canonical governing-source
+/// approval retained both in the signed outer payload and in the nested
+/// ConfigPolicySnapshot that the existing Policy owner stores.
+pub fn prepare_initial_snapshot_payload_with_source_approval(
+    identity: &InitialSnapshotIdentity,
+    privacy: PrivacyChoice,
+    first_run: &FirstRunDecision,
+    blob_process_policy: &BlobProcessPolicyValue,
+    governing_source_approval_json: &str,
+) -> Result<InitialSnapshotPayload, InitialSnapshotError> {
+    prepare_initial_snapshot_payload_inner(
+        identity,
+        privacy,
+        first_run,
+        Some(blob_process_policy),
+        Some(governing_source_approval_json),
+    )
 }
 
 fn prepare_initial_snapshot_payload_inner(
@@ -186,6 +216,7 @@ fn prepare_initial_snapshot_payload_inner(
     privacy: PrivacyChoice,
     first_run: &FirstRunDecision,
     blob_process_policy: Option<&BlobProcessPolicyValue>,
+    governing_source_approval_json: Option<&str>,
 ) -> Result<InitialSnapshotPayload, InitialSnapshotError> {
     identity.validate()?;
     if matches!(privacy, PrivacyChoice::LocalOnly) && first_run.has_paid_route() {
@@ -202,6 +233,14 @@ fn prepare_initial_snapshot_payload_inner(
                 .to_setting(&identity.owner_ref, &identity.scope_id)
                 .map_err(|error| invalid_field("blob_process_policy", error.to_string()))?,
         );
+    }
+    if let Some(approval_json) = governing_source_approval_json {
+        validate_canonical_json_object(approval_json, "governing_source_approval_json")?;
+        settings.push(crate::Setting {
+            key: GOVERNING_SOURCE_APPROVAL_KEY.to_owned(),
+            value_ref: format!("{GOVERNING_SOURCE_APPROVAL_LITERAL_PREFIX}{approval_json}"),
+            owner_ref: identity.owner_ref.clone(),
+        });
     }
     let snapshot = ConfigPolicySnapshot {
         snapshot_id: identity.snapshot_id.clone(),
@@ -236,7 +275,7 @@ fn prepare_initial_snapshot_payload_inner(
         key_identity: identity.key_identity.clone(),
         runtime_state_roots_digest: identity.runtime_state_roots_digest.clone(),
         setup_revision: identity.setup_revision,
-        governing_source_approval_json: None,
+        governing_source_approval_json: governing_source_approval_json.map(str::to_owned),
     };
     payload.validate()?;
     Ok(payload)
@@ -301,6 +340,37 @@ impl InitialSnapshotPayload {
         }
         if let Some(approval_json) = &self.governing_source_approval_json {
             validate_canonical_json_object(approval_json, "governing_source_approval_json")?;
+            let mut approval_settings = self
+                .snapshot
+                .settings
+                .iter()
+                .filter(|setting| setting.key == GOVERNING_SOURCE_APPROVAL_KEY);
+            let setting = approval_settings.next().ok_or_else(|| {
+                invalid_field(
+                    "snapshot.settings.governing_source_approval",
+                    "signed approval must also be retained in the Policy owner snapshot",
+                )
+            })?;
+            if approval_settings.next().is_some()
+                || setting.owner_ref != self.owner_ref
+                || setting.value_ref
+                    != format!("{GOVERNING_SOURCE_APPROVAL_LITERAL_PREFIX}{approval_json}")
+            {
+                return Err(invalid_field(
+                    "snapshot.settings.governing_source_approval",
+                    "must exactly match the signed approval JSON and owner",
+                ));
+            }
+        } else if self
+            .snapshot
+            .settings
+            .iter()
+            .any(|setting| setting.key == GOVERNING_SOURCE_APPROVAL_KEY)
+        {
+            return Err(invalid_field(
+                "snapshot.settings.governing_source_approval",
+                "a Policy owner approval Setting requires the matching signed payload field",
+            ));
         }
         self.snapshot
             .validate()
