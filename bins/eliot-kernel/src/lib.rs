@@ -1045,7 +1045,7 @@ struct AgentBridgeProfile {
 /// ticket and typed result that produced it, so a stored `Resolved` projection
 /// is never treated as perpetual authority on its own.
 #[cfg(windows)]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct ActivatedApplicationBinding {
     /// Application principal the activation owner resolved for this
     /// connection. Never the bridge module identity or the pipe peer identity.
@@ -1664,6 +1664,12 @@ pub enum KernelFrameAction {
         tool: serde_json::Value,
         admission_receipt: eliot_protocol::HostRequestAdmissionReceipt,
         record: eliot_ors::HostRequestRecord,
+        /// Present only for a reconnect `Status` resolution. The operation's
+        /// original envelope remains in `envelope`; this is the newly
+        /// authenticated transport request used solely for current read
+        /// authorization and correlated response delivery.
+        reconnect_envelope: Option<eliot_protocol::HostRequestEnvelope>,
+        logical_key: Option<String>,
     },
     /// Return a typed rejection, then fence the connection.
     Fence(Frame),
