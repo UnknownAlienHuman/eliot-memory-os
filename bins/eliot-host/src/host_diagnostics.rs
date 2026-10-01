@@ -724,6 +724,100 @@ pub fn observe_terminal_error_with_correlation(code: &str, correlation: &HostTer
     );
 }
 
+/// Immutable nonsecret runtime-control request identity carried by one terminal
+/// record (F-LOG-HOST-2, #893 D2/D3).
+///
+/// The second, distinct typed terminal projection, for the boundaries whose
+/// semantic owner is the runtime-control *request* rather than a Phase-B /
+/// activation transaction: `HostComposition::handle_store_recovery_request`,
+/// `reconcile_store_recovery_request`, `handle_kernel_restart_request`, and
+/// `reconcile_kernel_restart_request`. The owner-issued identity of that
+/// subject is exactly `(request.request_id, request.mutation_digest,
+/// request.request_digest)`, and the subordinate records of the same operation
+/// already render it as the `req_id`/`mutation`/`req` keys
+/// (`StoreRecoveryObservation::for_request` / `for_receipt` in
+/// `host_composition_store_recovery.rs`).
+///
+/// This is deliberately NOT a re-spelling of [`HostTerminalCorrelation`]. That
+/// projection's three slots are named for what the Phase-B and activation
+/// owner actually issued — a transaction id, a materialization effect id, and a
+/// request digest — and its `tx`/`effect` field names are that vocabulary.
+/// A recovery or restart request has no transaction and no materialization
+/// effect, so filling those slots here would assert an identity the owner never
+/// issued, and rendering it under the field names `tx`/`effect` would claim a
+/// join to activation records that have nothing to do with this operation. The
+/// slot names here are the request's own `req_id`/`mutation`/`req` spellings,
+/// so the terminal and its subordinate records are joined by an exact shared
+/// field rather than by position or by record order (I13.11: timeline **and**
+/// correlation, not adjacency inference).
+///
+/// Every slot is required, not optional: `HostRuntimeControlRequest` carries
+/// all three handles unconditionally, so absence is unrepresentable here and no
+/// `*_missing` flag or unavailable variant is needed. Nothing is probed,
+/// looked up, synthesized, hashed, or cached — the values are the exact
+/// nonsecret handles the authenticated pipe already delivered. It is never a
+/// dedup ledger, never a second lifecycle (I14.20), and never secret-bearing:
+/// no credential value, payload, path, or arbitrary error text (I15.4). It
+/// uses the same [`BoundedField`] bounding as every other field in this
+/// facade, so there is no second bounding scheme.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostRequestIdentityCorrelation {
+    request_id: BoundedField,
+    mutation: BoundedField,
+    request: BoundedField,
+}
+
+impl HostRequestIdentityCorrelation {
+    /// Binds the request identity this terminal record is about: the exact
+    /// request id, mutation digest, and request digest the semantic owner
+    /// already holds for the live runtime-control request, rendered under the
+    /// same `req_id`/`mutation`/`req` keys its subordinate records use. Each
+    /// handle is bounded with truncation honesty by the shared
+    /// [`bound_field`].
+    #[must_use]
+    pub fn bound(request_id: &str, mutation: &str, request: &str) -> Self {
+        Self {
+            request_id: bound_field(request_id),
+            mutation: bound_field(mutation),
+            request: bound_field(request),
+        }
+    }
+}
+
+/// Records the single terminal error boundary of a runtime-control request
+/// together with that request's immutable identity.
+///
+/// Emits exactly one `host.terminal_error` record — never a second terminal,
+/// never a dedup ledger — carrying the same `req_id`/`mutation`/`req` field
+/// spellings [`observe_entrypoint_with_detail`] renders for the subordinate
+/// phases of that request, so two interleaved runtime-control requests ending
+/// in the same frozen code stay distinguishable by a shared field. All macro
+/// arguments are precomputed pure values, so a disabled event evaluates no
+/// extra effectful operation.
+pub fn observe_terminal_error_with_request_identity(
+    code: &str,
+    correlation: &HostRequestIdentityCorrelation,
+) {
+    let bounded = bound_field(code);
+    tracing::error!(
+        target: HOST_DIAGNOSTICS_TARGET,
+        event = "host.terminal_error",
+        code = bounded.text(),
+        code_bytes = bounded.original_bytes(),
+        code_truncated = bounded.truncated(),
+        req_id = correlation.request_id.text(),
+        req_id_bytes = correlation.request_id.original_bytes(),
+        req_id_truncated = correlation.request_id.truncated(),
+        mutation = correlation.mutation.text(),
+        mutation_bytes = correlation.mutation.original_bytes(),
+        mutation_truncated = correlation.mutation.truncated(),
+        req = correlation.request.text(),
+        req_bytes = correlation.request.original_bytes(),
+        req_truncated = correlation.request.truncated(),
+        "host terminal error"
+    );
+}
+
 /// Notes Event Log sink unavailability where the sink cannot carry a record.
 ///
 /// Consumes the live [`crate::windows_event_log::event_log_sink_status`]
