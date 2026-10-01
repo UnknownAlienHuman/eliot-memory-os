@@ -1133,18 +1133,32 @@ fn product_proof_execution(action: FinishLifecycleAction) -> ExecutionStatus {
 const INSTALLED_ROUTE_REQUIRED_PROOF: &str =
     "installed Windows route pulse executed end to end on the target generation";
 
+/// The release-build evidence a product proof still needs when it carries none.
+///
+/// This is the text `eliot-finish`'s `missing_evidence` already writes for the
+/// parked record, restated here so both revisions name one requirement. The
+/// build axis is required independently of the runtime axis: observing the
+/// installed route never clears it, because a build receipt is not something a
+/// run produces.
+const BUILD_EVIDENCE_REQUIREMENT: &str = "release build evidence for the exact candidate";
+
 /// The observed installed-route stage a real finish receipt justifies.
 ///
-/// A terminal succeeded position alone is NOT an installed-route observation.
-/// The acceptance owner requires an installed-route receipt, so this reads the
-/// Product Proof plan's own concrete receipt identity out of the decision's
-/// *independently derived* artifact/verifier bindings — the set
-/// `eliot-canonical` assembles from rehydrated evidence, not from this
-/// product-proof path — and compares it against the plan's expected receipt
-/// name. The decision's own digest and its own lifecycle action are the same
-/// operation being measured, so neither can stand in for the independent
-/// expected set. A finish decision that closed successfully while carrying no
-/// installed-route receipt therefore yields no observed stage at all.
+/// A terminal succeeded position alone is NOT an installed-route observation,
+/// and neither is a handle from the BUILD axis. The acceptance owner requires
+/// an installed-route *execution*, so this reads the Product Proof plan's own
+/// concrete receipt identity out of the decision's *independently derived*
+/// artifact/verifier bindings — the set `eliot-canonical` assembles from
+/// rehydrated evidence, not from this product-proof path — and keeps only the
+/// bindings that are NOT build artifacts. `eliot-canonical` seeds that set with
+/// `evidence.artifact_refs` (lib.rs:1145) before adding the executed
+/// verifier-run refs (lib.rs:1146), and the decision does not re-tag an entry
+/// with the set it came from, so the axis is read from the handle the same way
+/// the receipt name is: by content. A build handle that merely carries the
+/// plan's receipt string is a compile/link result, not a run, and I0.5 keeps
+/// `build` and `runtime` as axes that cannot substitute for one another. The
+/// decision's own digest and its own lifecycle action are the same operation
+/// being measured, so neither can stand in for the independent expected set.
 fn observed_installed_route_stage(
     receipt: &FinishDecisionReceipt,
 ) -> Option<eliot_reports::product_proof::ProductProofStageReceipt> {
@@ -1154,12 +1168,40 @@ fn observed_installed_route_stage(
         .proof
         .artifact_and_verifier_bindings
         .iter()
+        .filter(|binding| !is_build_axis_binding(binding))
         .find_map(|binding| installed_route_receipt_id(binding, expected))?;
     Some(
         eliot_reports::product_proof::ProductProofStageReceipt::Observed {
             receipt_id: observed.to_owned(),
+            // Reached only from a binding that is not a build artifact, so the
+            // domain is the runtime axis by construction.
+            evidence: eliot_reports::product_proof::ProductProofRetainedEvidenceDomain::Runtime,
         },
     )
+}
+
+/// Whether one binding is a BUILD-axis artifact handle.
+///
+/// The handle is read by content, not by shape: `eliot-canonical` copies
+/// `evidence.artifact_refs` — the handles the candidate's build produced —
+/// into the binding set before it adds the executed verifier runs
+/// (eliot-canonical/src/lib.rs:1145-1146), and the decision does not re-tag an
+/// entry with the set it came from. Only unambiguous build outputs are matched:
+/// a path segment that is `target` (the Rust build root) or a compiled
+/// artifact extension. A receipt handle such as the plan's
+/// `ProductPulseReceipt` names neither, so it stays an observation. This is the
+/// I0.5 axis separation and the only test this path makes; no digest, MAC,
+/// nonce, or extra layer is added beyond it, and a handle that matches neither
+/// shape is treated as a runtime observation rather than being refused.
+fn is_build_axis_binding(binding: &str) -> bool {
+    binding.split([':', '/', '@', '#']).any(|segment| {
+        let segment = segment.trim();
+        segment == "target"
+            || segment.ends_with(".exe")
+            || segment.ends_with(".dll")
+            || segment.ends_with(".rlib")
+            || segment.ends_with(".pdb")
+    })
 }
 
 /// Extracts the installed-route receipt identity a binding handle names.
@@ -1202,45 +1244,59 @@ fn installed_route_stage(
 /// The raw readback handles a retained finish decision actually carries.
 ///
 /// The parked record must retain the evidence handles an operator needs for
-/// forensic readback, and it may not invent one: these are the decision's own
-/// derived artifact/verifier bindings, which `eliot-canonical` assembles from
-/// rehydrated evidence and `FinishDecisionReceipt::validate()` already checks
-/// for internal consistency. A decision that carries no binding therefore
-/// retains an empty handle set, which is a recorded absence rather than a
-/// fabricated log reference.
+/// forensic readback, and it may not invent one. It may not file a build
+/// artifact as a log either: a raw log handle is a retained readback handle, so
+/// the BUILD axis is excluded and only the non-build bindings the decision
+/// derived are kept. A decision that carries no such binding retains an empty
+/// handle set, which is a recorded absence rather than a fabricated log
+/// reference, and an absent build artifact stays on the build axis where the
+/// build-evidence handle already records it.
 fn product_proof_raw_log_refs(receipt: Option<&FinishDecisionReceipt>) -> Vec<String> {
     receipt.map_or_else(Vec::new, |receipt| {
-        let mut refs = Vec::new();
-        refs.clone_from_slice(&receipt.decision.proof.artifact_and_verifier_bindings);
+        let refs: Vec<String> = receipt
+            .decision
+            .proof
+            .artifact_and_verifier_bindings
+            .iter()
+            .filter(|binding| !is_build_axis_binding(binding))
+            .cloned()
+            .collect();
         refs
     })
 }
 
-/// Re-derives the evidence an unobserved product proof is still missing.
+/// Re-derives the evidence a product proof is still missing.
 ///
-/// This is computed from the record's own retained stage and the plan's
-/// concrete installed-route requirement rather than carried forward from a
-/// prior revision's list, so a requirement can never be cleared by repeating
-/// the same caller list. The installed-route proof text is read back off the
-/// record's own `Missing` stage, so the two always name the same thing, and
-/// the plan's receipt requirement is added independently so an operator sees
-/// the concrete receipt that was never produced. The result is sorted, which
+/// The list is computed against an expected set this function owns, never from
+/// the caller's prior list, so a requirement can never be cleared by repeating
+/// the same caller list. Both axes are re-derived independently and separately,
+/// which is what keeps them from substituting for one another: the installed
+/// route is missing whenever the record's own retained stage is not an observed
+/// runtime execution, and the release build is missing whenever the record
+/// carries no build handle of its own. An observed route therefore still lists
+/// the build evidence when the record has none. The result is sorted, which
 /// `ProductProofStatus::validate()` independently requires.
 fn product_proof_missing_evidence(
     previous: &eliot_reports::product_proof::ProductProofStatus,
 ) -> Vec<String> {
-    let mut missing: BTreeSet<String> = previous
-        .missing_evidence
-        .iter()
-        .filter(|requirement| **requirement != INSTALLED_ROUTE_REQUIRED_PROOF)
-        .cloned()
-        .collect();
+    let mut missing: BTreeSet<String> = BTreeSet::new();
     if !previous.retained.installed_route_observed() {
-        missing.insert(INSTALLED_ROUTE_REQUIRED_PROOF.to_owned());
+        // Read back off the record's own `Missing` stage when it has one, so
+        // the parked and revised records always name the same gap.
+        if let eliot_reports::product_proof::ProductProofStageReceipt::Missing { required_proof } =
+            &previous.retained.stage_receipts.installed_route
+        {
+            missing.insert(required_proof.clone());
+        } else {
+            missing.insert(INSTALLED_ROUTE_REQUIRED_PROOF.to_owned());
+        }
         missing.insert(format!(
             "{} receipt bound to the installed route (expected by the Product Proof plan {})",
             PRODUCT_PROOF_PLAN.installed_route_receipt, PRODUCT_PROOF_PLAN.plan_path
         ));
+    }
+    if previous.build_evidence.is_none() {
+        missing.insert(BUILD_EVIDENCE_REQUIREMENT.to_owned());
     }
     missing.into_iter().collect()
 }
@@ -6419,9 +6475,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         // stage receipt is moved into the retained record below, so the live
         // evidence below cites the same value rather than a recomputed one.
         let observed_receipt_id = match &installed_route {
-            eliot_reports::product_proof::ProductProofStageReceipt::Observed { receipt_id } => {
-                Some(receipt_id.clone())
-            }
+            eliot_reports::product_proof::ProductProofStageReceipt::Observed {
+                receipt_id, ..
+            } => Some(receipt_id.clone()),
             eliot_reports::product_proof::ProductProofStageReceipt::Missing { .. } => None,
         };
         // The retained evidence is rebuilt from this same record's identities
@@ -6435,18 +6491,15 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 installed_route,
             },
         };
-        // The still-missing evidence is recomputed from this record's own state
-        // and the plan's concrete requirement, not copied from the prior
-        // revision's list. Copying the same caller list forward would let an
-        // attempt "clear" the requirement without ever satisfying it; here an
-        // unobserved installed route always re-derives the exact proof that is
-        // still absent. A record whose installed route is observed clears the
-        // list only because this same call established that observation.
-        let missing_evidence = if observed {
-            Vec::new()
-        } else {
-            product_proof_missing_evidence(previous)
-        };
+        // The still-missing evidence is re-derived against an expected set this
+        // composition owns, not copied from the prior revision's list, and not
+        // emptied because the route was observed. Each axis is cleared only by
+        // the fact that satisfies it: observing the installed route clears the
+        // runtime requirement, while the build requirement stays listed until
+        // the record itself carries a build handle. Copying the same caller list
+        // forward, or dropping it on an observation, would let an attempt
+        // "clear" a requirement it never satisfied.
+        let missing_evidence = product_proof_missing_evidence(previous);
         let live_evidence = if observed {
             // The live evidence cites the *installed-route* receipt identity the
             // decision carried, not the finish decision's own digest, so the

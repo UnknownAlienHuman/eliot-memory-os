@@ -563,6 +563,12 @@ pub(super) struct ProductProofStatusWire {
     pub(super) build_evidence_id: Option<String>,
     /// Whether the required installed-route execution was observed.
     pub(super) installed_route_observed: bool,
+    /// I0.5 evidence domain of the retained installed-route stage receipt.
+    ///
+    /// This is published beside the boolean so an operator can see *which* axis
+    /// the receipt came from. A build-domain receipt is retained and readable,
+    /// but it is not an installed-route execution and never reports `pass`.
+    pub(super) installed_route_evidence: &'static str,
 }
 
 impl ProductProofStatusWire {
@@ -596,6 +602,20 @@ impl ProductProofStatusWire {
                 .as_ref()
                 .map(|build| build.evidence.evidence_id.clone()),
             installed_route_observed: status.retained.installed_route_observed(),
+            installed_route_evidence: match &status.retained.stage_receipts.installed_route {
+                eliot_reports::product_proof::ProductProofStageReceipt::Observed {
+                    evidence,
+                    ..
+                } => match evidence {
+                    eliot_reports::product_proof::ProductProofRetainedEvidenceDomain::Build => {
+                        "build"
+                    }
+                    eliot_reports::product_proof::ProductProofRetainedEvidenceDomain::Runtime => {
+                        "runtime"
+                    }
+                },
+                eliot_reports::product_proof::ProductProofStageReceipt::Missing { .. } => "none",
+            },
         }
     }
 }

@@ -15,8 +15,9 @@
 //!   accepted finish decision, so a compile/link result is a build-domain
 //!   handle and can never be read as a live-product outcome;
 //! * the installed-route stage receipt is derived from whether a runtime
-//!   domain receipt was actually retained, so a simulated absent launch
-//!   receipt is a recorded fact rather than a silent success;
+//!   domain receipt was actually retained, and is filed on the runtime I0.5
+//!   domain, so a build handle cannot be substituted for it and a simulated
+//!   absent launch receipt is a recorded fact rather than a silent success;
 //! * the terminal outcome is the I18.24 outcome of the record itself, taken
 //!   from the owner's own `FinishDecisionOutcome`, never from a second
 //!   taxonomy declared here.
@@ -34,9 +35,9 @@ use eliot_instrument_api::{ExecutionStatus, VerificationOutcome};
 use eliot_reports::product_proof::{
     ProductProofAuthority, ProductProofBuildEvidence, ProductProofEnvironmentIdentity,
     ProductProofEvidence, ProductProofEvidenceDomain, ProductProofExecutableIdentity,
-    ProductProofFailureClass, ProductProofRetainedEvidence, ProductProofRollup,
-    ProductProofRunAttempt, ProductProofStageReceipt, ProductProofStageReceipts,
-    ProductProofStatus,
+    ProductProofFailureClass, ProductProofRetainedEvidence, ProductProofRetainedEvidenceDomain,
+    ProductProofRollup, ProductProofRunAttempt, ProductProofStageReceipt,
+    ProductProofStageReceipts, ProductProofStatus,
 };
 use eliot_reports::projection::{ReportInputRevision, ReportInputSource};
 use thiserror::Error;
@@ -258,13 +259,16 @@ fn retained_source_bytes(inputs: &ProductProofStageInputs<'_>) -> String {
 
 /// Derives the installed-route stage receipt from the retained runtime receipt.
 ///
-/// An observed runtime receipt is cited by identity. Its absence is an
-/// explicit `Missing` stage naming what the absent execution would have
-/// proven, so an absent launch receipt can never be read as a success.
+/// An observed runtime receipt is cited by identity, on the runtime I0.5
+/// domain. Its absence is an explicit `Missing` stage naming what the absent
+/// execution would have proven, so an absent launch receipt can never be read as
+/// a success. There is deliberately no build-domain branch: a compile or link
+/// handle is not an installed-route execution, so it cannot be filed as one.
 fn installed_route_receipt(runtime_receipt_ref: Option<&str>) -> ProductProofStageReceipt {
     match runtime_receipt_ref {
         Some(receipt_ref) => ProductProofStageReceipt::Observed {
             receipt_id: receipt_ref.to_owned(),
+            evidence: ProductProofRetainedEvidenceDomain::Runtime,
         },
         None => ProductProofStageReceipt::Missing {
             required_proof:
@@ -299,7 +303,9 @@ fn build_evidence(
 /// The installed-route stage is compared by content against its own recorded
 /// requirement, and the build handle is checked for presence, so this list is
 /// derived from the record's retained evidence rather than supplied by the
-/// caller.
+/// caller. The two axes are independent: observing the installed route never
+/// clears the build requirement, because a build receipt is not something a run
+/// produces.
 fn missing_evidence(
     retained: &ProductProofRetainedEvidence,
     build_evidence_present: bool,
@@ -312,10 +318,17 @@ fn missing_evidence(
         missing.push(required_proof.clone());
     }
     if !build_evidence_present {
-        missing.push("release build evidence for the exact candidate".to_owned());
+        missing.push(BUILD_EVIDENCE_REQUIREMENT.to_owned());
     }
     missing
 }
+
+/// The release-build evidence this owner requires for the exact candidate.
+///
+/// `eliot-governor` restates this same text so both the parked and the revised
+/// record name one requirement rather than two an operator would read as two
+/// different gaps.
+const BUILD_EVIDENCE_REQUIREMENT: &str = "release build evidence for the exact candidate";
 
 /// The factual reason recorded for the parked state.
 ///

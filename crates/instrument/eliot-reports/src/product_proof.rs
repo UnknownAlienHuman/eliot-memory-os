@@ -25,6 +25,20 @@
 //! "`UNKNOWN`, `PARTIAL` and `BLOCKED` never become PASS through aggregation"
 //! is therefore a return path in code, not a comment.
 //!
+//! Build evidence and runtime evidence are separated in *both* directions, and
+//! the separation is carried by the data rather than by the prose:
+//!
+//! * a build handle is a [`ProductProofEvidenceDomain::Build`] value on a type
+//!   with no outcome field ([`ProductProofBuildEvidence`]), so a successful
+//!   release build can never be read as a live-product `PASS`;
+//! * the retained stage receipt carries its own I0.5 domain
+//!   ([`ProductProofRetainedEvidenceDomain`]), and the pass rule reads
+//!   [`ProductProofStageReceipt::observed_runtime`] — a build handle filed as an
+//!   installed-route receipt is refused rather than accepted;
+//! * [`ProductProofStatus::validate`] rejects a `PASS` whose build evidence is
+//!   absent or whose live-evidence set is empty, so the two axes cannot each
+//!   substitute for the other in either direction.
+//!
 //! The record reuses [`VerificationOutcome`] and [`ExecutionStatus`] from
 //! `eliot-instrument-api` rather than declaring a fourth outcome vocabulary, and
 //! it never widens the closed single-variant [`ProductSupportState`] support
@@ -200,7 +214,34 @@ pub struct ProductProofStageReceipts {
     pub installed_route: ProductProofStageReceipt,
 }
 
+/// Which I0.5 evidence domain a retained stage receipt belongs to.
+///
+/// I0.5's `domain_coverage` keeps `build` and `runtime` as separate axes whose
+/// values cannot substitute for one another, so a stage receipt that unlocks a
+/// live-product outcome must say which axis produced it. Without this domain a
+/// build handle and a runtime handle are the same value — a bare identity
+/// string — and the record could not tell an installed-route *execution* from
+/// an artifact the build produced. Only [`Self::Runtime`] may support a
+/// live-product outcome.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ProductProofRetainedEvidenceDomain {
+    /// Compile/build handle: never a live-product observation.
+    Build,
+    /// Live execution handle: the only domain that can carry a product proof.
+    Runtime,
+}
+
 /// The observed-or-missing state of one required stage.
+///
+/// An absent receipt is therefore a recorded fact, never a silent success:
+/// I18.24's "a required stage that is missing" reads here as an explicit entry
+/// rather than an omission.
+///
+/// An observed stage carries the I0.5 domain that produced it, because this is
+/// the one field that decides whether a rollup may reach `PASS`: a stage whose
+/// receipt is a build handle is not an installed-route *execution*, and
+/// [`Self::observed_runtime`] is what the pass rule reads.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "state")]
 pub enum ProductProofStageReceipt {
@@ -208,6 +249,8 @@ pub enum ProductProofStageReceipt {
     Observed {
         /// Stable identity of the retained stage receipt.
         receipt_id: String,
+        /// Evidence domain that produced this receipt.
+        evidence: ProductProofRetainedEvidenceDomain,
     },
     /// The stage was required and did not run; no receipt exists.
     Missing {
@@ -223,9 +266,25 @@ impl ProductProofStageReceipt {
         matches!(self, Self::Observed { .. })
     }
 
+    /// Whether this stage was observed on the runtime domain.
+    ///
+    /// This is the only predicate the pass rule may read. A stage observed on
+    /// the build domain is a recorded receipt, but it is not an installed-route
+    /// *execution*, so it can never lift a rollup to `PASS`.
+    #[must_use]
+    pub const fn observed_runtime(&self) -> bool {
+        matches!(
+            self,
+            Self::Observed {
+                evidence: ProductProofRetainedEvidenceDomain::Runtime,
+                ..
+            }
+        )
+    }
+
     fn validate(&self) -> Result<(), ProductProofError> {
         match self {
-            Self::Observed { receipt_id } => {
+            Self::Observed { receipt_id, .. } => {
                 valid_text(receipt_id, "product_proof.stage.receipt_id")
                     .map_err(ProductProofError::Report)
             }
@@ -432,10 +491,15 @@ pub struct ProductProofRetainedEvidence {
 }
 
 impl ProductProofRetainedEvidence {
-    /// Whether the required installed-route execution was actually observed.
+    /// Whether the required installed-route *execution* was actually observed.
+    ///
+    /// This reads the stage's I0.5 domain, not merely its presence, so a
+    /// retained build handle is a recorded receipt that still cannot satisfy
+    /// the installed-route requirement. Every pass path in this module and
+    /// both of its owners read this one predicate.
     #[must_use]
     pub const fn installed_route_observed(&self) -> bool {
-        self.stage_receipts.installed_route.is_observed()
+        self.stage_receipts.installed_route.observed_runtime()
     }
 
     fn validate(&self) -> Result<(), ProductProofError> {
@@ -516,6 +580,14 @@ impl ProductProofStatus {
             return Err(ProductProofError::ParkedRunCannotPass);
         }
         if retained.installed_route_observed() {
+            return Err(ProductProofError::ParkedRunCannotObserveInstalledRoute);
+        }
+        if retained.stage_receipts.installed_route.is_observed() {
+            // A parked run's retained stage must be explicitly `Missing`, as
+            // this constructor's own contract states. The runtime check above
+            // is not sufficient on its own: a build-domain `Observed` handle
+            // would read as unobserved there and slip through, so the absent
+            // stage is required outright rather than merely non-runtime.
             return Err(ProductProofError::ParkedRunCannotObserveInstalledRoute);
         }
         missing_evidence.sort();
@@ -642,6 +714,19 @@ impl ProductProofStatus {
                     execution: attempt.execution,
                 });
             }
+            // The separation holds in both directions. A `PASS` needs the build
+            // evidence it claims to be built on, and it needs runtime evidence
+            // that actually observed something: a live-evidence set that is
+            // empty leaves the runtime claim resting on the stage flag alone,
+            // which is the same substitution I0.5 forbids in the other
+            // direction. Build evidence is never required to be a runtime
+            // handle — that is its own guarantee.
+            if self.build_evidence.is_none() {
+                return Err(ProductProofError::PassWithoutBuildEvidence);
+            }
+            if self.live_evidence.is_empty() {
+                return Err(ProductProofError::PassWithoutRuntimeEvidence);
+            }
         }
         Ok(())
     }
@@ -650,7 +735,11 @@ impl ProductProofStatus {
     ///
     /// The refusal is the rule, not a comment: an I18.24 `PASS` is returned
     /// only when the record itself validated *and* the required installed-route
-    /// execution was actually observed. Any other case returns
+    /// execution was actually observed. `validate()` is what carries the
+    /// two-axis separation — it refuses a `PASS` whose installed-route stage is
+    /// a build-domain handle, whose build evidence is absent, or whose
+    /// live-evidence set is empty — so this rollup cannot present a build result
+    /// as a runtime proof, or a bare stage flag as one. Any other case returns
     /// [`ProductProofRollup::Refused`] carrying the exact outcome, the reason,
     /// and the required missing evidence, so `UNKNOWN`, `PARTIAL` and `BLOCKED`
     /// can never be aggregated into a pass.
@@ -785,6 +874,19 @@ pub enum ProductProofError {
     /// execution is absent or evidence is still missing.
     #[error("PASS requires an observed installed-route execution and no missing evidence")]
     PassWithoutInstalledRoute,
+    /// A `PASS` outcome was recorded without the build evidence it claims.
+    ///
+    /// Build evidence cannot stand in for runtime evidence, and the reverse
+    /// holds too: a proven product with no recorded build for the exact
+    /// candidate has not shown what it was built from.
+    #[error("PASS requires build evidence for the exact candidate")]
+    PassWithoutBuildEvidence,
+    /// A `PASS` outcome was recorded with no live-product evidence.
+    ///
+    /// The installed-route stage flag alone is not a runtime observation, so an
+    /// empty live-evidence set refuses the pass rather than passing on a flag.
+    #[error("PASS requires at least one live-product runtime evidence handle")]
+    PassWithoutRuntimeEvidence,
     /// A parked run was recorded with a `PASS` outcome.
     #[error("a parked run cannot carry a PASS outcome")]
     ParkedRunCannotPass,
