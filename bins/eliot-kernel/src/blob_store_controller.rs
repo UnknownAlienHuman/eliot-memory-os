@@ -603,16 +603,28 @@ impl super::KernelComposition {
 
     /// Captures one payload through the I1.11 step 4 first-demand trigger.
     ///
-    /// This is the composition-reachable demand trigger for a non-inline
-    /// capture: it reaches the existing [`Self::demand_blob_store`] signal and
-    /// the existing [`Self::capture_blob_payload`] classification through the
-    /// one approved manifest threshold, and the recorded probe result is the
-    /// [`BlobProbeStatus`] that decides the outcome. An inline payload returns
-    /// before any demand, so the blob generation is still started only on the
-    /// first non-inline capture, recovery, or GC demand. Returns `Err` only
-    /// when no approved manifest was validated at startup — the same closed
-    /// reason [`Self::demand_blob_store`] reports — because with no approved
-    /// manifest there is no approved threshold and no generation to demand.
+    /// This is the intended composition-reachable demand trigger for a
+    /// non-inline capture: it reaches the existing [`Self::demand_blob_store`]
+    /// signal and the existing [`Self::capture_blob_payload`] classification
+    /// through the one approved manifest threshold, and the recorded probe
+    /// result is the [`BlobProbeStatus`] that decides the outcome. An inline
+    /// payload returns before any demand, so the blob generation is still
+    /// started only on the first non-inline capture, recovery, or GC demand.
+    /// Returns `Err` only when no approved manifest was validated at startup -
+    /// the same closed reason [`Self::demand_blob_store`] reports - because with
+    /// no approved manifest there is no approved threshold and no generation to
+    /// demand.
+    ///
+    /// # Live status
+    ///
+    /// `caller: NONE`. There is no production caller: `git grep -n
+    /// capture_blob_payload_with_demand` returns only this definition. Its
+    /// one caller is the private `BlobStoreController::capture_on_demand`, which
+    /// is itself reachable only from the `#[cfg(test)] mod tests` below. The
+    /// live composition path reaches
+    /// [`Self::capture_blob_payload`], which does not take the demand path.
+    /// Whether this trigger is wired to a composition call site or retired is
+    /// an owner decision.
     pub fn capture_blob_payload_with_demand(
         &self,
         length: u64,
