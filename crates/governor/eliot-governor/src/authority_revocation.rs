@@ -135,6 +135,22 @@ fn catalogue_set_digest() -> Result<OperationManifestDigest, CompositionError> {
 /// receipt route instead of re-admitting. The `RecordAuthorityRevocation`
 /// parameters record the seven owner-approved revocation fields; ceilings
 /// stay fixed at `RecoverySchema` / `ReversibleMutation` by construction.
+/// Every operator-supplied revocation text must be present and free of control
+/// characters before it can enter a hashed parameter set.
+///
+/// A blank or control-bearing value would be hashed into the request identity,
+/// so it is refused here rather than becoming an unreproducible digest input.
+fn require_revocation_texts(values: [(&str, &str); 5]) -> Result<(), CompositionError> {
+    for (value, field) in values {
+        if value.trim().is_empty() || value.chars().any(char::is_control) {
+            return Err(owner_refused(format!(
+                "revocation {field} is blank or contains control characters"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// `invalidation_reason` carries the terminal reason in its
 /// `SCREAMING_SNAKE_CASE` wire spelling; `closure_revision` and
 /// `affected_count` travel as decimal strings, mirroring how
@@ -163,19 +179,13 @@ pub fn authority_revocation_envelope(
             "admitted request fence does not match the request binding fence".to_owned(),
         ));
     }
-    for (value, field) in [
+    require_revocation_texts([
         (origin_ref, "origin_ref"),
         (closure_id, "closure_id"),
         (affected_digest, "affected_digest"),
         (invalidation_reason, "invalidation_reason"),
         (fence_digest, "fence_digest"),
-    ] {
-        if value.trim().is_empty() || value.chars().any(char::is_control) {
-            return Err(owner_refused(format!(
-                "revocation {field} is blank or contains control characters"
-            )));
-        }
-    }
+    ])?;
     if closure_revision == 0 {
         return Err(owner_refused(
             "revocation closure revision must be non-zero".to_owned(),
