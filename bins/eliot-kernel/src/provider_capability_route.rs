@@ -12,7 +12,12 @@
 //! authenticated path also serves one read-only claim-row projection
 //! (`PROVIDER_CAPABILITY_CLAIM_ROW_READ_OPERATION`): the sealed durable
 //! row fields under one exact claim identity, with no presented values to
-//! echo. No signing, no tokens, no cached `Verified` marker, no user
+//! echo. It also serves one receipt-recording projection
+//! (`PROVIDER_CAPABILITY_RECEIPT_RECORD_OPERATION`): the daemon forwards
+//! one provider receipt's ORIGINAL canonical bytes under its exact claim
+//! identity and kind, and the Kernel records them through the ORS
+//! advance-time recorder, which computes the retained digest itself. No
+//! signing, no tokens, no cached `Verified` marker, no user
 //! authentication: every call re-queries ORS and the live authority epoch,
 //! so restore always observes fresh owner evidence.
 //!
@@ -52,7 +57,7 @@ use eliot_kernel_service::{
     ProviderCapabilityExpectation, ProviderCapabilityRequest, ProviderProofKind,
     verify_provider_capability,
 };
-use eliot_ors::{OperationIdentity, RedbRecoveryStore};
+use eliot_ors::{NativeWorkerClaimReceiptKind, OperationIdentity, OrsError, RedbRecoveryStore};
 use eliot_protocol::{Frame, FrameKind, MessageType, ProtocolPayload};
 use std::sync::{Arc, Mutex};
 
@@ -80,16 +85,50 @@ pub(crate) const PROVIDER_CAPABILITY_VERIFY_OPERATION: &str =
 pub(crate) const PROVIDER_CAPABILITY_CLAIM_ROW_READ_OPERATION: &str =
     "native_worker.provider_capability.claim_row.read";
 
+/// Records one provider receipt's ORIGINAL canonical bytes on its claim row
+/// (issue #1108, A5 five-kind recording op).
+///
+/// Daemon-target operation for the per-kind record callers
+/// (`bins/eliotd/src/daemon_kernel_client.rs`: `record_cancellation_receipt_async`,
+/// `record_worker_fence_receipt_async`, `record_reassignment_receipt_async`,
+/// `record_result_receipt_async`, `record_unknown_outcome_receipt_async`, over
+/// `transact_async`). The request carries the claim identity, the receipt
+/// kind, and the receipt's ORIGINAL canonical bytes; the Kernel passes those
+/// bytes to the ORS advance-time recorder
+/// (`record_native_worker_claim_receipt_payload`), which validates them and
+/// computes the retained digest itself, so no caller digest is ever accepted.
+/// The first record wins per kind, an exact replay returns the durable row,
+/// changed bytes under one identity conflict, and an unknown row stays
+/// fail-closed. Read-write only on the receipt-payload column: mints no row,
+/// admits nothing, caches no verdict.
+///
+/// The coordinator core gains no write path through this op: the coordinator
+/// never calls it (it holds no session and no ORS handle); the daemon
+/// forwards the ORIGINAL bytes of the provider receipts it holds at its
+/// production sites, and the Kernel authenticates the front-door
+/// session before recording.
+pub(crate) const PROVIDER_CAPABILITY_RECEIPT_RECORD_OPERATION: &str =
+    "native_worker.provider_capability.receipt.record";
+
 /// Returns true for the provider-capability operations owned here.
 pub(crate) fn is_provider_capability_operation(operation: &str) -> bool {
     operation == PROVIDER_CAPABILITY_VERIFY_OPERATION
         || operation == PROVIDER_CAPABILITY_CLAIM_ROW_READ_OPERATION
+        || operation == PROVIDER_CAPABILITY_RECEIPT_RECORD_OPERATION
 }
 
 /// Maximum length of a bounded presented identity field, in UTF-8 bytes.
 const MAX_CAPABILITY_TEXT_LEN: usize = 256;
 /// Maximum length of a presented proof reference, in UTF-8 bytes.
 const MAX_PROOF_REF_LEN: usize = 1_024;
+/// Maximum length of one forwarded receipt's canonical bytes, in UTF-8 bytes.
+///
+/// Mirrors the ORS receipt ceiling the recorder enforces
+/// (`crates/kernel/eliot-ors/src/store.rs::MAX_NATIVE_WORKER_CLAIM_RECEIPT_PAYLOAD_BYTES`):
+/// oversized bytes fail closed here at the transport boundary before any
+/// store lookup, and the recorder re-enforces the same ceiling on the bytes
+/// it retains.
+const MAX_RECEIPT_CANONICAL_BYTES: usize = 64 * 1024;
 /// Maximum length carried in any typed error message, in characters.
 const MAX_ERROR_TEXT_CHARS: usize = 128;
 
@@ -461,6 +500,67 @@ impl ProviderCapabilityContext {
             "read_at_unix_ms": unix_ms(),
         }))
     }
+
+    /// Records one provider receipt's ORIGINAL canonical bytes on its claim
+    /// row and returns the retained canonical-payload digest (issue #1108,
+    /// A5 five-kind recording op).
+    ///
+    /// Resolves the row by exact claim identity through the same
+    /// `ors.load_native_worker_claim` path as
+    /// [`ProviderCapabilityContext::read_claim_row`] (unknown identities stay
+    /// `UnknownClaim`) and records through the ORS advance-time recorder
+    /// (`record_native_worker_claim_receipt_payload`), which validates the
+    /// bytes — non-empty, within the bounded receipt ceiling, well-formed
+    /// JSON — and computes the retained digest itself with owner hashing over
+    /// those exact bytes; a caller-supplied digest is never accepted, so a
+    /// caller echo can never become owner evidence. The first record wins per kind: an
+    /// exact replay of recorded bytes returns the durable row unchanged
+    /// (same retained digest, disposition `retained`), while a changed
+    /// payload under one identity fails with `BindingMismatch` (transport
+    /// `IdentityConflict`) and never overwrites the durable binding. An
+    /// unknown claim returns `UnknownClaim` (transport `UnknownRequest`);
+    /// this method never invents a record, so rowlessness stays fail-closed
+    /// at the existing upstream gates. Only the receipt-payload column
+    /// writes: no row is minted, nothing is admitted, no verdict is cached.
+    pub fn record_receipt_payload(
+        &self,
+        claim_id: &str,
+        kind: NativeWorkerClaimReceiptKind,
+        canonical_receipt: &str,
+    ) -> Result<String, ProviderCapabilityRouteError> {
+        let claim_identity = OperationIdentity::new(claim_id).map_err(|_| {
+            ProviderCapabilityRouteError::Session("claim identity is malformed".to_owned())
+        })?;
+        let row = self
+            .ors
+            .record_native_worker_claim_receipt_payload(&claim_identity, kind, canonical_receipt)
+            .map_err(|error| match error {
+                OrsError::NativeWorkerClaimIdentityConflict { .. } => {
+                    ProviderCapabilityRouteError::BindingMismatch(bounded_identity(claim_id))
+                }
+                OrsError::InvalidField { .. } => ProviderCapabilityRouteError::Session(
+                    "capability receipt bytes".to_owned(),
+                ),
+                _ => ProviderCapabilityRouteError::Store(
+                    "durable claim record is unavailable".to_owned(),
+                ),
+            })?
+            .ok_or_else(|| {
+                ProviderCapabilityRouteError::UnknownClaim(bounded_identity(claim_id))
+            })?;
+        let payloads = row.receipt_payloads;
+        let retained: Option<String> = match kind {
+            NativeWorkerClaimReceiptKind::Admission => payloads.admission_payload_sha256,
+            NativeWorkerClaimReceiptKind::Cancellation => payloads.cancellation_payload_sha256,
+            NativeWorkerClaimReceiptKind::WorkerFence => payloads.worker_fence_payload_sha256,
+            NativeWorkerClaimReceiptKind::Reassignment => payloads.reassignment_payload_sha256,
+            NativeWorkerClaimReceiptKind::Result => payloads.result_payload_sha256,
+            NativeWorkerClaimReceiptKind::UnknownOutcome => payloads.unknown_outcome_payload_sha256,
+        };
+        retained.ok_or_else(|| {
+            ProviderCapabilityRouteError::Store("recorded receipt payload is missing".to_owned())
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -537,7 +637,9 @@ impl KernelComposition {
     /// live-epoch query, and the owner delegation live in
     /// [`ProviderCapabilityContext::verify`]; the claim-row read branch
     /// reuses the same session/fence gates and the same ORS claim-resolution
-    /// path through [`ProviderCapabilityContext::read_claim_row`].
+    /// path through [`ProviderCapabilityContext::read_claim_row`]; the
+    /// receipt-record branch reuses the same session/fence gates and records
+    /// through [`ProviderCapabilityContext::record_receipt_payload`].
     pub(crate) fn dispatch_provider_capability_frame(
         &self,
         session: &Session,
@@ -587,13 +689,16 @@ impl KernelComposition {
             .ok_or(TransportError::SessionFenced)?;
         if operation != PROVIDER_CAPABILITY_VERIFY_OPERATION
             && operation != PROVIDER_CAPABILITY_CLAIM_ROW_READ_OPERATION
+            && operation != PROVIDER_CAPABILITY_RECEIPT_RECORD_OPERATION
         {
             return Err(TransportError::SessionFenced);
         }
         let receipt = if operation == PROVIDER_CAPABILITY_VERIFY_OPERATION {
             self.handle_provider_capability_verify(session, &payload)
-        } else {
+        } else if operation == PROVIDER_CAPABILITY_CLAIM_ROW_READ_OPERATION {
             self.handle_provider_capability_claim_row_read(session, &payload)
+        } else {
+            self.handle_provider_capability_receipt_record(session, &payload)
         }
         .map_err(ProviderCapabilityRouteError::into_transport)?;
         let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, receipt)?;
@@ -737,6 +842,66 @@ impl KernelComposition {
         let body = context.read_claim_row(&claim_id)?;
         seal_capability_receipt(body)
     }
+
+    /// Records one provider receipt's ORIGINAL canonical bytes on its claim
+    /// row (issue #1108, A5 five-kind recording op).
+    ///
+    /// The request carries `wire_version`, `claim_id`, `proof_kind`, and the
+    /// receipt's ORIGINAL `canonical_receipt` bytes: the retained digest is
+    /// computed owner-side by the ORS recorder from those exact bytes, never
+    /// from a caller digest, so echoing presented values as retained ones is
+    /// impossible by construction. Session authentication, the session fence
+    /// join, and the ORS claim-resolution path are the existing ones
+    /// (dispatch gates above plus
+    /// [`KernelComposition::provider_capability_for_session`]). Unknown
+    /// identities fail closed as `UnknownRequest`; a changed payload under
+    /// one identity fails closed as `IdentityConflict`; malformed
+    /// identities, unknown kinds, oversized bytes, session/fence failures,
+    /// and store failures fail closed as `SessionFenced`. Only the
+    /// receipt-payload column writes: no row is minted, nothing is admitted.
+    ///
+    /// Reply contract (sealed with `receipt_digest`, same envelope as the
+    /// verify receipt): `kind` is
+    /// `native_worker_provider_capability_receipt_recorded`, `wire_version`
+    /// is [`PROVIDER_CAPABILITY_WIRE_VERSION`], then the exact `claim_id`,
+    /// the `proof_kind` wire name, the content disposition `retained` (first
+    /// record and exact replay are indistinguishable by content and share it),
+    /// the owner-retained `retained_payload_sha256`, plus
+    /// `recorded_at_unix_ms`.
+    fn handle_provider_capability_receipt_record(
+        &self,
+        session: &Session,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderCapabilityRouteError> {
+        let wire_version = payload
+            .get("wire_version")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                ProviderCapabilityRouteError::Session("capability wire version".to_owned())
+            })?;
+        if wire_version != PROVIDER_CAPABILITY_WIRE_VERSION {
+            return Err(ProviderCapabilityRouteError::Session(
+                "capability wire version".to_owned(),
+            ));
+        }
+        let claim_id = require_capability_text(payload, "claim_id", MAX_CAPABILITY_TEXT_LEN)?;
+        let proof_kind_value =
+            require_capability_text(payload, "proof_kind", MAX_CAPABILITY_TEXT_LEN)?;
+        let kind = parse_receipt_kind(&proof_kind_value)?;
+        let canonical_receipt = require_receipt_bytes(payload, "canonical_receipt")?;
+        let context = self.provider_capability_for_session(session)?;
+        let retained = context.record_receipt_payload(&claim_id, kind, &canonical_receipt)?;
+        let body = serde_json::json!({
+            "kind": "native_worker_provider_capability_receipt_recorded",
+            "wire_version": PROVIDER_CAPABILITY_WIRE_VERSION,
+            "claim_id": claim_id,
+            "proof_kind": proof_kind_value,
+            "disposition": "retained",
+            "retained_payload_sha256": retained,
+            "recorded_at_unix_ms": unix_ms(),
+        });
+        seal_capability_receipt(body)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -757,6 +922,48 @@ fn parse_proof_kind(value: &str) -> Result<ProviderProofKind, ProviderCapability
             "capability proof kind".to_owned(),
         )),
     }
+}
+
+/// Parses one wire proof-kind name into the ORS receipt-payload slot.
+///
+/// Accepts exactly the six kinds the ORS receipt column retains
+/// (issue #1108, A5): admission plus the five daemon-threaded kinds
+/// (cancellation, worker fence, reassignment, result, unknown outcome).
+/// `Binding` carries no retained payload and any other name is unknown, so
+/// both fail closed as a session rejection before any store lookup.
+fn parse_receipt_kind(
+    value: &str,
+) -> Result<NativeWorkerClaimReceiptKind, ProviderCapabilityRouteError> {
+    match value {
+        "Admission" => Ok(NativeWorkerClaimReceiptKind::Admission),
+        "Cancellation" => Ok(NativeWorkerClaimReceiptKind::Cancellation),
+        "WorkerFence" => Ok(NativeWorkerClaimReceiptKind::WorkerFence),
+        "Reassignment" => Ok(NativeWorkerClaimReceiptKind::Reassignment),
+        "Result" => Ok(NativeWorkerClaimReceiptKind::Result),
+        "UnknownOutcome" => Ok(NativeWorkerClaimReceiptKind::UnknownOutcome),
+        _ => Err(ProviderCapabilityRouteError::Session(
+            "capability receipt kind".to_owned(),
+        )),
+    }
+}
+
+/// Requires the receipt's ORIGINAL canonical bytes from the frame payload.
+///
+/// Non-empty and bounded by [`MAX_RECEIPT_CANONICAL_BYTES`]: oversized bytes
+/// fail closed here at the transport boundary before any store lookup, and
+/// the recorder re-enforces non-emptiness, the same ceiling, and well-formed
+/// JSON on the bytes it retains. No digest is read here: the retained digest
+/// is computed owner-side from these exact bytes.
+fn require_receipt_bytes(
+    payload: &serde_json::Value,
+    field: &'static str,
+) -> Result<String, ProviderCapabilityRouteError> {
+    let value = payload
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= MAX_RECEIPT_CANONICAL_BYTES)
+        .ok_or_else(|| ProviderCapabilityRouteError::Session(field.to_owned()))?;
+    Ok(value.to_owned())
 }
 
 /// Requires one bounded non-empty text field from the frame payload.
