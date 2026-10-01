@@ -1239,6 +1239,7 @@ fn provider_runtime_failure(provider: ProviderError) -> RuntimeFailure {
         ProviderErrorCode::PermissionDenied => RuntimeFailure::PermissionDenied,
         ProviderErrorCode::InvalidRequest => RuntimeFailure::InvalidInput,
         ProviderErrorCode::Timeout => RuntimeFailure::Timeout,
+        ProviderErrorCode::StorageFull => RuntimeFailure::ProviderFailed,
         ProviderErrorCode::Failed => RuntimeFailure::ProviderFailed,
     }
 }
