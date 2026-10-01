@@ -5049,8 +5049,15 @@ async fn run_observe_poll(
             };
         return Ok(step(outcome));
     }
-    let outcome =
-        execute_observation_capture(kernel, &composition, &envelope, &tool, &attempt).await?;
+    let outcome = execute_observation_capture(
+        kernel,
+        &composition,
+        &envelope,
+        &tool,
+        &attempt,
+        deferral.suboperation,
+    )
+    .await?;
     Ok(step(outcome))
 }
 
@@ -5083,11 +5090,80 @@ async fn execute_observation_capture(
     envelope: &eliot_protocol::HostRequestEnvelope,
     tool: &serde_json::Value,
     attempt: &eliot_protocol::LocalReadAttempt,
+    suboperation: ObserveSuboperation,
 ) -> Result<ObservePollOutcome, String> {
     let capture = decode_observation_capture(envelope, tool, attempt)
         .map_err(|error| format!("daemon observe capture decode: {error}"))?;
-    let identity = observation_request_identity(envelope, &capture, crate::unix_ms_i64())
-        .map_err(|error| format!("daemon observe identity: {error}"))?;
+    // W2: resolve the applicable authority for THIS operation before any
+    // identity is built. The resolution reads the #1746 activation /
+    // task-selection owner evidence through the composition, never the
+    // envelope's claimed task text, and it happens under the same composition
+    // guard the owner borrow below takes.
+    let authority = {
+        let guard = composition.lock().await;
+        let activation = guard
+            .current_activation_snapshot(crate::unix_ms())
+            .map_err(|error| format!("daemon observe authority resolution: {error}"))?;
+        let live_fence = guard.kernel_snapshot().state_fence().clone();
+        resolve_observe_operation_authority(
+            envelope,
+            suboperation,
+            activation.as_ref(),
+            &live_fence,
+        )
+        .map_err(|error| format!("daemon observe authority resolution: {error}"))?
+    };
+    tracing::debug!(
+        target: "eliotd::diagnostics",
+        event = "eliotd.observe_authority_resolved",
+        suboperation = suboperation.as_str(),
+        authority_layer = authority.effect_ceiling().as_str(),
+        admitting = authority.is_admitting(),
+    );
+    // A task-relative operation the owner could not bind, or a host claim that
+    // disagrees with owner authority, is refused as its own typed disposition.
+    // It is not admitted as an unbound cold capture, and nothing executes.
+    if !authority.is_admitting() {
+        let (class, code, reason) = match &authority {
+            eliotd::governor_observe_serve::ObserveOperationAuthority::TaskContractRequired {
+                class,
+                code,
+                reason,
+                ..
+            }
+            | eliotd::governor_observe_serve::ObserveOperationAuthority::ConflictingClaim {
+                class,
+                code,
+                reason,
+                ..
+            } => (*class, *code, reason.clone()),
+            // `is_admitting()` is exhaustive over the same enum, so this arm is
+            // unreachable in practice. It is handled as a typed refusal rather
+            // than a panic so the branch can never be the reason the daemon dies.
+            _ => (
+                observe_operation_class(suboperation)
+                    .map_err(|error| format!("daemon observe authority class: {error}"))?,
+                OBSERVE_TASK_CONTRACT_REQUIRED,
+                "authority resolver returned a non-admitting arm the refusal projection \
+                 does not classify"
+                    .to_owned(),
+            ),
+        };
+        let refused = eliotd::governor_observe_serve::ObserveServeOutcome::AuthorityRefused {
+            suboperation,
+            class,
+            code,
+            reason,
+        };
+        return submit_observe_result_idempotent(kernel, envelope, attempt, &refused)
+            .await
+            .map_err(|submit_error| {
+                format!("daemon observe authority refusal not retained: {submit_error}")
+            });
+    }
+    let identity =
+        observation_request_identity(envelope, &capture, &authority, crate::unix_ms_i64())
+            .map_err(|error| format!("daemon observe identity: {error}"))?;
     let base_operation = observation_base_operation(envelope)?;
     // The exact owner operation the commit would carry. It is derived here, not
     // guessed: it is the same identity the owner's own admission mints for this
