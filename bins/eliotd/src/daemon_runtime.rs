@@ -87,6 +87,7 @@ use eliotd::{
     forward_admitted_local_read, serve_admitted_observe, terminal_for_invalid_ticket,
 };
 use serde::Serialize;
+use thiserror::Error;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
 
 /// Shared daemon composition handle for the run loop. Flight futures own any
@@ -7267,13 +7268,34 @@ async fn trigger_accepted_cold_start(
 /// still lacks admitted privacy-boundary and governing-source digest evidence,
 /// so it can deliver its typed smallest-question result but cannot construct a
 /// durable readiness claim, join a lease, or compile a terminal receipt.
+#[derive(Debug, Error)]
+enum ColdStartIngressError {
+    #[error("cold-start clock: {0}")]
+    Clock(String),
+    #[error("cold-start Kernel owner {owner}: {detail}")]
+    Owner { owner: &'static str, detail: String },
+    #[error(
+        "I4.4.1 AttachOrLaunch discovery denied ({cause:?}); missing reads: {missing_reads:?}; Kernel contour: {contour_status}; Kernel binding: {binding_status}"
+    )]
+    DiscoveryDenied {
+        cause: eliot_workscope::OnboardingDegraded,
+        missing_reads: Vec<String>,
+        contour_status: String,
+        binding_status: String,
+    },
+    #[error(transparent)]
+    WorkScope(#[from] eliot_workscope::WorkScopeError),
+    #[error(transparent)]
+    Composition(#[from] eliot_governor::CompositionError),
+}
+
 fn trigger_cold_start_controller(
     kernel: &Arc<DaemonKernelClient>,
     ticket: &AgentActivationResolutionTicket,
     mut discovery: eliotd::task_binding_admission::ColdStartDiscoveryInput,
     contour_result: Result<eliot_governor::InstallationScanContour, String>,
-) -> Result<eliot_workscope::BootstrapScanOutcome, String> {
-    let now = unix_ms(SystemTime::now())?;
+) -> Result<eliot_workscope::BootstrapScanOutcome, ColdStartIngressError> {
+    let now = unix_ms(SystemTime::now()).map_err(ColdStartIngressError::Clock)?;
     let trigger = eliot_workscope::ColdStartTrigger::AttachOrLaunch;
     let controller_result = eliot_workscope::ColdStartController::check_discovery_with_scan(
         trigger,
@@ -7308,9 +7330,12 @@ fn trigger_cold_start_controller(
             })
             .map(|read| format!("{read:?}"))
             .collect::<Vec<_>>();
-        return Err(format!(
-            "I4.4.1 AttachOrLaunch refused before scanner: trigger discovery lease/evidence rejected by ColdStartController ({controller:?}); required reads missing from the lease or evidence: {missing_reads:?}; Kernel contour owner: {contour_status}; Kernel binding owner: {binding_status}",
-        ));
+        return Err(ColdStartIngressError::DiscoveryDenied {
+            cause: controller,
+            missing_reads,
+            contour_status: contour_status.to_owned(),
+            binding_status: binding_status.to_owned(),
+        });
     }
 
     let (Some(candidate_privacy), Some(privacy_boundary), Some(policy)) = (
@@ -7327,11 +7352,17 @@ fn trigger_cold_start_controller(
             &discovery.key,
             &discovery.discovery,
         )
-        .map_err(|error| format!("privacy-bounded attach scanner refused: {error}"));
+        .map_err(ColdStartIngressError::WorkScope);
     };
 
-    let contour = contour_result?;
-    let binding = binding_result?;
+    let contour = contour_result.map_err(|detail| ColdStartIngressError::Owner {
+        owner: "installation scan contour",
+        detail,
+    })?;
+    let binding = binding_result.map_err(|detail| ColdStartIngressError::Owner {
+        owner: "scan disclosure binding",
+        detail,
+    })?;
     let owner = Arc::new(
         eliotd::task_binding_admission::KernelScanDisclosureRecordOwner::new(
             Arc::clone(kernel),
@@ -7345,8 +7376,7 @@ fn trigger_cold_start_controller(
         contour.ors_object_ref(),
         contour.ors_generation(),
         owner,
-    )
-    .map_err(|error| format!("installation scan owner bind refused: {error}"))?;
+    )?;
     eliot_governor::GovernorComposition::<dyn eliot_governor::KernelGenerationPort>::run_cold_start_trigger_scan(
         trigger,
         &mut discovery.lease,
@@ -7362,7 +7392,6 @@ fn trigger_cold_start_controller(
         discovery.discovery.governing_source_refs.clone(),
         now,
     )
-    .map_err(|error| format!("I4.4.1 AttachOrLaunch scanner failed closed: {error}"))
 }
 
 /// Builds the lost-acknowledgement reconcile query from the single retained
