@@ -4,8 +4,7 @@ use std::fmt;
 use std::num::NonZeroU64;
 
 use eliot_contracts::{
-    AuthorityEpoch, ContractId, EpochId, EpochLineageId, ResourceGeneration, canonical_json_bytes,
-    sha256_hex,
+    ContractId, EpochId, EpochLineageId, ResourceGeneration, canonical_json_bytes, sha256_hex,
 };
 use eliot_kernel_core::{
     AuthorityGrantRequest, ControlOperationClass, ControlPermit, FrontDoor, KernelAuthority,
@@ -51,36 +50,16 @@ fn genesis_epoch() -> EpochId {
     .unwrap_or_else(|_| unreachable!())
 }
 
-/// Projects a canonical sync target to the scalar control-reserve fence.
+/// Lineage-aware authority fencing (Implements #64).
 ///
-/// Canonical-first (Implements #64): the same-lineage and non-regression
-/// rule is proven on the exact `(lineage_id, sequence)` tuple before any
-/// scalar value exists, so a cross-lineage target can never project to a
-/// scalar fence. The scalar control-reserve fence (`FrontDoor` /
-/// `KernelAuthority`, both core-owned scalar residuals) only follows the
-/// canonical decision for receipt-fencing compatibility; it never
-/// authorizes canonical work. Epoch mint stays Host-owned: the Kernel only
-/// adopts a Host-approved tuple through `reconcile`, and the
-/// `canonical_epoch` switch fences the old tuple — every old session fails
-/// its exact-tuple `is_same_authority` re-check from then on.
-fn scalar_fence_for_canonical_target(
-    target: &EpochId,
-    current: &EpochId,
-) -> Result<AuthorityEpoch, KernelServiceError> {
-    if target.lineage_id != current.lineage_id {
-        return Err(KernelServiceError::HandshakeMismatch {
-            field: "authority_epoch",
-        });
-    }
-    if target.sequence.get() < current.sequence.get() {
-        return Err(KernelServiceError::HandshakeMismatch {
-            field: "authority_epoch_regression",
-        });
-    }
-    AuthorityEpoch::new(target.sequence.get()).map_err(|_| KernelServiceError::HandshakeMismatch {
-        field: "authority_epoch_corrupt",
-    })
-}
+/// The canonical `(lineage_id, sequence)` tuple is the only authority fence:
+/// `FrontDoor` and `KernelAuthority` (both core-owned) fence the exact tuple,
+/// so a cross-lineage target can never project to a same-sequence fence and
+/// a MAC minted under one lineage never verifies under another. Epoch mint
+/// stays Host-owned: the Kernel only adopts a Host-approved tuple through
+/// `reconcile`, and the `canonical_epoch` switch fences the old tuple —
+/// every old session fails its exact-tuple `is_same_authority` re-check from
+/// then on.
 const GENERATION_FENCE_REASON_SUBSTITUTED: &str =
     "generation fence reason was invalid; canonical reason substituted";
 
@@ -467,10 +446,10 @@ pub struct KernelService {
     front_door: FrontDoor,
     /// Canonical lineage-aware authority epoch (Implements #64).
     /// Initialized to the inert lineage-A genesis before Host admission;
-    /// `reconcile` adopts the Host-approved candidate lineage. The scalar
-    /// `FrontDoor`/`KernelAuthority` fence is retained for control-reserve
-    /// compatibility and advanced alongside, but canonical fencing uses this
-    /// exact `(lineage_id, sequence)` tuple via `is_same_authority`.
+    /// `reconcile` adopts the Host-approved candidate lineage. The
+    /// `FrontDoor`/`KernelAuthority` fences carry the same exact
+    /// `(lineage_id, sequence)` tuple and advance alongside; canonical
+    /// fencing uses this tuple via `is_same_authority`.
     canonical_epoch: EpochId,
     candidate: Option<HostKernelCandidateBinding>,
     activation_receipt: Option<KernelActivationReceipt>,
@@ -499,7 +478,7 @@ impl KernelService {
     ) -> Result<Self, KernelServiceError> {
         let authority = KernelAuthority::new(
             KernelAuthorityKey::from_bytes(key_bytes),
-            AuthorityEpoch::genesis(),
+            genesis_epoch(),
         );
         Ok(Self {
             state: KernelServiceState::Cold,
@@ -1244,8 +1223,8 @@ impl KernelService {
     ///
     /// Advances the canonical lineage by exactly one sequence within the same
     /// lineage (Implements #64); cross-lineage advancement is impossible by
-    /// construction. The scalar control-reserve fence advances alongside for
-    /// compatibility but never authorizes canonical work.
+    /// construction. The core `FrontDoor`/`KernelAuthority` fences advance
+    /// the same tuple alongside but never authorize canonical work.
     ///
     /// I14.16 step 4: a `shadow_no_authority` candidate issues no epoch. The
     /// shadow gate is consulted here, before the first fence comparison, so no
@@ -1327,14 +1306,12 @@ impl KernelService {
                 field: "authority_epoch_oversized",
             });
         }
-        // The scalar control-reserve fence follows the canonical decision
-        // (core residual: no silent widening of the core). Projection goes
-        // through the canonical-first companion only — never a bare
-        // `AuthorityEpoch::new(sequence)` coercion.
-        let scalar_target = scalar_fence_for_canonical_target(&target, &current)?;
-        let front_door_epoch = self.front_door.synchronize_epoch(scalar_target)?;
-        let mirrored = self.authority.synchronize_epoch(scalar_target)?;
-        if front_door_epoch != mirrored || mirrored != scalar_target {
+        // Both core fences adopt the canonical tuple directly (Implements
+        // #64): no scalar projection exists, so a same-sequence tuple from
+        // another lineage can never become the fence.
+        let front_door_epoch = self.front_door.synchronize_epoch(target.clone())?;
+        let mirrored = self.authority.synchronize_epoch(target.clone())?;
+        if front_door_epoch != mirrored || mirrored != target {
             return Err(KernelServiceError::HandshakeMismatch {
                 field: "authority_epoch",
             });
@@ -2341,7 +2318,7 @@ mod tests {
         ProcessObservation, RestartBudget, StoreProcessBinding, StoreRebindHandoff,
         StoreRebindQuery,
     };
-    use eliot_contracts::StateFence;
+    use eliot_contracts::{AuthorityEpoch, StateFence};
     use eliot_platform::{KernelActivationNonce, PlatformHandle};
     use eliot_runtime_contracts::{
         HealthVector, RegisteredActivityWakePolicy, ServiceProcessState, SupervisionJournalEpoch,
