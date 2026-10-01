@@ -159,11 +159,12 @@ pub fn submit_admission_snapshot(
     // shared `ApplyInstrumentRegistryState` acceptance boundary runs over
     // `submission.parameters()`, so the compared bytes can never diverge
     // from the executed mutation.
-    let admitted_bytes = decode_instrument_registry_mutation(&submission.parameters()).map_err(
-        |error| ProfileError::Snapshot {
-            detail: error.to_string(),
-        },
-    )?;
+    let admitted_bytes =
+        decode_instrument_registry_mutation(&submission.parameters()).map_err(|error| {
+            ProfileError::Snapshot {
+                detail: error.to_string(),
+            }
+        })?;
     let recovered = InstrumentRegistry::recover(&admitted_bytes)?;
     let recovered_spec = recovered
         .spec(kind)
