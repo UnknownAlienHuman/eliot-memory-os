@@ -60,7 +60,8 @@ pub mod windows_event_log;
 // F-LOG-HOST-1 (#891) lifecycle/SCM observation helpers.
 //
 // Through the #889 facade only (`host_diagnostics::observe_entrypoint`,
-// `observe_entrypoint_with_detail`, `observe_terminal_error`); sink status is
+// `observe_entrypoint_with_detail`, `observe_terminal_error`,
+// `observe_terminal_error_with_correlation`); sink status is
 // the live `windows_event_log::event_log_sink_status` answer: `Ok` where
 // #984's accepted safe port is live (Windows), typed `EventLogUnavailable`
 // elsewhere. Delivery goes through `report_local_event` (landed `bf37d3e1` /
@@ -72,8 +73,21 @@ pub mod windows_event_log;
 // evaluates side-effectful values, acquires locks, or branches the semantic
 // result. Sink outcome never alters result/order/status/cleanup. There is no
 // mutable global dedup cache: one terminal emission per failed public
-// operation is enforced by the single outermost guard per operation, while
-// inner phase observations share correlation by stage order only.
+// operation is enforced by the single outermost guard per operation, and a
+// propagating inner owner disarms the outer one rather than duplicating the
+// claim. Inner phase observations are never duplicate failure claims.
+//
+// F-LOG-HOST-2 (#893 D1) terminal correlation: where the failing operation's
+// owner-issued identity exists at the boundary, the single terminal record
+// carries the SAME immutable `tx`/`effect`/`req` token the subordinate records
+// of that operation already render (`HostTerminalCorrelation`, projected by
+// `phase_b_terminal_correlation` / `phase_b_materialization_terminal_correlation`
+// and retained by `HostTerminalGuard`), so two interleaved operations ending in one
+// frozen code stay distinguishable by a shared field rather than by record
+// order (I13.11: timeline and correlation, not adjacency inference). Where no
+// operation subject exists yet, the terminal says correlation is explicitly
+// unavailable rather than relying on stage order. Bounded nonsecret handles
+// only — never a credential value, payload, path, or error text (I15.4).
 pub use host_diagnostics::note_event_log_sink_status;
 
 fn host_lifecycle_observe_requested(boundary: &'static HostLifecycleBoundary) {
@@ -100,9 +114,97 @@ fn host_lifecycle_observe_drain(boundary: &'static HostLifecycleBoundary) {
     );
 }
 
+/// Records one terminal for a boundary that holds no owner-issued operation
+/// identity (F-LOG-HOST-2, #893 D1).
+///
+/// Used only where no transaction, effect, or request handle exists at the
+/// boundary at all. The record then spells correlation explicitly
+/// unavailable (`correlation_available = false`, `tx_missing`, `effect_missing`,
+/// `req_missing`) instead of relying on record order, so a reader never infers
+/// the pairing by adjacency (I13.11: timeline and correlation). Where the
+/// failing operation's identity exists, use
+/// [`host_lifecycle_observe_terminal_with_correlation`] instead so the terminal
+/// shares the exact `tx`/`effect`/`req` token its subordinate records carry.
 fn host_lifecycle_observe_terminal(boundary: &'static HostLifecycleBoundary) {
     note_event_log_sink_status();
     host_diagnostics::observe_terminal_error(host_lifecycle_frozen_event(boundary));
+}
+
+/// Records the single terminal for a boundary together with the immutable
+/// nonsecret operation correlation the semantic owner already produced
+/// (F-LOG-HOST-2, #893 D1).
+///
+/// Exactly one `host.terminal_error` record, exactly as
+/// [`host_lifecycle_observe_terminal`] emits it: this only adds the operation
+/// token, never a second terminal, never a dedup ledger, and never a second
+/// evaluation of an effectful argument. The correlation is projected from the
+/// same transaction/effect/request handles the subordinate records of this
+/// operation already render, so two interleaved operations ending in the same
+/// frozen code stay distinguishable by a shared field rather than by position.
+fn host_lifecycle_observe_terminal_with_correlation(
+    boundary: &'static HostLifecycleBoundary,
+    correlation: &host_diagnostics::HostTerminalCorrelation,
+) {
+    note_event_log_sink_status();
+    host_diagnostics::observe_terminal_error_with_correlation(
+        host_lifecycle_frozen_event(boundary),
+        correlation,
+    );
+}
+
+/// Projects the owner-issued Phase-B operation identity of one live request
+/// into the immutable terminal correlation (F-LOG-HOST-2, #893 D1).
+///
+/// The exact three handles the subordinate records of this Phase-B operation
+/// already carry as the shared `tx`/`effect`/`req` fields
+/// (`PhaseBObservation::for_rebind`, `ActivationObservation::for_intent`,
+/// `phase_b_materialization`): transaction id, materialization effect id, and
+/// the exact request digest. Pure projection of owner-produced handles —
+/// nothing is probed, synthesized, cached, or hashed here. Nonsecret digests
+/// only, never a credential value, payload, path, or error text (I15.4).
+#[cfg(windows)]
+fn phase_b_terminal_correlation(
+    intent: &HostPhaseBMaterializationIntent,
+) -> host_diagnostics::HostTerminalCorrelation {
+    host_diagnostics::HostTerminalCorrelation::bound(
+        intent.transaction_id.as_str(),
+        intent.effect_id.as_str(),
+        intent.request_digest.as_str(),
+    )
+}
+
+/// Projects the owner-issued Phase-B operation identity of one retained
+/// materialization into the immutable terminal correlation (F-LOG-HOST-2, #893
+/// D1).
+///
+/// Same three handles as [`phase_b_terminal_correlation`], read from the
+/// materialization the semantic owner already retained and matched against the
+/// pending activation before this boundary was reached. That retained
+/// materialization IS this operation's identity, so the terminal shares the
+/// exact `tx`/`effect`/`req` token its subordinate Phase-B/activation records
+/// carry. Those three handles are populated only by the transaction-owned
+/// installer handoff; a materialization that never carried the full triple
+/// keeps correlation explicitly unavailable rather than a partly guessed token.
+/// Pure projection of already-owned handles — no read, probe, lookup, or
+/// synthesis — and nonsecret digests only (I15.4).
+#[cfg(windows)]
+fn phase_b_materialization_terminal_correlation(
+    materialization: &HostPhaseBMaterialization,
+) -> host_diagnostics::HostTerminalCorrelation {
+    match (
+        materialization.transaction_id.as_ref(),
+        materialization.effect_id.as_ref(),
+        materialization.request_digest.as_ref(),
+    ) {
+        (Some(transaction), Some(effect), Some(request)) => {
+            host_diagnostics::HostTerminalCorrelation::bound(
+                transaction.as_str(),
+                effect.as_str(),
+                request.as_str(),
+            )
+        }
+        _ => host_diagnostics::HostTerminalCorrelation::unavailable(),
+    }
 }
 
 /// Observes one identity bundle for a boundary the entrypoint records
@@ -125,8 +227,21 @@ fn host_lifecycle_observe_identity(projection: &host_diagnostics::HostRequestPro
 /// terminal record with the operation's frozen code. Emitting here never
 /// changes the `Result`: the guard only observes the already-produced
 /// outcome. No dedup cache, no lock, no second evaluation.
+///
+/// The guard also retains the immutable nonsecret operation correlation it is
+/// armed with (F-LOG-HOST-2, #893 D1), so the terminal record carries the
+/// SAME owner-issued transaction/effect/request token as the subordinate
+/// records of that operation instead of relying on record order. Arming
+/// starts explicitly uncorrelated — a boundary that has no operation subject
+/// yet says so — and the owner binds the identity through
+/// [`HostTerminalGuard::bind_operation`] once the live operation subject
+/// exists. The projection is fixed for the rest of the guarded operation:
+/// never re-armed, never cleared, never synthesized here. This mirrors the
+/// `CredentialTerminalGuard` model in `credential_control.rs` without
+/// touching it.
 struct HostTerminalGuard {
     boundary: &'static HostLifecycleBoundary,
+    correlation: host_diagnostics::HostTerminalCorrelation,
     armed: bool,
 }
 
@@ -134,8 +249,25 @@ impl HostTerminalGuard {
     fn armed(boundary: &'static HostLifecycleBoundary) -> Self {
         Self {
             boundary,
+            correlation: host_diagnostics::HostTerminalCorrelation::unavailable(),
             armed: true,
         }
+    }
+
+    /// Retains the immutable owner-issued operation correlation once the
+    /// operation's own identity subject exists (F-LOG-HOST-2, #893 D1).
+    ///
+    /// Called once, at the point where the semantic owner already holds the
+    /// operation identity in hand (here: the retained Phase-B materialization
+    /// it just matched against the exact pending activation), so every later
+    /// `?` return emits a terminal that shares the exact `tx`/`effect`/`req`
+    /// token with this operation's subordinate Phase-B/activation records
+    /// rather than a byte-identical frozen code only order could pair. A
+    /// failure before this point keeps the explicitly unavailable correlation
+    /// the guard was armed with — a missing identity stays an explicit missing
+    /// field, never an inferred one (I13.11: correlation, not adjacency).
+    fn bind_operation(&mut self, correlation: host_diagnostics::HostTerminalCorrelation) {
+        self.correlation = correlation;
     }
 
     fn disarm(&mut self) {
@@ -146,7 +278,7 @@ impl HostTerminalGuard {
 impl Drop for HostTerminalGuard {
     fn drop(&mut self) {
         if self.armed {
-            host_lifecycle_observe_terminal(self.boundary);
+            host_lifecycle_observe_terminal_with_correlation(self.boundary, &self.correlation);
         }
     }
 }
@@ -7904,7 +8036,14 @@ impl HostComposition {
         host_lifecycle_observe_scm(BOUNDARY_PHASE_B_REQUESTED);
         if self.store_recovery_startup_fence.is_fenced() {
             host_lifecycle_observe_scm(BOUNDARY_PHASE_B_UNKNOWN_STORE_RECOVERY_FENCE);
-            host_lifecycle_observe_terminal(BOUNDARY_PHASE_B_TERMINAL);
+            // The request subject is already in hand, so this terminal shares
+            // the exact `tx`/`effect`/`req` token with this operation's
+            // subordinate Phase-B records instead of a byte-identical frozen
+            // code that only order could pair (I13.11).
+            host_lifecycle_observe_terminal_with_correlation(
+                BOUNDARY_PHASE_B_TERMINAL,
+                &phase_b_terminal_correlation(intent),
+            );
             return HostCredentialControlResponse::Unknown {
                 pending_ref: phase_b_unknown_ref(
                     "store-recovery-fence",
@@ -8035,7 +8174,15 @@ impl HostComposition {
             }
             Err(_error) => {
                 host_lifecycle_observe_scm(BOUNDARY_PHASE_B_UNKNOWN);
-                host_lifecycle_observe_terminal(BOUNDARY_PHASE_B_TERMINAL);
+                // One terminal for this Unknown outcome, carrying the exact
+                // `tx`/`effect`/`req` token of the request whose subordinate
+                // Phase-B records sit above it, so two interleaved Phase-B
+                // attempts ending in this same frozen code stay distinguishable
+                // (I13.11: correlation, not adjacency).
+                host_lifecycle_observe_terminal_with_correlation(
+                    BOUNDARY_PHASE_B_TERMINAL,
+                    &phase_b_terminal_correlation(intent),
+                );
                 HostCredentialControlResponse::Unknown {
                     pending_ref: phase_b_unknown_ref("phase-b", "MaterializePhaseB", intent),
                 }
@@ -8148,7 +8295,16 @@ impl HostComposition {
         } else {
             host_lifecycle_observe_scm(BOUNDARY_PHASE_B_FINALIZE_UNKNOWN);
             if !resume_terminal_emitted {
-                host_lifecycle_observe_terminal(BOUNDARY_PHASE_B_FINALIZE_TERMINAL);
+                // Exactly one terminal for this Unknown outcome. When the
+                // inner resume continuation already emitted, this outer
+                // boundary stays disarmed by that propagated owner rather than
+                // duplicating the claim; when it did not, this record carries
+                // the exact `tx`/`effect`/`req` token of the finalize request
+                // whose subordinate records sit above it (I13.11).
+                host_lifecycle_observe_terminal_with_correlation(
+                    BOUNDARY_PHASE_B_FINALIZE_TERMINAL,
+                    &phase_b_terminal_correlation(intent),
+                );
             }
             HostCredentialControlResponse::Unknown {
                 pending_ref: phase_b_unknown_ref("phase-b-finalize", "FinalizePhaseB", intent),
@@ -8178,7 +8334,14 @@ impl HostComposition {
         host_lifecycle_observe_scm(BOUNDARY_PHASE_B_RECONCILE_REQUESTED);
         if self.store_recovery_startup_fence.is_fenced() {
             host_lifecycle_observe_scm(BOUNDARY_PHASE_B_RECONCILE_UNKNOWN_STORE_RECOVERY_FENCE);
-            host_lifecycle_observe_terminal(BOUNDARY_PHASE_B_RECONCILE_TERMINAL);
+            // The query request subject is in hand: this terminal shares its
+            // exact `tx`/`effect`/`req` token, so a fenced reconcile never
+            // shares a byte-identical frozen code with another reconcile query
+            // (I13.11).
+            host_lifecycle_observe_terminal_with_correlation(
+                BOUNDARY_PHASE_B_RECONCILE_TERMINAL,
+                &phase_b_terminal_correlation(intent),
+            );
             return HostCredentialControlResponse::Unknown {
                 pending_ref: phase_b_unknown_ref("store-recovery-fence", "ReconcilePhaseB", intent),
             };
@@ -8409,7 +8572,15 @@ impl HostComposition {
             }
             Err(_error) => {
                 host_lifecycle_observe_scm(BOUNDARY_PHASE_B_RECONCILE_UNKNOWN);
-                host_lifecycle_observe_terminal(BOUNDARY_PHASE_B_RECONCILE_TERMINAL);
+                // One terminal for this Unknown outcome, carrying the exact
+                // `tx`/`effect`/`req` token of the query whose subordinate
+                // records sit above it. Readback that fails stays Unknown and
+                // stays distinguishable from another failing query sharing this
+                // frozen code (I13.11).
+                host_lifecycle_observe_terminal_with_correlation(
+                    BOUNDARY_PHASE_B_RECONCILE_TERMINAL,
+                    &phase_b_terminal_correlation(intent),
+                );
                 HostCredentialControlResponse::Unknown {
                     pending_ref: phase_b_unknown_ref("phase-b-query", "ReconcilePhaseB", intent),
                 }
@@ -9940,15 +10111,26 @@ impl HostComposition {
             HostError::ProcessContour("no pending activation requires Phase-B resume".to_owned())
         })?;
         let manifest_digest = phase_b_manifest_digest(&pending.manifest)?;
-        if self
+        // Exactly the previous proof — a retained materialization whose
+        // manifest digest is the pending activation's exact one — restated so
+        // the matched proof is in hand as this operation's own identity. The
+        // same absence and the same refusal remain: no exact materialization
+        // still means no exact materialization, so a failure above it stays
+        // explicitly uncorrelated rather than inferred (I13.11).
+        let Some(receipt) = self
             .phase_b
             .as_ref()
-            .is_none_or(|receipt| receipt.manifest_digest != manifest_digest)
-        {
+            .filter(|receipt| receipt.manifest_digest == manifest_digest)
+        else {
             return Err(HostError::RecoveryRequired(
                 "pending activation has no exact Phase-B materialization receipt".to_owned(),
             ));
-        }
+        };
+        // Bind once: a failure inside the activation continuation then emits a
+        // terminal sharing the exact `tx`/`effect`/`req` token with that
+        // continuation's subordinate activation records, so two resume attempts
+        // ending in this frozen code stay distinguishable.
+        host_terminal.bind_operation(phase_b_materialization_terminal_correlation(receipt));
         self.reconcile_pending_activation(&pending)?;
         host_terminal.disarm();
         host_lifecycle_observe_requested(BOUNDARY_RESUME_PENDING_ADMITTED);
