@@ -19,10 +19,10 @@ use super::{
 // F-LOG-HOST-5 (#980) inner-phase observations for previous authority.
 //
 // Through the #889 facade only
-// (`crate::host_diagnostics::observe_entrypoint_with_detail`); the Event Log
-// seam stays typed-Unavailable
-// (`crate::windows_event_log::event_log_sink_status`), never implemented here
-// (#984 still open).
+// (`crate::host_diagnostics::observe_entrypoint_with_detail`); Event Log
+// sink disposition through the canonical
+// (`crate::host_diagnostics::note_event_log_sink_status`) over the landed
+// `windows_event_log` port, never probed here.
 //
 // Observation-only contract (mirrors `host_composition_phase_b.rs:30-41`):
 // every call projects a boundary already decided by the semantic owner.
@@ -33,15 +33,38 @@ use super::{
 // operation stays with the outermost contour (`lib.rs` `HostTerminalGuard` /
 // `host-phase-b-unknown`), while these inner phases correlate by stage order
 // only. A prior receipt is historical evidence only, never a live
-// authorization.
-#[cfg(windows)]
-fn phase_b_previous_authority_note_event_log_unavailable() {
-    let _ = crate::windows_event_log::event_log_sink_status();
-}
-
+// authorization. Live admission of the current incoming
+// `input.authority_descriptor_bytes` (`phase_b_validate_authority`) observes
+// under the separate current-authority vocabulary below, never
+// previous-binding labels.
 #[cfg(windows)]
 fn phase_b_previous_authority_observe(detail: &str) {
-    phase_b_previous_authority_note_event_log_unavailable();
+    crate::host_diagnostics::note_event_log_sink_status();
+    crate::host_diagnostics::observe_entrypoint_with_detail(
+        crate::host_diagnostics::EntrypointStage::ScmDispatch,
+        detail,
+    );
+}
+
+/// Closed observation vocabulary for live admission of the current incoming
+/// authority descriptor (`phase_b_validate_authority`).
+///
+/// Audit 5909832545 defect 2: the current descriptor is validated for a new
+/// materialization, so its request/refusal records name the live admission
+/// binding, never a previous binding. The historical
+/// `host.phase-b previous authority ...` labels stay with
+/// `phase_b_observe_previous_binding` and
+/// `phase_b_validate_durable_previous_binding` only.
+#[cfg(windows)]
+const PHASE_B_CURRENT_AUTHORITY_REQUESTED: &str =
+    "host.phase-b current authority admission requested";
+#[cfg(windows)]
+const PHASE_B_CURRENT_AUTHORITY_NOT_ADMITTED: &str =
+    "host.phase-b current authority admission refused: no exact live binding";
+
+#[cfg(windows)]
+fn phase_b_current_authority_observe(detail: &str) {
+    crate::host_diagnostics::note_event_log_sink_status();
     crate::host_diagnostics::observe_entrypoint_with_detail(
         crate::host_diagnostics::EntrypointStage::ScmDispatch,
         detail,
@@ -226,20 +249,16 @@ pub(super) fn phase_b_validate_authority(
     ),
     HostError,
 > {
-    phase_b_previous_authority_observe("host.phase-b previous authority requested");
+    phase_b_current_authority_observe(PHASE_B_CURRENT_AUTHORITY_REQUESTED);
     let descriptor: ProcessAuthorityHandoffDescriptor =
         serde_json::from_slice(bytes).map_err(|error| {
-            phase_b_previous_authority_observe(
-                "host.phase-b previous authority no exact binding retained",
-            );
+            phase_b_current_authority_observe(PHASE_B_CURRENT_AUTHORITY_NOT_ADMITTED);
             HostError::RecoveryRequired(format!(
                 "Phase-B authority descriptor is not parseable: {error}"
             ))
         })?;
     descriptor.validate_structure().map_err(|error| {
-        phase_b_previous_authority_observe(
-            "host.phase-b previous authority no exact binding retained",
-        );
+        phase_b_current_authority_observe(PHASE_B_CURRENT_AUTHORITY_NOT_ADMITTED);
         HostError::RecoveryRequired(format!(
             "Phase-B authority descriptor failed exact ORS validation: {error}"
         ))
@@ -260,6 +279,7 @@ pub(super) fn phase_b_validate_authority(
                 )
             })?;
         descriptor.validate(now_ms).map_err(|error| {
+            phase_b_current_authority_observe(PHASE_B_CURRENT_AUTHORITY_NOT_ADMITTED);
             HostError::RecoveryRequired(format!(
                 "Phase-B authority descriptor is not fresh for admission: {error}"
             ))
@@ -271,9 +291,7 @@ pub(super) fn phase_b_validate_authority(
         .is_same_authority(&host.epoch.current)
         || descriptor.state_fence.resource_generation != descriptor.generation
     {
-        phase_b_previous_authority_observe(
-            "host.phase-b previous authority no exact binding retained",
-        );
+        phase_b_current_authority_observe(PHASE_B_CURRENT_AUTHORITY_NOT_ADMITTED);
         return Err(HostError::RecoveryRequired(
             "Phase-B authority descriptor is not bound to a consistent live generation and Host epoch"
                 .to_owned(),
@@ -287,9 +305,7 @@ pub(super) fn phase_b_validate_authority(
         .iter()
         .any(|reference| reference == &marker)
     {
-        phase_b_previous_authority_observe(
-            "host.phase-b previous authority no exact binding retained",
-        );
+        phase_b_current_authority_observe(PHASE_B_CURRENT_AUTHORITY_NOT_ADMITTED);
         return Err(HostError::RecoveryRequired(
             "Phase-B authority descriptor is missing the exact Host/activation binding".to_owned(),
         ));
@@ -327,5 +343,59 @@ pub(super) fn phase_b_authority_is_observable(
         Err(error) => Err(HostError::RecoveryRequired(format!(
             "Phase-B authority destination cannot be observed: {error}"
         ))),
+    }
+}
+
+#[cfg(all(test, windows))]
+mod phase_b_current_authority_vocabulary_tests {
+    use super::{PHASE_B_CURRENT_AUTHORITY_NOT_ADMITTED, PHASE_B_CURRENT_AUTHORITY_REQUESTED};
+
+    /// Audit 5909832545 defect 2, positive: live admission of the current
+    /// incoming descriptor owns a dedicated vocabulary naming the live
+    /// admission binding.
+    #[test]
+    fn current_authority_admission_vocabulary_names_live_binding() {
+        for label in [
+            PHASE_B_CURRENT_AUTHORITY_REQUESTED,
+            PHASE_B_CURRENT_AUTHORITY_NOT_ADMITTED,
+        ] {
+            assert!(
+                label.contains("host.phase-b current authority"),
+                "live admission label must name the current authority: {label:?}"
+            );
+            assert!(
+                label.contains("admission"),
+                "live admission label must name admission, not readback: {label:?}"
+            );
+        }
+        assert_ne!(
+            PHASE_B_CURRENT_AUTHORITY_REQUESTED,
+            PHASE_B_CURRENT_AUTHORITY_NOT_ADMITTED
+        );
+    }
+
+    /// Audit 5909832545 defect 2, refusal: the current-authority vocabulary
+    /// never reads as a previous binding, and the historical vocabulary is
+    /// untouched.
+    #[test]
+    fn current_authority_vocabulary_never_reads_as_previous_binding() {
+        for label in [
+            PHASE_B_CURRENT_AUTHORITY_REQUESTED,
+            PHASE_B_CURRENT_AUTHORITY_NOT_ADMITTED,
+        ] {
+            assert!(
+                !label.contains("previous"),
+                "current admission must never emit previous-binding labels: {label:?}"
+            );
+        }
+        for historical in [
+            "host.phase-b previous authority requested",
+            "host.phase-b previous authority no exact binding retained",
+            "host.phase-b previous authority historical evidence observed",
+        ] {
+            assert!(historical.contains("previous"));
+            assert_ne!(historical, PHASE_B_CURRENT_AUTHORITY_REQUESTED);
+            assert_ne!(historical, PHASE_B_CURRENT_AUTHORITY_NOT_ADMITTED);
+        }
     }
 }

@@ -14,10 +14,10 @@ use super::{
 // F-LOG-HOST-5 (#980) inner-phase observations for previous projection.
 //
 // Through the #889 facade only
-// (`crate::host_diagnostics::observe_entrypoint_with_detail`); the Event Log
-// seam stays typed-Unavailable
-// (`crate::windows_event_log::event_log_sink_status`), never implemented here
-// (#984 still open).
+// (`crate::host_diagnostics::observe_entrypoint_with_detail`); Event Log
+// sink disposition through the canonical
+// (`crate::host_diagnostics::note_event_log_sink_status`) over the landed
+// `windows_event_log` port, never probed here.
 //
 // Observation-only contract (mirrors `host_composition_phase_b.rs:30-41`):
 // every call projects a boundary already decided by the semantic owner.
@@ -29,13 +29,8 @@ use super::{
 // `host-phase-b-unknown`), while these inner phases correlate by stage order
 // only. A mismatch retains its typed `RecoveryRequired` cause.
 #[cfg(windows)]
-fn phase_b_previous_projection_note_event_log_unavailable() {
-    let _ = crate::windows_event_log::event_log_sink_status();
-}
-
-#[cfg(windows)]
 fn phase_b_previous_projection_observe(detail: &str) {
-    phase_b_previous_projection_note_event_log_unavailable();
+    crate::host_diagnostics::note_event_log_sink_status();
     crate::host_diagnostics::observe_entrypoint_with_detail(
         crate::host_diagnostics::EntrypointStage::ScmDispatch,
         detail,

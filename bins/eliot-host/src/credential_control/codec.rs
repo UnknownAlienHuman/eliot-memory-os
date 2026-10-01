@@ -32,10 +32,10 @@ const MARKER_VERSION: &str = "eliot.store-credential-marker.v1";
 // F-LOG-HOST-5 (#980) inner-phase observations for credential codec.
 //
 // Through the #889 facade only
-// (`crate::host_diagnostics::observe_entrypoint_with_detail`); the Event Log
-// seam stays typed-Unavailable
-// (`crate::windows_event_log::event_log_sink_status`), never implemented here
-// (#984 still open).
+// (`crate::host_diagnostics::observe_entrypoint_with_detail`); Event Log
+// sink disposition through the canonical
+// (`crate::host_diagnostics::note_event_log_sink_status`) over the landed
+// `windows_event_log` port, never probed here.
 //
 // Observation-only contract (mirrors `host_composition_phase_b.rs:30-41`):
 // every call projects a boundary already decided by the semantic owner.
@@ -46,12 +46,8 @@ const MARKER_VERSION: &str = "eliot.store-credential-marker.v1";
 // per failed operation stays with the credential operation guard, while these
 // inner phases correlate by stage order only. Malformed input keeps its
 // original typed failure with zero byte leakage.
-fn credential_codec_note_event_log_unavailable() {
-    let _ = crate::windows_event_log::event_log_sink_status();
-}
-
 fn credential_codec_observe(detail: &str) {
-    credential_codec_note_event_log_unavailable();
+    crate::host_diagnostics::note_event_log_sink_status();
     crate::host_diagnostics::observe_entrypoint_with_detail(
         crate::host_diagnostics::EntrypointStage::ScmDispatch,
         detail,
