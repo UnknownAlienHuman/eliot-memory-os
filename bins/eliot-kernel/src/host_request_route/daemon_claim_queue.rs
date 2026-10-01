@@ -963,17 +963,17 @@ impl KernelComposition {
         for refs in index.values_mut() {
             for candidate in refs.iter_mut() {
                 let (Some(envelope), Some(tool)) = (
-                    candidate.finish_envelope.as_ref(),
-                    candidate.finish_tool.as_ref(),
+                    candidate.finish_envelope.clone(),
+                    candidate.finish_tool.clone(),
                 ) else {
                     continue;
                 };
-                finish_admission(envelope, tool)?;
-                if !self.application_binding_live_for_claim(envelope, &admission_owner, true)? {
+                finish_admission(&envelope, &tool)?;
+                if !self.application_binding_live_for_claim(&envelope, &admission_owner, true)? {
                     continue;
                 }
                 let owner_binding =
-                    self.finish_owner_binding_for_pair(envelope, tool, &admission_owner)?;
+                    self.finish_owner_binding_for_pair(&envelope, &tool, &admission_owner)?;
                 let operation = OperationIdentity::new(candidate.operation_id.clone())
                     .map_err(|_| TransportError::SessionFenced)?;
                 let stored = self
@@ -988,11 +988,11 @@ impl KernelComposition {
                 {
                     return Err(TransportError::SessionFenced);
                 }
-                let mut expected = super::requested_host_request_record(envelope)?;
+                let mut expected = super::requested_host_request_record(&envelope)?;
                 expected
                     .finish_replay_binding
                     .clone_from(&stored.finish_replay_binding);
-                if !stored.same_binding(&expected) || stored.payload_body.as_ref() != Some(tool) {
+                if !stored.same_binding(&expected) || stored.payload_body.as_ref() != Some(&tool) {
                     return Err(TransportError::IdentityConflict);
                 }
                 if !self.bind_claimed_finish_attempt(
@@ -1001,12 +1001,12 @@ impl KernelComposition {
                     &stored,
                     session,
                     now,
-                    envelope,
+                    &envelope,
                 )? {
                     continue;
                 }
-                let attempt = finish_attempt_from_claim(candidate, envelope, &owner_binding)?;
-                return Ok(Some((envelope.clone(), tool.clone(), attempt)));
+                let attempt = finish_attempt_from_claim(candidate, &envelope, &owner_binding)?;
+                return Ok(Some((envelope, tool, attempt)));
             }
         }
         Ok(None)

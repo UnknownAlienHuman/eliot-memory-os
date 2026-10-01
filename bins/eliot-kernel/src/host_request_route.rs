@@ -761,7 +761,7 @@ fn validate_host_request_admission(
         // refuses to serve its body without a current owner tuple and actual
         // committed Store receipt.
         let completed_finish_replay =
-            is_completed_finish_replay(expired, envelope, existing.as_ref(), &requested);
+            Self::is_completed_finish_replay(expired, envelope, existing.as_ref(), &requested);
         // Exact replay of an admitted or terminal operation remains an
         // observation path. A fresh or still-Requested Invocation can still
         // grant authority, so reject it before service admission and before

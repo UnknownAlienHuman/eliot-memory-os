@@ -71,7 +71,7 @@ pub(super) fn build_recovery_bindings(request: &StoreRecoveryRequest) -> Map<Str
             json!(request
                 .receipt_authority_operation_ids
                 .iter()
-                .map(|operation_id| operation_id.as_str())
+                .map(eliot_store_api::OperationId::as_str)
                 .collect::<Vec<_>>()),
         );
     }
