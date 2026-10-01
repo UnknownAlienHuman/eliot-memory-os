@@ -10,7 +10,7 @@ use std::pin::Pin;
 
 use crate::kernel_client::{KernelBlobStreamCallSequence, TestdIpcError};
 use eliot_blob_api::wire::{
-    BlobProcessStreamKernelOperationRequest as KernelOperation, BlobProcessStreamKernelOutcome,
+    BlobProcessStreamKernelOutcome,
     BlobProcessStreamKernelResponse,
     BlobProcessStreamKernelSourceReadbackRequest as KernelSourceRequest,
     BlobProcessStreamOperationResponse, PROCESS_STREAM_READBACK_MAX_CHUNK_BYTES,
@@ -66,7 +66,7 @@ impl BlobReadbackExchange for KernelBlobStreamCallSequence {
         let stream = request.stream;
         Box::pin(async move {
             match tokio::task::spawn_blocking(move || {
-                calls.exchange(KernelOperation::SourceReadback { request })
+                calls.read_source_chunk(request)
             })
             .await
             {
