@@ -1454,6 +1454,10 @@ impl KernelComposition {
 }
 
 fn is_daemon_operation(operation: &str) -> bool {
+    #[cfg(windows)]
+    if operation == super::process_execution::current_source_executable::OPERATION {
+        return true;
+    }
     matches!(
         operation,
         "snapshot"
@@ -1613,7 +1617,7 @@ fn is_daemon_operation(operation: &str) -> bool {
             // reads the canonical owner's own `WriteReceipt` for the original
             // operation identity, so the frame admits nothing.
             | ADMISSION_RESERVATION_ADMIT_OPERATION
-| INSTRUMENT_REGISTRY_EFFECT_RESERVATION_STAGE_OPERATION
+            | INSTRUMENT_REGISTRY_EFFECT_RESERVATION_STAGE_OPERATION
             | INSTRUMENT_REGISTRY_EFFECT_RESERVATION_ACTIVATE_OPERATION
             // The original-reservation read is a separate authenticated
             // daemon operation and must reach its owner route rather than the

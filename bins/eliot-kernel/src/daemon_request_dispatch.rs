@@ -677,6 +677,10 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         INSTRUMENT_REGISTRY_EFFECT_RESERVATION_ACTIVATE_OPERATION => {
             INSTRUMENT_REGISTRY_EFFECT_RESERVATION_ACTIVATE_OPERATION
         }
+        #[cfg(windows)]
+        process_execution::current_source_executable::OPERATION => {
+            process_execution::current_source_executable::OPERATION
+        }
         "local_read" => "local_read",
         "daemon_degraded" => "daemon_degraded",
         "daemon_fatal" => "daemon_fatal",
@@ -3203,6 +3207,24 @@ impl KernelComposition {
                     Some(identity),
                 )
                 .await?;
+            let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
+            frame.request_id = Some(request_id);
+            frame.validate()?;
+            return Ok(frame);
+        }
+        #[cfg(windows)]
+        if operation == process_execution::current_source_executable::OPERATION {
+            let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+            if identity.request.metadata.request_id != request_id
+                || identity.request.state_fence != session.module_generation.state_fence
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            let value = self.observe_current_source_executable_operation(
+                session,
+                payload.clone(),
+                Some(identity),
+            )?;
             let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
             frame.request_id = Some(request_id);
             frame.validate()?;
