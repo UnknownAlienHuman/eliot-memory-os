@@ -270,6 +270,12 @@ struct ActivationResolvedTicket {
     /// while resolving this ticket. The accepted-result trigger consumes this
     /// value; it never re-observes the workspace or recreates the lease.
     cold_start_discovery: Option<eliotd::task_binding_admission::ColdStartDiscoveryInput>,
+    /// The I4.4.1 trigger this ticket's activation event selected while
+    /// resolving (issue #1790, W3 production invocation). It travels with the
+    /// discovery inputs so the accepted-result trigger fires the same event
+    /// instead of re-deriving it. `Some` exactly when `cold_start_discovery`
+    /// is `Some`.
+    cold_start_trigger: Option<eliot_workscope::ColdStartTrigger>,
     /// Issue #1115: the semantic Governor binding combined with the P-07
     /// revision/digest, both captured before this flight was published. The
     /// submit path reuses this pair verbatim and never performs a second
@@ -3383,6 +3389,50 @@ async fn submit_supervision_heartbeat(
     Ok(())
 }
 
+/// Selects the I4.4.1 cold-start trigger for one resolved activation result
+/// (issue #1790, W3 production invocation).
+///
+/// The activation resolve path is the daemon attach-transport's only event
+/// producer, and its typed disposition already distinguishes four of the six
+/// I4.4.1 events: a resolved activation is the attach/launch event, a scope
+/// selection or ambiguity is the first event on an unknown workspace, a task
+/// selection is a resume without a current task, and a stale fence observed
+/// against a current fence is the stale-generation event. `NotReady` and
+/// `FailedInternal` are not workspace events and select no trigger, and a
+/// stale fence with no observed current fence selects none either: the Host
+/// observation requires a current fence and this path will not feed it a
+/// stale one. `FirstProjectOpen` (first UI project open) and
+/// `OnboardingRequest` (explicit onboarding request) have no producer in the
+/// daemon attach-transport — no UI project-open or onboarding-request ingress
+/// exists under `bins/eliotd` — so those variants stay unwired rather than
+/// firing from a fabricated event.
+fn cold_start_trigger_for_activation(
+    result: &AgentActivationResolutionResult,
+) -> Option<eliot_workscope::ColdStartTrigger> {
+    match &result.disposition {
+        AgentActivationResolutionDisposition::Resolved { .. } => {
+            Some(eliot_workscope::ColdStartTrigger::AttachOrLaunch)
+        }
+        AgentActivationResolutionDisposition::ScopeSelectionRequired { .. }
+        | AgentActivationResolutionDisposition::ScopeAmbiguous { .. } => {
+            Some(eliot_workscope::ColdStartTrigger::UnknownWorkspace)
+        }
+        AgentActivationResolutionDisposition::TaskSelectionRequired { .. } => {
+            Some(eliot_workscope::ColdStartTrigger::ResumeWithoutTask)
+        }
+        AgentActivationResolutionDisposition::StaleFence {
+            observed_state_fence: Some(_),
+            ..
+        } => Some(eliot_workscope::ColdStartTrigger::StaleGeneration),
+        AgentActivationResolutionDisposition::StaleFence {
+            observed_state_fence: None,
+            ..
+        }
+        | AgentActivationResolutionDisposition::NotReady { .. }
+        | AgentActivationResolutionDisposition::FailedInternal { .. } => None,
+    }
+}
+
 /// Resolves one validated ticket under the already-held composition guard.
 ///
 /// Returns `None` when the ticket expired at or after the Kernel deadline:
@@ -3399,6 +3449,7 @@ async fn submit_supervision_heartbeat(
 /// lock. A readback failure is deferred for negative dispositions, which do
 /// not create a Session and must remain independently reportable, so it is
 /// surfaced only once a `Resolved` result actually needs the pair.
+
 fn resolve_valid_ticket(
     composition: &DaemonComposition,
     readiness_composition: SharedComposition,
@@ -3432,12 +3483,24 @@ fn resolve_valid_ticket(
                 ticket.ticket_id
             )
         })?;
+    let cold_start_trigger = cold_start_trigger_for_activation(&result);
+    // A stale ticket fence cannot feed the Host observation: the
+    // stale-generation event observes at the resolver's current fence
+    // instead, and an event without any current fence carries no trigger at
+    // all, so it never reaches the observation below.
+    let cold_start_fence = match &result.disposition {
+        AgentActivationResolutionDisposition::StaleFence {
+            observed_state_fence: Some(observed),
+            ..
+        } => observed,
+        _ => &ticket.state_fence,
+    };
     let mut cold_start_discovery =
-        if result.resolved_binding().is_some() && ticket.workspace_selector.is_some() {
+        if cold_start_trigger.is_some() && ticket.workspace_selector.is_some() {
             Some(
                 eliotd::task_binding_admission::observe_cold_start_discovery(
                     &ticket,
-                    &ticket.state_fence,
+                    cold_start_fence,
                     now.max(1),
                 )
                 .map_err(|error| {
@@ -3519,6 +3582,7 @@ fn resolve_valid_ticket(
         result,
         composition: readiness_composition,
         cold_start_discovery,
+        cold_start_trigger,
         owner_readback,
     })))
 }
@@ -3547,6 +3611,7 @@ fn start_activation_dispatch(
                 resolved.result,
                 resolved.owner_readback,
                 resolved.cold_start_discovery,
+                resolved.cold_start_trigger,
             )
             .await;
             ActivationCompletion::Dispatch(outcome)
@@ -6839,6 +6904,7 @@ async fn dispatch_agent_activation_result(
     result: AgentActivationResolutionResult,
     owner_readback: Option<eliot_protocol::AgentActivationOwnerReadback>,
     cold_start_discovery: Option<eliotd::task_binding_admission::ColdStartDiscoveryInput>,
+    cold_start_trigger: Option<eliot_workscope::ColdStartTrigger>,
 ) -> Result<(), ActivationDispatchError> {
     // #740: dispatch span over the submit-then-reconcile path. The retained
     // result is reused verbatim; only bounded ticket identity is carried.
@@ -6862,6 +6928,7 @@ async fn dispatch_agent_activation_result(
                 Arc::clone(&composition),
                 ticket,
                 cold_start_discovery,
+                cold_start_trigger,
             )
             .await;
             Ok(())
@@ -6903,6 +6970,7 @@ async fn dispatch_agent_activation_result(
                 Arc::clone(&composition),
                 ticket,
                 cold_start_discovery,
+                cold_start_trigger,
             )
             .await;
             Ok(())
@@ -6913,14 +6981,18 @@ async fn dispatch_agent_activation_result(
 /// Runs the I4.4.1 trigger after either direct acceptance or an accepted
 /// reconciliation of a possibly-lost result acknowledgement. The exact Host
 /// lease/key/evidence stays attached to this resolved dispatch across both
-/// paths.
+/// paths, and the trigger selected at resolve time travels with it, so the
+/// accepted-result scanner pass fires the same event (attach/launch, unknown
+/// workspace, resume without a current task, or stale generation) instead of
+/// re-deriving one.
 async fn trigger_accepted_cold_start(
     kernel: &Arc<DaemonKernelClient>,
     composition: SharedComposition,
     ticket: &AgentActivationResolutionTicket,
     discovery: Option<eliotd::task_binding_admission::ColdStartDiscoveryInput>,
+    cold_start_trigger: Option<eliot_workscope::ColdStartTrigger>,
 ) {
-    if let Some(discovery) = discovery {
+    if let (Some(discovery), Some(trigger)) = (discovery, cold_start_trigger) {
         let kernel = Arc::clone(kernel);
         let ticket_id = ticket.ticket_id.clone();
         let worker_ticket = ticket.clone();
@@ -6967,7 +7039,7 @@ async fn trigger_accepted_cold_start(
             );
         }
         tokio::task::spawn_blocking(move || {
-            trigger_cold_start_controller(&kernel, &worker_ticket, discovery, contour_result)
+            trigger_cold_start_controller(trigger, &kernel, &worker_ticket, discovery, contour_result)
         })
         .await
         .map_or_else(
@@ -7007,22 +7079,25 @@ async fn trigger_accepted_cold_start(
     }
 }
 
-/// Fires the I4.4.1 `AttachOrLaunch` trigger only after Kernel accepted the
-/// exact typed activation result. The same retained Host lease/evidence is
-/// passed to `ColdStartController`; no second filesystem observation or new
-/// lease is created. The accepted ticket now binds the authenticated readiness
-/// transport adapter to the installation contour. The current Host discovery
-/// still lacks admitted privacy-boundary and governing-source digest evidence,
-/// so it can deliver its typed smallest-question result but cannot construct a
-/// durable readiness claim, join a lease, or compile a terminal receipt.
+/// Fires the resolved I4.4.1 trigger only after Kernel accepted the exact
+/// typed activation result (issue #1790, W3 production invocation). The same
+/// retained Host lease/evidence is passed to `ColdStartController`; no second
+/// filesystem observation or new lease is created. The accepted ticket now
+/// binds the authenticated readiness transport adapter to the installation
+/// contour. The current Host discovery still lacks admitted privacy-boundary
+/// and governing-source digest evidence, so it can deliver its typed
+/// smallest-question result and run the trigger's scanner pass but cannot
+/// construct a durable readiness claim, join a lease, or compile a terminal
+/// receipt: `join_cold_start_lease` and `compile_cold_start_at_trigger` stay
+/// unwired until the applicable owner supplies those inputs.
 fn trigger_cold_start_controller(
+    trigger: eliot_workscope::ColdStartTrigger,
     kernel: &Arc<DaemonKernelClient>,
     ticket: &AgentActivationResolutionTicket,
     mut discovery: eliotd::task_binding_admission::ColdStartDiscoveryInput,
     contour_result: Result<eliot_governor::InstallationScanContour, String>,
 ) -> Result<eliot_workscope::BootstrapScanOutcome, String> {
     let now = unix_ms(SystemTime::now())?;
-    let trigger = eliot_workscope::ColdStartTrigger::AttachOrLaunch;
     let controller_result = eliot_workscope::ColdStartController::check_discovery_with_scan(
         trigger,
         &discovery.lease,
@@ -7057,7 +7132,7 @@ fn trigger_cold_start_controller(
             .map(|read| format!("{read:?}"))
             .collect::<Vec<_>>();
         return Err(format!(
-            "I4.4.1 AttachOrLaunch refused before scanner: trigger discovery lease/evidence rejected by ColdStartController ({controller:?}); required reads missing from the lease or evidence: {missing_reads:?}; Kernel contour owner: {contour_status}; Kernel binding owner: {binding_status}",
+            "I4.4.1 {trigger:?} refused before scanner: trigger discovery lease/evidence rejected by ColdStartController ({controller:?}); required reads missing from the lease or evidence: {missing_reads:?}; Kernel contour owner: {contour_status}; Kernel binding owner: {binding_status}",
         ));
     }
 
@@ -7110,7 +7185,7 @@ fn trigger_cold_start_controller(
         discovery.discovery.governing_source_refs.clone(),
         now,
     )
-    .map_err(|error| format!("I4.4.1 AttachOrLaunch scanner failed closed: {error}"))
+    .map_err(|error| format!("I4.4.1 {trigger:?} scanner failed closed: {error}"))
 }
 
 /// Builds the lost-acknowledgement reconcile query from the single retained
