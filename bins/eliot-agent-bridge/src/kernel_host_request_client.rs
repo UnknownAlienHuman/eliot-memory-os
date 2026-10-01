@@ -1975,7 +1975,7 @@ fn host_request_observe_submit_frame(
 /// | `eliot.observe` | submit frame (tool bytes, dispatch-time revalidated) | `agent_host_request_submit` | daemon observe flight claims the retained pair, decodes the closed vocabulary and routes to the Governor observation owner; retained result via the governed submit leg; the bridge answers completed only with the owner-retained receipt |
 /// | `eliot.query` | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | exact bounded read result with revision via Governor read owner |
 /// | `eliot.act` | submit frame (digest-only, dispatch-time revalidated) | `agent_host_request_submit` | admission handle only; bridge revalidates session/fence/connection/payload linkage at dispatch and the Kernel submit gate revalidates the act dispatch binding pre-staging; the daemon-side `admit_material_decision` invocation over owner-resolved inputs with dispatch-time revalidation through a live act claim/flight is the remaining join (#1742 W4) |
-/// | `eliot.verify` | submit frame (digest-only) | `agent_host_request_submit` | admission handle only; verifier-owner invocation + evidence preservation missing |
+/// | `eliot.verify` | submit frame (digest-only, dispatch-time revalidated) | `agent_host_request_submit` | admission handle only; bridge revalidates session/fence/connection/payload linkage at dispatch and the Kernel submit gate revalidates the verify dispatch binding pre-staging; the daemon-side `eliot-verifier` (`eliot.instrument.verifier`) plan/execute/verdict invocation over the admitted intent, `artifact_refs` and `verifier_profile_ref` with not-executed/partial/unknown evidence preserved is the remaining join |
 /// | `eliot.coordinate` | submit frame (digest-only, dispatch-time revalidated) | `agent_host_request_submit` | admission handle only; bridge revalidates session/fence/connection/payload linkage at dispatch and the Kernel submit gate revalidates the coordinate dispatch binding pre-staging; the seven discriminators (delegate/audit/compare/wait/inspect/cancel/send) hand off to the #1740 execution-fabric owner through a live coordinate claim/flight — the remaining join (#1740 parked: no live owner yet, so no bytes retained here) |
 /// | `eliot.finish` | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | exact bounded finish decision receipt from the Governor finish owner; a simulated/stale/unbound/unknown-verifier candidate and a caller-supplied proof never yield `VERIFIED_COMPLETE` |
 /// | `eliot_user_automation` (non-hot) | submit frame (tool bytes) | `agent_host_request_submit` | operator carrier on its own leg; never a hot tool |
@@ -1994,10 +1994,6 @@ enum CanonicalDispatchEntry {
     /// payload-digest linkage before reading and serves the exact bounded
     /// result with its revision.
     InvokeRead,
-    /// Admission-only submit: the Accepted reply is an operation handle.
-    /// `completion_join` names the exact missing owner execution that must
-    /// complete the row before a completed response is legitimate.
-    SubmitAdmitOnly { completion_join: &'static str },
     /// Act effect dispatch with dispatch-time revalidation (issue #1742 W4,
     /// owned by #1739 dispatch).
     ///
@@ -2011,6 +2007,21 @@ enum CanonicalDispatchEntry {
     /// live act claim/flight, not here. The Accepted reply stays an operation
     /// handle until the effect owner completes it.
     SubmitActGated { completion_join: &'static str },
+    /// Verify dispatch with dispatch-time revalidation (issue #1739 W5).
+    ///
+    /// The bridge revalidates only what it owns at dispatch time (verify
+    /// shape, live session/fence/connection binding, exact payload-digest
+    /// linkage) and rides the same `agent_host_request_submit` entry; the
+    /// Kernel submit entry revalidates the verify dispatch binding
+    /// pre-staging (`check_verify_submit_binding`). The daemon-side
+    /// `eliot-verifier` (`eliot.instrument.verifier`) plan/execute/verdict
+    /// invocation over the admitted intent, `artifact_refs` and
+    /// `verifier_profile_ref` runs at the future live verify claim/flight,
+    /// not here: not-executed, partial and unknown evidence stays the
+    /// verifier owner's to produce and is never upgraded to a pass at this
+    /// seam. The Accepted reply stays an operation handle until the verifier
+    /// owner completes it.
+    SubmitVerifyGated { completion_join: &'static str },
     /// Coordinate effect dispatch with dispatch-time revalidation (issue
     /// #1739 W5, execution-fabric join owned by #1740).
     ///
@@ -2076,8 +2087,8 @@ fn canonical_dispatch_entry(tool: &ToolRequest) -> CanonicalDispatchEntry {
         ToolRequest::Act(_) => CanonicalDispatchEntry::SubmitActGated {
             completion_join: "daemon-side admit_material_decision invocation over Governor owner-resolved inputs with dispatch-time revalidation through a live act claim/flight (Kernel submit gate check_act_submit_binding and bridge dispatch revalidation done; #1742 W4)",
         },
-        ToolRequest::Verify(_) => CanonicalDispatchEntry::SubmitAdmitOnly {
-            completion_join: "verifier-owner invocation through the existing verifier owner with not-executed/partial/unknown evidence preserved",
+        ToolRequest::Verify(_) => CanonicalDispatchEntry::SubmitVerifyGated {
+            completion_join: "daemon-side eliot-verifier (eliot.instrument.verifier) plan/execute/verdict invocation over the admitted intent, artifact_refs and verifier_profile_ref with Partial/Unknown/not-executed evidence preserved, never upgraded to pass (Kernel submit gate check_verify_submit_binding and bridge dispatch revalidation done; #1739 W5)",
         },
         ToolRequest::Coordinate(_) => CanonicalDispatchEntry::SubmitCoordinateGated {
             completion_join: "execution-fabric owner invocation over the seven coordinate discriminators (delegate/audit/compare/wait/inspect/cancel/send) through a live coordinate claim/flight returning the same durable work/attempt identity (Kernel submit gate check_coordinate_submit_binding and bridge dispatch revalidation done; #1740 parked)",
@@ -2133,6 +2144,61 @@ fn revalidate_act_dispatch(
     if expected_payload != envelope.identity.payload_sha256 {
         return Err(PortFailure::TransportBindingRejected {
             reason: "act dispatch payload does not match the admitted payload digest".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Dispatch-time revalidation for one `eliot.verify` submit (issue #1739
+/// W5).
+///
+/// Re-checks at dispatch, against live Kernel-issued facts, only what the
+/// bridge owns: the tool is still the exact `eliot.verify` request admitted,
+/// the envelope still names the live session/fence/connection, and the
+/// canonical payload digest still binds the exact tool bytes. A swapped
+/// packet, forged binding, or stale fence fails closed here before any submit
+/// frame is built; the verification verdict itself stays the `eliot-verifier`
+/// (`eliot.instrument.verifier`) owner's plan/execute/verdict, never a bridge
+/// verdict (I01-08 canonical write path; I07-08 step 10). Not-executed,
+/// partial and unknown evidence is the verifier owner's to produce at the
+/// future live verify claim/flight — this seam neither demands nor
+/// synthesizes it, and it never upgrades an unknown to a pass. Failures are
+/// typed (I07-20): fence mismatch stays `FenceMismatch`, binding mismatches
+/// stay `TransportBindingRejected`, a missing session stays `PlanGap`.
+fn revalidate_verify_dispatch(
+    request: &HostInvocationRequest,
+    envelope: &HostRequestEnvelope,
+    facts: &TransportFacts,
+) -> Result<(), PortFailure> {
+    if !matches!(request.tool, ToolRequest::Verify(_)) {
+        return Err(request_failure());
+    }
+    if request.tool.canonical_name() != "eliot.verify"
+        || envelope.identity.capability != request.tool.canonical_name()
+    {
+        return Err(PortFailure::TransportBindingRejected {
+            reason: "verify dispatch capability does not match the admitted tool".to_owned(),
+        });
+    }
+    let live_session = facts.session.clone().ok_or_else(plan_gap_no_session)?;
+    if envelope.identity.session_id.as_deref() != Some(live_session.as_str()) {
+        return Err(PortFailure::TransportBindingRejected {
+            reason: "verify dispatch session does not match the live attach session".to_owned(),
+        });
+    }
+    if envelope.state_fence != facts.state_fence {
+        return Err(PortFailure::FenceMismatch);
+    }
+    if envelope.connection_id != facts.connection_id {
+        return Err(PortFailure::TransportBindingRejected {
+            reason: "verify dispatch connection does not match the live admitted connection"
+                .to_owned(),
+        });
+    }
+    let expected_payload = canonical_payload_digest(&request.tool)?;
+    if expected_payload != envelope.identity.payload_sha256 {
+        return Err(PortFailure::TransportBindingRejected {
+            reason: "verify dispatch payload does not match the admitted payload digest".to_owned(),
         });
     }
     Ok(())
@@ -3559,11 +3625,12 @@ fn invoke_request_frame(
         CanonicalDispatchEntry::InvokeRead => {
             host_request_invoke_read_frame(request, envelope, facts)?
         }
-        CanonicalDispatchEntry::SubmitAdmitOnly { .. } => {
-            host_request_frame_for_envelope(AGENT_HOST_REQUEST_SUBMIT_OPERATION, envelope, facts)?
-        }
         CanonicalDispatchEntry::SubmitActGated { .. } => {
             revalidate_act_dispatch(request, envelope, facts)?;
+            host_request_frame_for_envelope(AGENT_HOST_REQUEST_SUBMIT_OPERATION, envelope, facts)?
+        }
+        CanonicalDispatchEntry::SubmitVerifyGated { .. } => {
+            revalidate_verify_dispatch(request, envelope, facts)?;
             host_request_frame_for_envelope(AGENT_HOST_REQUEST_SUBMIT_OPERATION, envelope, facts)?
         }
         CanonicalDispatchEntry::SubmitCoordinateGated { .. } => {

@@ -4415,6 +4415,20 @@ pub(crate) const OBSERVE_CAPABILITY: &str = "eliot.observe";
 /// write path; I07-08 step 7).
 pub(crate) const ACT_CAPABILITY: &str = "eliot.act";
 
+/// Closed capability admitted to the verify submit entry (issue #1739 W5:
+/// the Kernel-side verify submit path, serially after the act gate on the
+/// same carrier).
+///
+/// Digest-only `eliot.verify` invocations ride the shared submit entry through
+/// [`KernelComposition::admit_and_queue_observe_submit`]. The Kernel owns
+/// only the mechanical dispatch binding here — capability plus invocation
+/// kind, checked before any staging — never the verification verdict or the
+/// not-executed/partial/unknown evidence: those belong to `eliot-verifier`
+/// (`eliot.instrument.verifier`) plan/execute/verdict at the future live
+/// verify claim/flight, the owner the bridge dispatch row names (I01-08
+/// canonical write path; I07-08 step 10). No tool bytes are retained here.
+pub(crate) const VERIFY_CAPABILITY: &str = "eliot.verify";
+
 /// Closed capability admitted to the coordinate submit entry (issue #1739
 /// W5; execution-fabric join owned by #1740).
 ///
@@ -4617,6 +4631,33 @@ pub(crate) fn check_act_submit_binding(
     Ok(())
 }
 
+/// Kernel-owned dispatch binding for one `eliot.verify` submit (issue #1739
+/// W5).
+///
+/// `Invocation` kind the submit entry serves. A swapped capability or a
+/// non-invocation kind fails closed as `SessionFenced` before the caller
+/// stages anything. Pure: validation performs no IO by construction.
+///
+/// Digest-only verify submits carry no tool bytes, so there is no payload
+/// digest to link here — the envelope digest already commits to the exact
+/// canonical request through admission, and the live session/fence/
+/// connection binding is enforced by the frame gateway plus the admission
+/// gates. The verification verdict itself stays `eliot-verifier`'s
+/// (`eliot.instrument.verifier`), never a Kernel verdict, and this gate
+/// never turns an absent or unknown verification into a pass (I01-08
+/// canonical write path).
+pub(crate) fn check_verify_submit_binding(
+    envelope: &HostRequestEnvelope,
+) -> Result<(), TransportError> {
+    if envelope.identity.capability != VERIFY_CAPABILITY {
+        return Err(TransportError::SessionFenced);
+    }
+    if envelope.kind != HostRequestKind::Invocation {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(())
+}
+
 /// Kernel-owned dispatch binding for one `eliot.coordinate` submit (issue
 /// #1739 W5; execution-fabric join owned by #1740).
 ///
@@ -4695,6 +4736,11 @@ impl KernelComposition {
     /// Kernel-owned dispatch binding ([`check_act_submit_binding`]) is
     /// revalidated before admission, while the material admission verdict
     /// stays the Governor owner's `admit_material_decision` (I01-08).
+    /// Digest-only `eliot.verify` invocations take the same entry next, in
+    /// row order: the Kernel-owned dispatch binding
+    /// ([`check_verify_submit_binding`]) is revalidated before admission,
+    /// while the verification verdict stays `eliot-verifier`'s
+    /// (`eliot.instrument.verifier`).
     /// Digest-only `eliot.coordinate` invocations take the same entry: the
     /// Kernel-owned dispatch binding ([`check_coordinate_submit_binding`])
     /// is revalidated before admission, while the fabric verdict stays the
@@ -4719,6 +4765,16 @@ impl KernelComposition {
         // (`eliot-context-admission::admit_material_decision`).
         if !is_observe && envelope.identity.capability == ACT_CAPABILITY {
             check_act_submit_binding(envelope)?;
+        }
+        // Verify effect dispatch (issue #1739 W5; the verifier-owner
+        // invocation stays open): digest-only `eliot.verify` submits ride
+        // this same entry, serially after the act gate. Revalidate the
+        // Kernel-owned dispatch binding before staging; the verification
+        // verdict itself stays `eliot-verifier`'s (`eliot.instrument.verifier`),
+        // never a Kernel verdict, and never an upgrade of an absent or unknown
+        // verification to a pass (I01-08).
+        if !is_observe && envelope.identity.capability == VERIFY_CAPABILITY {
+            check_verify_submit_binding(envelope)?;
         }
         // Coordinate effect dispatch (issue #1739 W5; #1740 owns the fabric
         // join): digest-only `eliot.coordinate` submits ride this same
