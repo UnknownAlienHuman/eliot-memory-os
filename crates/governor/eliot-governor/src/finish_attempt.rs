@@ -167,10 +167,13 @@ impl<'a, P: ?Sized> GovernorFinishAttempt<'a, P> {
                     .as_ref()
                     .map_or("", eliot_contracts::SessionId::as_str)
             || identity.request.metadata.task_id.as_ref() != Some(&task_id)
-            || semantic_fence.authority_epoch != identity.request.metadata.state_fence.authority_epoch
+            || semantic_fence.authority_epoch
+                != identity.request.metadata.state_fence.authority_epoch
             || semantic_fence.resource_generation
                 != identity.request.metadata.state_fence.resource_generation
-            || semantic_fence.task_revision.map(eliot_contracts::TaskRevision::value)
+            || semantic_fence
+                .task_revision
+                .map(eliot_contracts::TaskRevision::value)
                 != Some(draft.expected_task_revision)
         {
             return Err(FinishError::IdentityConflict.into());

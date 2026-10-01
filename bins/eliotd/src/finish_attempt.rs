@@ -228,7 +228,10 @@ pub async fn serve_finish_claim(
             return rejected_finish_result_with_detail(
                 &claimed,
                 &error.to_string(),
-                (AgentResponseDisposition::RecoveryRequired, "RECOVERY_REQUIRED"),
+                (
+                    AgentResponseDisposition::RecoveryRequired,
+                    "RECOVERY_REQUIRED",
+                ),
             );
         }
         guard.historical_finish_receipt(
@@ -249,14 +252,20 @@ pub async fn serve_finish_claim(
                 return rejected_finish_result_with_detail(
                     &claimed,
                     "retained Finish decision has no canonical receipt for its original operation",
-                    (AgentResponseDisposition::RecoveryRequired, "RECOVERY_REQUIRED"),
+                    (
+                        AgentResponseDisposition::RecoveryRequired,
+                        "RECOVERY_REQUIRED",
+                    ),
                 );
             }
             Err(error) => {
                 return rejected_finish_result_with_detail(
                     &claimed,
                     &format!("original Finish operation receipt read failed: {error}"),
-                    (AgentResponseDisposition::RecoveryRequired, "RECOVERY_REQUIRED"),
+                    (
+                        AgentResponseDisposition::RecoveryRequired,
+                        "RECOVERY_REQUIRED",
+                    ),
                 );
             }
         };
@@ -264,7 +273,10 @@ pub async fn serve_finish_claim(
             return rejected_finish_result_with_detail(
                 &claimed,
                 &format!("original Finish operation receipt is invalid: {error}"),
-                (AgentResponseDisposition::RecoveryRequired, "RECOVERY_REQUIRED"),
+                (
+                    AgentResponseDisposition::RecoveryRequired,
+                    "RECOVERY_REQUIRED",
+                ),
             );
         }
         if write_receipt.operation_id != claimed.operation_id
@@ -276,7 +288,10 @@ pub async fn serve_finish_claim(
             return rejected_finish_result_with_detail(
                 &claimed,
                 "canonical receipt does not bind the original committed Finish operation",
-                (AgentResponseDisposition::RecoveryRequired, "RECOVERY_REQUIRED"),
+                (
+                    AgentResponseDisposition::RecoveryRequired,
+                    "RECOVERY_REQUIRED",
+                ),
             );
         }
         let content = serde_json::to_value(&receipt)

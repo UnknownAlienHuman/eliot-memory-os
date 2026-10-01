@@ -1400,7 +1400,10 @@ fn finish_decision_task_binding(receipt_json: &str) -> Result<(String, u64), Ada
                 reason: "missing Finish decision task revision",
             }))?;
         let current = (task_id.to_owned(), task_revision);
-        if binding.as_ref().is_some_and(|previous| previous != &current) {
+        if binding
+            .as_ref()
+            .is_some_and(|previous| previous != &current)
+        {
             return Err(AdapterError::Store(StoreError::InvalidField {
                 field: "finish.receipt_json",
                 reason: "Finish decisions disagree on task identity or revision",
