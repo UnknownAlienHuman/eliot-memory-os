@@ -7251,6 +7251,8 @@ enum ColdStartIngressError {
     WorkScope(#[from] eliot_workscope::WorkScopeError),
     #[error(transparent)]
     Composition(#[from] eliot_governor::CompositionError),
+    #[error(transparent)]
+    Migration(#[from] eliotd::DaemonError),
 }
 
 async fn install_readback_work_scope_revision(
@@ -7511,6 +7513,20 @@ async fn trigger_cold_start_controller(
             owner: "installation scan store bind",
             detail: error.to_string(),
         })?;
+    let migration_store = store.clone();
+    let state_root = composition.lock().await.state_root().to_owned();
+    tokio::task::spawn_blocking(move || {
+        eliotd::scan_disclosure_migration::quarantine_loose_scan_disclosures(
+            &state_root,
+            &migration_store,
+        )
+    })
+    .await
+    .map_err(|error| ColdStartIngressError::Owner {
+        owner: "protected scan quarantine worker",
+        detail: error.to_string(),
+    })??;
+    let now = unix_ms(SystemTime::now()).map_err(ColdStartIngressError::Clock)?;
     let scan_evidence = discovery.discovery.evidence.clone();
     let outcome = composition
         .lock()

@@ -9942,7 +9942,10 @@ impl ScanDisclosureQuarantineRecord {
             return Err(OrsError::UnsupportedContractVersion(self.contract_version));
         }
         validate_text(&self.quarantine_key, "scan_disclosure_quarantine_key")?;
-        validate_digest(&self.request_hash, "scan_disclosure_quarantine_request_hash")?;
+        validate_digest(
+            &self.request_hash,
+            "scan_disclosure_quarantine_request_hash",
+        )?;
         validate_text(
             &self.installation_id,
             "scan_disclosure_quarantine_installation_id",
@@ -9960,7 +9963,10 @@ impl ScanDisclosureQuarantineRecord {
                 reason: "legacy capture exceeds the per-file bound",
             });
         }
-        validate_digest(&self.content_sha256, "scan_disclosure_quarantine_content_sha256")?;
+        validate_digest(
+            &self.content_sha256,
+            "scan_disclosure_quarantine_content_sha256",
+        )?;
         if sha256_hex(&self.original_bytes) != self.content_sha256 {
             return Err(OrsError::PayloadIntegrityMismatch);
         }

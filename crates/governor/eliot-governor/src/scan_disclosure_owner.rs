@@ -18,14 +18,14 @@ use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_ors::{
     ColdStartReadinessOrsRecord, ColdStartReadinessRecordOwner, ColdStartReadinessStageOutcome,
     ColdStartReadinessTerminalDisposition, OrsError, SCAN_DISCLOSURE_RECORD_TYPE,
-    ScanDisclosureOrsRecord, ScanDisclosureReadFailure, ScanDisclosureQuarantineRecord,
+    ScanDisclosureOrsRecord, ScanDisclosureQuarantineRecord, ScanDisclosureReadFailure,
     ScanDisclosureRecordOwner, ScanDisclosureRecordState, ScanDisclosureStageOutcome,
 };
 use eliot_workscope::{
-    LOOSE_SCAN_DISCLOSURE_PREFIX, LOOSE_SCAN_DISCLOSURE_SUFFIX,
-    SCAN_DISCLOSURE_SCHEMA_VERSION, ScanDisclosureOwnerBinding, ScanDisclosureReceipt,
-    ScanDisclosureStore, ScanReceiptDiagnosticView, ScanReceiptHandle, ScanReceiptRetention,
-    ScanRetentionPolicy, WorkScopeError, quarantine_loose_scan_disclosure,
+    LOOSE_SCAN_DISCLOSURE_PREFIX, LOOSE_SCAN_DISCLOSURE_SUFFIX, SCAN_DISCLOSURE_SCHEMA_VERSION,
+    ScanDisclosureOwnerBinding, ScanDisclosureReceipt, ScanDisclosureStore,
+    ScanReceiptDiagnosticView, ScanReceiptHandle, ScanReceiptRetention, ScanRetentionPolicy,
+    WorkScopeError, quarantine_loose_scan_disclosure,
 };
 
 /// Installation storage contour admitted for scan disclosure writes.
