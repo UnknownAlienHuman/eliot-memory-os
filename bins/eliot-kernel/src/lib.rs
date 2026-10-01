@@ -41,6 +41,15 @@
 
 #[cfg(windows)]
 mod agent_bridge;
+/// Kernel-owned durable anchored-review surface (issue #1823; I10.18/I10.21):
+/// the anchored-review record with its full response/change/verifier
+/// reference set, the derived batch envelope with independent per-item
+/// lifecycles, the seven-status evolving-anchor resolution with ambiguous
+/// results retained unattached, requested-change routing to the normal
+/// owner/effect/verifier path, and blocker escalation to the existing
+/// Problem/Critical-Attention control owner. Reviews grant no write,
+/// effect, goal, or acceptance authority; rejection requires a reason.
+pub mod anchored_review;
 /// Kernel-owned audit-fallback interface (issue #1840; I16.11): the
 /// independently persisted audit spool, the last-resort channel, the
 /// visible control-loss state, and reconciliation with receipts.
