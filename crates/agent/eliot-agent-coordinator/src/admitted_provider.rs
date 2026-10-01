@@ -272,7 +272,7 @@ impl OwnerLoadedClaimRow {
     /// cover) or with no recorded payload yet yields empty, which the owner
     /// treats as "no evidence on this leg"; a retained digest that
     /// disagrees with the presented payload fails closed in the owner.
-    pub(crate) fn receipt_payload_for_kind(&self, kind: &ProviderProofKind) -> &str {
+    pub(crate) fn receipt_payload_for_kind(&self, kind: ProviderProofKind) -> &str {
         match kind {
             ProviderProofKind::Admission => self.admission_payload_sha256.as_deref(),
             ProviderProofKind::Cancellation => self.cancellation_payload_sha256.as_deref(),
