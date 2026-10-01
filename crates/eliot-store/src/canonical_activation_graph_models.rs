@@ -4,25 +4,26 @@
 //! Mechanical extraction from `crates/eliot-store/src/canonical_store.rs` — preserves exact behavior, public API, imports, serde shape, and `CanonicalStore` facade. No semantic redesign and no canonical write-authority change. Excludes provider/handshake/migration/atomic-write, capacity/L2/recall, and Dreamer/Luna semantics.
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct RawActivationRelation {
     pub(super) from_ref: String,
     pub(super) to_ref: String,
 }
 
+/// Decoder: derived struct, no `flatten`. Unknown member keys are refused;
+/// duplicate member keys are already refused by the derived `MapAccess`.
+/// Every family key is required: the `LoadUlActivationGraph` projection
+/// always emits all seven keys (an empty family arrives as `[]`), so an
+/// absent family is a partial transport and must be refused rather than
+/// read as a known-empty graph.
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct RawActivationGraphRows {
-    #[serde(default)]
     pub(super) co_change: Vec<eliot_types::CoChangeEdge>,
-    #[serde(default)]
     pub(super) card_covers: Vec<RawActivationRelation>,
-    #[serde(default)]
     pub(super) capsule_covers: Vec<RawActivationRelation>,
-    #[serde(default)]
     pub(super) concept_implemented_by: Vec<RawActivationRelation>,
-    #[serde(default)]
     pub(super) concept_depends_on: Vec<RawActivationRelation>,
-    #[serde(default)]
     pub(super) supports: Vec<RawActivationRelation>,
-    #[serde(default)]
     pub(super) verified_by: Vec<RawActivationRelation>,
 }
