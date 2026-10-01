@@ -856,6 +856,16 @@ fn mcp_observation_envelope(
     expected_ordering_sequence: u64,
     task_selection: Option<&TaskSelectionAdmissionBinding>,
 ) -> Result<CanonicalWriteEnvelope, CompositionError> {
+    let same_selection = match (&submission.task_selection, task_selection) {
+        (Some(retained), Some(selection)) => retained == selection.evidence(),
+        (None, None) => identity.request.metadata.task_id.is_none(),
+        _ => false,
+    };
+    if !same_selection {
+        return Err(CompositionError::Kernel(
+            KernelPortError::TaskScopeIncompatible,
+        ));
+    }
     let submission_json =
         serde_json::to_string(submission).map_err(|error| owner_refused(error.to_string()))?;
     let mut parameters = BTreeMap::new();
@@ -1127,6 +1137,29 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
             return Err(identity_refused(
                 "Observation WorkScope differs from its exact owner projection",
             ));
+        }
+        if let Some(selection) = &input.task_selection {
+            // Task-bound capture must revalidate the complete source/privacy
+            // closure retained by task selection at this same request fence.
+            // A scope snapshot alone can support cold raw capture, but cannot
+            // authorize a capture leg bound to reusable task evidence.
+            let current_source_closure = self
+                .work_scope
+                .ok_or_else(|| {
+                    CompositionError::Kernel(KernelPortError::TaskScopeIncompatible)
+                })?
+                .read_current_source_closure(fence)
+                .map_err(|_| {
+                    CompositionError::Kernel(KernelPortError::TaskScopeIncompatible)
+                })?;
+            if selection.work_scope() != &current_scope
+                || selection.source_closure()
+                    != (&current_source_closure.0, &current_source_closure.1)
+            {
+                return Err(CompositionError::Kernel(
+                    KernelPortError::TaskScopeIncompatible,
+                ));
+            }
         }
         Ok((policy, current_scope))
     }
