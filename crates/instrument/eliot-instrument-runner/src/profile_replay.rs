@@ -17,7 +17,11 @@ use eliot_testd_core::{
     TestdProviderCatalogLifecycle, TestdSourceObservationRange, TestdStreamDisposition,
     TestdStreamEvidenceBinding, TestdToolObservation,
 };
-use eliot_bootstrap::{NormativePair, normative::parse_normative_pair_receipt};
+use eliot_bootstrap::{
+    NormativePair,
+    normative::{NormativePairReceiptIdentity, parse_normative_pair_receipt_identity},
+};
+use eliot_workscope::{GoverningSource, GoverningSourceRole, SourceStatus, WorkScopeBindingSnapshot};
 use thiserror::Error;
 
 use crate::{
@@ -47,26 +51,25 @@ pub struct ReplayObservedInputs {
 }
 
 /// Kernel/owner-issued replay context bound to one exact accepted catalog row
-/// and one independently admitted Bootstrap normative pair.
+/// and one exact current WorkScope owner snapshot.
 ///
 /// The context is deliberately not constructible from a Testd material
 /// projection. Callers mint it from a current `ModuleCatalogOwnerReadback`,
-/// the corresponding accepted `GenerationAdmission`, and the original
-/// `NormativePair` from the admitted Bootstrap source/catalogue. Required
-/// profile/provider denominators come from the complete profile DAG and the
-/// single current provider registry.
+/// the corresponding accepted `GenerationAdmission`, and the current
+/// WorkScope source admission. Replay joins its admitted Architecture and
+/// Implementation sources to the current receipt's exact references and
+/// content digests before deriving the original pair.
 #[derive(Clone, Debug)]
 pub struct VerifiedTestdReplayContext {
     profile_registry: InstrumentRegistry,
     lifecycle: eliot_module_registry::VerifiedModuleCatalogGeneration,
-    original_normative_pair: NormativePair,
+    work_scope_binding: WorkScopeBindingSnapshot,
 }
 
 impl VerifiedTestdReplayContext {
     /// Issues a replay context only after the exact current catalog readback
-    /// revalidates its accepted module generation. The original pair is
-    /// supplied by the authenticated Bootstrap owner-facts record, never by
-    /// Testd material or the currently read repository file.
+    /// revalidates its accepted module generation and current WorkScope source
+    /// snapshot at the same exact state fence.
     pub fn from_owner_readback(
         profile_registry: InstrumentRegistry,
         readback: &eliot_module_registry::ModuleCatalogOwnerReadback,
@@ -74,7 +77,7 @@ impl VerifiedTestdReplayContext {
         expected_catalog_revision: u64,
         expected_state_fence: &StateFence,
         admission: &eliot_module_registry::GenerationAdmission,
-        original_normative_pair: NormativePair,
+        work_scope_binding: WorkScopeBindingSnapshot,
     ) -> Result<Self, ProfileReplayError> {
         let lifecycle = readback.verify_generation_admission(
             expected_owner_revision,
@@ -82,15 +85,18 @@ impl VerifiedTestdReplayContext {
             expected_state_fence,
             admission,
         )?;
-        if !valid_sha256_text(&original_normative_pair.architecture_sha256)
-            || !valid_sha256_text(&original_normative_pair.implementation_sha256)
+        work_scope_binding
+            .validate()
+            .map_err(|error| ProfileReplayError::CurrentnessObservation(error.to_string()))?;
+        if work_scope_binding.state_fence != *expected_state_fence
+            || work_scope_binding.source_admission.is_none()
         {
-            return Err(ProfileReplayError::NormativePairMismatch);
+            return Err(ProfileReplayError::NormativePairSourceAdmission);
         }
         Ok(Self {
             profile_registry,
             lifecycle,
-            original_normative_pair,
+            work_scope_binding,
         })
     }
 
@@ -127,7 +133,7 @@ impl VerifiedTestdReplayContext {
         let (provider_registry, fingerprints) = current_testd_provider_registry(
             self.lifecycle.clone(),
             &self.profile_registry,
-            &self.original_normative_pair,
+            &self.work_scope_binding,
             observations,
         )?;
         let (required_profile_ids, required_provider_ids) =
@@ -144,8 +150,8 @@ impl VerifiedTestdReplayContext {
             stage,
             source,
             bytes,
-            &self.required_profile_ids,
-            &self.required_provider_ids,
+            &required_profile_ids,
+            &required_provider_ids,
             &observations.required_test_ids,
             terminal,
             started_at,
@@ -193,13 +199,13 @@ pub fn observed_invalidation_set(
 }
 
 /// Constructs the one current Testd provider registry from a verified catalog
-/// lifecycle, the original admitted Bootstrap pair, and the exact independent
-/// process/source/environment observations. The same function is used by the
-/// admission side and at replay so all seven invalidation axes have one owner.
+/// lifecycle, an exact current WorkScope owner snapshot, and the independent
+/// process/source/environment observations. The WorkScope source records must
+/// identify the exact normative sources and digests in the current receipt.
 pub fn current_testd_provider_registry(
     lifecycle: eliot_module_registry::VerifiedModuleCatalogGeneration,
     profile_registry: &InstrumentRegistry,
-    original_normative_pair: &NormativePair,
+    work_scope_binding: &WorkScopeBindingSnapshot,
     observations: &ReplayObservedInputs,
 ) -> Result<(ProviderRegistry, InvalidationSet), ProfileReplayError> {
     observations
@@ -218,30 +224,23 @@ pub fn current_testd_provider_registry(
         .tools
         .validate()
         .map_err(|error| ProfileReplayError::CurrentnessObservation(error.to_string()))?;
-    let current_pair = parse_normative_pair_receipt(&observations.normative_pair_receipt)
+    let receipt = parse_normative_pair_receipt_identity(&observations.normative_pair_receipt)
         .map_err(|error| ProfileReplayError::CurrentnessObservation(error.to_string()))?;
-    if &current_pair != original_normative_pair {
+    let admitted_pair = admitted_work_scope_normative_pair(
+        work_scope_binding,
+        &observations.source.before.repository_root,
+        &receipt,
+    )?;
+    if admitted_pair != receipt.pair {
         return Err(ProfileReplayError::NormativePairMismatch);
     }
     let fingerprints = observed_invalidation_set(profile_registry, observations)?;
     let registry = ProviderRegistry::ready_for_catalog_generation(
         lifecycle,
-        normative_pair_key(&current_pair),
+        receipt.pair_key,
         &fingerprints,
     )?;
     Ok((registry, fingerprints))
-}
-
-fn normative_pair_key(pair: &NormativePair) -> String {
-    let material = [
-        b"eliot-normative-pair-v1\0".as_slice(),
-        pair.architecture_sha256.as_bytes(),
-        b"\0".as_slice(),
-        pair.implementation_sha256.as_bytes(),
-        b"\0".as_slice(),
-    ]
-    .concat();
-    format!("sha256:{}", sha256_hex(&material))
 }
 
 fn valid_sha256_text(value: &str) -> bool {
@@ -250,6 +249,84 @@ fn valid_sha256_text(value: &str) -> bool {
         && hex
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn admitted_work_scope_normative_pair(
+    binding: &WorkScopeBindingSnapshot,
+    repository_root: &str,
+    receipt: &NormativePairReceiptIdentity,
+) -> Result<NormativePair, ProfileReplayError> {
+    binding
+        .validate()
+        .map_err(|error| ProfileReplayError::CurrentnessObservation(error.to_string()))?;
+    if binding.binding.scope.root_identity != repository_root
+        || binding.binding.scope.generation != binding.binding.governing_source_generation
+    {
+        return Err(ProfileReplayError::NormativePairSourceAdmission);
+    }
+    let source_admission = binding
+        .source_admission
+        .as_ref()
+        .ok_or(ProfileReplayError::NormativePairSourceAdmission)?;
+    let sources = &source_admission.sources;
+    if sources.scope_ref != binding.binding.scope.scope_ref
+        || sources.generation != binding.binding.governing_source_generation
+        || !sources.unresolved_conflict_refs.is_empty()
+    {
+        return Err(ProfileReplayError::NormativePairSourceAdmission);
+    }
+    let architecture = unique_admitted_normative_source(
+        sources.sources.iter(),
+        GoverningSourceRole::Architecture,
+        binding,
+    )?;
+    let implementation = unique_admitted_normative_source(
+        sources.sources.iter(),
+        GoverningSourceRole::Implementation,
+        binding,
+    )?;
+    let architecture_refs = [
+        receipt.architecture_path.as_str(),
+        receipt.architecture_entry_path.as_str(),
+        receipt.architecture_compatibility_path.as_str(),
+    ];
+    let implementation_refs = [
+        receipt.implementation_path.as_str(),
+        receipt.implementation_entry_path.as_str(),
+        receipt.implementation_compatibility_path.as_str(),
+    ];
+    if !architecture_refs.contains(&architecture.source_ref.as_str())
+        || !implementation_refs.contains(&implementation.source_ref.as_str())
+        || architecture.source_ref == implementation.source_ref
+        || architecture.digest != receipt.pair.architecture_sha256
+        || implementation.digest != receipt.pair.implementation_sha256
+    {
+        return Err(ProfileReplayError::NormativePairSourceAdmission);
+    }
+    Ok(NormativePair {
+        architecture_sha256: architecture.digest.clone(),
+        implementation_sha256: implementation.digest.clone(),
+    })
+}
+
+fn unique_admitted_normative_source<'a>(
+    sources: impl Iterator<Item = &'a GoverningSource>,
+    role: GoverningSourceRole,
+    binding: &WorkScopeBindingSnapshot,
+) -> Result<&'a GoverningSource, ProfileReplayError> {
+    let mut matches = sources.filter(|source| source.role == role);
+    let source = matches
+        .next()
+        .ok_or(ProfileReplayError::NormativePairSourceAdmission)?;
+    if matches.next().is_some()
+        || source.status != SourceStatus::Admitted
+        || source.applicable_generation != binding.binding.governing_source_generation
+        || source.authority_basis.is_none()
+        || source.assurance.state_fence != binding.state_fence
+    {
+        return Err(ProfileReplayError::NormativePairSourceAdmission);
+    }
+    Ok(source)
 }
 
 /// Derives the full required profile/provider denominator from the admitted
@@ -351,6 +428,9 @@ pub enum ProfileReplayError {
     /// authenticated Bootstrap pair used by the admitted provider registry.
     #[error("current normative pair differs from the admitted Bootstrap pair")]
     NormativePairMismatch,
+    /// Current WorkScope owner facts do not admit the exact normative sources.
+    #[error("WorkScope owner facts do not admit the exact normative source pair")]
+    NormativePairSourceAdmission,
     /// Production replay context omitted its independently retained profile set.
     #[error("replay context has no required profile IDs")]
     EmptyRequiredProfiles,

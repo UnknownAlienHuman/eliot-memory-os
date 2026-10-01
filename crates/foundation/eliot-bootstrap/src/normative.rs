@@ -10,7 +10,9 @@ use thiserror::Error;
 
 use crate::NormativePair;
 
-pub(crate) const MAX_RECEIPT_BYTES: usize = 16 * 1024;
+/// Maximum accepted normative-pair receipt size.
+pub const MAX_NORMATIVE_PAIR_RECEIPT_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_RECEIPT_BYTES: usize = MAX_NORMATIVE_PAIR_RECEIPT_BYTES;
 const RECEIPT_SCHEMA: &str = "eliot-normative-pair-v2-sharded";
 const RECEIPT_STATUS: &str = "accepted";
 const RECEIPT_BRANCH: &str = "main";
@@ -57,7 +59,7 @@ struct NormativePairReceipt {
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum NormativePairReceiptError {
     /// The caller supplied more than the bounded receipt envelope.
-    #[error("normative pair receipt exceeds {MAX_RECEIPT_BYTES} bytes")]
+    #[error("normative pair receipt exceeds {MAX_NORMATIVE_PAIR_RECEIPT_BYTES} bytes")]
     InputTooLarge,
     /// The receipt is not UTF-8 TOML input.
     #[error("normative pair receipt is not UTF-8")]
@@ -82,6 +84,31 @@ pub enum NormativePairReceiptError {
     CurrentEqualsSuperseded { field: &'static str },
 }
 
+/// Validated identity and source references from the accepted pair receipt.
+///
+/// Callers can join an independently admitted source snapshot to these exact
+/// handles and document digests without treating the receipt as the source
+/// admission itself.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NormativePairReceiptIdentity {
+    /// Architecture and Implementation document content digests.
+    pub pair: NormativePair,
+    /// Validated pair key recorded by the receipt.
+    pub pair_key: String,
+    /// Normative manifest handle for Architecture.
+    pub architecture_path: String,
+    /// Normative entry handle for Architecture.
+    pub architecture_entry_path: String,
+    /// Normative compatibility handle for Architecture.
+    pub architecture_compatibility_path: String,
+    /// Normative manifest handle for Implementation.
+    pub implementation_path: String,
+    /// Normative entry handle for Implementation.
+    pub implementation_entry_path: String,
+    /// Normative compatibility handle for Implementation.
+    pub implementation_compatibility_path: String,
+}
+
 /// Parse the accepted receipt supplied by an explicit repository boundary.
 ///
 /// The parser validates receipt structure and the external pair-key binding;
@@ -90,16 +117,32 @@ pub enum NormativePairReceiptError {
 pub fn parse_normative_pair_receipt(
     bytes: &[u8],
 ) -> Result<NormativePair, NormativePairReceiptError> {
-    if bytes.len() > MAX_RECEIPT_BYTES {
+    Ok(parse_normative_pair_receipt_identity(bytes)?.pair)
+}
+
+/// Parses and validates all source identity fields from the accepted receipt.
+pub fn parse_normative_pair_receipt_identity(
+    bytes: &[u8],
+) -> Result<NormativePairReceiptIdentity, NormativePairReceiptError> {
+    if bytes.len() > MAX_NORMATIVE_PAIR_RECEIPT_BYTES {
         return Err(NormativePairReceiptError::InputTooLarge);
     }
     let text = std::str::from_utf8(bytes).map_err(|_| NormativePairReceiptError::InvalidUtf8)?;
     let receipt: NormativePairReceipt =
         toml::from_str(text).map_err(|error| NormativePairReceiptError::Toml(error.to_string()))?;
     validate_receipt(&receipt)?;
-    Ok(NormativePair {
-        architecture_sha256: receipt.architecture_sha256,
-        implementation_sha256: receipt.implementation_sha256,
+    Ok(NormativePairReceiptIdentity {
+        pair: NormativePair {
+            architecture_sha256: receipt.architecture_sha256,
+            implementation_sha256: receipt.implementation_sha256,
+        },
+        pair_key: receipt.pair_key,
+        architecture_path: receipt.architecture_path,
+        architecture_entry_path: receipt.architecture_entry_path,
+        architecture_compatibility_path: receipt.architecture_compatibility_path,
+        implementation_path: receipt.implementation_path,
+        implementation_entry_path: receipt.implementation_entry_path,
+        implementation_compatibility_path: receipt.implementation_compatibility_path,
     })
 }
 
