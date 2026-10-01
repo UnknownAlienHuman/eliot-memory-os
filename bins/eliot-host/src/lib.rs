@@ -6810,12 +6810,10 @@ impl HostComposition {
         let max_restore_bytes =
             u64::try_from(eliot_protocol::backup::MAX_BACKUP_PAYLOAD_BYTES).unwrap_or(u64::MAX);
         let BackupOperationBody::PrepareIsolatedRestore(ref body) = request.body else {
-            return Err(
-                "the admitted backup request body is not an isolated-restore preparation",
-            );
+            return Err("the admitted backup request body is not an isolated-restore preparation");
         };
         let facts = PreparedDestinationFacts::issue_for_admitted_identity(&body.identity)
-            .map_err(Self::isolated_destination_reason)?;
+            .map_err(|error| Self::isolated_destination_reason(&error))?;
 
         // A repeated request — including one whose response was lost after the
         // destination was already created — resolves the SAME verified
@@ -6827,9 +6825,9 @@ impl HostComposition {
         // and the destination installation all have to be the ones this request
         // names, so a changed same-operation input is a conflict rather than a
         // second allocation.
-        let store = self.open_registry_store().map_err(|_| {
-            "the installation registry could not be opened to admit the isolated destination"
-        })?;
+        let store = self.open_registry_store().map_err(
+            |_| "the installation registry could not be opened to admit the isolated destination",
+        )?;
         let capability = self.owner_lease.activation_capability();
         if let Ok((retained, materialisation)) =
             store.read_prepared_isolated_destination_creation(&capability, &facts.operation_id)
@@ -6871,7 +6869,7 @@ impl HostComposition {
             })?;
         let requirements =
             ProposedRestorationRequirements::issue_for_facts(&facts, max_restore_bytes)
-                .map_err(Self::isolated_destination_reason)?;
+                .map_err(|error| Self::isolated_destination_reason(&error))?;
         let known = evidence.known_installations();
         let approved = evidence.approved();
         let active_generation = approved.manifest.generation.clone();
@@ -6889,7 +6887,7 @@ impl HostComposition {
                 known_installations: &known,
             },
         )
-        .map_err(Self::isolated_destination_reason)?;
+        .map_err(|error| Self::isolated_destination_reason(&error))?;
 
         // The destination is now actually CREATED, through the installation
         // authority's own create-new owned-directory publication, under the very
@@ -6905,7 +6903,7 @@ impl HostComposition {
             &allocation.admission,
             &area_lease,
         )
-        .map_err(Self::isolated_destination_reason)?;
+        .map_err(|error| Self::isolated_destination_reason(&error))?;
 
         // One compare-and-swap writes the admission and its materialisation
         // together, under the registry CAS revision fence and the live exclusive
@@ -6932,7 +6930,7 @@ impl HostComposition {
     /// compile error rather than a silently merged message.
     #[cfg(windows)]
     fn isolated_destination_reason(
-        error: eliot_installation::IsolatedDestinationError,
+        error: &eliot_installation::IsolatedDestinationError,
     ) -> &'static str {
         use eliot_installation::{IsolatedDestinationError, IsolatedDestinationRefusal};
         match error {
@@ -6942,8 +6940,10 @@ impl HostComposition {
             }
             IsolatedDestinationError::Refused(
                 IsolatedDestinationRefusal::SourceInstallationDestination,
-            ) => "the admitted destination is the source installation and is never a restore \
-                    destination",
+            ) => {
+                "the admitted destination is the source installation and is never a restore \
+                    destination"
+            }
             IsolatedDestinationError::Refused(
                 IsolatedDestinationRefusal::DestinationOverlapsSource,
             ) => "the admitted destination root is not isolated from the source installation root",
@@ -6953,8 +6953,10 @@ impl HostComposition {
             }
             IsolatedDestinationError::Refused(
                 IsolatedDestinationRefusal::ForeignInstallationOwner,
-            ) => "the destination is inside a foreign installation's own contour, so this \
-                    operation does not own it",
+            ) => {
+                "the destination is inside a foreign installation's own contour, so this \
+                    operation does not own it"
+            }
             IsolatedDestinationError::Refused(IsolatedDestinationRefusal::ClassNotRestorable) => {
                 "the declared archive class is not an installation-backup class and cannot name an \
                  isolated restore destination"
@@ -6965,18 +6967,28 @@ impl HostComposition {
             // not know is still refused rather than admitted.
             IsolatedDestinationError::Refused(
                 IsolatedDestinationRefusal::BoundRecordConflict { field },
-            ) => match field {
-                "target_schema_digest" => "an owner-issued bound record (target_schema_digest) \
-                    does not match the destination under admission",
-                "destination_installation" => "an owner-issued bound record \
-                    (destination_installation) does not match the destination under admission",
-                "destination_installation_root" => "an owner-issued bound record \
+            ) => match *field {
+                "target_schema_digest" => {
+                    "an owner-issued bound record (target_schema_digest) \
+                    does not match the destination under admission"
+                }
+                "destination_installation" => {
+                    "an owner-issued bound record \
+                    (destination_installation) does not match the destination under admission"
+                }
+                "destination_installation_root" => {
+                    "an owner-issued bound record \
                     (destination_installation_root) does not match the destination under \
-                    admission",
-                "admitted_classes" => "an owner-issued bound record (admitted_classes) does not \
-                    match the destination under admission",
-                "max_restore_bytes" => "an owner-issued bound record (max_restore_bytes) does not \
-                    match the destination under admission",
+                    admission"
+                }
+                "admitted_classes" => {
+                    "an owner-issued bound record (admitted_classes) does not \
+                    match the destination under admission"
+                }
+                "max_restore_bytes" => {
+                    "an owner-issued bound record (max_restore_bytes) does not \
+                    match the destination under admission"
+                }
                 _ => "an owner-issued bound record does not match the destination under admission",
             },
             IsolatedDestinationError::Refused(IsolatedDestinationRefusal::IsolatedAreaUnproved) => {

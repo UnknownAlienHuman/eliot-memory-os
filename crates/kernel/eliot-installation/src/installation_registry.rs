@@ -1868,10 +1868,12 @@ pub fn classify_installation_host_root(path: &Path) -> InstallationHostRootClass
     if !valid_installation_key(key) {
         return InstallationHostRootClass::Unowned;
     }
+    // A component past the key is an installation area unless it is exactly the
+    // `host` leaf, which is the installation Host root itself. Both a wrong leaf
+    // and an absent leaf are the same classification, so they share one arm.
     match identity.components.get(key_index + 2) {
         Some(leaf) if leaf == "host" => InstallationHostRootClass::InstallationHostRoot,
-        Some(_) => InstallationHostRootClass::InstallationArea,
-        None => InstallationHostRootClass::InstallationArea,
+        _ => InstallationHostRootClass::InstallationArea,
     }
 }
 
