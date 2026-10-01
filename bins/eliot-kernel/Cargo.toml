@@ -32,6 +32,7 @@ blake3.workspace = true
 # that path; do not read this line as evidence that artifact identity is already
 # resolved here.
 eliot-artifact.workspace = true
+eliot-blob-api.workspace = true
 eliot-authority.workspace = true
 eliot-backup = { path = "../../crates/storage/eliot-backup", version = "0.1.0" }
 eliot-contracts.workspace = true

@@ -10,7 +10,9 @@ use eliot_observability_runtime::{
 #[cfg(windows)]
 use eliot_ipc::NamedPipeServer;
 use eliot_ipc::TransportLimits;
+use eliot_contracts::{RequestId, StateFence};
 use eliot_protocol::MessageType;
+use eliot_protocol::{EncodingProfile, Frame, FrameKind, ProtocolPayload};
 use eliot_store_surreal::diagnostics::{
     BoundedEventLog, BridgeBoundary, BridgeIdentity, CompatibilityDecision, emit_dispatch_outcome,
     emit_lifecycle, emit_received, emit_validation_rejected, install_startup_subscriber,
@@ -26,6 +28,447 @@ use eliot_store_surreal::{
 
 mod launch_mode;
 use launch_mode::{LaunchMode, control_frame, parse_launch_mode, prepare_launch};
+
+fn is_blob_process_stream_frame(frame: &Frame) -> bool {
+    matches!(
+        &frame.payload,
+        ProtocolPayload::Json(payload)
+            if payload.get("wire_id").and_then(serde_json::Value::as_str)
+                == Some(eliot_blob_api::wire::BLOB_PROCESS_STREAM_WIRE_ID)
+    )
+}
+
+fn blob_process_stream_response_frame(
+    session: &eliot_store_surreal::StoreEbpSession,
+    request_id: Option<RequestId>,
+    response: eliot_blob_api::wire::BlobProcessStreamFrameResponse,
+) -> Result<Frame, String> {
+    response.validate().map_err(|error| error.to_string())?;
+    let payload = serde_json::to_value(response)
+        .map_err(|error| format!("Blob process-stream response encoding failed: {error}"))?;
+    let frame = Frame {
+        protocol_version: session.protocol_version(),
+        encoding_profile: EncodingProfile::JsonV1,
+        connection_id: session.connection_id().to_owned(),
+        request_id,
+        kind: FrameKind::Response,
+        message_type: MessageType::Result,
+        request_identity: None,
+        payload: ProtocolPayload::Json(payload),
+        trace_context: std::collections::BTreeMap::new(),
+    };
+    frame.validate().map_err(|error| error.to_string())?;
+    Ok(frame)
+}
+
+async fn dispatch_blob_process_stream_sink(
+    composition: &StoreComposition,
+    transport: &mut eliot_store_surreal::StoreEbpSession,
+    identity: &eliot_protocol::RequestIdentity,
+    request: eliot_blob_api::wire::ProcessStreamSinkWireRequest,
+) -> eliot_blob_api::wire::ProcessStreamSinkWireResponse {
+    use eliot_blob_api::wire::{
+        ProcessStreamSinkWireRequest as Request, ProcessStreamSinkWireResponse as Response,
+        ProcessStreamSinkUnavailableReason as Unavailable,
+    };
+    use eliot_process::stream_sink::{
+        ProcessStreamSinkAbortRequest, ProcessStreamSinkAppend,
+        ProcessStreamSinkFinalizeRequest, ProcessStreamSinkOpenRequest,
+        ProcessStreamSinkUnknownOutcome,
+    };
+
+    fn reject() -> Response {
+        Response::Unavailable {
+            reason: Unavailable::RequestRejected,
+        }
+    }
+
+    fn encode<T: serde::Serialize>(value: &T) -> Result<serde_json::Value, Response> {
+        serde_json::to_value(value).map_err(|_| Response::Unknown)
+    }
+
+    fn binding_ref(binding: &eliot_blob_api::wire::ProcessStreamSinkBindingRef) -> &str {
+        &binding.binding_ref
+    }
+
+    fn same_fence(
+        observed: &StateFence,
+        identity: &eliot_protocol::RequestIdentity,
+    ) -> bool {
+        observed == &identity.request.state_fence
+    }
+
+    fn failure(error: eliot_process::stream_sink::ProcessStreamSinkError) -> Response {
+        use eliot_process::stream_sink::ProcessStreamSinkError as Error;
+        match error {
+            Error::ProviderUnavailable => Response::Unavailable {
+                reason: Unavailable::ProviderUnavailable,
+            },
+            Error::AdmissionFenced { .. } => Response::Unavailable {
+                reason: Unavailable::AdmissionFenced,
+            },
+            Error::StorageCapacity {
+                possible_effect: false,
+                ..
+            } => Response::Unavailable {
+                reason: Unavailable::Capacity,
+            },
+            Error::InvalidReference { .. }
+            | Error::InvalidDigest { .. }
+            | Error::InvalidLimits { .. }
+            | Error::InvalidBinding
+            | Error::InvalidRequest { .. }
+            | Error::SessionMismatch
+            | Error::BindingMismatch
+            | Error::StreamMismatch
+            | Error::PolicyMismatch
+            | Error::SourceMismatch
+            | Error::OpenDigestMismatch
+            | Error::SequenceGap { .. }
+            | Error::OffsetMismatch { .. }
+            | Error::OverlapOrOutOfOrder
+            | Error::MismatchedReplay
+            | Error::ChunkLimitExceeded
+            | Error::AppendPayloadLimitExceeded
+            | Error::TotalLimitExceeded
+            | Error::ChunkCountLimitExceeded
+            | Error::PreviewLimitExceeded
+            | Error::InFlightChunkLimitExceeded
+            | Error::InFlightByteLimitExceeded
+            | Error::AppendAfterFinalizing
+            | Error::Terminal
+            | Error::TerminalIdentityConflict
+            | Error::TerminalCommandStateMismatch => reject(),
+            Error::StorageCapacity {
+                possible_effect: true,
+                ..
+            }
+            | Error::PossibleEffectUnknown { .. }
+            | Error::EvidenceInvariant { .. }
+            | Error::IntegrityFailure { .. }
+            | Error::Serialization { .. } => Response::Unknown,
+        }
+    }
+
+    match request {
+        Request::Open {
+            capability,
+            body,
+            owner_facts,
+            fence,
+            deadline_ms,
+        } => {
+            if !same_fence(&fence, identity) || deadline_elapsed(deadline_ms) {
+                return reject();
+            }
+            let open = match serde_json::from_value::<ProcessStreamSinkOpenRequest>(*body) {
+                Ok(open) if open.validate().is_ok() => open,
+                _ => return reject(),
+            };
+            match composition
+                .blob_sink_open(
+                    transport,
+                    identity,
+                    &capability.reference,
+                    &owner_facts,
+                    open,
+                )
+                .await
+            {
+                Ok((binding_ref, session)) => Response::Opened {
+                    binding: eliot_blob_api::wire::ProcessStreamSinkBindingRef {
+                        binding_ref,
+                        session_id: session.session_id().as_str().to_owned(),
+                        source_id: session.source_id().as_str().to_owned(),
+                        terminal_id: session.terminal_id().as_str().to_owned(),
+                        open_request_sha256: session.open_request_sha256().to_owned(),
+                    },
+                },
+                Err(error) => failure(error),
+            }
+        }
+        Request::Append {
+            capability,
+            binding,
+            body,
+            fence,
+            deadline_ms,
+        } => {
+            if !same_fence(&fence, identity) || deadline_elapsed(deadline_ms) {
+                return reject();
+            }
+            let append = match serde_json::from_value::<ProcessStreamSinkAppend>(*body) {
+                Ok(append) if append.validate().is_ok() => append,
+                _ => return reject(),
+            };
+            match composition
+                .blob_sink_append(
+                    transport,
+                    identity,
+                    &capability.reference,
+                    binding_ref(&binding),
+                    append,
+                )
+                .await
+            {
+                Ok(disposition) => match encode(&disposition) {
+                    Ok(body) => Response::AppendDisposition {
+                        body: Box::new(body),
+                    },
+                    Err(response) => response,
+                },
+                Err(error) => failure(error),
+            }
+        }
+        Request::Finalize {
+            capability,
+            binding,
+            body,
+            fence,
+            deadline_ms,
+        } => {
+            if !same_fence(&fence, identity) || deadline_elapsed(deadline_ms) {
+                return reject();
+            }
+            let finalize = match serde_json::from_value::<ProcessStreamSinkFinalizeRequest>(*body) {
+                Ok(finalize) if finalize.validate().is_ok() => finalize,
+                _ => return reject(),
+            };
+            match composition
+                .blob_sink_finalize(
+                    transport,
+                    identity,
+                    &capability.reference,
+                    binding_ref(&binding),
+                    finalize,
+                )
+                .await
+            {
+                Ok(terminal) => match encode(&terminal) {
+                    Ok(body) => Response::Finalized {
+                        body: Box::new(body),
+                    },
+                    Err(response) => response,
+                },
+                Err(error) => failure(error),
+            }
+        }
+        Request::Abort {
+            capability,
+            binding,
+            body,
+            fence,
+            deadline_ms,
+        } => {
+            if !same_fence(&fence, identity) || deadline_elapsed(deadline_ms) {
+                return reject();
+            }
+            let abort = match serde_json::from_value::<ProcessStreamSinkAbortRequest>(*body) {
+                Ok(abort) if abort.validate().is_ok() => abort,
+                _ => return reject(),
+            };
+            match composition
+                .blob_sink_abort(
+                    transport,
+                    identity,
+                    &capability.reference,
+                    binding_ref(&binding),
+                    abort,
+                )
+                .await
+            {
+                Ok(terminal) => match encode(&terminal) {
+                    Ok(body) => Response::Aborted {
+                        body: Box::new(body),
+                    },
+                    Err(response) => response,
+                },
+                Err(error) => failure(error),
+            }
+        }
+        Request::Readback {
+            capability,
+            binding,
+            fence,
+            deadline_ms,
+        } => {
+            if !same_fence(&fence, identity) || deadline_elapsed(deadline_ms) {
+                return reject();
+            }
+            match composition
+                .blob_sink_readback(
+                    transport,
+                    identity,
+                    &capability.reference,
+                    binding_ref(&binding),
+                )
+                .await
+            {
+                Ok(readback) => match encode(&readback) {
+                    Ok(body) => Response::Readback {
+                        body: Box::new(body),
+                    },
+                    Err(response) => response,
+                },
+                Err(error) => failure(error),
+            }
+        }
+        Request::Reconcile {
+            capability,
+            binding,
+            body,
+            fence,
+            deadline_ms,
+        } => {
+            if !same_fence(&fence, identity) || deadline_elapsed(deadline_ms) {
+                return reject();
+            }
+            let outcome = match serde_json::from_value::<ProcessStreamSinkUnknownOutcome>(*body) {
+                Ok(outcome) if outcome.validate().is_ok() => outcome,
+                _ => return reject(),
+            };
+            match composition
+                .blob_sink_reconcile(
+                    transport,
+                    identity,
+                    &capability.reference,
+                    binding_ref(&binding),
+                    outcome,
+                )
+                .await
+            {
+                Ok(readback) => match encode(&readback) {
+                    Ok(body) => Response::Readback {
+                        body: Box::new(body),
+                    },
+                    Err(response) => response,
+                },
+                Err(error) => failure(error),
+            }
+        }
+    }
+}
+
+async fn dispatch_blob_process_stream(
+    composition: &StoreComposition,
+    transport: &mut eliot_store_surreal::StoreEbpSession,
+    identity: &eliot_protocol::RequestIdentity,
+    request: eliot_blob_api::wire::BlobProcessStreamFrameRequest,
+) -> Result<eliot_blob_api::wire::BlobProcessStreamFrameResponse, String> {
+    use eliot_blob_api::wire::{
+        BlobProcessStreamFrameResponse, BlobProcessStreamOperationResponse,
+        BlobProcessStreamOperationRequest, ProcessStreamSourceReadbackResponse,
+    };
+
+    request.validate().map_err(|error| error.to_string())?;
+    let operation = match request.operation {
+        BlobProcessStreamOperationRequest::Sink { request } => {
+            BlobProcessStreamOperationResponse::Sink {
+                response: dispatch_blob_process_stream_sink(
+                    composition,
+                    transport,
+                    identity,
+                    request,
+                )
+                .await,
+            }
+        }
+        BlobProcessStreamOperationRequest::SourceReadback { request } => {
+            let response = if deadline_elapsed(request.deadline_ms) {
+                ProcessStreamSourceReadbackResponse::Unknown
+            } else {
+                match composition
+                    .blob_source_readback(
+                        transport,
+                        identity,
+                        request.clone(),
+                    )
+                    .await
+                {
+                    Ok(response) => {
+                        validate_source_readback_response(&request, identity, &response)?;
+                        response
+                    }
+                    Err(eliot_process::stream_sink::ProcessStreamSinkError::AdmissionFenced {
+                        ..
+                    }) => ProcessStreamSourceReadbackResponse::Unknown,
+                    Err(eliot_process::stream_sink::ProcessStreamSinkError::ProviderUnavailable)
+                    | Err(eliot_process::stream_sink::ProcessStreamSinkError::PossibleEffectUnknown {
+                        ..
+                    })
+                    | Err(eliot_process::stream_sink::ProcessStreamSinkError::IntegrityFailure {
+                        ..
+                    }) => ProcessStreamSourceReadbackResponse::Unknown,
+                    Err(error) => return Err(error.to_string()),
+                }
+            };
+            BlobProcessStreamOperationResponse::SourceReadback { response }
+        }
+    };
+    let response = BlobProcessStreamFrameResponse {
+        wire_id: eliot_blob_api::wire::BLOB_PROCESS_STREAM_WIRE_ID.to_owned(),
+        wire_revision: eliot_blob_api::wire::BLOB_PROCESS_STREAM_WIRE_REVISION,
+        operation,
+    };
+    response.validate().map_err(|error| error.to_string())?;
+    Ok(response)
+}
+
+fn validate_source_readback_response(
+    request: &eliot_blob_api::wire::ProcessStreamSourceReadbackRequest,
+    identity: &eliot_protocol::RequestIdentity,
+    response: &eliot_blob_api::wire::ProcessStreamSourceReadbackResponse,
+) -> Result<(), String> {
+    use eliot_blob_api::wire::{
+        ProcessStreamSourceReadbackResponse, PROCESS_STREAM_READBACK_MAX_CHUNK_BYTES,
+    };
+
+    if let ProcessStreamSourceReadbackResponse::Ready {
+        bytes,
+        whole_source_sha256,
+        whole_source_byte_length,
+        chunk_offset,
+        observed_sha256,
+        observed_byte_length,
+        ready_receipt_ref,
+        source_owner_generation,
+        readback_receipt_id,
+        observed_fence,
+        observed_at_unix_ms,
+    } = response
+    {
+        use sha2::{Digest, Sha256};
+        let chunk_sha256 = format!("{:x}", Sha256::digest(bytes));
+        let chunk_end = chunk_offset
+            .checked_add(*observed_byte_length)
+            .ok_or_else(|| "Blob source-readback chunk offset overflow".to_owned())?;
+        if *chunk_offset != request.offset
+            || bytes.len() > PROCESS_STREAM_READBACK_MAX_CHUNK_BYTES as usize
+            || *observed_byte_length != bytes.len() as u64
+            || chunk_sha256 != *observed_sha256
+            || whole_source_sha256 != &request.expected_sha256
+            || *whole_source_byte_length != request.expected_byte_length
+            || ready_receipt_ref != &request.ready_receipt_ref
+            || chunk_end > request.expected_byte_length
+            || source_owner_generation == &0
+            || readback_receipt_id.trim().is_empty()
+            || *observed_at_unix_ms == 0
+            || observed_fence != &identity.request.state_fence
+        {
+            return Err("Blob source-readback evidence does not match the exact request".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn deadline_elapsed(deadline_ms: u64) -> bool {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .is_none_or(|now_ms| now_ms >= deadline_ms)
+}
 
 /// Stable operational-log stem for this process. The generation name carries
 /// the exit code, so a fresh process start is distinguishable from a rolling
@@ -629,6 +1072,9 @@ async fn serve_handshake_loop(
         {
             Ok(frame) => frame,
             Err(error) => {
+                composition
+                    .release_blob_stream_session(session.connection_id())
+                    .await;
                 let mut events = BoundedEventLog::new();
                 emit_lifecycle(
                     &mut events,
@@ -648,6 +1094,73 @@ async fn serve_handshake_loop(
                 return Err(error);
             }
         };
+        if is_blob_process_stream_frame(&frame) {
+            let request_identity = eliot_store_surreal::validate_blob_process_stream_request_frame(
+                &mut session,
+                &frame,
+            );
+            let response_frame = match request_identity {
+                Ok(identity) => {
+                    let request = match &frame.payload {
+                        ProtocolPayload::Json(payload) => serde_json::from_value::<
+                            eliot_blob_api::wire::BlobProcessStreamFrameRequest,
+                        >(payload.clone())
+                        .map_err(|error| {
+                            format!("invalid Blob process-stream request: {error}")
+                        })?,
+                        _ => return Err("Blob process-stream request must be JSON".to_owned()),
+                    };
+                    match dispatch_blob_process_stream(
+                        composition,
+                        &mut session,
+                        &identity,
+                        request,
+                    )
+                    .await
+                    {
+                        Ok(response) => blob_process_stream_response_frame(
+                            &session,
+                            frame.request_id.clone(),
+                            response,
+                        )?,
+                        Err(error) => {
+                            let defect = frame_rejection_defect(frame.request_id.clone(), error);
+                            eliot_store_api::response_frame(
+                                session.connection_id(),
+                                session.protocol_version(),
+                                frame.request_id.clone(),
+                                defect,
+                            )
+                            .map_err(|error| {
+                                format!("invalid Blob rejection response: {error}")
+                            })?
+                        }
+                    }
+                }
+                Err(error) => {
+                    let defect = frame_rejection_defect(frame.request_id.clone(), error);
+                    eliot_store_api::response_frame(
+                        session.connection_id(),
+                        session.protocol_version(),
+                        frame.request_id.clone(),
+                        defect,
+                    )
+                    .map_err(|error| format!("invalid Blob rejection response: {error}"))?
+                }
+            };
+            if let Err(error) = server
+                .send_frame(&response_frame, negotiated_limits)
+                .await
+                .map_err(|error| format!("Blob process-stream response failed: {error}"))
+            {
+                composition
+                    .release_blob_stream_session(session.connection_id())
+                    .await;
+                return Err(error);
+            }
+            continue;
+        }
+
         let mut round = BoundedEventLog::new();
         let (request_identity, response) =
             match validate_request_frame_with_log(&mut session, &frame, &mut round) {
@@ -682,6 +1195,9 @@ async fn serve_handshake_loop(
         {
             Ok(frame) => frame,
             Err(error) => {
+                composition
+                    .release_blob_stream_session(session.connection_id())
+                    .await;
                 let mut events = BoundedEventLog::new();
                 emit_lifecycle(
                     &mut events,
@@ -706,6 +1222,9 @@ async fn serve_handshake_loop(
             .await
             .map_err(|error| format!("EBP response failed: {error}"))
         {
+            composition
+                .release_blob_stream_session(session.connection_id())
+                .await;
             // Response loss after mutation: the recorded dispatch outcome
             // stands with the same operation identity. Delivery and outcome
             // stay unknown here, never re-decided into commit or rollback.

@@ -1784,6 +1784,24 @@ pub(crate) struct KernelIssuedBlobProcessStreamGrant {
         eliot_blob_api::wire::BlobProcessStreamOwnerFactsPullResponse,
 }
 
+/// Derives the opaque, stable ORS key for one capability ordinal. The value
+/// contains no authority; Kernel still resolves it under the authenticated
+/// retained capability and exact ordinal.
+#[cfg(windows)]
+pub(crate) fn blob_process_stream_call_token_ref(
+    capability_ref: &str,
+    ordinal: u32,
+) -> Result<String, ProcessExecutionError> {
+    use eliot_contracts::{canonical_json_bytes, sha256_hex};
+
+    let seed = canonical_json_bytes(&(capability_ref, ordinal))
+        .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+    Ok(format!(
+        "blob-call-{}-{ordinal}",
+        &sha256_hex(&seed)[..32]
+    ))
+}
+
 #[cfg(windows)]
 pub(crate) struct CanonicalStoreAttachment<'a> {
     pub(crate) gateway: Arc<KernelStoreGateway>,
@@ -3866,9 +3884,7 @@ impl KernelComposition {
         ))
         .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
         let capability_ref = format!("blob-cap-{}", &sha256_hex(&capability_seed)[..40]);
-        let token_seed = canonical_json_bytes(&(capability_ref.as_str(), 1_u32, nonce))
-            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
-        let token_ref = format!("blob-call-{}", &sha256_hex(&token_seed)[..40]);
+        let token_ref = blob_process_stream_call_token_ref(&capability_ref, 1)?;
         let state_fence_json = canonical_json_bytes(&identity.request.state_fence)
             .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
         let store_session_binding_json = canonical_json_bytes(&(

@@ -41,7 +41,8 @@ use super::{
     route_doctor_repair, route_testd_admission, status_frame, unix_ms,
 };
 use eliot_blob_api::wire::{
-    BLOB_PROCESS_STREAM_KERNEL_WIRE_ID, BlobProcessStreamKernelRequest,
+    BLOB_PROCESS_STREAM_KERNEL_WIRE_ID, BLOB_PROCESS_STREAM_RECONCILE_WIRE_ID,
+    BlobProcessStreamKernelReconcileRequest, BlobProcessStreamKernelRequest,
 };
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_kernel_core::{
@@ -258,6 +259,7 @@ fn actual_route_name(action: &KernelFrameAction) -> &'static str {
     match action {
         KernelFrameAction::Reply(_) => "reply_admitted",
         KernelFrameAction::BlobProcessStream { .. } => "blob_process_stream_admitted",
+        KernelFrameAction::BlobProcessStreamReconcile { .. } => "blob_process_stream_reconcile_admitted",
         KernelFrameAction::Daemon { .. } => "daemon_admitted",
         KernelFrameAction::Process { .. } => "process_admitted",
         KernelFrameAction::Doctor { .. } => "doctor_admitted",
@@ -907,6 +909,28 @@ impl KernelComposition {
                     .validate()
                     .map_err(|_| TransportError::SessionFenced)?;
                 return Ok(KernelFrameAction::BlobProcessStream {
+                    request_id,
+                    request,
+                });
+            }
+            if payload.get("wire_id").and_then(serde_json::Value::as_str)
+                == Some(BLOB_PROCESS_STREAM_RECONCILE_WIRE_ID)
+            {
+                if session.module_generation.module_id.as_str() != TESTD_MODULE_ID
+                    || frame.request_identity.is_some()
+                    || !probe_ready_state_admitted(
+                        self.service_state()
+                            .map_err(|_| TransportError::SessionFenced)?,
+                    )
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                let request: BlobProcessStreamKernelReconcileRequest =
+                    serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+                request
+                    .validate()
+                    .map_err(|_| TransportError::SessionFenced)?;
+                return Ok(KernelFrameAction::BlobProcessStreamReconcile {
                     request_id,
                     request,
                 });

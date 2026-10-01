@@ -346,6 +346,30 @@ async fn serve_connection(
                     return Err(error);
                 }
             }
+            KernelFrameAction::BlobProcessStream {
+                request_id,
+                request,
+            } => {
+                let reply = kernel
+                    .execute_blob_process_stream_request(&session, request_id, request)
+                    .await?;
+                if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
+                    session.fence();
+                    return Err(error);
+                }
+            }
+            KernelFrameAction::BlobProcessStreamReconcile {
+                request_id,
+                request,
+            } => {
+                let reply = kernel
+                    .reconcile_blob_process_stream_request(&session, request_id, request)
+                    .await?;
+                if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
+                    session.fence();
+                    return Err(error);
+                }
+            }
             KernelFrameAction::Process {
                 request_id,
                 request,
@@ -617,6 +641,8 @@ async fn serve_user_broker_connection(
                 break send_checked(&mut front_door, &rejection, limits).await;
             }
             KernelFrameAction::Process { .. }
+            | KernelFrameAction::BlobProcessStream { .. }
+            | KernelFrameAction::BlobProcessStreamReconcile { .. }
             | KernelFrameAction::Daemon { .. }
             | KernelFrameAction::Doctor { .. }
             | KernelFrameAction::Testd { .. }
@@ -864,6 +890,8 @@ async fn serve_admitted_bridge_host_requests(
                 return Ok(());
             }
             KernelFrameAction::Process { .. }
+            | KernelFrameAction::BlobProcessStream { .. }
+            | KernelFrameAction::BlobProcessStreamReconcile { .. }
             | KernelFrameAction::Daemon { .. }
             | KernelFrameAction::Doctor { .. }
             | KernelFrameAction::Testd { .. }
