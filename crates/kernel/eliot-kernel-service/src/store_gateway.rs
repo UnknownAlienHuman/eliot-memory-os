@@ -76,7 +76,8 @@ use eliot_ors::{
     CONTRACT_VERSION as ORS_CONTRACT_VERSION, HOST_REQUEST_SEND_CLAIM_LEASE_MS, HostRequestAttempt,
     HostRequestAttemptPhase, HostRequestDeliveryReceipt, HostRequestKind, HostRequestNoSendProof,
     HostRequestOwnerReadbackEvidence, HostRequestRecord, HostRequestResponseSource,
-    HostRequestState, HostRequestTransportBoundary, HostRequestTransportObservation, OpaqueLabel,
+    HostRequestState, HostRequestTransportBoundary, HostRequestTransportObservation,
+    InitialSetupAuthorityPhase, OpaqueLabel, OperationalPhase, OperationalRecoveryStore,
     RedbRecoveryStore, ReservationRecord, UnknownCommitOutcome, UnknownCommitRecord,
     WriterReservationToken,
 };
@@ -98,12 +99,13 @@ use eliot_runtime_contracts::{
 };
 use eliot_store_api::{
     CanonicalRequestView, CanonicalRestoreBatch, CanonicalStoreClient, CanonicalValidationSnapshot,
-    NamedReadRequest, NamedReadResponse, OperationIdentity, OrderingHead, OrderingHeadExpectation,
-    OrderingScopeId, PreparedTransition, RecoveryRecord, RecoveryRecordKey, RequestMeta,
+    NamedMutationOperation, NamedReadRequest, NamedReadResponse, OperationIdentity, OrderingHead,
+    OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RecoveryRecord, RecoveryRecordKey,
+    RequestMeta,
     ReservedWriteRequest, RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation,
     RevisionKey, ScopeId, ScopeRevisionView, StoreError, StoreGenesisRequest, StoreHealth,
     StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, WriteReceiptStatus, WriteSubmission,
-    admit_write_submission, canonical_request_hash, dreamer_job_queue_key,
+    TransitionClass, admit_write_submission, canonical_request_hash, dreamer_job_queue_key,
     generated_operation_manifests, operation_manifest_set_digest, verify_canonical_request_hash,
 };
 use serde::{Deserialize, Serialize};
@@ -1282,6 +1284,50 @@ impl KernelStoreGateway {
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     ) -> Result<WriteReceipt, StoreApplyRefusal> {
+        self.apply_inner(
+            context,
+            None,
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+        )
+        .await
+    }
+
+    /// Applies the original Policy or WorkScope setup write while checking its
+    /// full authenticated request identity against the independently retained
+    /// setup-authority record (issue #1927).
+    ///
+    /// The generic `apply` route deliberately has no request-deadline or
+    /// cancellation identity. Owner-bound setup writes must use this narrow
+    /// entry so the receiving Kernel can compare the exact RequestIdentity
+    /// bytes before either admission or Store send.
+    pub async fn apply_initial_setup(
+        &self,
+        context: &RequestMetadata,
+        request_identity: &RequestIdentity,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    ) -> Result<WriteReceipt, StoreApplyRefusal> {
+        self.apply_inner(
+            context,
+            Some(request_identity),
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+        )
+        .await
+    }
+
+    async fn apply_inner(
+        &self,
+        context: &RequestMetadata,
+        request_identity: Option<&RequestIdentity>,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    ) -> Result<WriteReceipt, StoreApplyRefusal> {
         let _flight = self
             .flight
             .enter()
@@ -1319,9 +1365,11 @@ impl KernelStoreGateway {
         // decision as a success this route would then have to re-inspect.
         admit_prepared_transition(
             context,
+            request_identity,
             &transition,
             &expected_revision_heads,
             &expected_ordering_heads,
+            self.commit_ors.as_deref(),
         )?;
 
         let lease = {
@@ -1377,6 +1425,15 @@ impl KernelStoreGateway {
                 "canonical-store gateway is fenced for rebind".to_owned(),
             ));
         }
+        validate_current_proof_approval_support(
+            context,
+            request_identity,
+            &transition,
+            &expected_revision_heads,
+            &expected_ordering_heads,
+            self.commit_ors.as_deref(),
+        )
+        .map_err(|error| StoreApplyRefusal::GatewayRefusal(error.to_string()))?;
 
         let identity = transition.identity.clone();
         let ordering_scopes: Vec<String> = transition
@@ -1396,11 +1453,20 @@ impl KernelStoreGateway {
                 expected_ordering_heads.clone(),
             )
         };
-        let query = || {
-            self.store.receipt_exact(
-                identity.operation_id.clone(),
-                identity.canonical_request_hash.as_str(),
-            )
+        let query = || async {
+            let receipt = self
+                .store
+                .receipt_exact(
+                    identity.operation_id.clone(),
+                    identity.canonical_request_hash.as_str(),
+                )
+                .await?;
+            EbpCanonicalStoreClient::<NamedPipeTransport>::validate_preserved_receipt_bindings(
+                &transition.security.authority_binding,
+                &transition.security.causal_binding,
+                &receipt,
+            )?;
+            Ok(receipt)
         };
         let result = recover_commit(
             self.commit_ors.as_deref(),
@@ -1499,6 +1565,20 @@ impl KernelStoreGateway {
             "reserved writes require the composition-bound ORS; refusing without unreserved Apply fallback"
                 .to_owned()
         })?;
+        if transition.security.authority_binding.is_some()
+            || transition.security.causal_binding.is_some()
+            || transition.required_proof_and_approval_refs.is_empty()
+        {
+            validate_current_proof_approval_support(
+                context,
+                None,
+                &transition,
+                &expected_revision_heads,
+                &expected_ordering_heads,
+                Some(&commit_ors),
+            )
+            .map_err(|error| error.to_string())?;
+        }
         let owner = self.bind_reservation_owner(&commit_ors, context, &transition)?;
         // Reservation and eligibility run without any admission lease: queued
         // normal work holds no provider permit, Kernel lock, or
@@ -1514,7 +1594,14 @@ impl KernelStoreGateway {
         .map_err(|error| error.to_string())?;
         ensure_eligible(&owner, &sealed.token).map_err(|error| error.to_string())?;
         let operation_id = transition.identity.operation_id.as_str().to_owned();
-        if let Err(error) = validate_current_proof_approval_support(&transition) {
+        if let Err(error) = validate_current_proof_approval_support(
+            context,
+            None,
+            &transition,
+            &expected_revision_heads,
+            &expected_ordering_heads,
+            Some(&commit_ors),
+        ) {
             let refusal =
                 refuse_determinate_reserved_write(&owner, &sealed.token, &error, &operation_id);
             return Err(refusal);
@@ -1525,6 +1612,19 @@ impl KernelStoreGateway {
         let lease = self.acquire_send_lease(&transition)?;
         if self.is_fenced() {
             return Err("canonical-store gateway is fenced for rebind".to_owned());
+        }
+        if let Err(error) = validate_current_proof_approval_support(
+            context,
+            None,
+            &transition,
+            &expected_revision_heads,
+            &expected_ordering_heads,
+            Some(&commit_ors),
+        ) {
+            let refusal =
+                refuse_determinate_reserved_write(&owner, &sealed.token, &error, &operation_id);
+            drop(lease);
+            return Err(refusal);
         }
         // The single authenticated send goes through the Kernel-visible
         // reserved submission (issue #2031): the exact `#990` projection plus
@@ -1561,7 +1661,11 @@ impl KernelStoreGateway {
                 drop(lease);
                 Ok(receipt)
             }
-            Err(StoreError::MissingReceiptEnvelope) => {
+            Err(
+                StoreError::MissingReceiptEnvelope
+                | StoreError::UnknownOutcome { .. }
+                | StoreError::Unavailable,
+            ) => {
                 // Still unknown after possible submission: preserve
                 // `Executing`/`Reconciling` identity until exact Store receipt
                 // reconciliation. Never a blind retry, never a release.
@@ -9778,9 +9882,11 @@ fn refuse_determinate_reserved_write(
 /// outcome is the canonical receipt the send produces.
 fn admit_prepared_transition(
     context: &RequestMetadata,
+    request_identity: Option<&RequestIdentity>,
     transition: &PreparedTransition,
     expected_revision_heads: &[RevisionHeadExpectation],
     expected_ordering_heads: &[OrderingHeadExpectation],
+    ors: Option<&RedbRecoveryStore>,
 ) -> Result<(), StoreApplyRefusal> {
     let gate: Result<(), StoreError> = (|| {
         context.validate().map_err(StoreError::Foundation)?;
@@ -9790,7 +9896,14 @@ fn admit_prepared_transition(
             return Err(StoreError::ManifestMismatch);
         }
         transition.validate()?;
-        validate_current_proof_approval_support(transition)?;
+        validate_current_proof_approval_support(
+            context,
+            request_identity,
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+            ors,
+        )?;
         if transition.state_fence != context.state_fence {
             return Err(StoreError::FenceMismatch);
         }
@@ -9835,22 +9948,182 @@ fn admit_prepared_transition(
     Err(StoreApplyRefusal::admission(submission, cause))
 }
 
-/// Refuses recorded generic proof/approval handles unless this receiving
-/// Kernel has a current owner projection that can resolve them. The current
-/// contract carries opaque strings only and this build has no owner lookup
-/// for them, so non-empty handles cannot authorize execution. Reserved writes
-/// call this after staging and retain the exact plan as visible recovery work;
-/// unreserved writes refuse before any store send.
+/// Resolves the exact initial setup owner proof and compares the retained
+/// original plan before a Policy or WorkScope effect. Those two named owner
+/// writes always require the paired bindings and full request identity, even
+/// if a claimant clears the proof-reference list. Legacy non-empty proof
+/// references without the paired bindings remain unsupported and are refused;
+/// reserved writes preserve those original staged bytes as visible Recovery.
 fn validate_current_proof_approval_support(
+    context: &RequestMetadata,
+    request_identity: Option<&RequestIdentity>,
     transition: &PreparedTransition,
+    expected_revision_heads: &[RevisionHeadExpectation],
+    expected_ordering_heads: &[OrderingHeadExpectation],
+    ors: Option<&RedbRecoveryStore>,
 ) -> Result<(), StoreError> {
-    if transition.required_proof_and_approval_refs.is_empty() {
-        return Ok(());
-    }
-    Err(StoreError::InvalidField {
+    let refused = || StoreError::InvalidField {
         field: "proof_and_approval_refs",
-        reason: "receiving Kernel has no current owner lookup for these references",
-    })
+        reason: "receiving Kernel could not match this plan to the retained initial owner admission",
+    };
+    let setup_kind = transition.named_operations.iter().find_map(|named| {
+        match named.operation {
+            NamedMutationOperation::RecordPolicySnapshot => Some(InitialSetupWriteKind::Policy),
+            NamedMutationOperation::RecordWorkScopeSnapshot => {
+                Some(InitialSetupWriteKind::WorkScope)
+            }
+            _ => None,
+        }
+    });
+    let (authority, causal) = match (
+        transition.security.authority_binding.as_ref(),
+        transition.security.causal_binding.as_ref(),
+    ) {
+        (None, None)
+            if transition.required_proof_and_approval_refs.is_empty()
+                && request_identity.is_none()
+                && setup_kind.is_none() =>
+        {
+            return Ok(())
+        }
+        (Some(authority), Some(causal)) => (authority, causal),
+        _ => return Err(refused()),
+    };
+    if transition.transition_class != TransitionClass::RecoverySchema {
+        return Err(refused());
+    }
+    let setup_kind = setup_kind.ok_or_else(refused)?;
+    let ors = ors.ok_or_else(refused)?;
+    let is_work_scope = matches!(setup_kind, InitialSetupWriteKind::WorkScope);
+    let record = match setup_kind {
+        InitialSetupWriteKind::Policy if causal.parent_receipt_id.is_none() => {
+            ors.load_initial_setup_authority(transition.identity.operation_id.as_str())
+        }
+        InitialSetupWriteKind::WorkScope => {
+            let parent_receipt_id = causal.parent_receipt_id.as_ref().ok_or_else(refused)?;
+            ors.load_initial_setup_authority_by_policy_receipt_id(parent_receipt_id.as_str())
+        }
+        InitialSetupWriteKind::Policy => return Err(refused()),
+    }
+    .map_err(|_| refused())?
+    .ok_or_else(refused)?;
+    record.validate().map_err(|_| refused())?;
+
+    let (
+        expected_operation,
+        expected_identity_json,
+        expected_identity_sha256,
+        expected_request_json,
+        expected_request_sha256,
+        expected_causal,
+    ) = if is_work_scope {
+        if record.phase != InitialSetupAuthorityPhase::WorkScopePrepared {
+            return Err(refused());
+        }
+        (
+            record.work_scope_operation.as_ref().ok_or_else(refused)?,
+            record
+                .work_scope_request_identity_json
+                .as_deref()
+                .ok_or_else(refused)?,
+            record
+                .work_scope_request_identity_sha256
+                .as_deref()
+                .ok_or_else(refused)?,
+            record.work_scope_request_json.as_deref().ok_or_else(refused)?,
+            record.work_scope_request_sha256.as_deref().ok_or_else(refused)?,
+            record
+                .work_scope_causal_binding
+                .as_ref()
+                .ok_or_else(refused)?,
+        )
+    } else {
+        if record.phase != InitialSetupAuthorityPhase::Prepared {
+            return Err(refused());
+        }
+        (
+            &record.policy_operation,
+            record.policy_request_identity_json.as_str(),
+            record.policy_request_identity_sha256.as_str(),
+            record.policy_request_json.as_str(),
+            record.policy_request_sha256.as_str(),
+            &record.policy_causal_binding,
+        )
+    };
+
+    if record.state_fence != transition.state_fence
+        || expected_operation != &transition.identity
+        || &record.authority_binding != authority
+        || expected_causal != causal
+        || transition.state_fence != context.state_fence
+    {
+        return Err(refused());
+    }
+
+    let retained_identity: RequestIdentity =
+        serde_json::from_str(expected_identity_json).map_err(|_| refused())?;
+    retained_identity.validate().map_err(|_| refused())?;
+    let supplied_identity = request_identity.ok_or_else(refused)?;
+    supplied_identity.validate().map_err(|_| refused())?;
+    let supplied_identity_json =
+        canonical_json_bytes(supplied_identity).map_err(|_| refused())?;
+    if supplied_identity != &retained_identity
+        || supplied_identity_json.as_slice() != expected_identity_json.as_bytes()
+        || sha256_hex(expected_identity_json.as_bytes()) != expected_identity_sha256
+        || retained_identity.request.metadata != *context
+        || retained_identity.request.state_fence != transition.state_fence
+        || retained_identity.idempotency_key != transition.identity.idempotency_key
+    {
+        return Err(refused());
+    }
+
+    let request_view = CanonicalRequestView::from_apply(
+        context,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+    );
+    let request_json = canonical_json_bytes(&request_view).map_err(|_| refused())?;
+    if request_json.as_slice() != expected_request_json.as_bytes()
+        || sha256_hex(&request_json) != expected_request_sha256
+        || transition.identity.canonical_request_hash != expected_request_sha256
+    {
+        return Err(refused());
+    }
+
+    let expected_refs = [
+        record.root_grant_subject_id.as_str(),
+        record.root_grant_receipt.record_id().as_str(),
+    ];
+    if transition.required_proof_and_approval_refs.len() != expected_refs.len()
+        || transition
+            .required_proof_and_approval_refs
+            .iter()
+            .zip(expected_refs)
+            .any(|(actual, expected)| actual.as_str() != expected)
+    {
+        return Err(refused());
+    }
+    let grant = ors
+        .load_capability_grant(&record.root_grant_subject_id)
+        .map_err(|_| refused())?
+        .ok_or_else(refused)?;
+    if grant.record().subject_id.as_str() != record.root_grant_receipt.subject_id().as_str()
+        || grant.phase() != OperationalPhase::Active
+        || grant.operation_order() == 0
+        || grant.operation_order() != record.root_grant_receipt.operation_order()
+        || grant.receipt() != &record.root_grant_receipt
+    {
+        return Err(refused());
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InitialSetupWriteKind {
+    Policy,
+    WorkScope,
 }
 
 /// Reserved-write admission gates shared by the gateway entry point.
@@ -10324,23 +10597,23 @@ mod tests {
             &CanonicalRequestView::from_apply(&context, &transition, &[], &[]),
         )
         .unwrap_or_else(|_| unreachable!());
-        admit_prepared_transition(&context, &transition, &[], &[])
+        admit_prepared_transition(&context, None, &transition, &[], &[], None)
             .unwrap_or_else(|_| unreachable!());
 
         let mut widened = transition.clone();
         widened.requested_effect_ceiling = EffectClass::ReversibleMutation;
-        assert!(admit_prepared_transition(&context, &widened, &[], &[]).is_err());
+        assert!(admit_prepared_transition(&context, None, &widened, &[], &[], None).is_err());
 
         let mut reparam = transition.clone();
         reparam.named_operations[0].parameters.insert(
             "subject".to_owned(),
             serde_json::json!("observation-substituted"),
         );
-        assert!(admit_prepared_transition(&context, &reparam, &[], &[]).is_err());
+        assert!(admit_prepared_transition(&context, None, &reparam, &[], &[], None).is_err());
 
         let mut redigest = transition.clone();
         redigest.admission_contract_set_digest = "d".repeat(64);
-        assert!(admit_prepared_transition(&context, &redigest, &[], &[]).is_err());
+        assert!(admit_prepared_transition(&context, None, &redigest, &[], &[], None).is_err());
 
         let mut unsupported = transition.clone();
         unsupported.operation_manifest_digest =
@@ -10349,7 +10622,7 @@ mod tests {
             &CanonicalRequestView::from_apply(&context, &unsupported, &[], &[]),
         )
         .unwrap_or_else(|_| unreachable!());
-        let error = match admit_prepared_transition(&context, &unsupported, &[], &[]) {
+        let error = match admit_prepared_transition(&context, None, &unsupported, &[], &[], None) {
             Err(error) => error,
             Ok(_) => unreachable!("unsupported manifest must fail"),
         };
