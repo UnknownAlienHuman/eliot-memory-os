@@ -55,7 +55,9 @@ use eliot_protocol::{
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope, HostRequestInvokeReadPayload,
     HostRequestResultBody, HostRequestResultLineage, LocalReadAttempt, LocalReadExecutionEvidence,
     MessageType, ProtocolPayload, ProtocolVersion, RequestIdentity, TaskControllerAttempt,
-    TaskControllerInvocation, TaskControllerResultBody, host_request_operation_id,
+    SelectedSourceCaptureInvocation, SELECTED_SOURCE_CAPTURE_CAPABILITY,
+    SELECTED_SOURCE_CAPTURE_PAYLOAD_SCHEMA_ID, TaskControllerInvocation,
+    TaskControllerResultBody, host_request_operation_id,
 };
 use eliot_receipts::RequestBinding;
 #[cfg(windows)]
@@ -425,6 +427,79 @@ pub struct TaskControllerClaimedInvocation {
     pub request_identity: RequestIdentity,
     pub operation_id: OperationId,
     pub attempt: TaskControllerAttempt,
+}
+
+/// Kernel-claimed selected-source mutation request. The host envelope and
+/// original EBP `RequestIdentity` are retained exactly; this lane carries no
+/// LocalReadAttempt or Task Controller attempt.
+#[derive(Clone, Debug)]
+pub struct SelectedSourceCaptureClaimedInvocation {
+    pub host_request_envelope: HostRequestEnvelope,
+    pub invocation: SelectedSourceCaptureInvocation,
+    pub request_identity: RequestIdentity,
+}
+
+/// Parses one `source_capture.claim` answer into its exact typed request.
+pub fn parse_selected_source_capture_claimed_pair(
+    value: &serde_json::Value,
+) -> Result<Option<SelectedSourceCaptureClaimedInvocation>, String> {
+    let pair = value
+        .get("pair")
+        .ok_or_else(|| "Kernel source_capture.claim answer omits pair".to_owned())?;
+    if pair.is_null() {
+        return Ok(None);
+    }
+    if !pair.is_object() {
+        return Err("Kernel source_capture.claim pair is neither an object nor null".to_owned());
+    }
+    let decode = |field: &str| {
+        pair.get(field)
+            .cloned()
+            .ok_or_else(|| format!("Kernel source_capture.claim pair omits {field}"))
+    };
+    let envelope: HostRequestEnvelope = serde_json::from_value(decode("envelope")?)
+        .map_err(|error| format!("Kernel source_capture.claim envelope does not decode: {error}"))?;
+    envelope
+        .validate_for_admission()
+        .map_err(|error| format!("Kernel source_capture.claim envelope is invalid: {error}"))?;
+    let invocation: SelectedSourceCaptureInvocation =
+        serde_json::from_value(decode("invocation")?).map_err(|error| {
+            format!("Kernel source_capture.claim invocation does not decode: {error}")
+        })?;
+    invocation
+        .validate()
+        .map_err(|error| format!("Kernel source_capture.claim invocation is invalid: {error}"))?;
+    let request_identity: RequestIdentity = serde_json::from_value(decode("request_identity")?)
+        .map_err(|error| {
+            format!("Kernel source_capture.claim RequestIdentity does not decode: {error}")
+        })?;
+    request_identity
+        .validate()
+        .map_err(|error| format!("Kernel source_capture.claim RequestIdentity is invalid: {error}"))?;
+    if envelope.kind != eliot_protocol::HostRequestKind::SelectedSourceCapture
+        || envelope.identity.capability != SELECTED_SOURCE_CAPTURE_CAPABILITY
+        || envelope.identity.payload_schema_id != SELECTED_SOURCE_CAPTURE_PAYLOAD_SCHEMA_ID
+        || envelope.identity.parent_operation_id.is_some()
+        || envelope.identity.request_id != request_identity.request.metadata.request_id
+        || envelope.identity.idempotency_key != request_identity.idempotency_key
+        || envelope.identity.cancellation_id != request_identity.cancellation_id
+        || envelope.identity.deadline_unix_ms != request_identity.deadline_unix_ms
+        || request_identity.request.state_fence != envelope.state_fence
+        || request_identity.request.metadata.state_fence != envelope.state_fence
+        || request_identity.request.metadata.task_id.as_ref().map(ToString::to_string)
+            != envelope.identity.task_id
+        || request_identity.request.metadata.session_id.as_ref().map(ToString::to_string)
+            != envelope.identity.session_id
+    {
+        return Err(
+            "Kernel source_capture.claim pair does not bind the typed invocation to its authenticated envelope and original RequestIdentity".to_owned(),
+        );
+    }
+    Ok(Some(SelectedSourceCaptureClaimedInvocation {
+        host_request_envelope: envelope,
+        invocation,
+        request_identity,
+    }))
 }
 
 /// Typed outcome of one `task_controller_result` submit.
@@ -2782,6 +2857,25 @@ impl DaemonKernelClient {
             .await
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
         parse_task_controller_claimed_pair(&value).map_err(super::DaemonError::Kernel)
+    }
+
+    /// Claims one admitted selected-source capture invocation from its
+    /// dedicated Kernel queue. It returns the exact original host envelope and
+    /// EBP request identity without borrowing either the evidence-query or
+    /// Task Controller attempt capability.
+    #[cfg(windows)]
+    pub async fn claim_selected_source_capture_pair_async(
+        &self,
+    ) -> Result<Option<SelectedSourceCaptureClaimedInvocation>, super::DaemonError> {
+        let value = self
+            .transact_async(
+                "source_capture.claim",
+                serde_json::json!({ "operation": "source_capture.claim" }),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        parse_selected_source_capture_claimed_pair(&value)
+            .map_err(super::DaemonError::Kernel)
     }
 
     /// Submits one daemon-produced local-read result body for its waiting

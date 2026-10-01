@@ -10879,6 +10879,44 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         self.finish_task_selection_for_request(pending, completion_now, acceptance)
     }
 
+    /// Resolves task-selection evidence from the current retained activation
+    /// for an authenticated request whose Session, Task, WorkScope, and fence
+    /// are selectors only. The principal is derived from the live
+    /// WorkLease-to-WorkItem owner projection, then the full existing request
+    /// validator re-reads and compares that selection around the Kernel task
+    /// acceptance read. This keeps callers from supplying a principal label
+    /// when the protocol identity does not carry one.
+    pub async fn task_selection_evidence_for_authenticated_request(
+        &self,
+        mut read_now: impl FnMut() -> Result<u64, CompositionError>,
+        request_session_ref: &str,
+        request_task_ref: &str,
+        request_scope_ref: &str,
+        request_fence: &StateFence,
+    ) -> Result<TaskSelectionAdmissionBinding, CompositionError> {
+        request_fence
+            .validate()
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        let initial_now = read_now()?;
+        let (activation, _) = self.read_unique_agent_activation_with_selection(initial_now)?;
+        if !fences_match_exact(&activation.state_fence, request_fence)
+            || activation.session_id != request_session_ref
+            || activation.task_id.as_str() != request_task_ref
+            || activation.work_scope_id != request_scope_ref
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        self.task_selection_evidence_for_request(
+            &mut read_now,
+            &activation.principal_id,
+            request_session_ref,
+            request_task_ref,
+            request_scope_ref,
+            request_fence,
+        )
+        .await
+    }
+
     /// Captures the validated owner selection before Governor awaits its
     /// canonical acceptance-set read.
     fn prepare_task_selection_for_request(
