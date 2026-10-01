@@ -232,6 +232,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             Some(scan_receipt),
             now,
         )?;
-        Ok(ColdStartTriggerCompilation { claim, join: compiled })
+        Ok(ColdStartTriggerCompilation {
+            claim,
+            join: compiled,
+        })
     }
 }
