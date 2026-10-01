@@ -391,6 +391,32 @@ struct UnknownOriginRecord {
     /// the same resource continues from the same before-state.
     #[serde(default)]
     unresolved_gap: bool,
+    /// The observing lane's claimed correlation for a gap marker (I10.21
+    /// W3): the Session, lease, operation, attempt, and fence generation
+    /// the witness held when the observation failed. `None` for proven
+    /// transitions (their claimant correlation lives on the governed record
+    /// or the reconciling link) and for markers recorded before witness
+    /// correlation existed. A witness names who observed the failure, never
+    /// who wrote the bytes: uncertain provenance stays explicit.
+    #[serde(default)]
+    witness: Option<UnresolvedTransitionWitness>,
+}
+
+/// Witness correlation for one unresolved-transition marker (I10.21 W3):
+/// the Session, `ActionLease`, tool operation, attempt receipt, and
+/// State-Fence generation the observing lane claims for the failed
+/// observation. Every field is validated like claimed hint correlation
+/// (see [`validate_hint`]): present fields must be well-formed references,
+/// and `operation` is always present because the marker identity (`cmx:`)
+/// is keyed by it. Absent optionals mean the observing lane held no such
+/// evidence, never an unattributed claim.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct UnresolvedTransitionWitness {
+    pub session: Option<String>,
+    pub action_lease: Option<String>,
+    pub operation: String,
+    pub attempt_receipt: Option<String>,
+    pub fence_generation: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -703,6 +729,11 @@ pub(crate) fn confirm_hint(
                 transition_digest,
                 reconciled,
                 unresolved_gap: false,
+                // I10.21 W3: a proven transition carries no witness. Its
+                // claimant correlation lives on the governed record (or the
+                // reconciling link); the unknown record keeps the exact
+                // pair plus its reconciliation state.
+                witness: None,
             });
             reconciled
         }
@@ -1241,7 +1272,13 @@ pub(crate) fn reconcile_unknown_change(
 /// before-state (see [`confirm_hint`] and [`record_governed_tool_change`]),
 /// so a transient read glitch is recovered by the next capture instead of
 /// bricking the resource, while a real hidden mutation stays blocked
-/// behind the re-detected unknown.
+/// behind the re-detected unknown. The marker keeps the observing lane's
+/// claimed correlation ([`UnresolvedTransitionWitness`], I10.21 W3): Session,
+/// lease, operation, attempt, and fence generation the witness held when
+/// the observation failed. The witness names who observed the failure,
+/// never who wrote the bytes, and the first observing witness wins on
+/// replay — retrying the same failed observation replays the same marker
+/// with the same witness instead of conflicting.
 ///
 /// Caller (I10.21 A2/A4):
 /// `crate::process_execution::KernelGovernedProcessEffectPort`, on
@@ -1251,19 +1288,38 @@ pub(crate) fn reconcile_unknown_change(
 /// establishes it.
 pub(crate) fn note_unresolved_transition(
     resource: &str,
-    operation: &str,
+    witness: &UnresolvedTransitionWitness,
     before_digest: Option<String>,
 ) -> Result<String, ChangeMonitorError> {
-    if !text(resource) || !text(operation) {
+    if !text(resource) || !text(&witness.operation) {
         return Err(ChangeMonitorError::InvalidHint);
+    }
+    // I10.21 W3: witness correlation is validated exactly like claimed hint
+    // correlation. Absent optionals stay absent: only the observing lane's
+    // held Session/lease/attempt may appear here.
+    for reference in [
+        witness.session.as_ref(),
+        witness.action_lease.as_ref(),
+        witness.attempt_receipt.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !text(reference) {
+            return Err(ChangeMonitorError::InvalidHint);
+        }
     }
     if let Some(before) = &before_digest
         && !is_sha256_hex(before)
     {
         return Err(ChangeMonitorError::InvalidHint);
     }
-    let (change_id, transition_digest) =
-        material_transition_ids(&format!("cmx:{operation}"), before_digest.as_deref(), None);
+    let witness_operation = witness.operation.as_str();
+    let (change_id, transition_digest) = material_transition_ids(
+        &format!("cmx:{witness_operation}"),
+        before_digest.as_deref(),
+        None,
+    );
     let mut ledger = ledger()?;
     match ledger.unknown.entry(change_id.clone()) {
         Entry::Vacant(slot) => {
@@ -1274,6 +1330,7 @@ pub(crate) fn note_unresolved_transition(
                 transition_digest,
                 reconciled: false,
                 unresolved_gap: true,
+                witness: Some(witness.clone()),
             });
         }
         Entry::Occupied(slot) => {
@@ -1453,6 +1510,26 @@ fn validate_imported_ledger(ledger: &KernelChangeLedger) -> Result<(), ChangeMon
         if !change_id.starts_with("cmu:") || !text(&unknown.resource) {
             return Err(ChangeMonitorError::SidecarCorrupt);
         }
+        // I10.21 W3: a durable witness carries the same validated shape
+        // live ingress enforces; markers recorded before witness
+        // correlation carry none.
+        if let Some(witness) = &unknown.witness {
+            if !text(&witness.operation) {
+                return Err(ChangeMonitorError::SidecarCorrupt);
+            }
+            for reference in [
+                witness.session.as_ref(),
+                witness.action_lease.as_ref(),
+                witness.attempt_receipt.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if !text(reference) {
+                    return Err(ChangeMonitorError::SidecarCorrupt);
+                }
+            }
+        }
         for digest in [&unknown.before_digest, &unknown.after_digest]
             .into_iter()
             .flatten()
@@ -1609,7 +1686,12 @@ pub(crate) struct TransferredPendingHint {
 
 /// One unknown-origin Material change for the Governor owner (I10.21 W4):
 /// the exact before/after pair and transition the Kernel ledger recorded,
-/// with its reconciliation state and evidence class (I10.21 W6).
+/// with its reconciliation state and evidence class (I10.21 W6). A gap
+/// marker additionally carries the observing witness (I10.21 W3), so the
+/// owner keeps the uncertain-provenance classification — who observed the
+/// failure, never who wrote the bytes — instead of minting unattributed
+/// state. New for transfer documents written with witness correlation;
+/// older documents default it absent.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct TransferredUnknownChange {
     pub change_id: String,
@@ -1619,6 +1701,8 @@ pub(crate) struct TransferredUnknownChange {
     pub transition_digest: String,
     pub reconciled: bool,
     pub evidence_class: TransferEvidenceClass,
+    #[serde(default)]
+    pub witness: Option<UnresolvedTransitionWitness>,
 }
 
 /// One governed-tool original for the Governor owner (I10.21 W5): the
@@ -1756,6 +1840,7 @@ pub(crate) fn export_observation_transfer()
             } else {
                 TransferEvidenceClass::UnknownUnreconciled
             },
+            witness: unknown.witness.clone(),
         })
         .collect();
     let governed_originals = ledger
