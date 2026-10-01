@@ -1238,6 +1238,50 @@ impl StageOrchestrator {
     /// process. The tool version stays unobserved (`None`): no version is
     /// attested on this path, so none is claimed, while a spec-pinned
     /// version still gates inside admission.
+    /// Refuses anything but the admitted closed mutation request.
+    ///
+    /// Issue #1814: builds the snapshot when a live registry is present
+    /// (`None` registry preserves the recorded registry-less-caller
+    /// residual), then invokes the Governor-owned commit entry's closed
+    /// mutation request over it: the exact `ApplyInstrumentRegistryState`
+    /// command the canonical owner executes. Anything but the admitted
+    /// closed mutation refuses here, before any child exists.
+    fn refuse_unadmitted_stage(
+        live: Option<&InstrumentRegistry>,
+        planned: &PlannedStage,
+        identity: &ResolvedExecutableIdentity,
+        route: &TestExecutionPlaneRoute,
+    ) -> Option<InstrumentRun> {
+        let registry = live?;
+        let submission = match submit_admission_snapshot(registry, &planned.stage, identity) {
+            Ok(submission) => submission,
+            Err(error) => {
+                return Some(InstrumentRun::missing(
+                    route,
+                    format!("stage admission refused: {error}"),
+                ));
+            }
+        };
+        let request = submission.mutation_request();
+        let admitted = request.operation
+            == eliot_store_api::NamedMutationOperation::ApplyInstrumentRegistryState
+            && eliot_store_api::decode_instrument_registry_mutation(&request.parameters)
+                .is_ok_and(|snapshot| snapshot == submission.snapshot_json());
+        if admitted {
+            return None;
+        }
+        Some(InstrumentRun::missing(
+            route,
+            format!(
+                "stage admission refused: {}",
+                crate::profile::ProfileError::Snapshot {
+                    detail: "admission mutation is not the admitted closed registry request"
+                        .to_owned(),
+                }
+            ),
+        ))
+    }
+
     async fn launch_one<E: ProcessExecutor + 'static>(
         runner: &InstrumentRunner<E>,
         live: Option<&InstrumentRegistry>,
@@ -1312,42 +1356,8 @@ impl StageOrchestrator {
         ) {
             return InstrumentRun::missing(route, reason);
         }
-        let submission = if let Some(registry) = live {
-            match submit_admission_snapshot(registry, &planned.stage, &identity) {
-                Ok(submission) => Some(submission),
-                Err(error) => {
-                    return InstrumentRun::missing(
-                        route,
-                        format!("stage admission refused: {error}"),
-                    );
-                }
-            }
-        } else {
-            None
-        };
-        if let Some(submission) = submission.as_ref() {
-            // Issue #1814: invoke the Governor-owned commit entry's closed
-            // mutation request over the admitted snapshot: the exact
-            // `ApplyInstrumentRegistryState` command the canonical owner
-            // executes. Anything but the admitted closed mutation refuses
-            // here, before any child exists.
-            let request = submission.mutation_request();
-            let admitted = request.operation
-                == eliot_store_api::NamedMutationOperation::ApplyInstrumentRegistryState
-                && eliot_store_api::decode_instrument_registry_mutation(&request.parameters)
-                    .is_ok_and(|snapshot| snapshot == submission.snapshot_json());
-            if !admitted {
-                return InstrumentRun::missing(
-                    route,
-                    format!(
-                        "stage admission refused: {}",
-                        crate::profile::ProfileError::Snapshot {
-                            detail: "admission mutation is not the admitted closed registry request"
-                                .to_owned(),
-                        }
-                    ),
-                );
-            }
+        if let Some(refusal) = Self::refuse_unadmitted_stage(live, planned, &identity, route) {
+            return refusal;
         }
         let mut binding = match InstrumentBinding::from_request(invocation, process_request) {
             Ok(binding) => binding,
