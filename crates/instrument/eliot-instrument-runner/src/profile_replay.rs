@@ -22,8 +22,11 @@ use eliot_testd_core::{
     TestdStreamEvidenceBinding, TestdToolObservation,
 };
 use eliot_module_registry::ModuleCatalogSnapshot;
-use eliot_workscope::{
-    GoverningSource, GoverningSourceRole, SourceStatus, WorkScopeBindingSnapshot,
+use eliot_workscope::{GoverningSource, GoverningSourceRole, SourceStatus, WorkScopeBindingSnapshot};
+use eliot_bootstrap::{
+    NormativePair,
+    capture::{NormativePairSourceCapture, NormativePairSourceRole},
+    normative::{NormativePairReceiptIdentity, parse_normative_pair_receipt_identity},
 };
 use thiserror::Error;
 
@@ -432,6 +435,7 @@ pub fn current_testd_provider_registry(
         work_scope_binding,
         &observations.source.before.repository_root,
         &receipt,
+        &captured_sources,
     )?;
     if admitted_pair != receipt.pair {
         return Err(ProfileReplayError::NormativePairMismatch);
@@ -454,6 +458,7 @@ fn admitted_work_scope_normative_pair(
     binding: &WorkScopeBindingSnapshot,
     repository_root: &str,
     receipt: &NormativePairReceiptIdentity,
+    current_capture: &NormativePairSourceCapture,
 ) -> Result<NormativePair, ProfileReplayError> {
     binding
         .validate()
@@ -484,21 +489,46 @@ fn admitted_work_scope_normative_pair(
         GoverningSourceRole::Implementation,
         binding,
     )?;
-    let architecture_refs = [
-        receipt.architecture_path.as_str(),
-        receipt.architecture_entry_path.as_str(),
-        receipt.architecture_compatibility_path.as_str(),
-    ];
-    let implementation_refs = [
-        receipt.implementation_path.as_str(),
-        receipt.implementation_entry_path.as_str(),
-        receipt.implementation_compatibility_path.as_str(),
-    ];
-    if !architecture_refs.contains(&architecture.source_ref.as_str())
-        || !implementation_refs.contains(&implementation.source_ref.as_str())
-        || architecture.source_ref == implementation.source_ref
-        || architecture.digest != receipt.pair.architecture_sha256
-        || implementation.digest != receipt.pair.implementation_sha256
+    let capture_json = source_admission
+        .normative_pair_source_capture_json
+        .as_deref()
+        .ok_or(ProfileReplayError::NormativePairSourceAdmission)?;
+    let capture_sha256 = source_admission
+        .normative_pair_source_capture_sha256
+        .as_deref()
+        .ok_or(ProfileReplayError::NormativePairSourceAdmission)?;
+    let capture_digest = capture_sha256
+        .strip_prefix("sha256:")
+        .unwrap_or(capture_sha256);
+    let capture_value: serde_json::Value = serde_json::from_slice(capture_json.as_bytes())
+        .map_err(|_| ProfileReplayError::NormativePairSourceAdmission)?;
+    let canonical_capture = canonical_json_bytes(&capture_value)
+        .map_err(|_| ProfileReplayError::NormativePairSourceAdmission)?;
+    let current_capture_value = serde_json::to_value(current_capture)
+        .map_err(|_| ProfileReplayError::NormativePairSourceAdmission)?;
+    let current_capture_bytes = canonical_json_bytes(&current_capture_value)
+        .map_err(|_| ProfileReplayError::NormativePairSourceAdmission)?;
+    if !valid_sha256_text(capture_digest)
+        || sha256_hex(capture_json.as_bytes()) != capture_digest
+        || canonical_capture != capture_json.as_bytes()
+        || canonical_capture != current_capture_bytes
+        || current_capture.receipt != *receipt
+        || current_capture.architecture.role != NormativePairSourceRole::Architecture
+        || current_capture.architecture.source_ref != receipt.architecture_path
+        || current_capture.architecture.entry_ref != receipt.architecture_entry_path
+        || current_capture.architecture.compatibility_ref
+            != receipt.architecture_compatibility_path
+        || current_capture.architecture.content_sha256 != receipt.pair.architecture_sha256
+        || current_capture.implementation.role != NormativePairSourceRole::Implementation
+        || current_capture.implementation.source_ref != receipt.implementation_path
+        || current_capture.implementation.entry_ref != receipt.implementation_entry_path
+        || current_capture.implementation.compatibility_ref
+            != receipt.implementation_compatibility_path
+        || current_capture.implementation.content_sha256 != receipt.pair.implementation_sha256
+        || architecture.source_ref != current_capture.architecture.source_ref
+        || architecture.digest != current_capture.architecture.content_sha256
+        || implementation.source_ref != current_capture.implementation.source_ref
+        || implementation.digest != current_capture.implementation.content_sha256
     {
         return Err(ProfileReplayError::NormativePairSourceAdmission);
     }
