@@ -164,6 +164,12 @@ impl KernelComposition {
         launch
             .validate()
             .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        if self.quarantine_daemon_restart_budget_before_launch(&launch)? {
+            return Err(KernelBuildError::Service(
+                "eliotd restart budget is exhausted for this caller/generation; lineage quarantined"
+                    .to_owned(),
+            ));
+        }
         let gateway = self.process_gateway.as_ref().ok_or_else(|| {
             KernelBuildError::Service(
                 "process authority is required before eliotd launch".to_owned(),
