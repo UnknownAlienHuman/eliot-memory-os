@@ -121,8 +121,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use eliot_contracts::{
-    ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence, canonical_json_bytes,
-    sha256_hex,
+    ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence,
+    canonical_json_bytes, sha256_hex,
 };
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::RequestBinding;
@@ -195,12 +195,24 @@ pub async fn emit_notification_acknowledgement(
         return Ok(None);
     }
     let ordering_head = read_notification_ordering_head(&reads).await?;
-    // The submission identity is derived from the exact compare-and-swap state
-    // this transition observed: the same acknowledgement resubmitted against
-    // the same ordering sequence is the same operation and replays
-    // idempotently, while the sequence's own advance after a commit gives a
-    // later leg its own identity. No counter, clock, or random value is
-    // involved.
+    // The OPERATION TEXT is derived from the exact compare-and-swap state this
+    // transition observed: the same acknowledgement resubmitted against the
+    // same ordering sequence is the same operation and replays idempotently,
+    // while the sequence's own advance after a commit gives a later leg its own
+    // identity. No counter, clock, or random value enters THAT string.
+    //
+    // Stated precisely because the rest of the identity is not clock-free
+    // (issue #1927): `acknowledge_commit_identity` below reads `unix_ms_i64()`
+    // into `RequestMetadata::clock` and derives `deadline_unix_ms` from
+    // `unix_ms()`. `RequestMetadata` is a hashed member of
+    // `canonical_request_hash`, so the plan's `identity.canonical_request_hash`
+    // and therefore its `prepared_transition_digest` differ between two runs a
+    // millisecond apart. The idempotent replay above does not depend on them:
+    // it is keyed on the operation text and the observed ordering sequence.
+    // Whether an authenticated daemon write may carry no time observation at
+    // all is an I5.5 request-authentication decision owned by
+    // `eliot_contracts::RequestMetadata` and `eliot_protocol`; it is recorded
+    // in `notification_plan_admission.rs` and deliberately not taken here.
     let operation_text = format!(
         "notify-state:{dedup_key}:acknowledge:seq{}",
         ordering_head.expected_sequence
@@ -411,4 +423,3 @@ fn acknowledge_commit_identity(
         cancellation_id: format!("{SERVICE_NAME}:{operation_text}:cancel"),
     })
 }
-

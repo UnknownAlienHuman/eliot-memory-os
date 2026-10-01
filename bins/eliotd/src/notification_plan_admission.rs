@@ -10,7 +10,7 @@
 //! production `NotificationState` write legs, in one place, so the eighteen
 //! keys are bound by a single owner instead of being restated by each leg.
 //!
-//! # The plan is a pure function of the admitted inputs
+//! # The plan is a pure function of the admitted inputs, identity included
 //!
 //! [`NotificationPlanAdmission`] carries only state that was already admitted
 //! before this function runs: the authenticated ingress identity the leg
@@ -30,11 +30,44 @@
 //!   copies it verbatim without sorting, so execution order is declared, not
 //!   derived.
 //!
-//! Two runs over the same admitted state therefore produce a byte-identical
-//! plan, including `identity.canonical_request_hash`,
-//! `mutation_plan_digest`, `admission_digest` and — because
-//! `prepared_transition_digest` hashes this whole value — the staged plan
-//! digest.
+//! ## What that does and does not buy, stated exactly
+//!
+//! The determinism proven here is **conditional on the supplied
+//! `&RequestIdentity`**: given the same admitted state AND the same identity,
+//! two runs produce a byte-identical plan, including
+//! `identity.canonical_request_hash`, `mutation_plan_digest`,
+//! `admission_digest` and — because `prepared_transition_digest` hashes this
+//! whole value — the staged plan digest. This function itself contributes no
+//! clock, no random value, no environment read and no unordered iteration, so
+//! it is not the source of any variation in that result.
+//!
+//! It is not claimed that these two legs are replay-stable today, and they are
+//! not. Both legs derive their identity through
+//! `notification_state_emit::notification_commit_identity` and
+//! `notification_acknowledge_emit::acknowledge_commit_identity`, which read
+//! `unix_ms_i64()` into `RequestMetadata::clock` and set
+//! `deadline_unix_ms` from `unix_ms()`. `RequestMetadata` is a hashed member
+//! of `canonical_request_hash`
+//! (`crates/storage/eliot-store-api/src/request_hash.rs:98`), so
+//! `identity.canonical_request_hash` — and therefore
+//! `prepared_transition_digest` — varies per millisecond on these legs, and
+//! two runs a millisecond apart are NOT byte-identical. Neither leg's
+//! idempotence rests on that digest: the upsert leg's repeat guard is
+//! `notification_state_emit::notification_already_recorded`, which asks the
+//! store about `AutomationFailureKey::dedup_key` at this fence and returns
+//! before any write, and the acknowledgement leg's is
+//! `notification_acknowledge_emit::acknowledgement_still_owed`, which reads
+//! the addressed record and returns before any write. Both are keyed on store
+//! state and on the operation text, never on a plan digest.
+//!
+//! The named residual: whether an authenticated daemon WRITE request may carry
+//! no time observation at all, or must carry one, is a request-authentication
+//! decision owned by `eliot_contracts::RequestMetadata` and
+//! `eliot_protocol` — I5.5, not I5.6. Removing or defaulting the reading would
+//! change the canonical request identity of every plan these legs produce, so
+//! it is recorded here and deliberately not taken. Until that owner decides,
+//! the honest statement is the conditional one above, and no replay-stability
+//! claim is made anywhere in this file.
 //!
 //! # Each digest is computed over the bytes it names
 //!
@@ -103,6 +136,13 @@
 //! `privacy_origin_taint_metadata` is carried, on `SecurityContext`, as
 //! recorded provenance. This leg binds the empty chain explicitly rather than
 //! synthesizing source assurance it did not observe.
+//!
+//! And plan replay-stability is not claimed: see "What that does and does not
+//! buy, stated exactly" above. The plan is a pure function of the admitted
+//! inputs INCLUDING the supplied identity, and the identity those legs supply
+//! carries an observed clock reading, so the staged plan digest is not stable
+//! across two runs a millisecond apart. The owner of that decision is named
+//! there and is not this module.
 //!
 //! Forbidden authority: no Store or provider client, no alternate transport,
 //! no retry or default synthesis, no second notification model, and no semantic
@@ -226,8 +266,11 @@ pub struct VerifiedNotificationPlan {
 /// 10. freshness and post-commit revisions are not normalized here because this
 ///     leg is not a reusable candidate: it is admitted once against one
 ///     observed ordering sequence and never promoted to a hot candidate;
-/// 11. the plan is built deterministically and its admission-decision digest is
-///     derived over the carried content (I5.6 step 12) inside
+/// 11. the plan is built as a pure function of the supplied admitted inputs —
+///     identity included, and no replay-stability beyond that is claimed (see
+///     "What that does and does not buy, stated exactly" in the module
+///     documentation) — and its admission-decision digest is derived over the
+///     carried content (I5.6 step 12) inside
 ///     `CanonicalWriteEnvelope::prepare`.
 /// 12. the produced plan is then checked against current admissible support
 ///     and against its own recorded canonical request hash before it can be
