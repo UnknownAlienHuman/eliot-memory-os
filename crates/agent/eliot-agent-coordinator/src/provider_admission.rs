@@ -77,6 +77,7 @@ use crate::model::{
     ProviderReassignmentReceipt, ProviderUnknownOutcomeReconciliation, ProviderWorkerFenceReceipt,
     ResultSubmission, validate_text,
 };
+use crate::swarm_admission_bind::ADMISSION_EXPIRY_WINDOW_FIELD;
 
 /// Ingress-presented claim material for one provider admission (T9-05
 /// presented half, issue #1108).
@@ -688,6 +689,27 @@ fn receipt_proof_identity(
         ProviderProofKind::Admission => {
             let receipt = serde_json::from_str::<ProviderAdmissionReceipt>(canonical_payload)
                 .map_err(|_| CoordinatorError::InvalidField("canonical_payload"))?;
+            // Issue #370 R1: the admission owner-issued expiry is read here from
+            // the receipt's ORIGINAL canonical bytes and enforced as a refusal,
+            // because it is the one receipt field no issuer in this tree
+            // populates (every construction site is a test fixture). An
+            // unissued bound is refused here rather than read as "never
+            // expires": `ProviderAdmissionReceipt::expires_at_unix_ms` states
+            // that zero is an unissued bound, and
+            // `swarm_admission_bind::check_admission_window` already refuses
+            // it in the same way. Enforcing it at THIS leg means the admission
+            // can never be proved under an unissued time bound, so the moment a
+            // real owner-issued expiry lands the proof binds it, and before
+            // that a receipt carrying zero fails closed instead of admitting
+            // unbounded work. The value is compared as issued, never
+            // recomputed: no clock is invented here and no digest is
+            // re-derived, because the coordinator holds no observation instant
+            // at proof time.
+            if receipt.expires_at_unix_ms == 0 {
+                return Err(CoordinatorError::InvalidField(
+                    ADMISSION_EXPIRY_WINDOW_FIELD,
+                ));
+            }
             let first = receipt
                 .admitted_lanes
                 .first()
