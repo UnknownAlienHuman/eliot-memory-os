@@ -4261,23 +4261,28 @@ pub fn prepare_initial_policy_owner_snapshot(
     }
     let (expected_state, expected_revision, expected_digest, state_fence) =
         match &owner_readback.state {
-        PolicyOwnerSnapshotReadbackState::Absent => (
-            "physical_absence",
-            None,
-            None,
-            &identity.request.metadata.state_fence,
-        ),
-        PolicyOwnerSnapshotReadbackState::Empty {
-            state_fence,
-            owner_revision,
-            value_digest,
-        } => ("existing", Some(owner_revision), Some(value_digest), state_fence),
-        PolicyOwnerSnapshotReadbackState::Bound(_) => {
-            return Err(CompositionError::Provider(
-                "initial signed Policy snapshot cannot replace a bound Policy owner".to_owned(),
-            ));
-        }
-    };
+            PolicyOwnerSnapshotReadbackState::Absent => (
+                "physical_absence",
+                None,
+                None,
+                &identity.request.metadata.state_fence,
+            ),
+            PolicyOwnerSnapshotReadbackState::Empty {
+                state_fence,
+                owner_revision,
+                value_digest,
+            } => (
+                "existing",
+                Some(owner_revision),
+                Some(value_digest),
+                state_fence,
+            ),
+            PolicyOwnerSnapshotReadbackState::Bound(_) => {
+                return Err(CompositionError::Provider(
+                    "initial signed Policy snapshot cannot replace a bound Policy owner".to_owned(),
+                ));
+            }
+        };
     if *state_fence != identity.request.metadata.state_fence
         || expected_revision.is_some_and(|revision| *revision == 0)
     {

@@ -1074,25 +1074,22 @@ fn validate_policy_snapshot_transition(
                     reason: "physical absence cannot carry revision or digest sentinels",
                 });
             }
-            let response_json = optional_text("absence_read_response_json")?.ok_or(
-                StoreError::InvalidField {
+            let response_json =
+                optional_text("absence_read_response_json")?.ok_or(StoreError::InvalidField {
                     field: "policy.absence_read_response_json",
                     reason: "physical absence requires the exact named-read response",
-                },
-            )?;
-            let response_digest = optional_text("absence_read_response_sha256")?.ok_or(
-                StoreError::InvalidField {
+                })?;
+            let response_digest =
+                optional_text("absence_read_response_sha256")?.ok_or(StoreError::InvalidField {
                     field: "policy.absence_read_response_sha256",
                     reason: "physical absence requires the exact response digest",
-                },
-            )?;
+                })?;
             validate_digest(response_digest, "policy.absence_read_response_sha256")?;
-            let response_value: serde_json::Value = serde_json::from_str(response_json).map_err(|_| {
-                StoreError::InvalidField {
+            let response_value: serde_json::Value =
+                serde_json::from_str(response_json).map_err(|_| StoreError::InvalidField {
                     field: "policy.absence_read_response_json",
                     reason: "must be canonical named-read response JSON",
-                }
-            })?;
+                })?;
             if !response_value.is_object()
                 || canonical_json_bytes(&response_value)
                     .map_err(|error| StoreError::Serialization(error.to_string()))?
@@ -1104,8 +1101,8 @@ fn validate_policy_snapshot_transition(
                     reason: "must match its canonical named-read response digest",
                 });
             }
-            let response: NamedReadResponse = serde_json::from_value(response_value)
-                .map_err(|_| StoreError::InvalidField {
+            let response: NamedReadResponse =
+                serde_json::from_value(response_value).map_err(|_| StoreError::InvalidField {
                     field: "policy.absence_read_response_json",
                     reason: "must be a closed named-read response",
                 })?;

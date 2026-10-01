@@ -20,9 +20,9 @@ use eliot_store_api::{
     FencedProjectionPublication, NamedReadOperation, NamedReadRequest, NamedReadResponse,
     OperationId, OrderingHead, OrderingScopeId, PAYLOAD_AUTHORITY_VERSION, PayloadEncoding,
     PayloadSource, PolicyOwnerSnapshotReadResult, ProjectionPublicationRecord, RecoveryRecord,
-    RecoveryRecordKey, RevisionHead, RevisionKey, ScopeId,
-    ScopeRevisionView, StateFence, StoreError, WriteReceipt, WriteReceiptStatus,
-    audit_heads_digest, generated_operation_manifests, named_mutation_operation_name,
+    RecoveryRecordKey, RevisionHead, RevisionKey, ScopeId, ScopeRevisionView, StateFence,
+    StoreError, WriteReceipt, WriteReceiptStatus, audit_heads_digest,
+    generated_operation_manifests, named_mutation_operation_name,
 };
 
 use super::{

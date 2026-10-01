@@ -176,10 +176,12 @@ pub(super) fn append_policy_owner_statement(
             .parameters
             .get(name)
             .map(|value| {
-                value.as_str().ok_or(AdapterError::Store(StoreError::InvalidField {
-                    field: "operation.parameter",
-                    reason: "optional policy parameter must be text",
-                }))
+                value
+                    .as_str()
+                    .ok_or(AdapterError::Store(StoreError::InvalidField {
+                        field: "operation.parameter",
+                        reason: "optional policy parameter must be text",
+                    }))
             })
             .transpose()
     };
@@ -207,7 +209,9 @@ pub(super) fn append_policy_owner_statement(
                 }),
             )?;
             if response_sha.len() != 64
-                || response_sha.bytes().any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+                || response_sha
+                    .bytes()
+                    .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
                 || eliot_store_api::sha256_hex(response_json.as_bytes()) != response_sha
             {
                 return Err(AdapterError::Store(StoreError::InvalidField {
@@ -252,8 +256,13 @@ pub(super) fn append_policy_owner_statement(
                         reason: "must carry the typed policy-owner result",
                     })
                 })?;
-            absence.validate(&transition.state_fence).map_err(AdapterError::Store)?;
-            if !matches!(absence, eliot_store_api::PolicyOwnerSnapshotReadResult::Absent { .. }) {
+            absence
+                .validate(&transition.state_fence)
+                .map_err(AdapterError::Store)?;
+            if !matches!(
+                absence,
+                eliot_store_api::PolicyOwnerSnapshotReadResult::Absent { .. }
+            ) {
                 return Err(AdapterError::Store(StoreError::InvalidField {
                     field: "policy.absence_read_response_json",
                     reason: "must prove physical policy-row absence",
@@ -270,12 +279,14 @@ pub(super) fn append_policy_owner_statement(
                     reason: "existing-row CAS cannot carry absence proof",
                 }));
             }
-            let revision = text_param("expected_policy_revision")?.parse::<u64>().map_err(|_| {
-                AdapterError::Store(StoreError::InvalidField {
-                    field: "policy.owner_revision",
-                    reason: "expected revision must be a decimal revision",
-                })
-            })?;
+            let revision = text_param("expected_policy_revision")?
+                .parse::<u64>()
+                .map_err(|_| {
+                    AdapterError::Store(StoreError::InvalidField {
+                        field: "policy.owner_revision",
+                        reason: "expected revision must be a decimal revision",
+                    })
+                })?;
             if revision == 0 {
                 return Err(AdapterError::Store(StoreError::InvalidField {
                     field: "policy.owner_revision",
@@ -284,7 +295,9 @@ pub(super) fn append_policy_owner_statement(
             }
             let digest = text_param("expected_policy_digest")?;
             if digest.len() != 64
-                || digest.bytes().any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+                || digest
+                    .bytes()
+                    .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
             {
                 return Err(AdapterError::Store(StoreError::InvalidField {
                     field: "policy.owner_digest",
@@ -342,8 +355,8 @@ pub(super) fn append_policy_owner_statement(
             }));
         }
     };
-    let key = eliot_store_api::RecoveryRecordKey::new("owner", "policy")
-        .map_err(AdapterError::Store)?;
+    let key =
+        eliot_store_api::RecoveryRecordKey::new("owner", "policy").map_err(AdapterError::Store)?;
     let key_json = eliot_store_api::canonical_json_bytes(&key)
         .map_err(|error| AdapterError::Serialization(error.to_string()))?;
     let owner_id = eliot_store_api::sha256_hex(&key_json);
@@ -380,7 +393,10 @@ pub(super) fn append_policy_owner_statement(
         "policy_expected_value_digest".to_owned(),
         json!(expected_value_digest),
     );
-    bindings.insert("policy_create_if_absent".to_owned(), json!(create_if_absent));
+    bindings.insert(
+        "policy_create_if_absent".to_owned(),
+        json!(create_if_absent),
+    );
     bindings.insert("policy_owner_record".to_owned(), Value::Object(record));
     Ok(())
 }
