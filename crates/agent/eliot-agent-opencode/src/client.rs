@@ -2681,7 +2681,7 @@ mod tests {
     }
 
     #[test]
-    fn correlated_wrong_route_and_unbound_session_error_are_terminal()
+    fn correlated_route_divergence_is_observed_and_unbound_session_error_is_terminal()
     -> Result<(), Box<dyn std::error::Error>> {
         let model = ModelSelection::new("opencode-go", "deepseek-v4-flash")?;
         let mut state = CorrelatedEventState::new("ses_1", "msg_user_1", &model);
@@ -2693,10 +2693,20 @@ mod tests {
                 "modelID": "deepseek-v4-flash-free", "time": {"completed": 2}
             }}
         }))?;
-        assert!(matches!(
-            state.observe(&wrong_route),
-            Err(OpenCodeRunError::Protocol(_))
-        ));
+        // #369 W12 treats an observed provider/model mismatch as physical
+        // route-divergence evidence, not malformed protocol. Correlation must
+        // retain the assistant event so the admitted sealer can publish the
+        // typed DIVERGED receipt with both route fingerprints.
+        let info = wrong_route
+            .properties
+            .get("info")
+            .and_then(Value::as_object)
+            .ok_or("assistant info must be an object")?;
+        let observed_route = attest_message_route(info, &model)?;
+        assert_ne!(observed_route, model);
+        state.observe(&wrong_route)?;
+        assert_eq!(state.assistant_message_id.as_deref(), Some("msg_assistant_1"));
+        assert!(!state.is_complete());
 
         let unbound_error = serde_json::from_value::<OpenCodeEvent>(serde_json::json!({
             "type": "session.error",
