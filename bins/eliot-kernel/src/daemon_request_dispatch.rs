@@ -9743,6 +9743,7 @@ impl KernelComposition {
             verified_correction = None;
         }
         super::blackboard::validate_blackboard_transition(session, &operation.transition)?;
+        validate_mailbox_transition(session, &operation.transition)?;
         let gateway = self.retained_store_gateway()?;
         if let Some(replayed) = self
             .replay_committed_apply_receipt(
@@ -12643,6 +12644,124 @@ fn validate_origin_inspection(
         super::dispatch_launch::ComposedDispatchContour::installation_id,
     );
     if live.trim().is_empty() || request.installation_id() != live {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(())
+}
+
+/// Mechanically admits an `AdmitMailboxMessage` operation in an existing
+/// owner-prepared transition (issue #1820).
+///
+/// This is the Kernel mailbox dispatch hook beside the blackboard gate in
+/// `store_apply_operation`: the owner-prepared transition carries exactly one
+/// named `AdmitMailboxMessage` mutation; the hook decodes it through the store
+/// contract, rebuilds the mailbox message draft and the caller-read-back
+/// record view from the carried `expected_head`, and runs the mechanical
+/// `admit_mailbox_message` admission over them. The admitted record must be
+/// the carried record, so the hook agrees with the exact bytes the store leg
+/// below persists and the batch runs draft -> admit -> store mutation ->
+/// receipt with one admission vocabulary. Typed refusals stay typed: a reused
+/// identity naming a different message is `TransportError::IdentityConflict`
+/// and every other refusal is `TransportError::SessionFenced`. Transitions
+/// without a mailbox operation pass through untouched, exactly like the
+/// blackboard gate.
+#[cfg(windows)]
+fn validate_mailbox_transition(
+    session: &Session,
+    transition: &PreparedTransition,
+) -> Result<(), TransportError> {
+    let Some(operation) = transition.named_operations.iter().find(|operation| {
+        operation.operation == eliot_store_api::NamedMutationOperation::AdmitMailboxMessage
+    }) else {
+        return Ok(());
+    };
+    if transition.named_operations.len() != 1
+        || transition.transition_class != eliot_store_api::TransitionClass::CaptureCandidate
+        || transition.requested_effect_ceiling != eliot_store_api::EffectClass::Candidate
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    let admission =
+        eliot_store_api::decode_mailbox_item(operation.operation, &operation.parameters)
+            .map_err(|_| TransportError::SessionFenced)?;
+    let record = &admission.record;
+    if transition.task_id.as_deref() != Some(record.task_id.as_str())
+        || record.state_fence != transition.state_fence
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    let principal = match &session.peer {
+        PeerIdentity::Authenticated { user_identity, .. }
+            if !user_identity.trim().is_empty() && !user_identity.chars().any(char::is_control) =>
+        {
+            user_identity
+        }
+        PeerIdentity::Authenticated { .. } => return Err(TransportError::SessionFenced),
+        PeerIdentity::Unavailable { .. } => {
+            return Err(TransportError::PeerIdentityUnavailable);
+        }
+    };
+    if record.submitter_principal.as_str() != principal.as_str() {
+        return Err(TransportError::SessionFenced);
+    }
+    let expected = super::coordination_mailbox::CoordinationMailboxRecord {
+        message_id: record.message_id.clone(),
+        recipient_id: record.recipient_id.clone(),
+        task_id: record.task_id.clone(),
+        sender_principal: record.sender_principal.clone(),
+        submitter_principal: record.submitter_principal.clone(),
+        provenance: record.provenance.clone(),
+        privacy_class: record.privacy_class.clone(),
+        disclosure: record.disclosure.clone(),
+        body: record.body.clone(),
+        requires_acknowledgement: record.requires_acknowledgement,
+        state_fence: record.state_fence.clone(),
+        submitted_at_unix_ms: record.submitted_at_unix_ms,
+        sequence: record.sequence,
+    };
+    let draft = super::coordination_mailbox::MailboxMessageDraft {
+        message_id: expected.message_id.clone(),
+        recipient_id: expected.recipient_id.clone(),
+        task_id: expected.task_id.clone(),
+        sender_principal: expected.sender_principal.clone(),
+        submitter_principal: expected.submitter_principal.clone(),
+        provenance: expected.provenance.clone(),
+        privacy_class: expected.privacy_class.clone(),
+        disclosure: expected.disclosure.clone(),
+        body: expected.body.clone(),
+        requires_acknowledgement: expected.requires_acknowledgement,
+        state_fence: expected.state_fence.clone(),
+        submitted_at_unix_ms: expected.submitted_at_unix_ms,
+    };
+    let existing: Vec<super::coordination_mailbox::CoordinationMailboxRecord> = admission
+        .expected_head
+        .iter()
+        .map(
+            |head| super::coordination_mailbox::CoordinationMailboxRecord {
+                message_id: head.message_id.clone(),
+                recipient_id: head.recipient_id.clone(),
+                task_id: head.task_id.clone(),
+                sender_principal: head.sender_principal.clone(),
+                submitter_principal: head.submitter_principal.clone(),
+                provenance: head.provenance.clone(),
+                privacy_class: head.privacy_class.clone(),
+                disclosure: head.disclosure.clone(),
+                body: head.body.clone(),
+                requires_acknowledgement: head.requires_acknowledgement,
+                state_fence: head.state_fence.clone(),
+                submitted_at_unix_ms: head.submitted_at_unix_ms,
+                sequence: head.sequence,
+            },
+        )
+        .collect();
+    let admitted = match super::coordination_mailbox::admit_mailbox_message(draft, &existing) {
+        Ok(admitted) => admitted,
+        Err(super::coordination_mailbox::CoordinationMailboxError::IdentityConflict { .. }) => {
+            return Err(TransportError::IdentityConflict);
+        }
+        Err(_) => return Err(TransportError::SessionFenced),
+    };
+    if admitted.record != expected {
         return Err(TransportError::SessionFenced);
     }
     Ok(())

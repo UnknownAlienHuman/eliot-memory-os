@@ -50,6 +50,7 @@ pub mod epistemic_revision;
 pub mod erasure_admission;
 pub mod experience_store;
 pub mod learning_store;
+mod mailbox;
 mod named_mutation_receipt;
 mod notification_state;
 mod payload_authority;
@@ -92,6 +93,11 @@ pub use blackboard::{
     BLACKBOARD_ITEM_MUTATION_NAME, BLACKBOARD_ITEM_READ_NAME, BLACKBOARD_ITEM_SCHEMA_V1,
     BlackboardItemRecord, BlackboardItemRevision, blackboard_item_read_request,
     blackboard_item_request, decode_blackboard_item,
+};
+
+pub use mailbox::{
+    MAILBOX_ITEM_MUTATION_NAME, MAILBOX_ITEM_SCHEMA_V1, MAX_MAILBOX_BODY_BYTES,
+    MailboxItemAdmission, MailboxItemRecord, decode_mailbox_item, mailbox_item_request,
 };
 
 pub use canonical_event::{
@@ -4143,6 +4149,11 @@ pub enum NamedMutationOperation {
     /// ceiling; it does not perform decisions, truth promotion, acceptance,
     /// or write-authority changes.
     ApplyBlackboardItem,
+    /// Canonical typed mailbox admission persistence (issue #1820).
+    /// Persists a Kernel-admitted mailbox message with its stream-head
+    /// compare-and-set under the candidate-only ceiling; it does not perform
+    /// delivery, acknowledgement, routing, or expiry.
+    AdmitMailboxMessage,
     /// Canonical learning-record commit (issue #1868, I12.24).
     ///
     /// Durable learning-record persistence only: the prepared transition
@@ -4207,6 +4218,7 @@ impl NamedMutationOperation {
             | Self::CommitExperienceBank
             | Self::CommitAgentFeedback
             | Self::ApplyBlackboardItem
+            | Self::AdmitMailboxMessage
             | Self::RecordCapabilityEvidenceRecord => TransitionClass::CaptureCandidate,
             Self::ApplyEpistemicRevision => TransitionClass::Epistemic,
             Self::UpdateTaskState

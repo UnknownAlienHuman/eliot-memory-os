@@ -1514,6 +1514,9 @@ mod single_shape_constructors {
             state_fence: fence(),
             wire_version: NATIVE_WORKER_CLAIM_WIRE_VERSION,
             executable_binding: Some(join(&registration.worker_config_digest)),
+            visibility: None,
+            privacy_class: None,
+            swarm_id: None,
             binding_digest: String::new(),
         }
         .with_computed_digest()

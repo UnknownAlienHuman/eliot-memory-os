@@ -477,11 +477,8 @@ pub(crate) fn validate_text(value: &str, field: &'static str) -> Result<(), Kern
 /// Effect-capable generations may resume only exact already-authorized
 /// operations covered by an unexpired operation lease; every invalid or
 /// unavailable authorization state runs in shadow/no-effect diagnostics only.
-/// This is the one query the effect-capable restart/replay paths
-/// (`dispatch_launch`, `process_execution`, the native-worker lifecycle
-/// routes and the Dreamer dispatch paths) run before dispatching an effect:
-/// it resolves the lease by the attempt's own operation identity through
-/// [`eliot_ors::OperationalRecoveryStore::load_effect_operation_lease_for_operation`],
+/// The join resolves the lease by the attempt's own operation identity
+/// through [`eliot_ors::OperationalRecoveryStore::load_effect_operation_lease_for_operation`],
 /// loads the bound execution manifest, and verifies the triple through the
 /// owning [`eliot_ors::authorize_effect_replay`] verifier. The record itself
 /// stays owned by `eliot-ors`; this join defines no lease type, no alias and
@@ -502,6 +499,23 @@ pub(crate) fn validate_text(value: &str, field: &'static str) -> Result<(), Kern
 /// Store failures surface as the owner's typed [`eliot_ors::OrsError`]; they
 /// are unavailable authorization state, so the caller treats them like any
 /// other non-admission and stays in shadow diagnostics.
+///
+/// # Live status
+///
+/// No production caller. Measured on this tree, no code in any crate names
+/// this function other than its defining line. The effect-capable restart and
+/// replay paths this doc describes do run the gate before dispatching an
+/// effect, but they do not run *this* join: they resolve the same lease,
+/// manifest and verifier triple one level down, through
+/// `RedbRecoveryStore::authorize_effect_replay_for_operation`, which loads the
+/// same two durable rows, applies the same
+/// [`eliot_ors::authorize_effect_replay`] verifier, and additionally persists
+/// the durable reconciliation intent for a denied, expired or unknown replay.
+/// So this function describes a capability the crate spells out rather than a
+/// call edge into it; the live query is the ORS owner's method and this free
+/// function is the unexercised equivalent. Nothing was wired to close that gap
+/// and no caller was invented; whether one is bound to this spelling or the
+/// entry is retired is an owner decision.
 pub fn query_effect_replay_authority(
     store: &eliot_ors::RedbRecoveryStore,
     request: &eliot_ors::EffectReplayRequest,

@@ -16,6 +16,7 @@ use eliot_protocol::{
 };
 use eliot_receipts::ReceiptDisposition;
 use eliot_runtime_contracts::ServiceProcessState;
+use eliot_security_contracts::PrivacyClass;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -110,6 +111,22 @@ pub struct WorkerHello {
     pub state_fence: StateFence,
     pub route_ref: String,
     pub requested_capabilities: BTreeSet<String>,
+    /// Harness-bound visibility label (A12.2: the harness or installation
+    /// boundary binds visibility; the worker never invents it). `None`
+    /// until the harness publishes the leg on the wire; validated
+    /// shape-only when `Some`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<String>,
+    /// Canonical privacy class (A12.6: a model job carries a privacy class
+    /// beside its route class). Reuses the canonical owner type, so the
+    /// shape is enforced at the Deserialize boundary; `None` until the
+    /// privacy owner publishes the leg.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privacy_class: Option<PrivacyClass>,
+    /// Swarm identity the unit is attributed to. `None` until the swarm
+    /// publisher publishes the leg; validated shape-only when `Some`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swarm_id: Option<String>,
 }
 
 impl WorkerHello {
@@ -148,6 +165,16 @@ impl WorkerHello {
         self.state_fence
             .validate()
             .map_err(|_| WorkerError::InvalidHandshake("state_fence"))?;
+        // Harness/swarm legs are owner-published: `None` until the owner
+        // publishes them, shape-only text when present, never invented here.
+        // `privacy_class` is the canonical owner type, so its shape is
+        // enforced at the Deserialize boundary and needs no string arm here.
+        if let Some(visibility) = &self.visibility {
+            validate_claim_text(visibility, "visibility")?;
+        }
+        if let Some(swarm_id) = &self.swarm_id {
+            validate_claim_text(swarm_id, "swarm_id")?;
+        }
         if !self
             .authority_epoch
             .is_same_authority(&self.state_fence.authority_epoch)
@@ -1240,6 +1267,19 @@ pub struct NativeWorkerClaim {
     /// never carry executable authority; required on wire v2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable_binding: Option<NativeWorkerExecutableBinding>,
+    /// Harness-bound visibility label (A12.2). `None` until the harness
+    /// publishes the leg on the wire; validated shape-only when `Some`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<String>,
+    /// Canonical privacy class (A12.6). Reuses the canonical owner type,
+    /// so the shape is enforced at the Deserialize boundary; `None` until
+    /// the privacy owner publishes the leg.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privacy_class: Option<PrivacyClass>,
+    /// Swarm identity the unit is attributed to. `None` until the swarm
+    /// publisher publishes the leg; validated shape-only when `Some`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swarm_id: Option<String>,
     /// Canonical digest over every bound work field (see
     /// [`NativeWorkerClaim::compute_binding_digest`]).
     pub binding_digest: String,
@@ -1253,8 +1293,9 @@ impl NativeWorkerClaim {
     /// `deadline_unix_ms`, `decision_id`, `executable_binding`,
     /// `expected_result_schema`, `expected_result_schema_version`,
     /// `operation_id`, `parent_job_id`, `predecessor_revision`,
-    /// `registration_id`, `route_class`, `state_fence`, `task_id`,
-    /// `work_scope_id`, `worker_generation`. The nested `executable_binding`
+    /// `privacy_class`, `registration_id`, `route_class`, `state_fence`,
+    /// `swarm_id`, `task_id`, `visibility`, `work_scope_id`,
+    /// `worker_generation`. The nested `executable_binding`
     /// object is JSON `null` for wire-v1 claims (which predate the join) and
     /// otherwise covers exactly the keys `adapter_id`, `adapter_revision`,
     /// `authority_epoch`, `capability_cell`, `config_digest`, `deadline_unix_ms`,
@@ -1291,11 +1332,14 @@ impl NativeWorkerClaim {
             "operation_id": self.operation_id,
             "parent_job_id": self.parent_job_id,
             "predecessor_revision": self.predecessor_revision,
+            "privacy_class": self.privacy_class,
             "registration_id": self.registration_id,
             "route_class": self.route_class,
             "state_fence": self.state_fence,
+            "swarm_id": self.swarm_id,
             "task_id": self.task_id,
             "work_scope_id": self.work_scope_id,
+            "visibility": self.visibility,
             "worker_generation": self.worker_generation,
         });
         let bytes = canonical_json_bytes(&canonical)
@@ -1352,6 +1396,16 @@ impl NativeWorkerClaim {
         self.budget
             .validate()
             .map_err(|_| WorkerError::InvalidRequest("budget"))?;
+        // Harness/swarm legs are owner-published: `None` until the owner
+        // publishes them, shape-only text when present, never invented
+        // here. `privacy_class` is the canonical owner type, so its shape
+        // is enforced at the Deserialize boundary and needs no string arm.
+        if let Some(visibility) = &self.visibility {
+            validate_claim_text(visibility, "visibility")?;
+        }
+        if let Some(swarm_id) = &self.swarm_id {
+            validate_claim_text(swarm_id, "swarm_id")?;
+        }
         self.state_fence
             .validate()
             .map_err(|_| WorkerError::InvalidRequest("state_fence"))?;

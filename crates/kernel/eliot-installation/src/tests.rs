@@ -6651,6 +6651,12 @@ fn pending_phase_b_intent_is_durable_before_destination_publication_and_rejects_
         semantic_config_hash: test_handle("9".repeat(64)),
         launch: phase_b_launch,
         agent_bridge: None,
+        // This contour stages no protected User Broker front-door pair, so the
+        // prepared record binds none. The field still participates in
+        // `computed_digest`, so a v5 preparation without a recorded pair cannot
+        // replay as a proof of a contour whose broker declaration it never
+        // observed; see `HostPhaseBPreparedMaterialization::WIRE`.
+        user_broker: None,
         prepared_digest: test_handle("pending"),
     };
     prepared.prepared_digest = must(prepared.computed_digest());
