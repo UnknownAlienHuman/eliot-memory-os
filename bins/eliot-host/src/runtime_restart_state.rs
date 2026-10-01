@@ -173,13 +173,14 @@ pub(super) fn load_durable_runtime_restarts(
                     "runtime restart store contains a non-text filename".to_owned(),
                 )
             })?;
-        if note_unadopted_restart_budget(file_name) { continue; }
+        if note_unadopted_restart_budget(file_name) {
+            continue;
+        }
         let pending_digest = file_name
             .strip_suffix(".pending.json")
             .filter(|digest| valid_sha256_text(digest));
         if pending_digest.is_some() {
-            // Pending records are validated by the bounded reader below. They
-            // are not receipts and therefore never enter the adoption map.
+            // Pending records go to the bounded reader below, never the adoption map.
             host_restart_observe("host.restart pending not adopted observed");
             let _ = read_runtime_restart_pending_identity(&path)?;
             continue;
