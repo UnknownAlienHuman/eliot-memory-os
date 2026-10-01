@@ -437,9 +437,7 @@ fn validate_source_binding(binding: &JournalSourceBinding) -> Result<(), SpoolEr
 /// preserves the old generation's history. The row stores the full lineage
 /// and is cross-checked against this key on every read.
 pub(crate) fn journal_cursor_key(scope_root: &str, scope_generation: &str) -> String {
-    sha256_hex(
-        format!("journal-cursor/v1\x00{scope_root}\x00{scope_generation}").as_bytes(),
-    )
+    sha256_hex(format!("journal-cursor/v1\x00{scope_root}\x00{scope_generation}").as_bytes())
 }
 
 /// Derives the ledger key one evidence row is filed under.
@@ -674,10 +672,9 @@ where
     else {
         return Ok(None);
     };
-    let cursor: StoredJournalCursor =
-        serde_json::from_slice(value.value()).map_err(|error| {
-            SpoolError::Corrupt(format!("journal replay cursor row is invalid: {error}"))
-        })?;
+    let cursor: StoredJournalCursor = serde_json::from_slice(value.value()).map_err(|error| {
+        SpoolError::Corrupt(format!("journal replay cursor row is invalid: {error}"))
+    })?;
     cursor.validate()?;
     if journal_cursor_key(&cursor.scope_root, &cursor.scope_generation) != ledger_key {
         return Err(SpoolError::Corrupt(
@@ -708,8 +705,8 @@ fn write_journal_cursor(
             "journal replay cursor row does not match the ledger key it is filed under".to_owned(),
         ));
     }
-    let bytes = serde_json::to_vec(cursor)
-        .map_err(|error| SpoolError::Serialization(error.to_string()))?;
+    let bytes =
+        serde_json::to_vec(cursor).map_err(|error| SpoolError::Serialization(error.to_string()))?;
     let mut table = write
         .open_table(JOURNAL_REPLAY_CURSOR_TABLE)
         .map_err(|error| SpoolError::Database(error.to_string()))?;
@@ -857,8 +854,7 @@ fn decide_journal_replay(
     {
         return JournalReplayDecision::RebindAfterGap;
     }
-    if cursor.committed_usn < binding.lowest_valid_usn
-        || cursor.committed_usn > binding.horizon_usn
+    if cursor.committed_usn < binding.lowest_valid_usn || cursor.committed_usn > binding.horizon_usn
     {
         return JournalReplayDecision::ResumeAfterWrap;
     }
@@ -925,7 +921,12 @@ impl WatchdogSpool {
                         "journal replay resume decided without a stored cursor".to_owned(),
                     )
                 })?;
-                self.resume_journal_cursor_after_wrap(&cursor_key, previous, &binding, observed_at_ms)
+                self.resume_journal_cursor_after_wrap(
+                    &cursor_key,
+                    previous,
+                    &binding,
+                    observed_at_ms,
+                )
             }
             JournalReplayDecision::ReadPage => {
                 let previous = stored.as_ref().ok_or_else(|| {
@@ -1003,8 +1004,7 @@ impl WatchdogSpool {
                 .iter()
                 .map_err(|error| SpoolError::Database(error.to_string()))?
             {
-                let (key, _) =
-                    item.map_err(|error| SpoolError::Database(error.to_string()))?;
+                let (key, _) = item.map_err(|error| SpoolError::Database(error.to_string()))?;
                 keys.push(key.value().to_owned());
             }
             if keys.len() >= JOURNAL_REPLAY_MAX_CURSORS {
@@ -1270,7 +1270,9 @@ impl WatchdogSpool {
         let mut unsupported: Vec<&JournalRecord> = Vec::new();
         for record in &page.records {
             match record.change.as_str() {
-                Some(reason) if record.path.len() <= JOURNAL_PATH_MAX_BYTES && !record.path.is_empty() => {
+                Some(reason)
+                    if record.path.len() <= JOURNAL_PATH_MAX_BYTES && !record.path.is_empty() =>
+                {
                     observations.push(StoredJournalEvidence::Observation {
                         schema_version: JOURNAL_REPLAY_EVIDENCE_SCHEMA_VERSION,
                         cursor_key: cursor_key.to_owned(),
@@ -1293,7 +1295,9 @@ impl WatchdogSpool {
                 SpoolError::Corrupt("journal replay unsupported span is empty".to_owned())
             })?;
             let count = u64::try_from(unsupported.len()).map_err(|_| {
-                SpoolError::Corrupt("journal replay unsupported span exceeds its counter".to_owned())
+                SpoolError::Corrupt(
+                    "journal replay unsupported span exceeds its counter".to_owned(),
+                )
             })?;
             gaps.push(StoredJournalEvidence::Gap {
                 schema_version: JOURNAL_REPLAY_EVIDENCE_SCHEMA_VERSION,
@@ -1450,7 +1454,9 @@ impl WatchdogSpool {
                 .checked_add(path_len.checked_add(64).ok_or_else(|| {
                     SpoolError::Corrupt("journal replay page size overflow".to_owned())
                 })?)
-                .ok_or_else(|| SpoolError::Corrupt("journal replay page size overflow".to_owned()))?;
+                .ok_or_else(|| {
+                    SpoolError::Corrupt("journal replay page size overflow".to_owned())
+                })?;
         }
         if estimated > limits.max_bytes {
             return Err(SpoolError::Corrupt(
