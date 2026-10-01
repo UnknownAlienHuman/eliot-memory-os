@@ -22,7 +22,7 @@ use eliot_store_api::{
 use serde_json::Value;
 
 use crate::profile::{AdmittedStage, InstrumentRegistry, ProfileError};
-use crate::registry::ResolvedExecutableIdentity;
+use crate::registry::{ResolvedExecutableIdentity, SupplyChainReceipt};
 
 /// Closed `ApplyInstrumentRegistryState` mutation for one admitted stage launch.
 ///
@@ -124,7 +124,7 @@ pub fn submit_admission_snapshot(
     let admitted_supply = stage
         .supply_receipt
         .as_ref()
-        .map(|receipt| receipt.digest())
+        .map(SupplyChainReceipt::digest)
         .unwrap_or_default();
     match (&stage.supply_receipt, registry.supply_chain(kind)) {
         (Some(receipt), Some(live)) => {
@@ -168,7 +168,7 @@ pub fn submit_admission_snapshot(
     if recovered_spec.digest() != stage.spec_digest
         || recovered
             .supply_chain(kind)
-            .map(|receipt| receipt.digest())
+            .map(SupplyChainReceipt::digest)
             .unwrap_or_default()
             != admitted_supply
         || recovered.generation() != registry.generation()
