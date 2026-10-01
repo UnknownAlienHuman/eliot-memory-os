@@ -33,7 +33,7 @@ use eliot_kernel_core::KernelRuntimeHealthEvidence;
 use eliot_mcp::{
     HostCancellationPortOutcome, HostCancellationRequest, HostInvocationPortOutcome,
     HostInvocationRequest, HostOperationHandle, KernelHostRequestPort, McpResponse, PortFailure,
-    ProofCeiling, ResponseKind, ToolRequest,
+    ObserveInput, ResponseKind, ToolRequest,
 };
 use eliot_protocol::{
     AgentHostRequestFailure, EncodingProfile, FINISH_INVOKE_PAYLOAD_SCHEMA_ID, Frame, FrameKind,
@@ -45,7 +45,7 @@ use eliot_protocol::{
     REACTIVE_RESTORE_PAYLOAD_SCHEMA_ID, ReactiveRestoreQuery, ReactiveRestoreReply,
     RequestIdentity, host_request_operation_id, restore_correlation,
 };
-use eliot_receipts::RequestBinding;
+use eliot_receipts::{ProofCeiling, RequestBinding};
 use eliot_store_api::{WriteSubmission, WriteSubmissionState};
 use serde::Deserialize;
 
@@ -3523,7 +3523,7 @@ fn terminal_without_result_outcome(
 fn accepts_after_stage(request: &HostInvocationRequest) -> bool {
     matches!(
         &request.tool,
-        ToolRequest::Observe(observation)
+        ToolRequest::Observe(ObserveInput::Observation(observation))
             if observation.write_submission.response_mode == "accept_after_stage"
     )
 }
@@ -3531,7 +3531,7 @@ fn accepts_after_stage(request: &HostInvocationRequest) -> bool {
 fn waits_for_commit(request: &HostInvocationRequest) -> bool {
     matches!(
         &request.tool,
-        ToolRequest::Observe(observation)
+        ToolRequest::Observe(ObserveInput::Observation(observation))
             if observation.write_submission.response_mode == "wait_for_commit"
     )
 }
@@ -3846,14 +3846,19 @@ impl KernelHostRequestPort for KernelHostRequestClient {
                 if is_nonterminal_request_state(record.state)
                     && (accepts_after_stage(request) || waits_for_commit(request))
                 {
-                    if let Some(stage) = record.staged_write_submission.clone() {
-                        let deadline_reached = record
+                    let wait_deadline_reached = if waits_for_commit(request) {
+                        let now_after_owner_read = unix_ms()?;
+                        record
                             .deadline_unix_ms
-                            .is_some_and(|deadline| now_ms >= deadline);
+                            .is_some_and(|deadline| now_after_owner_read >= deadline)
+                    } else {
+                        false
+                    };
+                    if let Some(stage) = record.staged_write_submission.clone() {
                         if waits_for_commit(request) && record.deadline_unix_ms.is_none() {
                             return Err(unknown_resolve_outcome(logical_key.as_str()));
                         }
-                        if accepts_after_stage(request) || deadline_reached {
+                        if accepts_after_stage(request) || wait_deadline_reached {
                             return self.record_settled(
                                 correlation.as_str(),
                                 staged_resolved_observe_outcome(
@@ -3865,11 +3870,7 @@ impl KernelHostRequestPort for KernelHostRequestClient {
                                 ),
                             );
                         }
-                    } else if waits_for_commit(request)
-                        && record
-                            .deadline_unix_ms
-                            .is_some_and(|deadline| now_ms >= deadline)
-                    {
+                    } else if wait_deadline_reached {
                         return Err(unknown_resolve_outcome(logical_key.as_str()));
                     }
                 }
@@ -3885,7 +3886,7 @@ impl KernelHostRequestPort for KernelHostRequestClient {
             }
             InvocationPreparation::Submit(envelope) => envelope,
         };
-        if now_ms >= envelope.identity.deadline_unix_ms {
+        if unix_ms()? >= envelope.identity.deadline_unix_ms {
             // Only a cached replay can be stale here: fresh builds set
             // deadline to now plus a positive preference. The original attempt
             // may still be live kernel-side, so probe once instead of assuming
@@ -4270,7 +4271,8 @@ impl KernelHostRequestClient {
         match decode_admitted_reply(&reply, &probe) {
             Some(_) => {
                 let stage_is_due = accepts_after_stage(request)
-                    || (waits_for_commit(request) && now_ms >= envelope.identity.deadline_unix_ms);
+                    || (waits_for_commit(request)
+                        && unix_ms()? >= envelope.identity.deadline_unix_ms);
                 if stage_is_due {
                     let record =
                         self.resolve_original_invocation(envelope, facts, session_id, now_ms)?;
