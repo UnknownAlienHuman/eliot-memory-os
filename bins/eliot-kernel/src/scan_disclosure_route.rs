@@ -211,6 +211,44 @@ pub(crate) enum ScanDisclosureOwnerValue {
     ReadinessRecord {
         record: Option<ColdStartReadinessOrsRecord>,
     },
+    /// A retained scan handle did not resolve to a valid durable receipt.
+    /// This is a typed negative owner result; callers must not interpret it
+    /// as readiness or as an absent optional receipt.
+    ReceiptReadFailure {
+        failure: ScanReceiptReadFailure,
+    },
+}
+
+/// Closed projection of the original WorkScope scan-read causes. The source
+/// `WorkScopeError` is not serde-enabled, so these wire cases preserve its
+/// existing categories without inventing a new validation scheme.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ScanReceiptReadFailure {
+    Missing,
+    Inaccessible,
+    Corrupt,
+    Replaced,
+    Stale,
+    Invalidated,
+    UnknownCommit,
+}
+
+enum ScanDisclosureOwnerActionError {
+    Transport(TransportError),
+    ReceiptRead(ScanReceiptReadFailure),
+}
+
+impl From<TransportError> for ScanDisclosureOwnerActionError {
+    fn from(error: TransportError) -> Self {
+        Self::Transport(error)
+    }
+}
+
+impl From<ScanReceiptReadFailure> for ScanDisclosureOwnerActionError {
+    fn from(failure: ScanReceiptReadFailure) -> Self {
+        Self::ReceiptRead(failure)
+    }
 }
 
 #[cfg(windows)]
@@ -253,9 +291,16 @@ impl KernelComposition {
             &current,
             &request.application_connection_id,
         )?;
-        let value = self
+        let value = match self
             .apply_scan_disclosure_owner_action(&current, request.action)
-            .await?;
+            .await
+        {
+            Ok(value) => value,
+            Err(ScanDisclosureOwnerActionError::ReceiptRead(failure)) => {
+                ScanDisclosureOwnerValue::ReceiptReadFailure { failure }
+            }
+            Err(ScanDisclosureOwnerActionError::Transport(error)) => return Err(error),
+        };
         serde_json::to_value(ScanDisclosureOwnerResponse {
             wire_version: WIRE_VERSION,
             value,
@@ -319,7 +364,7 @@ impl KernelComposition {
         &self,
         current: &CurrentScanDisclosureActivation,
         action: ScanDisclosureOwnerAction,
-    ) -> Result<ScanDisclosureOwnerValue, TransportError> {
+    ) -> Result<ScanDisclosureOwnerValue, ScanDisclosureOwnerActionError> {
         match action {
             ScanDisclosureOwnerAction::IssueContour => {
                 let contour = self.issue_scan_disclosure_contour(current)?;
@@ -439,18 +484,18 @@ impl KernelComposition {
         &self,
         current: &CurrentScanDisclosureActivation,
         key: &ColdStartReadinessOwnerKey,
-    ) -> Result<ScanDisclosureOwnerValue, TransportError> {
+    ) -> Result<ScanDisclosureOwnerValue, ScanDisclosureOwnerActionError> {
         let (record, owner, snapshot, inputs) =
             self.load_retained_work_scope_owner(current, true).await?;
         self.recheck_scan_disclosure_activation(current)?;
         if record.revision != snapshot.owner_revision {
-            return Err(TransportError::IdentityConflict);
+            return Err(TransportError::IdentityConflict.into());
         }
         let (sources, privacy) = owner
             .read_current_source_closure(&current.ticket.state_fence)
             .map_err(|_| TransportError::SessionFenced)?;
         if sources != inputs.governing_sources || privacy != inputs.privacy {
-            return Err(TransportError::IdentityConflict);
+            return Err(TransportError::IdentityConflict.into());
         }
         let binding = inputs
             .scan_binding
@@ -463,7 +508,9 @@ impl KernelComposition {
         let receipt_handle = inputs
             .scan_receipt_handle
             .as_ref()
-            .ok_or(TransportError::SessionFenced)?;
+            .ok_or(ScanDisclosureOwnerActionError::ReceiptRead(
+                ScanReceiptReadFailure::Missing,
+            ))?;
         let discovery = inputs
             .bootstrap_discovery_inputs
             .as_ref()
@@ -487,7 +534,7 @@ impl KernelComposition {
             evidence,
         )?;
         if &expected_key != key {
-            return Err(TransportError::IdentityConflict);
+            return Err(TransportError::IdentityConflict.into());
         }
         let lease_deadline = inputs
             .discovery_lease
@@ -507,7 +554,7 @@ impl KernelComposition {
             | ColdStartReadinessStageOutcome::AlreadyBound { record } => {
                 Self::validate_cold_start_readiness_record(current, record)?;
                 if !record.claim.key.eq(key) {
-                    return Err(TransportError::IdentityConflict);
+                    return Err(TransportError::IdentityConflict.into());
                 }
             }
         }
@@ -518,18 +565,18 @@ impl KernelComposition {
     async fn validated_current_cold_start_owner_key(
         &self,
         current: &CurrentScanDisclosureActivation,
-    ) -> Result<(ColdStartReadinessOwnerKey, u64), TransportError> {
+    ) -> Result<(ColdStartReadinessOwnerKey, u64), ScanDisclosureOwnerActionError> {
         let (record, owner, snapshot, inputs) =
             self.load_retained_work_scope_owner(current, true).await?;
         self.recheck_scan_disclosure_activation(current)?;
         if record.revision != snapshot.owner_revision {
-            return Err(TransportError::IdentityConflict);
+            return Err(TransportError::IdentityConflict.into());
         }
         let (sources, privacy) = owner
             .read_current_source_closure(&current.ticket.state_fence)
             .map_err(|_| TransportError::SessionFenced)?;
         if sources != inputs.governing_sources || privacy != inputs.privacy {
-            return Err(TransportError::IdentityConflict);
+            return Err(TransportError::IdentityConflict.into());
         }
         let binding = inputs
             .scan_binding
@@ -542,7 +589,9 @@ impl KernelComposition {
         let receipt_handle = inputs
             .scan_receipt_handle
             .as_ref()
-            .ok_or(TransportError::SessionFenced)?;
+            .ok_or(ScanDisclosureOwnerActionError::ReceiptRead(
+                ScanReceiptReadFailure::Missing,
+            ))?;
         let discovery = inputs
             .bootstrap_discovery_inputs
             .as_ref()
@@ -585,7 +634,7 @@ impl KernelComposition {
         disposition: ColdStartReadinessTerminalDisposition,
         receipt_ref: &str,
         receipt_bytes: &str,
-    ) -> Result<ScanDisclosureOwnerValue, TransportError> {
+    ) -> Result<ScanDisclosureOwnerValue, ScanDisclosureOwnerActionError> {
         let existing = self
             .p07_ors
             .load_cold_start_readiness(record_key)
@@ -598,7 +647,7 @@ impl KernelComposition {
         if existing.claim.binding_digest != binding_digest || existing.claim.lease_ref != lease_ref
             || existing.claim.key != expected_key
         {
-            return Err(TransportError::IdentityConflict);
+            return Err(TransportError::IdentityConflict.into());
         }
         let record = self
             .p07_ors
@@ -623,7 +672,7 @@ impl KernelComposition {
         &self,
         current: &CurrentScanDisclosureActivation,
         record_key: &str,
-    ) -> Result<ScanDisclosureOwnerValue, TransportError> {
+    ) -> Result<ScanDisclosureOwnerValue, ScanDisclosureOwnerActionError> {
         let record = self
             .p07_ors
             .load_cold_start_readiness(record_key)
@@ -631,13 +680,13 @@ impl KernelComposition {
         if let Some(record) = record.as_ref() {
             Self::validate_cold_start_readiness_record(current, record)?;
             if record.record_key != record_key {
-                return Err(TransportError::IdentityConflict);
+                return Err(TransportError::IdentityConflict.into());
             }
             let (expected_key, _) = self
                 .validated_current_cold_start_owner_key(current)
                 .await?;
             if record.claim.key != expected_key {
-                return Err(TransportError::IdentityConflict);
+                return Err(TransportError::IdentityConflict.into());
             }
         }
         Ok(ScanDisclosureOwnerValue::ReadinessRecord { record })
@@ -648,7 +697,7 @@ impl KernelComposition {
         &self,
         current: &CurrentScanDisclosureActivation,
         binding_digest: &str,
-    ) -> Result<ScanDisclosureOwnerValue, TransportError> {
+    ) -> Result<ScanDisclosureOwnerValue, ScanDisclosureOwnerActionError> {
         let (expected_key, _) = self
             .validated_current_cold_start_owner_key(current)
             .await?;
@@ -657,7 +706,7 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?
             != binding_digest
         {
-            return Err(TransportError::IdentityConflict);
+            return Err(TransportError::IdentityConflict.into());
         }
         let record = self
             .p07_ors
@@ -666,10 +715,10 @@ impl KernelComposition {
         if let Some(record) = record.as_ref() {
             Self::validate_cold_start_readiness_record(current, record)?;
             if record.claim.binding_digest != binding_digest {
-                return Err(TransportError::IdentityConflict);
+                return Err(TransportError::IdentityConflict.into());
             }
             if record.claim.key != expected_key {
-                return Err(TransportError::IdentityConflict);
+                return Err(TransportError::IdentityConflict.into());
             }
         }
         Ok(ScanDisclosureOwnerValue::ReadinessRecord { record })
@@ -710,7 +759,7 @@ impl KernelComposition {
         current: &CurrentScanDisclosureActivation,
         binding: &ScanDisclosureOwnerBinding,
         record: &ScanDisclosureOrsRecord,
-    ) -> Result<ScanDisclosureOwnerValue, TransportError> {
+    ) -> Result<ScanDisclosureOwnerValue, ScanDisclosureOwnerActionError> {
         self.validate_scan_disclosure_binding(current, binding).await?;
         Self::validate_record_binding(current, binding, record)?;
         match self.p07_ors.stage_scan_disclosure(record) {
@@ -724,7 +773,7 @@ impl KernelComposition {
                     record: Some(*record),
                 })
             }
-            Err(_) => Err(TransportError::SessionFenced),
+            Err(_) => Err(TransportError::SessionFenced.into()),
         }
     }
 
@@ -736,13 +785,13 @@ impl KernelComposition {
         operation_key: &str,
         request_hash: &str,
         writer_receipt: &str,
-    ) -> Result<ScanDisclosureOwnerValue, TransportError> {
+    ) -> Result<ScanDisclosureOwnerValue, ScanDisclosureOwnerActionError> {
         self.validate_scan_disclosure_binding(current, binding).await?;
         if operation_key != binding.operation_key().as_str()
             || request_hash.trim().is_empty()
             || writer_receipt.trim().is_empty()
         {
-            return Err(TransportError::IdentityConflict);
+            return Err(TransportError::IdentityConflict.into());
         }
         let record = self
             .p07_ors
@@ -760,10 +809,10 @@ impl KernelComposition {
         current: &CurrentScanDisclosureActivation,
         binding: &ScanDisclosureOwnerBinding,
         operation_key: &str,
-    ) -> Result<ScanDisclosureOwnerValue, TransportError> {
+    ) -> Result<ScanDisclosureOwnerValue, ScanDisclosureOwnerActionError> {
         self.validate_scan_disclosure_binding(current, binding).await?;
         if operation_key != binding.operation_key().as_str() {
-            return Err(TransportError::IdentityConflict);
+            return Err(TransportError::IdentityConflict.into());
         }
         let record = self
             .p07_ors
@@ -784,13 +833,13 @@ impl KernelComposition {
         request_hash: &str,
         policy_revision: u64,
         successor_ref: Option<&str>,
-    ) -> Result<ScanDisclosureOwnerValue, TransportError> {
+    ) -> Result<ScanDisclosureOwnerValue, ScanDisclosureOwnerActionError> {
         self.validate_scan_disclosure_binding(current, binding).await?;
         if operation_key != binding.operation_key().as_str()
             || policy_revision != binding.policy_revision
             || request_hash.trim().is_empty()
         {
-            return Err(TransportError::IdentityConflict);
+            return Err(TransportError::IdentityConflict.into());
         }
         let record = self
             .p07_ors
@@ -808,10 +857,10 @@ impl KernelComposition {
         current: &CurrentScanDisclosureActivation,
         binding: &ScanDisclosureOwnerBinding,
         limit: u16,
-    ) -> Result<ScanDisclosureOwnerValue, TransportError> {
+    ) -> Result<ScanDisclosureOwnerValue, ScanDisclosureOwnerActionError> {
         self.validate_scan_disclosure_binding(current, binding).await?;
         if limit == 0 || limit > eliot_ors::MAX_SCAN_DISCLOSURE_PAGE {
-            return Err(TransportError::SessionFenced);
+            return Err(TransportError::SessionFenced.into());
         }
         let records = self
             .p07_ors
@@ -1282,12 +1331,19 @@ impl KernelComposition {
         {
             return Err(TransportError::IdentityConflict);
         }
-        let mut records = recovery.owner_records.into_iter();
-        let record = records
+        // Recovery enumeration order is not an identity contract. Resolve
+        // each requested owner row independently before consuming the vector.
+        let record = recovery
+            .owner_records
+            .iter()
             .find(|record| record.record_key() == work_scope_key)
+            .cloned()
             .ok_or(TransportError::SessionFenced)?;
-        let policy_record = records
+        let policy_record = recovery
+            .owner_records
+            .iter()
             .find(|record| record.record_key() == policy_key)
+            .cloned()
             .ok_or(TransportError::SessionFenced)?;
         if record.record_key() != work_scope_key
             || record.state_fence != current.ticket.state_fence
@@ -1356,6 +1412,11 @@ impl KernelComposition {
         let policy_content = policy_snapshot
             .get("snapshot")
             .ok_or(TransportError::SessionFenced)?;
+        let policy_owner_ref = policy_content
+            .get("policy_owner")
+            .and_then(|owner| owner.get("owner_ref"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TransportError::SessionFenced)?;
         let policy_content_digest = sha256_json(policy_content)
             .map_err(|_| TransportError::SessionFenced)?;
         if policy_canonical != policy_record.payload
@@ -1364,6 +1425,7 @@ impl KernelComposition {
             || policy_revision != cold_start_inputs.policy_revision
             || policy_digest != cold_start_inputs.policy_digest
             || policy_content_digest != cold_start_inputs.policy_digest
+            || policy_owner_ref != cold_start_inputs.policy_owner_ref
         {
             return Err(TransportError::IdentityConflict);
         }
@@ -1373,11 +1435,7 @@ impl KernelComposition {
             || cold_start_inputs.session_ref != current.binding.session_id
             || cold_start_inputs.task_selection.task_ref != current.binding.task_id
             || cold_start_inputs.task_selection.work_scope_ref != current.binding.work_scope_id
-            || cold_start_inputs
-                .task_selection
-                .task_revision
-                .value()
-                .to_string()
+            || cold_start_inputs.task_selection.task_revision.to_string()
                 != current.binding.task_revision
         {
             return Err(TransportError::IdentityConflict);
@@ -1546,7 +1604,7 @@ impl KernelComposition {
         expected_owner_revision: u64,
         lease: &DiscoveryReadLease,
         proposed_snapshot: &WorkScopeBindingSnapshot,
-    ) -> Result<ScanDisclosureOwnerValue, TransportError> {
+    ) -> Result<ScanDisclosureOwnerValue, ScanDisclosureOwnerActionError> {
         let (record, owner, snapshot, inputs) =
             self.load_retained_work_scope_owner(current, false).await?;
         self.recheck_scan_disclosure_activation(current)?;
@@ -1554,6 +1612,7 @@ impl KernelComposition {
             && record.revision - expected_owner_revision == 1
             && snapshot.owner_revision == record.revision
             && inputs.discovery_lease.as_ref() == Some(lease)
+            && &snapshot == proposed_snapshot
         {
             return Ok(ScanDisclosureOwnerValue::WorkScopeOwnerRevision {
                 owner_revision: record.revision,
@@ -1564,16 +1623,16 @@ impl KernelComposition {
             || snapshot.owner_revision != expected_owner_revision
             || inputs.state_fence != current.ticket.state_fence
         {
-            return Err(TransportError::IdentityConflict);
+            return Err(TransportError::IdentityConflict.into());
         }
-        if inputs.discovery_lease.as_ref() == Some(lease) {
+        if inputs.discovery_lease.as_ref() == Some(lease) && &snapshot == proposed_snapshot {
             return Ok(ScanDisclosureOwnerValue::WorkScopeOwnerRevision {
                 owner_revision: record.revision,
                 state_fence: record.state_fence,
             });
         }
         if inputs.discovery_lease.is_some() {
-            return Err(TransportError::IdentityConflict);
+            return Err(TransportError::IdentityConflict.into());
         }
         let next_owner_revision = expected_owner_revision
             .checked_add(1)
@@ -1589,7 +1648,7 @@ impl KernelComposition {
             .read_current(&current.ticket.state_fence)
             .map_err(|_| TransportError::SessionFenced)?;
         if &next_snapshot != proposed_snapshot {
-            return Err(TransportError::IdentityConflict);
+            return Err(TransportError::IdentityConflict.into());
         }
         self.persist_work_scope_owner_revision(
             current,
@@ -1614,7 +1673,7 @@ impl KernelComposition {
         binding: &ScanDisclosureOwnerBinding,
         receipt_handle: &ScanReceiptHandle,
         proposed_snapshot: &WorkScopeBindingSnapshot,
-    ) -> Result<ScanDisclosureOwnerValue, TransportError> {
+    ) -> Result<ScanDisclosureOwnerValue, ScanDisclosureOwnerActionError> {
         let (record, owner, snapshot, inputs) =
             self.load_retained_work_scope_owner(current, true).await?;
         self.recheck_scan_disclosure_activation(current)?;
@@ -1630,13 +1689,28 @@ impl KernelComposition {
                 })
                 && inputs.scan_receipt_handle.as_ref() == Some(receipt_handle)
                 && inputs.discovery_lease.as_ref() == Some(discovery_lease)
+                && &snapshot == proposed_snapshot
             {
+                let discovery = inputs
+                    .bootstrap_discovery_inputs
+                    .as_ref()
+                    .ok_or(TransportError::SessionFenced)?;
+                if discovery.evidence != *evidence {
+                    return Err(TransportError::IdentityConflict.into());
+                }
+                self.validate_scan_receipt_handle(
+                    current,
+                    binding,
+                    &discovery.scan_ref,
+                    evidence,
+                    receipt_handle,
+                )?;
                 return Ok(ScanDisclosureOwnerValue::WorkScopeOwnerRevision {
                     owner_revision: record.revision,
                     state_fence: record.state_fence,
                 });
             }
-            return Err(TransportError::IdentityConflict);
+            return Err(TransportError::IdentityConflict.into());
         }
         let original_lease = inputs
             .discovery_lease
@@ -1646,11 +1720,11 @@ impl KernelComposition {
             || discovery_lease.consumed < original_lease.consumed
             || discovery_lease.consumed > discovery_lease.consumption_limit
         {
-            return Err(TransportError::IdentityConflict);
+            return Err(TransportError::IdentityConflict.into());
         }
         let expected_binding = Self::expected_scan_disclosure_binding(current, &snapshot, &inputs)?;
         if binding != &expected_binding {
-            return Err(TransportError::IdentityConflict);
+            return Err(TransportError::IdentityConflict.into());
         }
         self.validate_scan_receipt_handle(
             current,
@@ -1680,7 +1754,7 @@ impl KernelComposition {
             .read_current(&current.ticket.state_fence)
             .map_err(|_| TransportError::SessionFenced)?;
         if &next_snapshot != proposed_snapshot {
-            return Err(TransportError::IdentityConflict);
+            return Err(TransportError::IdentityConflict.into());
         }
         self.persist_work_scope_owner_revision(
             current,
@@ -1961,27 +2035,86 @@ impl KernelComposition {
         expected_scan_ref: &str,
         evidence: &BootstrapScanEvidence,
         handle: &ScanReceiptHandle,
-    ) -> Result<(), TransportError> {
-        handle
+    ) -> Result<(), ScanReceiptReadFailure> {
+        handle.validate().map_err(|error| match error {
+            eliot_workscope::WorkScopeError::ScanReceiptMissing => {
+                ScanReceiptReadFailure::Missing
+            }
+            eliot_workscope::WorkScopeError::ScanReceiptInaccessible => {
+                ScanReceiptReadFailure::Inaccessible
+            }
+            eliot_workscope::WorkScopeError::ScanReceiptCorrupt => {
+                ScanReceiptReadFailure::Corrupt
+            }
+            eliot_workscope::WorkScopeError::ScanReceiptReplaced => {
+                ScanReceiptReadFailure::Replaced
+            }
+            eliot_workscope::WorkScopeError::ScanReceiptStale => ScanReceiptReadFailure::Stale,
+            eliot_workscope::WorkScopeError::ScanReceiptInvalidated => {
+                ScanReceiptReadFailure::Invalidated
+            }
+            eliot_workscope::WorkScopeError::ScanReceiptUnknownCommit => {
+                ScanReceiptReadFailure::UnknownCommit
+            }
+            _ => ScanReceiptReadFailure::Corrupt,
+        })?;
+        let record = match self.p07_ors.load_scan_disclosure(&binding.operation_key()) {
+            Ok(Some(record)) => record,
+            Ok(None) => return Err(ScanReceiptReadFailure::Missing),
+            Err(eliot_ors::OrsError::Storage(_)) => {
+                return Err(ScanReceiptReadFailure::Inaccessible);
+            }
+            Err(eliot_ors::OrsError::StoreContract(error)) => {
+                return Err(match *error {
+                    eliot_store_api::StoreError::Unavailable => {
+                        ScanReceiptReadFailure::Inaccessible
+                    }
+                    eliot_store_api::StoreError::UnknownOutcome { .. }
+                    | eliot_store_api::StoreError::MissingReceiptEnvelope => {
+                        ScanReceiptReadFailure::UnknownCommit
+                    }
+                    _ => ScanReceiptReadFailure::Corrupt,
+                });
+            }
+            Err(eliot_ors::OrsError::IntegrityProblem { .. }) => {
+                return Err(ScanReceiptReadFailure::Corrupt);
+            }
+            Err(eliot_ors::OrsError::MigrationRequired { .. }) => {
+                return Err(ScanReceiptReadFailure::Stale);
+            }
+            Err(eliot_ors::OrsError::StagingCommitOutcomeUnknown { .. }) => {
+                return Err(ScanReceiptReadFailure::UnknownCommit);
+            }
+            Err(_) => return Err(ScanReceiptReadFailure::Corrupt),
+        };
+        if handle.retention != eliot_workscope::ScanReceiptRetention::Active {
+            return Err(ScanReceiptReadFailure::Invalidated);
+        }
+        record
             .validate()
-            .map_err(|_| TransportError::SessionFenced)?;
-        let record = self
-            .p07_ors
-            .load_scan_disclosure(&binding.operation_key())
-            .map_err(|_| TransportError::SessionFenced)?
-            .ok_or(TransportError::SessionFenced)?;
-        Self::validate_record_binding(current, binding, &record)?;
-        if record.state != eliot_ors::ScanDisclosureRecordState::Committed
-            || record.writer_receipt.trim().is_empty()
+            .map_err(|_| ScanReceiptReadFailure::Corrupt)?;
+        if record.operation_key != binding.operation_key()
+            || Self::validate_record_binding(current, binding, &record).is_err()
         {
-            return Err(TransportError::SessionFenced);
+            return Err(ScanReceiptReadFailure::Replaced);
+        }
+        match record.state {
+            eliot_ors::ScanDisclosureRecordState::Prepared => {
+                return Err(ScanReceiptReadFailure::UnknownCommit);
+            }
+            eliot_ors::ScanDisclosureRecordState::Retired
+            | eliot_ors::ScanDisclosureRecordState::Superseded => {
+                return Err(ScanReceiptReadFailure::Invalidated);
+            }
+            eliot_ors::ScanDisclosureRecordState::Committed => {}
+        }
+        if record.writer_receipt.trim().is_empty() {
+            return Err(ScanReceiptReadFailure::Corrupt);
         }
         let receipt: eliot_workscope::ScanDisclosureReceipt =
             serde_json::from_str(&record.receipt_bytes)
-                .map_err(|_| TransportError::SessionFenced)?;
-        receipt
-            .validate()
-            .map_err(|_| TransportError::SessionFenced)?;
+                .map_err(|_| ScanReceiptReadFailure::Corrupt)?;
+        receipt.validate().map_err(|_| ScanReceiptReadFailure::Corrupt)?;
         let expected_commitment = format!("{}:{}", record.operation_key, record.request_hash);
         let expected_owner = format!("installation:{}:scan-disclosure", current.installation_id);
         if record.operation_key != binding.operation_key()
@@ -1999,10 +2132,9 @@ impl KernelComposition {
             || handle.receipt_digest != record.receipt_digest
             || handle.schema_version != record.schema_version
             || handle.writer_receipt_ref != record.writer_receipt
-            || handle.retention != eliot_workscope::ScanReceiptRetention::Active
             || evidence.canonical_root_ref != receipt.candidate_root_ref
         {
-            return Err(TransportError::IdentityConflict);
+            return Err(ScanReceiptReadFailure::Replaced);
         }
         Ok(())
     }
@@ -2068,7 +2200,7 @@ impl KernelComposition {
         &self,
         current: &CurrentScanDisclosureActivation,
         binding: &ScanDisclosureOwnerBinding,
-    ) -> Result<(), TransportError> {
+    ) -> Result<(), ScanDisclosureOwnerActionError> {
         let (_record, _owner, snapshot, inputs) =
             self.load_retained_work_scope_owner(current, true).await?;
         self.recheck_scan_disclosure_activation(current)?;
@@ -2094,7 +2226,7 @@ impl KernelComposition {
             .map(Ok)
             .unwrap_or_else(|| Self::expected_scan_disclosure_binding(current, &snapshot, &inputs))?;
         if binding != &expected {
-            return Err(TransportError::IdentityConflict);
+            return Err(TransportError::IdentityConflict.into());
         }
         Self::validate_scan_disclosure_binding_shape(current, binding)?;
         let retained_scan_fields = [
@@ -2102,10 +2234,18 @@ impl KernelComposition {
             inputs.scan_binding.is_some(),
             inputs.scan_receipt_handle.is_some(),
         ];
+        if inputs.scan_evidence.is_some()
+            && inputs.scan_binding.is_some()
+            && inputs.scan_receipt_handle.is_none()
+        {
+            return Err(ScanDisclosureOwnerActionError::ReceiptRead(
+                ScanReceiptReadFailure::Missing,
+            ));
+        }
         if retained_scan_fields.iter().any(|present| *present)
             && !retained_scan_fields.iter().all(|present| *present)
         {
-            return Err(TransportError::IdentityConflict);
+            return Err(TransportError::IdentityConflict.into());
         }
         if let (Some(evidence), Some(handle), Some(discovery)) = (
             inputs.scan_evidence.as_ref(),
@@ -2113,12 +2253,12 @@ impl KernelComposition {
             inputs.bootstrap_discovery_inputs.as_ref(),
         ) {
             if discovery.evidence != *evidence {
-                return Err(TransportError::IdentityConflict);
+                return Err(TransportError::IdentityConflict.into());
             }
             if Self::workscope_binding(binding) != inputs.scan_binding.clone().ok_or(
                 TransportError::IdentityConflict,
             )? {
-                return Err(TransportError::IdentityConflict);
+                return Err(TransportError::IdentityConflict.into());
             }
             self.validate_scan_receipt_handle(
                 current,
