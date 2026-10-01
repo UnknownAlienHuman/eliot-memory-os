@@ -519,6 +519,8 @@ fn admit_approved_candidates(
     require_exact_admitted_pair(
         &admission,
         required_owner_ref,
+        generation,
+        state_fence,
         architecture,
         implementation,
     )?;
@@ -528,6 +530,8 @@ fn admit_approved_candidates(
 fn require_exact_admitted_pair(
     admission: &GoverningSourceAdmission,
     required_owner_ref: &str,
+    generation: u64,
+    state_fence: &StateFence,
     architecture: &ApprovedNormativeSource,
     implementation: &ApprovedNormativeSource,
 ) -> Result<(), WorkScopeSourceAdmissionError> {
@@ -545,11 +549,13 @@ fn require_exact_admitted_pair(
             source.role == role
                 && source.source_ref == document.source_ref
                 && source.digest == document.content_sha256
+                && source.applicable_generation == generation
                 && source.authority_basis
                     == Some(AuthorityBasis::HumanOwner {
                         owner_ref: required_owner_ref.to_owned(),
                     })
                 && source.assurance.source_ref == document.source_ref
+                && source.assurance.state_fence == *state_fence
                 && source.assurance.integrity == IntegrityStatus::Verified
                 && source.assurance.freshness == FreshnessStatus::Current
                 && source.assurance.privacy_class == document.privacy_class
@@ -690,6 +696,9 @@ pub enum WorkScopeSourceAdmissionError {
     /// The source capture could not be rendered as canonical JSON.
     #[error("normative pair source capture serialization failed: {0}")]
     CaptureSerialization(String),
+    /// The exact approved normative sources could not be freshly recaptured.
+    #[error("normative pair source capture failed: {0}")]
+    SourceCapture(String),
     /// The signed approval does not have the closed source-approval shape.
     #[error("governing source approval is malformed")]
     InvalidSourceApproval,
@@ -721,10 +730,13 @@ pub enum WorkScopeSourceAdmissionError {
 ///
 /// The function re-runs initial binding admission and computes the matched
 /// guard itself. It never accepts caller-created source statuses, authority
-/// bases, or guard receipts. `approval` can only be constructed from the
-/// trust-anchor-verified first-run config snapshot; the current
-/// `NormativePairSourceCapture` is joined against that signed approval before
-/// the WorkScope source set is derived.
+/// bases, guard receipts, or source capture. `approval` can only be
+/// constructed from the trust-anchor-verified first-run config snapshot. The
+/// function rereads the exact observed root through the Bootstrap capture
+/// parser and joins those bytes against the signed approval before deriving
+/// the WorkScope source set. `lease_key` must come from the authenticated
+/// Kernel peer projection; this function binds its request, session, and root
+/// components to the verified `RequestIdentity` and observed root.
 /// `operation_id` is the exact admitted Store operation identity retained by
 /// the authenticated Task Controller attempt; this producer never aliases it
 /// to the transport `RequestId`.
@@ -747,7 +759,6 @@ pub fn prepare_initial_work_scope_source_admission(
     observed_resources: &ObservedScopeResources,
     governing_source_generation: u64,
     approval: &VerifiedGoverningSourceApproval,
-    capture: &NormativePairSourceCapture,
     owner_readback: &WorkScopeOwnerSnapshotReadback,
     lease_key: &DiscoveryLeaseKey,
     now: u64,
@@ -781,6 +792,10 @@ pub fn prepare_initial_work_scope_source_admission(
         approved.scope_privacy_class,
         governing_source_generation,
     )?;
+    let capture = eliot_bootstrap::capture::capture_normative_pair_sources(Path::new(
+        &binding.scope.root_identity,
+    ))
+    .map_err(|error| WorkScopeSourceAdmissionError::SourceCapture(error.to_string()))?;
     if now > identity.deadline_unix_ms {
         return Err(WorkScopeSourceAdmissionError::SourceAdmission(
             "request deadline has elapsed".to_owned(),
@@ -808,7 +823,7 @@ pub fn prepare_initial_work_scope_source_admission(
         ));
     }
     let sources = approval.derive_work_scope_sources(
-        capture,
+        &capture,
         &binding.scope.root_identity,
         &identity.request.metadata.product_id,
         &identity.request.metadata.source_id,
@@ -865,7 +880,7 @@ pub fn prepare_initial_work_scope_source_admission(
         .read_current(fence)
         .map_err(|error| WorkScopeSourceAdmissionError::InitialAdmission(error.to_string()))?;
 
-    let capture_bytes = canonical_json_bytes(capture)
+    let capture_bytes = canonical_json_bytes(&capture)
         .map_err(|error| WorkScopeSourceAdmissionError::CaptureSerialization(error.to_string()))?;
     let capture_json = String::from_utf8(capture_bytes.clone())
         .map_err(|error| WorkScopeSourceAdmissionError::CaptureSerialization(error.to_string()))?;
