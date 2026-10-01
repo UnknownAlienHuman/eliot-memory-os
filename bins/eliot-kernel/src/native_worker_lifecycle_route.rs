@@ -3547,26 +3547,20 @@ mod single_shape_proof {
         let nonce = "launch-nonce-0123456789abcdef";
         let invocation_digest = test_invocation_digest(claim_id, operation_id);
         let owner_digest = test_owner_digest(claim_id, operation_id, nonce, &invocation_digest);
-        let join = serde_json::json!({
-            "route_ref": "route://test/full-canonical-route",
-            "adapter_id": "adapter-test",
-            "adapter_revision": 3,
-            "config_digest": "b".repeat(64),
-            "facet_manifest_ref": "facet-manifest-7",
-            "capability_cell": eliot_contracts::CapabilityCellId::new("native-worker-core").expect("cell id"),
-            "grant_graph_revision": 5,
-            "module_catalog_revision": 7,
-            "replay_stream_id": replay_stream_id,
-            "launch_nonce": nonce,
-            "process_invocation_digest": invocation_digest,
-            "authority_epoch": epoch_value,
-            "generation": serde_json::to_value(fence().resource_generation).expect("gen"),
-            "state_fence": fence_value,
-            "deadline_unix_ms": 9_000_000_000_000u64,
-            "expires_at_unix_ms": 9_000_000_100_000u64,
-            "executable_wire_version": NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION,
-            "executable_binding_digest": owner_digest,
-        });
+        // Start from the current owner join fixture so additions to the
+        // closed executable-binding contract stay represented here. Only
+        // claim-specific values are rebound for this proof.
+        let mut join = super::native_worker_claim_plumbing::test_executable_join();
+        join.replay_stream_id = replay_stream_id.to_owned();
+        join.launch_nonce = nonce.to_owned();
+        join.process_invocation_digest = invocation_digest;
+        join.authority_epoch = epoch(1);
+        join.generation = fence().resource_generation;
+        join.state_fence = fence();
+        join.deadline_unix_ms = 9_000_000_000_000u64;
+        join.expires_at_unix_ms = 9_000_000_100_000u64;
+        join.executable_binding_digest = owner_digest;
+        let join = serde_json::to_value(join).expect("owner executable join serializes");
         // Binding digest over the shared bound-work key set (the exact key
         // set both `compute_binding_digest` implementations cover, so the
         // presented digest binds; envelope-only fields are excluded, so
