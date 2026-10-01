@@ -10932,6 +10932,108 @@ where
         Ok(readback)
     }
 
+    /// Verifies the ordered Watchdog is an exact transaction-created
+    /// convergence for owner rollback, proved current by its own
+    /// authoritative readback.
+    ///
+    /// A Watchdog outside `Applied` needs no verification.  Otherwise the
+    /// readback must observe `Absent` with no lineage, `Absent` with the
+    /// recorded lineage, or `Matching` with the recorded identity and no
+    /// foreign lineage; any foreign or mismatched ownership refuses
+    /// fail-closed with `IdentityConflict`, and any residual unknown refuses
+    /// with `IncompleteObservation`.  The intent is kept in every refusal.
+    /// This never executes an effect: reconciliation is read-only.
+    fn verify_watchdog_convergence_for_owner_rollback(
+        &mut self,
+        transaction: &InstallationTransaction,
+        watchdog_index: usize,
+    ) -> Result<(), InstallationError> {
+        if let InstallationEffectProgressState::Applied {
+            disposition: InstallationEffectDisposition::CreatedByTransaction,
+            external_identity,
+            ..
+        } = &transaction.effect_progress[watchdog_index].state
+        {
+            let proof = transaction.effect_progress[watchdog_index]
+                .service_start_proof
+                .as_ref()
+                .ok_or(InstallationError::IdentityConflict)?;
+            let lineage = proof.process_lineage.as_ref().ok_or_else(|| {
+                InstallationError::IncompleteObservation(
+                    "service start reconciliation requires the transaction-created Watchdog process lineage"
+                        .to_owned(),
+                )
+            })?;
+            if transaction.effect_progress[watchdog_index]
+                .service_start_deadline_ms
+                .is_none()
+            {
+                return Err(InstallationError::IncompleteObservation(
+                    "service start reconciliation requires the transaction-created Watchdog start deadline"
+                        .to_owned(),
+                ));
+            }
+            transaction
+                .recorded_service_registration_identity(InstallerServiceRole::Watchdog)?;
+            let request = effect_request(
+                transaction,
+                watchdog_index,
+                1,
+                InstallationEffectAction::Rollback,
+                Some(external_identity.clone()),
+            )?;
+            let observed = match self.port.reconcile(&request) {
+                PortOutcome::Known(observed) => {
+                    observed.validate()?;
+                    observed
+                        .validate_for_effect(&transaction.installer_effects[watchdog_index])?;
+                    observed
+                }
+                other => {
+                    return Err(InstallationError::IncompleteObservation(format!(
+                        "service start reconciliation stays unknown for effect {}: {}",
+                        transaction.effect_progress[watchdog_index]
+                            .effect_id
+                            .as_str(),
+                        port_pending(other).as_str(),
+                    )));
+                }
+            };
+            match observed {
+                InstallationEffectObservation::Absent {
+                    service_runtime_lineage: None,
+                    ..
+                } => {}
+                InstallationEffectObservation::Absent {
+                    service_runtime_lineage: Some(seen),
+                    ..
+                } if seen == *lineage => {}
+                InstallationEffectObservation::Matching {
+                    disposition: InstallationEffectDisposition::CreatedByTransaction,
+                    external_identity: seen,
+                    service_runtime_lineage,
+                    ..
+                } if seen == *external_identity => {
+                    if let Some(seen_lineage) = service_runtime_lineage
+                        && seen_lineage != *lineage
+                    {
+                        return Err(InstallationError::IdentityConflict);
+                    }
+                }
+                // A residual foreign lineage on an otherwise absent Watchdog and any
+                // foreign or mismatched Watchdog ownership share the same fail-closed
+                // disposition: the reconciliation can never adopt an unknown process,
+                // and the intent is kept for recovery/forward-repair.
+                InstallationEffectObservation::Absent { .. }
+                | InstallationEffectObservation::Matching { .. }
+                | InstallationEffectObservation::Mismatch { .. } => {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Recovery-only readback reconciliation for a first-install service-start
     /// timeout, called before the Host registry abort in
     /// `rollback_with_activation_owner`.
@@ -10982,87 +11084,7 @@ where
                 }
             )
         }) {
-            if let InstallationEffectProgressState::Applied {
-                disposition: InstallationEffectDisposition::CreatedByTransaction,
-                external_identity,
-                ..
-            } = &transaction.effect_progress[watchdog_index].state
-            {
-                let proof = transaction.effect_progress[watchdog_index]
-                    .service_start_proof
-                    .as_ref()
-                    .ok_or(InstallationError::IdentityConflict)?;
-                let lineage = proof.process_lineage.as_ref().ok_or_else(|| {
-                    InstallationError::IncompleteObservation(
-                        "service start reconciliation requires the transaction-created Watchdog process lineage"
-                            .to_owned(),
-                    )
-                })?;
-                if transaction.effect_progress[watchdog_index]
-                    .service_start_deadline_ms
-                    .is_none()
-                {
-                    return Err(InstallationError::IncompleteObservation(
-                        "service start reconciliation requires the transaction-created Watchdog start deadline"
-                            .to_owned(),
-                    ));
-                }
-                transaction
-                    .recorded_service_registration_identity(InstallerServiceRole::Watchdog)?;
-                let request = effect_request(
-                    transaction,
-                    watchdog_index,
-                    1,
-                    InstallationEffectAction::Rollback,
-                    Some(external_identity.clone()),
-                )?;
-                let observed = match self.port.reconcile(&request) {
-                    PortOutcome::Known(observed) => {
-                        observed.validate()?;
-                        observed
-                            .validate_for_effect(&transaction.installer_effects[watchdog_index])?;
-                        observed
-                    }
-                    other => {
-                        return Err(InstallationError::IncompleteObservation(format!(
-                            "service start reconciliation stays unknown for effect {}: {}",
-                            transaction.effect_progress[watchdog_index]
-                                .effect_id
-                                .as_str(),
-                            port_pending(other).as_str(),
-                        )));
-                    }
-                };
-                match observed {
-                    InstallationEffectObservation::Absent {
-                        service_runtime_lineage: None,
-                        ..
-                    } => {}
-                    InstallationEffectObservation::Absent {
-                        service_runtime_lineage: Some(seen),
-                        ..
-                    } if seen == *lineage => {}
-                    InstallationEffectObservation::Absent { .. } => {
-                        return Err(InstallationError::IdentityConflict);
-                    }
-                    InstallationEffectObservation::Matching {
-                        disposition: InstallationEffectDisposition::CreatedByTransaction,
-                        external_identity: seen,
-                        service_runtime_lineage,
-                        ..
-                    } if seen == *external_identity => {
-                        if let Some(seen_lineage) = service_runtime_lineage
-                            && seen_lineage != *lineage
-                        {
-                            return Err(InstallationError::IdentityConflict);
-                        }
-                    }
-                    InstallationEffectObservation::Matching { .. }
-                    | InstallationEffectObservation::Mismatch { .. } => {
-                        return Err(InstallationError::IdentityConflict);
-                    }
-                }
-            }
+            self.verify_watchdog_convergence_for_owner_rollback(transaction, watchdog_index)?;
         }
         for index in &candidates {
             let role = match &transaction.installer_effects[*index] {
