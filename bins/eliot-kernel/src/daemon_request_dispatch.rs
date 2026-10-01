@@ -671,6 +671,7 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "semantic_observe_deferred" => "semantic_observe_deferred",
         "watchdog_export_claim" => "watchdog_export_claim",
         "watchdog_export_result" => "watchdog_export_result",
+        "watchdog_intent_result" => "watchdog_intent_result",
         "campaign_packet_claim" => "campaign_packet_claim",
         "campaign_packet_result" => "campaign_packet_result",
         "task_controller_claim" => "task_controller_claim",
@@ -3828,6 +3829,38 @@ impl KernelComposition {
                     let result = host_request_route::watchdog_export_result_from_payload(payload)?;
                     let projections = self.record_watchdog_export_outcomes(session, &result)?;
                     Ok(host_request_route::watchdog_export_result_response(
+                        &projections,
+                    ))
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "watchdog_intent_result" => {
+                // Daemon outcome leg for the reconciled Watchdog intents
+                // (#1754): records the Governor's OWN terminal per-record
+                // dispositions against the durable intent projections this
+                // Kernel already staged. It mirrors `watchdog_export_result`:
+                // same dispatcher-head session/auth/ready/fence gates, same
+                // admitted daemon dispatch. The Kernel writes no disposition
+                // of its own; it only persists the submitted ones through the
+                // owner's ORS result path, after proving each one answers the
+                // exact retained record the intent route projected. There is
+                // deliberately no Watchdog front-door operation carrying this
+                // shape, so the observed party can never record its own
+                // terminal outcome.
+                #[cfg(windows)]
+                {
+                    let (installation_id, outcomes) =
+                        host_request_route::watchdog_intent_outcome_from_payload(payload)?;
+                    let projections = self.record_watchdog_intent_outcomes(
+                        session,
+                        &installation_id,
+                        &outcomes,
+                    )?;
+                    Ok(host_request_route::watchdog_intent_outcome_response(
                         &projections,
                     ))
                 }
