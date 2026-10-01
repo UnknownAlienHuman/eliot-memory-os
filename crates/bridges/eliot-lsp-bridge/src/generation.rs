@@ -21,10 +21,10 @@
 //! caller-observed identity line, it does not install anything.
 //!
 //! Wiring: the crate root declares `mod generation;` and re-exports this
-//! sequence. LspBridge::stage_generation feeds staged values built from
+//! sequence. `LspBridge::stage_generation` feeds staged values built from
 //! `lsp_application_obligations().supported_operations`, the launch path
 //! records dispatched operation identities in the ledger, and the
-//! composition owner holding the AdmittedLine supplies the canary verdict
+//! composition owner holding the `AdmittedLine` supplies the canary verdict
 //! and performs the switch.
 
 use thiserror::Error;

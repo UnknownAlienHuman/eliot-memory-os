@@ -20,7 +20,7 @@
 //! new journal.
 //!
 //! Wiring: the crate root declares `mod removal;` and re-exports this
-//! sequence. The launch path consults blocks_new_calls before launch,
+//! sequence. The launch path consults `blocks_new_calls` before launch,
 //! feeds per-operation exit evidence from real receipts, and the
 //! composition owner performs the revocations and the artifact release the
 //! receipt enumerates.
