@@ -1378,53 +1378,12 @@ impl OwnerClosureProvider {
         &self,
         intent: &GrantActivationIntent,
     ) -> Result<(), CompositionError> {
-        let subset = &intent.mechanical_subset;
-        subset
-            .verify_recorded_commitment()
-            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        if intent.mechanical_subset_commitment != subset.content_commitment {
-            return Err(CompositionError::Recovery(
-                "admitted mechanical subset disagrees with its recorded content commitment"
-                    .to_owned(),
-            ));
-        }
         let record = self.snapshot_grant(&intent.grant_id).ok_or_else(|| {
             CompositionError::Recovery(
                 "admitted mechanical subset names unknown canonical grant lineage".to_owned(),
             )
         })?;
-        if subset.grant_id != intent.grant_id
-            || subset.holder_principal != intent.holder_principal
-            || subset.session_id != intent.session_id
-            || subset.scope_id != intent.scope_id
-            || subset.authority_root_ref != intent.authority_root_ref
-            || subset.governor_snapshot_id != intent.snapshot_id
-            || subset.binding != intent.binding
-            || subset.effect_ceiling != intent.allowed_effect
-            || subset.proof_ceiling != intent.proof_ceiling
-            || subset.expires_at_ms != intent.expires_at_ms
-            || subset.issued_at_ms != intent.issued_at_ms
-        {
-            return Err(CompositionError::Recovery(
-                "admitted mechanical subset disagrees with its admitted grant intent".to_owned(),
-            ));
-        }
-        if subset.operations != record.allowed_operations
-            || subset.scopes != record.allowed_resources
-            || subset.effect_ceiling != record.max_effect
-            || subset.source.source_grant_id != record.grant_id
-        {
-            return Err(CompositionError::Recovery(
-                "admitted mechanical subset is not a subset of the current canonical grant"
-                    .to_owned(),
-            ));
-        }
-        if subset.source.source_grant_commitment != canonical_grant_record_commitment(record)? {
-            return Err(CompositionError::Recovery(
-                "admitted mechanical subset names a different canonical grant revision".to_owned(),
-            ));
-        }
-        Ok(())
+        verify_mechanical_subset_against_current_grant_record(intent, record)
     }
 
     fn sync_owner_hydrations(&mut self) -> Result<(), CompositionError> {
@@ -2158,6 +2117,56 @@ fn grant_admission_params_from_intent(intent: &GrantActivationIntent) -> GrantAd
         expires_at_ms: intent.expires_at_ms,
         receipt_obligations: intent.receipt_obligations.clone(),
     }
+}
+
+/// Reuses the exact closure-provider comparison at other Governor owner
+/// boundaries that consume retained grant hydrations directly.
+pub(crate) fn verify_mechanical_subset_against_current_grant_record(
+    intent: &GrantActivationIntent,
+    record: &GrantRecoveryRecord,
+) -> Result<(), CompositionError> {
+    let subset = &intent.mechanical_subset;
+    subset
+        .verify_recorded_commitment()
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+    if intent.mechanical_subset_commitment != subset.content_commitment {
+        return Err(CompositionError::Recovery(
+            "admitted mechanical subset disagrees with its recorded content commitment"
+                .to_owned(),
+        ));
+    }
+    if subset.grant_id != intent.grant_id
+        || subset.holder_principal != intent.holder_principal
+        || subset.session_id != intent.session_id
+        || subset.scope_id != intent.scope_id
+        || subset.authority_root_ref != intent.authority_root_ref
+        || subset.governor_snapshot_id != intent.snapshot_id
+        || subset.binding != intent.binding
+        || subset.effect_ceiling != intent.allowed_effect
+        || subset.proof_ceiling != intent.proof_ceiling
+        || subset.expires_at_ms != intent.expires_at_ms
+        || subset.issued_at_ms != intent.issued_at_ms
+    {
+        return Err(CompositionError::Recovery(
+            "admitted mechanical subset disagrees with its admitted grant intent".to_owned(),
+        ));
+    }
+    if subset.operations != record.allowed_operations
+        || subset.scopes != record.allowed_resources
+        || subset.effect_ceiling != record.max_effect
+        || subset.source.source_grant_id != record.grant_id
+    {
+        return Err(CompositionError::Recovery(
+            "admitted mechanical subset is not a subset of the current canonical grant"
+                .to_owned(),
+        ));
+    }
+    if subset.source.source_grant_commitment != canonical_grant_record_commitment(record)? {
+        return Err(CompositionError::Recovery(
+            "admitted mechanical subset names a different canonical grant revision".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Immutable commitment of one canonical grant record: the canonical digest of
