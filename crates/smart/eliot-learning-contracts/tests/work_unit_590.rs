@@ -3836,3 +3836,234 @@ fn independent_consumer_compile_fixtures_without_inter_algorithm_dependencies() 
     let _campaign = CampaignId::from_artifact(aid("campaign-590-c58"));
     let _learning_target = LearningTargetId::from_artifact(aid("ltarget-590-c58"));
 }
+
+/// A view over one declared slot, bound to its exact owner source revisions.
+///
+/// `disposition`/`member_disposition` of `None` leave the declared slot absent;
+/// `on_frontier` then records it on the view frontier, and `false` records it
+/// nowhere at all.
+fn single_slot_view(
+    tag: &str,
+    requirement: SlotRequirement,
+    disposition: Option<SlotDisposition>,
+    member_disposition: Option<SlotDisposition>,
+    on_frontier: bool,
+    completeness: Completeness,
+) -> (LearningStateViewRecipe, CampaignLearningStateView) {
+    let binding = binding(tag);
+    let target = target(&format!("target-590-{tag}"));
+    let spec = slot_spec("req", &target, requirement);
+    let (source_requirements, mut provenance) = campaign_source_contract(&binding, tag);
+    let mut recipe = LearningStateViewRecipe {
+        recipe_id: aid(&format!("recipe-590-{tag}")),
+        campaign_id: CampaignId::from_artifact(aid(&format!("campaign-590-{tag}"))),
+        target: target.clone(),
+        binding: binding.clone(),
+        slots: vec![spec.clone()],
+        source_requirements,
+        active_overlay_policy: CampaignActiveOverlayPolicy::ExplicitlyAbsentAllowed,
+        freshness: EvidenceFreshness::ExactCandidate,
+        privacy_class: "task-local".to_owned(),
+        omission_policy: OmissionPolicy::RequiredSlots,
+        canonical_digest: String::new(),
+    };
+    let slots = disposition
+        .map(|slot_disposition| {
+            vec![SlotProjection {
+                slot_id: spec.slot_id.clone(),
+                disposition: slot_disposition,
+                members: vec![MemberProjection {
+                    member_id: spec.declared_members[0].clone(),
+                    owner: spec.owner.clone(),
+                    source: binding.source.clone(),
+                    projection_revision: TaskRevision::genesis(),
+                    disposition: member_disposition.unwrap_or(slot_disposition),
+                    value_digest: Some(digest(&format!("value-590-{tag}"))),
+                    evidence: vec![aid(&format!("ev-590-{tag}"))],
+                }],
+                evidence: vec![aid(&format!("slot-ev-590-{tag}"))],
+            }]
+        })
+        .unwrap_or_default();
+    let observed = u32::from(!slots.is_empty());
+    bind_slot_source_contract(&mut recipe, &mut provenance, &slots);
+    let mut view = CampaignLearningStateView {
+        view_id: aid(&format!("view-590-{tag}")),
+        recipe_id: recipe.recipe_id.clone(),
+        campaign_id: recipe.campaign_id.clone(),
+        target,
+        binding,
+        recipe_digest: recipe.canonical_digest.clone(),
+        provenance,
+        slots,
+        denominator: SourceDenominator {
+            declared: 1,
+            observed,
+        },
+        completeness,
+        omissions: vec![],
+        frontier: if on_frontier {
+            vec![spec.slot_id.clone()]
+        } else {
+            vec![]
+        },
+        owner_disagreements: vec![],
+        required_references: vec![aid("objective-590-ref")],
+        invalidated: false,
+        invalidation_reason: None,
+        canonical_digest: String::new(),
+    };
+    must(view.seal_content_addressed());
+    (recipe, view)
+}
+
+// WORK_UNIT_CASE: 590/59
+#[test]
+fn required_non_current_disposition_is_partial_and_refusal_stays_blocked() {
+    // A required slot the owner did project at a known non-current position
+    // leaves the declared coverage open; nothing has to be silently filled.
+    for (index, disposition) in [
+        SlotDisposition::Historical,
+        SlotDisposition::Superseded,
+        SlotDisposition::Unknown,
+        SlotDisposition::Conflicted,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (recipe, view) = single_slot_view(
+            &format!("req-partial-{index}"),
+            SlotRequirement::Required,
+            Some(disposition),
+            None,
+            false,
+            Completeness::Partial,
+        );
+        assert_eq!(view.derived_completeness(&recipe), Completeness::Partial);
+        must(view.validate_against(&recipe));
+    }
+    // A member crosses its own freshness boundary, so the view is stale
+    // rather than merely partial, even though the slot itself was projected.
+    let (recipe, view) = single_slot_view(
+        "req-member-stale",
+        SlotRequirement::Required,
+        Some(SlotDisposition::Historical),
+        Some(SlotDisposition::Stale),
+        false,
+        Completeness::Stale,
+    );
+    assert_eq!(view.derived_completeness(&recipe), Completeness::Stale);
+    must(view.validate_against(&recipe));
+    // Refusal: a source its owner declared unavailable, or a blocked owner or
+    // dependency, stays blocked and cannot be recorded as partial evidence.
+    for (index, disposition) in [SlotDisposition::Unavailable, SlotDisposition::Blocked]
+        .into_iter()
+        .enumerate()
+    {
+        let (recipe, view) = single_slot_view(
+            &format!("req-blocked-{index}"),
+            SlotRequirement::Required,
+            Some(disposition),
+            None,
+            false,
+            Completeness::Blocked,
+        );
+        assert_eq!(view.derived_completeness(&recipe), Completeness::Blocked);
+        must(view.validate_against(&recipe));
+    }
+    // Refusal: crossed freshness is stale, never partial.
+    let (recipe, view) = single_slot_view(
+        "req-stale",
+        SlotRequirement::Required,
+        Some(SlotDisposition::Stale),
+        None,
+        false,
+        Completeness::Stale,
+    );
+    assert_eq!(view.derived_completeness(&recipe), Completeness::Stale);
+    must(view.validate_against(&recipe));
+}
+
+// WORK_UNIT_CASE: 590/60
+#[test]
+fn optional_slot_disposition_does_not_degrade_completeness() {
+    // An optional slot is declared but not required by the recipe, so its own
+    // non-current disposition stays visible without withholding completeness.
+    for (index, disposition) in [
+        SlotDisposition::Historical,
+        SlotDisposition::Stale,
+        SlotDisposition::Superseded,
+        SlotDisposition::Unavailable,
+        SlotDisposition::Blocked,
+        SlotDisposition::Unknown,
+        SlotDisposition::Conflicted,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (recipe, view) = single_slot_view(
+            &format!("opt-noncurrent-{index}"),
+            SlotRequirement::Optional,
+            Some(disposition),
+            None,
+            false,
+            Completeness::CompleteForDeclaredRecipe,
+        );
+        assert_eq!(
+            view.derived_completeness(&recipe),
+            Completeness::CompleteForDeclaredRecipe
+        );
+        must(view.validate_against(&recipe));
+    }
+    // Refusal: an optional slot that is absent rather than projected still
+    // affects completeness, because the declared coverage stays open.
+    let (recipe, view) = single_slot_view(
+        "opt-frontier",
+        SlotRequirement::Optional,
+        None,
+        None,
+        true,
+        Completeness::Partial,
+    );
+    assert_eq!(view.derived_completeness(&recipe), Completeness::Partial);
+    must(view.validate_against(&recipe));
+}
+
+// WORK_UNIT_CASE: 590/61
+#[test]
+fn frontier_recorded_slot_is_partial_and_unrecorded_required_stays_blocked() {
+    // A frontier entry is the view's own record that a declared slot was not
+    // visited, so a required slot recorded there is partial, not blocked.
+    for (index, requirement) in [SlotRequirement::Required, SlotRequirement::Optional]
+        .into_iter()
+        .enumerate()
+    {
+        let (recipe, view) = single_slot_view(
+            &format!("frontier-{index}"),
+            requirement,
+            None,
+            None,
+            true,
+            Completeness::Partial,
+        );
+        assert_eq!(view.derived_completeness(&recipe), Completeness::Partial);
+        must(view.validate_against(&recipe));
+    }
+    // Refusal: a required slot that is absent and recorded nowhere is neither
+    // projected nor frontier-named, so it cannot be silently filled.
+    let (recipe, view) = single_slot_view(
+        "required-unrecorded",
+        SlotRequirement::Required,
+        None,
+        None,
+        false,
+        Completeness::Blocked,
+    );
+    assert_eq!(view.derived_completeness(&recipe), Completeness::Blocked);
+    // The unrecorded absence is refused by the exact slot partition before any
+    // caller-supplied completeness is compared.
+    assert!(matches!(
+        view.validate_against(&recipe),
+        Err(LearningContractError::IncompleteCoverage)
+    ));
+}
