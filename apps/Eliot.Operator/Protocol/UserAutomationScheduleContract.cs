@@ -1566,7 +1566,7 @@ public static class UserAutomationOutcomeClassifier
             || !TryGetObject(transition, "execution", out var execution)
             || !HasCurrentConfigurationPhase(configuration, parent)
             || !HasCurrentWakePhase(wake, parent)
-            || !HasCurrentExecutionPhase(execution)
+            || !HasCurrentExecutionPhase(execution))
         {
             return false;
         }
@@ -2172,6 +2172,24 @@ public static class UserAutomationOutcomeClassifier
         };
     }
 
+    /// <summary>
+    /// The execution phase, shape-checked only.
+    /// </summary>
+    /// <remarks>
+    /// This phase deliberately takes no parent binding, and that is a decision
+    /// read off the owner rather than an omission. In the Kernel owner's
+    /// `validate_phase_joins` the execution phase is never joined to
+    /// <c>self.identity</c> or <c>self.state_fence</c>: a read and a committed
+    /// revision both require it to be <c>NotApplicable</c>, and the only
+    /// non-<c>NotApplicable</c> arm reachable — a <c>run_now</c> — joins
+    /// <c>Admitted { execution }</c> on <c>execution.occurrence_id ==
+    /// occurrence_id</c>, the identity derived from the committed invocation.
+    /// The reference itself carries only <c>occurrence_id</c>,
+    /// <c>durable_job_ref</c> and <c>state</c>
+    /// (<c>AutomationExecutionReference</c>); it has no <c>operation_id</c>,
+    /// <c>idempotency_key</c>, <c>canonical_request_hash</c> or
+    /// <c>state_fence</c> to compare against a parent at all.
+    /// </remarks>
     private static bool HasCurrentExecutionPhase(JsonElement phase)
     {
         if (!TryReadClosedValue(
