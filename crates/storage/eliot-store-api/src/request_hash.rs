@@ -699,8 +699,9 @@ mod tests {
         // Both moves follow this module's documented discipline: a retained
         // digest computed under pre-binding bytes is never reinterpreted
         // under the new bytes. The value cannot be derived by reading this
-        // file; it is whatever the shared owner function emits, so it is left
-        // as a failing sentinel rather than invented.
+        // file; it is whatever the shared owner function emits, so it was
+        // MEASURED from that function's own assertion output rather than
+        // written by hand.
         assert_eq!(
             canonical_request_hash(&view).expect("golden hash computes"),
             "05cedc381edc6a841ee071f1fd5eaba6c667dac0c14fa4262c94a740aaac51f7"
