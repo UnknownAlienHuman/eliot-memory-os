@@ -1398,10 +1398,6 @@ pub struct IsolatedDestinationAdmissionInput<'a> {
 /// when an owner record fails its own contract, and
 /// [`IsolatedDestinationError::Installation`] when the installation owner's own
 /// roots or manifests cannot produce a value.
-#[allow(
-    clippy::too_many_lines,
-    reason = "the admission keeps the validation-before-effects order in one auditable sequence"
-)]
 pub fn admit_prepared_isolated_destination(
     input: &IsolatedDestinationAdmissionInput<'_>,
 ) -> Result<IsolatedDestinationAllocation, IsolatedDestinationError> {
@@ -1465,22 +1461,222 @@ pub fn admit_prepared_isolated_destination(
         return Err(IsolatedDestinationRefusal::ExistingInstallation.into());
     }
 
-    // 6. The owner-declared isolated restore area, proved through the retained
-    //    no-follow lease the caller already holds, and the destination root
-    //    DERIVED from it. I5.13's "restore to isolated root" is therefore a
-    //    position inside an owner-declared area, never a supplied name.
+    // 6, 5b and 7: the owner-declared isolated restore area, proved through the
+    //    retained no-follow lease the caller already holds; the destination root
+    //    DERIVED from it; and the newness the owner OBSERVES rather than infers.
+    //    I5.13's "restore to isolated root" is therefore a position inside an
+    //    owner-declared area, never a supplied name.
+    let derived = derive_isolated_destination_root(input, &destination_key)?;
+
+    // 8. Restoration requirements are the installation authority's own record,
+    //    issued from the owner-issued facts. They are re-validated here and must
+    //    admit exactly the bound archive class, the bound target schema and no
+    //    fewer bytes than the owner admitted, so a destination cannot be widened.
+    validate_restoration_requirements(input)?;
+
+    // 9. The current purge-ledger revision comes from the ORS purge-ledger owner,
+    //    never from the caller's assertion, and zero is refused: a destination
+    //    bound to no purge revision would restore without applying the current
+    //    privacy purge, which A13.7's verification list requires.
+    if input.current_purge_ledger_revision == 0 {
+        return Err(IsolatedDestinationError::Installation(
+            InstallationError::IncompleteObservation(
+                "the owner issued no current purge-ledger revision for this destination".to_owned(),
+            ),
+        ));
+    }
+
+    build_admission_record(
+        input,
+        &destination_key,
+        &derived,
+        approved_target_build,
+    )
+}
+
+/// Builds and self-validates the isolation evidence for
+/// [`admit_prepared_isolated_destination`].
+///
+/// Every bound value comes from the owner-resolved geometry in `derived` or from
+/// the owner-issued records; none of it is caller text. The evidence digest is
+/// computed from those values BEFORE the record exists, so the record is built
+/// once with its real digest, and the record is then validated against it.
+///
+/// This is a pure move of record assembly; it adds no check and removes none.
+fn build_isolation_evidence(
+    input: &IsolatedDestinationAdmissionInput<'_>,
+    destination_key: &PlatformHandle,
+    derived: &DerivedIsolation,
+) -> Result<IsolationEvidence, IsolatedDestinationError> {
+    let DerivedIsolation {
+        area_identity,
+        resolved_area_text,
+        destination_installation_root,
+        source_installation_root,
+    } = derived;
+    let isolation_wire = PlatformHandle::new(IsolationEvidence::WIRE).map_err(|error| {
+        InstallationError::InvalidField {
+            field: "prepared_destination.isolation.wire".to_owned(),
+            reason: error.to_string(),
+        }
+    })?;
+    let source_host_root = input.source_roots.host_state_root.as_str().to_owned();
+    let isolation = IsolationEvidence {
+        wire: isolation_wire.clone(),
+        isolated_area_root: resolved_area_text.clone(),
+        isolated_area_identity: *area_identity,
+        destination_installation_root: destination_installation_root.clone(),
+        destination_installation_key: destination_key.clone(),
+        source_installation_root: source_installation_root.clone(),
+        source_host_root: source_host_root.clone(),
+        source_active_generation: input.source_active_generation.clone(),
+        destination_observed_absent: true,
+        isolated_area_reparse_free: true,
+        evidence_digest: IsolationEvidence::digest_over_fields(
+            &isolation_wire,
+            resolved_area_text,
+            area_identity,
+            destination_installation_root,
+            destination_key,
+            source_installation_root,
+            &source_host_root,
+            input.source_active_generation,
+            true,
+            true,
+        )?,
+    };
+    isolation.validate()?;
+    Ok(isolation)
+}
+
+/// Builds and self-validates the admission record and its allocation for
+/// [`admit_prepared_isolated_destination`].
+///
+/// The isolation evidence and the admission commitments are computed from the
+/// values themselves BEFORE each record exists, so both records are built once
+/// with their real digests rather than with placeholders. Both are then
+/// validated against their own digests before the allocation is returned, so an
+/// allocation is never handed back unproved.
+///
+/// This is a pure move of record assembly; it adds no check and removes none.
+fn build_admission_record(
+    input: &IsolatedDestinationAdmissionInput<'_>,
+    destination_key: &PlatformHandle,
+    derived: &DerivedIsolation,
+    approved_target_build: PlatformHandle,
+) -> Result<IsolatedDestinationAllocation, IsolatedDestinationError> {
+    let profile_token = match input.approved_target_manifest.runtime_launch.profile {
+        super::InstallationProfile::SystemService => "system_service",
+        super::InstallationProfile::UserMode => "user_mode",
+        super::InstallationProfile::PortableDev => "portable_dev",
+    };
+    let approved_target_profile =
+        PlatformHandle::new(profile_token).map_err(|error| InstallationError::InvalidField {
+            field: "prepared_destination.approved_target_profile".to_owned(),
+            reason: error.to_string(),
+        })?;
+
+    let isolation = build_isolation_evidence(input, destination_key, derived)?;
+
+    let wire = PlatformHandle::new(PreparedDestinationAdmission::WIRE).map_err(|error| {
+        InstallationError::InvalidField {
+            field: "prepared_destination.wire".to_owned(),
+            reason: error.to_string(),
+        }
+    })?;
+    let operation_id = input.facts.operation_id.clone();
+    let archive_id = input.facts.archive_id.clone();
+    let archive_digest = input.facts.archive_digest.clone();
+    let target_schema_digest = input.facts.target_schema_digest.clone();
+    let admission_digest = PreparedDestinationAdmission::digest_over_fields(
+        &wire,
+        &operation_id,
+        &input.facts.source_installation,
+        destination_key,
+        &archive_id,
+        &archive_digest,
+        input.facts.archive_class,
+        input.current_purge_ledger_revision,
+        &target_schema_digest,
+        &approved_target_build,
+        &approved_target_profile,
+        &input.restoration_requirements.requirements_digest,
+        &isolation.evidence_digest,
+    )?;
+    let admission = PreparedDestinationAdmission {
+        wire,
+        operation_id,
+        source_installation: input.facts.source_installation.clone(),
+        destination_installation: destination_key.clone(),
+        archive_id,
+        archive_digest,
+        archive_class: input.facts.archive_class,
+        current_purge_ledger_revision: input.current_purge_ledger_revision,
+        target_schema_digest,
+        approved_target_build,
+        approved_target_profile,
+        restoration_requirements: input.restoration_requirements.clone(),
+        isolation,
+        admission_digest,
+    };
+    admission.validate()?;
+
+    Ok(IsolatedDestinationAllocation {
+        operation_id: admission.operation_id.clone(),
+        destination_installation: destination_key.clone(),
+        destination_installation_root: derived.destination_installation_root.clone(),
+        admission,
+    })
+}
+
+/// The owner-resolved geometry an admitted isolated destination is derived from.
+///
+/// Every value here comes from the owner's own lease resolution and layout
+/// classification; none of it is caller text. It is the single bundle the
+/// admission record's isolation evidence is built from.
+struct DerivedIsolation {
+    /// The area identity the retained lease still holds.
+    area_identity: FileIdentity,
+    /// The area root the retained lease resolves now.
+    resolved_area_text: String,
+    /// The destination root DERIVED inside that area, never supplied.
+    destination_installation_root: String,
+    /// The source installation root, from the owner-issued source roots.
+    source_installation_root: String,
+}
+
+/// Proves the owner-declared isolated restore area and derives the destination
+/// root inside it, for [`admit_prepared_isolated_destination`].
+///
+/// This carries validation steps 6, 5b and 7 of the admission:
+///
+/// - the "preexisting foreign owner" clause, decided by the owner against its
+///   own declared LAYOUT rather than against a name. The source's Host root must
+///   really BE an installation Host root of this layout -- if it is not, the
+///   source is a foreign directory and every isolation statement derived from
+///   its roots is a claim, not a fact. The isolated area and the derived
+///   destination leaf must NOT classify as any part of an installation tree,
+///   because a destination that some foreign installation already owns is not a
+///   new distinct isolated installation. Both directions are pure layout
+///   classification: they observe no filesystem, so existence and reparse
+///   freedom stay the protected-root lease's proof, composed on top;
+/// - the retained lease must still name the same object, and the area it
+///   resolves now must be the declared one;
+/// - the destination must be STRICTLY inside the area (the area itself is not a
+///   destination) and must neither contain, be contained by, nor equal the
+///   source installation root: I5.13's isolated root, A13.7's isolated area;
+/// - the allocation must be NEW and DISTINCT, and the owner OBSERVES that
+///   rather than inferring it from a name: a leaf that already exists is not
+///   owned by this operation, so it is refused -- never reused, and never
+///   deleted by path name.
+///
+/// This is a pure move of those checks; it adds no check and removes none, and
+/// the caller runs it at exactly the same point in the validation order.
+fn derive_isolated_destination_root(
+    input: &IsolatedDestinationAdmissionInput<'_>,
+    destination_key: &PlatformHandle,
+) -> Result<DerivedIsolation, IsolatedDestinationError> {
     input.source_roots.validate()?;
-    // 5b. The "preexisting foreign owner" clause, decided by the owner against
-    //     its own declared LAYOUT rather than against a name. The source's Host
-    //     root must really BE an installation Host root of this layout -- if it
-    //     is not, the source is a foreign directory and every isolation
-    //     statement derived from its roots is a claim, not a fact. The isolated
-    //     area and the derived destination leaf must NOT classify as any part of
-    //     an installation tree, because a destination that some foreign
-    //     installation already owns is not a new distinct isolated
-    //     installation. Both directions are pure layout classification: they
-    //     observe no filesystem, so existence and reparse freedom stay the
-    //     protected-root lease's proof, composed on top.
     if !classify_installation_host_root(std::path::Path::new(
         input.source_roots.host_state_root.as_str(),
     ))
@@ -1516,9 +1712,6 @@ pub fn admit_prepared_isolated_destination(
         joined_windows_path(&resolved_area_text, destination_key.as_str());
     let source_installation_root = input.source_roots.installation_root.as_str().to_owned();
 
-    // The destination must be STRICTLY inside the area (the area itself is not a
-    // destination) and must neither contain, be contained by, nor equal the
-    // source installation root: I5.13's isolated root, A13.7's isolated area.
     let strictly_inside_area =
         !same_windows_root_text(&destination_installation_root, &resolved_area_text)
             && path_is_within(&destination_installation_root, &resolved_area_text);
@@ -1540,18 +1733,30 @@ pub fn admit_prepared_isolated_destination(
         return Err(IsolatedDestinationRefusal::ForeignInstallationOwner.into());
     }
 
-    // 7. The allocation must be NEW and DISTINCT, and the owner OBSERVES that
-    //    rather than inferring it from a name: a leaf that already exists is not
-    //    owned by this operation, so it is refused -- never reused, and never
-    //    deleted by path name.
     if std::path::Path::new(&destination_installation_root).exists() {
         return Err(IsolatedDestinationRefusal::DestinationNotAbsent.into());
     }
 
-    // 8. Restoration requirements are the installation authority's own record,
-    //    issued from the owner-issued facts. They are re-validated here and must
-    //    admit exactly the bound archive class, the bound target schema and no
-    //    fewer bytes than the owner admitted, so a destination cannot be widened.
+    Ok(DerivedIsolation {
+        area_identity,
+        resolved_area_text,
+        destination_installation_root,
+        source_installation_root,
+    })
+}
+
+/// Re-validates the bound restoration requirements for
+/// [`admit_prepared_isolated_destination`].
+///
+/// The requirements are the installation authority's own record, issued from the
+/// owner-issued facts. They must admit exactly the bound archive class, the bound
+/// target schema and no fewer bytes than the owner admitted, so a destination
+/// cannot be widened.
+///
+/// This is a pure move of those checks; it adds no check and removes none.
+fn validate_restoration_requirements(
+    input: &IsolatedDestinationAdmissionInput<'_>,
+) -> Result<(), IsolatedDestinationError> {
     input.restoration_requirements.validate()?;
     if input.restoration_requirements.admitted_classes != [input.facts.archive_class] {
         return Err(IsolatedDestinationRefusal::BoundRecordConflict {
@@ -1571,112 +1776,7 @@ pub fn admit_prepared_isolated_destination(
         }
         .into());
     }
-
-    // 9. The current purge-ledger revision comes from the ORS purge-ledger owner,
-    //    never from the caller's assertion, and zero is refused: a destination
-    //    bound to no purge revision would restore without applying the current
-    //    privacy purge, which A13.7's verification list requires.
-    if input.current_purge_ledger_revision == 0 {
-        return Err(IsolatedDestinationError::Installation(
-            InstallationError::IncompleteObservation(
-                "the owner issued no current purge-ledger revision for this destination".to_owned(),
-            ),
-        ));
-    }
-
-    let profile_token = match input.approved_target_manifest.runtime_launch.profile {
-        super::InstallationProfile::SystemService => "system_service",
-        super::InstallationProfile::UserMode => "user_mode",
-        super::InstallationProfile::PortableDev => "portable_dev",
-    };
-    let approved_target_profile =
-        PlatformHandle::new(profile_token).map_err(|error| InstallationError::InvalidField {
-            field: "prepared_destination.approved_target_profile".to_owned(),
-            reason: error.to_string(),
-        })?;
-
-    let isolation_wire = PlatformHandle::new(IsolationEvidence::WIRE).map_err(|error| {
-        InstallationError::InvalidField {
-            field: "prepared_destination.isolation.wire".to_owned(),
-            reason: error.to_string(),
-        }
-    })?;
-    let source_host_root = input.source_roots.host_state_root.as_str().to_owned();
-    let isolation = IsolationEvidence {
-        wire: isolation_wire.clone(),
-        isolated_area_root: resolved_area_text.clone(),
-        isolated_area_identity: area_identity,
-        destination_installation_root: destination_installation_root.clone(),
-        destination_installation_key: destination_key.clone(),
-        source_installation_root: source_installation_root.clone(),
-        source_host_root: source_host_root.clone(),
-        source_active_generation: input.source_active_generation.clone(),
-        destination_observed_absent: true,
-        isolated_area_reparse_free: true,
-        evidence_digest: IsolationEvidence::digest_over_fields(
-            &isolation_wire,
-            &resolved_area_text,
-            &area_identity,
-            &destination_installation_root,
-            &destination_key,
-            &source_installation_root,
-            &source_host_root,
-            input.source_active_generation,
-            true,
-            true,
-        )?,
-    };
-    isolation.validate()?;
-
-    let wire = PlatformHandle::new(PreparedDestinationAdmission::WIRE).map_err(|error| {
-        InstallationError::InvalidField {
-            field: "prepared_destination.wire".to_owned(),
-            reason: error.to_string(),
-        }
-    })?;
-    let operation_id = input.facts.operation_id.clone();
-    let archive_id = input.facts.archive_id.clone();
-    let archive_digest = input.facts.archive_digest.clone();
-    let target_schema_digest = input.facts.target_schema_digest.clone();
-    let admission_digest = PreparedDestinationAdmission::digest_over_fields(
-        &wire,
-        &operation_id,
-        &input.facts.source_installation,
-        &destination_key,
-        &archive_id,
-        &archive_digest,
-        input.facts.archive_class,
-        input.current_purge_ledger_revision,
-        &target_schema_digest,
-        &approved_target_build,
-        &approved_target_profile,
-        &input.restoration_requirements.requirements_digest,
-        &isolation.evidence_digest,
-    )?;
-    let admission = PreparedDestinationAdmission {
-        wire,
-        operation_id,
-        source_installation: input.facts.source_installation.clone(),
-        destination_installation: destination_key.clone(),
-        archive_id,
-        archive_digest,
-        archive_class: input.facts.archive_class,
-        current_purge_ledger_revision: input.current_purge_ledger_revision,
-        target_schema_digest,
-        approved_target_build,
-        approved_target_profile,
-        restoration_requirements: input.restoration_requirements.clone(),
-        isolation,
-        admission_digest,
-    };
-    admission.validate()?;
-
-    Ok(IsolatedDestinationAllocation {
-        operation_id: admission.operation_id.clone(),
-        destination_installation: destination_key,
-        destination_installation_root,
-        admission,
-    })
+    Ok(())
 }
 
 /// Materialises the ADMITTED isolated destination root, through the
@@ -1756,39 +1856,8 @@ pub fn materialise_prepared_isolated_destination(
     // (1) and (2): the retained lease must still be the object and the path the
     // admission was proved against, and the destination root is re-derived from
     // that resolution rather than taken from the record.
-    isolated_area_lease
-        .verify_stable_identity()
-        .map_err(|_| IsolatedDestinationRefusal::IsolatedAreaUnproved)?;
-    let observed_area_identity = isolated_area_lease.identity();
-    if observed_area_identity != admission.isolation.isolated_area_identity {
-        return Err(IsolatedDestinationRefusal::IsolatedAreaUnproved.into());
-    }
-    let resolved_area = isolated_area_lease
-        .canonical_path()
-        .map_err(|_| IsolatedDestinationRefusal::IsolatedAreaUnproved)?;
-    let resolved_area_text = resolved_area.to_string_lossy().into_owned();
-    if !same_windows_root_text(&resolved_area_text, &admission.isolation.isolated_area_root) {
-        return Err(IsolatedDestinationRefusal::IsolatedAreaUnproved.into());
-    }
-    let derived_destination_root = joined_windows_path(
-        &resolved_area_text,
-        admission.destination_installation.as_str(),
-    );
-    if !same_windows_root_text(
-        &derived_destination_root,
-        &admission.isolation.destination_installation_root,
-    ) {
-        return Err(IsolatedDestinationRefusal::BoundRecordConflict {
-            field: "destination_installation_root",
-        }
-        .into());
-    }
-    if !matches!(
-        classify_installation_host_root(std::path::Path::new(&derived_destination_root)),
-        InstallationHostRootClass::Unowned
-    ) {
-        return Err(IsolatedDestinationRefusal::ForeignInstallationOwner.into());
-    }
+    let (observed_area_identity, derived_destination_root) =
+        prove_isolated_area_and_derive_destination(admission, isolated_area_lease)?;
 
     // The owner must observe absence itself, immediately before the create. A
     // name a caller can predict is not evidence that this operation owns it, so
@@ -1864,57 +1933,41 @@ pub fn materialise_prepared_isolated_destination(
     // protected-root contour, the same no-follow pin -- and its identity is what
     // gets recorded. A junction swapped in immediately after the move is
     // refused here rather than adopted.
-    let created_lease =
-        ProtectedRootLease::open_existing(std::path::Path::new(&derived_destination_root))
-            .map_err(|_| {
-                IsolatedDestinationError::Installation(InstallationError::IncompleteObservation(
-        "the created isolated destination could not be re-proved through a protected-root lease, \
-         so its ownership is not established"
-            .to_owned(),
-    ))
-            })?;
-    created_lease.verify_stable_identity().map_err(|_| {
-        IsolatedDestinationError::Installation(InstallationError::IncompleteObservation(
-            "the created isolated destination root did not keep its retained identity".to_owned(),
-        ))
-    })?;
-    let created_path = created_lease.canonical_path().map_err(|_| {
-        IsolatedDestinationError::Installation(InstallationError::IncompleteObservation(
-            "the created isolated destination root could not be resolved through its retained \
-             lease"
-                .to_owned(),
-        ))
-    })?;
-    if !same_windows_root_text(
-        &created_path.to_string_lossy(),
-        &admission.isolation.destination_installation_root,
-    ) {
-        return Err(IsolatedDestinationError::Installation(
-            InstallationError::IncompleteObservation(
-                "the created isolated destination root does not resolve to the admitted root"
-                    .to_owned(),
-            ),
-        ));
-    }
-    let destination_root_identity = created_lease.identity();
-    if destination_root_identity != receipt.destination_identity {
-        return Err(IsolatedDestinationError::Installation(
-            InstallationError::IncompleteObservation(
-                "the identity observed for the created isolated destination is not the identity \
-                 the installation authority published"
-                    .to_owned(),
-            ),
-        ));
-    }
+    let destination_root_identity = reprove_created_destination_root(
+        admission,
+        &derived_destination_root,
+        receipt.destination_identity,
+    )?;
 
+    build_materialisation_record(
+        admission,
+        observed_area_identity,
+        derived_destination_root,
+        destination_root_identity,
+    )
+}
+
+/// Builds and self-validates the materialisation record for
+/// [`materialise_prepared_isolated_destination`].
+///
+/// The commitment is computed from the values themselves BEFORE the record
+/// exists, so the record is built once with its real digest rather than with a
+/// placeholder that would have to be a second, weaker value type. The record is
+/// then validated against its own digest before it is returned, so a
+/// materialisation is never handed back unproved.
+///
+/// This is a pure move of record assembly; it adds no check and removes none.
+fn build_materialisation_record(
+    admission: &PreparedDestinationAdmission,
+    observed_area_identity: FileIdentity,
+    derived_destination_root: String,
+    destination_root_identity: FileIdentity,
+) -> Result<PreparedDestinationMaterialisation, IsolatedDestinationError> {
     let materialisation_wire = PlatformHandle::new(PreparedDestinationMaterialisation::WIRE)
         .map_err(|error| InstallationError::InvalidField {
             field: "prepared_destination.materialisation.wire".to_owned(),
             reason: error.to_string(),
         })?;
-    // The commitment is computed from the values themselves BEFORE the record
-    // exists, so the record is built once with its real digest rather than with
-    // a placeholder that would have to be a second, weaker value type.
     let materialisation_digest = PreparedDestinationMaterialisation::digest_over_fields(
         &materialisation_wire,
         &admission.operation_id,
@@ -1942,6 +1995,120 @@ pub fn materialise_prepared_isolated_destination(
     };
     materialisation.validate()?;
     Ok(materialisation)
+}
+
+/// Re-proves the retained isolated area and re-derives the destination root
+/// from that resolution, for
+/// [`materialise_prepared_isolated_destination`].
+///
+/// Returns the area identity the retained lease still holds together with the
+/// root derived from the owner's own resolution. The root is derived, never read
+/// from the record, and the bound-record check re-proves that the derivation
+/// still agrees with what the admission retained.
+///
+/// This is a pure move of validation steps (1) and (2); it adds no check and
+/// removes none, and the caller runs it at exactly the same point in the
+/// validation-before-effects order.
+fn prove_isolated_area_and_derive_destination(
+    admission: &PreparedDestinationAdmission,
+    isolated_area_lease: &ProtectedRootLease,
+) -> Result<(FileIdentity, String), IsolatedDestinationError> {
+    isolated_area_lease
+        .verify_stable_identity()
+        .map_err(|_| IsolatedDestinationRefusal::IsolatedAreaUnproved)?;
+    let observed_area_identity = isolated_area_lease.identity();
+    if observed_area_identity != admission.isolation.isolated_area_identity {
+        return Err(IsolatedDestinationRefusal::IsolatedAreaUnproved.into());
+    }
+    let resolved_area = isolated_area_lease
+        .canonical_path()
+        .map_err(|_| IsolatedDestinationRefusal::IsolatedAreaUnproved)?;
+    let resolved_area_text = resolved_area.to_string_lossy().into_owned();
+    if !same_windows_root_text(&resolved_area_text, &admission.isolation.isolated_area_root) {
+        return Err(IsolatedDestinationRefusal::IsolatedAreaUnproved.into());
+    }
+    let derived_destination_root = joined_windows_path(
+        &resolved_area_text,
+        admission.destination_installation.as_str(),
+    );
+    if !same_windows_root_text(
+        &derived_destination_root,
+        &admission.isolation.destination_installation_root,
+    ) {
+        return Err(IsolatedDestinationRefusal::BoundRecordConflict {
+            field: "destination_installation_root",
+        }
+        .into());
+    }
+    if !matches!(
+        classify_installation_host_root(std::path::Path::new(&derived_destination_root)),
+        InstallationHostRootClass::Unowned
+    ) {
+        return Err(IsolatedDestinationRefusal::ForeignInstallationOwner.into());
+    }
+    Ok((observed_area_identity, derived_destination_root))
+}
+
+/// Re-proves the object now carrying the admitted destination name and returns
+/// the identity that gets recorded, for
+/// [`materialise_prepared_isolated_destination`].
+///
+/// `published_identity` is the identity the authority's own publication receipt
+/// carries. The created object is re-opened through a fresh no-follow
+/// protected-root lease, so a junction swapped in immediately after the move is
+/// refused rather than adopted, and the observed identity must equal the
+/// published one.
+///
+/// This is a pure move of check (4); it adds no check and removes none.
+fn reprove_created_destination_root(
+    admission: &PreparedDestinationAdmission,
+    derived_destination_root: &str,
+    published_identity: FileIdentity,
+) -> Result<FileIdentity, IsolatedDestinationError> {
+    let created_lease =
+        ProtectedRootLease::open_existing(std::path::Path::new(derived_destination_root)).map_err(
+            |_| {
+                IsolatedDestinationError::Installation(InstallationError::IncompleteObservation(
+        "the created isolated destination could not be re-proved through a protected-root lease, \
+         so its ownership is not established"
+            .to_owned(),
+    ))
+            },
+        )?;
+    created_lease.verify_stable_identity().map_err(|_| {
+        IsolatedDestinationError::Installation(InstallationError::IncompleteObservation(
+            "the created isolated destination root did not keep its retained identity".to_owned(),
+        ))
+    })?;
+    let created_path = created_lease.canonical_path().map_err(|_| {
+        IsolatedDestinationError::Installation(InstallationError::IncompleteObservation(
+            "the created isolated destination root could not be resolved through its retained \
+             lease"
+                .to_owned(),
+        ))
+    })?;
+    if !same_windows_root_text(
+        &created_path.to_string_lossy(),
+        &admission.isolation.destination_installation_root,
+    ) {
+        return Err(IsolatedDestinationError::Installation(
+            InstallationError::IncompleteObservation(
+                "the created isolated destination root does not resolve to the admitted root"
+                    .to_owned(),
+            ),
+        ));
+    }
+    let destination_root_identity = created_lease.identity();
+    if destination_root_identity != published_identity {
+        return Err(IsolatedDestinationError::Installation(
+            InstallationError::IncompleteObservation(
+                "the identity observed for the created isolated destination is not the identity \
+                 the installation authority published"
+                    .to_owned(),
+            ),
+        ));
+    }
+    Ok(destination_root_identity)
 }
 
 /// Lexical, separator-aware containment over already-resolved Windows paths.

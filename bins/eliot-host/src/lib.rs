@@ -6783,7 +6783,7 @@ impl HostComposition {
     fn admit_owner_isolated_destination(
         &self,
         request: &eliot_host_control_endpoint::BackupRuntimeControlRequest,
-    ) -> Result<(), String> {
+    ) -> Result<(), &'static str> {
         use eliot_host_service::runtime_control::BackupOperationBody;
         use eliot_installation::{
             IsolatedDestinationAdmissionInput, PreparedDestinationFacts,
@@ -6794,8 +6794,7 @@ impl HostComposition {
             u64::try_from(eliot_protocol::backup::MAX_BACKUP_PAYLOAD_BYTES).unwrap_or(u64::MAX);
         let BackupOperationBody::PrepareIsolatedRestore(ref body) = request.body else {
             return Err(
-                "the admitted backup request body is not an isolated-restore preparation"
-                    .to_owned(),
+                "the admitted backup request body is not an isolated-restore preparation",
             );
         };
         let facts = PreparedDestinationFacts::issue_for_admitted_identity(&body.identity)
@@ -6813,7 +6812,6 @@ impl HostComposition {
         // second allocation.
         let store = self.open_registry_store().map_err(|_| {
             "the installation registry could not be opened to admit the isolated destination"
-                .to_owned()
         })?;
         let capability = self.owner_lease.activation_capability();
         if let Ok((retained, materialisation)) =
@@ -6831,8 +6829,7 @@ impl HostComposition {
             {
                 return Err(
                     "a different isolated destination was already admitted for this operation, so \
-                     the request conflicts instead of allocating a second installation"
-                        .to_owned(),
+                     the request conflicts instead of allocating a second installation",
                 );
             }
             return Ok(());
@@ -6842,20 +6839,18 @@ impl HostComposition {
             .map_err(|_| {
                 "the source installation owner evidence could not be inspected, so no isolated \
                  destination can be admitted"
-                    .to_owned()
             })?;
         let purge_revision = evidence
             .owner_purge_ledger_revision()
-            .map_err(|_| "no current owner-issued purge-ledger revision is available".to_owned())?;
+            .map_err(|_| "no current owner-issued purge-ledger revision is available")?;
         let roots = evidence.runtime_roots();
-        let area = roots.isolated_restore_root().map_err(|_| {
-            "this installation profile declares no isolated restore area".to_owned()
-        })?;
+        let area = roots
+            .isolated_restore_root()
+            .map_err(|_| "this installation profile declares no isolated restore area")?;
         let area_lease = ProtectedRootLease::open_existing(std::path::Path::new(area.as_str()))
             .map_err(|_| {
                 "the owner-declared isolated restore area could not be proved through its \
                  protected-root lease"
-                    .to_owned()
             })?;
         let requirements =
             ProposedRestorationRequirements::issue_for_facts(&facts, max_restore_bytes)
@@ -6910,7 +6905,6 @@ impl HostComposition {
             .map(|_| ())
             .map_err(|_| {
                 "the installation authority refused to retain the admitted isolated destination"
-                    .to_owned()
             })
     }
 
@@ -6920,59 +6914,79 @@ impl HostComposition {
     /// error body never reaches a dispatch answer and a new refusal class is a
     /// compile error rather than a silently merged message.
     #[cfg(windows)]
-    fn isolated_destination_reason(error: eliot_installation::IsolatedDestinationError) -> String {
+    fn isolated_destination_reason(
+        error: eliot_installation::IsolatedDestinationError,
+    ) -> &'static str {
         use eliot_installation::{IsolatedDestinationError, IsolatedDestinationRefusal};
+        // Every arm is a bounded STATIC class. The refusal this renders into is
+        // `BackupDispatchRefusal`, whose `reason` is `&'static str` precisely so a
+        // refusal cannot carry owner payload text (its own documented contract:
+        // "no payload text, no owner internals and no secret"), and it is `Copy`.
+        // The typed refusal stays distinguishable VARIANT by variant -- a new
+        // refusal class is a compile error here rather than a merged message --
+        // and `BoundRecordConflict` keeps its own per-field class below instead
+        // of interpolating a field name into an owned String.
         match error {
             IsolatedDestinationError::Refused(IsolatedDestinationRefusal::ArbitraryDestination) => {
                 "the admitted destination identity is not an owner installation key, so no \
                  isolated destination root can be derived for it"
-                    .to_owned()
             }
             IsolatedDestinationError::Refused(
                 IsolatedDestinationRefusal::SourceInstallationDestination,
             ) => "the admitted destination is the source installation and is never a restore \
-                    destination"
-                .to_owned(),
+                    destination",
             IsolatedDestinationError::Refused(
                 IsolatedDestinationRefusal::DestinationOverlapsSource,
-            ) => "the admitted destination root is not isolated from the source installation root"
-                .to_owned(),
+            ) => "the admitted destination root is not isolated from the source installation root",
             IsolatedDestinationError::Refused(IsolatedDestinationRefusal::ExistingInstallation) => {
                 "the admitted destination is an installation this authority already holds, so it \
                  is not a new distinct isolated installation"
-                    .to_owned()
             }
             IsolatedDestinationError::Refused(
                 IsolatedDestinationRefusal::ForeignInstallationOwner,
             ) => "the destination is inside a foreign installation's own contour, so this \
-                    operation does not own it"
-                .to_owned(),
+                    operation does not own it",
             IsolatedDestinationError::Refused(IsolatedDestinationRefusal::ClassNotRestorable) => {
                 "the declared archive class is not an installation-backup class and cannot name an \
                  isolated restore destination"
-                    .to_owned()
             }
             IsolatedDestinationError::Refused(
                 IsolatedDestinationRefusal::BoundRecordConflict { field },
-            ) => format!(
-                "an owner-issued bound record ({field}) does not match the destination under \
-                 admission"
-            ),
+            ) => match field {
+                "destination_installation" => {
+                    "an owner-issued bound record (destination_installation) does not match the \
+                     destination under admission"
+                }
+                "target_schema_digest" => {
+                    "an owner-issued bound record (target_schema_digest) does not match the \
+                     destination under admission"
+                }
+                "admitted_classes" => {
+                    "an owner-issued bound record (admitted_classes) does not match the \
+                     destination under admission"
+                }
+                "max_restore_bytes" => {
+                    "an owner-issued bound record (max_restore_bytes) does not match the \
+                     destination under admission"
+                }
+                "destination_installation_root" => {
+                    "an owner-issued bound record (destination_installation_root) does not match \
+                     the destination under admission"
+                }
+                _ => "an owner-issued bound record does not match the destination under admission",
+            },
             IsolatedDestinationError::Refused(IsolatedDestinationRefusal::IsolatedAreaUnproved) => {
                 "the owner-declared isolated restore area is not resolvable through its \
                  protected-root lease"
-                    .to_owned()
             }
             IsolatedDestinationError::Refused(IsolatedDestinationRefusal::DestinationNotAbsent) => {
                 "the derived destination leaf already exists and is not owned by this operation"
-                    .to_owned()
             }
             IsolatedDestinationError::BoundRecord(_) => {
-                "an owner-issued backup record bound to this operation did not validate".to_owned()
+                "an owner-issued backup record bound to this operation did not validate"
             }
             IsolatedDestinationError::Installation(_) => {
                 "the installation authority could not admit and materialise the isolated destination"
-                    .to_owned()
             }
         }
     }

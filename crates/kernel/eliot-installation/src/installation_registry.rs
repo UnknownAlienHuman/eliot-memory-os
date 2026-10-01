@@ -1869,9 +1869,12 @@ pub fn classify_installation_host_root(path: &Path) -> InstallationHostRootClass
         return InstallationHostRootClass::Unowned;
     }
     match identity.components.get(key_index + 2) {
+        // Only the exact `host` leaf is an installation Host root. Any OTHER
+        // present leaf, and the ABSENT-leaf case, are both the installation
+        // AREA rather than the Host root beneath it, so they deliberately share
+        // one arm; merging them changes no classification.
         Some(leaf) if leaf == "host" => InstallationHostRootClass::InstallationHostRoot,
-        Some(_) => InstallationHostRootClass::InstallationArea,
-        None => InstallationHostRootClass::InstallationArea,
+        _ => InstallationHostRootClass::InstallationArea,
     }
 }
 
