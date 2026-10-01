@@ -8,6 +8,16 @@
 //! runner where a swarm work item becomes a Cargo argv, a producer claim on a
 //! target root, a cancellation/quarantine record, or a cleanup decision.
 //!
+//! # Who reaches it
+//!
+//! The production agent-build launch path does: `eliot-engine`'s
+//! `agent_build_projection` declares a real [`DeclaredWorkItem`] and claims a
+//! producer slot through [`TargetRootBuildCoordinator`] for every agent Cargo
+//! build, and the `eliot-app` registered verifier lane is its caller. The
+//! runner holds the projection and the admission; the engine seam holds the
+//! declaration, because `eliot-app` reaches the runner through `eliot-engine`
+//! and the two lanes must not be able to diverge.
+//!
 //! What it owns, mapping each Work bullet to the I18.26 lines it implements:
 //!
 //! * **the declaration gate** — "one work item -> primary crate + frozen

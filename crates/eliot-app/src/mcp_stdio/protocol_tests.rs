@@ -1682,7 +1682,8 @@ async fn cargo_workspace_check_registry_runs_fixed_offline_command() -> Result<(
     )?;
 
     let cargo_target = prepare_registered_cargo_target(&root, &runtime_root)?;
-    let result = run_cargo_workspace_check_verifier(&root, &runtime_root).await;
+    let result = run_cargo_workspace_check_verifier(&root, &runtime_root, "protocol-test", "abc123")
+        .await;
     assert!(
         !root.join("target").exists(),
         "registered verifier must not write build output into the leased worktree"

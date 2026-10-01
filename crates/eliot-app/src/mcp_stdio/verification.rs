@@ -833,6 +833,8 @@ pub(super) fn verifier_scope_hash_is_valid(scope: &VerifierArtifactScope) -> Res
 pub(super) async fn run_registered_cargo_verifier(
     worktree: &Path,
     runtime_root: &Path,
+    work_item_id: &str,
+    candidate_commit: &str,
     args: &[&str],
     timeout_seconds: u64,
     verifier_name: &str,
@@ -850,6 +852,20 @@ pub(super) async fn run_registered_cargo_verifier(
             "registered {verifier_name} verifier refused by the agent cargo projection (issue #1902)"
         )
     })?;
+    // I18.26 line 3, the claim half (issue #1902 AUD1): the argv gate above
+    // refuses an unrestricted selection but does not make the build a
+    // *coordinated* one. This is the production agent-build launch, so it takes
+    // a real producer claim on the governed target root its lane tuple derives
+    // and releases it through the same handle, on both the success and the
+    // failure path. A claim this coordinator cannot grant is the typed refusal:
+    // launch nothing.
+    let flight = claimed_registered_cargo_flight(
+        work_item_id,
+        candidate_commit,
+        worktree,
+        verifier_name,
+        &argv,
+    )?;
     let cargo_target_dir = prepare_registered_cargo_target(worktree, runtime_root)?;
     let mut command = tokio::process::Command::new(&admitted[0]);
     command
@@ -867,6 +883,26 @@ pub(super) async fn run_registered_cargo_verifier(
     )
     .await
     .with_context(|| format!("registered {verifier_name} verifier timed out"))??;
+    // The flight is settled on every terminal path, including a failed build:
+    // I18.26 line 34 publishes the producer's own evidence to the waiters on
+    // the failure path too, and the release is the same handle the claim took.
+    let evidence = eliot_engine::agent_build_projection::retain_agent_build_evidence(
+        work_item_id,
+        &output.status,
+        &output.stdout,
+        &output.stderr,
+    )
+    .context("retain registered verifier build evidence")?;
+    let execution = if output.status.success() {
+        eliot_engine::agent_build_projection::ExecutionStatus::Succeeded
+    } else {
+        eliot_engine::agent_build_projection::ExecutionStatus::Failed
+    };
+    flight
+        .release(evidence, execution)
+        .with_context(|| {
+            format!("registered {verifier_name} verifier could not release its build flight")
+        })?;
     if !output.status.success() {
         let stdout = bounded_verifier_output(&output.stdout);
         let stderr = bounded_verifier_output(&output.stderr);
@@ -876,6 +912,79 @@ pub(super) async fn run_registered_cargo_verifier(
         );
     }
     Ok(())
+}
+
+/// Declares and claims the producer slot for one production agent Cargo build.
+///
+/// This is the caller half of issue #1902: the returned
+/// [`AgentBuildFlight`](eliot_engine::agent_build_projection::AgentBuildFlight)
+/// is the coordinator's own claim, and the caller must release it through that
+/// same handle or the target root keeps exactly one live producer and no
+/// second one may start.
+///
+/// Every element of the declaration is a fact this lane already resolved: the
+/// task identity it is verifying, the candidate commit and worktree root from
+/// the Git artifact snapshot taken immediately before this launch, the argv it
+/// is about to run, and the verifier's own name. Nothing is defaulted, so a
+/// lane that cannot present the complete tuple is refused rather than admitted
+/// with a synthetic build identity.
+fn claimed_registered_cargo_flight(
+    work_item_id: &str,
+    candidate_commit: &str,
+    worktree: &Path,
+    verifier_name: &str,
+    argv: &[String],
+) -> Result<eliot_engine::agent_build_projection::AgentBuildFlight> {
+    let local_app_data = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .context("LOCALAPPDATA is required for governed agent build target roots")?;
+    let worktree_root = worktree
+        .canonicalize()
+        .context("canonicalize agent build worktree for the build claim")?;
+    eliot_engine::agent_build_projection::claim_agent_cargo_build(
+        &eliot_engine::agent_build_projection::AgentBuildDeclaration {
+            work_item_id: work_item_id.to_owned(),
+            // I18.26 line 7: this lane's primary crate is the crate whose
+            // workspace check it runs, which is the first explicit `-p`
+            // selection the registered argv names.
+            primary_crate: registered_primary_crate(argv),
+            candidate_commit: candidate_commit.to_owned(),
+            worktree_id: agent_build_worktree_id(&worktree_root),
+            argv: argv.to_vec(),
+            local_app_data,
+            build_mode: eliot_engine::agent_build_projection::BuildMode::InteractiveIncremental,
+            build_class: verifier_name.to_owned(),
+        },
+    )
+    .with_context(|| {
+        format!(
+            "registered {verifier_name} verifier could not claim its target root build (issue #1902)"
+        )
+    })
+}
+
+/// The one Cargo package the registered argv is scoped to.
+///
+/// I18.26 line 7 names a primary crate, and the registered workspace check is
+/// package-selected rather than workspace-selected precisely because line 3
+/// withdrew `--workspace`. The first `-p` selection is therefore the declared
+/// primary crate, read from the argv that is actually launched so the
+/// declaration cannot disagree with the launch.
+fn registered_primary_crate(argv: &[String]) -> String {
+    argv.windows(2)
+        .find(|pair| pair[0] == "-p")
+        .map_or_else(|| argv[0].clone(), |pair| pair[1].clone())
+}
+
+/// A single path segment standing for the leased worktree this build runs in.
+///
+/// I2.22 places the worktree id in the governed build root's path, and
+/// `GovernedWorkEnvelope::validate` requires it to be one usable segment, so
+/// the absolute path cannot be used directly. The digest is over the exact
+/// canonical worktree root, which keeps it stable for that worktree and
+/// distinct for every other one.
+fn agent_build_worktree_id(worktree_root: &Path) -> String {
+    blake3::hash(worktree_root.as_os_str().as_encoded_bytes()).to_hex().to_string()
 }
 
 fn bounded_verifier_output(bytes: &[u8]) -> String {
@@ -933,10 +1042,17 @@ pub(super) fn prepare_registered_cargo_target(
     Ok(target)
 }
 
-pub(super) async fn run_dogfood_blob_verifier(worktree: &Path, runtime_root: &Path) -> Result<()> {
+pub(super) async fn run_dogfood_blob_verifier(
+    worktree: &Path,
+    runtime_root: &Path,
+    work_item_id: &str,
+    candidate_commit: &str,
+) -> Result<()> {
     run_registered_cargo_verifier(
         worktree,
         runtime_root,
+        work_item_id,
+        candidate_commit,
         &[
             "test",
             "--offline",
@@ -979,10 +1095,14 @@ const REGISTERED_WORKSPACE_CHECK_ARGV: [&str; 11] = [
 pub(super) async fn run_cargo_workspace_check_verifier(
     worktree: &Path,
     runtime_root: &Path,
+    work_item_id: &str,
+    candidate_commit: &str,
 ) -> Result<()> {
     run_registered_cargo_verifier(
         worktree,
         runtime_root,
+        work_item_id,
+        candidate_commit,
         &REGISTERED_WORKSPACE_CHECK_ARGV,
         300,
         "workspace cargo check",
@@ -1200,10 +1320,22 @@ pub(super) async fn resolve_verifier_artifact_scope(
             }
             match verifier {
                 RegisteredTaskVerifier::DogfoodBlobIntegrity => {
-                    run_dogfood_blob_verifier(&before.root, runtime_root).await?;
+                    run_dogfood_blob_verifier(
+                        &before.root,
+                        runtime_root,
+                        task.task_id.as_str(),
+                        &before.commit,
+                    )
+                    .await?;
                 }
                 RegisteredTaskVerifier::CargoWorkspaceCheck => {
-                    run_cargo_workspace_check_verifier(&before.root, runtime_root).await?;
+                    run_cargo_workspace_check_verifier(
+                        &before.root,
+                        runtime_root,
+                        task.task_id.as_str(),
+                        &before.commit,
+                    )
+                    .await?;
                 }
                 RegisteredTaskVerifier::ReceiptResolution => unreachable!(),
             }

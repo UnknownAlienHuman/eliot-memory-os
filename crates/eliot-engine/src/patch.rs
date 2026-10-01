@@ -874,12 +874,19 @@ fn fixed_verifier_command(kind: VerifierCommandKind) -> Option<FixedCommand> {
 /// The argv is presented as [`CargoOrigin::Agent`] because it is
 /// agent-originated. The projected origin additionally requires the argv to
 /// equal the argv of a live [`ProjectedBuild`](eliot_instrument_runner::ProjectedBuild),
-/// and neither verifier lane owns an admitted work-item declaration to present
-/// one — no [`DeclaredWorkItem`](eliot_instrument_runner::DeclaredWorkItem)
-/// producer, no admitted [`GovernedWorkEnvelope`](eliot_instrument_runner::GovernedWorkEnvelope),
-/// and no [`BuildTestGraph`](eliot_build_test_graph::BuildTestGraph) source
-/// exists at either seam — so claiming that origin here would be an unbacked
-/// assertion rather than an admission.
+/// and neither verifier lane builds that projection through
+/// [`DeclaredWorkItem::project`](eliot_instrument_runner::DeclaredWorkItem::project):
+/// doing so needs a [`BuildTestGraph`](eliot_build_test_graph::BuildTestGraph)
+/// source and, for the public-contract class, a declared capsule set, neither of
+/// which either seam resolves. Claiming that origin here would therefore be an
+/// unbacked assertion rather than an admission.
+///
+/// The *claim* half is separate and does reach production: both lanes declare a
+/// real [`DeclaredWorkItem`](eliot_instrument_runner::DeclaredWorkItem) and take
+/// a producer claim on the governed target root through
+/// [`crate::agent_build_projection::claim_agent_cargo_build`]. This function
+/// stays the shared argv gate it was, and the claim does not weaken it — a
+/// claimed build is admitted by exactly the same refusal.
 ///
 /// # Errors
 ///

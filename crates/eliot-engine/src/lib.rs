@@ -3,6 +3,7 @@
 pub mod action;
 pub mod adapter;
 pub mod admission;
+pub mod agent_build_projection;
 pub mod antigravity;
 pub mod antigravity_persistent;
 pub mod cached_derivation;
