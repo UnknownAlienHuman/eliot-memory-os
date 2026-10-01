@@ -316,7 +316,7 @@ fn case_01_cell_identity_separate_from_closure_and_self_quality() {
     assert!(!promotion_router.contains("learning_closure.rs"));
     assert!(closure_router.contains("meta.learning.closure"));
     assert!(closure_router.contains("agent_order = 37"));
-    assert!(!closure_router.contains("promotion_input.rs"));
+    assert!(!router_declarations(closure_router).contains("promotion_input.rs"));
     assert_ne!(MODULE_ID, "meta.learning.closure");
     assert_ne!(AGENT_ORDER, 37);
 }
@@ -1172,7 +1172,7 @@ fn case_27_integrator_export_turn_minimal_without_duplication() {
     const LIB: &str = include_str!("../src/lib.rs");
     assert!(LIB.contains("mod promotion_input"));
     assert!(LIB.contains("prepare_promotion_input"));
-    assert!(!LIB.contains("promotion_input.rs"));
+    assert!(!code_surface(LIB).contains("promotion_input.rs"));
     assert!(LIB.contains("PromotionInput"));
     // Ordinary public package imports resolve (no path-copy substitute).
     let _ = eliot_improvement::prepare_promotion_input;
@@ -1234,4 +1234,52 @@ fn case_28_no_runtime_assessment_promotion_effect_calls() {
         .map(|g| g.gate.as_str())
         .collect();
     assert_eq!(distinct.len(), advisory.gate_report.len());
+}
+
+// The two scanners below back the boundary assertions in `case_01` and
+// `case_27`. They are declared after the last case on purpose: the crate
+// document in `src/lib.rs` pins lines inside this file (`case_28` at :1197 and
+// its forbidden-substring list at :1199-1221), and appending here leaves every
+// pin above it resolving to the same line.
+
+/// The declarative surface of a per-cell router manifest: every line except the
+/// single-line free-prose `evidence_status_and_review_owner` review paragraph.
+///
+/// That paragraph is narrative evidence *about* the cell, and it legitimately
+/// names sibling paths to record that they are not coupled - the learning-closure
+/// router states that `src/promotion_input.rs` never imports `learning_closure`.
+/// Routing, dependency and write-surface claims live in the manifest keys and
+/// values, so cell non-overlap is asserted over exactly those: `depends_on`,
+/// `consumers`, `inputs`, `providers`, `[[donor]].path`, `[agent_task].write_scope`
+/// and `proof_surface` all stay in scope, and the assertion still forbids both
+/// the sibling cell's source path and its test module path there. Exactly one
+/// key is excluded, so the paragraph cannot become a place where a routing edge
+/// is declared in prose.
+fn router_declarations(router: &str) -> String {
+    router
+        .lines()
+        .filter(|line| {
+            !line
+                .trim_start()
+                .starts_with("evidence_status_and_review_owner")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The compiled surface of a Rust source file: every line that is not a line or
+/// documentation comment.
+///
+/// A comment cannot declare `mod`, `#[path]` or `include!`, so the package root's
+/// boundary - turn the cell into a plain `pub mod` plus `pub use` export, never a
+/// path-copy or inline duplicate of `promotion_input.rs` - is a property of the
+/// code surface. The crate document may still cite `promotion_input.rs` and
+/// `tests/promotion_input.rs` as inventory evidence; what remains forbidden is a
+/// code line that names the implementation file.
+fn code_surface(source: &str) -> String {
+    source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }

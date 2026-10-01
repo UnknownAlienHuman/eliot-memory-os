@@ -246,7 +246,7 @@ fn case_01_router_meta_identity_and_two_file_nonoverlap() {
     assert!(promotion_router.contains("crates/meta/eliot-improvement/src/promotion_input.rs"));
     assert!(promotion_router.contains("crates/meta/eliot-improvement/tests/promotion_input.rs"));
     assert!(!promotion_router.contains("learning_closure.rs"));
-    assert!(!closure_router.contains("promotion_input.rs"));
+    assert!(!router_declarations(closure_router).contains("promotion_input.rs"));
 }
 
 // WORK_UNIT_CASE: 819/2
@@ -1953,4 +1953,34 @@ fn case_58_no_runtime_store_path_source_bound_tests_first() {
         }
         other => panic!("source-bound assembly must close, got {other:?}"),
     }
+}
+
+// Backs the source-path non-overlap assertion in `case_01`. It is declared after
+// the last case so that every line pin the crate document in `src/lib.rs` records
+// inside this file (`case_58` at :1926 and its forbidden-substring list at
+// :1928-1941) keeps resolving to the same line.
+
+/// The declarative surface of a per-cell router manifest: every line except the
+/// single-line free-prose `evidence_status_and_review_owner` review paragraph.
+///
+/// That paragraph is narrative evidence *about* the cell, and it legitimately
+/// names sibling paths to record that they are not coupled - this router states
+/// that `src/promotion_input.rs` never imports `learning_closure`. Routing,
+/// dependency and write-surface claims live in the manifest keys and values, so
+/// cell non-overlap is asserted over exactly those: `depends_on`, `consumers`,
+/// `inputs`, `providers`, `[[donor]].path`, `[agent_task].write_scope` and
+/// `proof_surface` all stay in scope, and the assertion still forbids both the
+/// sibling cell's source path and its test module path there. Exactly one key is
+/// excluded, so the paragraph cannot become a place where a routing edge is
+/// declared in prose.
+fn router_declarations(router: &str) -> String {
+    router
+        .lines()
+        .filter(|line| {
+            !line
+                .trim_start()
+                .starts_with("evidence_status_and_review_owner")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
