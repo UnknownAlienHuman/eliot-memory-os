@@ -230,6 +230,67 @@ impl RestoreJournalPort for FixtureFileJournal {
     }
 }
 
+/// Fixture journal that refuses exactly one compare-and-swap, at a chosen
+/// index in the engine's own call order, so an execution can be interrupted
+/// AFTER a phase has staged its material and BEFORE the journal records that
+/// phase's receipt. Adapter-mapping proof only, exactly like [`FixtureJournal`]:
+/// never a production durable-recovery claim.
+struct InterruptOnceJournal {
+    record: Option<RestoreJournalRecord>,
+    fail_at_cas: usize,
+    cas_calls: usize,
+}
+
+impl RestoreJournalPort for InterruptOnceJournal {
+    fn load(&mut self, journal_key: &str) -> Result<Option<RestoreJournalRecord>, BackupError> {
+        Ok(self
+            .record
+            .clone()
+            .filter(|record| record.journal_key == journal_key))
+    }
+
+    fn compare_and_swap(
+        &mut self,
+        journal_key: &str,
+        expected_revision: u64,
+        next: RestoreJournalRecord,
+    ) -> Result<(), BackupError> {
+        self.cas_calls += 1;
+        if self.cas_calls == self.fail_at_cas {
+            return Err(BackupError::RestoreJournalCasConflict);
+        }
+        if next.journal_key != journal_key
+            || self.record.as_ref().map_or(0, |record| record.revision) != expected_revision
+        {
+            return Err(BackupError::RestoreJournalCasConflict);
+        }
+        self.record = Some(next);
+        Ok(())
+    }
+}
+
+/// Every regular file under `root`, recursively. A test-local walk over one
+/// already-known destination tree, used only to assert what survived on disk.
+fn files_under(root: &std::path::Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
 fn production_ports<'a>(
     admission: &'a RestoreJournalAdmission,
     fence: &'a StateFence,
@@ -1036,6 +1097,142 @@ fn persistent_adapter_readback_across_handles_not_mock_only() {
     let fixture = fixture_admission();
     assert!(fixture.fixture_proof_only);
     assert!(!admission.fixture_proof_only);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// WORK_UNIT_CASE: 960/21
+#[test]
+fn interrupted_restore_retains_its_own_phase_material_and_resumes() {
+    let target = "t960-21";
+    let bundle = test_bundle(target);
+    let context = test_context(target);
+    let root = work_root("21");
+    let fence = bundle.export_fence.state_fence.clone();
+    let admission = production_admission();
+    let ports = production_ports(&admission, &fence);
+    let coordinator = KernelBackupRestore::bind(root.clone());
+    // The engine writes its journal row four times before it has recorded
+    // prepare's receipt: genesis, first-phase selection, prepare's intent, and
+    // only then prepare's receipt. Refusing the fourth interrupts the execution
+    // AFTER prepare staged and published its material, so this is an
+    // interruption after staging rather than before any byte was written.
+    let mut journal = InterruptOnceJournal {
+        record: None,
+        fail_at_cas: 4,
+        cas_calls: 0,
+    };
+    let interrupted = coordinator.restore(&bundle, context.clone(), &ports, &mut journal);
+    // The typed outcome names BOTH independent facts: the engine's own failure
+    // is preserved as the cause, and the retained material is reported rather
+    // than inferred from silence.
+    let error = interrupted.expect_err("the interrupted execution refuses");
+    let (primary, retained, cleanup) = match error {
+        KernelRestoreError::RetainedForResume {
+            primary,
+            retained,
+            cleanup,
+        } => (primary, retained, cleanup),
+        other => panic!("expected RetainedForResume, got {other:?}"),
+    };
+    assert_eq!(primary, BackupError::RestoreJournalCasConflict);
+    assert_eq!(
+        retained.members, 1,
+        "exactly the material prepare published is reported as retained"
+    );
+    assert!(
+        retained.bytes > 0,
+        "retained bytes are counted at write time, not defaulted"
+    );
+    assert!(
+        cleanup.to_string().contains("unpublished temporary"),
+        "the bounded cleanup disposition is reported, not dropped: {cleanup}"
+    );
+    // The guarantee itself: the phase material this execution published is
+    // STILL ON DISK. A resume is possible because the bytes survived, not
+    // because the refusal said so.
+    let destination = root.join(".eliot").join(RESTORE_ISOLATED_AREA).join(target);
+    let staged = files_under(&destination);
+    assert!(
+        !staged.is_empty(),
+        "published phase material survives the interrupted execution"
+    );
+    // The SAME transaction then resumes over that retained material. Prepare is
+    // reconciled from its own persisted receipt rather than re-applied, so it
+    // is absent from the resumed phase log: the run continued, it did not
+    // restart.
+    let resumed = coordinator
+        .restore(&bundle, context, &ports, &mut journal)
+        .expect("the interrupted transaction resumes");
+    resumed
+        .receipt
+        .validate()
+        .expect("resumed receipt validates");
+    assert!(
+        !resumed.phase_log.contains(&"prepare".to_owned()),
+        "the already-staged phase is resumed, not re-applied: {:?}",
+        resumed.phase_log
+    );
+    assert_eq!(resumed.phase_log.len(), 4, "the remaining phases applied");
+    // Everything the interrupted run retained is still present after the resume
+    // over it: the resume consumed the material, it did not replace it.
+    for path in staged {
+        assert!(path.exists(), "retained material {path:?} was destroyed");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// WORK_UNIT_CASE: 960/22
+#[test]
+fn unowned_staged_temporary_is_preserved_and_the_refusal_is_typed() {
+    let target = "t960-22";
+    let bundle = test_bundle(target);
+    let context = test_context(target);
+    let root = work_root("22");
+    let fence = bundle.export_fence.state_fence.clone();
+    let admission = production_admission();
+    let ports = production_ports(&admission, &fence);
+    let coordinator = KernelBackupRestore::bind(root.clone());
+    // A temporary that carries the exact suffix this owner's own staging uses,
+    // planted in the destination by something that is NOT this operation. Its
+    // name is deliberately right: only the ownership evidence this execution
+    // actually holds may decide, and a predictable name is not that evidence.
+    let destination = root.join(".eliot").join(RESTORE_ISOLATED_AREA).join(target);
+    std::fs::create_dir_all(&destination).expect("destination exists");
+    let foreign = destination.join("not-ours.tmp-restore");
+    let foreign_bytes = b"staged by another operation".to_vec();
+    std::fs::write(&foreign, &foreign_bytes).expect("foreign temporary staged");
+    // Interrupting after prepare staged material makes the bounded cleanup
+    // actually run with a non-empty candidate set, which is the only state in
+    // which a removal decision is made at all.
+    let mut journal = InterruptOnceJournal {
+        record: None,
+        fail_at_cas: 4,
+        cas_calls: 0,
+    };
+    let error = coordinator
+        .restore(&bundle, context, &ports, &mut journal)
+        .expect_err("the interrupted execution refuses");
+    let cleanup = match error {
+        KernelRestoreError::RetainedForResume { cleanup, .. } => cleanup,
+        other => panic!("expected RetainedForResume, got {other:?}"),
+    };
+    // The refusal is TYPED and names why: the destination was resumed rather
+    // than constructed by this execution, so its contents are not provably
+    // this operation's to remove. A successful cleanup is never reported for a
+    // pass that preserved something.
+    assert!(
+        cleanup
+            .to_string()
+            .contains("could not be proven removable"),
+        "a preservation must be reported as a preservation: {cleanup}"
+    );
+    // The refusal case: the path this operation does not own survives, byte for
+    // byte. It is not removed, not truncated, and not renamed.
+    assert_eq!(
+        std::fs::read(&foreign).expect("foreign temporary still readable"),
+        foreign_bytes,
+        "a staged temporary this operation does not own is never cleaned up"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
