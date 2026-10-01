@@ -1,5 +1,5 @@
 //! Owner-side typed load and compare-and-swap publication for the Human
-//! model preference policy (issue #485, audit 5872395796 step 2).
+//! model preference policy (issue #485, audit 5872395796 steps 2-3).
 //!
 //! Owner: `eliot-host-state`. The schema stays where step 1 put it
 //! (`eliot-agent-contracts::model_preference`, I/O-free); the pure validator
@@ -22,12 +22,21 @@
 //! [`preference_policy_digest`](eliot_agent_contracts::model_preference::preference_policy_digest);
 //! this module never branches on preference content.
 //!
-//! Residuals (later slices, not this one): R3 serializes the daemon-side
-//! publication critical section and pins the exact protected storage
-//! contour; R4 reconstructs the immutable publication receipt from the
-//! retained committed document; R5 wires the #484 candidate-side CAS anchor
-//! to this owner recheck. No production caller exists yet on purpose: the
-//! daemon/publication wiring is STITCH and must arrive with its own review.
+//! Residuals (later slices, not this one): R4 reconstructs the immutable
+//! publication receipt from the retained committed document; R5 wires the
+//! #484 candidate-side CAS anchor to this owner recheck. No production
+//! caller exists yet on purpose: the daemon/publication wiring is STITCH
+//! and must arrive with its own review.
+//!
+//! Critical-section discipline (step 3): the CAS opens the store with a
+//! single open-or-create, then performs the entire predecessor re-read,
+//! identity compare, and staged commit inside one redb write transaction,
+//! so two publishers against one predecessor cannot both commit. Replay
+//! stages no write and aborts instead of committing. Retained table values
+//! are length-checked before any heap copy, so an oversized value fails
+//! closed during reading. Publication stages no temporary path, removes no
+//! file, and inserts the replacement only after the byte-bound check: the
+//! last valid document stays retained until the atomic commit lands.
 
 use std::path::{Path, PathBuf};
 
@@ -227,6 +236,16 @@ fn map_database_error(error: &redb::DatabaseError) -> ModelPreferenceStoreError 
     }
 }
 
+/// Copies a retained table value into memory only after its length passes
+/// the document byte bound, so an oversized value fails closed during
+/// reading instead of forcing an unbounded heap allocation first.
+fn copy_bounded_table_value(value: &[u8]) -> Result<Vec<u8>, ModelPreferenceStoreError> {
+    if value.len() > MAX_MODEL_PREFERENCE_DOCUMENT_BYTES {
+        return Err(ModelPreferenceStoreError::Oversized);
+    }
+    Ok(value.to_vec())
+}
+
 fn classify_meta(bytes: &[u8]) -> Result<(), ModelPreferenceStoreError> {
     if bytes.len() > MAX_MODEL_PREFERENCE_DOCUMENT_BYTES {
         return Err(ModelPreferenceStoreError::Oversized);
@@ -416,7 +435,10 @@ impl ModelPreferenceStore {
             .map_err(|_| ModelPreferenceStoreError::Corrupt)?
         {
             None => return Ok(None),
-            Some(guard) => classify_meta(guard.value())?,
+            Some(guard) => {
+                let bytes = copy_bounded_table_value(guard.value())?;
+                classify_meta(&bytes)?;
+            }
         }
         let prefs = match read.open_table(PREFS_TABLE) {
             Ok(prefs) => prefs,
@@ -430,7 +452,10 @@ impl ModelPreferenceStore {
             .map_err(|_| ModelPreferenceStoreError::Corrupt)?
         {
             None => return Err(ModelPreferenceStoreError::Corrupt),
-            Some(guard) => decode_envelope(guard.value())?,
+            Some(guard) => {
+                let bytes = copy_bounded_table_value(guard.value())?;
+                decode_envelope(&bytes)?
+            }
         };
         validated_publication(envelope).map(Some)
     }
@@ -457,6 +482,15 @@ impl ModelPreferenceStore {
     /// and commits revision predecessor + 1 with the prior revision/digest
     /// link. A canonically identical replacement under a matching
     /// predecessor replays without writing.
+    ///
+    /// The store handle opens with a single open-or-create (no
+    /// check-then-create race: file minting is decided inside the same
+    /// serialized write transaction that re-reads the predecessor), and
+    /// retained values are length-checked before any heap copy. Replay
+    /// aborts the write transaction instead of committing it; only a staged
+    /// replacement reaches `commit`, after the byte-bound check, so the
+    /// retained document is never displaced by an oversized write and no
+    /// temporary path is staged or removed.
     pub fn compare_and_swap_model_preferences(
         &self,
         expected: &PreferenceCasExpected,
@@ -465,13 +499,7 @@ impl ModelPreferenceStore {
         replacement.validate()?;
         let replacement_digest = preference_policy_digest(replacement)?;
         validate_store_path(&self.path)?;
-        let database = match std::fs::symlink_metadata(&self.path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Database::create(&self.path).map_err(|error| map_database_error(&error))?
-            }
-            Ok(_) => Database::open(&self.path).map_err(|error| map_database_error(&error))?,
-            Err(_) => return Err(ModelPreferenceStoreError::Unavailable),
-        };
+        let database = Database::create(&self.path).map_err(|error| map_database_error(&error))?;
         let write = database
             .begin_write()
             .map_err(|_| ModelPreferenceStoreError::Unavailable)?;
@@ -485,7 +513,8 @@ impl ModelPreferenceStore {
             let current_meta: Option<Vec<u8>> = meta
                 .get(META_KEY)
                 .map_err(|_| ModelPreferenceStoreError::Corrupt)?
-                .map(|guard| guard.value().to_vec());
+                .map(|guard| copy_bounded_table_value(guard.value()))
+                .transpose()?;
             let current = match current_meta {
                 None => {
                     let meta_bytes = serde_json::to_vec(&StoreMeta {
@@ -505,30 +534,35 @@ impl ModelPreferenceStore {
                     {
                         None => return Err(ModelPreferenceStoreError::Corrupt),
                         Some(guard) => {
-                            Some(validated_publication(decode_envelope(guard.value())?)?)
+                            let bytes = copy_bounded_table_value(guard.value())?;
+                            Some(validated_publication(decode_envelope(&bytes)?)?)
                         }
                     }
                 }
             };
-            let committed =
-                match decide_cas_envelope(expected, replacement, &replacement_digest, current)? {
-                    CasPendingEnvelope::Replayed { store_revision } => {
-                        return Ok(ModelPreferenceCasOutcome::Replayed { store_revision });
+            match decide_cas_envelope(expected, replacement, &replacement_digest, current)? {
+                CasPendingEnvelope::Replayed { store_revision } => {
+                    ModelPreferenceCasOutcome::Replayed { store_revision }
+                }
+                CasPendingEnvelope::Commit(envelope) => {
+                    let bytes = serde_json::to_vec(&*envelope)
+                        .map_err(|_| ModelPreferenceStoreError::Unavailable)?;
+                    if bytes.len() > MAX_MODEL_PREFERENCE_DOCUMENT_BYTES {
+                        return Err(ModelPreferenceStoreError::Oversized);
                     }
-                    CasPendingEnvelope::Commit(envelope) => *envelope,
-                };
-            let bytes = serde_json::to_vec(&committed)
-                .map_err(|_| ModelPreferenceStoreError::Unavailable)?;
-            if bytes.len() > MAX_MODEL_PREFERENCE_DOCUMENT_BYTES {
-                return Err(ModelPreferenceStoreError::Oversized);
-            }
-            prefs
-                .insert(CURRENT_KEY, bytes.as_slice())
-                .map_err(|_| ModelPreferenceStoreError::Unavailable)?;
-            ModelPreferenceCasOutcome::Committed {
-                store_revision: committed.store_revision,
+                    prefs
+                        .insert(CURRENT_KEY, bytes.as_slice())
+                        .map_err(|_| ModelPreferenceStoreError::Unavailable)?;
+                    ModelPreferenceCasOutcome::Committed {
+                        store_revision: envelope.store_revision,
+                    }
+                }
             }
         };
+        if matches!(outcome, ModelPreferenceCasOutcome::Replayed { .. }) {
+            drop(write);
+            return Ok(outcome);
+        }
         write
             .commit()
             .map_err(|_| ModelPreferenceStoreError::Unavailable)?;
