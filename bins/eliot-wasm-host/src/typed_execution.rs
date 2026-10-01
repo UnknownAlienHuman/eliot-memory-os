@@ -2979,6 +2979,16 @@ fn bound_request(
     }
 }
 
+/// Production caller for the audit-5884499327 admission closure: walks
+/// every heap leaf of `wit/typed/context-admission.wit::record
+/// admission-request` — binding, candidates, floor with member
+/// dependencies, priority policy, admission rule, measurement-composition
+/// profile, supplied omission bindings, full typed measurements with
+/// measured cost, and learning tickets — into the pre-lift bound checked
+/// by [`execute_domain_experimental`]. Boring adapter only (I2.19):
+/// leaves are measured, never interpreted; scalar/enum leaves carry no
+/// heap and need no bound. Removing or renaming a walked WIT field breaks
+/// this production path, not just the contract suite.
 fn bound_admission_request(
     value: &crate::typed_bindings::context_admission::exports::eliot::current::admission::AdmissionRequest,
     admitted: &TypedDomainAdmission,
