@@ -47,8 +47,8 @@ use super::{
 };
 use eliot_contracts::{
     CapabilityCellExpectation, CapabilityCellId, CapabilityCellProof, CapabilityCellProofError,
-    CapabilityCellRegistry, ContractDigest, ExecutionContour, ProofEntrypointRef, ResourceGeneration,
-    RuntimeBundleId, SourceCrateRef, SupportStatus,
+    CapabilityCellRegistry, ContractDigest, ExecutionContour, ProofEntrypointRef,
+    ResourceGeneration, RuntimeBundleId, SourceCrateRef, SupportStatus,
 };
 use eliot_platform_windows::ProtectedPathLease;
 use std::collections::BTreeMap;
@@ -68,8 +68,10 @@ use crate::kernel_diagnostics::{
 // BEGIN GENERATED native-worker capability-cell registry (scripts/gen_capability_cell_registry.py; do not hand-edit)
 const NATIVE_WORKER_CAPABILITY_CELL_ID: &str = "native-worker-core";
 const NATIVE_WORKER_CAPABILITY_SOURCE_PACKAGE: &str = "eliot-native-worker-core";
-const NATIVE_WORKER_CAPABILITY_CONTRACT_DIGEST: &str = "418bf928930a0ce60690ffa67964ab863a18f637b4b7021561aead29e60f423c";
-const NATIVE_WORKER_CAPABILITY_PROOF_ENTRYPOINT: &str = "cargo test -p eliot-native-worker-core --all-targets --all-features";
+const NATIVE_WORKER_CAPABILITY_CONTRACT_DIGEST: &str =
+    "418bf928930a0ce60690ffa67964ab863a18f637b4b7021561aead29e60f423c";
+const NATIVE_WORKER_CAPABILITY_PROOF_ENTRYPOINT: &str =
+    "cargo test -p eliot-native-worker-core --all-targets --all-features";
 const NATIVE_WORKER_CAPABILITY_CURRENT_SUPPORT: &str = "CURRENT_UNVERIFIED";
 const NATIVE_WORKER_CAPABILITY_CELL_REGISTRY_JSON: &str = r#"{"cells":[{"affected_edges":[],"allowed_effect_classes":[],"cell":"native-worker-core","cell_revision":{"major":1,"minor":0,"patch":0},"contract_digest":"418bf928930a0ce60690ffa67964ab863a18f637b4b7021561aead29e60f423c","contract_digest_source":"crates/modules/eliot-native-worker-core/capability-cell.contract.toml#contract-surface","execution_contour":"DELEGATED_BUNDLE","freshness":{"current_support":"CURRENT_UNVERIFIED","invalidation":[]},"generation_owner":"A-13","lifecycle_owner":"A-13","maintenance_owner":"A-13","manifest":{"context_capsule":{"owner":"A-13","present":true},"contract_kit":{"owner":"A-13","present":true},"test_capsule":{"owner":"A-13","present":true}},"product_pulse":{"NOT_APPLICABLE":{"reason":"This internal process protocol core has no independent Product Pulse; product behavior is measured at the native-worker bundle contour."}},"proof_ceiling":"STATIC_FIELD_AND_MIGRATION_CONTRACT_ONLY","proof_entrypoint":"cargo test -p eliot-native-worker-core --all-targets --all-features","removal_boundary":"Stop claim admission, drain and cancel the exact native-worker process generation through Kernel, then replace the worker bundle.","replacement_class":"isolate_dependency","runtime_bundle":"eliot-native-worker","semantic_owner":"A-13","source_crate":"eliot-native-worker-core","state_owners":[{"owner":"A-13","state":"WorkerCore lifecycle, grant, process binding and start receipt, connection, and last-event sequence"}],"stateless":false}],"generator_version":"1.0.0","pair_key":"sha256:ab2011bd67557d89b2f094061d350a297389f7f57d0478be5e1ff8d2da8ed1c1","registry_version":1,"source_identity":{"cargo_lock_digest":"0edff9845221d821ce0cef521d9503a8902a091760a8e571244c0c90e36878d8","generator_version":"1.0.0","toolchain":"rustc 1.97.1 (8bab26f4f 2026-07-14); binary: rustc; commit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452; commit-date: 2026-07-14; host: x86_64-pc-windows-msvc; release: 1.97.1; LLVM version: 22.1.6","tree_digest":"f1d8ef891dcfbeca7daab3667fe69a16435a6ba8eb9cc4ddca6913a14bb9f9f1"}}"#;
 // END GENERATED native-worker capability-cell registry
@@ -144,7 +146,9 @@ fn validated_native_worker_cell_registry()
         let registry: CapabilityCellRegistry =
             serde_json::from_str(NATIVE_WORKER_CAPABILITY_CELL_REGISTRY_JSON)
                 .map_err(|_| NativeWorkerCellRefusal::InvalidRegistry)?;
-        registry.validate().map_err(|_| NativeWorkerCellRefusal::InvalidRegistry)?;
+        registry
+            .validate()
+            .map_err(|_| NativeWorkerCellRefusal::InvalidRegistry)?;
         // The registry is validated first, then the one cell this composition
         // admits is resolved through the #13 owner primitive. Both refusals are
         // kept as the owner's own typed values so the compared evidence
@@ -214,10 +218,16 @@ impl std::fmt::Display for NativeWorkerCellRefusal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidRegistry => {
-                write!(formatter, "embedded native-worker capability-cell registry is invalid")
+                write!(
+                    formatter,
+                    "embedded native-worker capability-cell registry is invalid"
+                )
             }
             Self::Proof(error) => write!(formatter, "native-worker cell proof refused: {error}"),
-            Self::PresentedCellMismatch { presented, declared } => write!(
+            Self::PresentedCellMismatch {
+                presented,
+                declared,
+            } => write!(
                 formatter,
                 "claim selected capability cell '{presented}', but this composition declares '{declared}'"
             ),
