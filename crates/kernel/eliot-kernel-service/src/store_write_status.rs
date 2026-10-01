@@ -20,7 +20,9 @@
 //! without valid lineage, and an unobserved dimension are different results,
 //! not one "store healthy" boolean.
 
-use eliot_host_state::CanonicalStoreWriteRefusal;
+use eliot_contracts::EpochTransition;
+use eliot_host_state::{CanonicalStoreWriteRefusal, HostState, ImmutableProcessManifest};
+use eliot_platform::PlatformHandle;
 use eliot_store_api::{SemanticDimension, StoreSemanticReadiness};
 
 /// Front-door/recovery status for canonical-store write readiness.
@@ -99,4 +101,55 @@ pub fn project_canonical_store_write_status(
             _ => CanonicalStoreWriteStatusRefusal::SemanticUnobserved,
         },
     )
+}
+
+/// Front-door/recovery join over the journal and the bridge receipt
+/// (issue #1887 W-status).
+///
+/// Reads the Host-managed half from the caller's [`HostState`] journal view
+/// through [`HostState::managed_dependency`] and evaluates it with
+/// [`ManagedDependencyRecord::canonical_store_write_readiness`](eliot_host_state::ManagedDependencyRecord::canonical_store_write_readiness),
+/// passing `semantic.is_ready()` as the semantic verdict, then projects the
+/// dimension-surfaced [`CanonicalStoreWriteStatus`] from that Host decision
+/// and the bridge's current typed [`StoreSemanticReadiness`]. A responsive
+/// bridge with no Host-managed record for `dependency` is refused as
+/// [`CanonicalStoreWriteRefusal::MissingPidJobLineage`], never accepted; a
+/// live process with a failed schema probe is refused as
+/// [`CanonicalStoreWriteStatusRefusal::SchemaIncompatible`]. Failures stay
+/// typed: no boolean crosses this boundary in either direction.
+///
+/// This entry starts no process, runs no probe, and holds no authority. The
+/// caller supplies the authenticated journal view and the bridge receipt for
+/// the same current observation.
+///
+/// Caller: STITCH — the front-door/recovery owners call this instead of
+/// reading [`StoreHealth`](eliot_store_api::StoreHealth): the Kernel
+/// recovery/status projections in `bins/eliot-kernel/src/health_view.rs` and
+/// `bins/eliot-kernel/src/kernel_unavailability.rs` (`RecoveryView`,
+/// `admit_canonical_write`; running #1972 writer) and the Kernel front-door
+/// write gate in `store_gateway.rs`. This crate does not call into `bins/`.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn project_canonical_store_write_status_from_journal(
+    journal: &HostState,
+    dependency: &PlatformHandle,
+    required_process_manifest: &ImmutableProcessManifest,
+    required_process_generation: &EpochTransition,
+    required_artifact_hash: &PlatformHandle,
+    required_config_hash: &PlatformHandle,
+    required_pid_job_lineage_refs: &[PlatformHandle],
+    semantic: &StoreSemanticReadiness,
+) -> CanonicalStoreWriteStatus {
+    let host = match journal.managed_dependency(dependency) {
+        Some(record) => record.canonical_store_write_readiness(
+            required_process_manifest,
+            required_process_generation,
+            required_artifact_hash,
+            required_config_hash,
+            required_pid_job_lineage_refs,
+            semantic.is_ready(),
+        ),
+        None => Err(CanonicalStoreWriteRefusal::MissingPidJobLineage),
+    };
+    project_canonical_store_write_status(host, semantic)
 }
