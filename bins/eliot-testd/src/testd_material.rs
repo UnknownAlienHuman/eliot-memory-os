@@ -232,14 +232,27 @@ pub struct TestdMaterialAdmission {
     pub admission_digest: String,
 }
 
+/// Opaque Kernel-issued Blob stream references copied into launch material.
+/// The authenticated TestD worker must compare this projection to the durable
+/// grant retained on its owner row before using any token.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdMaterialBlobStreamGrant {
+    pub capability_ref: String,
+    pub tokens: Vec<eliot_testd_core::TestdBlobProcessStreamTokenRef>,
+}
+
 /// Bins-local dispatch file envelope (NOT a wire contract change): the exact
-/// seven keys the kernel contour writes.
+/// keys the kernel contour writes, including the optional opaque stream
+/// references required by productive attempts.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TestdMaterialFile {
     request: TestdMaterialRequest,
     envelope: TestdMaterialEnvelope,
     admission: TestdMaterialAdmission,
+    #[serde(default)]
+    blob_stream: Option<TestdMaterialBlobStreamGrant>,
     epoch: EpochId,
     generation: u64,
     nonce: String,
@@ -269,6 +282,8 @@ pub struct ValidatedTestdMaterial {
     pub profile_binding_digest: String,
     /// Exact stored runner-admitted stage, when this is a productive job.
     pub stage_request: Option<InstrumentStageRequest>,
+    /// Opaque stream references; the durable owner row remains authority.
+    pub blob_stream: Option<TestdMaterialBlobStreamGrant>,
     /// Exact non-secret environment bindings admitted for this profile.
     pub environment: Vec<(String, String)>,
     /// Canonical digest of the exact admitted request envelope.
@@ -459,8 +474,14 @@ fn validate_material(
         ));
     }
     validate_admission(&file.admission, &file.request)?;
+    validate_blob_stream_material(&file.admission, file.blob_stream.as_ref())?;
     validate_session_binding(&file)?;
-    let (fence, _lease) = validate_grant(&file.grant, &file.admission, now_unix_ms)?;
+    let (fence, _lease) = validate_grant(
+        &file.grant,
+        &file.admission,
+        file.blob_stream.as_ref(),
+        now_unix_ms,
+    )?;
     let owner_store_path = file
         .grant
         .testd_owner_store_path
@@ -487,6 +508,7 @@ fn validate_material(
         sealed_slot_suffix: file.admission.sealed_slot_suffix.clone(),
         profile_binding_digest: file.admission.profile_binding_digest.clone(),
         stage_request: file.admission.stage_request.clone(),
+        blob_stream: file.blob_stream,
         environment: file.admission.environment.clone(),
         request_digest: file.admission.request_digest,
         admission_digest: file.admission.admission_digest,
@@ -655,6 +677,43 @@ fn validate_admission(
     Ok(())
 }
 
+fn validate_blob_stream_material(
+    admission: &TestdMaterialAdmission,
+    stream: Option<&TestdMaterialBlobStreamGrant>,
+) -> Result<(), TestdMaterialError> {
+    if admission.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE {
+        let stream = stream.ok_or_else(|| {
+            TestdMaterialError::Contract(
+                "productive testd material is missing its Kernel-issued Blob stream grant"
+                    .to_owned(),
+            )
+        })?;
+        validate_wire_text(&stream.capability_ref, "testd_material.blob_stream.capability_ref")?;
+        if stream.tokens.is_empty() || stream.tokens.len() > 8_336 {
+            return Err(TestdMaterialError::Contract(
+                "productive testd Blob stream grant has no bounded call-token table".to_owned(),
+            ));
+        }
+        for (index, token) in stream.tokens.iter().enumerate() {
+            validate_wire_text(&token.reference, "testd_material.blob_stream.token.reference")?;
+            if token.ordinal as usize != index
+                || stream.tokens[..index]
+                    .iter()
+                    .any(|previous| previous.reference == token.reference)
+            {
+                return Err(TestdMaterialError::Contract(
+                    "productive testd Blob call tokens must be unique and ordered".to_owned(),
+                ));
+            }
+        }
+    } else if stream.is_some() {
+        return Err(TestdMaterialError::Contract(
+            "non-productive testd material cannot carry a Blob stream grant".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Validates the session binding inside the material: the carried epoch must
 /// equal the grant epoch as an exact tuple, the carried generation must be
 /// non-zero and equal both the grant fence generation and the envelope fence
@@ -702,6 +761,7 @@ fn validate_session_binding(file: &TestdMaterialFile) -> Result<(), TestdMateria
 fn validate_grant(
     grant: &DispatchGrant,
     admission: &TestdMaterialAdmission,
+    blob_stream: Option<&TestdMaterialBlobStreamGrant>,
     now_unix_ms: u64,
 ) -> Result<(FencingToken, ActionLeaseRef), TestdMaterialError> {
     validate_wire_digest(&grant.grant_digest, "testd_material.grant_digest")?;
@@ -725,7 +785,8 @@ fn validate_grant(
     .map_err(|error| TestdMaterialError::Contract(truncate_detail(&error.to_string())))?;
     let lease = ActionLeaseRef::new(grant.idempotency_key.clone())
         .map_err(|error| TestdMaterialError::Contract(truncate_detail(&error.to_string())))?;
-    if recomputed_grant_digest(grant, &admission.admission_digest)? != grant.grant_digest {
+    let identity_digest = testd_material_identity_digest(admission, blob_stream)?;
+    if recomputed_grant_digest(grant, &identity_digest)? != grant.grant_digest {
         return Err(TestdMaterialError::Contract(
             "testd_material.grant_digest mismatch".to_owned(),
         ));
@@ -736,6 +797,22 @@ fn validate_grant(
         ));
     }
     Ok((fence, lease))
+}
+
+fn testd_material_identity_digest(
+    admission: &TestdMaterialAdmission,
+    blob_stream: Option<&TestdMaterialBlobStreamGrant>,
+) -> Result<String, TestdMaterialError> {
+    if blob_stream.is_none() {
+        return Ok(admission.admission_digest.clone());
+    }
+    canonical_json_bytes(&(admission.admission_digest.as_str(), blob_stream))
+        .map(|bytes| sha256_hex(&bytes))
+        .map_err(|_| {
+            TestdMaterialError::Contract(
+                "testd_material Blob stream identity cannot canonicalize".to_owned(),
+            )
+        })
 }
 
 /// Recomputes the grant digest over the exact kernel binding
