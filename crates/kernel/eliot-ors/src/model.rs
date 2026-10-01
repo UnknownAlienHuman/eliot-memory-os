@@ -1409,6 +1409,12 @@ pub struct BlobProcessStreamCallRecord {
     pub ordinal: u32,
     /// Exact typed operation digest, absent until the token is reserved.
     pub operation_sha256: Option<String>,
+    /// Small exact typed operation projection retained only for Open,
+    /// Finalize, and Abort so a restarted Kernel can recover the original
+    /// Store binding/terminal identity. Append bodies and source bytes are
+    /// never retained here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_projection_json: Option<String>,
     /// Canonical exact Store RequestIdentity JSON, absent until reservation.
     pub request_identity_json: Option<String>,
     /// Digest of `request_identity_json`.
@@ -1417,6 +1423,11 @@ pub struct BlobProcessStreamCallRecord {
     pub state: BlobProcessStreamCallState,
     /// Digest of the bounded exact response projection, when available.
     pub response_sha256: Option<String>,
+    /// Bounded metadata-only response projection for Opened/terminal outcomes.
+    /// Chunk bytes and arbitrary Blob payloads are forbidden by the owner that
+    /// supplies this projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_projection_json: Option<String>,
     /// Immutable owner-issued reference from which a response can be reconciled.
     pub response_ref: Option<String>,
     /// Owner receipt reference proving a completed Store operation/readback.
@@ -1435,6 +1446,36 @@ impl BlobProcessStreamCallRecord {
             (&self.token_ref, "blob_process_stream_call_token"),
         ] {
             validate_text(value, field)?;
+        }
+        if let Some(json) = &self.operation_projection_json {
+            if json.len() > MAX_BLOB_PROCESS_STREAM_PROJECTION_JSON_BYTES
+                || !matches!(serde_json::from_str::<serde_json::Value>(json), Ok(serde_json::Value::Object(_)))
+                || serde_json::to_string(&serde_json::from_str::<serde_json::Value>(json).map_err(|_| OrsError::InvalidField {
+                    field: "blob_process_stream_call_operation_projection",
+                    reason: "must be a bounded canonical JSON object",
+                })?).as_bytes() != json.as_bytes()
+                || self.operation_sha256.as_deref().is_none_or(|digest| sha256_hex(json.as_bytes()) != digest)
+            {
+                return Err(OrsError::InvalidField {
+                    field: "blob_process_stream_call_operation_projection",
+                    reason: "must be canonical, bounded, and match operation digest",
+                });
+            }
+        }
+        if let Some(json) = &self.response_projection_json {
+            if json.len() > MAX_BLOB_PROCESS_STREAM_PROJECTION_JSON_BYTES
+                || !matches!(serde_json::from_str::<serde_json::Value>(json), Ok(serde_json::Value::Object(_)))
+                || serde_json::to_string(&serde_json::from_str::<serde_json::Value>(json).map_err(|_| OrsError::InvalidField {
+                    field: "blob_process_stream_call_response_projection",
+                    reason: "must be a bounded canonical JSON object",
+                })?).as_bytes() != json.as_bytes()
+                || self.response_sha256.as_deref().is_none_or(|digest| sha256_hex(json.as_bytes()) != digest)
+            {
+                return Err(OrsError::InvalidField {
+                    field: "blob_process_stream_call_response_projection",
+                    reason: "must be canonical, bounded, and match response digest",
+                });
+            }
         }
         if self.ordinal == 0 {
             return Err(OrsError::InvalidField {
@@ -1525,6 +1566,7 @@ impl BlobProcessStreamCallRecord {
             && self.token_ref == other.token_ref
             && self.ordinal == other.ordinal
             && self.operation_sha256 == other.operation_sha256
+            && self.operation_projection_json == other.operation_projection_json
             && self.request_identity_json == other.request_identity_json
             && self.request_identity_sha256 == other.request_identity_sha256
     }
@@ -1537,6 +1579,8 @@ pub const BLOB_PROCESS_STREAM_ORS_VERSION: u16 = 1;
 pub const MAX_BLOB_PROCESS_STREAM_OWNER_FACTS_JSON_BYTES: usize = 64 * 1024;
 /// Maximum serialized Kernel-created Store identity retained in ORS.
 pub const MAX_BLOB_PROCESS_STREAM_IDENTITY_JSON_BYTES: usize = 16 * 1024;
+/// Maximum exact operation projection retained for restart binding recovery.
+pub const MAX_BLOB_PROCESS_STREAM_PROJECTION_JSON_BYTES: usize = 16 * 1024;
 
 /// Durable one-shot authority handoff disposition.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
