@@ -2506,16 +2506,21 @@ mod owner_closure_provider_tests {
         }
     }
 
-    fn grant_entry(fence: &StateFence, grant_id: &str, parent: Option<&str>) -> CapabilityGrant {
+    /// The authority-root grant this fixture lineage starts from. A root has
+    /// no parent, so it carries no narrowing obligation; it is deliberately
+    /// WIDER than any child (an extra resource) so a genuinely-narrowed child
+    /// can be derived from it, per I6.15: "each child is an intersection of
+    /// parent authority, requested scope and current policy."
+    fn grant_entry(fence: &StateFence, grant_id: &str) -> CapabilityGrant {
         CapabilityGrant {
             grant_id: GrantId::new(grant_id).expect("id"),
-            parent_grant_id: parent.map(|id| GrantId::new(id).expect("parent")),
+            parent_grant_id: None,
             authority_root_ref: "root:alpha".to_owned(),
             issuer: PrincipalRef::new("principal:issuer").expect("issuer"),
             holder: PrincipalRef::new("principal:holder").expect("holder"),
             authority: AuthoritySet::new(
                 ["op.read".to_owned()],
-                ["res:1".to_owned()],
+                ["res:1".to_owned(), "res:2".to_owned()],
                 EffectClass::Read,
             )
             .expect("authority"),
@@ -2533,15 +2538,56 @@ mod owner_closure_provider_tests {
         }
     }
 
-    fn owner_snapshot(fence: &StateFence) -> AuthorityOwnerSnapshot {
-        let graph = GrantGraph::from_grants(
-            [
-                grant_entry(fence, "grant:origin", None),
-                grant_entry(fence, "grant:child", Some("grant:origin")),
-            ],
-            7,
+    /// The narrowed child grant, derived from its parent exactly the way the
+    /// I6.15 intersection rule requires and exactly the way the authority
+    /// validator reads it: the child's authority is the parent's authority
+    /// intersected with a strictly-smaller requested scope, and the child's
+    /// issuer is the PARENT'S HOLDER. `check_narrowing` (eliot-authority
+    /// grants.rs) refuses any child that is not a strict subset on all four
+    /// axes, so this fixture must present a real narrowing — an identical
+    /// (or wider) child is `GrantNotNarrower`.
+    fn narrowed_child_entry(
+        parent: &CapabilityGrant,
+        fence: &StateFence,
+        grant_id: &str,
+    ) -> CapabilityGrant {
+        let requested_scope = AuthoritySet::new(
+            ["op.read".to_owned()],
+            ["res:1".to_owned()],
+            EffectClass::Read,
         )
-        .expect("graph");
+        .expect("requested scope");
+        let narrowed = parent.authority.intersection(&requested_scope).expect(
+            "the requested scope is a sub-scope of the parent authority, so the intersection is \
+             total and is a strict subset of the parent",
+        );
+        // A child that equals its parent would not be a narrowing; assert the
+        // fixture keeps the strict-subset invariant it is here to prove.
+        assert!(
+            narrowed.is_strict_subset_of(&parent.authority),
+            "fixture child must be a strict subset of its parent authority"
+        );
+        CapabilityGrant {
+            grant_id: GrantId::new(grant_id).expect("id"),
+            parent_grant_id: Some(parent.grant_id.clone()),
+            authority_root_ref: parent.authority_root_ref.clone(),
+            // Narrowing clause 1: the child's issuer is the parent's holder.
+            issuer: parent.holder.clone(),
+            holder: PrincipalRef::new("principal:holder").expect("holder"),
+            authority: narrowed,
+            inherited_source_ceiling: None,
+            binding: binding(fence),
+            issued_at: LogicalTime::new(1_000),
+            expires_at: LogicalTime::new(10_000),
+            max_uses: 2,
+            status: GrantStatus::Active,
+        }
+    }
+
+    fn owner_snapshot(fence: &StateFence) -> AuthorityOwnerSnapshot {
+        let parent = grant_entry(fence, "grant:origin");
+        let child = narrowed_child_entry(&parent, fence, "grant:child");
+        let graph = GrantGraph::from_grants([parent, child], 7).expect("graph");
         let effect_authorizer = EffectAuthorizer::default().snapshot().expect("authorizer");
         AuthorityOwnerSnapshot::new(
             fence.clone(),
