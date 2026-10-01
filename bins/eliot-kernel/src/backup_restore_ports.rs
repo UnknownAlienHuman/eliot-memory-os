@@ -190,9 +190,21 @@ pub const MAX_TRACKED_JOURNAL_PAYLOADS: usize = MAX_JOURNAL_PAGE_ENTRIES;
 /// (never caller text); when the archive carries a `config` artifact, the
 /// admitted manifest digest must equal that artifact's digest; the admitted
 /// values pin to [`DESTINATION_ADMISSION_FILE`] at prepare and any drift
-/// refuses later effects. Rehearsal without Host admission carries `None`
-/// instead: isolated import still runs, but cutover refuses without a
-/// pinned owner-approved admission.
+/// refuses later effects.
+///
+/// WITHOUT this record there is no import at all, and that is the restore
+/// owner's decision rather than a reading of this doc: a bundle that carries
+/// `None` is refused with [`KernelRestoreError::DestinationNotAdmitted`] before
+/// the plan is compiled and before a destination root is constructed, so no
+/// destination byte exists, nothing is pinned, and cutover qualification is
+/// never reached (#955). A rehearsal is not an exception — the rehearsal posture
+/// is not a reason to refuse, but it is also not a substitute for admission.
+/// The record is required rather than inspected when present because
+/// `KernelIsolatedDestination::open` CONSTRUCTS
+/// `<work_root>/.eliot/restore-isolated/<label>` from a label the request
+/// chose: a predictable directory that exists is not evidence that an external
+/// owner admitted it, and a path this operation built for itself is not
+/// admission.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DestinationManifestEvidence {
@@ -645,12 +657,24 @@ pub struct RestorePorts<'a> {
     /// value is #962/AUDIT-7 and lives in this file, so the value is now
     /// constructible from owner evidence rather than only describable.
     ///
-    /// `None` is a supported shape, not an absent one: it is a bundle with no Host
-    /// admission, which is the rehearsal-without-admission case the
-    /// [`DestinationManifestEvidence`] doc names.
+    /// `None` means this bundle carries NO Host admission, and the restore
+    /// owner now refuses it: [`KernelRestoreError::DestinationNotAdmitted`],
+    /// raised before any plan is compiled and before a destination root is
+    /// constructed. The field stays `Option` because admitting or withholding
+    /// the record is the owner's call; reading it optionally is not.
+    ///
+    /// On the production front door (`request_dispatch::handle_backup_restore_test`)
+    /// `None` is the value the bundle carries, so that route is fail-closed
+    /// today: it holds no channel to the Host manifest binding, which is the
+    /// #958 decision and is not resolved (#955).
     pub manifest_evidence: Option<DestinationManifestEvidence>,
-    /// Rehearsal mode: isolated import runs, but cutover refuses and no
-    /// activation, retirement, or effect unblocking exists on any path.
+    /// Rehearsal mode: no activation, retirement or effect unblocking exists on
+    /// any path, and cutover qualification refuses.
+    ///
+    /// It does NOT relax the destination gate: a rehearsal still needs the
+    /// owner-issued `manifest_evidence` above, and it is equally not by itself
+    /// a reason to refuse. The two flags are independent — one is the owner's
+    /// admission, the other is the posture that admission runs under.
     pub rehearsal: bool,
 }
 
@@ -693,17 +717,23 @@ impl RestorePorts<'_> {
     /// defaulted and nothing is dropped: absent key material or blob scope stays
     /// absent, and the rehearsal posture is untouched.
     ///
-    /// ## Why `None` is a supported answer and is not repaired here
+    /// ## Why this method never invents the value, and never clears one
     ///
-    /// A bundle whose `manifest_evidence` is `None` is a bundle with **no Host
-    /// admission** — the rehearsal-without-admission shape the type's own doc names.
-    /// That is not a missing value to fill in: isolated import still runs under
-    /// it, prepare writes no [`DESTINATION_ADMISSION_FILE`] pin, and cutover
-    /// qualification refuses for want of a pinned owner-approved admission. A
-    /// caller that holds Host admission calls this method; a caller that does not
-    /// simply keeps the `None` it has, and the gate is what makes the difference
-    /// observable instead of guessed. This method therefore never invents an
-    /// evidence value to fill the gap, and it never clears an existing one.
+    /// A bundle whose `manifest_evidence` is `None` is a bundle with no Host
+    /// admission, and since the destination-admission gate (#955) the restore
+    /// owner REFUSES it: `restore_with_owner` requires the record and raises
+    /// [`KernelRestoreError::DestinationNotAdmitted`] before `compile_plan` and
+    /// before `KernelIsolatedDestination::open` constructs the root. So `None` is
+    /// not a supported import shape any more — it is the exact shape the gate
+    /// exists to stop — and this method therefore does not "repair" it by minting
+    /// a value here: a Kernel-minted record would be a Host binding the Kernel
+    /// never observed, which is the very thing the gate refuses to accept.
+    ///
+    /// The honest difference between the two callers is therefore made by the
+    /// owner, not guessed here: a caller that holds Host admission calls this
+    /// method and proceeds; a caller that does not is refused and has no
+    /// destination to import into. This method never invents an evidence value to
+    /// fill the gap, and it never clears an existing one.
     ///
     /// The rehearsal flag is deliberately NOT a reason to refuse. A rehearsal that
     /// *does* hold Host admission is a supported shape: it carries this evidence,
