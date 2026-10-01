@@ -888,6 +888,9 @@ pub enum InitialSnapshotError {
     /// Canonical JSON serialization failed.
     #[error("initial snapshot canonicalization failed: {0}")]
     Canonicalization(String),
+    /// The retained protected signer refused one canonical preimage.
+    #[error("initial snapshot signer failed: {0}")]
+    SigningFailure(String),
     /// Signature algorithm is not admitted.
     #[error("unsupported initial snapshot signature algorithm: {0}")]
     UnsupportedAlgorithm(String),
