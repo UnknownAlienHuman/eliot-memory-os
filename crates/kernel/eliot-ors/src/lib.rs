@@ -54,11 +54,11 @@ pub use admission_reservation_stage::{
     CanonicalAdmissionResolution, CanonicalAdmissionUnknownReason, CanonicalLaunchOutboxIntent,
     ProvenCanonicalAdmission, StagedClaimRole, activate_admission_reservation_from_owner_evidence,
     activation_operation_identity, admission_reservation_identity,
-    canonical_admission_from_owner_commit, epoch_lineage_for, launch_outbox_readback,
-    proposed_attempt_identity, prove_canonical_admission_for_reservation,
-    reconcile_canonical_admission, reload_staged_admission_reservation,
-    stage_admission_reservation_inactive, stage_operation_identity, verify_launch_outbox_intent,
-    verify_staged_claim_completeness,
+    canonical_admission_from_owner_commit, canonical_admission_receipt_from_owner_receipt,
+    epoch_lineage_for, launch_outbox_readback, proposed_attempt_identity,
+    prove_canonical_admission_for_reservation, reconcile_canonical_admission,
+    reload_staged_admission_reservation, stage_admission_reservation_inactive,
+    stage_operation_identity, verify_launch_outbox_intent, verify_staged_claim_completeness,
 };
 pub use backup_snapshot::{
     BACKUP_SNAPSHOT_SCHEMA_VERSION, BackupCompleteness, BackupPartialReason, MAX_BACKUP_BYTES,
