@@ -1311,9 +1311,13 @@ pub enum CutoverError {
 // that refusal into a real admitted call needs the #962/#945 transport surface
 // this issue does not own, so the gap is stated here rather than papered over
 // with a fabricated request. `validate_cutover_request` therefore has exactly
-// one production caller, `HostComposition::backup_dispatch_cutover`, and its
-// diagnostic records are emitted on the same `op` token the owner arm would
-// file them under, so the records line up if and when that transport lands.
+// one in-source caller, `HostComposition::backup_dispatch_cutover`, which no
+// live contour yet reaches: the live owner arm above refuses pre-effect for
+// want of a separately admitted body, so reaching that port needs the
+// #962/#945 transport surface this issue does not own (lib.rs boundary work,
+// never a leaf-side fabrication). Its diagnostic records are emitted on the
+// same `op` token the owner arm would file them under, so the records line up
+// if and when that transport lands.
 //
 // There is ONE status read model, not two. Every disposition read enters
 // `read_cutover_disposition`; it reads the registry and the journal, brackets
@@ -4564,4 +4568,77 @@ pub fn reconcile_cutover_outcome(
         backup_cutover_count(outcome.evidence_refs.len()),
     );
     outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn handle(value: &str) -> PlatformHandle {
+        PlatformHandle::new(value).unwrap_or_else(|error| panic!("test handle: {error}"))
+    }
+
+    /// The readback the status model consumes, built from synthetic non-secret
+    /// handles only (no canary material, I15.4).
+    fn readback() -> CutoverReadback {
+        CutoverReadback {
+            operation: CutoverOperationIdentity {
+                installation: handle("test-installation-983"),
+                operation_id: handle("test-operation-983"),
+                request_digest: handle("test-request-digest-983"),
+            },
+            target_generation: handle("test-target-generation-983"),
+            expected_predecessor: handle("test-expected-predecessor-983"),
+            user_broker_ref: handle("test-user-broker-983"),
+            target_build_digest: handle("test-target-build-983"),
+            target_config_digest: handle("test-target-config-983"),
+        }
+    }
+
+    // WORK_UNIT_CASE: 983/7
+    #[test]
+    fn torn_pair_without_retained_intent_reports_movement_not_requested() {
+        // CHECKLIST W6 counterexample: no durable intent, no retirement, the
+        // registry on a third generation that is neither the expected
+        // predecessor nor the target, and the reader's own coherence bracket
+        // reporting movement. The missing intent may have landed after the
+        // sampled journal read, so the torn pair answers Unknown with
+        // ConcurrentOwnerMovement — never the settled pre-effect Requested
+        // (I14.21: ambiguity stays unknown under the original identity).
+        let readback = readback();
+        let registry_active = handle("test-third-generation-983");
+        let outcome = reconcile_cutover_outcome(
+            &readback,
+            None,
+            None,
+            Some(&registry_active),
+            &CutoverRetirementEvidence::Absent,
+            OwnerObservationCoherence::Moving,
+        );
+        assert_eq!(outcome.disposition, CutoverDisposition::Unknown);
+        assert_eq!(outcome.residual, CutoverResidual::ConcurrentOwnerMovement);
+        assert_eq!(outcome.operation, *readback.operation());
+    }
+
+    // WORK_UNIT_CASE: 983/7
+    #[test]
+    fn coherent_pair_without_retained_intent_reports_requested() {
+        // Control for the W6 counterexample: the same owner observations read
+        // as one coherent moment honestly establish nothing, which is the
+        // unqualified pre-effect Requested — qualification unavailable, not
+        // validated. Only a torn pair withholds it for movement.
+        let readback = readback();
+        let registry_active = handle("test-third-generation-983");
+        let outcome = reconcile_cutover_outcome(
+            &readback,
+            None,
+            None,
+            Some(&registry_active),
+            &CutoverRetirementEvidence::Absent,
+            OwnerObservationCoherence::Coherent,
+        );
+        assert_eq!(outcome.disposition, CutoverDisposition::Requested);
+        assert_eq!(outcome.residual, CutoverResidual::None);
+        assert_eq!(outcome.operation, *readback.operation());
+    }
 }
