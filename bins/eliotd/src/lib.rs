@@ -748,7 +748,17 @@ pub struct DaemonComposition {
     /// a second job observes the canonical winner. Cross-process durability
     /// of the store image itself follows the canonical-write envelope wiring
     /// (remainder, #1699); this field never claims it.
-    swarm_attachment: eliot_governor::SwarmAttachmentComposition,
+    ///
+    /// Held behind an [`Arc`] because the one owner instance is shared by
+    /// value-holding callers: [`Self::swarm_composition`] borrows it, and the
+    /// production admission port
+    /// ([`ProductionAdmissionAuthorityPort`], issue #370 R1) must hold an
+    /// owned handle to the SAME owner for the life of the injected
+    /// `Arc<dyn AdmissionAuthorityPort>`. The owner is not `Clone` and must
+    /// not be constructed twice ("share by reference; never construct a
+    /// second instance"), so sharing it by `Arc` is what keeps it one owner
+    /// rather than two.
+    swarm_attachment: Arc<eliot_governor::SwarmAttachmentComposition>,
 }
 
 /// Production B-MOD model registry port (issue #1108 W4/A2).
@@ -1213,9 +1223,9 @@ impl DaemonComposition {
             governor_authority: eliot_governor::LiveGovernorAuthority::new(),
             external_attach: None,
             solo_state: std::sync::Mutex::new(solo_agent_driver::SoloDriverState::new()),
-            swarm_attachment: eliot_governor::SwarmAttachmentComposition::new(
+            swarm_attachment: Arc::new(eliot_governor::SwarmAttachmentComposition::new(
                 eliot_governor::SwarmPlanAttachmentService::new(),
-            ),
+            )),
         })
     }
 
@@ -2069,10 +2079,10 @@ impl DaemonComposition {
 
     /// Borrows the single Governor-owned durable swarm attachment composition.
     #[must_use]
-    pub const fn swarm_attachment_composition(
+    pub fn swarm_attachment_composition(
         &self,
     ) -> &eliot_governor::SwarmAttachmentComposition {
-        &self.swarm_attachment
+        self.swarm_attachment.as_ref()
     }
 
     /// Binds the daemon swarm composition over the single Governor attachment
@@ -2100,7 +2110,7 @@ impl DaemonComposition {
         L: swarm_composition::LaunchIntentLedger,
         R: swarm_composition::ChildRunner,
     {
-        swarm_composition::SwarmComposition::new(&self.swarm_attachment, ledger, runner)
+        swarm_composition::SwarmComposition::new(self.swarm_attachment.as_ref(), ledger, runner)
     }
 
     /// Returns the retained protected config path, for diagnostics only.
