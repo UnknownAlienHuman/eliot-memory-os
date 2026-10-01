@@ -950,6 +950,17 @@ struct BridgeEventRow {
     envelope_bytes: Vec<u8>,
     staging_connection: String,
     staged_at_ms: u64,
+    /// Absolute host-request submit deadline this event was staged under
+    /// (issue #2731, item 3): the durable-stage input named by the Kernel
+    /// admit leg. Zero means no deadline was presented — legacy rows and
+    /// entries whose caller predates this evidence — never "expired at
+    /// epoch" (I7.23: zero is not a substitute for missing data). A nonzero
+    /// deadline may precede `staged_at_ms`: an expired submit is staged
+    /// honestly and answered as a timeout, so the deadline never gates
+    /// admission and never joins identity comparisons; bounded owner
+    /// recovery validates it against `staged_at_ms` instead.
+    #[serde(default)]
+    submit_deadline_ms: u64,
     phase: String,
     /// Versioned owner namespace digest binding this event to its admitted
     /// stream owner (issue #2729). Empty on rows staged before owner
@@ -3045,6 +3056,10 @@ struct BridgeCheckedStage {
     staging_connection: String,
     namespace: String,
     key: String,
+    /// Absolute host-request submit deadline carried for the durable row
+    /// (issue #2731, item 3). Zero when the caller presented none: unknown
+    /// expiry evidence, never an identity input.
+    submit_deadline_ms: u64,
 }
 
 /// Parsed inputs for one owner-checked gap record (issue #2729): the gap
@@ -12314,6 +12329,9 @@ impl RedbRecoveryStore {
                     envelope_bytes: staging.stored_bytes.clone(),
                     staging_connection,
                     staged_at_ms: now_ms,
+                    // No submit deadline was presented on this legacy entry:
+                    // unknown expiry evidence, never expired-at-epoch.
+                    submit_deadline_ms: 0,
                     phase: BRIDGE_EVENT_PHASE_DURABLE.to_owned(),
                     // Legacy entry: no owner binding was presented, so the
                     // row stays ownerless. Owner-checked entries use
@@ -17273,6 +17291,22 @@ impl RedbRecoveryStore {
         if crate::model::sha256_hex(&envelope_bytes) != presented_sha {
             return Err(OrsError::PayloadIntegrityMismatch);
         }
+        // The absolute host-request submit deadline is optional transport
+        // evidence (issue #2731, item 3): the current route does not thread
+        // it yet, so absence means unknown, never expired. A non-integer
+        // deadline is refused rather than defaulted silently (I5.27:
+        // fields affecting effect timing cannot be omitted/defaulted
+        // silently once presented).
+        let submit_deadline_ms = staged
+            .get("submit_deadline_ms")
+            .map(|value| {
+                value.as_u64().ok_or(OrsError::InvalidField {
+                    field: "submit_deadline_ms",
+                    reason: "bridge event submit deadline must be a non-negative integer",
+                })
+            })
+            .transpose()?
+            .unwrap_or(0);
         let namespace = Self::bridge_stream_owner_digest(
             &evidence.lineage,
             &evidence.principal,
@@ -17300,6 +17334,7 @@ impl RedbRecoveryStore {
             staging_connection,
             namespace,
             key,
+            submit_deadline_ms,
         };
         Ok((stage, staging, provenance))
     }
@@ -17593,6 +17628,7 @@ impl RedbRecoveryStore {
             envelope_bytes: staging.stored_bytes.clone(),
             staging_connection: stage.staging_connection.clone(),
             staged_at_ms: now_ms,
+            submit_deadline_ms: stage.submit_deadline_ms,
             phase: BRIDGE_EVENT_PHASE_DURABLE.to_owned(),
             owner_namespace: stage.namespace.clone(),
             transport_hash: staging.transport_hash.clone(),
@@ -19271,6 +19307,15 @@ impl RedbRecoveryStore {
     /// [`OrsError::DuplicateConflict`]; a full handoff table returns typed
     /// pending-handoff backpressure instead of declaring missing evidence
     /// complete.
+    ///
+    /// Expiry is validated from the retained row's own
+    /// `submit_deadline_ms` against its `staged_at_ms`: a nonzero deadline
+    /// at or before the stage time proves an expired submit (staged
+    /// honestly, answered as a timeout), never a non-acceptance, so the
+    /// row is still retained under its original identity. `expired_repaired`
+    /// counts those rows explicitly for the missing receiver contract; a
+    /// zero deadline is unknown evidence (I7.23), always repaired, never
+    /// treated as expired-at-epoch.
     pub fn repair_bridge_event_handoffs_checked(
         &self,
         request: &serde_json::Value,
@@ -19511,6 +19556,11 @@ impl RedbRecoveryStore {
     /// missing source at or below that boundary is historical. The persisted
     /// continuation is owner/revision bound and reports whether more indexed
     /// rows remain to scan, not whether the whole owner is repaired.
+    /// Expiry evidence travels on the retained row (`submit_deadline_ms`,
+    /// zero when never presented): repair validates it against the row's
+    /// own `staged_at_ms` and reports expired submits in
+    /// `expired_repaired` while retaining them under their original
+    /// identity — a timeout after stage is not proof of non-acceptance.
     #[allow(
         clippy::too_many_lines,
         reason = "The bounded source join, capacity preflight, cursor advance, and repair inserts must remain one reviewable write-transaction flow."
@@ -19563,6 +19613,7 @@ impl RedbRecoveryStore {
             return Ok(json!({
                 "namespace": access.namespace,
                 "repaired": 0_u64,
+                "expired_repaired": 0_u64,
                 "repair_continuation": false,
                 "handoff_scan_bytes": scan_bytes,
             }));
@@ -19585,6 +19636,7 @@ impl RedbRecoveryStore {
         };
         let mut handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
         let mut missing = Vec::new();
+        let mut expired_repaired = 0_u64;
         for (sequence, event_id) in &positions {
             let Some(row) = Self::bridge_event_record_for_maintenance_position_in(
                 write,
@@ -19614,6 +19666,17 @@ impl RedbRecoveryStore {
                     return Err(OrsError::DuplicateConflict);
                 }
             } else {
+                // Expiry is validated against the retained row's own stage
+                // time, never the repair clock: a nonzero deadline at or
+                // before `staged_at_ms` proves this row was an expired
+                // submit (staged honestly, answered as a timeout), not a
+                // non-acceptance. It is still retained under its original
+                // identity below; the count keeps that obligation explicit
+                // for the missing receiver contract instead of mixing it
+                // silently into fresh repairs.
+                if row.submit_deadline_ms != 0 && row.submit_deadline_ms <= row.staged_at_ms {
+                    expired_repaired += 1;
+                }
                 missing.push((key, row));
             }
         }
@@ -19699,6 +19762,7 @@ impl RedbRecoveryStore {
         Ok(json!({
             "namespace": access.namespace,
             "repaired": repaired,
+            "expired_repaired": expired_repaired,
             "repair_continuation": continuation,
             "handoff_scan_bytes": scan_bytes,
         }))
