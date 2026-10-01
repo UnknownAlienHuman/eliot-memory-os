@@ -711,6 +711,25 @@ pub fn negative_memory_activation_mutation_request(
 /// Returns [`NegativeMemoryActivationRefusal`] when the request fails
 /// activation admission, and [`CompositionError`] for the guard, envelope,
 /// transport and receipt checks.
+///
+/// # Live status
+///
+/// No production caller. Measured on this tree, no code in any crate calls
+/// this function; the only references to its name are this definition and the
+/// `pub use` re-export in `lib.rs`. The activation surface around it is in the
+/// same state: `NegativeMemoryActivationRequest` and the internal
+/// prepare/admit helpers are reached only from this module and from
+/// `negative_memory_read.rs`, which imports the document and handle
+/// constants but never this commit. The nearest live negative-memory write is
+/// the daemon's own gated effect commit,
+/// `commit_gated_action` in
+/// `bins/eliotd/src/negative_memory_action_gate.rs`, which commits its own
+/// pending action through `GovernorComposition::commit_canonical` — the same
+/// seam this function wraps, reached without going through activation
+/// admission. So the fail-closed activation guard above is not exercised on
+/// any live path; a direct commit bypasses it by design. Whether an ingress
+/// is wired to admit through this activation seam or it is retired is an
+/// owner decision; no caller was added to close the gap.
 #[allow(
     clippy::too_many_arguments,
     reason = "the commit caller joins every handoff-required envelope input in one typed call"

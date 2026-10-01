@@ -1057,6 +1057,22 @@ fn selection_chain_parameters(
 ///
 /// Returns [`CompositionError`] when the envelope cannot be built or the
 /// canonical commit refuses.
+///
+/// # Live status
+///
+/// No production caller. Measured on this tree, no code in any crate calls
+/// this function; the only references to its name are this definition, the
+/// `pub use` re-export in `lib.rs`, and prose. This is the commit half of
+/// issue #1728 step 4, and the whole `selection_chain` surface is in the same
+/// state: the pure producer join `prepare_selection_chain` and the envelope
+/// builder `selection_chain_envelope` it calls are named only by this
+/// module's own re-exports, so no membership-changing stage is recorded on a
+/// live path yet. Nothing is lost by leaving it unwired — an
+/// uncommitted chain is the same honest absence the module header describes
+/// — but the step-4 join the heading above claims is not currently exercised.
+/// Whether the context-compilation owner that owns each stage is wired to this
+/// commit or the surface is retired is an owner decision; no caller was added
+/// to close the gap.
 pub async fn commit_selection_chain<P: KernelGenerationPort + ?Sized>(
     composition: &GovernorComposition<P>,
     identity: &RequestIdentity,

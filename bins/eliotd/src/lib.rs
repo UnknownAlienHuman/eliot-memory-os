@@ -1949,6 +1949,22 @@ impl DaemonComposition {
     /// #22). The returned composition enforces the owner order — persist
     /// intent before execution, reconcile before relaunch, unknown blocks
     /// terminal — for whatever owners the caller supplies.
+    ///
+    /// # Live status
+    ///
+    /// No production caller for THIS accessor. The sentence above names
+    /// `swarm_composition::SwarmComposition::new`, whose production caller is
+    /// claimed but which is itself only reached by naming it: no code in any
+    /// crate calls this method, so the composition it binds is never built.
+    /// The nearest live thing is
+    /// [`Self::swarm_attachment_composition`], the accessor over the same
+    /// Governor-owned attachment owner that the daemon swarm path does read.
+    /// The two remainders this accessor documents are still open: no non-test
+    /// `LaunchIntentLedger`/`ChildRunner` or `DurableWorkStore` implementation
+    /// exists (remainder #1699), so there is no owner to pass in even if a
+    /// caller appeared. Whether the front door supplies those owners or this
+    /// accessor is retired is an owner decision; no caller and no port
+    /// implementation was invented to close the gap.
     #[must_use]
     pub fn swarm_composition<'a, L, R>(
         &'a self,
@@ -3153,6 +3169,18 @@ impl DaemonComposition {
     /// only the public `owners()`/`read_unique_agent_activation()`/`readiness()`
     /// surface plus the associated `borrow` constructor inside
     /// `epistemic_composition.rs`.
+    ///
+    /// # Live status
+    ///
+    /// No production caller. Measured on this tree, no code in any crate names
+    /// this method other than its defining line. The nearest live thing is
+    /// [`Self::context_read_client`], which this mirrors and which the daemon
+    /// attach path does call: it checks readiness and hands back the one
+    /// concrete `KernelContextReadClient` this accessor then expects to be
+    /// passed. The Governor-side `borrow` constructor is live, so the
+    /// composition itself is reachable; only this daemon-level accessor over
+    /// it is not. Whether a caller needs this handle or it is retired is an
+    /// owner decision; no caller was added to close the gap.
     pub fn epistemic_composition<'a>(
         &'a self,
         kernel: &'a Arc<DaemonKernelClient>,

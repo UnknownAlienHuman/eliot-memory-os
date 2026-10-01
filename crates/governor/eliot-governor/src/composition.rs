@@ -9430,8 +9430,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Dispatches one exact durable authority request through the retained
     /// production P-07 port. The daemon composition root owns construction of
     /// the request from its admitted canonical source; this method is the
-    /// single application seam that gives all four authority operations a
-    /// production caller without reimplementing receipt reconciliation.
+    /// single application seam intended to give all four authority operations
+    /// one shared call site without reimplementing receipt reconciliation.
     ///
     /// A grant revocation is the only arm with a canonical second phase, so it
     /// is the only arm that reads `canonical_operation_id`,
@@ -9459,10 +9459,19 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// The grant-revocation arm runs through
     /// [`Self::apply_admitted_authority_revocation`], which admits the
     /// presented operation against the live composition generation before
-    /// the saga starts. Live status: production seam for all four authority
-    /// families; the daemon composition root's authority pass is its one
-    /// production caller (BLOCKED-BY authority-transport: that pass does not
-    /// yet build one of these requests from an admitted canonical source).
+    /// the saga starts. Live status: intended production seam for all four
+    /// authority families, but it currently has NO production caller. Measured
+    /// on this tree, no code in any crate names this method other than its
+    /// defining line; the daemon composition root's authority pass is the
+    /// caller that would supply it, and that pass does not build one of these
+    /// requests from an admitted canonical source (BLOCKED-BY
+    /// authority-transport). The nearest live thing is
+    /// [`Self::authority_activation_available`], which reports whether the
+    /// retained P-07 port exists; the four authority families themselves are
+    /// reached through their own admitted entry points, so no authority
+    /// operation is blocked by this gap — only this shared seam is unused.
+    /// Whether the authority pass is wired to it or it is retired is an owner
+    /// decision; no caller was added to close the gap.
     pub async fn apply_authority_request<L, C>(
         &mut self,
         request: PresentedAuthorityRequest,
@@ -10402,6 +10411,23 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// namespace/digest/bounds records, so none of the identity's five
     /// coordinates is derivable here. Restoring under a synthesized
     /// identity would make the origin-bound recheck certify itself.
+    ///
+    /// # Live status
+    ///
+    /// This method currently has NO production caller; the body is reachable
+    /// only by naming it. A source implementation is not evidence of a live
+    /// edge. The nearest live thing is the free
+    /// [`synchronize_owner_feed_with_canonical_receipts`], which the owning
+    /// daemon runtime does call (`bins/eliotd/src/owner_feed.rs`) and which
+    /// performs this same restore-against-live-revocation-history step; this
+    /// method is only a bound-snapshot wrapper over it, in the same way
+    /// [`Self::synchronize_kernel_owner`] wraps [`synchronize_owner_feed`].
+    /// The `#2100` owner-closure join the heading names therefore does run on
+    /// the live path, through the free function; this method is the unused
+    /// wrapper, not a missing capability, and it must not be read as a live
+    /// entry point. Whether the daemon calls the bound form instead or this
+    /// wrapper is retired is an owner decision; no caller was added to close
+    /// the gap.
     pub async fn restore_authority_with_live_history<R: CanonicalReadClient + ?Sized>(
         reads: &R,
         snapshot: &AuthorityOwnerSnapshot,
