@@ -2296,6 +2296,19 @@ impl KernelComposition {
         admission.validate().map_err(|error| error.to_string())?;
         let ready = admission.ready.as_ref()
             .ok_or_else(|| "ReadyAttach response contains no Ready source row".to_owned())?;
+        let pending_admission_json = String::from_utf8(
+            canonical_json_bytes(&pending_readback.admission).map_err(|error| error.to_string())?,
+        ).map_err(|error| error.to_string())?;
+        if ready.pending_admission_json != pending_admission_json
+            || ready.pending_admission_sha256 != sha256_hex(pending_admission_json.as_bytes())
+            || ready_request.source_admission_json.as_deref() != Some(pending_admission_json.as_str())
+            || ready_request.source_admission_sha256.as_deref()
+                != Some(ready.pending_admission_sha256.as_str())
+            || ready_request.owner_update_identity_json.as_deref()
+                != Some(ready.ready_request_identity_json.as_str())
+        {
+            return Err("ReadyAttach does not carry the exact Pending admission and owner identity".to_owned());
+        }
         let ready_receipt: serde_json::Value = serde_json::from_str(&ready.blob_ready_receipt_json)
             .map_err(|error| error.to_string())?;
         let ready_receipt_ref = ready_receipt.get("receipt")
