@@ -1758,12 +1758,15 @@ impl KernelComposition {
         receipt: &HostRequestAdmissionReceipt,
     ) -> Result<(), TransportError> {
         let mut mismatch_reason: Option<&'static str> = None;
-        // The routing match below either names a lane whose carrier retained
-        // this request, or records the refusal that it did not. There is no
-        // third outcome, so no error is carried out of the match: every lane
-        // either returns through `?` or answers with its own refusal reason,
-        // and `state_carrier_refused` is recorded only when retention genuinely
-        // failed rather than being recorded beside a retained state pair.
+        // A carrier gate failure is a real refusal that must keep its durable
+        // evidence before it propagates: the routing match above can return
+        // through `?` (Backpressure, IdentityConflict, the byte bound, a
+        // connection or replay-class refusal), and a refusal that is never
+        // observed is indistinguishable from a request that never arrived.
+        // So the carrier's own typed reason is carried out of the match and
+        // raised only after the audit block below has recorded it. `None`
+        // until a lane sets it.
+        let mut refused_carrier_error: Option<TransportError> = None;
         let routed_lane = match check_local_read_admission(envelope, tool) {
             Ok(LocalReadAdmission::Query(_)) => {
                 // Queue admission is part of the same authenticated
@@ -1821,17 +1824,28 @@ impl KernelComposition {
                     // carrier, under the same byte/slot bounds, tagged with
                     // its own carrier form so the daemon's query leg can
                     // never claim it. The disposition is handled, not
-                    // discarded: `?` means a request is never acknowledged
-                    // when the carrier could not retain it, so
-                    // `state_carrier_refused` is recorded only when
-                    // retention genuinely failed and a retained state pair
-                    // is routed and served rather than recorded as a
-                    // mismatch.
-                    if self.retain_bounded_state_pair(envelope, tool)? {
-                        Some("state")
-                    } else {
-                        mismatch_reason = Some("state_carrier_refused");
-                        None
+                    // discarded: a carrier gate failure is carried out and
+                    // raised after its audit evidence is recorded, so a
+                    // state read is never acknowledged when its pair could
+                    // not be retained and the real gate failure is never
+                    // flattened into a generic fence.
+                    //
+                    // `retain_bounded_state_pair` cannot answer `false` here:
+                    // it re-derives the form from the same two admission
+                    // owners this arm has just consulted, so the carrier
+                    // retains exactly the State form or returns its own
+                    // typed gate error. There is no form mismatch to record,
+                    // so `state_carrier_refused` is not invented here.
+                    match self.retain_bounded_state_pair(envelope, tool) {
+                        Ok(true) => Some("state"),
+                        Ok(false) => {
+                            mismatch_reason = Some("state_carrier_refused");
+                            None
+                        }
+                        Err(error) => {
+                            refused_carrier_error = Some(error);
+                            None
+                        }
                     }
                 } else {
                     mismatch_reason = Some("no_lane");
@@ -1859,6 +1873,13 @@ impl KernelComposition {
             // route. The requested capability matched no serving lane,
             // so the work was refused before queueing.
             self.audit_observe(AuditEventDraft::route_mismatch_routing(envelope, reason));
+        }
+        // #2564 AUD-C2/AUD-C5: retention is part of admission. The refusal has
+        // already been recorded durably above, so the carrier's own typed gate
+        // failure is raised here instead of being answered with a successful
+        // admission record.
+        if let Some(error) = refused_carrier_error {
+            return Err(error);
         }
         Ok(())
     }
