@@ -119,6 +119,276 @@ interface admission {
     disposition: admission-disposition,
   }
 
+  // Native AdmissionInput closure projection (audit 5884499327).
+  // Native owner: crates/smart/eliot-context-contracts/src/admission_input.rs
+  // (AdmissionInput, AdmissionMeasurement, AdmissionMeasuredCost,
+  // MeasurementCompositionProfile, SafetyFloorIdentity, PriorityPolicyIdentity,
+  // AdmissionRuleIdentity, SuppliedOmissionBinding, LearningAdmissionTicket).
+  // These types carry the inputs the admission algorithm reads (floor,
+  // required-member dependencies, priority ordering, omission construction);
+  // digests/references alone cannot reconstruct them in a zero-import world.
+
+  // Native: SemanticRole
+  // (crates/smart/eliot-context-contracts/src/identity.rs).
+  enum semantic-role {
+    authority,
+    goal,
+    scope,
+    acceptance,
+    source,
+    verifier,
+    material-unknown,
+    negative,
+    security,
+    evidence,
+    instruction,
+    optional,
+    conflict,
+    constraint,
+  }
+
+  // Native: ContextBinding
+  // (crates/smart/eliot-context-contracts/src/identity.rs). The complete
+  // task/attempt/scope/fence/decision identity shared by recipe, candidates,
+  // floor and measurements. Fence leaves follow this file's established
+  // fence-epoch/fence-generation spelling.
+  record context-binding {
+    task-id: string,
+    attempt-id: string,
+    scope-id: string,
+    fence-epoch: string,
+    fence-generation: u64,
+    decision-id: string,
+    operation-id: option<string>,
+  }
+
+  // Native: DecisionRevision
+  // (crates/smart/eliot-context-contracts/src/identity.rs).
+  record decision-revision {
+    decision-id: string,
+    recipe-revision: string,
+    policy-sha256: digest-hex,
+  }
+
+  // Native: ProviderRoleDenominator
+  // (crates/smart/eliot-context-contracts/src/atom.rs). Exact requested
+  // denominator with one explicit disposition per requested slot.
+  record provider-denominator {
+    requested: list<provider-role>,
+    dispositions: list<provider-disposition>,
+  }
+
+  // Native: SafetyFloorMember
+  // (crates/smart/eliot-context-contracts/src/admission.rs), including the
+  // member measurement and required member dependencies.
+  record safety-floor-member {
+    atom-id: artifact-id,
+    role: semantic-role,
+    availability: atom-availability,
+    measurement: option<measurement-ref>,
+    required-dependencies: list<artifact-id>,
+  }
+
+  // Native: DecisionSafetyFloor
+  // (crates/smart/eliot-context-contracts/src/admission.rs), including member
+  // and interpretation dependencies.
+  record safety-floor {
+    binding: context-binding,
+    mandatory-atoms: list<artifact-id>,
+    mandatory-roles: list<semantic-role>,
+    providers: provider-denominator,
+    members: list<safety-floor-member>,
+    interpretation-dependencies: list<artifact-id>,
+    rule-evidence: artifact-id,
+    capacity: capacity-limits,
+  }
+
+  // Native: SafetyFloorIdentity (admission_input.rs).
+  record safety-floor-identity {
+    floor-id: artifact-id,
+    decision: decision-revision,
+    floor: safety-floor,
+  }
+
+  // Native: AdmissionPriorityClass (admission_input.rs).
+  enum admission-priority-class {
+    protected,
+    required,
+    high,
+    normal,
+    low,
+  }
+
+  // Native: CandidatePriority (admission_input.rs). Immutable priority
+  // declaration for one candidate; recipe order with atom identity as the
+  // deterministic tie-break.
+  record candidate-priority {
+    atom-id: artifact-id,
+    class: admission-priority-class,
+    ordinal: u32,
+  }
+
+  // Native: PriorityPolicyIdentity (admission_input.rs). One declaration per
+  // candidate; drives optional allocation ordering.
+  record priority-policy {
+    policy-id: artifact-id,
+    decision: decision-revision,
+    priorities: list<candidate-priority>,
+  }
+
+  // Native: AdmissionRuleIdentity (admission_input.rs). Immutable identity of
+  // the admission rule and policy revision; validated, never interpreted here.
+  record admission-rule {
+    rule-id: artifact-id,
+    decision: decision-revision,
+    rule-sha256: digest-hex,
+  }
+
+  // Native: MeasurementUnit (admission_input.rs). Closed unit; never inferred
+  // from a route or from the magnitude of a number.
+  enum measurement-unit {
+    utf8-bytes,
+    stu,
+    tokenizer-tokens,
+  }
+
+  // Native: MeasurementAggregationMode (admission_input.rs). Qualification
+  // for combining per-unit costs.
+  enum measurement-aggregation {
+    qualified-utf8-contribution,
+    whole-context-observation,
+  }
+
+  // Native: MeasurementCompositionProfile (admission_input.rs). Closed
+  // serializer/route profile that qualifies additive cost accounting.
+  record measurement-composition-profile {
+    profile-id: artifact-id,
+    schema-version: u32,
+    serializer-id: string,
+    serializer-version: string,
+    serializer-options-digest: digest-hex,
+    route-id: string,
+    model-id: string,
+    unit: measurement-unit,
+    aggregation: measurement-aggregation,
+    qualification: artifact-id,
+    capacity: capacity-limits,
+  }
+
+  // Native: MeasurementStatus
+  // (crates/smart/eliot-context-contracts/src/measurement.rs). Whether a
+  // measurement is independently qualified for capacity decisions. Mirrors
+  // the measured-cost discriminant; kept as an explicit field so qualification
+  // survives transport without re-derivation.
+  enum measurement-status {
+    exact-utf8,
+    conservative-stu,
+    exact-tokenizer,
+    unknown,
+    unavailable,
+  }
+
+  // Native: StuEstimate (measurement.rs). Conservative estimate; never proves
+  // route fit.
+  record stu-estimate {
+    value: u64,
+    empirical: bool,
+  }
+
+  // Native: TokenizerObservation (measurement.rs). Exact observation from
+  // actually running the route tokenizer.
+  record tokenizer-observation {
+    tokenizer-id: string,
+    tokenizer-version: string,
+    tokenizer-hash: digest-hex,
+    tokens: u64,
+  }
+
+  // Native: AdmissionMeasuredCost (admission_input.rs). Exact, conservative,
+  // or unavailable cost for one atom representation. Zero (exact-utf8-bytes
+  // with value zero), unknown and unavailable remain distinct variants.
+  variant measured-cost {
+    exact-utf8-bytes(u64),
+    conservative-stu(stu-estimate),
+    exact-tokenizer(tokenizer-observation),
+    unknown,
+    unavailable,
+  }
+
+  // Native: AdmissionMeasurementBinding (admission_input.rs). Serializer,
+  // route, schema and Context identity for one atom measurement, with the
+  // complete subject/output binding: subject-digest names the measured
+  // candidate, input-digest the candidate MeasurementRef digest, output-digest
+  // the measured serialized representation.
+  record measurement-binding {
+    context: context-binding,
+    schema-version: u32,
+    subject-digest: digest-hex,
+    input-digest: digest-hex,
+    output-digest: digest-hex,
+    serializer-id: string,
+    serializer-version: string,
+    serializer-options-digest: digest-hex,
+    route-id: string,
+    model-id: string,
+  }
+
+  // Native: AdmissionMeasurement (admission_input.rs). One measured cost for
+  // one exact candidate atom/representation pair: atom/representation, explicit
+  // unit, exact binding, typed cost, and an optional unqualified observation
+  // retained for diagnostics only (never authorizes additive fit).
+  // The candidate-attached MeasurementRef stays projected as measurement-ref;
+  // request-level measurements use this full record.
+  record admission-measurement {
+    measurement-id: artifact-id,
+    atom-id: artifact-id,
+    representation: representation-kind,
+    unit: measurement-unit,
+    status: measurement-status,
+    binding: measurement-binding,
+    cost: measured-cost,
+    observation: option<measured-cost>,
+  }
+
+  // Native: SuppliedOmissionBinding (admission_input.rs). A supplied,
+  // policy-bound way to account for an omitted candidate, with the
+  // authorization/privacy/proof requirements the omission evidence must match.
+  // Reuses the file's established non-recoverable-reason spelling.
+  record supplied-omission-binding {
+    atom-id: artifact-id,
+    policy: loss-policy,
+    expansion: option<expansion-handle>,
+    non-recoverable-reason: option<non-recoverable-reason>,
+    authorization-requirement: string,
+    privacy-requirement: string,
+    proof-requirement: string,
+    expires: option<artifact-id>,
+    invalidation: option<artifact-id>,
+  }
+
+  // Native: LearningAdmissionTicket
+  // (crates/smart/eliot-context-contracts/src/learning_ticket.rs).
+  // Owner-minted ticket authorizing marked atoms in this input. Carried
+  // verbatim; dropping it must not make governed-only input appear plain.
+  // The plain entrypoint may still refuse such input; no learning authority
+  // or new admission route is granted here. Fence leaves follow this file's
+  // established fence-epoch/fence-generation spelling.
+  record learning-ticket {
+    schema-version: u32,
+    source-campaign-id: string,
+    target-task-id: string,
+    fence-epoch: string,
+    fence-generation: u64,
+    overlay-id: option<string>,
+    candidate-id: option<string>,
+    scope-ref: string,
+    authority-ref: string,
+    retention-ref: string,
+    evaluator-ref: string,
+    rollback-ref: string,
+    digest: digest-hex,
+  }
+
   record atom-representation {
     kind: representation-kind,
     content: string,
@@ -139,6 +409,11 @@ interface admission {
     privacy: privacy-class,
     authority: authority-class,
     availability: atom-availability,
+    // Native: ContextCandidate.dependencies
+    // (crates/smart/eliot-context-contracts/src/atom.rs). Interpretation
+    // dependency atom identities; validated against the floor member's
+    // required-dependencies.
+    dependencies: list<artifact-id>,
   }
 
   record admitted-atom {
@@ -243,6 +518,11 @@ interface admission {
     incomplete(decision-incomplete),
   }
 
+  // Native: AdmissionInput (admission_input.rs). Complete immutable input
+  // closure: binding shared by recipe/candidates/floor/measurements, the
+  // safety floor with member dependencies, the priority policy, the admission
+  // rule, the qualified measurement-composition profile, the supplied omission
+  // bindings, the full typed measurements, and the learning tickets.
   record admission-request {
     schema-revision: u32,
     operation-id: string,
@@ -251,12 +531,19 @@ interface admission {
     scope-id: string,
     fence-epoch: string,
     fence-generation: u64,
+    binding: context-binding,
     candidates: list<context-candidate>,
     recipe-digest: digest-hex,
     recipe-revision: string,
     provider-denominator: list<provider-role>,
     capacity: capacity-limits,
-    measurements: list<measurement-ref>,
+    floor: safety-floor-identity,
+    priority: priority-policy,
+    rule: admission-rule,
+    measurement-profile: measurement-composition-profile,
+    supplied-omissions: list<supplied-omission-binding>,
+    measurements: list<admission-measurement>,
+    learning-tickets: list<learning-ticket>,
     deadline-ms: option<s64>,
     cancelled: bool,
     predecessor-digest: option<digest-hex>,
