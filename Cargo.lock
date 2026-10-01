@@ -3562,6 +3562,7 @@ version = "0.1.0"
 dependencies = [
  "eliot-bootstrap",
  "eliot-contracts",
+ "eliot-observation",
  "eliot-security-contracts",
  "schemars",
  "serde",

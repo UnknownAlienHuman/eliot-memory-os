@@ -6408,11 +6408,8 @@ impl RedbRecoveryStore {
         // A revision-one claim is used only to address the existing binding
         // index and revision head. It is not persisted unless the owner
         // allocates revision one below.
-        let probe = crate::ColdStartReadinessClaim::issued_for_revision(
-            key.clone(),
-            1,
-            lease_deadline,
-        )?;
+        let probe =
+            crate::ColdStartReadinessClaim::issued_for_revision(key.clone(), 1, lease_deadline)?;
 
         if let Some(existing) = Self::load_cold_start_binding(&write, &probe, &store_identity)?
             .filter(|existing| now <= existing.claim.lease_deadline)
