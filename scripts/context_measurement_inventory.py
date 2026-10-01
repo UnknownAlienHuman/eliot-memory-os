@@ -2092,6 +2092,36 @@ def _measure_test_paths(
     return measured
 
 
+def _absent_declared_test_paths(
+    root: Path, worksets: list[dict[str, object]], test_bytes_by_path: dict[str, int]
+) -> list[str]:
+    """Every declared test path that does not exist as a readable file on disk.
+
+    A declared test file that is absent is a hard fact about the tree, not a
+    stale number: nothing on disk carries its bytes. `_measure_test_paths`
+    deliberately leaves such a path unmeasured so a later pass can name it, but
+    that silence let one consumer's absent file be masked by an unrelated
+    consumer's stale `test_bytes` -- the run then named the wrong owner and hid
+    the vanished path entirely. `check` now settles absence for the WHOLE workset
+    set, by owner and path, before any per-workset byte accounting runs, so a
+    declared-but-absent file is always reported as itself and never as another
+    consumer's mismatch.
+    """
+    absent: list[str] = []
+    seen: set[str] = set()
+    for workset in worksets:
+        if not isinstance(workset, dict) or "test_paths" not in workset:
+            continue
+        issue = str(workset.get("issue", ""))
+        for path in workset["test_paths"]:  # type: ignore[union-attr]
+            rel = str(path)
+            if rel in seen or rel in test_bytes_by_path:
+                continue
+            seen.add(rel)
+            absent.append(f"{issue}: {rel}")
+    return absent
+
+
 def _validate_artifact(
     artifact: dict[str, object],
     test_bytes_by_path: dict[str, int],
@@ -2690,6 +2720,33 @@ def _fail(code: str, detail: str, status: str = "error") -> int:
     return 1 if status == "stale" else 2
 
 
+# Stored figures that go stale purely because a DECLARED TEST FILE ON DISK moved,
+# never because an inventory row is malformed. Both are recomputed against real
+# files, so drift is a legitimate condition, not a corruption: `sync` is the owner
+# path that re-derives it. Reporting it with the `error` disposition made an
+# honest drift indistinguishable from a real accounting failure; these now report
+# as `stale`, matching the existing STALE_ARTIFACT / ARTIFACT_MISSING convention.
+_DRIFT_CODES = ("WORKSET_ACCOUNTING_MISMATCH", "SPLIT_ACCOUNTING_MISMATCH")
+
+
+def _fail_validated(code: str, detail: str) -> int:
+    """Report a validation failure, downgrading re-derivable drift to `stale`.
+
+    Drift keeps its own vocabulary and its own remediation (`sync`); only the
+    disposition changes, so the run still fails closed and still names the exact
+    workset and key. A genuine accounting failure -- a malformed row, a digest
+    or count that does not reconcile -- keeps the `error` disposition.
+    """
+    if code in _DRIFT_CODES:
+        return _fail(
+            code,
+            f"{detail}; a declared test file on disk no longer matches the stored figure, "
+            "so this is drift and not a malformed row: run sync to re-derive it",
+            "stale",
+        )
+    return _fail(code, detail)
+
+
 def cmd_sync(root: Path, generation_command: str) -> int:
     owner_map = load_owner_map(root)
     inventory = build_inventory(root, None, generation_command, owner_map)
@@ -2757,9 +2814,24 @@ def cmd_check(root: Path) -> int:
         if not isinstance(declared_worksets, list):
             raise InventoryError("MALFORMED_INVENTORY", "consumer_worksets must be a list")
         test_bytes = _measure_test_paths(root, declared_worksets)
+        # A declared test file that is absent on disk is settled for the whole
+        # set first, and named by owner and path. It is a fact about the tree
+        # (no bytes exist to compare), not a stale stored number, so it is
+        # reported as itself instead of surfacing as whichever consumer's byte
+        # accounting happens to run first. Without this, an absent file was
+        # masked by an unrelated consumer's drift and the wrong owner was named.
+        absent = _absent_declared_test_paths(root, declared_worksets, test_bytes)
+        if absent:
+            return _fail(
+                "WORKSET_TEST_PATH_ABSENT",
+                "declared test file(s) absent from disk; they cannot be re-derived and "
+                "the accounting cannot be settled until each is restored or re-allocated: "
+                + "; ".join(sorted(absent)),
+                "stale",
+            )
         header, _rows, worksets, _splits = _validate_artifact(artifact, test_bytes)
     except InventoryError as exc:
-        return _fail(exc.code, exc.detail)
+        return _fail_validated(exc.code, exc.detail)
     mapping, map_status, _map_digest = load_owner_map(root)
     if map_status != "SUPPLIED":
         return _fail(
