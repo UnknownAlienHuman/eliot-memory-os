@@ -770,11 +770,19 @@ fn admitted_write_binding(
         payload_known_at_ms: envelope.known_at_ms,
         payload_expires_at_ms: envelope.expires_at_ms,
         operation_id: envelope.operation_or_checkpoint_id.clone(),
-        write_intent_id: OpaqueLabel::new(transition.write_intent_id.as_str()).map_err(|error| {
-            admission(format!("admitted write intent is not a usable label: {error}"))
-        })?,
+        write_intent_id: OpaqueLabel::new(transition.write_intent_id.as_str()).map_err(
+            |error| {
+                admission(format!(
+                    "admitted write intent is not a usable label: {error}"
+                ))
+            },
+        )?,
         idempotency_key: OpaqueLabel::new(transition.identity.idempotency_key.as_str()).map_err(
-            |error| admission(format!("admitted idempotency key is not a usable label: {error}")),
+            |error| {
+                admission(format!(
+                    "admitted idempotency key is not a usable label: {error}"
+                ))
+            },
         )?,
         canonical_request_sha256: transition.identity.canonical_request_hash.clone(),
         prepared_transition_sha256: transition_digest.to_owned(),

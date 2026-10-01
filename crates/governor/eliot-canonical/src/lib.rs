@@ -1596,11 +1596,11 @@ mod tests {
     /// shared hash over those fixed inputs (not hand-written):
     /// `eliot-store-api` and `eliot-store-memory` assert the same literal.
     ///
-    /// #1925 RE-PIN REQUIRED — the literal below is a deliberate fail-closed
-    /// sentinel, NOT a digest. It must be replaced with the value
-    /// `canonical_request_hash` actually emits over the current fixture
-    /// before this assertion can pass, and the SAME value must be installed
-    /// in `eliot-store-memory`'s `ISSUE_63_GOLDEN_CHAIN_DIGEST`.
+    /// #1925 RE-PIN — the literal below is the value the shared owner function
+    /// EMITTED over the current fixture, read off its own assertion output. It
+    /// was not derived by reading this file and it was not invented. The SAME
+    /// value is installed in `eliot-store-memory`'s `ISSUE_63_GOLDEN_CHAIN_DIGEST`,
+    /// which is what makes this a CROSS-crate pin rather than two local ones.
     ///
     /// Why the digest moved, twice, by design:
     ///
@@ -1614,9 +1614,10 @@ mod tests {
     /// Both moves follow the documented `request_hash.rs` discipline: a
     /// retained digest computed under pre-binding bytes is never
     /// reinterpreted under the new bytes. The value cannot be derived by
-    /// reading this file; it is whatever the shared owner function emits, so
-    /// it is deliberately left as a failing sentinel rather than invented.
-    const ISSUE_63_GOLDEN_CHAIN_DIGEST: &str = "REPIN-REQUIRED-1925-NOT-A-DIGEST";
+    /// reading this file, so it was MEASURED from the owner function's own
+    /// assertion output rather than written by hand.
+    const ISSUE_63_GOLDEN_CHAIN_DIGEST: &str =
+        "f6a5fb17f7fcb06b4d89650c6a2abef1db7eba620d42c4278732b684ebdec75b";
 
     #[test]
     fn golden_chain_envelope_hash_matches_the_pinned_cross_crate_digest() {

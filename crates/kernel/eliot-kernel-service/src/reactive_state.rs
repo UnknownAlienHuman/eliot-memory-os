@@ -29,6 +29,10 @@ use thiserror::Error;
 
 use crate::{KernelService, KernelServiceError, KernelServiceState, validate_text};
 
+/// Closed leg name of the reactive-state commit, so its declared write intent
+/// can never collide with another leg committing the same scope (#1925).
+const REACTIVE_STATE_WRITE_INTENT_LEG: &str = "reactive-state";
+
 /// Authenticated reactive session bound from live Kernel state.
 #[derive(Clone, Debug)]
 pub struct AuthenticatedReactiveSession {
@@ -667,6 +671,18 @@ where
     })?;
     let mut transition = PreparedTransition {
         contract_version: eliot_store_api::CONTRACT_VERSION,
+        // #1925: this leg's stable intent is the owner-issued reactive scope
+        // the transition addresses, declared through the OWNER's single
+        // derivation rather than a local spelling.
+        write_intent_id: eliot_store_api::admission_write_intent(
+            REACTIVE_STATE_WRITE_INTENT_LEG,
+            scope.as_str(),
+        )
+        .ok_or(ReactiveServiceError::InvalidField {
+            field: "reactive.write_intent_id",
+            reason: "the reactive scope declares no stable write intent",
+        })?,
+        write_envelope_protocol_version: eliot_store_api::WRITE_ENVELOPE_PROTOCOL_VERSION,
         identity: request.operation().clone(),
         state_fence: request.fence().clone(),
         scope_id: scope,

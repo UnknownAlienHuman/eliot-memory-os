@@ -1510,13 +1510,12 @@ impl KernelStoreGateway {
                 revision_head: None,
             });
         }
-        let mut observed_scopes: Vec<&str> =
-            heads.iter().map(|head| head.scope.as_str()).collect();
+        let mut observed_scopes: Vec<&str> = heads.iter().map(|head| head.scope.as_str()).collect();
         observed_scopes.sort_unstable();
         let mut declared: Vec<&str> = transition
             .ordering_scopes
             .iter()
-            .map(|scope| scope.as_str())
+            .map(eliot_store_api::OrderingScopeId::as_str)
             .collect();
         declared.sort_unstable();
         if observed_scopes != declared {
