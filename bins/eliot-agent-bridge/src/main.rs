@@ -11,12 +11,16 @@ use eliot_agent_bridge::{
     UnderstandingBootstrap, UseOutcome, kernel_ports_with_declaration, loopback_http_route,
     parse_args, reactive_runtime_composition, validate_credential, validate_host, validate_origin,
 };
+use eliot_agent_bridge::opencode_host_events::{
+    BridgeIntroductionStore, HostEventsServiceError, serve_host_events,
+};
 use eliot_agent_bridge_core::{
     ACTIVATION_DISPOSITION_INVALID_REQUEST, ACTIVATION_DISPOSITION_STALE_OR_CONFLICT,
     ACTIVATION_DISPOSITION_UNAVAILABLE_OR_CAPACITY, AttachRequest, BridgeError, ConnectionId,
     CoverageGap, DemandId, EventForwardStatus, FencingToken, Generation, HostEventEnvelope,
     ReconnectRequest, RecoveryProjectionPage, ResourceHandle, SessionId,
 };
+use eliot_agent_opencode::HostEventsShutdown;
 use eliot_contracts::{
     BridgeEventCapacityPressure, BridgeTransportBackpressure, EpochId, HostCorrelationDomain,
     HostCorrelationProjection,
@@ -61,6 +65,15 @@ const PROVIDER_PORT_EXIT: i32 = 69;
 /// materialization of that argv; the tokenless argv keeps serving the
 /// existing private `op` clients byte-for-byte.
 const MCP_MODE_TOKEN: &str = "mcp";
+
+/// Explicit checked host-events entrypoint token (issue #332): a leading
+/// `host-events` argv token selects the supervised `/v1/host-events` front
+/// door over the live bridge composition. It is stripped before the checked
+/// CLI parse exactly like the `mcp` token, so the remaining argv keeps the
+/// documented `--profile/--transport/--client-declaration` contract the
+/// shared runner composition requires. The token names the serving mode,
+/// never a payload, port, or environment entry.
+const HOST_EVENTS_MODE_TOKEN: &str = "host-events";
 
 /// Media type of retained hot-resource snapshots: `record_tool_result_delivery`
 /// publishes the JSON-serialized response content (`serde_json::to_vec`), so
@@ -762,10 +775,16 @@ fn main() {
         .first()
         .is_some_and(|first| first == hook_intake::HOOK_MODE_TOKEN);
     let mcp_mode = argv.first().is_some_and(|first| first == MCP_MODE_TOKEN);
+    let host_events_mode = argv
+        .first()
+        .is_some_and(|first| first == HOST_EVENTS_MODE_TOKEN);
     if hook_mode {
         argv.remove(0);
     }
     if mcp_mode {
+        argv.remove(0);
+    }
+    if host_events_mode {
         argv.remove(0);
     }
     if hook_mode {
@@ -842,6 +861,16 @@ fn main() {
     // process removes only the transport binding: the profile holds no
     // Kernel or canonical state, and the Kernel session and work state stay
     // intact kernel-side.
+    if host_events_mode {
+        // The host-events front door owns its serving loop from here: it
+        // never falls through to the loopback HTTP, MCP, or private `op`
+        // loops below. The explicit mode token is authoritative over the
+        // parsed transport, so a `host-events` invocation is never silently
+        // served as another surface; the exit code mirrors the provider
+        // discipline of the sibling front doors.
+        let code = run_host_events_front_door(&mut runner);
+        std::process::exit(code);
+    }
     if let TransportProfile::LoopbackHttp(profile) = config.transport {
         let code = run_loopback_http_bridge(
             &profile,
@@ -3140,6 +3169,54 @@ fn run_mcp_front_door(
         PROVIDER_PORT_EXIT
     } else {
         0
+    }
+}
+
+/// Serves the supervised `POST /v1/host-events` route for the life of the
+/// bridge process (issue #332) through [`serve_host_events`].
+///
+/// This is the same scheduling shape as the sibling front doors: one
+/// process, one blocking serving loop owning `&mut BridgeRunner`, no
+/// supervisor thread and no second scheduler. The introduction store starts
+/// empty because no User Broker producer installs introductions in this
+/// process (issue #2898 owns minting), so an unintroduced composition
+/// refuses closed with [`HostEventsServiceError::Unintroduced`] without
+/// binding a port. The credential resolver offers no secret this process
+/// cannot own, so the credential join refuses as capability-unavailable
+/// rather than comparing against foreign material. The stop and generation
+/// senders are held for the whole serving life, so a dropped supervisor
+/// channel can never be mistaken for a supervised stop.
+fn run_host_events_front_door(runner: &mut BridgeRunner) -> i32 {
+    let store = BridgeIntroductionStore::new();
+    let (_stop, stop) = tokio::sync::watch::channel(false);
+    let (_active_generation, active_generation) = tokio::sync::watch::channel(0_u64);
+    match serve_host_events(
+        runner,
+        store,
+        None,
+        |_: &eliot_process::SecretRef| None,
+        stop,
+        active_generation,
+    ) {
+        Ok(HostEventsShutdown::Stopped) => 0,
+        Ok(HostEventsShutdown::Rotated) => {
+            emit_error(
+                "HOST_EVENTS_SUPERSEDED",
+                "active bridge generation moved away from the bound introduction",
+            );
+            PROVIDER_PORT_EXIT
+        }
+        Err(HostEventsServiceError::Unintroduced) => {
+            emit_error(
+                "HOST_EVENTS_SERVICE_REFUSED",
+                "host-events route is not introduced: the User Broker owns no current introduction",
+            );
+            PROVIDER_PORT_EXIT
+        }
+        Err(error) => {
+            emit_error("HOST_EVENTS_SERVICE_FAILED", &error.to_string());
+            PROVIDER_PORT_EXIT
+        }
     }
 }
 
