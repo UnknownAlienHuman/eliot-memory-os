@@ -1867,12 +1867,20 @@ mod slice_7_native_owner_tests {
     }
 
     /// Runs the genuine admitted chain up to the structured A-05 gate for one
-    /// fixture job, returning the validated receipt dispatch requires.
-    /// Every stage genuinely invokes its owner; any refusal fails the proof.
+    /// fixture job, returning the owner grounding request the run actually
+    /// issued together with the validated receipt dispatch requires.
+    ///
+    /// Both records are the pipeline's own outputs, so a caller that has to
+    /// supply [`PipelineOrientationRecords`] joins exactly these two instead of
+    /// a rebuilt lookalike. Every stage genuinely invokes its owner; any refusal
+    /// fails the proof.
     fn validated_for(
         admission: &KernelJobAdmission,
         job: &DreamJobInput,
-    ) -> eliot_dreamer_contracts::validation::structured::ValidatedGroundingCandidate {
+    ) -> (
+        GroundingRequest,
+        eliot_dreamer_contracts::validation::structured::ValidatedGroundingCandidate,
+    ) {
         let model_inputs = match crate::model_stage::resolve_model_inputs(admission, job) {
             Ok(inputs) => inputs,
             Err(error) => panic!("fixture model inputs must resolve, got {error:?}"),
@@ -1886,7 +1894,10 @@ mod slice_7_native_owner_tests {
             Ok(request) => request,
             Err(error) => panic!("fixture grounding must resolve, got {error:?}"),
         };
-        let grounded = match crate::grounding_stage::ground_admitted_draft(request) {
+        // The grounding owner takes its request by value; the same admitted
+        // request is retained so `PipelineOrientationRecords` joins the exact
+        // one this stage ran under instead of a second derivation.
+        let grounded = match crate::grounding_stage::ground_admitted_draft(request.clone()) {
             Ok(grounded) => grounded,
             Err(error) => panic!("fixture grounding must prove, got {error:?}"),
         };
@@ -1897,8 +1908,21 @@ mod slice_7_native_owner_tests {
                 Err(error) => panic!("fixture carrier must build, got {error:?}"),
             };
         match crate::validation_stage::validate_admitted_draft(&carrier) {
-            Ok(validated) => validated,
+            Ok(validated) => (request, validated),
             Err(error) => panic!("fixture carrier must validate, got {error:?}"),
+        }
+    }
+
+    /// The carrier set for an admitted job whose owner records are absent: no
+    /// Curation batch and ports, no screened binding, no protection assessment,
+    /// and no Orientation supply. This is the worker role's real shape — every
+    /// field is honest absence, never a fabricated carrier.
+    fn no_owner_carriers<'a>() -> OwnerCarriers<'a> {
+        OwnerCarriers {
+            curation: None,
+            screen: None,
+            curation_protection: None,
+            orientation: None,
         }
     }
 
@@ -1915,11 +1939,10 @@ mod slice_7_native_owner_tests {
         let result = dispatch_admitted(
             &admission,
             &job,
-            None,
-            None,
+            no_owner_carriers(),
             JobClass::Orientation,
-            Some(&validated),
-            None,
+            Some(&validated.1),
+            PipelineOrientationRecords::new(&validated.0, &validated.1),
         );
         let Ok(DreamResult::Packet(packet)) = result else {
             panic!("orientation must project, got {result:?}");
@@ -1986,11 +2009,10 @@ mod slice_7_native_owner_tests {
         let refused = dispatch_admitted(
             &admission,
             &job,
-            None,
-            None,
+            no_owner_carriers(),
             JobClass::Orientation,
-            Some(&validated),
-            None,
+            Some(&validated.1),
+            PipelineOrientationRecords::new(&validated.0, &validated.1),
         );
         assert!(
             matches!(
@@ -2011,14 +2033,18 @@ mod slice_7_native_owner_tests {
     /// architecturally impossible through this seam.
     #[test]
     fn orientation_without_validated_refuses_receipt_gate() {
+        // The pipeline records exist and are joined; only the `validated`
+        // parameter is withheld, which is exactly the arm under proof.
+        let admission = admission();
+        let job = semantic_job(JobClass::Orientation);
+        let records = validated_for(&admission, &job);
         let refused = dispatch_admitted(
-            &admission(),
-            &semantic_job(JobClass::Orientation),
-            None,
-            None,
+            &admission,
+            &job,
+            no_owner_carriers(),
             JobClass::Orientation,
             None,
-            None,
+            PipelineOrientationRecords::new(&records.0, &records.1),
         );
         assert!(
             matches!(
@@ -2060,14 +2086,19 @@ mod slice_7_native_owner_tests {
     /// class binding before any owner work (and before the receipt gate).
     #[test]
     fn class_parameter_mismatch_refuses_at_binding() {
+        // The semantic job is Orientation, so its own pipeline records are
+        // available; only the class parameter disagrees, and that binding is
+        // what this proof exercises.
+        let admission = admission();
+        let job = semantic_job(JobClass::Orientation);
+        let records = validated_for(&admission, &job);
         let refused = dispatch_admitted(
-            &admission(),
-            &semantic_job(JobClass::Orientation),
-            None,
-            None,
+            &admission,
+            &job,
+            no_owner_carriers(),
             JobClass::Curation,
             None,
-            None,
+            PipelineOrientationRecords::new(&records.0, &records.1),
         );
         assert!(
             matches!(
@@ -2319,9 +2350,15 @@ mod slice_7_native_owner_tests {
         ] {
             let admission = admission();
             let job = semantic_job(class);
-            let validated = validated_for(&admission, &job);
-            let refused =
-                dispatch_admitted(&admission, &job, None, None, class, Some(&validated), None);
+            let records = validated_for(&admission, &job);
+            let refused = dispatch_admitted(
+                &admission,
+                &job,
+                no_owner_carriers(),
+                class,
+                Some(&records.1),
+                PipelineOrientationRecords::new(&records.0, &records.1),
+            );
             assert!(
                 matches!(refused, Err(DreamerError::InvalidAdmission(got)) if got == reason),
                 "class {class:?} must name its governed input, got {refused:?}"
