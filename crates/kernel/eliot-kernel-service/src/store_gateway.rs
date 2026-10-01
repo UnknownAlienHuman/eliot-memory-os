@@ -9,6 +9,46 @@
 //! no capability is advertised, no retry/cache/default policy is invented,
 //! and unknown genesis outcomes remain the EBP client's exact-operation
 //! reconciliation result.
+//!
+//! # Live status
+//!
+//! The maintenance-trigger owner surface of [`KernelStoreGateway`] below is
+//! **not** a live route, with exactly one exception.
+//!
+//! [`KernelStoreGateway::admit_maintenance_trigger`] is live: `eliotd` is not
+//! its only caller, and the Kernel front door reaches it through the
+//! `maintenance_trigger_intake` operation dispatched by
+//! `bins/eliot-kernel/src/daemon_request_dispatch.rs`.
+//!
+//! The other fourteen owner entries — `claim_maintenance_trigger`,
+//! `release_expired_maintenance_trigger_claim`,
+//! `maintenance_trigger_pending_page`,
+//! `record_maintenance_trigger_decision`, `acknowledge_maintenance_trigger`,
+//! `replay_maintenance_trigger_after_crash`,
+//! `recover_maintenance_trigger_commit`,
+//! `mark_maintenance_trigger_commit_ambiguous`,
+//! `revoke_maintenance_trigger_consumer`,
+//! `maintenance_trigger_replacement_pending_set`, `expire_maintenance_trigger`,
+//! `supersede_maintenance_trigger`, `record_maintenance_trigger_gap`, and
+//! `restore_maintenance_trigger_ledger` — have **no production caller**. Each
+//! one has exactly one code caller, and every such caller lives in the
+//! `#1694` W2–W7 route of `bins/eliotd/src/maintenance_dispatch.rs`, which is
+//! itself entirely unwired. Three of those callers are additionally
+//! *transitively* dead, so a name-level scan reports a call site where no live
+//! path exists.
+//!
+//! Because `KernelStoreGateway` is re-exported from this crate's root
+//! (`pub use store_gateway::KernelStoreGateway`), these entries are effectively
+//! publicly reachable and `rustc`'s `dead_code` lint will never report any of
+//! them, even though `mod store_gateway` is itself private. A reader therefore
+//! gets no compiler signal at all on this surface; each entry below states its
+//! own status under a `# Live status` heading instead.
+//!
+//! A source implementation is not evidence of a live edge, and nothing here
+//! promotes these entries to current support. Whether each is wired to a
+//! daemon maintenance route or retired is an owner decision for the Kernel
+//! and `eliotd` composition roots, not a documentation one. Nothing is wired,
+//! removed, or allow-listed to produce this status.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -1894,6 +1934,17 @@ impl KernelStoreGateway {
     /// this transition. `handle_maintenance_trigger_intake` stays the seam
     /// for guard-free front-door callers (STITCH): this owner entry proves
     /// staging first so no guard is ever held across the ORS read.
+    ///
+    /// # Live status
+    ///
+    /// This entry is the one **live** member of the maintenance-trigger owner
+    /// surface; the other fourteen entries in this cluster have no production
+    /// caller. It has two code callers, and only one of them is live: the
+    /// `eliotd` intake leg in `bins/eliotd/src/maintenance_dispatch.rs` is
+    /// itself uncalled, but the Kernel front door reaches this entry
+    /// independently through the `maintenance_trigger_intake` operation
+    /// dispatched by `bins/eliot-kernel/src/daemon_request_dispatch.rs`, which
+    /// runs under `main()` via `run_front_door_loop`.
     pub fn admit_maintenance_trigger(
         &self,
         principal_ref: &str,
@@ -1935,6 +1986,17 @@ impl KernelStoreGateway {
     /// the current compatible daemon generation/session, trigger revision,
     /// and delivery identity through the existing ledger seam. The returned
     /// rows are the durable snapshot after this transition.
+    ///
+    /// # Live status
+    ///
+    /// This entry currently has NO production caller. It is *transitively*
+    /// dead rather than name-level dead, so a scan for call sites reports
+    /// one: the single call is `claim_maintenance_trigger_for_daemon` in
+    /// `bins/eliotd/src/maintenance_dispatch.rs`, whose own only caller,
+    /// `redeliver_maintenance_trigger_after_timeout`, is itself uncalled.
+    /// No live daemon claim loop issues a claim through this entry today.
+    /// Whether a daemon claim loop is wired to it or the entry is retired is
+    /// an owner decision, not a documentation one.
     pub fn claim_maintenance_trigger(
         &self,
         principal_ref: &str,
@@ -1958,6 +2020,16 @@ impl KernelStoreGateway {
     /// receipt preserved. Redelivery always needs a fresh finite claim,
     /// never a new trigger ID. The returned rows are the durable snapshot
     /// after this transition.
+    ///
+    /// # Live status
+    ///
+    /// This entry currently has NO production caller. It is *transitively*
+    /// dead rather than name-level dead, so a scan for call sites reports
+    /// one: the single call is
+    /// `redeliver_maintenance_trigger_after_timeout` in
+    /// `bins/eliotd/src/maintenance_dispatch.rs`, which is itself uncalled.
+    /// Whether a timeout-redelivery loop is wired to it or the entry is
+    /// retired is an owner decision, not a documentation one.
     pub fn release_expired_maintenance_trigger_claim(
         &self,
         principal_ref: &str,
@@ -1983,6 +2055,14 @@ impl KernelStoreGateway {
     /// A read: no ledger transition, so no rows snapshot. A reconnect
     /// resumes from its cursor and never resets progress to a guessed
     /// complete-empty set.
+    ///
+    /// # Live status
+    ///
+    /// This entry currently has NO production caller: the single call is
+    /// `collect_pending_maintenance_triggers` in
+    /// `bins/eliotd/src/maintenance_dispatch.rs`, which is uncalled outright.
+    /// Whether a pending-set collector is wired to it or the entry is retired
+    /// is an owner decision, not a documentation one.
     pub fn maintenance_trigger_pending_page(
         &self,
         principal_ref: &str,
@@ -2004,19 +2084,31 @@ impl KernelStoreGateway {
     /// Records one daemon decision into the owned delivery ledger against
     /// its committed named Store transaction (issue #1694).
     ///
-    /// The authenticated daemon submits its decision through the Governor
-    /// `PreparedTransition` → Kernel → named Store transaction; that
-    /// transaction's committed [`WriteReceipt`] is the durability the
-    /// ledger row rides on. This owner entry re-reads the exact receipt
-    /// through the existing Store client, requires `Committed` status,
-    /// re-proves the canonical-bytes digest the decision receipt binds, and
-    /// requires the receipt fence to match live service authority — an
-    /// arbitrary receipt ID or transport `Ok(())` can never complete this
-    /// transition. Only then is the decision recorded; the returned rows
-    /// are the durable snapshot after the transition. A lost or ambiguous
-    /// commit stays pending/reconciling through
+    /// Were it reached, the authenticated daemon would submit its decision
+    /// through the Governor `PreparedTransition` → Kernel → named Store
+    /// transaction; that transaction's committed [`WriteReceipt`] is the
+    /// durability the ledger row rides on. This owner entry re-reads the
+    /// exact receipt through the existing Store client, requires `Committed`
+    /// status, re-proves the canonical-bytes digest the decision receipt
+    /// binds, and requires the receipt fence to match live service authority
+    /// — an arbitrary receipt ID or transport `Ok(())` can never complete
+    /// this transition. Only then is the decision recorded; the returned
+    /// rows are the durable snapshot after the transition. A lost or
+    /// ambiguous commit stays pending/reconciling through
     /// [`Self::mark_maintenance_trigger_commit_ambiguous`]: receipt absence
     /// here is never reported as proof of non-commit.
+    ///
+    /// # Live status
+    ///
+    /// This entry currently has NO production caller: the single call is
+    /// `record_committed_maintenance_decision` in
+    /// `bins/eliotd/src/maintenance_dispatch.rs`, which is itself uncalled.
+    /// The first paragraph above is therefore conditional on reachability,
+    /// not a report that a daemon decision currently travels this path. This
+    /// is the strongest claim in the maintenance-trigger surface and it is
+    /// not established by any live caller. The body, its receipt
+    /// re-validation, and its fence check are unchanged; wiring or retiring
+    /// the entry is an owner decision, not a documentation one.
     pub async fn record_maintenance_trigger_decision(
         &self,
         principal_ref: &str,
@@ -2089,6 +2181,14 @@ impl KernelStoreGateway {
     /// The ack must echo the live claim exactly and embed the committed
     /// receipt byte for byte; a stale consumer cannot ack after revocation.
     /// The returned rows are the durable snapshot after this transition.
+    ///
+    /// # Live status
+    ///
+    /// This entry currently has NO production caller: the single call is
+    /// `acknowledge_recovered_maintenance_commit` in
+    /// `bins/eliotd/src/maintenance_dispatch.rs`, which is itself uncalled.
+    /// Whether a post-recovery acknowledgement path is wired to it or the
+    /// entry is retired is an owner decision, not a documentation one.
     pub fn acknowledge_maintenance_trigger(
         &self,
         principal_ref: &str,
@@ -2113,8 +2213,18 @@ impl KernelStoreGateway {
     /// Replays one retained trigger after a pre-commit crash, without
     /// minting new state (issue #1694).
     ///
-    /// A read: the caller re-presents the exact retained record to the
+    /// A read: a caller would re-present the exact retained record to the
     /// evaluator under the same identity.
+    ///
+    /// # Live status
+    ///
+    /// This entry currently has NO production caller: the single call is
+    /// `recover_maintenance_trigger_handoff` in
+    /// `bins/eliotd/src/maintenance_dispatch.rs`, which is itself uncalled.
+    /// The `A read:` paragraph describes what the entry would do if reached;
+    /// no live path reaches it today. Whether a crash-recovery path is wired
+    /// to it or the entry is retired is an owner decision, not a
+    /// documentation one.
     pub fn replay_maintenance_trigger_after_crash(
         &self,
         principal_ref: &str,
@@ -2129,8 +2239,19 @@ impl KernelStoreGateway {
     /// Recovers one committed decision receipt after a post-commit crash
     /// (issue #1694).
     ///
-    /// A read: the caller acknowledges this exact receipt without a new
+    /// A read: a caller would acknowledge this exact receipt without a new
     /// job, recommendation, or wake.
+    ///
+    /// # Live status
+    ///
+    /// This entry currently has NO production caller: the single call is
+    /// `recover_maintenance_trigger_handoff` in
+    /// `bins/eliotd/src/maintenance_dispatch.rs`, which is itself uncalled.
+    /// Note that this entry is the one the sibling
+    /// `recover_maintenance_trigger_handoff` leg would use, so it shares that
+    /// leg's disposition; it is not independently live. Whether a
+    /// crash-recovery path is wired to it or the entry is retired is an owner
+    /// decision, not a documentation one.
     pub fn recover_maintenance_trigger_commit(
         &self,
         principal_ref: &str,
@@ -2148,6 +2269,17 @@ impl KernelStoreGateway {
     /// trigger stays open, gains an `AmbiguousCommit` gap record, and must
     /// be reconciled by receipt lookup before any further effect. The
     /// returned rows are the durable snapshot after this transition.
+    ///
+    /// # Live status
+    ///
+    /// This entry currently has NO production caller: the single call is
+    /// `mark_maintenance_trigger_commit_ambiguous_after_loss` in
+    /// `bins/eliotd/src/maintenance_dispatch.rs`, which is itself uncalled.
+    /// Because the sibling [`Self::record_maintenance_trigger_decision`] entry
+    /// that cross-references this one is also uncallered, the ambiguous-commit
+    /// reconciliation this describes is not currently reachable at all.
+    /// Whether that reconciliation is wired or the entry is retired is an
+    /// owner decision, not a documentation one.
     pub fn mark_maintenance_trigger_commit_ambiguous(
         &self,
         principal_ref: &str,
@@ -2174,6 +2306,18 @@ impl KernelStoreGateway {
     /// generation, committed rows move to `Reconciling` with receipts
     /// preserved, and every later old-generation claim or ack fails. The
     /// returned rows are the durable snapshot after this transition.
+    ///
+    /// # Live status
+    ///
+    /// This entry currently has NO production caller. It is *transitively*
+    /// dead rather than name-level dead, so a scan for call sites reports
+    /// one: the single call is
+    /// `revoke_lost_daemon_consumer_for_replacement` in
+    /// `bins/eliotd/src/maintenance_dispatch.rs`, whose own only caller,
+    /// `recover_replacement_generation`, is itself uncalled. The revocation
+    /// this describes therefore does not currently occur on any live path.
+    /// Whether a daemon generation-replacement path is wired to it or the
+    /// entry is retired is an owner decision, not a documentation one.
     pub fn revoke_maintenance_trigger_consumer(
         &self,
         principal_ref: &str,
@@ -2189,10 +2333,21 @@ impl KernelStoreGateway {
     /// Surfaces the bounded pending set to a replacement generation (issue
     /// #1694).
     ///
-    /// A read: after replacement authentication plus the required mirror
-    /// recovery, the replacement sees the bounded pending set before
-    /// reconciliation may be claimed complete. Ordinary pending debt
-    /// acquires no runtime lease here.
+    /// A read: were it reached, then after replacement authentication plus the
+    /// required mirror recovery the replacement would see the bounded pending
+    /// set before reconciliation could be claimed complete. Ordinary pending
+    /// debt acquires no runtime lease here.
+    ///
+    /// # Live status
+    ///
+    /// This entry currently has NO production caller. It is *transitively*
+    /// dead rather than name-level dead, so a scan for call sites reports
+    /// one: the single call is `surface_replacement_pending_set` in
+    /// `bins/eliotd/src/maintenance_dispatch.rs`, whose own only caller,
+    /// `recover_replacement_generation`, is itself uncalled. No replacement
+    /// generation currently enumerates this pending set. Whether a
+    /// generation-replacement path is wired to it or the entry is retired is
+    /// an owner decision, not a documentation one.
     pub fn maintenance_trigger_replacement_pending_set(
         &self,
         principal_ref: &str,
@@ -2218,6 +2373,15 @@ impl KernelStoreGateway {
     /// Expired eligibility blocks stale execution but never deletes the row,
     /// its record, or its evidence locators. The returned rows are the
     /// durable snapshot after this transition.
+    ///
+    /// # Live status
+    ///
+    /// This entry currently has NO production caller: the single call is
+    /// `expire_inapplicable_maintenance_trigger` in
+    /// `bins/eliotd/src/maintenance_dispatch.rs`, which is itself uncalled.
+    /// No live expiry path records terminal expiry through this entry.
+    /// Whether one is wired or the entry is retired is an owner decision,
+    /// not a documentation one.
     pub fn expire_maintenance_trigger(
         &self,
         principal_ref: &str,
@@ -2245,6 +2409,15 @@ impl KernelStoreGateway {
     /// The successor is named, both rows stay readable, and materially new
     /// evidence arrives as a new trigger rather than an overwrite. The
     /// returned rows are the durable snapshot after this transition.
+    ///
+    /// # Live status
+    ///
+    /// This entry currently has NO production caller: the single call is
+    /// `supersede_maintenance_trigger_with_successor` in
+    /// `bins/eliotd/src/maintenance_dispatch.rs`, which is itself uncalled.
+    /// No live path supersedes a trigger through this entry. Whether one is
+    /// wired or the entry is retired is an owner decision, not a
+    /// documentation one.
     pub fn supersede_maintenance_trigger(
         &self,
         principal_ref: &str,
@@ -2274,6 +2447,16 @@ impl KernelStoreGateway {
     /// enumeration produce this record — never a plaintext fallback and
     /// never silent deletion. The returned rows are the durable snapshot
     /// after this transition.
+    ///
+    /// # Live status
+    ///
+    /// This entry currently has NO production caller: the single call is
+    /// `record_maintenance_trigger_damage` in
+    /// `bins/eliotd/src/maintenance_dispatch.rs`, which is itself uncalled.
+    /// Because no live path records a gap here either, a maintenance-trigger
+    /// damage event is currently neither recorded nor recoverable through
+    /// this surface. Whether a damage recorder is wired or the entry is
+    /// retired is an owner decision, not a documentation one.
     pub fn record_maintenance_trigger_gap(
         &self,
         principal_ref: &str,
@@ -2300,14 +2483,28 @@ impl KernelStoreGateway {
     /// Restores the owned delivery ledger from previously persisted durable
     /// rows (issue #1694).
     ///
-    /// Runs once at startup before any claim is served: refuses when the
-    /// owner already holds rows, then every row is revalidated through the
-    /// existing validators before entering the ledger — a damaged row fails
-    /// the restore instead of entering as a guessed-complete entry. The
-    /// rows source is the startup composition's read-back of the persisted
-    /// rows through the Store-lane rows backend (STITCH): this entry owns
-    /// the restore, not the read-back. The returned rows are the restored
-    /// durable snapshot.
+    /// Were it reached, it would run once at startup before any claim is
+    /// served: refuses when the owner already holds rows, then every row is
+    /// revalidated through the existing validators before entering the
+    /// ledger — a damaged row fails the restore instead of entering as a
+    /// guessed-complete entry. The rows source is the startup composition's
+    /// read-back of the persisted rows through the Store-lane rows backend
+    /// (STITCH): this entry owns the restore, not the read-back. The
+    /// returned rows are the restored durable snapshot.
+    ///
+    /// # Live status
+    ///
+    /// This entry currently has NO production caller. It is *transitively*
+    /// dead rather than name-level dead, so a scan for call sites reports
+    /// one: the single call is
+    /// `restore_maintenance_trigger_ledger_at_startup` in
+    /// `bins/eliotd/src/maintenance_dispatch.rs`, which is itself uncalled.
+    /// The sentence above about running "once at startup" therefore describes
+    /// an intended startup order, not observed behaviour: no startup path
+    /// calls this entry, so the ledger is never restored from persisted rows.
+    /// The body is unchanged and still correct if reached; whether a startup
+    /// composition is wired to it or the entry is retired is an owner
+    /// decision, not a documentation one.
     pub fn restore_maintenance_trigger_ledger(
         &self,
         rows: Vec<MaintenanceTriggerDeliveryRow>,
