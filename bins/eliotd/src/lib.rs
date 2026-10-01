@@ -94,6 +94,17 @@ pub struct LiveLspCaptureInvocation<'a, G, C> {
     pub await_terminal: C,
 }
 
+/// One admitted selected-source attempt after the canonical owner has
+/// returned its original causal receipt/readback and the ORS owner has
+/// activated the matching reservation.
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+pub struct SelectedSourceCaptureCanonicalAdmission {
+    pub record: eliot_store_api::ProposedAttemptRecord,
+    pub causal_receipt: eliot_store_api::CausalWriteReceipt,
+    pub activation: crate::daemon_kernel_client::SelectedSourceCaptureActivation,
+}
+
 /// Typed failures from the live captured-LSP source read and semantic adoption.
 #[derive(Debug, Error)]
 pub enum CapturedLspAdoptionError {
@@ -2372,6 +2383,182 @@ impl DaemonComposition {
             )
             .await
             .map_err(CapturedLspAdoptionError::TaskSelection)
+    }
+
+    /// Compiles exactly one Kernel-issued staged ProposedAttempt into the
+    /// existing Governor canonical-write path, then invokes the existing ORS
+    /// activation saga. The request, task binding, WorkItem/lease, source
+    /// commitments, and stage operation identity are all compared before a
+    /// prepared transition can leave the daemon.
+    #[cfg(windows)]
+    pub async fn commit_selected_source_capture_stage(
+        &mut self,
+        kernel: &DaemonKernelClient,
+        claimed: &crate::daemon_kernel_client::SelectedSourceCaptureClaimedInvocation,
+        selected: &eliot_governor::TaskSelectionAdmissionBinding,
+        staged: crate::daemon_kernel_client::SelectedSourceCaptureStagedAdmission,
+        governing_sources: &eliot_governor::GoverningSourceSet,
+        privacy_profile: &eliot_governor::PrivacyProfile,
+    ) -> Result<SelectedSourceCaptureCanonicalAdmission, CapturedLspAdoptionError> {
+        let current = self
+            .selected_source_capture_task_selection(
+                &claimed.host_request_envelope,
+                &claimed.request_identity,
+            )
+            .await?;
+        if &current != selected {
+            return Err(CapturedLspAdoptionError::SelectedSourceCaptureRequest(
+                "Task/Session/WorkScope/WorkLease/WorkItem selection changed after ORS stage",
+            ));
+        }
+        let record = &staged.record;
+        let expected_operation = match claimed.invocation.operation {
+            eliot_protocol::SelectedSourceCaptureOperation::Diagnostics => "Diagnostics",
+            eliot_protocol::SelectedSourceCaptureOperation::ProbeVersion => "ProbeVersion",
+        };
+        let identity_value = serde_json::to_value(&claimed.request_identity)?;
+        let stage_operation_id = staged.staged_record.stage_operation_id.as_str();
+        if record.request_identity != identity_value
+            || record.parent_operation_id
+                != eliot_protocol::host_request_operation_id(&claimed.host_request_envelope)
+            || record.work_item_id != current.evidence_ref()
+            || record.work_lease_id != current.selection_source_ref()
+            || record.principal_id != current.principal_ref()
+            || record.task_id != current.task_ref()
+            || record.session_id != current.session_ref()
+            || record.work_scope_id != current.work_scope().binding.scope.scope_ref
+            || record.state_fence != claimed.host_request_envelope.state_fence
+            || record.operation != expected_operation
+            || record.selected_relative_path != claimed.invocation.selected_relative_path
+            || record.selector != claimed.invocation.selector
+            || record.reservation_id != staged.staged_record.reservation_id.as_str()
+            || record.proposed_attempt_id != staged.staged_record.proposed_attempt_id.as_str()
+            || record.work_item_id != staged.staged_record.work_item_id.as_str()
+            || record.reservation_stage_receipt_id != staged.stage_receipt_id
+            || staged.stage_receipt_id != stage_operation_id
+            || staged.staged_record.operation_id != staged.staged_record.stage_operation_id
+            || staged.stage_receipt.record_id().as_str() != staged.stage_receipt_id
+            || staged.stage_receipt.subject_id() != &staged.staged_record.reservation_id
+        {
+            return Err(CapturedLspAdoptionError::SelectedSourceCaptureRequest(
+                "staged ProposedAttempt or ORS receipt differs from the retained request and current owner selection",
+            ));
+        }
+        crate::task_binding_admission::admit_task_bound(
+            Some(current.evidence()),
+            current.task_ref(),
+            current.work_scope().binding.scope.scope_ref.as_str(),
+            current.state_fence(),
+            crate::task_binding_admission::CompatibilityDisposition::Compatible,
+        )?;
+        self.governor
+            .check_canonical_write_work_scope(
+                record.work_scope_id.as_str(),
+                &current.work_scope().binding,
+                Some((governing_sources, privacy_profile)),
+            )
+            .map_err(CapturedLspAdoptionError::TaskSelection)?;
+
+        let command = eliot_store_api::proposed_attempt_record_request(record)
+            .map_err(|error| CapturedLspAdoptionError::CanonicalEnvelope(error.to_string()))?;
+        let manifests = eliot_store_api::generated_operation_manifests()
+            .map_err(|error| CapturedLspAdoptionError::CanonicalEnvelope(error.to_string()))?;
+        let operation_manifest_digest = eliot_store_api::operation_manifest_set_digest(&manifests)
+            .map_err(|error| CapturedLspAdoptionError::CanonicalEnvelope(error.to_string()))?;
+        let operation_id = OperationId::new(stage_operation_id.to_owned())
+            .map_err(|error| CapturedLspAdoptionError::CanonicalEnvelope(error.to_string()))?;
+        let scope_id = eliot_store_api::ScopeId::new(record.work_scope_id.clone())
+            .map_err(|error| CapturedLspAdoptionError::CanonicalEnvelope(error.to_string()))?;
+        let envelope = eliot_governor::CanonicalWriteEnvelope {
+            operation_id: operation_id.clone(),
+            request: claimed.request_identity.request.metadata.clone(),
+            idempotency_key: claimed.request_identity.idempotency_key.clone(),
+            scope_id,
+            task_id: Some(record.task_id.clone()),
+            transition_class: eliot_store_api::TransitionClass::TaskControl,
+            requested_effect_ceiling: eliot_store_api::EffectClass::ReversibleMutation,
+            admission_contract_set_digest: eliot_canonical::supported_admission_contract_set_digest()
+                .map_err(|error| CapturedLspAdoptionError::CanonicalEnvelope(error.to_string()))?,
+            operation_manifest_digest,
+            semantic_commands: vec![command],
+            event_projection_relation_intents: eliot_store_api::EventProjectionRelationIntents {
+                event_ids: Vec::new(),
+                projection_kinds: Vec::new(),
+                relation_kinds: Vec::new(),
+            },
+            security: eliot_store_api::SecurityContext::default(),
+            required_proof_and_approval_refs: vec![
+                record.work_item_id.clone(),
+                record.work_lease_id.clone(),
+                record.reservation_stage_receipt_id.clone(),
+                record.source_digest.clone(),
+                record.configuration_digest.clone(),
+                record.action_contract_digest.clone(),
+            ],
+            expected_revision_heads: Vec::new(),
+            expected_ordering_heads: Vec::new(),
+        };
+        envelope
+            .validate()
+            .map_err(|error| CapturedLspAdoptionError::CanonicalEnvelope(error.to_string()))?;
+        let prepared = self
+            .governor
+            .owners()
+            .canonical
+            .prepare(&envelope)
+            .map_err(|error| CapturedLspAdoptionError::CanonicalEnvelope(error.to_string()))?;
+        if prepared.identity.operation_id.as_str() != stage_operation_id
+            || prepared.named_operations.len() != 1
+            || prepared.named_operations[0].operation
+                != eliot_store_api::NamedMutationOperation::AdmitProposedAttempt
+        {
+            return Err(CapturedLspAdoptionError::CanonicalEnvelope(
+                "prepared transition changed the owner stage identity or ProposedAttempt command"
+                    .to_owned(),
+            ));
+        }
+        let causal_receipt = eliot_governor::KernelTransitionPort::apply_prepared_with_causal(
+            kernel,
+            &claimed.request_identity,
+            prepared,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .map_err(CapturedLspAdoptionError::KernelTransition)?;
+        if causal_receipt.receipt.operation_id != operation_id
+            || causal_receipt.receipt.idempotency_key != claimed.request_identity.idempotency_key
+            || causal_receipt.receipt.state_fence != record.state_fence
+            || causal_receipt.receipt.outbox_refs.is_empty()
+        {
+            return Err(CapturedLspAdoptionError::SelectedSourceCaptureRequest(
+                "canonical owner receipt does not bind the original staged operation and launch outbox",
+            ));
+        }
+        let activation = kernel
+            .activate_selected_source_capture_async(&claimed.request_identity, &staged)
+            .await
+            .map_err(|error| {
+                CapturedLspAdoptionError::SelectedSourceCaptureRequest(match error {
+                    DaemonError::Kernel(_) => "Kernel ORS activation saga rejected the canonical owner result",
+                    _ => "Kernel ORS activation saga failed",
+                })
+            })?;
+        if !causal_receipt
+            .receipt
+            .outbox_refs
+            .iter()
+            .any(|outbox| outbox.as_str() == activation.launch_outbox_id)
+        {
+            return Err(CapturedLspAdoptionError::SelectedSourceCaptureRequest(
+                "activated reservation names an outbox absent from the original canonical terminal receipt",
+            ));
+        }
+        Ok(SelectedSourceCaptureCanonicalAdmission {
+            record: staged.record,
+            causal_receipt,
+            activation,
+        })
     }
 
     /// Runs the internal W1 one-shot LSP capture through the original
