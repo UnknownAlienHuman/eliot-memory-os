@@ -1649,6 +1649,20 @@ pub enum KernelFrameAction {
         /// Bounded operation payload carrying context, batch and archive.
         payload: serde_json::Value,
     },
+    /// Continue an exact completed Finish invoke-read on the asynchronous
+    /// bridge owner. The synchronous dispatcher may carry the retained
+    /// envelope, tool, admission receipt, and ORS row here, but the front-door
+    /// driver must re-read the canonical Store receipt before serving the
+    /// retained result body.
+    #[cfg(windows)]
+    FinishReplay {
+        request_id: RequestId,
+        protocol_version: eliot_protocol::ProtocolVersion,
+        envelope: eliot_protocol::HostRequestEnvelope,
+        tool: serde_json::Value,
+        admission_receipt: eliot_protocol::HostRequestAdmissionReceipt,
+        record: eliot_ors::HostRequestRecord,
+    },
     /// Return a typed rejection, then fence the connection.
     Fence(Frame),
 }
