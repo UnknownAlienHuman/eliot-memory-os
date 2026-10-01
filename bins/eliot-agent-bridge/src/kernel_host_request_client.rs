@@ -4067,8 +4067,17 @@ mod tests {
     }
 
     fn test_envelope() -> (HostInvocationRequest, TransportFacts, HostRequestEnvelope) {
-        let request: HostInvocationRequest =
+        let mut request: HostInvocationRequest =
             serde_json::from_str(INVOCATION_JSON).expect("fixture must deserialize");
+        // Match the production bounded decoder's explicit private-op
+        // correlation profile (I5.27; #2765/#3391,
+        // `fe02f06c654150b4aeb21fefdef2d692c044a738`). The builder deliberately
+        // refuses an absent projection; a test that calls it directly must
+        // supply the same typed identity instead of bypassing that contract.
+        request.correlation_projection = Some(HostCorrelationProjection::Opaque {
+            domain: HostCorrelationDomain::Request,
+            occurrence: request.correlation_id.as_str().to_owned(),
+        });
         let facts = test_facts("conn-test-1");
         let payload_digest =
             canonical_payload_digest(&request.tool).expect("payload digest must compute");
