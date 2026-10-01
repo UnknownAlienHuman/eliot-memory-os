@@ -12,7 +12,8 @@
 //! Coordinator bindings under test (see `assemble_input` and `capture`):
 //! the archive identity binds the canonical export identity (`backup_id` is
 //! the export fence `export_id`, never the caller-supplied input id); the
-//! purge revision binds the carried ledger length; class, source adapter, and
+//! purge revision is read from the purge OWNER the coordinator is bound to, not
+//! derived from the carried ledger; class, source adapter, and
 //! schema generation cross from the frozen plan; generations bind through the
 //! cross-owner fence relation, not string equality. A lost publication
 //! response reconciles the SAME operation by identity, never by second
@@ -32,6 +33,7 @@ use eliot_kernel::{
     FrozenCapturePlan, KernelBackupCapture, KernelCaptureError, PublicationPort,
     PublicationReceipt, SnapshotRelation, require_capture_admitted,
 };
+use eliot_ors::RedbRecoveryStore;
 use eliot_security_contracts::{PurgeLedgerEntry, PurgeLocation, PurgeState};
 use eliot_store_api::{
     CommitId, EventId, OperationId, OperationManifestDigest, Resubmission, ScopeId,
@@ -456,7 +458,6 @@ fn to_request(input: &BackupInput, suspended: u64) -> CaptureRequest {
         receipts: input.receipts.clone(),
         blobs: input.blobs.clone(),
         purge_ledger: input.purge_ledger.clone(),
-        purge_ledger_revision: input.purge_ledger_revision,
         ors_snapshot: input.ors_snapshot.clone(),
         suspended_count: suspended,
         artifacts: input.artifacts.clone(),
@@ -465,20 +466,49 @@ fn to_request(input: &BackupInput, suspended: u64) -> CaptureRequest {
     }
 }
 
-fn coordinator() -> KernelBackupCapture {
-    KernelBackupCapture::bind(std::env::temp_dir().join("eliot-959-capture"))
+/// A real purge owner for the coordinator to read, mirroring the production
+/// wiring: the capture reads the ledger-wide revision from the same
+/// `RedbRecoveryStore` the restore compares against, so the fixture supplies a
+/// real one rather than a number.
+///
+/// The full-recovery case carries one purge entry, so its owner must have
+/// applied exactly that entry — otherwise the owner reports 0 and `eliot-backup`
+/// refuses a non-empty ledger bound to a zero revision. The degraded and scope
+/// cases carry no ledger and need a virgin owner, so each case gets its own.
+fn purge_owner(entries: &[PurgeLedgerEntry], label: &str) -> std::sync::Arc<RedbRecoveryStore> {
+    let path = std::env::temp_dir().join(format!("eliot-960-capture-owner-{label}"));
+    let _ = std::fs::remove_dir_all(&path);
+    let owner = std::sync::Arc::new(
+        RedbRecoveryStore::open(&path).expect("fixture purge owner opens for the capture"),
+    );
+    for entry in entries {
+        owner
+            .apply_purge_ledger_entry(entry)
+            .expect("fixture purge owner applies the carried entry");
+    }
+    owner
+}
+
+fn coordinator(owner: std::sync::Arc<RedbRecoveryStore>) -> KernelBackupCapture {
+    KernelBackupCapture::bind(std::env::temp_dir().join("eliot-959-capture"), owner)
+}
+
+/// The coordinator most cases need: a virgin purge owner, so the ledger-wide
+/// revision is 0 and an empty carried ledger is coherent with it.
+fn virgin_coordinator(label: &str) -> KernelBackupCapture {
+    coordinator(purge_owner(&[], label))
 }
 
 /// Mirrors the coordinator's `assemble_input` binding for independent digest
 /// recomputation: archive identity from the export fence, class/source/schema
 /// from the frozen plan, and the purge revision the PRODUCER declared.
 ///
-/// The revision crosses the request unchanged, exactly as `assemble_input`
-/// copies it. This fixture previously recomputed it as the carried ledger
-/// length, which is the count-of-the-caller's-own-list binding #960 A14
-/// removes: it could never be cross-checked against the purge owner that
-/// applies the ledger.
-fn coordinator_input(request: &CaptureRequest) -> BackupInput {
+/// The revision is NOT a request field: the coordinator reads it from the purge
+/// owner it is bound to, so the mirror helper is given the owner's value by the
+/// caller. This fixture previously recomputed it as the carried ledger length,
+/// which is the count-of-the-caller's-own-list binding #960 A14 removes — it
+/// could never be cross-checked against the purge owner that applies the ledger.
+fn coordinator_input(request: &CaptureRequest, purge_ledger_revision: u64) -> BackupInput {
     BackupInput {
         backup_id: request.export_fence.export_id.clone(),
         class: request.plan.class,
@@ -495,7 +525,7 @@ fn coordinator_input(request: &CaptureRequest) -> BackupInput {
         watchdog_spool: request.watchdog_spool.clone(),
         host_audit: request.host_audit.clone(),
         missing_features: Vec::new(),
-        purge_ledger_revision: request.purge_ledger_revision,
+        purge_ledger_revision,
     }
 }
 
@@ -626,7 +656,21 @@ fn admitted_full_recovery_capture_completes_and_binds_archive() {
     let input = valid_full_input();
     let request = to_request(&input, 0);
     let mut publisher = MemPublisher::default();
-    let report = coordinator()
+    // This case carries one purge entry, so the bound owner must have applied
+    // exactly that entry: the coordinator reads the ledger-wide revision from
+    // the owner, and `eliot-backup` refuses a non-empty ledger bound to a zero
+    // revision. Seeding it with the carried entry makes the declared position
+    // and the carried evidence agree, which is the point of A14.
+    let owner = purge_owner(&request.purge_ledger, "full");
+    let owner_revision = owner
+        .purge_ledger_revision()
+        .expect("seeded fixture owner reports its revision");
+    assert_eq!(
+        owner_revision,
+        request.purge_ledger.len() as u64,
+        "the owner issued one revision per carried entry"
+    );
+    let report = coordinator(owner)
         .capture(&request, &mut publisher)
         .expect("admitted FullRecovery capture completes");
     assert_eq!(report.state, CaptureState::Complete);
@@ -639,7 +683,8 @@ fn admitted_full_recovery_capture_completes_and_binds_archive() {
     assert_eq!(report.operation_id, "capture-publish-export-959-full");
     // Independent recomputation through the real bundle API binds the digest:
     // same export-bound input rebuilds to the same archive sha.
-    let rebuilt = BackupBundle::build(coordinator_input(&request)).expect("bundle rebuilds");
+    let rebuilt =
+        BackupBundle::build(coordinator_input(&request, owner_revision)).expect("bundle rebuilds");
     assert_eq!(
         report.archive_sha256,
         rebuilt.bundle_sha256().expect("rebuilt digest")
@@ -701,7 +746,7 @@ fn explicit_canonical_only_degraded_capture() {
     let input = degraded_input();
     let request = to_request(&input, 0);
     let mut publisher = MemPublisher::default();
-    let report = coordinator()
+    let report = virgin_coordinator("case")
         .capture(&request, &mut publisher)
         .expect("degraded capture completes explicitly");
     assert_eq!(report.state, CaptureState::Complete);
@@ -714,7 +759,7 @@ fn explicit_canonical_only_degraded_capture() {
     // The contrast with verification-only is explicit: the same published
     // archive verifies as degraded (Incomplete), while the capture that
     // produced it is Complete.
-    let verified = coordinator()
+    let verified = virgin_coordinator("case")
         .verify_only(
             &publisher.publishes[0].2,
             &admitted_caller(),
@@ -736,7 +781,7 @@ fn bounded_scope_export_distinct_from_installation_backup() {
     let input = scope_input();
     let request = to_request(&input, 0);
     let mut publisher = MemPublisher::default();
-    let report = coordinator()
+    let report = virgin_coordinator("case")
         .capture(&request, &mut publisher)
         .expect("scope export completes");
     assert_eq!(report.state, CaptureState::Complete);
@@ -759,7 +804,7 @@ fn missing_class_capability_refuses_without_downgrade() {
     input.ors_snapshot = None;
     let request = to_request(&input, 0);
     let mut publisher = MemPublisher::default();
-    let refused = coordinator().capture(&request, &mut publisher);
+    let refused = virgin_coordinator("case").capture(&request, &mut publisher);
     assert_eq!(
         refused.unwrap_err(),
         KernelCaptureError::ClassCapabilityUnsupported {
@@ -781,7 +826,9 @@ fn unadmitted_caller_and_bad_scope_refuse_before_publication() {
     request.caller.admitted = false;
     let mut publisher = MemPublisher::default();
     assert_eq!(
-        coordinator().capture(&request, &mut publisher).unwrap_err(),
+        virgin_coordinator("case")
+            .capture(&request, &mut publisher)
+            .unwrap_err(),
         KernelCaptureError::NotAdmitted
     );
     assert!(publisher.publishes.is_empty(), "zero publishes on refusal");
@@ -795,7 +842,9 @@ fn unadmitted_caller_and_bad_scope_refuse_before_publication() {
     let mut scoped = to_request(&scope_input(), 0);
     scoped.plan.scope_id = None;
     let mut publisher = MemPublisher::default();
-    let refused = coordinator().capture(&scoped, &mut publisher).unwrap_err();
+    let refused = virgin_coordinator("case")
+        .capture(&scoped, &mut publisher)
+        .unwrap_err();
     assert!(
         matches!(
             refused,
@@ -892,7 +941,7 @@ fn controlled_concurrent_mutation_excluded_or_represented() {
     clean_input.ors_snapshot = Some(ors_fence(&base_fence(), Vec::new()));
     let clean_request = to_request(&clean_input, 0);
     let mut publisher = MemPublisher::default();
-    let clean = coordinator()
+    let clean = virgin_coordinator("case")
         .capture(&clean_request, &mut publisher)
         .expect("immutable snapshot capture passes");
     assert_eq!(clean.state, CaptureState::Complete);
@@ -908,7 +957,7 @@ fn controlled_concurrent_mutation_excluded_or_represented() {
     ));
     let frontier_request = to_request(&frontier_input, 2);
     let mut publisher = MemPublisher::default();
-    let frontier = coordinator()
+    let frontier = virgin_coordinator("case")
         .capture(&frontier_request, &mut publisher)
         .expect("frontier-recorded capture passes");
     assert_eq!(frontier.state, CaptureState::Complete);
@@ -939,7 +988,7 @@ fn generation_schema_continuation_drift_blocks_complete() {
     generation_input.export_fence.state_fence = advanced.clone();
     let generation_request = to_request(&generation_input, 0);
     let mut publisher = MemPublisher::default();
-    let generation_blocked = coordinator()
+    let generation_blocked = virgin_coordinator("case")
         .capture(&generation_request, &mut publisher)
         .unwrap_err();
     assert!(
@@ -959,7 +1008,7 @@ fn generation_schema_continuation_drift_blocks_complete() {
     let mut schema_request = to_request(&schema_input, 0);
     schema_request.plan.schema_generation = drifted.schema_generation.clone();
     let mut publisher = MemPublisher::default();
-    let schema_blocked = coordinator()
+    let schema_blocked = virgin_coordinator("case")
         .capture(&schema_request, &mut publisher)
         .unwrap_err();
     assert!(
@@ -981,7 +1030,7 @@ fn every_member_has_one_disposition() {
     let input = valid_full_input();
     let request = to_request(&input, 0);
     let mut publisher = MemPublisher::default();
-    let report = coordinator()
+    let report = virgin_coordinator("case")
         .capture(&request, &mut publisher)
         .expect("capture completes");
     // Bijection: exactly one disposition per expected member, no more.
@@ -998,7 +1047,7 @@ fn every_member_has_one_disposition() {
     duplicated.export_fence.event_range.count = 3;
     let duplicated_request = to_request(&duplicated, 0);
     let mut publisher = MemPublisher::default();
-    let refused = coordinator()
+    let refused = virgin_coordinator("case")
         .capture(&duplicated_request, &mut publisher)
         .unwrap_err();
     assert!(
@@ -1020,7 +1069,7 @@ fn incoherent_boundary_and_count_gap_never_capture() {
     let incoherent_request = to_request(&incoherent, 0);
     let mut publisher = MemPublisher::default();
     assert_eq!(
-        coordinator()
+        virgin_coordinator("case")
             .capture(&incoherent_request, &mut publisher)
             .unwrap_err(),
         KernelCaptureError::RelationIncoherent("export fence is not consistent".to_owned())
@@ -1031,7 +1080,7 @@ fn incoherent_boundary_and_count_gap_never_capture() {
     gapped.export_fence.event_range.count = 5;
     let gapped_request = to_request(&gapped, 0);
     let mut publisher = MemPublisher::default();
-    let refused = coordinator()
+    let refused = virgin_coordinator("case")
         .capture(&gapped_request, &mut publisher)
         .unwrap_err();
     assert!(
@@ -1050,7 +1099,7 @@ fn references_and_residency_closure_preserved() {
     dangling.projections = vec![projection_for("event-missing-959")];
     let dangling_request = to_request(&dangling, 0);
     let mut publisher = MemPublisher::default();
-    let refused = coordinator()
+    let refused = virgin_coordinator("case")
         .capture(&dangling_request, &mut publisher)
         .unwrap_err();
     assert!(
@@ -1065,7 +1114,7 @@ fn references_and_residency_closure_preserved() {
     doubled.blobs.push(second);
     let doubled_request = to_request(&doubled, 0);
     let mut publisher = MemPublisher::default();
-    let refused = coordinator()
+    let refused = virgin_coordinator("case")
         .capture(&doubled_request, &mut publisher)
         .unwrap_err();
     assert!(
@@ -1086,7 +1135,7 @@ fn references_and_residency_closure_preserved() {
         .push(hash);
     let duplicated_request = to_request(&duplicated_manifest, 0);
     let mut publisher = MemPublisher::default();
-    let refused = coordinator()
+    let refused = virgin_coordinator("case")
         .capture(&duplicated_request, &mut publisher)
         .unwrap_err();
     assert!(
@@ -1096,7 +1145,7 @@ fn references_and_residency_closure_preserved() {
     assert!(publisher.publishes.is_empty());
     // The valid closure captures: distinct residency domains stay distinct.
     let mut publisher = MemPublisher::default();
-    coordinator()
+    virgin_coordinator("case")
         .capture(&to_request(&valid_full_input(), 0), &mut publisher)
         .expect("closed bundle captures");
     assert_eq!(publisher.publishes.len(), 1);
@@ -1110,7 +1159,7 @@ fn suspended_unresolved_distinguished_from_incoherent() {
     // not archive corruption.
     let request = to_request(&valid_full_input(), 1);
     let mut publisher = MemPublisher::default();
-    let report = coordinator()
+    let report = virgin_coordinator("case")
         .capture(&request, &mut publisher)
         .expect("bounded unresolved with full evidence completes");
     assert_eq!(report.state, CaptureState::Complete);
@@ -1123,7 +1172,7 @@ fn suspended_unresolved_distinguished_from_incoherent() {
     incoherent.ors_snapshot = Some(ors_fence(&foreign, vec!["op-pending-959-1".to_owned()]));
     let incoherent_request = to_request(&incoherent, 1);
     let mut publisher = MemPublisher::default();
-    let refused = coordinator()
+    let refused = virgin_coordinator("case")
         .capture(&incoherent_request, &mut publisher)
         .unwrap_err();
     assert!(
@@ -1145,7 +1194,13 @@ fn suspended_unresolved_distinguished_from_incoherent() {
 fn config_purge_build_and_forensic_audit_ceilings_retained() {
     let request = to_request(&valid_full_input(), 0);
     let mut publisher = MemPublisher::default();
-    let report = coordinator()
+    // A full input carries one purge entry, so the bound owner is seeded with
+    // that entry and the declared position is the owner's own value.
+    let owner = purge_owner(&request.purge_ledger, "ceilings");
+    let owner_revision = owner
+        .purge_ledger_revision()
+        .expect("seeded fixture owner reports its revision");
+    let report = coordinator(owner)
         .capture(&request, &mut publisher)
         .expect("full capture completes");
     assert_eq!(report.class, BackupClass::FullRecovery);
@@ -1165,14 +1220,13 @@ fn config_purge_build_and_forensic_audit_ceilings_retained() {
     for kept in &bundle.artifacts {
         kept.validate().expect("artifact digest binds bytes");
     }
-    // The purge revision is the purge OWNER's declared value, carried across
-    // the request verbatim: the coordinator neither counts the carried ledger
-    // nor derives the value, so a restore can cross-check this archive against
-    // the owner that applies the ledger. The fixture declares 7 against a
-    // single carried entry precisely so the manifest is not the entry count
-    // (#960 A14).
+    // The purge revision is the purge OWNER's declared ledger position, read
+    // from the owner the coordinator is bound to. It is no longer a request
+    // field at all, so there is nothing for a caller to fill and nothing that
+    // could be a count of the carried ledger (#960 A14). The manifest must
+    // carry the owner's value, which the fixture seeded to one entry.
     assert_eq!(bundle.purge_ledger.len(), 1);
-    assert_eq!(bundle.manifest.purge_ledger_revision, 7);
+    assert_eq!(bundle.manifest.purge_ledger_revision, owner_revision);
     assert!(!bundle.purge_ledger.is_empty(), "purge ledger retained");
     // Host audit is present but forensic: never active authority, never part
     // of the recovery denominator, and the class stays FullRecovery.
@@ -1186,7 +1240,7 @@ fn config_purge_build_and_forensic_audit_ceilings_retained() {
 fn no_plaintext_keys_or_live_database_exported() {
     let request = to_request(&valid_full_input(), 0);
     let mut publisher = MemPublisher::default();
-    let report = coordinator()
+    let report = virgin_coordinator("case")
         .capture(&request, &mut publisher)
         .expect("full capture completes");
     let bytes = &publisher.publishes[0].2;
@@ -1258,7 +1312,7 @@ fn real_bundle_api_with_allowed_revalidation() {
 fn one_publication_binds_archive_and_receipt() {
     let request = to_request(&valid_full_input(), 0);
     let mut publisher = MemPublisher::default();
-    let report = coordinator()
+    let report = virgin_coordinator("case")
         .capture(&request, &mut publisher)
         .expect("capture completes");
     assert_eq!(
@@ -1289,7 +1343,7 @@ fn lost_publication_response_reconciles_same_operation() {
         drop_first: true,
         ..MemPublisher::default()
     };
-    let report = coordinator()
+    let report = virgin_coordinator("case")
         .capture(&request, &mut publisher)
         .expect("lost response still captures via reconcile");
     assert_eq!(publisher.publishes.len(), 1, "publish count stays 1");
@@ -1326,7 +1380,9 @@ fn bounds_refuse_before_publication_and_zero_budgets_are_invalid() {
         max_duration_ms: 60_000,
     };
     let mut publisher = MemPublisher::default();
-    let refused = coordinator().capture(&request, &mut publisher).unwrap_err();
+    let refused = virgin_coordinator("case")
+        .capture(&request, &mut publisher)
+        .unwrap_err();
     assert!(
         matches!(refused, KernelCaptureError::BudgetExceeded { .. }),
         "tiny bounds-cancel budgets refuse the full capture, got {refused:?}"
@@ -1345,7 +1401,9 @@ fn bounds_refuse_before_publication_and_zero_budgets_are_invalid() {
         max_duration_ms: 0,
     };
     let mut publisher = MemPublisher::default();
-    let refused = coordinator().capture(&request, &mut publisher).unwrap_err();
+    let refused = virgin_coordinator("case")
+        .capture(&request, &mut publisher)
+        .unwrap_err();
     assert!(
         matches!(refused, KernelCaptureError::InvalidInput { .. }),
         "zero budgets refuse at plan validation, got {refused:?}"
@@ -1361,12 +1419,12 @@ fn bounds_refuse_before_publication_and_zero_budgets_are_invalid() {
 fn verify_only_never_restores_or_mutates() {
     let request = to_request(&valid_full_input(), 0);
     let mut publisher = MemPublisher::default();
-    let report = coordinator()
+    let report = virgin_coordinator("case")
         .capture(&request, &mut publisher)
         .expect("capture completes");
     // Verification-only takes no publisher at all: no publication is
     // representable here, and the report carries the verify-only identity.
-    let verified = coordinator()
+    let verified = virgin_coordinator("case")
         .verify_only(
             &publisher.publishes[0].2,
             &admitted_caller(),
