@@ -11,6 +11,12 @@
 //! Ordinary module: I2.23 Capability-family topology and crate extraction decisions — ordinary single-file extraction (<10k LOC) owning only `KernelComposition::dispatch_frame` plus inseparable dispatch-only helpers with zero external users.
 
 use super::admission_reservation_saga::ADMISSION_RESERVATION_ADMIT_OPERATION;
+use super::anchored_review_bridge::{
+    ANCHORED_REVIEW_ACCEPT_OPERATION, ANCHORED_REVIEW_ADVANCE_OPERATION,
+    ANCHORED_REVIEW_BATCH_SUBMIT_OPERATION, ANCHORED_REVIEW_ESCALATE_OPERATION,
+    ANCHORED_REVIEW_OBSERVE_OPERATION, ANCHORED_REVIEW_ROUTE_OPERATION,
+    ANCHORED_REVIEW_SUBMIT_OPERATION,
+};
 use super::daemon_request_dispatch::{
     DAEMON_STARTUP_EVIDENCE_OPERATION, NOTIFICATION_STATE_MUTATION_OPERATION,
     NOTIFICATION_STATE_READ_OPERATION, USER_AUTOMATION_OPERATOR_OPERATION,
@@ -1598,6 +1604,23 @@ fn is_daemon_operation(operation: &str) -> bool {
             // `ProcessExecutionRequest` decode, and fenced the session.
             | NOTIFICATION_STATE_MUTATION_OPERATION
             | NOTIFICATION_STATE_READ_OPERATION
+            // Issue #1823 (I10.18/I10.21): the anchored-review Store-bridge
+            // legs. The markers are the one strings the admitted dispatch
+            // arms in `daemon_request_dispatch.rs` already serve; without
+            // these entries a frame naming one falls through every predicate
+            // here, fails the `ProcessExecutionRequest` decode, and fences
+            // the session before the arm is ever entered. The entries only
+            // let the frame reach the arms: each arm still proves the module
+            // binding and the exact session State Fence, and the admitted
+            // record or row still persists through the existing coordination
+            // Store owner rather than through any store owned here.
+            | ANCHORED_REVIEW_SUBMIT_OPERATION
+            | ANCHORED_REVIEW_BATCH_SUBMIT_OPERATION
+            | ANCHORED_REVIEW_OBSERVE_OPERATION
+            | ANCHORED_REVIEW_ADVANCE_OPERATION
+            | ANCHORED_REVIEW_ROUTE_OPERATION
+            | ANCHORED_REVIEW_ACCEPT_OPERATION
+            | ANCHORED_REVIEW_ESCALATE_OPERATION
             // Issue #1678 (W3/W5, REQ4, REQ6, A3, A4, A7): the admit +
             // activate leg of the admission-reservation saga. Without this
             // entry the frame fell through every predicate here, failed the
