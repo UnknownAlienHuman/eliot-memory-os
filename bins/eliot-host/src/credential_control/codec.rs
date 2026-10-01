@@ -39,22 +39,118 @@ const MARKER_VERSION: &str = "eliot.store-credential-marker.v1";
 //
 // Observation-only contract (mirrors `host_composition_phase_b.rs:30-41`):
 // every call projects a boundary already decided by the semantic owner.
-// Arguments are static literals only — no bytes, digests, keys, identities,
-// or error text are formatted, so no secret material can cross (I15.4) and no
-// extra evaluation runs on the semantic path. Sink outcome never alters the
-// typed `Err(())`, order, or cleanup. No terminal emission here: one terminal
-// per failed operation stays with the credential operation guard, while these
-// inner phases correlate by stage order only. Malformed input keeps its
-// original typed failure with zero byte leakage.
+// Arguments are closed enum variants resolved to `&'static str` only — no
+// bytes, digests, keys, identities, `serde` error text, or credential contents
+// are formatted, so no secret material can cross (I15.4) and no extra
+// evaluation runs on the semantic path. Sink outcome never alters the typed
+// `Err(())`, order, or cleanup. No terminal emission here: one terminal per
+// failed operation stays with the credential operation guard, while these inner
+// phases refine — and never contradict — that terminal's reason code. Rejected
+// input keeps its original typed failure with zero byte leakage.
 fn credential_codec_note_event_log_unavailable() {
     let _ = crate::windows_event_log::event_log_sink_status();
 }
 
-fn credential_codec_observe(detail: &str) {
+/// Closed reason discriminant for one rejected credential wire record
+/// (F-LOG-HOST-5, #980).
+///
+/// The codec previously emitted the single label `marker malformed retained`
+/// / `envelope malformed retained` for five materially different failures
+/// (JSON/shape, expected-marker encoding, MAC mismatch, protected marker
+/// object mismatch, wire-version mismatch), erasing the contour the parent
+/// already distinguishes and contradicting the owner reason that follows.
+/// Each variant below is constructed by the exact branch that failed, so the
+/// emitted record names the real cause instead of a catch-all.
+///
+/// Owner mapping (the reason codes `credential_control.rs` mints through
+/// `unknown(request, <label>)`, each registered in `eliot_installation`'s
+/// `is_credential_unknown_reason`). The codec never mints or claims one of
+/// these; the parent's single terminal still carries the exact code, and the
+/// contour below only states which check inside this codec rejected the record:
+///
+/// - `credential-marker-mac` / `credential-marker-created-mac` /
+///   `credential-delete-marker-mac` — every marker variant, whichever
+///   `decode_marker` call site rejected;
+/// - `credential-target-binding` / `credential-target-without-marker` /
+///   `credential-target-without-marker-delete` / `credential-write-mismatch` /
+///   `credential-delete-readback` — every envelope variant, whichever
+///   `decode_envelope` call site rejected.
+///
+/// The call site, not this codec, selects between those owner codes; the
+/// contour is the codec's contribution and cannot disagree with any of them.
+#[derive(Clone, Copy)]
+enum CodecRejectReason {
+    /// Marker bytes were not a decodable `MarkerRecord` (shape or JSON).
+    MarkerRecordShape,
+    /// The expected marker record could not be re-encoded for comparison.
+    MarkerExpectedMac,
+    /// Marker MAC did not match the recomputed expected MAC.
+    MarkerMacMismatch,
+    /// Marker protected-object identity did not match the served object.
+    MarkerProtectedObjectMismatch,
+    /// Marker wire version is not the version this codec owns.
+    MarkerWireVersionMismatch,
+    /// Envelope bytes were not a decodable `CredentialEnvelope` (shape/JSON).
+    EnvelopeRecordShape,
+    /// The expected envelope record could not be re-encoded for comparison.
+    EnvelopeExpectedMac,
+    /// Envelope MAC did not match the recomputed expected MAC.
+    EnvelopeMacMismatch,
+    /// Envelope protected marker identity did not match the served object.
+    EnvelopeProtectedObjectMismatch,
+    /// Envelope wire version is not the version this codec owns.
+    EnvelopeWireVersionMismatch,
+}
+
+impl CodecRejectReason {
+    /// Frozen codec boundary label. The frozen label stays first so
+    /// label-prefix consumers keep matching.
+    const fn boundary(self) -> &'static str {
+        match self {
+            Self::MarkerRecordShape
+            | Self::MarkerExpectedMac
+            | Self::MarkerMacMismatch
+            | Self::MarkerProtectedObjectMismatch
+            | Self::MarkerWireVersionMismatch => "host.credential codec marker rejected",
+            Self::EnvelopeRecordShape
+            | Self::EnvelopeExpectedMac
+            | Self::EnvelopeMacMismatch
+            | Self::EnvelopeProtectedObjectMismatch
+            | Self::EnvelopeWireVersionMismatch => "host.credential codec envelope rejected",
+        }
+    }
+
+    /// Bounded, secret-free contour produced by the failing branch itself.
+    const fn contour(self) -> &'static str {
+        match self {
+            Self::MarkerRecordShape => "marker-record-shape",
+            Self::MarkerExpectedMac => "marker-expected-mac",
+            Self::MarkerMacMismatch => "marker-mac-mismatch",
+            Self::MarkerProtectedObjectMismatch => "marker-protected-object-mismatch",
+            Self::MarkerWireVersionMismatch => "marker-wire-version-mismatch",
+            Self::EnvelopeRecordShape => "envelope-record-shape",
+            Self::EnvelopeExpectedMac => "envelope-expected-mac",
+            Self::EnvelopeMacMismatch => "envelope-mac-mismatch",
+            Self::EnvelopeProtectedObjectMismatch => "envelope-protected-object-mismatch",
+            Self::EnvelopeWireVersionMismatch => "envelope-wire-version-mismatch",
+        }
+    }
+}
+
+/// Projects one discriminated codec rejection through the #889 facade.
+///
+/// The detail is assembled only from the two `&'static str` projections of the
+/// supplied discriminant, so no rejected byte, key, or `serde` text can reach
+/// the record; `observe_entrypoint_with_detail` bounds the result.
+fn credential_codec_observe(reason: CodecRejectReason) {
     credential_codec_note_event_log_unavailable();
     crate::host_diagnostics::observe_entrypoint_with_detail(
         crate::host_diagnostics::EntrypointStage::ScmDispatch,
-        detail,
+        &format!(
+            "{boundary} reason={contour}",
+            boundary = reason.boundary(),
+            contour = reason.contour(),
+        ),
     );
 }
 
@@ -176,9 +272,12 @@ pub(super) fn decode_marker(
     identity: &InstallerRootObjectSnapshot,
     bytes: &[u8],
 ) -> Result<MarkerRecord, ()> {
-    let marker: MarkerRecord = serde_json::from_slice(bytes).map_err(|_| {
-        credential_codec_observe("host.credential codec marker malformed retained");
-    })?;
+    // F-LOG-HOST-5 (#980): each rejection is projected by the branch that
+    // actually failed, so the record names the exact cause instead of one
+    // collapsed `malformed` label. The typed `Err(())` and the rejection
+    // order are unchanged.
+    let marker: MarkerRecord = serde_json::from_slice(bytes)
+        .map_err(|_| credential_codec_observe(CodecRejectReason::MarkerRecordShape))?;
     let expected = marker_bytes(
         request,
         key,
@@ -186,17 +285,19 @@ pub(super) fn decode_marker(
         marker.phase,
         marker.credential_envelope_digest.as_ref(),
     )
-    .map_err(|_| {
-        credential_codec_observe("host.credential codec marker malformed retained");
-    })?;
-    let expected: MarkerRecord = serde_json::from_slice(&expected).map_err(|_| {
-        credential_codec_observe("host.credential codec marker malformed retained");
-    })?;
-    if !constant_time_handle_equal(&marker.mac, &expected.mac)
-        || marker.marker != marker_identity(identity)
-        || marker.version != MARKER_VERSION
-    {
-        credential_codec_observe("host.credential codec marker malformed retained");
+    .map_err(|_| credential_codec_observe(CodecRejectReason::MarkerExpectedMac))?;
+    let expected: MarkerRecord = serde_json::from_slice(&expected)
+        .map_err(|_| credential_codec_observe(CodecRejectReason::MarkerRecordShape))?;
+    if !constant_time_handle_equal(&marker.mac, &expected.mac) {
+        credential_codec_observe(CodecRejectReason::MarkerMacMismatch);
+        return Err(());
+    }
+    if marker.marker != marker_identity(identity) {
+        credential_codec_observe(CodecRejectReason::MarkerProtectedObjectMismatch);
+        return Err(());
+    }
+    if marker.version != MARKER_VERSION {
+        credential_codec_observe(CodecRejectReason::MarkerWireVersionMismatch);
         return Err(());
     }
     Ok(marker)
@@ -265,21 +366,24 @@ pub(super) fn decode_envelope(
     identity: &InstallerRootObjectSnapshot,
     bytes: &[u8],
 ) -> Result<(), ()> {
-    let envelope: CredentialEnvelope = serde_json::from_slice(bytes).map_err(|_| {
-        credential_codec_observe("host.credential codec envelope malformed retained");
-    })?;
+    // F-LOG-HOST-5 (#980): the envelope path collapses to `malformed` too;
+    // each rejection is projected by the branch that actually failed.
+    let envelope: CredentialEnvelope = serde_json::from_slice(bytes)
+        .map_err(|_| credential_codec_observe(CodecRejectReason::EnvelopeRecordShape))?;
     let expected = envelope_bytes(request, key, host_owner_epoch, identity, &envelope.secret)
-        .map_err(|_| {
-            credential_codec_observe("host.credential codec envelope malformed retained");
-        })?;
-    let expected: CredentialEnvelope = serde_json::from_slice(&expected).map_err(|_| {
-        credential_codec_observe("host.credential codec envelope malformed retained");
-    })?;
-    if !constant_time_handle_equal(&envelope.mac, &expected.mac)
-        || envelope.marker != marker_identity(identity)
-        || envelope.version != ENVELOPE_VERSION
-    {
-        credential_codec_observe("host.credential codec envelope malformed retained");
+        .map_err(|_| credential_codec_observe(CodecRejectReason::EnvelopeExpectedMac))?;
+    let expected: CredentialEnvelope = serde_json::from_slice(&expected)
+        .map_err(|_| credential_codec_observe(CodecRejectReason::EnvelopeRecordShape))?;
+    if !constant_time_handle_equal(&envelope.mac, &expected.mac) {
+        credential_codec_observe(CodecRejectReason::EnvelopeMacMismatch);
+        return Err(());
+    }
+    if envelope.marker != marker_identity(identity) {
+        credential_codec_observe(CodecRejectReason::EnvelopeProtectedObjectMismatch);
+        return Err(());
+    }
+    if envelope.version != ENVELOPE_VERSION {
+        credential_codec_observe(CodecRejectReason::EnvelopeWireVersionMismatch);
         return Err(());
     }
     Ok(())
