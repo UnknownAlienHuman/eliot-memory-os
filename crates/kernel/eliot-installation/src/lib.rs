@@ -162,7 +162,8 @@ pub use approved_generation_registry::{
     AgentBridgePreparedBinding, AgentBridgeSecurityContour, AgentBridgeStagePrepared,
     ApprovedGeneration, ApprovedGenerationRegistry, CommittedCutoverActivation,
     HostPhaseBPreparedMaterialization, PendingActivation, PendingActivationState,
-    PhaseBDigestState, PhaseBLiveBinding, phase_b_digest_state, phase_b_scm_selector,
+    PhaseBDigestState, PhaseBLiveBinding, UserBrokerPreparedBinding, phase_b_digest_state,
+    phase_b_scm_selector,
 };
 use approved_generation_registry::{
     ActiveVerifiedReceiptBinding, PendingActivationAbortReceipt, PendingActivationTerminal,

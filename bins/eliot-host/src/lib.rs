@@ -1641,7 +1641,7 @@ use eliot_installation::{
     InstallerServiceRegistrationApproval, InstallerServiceRole, LOCAL_SERVICE_SID,
     PHASE_B_PENDING_MARKER, PendingActivationState, PhaseBLiveBinding,
     ProvisionedSupervisionAuthority, RedbInstallationRegistry, RuntimeLaunchDescriptor,
-    StoreCredentialProvider, StoreCredentialScope,
+    StoreCredentialProvider, StoreCredentialScope, UserBrokerPreparedBinding,
     phase_b_credential_receipt_digest as installation_phase_b_credential_receipt_digest,
     phase_b_host_state_root_digest as installation_phase_b_host_state_root_digest,
     phase_b_scm_selector, phase_b_static_template_for_candidate,
@@ -5662,6 +5662,9 @@ pub struct HostPhaseBMaterialization {
     agent_bridge: Option<AgentBridgePreparedBinding>,
     /// Final provider proof, populated only after `FinalizePhaseB` CAS.
     agent_bridge_final: Option<AgentBridgePhaseBBinding>,
+    /// Protected User Broker front-door record pair published and read back for
+    /// this contour. Never synthesized from a manifest or runtime descriptor.
+    user_broker: Option<UserBrokerPreparedBinding>,
     file_identities: [FileIdentity; 4],
     launch: RuntimeLaunchDescriptor,
 }
@@ -5748,6 +5751,13 @@ impl HostPhaseBMaterialization {
     #[must_use]
     pub const fn final_agent_bridge(&self) -> Option<&AgentBridgePhaseBBinding> {
         self.agent_bridge_final.as_ref()
+    }
+
+    /// Returns the published User Broker front-door record pair, when this
+    /// Phase-B materialization published one.
+    #[must_use]
+    pub const fn user_broker(&self) -> Option<&UserBrokerPreparedBinding> {
+        self.user_broker.as_ref()
     }
 }
 
