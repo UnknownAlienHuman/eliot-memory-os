@@ -18,6 +18,16 @@
 //!   [`RetainedHandoffCheckpoint::validate`](eliot_agent_contracts::RetainedHandoffCheckpoint::validate),
 //!   which re-runs the checkpoint-to-link binding (including the continuity
 //!   attempt-identity rule) against the original digests;
+//! - the payload must also be bound to the controlled-boundary capture the
+//!   resume owner names through
+//!   [`HandoffRecoveryInputs::ledger`](eliot_agent_contracts::HandoffRecoveryInputs),
+//!   which
+//!   [`recover_handoff`](eliot_agent_contracts::recover_handoff) enforces with
+//!   the existing
+//!   [`HandoffCheckpoint::validate_capture_binding`](eliot_agent_contracts::HandoffCheckpoint::validate_capture_binding):
+//!   the named boundary must have registered a capture of exactly this payload
+//!   and that capture must hold a durable readback, so a checkpoint that no
+//!   boundary ever captured cannot be resumed on a commit permit alone;
 //! - the durable capture is corroborated against the live owner event stream:
 //!   the exact owner-digest text committed at capture must read back as a
 //!   `Checkpointed` event, otherwise the resume is refused instead of running

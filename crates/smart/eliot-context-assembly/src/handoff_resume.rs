@@ -24,6 +24,10 @@
 //!   and intent. A stale request naming another target is refused before any
 //!   dispatch or launch, so it can never launch another worker; a repeated
 //!   request for the same target intent reconciles to the recorded stage.
+//! - the run additionally requires the payload to be bound to the
+//!   controlled-boundary capture named by `inputs.ledger` /`inputs.boundary`.
+//!   A commit permit alone is not a capture: the boundary ledger is what
+//!   proves a real boundary captured this exact payload and read it back.
 //! - Only an admitted executable outcome is bound: the bound link is cited
 //!   on the target attempt record through the finisher, and the launch owner
 //!   may launch the worker. A `DiagnosticOnly` outcome — from the gate or

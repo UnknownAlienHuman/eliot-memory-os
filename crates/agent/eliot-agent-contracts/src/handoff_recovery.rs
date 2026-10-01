@@ -57,11 +57,11 @@ use thiserror::Error;
 
 use crate::{
     AgentAttempt, AgentAttemptId, ContractError, HandoffAttemptIdentity, HandoffCaptureAcceptance,
-    HandoffCaptureOperation, HandoffCausalLink, HandoffCheckpointError, HandoffCheckpointId,
-    HandoffContinuity, HandoffEffectDisposition, HandoffEffectRecord,
-    HandoffProviderCompactionCapability, HandoffProviderGap, HandoffResumeIntent,
-    HandoffResumeRevalidation, HandoffResumeStatus, HandoffSourceGenerations, PublicReference,
-    RetainedHandoffCheckpoint, TaskControllerLease, validate_text,
+    HandoffCaptureBoundary, HandoffCaptureLedger, HandoffCaptureOperation, HandoffCausalLink,
+    HandoffCheckpointError, HandoffCheckpointId, HandoffContinuity, HandoffEffectDisposition,
+    HandoffEffectRecord, HandoffProviderCompactionCapability, HandoffProviderGap,
+    HandoffResumeIntent, HandoffResumeRevalidation, HandoffResumeStatus, HandoffSourceGenerations,
+    PublicReference, RetainedHandoffCheckpoint, TaskControllerLease, validate_text,
 };
 
 /// Failure of a recovery-handoff runtime step.
@@ -1092,6 +1092,22 @@ pub struct HandoffRecoveryInputs<'a> {
     pub recipe_ref: &'a PublicReference,
     /// Incoming resume request, reconciled against the bound intent.
     pub resume_request: &'a HandoffResumeIntent,
+    /// Controlled-boundary capture ledger the payload must be registered in.
+    ///
+    /// The registry above is keyed by checkpoint identity and answers "was this
+    /// checkpoint committed". This ledger is keyed by controlled boundary and
+    /// source attempt and answers the different question "did a real boundary
+    /// capture exactly this payload, and does the store hold it back". The
+    /// resume owner reads both, because the registry alone cannot tell a
+    /// boundary capture from a hand-assembled payload.
+    pub ledger: &'a HandoffCaptureLedger,
+    /// The controlled boundary this resume is admitted under.
+    ///
+    /// Named by the resume owner from where the attempt actually resumed; it
+    /// selects the ledger arm and is never inferred from the payload. A
+    /// boundary that never registered a capture for this source attempt is
+    /// refused with [`HandoffCheckpointError::CaptureNotRegistered`].
+    pub boundary: HandoffCaptureBoundary,
 }
 
 /// Outcome of one recovery-handoff run.
@@ -1183,6 +1199,22 @@ pub fn recover_handoff(
         .require_compaction_permit(&retained.checkpoint.checkpoint_id)?;
     advance_floor(intent, HandoffResumeStatus::CompactionObserved)?;
     advance_floor(intent, HandoffResumeStatus::RevalidationPending)?;
+    // The capture permit above answers "was this checkpoint committed". It is
+    // satisfied by a checkpoint-identity registration alone, so it cannot
+    // distinguish a boundary capture from a hand-assembled payload. The ledger
+    // arm below is what makes that distinction: the boundary must have
+    // registered a capture of exactly this payload, that capture must hold a
+    // durable readback of the stored bytes, and the payload must bind to its
+    // own retained link. This runs before the gate so a payload no boundary
+    // ever captured cannot reach authority, dispatch, or binding.
+    retained
+        .checkpoint
+        .validate_capture_binding(
+            inputs.ledger,
+            inputs.boundary,
+            &retained.link,
+            &retained.attempt_identity,
+        )?;
     let admission = HandoffResumeGate::admit(inputs.evidence, inputs.observations, intent)?;
     let rebuild_required = match &admission {
         HandoffResumeAdmission::Executable {

@@ -16,8 +16,14 @@
 //!   artifact that is merely named by a predictable path is not owned by it.
 //!
 //! The module performs no IO and reads no store. It is the admission rule the
-//! Governor/Task Controller capture path and the Store readback path both
-//! answer to, and the resume path refuses without it.
+//! resume path refuses without: [`recover_handoff`](crate::recover_handoff)
+//! requires every retained payload to be bound to a registered boundary
+//! capture through
+//! [`HandoffCheckpoint::validate_capture_binding`](crate::HandoffCheckpoint::validate_capture_binding),
+//! so a payload no boundary registered cannot be resumed on a commit permit
+//! alone. On current main no boundary or Store path constructs a capture yet —
+//! the producer is upstream owner work — but the resume-side refusal is
+//! enforced here and now.
 
 #![forbid(unsafe_code)]
 

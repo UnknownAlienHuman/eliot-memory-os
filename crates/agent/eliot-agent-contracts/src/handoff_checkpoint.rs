@@ -402,6 +402,22 @@ impl HandoffEffectRecord {
 /// its own resource dependency; the fence's `resource_generation` is a separate
 /// dependency and is never copied into these fields. A generation is
 /// non-zero by construction, so a missing generation cannot be spelled as `0`.
+///
+/// STITCH — no producer exists for these four members. On current main
+/// `git grep -in world_generation` over all file types returns zero hits, and
+/// `git grep -n "HandoffSourceGenerations {"` finds only this struct and its
+/// own readers, so nothing in the repository observes or supplies a
+/// `world` generation. This is upstream owner work and is deliberately not
+/// faked here: minting a generation to make a capture reachable would forge
+/// the exact dependency signal the resume fence compares against.
+/// Owners, by member: `scope` — the scope writer / `DurableWorkRecord.scope_id`
+/// owner (`crates/agent/eliot-swarm/src/lib.rs`); `route` — the route catalogue
+/// owner that already grants `RouteGrant.generation`;
+/// `module` and `world` — the module and world-model owners, which have no
+/// generation counter today and must add one before any boundary capture can be
+/// sourced. Until every member has an owner-supplied producer, no
+/// `HandoffCheckpoint` can be produced honestly, and the resume path refuses
+/// rather than guessing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HandoffSourceGenerations {

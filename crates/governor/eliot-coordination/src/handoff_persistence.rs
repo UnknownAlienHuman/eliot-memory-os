@@ -15,9 +15,16 @@
 //!
 //! Actual-caller coverage on current main:
 //!
-//! - the Governor/Task Controller capture producer calls
-//!   [`capture_handoff_checkpoint`]; its operation is the registered ELIOT-
-//!   controlled capture, and [`HandoffCaptureRegistry`](eliot_agent_contracts::HandoffCaptureRegistry)
+//! - no caller invokes [`capture_handoff_checkpoint`] on current main. It is
+//!   the canonical join, not a description of a call that happens: the four
+//!   registered controlled boundaries
+//!   ([`HandoffCaptureBoundary::CONTROLLED_BOUNDARIES`](eliot_agent_contracts::HandoffCaptureBoundary))
+//!   do not reach it, and no owner holds the I12.17 source values it would
+//!   have to bind. Producing the payload at a real boundary is upstream work
+//!   owned by the task/scope/world/module/policy/route owners; this module
+//!   stays the one place that persists a payload once one exists, and its
+//!   operation is the registered ELIOT-controlled capture, so
+//!   [`HandoffCaptureRegistry`](eliot_agent_contracts::HandoffCaptureRegistry)
 //!   refuses the same checkpoint under any other operation;
 //! - provider-internal compaction has no controllable pre-hook on main (the
 //!   claude/codex/opencode adapters launch sidecars and only measure
