@@ -312,12 +312,20 @@ fn console_process_exit_code() -> i32 {
 // B13 terminal exit codes (`console_process_exit_code`): unchanged.
 // B14 start-failure capsule/stderr/SCM status: untouched receipt owners.
 
-/// Reads the admitted current-user supervisor switch from the process
-/// arguments, leaving every other launch argument untouched.
+/// Reads the admitted profile supervisor switch from the process arguments,
+/// leaving every other launch argument untouched.
 ///
-/// Only the one admitted `UserMode` supervisor is supported; an unrecognised
-/// value under that switch is refused rather than silently ignored, because the
-/// switch selects the supervision path the process will commit to.
+/// The single admitted switch value vocabulary is the I3.1 profile table, and
+/// the value names the supervision the process commits to: `user_mode` is the
+/// current-user launcher/Task Scheduler supervision and `portable_dev` is the
+/// explicitly disposable repository-local supervision. Both are supervised in
+/// the current user's own context and are composed by the one supervisor below,
+/// so admitting the second value adds no second loop and no second state
+/// machine. `system_service` is deliberately not a value here: its supervision
+/// is the SCM service path this switch does not own. Any other value under the
+/// switch — including `system_service` — is refused rather than silently
+/// ignored, because the switch selects the supervision path the process will
+/// commit to.
 #[cfg(windows)]
 fn profile_supervisor_selection_from_args(
     process_args: &[std::ffi::OsString],
@@ -326,10 +334,11 @@ fn profile_supervisor_selection_from_args(
         Some(USER_MODE_SUPERVISOR_SWITCH) => {
             match process_args.get(1).and_then(|argument| argument.to_str()) {
                 Some("user_mode") => Some(InstallationProfile::UserMode),
+                Some("portable_dev") => Some(InstallationProfile::PortableDev),
                 _ => {
                     let _ = writeln!(
                         io::stderr().lock(),
-                        "eliot-host: only the admitted UserMode supervisor is supported"
+                        "eliot-host: only the admitted user_mode and portable_dev profile supervisors are supported"
                     );
                     std::process::exit(HOST_CONSOLE_PROCESS_EXIT_CODE);
                 }
@@ -379,7 +388,7 @@ fn main() {
         if let Err(error) = result {
             let _ = writeln!(
                 io::stderr().lock(),
-                "eliot-host: UserMode supervisor failed: {error}"
+                "eliot-host: {profile:?} profile supervisor failed: {error}"
             );
             std::process::exit(HOST_CONSOLE_PROCESS_EXIT_CODE);
         }
@@ -656,6 +665,16 @@ fn run_console() -> (bool, Option<HostLaunchOptions>) {
     (drained, Some(launch_options))
 }
 
+/// Runs the one admitted current-user profile supervisor.
+///
+/// The body below is profile-generic in substance and stays that way: the
+/// selected profile only chooses which lease family
+/// [`HostComposition::open_for_profile`] binds and which I3.1 roots it
+/// retains, while admission, readiness, the contour tick, runtime control and
+/// the idle-drain supervisor are one implementation. Both admitted non-service
+/// profiles (`user_mode` current-user supervision, `portable_dev` repository-
+/// local disposable supervision) share it, so admitting the second profile
+/// forks nothing.
 #[cfg(windows)]
 fn run_profile_supervisor(
     arguments: Vec<OsString>,
@@ -663,9 +682,13 @@ fn run_profile_supervisor(
 ) -> Result<(), HostError> {
     use std::sync::atomic::Ordering;
 
-    if profile != InstallationProfile::UserMode {
+    // I3.1 gives `system_service` SCM demand-start supervision, which the
+    // existing SCM service path owns. This switch composes only the two
+    // current-user profiles, so the privileged profile is refused here rather
+    // than supervised without its service identity.
+    if profile == InstallationProfile::SystemService {
         return Err(HostError::ProcessContour(
-            "current-user supervisor handoff is supported only for UserMode".to_owned(),
+            "profile supervisor handoff composes the current-user and repository-local profiles; system_service supervision is SCM-owned".to_owned(),
         ));
     }
     STOP_REQUESTED.store(false, Ordering::Release);
@@ -717,10 +740,13 @@ fn run_profile_supervisor(
         }
     }
 
-    // UserMode never enters the SystemService credential-control endpoint,
-    // which requires Administrators and opens ProgramData. `open_for_profile`
-    // has bound this launch descriptor to the approved UserMode generation
-    // and retained the current user's descriptor-bound roots before startup.
+    // Neither admitted profile enters the SystemService credential-control
+    // endpoint, which requires Administrators and opens ProgramData.
+    // `open_for_profile` has bound this launch descriptor to the approved
+    // generation of the selected profile and retained that profile's own
+    // descriptor-bound roots — the current user's `%LocalAppData%` contour for
+    // `user_mode`, the retained repository contour for `portable_dev` — before
+    // startup.
     let runtime_control = match host.runtime_control() {
         Ok(control) => control,
         Err(error) => {
