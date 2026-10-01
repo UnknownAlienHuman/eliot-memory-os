@@ -300,6 +300,7 @@ fn activation_canonical_snapshot(fence: &StateFence) -> CanonicalAdmissionSnapsh
     CanonicalAdmissionSnapshot {
         state_fence: fence.clone(),
         owner_revision: 1,
+        work_admission_revision: None,
         current_plan: Some(CanonicalPlanBinding {
             plan_id: "plan:current".to_owned(),
             plan_revision: "1".to_owned(),

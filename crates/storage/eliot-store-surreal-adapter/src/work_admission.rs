@@ -10,9 +10,9 @@ use std::fmt::Write as _;
 
 use eliot_store_api::{
     NamedMutationOperation, PreparedTransition, RecoveryRecord, RecoveryRecordKey,
-    WORK_ADMISSION_RECORD_NAMESPACE, WORK_ADMISSION_SCHEMA_V1, WorkAdmissionRecord, StoreError,
-    canonical_json_bytes, decode_work_admission_record, sha256_hex,
-    validate_work_admission_transition,
+    WORK_ADMISSION_RECORD_NAMESPACE, WORK_ADMISSION_SCHEMA_V1, WorkAdmissionRecord,
+    StoreError, canonical_json_bytes, decode_work_admission_record, sha256_hex,
+    validate_work_admission_owner_cas, validate_work_admission_transition,
 };
 use serde_json::{Map, Value, json};
 
@@ -48,7 +48,60 @@ pub(crate) fn work_admission_statements(
             reason: "must match the prepared transition task",
         }));
     }
-    record_write(&record)
+    let (mut sql, mut bindings) = record_write(&record)?;
+    validate_work_admission_owner_cas(&record, &command.parameters)
+        .map_err(AdapterError::Store)?;
+    let expected_revision = command.parameters["expected_canonical_revision"]
+        .as_str()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or(AdapterError::Store(StoreError::InvalidField {
+            field: "work_admission.expected_canonical_revision",
+            reason: "must be the original canonical-owner predecessor",
+        }))?;
+    let snapshot_json = command.parameters["canonical_owner_snapshot_json"]
+        .as_str()
+        .ok_or(AdapterError::Store(StoreError::InvalidField {
+            field: "work_admission.canonical_owner_snapshot_json",
+            reason: "must be the proposed canonical-owner snapshot",
+        }))?;
+    let canonical_key = RecoveryRecordKey::new("owner", "canonical")
+        .map_err(AdapterError::Store)?;
+    let canonical_id = crate::apply::surreal_blackboard::recovery_owner_id(&canonical_key)?;
+    let canonical_payload = snapshot_json.as_bytes();
+    let canonical_revision = expected_revision.checked_add(1).ok_or(
+        AdapterError::Store(StoreError::InvalidField {
+            field: "work_admission.expected_canonical_revision",
+            reason: "canonical owner revision overflow",
+        }),
+    )?;
+    let canonical_record = RecoveryRecord {
+        namespace: canonical_key.namespace,
+        key: canonical_key.key,
+        state_fence: record.state_fence.clone(),
+        revision: canonical_revision,
+        schema: eliot_store_api::OWNER_SNAPSHOT_SCHEMA.to_owned(),
+        value_digest: sha256_hex(canonical_payload),
+        payload: canonical_payload.to_vec(),
+    };
+    sql.push_str(schema::TX_CANONICAL_OWNER);
+    bindings.insert(
+        "canonical_owner_table".to_owned(),
+        json!(schema::table::RECOVERY_OWNER),
+    );
+    bindings.insert("canonical_owner_id".to_owned(), json!(canonical_id));
+    bindings.insert(
+        "canonical_expected_state_fence".to_owned(),
+        json!(&record.state_fence),
+    );
+    bindings.insert(
+        "canonical_expected_revision".to_owned(),
+        json!(expected_revision),
+    );
+    bindings.insert(
+        "canonical_owner_record".to_owned(),
+        json!(canonical_record),
+    );
+    Ok((sql, bindings))
 }
 
 fn record_write(

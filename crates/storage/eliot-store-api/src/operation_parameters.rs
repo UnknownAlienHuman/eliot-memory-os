@@ -191,6 +191,17 @@ pub enum ParameterShape {
     /// Closed Governor-owned work ADMITTED record with its reservation and
     /// exact launch-outbox commitment (#1678, I14.6/I10.15).
     WorkAdmission,
+    /// Decimal predecessor for the existing `owner/canonical` CAS used by
+    /// the same `AdmitWork` operation.
+    WorkAdmissionCanonicalRevision,
+    /// Canonical JSON image of the existing owner/canonical snapshot that
+    /// carries the admitted semantic revision in the same transaction.
+    WorkAdmissionCanonicalSnapshot,
+    /// Closed measured-usage attribution row emitted by the current
+    /// Governor BudgetLedger owner.
+    BudgetConsumption,
+    /// Canonical JSON image of the next existing owner/budget snapshot.
+    BudgetOwnerSnapshot,
 }
 
 impl ParameterShape {
@@ -213,6 +224,10 @@ impl ParameterShape {
             Self::ProblemOwnerState => crate::PROBLEM_OWNER_STATE_SCHEMA_V1,
             Self::TaskContractAcceptanceRecord => crate::TASK_CONTRACT_ACCEPTANCE_RECORD_SCHEMA_V1,
             Self::WorkAdmission => crate::WORK_ADMISSION_SCHEMA_V1,
+            Self::WorkAdmissionCanonicalRevision => "eliot.storage.canonical-owner-revision.v1",
+            Self::WorkAdmissionCanonicalSnapshot => "eliot.storage.canonical-owner-snapshot.v1",
+            Self::BudgetConsumption => crate::BUDGET_CONSUMPTION_SCHEMA_V1,
+            Self::BudgetOwnerSnapshot => "eliot.storage.budget-owner-snapshot.v1",
         }
     }
 }
@@ -1247,11 +1262,45 @@ static RECORD_TASK_CONTRACT_ACCEPTANCE_SET_PARAMETERS: [ParameterDeclaration; 1]
         shape: ParameterShape::TaskContractAcceptanceRecord,
         required: true,
     }];
-static ADMIT_WORK_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
-    name: "record",
-    shape: ParameterShape::WorkAdmission,
-    required: true,
-}];
+static ADMIT_WORK_PARAMETERS: [ParameterDeclaration; 3] = [
+    ParameterDeclaration {
+        name: "record",
+        shape: ParameterShape::WorkAdmission,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "expected_canonical_revision",
+        shape: ParameterShape::WorkAdmissionCanonicalRevision,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "canonical_owner_snapshot_json",
+        shape: ParameterShape::WorkAdmissionCanonicalSnapshot,
+        required: true,
+    },
+];
+static COMMIT_BUDGET_CONSUMPTION_PARAMETERS: [ParameterDeclaration; 4] = [
+    ParameterDeclaration {
+        name: "consumption",
+        shape: ParameterShape::BudgetConsumption,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "expected_budget_owner_revision",
+        shape: ParameterShape::WorkAdmissionCanonicalRevision,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "expected_budget_owner_digest",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "budget_owner_snapshot_json",
+        shape: ParameterShape::BudgetOwnerSnapshot,
+        required: true,
+    },
+];
 /// Exact owner-acceptance selectors for `GetTaskContractAcceptanceSet`
 /// (issue #1741, I7.9).
 ///
@@ -1389,6 +1438,7 @@ pub const fn named_mutation_operation_name(operation: NamedMutationOperation) ->
         NamedMutationOperation::RecordFinishDecision => "RecordFinishDecision",
         NamedMutationOperation::RecordFinishEvidence => "RecordFinishEvidence",
         NamedMutationOperation::RecordModuleCatalogSnapshot => "RecordModuleCatalogSnapshot",
+        NamedMutationOperation::CommitBudgetConsumption => "CommitBudgetConsumption",
         NamedMutationOperation::AppendAuditEvent => "AppendAuditEvent",
         NamedMutationOperation::RecordAuthorityRevocation => "RecordAuthorityRevocation",
         NamedMutationOperation::ApplyErasure => "ApplyErasure",
@@ -1424,6 +1474,7 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
         b"RecordFinishDecision" => Some(NamedMutationOperation::RecordFinishDecision),
         b"RecordFinishEvidence" => Some(NamedMutationOperation::RecordFinishEvidence),
         b"RecordModuleCatalogSnapshot" => Some(NamedMutationOperation::RecordModuleCatalogSnapshot),
+        b"CommitBudgetConsumption" => Some(NamedMutationOperation::CommitBudgetConsumption),
         b"AppendAuditEvent" => Some(NamedMutationOperation::AppendAuditEvent),
         b"RecordAuthorityRevocation" => Some(NamedMutationOperation::RecordAuthorityRevocation),
         b"ApplyErasure" => Some(NamedMutationOperation::ApplyErasure),
@@ -1607,6 +1658,9 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::RecordModuleCatalogSnapshot => {
             &RECORD_MODULE_CATALOG_SNAPSHOT_PARAMETERS
         }
+        NamedMutationOperation::CommitBudgetConsumption => {
+            &COMMIT_BUDGET_CONSUMPTION_PARAMETERS
+        }
         NamedMutationOperation::UpdateTaskState => &UPDATE_TASK_STATE_PARAMETERS,
         NamedMutationOperation::ApplySwarmOwnerRevisions => &APPLY_SWARM_OWNER_REVISION_PARAMETERS,
         NamedMutationOperation::ApplyBlackboardItem => &APPLY_BLACKBOARD_ITEM_PARAMETERS,
@@ -1722,7 +1776,10 @@ pub fn verify_declaration_holds_no_payload_encoding(
         | ParameterShape::InstrumentRegistrySnapshot
         | ParameterShape::ProblemOwnerState
         | ParameterShape::TaskContractAcceptanceRecord
-        | ParameterShape::WorkAdmission => true,
+        | ParameterShape::WorkAdmission
+        | ParameterShape::WorkAdmissionCanonicalSnapshot => true,
+        ParameterShape::BudgetConsumption | ParameterShape::BudgetOwnerSnapshot => true,
+        ParameterShape::WorkAdmissionCanonicalRevision => false,
     };
     if structured && CONTROL_FIELD_DENYLIST.contains(&declaration.name) {
         return Err(StoreError::InvalidField {
@@ -1917,6 +1974,67 @@ fn check_declared_shape(
             let record: crate::WorkAdmissionRecord = serde_json::from_value(value.clone())
                 .map_err(|error| StoreError::Serialization(error.to_string()))?;
             record.validate()
+        }
+        ParameterShape::WorkAdmissionCanonicalRevision => {
+            let revision = value.as_str().ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "expected_canonical_revision must be a decimal string",
+            })?;
+            let parsed = revision.parse::<u64>().map_err(|_| StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "expected_canonical_revision must be a canonical decimal revision",
+            })?;
+            if parsed.to_string() != revision {
+                return Err(StoreError::InvalidField {
+                    field: "operation.parameter",
+                    reason: "expected_canonical_revision must be a canonical decimal revision",
+                });
+            }
+            Ok(())
+        }
+        ParameterShape::WorkAdmissionCanonicalSnapshot => {
+            let snapshot = value.as_str().ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "canonical_owner_snapshot_json must be a JSON string",
+            })?;
+            if snapshot.is_empty() || snapshot.len() > crate::MAX_RECOVERY_RECORD_BYTES {
+                return Err(StoreError::InvalidField {
+                    field: "operation.parameter",
+                    reason: "canonical_owner_snapshot_json must be non-empty and bounded",
+                });
+            }
+            Ok(())
+        }
+        ParameterShape::BudgetConsumption => {
+            let record: crate::BudgetConsumptionRecord = serde_json::from_value(value.clone())
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            record.validate()
+        }
+        ParameterShape::BudgetOwnerSnapshot => {
+            let snapshot_json = value.as_str().ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "budget_owner_snapshot_json must be a canonical JSON string",
+            })?;
+            if snapshot_json.is_empty() || snapshot_json.len() > crate::MAX_RECOVERY_RECORD_BYTES {
+                return Err(StoreError::InvalidField {
+                    field: "operation.parameter",
+                    reason: "budget owner snapshot must be non-empty and bounded",
+                });
+            }
+            let snapshot: Value = serde_json::from_str(snapshot_json)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            let bytes = canonical_json_bytes(&snapshot)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            if String::from_utf8(bytes).ok().as_deref() != Some(snapshot_json)
+                || snapshot.get("state_fence").is_none()
+                || snapshot.get("revision").and_then(Value::as_u64).is_none()
+            {
+                return Err(StoreError::InvalidField {
+                    field: "operation.parameter",
+                    reason: "budget owner snapshot must be canonical and retain its fence/revision",
+                });
+            }
+            Ok(())
         }
     }
 }

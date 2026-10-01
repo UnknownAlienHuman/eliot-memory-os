@@ -43,6 +43,7 @@ use thiserror::Error;
 mod architecture_self_model;
 mod backup_io;
 mod blackboard;
+pub mod budget_consumption;
 pub mod canonical_event;
 mod dreamer_job;
 pub mod epistemic_revision;
@@ -93,6 +94,13 @@ pub use blackboard::{
     BLACKBOARD_ITEM_MUTATION_NAME, BLACKBOARD_ITEM_READ_NAME, BLACKBOARD_ITEM_SCHEMA_V1,
     BlackboardItemRecord, BlackboardItemRevision, blackboard_item_read_request,
     blackboard_item_request, decode_blackboard_item,
+};
+
+pub use budget_consumption::{
+    BUDGET_CONSUMPTION_RECORD_NAMESPACE, BUDGET_CONSUMPTION_SCHEMA_V1,
+    BudgetConsumptionRecord, BudgetConsumptionSubmission,
+    ExpectedBudgetConsumptionCommitment, commit_budget_consumption_operation,
+    decode_budget_consumption_record, validate_budget_consumption_transition,
 };
 
 pub use mailbox::{
@@ -252,12 +260,17 @@ pub use task_contract_acceptance::{
     validate_acceptance_record_identity,
 };
 pub use work_admission::{
-    ExpectedWorkAdmissionCommitment, WORK_ADMISSION_SCHEMA_V1, WorkAdmissionBudget,
+    CANONICAL_ADMISSION_OWNER_KEY, ExpectedWorkAdmissionCommitment, WORK_ADMISSION_SCHEMA_V1,
+    WORK_ADMISSION_RECORD_NAMESPACE, WorkAdmissionBudget, WorkAdmissionBudgetAttribution,
     WorkAdmissionBudgetDimension, WorkAdmissionClaimRef, WorkAdmissionClaims,
-    WorkAdmissionDependency, WorkAdmissionRecord, WorkAdmissionSemanticRevision,
-    WorkAdmissionState, WorkAdmissionSubmission, admit_work_operation, decode_work_admission_record,
-    validate_admit_work_command, validate_work_admission_transition,
-    work_admission_value_digest, WORK_ADMISSION_RECORD_NAMESPACE,
+    WorkAdmissionDependency, WorkAdmissionOwnerAttribution, WorkAdmissionOwnerReadback,
+    WorkAdmissionOwnerReference, WorkAdmissionOwnerRole, WorkAdmissionRecord,
+    WorkAdmissionModelCatalogEvidence, WorkAdmissionModelCatalogueImage,
+    WorkAdmissionProviderAccountObservation, WorkAdmissionProviderAccountUnavailableReason,
+    WorkAdmissionSemanticRevision, WorkAdmissionState, WorkAdmissionSubmission,
+    WorkAdmissionSwarmBudgetAttribution, admit_work_operation, decode_work_admission_record,
+    validate_admit_work_command, validate_work_admission_owner_cas,
+    validate_work_admission_transition, work_admission_value_digest,
 };
 
 pub use wire::{
@@ -4070,6 +4083,9 @@ pub enum NamedMutationOperation {
     /// opaque bytes and only arbitrates the fixed `owner/module_registry`
     /// revision. Admission currentness remains a Governor readback decision.
     RecordModuleCatalogSnapshot,
+    /// Commits exact provider/tool-measured usage into the existing Budget
+    /// owner snapshot and records its work/admission attribution atomically.
+    CommitBudgetConsumption,
     AppendAuditEvent,
     /// Durable authority-revocation record (issue #686). Known-but-
     /// unsupported until a store-owned slice activates its catalogue row
@@ -4226,6 +4242,7 @@ impl NamedMutationOperation {
             | Self::RecordFinishDecision
             | Self::RecordFinishEvidence
             | Self::RecordModuleCatalogSnapshot
+            | Self::CommitBudgetConsumption
             | Self::RecordAuthorityRevocation
             | Self::ApplyProblemOwnerState => TransitionClass::RecoverySchema,
             Self::ApplyErasure => TransitionClass::Erasure,

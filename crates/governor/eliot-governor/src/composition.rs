@@ -54,7 +54,7 @@ use eliot_authority::{
     RevocationOrigin, RevocationTransitionDisposition, RevocationTransitionRequest,
     RootTransitionActivationReceipt, RootTransitionActivationRequest,
 };
-use eliot_budget::{BudgetLedger, BudgetLedgerRecoverySnapshot};
+use eliot_budget::{BudgetLedger, BudgetLedgerRecoverySnapshot, MeasuredUsage, ReservationState};
 use eliot_canonical::{
     AcceptanceCoverage, CanonicalError, CanonicalWriteEnvelope, FinishAttemptDraft,
     FinishDecisionOutcome, FinishEvidence,
@@ -109,9 +109,10 @@ use eliot_security_contracts::{PrivacyClass, RevocationReason};
 use eliot_session::{SessionLifecycleOwner, SessionLifecycleSnapshot, SessionState};
 use eliot_skill::{SkillLifecycleView, SkillRegistry};
 use eliot_store_api::{
-    CanonicalReadClient, OrderingHeadExpectation, PreparedTransition, ProblemOwnerTransition,
-    RevisionHeadExpectation, ScopeRevisionView, StoreHealth, TaskContractAcceptanceSet,
-    WriteReceipt,
+    BudgetConsumptionRecord, CanonicalReadClient, OperationIdentity, OrderingHeadExpectation,
+    PreparedTransition, ProblemOwnerTransition, RevisionHeadExpectation, ScopeRevisionView,
+    StoreHealth, TaskContractAcceptanceSet, WorkAdmissionRecord, WorkAdmissionSemanticRevision,
+    WriteReceipt, CANONICAL_ADMISSION_OWNER_KEY,
 };
 use eliot_task::{TaskLifecycleOwner, TaskLifecycleSnapshot, TaskRecord, TaskState};
 use eliot_testd_core::{
@@ -3351,6 +3352,12 @@ fn validate_canonical_receipt_binding(
 pub struct CanonicalAdmissionSnapshot {
     pub state_fence: StateFence,
     pub owner_revision: u64,
+    /// Last semantic revision issued by this same canonical owner for work
+    /// admission. The owner revision is advanced atomically with the admitted
+    /// work row; this retained value is never derived from a task-plan revision
+    /// or a request digest.
+    #[serde(default)]
+    pub work_admission_revision: Option<WorkAdmissionSemanticRevision>,
     pub current_plan: Option<CanonicalPlanBinding>,
     /// Last terminal verifier execution fact admitted for this exact task,
     /// plan, artifact lineage, and fence.
@@ -3611,6 +3618,7 @@ impl CanonicalAdmissionSnapshot {
         let snapshot = Self {
             state_fence,
             owner_revision,
+            work_admission_revision: None,
             current_plan,
             verifier_execution_fact: None,
             finish_evidence: None,
@@ -3628,6 +3636,27 @@ impl CanonicalAdmissionSnapshot {
             return Err(CompositionError::Recovery(
                 "canonical owner revision is zero".to_owned(),
             ));
+        }
+        if let Some(revision) = &self.work_admission_revision {
+            let revision_number = revision.revision.parse::<u64>().map_err(|_| {
+                CompositionError::Recovery(
+                    "canonical work-admission revision is not a decimal owner revision".to_owned(),
+                )
+            })?;
+            let predecessor = revision_number.checked_sub(1).ok_or_else(|| {
+                CompositionError::Recovery(
+                    "canonical work-admission revision must be positive".to_owned(),
+                )
+            })?;
+            revision
+                .validate_owner_canonical(predecessor)
+                .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+            if revision_number > self.owner_revision {
+                return Err(CompositionError::Recovery(
+                    "canonical work-admission revision is foreign or newer than its owner snapshot"
+                        .to_owned(),
+                ));
+            }
         }
         if let Some(current_plan) = &self.current_plan {
             current_plan.validate()?;
@@ -3663,11 +3692,24 @@ impl CanonicalAdmissionSnapshot {
     }
 }
 
+/// Owner-issued revision proposal for one first-class work admission.
+///
+/// The exact predecessor, next typed revision, and full existing owner image
+/// travel together into the original `AdmitWork` transition.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq)]
+pub struct WorkAdmissionOwnerRevisionProposal {
+    pub predecessor_revision: u64,
+    pub semantic_revision: WorkAdmissionSemanticRevision,
+    pub snapshot: CanonicalAdmissionSnapshot,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CanonicalAdmissionSnapshotWire {
     state_fence: StateFence,
     owner_revision: u64,
+    #[serde(default)]
+    work_admission_revision: Option<WorkAdmissionSemanticRevision>,
     current_plan: Option<CanonicalPlanBinding>,
     #[serde(default)]
     verifier_execution_fact: Option<CanonicalVerifierExecutionFact>,
@@ -3684,6 +3726,7 @@ impl<'de> Deserialize<'de> for CanonicalAdmissionSnapshot {
         let snapshot = Self {
             state_fence: wire.state_fence,
             owner_revision: wire.owner_revision,
+            work_admission_revision: wire.work_admission_revision,
             current_plan: wire.current_plan,
             verifier_execution_fact: wire.verifier_execution_fact,
             finish_evidence: wire.finish_evidence,
@@ -3883,6 +3926,33 @@ impl CanonicalAdmissionOwner {
         self.snapshot.owner_revision
     }
 
+    /// Issues the next work-admission revision from this canonical owner's
+    /// actual CAS head and returns the exact proposed snapshot. The caller
+    /// keeps this proposal with the original operation identity and reuses it
+    /// unchanged on retries; a fresh attempt after capacity loss requests a
+    /// fresh proposal from a fresh owner read.
+    pub fn prepare_work_admission_revision(
+        &self,
+    ) -> Result<WorkAdmissionOwnerRevisionProposal, CompositionError> {
+        let predecessor_revision = self.snapshot.owner_revision;
+        let next_revision = predecessor_revision.checked_add(1).ok_or_else(|| {
+            CompositionError::Recovery("canonical owner revision overflow".to_owned())
+        })?;
+        let semantic_revision = WorkAdmissionSemanticRevision {
+            key: CANONICAL_ADMISSION_OWNER_KEY.to_owned(),
+            revision: next_revision.to_string(),
+        };
+        let mut snapshot = self.snapshot.clone();
+        snapshot.owner_revision = next_revision;
+        snapshot.work_admission_revision = Some(semantic_revision.clone());
+        snapshot.validate()?;
+        Ok(WorkAdmissionOwnerRevisionProposal {
+            predecessor_revision,
+            semantic_revision,
+            snapshot,
+        })
+    }
+
     /// Builds the next canonical owner image after a verifier has completed
     /// and its durable TestD row has been rehydrated. The fact is retained
     /// even when its execution/outcome is non-certifying; finish evaluation
@@ -3908,6 +3978,7 @@ impl CanonicalAdmissionOwner {
         let snapshot = CanonicalAdmissionSnapshot {
             state_fence: self.state_fence.clone(),
             owner_revision,
+            work_admission_revision: self.snapshot.work_admission_revision.clone(),
             current_plan: self.snapshot.current_plan.clone(),
             verifier_execution_fact: Some(fact),
             finish_evidence: self.snapshot.finish_evidence.clone(),
@@ -3997,6 +4068,7 @@ impl CanonicalAdmissionOwner {
         let snapshot = CanonicalAdmissionSnapshot {
             state_fence: self.state_fence.clone(),
             owner_revision,
+            work_admission_revision: self.snapshot.work_admission_revision.clone(),
             current_plan: Some(plan),
             verifier_execution_fact: self.snapshot.verifier_execution_fact.clone(),
             finish_evidence: self.snapshot.finish_evidence.clone(),
@@ -4026,6 +4098,7 @@ impl CanonicalAdmissionOwner {
         let snapshot = CanonicalAdmissionSnapshot {
             state_fence: self.state_fence.clone(),
             owner_revision,
+            work_admission_revision: self.snapshot.work_admission_revision.clone(),
             current_plan: self.snapshot.current_plan.clone(),
             verifier_execution_fact: self.snapshot.verifier_execution_fact.clone(),
             finish_evidence: Some(evidence),
@@ -4288,7 +4361,36 @@ impl PolicyOwner {
 pub struct BudgetOwner {
     state_fence: StateFence,
     revision: u64,
+    /// Digest of the exact current Kernel named-read payload. This retained
+    /// digest is the predecessor value used by the durable Budget CAS.
+    canonical_digest: String,
     ledger: Option<BudgetLedger>,
+}
+
+/// Governor-prepared terminal usage update. It carries the original owner
+/// record and next existing-ledger image through canonical persistence; no
+/// in-memory mutation becomes current until `accept_budget_consumption` sees
+/// the exact committed receipt and owner readback.
+#[derive(Clone, Debug)]
+pub struct PreparedBudgetConsumption {
+    pub record: BudgetConsumptionRecord,
+    pub budget_owner_snapshot_json: String,
+    previous_owner_revision: u64,
+    previous_owner_sha256: String,
+    next_owner_snapshot: BudgetOwnerSnapshot,
+    next_ledger: BudgetLedger,
+}
+
+/// Governor-issued result accounting receipt. Consumers receive it only after
+/// the exact Store transition and durable owner snapshot have been joined.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GovernorConsumptionReceipt {
+    pub schema: String,
+    pub record: BudgetConsumptionRecord,
+    pub budget_owner_snapshot_json: String,
+    pub budget_owner_snapshot_sha256: String,
+    pub write_receipt: WriteReceipt,
 }
 
 impl BudgetOwner {
@@ -4330,6 +4432,156 @@ impl BudgetOwner {
             state_fence: self.state_fence.clone(),
             revision: self.revision,
             state,
+        })
+    }
+
+    fn prepare_consumption(
+        &self,
+        admission: &WorkAdmissionRecord,
+        reservation_idempotency_key: &str,
+        usage: &MeasuredUsage,
+        canonical_identity: &OperationIdentity,
+    ) -> Result<PreparedBudgetConsumption, CompositionError> {
+        admission
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if self.state_fence != admission.state_fence || self.revision == 0 {
+            return Err(CompositionError::Recovery(
+                "budget consumption admission is bound to a stale owner fence".to_owned(),
+            ));
+        }
+        let current_ledger = self.ledger.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "budget owner is explicitly unconfigured; measured usage cannot be committed".to_owned(),
+            )
+        })?;
+        let current_snapshot = self.snapshot()?;
+        let current_bytes = canonical_json_bytes(&current_snapshot).map_err(|error| {
+            CompositionError::Recovery(format!("budget owner snapshot encoding failed: {error}"))
+        })?;
+        if sha256_hex(&current_bytes) != self.canonical_digest {
+            return Err(CompositionError::Recovery(
+                "retained Budget owner differs from its exact current named readback".to_owned(),
+            ));
+        }
+        let current_ledger_snapshot = current_ledger.snapshot().map_err(|error| {
+            CompositionError::Recovery(format!("budget ledger snapshot failed: {error:?}"))
+        })?;
+        let reservation = current_ledger_snapshot
+            .reservations
+            .iter()
+            .find(|item| item.idempotency_key == reservation_idempotency_key)
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "measured usage has no exact owner-issued Budget reservation".to_owned(),
+                )
+            })?;
+        if !matches!(
+            reservation.receipt.state,
+            ReservationState::Active | ReservationState::Reconciling
+        )
+            || reservation.receipt.operation.operation_id != usage.operation.operation_id
+            || reservation.receipt.authority.state_fence != admission.state_fence
+            || reservation.receipt.provider_tool.provider_ref
+                != admission.owner_attribution.budget_attribution.provider_ref
+            || reservation.receipt.provider_tool.tool_ref
+                != admission.owner_attribution.budget_attribution.tool_ref
+        {
+            return Err(CompositionError::Recovery(
+                "measured usage does not join the active exact admission reservation".to_owned(),
+            ));
+        }
+        let authority = reservation.receipt.authority.clone();
+        let mut next_ledger = current_ledger.clone();
+        let committed_receipt = match reservation.receipt.state {
+            ReservationState::Active => next_ledger.commit(
+                reservation_idempotency_key,
+                &authority,
+                usage,
+            ),
+            ReservationState::Reconciling => next_ledger.reconcile_usage(
+                reservation_idempotency_key,
+                &authority,
+                usage,
+            ),
+            ReservationState::StagedInactive | ReservationState::Released | ReservationState::Expired => {
+                return Err(CompositionError::Recovery(
+                    "Budget reservation is not active or reconciling for measured usage".to_owned(),
+                ));
+            }
+        }
+        .map_err(|error| CompositionError::Recovery(format!("BudgetLedger rejected measured usage: {error:?}")))?;
+        let revision = self.revision.checked_add(1).ok_or_else(|| {
+            CompositionError::Recovery("Budget owner revision overflow".to_owned())
+        })?;
+        let next_owner_snapshot = BudgetOwnerSnapshot {
+            schema: BUDGET_OWNER_SNAPSHOT_SCHEMA.to_owned(),
+            version: BUDGET_OWNER_SNAPSHOT_VERSION,
+            state_fence: self.state_fence.clone(),
+            revision,
+            state: BudgetOwnerState::Configured {
+                ledger: Box::new(next_ledger.snapshot().map_err(|error| {
+                    CompositionError::Recovery(format!("next budget ledger snapshot failed: {error:?}"))
+                })?),
+            },
+        };
+        let next_bytes = canonical_json_bytes(&next_owner_snapshot).map_err(|error| {
+            CompositionError::Recovery(format!("next Budget owner image encoding failed: {error}"))
+        })?;
+        let next_snapshot_json = String::from_utf8(next_bytes.clone()).map_err(|error| {
+            CompositionError::Recovery(format!("next Budget owner image is not UTF-8: {error}"))
+        })?;
+        let admission_bytes = canonical_json_bytes(admission).map_err(|error| {
+            CompositionError::Recovery(format!("work admission record encoding failed: {error}"))
+        })?;
+        let usage_bytes = canonical_json_bytes(usage).map_err(|error| {
+            CompositionError::Recovery(format!("measured usage encoding failed: {error}"))
+        })?;
+        let receipt_bytes = canonical_json_bytes(&committed_receipt).map_err(|error| {
+            CompositionError::Recovery(format!("Budget reservation receipt encoding failed: {error}"))
+        })?;
+        let record = BudgetConsumptionRecord {
+            schema: eliot_store_api::BUDGET_CONSUMPTION_SCHEMA_V1.to_owned(),
+            consumption_id: usage.operation.operation_id.to_string(),
+            state_fence: admission.state_fence.clone(),
+            session_id: admission.session_id.clone(),
+            task_id: admission.task_id.clone(),
+            work_id: admission.work_id.clone(),
+            work_scope_id: admission.scope_id.clone(),
+            attempt_id: admission.proposed_attempt_id.operation_id.to_string(),
+            admitted_operation_id: admission.admitted_operation_id.clone(),
+            provider_operation_id: usage.operation.operation_id.clone(),
+            admission_record_key: admission.record_key(),
+            admission_record_sha256: sha256_hex(&admission_bytes),
+            reservation_id: committed_receipt.reservation_id.clone(),
+            reservation_idempotency_key: reservation_idempotency_key.to_owned(),
+            provider_ref: committed_receipt.provider_tool.provider_ref.clone(),
+            tool_ref: committed_receipt.provider_tool.tool_ref.clone(),
+            reservation_receipt_json: String::from_utf8(receipt_bytes.clone()).map_err(|error| {
+                CompositionError::Recovery(format!("Budget receipt is not UTF-8: {error}"))
+            })?,
+            reservation_receipt_sha256: sha256_hex(&receipt_bytes),
+            measured_usage_json: String::from_utf8(usage_bytes.clone()).map_err(|error| {
+                CompositionError::Recovery(format!("measured usage is not UTF-8: {error}"))
+            })?,
+            measured_usage_sha256: sha256_hex(&usage_bytes),
+            expected_budget_owner_revision: self.revision,
+            expected_budget_owner_sha256: self.canonical_digest.clone(),
+            committed_budget_owner_revision: revision,
+            committed_budget_owner_sha256: sha256_hex(&next_bytes),
+            canonical_operation_id: canonical_identity.operation_id.clone(),
+            canonical_idempotency_key: canonical_identity.idempotency_key.clone(),
+        };
+        record
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        Ok(PreparedBudgetConsumption {
+            record,
+            budget_owner_snapshot_json: next_snapshot_json,
+            previous_owner_revision: self.revision,
+            previous_owner_sha256: self.canonical_digest.clone(),
+            next_owner_snapshot,
+            next_ledger,
         })
     }
 }
@@ -4522,7 +4774,9 @@ impl<P: KernelDurableJobPort + ?Sized> GovernorOwners<P> {
         // re-derives every closure against the current committed history
         // before any grant becomes effective.
         let authority = AuthorityOwner::from_snapshot(&authority_snapshot, state_fence)?;
-        let budget_read_revision = recovery.owner_read(RecoveryOwner::Budget)?.revision;
+        let budget_read = recovery.owner_read(RecoveryOwner::Budget)?;
+        let budget_read_revision = budget_read.revision;
+        let budget_canonical_digest = budget_read.value_digest.clone();
         let budget_snapshot: BudgetOwnerSnapshot =
             decode_owner_snapshot(recovery, RecoveryOwner::Budget)?;
         if budget_snapshot.revision != budget_read_revision {
@@ -4662,6 +4916,7 @@ impl<P: KernelDurableJobPort + ?Sized> GovernorOwners<P> {
             budget: BudgetOwner {
                 state_fence: state_fence.clone(),
                 revision: budget_revision,
+                canonical_digest: budget_canonical_digest,
                 ledger: budget_ledger,
             },
             config: ConfigOwner {
@@ -5989,6 +6244,117 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             return Err(CompositionError::NotReady);
         }
         self.owners.canonical.read_current_plan(state_fence)
+    }
+
+    /// Prepares the next work-admission semantic revision from the existing
+    /// canonical owner's current CAS head. The caller must retain this exact
+    /// proposal with the original request/operation and pass its full snapshot
+    /// to the same `AdmitWork` transition; retries reuse it unchanged.
+    pub fn prepare_work_admission_owner_revision(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<WorkAdmissionOwnerRevisionProposal, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        state_fence
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if self.owners.canonical.state_fence() != state_fence
+            || self.owners.canonical.snapshot.state_fence != *state_fence
+        {
+            return Err(CompositionError::Recovery(
+                "work-admission proposal used a stale canonical owner fence".to_owned(),
+            ));
+        }
+        self.owners.canonical.prepare_work_admission_revision()
+    }
+
+    /// Prepares terminal measured provider usage against the existing
+    /// configured Budget ledger and exact admitted-work record. It mutates no
+    /// retained owner state; the returned original proposal must be persisted
+    /// by `CommitBudgetConsumption` and accepted only after owner readback.
+    pub fn prepare_budget_consumption(
+        &self,
+        admission: &WorkAdmissionRecord,
+        reservation_idempotency_key: &str,
+        usage: &MeasuredUsage,
+        canonical_identity: &OperationIdentity,
+    ) -> Result<PreparedBudgetConsumption, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        self.owners.budget.prepare_consumption(
+            admission,
+            reservation_idempotency_key,
+            usage,
+            canonical_identity,
+        )
+    }
+
+    /// Advances the in-memory Budget owner and issues its terminal consumption
+    /// receipt only after the exact canonical Store receipt and configured
+    /// owner image have both been read back.
+    pub fn accept_budget_consumption(
+        &mut self,
+        proposal: PreparedBudgetConsumption,
+        submission: &eliot_store_api::BudgetConsumptionSubmission,
+        write_receipt: WriteReceipt,
+        owner_readback: BudgetOwnerSnapshot,
+    ) -> Result<GovernorConsumptionReceipt, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        submission
+            .validate_receipt(&write_receipt)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let committed_record = eliot_store_api::decode_budget_consumption_record(
+            &submission.prepared_transition.named_operations[0].parameters,
+        )
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if committed_record != proposal.record
+            || self.owners.budget.revision != proposal.previous_owner_revision
+            || self.owners.budget.canonical_digest != proposal.previous_owner_sha256
+            || owner_readback != proposal.next_owner_snapshot
+        {
+            return Err(CompositionError::Recovery(
+                "Budget consumption receipt or owner readback does not match the original proposal".to_owned(),
+            ));
+        }
+        let next_ledger = owner_readback.restore(&self.owners.budget.state_fence)?
+            .ok_or_else(|| CompositionError::Recovery(
+                "committed Budget owner readback is unconfigured".to_owned(),
+            ))?;
+        if next_ledger != proposal.next_ledger {
+            return Err(CompositionError::Recovery(
+                "committed Budget ledger differs from measured usage proposal".to_owned(),
+            ));
+        }
+        let owner_bytes = canonical_json_bytes(&owner_readback).map_err(|error| {
+            CompositionError::Recovery(format!("committed Budget owner readback encoding failed: {error}"))
+        })?;
+        let owner_digest = sha256_hex(&owner_bytes);
+        if owner_digest != proposal.record.committed_budget_owner_sha256
+            || String::from_utf8(owner_bytes.clone()).ok().as_deref()
+                != Some(proposal.budget_owner_snapshot_json.as_str())
+        {
+            return Err(CompositionError::Recovery(
+                "committed Budget owner bytes differ from the original measured-use proposal".to_owned(),
+            ));
+        }
+        self.owners.budget = BudgetOwner {
+            state_fence: owner_readback.state_fence.clone(),
+            revision: owner_readback.revision,
+            canonical_digest: owner_digest.clone(),
+            ledger: Some(next_ledger),
+        };
+        Ok(GovernorConsumptionReceipt {
+            schema: "eliot.governor.consumption-receipt.v1".to_owned(),
+            record: proposal.record,
+            budget_owner_snapshot_json: proposal.budget_owner_snapshot_json,
+            budget_owner_snapshot_sha256: owner_digest,
+            write_receipt,
+        })
     }
 
     /// Admits the Task Controller's current plan revision for one task from
@@ -11887,6 +12253,7 @@ mod tests {
             RecoveryOwner::Canonical => serde_json::to_value(CanonicalAdmissionSnapshot {
                 state_fence: state_fence.clone(),
                 owner_revision: 1,
+                work_admission_revision: None,
                 current_plan: None,
                 verifier_execution_fact: None,
                 finish_evidence: None,
@@ -11997,6 +12364,7 @@ mod tests {
         CanonicalAdmissionSnapshot {
             state_fence: fence.clone(),
             owner_revision: 1,
+            work_admission_revision: None,
             current_plan: Some(CanonicalPlanBinding {
                 plan_id: "plan:current".to_owned(),
                 plan_revision: "1".to_owned(),
@@ -12895,6 +13263,7 @@ mod tests {
         let mismatched_plan = CanonicalAdmissionSnapshot {
             state_fence: observed.state_fence(),
             owner_revision: 1,
+            work_admission_revision: None,
             current_plan: Some(CanonicalPlanBinding {
                 plan_id: "plan:current".to_owned(),
                 plan_revision: "1".to_owned(),
@@ -13042,6 +13411,9 @@ mod tests {
         let owner = BudgetOwner {
             state_fence: observed.state_fence().clone(),
             revision: owner_snapshot.revision,
+            canonical_digest: sha256_hex(
+                &canonical_json_bytes(&owner_snapshot).expect("canonical Budget owner snapshot"),
+            ),
             ledger: Some(ledger),
         };
         assert_eq!(owner.snapshot().expect("owner snapshot"), owner_snapshot);
