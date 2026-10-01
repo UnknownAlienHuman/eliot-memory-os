@@ -13,7 +13,7 @@ pub use eliot_build_test_graph::{
     RuntimeEnvironmentLease,
 };
 use eliot_contracts::{
-    ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, RequestId,
+    ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, RequestId, StateFence,
     canonical_json_bytes,
 };
 pub use eliot_instrument_api::KernelProcessAdmissionRequest;
@@ -147,6 +147,60 @@ impl TestdProviderRegistryFreshness {
     }
 }
 
+/// Data-only projection of the accepted module-catalog lifecycle used to
+/// create a provider registry. It is retained with a stage so the Kernel can
+/// compare it with independently revalidated owner facts; this record alone
+/// is never currentness authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdProviderCatalogLifecycle {
+    pub owner_revision: u64,
+    pub catalog_revision: u64,
+    pub catalog_digest: String,
+    pub state_fence: StateFence,
+    pub module_id: String,
+    pub generation_id: String,
+    pub artifact_digest: String,
+    pub config_digest: String,
+    pub protocol_digest: String,
+    pub manifest_digest: String,
+    pub admission_receipt: String,
+}
+
+impl TestdProviderCatalogLifecycle {
+    /// Validates the complete, bounded owner-lifecycle projection.
+    pub fn validate(&self) -> Result<(), TestdError> {
+        if self.owner_revision == 0 || self.catalog_revision == 0 {
+            return Err(TestdError::InvalidBinding);
+        }
+        self.state_fence
+            .validate()
+            .map_err(|error| TestdError::Contract(error.to_string()))?;
+        for (field, value) in [
+            ("provider_catalog.module_id", self.module_id.as_str()),
+            ("provider_catalog.generation_id", self.generation_id.as_str()),
+            ("provider_catalog.admission_receipt", self.admission_receipt.as_str()),
+        ] {
+            validate_text(value, field)?;
+        }
+        for (field, value) in [
+            ("provider_catalog.catalog_digest", self.catalog_digest.as_str()),
+            ("provider_catalog.artifact_digest", self.artifact_digest.as_str()),
+            ("provider_catalog.config_digest", self.config_digest.as_str()),
+            ("provider_catalog.protocol_digest", self.protocol_digest.as_str()),
+            ("provider_catalog.manifest_digest", self.manifest_digest.as_str()),
+        ] {
+            if !is_binding_digest(value) {
+                return Err(TestdError::Invalid {
+                    field,
+                    reason: "must be a lowercase SHA-256 digest",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Closed, durable identity of one profile stage admitted by the runner.
 ///
 /// This carries identity and policy bindings only. In particular it contains
@@ -174,6 +228,10 @@ pub struct InstrumentStageRequest {
     /// with the ProfileRegistry generation/digest above.
     #[serde(default)]
     pub provider_freshness: Option<TestdProviderRegistryFreshness>,
+    /// Accepted catalog lifecycle projected by the runner. Kernel must
+    /// compare this to the current catalog owner record before admission.
+    #[serde(default)]
+    pub provider_catalog_lifecycle: Option<TestdProviderCatalogLifecycle>,
     /// Exact admitted stage identifier.
     pub stage_id: String,
     /// Registered stage specification identity.
@@ -234,6 +292,17 @@ impl InstrumentStageRequest {
         }
         if let Some(freshness) = &self.provider_freshness {
             freshness.validate()?;
+        }
+        if let Some(lifecycle) = &self.provider_catalog_lifecycle {
+            lifecycle.validate()?;
+        }
+        if self.profile_name == TESTD_PRODUCTIVE_PROFILE
+            && (self.provider_freshness.is_none() || self.provider_catalog_lifecycle.is_none())
+        {
+            return Err(TestdError::Invalid {
+                field: "stage_request.provider_currentness",
+                reason: "productive stages require provider freshness and accepted catalog lifecycle evidence",
+            });
         }
         Ok(())
     }
@@ -2593,6 +2662,12 @@ impl TestdVerifierJobSubmission {
                 reason: "productive submission requires owner-issued provider currentness",
             });
         }
+        if stage.provider_catalog_lifecycle.is_none() {
+            return Err(TestdError::Invalid {
+                field: "stage_request.provider_catalog_lifecycle",
+                reason: "productive submission requires an accepted catalog lifecycle projection",
+            });
+        }
         if stage.invocation != self.invocation
             || stage.execution != StageExecutionKind::Process
             || stage.adapter != TESTD_PRODUCTIVE_ADAPTER
@@ -4021,6 +4096,18 @@ impl TestdStore {
                 reason: "stream capability requires a currentness-bound productive job",
             });
         };
+        let Some(stage_lifecycle) = job
+            .stage_request
+            .as_ref()
+            .and_then(|stage| stage.provider_catalog_lifecycle.as_ref())
+        else {
+            return Err(TestdError::Invalid {
+                field: "blob_stream.grant",
+                reason: "stream capability requires an accepted catalog lifecycle projection",
+            });
+        };
+        stage_freshness.validate()?;
+        stage_lifecycle.validate()?;
         let Some(tool_observation) = job.provider_tool_observation.as_ref() else {
             return Err(TestdError::Invalid {
                 field: "blob_stream.grant",
@@ -4035,6 +4122,7 @@ impl TestdStore {
         };
         let currentness_bytes = canonical_json_bytes(&(
             stage_freshness,
+            stage_lifecycle,
             tool_observation,
             environment,
         ))
