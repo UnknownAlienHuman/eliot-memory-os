@@ -37,7 +37,7 @@ pub enum EpistemicError {
         handle: ArtifactId,
         predecessor: ArtifactId,
     },
-    #[error("supersession lineage is cyclic: {}", handles.iter().map(|handle| handle.as_str()).collect::<Vec<_>>().join(", "))]
+    #[error("supersession lineage is cyclic: {}", handles.iter().map(ArtifactId::as_str).collect::<Vec<_>>().join(", "))]
     SupersessionCycle { handles: Vec<ArtifactId> },
     #[error("record {handle} has a scope different from the requested scope")]
     ScopeMismatch { handle: ArtifactId },
