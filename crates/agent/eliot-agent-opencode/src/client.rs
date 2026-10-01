@@ -2553,8 +2553,8 @@ mod tests {
         AuthorityCeiling, BasicAuth, LoopbackEndpoint, LoopbackHttpError, ModelSelection,
         OpenCodeEvent, OpenCodeWireRouteState, ReadOnlyRunRequest, RunStatus,
     };
-    use serde_json::Value;
     use secrecy::SecretString;
+    use serde_json::Value;
     use std::collections::VecDeque;
     use std::path::Path;
     use std::sync::Arc;
