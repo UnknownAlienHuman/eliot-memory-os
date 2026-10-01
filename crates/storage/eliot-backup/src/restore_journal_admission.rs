@@ -52,6 +52,19 @@
 //! identity and the receipt, so an admission that is well formed but borrowed
 //! from a different operation or installation fails closed.
 //!
+//! Agreement with the owner alone is not enough for the receipt, and is not
+//! treated as enough here. An owner that answers the same way twice agrees with
+//! itself whatever operation it was asked about, so a receipt compared only with
+//! the owner's own re-read carries no operation identity at all. The receipt is
+//! therefore held to the durable transaction identity on the journal row this
+//! plan's own derived stream key resolves to — a content comparison against THAT
+//! operation — at issue time and at every re-proof. The other three references
+//! have no such per-operation value in this crate to compare against: the
+//! database label, the installation identity and the durable channel name are
+//! single facts about the store this owner serves, identical for every stream it
+//! answers, and the owner is their authority. Binding those three to durable
+//! per-operation state is the OWNER's write side, not this crate's.
+//!
 //! ## Why the owner also ISSUES the stream, rather than only reading one
 //!
 //! An admission admits an EXISTING durable journal, so the row it is admitted
@@ -232,13 +245,13 @@ impl AdmittedJournalOperation {
         })
     }
 
-    /// Requires that the live journal is this operation's own durable journal.
+    /// Returns this operation's own durable journal row, read at issue time.
     ///
     /// The row is read through the accepted [`RestoreJournalPort`] seam the
     /// restore engine writes through, so the admission can only ever be issued
     /// against a journal that really holds this exact transaction, and the
     /// owner-reported record can only be compared against a row that exists.
-    fn is_journal_of<J>(&self, journal: &mut J) -> Result<(), BackupError>
+    fn durable_row<J>(&self, journal: &mut J) -> Result<RestoreJournalRecord, BackupError>
     where
         J: RestoreJournalPort + ?Sized,
     {
@@ -246,6 +259,42 @@ impl AdmittedJournalOperation {
             .load(&self.journal_key)?
             .ok_or(BackupError::RestoreJournalRequired)?;
         if row.journal_key != self.journal_key || row.transaction != self.transaction {
+            return Err(BackupError::RestoreJournalMismatch);
+        }
+        Ok(row)
+    }
+
+    /// Requires that the live journal is this operation's own durable journal.
+    fn is_journal_of<J>(&self, journal: &mut J) -> Result<(), BackupError>
+    where
+        J: RestoreJournalPort + ?Sized,
+    {
+        self.durable_row(journal).map(|_| ())
+    }
+
+    /// Requires that `receipt_ref` is THIS operation's own admission receipt.
+    ///
+    /// This is the one of the four owner-issued references whose exact value is
+    /// recoverable from durable owner state this crate already holds: `row` is
+    /// the durable journal row this operation's own derived stream key resolved
+    /// to, and the transaction identity on it is the operation identity the
+    /// journal owner durably committed for that stream. The check therefore
+    /// compares the reference's CONTENT with THAT operation — not its shape, not
+    /// its non-emptiness, and not the owner's own second reading of itself.
+    ///
+    /// Before this check the receipt was only ever compared with the owner's own
+    /// re-read of itself, so the reference's operation identity rested entirely
+    /// on the owner agreeing with the owner. A receipt borrowed from a different
+    /// operation now refuses, because the durable row under this plan's own
+    /// stream holds a different transaction identity.
+    fn binds_admission_receipt(
+        &self,
+        row: &RestoreJournalRecord,
+        receipt_ref: &str,
+    ) -> Result<(), BackupError> {
+        if row.transaction.transaction_id != receipt_ref
+            || self.transaction.transaction_id != receipt_ref
+        {
             return Err(BackupError::RestoreJournalMismatch);
         }
         Ok(())
@@ -335,6 +384,14 @@ impl RestoreJournalAdmission {
             return Err(BackupError::RestoreJournalMismatch);
         }
         let record = owner.durable_journal_record(&issued_stream_key)?;
+        // The receipt is the one owner-issued reference this crate can hold to
+        // the exact operation with a durable fact of its own: the transaction
+        // identity on the journal row this plan's own derived stream resolved
+        // to. Reading that row here means a receipt borrowed from another
+        // operation is refused at ISSUE time, before the value is ever copied
+        // into an admission, instead of only being caught by the later re-proof.
+        let issued_row = operation.durable_row(journal)?;
+        operation.binds_admission_receipt(&issued_row, &record.admission_receipt_ref)?;
         let admission = Self {
             persistent_owner: record.persistent_owner,
             database_ref: record.database_ref,
@@ -410,8 +467,16 @@ impl RestoreJournalAdmission {
         // The live journal must hold this exact transaction under the stream
         // this plan derives, and the owner's record for that same stream must
         // still be the one this admission names. Both are reads of durable
-        // state; neither is re-derived.
-        operation.is_journal_of(journal)?;
+        // state; neither is re-derived. The row is kept so the receipt below is
+        // compared against that same durable read instead of against a second
+        // load of the same key.
+        let row = operation.durable_row(journal)?;
+        // The admission's own receipt must be the transaction identity on THAT
+        // row. This is a content comparison against the exact operation; the
+        // field-by-field agreement below would otherwise accept any receipt the
+        // owner happened to report for itself, because an owner that is stable
+        // across two of its own reads agrees with itself whatever the operation.
+        operation.binds_admission_receipt(&row, &self.admission_receipt_ref)?;
         let current = owner.durable_journal_record(&operation.journal_key)?;
         let agrees = self.persistent_owner == current.persistent_owner
             && self.database_ref == current.database_ref
