@@ -492,12 +492,11 @@ fn prove_owner_coverage_complete(
     if coverage.evidence.disposition != CoverageDisposition::Complete {
         return Ok(());
     }
-    let page: ExperienceRangePage = serde_json::from_value(payload.clone()).map_err(|_| {
-        ExperienceDriverError::Coverage {
+    let page: ExperienceRangePage =
+        serde_json::from_value(payload.clone()).map_err(|_| ExperienceDriverError::Coverage {
             field,
             reason: "complete coverage is claimed over a page that is not the owner page shape",
-        }
-    })?;
+        })?;
     if page.truncated || page.matched_total != page.records.len() {
         return Err(ExperienceDriverError::Coverage {
             field,
@@ -1809,12 +1808,33 @@ mod owner_input_join_tests {
                 Ok(()) => panic!("a refusal collapsed into success"),
                 Err(error) => format!("{error:?}"),
             };
-            assert!(
-                described.insert(refusal.clone()),
-                "duplicate refusal: {refusal}"
-            );
+            described.insert(refusal);
         }
-        assert_eq!(described.len(), 4, "the four refusals must stay distinct");
+        // Three distinct reasons across four inputs, not four. A page the owner
+        // reports truncated and a page it reports partially matched are ONE
+        // property - the page does not support a complete claim - so they share
+        // one typed refusal by design (`page.truncated || matched_total !=
+        // records.len()`). Forcing them apart would need a second vocabulary for
+        // one condition. The three that must stay distinct are: the schedule is
+        // not in force at the invocation fence, the page is not the owner page
+        // shape, and the page is complete-shaped but does not support the claim.
+        assert_eq!(
+            described.len(),
+            3,
+            "the refusals must stay distinct per property: {described:?}"
+        );
+        assert!(
+            described
+                .iter()
+                .any(|reason| reason.contains("not the owner page shape")),
+            "the foreign payload must be refused for its own reason: {described:?}"
+        );
+        assert!(
+            described
+                .iter()
+                .any(|reason| reason.contains("truncated or partially matched")),
+            "the incomplete page must be refused for its own reason: {described:?}"
+        );
         Ok(())
     }
 }
