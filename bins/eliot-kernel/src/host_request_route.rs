@@ -2162,7 +2162,10 @@ impl KernelComposition {
         let ProtocolPayload::Json(reply_payload) = &reply.payload else {
             return Ok(());
         };
-        if reply_payload.get("status").and_then(serde_json::Value::as_str) != Some("known")
+        if reply_payload
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            != Some("known")
             || reply_payload
                 .get("value")
                 .and_then(|value| value.get("accepted"))
@@ -2229,7 +2232,9 @@ impl KernelComposition {
             SpawnDisposition::DeniedShuttingDown => return Err(TransportError::SessionFenced),
             SpawnDisposition::Admitted(handle) => drop(handle),
         }
-        let (record, stage) = receiver.await.map_err(|_| TransportError::SessionFenced)??;
+        let (record, stage) = receiver
+            .await
+            .map_err(|_| TransportError::SessionFenced)??;
         let ProtocolPayload::Json(reply_payload) = &mut reply.payload else {
             return Err(TransportError::SessionFenced);
         };
