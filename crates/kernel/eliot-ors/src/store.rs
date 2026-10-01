@@ -11019,6 +11019,7 @@ impl RedbRecoveryStore {
             return Ok(None);
         };
         record.validate()?;
+        let previous_state = record.state;
         if record.operation_id != *operation_id || record.request_digest != request_digest {
             return Err(OrsError::HostRequestIdentityConflict {
                 operation_id: operation_id.as_str().to_owned(),
@@ -11224,6 +11225,9 @@ impl RedbRecoveryStore {
                 .map_err(storage)?;
         }
         write.commit().map_err(storage)?;
+        if record.state != previous_state {
+            self.reservation_lifecycle_changed.notify_waiters();
+        }
         Ok(Some(record))
     }
 
