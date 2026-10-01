@@ -136,10 +136,7 @@ impl PhaseBAuthorityIdentity {
     /// the authority contour: the installation identity, the live Host epoch,
     /// and the current activation generation. Every remaining slot stays
     /// explicitly unavailable until its own owner computes it.
-    pub(super) fn new(
-        host: &HostInstallationEpoch,
-        activation_generation: &EpochIdentity,
-    ) -> Self {
+    pub(super) fn new(host: &HostInstallationEpoch, activation_generation: &EpochIdentity) -> Self {
         Self {
             installation: Some(host.installation.as_str().to_owned()),
             live_host_epoch: Some(phase_b_epoch_identity_label(&host.epoch.current)),
@@ -202,8 +199,14 @@ impl PhaseBAuthorityIdentity {
     fn slots(&self) -> [(&'static str, PhaseBIdentity<'_>); 9] {
         [
             ("installation", self.slot(self.installation.as_deref())),
-            ("live_host_epoch", self.slot(self.live_host_epoch.as_deref())),
-            ("live_activation", self.slot(self.live_activation.as_deref())),
+            (
+                "live_host_epoch",
+                self.slot(self.live_host_epoch.as_deref()),
+            ),
+            (
+                "live_activation",
+                self.slot(self.live_activation.as_deref()),
+            ),
             ("host_epoch", self.slot(self.host_epoch.as_deref())),
             ("fence", self.slot(self.state_fence.as_deref())),
             ("declared", self.slot(self.declared_descriptor.as_deref())),
