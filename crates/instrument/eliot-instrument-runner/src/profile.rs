@@ -192,6 +192,16 @@ pub enum ProfileError {
         /// Declared stage class.
         kind: InstrumentKind,
     },
+    /// A stage-specific command changed its bound spec executable identity.
+    #[error("profile '{profile}' stage '{stage}' command does not bind spec '{spec}'")]
+    SpecCommandMismatch {
+        /// Profile that contains the mismatched stage.
+        profile: String,
+        /// Stage with the mismatched command.
+        stage: String,
+        /// Bound instrument spec.
+        spec: String,
+    },
     /// The invocation class is outside the admitted profile classes.
     #[error("profile '{profile}' revision {revision} does not admit {kind:?} invocations")]
     UnsupportedKind {
@@ -587,6 +597,38 @@ pub struct StageDecl {
     pub required: bool,
     /// Whether the stage dispatches through `TestExecutionPlane`.
     pub external: bool,
+    /// Optional stage-specific command in the same admitted registry.
+    ///
+    /// Most stages use their bound spec's command. A stage may override only
+    /// the argv for a different operation owned by the same adapter (for
+    /// example Nextest inventory); the executable selector must remain equal
+    /// to the bound spec and the command becomes part of the DAG digest.
+    #[serde(default)]
+    pub command: Option<RegisteredStageCommand>,
+}
+
+/// Exact selector and argv for one registered profile stage.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegisteredStageCommand {
+    /// Stable executable selector declared by the bound InstrumentSpec.
+    pub executable: String,
+    /// Exact argv elements; no shell parsing or expansion is implied.
+    pub argv: Vec<String>,
+}
+
+impl RegisteredStageCommand {
+    /// Records one selector and exact argv after shape validation.
+    pub fn new(executable: String, argv: Vec<String>) -> Result<Self, ProfileError> {
+        validate_text(&executable, "stage_command.executable")?;
+        if argv.is_empty() {
+            return Err(ProfileError::InvalidText { field: "stage_command.argv" });
+        }
+        for argument in &argv {
+            validate_text(argument, "stage_command.argv")?;
+        }
+        Ok(Self { executable, argv })
+    }
 }
 
 impl StageDecl {
@@ -617,7 +659,14 @@ impl StageDecl {
             depends_on,
             required,
             external,
+            command: None,
         })
+    }
+
+    /// Binds an exact stage-specific argv from the owning adapter API.
+    pub fn with_command(mut self, command: RegisteredStageCommand) -> Self {
+        self.command = Some(command);
+        self
     }
 }
 
@@ -785,6 +834,12 @@ impl StageDag {
             });
             material.push('\0');
             material.push_str(if stage.external { "external" } else { "pure" });
+            material.push('\0');
+            if let Some(command) = &stage.command {
+                material.push_str(&command.executable);
+                material.push('\0');
+                material.push_str(&command.argv.join("\0"));
+            }
             material.push('\0');
         }
         sha256_hex(material.as_bytes())
@@ -988,7 +1043,9 @@ pub fn builtin_specs() -> Result<Vec<InstrumentSpec>, ProfileError> {
             revision: BUILTIN_SPEC_VERSION,
             executable: "cargo".to_owned(),
             executable_version: None,
-            parser: ContractId::new(DIAGNOSTIC_PARSER_CONTRACT)?,
+            // Cargo JSON is parsed by eliot-instrument-cargo's maintained
+            // parser; it is not the free-standing diagnostic prose parser.
+            parser: ContractId::new(CARGO_CONTRACT_NAME)?,
             parser_generation: BUILTIN_PARSER_GENERATION,
             environment_profile: ISOLATED_PROCESS_CLASS.to_owned(),
             schema: ContractId::new(CARGO_CONTRACT_NAME)?,
@@ -1032,20 +1089,17 @@ pub fn builtin_specs() -> Result<Vec<InstrumentSpec>, ProfileError> {
             )?,
             class: InstrumentClass::Test,
             revision: BUILTIN_SPEC_VERSION,
-            executable: "cargo".to_owned(),
+            executable: "cargo-nextest".to_owned(),
             executable_version: None,
             parser: ContractId::new(NEXTEST_INSTRUMENT)?,
             parser_generation: BUILTIN_PARSER_GENERATION,
             environment_profile: ISOLATED_PROCESS_CLASS.to_owned(),
             schema: ContractId::new(NEXTEST_INSTRUMENT)?,
             argument_template: Vec::new(),
-            // `cargo nextest` is the admitted executable's subcommand surface,
-            // and the argument spine is the one
-            // `eliot_instrument_nextest::NextestCommand` renders, so the
-            // libtest-json-plus stream the admitted nextest parser reads is
-            // the one this command produces.
+            // The adapter owns standalone `cargo-nextest`; the registered
+            // command starts at its `run` operation. Inventory is a
+            // stage-specific override on this same admitted spec.
             verification_command: vec![
-                "nextest".to_owned(),
                 "run".to_owned(),
                 "--message-format".to_owned(),
                 "libtest-json-plus".to_owned(),
@@ -1160,7 +1214,11 @@ pub fn test_profile() -> Result<InstrumentProfile, ProfileError> {
                 Vec::new(),
                 true,
                 true,
-            )?,
+            )?
+            .with_command(RegisteredStageCommand::new(
+                "cargo-nextest".to_owned(),
+                vec!["list".to_owned(), "--message-format".to_owned(), "json".to_owned()],
+            )?),
             StageDecl::new(
                 "nextest-run".to_owned(),
                 ContractId::new(NEXTEST_INSTRUMENT)?,
@@ -1449,6 +1507,15 @@ impl InstrumentRegistry {
                         stage: stage.stage_id.clone(),
                         spec: stage.spec.as_str().to_owned(),
                         kind: stage.kind,
+                    });
+                }
+                if stage.command.as_ref().is_some_and(|command| {
+                    command.executable != spec.executable || command.argv.is_empty()
+                }) {
+                    return Err(ProfileError::SpecCommandMismatch {
+                        profile: profile.name.clone(),
+                        stage: stage.stage_id.clone(),
+                        spec: stage.spec.as_str().to_owned(),
                     });
                 }
             }
@@ -1953,6 +2020,8 @@ pub struct ResolvedStage {
     pub external: bool,
     /// Prerequisite stage identities.
     pub depends_on: Vec<String>,
+    /// Exact registered executable selector and argv for this stage.
+    pub command: RegisteredStageCommand,
 }
 
 /// One fully resolved profile: exact revision plus bound layout, scope,
@@ -2063,13 +2132,20 @@ impl<'a> InstrumentProfileResolver<'a> {
             .dag
             .topological_order()
             .into_iter()
-            .map(|stage| ResolvedStage {
-                stage_id: stage.stage_id.clone(),
-                spec: stage.spec.clone(),
-                kind: stage.kind,
-                required: stage.required,
-                external: stage.external,
-                depends_on: stage.depends_on.clone(),
+            .map(|stage| {
+                let spec = self.registry.spec(stage.spec.as_str()).expect("stage spec checked above");
+                ResolvedStage {
+                    stage_id: stage.stage_id.clone(),
+                    spec: stage.spec.clone(),
+                    kind: stage.kind,
+                    required: stage.required,
+                    external: stage.external,
+                    depends_on: stage.depends_on.clone(),
+                    command: stage.command.clone().unwrap_or_else(|| RegisteredStageCommand {
+                        executable: spec.executable.clone(),
+                        argv: spec.verification_command.clone(),
+                    }),
+                }
             })
             .collect::<Vec<_>>();
         let profile_digest = profile.digest();
@@ -2153,6 +2229,9 @@ pub struct AdmittedStage {
     /// stage exactly as `argument_template` is: a stage cannot be launched
     /// under an argv the admitted spec did not declare.
     pub verification_command: Vec<String>,
+    /// Exact per-stage executable selector and argv, including a catalogued
+    /// adapter operation such as Nextest inventory.
+    pub command: RegisteredStageCommand,
     /// Invocation schema authority.
     pub schema: ContractId,
     /// Admitted environment class.
@@ -2725,6 +2804,10 @@ impl<'a> ProfileCompiler<'a> {
                 supply_receipt,
                 argument_template: spec.argument_template.clone(),
                 verification_command: spec.verification_command.clone(),
+                command: stage.command.clone().unwrap_or_else(|| RegisteredStageCommand {
+                    executable: spec.executable.clone(),
+                    argv: spec.verification_command.clone(),
+                }),
                 schema: spec.schema.clone(),
                 environment_class: spec.environment_profile.clone(),
                 credential_policy: spec.credential_policy.clone(),

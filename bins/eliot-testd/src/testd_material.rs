@@ -578,11 +578,32 @@ fn validate_admission(
             "testd admits only registered probe or productive nextest profiles".to_owned(),
         ));
     }
-    if admission.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE
-        && admission.stage_request.is_none()
+    let productive_executor = eliot_testd_core::is_productive_testd_profile(&admission.profile);
+    if productive_executor && admission.stage_request.is_none()
     {
         return Err(TestdMaterialError::Contract(
             "productive testd material is missing its durable stage identity".to_owned(),
+        ));
+    }
+    if productive_executor
+        && admission
+            .stage_request
+            .as_ref()
+            .is_some_and(|stage| stage.provider_freshness.is_none())
+    {
+        return Err(TestdMaterialError::Contract(
+            "productive testd material is missing its provider freshness issuer record".to_owned(),
+        ));
+    }
+    if productive_executor
+        && admission
+            .stage_request
+            .as_ref()
+            .is_some_and(|stage| stage.provider_catalog_lifecycle.is_none())
+    {
+        return Err(TestdMaterialError::Contract(
+            "productive testd material is missing its accepted Module Catalog lifecycle record"
+                .to_owned(),
         ));
     }
     validate_wire_digest(
@@ -623,10 +644,7 @@ fn validate_admission(
             ));
         }
     }
-    let expected_environment = if admission.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE
-        || admission.profile == eliot_testd_core::TESTD_LIST_PROFILE
-        || admission.profile == eliot_testd_core::TESTD_SCOPED_PROFILE
-    {
+    let expected_environment = if productive_executor {
         eliot_testd_core::TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT
             .iter()
             .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
@@ -671,7 +689,7 @@ fn validate_blob_stream_material(
     admission: &TestdMaterialAdmission,
     stream: Option<&TestdMaterialBlobStreamGrant>,
 ) -> Result<(), TestdMaterialError> {
-    if admission.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE {
+    if eliot_testd_core::is_productive_testd_profile(&admission.profile) {
         let stream = stream.ok_or_else(|| {
             TestdMaterialError::Contract(
                 "productive testd material is missing its Kernel-issued Blob stream grant"
