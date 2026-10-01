@@ -2216,6 +2216,10 @@ mod tests {
                     "principal_service": eliot_platform_windows::ELIOT_HOST_SERVICE_NAME,
                     "principal_sid": principal_sid,
                     "access_mask": eliot_platform_windows::ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK,
+                    "security_descriptor_owner":
+                        eliot_platform_windows::SERVICE_EXPECTED_OWNER_SID,
+                    "security_descriptor_group":
+                        eliot_platform_windows::SERVICE_EXPECTED_GROUP_SID,
                     "security_descriptor_digest": security_descriptor_digest,
                 })
             }
@@ -2232,6 +2236,10 @@ mod tests {
                     "principal_service": eliot_platform_windows::ELIOT_HOST_SERVICE_NAME,
                     "principal_sid": principal_sid,
                     "access_mask": eliot_platform_windows::ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
+                    "security_descriptor_owner":
+                        eliot_platform_windows::SERVICE_EXPECTED_OWNER_SID,
+                    "security_descriptor_group":
+                        eliot_platform_windows::SERVICE_EXPECTED_GROUP_SID,
                     "security_descriptor_digest": security_descriptor_digest,
                 })
             }
@@ -2332,6 +2340,29 @@ mod tests {
         .unwrap_or_else(|error| panic!("test provisioned supervision authority: {error}"));
         let descriptor = serde_json::json!({
             "profile": "system_service",
+            "profile_component": "eliot",
+            "profile_version": "test-version",
+            "profile_installation_key": installation,
+            "profile_governed_roots": {
+                "binding_version": eliot_installation::INSTALLATION_ROOT_BINDING_VERSION,
+                "immutable_binaries": r"C:\Program Files\Eliot\eliot\test-version",
+                "durable_data": r"C:\ProgramData\Eliot",
+                "user_config": r"C:\Users\eliot-installer\AppData\Local\Eliot",
+                "user_cache": r"C:\Users\eliot-installer\AppData\Local\Eliot",
+                "runtime_state_roots": {
+                    "profile": "system_service",
+                    "profile_anchor_root": r"C:\ProgramData",
+                    "installation_root": r"C:\ProgramData\Eliot\installations\installation-7",
+                    "host_state_root": host_state_root,
+                    "kernel_ors_root": r"C:\ProgramData\Eliot\state\kernel\state",
+                    "kernel_work_root": r"C:\ProgramData\Eliot\state\kernel\work",
+                    "store_data_root": r"C:\ProgramData\Eliot\state\store\data",
+                    "store_work_root": r"C:\ProgramData\Eliot\state\store\work",
+                    "store_temp_root": r"C:\ProgramData\Eliot\state\store\tmp",
+                    "watchdog_state_root": r"C:\ProgramData\Eliot\state\watchdog",
+                    "roots_digest": roots_digest
+                }
+            },
             "portable_root": null,
             "installation_epoch": {
                 "installation": installation,

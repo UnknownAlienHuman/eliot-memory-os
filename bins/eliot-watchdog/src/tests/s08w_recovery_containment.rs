@@ -733,8 +733,14 @@ async fn s08w_sensor_port_recovery_containment_export() {
         "watchdog composition must not invent a child launcher"
     );
     let driver_src = include_str!("../watchdog_spool/export_driver.rs");
+    // The boundary sentence may reflow across lines; normalize whitespace so
+    // the check tracks the documented boundary instead of one line layout.
+    let driver_text = driver_src
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(
-        driver_src.contains("no process execution"),
+        driver_text.contains("no process execution"),
         "export driver must document the no-launcher boundary"
     );
 
