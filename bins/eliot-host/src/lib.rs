@@ -1561,9 +1561,87 @@ const _: () = assert!(
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
+    clippy::unwrap_used,
     reason = "case-1/22 fixture proof reads tracked files like the integration probes"
 )]
 mod host_lifecycle_boundary_table_tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    use super::PlatformHandle;
+    #[cfg(windows)]
+    use eliot_host_state::{
+        ActivationState, DrainRecord, DrainState, HostStateJournalService, HostStateRecord,
+        MemoryBackend,
+    };
+
+    /// Shared in-memory sink proving the real facade records reach the real
+    /// `tracing` subscriber without contending for the process-global one.
+    #[derive(Clone, Default)]
+    struct RecordCapture {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for RecordCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.bytes
+                .lock()
+                .map_err(|_| std::io::Error::other("record capture poisoned"))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Runs the real production observation helpers under a scoped subscriber
+    /// and returns what the real `#889` facade actually emitted.
+    fn capture_records(emit: impl FnOnce()) -> String {
+        let capture = RecordCapture::default();
+        let writer = capture.clone();
+        {
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, emit);
+        }
+        let bytes = capture
+            .bytes
+            .lock()
+            .unwrap_or_else(|_| std::io::Error::other("record capture poisoned"))
+            .clone();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn occurrences(haystack: &str, needle: &str) -> usize {
+        haystack.matches(needle).count()
+    }
+
+    /// Returns the one frozen table row a `BOUNDARY_*` identifier selects, so a
+    /// case can assert the row's own `name`/`event`/`owner_state` instead of a
+    /// hand-written copy of the vocabulary.
+    fn row(boundary: &'static super::HostLifecycleBoundary) -> &'static super::HostLifecycleBoundary {
+        let resolved = super::boundary_by_event(boundary.event);
+        assert_eq!(
+            resolved.name, boundary.name,
+            "boundary identifier must resolve to its own table row"
+        );
+        resolved
+    }
+
+    #[cfg(windows)]
+    fn test_host() -> super::HostInstallationEpoch {
+        super::fresh_host_epoch(
+            PlatformHandle::new("891-case-journal-installation")
+                .expect("test installation handle must be valid"),
+            None,
+        )
+        .expect("test host epoch must be constructible")
+    }
+
     fn lifecycle_fixture() -> serde_json::Value {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/data/host_lifecycle_diagnostics.json");
@@ -1723,6 +1801,1075 @@ mod host_lifecycle_boundary_table_tests {
         assert!(
             lib.contains("struct HostTerminalGuard"),
             "the single-terminal guard must remain the terminal mechanism"
+        );
+    }
+
+    #[cfg(windows)]
+    // WORK_UNIT_CASE: 891/3
+    #[test]
+    fn case_3_startup_ready_requires_actual_readiness_evidence() {
+        use super::readiness_gate::{
+            HostReadinessGate, ReadinessCadence, ReadinessContourIdentity,
+        };
+
+        // The frozen contract: `readiness-proof.ready` is a positive readiness
+        // event; `readiness.degraded` and `liveness.observed` are not, and
+        // neither of them may ever carry the ready event's spelling.
+        let ready = row(super::BOUNDARY_READINESS_PROOF_READY);
+        let degraded = row(super::BOUNDARY_READINESS_DEGRADED);
+        let liveness = row(super::BOUNDARY_LIVENESS_OBSERVED);
+        assert_eq!(ready.name, "readiness-proof.ready");
+        assert_eq!(degraded.name, "readiness.degraded");
+        assert_eq!(liveness.name, "liveness.observed");
+        assert_ne!(ready.event, degraded.event);
+        assert_ne!(ready.event, liveness.event);
+        assert_ne!(
+            liveness.owner_state, ready.owner_state,
+            "a liveness sighting never owns the readiness proof state"
+        );
+
+        // The real owner: `HostReadinessGate::grant` refuses a contour that
+        // carries no store proof fence, so no ready lease can exist without
+        // actual readiness evidence. This is the production seam the ready
+        // boundary observes, not a restatement of the table.
+        let incomplete = ReadinessContourIdentity {
+            approved_generation: PlatformHandle::new("891-case-3-generation").unwrap(),
+            approved_kernel_artifact: PlatformHandle::new("891-case-3-kernel").unwrap(),
+            approved_store_artifact: PlatformHandle::new("891-case-3-store").unwrap(),
+            approved_config: PlatformHandle::new("891-case-3-config").unwrap(),
+            active_kernel_record_checksum: PlatformHandle::new("891-case-3-checksum").unwrap(),
+            candidate_binding_digest: PlatformHandle::new("891-case-3-binding").unwrap(),
+            store_requirement_digest: PlatformHandle::new("891-case-3-requirement").unwrap(),
+            store_proof_fence: None,
+            supervision_lease_id: None,
+            supervision_ors_receipt_digest: None,
+            watchdog_publication_digest: None,
+        };
+        let mut gate = HostReadinessGate::with_cadence(ReadinessCadence::default());
+        let now = std::time::Instant::now();
+        assert!(
+            !gate.grant(incomplete.clone(), now),
+            "a contour with no store proof fence must never be granted a ready lease"
+        );
+        assert!(
+            !matches!(
+                gate.action(Some(&incomplete), now),
+                super::readiness_gate::ReadinessGateAction::PreserveAuthenticatedHealth
+            ),
+            "an ungranted contour must degrade, never preserve authenticated health"
+        );
+
+        // Same input through the real supervisor entry point: even when the
+        // authenticated probe itself succeeds, the contour it returns carries
+        // no store proof fence, so the grant is refused and the disposition
+        // degrades. A successful probe is not readiness evidence on its own.
+        let mut probe_calls = 0_u32;
+        let disposition = super::reconcile_authenticated_readiness(
+            &mut gate,
+            Ok(incomplete.clone()),
+            now,
+            || -> Result<ReadinessContourIdentity, super::HostError> {
+                probe_calls += 1;
+                Ok(incomplete.clone())
+            },
+        );
+        assert_eq!(probe_calls, 1, "the real probe path must have run once");
+        assert_eq!(
+            disposition,
+            super::HostBranchDisposition::ReadinessDegraded,
+            "missing readiness evidence must degrade, never become ready"
+        );
+        assert!(
+            !matches!(
+                gate.action(Some(&incomplete), now),
+                super::readiness_gate::ReadinessGateAction::PreserveAuthenticatedHealth
+            ),
+            "a refused grant must leave no lease that could preserve health"
+        );
+
+        // And the emitted vocabulary follows the decision: the real observer
+        // for the ready row and the degraded row are distinct records.
+        let emitted = capture_records(|| {
+            super::host_lifecycle_observe_requested(super::BOUNDARY_READINESS_PROOF_REQUESTED);
+            super::host_lifecycle_observe_requested(super::BOUNDARY_READINESS_DEGRADED);
+            super::host_lifecycle_observe_requested(super::BOUNDARY_READINESS_PROOF_READY);
+        });
+        assert_eq!(
+            occurrences(&emitted, super::BOUNDARY_READINESS_PROOF_REQUESTED.event),
+            1,
+            "requested-proof must emit exactly once"
+        );
+        assert_eq!(
+            occurrences(&emitted, super::BOUNDARY_READINESS_DEGRADED.event),
+            1,
+            "degraded must emit exactly once"
+        );
+        assert_eq!(
+            occurrences(&emitted, super::BOUNDARY_READINESS_PROOF_READY.event),
+            1,
+            "ready-proof must emit exactly once"
+        );
+        assert_ne!(
+            super::BOUNDARY_READINESS_DEGRADED.event,
+            super::BOUNDARY_READINESS_PROOF_READY.event,
+            "a degraded record may never reuse the ready spelling"
+        );
+    }
+
+    // WORK_UNIT_CASE: 891/4
+    #[test]
+    fn case_4_scm_receipt_retains_control_operation_identity() {
+        // The frozen contract: the admitted SCM receipt is its own row, and it
+        // is not the requested row and not the terminal row.
+        let requested = row(super::BOUNDARY_RUNTIME_CONTROL_REQUESTED);
+        let receipt = row(super::BOUNDARY_RUNTIME_CONTROL_ADMITTED_RECEIPT);
+        let terminal = row(super::BOUNDARY_RUNTIME_CONTROL_TERMINAL);
+        assert_eq!(receipt.name, "runtime-control.admitted-receipt");
+        assert_ne!(receipt.event, requested.event);
+        assert_ne!(receipt.event, terminal.event);
+        assert_eq!(receipt.caller, "main::service_main");
+
+        // Two real SCM requests for two different operations, through the real
+        // wire types the production handler consumes.
+        let restart = super::HostRuntimeControlRequest::new(
+            super::HostRuntimeControlOperation::RestartKernel,
+            PlatformHandle::new("891-case-4-restart").unwrap(),
+        )
+        .unwrap();
+        let store = super::HostRuntimeControlRequest::new(
+            super::HostRuntimeControlOperation::RecoverStore,
+            PlatformHandle::new("891-case-4-store").unwrap(),
+        )
+        .unwrap();
+        restart.validate().unwrap();
+        store.validate().unwrap();
+        assert_ne!(
+            restart.request_digest.as_str(),
+            store.request_digest.as_str(),
+            "two operations must not share a request digest"
+        );
+
+        // The real receipt constructor the SCM handler uses for an admitted
+        // receipt: its identity is the request's own, so it cannot be confused
+        // with another operation's answer.
+        let restart_unknown = super::HostRuntimeControlResponse::unknown_for(
+            &restart,
+            super::runtime_control_unknown_ref("kernel-restart", &restart),
+        );
+        let store_unknown = super::HostRuntimeControlResponse::unknown_for(
+            &store,
+            super::runtime_control_unknown_ref("kernel-restart", &store),
+        );
+        restart_unknown.validate().unwrap();
+        store_unknown.validate().unwrap();
+        assert!(eliot_host_service::runtime_control::response_matches_request(
+            &restart, &restart_unknown
+        ));
+        assert!(
+            !eliot_host_service::runtime_control::response_matches_request(
+                &store, &restart_unknown
+            ),
+            "one operation's receipt must never answer another operation's request"
+        );
+        let super::HostRuntimeControlResponse::Unknown { pending_ref } = &restart_unknown else {
+            panic!("restart refusal must be typed Unknown");
+        };
+        assert!(
+            pending_ref.as_str().contains(restart.request_digest.as_str()),
+            "the refusal must carry its own request identity"
+        );
+        assert!(
+            !pending_ref.as_str().contains(store.request_digest.as_str()),
+            "the refusal must not carry a foreign operation's identity"
+        );
+
+        // The identity observation is a real facade call with the real
+        // projection type; the bounded detail the SCM path emits carries the
+        // operation name and never the request payload.
+        let identity = capture_records(|| {
+            super::host_lifecycle_observe_identity(
+                &super::host_diagnostics::HostRequestProjection::observed(
+                    super::host_diagnostics::EntrypointStage::ScmDispatch,
+                )
+                .with_process(std::process::id()),
+            );
+            super::host_lifecycle_observe_scm(super::BOUNDARY_RUNTIME_CONTROL_REQUESTED);
+            super::host_lifecycle_observe_scm(super::BOUNDARY_RUNTIME_CONTROL_ADMITTED_RECEIPT);
+        });
+        assert!(
+            identity.contains("host.request"),
+            "the SCM identity sighting must be a request projection"
+        );
+        assert_eq!(
+            occurrences(&identity, super::BOUNDARY_RUNTIME_CONTROL_REQUESTED.event),
+            1,
+            "the requested row must reach the real sink exactly once"
+        );
+        assert_eq!(
+            occurrences(&identity, super::BOUNDARY_RUNTIME_CONTROL_ADMITTED_RECEIPT.event),
+            1,
+            "the admitted receipt row must reach the real sink exactly once"
+        );
+    }
+
+    // WORK_UNIT_CASE: 891/5
+    #[test]
+    fn case_5_unsupported_control_is_typed_non_success() {
+        // The frozen contract: the unsupported/unknown observation and its
+        // terminal are separate rows, and neither is the receipt-completion row.
+        let unknown = row(super::BOUNDARY_KERNEL_RESTART_UNKNOWN);
+        let completion = row(super::BOUNDARY_KERNEL_RESTART_RECEIPT_COMPLETION);
+        let terminal = row(super::BOUNDARY_KERNEL_RESTART_TERMINAL);
+        assert_eq!(unknown.name, "kernel-restart.unknown");
+        assert_eq!(completion.name, "kernel-restart.receipt-completion");
+        assert_eq!(terminal.name, "kernel-restart.terminal");
+        assert_ne!(unknown.event, completion.event);
+        assert_ne!(terminal.event, completion.event);
+        assert_eq!(terminal.event, "host-kernel-restart-unknown");
+
+        // The real owner: `handle_kernel_restart_request` only accepts a
+        // RestartKernel or a reconcile of one. Every other operation on the
+        // same wire type is refused typed, never answered as a completion.
+        let store = super::HostRuntimeControlRequest::new(
+            super::HostRuntimeControlOperation::RecoverStore,
+            PlatformHandle::new("891-case-5-unsupported").unwrap(),
+        )
+        .unwrap();
+        store.validate().unwrap();
+        let unsupported_response = super::HostRuntimeControlResponse::unknown_for(
+            &store,
+            super::runtime_control_unknown_ref("kernel-restart", &store),
+        );
+        unsupported_response.validate().unwrap();
+        assert!(
+            matches!(
+                unsupported_response,
+                super::HostRuntimeControlResponse::Unknown { .. }
+            ),
+            "an unsupported operation must stay typed Unknown, never a completion"
+        );
+        assert!(
+            eliot_host_service::runtime_control::response_matches_request(
+                &store, &unsupported_response
+            ),
+            "the typed refusal must preserve the exact refused request identity"
+        );
+
+        // An unsupported operation can never be answered with a completion:
+        // even a well-formed restart receipt is rejected for a request the
+        // restart contour does not own, because the receipt binds the exact
+        // request/mutation digests of the restart it was produced for.
+        let restart = super::HostRuntimeControlRequest::new(
+            super::HostRuntimeControlOperation::RestartKernel,
+            PlatformHandle::new("891-case-5-restart").unwrap(),
+        )
+        .unwrap();
+        restart.validate().unwrap();
+        let mut receipt = super::HostKernelRestartReceipt {
+            mutation_digest: restart.mutation_digest.clone(),
+            request_digest: restart.request_digest.clone(),
+            old_kernel_generation: PlatformHandle::new("a".repeat(64)).unwrap(),
+            new_kernel_generation: PlatformHandle::new("b".repeat(64)).unwrap(),
+            store_fence: PlatformHandle::new("c".repeat(64)).unwrap(),
+            activation_receipt_digest: PlatformHandle::new("d".repeat(64)).unwrap(),
+            ready_receipt_digest: PlatformHandle::new("e".repeat(64)).unwrap(),
+            receipt_digest: PlatformHandle::new("f".repeat(64)).unwrap(),
+        };
+        // The real owner computes the receipt digest; a hand-picked one is
+        // refused by `validate`, so the completion under test is the owner's.
+        receipt.receipt_digest = receipt.computed_digest().unwrap();
+        receipt.validate().unwrap();
+        let restarted_for_restart =
+            super::HostRuntimeControlResponse::restarted_for(&restart, receipt);
+        assert!(
+            eliot_host_service::runtime_control::response_matches_request(
+                &restart,
+                &restarted_for_restart
+            ),
+            "the completion must bind its own restart request"
+        );
+        assert!(
+            !eliot_host_service::runtime_control::response_matches_request(
+                &store,
+                &restarted_for_restart
+            ),
+            "a completion for another operation must never answer an unsupported request"
+        );
+
+        // The refused operation still emits the unknown row and exactly one
+        // terminal through the real observers, and never the completion row.
+        let refused = capture_records(|| {
+            super::host_lifecycle_observe_scm(super::BOUNDARY_KERNEL_RESTART_REQUESTED);
+            super::host_lifecycle_observe_scm(super::BOUNDARY_KERNEL_RESTART_UNKNOWN);
+            {
+                // The refusal path leaves the guard armed: dropping it here is
+                // the single terminal emission for this operation.
+                let _guard =
+                    super::HostTerminalGuard::armed(super::BOUNDARY_KERNEL_RESTART_TERMINAL);
+            }
+        });
+        assert_eq!(
+            occurrences(&refused, super::BOUNDARY_KERNEL_RESTART_UNKNOWN.event),
+            1,
+            "the refused operation must emit exactly one unknown row"
+        );
+        assert_eq!(
+            occurrences(&refused, "host.terminal_error"),
+            1,
+            "one failed operation emits exactly one terminal"
+        );
+        assert!(
+            !refused.contains(super::BOUNDARY_KERNEL_RESTART_RECEIPT_COMPLETION.event),
+            "a refused operation must never emit the completion row"
+        );
+    }
+
+    // WORK_UNIT_CASE: 891/6
+    #[test]
+    fn case_6_stop_request_pending_stopped_are_distinct() {
+        // The frozen contract: stop requested, cancellation requested, drain
+        // requested, drain draining, drain commit, and the two stopped rows are
+        // seven distinct boundaries, none of which is the stop terminal.
+        let rows = [
+            row(super::BOUNDARY_STOP_REQUESTED),
+            row(super::BOUNDARY_STOP_CANCELLATION_REQUESTED),
+            row(super::BOUNDARY_DRAIN_REQUESTED),
+            row(super::BOUNDARY_DRAIN_DRAINING),
+            row(super::BOUNDARY_DRAIN_COMMIT),
+            row(super::BOUNDARY_STOP_STOPPED_CLEAN_DRAINED),
+            row(super::BOUNDARY_STOP_STOPPED),
+        ];
+        for (index, boundary) in rows.iter().enumerate() {
+            for other in rows.iter().skip(index + 1) {
+                assert_ne!(
+                    boundary.event, other.event,
+                    "stop phases {} and {} must stay distinct records",
+                    boundary.name, other.name
+                );
+            }
+            assert_ne!(
+                boundary.event,
+                super::BOUNDARY_STOP_TERMINAL.event,
+                "phase {} must not reuse the stop terminal code",
+                boundary.name
+            );
+        }
+
+        // The real single-terminal mechanism, driven through a real nested
+        // `?` propagation: the inner stop phase fails and its error propagates
+        // out of the outer operation, which owns the only armed guard. Exactly
+        // one terminal is emitted, carrying the outer operation's frozen code,
+        // and the inner phase's own boundary observations stay non-terminal.
+        fn nested_stop_phase() -> Result<(), super::HostError> {
+            super::host_lifecycle_observe_drain(super::BOUNDARY_STOP_CANCELLATION_REQUESTED);
+            Err(super::HostError::Stopped)
+        }
+        let refused = capture_records(|| {
+            super::host_lifecycle_observe_drain(super::BOUNDARY_STOP_REQUESTED);
+            let mut guard = super::HostTerminalGuard::armed(super::BOUNDARY_STOP_TERMINAL);
+            let outcome: Result<(), super::HostError> = (|| {
+                super::host_lifecycle_observe_drain(super::BOUNDARY_DRAIN_REQUESTED);
+                nested_stop_phase()
+            })();
+            assert!(
+                matches!(outcome, Err(super::HostError::Stopped)),
+                "an already-stopped Host must refuse the stop with the typed error"
+            );
+            // The guard stays armed on the error return: one terminal, dropped
+            // here when this closure ends.
+        });
+        assert_eq!(
+            occurrences(&refused, super::BOUNDARY_STOP_REQUESTED.event),
+            1,
+            "a refused stop must still record the stop request"
+        );
+        assert_eq!(
+            occurrences(&refused, super::BOUNDARY_DRAIN_REQUESTED.event),
+            1,
+            "the drain phase must be recorded as a phase, not skipped"
+        );
+        assert_eq!(
+            occurrences(&refused, super::BOUNDARY_STOP_CANCELLATION_REQUESTED.event),
+            1,
+            "the inner phase is recorded once"
+        );
+        assert_eq!(
+            occurrences(&refused, "host.terminal_error"),
+            1,
+            "a nested failure propagates to exactly one terminal, not one per question mark"
+        );
+        assert!(
+            refused.contains(super::BOUNDARY_STOP_TERMINAL.event),
+            "the single terminal must carry the outer operation's frozen code"
+        );
+        assert!(
+            !refused.contains(super::BOUNDARY_STOP_STOPPED.event),
+            "a refused stop never reaches the stopped row"
+        );
+        assert!(
+            !refused.contains(super::BOUNDARY_STOP_STOPPED_CLEAN_DRAINED.event),
+            "a refused stop never reaches the drained row"
+        );
+
+        // A successful stop disarms its guard, so no terminal is emitted at all.
+        let succeeded = capture_records(|| {
+            let mut guard = super::HostTerminalGuard::armed(super::BOUNDARY_STOP_TERMINAL);
+            guard.disarm();
+            super::host_lifecycle_observe_drain(super::BOUNDARY_STOP_STOPPED_CLEAN_DRAINED);
+        });
+        assert_eq!(
+            occurrences(&succeeded, "host.terminal_error"),
+            0,
+            "a successful operation emits no terminal"
+        );
+        assert_eq!(
+            occurrences(&succeeded, super::BOUNDARY_STOP_STOPPED_CLEAN_DRAINED.event),
+            1,
+            "the drained row is reachable only on the success path"
+        );
+    }
+
+    #[cfg(windows)]
+    // WORK_UNIT_CASE: 891/7
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "case 7 keeps the durable activation phase order and its per-phase readiness evidence in one deterministic reducer walk"
+    )]
+    fn case_7_activation_requested_started_ready_failed_are_distinct() {
+        // The frozen contract: activation admission, start-manifest requested,
+        // start-manifest started, and resume-pending admission are four
+        // distinct rows.
+        let admission = row(super::BOUNDARY_ACTIVATION_ADMISSION_REQUESTED);
+        let manifest_requested = row(super::BOUNDARY_START_MANIFEST_REQUESTED);
+        let manifest_started = row(super::BOUNDARY_START_MANIFEST_STARTED);
+        let resume_admitted = row(super::BOUNDARY_RESUME_PENDING_ADMITTED);
+        assert_eq!(manifest_requested.name, "start-manifest.requested");
+        assert_eq!(manifest_started.name, "start-manifest.started");
+        assert_ne!(manifest_requested.event, manifest_started.event);
+        assert_ne!(manifest_requested.event, admission.event);
+        assert_ne!(manifest_requested.event, resume_admitted.event);
+
+        // The real owner: the durable activation reducer refuses to skip a
+        // phase. A `Stopped` activation may only become `Starting`, and the
+        // requested/started/ready/failed vocabulary is enforced by the
+        // reducer, not by the diagnostics vocabulary.
+        let host = test_host();
+        let activation_generation = super::root_epoch(super::fresh_lineage_id().unwrap());
+        let activation_id = super::fresh_identity("891-case-7-activation").unwrap();
+        let ingress = super::journal_append::test_activation_ingress();
+        let starting = super::journal_append::initial_activation_record(
+            &host,
+            &activation_id,
+            &activation_generation,
+            ActivationState::Starting,
+            "891-case-7-starting",
+            &ingress,
+        )
+        .unwrap();
+        assert_eq!(starting.state, ActivationState::Starting);
+        assert!(
+            !starting.readiness.control_ready,
+            "a requested activation must not carry ready evidence"
+        );
+
+        let control_ready = super::journal_append::transition_activation_record(
+            &starting,
+            ActivationState::ControlReady,
+            "891-case-7-control-ready",
+        )
+        .unwrap();
+        assert!(
+            control_ready.readiness.control_ready,
+            "ControlReady is the first state that may carry ready evidence"
+        );
+        let active = super::journal_append::transition_activation_record(
+            &control_ready,
+            ActivationState::Active,
+            "891-case-7-active",
+        )
+        .unwrap();
+        assert_eq!(active.state, ActivationState::Active);
+
+        // Failed is a distinct state that requires its own directive; it is
+        // never reached by relabelling Active.
+        let failed = super::journal_append::degraded_activation(
+            &active,
+            "891-case-7-failed",
+            &PlatformHandle::new("891-case-7-failure-ref").unwrap(),
+            "891-case-7-recovery-directive",
+        )
+        .unwrap();
+        assert_eq!(failed.state, ActivationState::DegradedRecovery);
+        assert!(
+            failed.failure_and_recovery_directive.is_some(),
+            "a failed activation must carry its own recovery directive"
+        );
+        assert!(
+            !failed.readiness.control_ready,
+            "a degraded activation must not keep ready evidence"
+        );
+
+        // The durable reducer itself refuses to skip a phase: an activation may
+        // not go straight from `Starting` to `Active` (ready without the
+        // control-ready step), and may not go from `Active` back to
+        // `Starting`. The vocabulary above is only sound because the owner
+        // enforces the same distinctions in the journal.
+        let journal = HostStateJournalService::from_backend(MemoryBackend::default(), host.clone())
+            .expect("in-memory journal must open");
+        super::journal_append::append_reconciled(&journal, HostStateRecord::Activation(starting.clone()))
+            .unwrap();
+        let skipping_control_ready = super::journal_append::transition_activation_record(
+            &starting,
+            ActivationState::Active,
+            "891-case-7-skip-control-ready",
+        )
+        .unwrap();
+        assert!(
+            journal
+                .append(HostStateRecord::Activation(skipping_control_ready))
+                .is_err(),
+            "Active without the ControlReady step must be refused"
+        );
+        let rewinding = super::journal_append::transition_activation_record(
+            &active,
+            ActivationState::Starting,
+            "891-case-7-rewind",
+        )
+        .unwrap();
+        assert!(
+            journal.append(HostStateRecord::Activation(rewinding)).is_err(),
+            "an Active activation may not rewind to Starting in place"
+        );
+        // The ordered contour is admitted, which is what makes the refusals above
+        // phase distinctions rather than a blanket rejection.
+        super::journal_append::append_reconciled(
+            &journal,
+            HostStateRecord::Activation(control_ready.clone()),
+        )
+        .unwrap();
+        super::journal_append::append_reconciled(
+            &journal,
+            HostStateRecord::Activation(active.clone()),
+        )
+        .unwrap();
+        let snapshot = journal.snapshot().unwrap();
+        assert_eq!(
+            snapshot.activation.as_ref().map(|record| record.state),
+            Some(ActivationState::Active),
+            "the ordered requested -> started -> ready contour must commit"
+        );
+    }
+
+    #[cfg(windows)]
+    // WORK_UNIT_CASE: 891/8
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "case 8 keeps the durable drain phase order, its refused shortcuts, and the commit linearization in one deterministic reducer walk"
+    )]
+    fn case_8_drain_request_progress_completion_are_distinct() {
+        // The frozen contract: drain requested, draining, and commit are three
+        // distinct rows with distinct frozen spellings.
+        let requested = row(super::BOUNDARY_DRAIN_REQUESTED);
+        let draining = row(super::BOUNDARY_DRAIN_DRAINING);
+        let commit = row(super::BOUNDARY_DRAIN_COMMIT);
+        assert_eq!(requested.name, "drain.requested");
+        assert_eq!(draining.name, "drain.draining");
+        assert_eq!(commit.name, "drain.commit");
+        assert_ne!(requested.event, draining.event);
+        assert_ne!(draining.event, commit.event);
+        assert_ne!(requested.event, commit.event);
+        assert_eq!(
+            requested.owner_state, "manifest/branch/pending",
+            "drain.requested must record the pre-linearization owner state"
+        );
+
+        // The real owner: the durable drain reducer refuses to skip or repeat a
+        // phase, so requested / progressing / completed cannot collapse into
+        // one another in the journal the diagnostics observe.
+        let host = test_host();
+        let activation_generation = super::root_epoch(super::fresh_lineage_id().unwrap());
+        let activation_id = super::fresh_identity("891-case-8-activation").unwrap();
+        let ingress = super::journal_append::test_activation_ingress();
+        let journal = HostStateJournalService::from_backend(MemoryBackend::default(), host.clone())
+            .expect("in-memory journal must open");
+        let starting = super::journal_append::initial_activation_record(
+            &host,
+            &activation_id,
+            &activation_generation,
+            ActivationState::Starting,
+            "891-case-8-starting",
+            &ingress,
+        )
+        .unwrap();
+        super::journal_append::append_reconciled(&journal, HostStateRecord::Activation(starting))
+            .unwrap();
+        let active = {
+            let snapshot = journal.snapshot().unwrap();
+            let current = snapshot.activation.clone().unwrap();
+            super::journal_append::transition_activation_record(
+                &current,
+                ActivationState::Active,
+                "891-case-8-active",
+            )
+            .unwrap()
+        };
+        super::journal_append::append_reconciled(&journal, HostStateRecord::Activation(active.clone()))
+            .unwrap();
+        let drain_generation = active.fence.activation_generation.clone();
+
+        // Progressing without a request is refused: the reducer owns the order.
+        let unrequested = DrainRecord {
+            fence: active.fence.clone(),
+            operation: super::operation("891-case-8-draining-without-request").unwrap(),
+            drain_generation: drain_generation.clone(),
+            state: DrainState::Draining,
+            evidence_refs: vec![PlatformHandle::new("891-case-8-no-request").unwrap()],
+            expected_predecessor: None,
+        };
+        assert!(
+            journal
+                .append(HostStateRecord::Drain(unrequested))
+                .is_err(),
+            "Draining without a Requested predecessor must be refused"
+        );
+
+        super::journal_append::append_reconciled(
+            &journal,
+            HostStateRecord::Drain(DrainRecord {
+                fence: active.fence.clone(),
+                operation: super::operation("891-case-8-drain-request").unwrap(),
+                drain_generation: drain_generation.clone(),
+                state: DrainState::Requested,
+                evidence_refs: vec![PlatformHandle::new("891-case-8-request").unwrap()],
+                expected_predecessor: None,
+            }),
+        )
+        .unwrap();
+        let repeating_request = DrainRecord {
+            fence: active.fence.clone(),
+            operation: super::operation("891-case-8-repeat-request").unwrap(),
+            drain_generation: drain_generation.clone(),
+            state: DrainState::Requested,
+            evidence_refs: vec![PlatformHandle::new("891-case-8-repeat").unwrap()],
+            expected_predecessor: None,
+        };
+        assert!(
+            journal
+                .append(HostStateRecord::Drain(repeating_request))
+                .is_err(),
+            "Requested must not repeat in place of Draining"
+        );
+        super::journal_append::append_reconciled(
+            &journal,
+            HostStateRecord::Drain(DrainRecord {
+                fence: active.fence.clone(),
+                operation: super::operation("891-case-8-drain-start").unwrap(),
+                drain_generation: drain_generation.clone(),
+                state: DrainState::Draining,
+                evidence_refs: vec![PlatformHandle::new("891-case-8-start").unwrap()],
+                expected_predecessor: None,
+            }),
+        )
+        .unwrap();
+        // The commit is admitted only from the real `Draining` activation the
+        // stop contour writes before it, exactly as production orders it.
+        let draining_activation = super::journal_append::transition_activation_record(
+            &active,
+            ActivationState::Draining,
+            "891-case-8-draining",
+        )
+        .unwrap();
+        super::journal_append::append_reconciled(
+            &journal,
+            HostStateRecord::Activation(draining_activation.clone()),
+        )
+        .unwrap();
+        let snapshot = journal.snapshot().unwrap();
+        let committed =
+            super::drain_commit_record_for_stop(&snapshot, &draining_activation, &drain_generation)
+                .unwrap();
+        super::journal_append::append_reconciled(&journal, HostStateRecord::DrainCommit(committed))
+            .unwrap();
+        let after_commit = DrainRecord {
+            fence: active.fence.clone(),
+            operation: super::operation("891-case-8-after-commit").unwrap(),
+            drain_generation,
+            state: DrainState::Draining,
+            evidence_refs: vec![PlatformHandle::new("891-case-8-after-commit").unwrap()],
+            expected_predecessor: None,
+        };
+        assert!(
+            journal
+                .append(HostStateRecord::Drain(after_commit))
+                .is_err(),
+            "a committed drain admits no further drain record"
+        );
+    }
+
+    #[cfg(windows)]
+    // WORK_UNIT_CASE: 891/9
+    #[test]
+    fn case_9_managed_launch_request_is_not_readiness() {
+        use super::HostRequestEvidence;
+
+        // The frozen contract: jobs requested/admitted and start-manifest
+        // requested/started are launch boundaries; readiness is a separate row.
+        let jobs_requested = row(super::BOUNDARY_JOBS_REQUESTED);
+        let jobs_admitted = row(super::BOUNDARY_JOBS_ADMITTED);
+        let manifest_requested = row(super::BOUNDARY_START_MANIFEST_REQUESTED);
+        let manifest_started = row(super::BOUNDARY_START_MANIFEST_STARTED);
+        let ready = row(super::BOUNDARY_READINESS_PROOF_READY);
+        for launch in [
+            jobs_requested,
+            jobs_admitted,
+            manifest_requested,
+            manifest_started,
+        ] {
+            assert_ne!(
+                launch.event, ready.event,
+                "launch boundary {} must never claim readiness",
+                launch.name
+            );
+        }
+        assert_ne!(jobs_requested.event, jobs_admitted.event);
+
+        // The real owner: the facade's evidence taxonomy keeps process liveness
+        // and semantic readiness apart, and only the started class carries a
+        // process id.
+        assert_ne!(
+            HostRequestEvidence::ProcessStarted.as_str(),
+            HostRequestEvidence::SemanticallyReady.as_str()
+        );
+        let started = super::host_diagnostics::HostRequestProjection::process_started(
+            super::host_diagnostics::EntrypointStage::Startup,
+            std::process::id(),
+        );
+        let ready_projection = super::host_diagnostics::HostRequestProjection::observed(
+            super::host_diagnostics::EntrypointStage::Startup,
+        );
+        let emitted = capture_records(|| {
+            super::host_diagnostics::observe_host_request(&started);
+            super::host_lifecycle_observe_requested(super::BOUNDARY_START_MANIFEST_REQUESTED);
+            super::host_lifecycle_observe_requested(super::BOUNDARY_START_MANIFEST_STARTED);
+        });
+        assert_eq!(
+            occurrences(&emitted, "process_started"),
+            1,
+            "a started process must be recorded exactly once as started, got: {emitted}"
+        );
+        assert!(
+            !emitted.contains("semantically_ready"),
+            "a launch record must never claim semantic readiness, got: {emitted}"
+        );
+        assert_eq!(
+            occurrences(&emitted, super::BOUNDARY_START_MANIFEST_REQUESTED.event),
+            1
+        );
+        assert_eq!(
+            occurrences(&emitted, super::BOUNDARY_START_MANIFEST_STARTED.event),
+            1
+        );
+        assert_ne!(
+            super::BOUNDARY_START_MANIFEST_REQUESTED.event,
+            super::BOUNDARY_START_MANIFEST_STARTED.event
+        );
+
+        // The real launch owner: creating the two owner-scoped Job identities
+        // emits the jobs requested/admitted pair and nothing else. A managed
+        // launch therefore has no vocabulary through which it could claim
+        // readiness, whatever the request said.
+        let launched = capture_records(|| {
+            let host = super::fresh_host_epoch(
+                PlatformHandle::new("891-case-9-launch-installation").unwrap(),
+                None,
+            )
+            .unwrap();
+            let branches = super::HostJobBranches::new(&host)
+                .expect("owner-scoped job identities must be constructible");
+            // No child is adopted by creating the identities.
+            assert!(branches.kernel.is_none());
+            assert!(branches.store.is_none());
+        });
+        assert_eq!(
+            occurrences(&launched, super::BOUNDARY_JOBS_REQUESTED.event),
+            1,
+            "the launch owner must record exactly one jobs-requested row"
+        );
+        assert_eq!(
+            occurrences(&launched, super::BOUNDARY_JOBS_ADMITTED.event),
+            1,
+            "the launch owner must record exactly one jobs-admitted row"
+        );
+        assert!(
+            !launched.contains(ready.event),
+            "creating the managed launch branches must never emit a readiness row, got: {launched}"
+        );
+        assert!(
+            !launched.contains(super::BOUNDARY_START_MANIFEST_REQUESTED.event),
+            "identity construction is not the manifest start contour, got: {launched}"
+        );
+        // `observed` asserts nothing positive at all.
+        assert_ne!(
+            ready_projection, started,
+            "a started projection and an observed sighting are different records"
+        );
+    }
+    #[cfg(windows)]
+    // WORK_UNIT_CASE: 891/10
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "case 10 keeps both liveness classifications and the emitted-vocabulary proof in one deterministic gate walk"
+    )]
+    fn case_10_process_liveness_is_not_semantic_readiness() {
+        use super::readiness_gate::{
+            HostReadinessGate, ReadinessCadence, ReadinessContourIdentity,
+        };
+
+        // The frozen contract: liveness.observed exists precisely because
+        // liveness is not readiness, and its owner_state says so.
+        let liveness = row(super::BOUNDARY_LIVENESS_OBSERVED);
+        assert_eq!(liveness.name, "liveness.observed");
+        assert_eq!(liveness.owner_state, "observation, never readiness");
+
+        // The real owner: `classify_liveness_tick` degrades a non-live branch
+        // and never preserves health from liveness alone.
+        let mut gate = HostReadinessGate::with_cadence(ReadinessCadence::default());
+        let now = std::time::Instant::now();
+        let degraded = super::classify_liveness_tick(
+            &mut gate,
+            super::HostBranchDisposition::KernelDegraded,
+            Some(Ok(ReadinessContourIdentity {
+                approved_generation: PlatformHandle::new("891-case-10-generation").unwrap(),
+                approved_kernel_artifact: PlatformHandle::new("891-case-10-kernel").unwrap(),
+                approved_store_artifact: PlatformHandle::new("891-case-10-store").unwrap(),
+                approved_config: PlatformHandle::new("891-case-10-config").unwrap(),
+                active_kernel_record_checksum: PlatformHandle::new("891-case-10-checksum")
+                    .unwrap(),
+                candidate_binding_digest: PlatformHandle::new("891-case-10-binding").unwrap(),
+                store_requirement_digest: PlatformHandle::new("891-case-10-requirement").unwrap(),
+                store_proof_fence: None,
+                supervision_lease_id: None,
+                supervision_ors_receipt_digest: None,
+                watchdog_publication_digest: None,
+            })),
+            now,
+        );
+        assert_eq!(
+            degraded,
+            super::HostLivenessTick::FullReconcileDue,
+            "a degraded branch must never preserve authenticated health"
+        );
+        // A live branch with no contour at all is still not preserved health.
+        let live_without_contour = super::classify_liveness_tick(
+            &mut gate,
+            super::HostBranchDisposition::LiveAwaitingReadiness,
+            None,
+            now,
+        );
+        assert_eq!(
+            live_without_contour,
+            super::HostLivenessTick::FullReconcileDue,
+            "liveness alone must never be promoted to preserved readiness"
+        );
+
+        // The same live branch with a fully proven contour does preserve health,
+        // which is what makes the two results above a real distinction rather
+        // than a constant: only actual readiness evidence changes the answer.
+        let proven = ReadinessContourIdentity {
+            store_proof_fence: Some(PlatformHandle::new("891-case-10-store-fence").unwrap()),
+            supervision_lease_id: Some(PlatformHandle::new("891-case-10-lease-id").unwrap()),
+            supervision_ors_receipt_digest: Some(
+                PlatformHandle::new("891-case-10-ors-digest").unwrap(),
+            ),
+            watchdog_publication_digest: Some(
+                PlatformHandle::new("891-case-10-watchdog-digest").unwrap(),
+            ),
+            ..ReadinessContourIdentity {
+                approved_generation: PlatformHandle::new("891-case-10-generation").unwrap(),
+                approved_kernel_artifact: PlatformHandle::new("891-case-10-kernel").unwrap(),
+                approved_store_artifact: PlatformHandle::new("891-case-10-store").unwrap(),
+                approved_config: PlatformHandle::new("891-case-10-config").unwrap(),
+                active_kernel_record_checksum: PlatformHandle::new("891-case-10-checksum")
+                    .unwrap(),
+                candidate_binding_digest: PlatformHandle::new("891-case-10-binding").unwrap(),
+                store_requirement_digest: PlatformHandle::new("891-case-10-requirement").unwrap(),
+                store_proof_fence: None,
+                supervision_lease_id: None,
+                supervision_ors_receipt_digest: None,
+                watchdog_publication_digest: None,
+            }
+        };
+        let mut proven_gate = HostReadinessGate::with_cadence(ReadinessCadence::default());
+        let first = super::classify_liveness_tick(
+            &mut proven_gate,
+            super::HostBranchDisposition::LiveAwaitingReadiness,
+            Some(Ok(proven.clone())),
+            now,
+        );
+        assert_eq!(
+            first,
+            super::HostLivenessTick::FullReconcileDue,
+            "the first sighting of a proven contour still owes the grant"
+        );
+        assert!(
+            proven_gate.grant(proven.clone(), now),
+            "a fully proven contour is grantable"
+        );
+        let second = super::classify_liveness_tick(
+            &mut proven_gate,
+            super::HostBranchDisposition::LiveAwaitingReadiness,
+            Some(Ok(proven)),
+            now,
+        );
+        assert_eq!(
+            second,
+            super::HostLivenessTick::HealthyLeasePreserved,
+            "only a granted proof lease preserves health; liveness by itself never does"
+        );
+
+        // The emitted liveness row is one observation record, never the ready
+        // row and never a terminal.
+        let emitted = capture_records(|| {
+            super::host_lifecycle_observe_requested(super::BOUNDARY_LIVENESS_REQUESTED);
+            super::host_lifecycle_observe_requested(super::BOUNDARY_LIVENESS_OBSERVED);
+        });
+        assert_eq!(occurrences(&emitted, super::BOUNDARY_LIVENESS_OBSERVED.event), 1);
+        assert!(
+            !emitted.contains(super::BOUNDARY_READINESS_READY_PROOF.event),
+            "a liveness record must never carry the ready-proof spelling"
+        );
+        assert!(
+            !emitted.contains("host.terminal_error"),
+            "an observation never owns a terminal"
+        );
+    }
+
+    #[cfg(windows)]
+    // WORK_UNIT_CASE: 891/11
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "case 11 keeps the restart/reconcile wire identities and the real readback rebind in one deterministic walk"
+    )]
+    fn case_11_restart_and_rollback_are_distinct() {
+        // The frozen contract: a restart is an emitting row; the Phase-B
+        // rollback is an explicit propagated exclusion that owns no emission.
+        let restart = row(super::BOUNDARY_KERNEL_RESTART_REQUESTED);
+        let execute = row(super::BOUNDARY_KERNEL_RESTART_EXECUTE_REQUESTED);
+        let rollback = row(super::PROPAGATED_PHASE_B_ROLLBACK);
+        let cutover_arm = row(super::PROPAGATED_CUTOVER_CANDIDATE_ARM);
+        assert_eq!(restart.name, "kernel-restart.requested");
+        assert_eq!(execute.name, "kernel-restart-execute.requested");
+        assert_eq!(rollback.name, "propagated.phase-b-rollback");
+        assert_ne!(restart.event, execute.event);
+        assert!(rollback.event.starts_with("propagated:"));
+        assert!(cutover_arm.event.starts_with("propagated:"));
+        assert_ne!(rollback.event, cutover_arm.event);
+        assert!(
+            !rollback.event.starts_with("host."),
+            "a propagated row must never spell production vocabulary"
+        );
+
+        // The real owner: the two request shapes are different operations on
+        // the wire, so a reconcile readback can never be mistaken for a fresh
+        // restart commit.
+        let restart = super::HostRuntimeControlRequest::new(
+            super::HostRuntimeControlOperation::RestartKernel,
+            PlatformHandle::new("891-case-11-restart").unwrap(),
+        )
+        .unwrap();
+        let reconcile = super::HostRuntimeControlRequest::new_reconcile(
+            PlatformHandle::new("891-case-11-restart").unwrap(),
+            restart.mutation_digest.clone(),
+        )
+        .unwrap();
+        restart.validate().unwrap();
+        reconcile.validate().unwrap();
+        assert_ne!(
+            restart.operation, reconcile.operation,
+            "a restart and its reconcile readback are different operations"
+        );
+        assert_eq!(
+            restart.mutation_digest.as_str(),
+            reconcile.mutation_digest.as_str(),
+            "the reconcile queries the restart by its exact mutation key"
+        );
+        assert_ne!(
+            restart.request_digest.as_str(),
+            reconcile.request_digest.as_str(),
+            "the reconcile must not borrow the restart's request identity"
+        );
+        assert!(
+            !eliot_host_service::runtime_control::response_matches_request(
+                &restart,
+                &super::HostRuntimeControlResponse::unknown_for(
+                    &reconcile,
+                    super::runtime_control_unknown_ref("kernel-restart-reconcile", &reconcile),
+                )
+            ),
+            "a reconcile readback answer must never satisfy the restart request"
+        );
+
+        // The real readback owner: `rebind_runtime_restart_receipt` accepts a
+        // committed receipt only for a reconcile of the exact mutation, and
+        // refuses it for the restart commit itself. A rollback/readback is
+        // therefore never adopted as a fresh restart commit.
+        let mut receipt = super::HostKernelRestartReceipt {
+            mutation_digest: restart.mutation_digest.clone(),
+            request_digest: restart.request_digest.clone(),
+            old_kernel_generation: PlatformHandle::new("1".repeat(64)).unwrap(),
+            new_kernel_generation: PlatformHandle::new("2".repeat(64)).unwrap(),
+            store_fence: PlatformHandle::new("3".repeat(64)).unwrap(),
+            activation_receipt_digest: PlatformHandle::new("4".repeat(64)).unwrap(),
+            ready_receipt_digest: PlatformHandle::new("5".repeat(64)).unwrap(),
+            receipt_digest: PlatformHandle::new("6".repeat(64)).unwrap(),
+        };
+        receipt.receipt_digest = receipt.computed_digest().unwrap();
+        assert!(
+            super::rebind_runtime_restart_receipt(&receipt, &restart).is_err(),
+            "a restart commit request must never read back as a rollback"
+        );
+        let rebound = super::rebind_runtime_restart_receipt(&receipt, &reconcile)
+            .expect("the exact reconcile readback must be admitted");
+        assert_ne!(
+            rebound.request_digest.as_str(),
+            receipt.request_digest.as_str(),
+            "the readback rebinds the reconcile's own request identity"
+        );
+        assert_eq!(
+            rebound.mutation_digest.as_str(),
+            restart.mutation_digest.as_str(),
+            "the readback still answers the exact restart mutation"
+        );
+        rebound.validate().unwrap();
+        assert!(
+            eliot_host_service::runtime_control::response_matches_request(
+                &reconcile,
+                &super::HostRuntimeControlResponse::restarted_for(&reconcile, rebound)
+            ),
+            "the readback receipt answers the reconcile, never the restart"
+        );
+
+        // The restart rows emit; the rollback row does not. Emitting the
+        // restart rows must not produce any propagated vocabulary.
+        let emitted = capture_records(|| {
+            super::host_lifecycle_observe_scm(super::BOUNDARY_KERNEL_RESTART_REQUESTED);
+            super::host_lifecycle_observe_scm(super::BOUNDARY_KERNEL_RESTART_EXECUTE_REQUESTED);
+        });
+        assert_eq!(
+            occurrences(&emitted, super::BOUNDARY_KERNEL_RESTART_REQUESTED.event),
+            1
+        );
+        assert_eq!(
+            occurrences(&emitted, super::BOUNDARY_KERNEL_RESTART_EXECUTE_REQUESTED.event),
+            1
+        );
+        assert!(
+            !emitted.contains("propagated:"),
+            "propagated rows own no emission, got: {emitted}"
         );
     }
 }
