@@ -105,9 +105,11 @@ use crate::{
     SupervisionLeaseReceiptInput, SupervisionLeaseRecord, SupervisionLeaseSnapshot,
     SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
     SupervisionLeaseStageResolutionDisposition, SupervisionLeaseTicketReconciliation,
-    UnknownCommitOutcome, UnknownCommitRecord, UserBrokerFence, UserBrokerHeartbeat,
-    UserBrokerRegistration, UserBrokerRegistrationReceipt, UserBrokerRegistrationSnapshot,
-    UserBrokerResourceSelection, UserBrokerResourceSelectionSnapshot, VersionedArtifactEntry,
+    StagedEnvelopeRecoveryCursor, StagedEnvelopeRecoveryEntry, StagedEnvelopeRecoveryPage,
+    StagedWriteRecoveryReport, UnknownCommitOutcome, UnknownCommitRecord, UserBrokerFence,
+    UserBrokerHeartbeat, UserBrokerRegistration, UserBrokerRegistrationReceipt,
+    UserBrokerRegistrationSnapshot, UserBrokerResourceSelection,
+    UserBrokerResourceSelectionSnapshot, VersionedArtifactEntry,
     VersionedArtifactRegistry, WorkerReplayAck, WorkerReplayAckRecord, WorkerReplayBegin,
     WorkerReplayCursors, WorkerReplayDraft, WorkerReplayEvent, WorkerReplayRequestDecision,
     WorkerReplayRequestRecord, WorkerReplayStreamRecord, WriteIdempotencyRecoveryCursor,
@@ -4082,6 +4084,29 @@ pub trait OperationalRecoveryStore: Send + Sync {
         &self,
         operation_id: &crate::OperationIdentity,
     ) -> Result<Option<RecoveryPayloadEnvelope>, OrsError>;
+    /// Enumerates the staged write envelopes this store durably holds, in
+    /// operation-identity order, one bounded page at a time (issue #1925,
+    /// I5.2/I5.6, A1).
+    ///
+    /// This is the startup recovery owner's ENUMERATE half: it proves that a
+    /// record staged by [`Self::accept_after_stage`] can be named again after
+    /// a restart, by its exact key, without any caller supplying the identity
+    /// from outside. Each entry names the row by its exact key and carries the
+    /// owning reservation's lifecycle position, both resolved in one read
+    /// snapshot; the row's stored bytes are never returned and never
+    /// interpreted. Validation is a separate, existing owner read
+    /// ([`Self::verify_staged_envelope`]) so there is exactly one integrity
+    /// gate.
+    ///
+    /// `next_cursor` is `None` exactly when the table was exhausted within the
+    /// cursor's budget, so a caller can tell complete coverage from a partial
+    /// page instead of assuming it. A row whose bytes do not decode is still
+    /// enumerated by its key, so the owner can turn it into a durable Recovery
+    /// Problem instead of losing it.
+    fn scan_staged_envelopes(
+        &self,
+        cursor: StagedEnvelopeRecoveryCursor,
+    ) -> Result<StagedEnvelopeRecoveryPage, OrsError>;
     /// Durably stages one complete opaque operation and reserves every
     /// declared Ordering Scope in one atomic ORS transaction, then proves the
     /// staging before returning `ACCEPTED_PENDING` (issue #1925, I5.5/I5.6).
@@ -31978,6 +32003,25 @@ impl AdmissionReservationTransitionSpec<'_> {
 }
 
 impl RedbRecoveryStore {
+    /// Enumerates, validates and reconciles every durable staged write envelope
+    /// (issue #1925, I5.2/I5.6, A1).
+    ///
+    /// The startup recovery owner for the envelope
+    /// [`OperationalRecoveryStore::accept_after_stage`] stages. It is driven by
+    /// [`crate::staged_write_recovery::recover_staged_write_envelopes`] and lives
+    /// here so the composition that holds this store can run the pass directly,
+    /// over exactly the ORS that holds the staged records.
+    ///
+    /// `limit` is the whole-scan ceiling for the enumeration; a scan that stops
+    /// at that bound reports `truncated` rather than claiming it covered every
+    /// staged row.
+    pub fn recover_staged_write_envelopes(
+        &self,
+        limit: u16,
+    ) -> Result<StagedWriteRecoveryReport, OrsError> {
+        crate::staged_write_recovery::recover_staged_write_envelopes(self, limit)
+    }
+
     pub(super) fn admission_reservation_input(
         record: &AdmissionReservationRecord,
     ) -> Result<OperationalRecordInput, OrsError> {
@@ -34444,6 +34488,105 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             .map_err(storage)?
             .map(|value| decode(value.value()))
             .transpose()
+    }
+
+    /// Enumerates staged write envelopes by exact operation identity
+    /// (issue #1925, I5.2/I5.6, A1).
+    ///
+    /// One read snapshot resolves each row's key together with the owning
+    /// reservation's identity, lifecycle state and terminal receipt, so a page
+    /// can never mix an envelope with a reservation position read from a
+    /// different moment.
+    ///
+    /// The row's stored bytes are deliberately NOT read here. A corrupted or
+    /// undecryptable payload must still be enumerated so the owner can retain a
+    /// durable Recovery Problem for it; decoding during enumeration would turn a
+    /// recoverable, reportable record into an error that aborts the whole page.
+    /// Decoding, identity binding and integrity validation stay in
+    /// [`Self::verify_staged_envelope`], which is the single existing gate and
+    /// which never deletes a staged row.
+    fn scan_staged_envelopes(
+        &self,
+        cursor: StagedEnvelopeRecoveryCursor,
+    ) -> Result<StagedEnvelopeRecoveryPage, OrsError> {
+        if cursor.limit == 0 || cursor.limit > crate::MAX_RECOVERY_PAGE {
+            return Err(OrsError::InvalidCursorLimit);
+        }
+        let read = self.database.begin_read().map_err(storage)?;
+        let envelopes = read.open_table(ENVELOPES).map_err(storage)?;
+        let operations = read.open_table(OPERATIONS).map_err(storage)?;
+        let reservations = read.open_table(RESERVATIONS).map_err(storage)?;
+        let rows = match cursor.after_operation_id.as_ref() {
+            Some(after) => envelopes
+                .range::<&str>((Bound::Excluded(after.as_str()), Bound::Unbounded))
+                .map_err(storage)?,
+            None => envelopes.range::<&str>(..).map_err(storage)?,
+        };
+        let limit = usize::from(cursor.limit);
+        let mut records = Vec::new();
+        let mut last_key: Option<OperationIdentity> = None;
+        let mut continues = false;
+        for (offset, entry) in rows.take(limit + 1).enumerate() {
+            if offset == limit {
+                continues = true;
+                break;
+            }
+            let (key, _stored_bytes) = entry.map_err(storage)?;
+            let operation_id = OperationIdentity::new(key.value().to_owned())?;
+            // The owner's own operation index is the only way from an operation
+            // identity to its reservation. A staged envelope with no index row
+            // is an integrity failure, not a silently skipped record.
+            let reservation_id = {
+                let indexed = operations
+                    .get(operation_id.as_str())
+                    .map_err(storage)?
+                    .map(|value| value.value().to_owned())
+                    .ok_or_else(|| OrsError::IntegrityProblem {
+                        record_type: "recovery_envelope",
+                        reason: "staged envelope has no operation index row".to_owned(),
+                    })?;
+                OperationIdentity::new(indexed).map_err(|error| OrsError::IntegrityProblem {
+                    record_type: "operation_index",
+                    reason: error.to_string(),
+                })?
+            };
+            let record = reservations
+                .get(reservation_id.as_str())
+                .map_err(storage)?
+                .map(|value| decode::<ReservationRecord>(value.value()))
+                .transpose()?
+                .ok_or(OrsError::IntegrityProblem {
+                    record_type: "operation_index",
+                    reason: "staged envelope operation index is dangling".to_owned(),
+                })?;
+            if record.token.operation_id != operation_id {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "recovery_envelope",
+                    reason: "staged envelope key differs from its reservation's operation \
+                             identity"
+                        .to_owned(),
+                });
+            }
+            last_key = Some(operation_id.clone());
+            records.push(StagedEnvelopeRecoveryEntry {
+                operation_id,
+                reservation_id,
+                reservation_state: record.state,
+                terminal_receipt_id: record.terminal_receipt_id,
+            });
+        }
+        let next_cursor = if continues {
+            Some(cursor.continue_after(last_key.ok_or(OrsError::IntegrityProblem {
+                record_type: "recovery_envelope",
+                reason: "continuing staged envelope page has no exclusive continuation".to_owned(),
+            })?))
+        } else {
+            None
+        };
+        Ok(StagedEnvelopeRecoveryPage {
+            records,
+            next_cursor,
+        })
     }
 
     #[expect(

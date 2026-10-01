@@ -20,7 +20,9 @@ use eliot_kernel_core::{
     restore_recorded_evidence,
 };
 use eliot_kernel_service::KernelService;
-use eliot_ors::{CutoverRouteSnapshot, CutoverRouteTable, OrsError, RedbRecoveryStore};
+use eliot_ors::{
+    CutoverRouteSnapshot, CutoverRouteTable, OrsError, RedbRecoveryStore, StagedWriteRecoveryReport,
+};
 use eliot_runtime_contracts::{
     GenerationCutoverRecord as RuntimeGenerationCutoverRecord, GenerationCutoverState,
 };
@@ -282,6 +284,58 @@ impl OrsGenerationCoordinator {
             observe_recovery("kernel.recovery.cutover_ownership_failed", "rejected");
         }
         outcome
+    }
+
+    /// Startup recovery owner for the durable staged write envelopes
+    /// (#1925, I5.2/I5.6, A1).
+    ///
+    /// This is the composition-startup counterpart of the write route: the same
+    /// ORS holds the envelope
+    /// [`eliot_ors::OperationalRecoveryStore::accept_after_stage`] staged, and
+    /// this pass proves that after a restart those records can be enumerated,
+    /// validated by their own recorded integrity bindings, and reconciled by
+    /// operation identity into either a canonical receipt or a visible Recovery
+    /// Problem.
+    ///
+    /// It runs at the same point in composition assembly as
+    /// `recover_admission_reservations` — after the generation/cutover recovery
+    /// above it and before the Kernel admits any overlapping work — so a record
+    /// staged before a crash is loaded under its ORIGINAL identity rather than
+    /// forgotten. A shadow candidate admits no durable recovery posture and
+    /// therefore skips it exactly as it skips the other recovery passes.
+    ///
+    /// What it does NOT do: it holds no Store gateway, executes nothing, retries
+    /// nothing, and never removes a staged row. A corrupted or undecryptable
+    /// payload is retained by ORS as a durable Recovery Problem and stays
+    /// available for explicit disposition; it is never deleted and never falls
+    /// back to plaintext. The pass therefore cannot report a clean outcome it
+    /// did not earn: a non-exhaustive scan and a retained Recovery Problem are
+    /// both returned to composition, which records the stage as incomplete
+    /// rather than folding either into a recovered composition.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store's typed ORS failure when the staged-envelope table is
+    /// unreadable, when a row's owner index does not resolve, or when retaining
+    /// a Recovery Problem for a failed record failed as well. No failure is
+    /// downgraded to an empty or clean report.
+    pub(crate) fn recover_staged_write_envelopes(
+        &self,
+    ) -> Result<StagedWriteRecoveryReport, String> {
+        observe_recovery("kernel.recovery.staged_writes_requested", "attempt");
+        let report = self
+            .ors
+            .recover_staged_write_envelopes(eliot_ors::MAX_RECOVERY_PAGE)
+            .map_err(|error| error.to_string())?;
+        // A truncated pass has proved nothing about the rows it did not reach, so
+        // it is reported as such rather than folded into a success outcome.
+        let outcome = if report.truncated {
+            "truncated"
+        } else {
+            "success"
+        };
+        observe_recovery("kernel.recovery.staged_writes_reconciled", outcome);
+        Ok(report)
     }
 
     pub(crate) fn recover(

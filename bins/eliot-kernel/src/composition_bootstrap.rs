@@ -50,6 +50,7 @@ use eliot_contracts::{
     CapabilityCellRegistry, ContractDigest, ExecutionContour, ProofEntrypointRef,
     ResourceGeneration, RuntimeBundleId, SourceCrateRef, SupportStatus,
 };
+use eliot_ors::{StagedWriteReconciliation, StagedWriteRecoveryReport};
 use eliot_platform_windows::ProtectedPathLease;
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -125,6 +126,25 @@ fn native_worker_cell_expectation() -> Result<CapabilityCellExpectation, Capabil
             .map_err(|_| CapabilityCellProofError::InvalidRegistry)?,
         native_worker_declared_support()?,
     ))
+}
+
+/// Reports whether one startup recovery pass left a staged write that ORS
+/// retained a durable Recovery Problem for.
+///
+/// This is a bounded read of the owner's own outcome. A record whose envelope
+/// failed validation keeps both its staged row and its durable problem, so this
+/// predicate never claims the operation was dropped, cleaned up, or decrypted —
+/// it names exactly the disposition ORS holds. `Staged` (validated, still
+/// awaiting its canonical receipt) is deliberately NOT a problem: a healthy
+/// pending stage is not a fault, and treating it as one would make this stage
+/// permanently incomplete on a store with in-flight work.
+fn staged_write_recovery_has_problem(report: &StagedWriteRecoveryReport) -> bool {
+    report.reconciliations.iter().any(|reconciliation| {
+        matches!(
+            reconciliation,
+            StagedWriteReconciliation::RecoveryProblem { .. }
+        )
+    })
 }
 
 /// Parses the declared support claim through #13's own closed vocabulary.
@@ -1955,6 +1975,44 @@ impl KernelComposition {
                     );
                     KernelBuildError::Ors(error)
                 })?;
+            // Issue #1925 / I5.2 / I5.6 / A1: the durable staged write envelopes
+            // that `accept_after_stage` committed must be loadable after a
+            // restart. This pass enumerates them by operation identity,
+            // revalidates each against its OWN recorded integrity bindings, and
+            // reconciles each into either its canonical receipt or a visible
+            // Recovery Problem, before the Kernel admits any overlapping work.
+            // A corrupted or undecryptable payload keeps its durable Recovery
+            // Problem and its staged row: nothing is deleted, retried, or
+            // decrypted into plaintext here.
+            let staged_write_recovery = generation_gateway
+                .recover_staged_write_envelopes()
+                .map_err(|error| {
+                    observe_entrypoint_with_detail(
+                        EntrypointStage::Composition,
+                        "kernel.composition.staged_write_recovery_rejected",
+                    );
+                    KernelBuildError::Ors(error)
+                })?;
+            // What this stage may claim is exactly what the pass proved: that
+            // every staged envelope was enumerated and validated, and that none
+            // of them is under a durable Recovery Problem. It does NOT claim the
+            // staged writes committed — an envelope whose reservation is still
+            // awaiting its canonical receipt is healthy pending work, and
+            // receipt observation stays with the Store-receipt owner. A
+            // non-exhaustive scan or a retained problem is reported as
+            // incomplete here rather than folded into a clean composition.
+            let staged_write_recovery_detail =
+                if staged_write_recovery.truncated
+                    || staged_write_recovery_has_problem(&staged_write_recovery)
+                {
+                    "kernel.composition.staged_write_recovery_incomplete"
+                } else {
+                    "kernel.composition.staged_write_recovery_recovered"
+                };
+            observe_entrypoint_with_detail(
+                EntrypointStage::Composition,
+                staged_write_recovery_detail,
+            );
         }
         startup_coordinator
             .record_live_evidence(3)
