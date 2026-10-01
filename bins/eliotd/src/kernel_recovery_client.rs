@@ -179,12 +179,11 @@ fn work_scope_owner_record(
             expected: Some(Box::new(expected.clone())),
         }
     })?;
-    let record: RecoveryRecord = serde_json::from_value(value).map_err(|error| {
-        WorkScopeOwnerWriteFailure::Kernel {
+    let record: RecoveryRecord =
+        serde_json::from_value(value).map_err(|error| WorkScopeOwnerWriteFailure::Kernel {
             error: KernelPortError::Contract(error.to_string()),
             expected: Some(Box::new(expected.clone())),
-        }
-    })?;
+        })?;
     record
         .validate_for_fence(state_fence)
         .map_err(|error| WorkScopeOwnerWriteFailure::Kernel {

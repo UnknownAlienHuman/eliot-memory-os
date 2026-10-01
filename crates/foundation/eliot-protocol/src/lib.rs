@@ -11,8 +11,7 @@
 use std::{collections::BTreeMap, fmt, io::Read};
 
 use crate::{
-    AgentActivationBindScopeEvidence,
-    activation_resolution::AgentActivationResolutionDisposition,
+    AgentActivationBindScopeEvidence, activation_resolution::AgentActivationResolutionDisposition,
 };
 use eliot_agent_contracts::LivePeerMessage;
 use eliot_contracts::{

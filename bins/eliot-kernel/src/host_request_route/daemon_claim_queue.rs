@@ -25,12 +25,12 @@ use eliot_contracts::{
     ClockReading, ProductId, RequestId, RequestMetadata, SessionId, SourceId, TaskId,
 };
 use eliot_ors::{HostRequestState, OperationIdentity, OrsError};
-use eliot_receipts::RequestBinding;
 use eliot_protocol::{
     FinishAttempt, FinishResultBody, HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope,
-    HostRequestInvokeReadPayload, HostRequestResultBody, TaskControllerAttempt,
-    RequestIdentity, TaskControllerInvocation, TaskControllerResultBody, host_request_operation_id,
+    HostRequestInvokeReadPayload, HostRequestResultBody, RequestIdentity, TaskControllerAttempt,
+    TaskControllerInvocation, TaskControllerResultBody, host_request_operation_id,
 };
+use eliot_receipts::RequestBinding;
 use eliot_store_api::ScopeId;
 
 use crate::{
@@ -625,16 +625,32 @@ impl KernelComposition {
             || presented_attempt.attempt_id != state.attempt_id
             || presented_attempt.fencing_generation != state.generation
             || presented_attempt.task_id.as_str()
-                != envelope.identity.task_id.as_deref().ok_or(TransportError::SessionFenced)?
+                != envelope
+                    .identity
+                    .task_id
+                    .as_deref()
+                    .ok_or(TransportError::SessionFenced)?
             || presented_attempt.scope_id
-                != envelope.identity.work_scope_id.as_deref().ok_or(TransportError::SessionFenced)?
+                != envelope
+                    .identity
+                    .work_scope_id
+                    .as_deref()
+                    .ok_or(TransportError::SessionFenced)?
             || presented_attempt.session_id
-                != envelope.identity.session_id.as_deref().ok_or(TransportError::SessionFenced)?
+                != envelope
+                    .identity
+                    .session_id
+                    .as_deref()
+                    .ok_or(TransportError::SessionFenced)?
             || presented_attempt.expires_at_unix_ms != envelope.identity.deadline_unix_ms
             || presented_attempt.state_fence != envelope.state_fence
-            || !presented_attempt.authority_epoch.is_same_authority(&envelope.state_fence.authority_epoch)
+            || !presented_attempt
+                .authority_epoch
+                .is_same_authority(&envelope.state_fence.authority_epoch)
             || session.module_generation.state_fence != envelope.state_fence
-            || !session.authority_epoch.is_same_authority(&envelope.state_fence.authority_epoch)
+            || !session
+                .authority_epoch
+                .is_same_authority(&envelope.state_fence.authority_epoch)
         {
             return Err(TransportError::SessionFenced);
         }

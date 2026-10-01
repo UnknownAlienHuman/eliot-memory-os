@@ -108,8 +108,8 @@ use eliot_observation::TaskSelectionEvidence;
 use eliot_ors::{
     ColdStartReadinessClaim, ColdStartReadinessOrsRecord, ColdStartReadinessRecordOwner,
     ColdStartReadinessStageOutcome, ColdStartReadinessTerminalDisposition, OrsError,
-    ScanDisclosureReadFailure,
-    ScanDisclosureOrsRecord, ScanDisclosureRecordOwner, ScanDisclosureStageOutcome,
+    ScanDisclosureOrsRecord, ScanDisclosureReadFailure, ScanDisclosureRecordOwner,
+    ScanDisclosureStageOutcome,
 };
 use eliot_protocol::{
     AgentActivationCandidateCoverage, AgentActivationResolutionDisposition,
@@ -121,9 +121,9 @@ use eliot_workscope::{
     BootstrapDiscoveryInputs, BootstrapScanEvidence, DiscoveryLeaseKey, DiscoveryLeaseRequest,
     DiscoveryRead, DiscoveryReadLease, GoverningSourceCandidate, GoverningSourceCandidateEvidence,
     GoverningSourceRole, ManifestEvidence, ObservedScopeResources, OnboardingLease,
-    OnboardingReadinessReceipt, PrecedenceDeclaration, ReadinessLifecycle,
-    ScopeBindingDisposition, ScopeResolutionState, TaskBindingState, issue_discovery_lease,
-    task_selection_required, WorkScopeBindingSnapshot,
+    OnboardingReadinessReceipt, PrecedenceDeclaration, ReadinessLifecycle, ScopeBindingDisposition,
+    ScopeResolutionState, TaskBindingState, WorkScopeBindingSnapshot, issue_discovery_lease,
+    task_selection_required,
 };
 
 /// Authenticated activation's bounded filesystem/VCS observation and its
@@ -209,11 +209,16 @@ impl InitialWorkScopeBindingRequest {
                 .discovery_lease
                 .as_ref()
                 .is_some_and(|lease| lease.candidate_root_ref != self.binding.scope.root_identity)
-            || self.bootstrap_discovery.evidence.attested_reads.iter().any(|read| {
-                self.discovery_lease
-                    .as_ref()
-                    .is_some_and(|lease| !lease.allowed_reads.contains(read))
-            })
+            || self
+                .bootstrap_discovery
+                .evidence
+                .attested_reads
+                .iter()
+                .any(|read| {
+                    self.discovery_lease
+                        .as_ref()
+                        .is_some_and(|lease| !lease.allowed_reads.contains(read))
+                })
         {
             return Err("WorkScope request does not match the admitted task scope/root".to_owned());
         }
@@ -255,9 +260,7 @@ pub struct ColdStartScanOwnerReceipt {
 
 pub enum ColdStartTriggerResult {
     Question(eliot_workscope::BootstrapScanOutcome),
-    Persisted {
-        scan: ColdStartScanOwnerReceipt,
-    },
+    Persisted { scan: ColdStartScanOwnerReceipt },
 }
 
 const SCAN_DISCLOSURE_OWNER_OPERATION: &str = "scan_disclosure_owner";
@@ -855,12 +858,13 @@ async fn request_scan_work_scope_revision(
             owner_revision,
             state_fence,
         } if owner_revision == expected_snapshot.owner_revision
-            && state_fence == expected_snapshot.state_fence => Ok(()),
-        ScanDisclosureOwnerRpcResult::WorkScopeOwnerRevision { .. } => Err(
-            OrsError::Contract(
-                "Kernel WorkScope owner CAS acknowledged another revision or fence".to_owned(),
-            ),
-        ),
+            && state_fence == expected_snapshot.state_fence =>
+        {
+            Ok(())
+        }
+        ScanDisclosureOwnerRpcResult::WorkScopeOwnerRevision { .. } => Err(OrsError::Contract(
+            "Kernel WorkScope owner CAS acknowledged another revision or fence".to_owned(),
+        )),
         ScanDisclosureOwnerRpcResult::ReceiptReadFailure { failure } => {
             Err(OrsError::ScanDisclosureReadFailure(failure))
         }

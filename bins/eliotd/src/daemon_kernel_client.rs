@@ -584,9 +584,19 @@ pub fn parse_task_controller_claimed_pair(
                 .unwrap_or_default()
         || request_identity.as_ref().is_some_and(|identity| {
             identity.request.metadata.request_id != envelope.identity.request_id
-                || identity.request.metadata.session_id.as_ref().map(SessionId::as_str)
+                || identity
+                    .request
+                    .metadata
+                    .session_id
+                    .as_ref()
+                    .map(SessionId::as_str)
                     != envelope.identity.session_id.as_deref()
-                || identity.request.metadata.task_id.as_ref().map(TaskId::as_str)
+                || identity
+                    .request
+                    .metadata
+                    .task_id
+                    .as_ref()
+                    .map(TaskId::as_str)
                     != envelope.identity.task_id.as_deref()
                 || identity.request.metadata.product_id.as_str() != "eliotd"
                 || identity.request.metadata.source_id.as_str() != "eliotd"

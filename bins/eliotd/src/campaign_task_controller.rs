@@ -7,6 +7,13 @@
 //! Task Controller's native campaign rows; this adapter never writes a source
 //! record or reconstructs a missing owner publication.
 
+use crate::{
+    DaemonComposition, KernelContextReadClient,
+    daemon_kernel_client::{DaemonKernelClient, TaskControllerClaimedInvocation},
+    kernel_recovery_client::WorkScopeOwnerWriteFailure,
+    task_binding_admission::{InitialWorkScopeBindingRequest, observe_explicit_workspace},
+    unix_ms,
+};
 use eliot_context::campaign_publication::ContextCampaignRecipeBody;
 use eliot_context_contracts::SessionDeliverySnapshot;
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
@@ -30,13 +37,6 @@ use eliot_store_api::{
 use eliot_workscope::ObservedScopeResources;
 use serde::Deserialize;
 use serde_json::json;
-use crate::{
-    DaemonComposition, KernelContextReadClient,
-    daemon_kernel_client::{DaemonKernelClient, TaskControllerClaimedInvocation},
-    kernel_recovery_client::WorkScopeOwnerWriteFailure,
-    task_binding_admission::{InitialWorkScopeBindingRequest, observe_explicit_workspace},
-    unix_ms,
-};
 
 /// Task Controller input fully decoded and all required campaign reads
 /// completed before the daemon borrows the shared composition.
@@ -431,9 +431,9 @@ pub async fn prepare_task_controller_claim(
 ) -> Result<TaskControllerClaimPreparation, String> {
     let invocation = &claimed.invocation;
     if invocation.action == TaskControllerAction::BindScope {
-        let Ok(request) = serde_json::from_value::<InitialWorkScopeBindingRequest>(
-            invocation.task_input.clone(),
-        ) else {
+        let Ok(request) =
+            serde_json::from_value::<InitialWorkScopeBindingRequest>(invocation.task_input.clone())
+        else {
             return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
                 task_controller_rejection(&claimed, "invalid_scope_binding")?,
             )));
@@ -671,8 +671,7 @@ fn initial_scope_task_revision(
     fence: &StateFence,
 ) -> Result<Option<u64>, &'static str> {
     if claimed.envelope.identity.session_id.as_deref() != Some(claimed.attempt.session_id.as_str())
-        || claimed.envelope.identity.task_id.as_deref()
-            != Some(claimed.invocation.task_id.as_str())
+        || claimed.envelope.identity.task_id.as_deref() != Some(claimed.invocation.task_id.as_str())
         || claimed.envelope.identity.work_scope_id.as_deref()
             != Some(claimed.invocation.work_scope_id.as_str())
         || claimed.attempt.state_fence != *fence
@@ -778,8 +777,9 @@ pub async fn complete_initial_work_scope_binding(
     readback
         .validate_for_fence(fence)
         .map_err(|error| format!("WorkScope owner readback is invalid: {error}"))?;
-    if readback.payload != canonical_json_bytes(&snapshot)
-        .map_err(|error| format!("WorkScope snapshot serialization failed: {error}"))?
+    if readback.payload
+        != canonical_json_bytes(&snapshot)
+            .map_err(|error| format!("WorkScope snapshot serialization failed: {error}"))?
         || readback.revision != snapshot.owner_revision
         || readback.state_fence != *fence
         || readback.schema != OWNER_SNAPSHOT_SCHEMA
@@ -812,11 +812,13 @@ fn work_scope_owner_revision_state(
         return Err(());
     };
     if object.len() == 2 && object.contains_key("revision") && object.contains_key("state_fence") {
-        let embedded_revision = object.get("revision").and_then(serde_json::Value::as_u64).ok_or(())?;
-        let embedded_fence: StateFence = serde_json::from_value(
-            object.get("state_fence").cloned().ok_or(())?,
-        )
-        .map_err(|_| ())?;
+        let embedded_revision = object
+            .get("revision")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(())?;
+        let embedded_fence: StateFence =
+            serde_json::from_value(object.get("state_fence").cloned().ok_or(())?)
+                .map_err(|_| ())?;
         if embedded_revision != record.revision || embedded_fence != *expected_fence {
             return Err(());
         }
@@ -940,7 +942,10 @@ pub async fn commit_task_controller_transition(
     composition: &tokio::sync::Mutex<DaemonComposition>,
     execution: PreparedTaskControllerExecution,
 ) -> Result<TaskControllerResultBody, String> {
-    let PreparedTaskControllerExecution { claimed, transition } = execution;
+    let PreparedTaskControllerExecution {
+        claimed,
+        transition,
+    } = execution;
     let identity = transition.request_identity().clone();
     let envelope = transition.original_envelope().clone();
     if claimed.request_identity.as_ref() != Some(&identity)
@@ -988,8 +993,7 @@ pub async fn commit_task_controller_transition(
         (task_selection, readiness)
     };
     if readiness.state_fence != fence
-        || readiness.receipt.task_selection_evidence.as_ref()
-            != Some(&task_selection)
+        || readiness.receipt.task_selection_evidence.as_ref() != Some(&task_selection)
     {
         return task_controller_rejection(&claimed, "TASK_SCOPE_INCOMPATIBLE");
     }
