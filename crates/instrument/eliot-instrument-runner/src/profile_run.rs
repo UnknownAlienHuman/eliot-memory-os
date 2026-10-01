@@ -23,6 +23,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use eliot_contracts::{ModuleRuntimeClass, sha256_hex};
@@ -35,7 +37,9 @@ use eliot_process_executor::ExecutableObservation;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::admission_submission::submit_admission_snapshot;
+use crate::admission_submission::{
+    AdmissionSubmission, AdmissionSubmissionReadback, submit_admission_snapshot,
+};
 use crate::profile::{AdmissionError, AdmittedProfile, AdmittedStage, InstrumentRegistry};
 use crate::registry::{
     RegistryEntry, RegistryError, ResolvedExecutableIdentity, SupplyChainReceipt,
@@ -45,6 +49,7 @@ use crate::{
     InstrumentBinding, InstrumentRequestPort, InstrumentRunner, InstrumentStartReceipt,
     RunnerError, bridge_executor_observation,
 };
+use eliot_store_api::{NamedReadResponse, WriteReceipt};
 
 /// Failures raised while planning or recording profile runs.
 ///
@@ -298,6 +303,23 @@ pub trait StageLauncher: Send + Sync {
     /// Returns a runner error when the stage invocation is unavailable; the
     /// orchestrator records the stage as missing instead of failing the plan.
     fn invocation(&self, stage: &PlannedStage) -> Result<InstrumentInvocation, RunnerError>;
+
+    /// Commits one admitted executable/spec submission through the real owner
+    /// and returns its original write receipt plus the named registry read.
+    /// The orchestrator validates that pair against the exact submission
+    /// before it asks the process executor to create a child.
+    fn persist_admission<'a>(
+        &'a self,
+        stage: &'a PlannedStage,
+        observed: &'a ResolvedExecutableIdentity,
+        submission: AdmissionSubmission,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<(WriteReceipt, NamedReadResponse), RunnerError>>
+                + Send
+                + 'a,
+        >,
+    >;
 
     /// Returns the admitted request port for one planned stage.
     fn port(&self, stage: &PlannedStage) -> &dyn InstrumentRequestPort;
@@ -1312,10 +1334,41 @@ impl StageOrchestrator {
         ) {
             return InstrumentRun::missing(route, reason);
         }
-        if let Some(registry) = live
-            && let Err(error) = submit_admission_snapshot(registry, &planned.stage, &identity)
-        {
-            return InstrumentRun::missing(route, format!("stage admission refused: {error}"));
+        if planned.route.external() {
+            let Some(registry) = live else {
+                return InstrumentRun::missing(
+                    route,
+                    "external stage lacks a live owner registry and persisted admission".to_owned(),
+                );
+            };
+            let submission = match submit_admission_snapshot(registry, &planned.stage, &identity) {
+                Ok(submission) => submission,
+                Err(error) => {
+                    return InstrumentRun::missing(
+                        route,
+                        format!("stage admission refused: {error}"),
+                    );
+                }
+            };
+            let (receipt, readback) = match launcher
+                .persist_admission(planned, &identity, submission.clone())
+                .await
+            {
+                Ok(proof) => proof,
+                Err(error) => {
+                    return InstrumentRun::missing(
+                        route,
+                        format!("canonical registry persistence refused: {error}"),
+                    );
+                }
+            };
+            if let Err(error) = AdmissionSubmissionReadback::verify(&submission, receipt, readback)
+            {
+                return InstrumentRun::missing(
+                    route,
+                    format!("canonical registry readback refused: {error}"),
+                );
+            }
         }
         let mut binding = match InstrumentBinding::from_request(invocation, process_request) {
             Ok(binding) => binding,
@@ -1378,7 +1431,27 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
 pub struct MappedStageLauncher<'p> {
     invocations: BTreeMap<String, InstrumentInvocation>,
     port: &'p dyn InstrumentRequestPort,
+    persistence: &'p dyn AdmissionSubmissionPort,
     sink: Arc<dyn ProcessEvidenceSink>,
+}
+
+/// Owner port that commits one instrument registry snapshot and returns the
+/// exact canonical receipt and named readback for the runner's verification.
+pub trait AdmissionSubmissionPort: Send + Sync {
+    /// Persists and reads the submitted record under the original admitted
+    /// request context retained by the implementation.
+    fn persist<'a>(
+        &'a self,
+        stage: &'a PlannedStage,
+        observed: &'a ResolvedExecutableIdentity,
+        submission: AdmissionSubmission,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<(WriteReceipt, NamedReadResponse), RunnerError>>
+                + Send
+                + 'a,
+        >,
+    >;
 }
 
 impl<'p> MappedStageLauncher<'p> {
@@ -1386,11 +1459,13 @@ impl<'p> MappedStageLauncher<'p> {
     pub fn new(
         invocations: BTreeMap<String, InstrumentInvocation>,
         port: &'p dyn InstrumentRequestPort,
+        persistence: &'p dyn AdmissionSubmissionPort,
         sink: Arc<dyn ProcessEvidenceSink>,
     ) -> Self {
         Self {
             invocations,
             port,
+            persistence,
             sink,
         }
     }
@@ -1402,6 +1477,21 @@ impl StageLauncher for MappedStageLauncher<'_> {
         self.invocations.get(stage_id).cloned().ok_or_else(|| {
             RunnerError::Binding(format!("no admitted invocation for stage '{stage_id}'"))
         })
+    }
+
+    fn persist_admission<'a>(
+        &'a self,
+        stage: &'a PlannedStage,
+        observed: &'a ResolvedExecutableIdentity,
+        submission: AdmissionSubmission,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<(WriteReceipt, NamedReadResponse), RunnerError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        self.persistence.persist(stage, observed, submission)
     }
 
     fn port(&self, _stage: &PlannedStage) -> &dyn InstrumentRequestPort {

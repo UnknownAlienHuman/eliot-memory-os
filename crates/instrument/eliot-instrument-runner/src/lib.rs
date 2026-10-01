@@ -33,7 +33,9 @@ pub mod testd_port;
 pub mod testd_profile_dispatch;
 pub mod verification_profile;
 
-pub use admission_submission::{AdmissionSubmission, submit_admission_snapshot};
+pub use admission_submission::{
+    AdmissionSubmission, AdmissionSubmissionReadback, submit_admission_snapshot,
+};
 pub use build_projection::{
     AffectedEdge, BuildCacheDecision, BuildCancellation, BuildClaimOrder, BuildCleanupPass,
     BuildProjectionError, CargoOrigin, CargoScopeRefusal, ClaimedBuild, CleanupCandidate,
@@ -86,10 +88,11 @@ pub use profile::{
     package_verification_profile, test_profile,
 };
 pub use profile_run::{
-    AggregateStatus, InstrumentRun, MappedStageLauncher, PlannedStage, ProfileAggregate,
-    ProfileRunError, ProviderDispatch, RetainedExitOutcome, RetainedToolIdentity, StageEvidence,
-    StageIdentity, StageLauncher, StageOrchestrator, StagePlan, StageTargetLayout,
-    TestExecutionPlaneRoute, TestdPlaneAdmission, compose_provider_dispatch,
+    AdmissionSubmissionPort, AggregateStatus, InstrumentRun, MappedStageLauncher, PlannedStage,
+    ProfileAggregate, ProfileRunError, ProviderDispatch, RetainedExitOutcome,
+    RetainedToolIdentity, StageEvidence, StageIdentity, StageLauncher, StageOrchestrator,
+    StagePlan, StageTargetLayout, TestExecutionPlaneRoute, TestdPlaneAdmission,
+    compose_provider_dispatch,
 };
 pub use provider_denominator::{
     ADVERTISED_INSTRUMENTS, AvailabilityInputs, ConformanceCase, ConformanceCorpus,

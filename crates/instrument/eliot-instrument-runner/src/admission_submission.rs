@@ -17,7 +17,8 @@
 use std::collections::BTreeMap;
 
 use eliot_store_api::{
-    NamedMutationOperation, NamedReadOperation, decode_instrument_registry_mutation,
+    NamedMutationOperation, NamedReadOperation, NamedReadResponse, WriteReceipt,
+    WriteReceiptStatus, decode_instrument_registry_mutation,
 };
 use serde_json::Value;
 
@@ -37,6 +38,87 @@ pub struct AdmissionSubmission {
     supply_digest: String,
     executable_path: String,
     content_digest: String,
+}
+
+/// Owner-issued canonical receipt and exact named registry readback observed
+/// before an external stage may create a child process.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdmissionSubmissionReadback {
+    receipt: WriteReceipt,
+    readback: NamedReadResponse,
+    registry_revision: u64,
+}
+
+impl AdmissionSubmissionReadback {
+    /// Validates a committed write receipt and a same-fence named read whose
+    /// stored snapshot is byte-for-byte the submitted mutation content.
+    pub fn verify(
+        submission: &AdmissionSubmission,
+        receipt: WriteReceipt,
+        readback: NamedReadResponse,
+    ) -> Result<Self, ProfileError> {
+        let refuse = |detail: &str| ProfileError::Snapshot {
+            detail: detail.to_owned(),
+        };
+        if receipt.status != WriteReceiptStatus::Committed || receipt.commit_id.is_none() {
+            return Err(refuse("registry write did not return its committed owner receipt"));
+        }
+        readback.validate().map_err(|error| refuse(&error.to_string()))?;
+        if readback.operation != NamedReadOperation::GetInstrumentRegistryState
+            || readback.state_fence != receipt.state_fence
+        {
+            return Err(refuse("registry named read does not match the committed receipt fence"));
+        }
+        let snapshot = readback
+            .payload
+            .get("snapshot_json")
+            .and_then(Value::as_str)
+            .ok_or_else(|| refuse("registry named read omitted its stored snapshot bytes"))?;
+        if snapshot != submission.snapshot_json {
+            return Err(refuse("registry named read differs from the submitted mutation bytes"));
+        }
+        let registry_revision = readback
+            .payload
+            .get("revision")
+            .and_then(Value::as_u64)
+            .filter(|revision| *revision > 0)
+            .ok_or_else(|| refuse("registry named read omitted its nonzero revision"))?;
+        let payload_fence: eliot_contracts::StateFence = serde_json::from_value(
+            readback
+                .payload
+                .get("state_fence")
+                .cloned()
+                .ok_or_else(|| refuse("registry named read omitted its state fence"))?,
+        )
+        .map_err(|_| refuse("registry named read carried an invalid state fence"))?;
+        if payload_fence != readback.state_fence
+            || !readback.revision_heads.iter().any(|head| {
+                head.revision == registry_revision && head.state_fence == receipt.state_fence
+            })
+        {
+            return Err(refuse("registry named read revision or fence is not owner-bound"));
+        }
+        Ok(Self {
+            receipt,
+            readback,
+            registry_revision,
+        })
+    }
+
+    /// Exact committed owner receipt returned for the submitted mutation.
+    pub fn receipt(&self) -> &WriteReceipt {
+        &self.receipt
+    }
+
+    /// Exact named read response used to prove the committed registry value.
+    pub fn readback(&self) -> &NamedReadResponse {
+        &self.readback
+    }
+
+    /// Registry revision witnessed by the named read.
+    pub const fn registry_revision(&self) -> u64 {
+        self.registry_revision
+    }
 }
 
 impl AdmissionSubmission {

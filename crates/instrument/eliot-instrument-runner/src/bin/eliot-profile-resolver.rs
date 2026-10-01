@@ -103,8 +103,10 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::future::Future;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -115,14 +117,15 @@ use eliot_contracts::{
 };
 use eliot_instrument_api::{InstrumentContractError, InstrumentInvocation};
 use eliot_instrument_runner::{
-    ADMITTED_SCOPE_CLASS, AdmittedProfile, DeclaredEnvironmentDependency, ISOLATED_PROCESS_CLASS,
-    InstrumentRegistry, InstrumentRequestPort, InstrumentRunner, InstrumentSpec, ParityVerdict,
-    PlannedStage, ProfileAggregate, ProfileCompiler, RunnerError, StageEnvironment, StageEvidence,
-    StageLauncher, StageOrchestrator, SupplyChainReceipt, TargetLayout, VerificationProfileReceipt,
-    VerificationRouteRequest, WorkScope, admitted_profile_for_alias, parity_summary,
-    profile::{PROFILE_ALIASES, TOOLCHAIN_PATH_ENV, builtin_specs},
+    ADMITTED_SCOPE_CLASS, AdmissionSubmission, AdmittedProfile, DeclaredEnvironmentDependency,
+    ISOLATED_PROCESS_CLASS, InstrumentRegistry, InstrumentRequestPort, InstrumentRunner,
+    InstrumentSpec, ParityVerdict, PlannedStage, ProfileAggregate, ProfileCompiler, RunnerError,
+    StageEnvironment, StageEvidence, StageLauncher, StageOrchestrator, SupplyChainReceipt,
+    TargetLayout, VerificationProfileReceipt, VerificationRouteRequest, WorkScope,
+    admitted_profile_for_alias, parity_summary, profile::{PROFILE_ALIASES, TOOLCHAIN_PATH_ENV, builtin_specs},
     resolve_verification_route, verify_profile_parity,
 };
+use eliot_store_api::{NamedReadResponse, WriteReceipt};
 use eliot_process::{
     ActionLeaseRef, CancellationReceipt, DispatchAuthorityId, DispatchPermitAuthority,
     DispatchValidationContext, EnvironmentInheritance, EnvironmentProjection, EvidenceSinkError,
@@ -1900,6 +1903,25 @@ impl StageLauncher for StageRoute {
             RunnerError::Binding(format!("stage '{stage_id}' invocation refused: {error}"))
         })?;
         Ok(invocation)
+    }
+
+    fn persist_admission<'a>(
+        &'a self,
+        _stage: &'a PlannedStage,
+        _observed: &'a eliot_instrument_runner::registry::ResolvedExecutableIdentity,
+        _submission: AdmissionSubmission,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<(WriteReceipt, NamedReadResponse), RunnerError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async {
+            Err(RunnerError::Binding(
+                "standalone profile resolution has no authenticated canonical registry owner; use an admitted owner-dispatched profile run".to_owned(),
+            ))
+        })
     }
 
     fn port(&self, _stage: &PlannedStage) -> &dyn InstrumentRequestPort {
