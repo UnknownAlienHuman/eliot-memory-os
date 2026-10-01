@@ -8,8 +8,8 @@
 //! wall clocks through its pinned zone table and declared DST policy.
 
 use eliot_kernel_core::user_automation::{
-    NormalizedSchedule, PINNED_ZONE_DATABASE_REVISION, ScheduleKind,
-    ScheduleNormalizationReceipt, UserAutomationError,
+    NormalizedSchedule, PINNED_ZONE_DATABASE_REVISION, ScheduleKind, ScheduleNormalizationReceipt,
+    UserAutomationError,
 };
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -76,8 +76,7 @@ pub(crate) fn normalize_schedule(
             normalized.apply_compiled_utc_instants(&instants)?;
         }
         GREGORIAN_LOCAL_CALENDAR => {
-            let local_clocks =
-                compile_local_clock_seconds(schedule_source, occurrence_count)?;
+            let local_clocks = compile_local_clock_seconds(schedule_source, occurrence_count)?;
             normalized.apply_compiled_local_clock_seconds(&local_clocks)?;
         }
         _ => return Err(UserAutomationError::Invalid(UNSUPPORTED_CALENDAR)),
@@ -127,9 +126,10 @@ fn compile_local_clock_seconds(
             (0..occurrence_count)
                 .map(|index| {
                     let offset = interval_seconds
-                        .checked_mul(i64::try_from(index).map_err(|_| {
-                            UserAutomationError::Invalid(EXPRESSION_ARITHMETIC)
-                        })?)
+                        .checked_mul(
+                            i64::try_from(index)
+                                .map_err(|_| UserAutomationError::Invalid(EXPRESSION_ARITHMETIC))?,
+                        )
                         .ok_or(UserAutomationError::Invalid(EXPRESSION_ARITHMETIC))?;
                     anchor
                         .checked_add(offset)

@@ -449,9 +449,7 @@ impl NormalizedSchedule {
             text(end_at, "schedule.end_at")?;
         }
         if !self.next_occurrences.is_empty()
-            || !self
-                .normalization_receipt
-                .is_unissued_draft_projection()
+            || !self.normalization_receipt.is_unissued_draft_projection()
         {
             return Err(UserAutomationError::Invalid(
                 "schedule.normalization.input_contains_owner_output",
@@ -759,11 +757,9 @@ impl NormalizedSchedule {
                 ))?;
             let local = civil_from_unix_seconds(resolved_local_seconds)?;
             let local_text = format_civil_wall_clock(local);
-            let reality = user_automation_zones::classify_local_clock(
-                &self.timezone,
-                resolved_local_seconds,
-            )
-            .map_err(|error| map_zone_error(error, "schedule.occurrence_key.zone"))?;
+            let reality =
+                user_automation_zones::classify_local_clock(&self.timezone, resolved_local_seconds)
+                    .map_err(|error| map_zone_error(error, "schedule.occurrence_key.zone"))?;
 
             let (transition, disposition) = match reality {
                 user_automation_zones::LocalClockReality::Unique {
@@ -776,26 +772,30 @@ impl NormalizedSchedule {
                     first_instant_seconds,
                     transition,
                     ..
-                } if first_instant_seconds == *instant
-                    && self.dst_fold == DstFoldPolicy::First => (
-                    format_transition_offsets(
-                        transition.pre_offset_minutes,
-                        transition.post_offset_minutes,
-                    ),
-                    "FOLD_FIRST",
-                ),
+                } if first_instant_seconds == *instant && self.dst_fold == DstFoldPolicy::First => {
+                    (
+                        format_transition_offsets(
+                            transition.pre_offset_minutes,
+                            transition.post_offset_minutes,
+                        ),
+                        "FOLD_FIRST",
+                    )
+                }
                 user_automation_zones::LocalClockReality::Fold {
                     second_instant_seconds,
                     transition,
                     ..
                 } if second_instant_seconds == *instant
-                    && self.dst_fold == DstFoldPolicy::Second => (
-                    format_transition_offsets(
-                        transition.pre_offset_minutes,
-                        transition.post_offset_minutes,
-                    ),
-                    "FOLD_SECOND",
-                ),
+                    && self.dst_fold == DstFoldPolicy::Second =>
+                {
+                    (
+                        format_transition_offsets(
+                            transition.pre_offset_minutes,
+                            transition.post_offset_minutes,
+                        ),
+                        "FOLD_SECOND",
+                    )
+                }
                 user_automation_zones::LocalClockReality::Fold { .. } => {
                     return Err(UserAutomationError::Invalid(
                         "schedule.expression.fold_policy_mismatch",
@@ -820,7 +820,10 @@ impl NormalizedSchedule {
                 local_text,
                 local_text,
                 format_utc_offset(offset_minutes),
-                format!("{}Z", format_civil_wall_clock(civil_from_unix_seconds(*instant)?)),
+                format!(
+                    "{}Z",
+                    format_civil_wall_clock(civil_from_unix_seconds(*instant)?)
+                ),
                 transition,
                 disposition,
                 source_digest,
@@ -854,85 +857,78 @@ impl NormalizedSchedule {
         let mut encoded = Vec::with_capacity(local_clock_seconds.len());
         for local_seconds in local_clock_seconds {
             let requested_local = civil_from_unix_seconds(*local_seconds)?;
-            let reality = user_automation_zones::classify_local_clock(
-                &self.timezone,
-                *local_seconds,
-            )
-            .map_err(|error| map_zone_error(error, "schedule.occurrence_key.zone"))?;
-            let (
-                instant_seconds,
-                offset_minutes,
-                resolved_local_seconds,
-                transition,
-                disposition,
-            ) = match reality {
-                user_automation_zones::LocalClockReality::Unique {
-                    instant_seconds,
-                    offset_minutes,
-                } => (
-                    instant_seconds,
-                    offset_minutes,
-                    *local_seconds,
-                    "-".to_owned(),
-                    "UNIQUE",
-                ),
-                user_automation_zones::LocalClockReality::Fold {
-                    first_instant_seconds,
-                    first_offset_minutes,
-                    transition,
-                    ..
-                } if self.dst_fold == DstFoldPolicy::First => (
-                    first_instant_seconds,
-                    first_offset_minutes,
-                    *local_seconds,
-                    format_transition_offsets(
-                        transition.pre_offset_minutes,
-                        transition.post_offset_minutes,
+            let reality =
+                user_automation_zones::classify_local_clock(&self.timezone, *local_seconds)
+                    .map_err(|error| map_zone_error(error, "schedule.occurrence_key.zone"))?;
+            let (instant_seconds, offset_minutes, resolved_local_seconds, transition, disposition) =
+                match reality {
+                    user_automation_zones::LocalClockReality::Unique {
+                        instant_seconds,
+                        offset_minutes,
+                    } => (
+                        instant_seconds,
+                        offset_minutes,
+                        *local_seconds,
+                        "-".to_owned(),
+                        "UNIQUE",
                     ),
-                    "FOLD_FIRST",
-                ),
-                user_automation_zones::LocalClockReality::Fold {
-                    second_instant_seconds,
-                    second_offset_minutes,
-                    transition,
-                    ..
-                } if self.dst_fold == DstFoldPolicy::Second => (
-                    second_instant_seconds,
-                    second_offset_minutes,
-                    *local_seconds,
-                    format_transition_offsets(
-                        transition.pre_offset_minutes,
-                        transition.post_offset_minutes,
+                    user_automation_zones::LocalClockReality::Fold {
+                        first_instant_seconds,
+                        first_offset_minutes,
+                        transition,
+                        ..
+                    } if self.dst_fold == DstFoldPolicy::First => (
+                        first_instant_seconds,
+                        first_offset_minutes,
+                        *local_seconds,
+                        format_transition_offsets(
+                            transition.pre_offset_minutes,
+                            transition.post_offset_minutes,
+                        ),
+                        "FOLD_FIRST",
                     ),
-                    "FOLD_SECOND",
-                ),
-                user_automation_zones::LocalClockReality::Fold { .. } => {
-                    return Err(UserAutomationError::Invalid(
-                        "schedule.expression.fold_policy_rejected",
-                    ));
-                }
-                user_automation_zones::LocalClockReality::Gap {
-                    transition,
-                    shifted_local_unix_seconds,
-                    resolved_instant_seconds,
-                    post_offset_minutes,
-                    ..
-                } if self.dst_gap == DstGapPolicy::ShiftForward => (
-                    resolved_instant_seconds,
-                    post_offset_minutes,
-                    shifted_local_unix_seconds,
-                    format_transition_offsets(
-                        transition.pre_offset_minutes,
-                        transition.post_offset_minutes,
+                    user_automation_zones::LocalClockReality::Fold {
+                        second_instant_seconds,
+                        second_offset_minutes,
+                        transition,
+                        ..
+                    } if self.dst_fold == DstFoldPolicy::Second => (
+                        second_instant_seconds,
+                        second_offset_minutes,
+                        *local_seconds,
+                        format_transition_offsets(
+                            transition.pre_offset_minutes,
+                            transition.post_offset_minutes,
+                        ),
+                        "FOLD_SECOND",
                     ),
-                    "GAP_SHIFT_FORWARD",
-                ),
-                user_automation_zones::LocalClockReality::Gap { .. } => {
-                    return Err(UserAutomationError::Invalid(
-                        "schedule.expression.gap_policy_rejected",
-                    ));
-                }
-            };
+                    user_automation_zones::LocalClockReality::Fold { .. } => {
+                        return Err(UserAutomationError::Invalid(
+                            "schedule.expression.fold_policy_rejected",
+                        ));
+                    }
+                    user_automation_zones::LocalClockReality::Gap {
+                        transition,
+                        shifted_local_unix_seconds,
+                        resolved_instant_seconds,
+                        post_offset_minutes,
+                        ..
+                    } if self.dst_gap == DstGapPolicy::ShiftForward => (
+                        resolved_instant_seconds,
+                        post_offset_minutes,
+                        shifted_local_unix_seconds,
+                        format_transition_offsets(
+                            transition.pre_offset_minutes,
+                            transition.post_offset_minutes,
+                        ),
+                        "GAP_SHIFT_FORWARD",
+                    ),
+                    user_automation_zones::LocalClockReality::Gap { .. } => {
+                        return Err(UserAutomationError::Invalid(
+                            "schedule.expression.gap_policy_rejected",
+                        ));
+                    }
+                };
             let resolved_local = civil_from_unix_seconds(resolved_local_seconds)?;
             let instant = civil_from_unix_seconds(instant_seconds)?;
             encoded.push(format!(
@@ -1339,19 +1335,17 @@ fn days_from_civil(year: u32, month: u32, day: u32) -> i64 {
 fn civil_from_unix_seconds(seconds: i64) -> Result<CivilDateTime, UserAutomationError> {
     let days = seconds.div_euclid(SECONDS_PER_DAY);
     let second_of_day = seconds.rem_euclid(SECONDS_PER_DAY);
-    let shifted_days = days
-        .checked_add(CIVIL_EPOCH_DAY_OFFSET)
-        .ok_or(UserAutomationError::Invalid(
-            "schedule.occurrence_key.instant",
-        ))?;
+    let shifted_days =
+        days.checked_add(CIVIL_EPOCH_DAY_OFFSET)
+            .ok_or(UserAutomationError::Invalid(
+                "schedule.occurrence_key.instant",
+            ))?;
     let era = shifted_days.div_euclid(DAYS_PER_CIVIL_ERA);
     let day_of_era = shifted_days - era * DAYS_PER_CIVIL_ERA;
-    let year_of_era = (day_of_era - day_of_era / 1_460 + day_of_era / 36_524
-        - day_of_era / 146_096)
-        / 365;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
     let mut year = year_of_era + era * 400;
-    let day_of_year = day_of_era
-        - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
     let month_position = (5 * day_of_year + 2) / 153;
     let day = day_of_year - (153 * month_position + 2) / 5 + 1;
     let month = month_position + if month_position < 10 { 3 } else { -9 };
@@ -2412,9 +2406,7 @@ impl UserAutomationRevision {
 
     /// Validates a revision whose schedule source is awaiting its first
     /// owner-generated V4 occurrence set.
-    pub fn validate_for_schedule_normalization(
-        &self,
-    ) -> Result<(), UserAutomationError> {
+    pub fn validate_for_schedule_normalization(&self) -> Result<(), UserAutomationError> {
         self.validate_revision_fields_without_schedule()?;
         self.schedule.validate_for_owner_normalization()
     }
@@ -2422,21 +2414,16 @@ impl UserAutomationRevision {
     /// Validates the non-schedule part of a legacy revision for an explicit
     /// migration request. Its old projection must be uniformly retired; a
     /// partially current or malformed projection is not silently repaired.
-    pub fn validate_legacy_for_schedule_migration(
-        &self,
-    ) -> Result<(), UserAutomationError> {
+    pub fn validate_legacy_for_schedule_migration(&self) -> Result<(), UserAutomationError> {
         self.validate_revision_fields_without_schedule()?;
         self.schedule.validate()?;
-        if self
-            .schedule
-            .next_occurrences
-            .iter()
-            .any(|occurrence| !is_legacy_occurrence_key(occurrence)
+        if self.schedule.next_occurrences.iter().any(|occurrence| {
+            !is_legacy_occurrence_key(occurrence)
                 && !occurrence
                     .split(NORMALIZED_OCCURRENCE_FIELD_SEPARATOR)
                     .next()
-                    .is_some_and(is_legacy_normalized_occurrence_encoding))
-        {
+                    .is_some_and(is_legacy_normalized_occurrence_encoding)
+        }) {
             return Err(UserAutomationError::Invalid(
                 "schedule.migration.previous_revision_not_legacy",
             ));
@@ -4099,10 +4086,7 @@ impl UserAutomationOperation {
                 normalization_receipt_envelope,
             } => {
                 revision.validate()?;
-                if normalization_receipt_envelope
-                    .core
-                    .operation
-                    .operation_kind
+                if normalization_receipt_envelope.core.operation.operation_kind
                     != USER_AUTOMATION_NORMALIZATION_OPERATION_KIND
                 {
                     return Err(UserAutomationError::ReceiptBinding);
