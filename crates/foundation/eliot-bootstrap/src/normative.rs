@@ -5,7 +5,7 @@
 //! document identities used by bootstrap artifacts.
 
 use eliot_contracts::sha256_hex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::NormativePair;
@@ -89,7 +89,7 @@ pub enum NormativePairReceiptError {
 /// Callers can join an independently admitted source snapshot to these exact
 /// handles and document digests without treating the receipt as the source
 /// admission itself.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct NormativePairReceiptIdentity {
     /// Architecture and Implementation document content digests.
     pub pair: NormativePair,

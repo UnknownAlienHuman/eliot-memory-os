@@ -34,6 +34,7 @@ use crate::{
 };
 
 const SNAPSHOT_TEMP_CREATE_ATTEMPTS: usize = 128;
+const DOCS_SHARD_RENDERED_BYTE_LIMIT: usize = 48_000;
 static SNAPSHOT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// Immutable receipt proving which snapshot was emitted.
@@ -221,7 +222,7 @@ pub enum NormativePairSourceRole {
 ///
 /// This is evidence for an existing WorkScope/source-admission owner to
 /// evaluate. It does not admit or promote a source by itself.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct NormativePairSourceCapture {
     /// Validated pair identity and its exact repository source handles.
     pub receipt: NormativePairReceiptIdentity,
@@ -392,7 +393,9 @@ fn capture_normative_source_document(
     safe_repository_file(canonical_root, entry_ref)?;
     safe_repository_file(canonical_root, compatibility_ref)?;
 
-    let mut reconstructed = String::with_capacity(manifest.source_bytes);
+    // `source_bytes` is supplied by the mutable manifest. Do not let it
+    // choose an allocation before the reconstructed bytes have been checked.
+    let mut reconstructed = String::new();
     let mut expected_order = 0usize;
     let mut expected_start = 0usize;
     let mut seen_paths = std::collections::BTreeSet::new();
@@ -408,14 +411,34 @@ fn capture_normative_source_document(
             ));
         }
         let fragment_path = safe_repository_file(canonical_root, &fragment.path)?;
-        let rendered = fs::read_to_string(&fragment_path).map_err(|error| {
+        // The shard contract owns a 48,000-byte rendered-source bound. Read
+        // only one byte past it so an oversized mutable shard cannot force an
+        // unbounded allocation before the length and digest checks below.
+        let mut rendered_bytes = Vec::new();
+        File::open(&fragment_path)
+            .map_err(|error| CaptureError::NormativePairReceipt {
+                path: fragment_path.clone(),
+                detail: error.to_string(),
+            })?
+            .take((DOCS_SHARD_RENDERED_BYTE_LIMIT + 1) as u64)
+            .read_to_end(&mut rendered_bytes)
+            .map_err(|error| CaptureError::NormativePairReceipt {
+                path: fragment_path.clone(),
+                detail: error.to_string(),
+            })?;
+        if rendered_bytes.len() > DOCS_SHARD_RENDERED_BYTE_LIMIT {
+            return Err(normative_capture_error(
+                &fragment_path,
+                "rendered shard exceeds the docs-shards rendered-byte bound",
+            ));
+        }
+        let rendered = String::from_utf8(rendered_bytes).map_err(|error| {
             CaptureError::NormativePairReceipt {
                 path: fragment_path.clone(),
                 detail: error.to_string(),
             }
         })?;
-        if rendered.len() > 48_000
-            || rendered.len() != fragment.rendered_bytes
+        if rendered.len() != fragment.rendered_bytes
             || sha256_hex(rendered.as_bytes()) != fragment.rendered_sha256
         {
             return Err(normative_capture_error(
