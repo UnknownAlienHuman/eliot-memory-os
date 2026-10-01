@@ -31,6 +31,8 @@ pub use initial_snapshot::{
     InitialSnapshotVerificationContext, PRIVACY_MODE_KEY, PrivacyChoice,
     SignedInitialConfigSnapshot, VerifiedInitialConfigSnapshot, prepare_initial_snapshot_payload,
     prepare_initial_snapshot_payload_with_blob_policy,
+    GOVERNING_SOURCE_APPROVAL_KEY, GOVERNING_SOURCE_APPROVAL_LITERAL_PREFIX,
+    prepare_initial_snapshot_payload_with_source_approval,
 };
 
 pub const CONTRACT_NAME: &str = "eliot.governor.config";
