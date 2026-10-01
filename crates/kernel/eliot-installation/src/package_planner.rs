@@ -2972,7 +2972,14 @@ impl SealedPackagePlanner {
             generation: candidate_manifest.generation.clone(),
             manifest: manifest.clone(),
             staging_root: staging_root.clone(),
-            destination_root: None,
+            // Match the candidate profile immutable publication destination.
+            destination_root: Some(
+                candidate_manifest
+                    .runtime_launch
+                    .profile_governed_roots
+                    .immutable_binaries
+                    .clone(),
+            ),
             expected_file_digests,
             candidate_manifest_digest,
             package_manifest_digest,
