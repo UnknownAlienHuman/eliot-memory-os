@@ -20,34 +20,13 @@ use eliot_store_api::{
     generated_operation_manifests, operation_manifest_set_digest,
     supported_admission_contract_set_digest,
 };
+use crate::composition::WorkScopeOwnerReadback;
 use eliot_workscope::{
     GoverningSourceSet, PrivacyProfile, ScopeBinding, WorkScopeBindingOwner,
     WorkScopeBindingSnapshot, WorkScopeDescriptor, admit_initial_binding,
 };
 use serde_json::Value;
 use thiserror::Error;
-
-/// Exact prior owner state established by the canonical named-read path.
-///
-/// `Absent` is valid only when the caller's exact-fence named read returned no
-/// `owner/work_scope` row. This producer is only for the first owner creation;
-/// it cannot replace or re-admit an existing row. The Store adapter performs
-/// the absent-row CAS and refuses payload-only convergence for an existing
-/// row.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum WorkScopeOwnerCasExpectation {
-    /// The owner read proved that the `owner/work_scope` row is absent.
-    Absent { state_fence: StateFence },
-}
-
-impl WorkScopeOwnerCasExpectation {
-    fn validate_for(&self, fence: &StateFence) -> Result<(u64, String), WorkScopeSourceAdmissionError> {
-        match self {
-            Self::Absent { state_fence } if state_fence == fence => Ok((0, String::new())),
-            Self::Absent { .. } => Err(WorkScopeSourceAdmissionError::FenceMismatch),
-        }
-    }
-}
 
 /// Fully prepared initial owner snapshot and the ordinary canonical write
 /// transition that persists it.
@@ -73,6 +52,9 @@ pub enum WorkScopeSourceAdmissionError {
     /// A supplied identity, authority, causal, binding, or CAS fence differed.
     #[error("WorkScope source admission inputs do not share the exact request fence")]
     FenceMismatch,
+    /// Initial admission was attempted over an already existing owner row.
+    #[error("initial WorkScope source admission requires an absent owner row")]
+    OwnerAlreadyExists,
     /// The owner revision overflowed while advancing the admitted snapshot.
     #[error("WorkScope owner revision overflowed")]
     OwnerRevisionOverflow,
@@ -102,10 +84,10 @@ pub enum WorkScopeSourceAdmissionError {
 /// WorkScope validates its canonical bytes and the role/reference/content
 /// digest join against the admitted `sources` before accepting the snapshot.
 ///
-/// `owner_cas` must come from a fresh named `owner/work_scope` read at the same
-/// fence and prove the row absent. Existing owners must use their dedicated
-/// update/admission flow; this initial-admission function cannot overwrite
-/// them. The Store operation receives the exact absence tuple and performs
+/// `owner_readback` must be the result of the exact-fence named
+/// `owner/work_scope` read. This initial-admission function accepts only the
+/// absent result; existing owners must use their dedicated update/admission
+/// flow. The Store operation receives the exact absence tuple and performs
 /// the CAS.
 #[allow(
     clippy::too_many_arguments,
@@ -121,7 +103,7 @@ pub fn prepare_initial_work_scope_source_admission(
     sources: &GoverningSourceSet,
     privacy: &PrivacyProfile,
     capture: &NormativePairSourceCapture,
-    owner_cas: &WorkScopeOwnerCasExpectation,
+    owner_readback: Option<&WorkScopeOwnerReadback>,
 ) -> Result<PreparedWorkScopeSourceAdmission, WorkScopeSourceAdmissionError> {
     identity
         .validate()
@@ -140,7 +122,13 @@ pub fn prepare_initial_work_scope_source_admission(
     {
         return Err(WorkScopeSourceAdmissionError::FenceMismatch);
     }
-    let (expected_revision, expected_digest) = owner_cas.validate_for(fence)?;
+    if let Some(owner) = owner_readback {
+        if owner.state_fence != *fence {
+            return Err(WorkScopeSourceAdmissionError::FenceMismatch);
+        }
+        return Err(WorkScopeSourceAdmissionError::OwnerAlreadyExists);
+    }
+    let (expected_revision, expected_digest) = (0_u64, String::new());
     let owner_revision = expected_revision
         .checked_add(1)
         .ok_or(WorkScopeSourceAdmissionError::OwnerRevisionOverflow)?;
@@ -254,4 +242,3 @@ pub fn prepare_initial_work_scope_source_admission(
         causal_binding: causal.clone(),
     })
 }
-
