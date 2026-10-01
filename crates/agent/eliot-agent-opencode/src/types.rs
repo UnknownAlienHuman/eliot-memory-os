@@ -4452,6 +4452,13 @@ mod tests {
         let wire: OpenCodeEvent = serde_json::from_slice(raw)?;
         let cursor = EventCursor::new("cursor-opencode-forged-1")?;
         // Zero sequence fails closed before any digest is minted.
+        //
+        // The arm below is a `matches!` **pattern**, not a constructor call, so
+        // it binds the variant's `String` field and compares it in the guard
+        // rather than calling `.to_owned()` on a literal. It still asserts the
+        // exact field text the producer issues, which is the whole point of the
+        // case: a refusal that named any other field would pass a bare
+        // `InvalidInput(_)` arm and hide the drift this test exists to catch.
         assert!(matches!(
             normalize_opencode_event(OpenCodeHostEventInput {
                 event: &wire,
@@ -4466,9 +4473,7 @@ mod tests {
                 delivery: HostEventDeliveryDisposition::DurableOrdered,
                 admission: Some(&admission),
             }),
-            Err(OpenCodeObservationConversionError::InvalidInput(
-                "sequence".to_owned(),
-            ))
+            Err(OpenCodeObservationConversionError::InvalidInput(field)) if field == "sequence"
         ));
         // Missing admission for execution-unit lineage fails closed.
         assert!(matches!(
@@ -4485,9 +4490,8 @@ mod tests {
                 delivery: HostEventDeliveryDisposition::DurableOrdered,
                 admission: None,
             }),
-            Err(OpenCodeObservationConversionError::InvalidInput(
-                "admission/lineage"
-            ))
+            Err(OpenCodeObservationConversionError::InvalidInput(field))
+                if field == "admission/lineage"
         ));
         // A forged caller-supplied output digest fails closed at validation.
         let (mut envelope, _) = normalize_opencode_event(OpenCodeHostEventInput {
