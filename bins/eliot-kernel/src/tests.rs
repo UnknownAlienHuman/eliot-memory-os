@@ -2963,7 +2963,10 @@ fn normal_composition_is_not_process_ready_without_host_handoff() {
     std::fs::create_dir_all(&root).expect("test work root");
     let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("composition");
     assert!(!kernel.process_execution_configured());
-    assert_eq!(Arc::strong_count(&kernel.generation_gateway.ors), 1);
+    assert!(
+        kernel.process_gateway.is_none(),
+        "ordinary composition has no Host-admitted process gateway"
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -3671,7 +3674,17 @@ fn process_authority_constructor_reuses_one_real_ors_store() {
     )
     .expect("process authority constructor");
     assert!(kernel.process_execution_configured());
-    assert_eq!(Arc::strong_count(&kernel.generation_gateway.ors), 4);
+    let process_gateway = kernel
+        .process_gateway
+        .as_ref()
+        .expect("Host-admitted process gateway");
+    assert!(
+        Arc::ptr_eq(
+            &kernel.generation_gateway.ors,
+            &process_gateway.evidence_store
+        ),
+        "process authority and generation recovery must share the same real ORS handle"
+    );
     drop(kernel);
     let _ = std::fs::remove_dir_all(root);
 }
@@ -5516,11 +5529,18 @@ async fn c183_probe_ready_shares_store_rebind_gate_and_requires_committed_public
     );
     let kernel = std::sync::Arc::new(kernel);
     let gate_kernel = std::sync::Arc::clone(&kernel);
+    let (gate_held_tx, gate_held_rx) = tokio::sync::oneshot::channel();
+    let (release_gate_tx, release_gate_rx) = tokio::sync::oneshot::channel();
     let holder = tokio::spawn(async move {
         let _guard = gate_kernel.store_rebind_gate.lock().await;
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        gate_held_tx.send(()).expect("signal held store rebind gate");
+        release_gate_rx
+            .await
+            .expect("release held store rebind gate");
     });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    gate_held_rx
+        .await
+        .expect("store rebind gate holder started");
     assert!(
         kernel.store_rebind_gate.try_lock().is_err(),
         "gate must be held by holder task"
@@ -5546,11 +5566,14 @@ async fn c183_probe_ready_shares_store_rebind_gate_and_requires_committed_public
         _ = &mut probe_fut => false,
         () = &mut timeout => true,
     };
+    release_gate_tx
+        .send(())
+        .expect("release held store rebind gate");
+    let _ = holder.await;
     assert!(
         blocked,
         "ProbeReady must share store_rebind_gate and block while gate is held"
     );
-    let _ = holder.await;
     let probe_result = probe_fut.await;
     assert!(
         probe_result.is_err(),
