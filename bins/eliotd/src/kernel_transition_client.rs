@@ -924,16 +924,12 @@ mod tests {
                 &heads,
             ))
             .expect("recomputed hash");
-        let error = match check_identity_binding_with_selection(
-            &identity,
-            &unsupported,
-            &[],
-            &heads,
-            None,
-        ) {
-            Err(error) => error,
-            Ok(()) => unreachable!("unsupported manifest must fail"),
-        };
+        let error =
+            match check_identity_binding_with_selection(&identity, &unsupported, &[], &heads, None)
+            {
+                Err(error) => error,
+                Ok(()) => unreachable!("unsupported manifest must fail"),
+            };
         assert!(
             matches!(error, KernelPortError::Contract(ref detail) if detail.contains("recovery")),
             "unsupported plan must name recovery, got: {error:?}"

@@ -400,12 +400,9 @@ async fn dispatch_genesis_request(
     context: RequestMeta,
     request: StoreGenesisRequest,
 ) -> Response {
-    let result = CanonicalStoreClient::initialize_genesis(
-        &composition.store,
-        &context,
-        request.clone(),
-    )
-    .await;
+    let result =
+        CanonicalStoreClient::initialize_genesis(&composition.store, &context, request.clone())
+            .await;
     map_genesis_dispatch_result(&context, &request, result)
 }
 
