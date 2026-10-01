@@ -250,7 +250,11 @@ pub fn canonical_request_bytes(view: &CanonicalRequestView) -> Result<Vec<u8>, S
     // post-admission scope duplication fails here before any
     // lookup/transaction as well.
     normalized.ordering_scopes.sort();
-    if normalized.ordering_scopes.windows(2).any(|pair| pair[0] == pair[1]) {
+    if normalized
+        .ordering_scopes
+        .windows(2)
+        .any(|pair| pair[0] == pair[1])
+    {
         return Err(StoreError::Duplicate {
             field: "ordering_scopes",
         });

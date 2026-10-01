@@ -613,6 +613,11 @@ impl CanonicalWriteEnvelope {
             ),
             expected_revision_heads: self.expected_revision_heads.clone(),
             expected_ordering_heads: self.expected_ordering_heads.clone(),
+            ordering_scopes: self
+                .expected_ordering_heads
+                .iter()
+                .map(|head| head.scope.clone())
+                .collect(),
         }
     }
 
