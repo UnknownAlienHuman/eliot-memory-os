@@ -354,6 +354,36 @@ def _tracked_rust_files(root: Path) -> list[str]:
     return sorted(found)
 
 
+def _skip_continuation(source: str, start: int) -> int:
+    """Return the offset where a string literal resumes after a line continuation.
+
+    Rust strips a backslash that ends a line, the newline itself, and the
+    indentation that follows it, then continues the literal on the next line.
+    Only the newline and the immediately following spaces/tabs/CR are consumed;
+    the first other character belongs to the literal again. An unterminated
+    continuation stops at end of input and is reported by the caller's
+    unclosed-literal check rather than silently accepted.
+    """
+    n = len(source)
+    i = start
+    while i < n and source[i] != "\n":
+        i += 1
+    if i < n:
+        i += 1  # the continuation newline
+    while i < n and source[i] in " \t\r":
+        i += 1
+    return i
+
+
+def _mask_continuation(source: str, start: int) -> list[str]:
+    """Mask the newline and indentation a line continuation strips.
+
+    Newlines are emitted as newlines and horizontal whitespace as spaces, so the
+    masked text keeps exactly one line per source line.
+    """
+    return ["\n" if c == "\n" else " " for c in source[start:_skip_continuation(source, start)]]
+
+
 def _mask_rust(source: str) -> str:
     """Blank strings/comments with spaces, preserving newlines and spans.
 
@@ -410,6 +440,17 @@ def _mask_rust(source: str) -> str:
             while i < n:
                 c = source[i]
                 if c == "\\":
+                    # A backslash immediately before a newline is a Rust line
+                    # continuation, not an escape: the newline and the following
+                    # indentation are stripped and the literal continues on the
+                    # next line. Blank the backslash but keep every newline so
+                    # masked line numbers stay identical to source line numbers.
+                    j = i + 1
+                    if source[j: j + 1] == "\n":
+                        out.append(" ")
+                        out.extend(_mask_continuation(source, j))
+                        i = _skip_continuation(source, j)
+                        continue
                     out.extend([" ", " "])
                     i += 2
                     continue
@@ -439,6 +480,17 @@ def _mask_rust(source: str) -> str:
             while i < n:
                 c = source[i]
                 if c == "\\":
+                    # A backslash immediately before a newline is a Rust line
+                    # continuation, not an escape: the newline and the following
+                    # indentation are stripped and the literal continues on the
+                    # next line. Blank the backslash but keep every newline so
+                    # masked line numbers stay identical to source line numbers.
+                    j = i + 1
+                    if source[j: j + 1] == "\n":
+                        out.append(" ")
+                        out.extend(_mask_continuation(source, j))
+                        i = _skip_continuation(source, j)
+                        continue
                     out.extend([" ", " "])
                     i += 2
                     continue
