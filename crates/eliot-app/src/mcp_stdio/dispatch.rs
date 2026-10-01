@@ -286,7 +286,12 @@ pub(super) async fn handle_message(
 /// `/4`, a character count, zero or one.
 fn dispatch_error_response(id: &Value, error: &anyhow::Error) -> Result<Value> {
     if let Some(input) = error.downcast_ref::<eliot_types::ToolInputError>() {
-        Ok(error_response_with_data(id, -32602, "invalid tool input", &input.data))
+        Ok(error_response_with_data(
+            id,
+            -32602,
+            "invalid tool input",
+            &input.data,
+        ))
     } else if let Some(eliot_engine::EngineError::EncodingRejected { violations }) =
         error.downcast_ref::<eliot_engine::EngineError>()
     {
@@ -309,7 +314,12 @@ fn dispatch_error_response(id: &Value, error: &anyhow::Error) -> Result<Value> {
                 .collect(),
             minimal_valid_example: Value::Null,
         };
-        Ok(error_response_with_data(id, -32602, "encoding rejected", &data))
+        Ok(error_response_with_data(
+            id,
+            -32602,
+            "encoding rejected",
+            &data,
+        ))
     } else if matches!(
         error.downcast_ref::<eliot_engine::EngineError>(),
         Some(eliot_engine::EngineError::ObservabilityConflict)
@@ -324,7 +334,7 @@ fn dispatch_error_response(id: &Value, error: &anyhow::Error) -> Result<Value> {
             id,
             -32602,
             "observability write_id conflict",
-            &data
+            &data,
         ))
     } else if let Some(eliot_engine::PacketCompileError::HardCeiling(details)) =
         error.downcast_ref::<eliot_engine::PacketCompileError>()

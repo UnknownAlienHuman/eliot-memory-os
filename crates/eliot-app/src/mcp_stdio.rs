@@ -437,14 +437,15 @@ pub(crate) fn recorded_planning_wire(unit: &str, value: Option<u64>) -> Value {
 /// absent-becomes-a-number collapse this migration forbids, and the one
 /// documented as the opposite of [`MeasurementStatus::Unavailable`], which is
 /// the only representation of "unmeasured" on this seam.
-fn recorded_section_wire(
-    section_tokens: &BTreeMap<String, usize>,
-) -> Result<Value> {
+fn recorded_section_wire(section_tokens: &BTreeMap<String, usize>) -> Result<Value> {
     let mut sections = serde_json::Map::new();
     for (name, value) in section_tokens {
         let value =
             u64::try_from(*value).with_context(|| format!("section figure {name} exceeds u64"))?;
-        sections.insert(name.clone(), recorded_planning_wire("stu_estimate", Some(value)));
+        sections.insert(
+            name.clone(),
+            recorded_planning_wire("stu_estimate", Some(value)),
+        );
     }
     Ok(Value::Object(sections))
 }
