@@ -1250,6 +1250,41 @@ impl ProcessRequest {
         )
     }
 
+    /// Projects the exact Kernel-issued permit and immutable intent into the
+    /// expected execution binding before launch.
+    ///
+    /// This is an evidence projection only: it does not consume the permit,
+    /// validate current Kernel authority, or grant permission to execute. The
+    /// projection is refused when the admitted permit lacks the validation
+    /// revision that a consumed `ValidatedDispatch` would bind.
+    pub fn expected_execution_binding(&self) -> Result<ProcessExecutionBinding, ContractError> {
+        self.validate()?;
+        let validation_revision = self.permit.validation_revision.ok_or(
+            ContractError::InvalidValue {
+                field: "validation_revision",
+                reason: "expected execution binding requires an admitted validation revision",
+            },
+        )?;
+        let binding = ProcessExecutionBinding {
+            operation_id: self.intent.operation_id.clone(),
+            process_tree_id: self.intent.process_tree_id.clone(),
+            job_id: self.intent.job_id.clone(),
+            image_id: self.intent.image_id.clone(),
+            session_id: self.intent.session_id.clone(),
+            generation: self.intent.generation,
+            action_lease_ref: self.permit.action_lease_ref.clone(),
+            authority_id: self.permit.authority_id.clone(),
+            authority_epoch: self.permit.state_fence.authority_epoch.clone(),
+            state_fence: self.permit.state_fence.clone(),
+            request_digest: self.invocation_digest.clone(),
+            permit_digest: self.permit.permit_digest.clone(),
+            effect_digest: self.intent.effect_digest.clone(),
+            validation_revision,
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
     fn compute_digest(&self) -> Result<String, ContractError> {
         #[derive(Serialize)]
         struct UnsignedRequest<'a> {
