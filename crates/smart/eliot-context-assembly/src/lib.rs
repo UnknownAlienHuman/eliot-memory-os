@@ -47,9 +47,9 @@ pub use assemble::{
     rendered_output_identity,
 };
 pub use boundary::{
-    BOUNDARY_ASSEMBLY_TRANSFORMER_ID, BOUNDARY_ASSEMBLY_TRANSFORMER_REVISION,
-    assembly_boundary_limits, boundary_binding_digest, project_assembly_boundaries,
-    read_back_boundaries, verify_boundary_binding,
+    ASSEMBLY_SECTION_UNIT_BOUNDARY, BOUNDARY_ASSEMBLY_TRANSFORMER_ID,
+    BOUNDARY_ASSEMBLY_TRANSFORMER_REVISION, assembly_boundary_limits, boundary_binding_digest,
+    project_assembly_boundaries, read_back_boundaries, verify_boundary_binding,
 };
 pub use campaign_view::check_campaign_view_for_assembly;
 pub use cite::project_citation;

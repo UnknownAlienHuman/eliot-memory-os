@@ -32,6 +32,26 @@ pub const BOUNDARY_ASSEMBLY_TRANSFORMER_ID: &str = "context.assembly.render";
 /// Contract revision of the A-18 boundary projection.
 pub const BOUNDARY_ASSEMBLY_TRANSFORMER_REVISION: ContractVersion = ContractVersion::new(1, 0, 0);
 
+/// The whole-unit boundary kind this projection emits for one budgeted section.
+///
+/// #1724. This is the EXECUTION OWNER's own statement of the kind its boundary
+/// projection writes into every per-record `BoundaryMetadataEnvelope`, and it is
+/// the only place in this crate that states it: `unit_envelope` builds the envelope
+/// from it and `verify_against_rendered` reads back through it, so there is one
+/// derivation rather than two literals that must agree.
+///
+/// The contract crate cannot read this constant — `eliot-context-assembly` depends
+/// on `eliot-context-contracts`, not the other way round — so this fact reaches the
+/// contract through the execution owner's own support record instead
+/// (`RecipeExecutionSupport::section_unit_boundary`, built in
+/// `eliot-context/src/campaign_publication.rs`), and
+/// `ContextRecipePolicy::require_executable` compares that presented member against
+/// the boundary kind the contract authorises. An execution owner that starts
+/// emitting another kind therefore refuses by name
+/// (`recipe_support.section_unit_boundary`) until the contract authorises it, instead
+/// of the contract asserting what this projection happens to emit today.
+pub const ASSEMBLY_SECTION_UNIT_BOUNDARY: BoundaryUnitKind = BoundaryUnitKind::Unit;
+
 /// Deterministic caller-supplied resource bounds for one boundary projection.
 ///
 /// Assembly owns these values because it is the projection site; the contract still
@@ -124,7 +144,7 @@ fn unit_envelope(
     let member_id = candidate.atom_id.clone();
     BoundaryMetadataEnvelope {
         unit_id: member_id.clone(),
-        unit_kind: BoundaryUnitKind::Unit,
+        unit_kind: ASSEMBLY_SECTION_UNIT_BOUNDARY,
         binding: admitted.binding.clone(),
         source: Some(candidate.source.clone()),
         source_attempt_id: Some(admitted.binding.attempt_id.clone()),
@@ -297,7 +317,7 @@ fn verify_against_rendered(
 
     let mut seen: BTreeMap<&ArtifactId, &BoundaryMetadataEnvelope> = BTreeMap::new();
     for unit in &boundaries.units {
-        if unit.unit_kind != BoundaryUnitKind::Unit {
+        if unit.unit_kind != ASSEMBLY_SECTION_UNIT_BOUNDARY {
             continue;
         }
         if seen.insert(&unit.unit_id, unit).is_some() {

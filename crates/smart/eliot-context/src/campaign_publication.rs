@@ -34,6 +34,14 @@ use crate::{ContextError, ContextInput};
 /// - the repetition treatment is `EXECUTED_REPETITION_POLICY`, which is what
 ///   the renderer does today: project each admitted record once, with
 ///   `AdmittedContextSet::validate` refusing a repeated atom identity;
+/// - the section unit boundary kind is
+///   `eliot_context_assembly::ASSEMBLY_SECTION_UNIT_BOUNDARY`, the kind this
+///   owner's boundary projection writes into every per-record envelope, read from
+///   that crate rather than restated here. This is a #1724 addition: the contract
+///   used to assert the kind itself, so changing the kind this owner emits moved
+///   the delivered boundary with nothing to compare against; now the owner
+///   presents it and `require_executable` cross-checks the presentation, refusing
+///   as `recipe_support.section_unit_boundary` when the two disagree;
 /// - the section degradation is `EXECUTED_SECTION_DEGRADATION`, which is what
 ///   admission and assembly do today: refuse the dependent operation rather
 ///   than narrow a section behind a declared degradation;
@@ -51,6 +59,7 @@ fn context_execution_support() -> Result<RecipeExecutionSupport, ContextPublicat
         executed_stage: stage,
         ordering_revision,
         repetition: EXECUTED_REPETITION_POLICY,
+        section_unit_boundary: eliot_context_assembly::ASSEMBLY_SECTION_UNIT_BOUNDARY,
         section_degradation: EXECUTED_SECTION_DEGRADATION,
         supports_feature_disable: false,
     };

@@ -186,8 +186,10 @@
 //!
 //! ```text
 //! section_budgets[].unit_boundary_kind
-//!     require_executable compares it with EXECUTED_SECTION_UNIT_BOUNDARY, the
-//!     whole-unit boundary kind the assembly projection actually emits per record
+//!     require_executable compares it with the EXECUTION OWNER's own presented
+//!     `RecipeExecutionSupport::section_unit_boundary`, and separately refuses
+//!     that presented member unless it is a kind this contract authorises
+//!     ([`EXECUTED_SECTION_UNIT_BOUNDARY`])
 //! section_budgets[].omission_or_handle_policy
 //!     binds_recipe compares it with the instance's own per-role
 //!     RoleLossRule::loss_policy for the same role
@@ -230,8 +232,10 @@
 //! decision itself cites, `position` against the order the execution path renders
 //! under, `forbidden_movement` against the candidate's own measured guardrail set,
 //! and the protected reserves against the governing floor's route capacity). One
-//! compares against a compiled-in executed fact stated in this contract
-//! (`unit_boundary_kind` against [`EXECUTED_SECTION_UNIT_BOUNDARY`]), and one
+//! compares against what the EXECUTION OWNER itself presents for that member
+//! (`unit_boundary_kind` against `RecipeExecutionSupport::section_unit_boundary`,
+//! which this contract then holds to the authorised
+//! [`EXECUTED_SECTION_UNIT_BOUNDARY`]), and one
 //! refuses an incoherent value outright (`margin_reserve == 0`). A policy cannot
 //! reach a delivered View by declaring one of these settings unless something
 //! outside the policy agrees with it.
@@ -246,12 +250,18 @@
 //!    not enforced at all is now enforced — LOWERING either below the floor's
 //!    mandatory member count refuses with `MissingFloor` — so neither can weaken
 //!    a floor while moving the identity.
-//! 2. [`EXECUTED_ORDERING_REVISION`] and [`EXECUTED_SECTION_UNIT_BOUNDARY`] are
-//!    stated by this contract rather than published by the execution owner in
-//!    [`RecipeExecutionSupport`]. Both comparisons fail CLOSED when the two
-//!    disagree, so the coupling cannot be silently wrong, but promoting both
-//!    facts into [`RecipeExecutionSupport`] is the change that would let the
-//!    execution owner state them, and it is owed there.
+//! 2. Both executed facts are PRESENTED BY THE EXECUTION OWNER in
+//!    [`RecipeExecutionSupport`] and cross-checked here rather than asserted here:
+//!    `ordering_revision` against the scheme this contract authorises, and
+//!    `section_unit_boundary` against [`EXECUTED_SECTION_UNIT_BOUNDARY`]. What
+//!    remains stated in this contract is the AUTHORISATION, not the executed fact,
+//!    and the two comparisons fail CLOSED when either side disagrees, so the
+//!    coupling cannot be silently wrong. One residue of the dependency direction
+//!    cannot be removed: the authorised SCHEME STRING
+//!    ([`EXECUTED_ORDERING_REVISION`]) necessarily exists in both crates, because
+//!    `eliot-context-assembly` depends on this one and cannot be read from it, and
+//!    a contract that did not name the scheme could not authorise it. That is an
+//!    authorisation the contract must own, not an executed fact it is guessing.
 //! 3. `admission.admission_rule` and the protected reserves are bound by IDENTITY
 //!    and by CAPACITY CEILING respectively. I7.11 places the admission rule's own
 //!    class comparison in `eliot-context-admission`, which depends on this crate,
@@ -328,28 +338,31 @@ pub const EXECUTED_CONTEXT_STAGE: &str = "context.stage.compile-and-render.v1";
 pub const EXECUTED_SECTION_DEGRADATION: BoundaryDisposition =
     BoundaryDisposition::BlockDependentDecisionOrEffect;
 
-/// The whole-unit boundary kind the current path emits for one budgeted section.
+/// The whole-unit boundary kind this contract authorises the executing path to
+/// emit for one budgeted section.
 ///
 /// I12.13 `ContextSectionBudget.unit_boundary_kind` names what one whole unit of
-/// a section is, and the current assembly projection emits exactly one
-/// independently addressable `BoundaryMetadataEnvelope` of kind
-/// [`BoundaryUnitKind::Unit`] per admitted record
-/// (`eliot-context-assembly/src/boundary.rs::unit_envelope`); the `Batch`
-/// envelope it also emits is the source-less parent of the whole admitted set,
-/// not a section unit. `ContiguousExtract`, `CallResultPair` and `EvidenceEdge`
-/// describe composite units this path never builds per section, so a policy
-/// declaring one would be certifying a boundary the delivered packet does not
-/// have. [`ContextRecipePolicy::require_executable`] refuses that by name.
+/// a section is. `Unit` is the only kind an assembly path can emit per section
+/// unit today: the `Batch` envelope it also emits is the source-less parent of the
+/// whole admitted set, not a section unit, and `ContiguousExtract`,
+/// `CallResultPair` and `EvidenceEdge` describe composite units no such path builds
+/// per section. [`ContextRecipePolicy::require_executable`] refuses any other.
 ///
-/// This is the contract's own statement of an executed fact, in the same
-/// standing as [`EXECUTED_CONTEXT_STAGE`], [`EXECUTED_SECTION_DEGRADATION`],
-/// [`EXECUTED_REPETITION_POLICY`] and [`EXECUTED_ORDERING_REVISION`]. It is not
-/// a member of [`RecipeExecutionSupport`] because that record is the execution
-/// owner's, and adding a member to it is a change to a struct the owner builds;
-/// naming the fact here keeps this change inside one file. Promoting it into
-/// `RecipeExecutionSupport` is the change that would let the execution owner
-/// state the kind it emits instead of this contract asserting it. Until then the
-/// coupling fails CLOSED: a policy declaring another kind refuses.
+/// This constant is the kind this contract AUTHORISES, in the same standing
+/// as [`EXECUTED_CONTEXT_STAGE`], [`EXECUTED_SECTION_DEGRADATION`] and
+/// [`EXECUTED_REPETITION_POLICY`]. It is deliberately NOT a statement of what the
+/// assembly projection emits: that fact belongs to the execution owner, which
+/// publishes it as [`RecipeExecutionSupport::section_unit_boundary`] (built from
+/// `eliot-context-assembly`'s own `ASSEMBLY_SECTION_UNIT_BOUNDARY`, the single
+/// place its boundary projection states the kind it writes into each envelope), and
+/// `require_executable` cross-checks the two. #1724 closed that owed promotion: the
+/// contract used to assert the emitted kind outright, so an execution owner that
+/// began emitting another kind changed the delivered boundary with nothing to
+/// refuse. It now refuses with
+/// [`RecipeResolutionRefusal::UnsupportedSetting`] naming
+/// `recipe_support.section_unit_boundary`, which is the member that changed, and
+/// `section_budget.unit_boundary_kind` when a policy declares a kind the executing
+/// path does not emit.
 const EXECUTED_SECTION_UNIT_BOUNDARY: BoundaryUnitKind = BoundaryUnitKind::Unit;
 
 /// The repetition treatment the current renderer actually applies.
@@ -391,10 +404,21 @@ pub const EXECUTED_REPETITION_POLICY: RecipeRepetitionPolicy =
 /// revisions with different declared orders carry different executed ordering
 /// revisions on their Views.
 ///
-/// The same pattern, and the same owed promotion, applies to
-/// [`EXECUTED_SECTION_UNIT_BOUNDARY`]: both facts are stated here because this file
-/// is the only one in scope, and both belong in [`RecipeExecutionSupport`] once the
-/// execution owner can restate them.
+/// This is the ONE executed fact whose name cannot move into
+/// [`RecipeExecutionSupport`], and it is not an executed fact at all: it is the
+/// scheme this contract authorises. A contract that did not name the scheme could
+/// not decide whether a presented one is authorised, and the only ways to learn the
+/// execution owner's spelling from here are the dependency edge this crate may not
+/// take or a third crate both depend on. So the executed side
+/// ([`RecipeExecutionSupport::ordering_revision`]) was already the owner's own
+/// statement, and this side remains what this contract authorises — the two are
+/// compared rather than restated, and a mismatch refuses by name.
+///
+/// The same pattern applies to the section unit boundary kind, with the two
+/// statements on opposite sides: [`EXECUTED_SECTION_UNIT_BOUNDARY`] is what this
+/// contract authorises, and
+/// [`RecipeExecutionSupport::section_unit_boundary`] is what the execution owner
+/// publishes it renders under.
 pub const EXECUTED_ORDERING_REVISION: &str = "a18.declared-role-position.v1";
 
 /// I12.13 `applicable_task_route_impact_and_governance_profiles`.
@@ -1555,10 +1579,20 @@ impl ContextRecipePolicy {
     /// and the identity of the revision that declares it, so a dependent
     /// compilation is blocked with a name rather than a silent degradation.
     ///
-    /// #1724 A2 adds the whole-unit boundary kind: a section may only declare
-    /// the kind the assembly projection actually emits
-    /// ([`EXECUTED_SECTION_UNIT_BOUNDARY`]). It was previously inside the digest
-    /// with no reader anywhere, including this refusal.
+    /// #1724 A2 adds the whole-unit boundary kind: a section may only declare a kind
+    /// the executing path emits. It was previously inside the digest with no reader
+    /// anywhere, including this refusal.
+    ///
+    /// #1724 promoted that member into the EXECUTION OWNER's record. The kind the
+    /// boundary projection emits is now PRESENTED as
+    /// [`RecipeExecutionSupport::section_unit_boundary`] and cross-checked in both
+    /// directions instead of being asserted by this contract: the presented member
+    /// must equal the kind this contract authorises, and a budget must equal the
+    /// presented member. Before the promotion this function compared a budget
+    /// against its OWN constant, so nothing consulted the kind the projection
+    /// actually wrote into each envelope and the execution owner could change the
+    /// delivered boundary with no refusal anywhere. Both comparisons remain strict
+    /// equality — the promotion adds the missing subject, it relaxes nothing.
     ///
     /// #1724 W4 closes the ordering half. Two changes together, and neither is
     /// sufficient alone:
@@ -1575,11 +1609,13 @@ impl ContextRecipePolicy {
     ///   in `policy_sha256` while the renderer emitted its own order; it now
     ///   renders in the order it declared.
     ///
-    /// The refusal names the field whose value is unsupported, so the two halves
-    /// stay distinguishable in what the caller receives:
-    /// `recipe_support.ordering_revision` is the executing path declaring a scheme
-    /// this contract cannot cross-check, and `section_budget.unit_boundary_kind` is
-    /// the policy declaring a boundary kind the projection does not emit.
+    /// The refusal names the field whose value is unsupported, so each subject stays
+    /// distinguishable in what the caller receives:
+    /// `recipe_support.ordering_revision` is the executing path presenting a scheme
+    /// this contract does not authorise, `recipe_support.section_unit_boundary` is
+    /// the executing path presenting a boundary kind this contract does not
+    /// authorise, and `section_budget.unit_boundary_kind` is the policy declaring a
+    /// boundary kind the executing path does not emit.
     pub fn require_executable(
         &self,
         support: &RecipeExecutionSupport,
@@ -1616,6 +1652,15 @@ impl ContextRecipePolicy {
         if support.ordering_revision.as_str() != Self::declared_ordering_revision() {
             return Err(unsupported("recipe_support.ordering_revision"));
         }
+        // #1724. `section_unit_boundary` is the EXECUTION OWNER's own statement of
+        // the kind its boundary projection emits per admitted record. It is refused
+        // here against the kind this contract authorises BEFORE any policy budget is
+        // compared, so an execution owner that changes the kind it emits is refused
+        // naming the member that changed rather than having the change surface as a
+        // policy budget that declares something the path no longer produces.
+        if support.section_unit_boundary != EXECUTED_SECTION_UNIT_BOUNDARY {
+            return Err(unsupported("recipe_support.section_unit_boundary"));
+        }
         // `layout.role_positions` needs no comparison here: the renderer APPLIES
         // the declared order (eliot-context-assembly `render::render` reads
         // `layout.role_positions` and sorts by `position`), so a declaration that
@@ -1625,7 +1670,7 @@ impl ContextRecipePolicy {
         // position, which `RecipeLayoutPolicy::validate` already makes impossible
         // by requiring the positions to be the contiguous sequence `0..n`.
         for budget in &self.section_budgets {
-            if budget.unit_boundary_kind != EXECUTED_SECTION_UNIT_BOUNDARY {
+            if budget.unit_boundary_kind != support.section_unit_boundary {
                 return Err(unsupported("section_budget.unit_boundary_kind"));
             }
             if budget.degradation_behavior != support.section_degradation {
@@ -1797,6 +1842,25 @@ pub struct RecipeExecutionSupport {
     /// scheme this contract authorises — a token nothing read, added for the exact
     /// purpose this check now serves.
     pub ordering_revision: ArtifactId,
+    /// Whole-unit boundary kind this path emits for one budgeted section.
+    ///
+    /// I12.13 makes the unit boundary kind part of the recipe, so what this member
+    /// states is what the boundary projection actually writes into each per-record
+    /// envelope. It is the execution owner's own statement, read from
+    /// `eliot-context-assembly`'s `ASSEMBLY_SECTION_UNIT_BOUNDARY` rather than
+    /// restated here, and `eliot-context-contracts` cannot read that crate's constant
+    /// because the dependency runs the other way.
+    ///
+    /// #1724: read by [`ContextRecipePolicy::require_executable`], which refuses
+    /// unless it equals [`EXECUTED_SECTION_UNIT_BOUNDARY`] and then requires every
+    /// declared `section_budget.unit_boundary_kind` to equal this member. Before
+    /// this member existed the contract compared a declared budget against its own
+    /// constant, so nothing read the kind the projection emitted and changing it
+    /// changed the delivered boundary with no refusal; a change now refuses as
+    /// `recipe_support.section_unit_boundary`, naming the member that changed. The
+    /// member is required rather than defaulted so a path that gains a composite
+    /// unit states it explicitly and refuses until this contract authorises it.
+    pub section_unit_boundary: BoundaryUnitKind,
     /// Repetition treatment this path applies to repeated content.
     pub repetition: RecipeRepetitionPolicy,
     /// Whole-unit disposition this path applies when a section floor cannot be
