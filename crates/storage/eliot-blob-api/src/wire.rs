@@ -1045,6 +1045,20 @@ pub struct BlobProcessStreamVerifiedOwnerFacts {
     pub authority_binding_sha256: String,
     /// Owner-computed digest over the exact currentness input set.
     pub currentness_sha256: String,
+    /// Current task binding read by the named Task owner, when the admitted
+    /// RequestIdentity carries a task ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_binding_json: Option<String>,
+    /// SHA-256 of the exact canonical TaskBinding JSON above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_binding_sha256: Option<String>,
+    /// Current authenticated SessionBinding, when the caller carries a
+    /// session ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_binding_json: Option<String>,
+    /// SHA-256 of the exact canonical SessionBinding JSON above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_binding_sha256: Option<String>,
 }
 
 impl BlobProcessStreamVerifiedOwnerFacts {
@@ -1081,7 +1095,17 @@ impl BlobProcessStreamVerifiedOwnerFacts {
         ] {
             validate_canonical_owner_json(name, json, digest)?;
         }
-        validate_digest("currentness_sha256", &self.currentness_sha256)
+        validate_digest("currentness_sha256", &self.currentness_sha256)?;
+        validate_optional_canonical_owner_json_pair(
+            "task_binding",
+            self.task_binding_json.as_deref(),
+            self.task_binding_sha256.as_deref(),
+        )?;
+        validate_optional_canonical_owner_json_pair(
+            "session_binding",
+            self.session_binding_json.as_deref(),
+            self.session_binding_sha256.as_deref(),
+        )
     }
 }
 
@@ -1394,6 +1418,33 @@ impl BlobProcessStreamOwnerFactsPullResponse {
                 || owner_facts.authority_binding_sha256 != request.kernel_authority_binding_sha256
             {
                 return Err(WireValidationError::InvalidField("owner_authority_binding"));
+            }
+            match (&request.task_id, &owner_facts.task_binding_json) {
+                (Some(task_id), Some(binding_json)) => {
+                    let binding: eliot_receipts::TaskBinding = serde_json::from_str(binding_json)
+                        .map_err(|_| WireValidationError::InvalidField("task_binding"))?;
+                    if binding.task_id.as_str() != task_id
+                        || binding.state_fence != request.state_fence
+                    {
+                        return Err(WireValidationError::InvalidField("task_binding"));
+                    }
+                }
+                (None, None) => {}
+                _ => return Err(WireValidationError::InvalidField("task_binding")),
+            }
+            match (&request.session_id, &owner_facts.session_binding_json) {
+                (Some(session_id), Some(binding_json)) => {
+                    let binding: eliot_receipts::SessionBinding =
+                        serde_json::from_str(binding_json)
+                            .map_err(|_| WireValidationError::InvalidField("session_binding"))?;
+                    if binding.session_id.as_str() != session_id
+                        || binding.state_fence != request.state_fence
+                    {
+                        return Err(WireValidationError::InvalidField("session_binding"));
+                    }
+                }
+                (None, None) => {}
+                _ => return Err(WireValidationError::InvalidField("session_binding")),
             }
             if request.purpose == BlobProcessStreamOwnerFactsPullPurpose::SourceReadback
                 && request
