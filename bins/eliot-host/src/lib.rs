@@ -3873,8 +3873,8 @@ impl HostJobBranches {
             // Retain the exact attempted original digest before sending. If
             // Kernel commits the report but its ACK is lost, revoke by this
             // exact CAS selector; this is not an acceptance claim.
-            self.current_supervision_observation_digest =
-                reported_observation_digest.clone();
+            self.current_supervision_observation_digest
+                .clone_from(&reported_observation_digest);
             if let Err(error) = Self::send_host_startup_evidence(
                 &mut transport,
                 journal,
@@ -3970,9 +3970,7 @@ impl HostJobBranches {
             }
         };
         if let Err(error) = activation.active(&candidate, &activation_receipt, &ready) {
-            if let Err(revocation_error) = self.revoke_host_supervision_evidence(generation) {
-                return Err(revocation_error);
-            }
+            self.revoke_host_supervision_evidence(generation)?;
             let failure = activation.fail("kernel-active-commit-failed");
             return Err(match failure {
                 Ok(()) => error,
@@ -4863,7 +4861,8 @@ impl HostJobBranches {
             // Retain the exact attempted original digest before sending. A
             // lost ACK may follow a committed report, so this is a CAS
             // selector only and does not claim acceptance.
-            self.current_supervision_observation_digest = reported_observation_digest.clone();
+            self.current_supervision_observation_digest
+                .clone_from(&reported_observation_digest);
             report_attempted = true;
             HostJobBranches::send_bound_host_startup_evidence(
                 &mut transport,
@@ -11960,6 +11959,88 @@ impl HostComposition {
     }
 
     #[cfg(windows)]
+    fn has_current_active_activation_for_readiness_at(
+        &mut self,
+        now: std::time::Instant,
+    ) -> bool {
+        // A late Store recovery result is not proof that Host supervision
+        // recovered. Require the exact current Active activation generation
+        // before any fresh positive readiness observation is appended; a
+        // Starting, DegradedRecovery, missing, or unreadable activation remains
+        // a visible recovery boundary.
+        let activation = match self.journal.snapshot() {
+            Ok(state) => state.activation,
+            Err(error) => {
+                self.readiness_gate.fail(
+                    None,
+                    readiness_failure_kind(&HostError::Journal(error)),
+                    now,
+                );
+                return false;
+            }
+        };
+        let Some(activation) = activation else {
+            self.readiness_gate.fail(
+                None,
+                readiness_failure_kind(&HostError::OwnerLeaseRecovery(
+                    "activation record is absent".to_owned(),
+                )),
+                now,
+            );
+            return false;
+        };
+        if activation.state != ActivationState::Active
+            || activation.fence.activation_generation != self.activation_generation
+        {
+            self.readiness_gate.fail(
+                None,
+                readiness_failure_kind(&HostError::RecoveryRequired(
+                    "fresh readiness requires the exact current Active Host activation".to_owned(),
+                )),
+                now,
+            );
+            return false;
+        }
+        true
+    }
+
+    #[cfg(windows)]
+    fn reconcile_non_live_branch_readiness_at(
+        &mut self,
+        generation: &PlatformHandle,
+        disposition: HostBranchDisposition,
+        now: std::time::Instant,
+    ) -> Result<HostBranchDisposition, HostError> {
+        let supervised_system_service = self
+            .registry
+            .generations()
+            .iter()
+            .find(|item| item.manifest.generation == *generation)
+            .is_some_and(|item| {
+                item.manifest.runtime_launch.profile == InstallationProfile::SystemService
+            });
+        self.readiness_gate.branch_degraded();
+        host_lifecycle_observe_requested(BOUNDARY_READINESS_DEGRADED);
+        if supervised_system_service
+            && !self.persist_supervised_degraded_activation(generation, disposition, now)
+        {
+            return Ok(HostBranchDisposition::ReadinessDegraded);
+        }
+        // The durable activation fence above is written BEFORE this
+        // observation, so a failure here cannot leave a supervised contour
+        // observably `Active` in the durable projection. We still fail closed
+        // and return degraded.
+        if let Err(error) =
+            self.persist_degraded_process_observation(generation, disposition, None, None)
+        {
+            self.readiness_gate
+                .fail(None, readiness_failure_kind(&error), now);
+            return Ok(HostBranchDisposition::ReadinessDegraded);
+        }
+        Ok(disposition)
+    }
+
+    #[cfg(windows)]
     fn reconcile_branch_readiness_at(
         &mut self,
         generation: &PlatformHandle,
@@ -11971,12 +12052,15 @@ impl HostComposition {
     ) -> Result<HostBranchDisposition, HostError> {
         // Invalidate the old exact candidate/fence before even the local
         // contour inspection can fail or decide to skip fresh evidence.
-        if disposition == HostBranchDisposition::LiveAwaitingReadiness {
-            if let Err(error) = self.jobs.revoke_host_supervision_evidence(generation) {
-                self.readiness_gate
-                    .fail(None, readiness_failure_kind(&error), now);
-                return Err(error);
-            }
+        if disposition == HostBranchDisposition::LiveAwaitingReadiness
+            && let Err(error) = self.jobs.revoke_host_supervision_evidence(generation)
+        {
+            self.readiness_gate
+                .fail(None, readiness_failure_kind(&error), now);
+            return Err(error);
+        }
+        if disposition != HostBranchDisposition::LiveAwaitingReadiness {
+            return self.reconcile_non_live_branch_readiness_at(generation, disposition, now);
         }
         // F-LOG-HOST-1: readiness is claimed only with authenticated proof.
         // Degraded vs ready preserved; liveness alone never becomes ready.
@@ -11989,63 +12073,7 @@ impl HostComposition {
             .is_some_and(|item| {
                 item.manifest.runtime_launch.profile == InstallationProfile::SystemService
             });
-        if disposition != HostBranchDisposition::LiveAwaitingReadiness {
-            self.readiness_gate.branch_degraded();
-            host_lifecycle_observe_requested(BOUNDARY_READINESS_DEGRADED);
-            if supervised_system_service
-                && !self.persist_supervised_degraded_activation(generation, disposition, now)
-            {
-                return Ok(HostBranchDisposition::ReadinessDegraded);
-            }
-            // The durable activation fence above is written BEFORE this
-            // observation, so a failure here cannot leave a supervised contour
-            // observably `Active` in the durable projection. We still fail
-            // closed and return degraded.
-            if let Err(error) =
-                self.persist_degraded_process_observation(generation, disposition, None, None)
-            {
-                self.readiness_gate
-                    .fail(None, readiness_failure_kind(&error), now);
-                return Ok(HostBranchDisposition::ReadinessDegraded);
-            }
-            return Ok(disposition);
-        }
-        // A late Store recovery result is not proof that Host supervision
-        // recovered.  Require the exact current Active activation generation
-        // before any fresh positive readiness observation is appended; a
-        // Starting, DegradedRecovery, missing, or unreadable activation remains
-        // a visible recovery boundary.
-        let activation = match self.journal.snapshot() {
-            Ok(state) => state.activation,
-            Err(error) => {
-                self.readiness_gate.fail(
-                    None,
-                    readiness_failure_kind(&HostError::Journal(error)),
-                    now,
-                );
-                return Ok(HostBranchDisposition::ReadinessDegraded);
-            }
-        };
-        let Some(activation) = activation else {
-            self.readiness_gate.fail(
-                None,
-                readiness_failure_kind(&HostError::OwnerLeaseRecovery(
-                    "activation record is absent".to_owned(),
-                )),
-                now,
-            );
-            return Ok(HostBranchDisposition::ReadinessDegraded);
-        };
-        if activation.state != ActivationState::Active
-            || activation.fence.activation_generation != self.activation_generation
-        {
-            self.readiness_gate.fail(
-                None,
-                readiness_failure_kind(&HostError::RecoveryRequired(
-                    "fresh readiness requires the exact current Active Host activation".to_owned(),
-                )),
-                now,
-            );
+        if !self.has_current_active_activation_for_readiness_at(now) {
             return Ok(HostBranchDisposition::ReadinessDegraded);
         }
         host_lifecycle_observe_requested(BOUNDARY_READINESS_REQUESTED_PROOF);
