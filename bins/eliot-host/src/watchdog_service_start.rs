@@ -203,17 +203,36 @@ where
             }
             let service = PlatformHandle::new(registration.service_name())
                 .map_err(|error| HostError::Platform(error.to_string()))?;
-            // A StartService result can be Known, Partial, Unknown, or Error
-            // while the external SCM effect remains live. Reconciliation below
-            // is the only authority, and this branch is the sole Start call.
-            let _ = control.start(&eliot_platform::ServiceRequest {
+            // Audit 5909923856 defect 4: the typed owner outcome is attempt
+            // evidence only. Read-only reconciliation below stays the sole
+            // authority for Running/readiness, and this branch remains the
+            // single Start call.
+            let start_attempt = control.start(&eliot_platform::ServiceRequest {
                 context,
                 service,
                 operation: eliot_platform::ServiceOperation::Start,
             });
-            // WORK_UNIT_CASE: 979/5 — SCM start issued; the ack is never
+            // WORK_UNIT_CASE: 979/5 — SCM start issued; the ack below is never
             // process/readiness evidence, only reconciliation below decides.
             watchdog_start_observe("watchdog.start SCM start issued");
+            match start_attempt {
+                eliot_platform::PortOutcome::Known(_) => {
+                    // WORK_UNIT_CASE: 979/5 — provider acknowledged the start attempt.
+                    watchdog_start_observe("watchdog.start attempt acknowledged");
+                }
+                eliot_platform::PortOutcome::Partial { .. } => {
+                    // WORK_UNIT_CASE: 979/5 — provider partially observed the start attempt.
+                    watchdog_start_observe("watchdog.start attempt partially observed");
+                }
+                eliot_platform::PortOutcome::Unknown(_) => {
+                    // WORK_UNIT_CASE: 979/5 — start attempt of unknown possible effect.
+                    watchdog_start_observe("watchdog.start attempt unknown effect");
+                }
+                eliot_platform::PortOutcome::Error(_) => {
+                    // WORK_UNIT_CASE: 979/5 — provider failed the start attempt.
+                    watchdog_start_observe("watchdog.start attempt failed");
+                }
+            }
         }
         InstalledWatchdogRuntimeInspection::Matching {
             state: ServiceState::Starting,

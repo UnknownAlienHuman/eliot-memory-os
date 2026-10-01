@@ -214,22 +214,42 @@ pub(super) fn live_supervision_obligation(
     activation_id: &PlatformHandle,
     now_ms: u64,
 ) -> Result<Option<PlatformHandle>, HostError> {
+    // Audit 5909923856 defect 3: project a closed supervision disposition
+    // bound to the requested installation/activation. At most one line below
+    // fires per call; skipped spool entries stay silent so mixed spool states
+    // resolve to a single disposition in severity order
+    // terminal > expired > stale activation > foreign > absent. `ActiveCurrent`
+    // keeps the existing live-obligation line. Every line is a static literal
+    // (I15.4): signed lease bytes never leave the owner types.
+    let mut saw_foreign = false;
+    let mut saw_stale_activation = false;
+    let mut saw_expired = false;
+    let mut saw_terminal = false;
     // `?` propagates the already-observed inner scan boundary; no second record.
     for observation in scan_host_watchdog_publications(host_state_root)? {
         let payload = &observation.lease.payload;
         if payload.installation_id != installation.as_str()
             || payload.scope_ref != observation.admission.supervision_lease_scope_id
             || observation.admission.installation_id != payload.installation_id
-            || payload.activation_id != activation_id.as_str()
         {
-            // A publication bound to a different installation, scope or
-            // activation generation is a stale spool entry, never a live
-            // obligation for this generation.
+            // A publication bound to another installation, scope, or admission
+            // is foreign to this installation, never its live obligation.
+            saw_foreign = true;
             continue;
         }
-        if payload.state != eliot_runtime_contracts::LeaseState::Active
-            || now_ms >= payload.expires_at_ms
-        {
+        if payload.activation_id != activation_id.as_str() {
+            // Same installation but another activation generation: a stale
+            // spool entry, never live coverage for the requested generation.
+            saw_stale_activation = true;
+            continue;
+        }
+        if payload.state != eliot_runtime_contracts::LeaseState::Active {
+            // Inactive/terminal lease state never blocks drain.
+            saw_terminal = true;
+            continue;
+        }
+        if now_ms >= payload.expires_at_ms {
+            saw_expired = true;
             continue;
         }
         return PlatformHandle::new(payload.lease_id.clone())
@@ -244,8 +264,24 @@ pub(super) fn live_supervision_obligation(
                 HostError::RecoveryRequired(error.to_string())
             });
     }
-    // WORK_UNIT_CASE: 979/2 — no live supervision obligation; stale spool is not coverage.
-    watchdog_publication_observe("watchdog.publication no live obligation");
+    // Every scanned entry sets exactly one flag above, so reaching here with
+    // no flag means the spool held no publication at all.
+    if saw_terminal {
+        // WORK_UNIT_CASE: 979/2 — closed disposition `Terminal`: no live obligation.
+        watchdog_publication_observe("watchdog.publication obligation terminal");
+    } else if saw_expired {
+        // WORK_UNIT_CASE: 979/2 — closed disposition `Expired`: no live obligation.
+        watchdog_publication_observe("watchdog.publication obligation expired");
+    } else if saw_stale_activation {
+        // WORK_UNIT_CASE: 979/2 — closed disposition `StaleActivation`: no live obligation.
+        watchdog_publication_observe("watchdog.publication obligation stale activation");
+    } else if saw_foreign {
+        // WORK_UNIT_CASE: 979/2 — closed disposition `Foreign`: no live obligation.
+        watchdog_publication_observe("watchdog.publication obligation foreign");
+    } else {
+        // WORK_UNIT_CASE: 979/2 — closed disposition `Absent`: no live obligation.
+        watchdog_publication_observe("watchdog.publication obligation absent");
+    }
     Ok(None)
 }
 
@@ -400,6 +436,11 @@ pub(super) fn publish_current_watchdog_supervision_bundle(
         HostError::RecoveryRequired(error.to_string())
     })?);
 
+    // Audit 5909923856 defect 2: `AlreadyExists` proves only that the name
+    // is occupied. The replay fact exists only after the retained readback,
+    // exact-current verification, and current-ORS re-read below all pass.
+    let mut retained_candidate_requires_reconciliation = false;
+
     match OwnedDirectoryPublication::create(&destination) {
         Ok(publication) => {
             let temporary = publication.temporary_path().to_path_buf();
@@ -453,8 +494,13 @@ pub(super) fn publish_current_watchdog_supervision_bundle(
                     watchdog_publication_observe("watchdog.publication commit unknown");
                 }
                 Err(DirectoryPublicationError::AlreadyExists) => {
-                    // WORK_UNIT_CASE: 979/8 — concurrent exact replay retained, no new publication.
-                    watchdog_publication_observe("watchdog.publication replay retained");
+                    // WORK_UNIT_CASE: 979/8 — name already occupied; the
+                    // retained candidate requires reconciliation below before
+                    // any replay classification.
+                    watchdog_publication_observe(
+                        "watchdog.publication name occupied retained candidate requires reconciliation",
+                    );
+                    retained_candidate_requires_reconciliation = true;
                 }
                 Err(error) => {
                     // WORK_UNIT_CASE: 979/1 — directory commit boundary.
@@ -466,8 +512,13 @@ pub(super) fn publish_current_watchdog_supervision_bundle(
             }
         }
         Err(DirectoryPublicationError::AlreadyExists) => {
-            // WORK_UNIT_CASE: 979/8 — concurrent exact replay retained, no new publication.
-            watchdog_publication_observe("watchdog.publication replay retained");
+            // WORK_UNIT_CASE: 979/8 — name already occupied; the retained
+            // candidate requires reconciliation below before any replay
+            // classification.
+            watchdog_publication_observe(
+                "watchdog.publication name occupied retained candidate requires reconciliation",
+            );
+            retained_candidate_requires_reconciliation = true;
         }
         Err(error) => {
             // WORK_UNIT_CASE: 979/1 — directory preparation boundary.
@@ -492,6 +543,13 @@ pub(super) fn publish_current_watchdog_supervision_bundle(
     }
     // WORK_UNIT_CASE: 979/2 — retained publication read back as the exact current head.
     watchdog_publication_observe("watchdog.publication observed");
+    if retained_candidate_requires_reconciliation {
+        // WORK_UNIT_CASE: 979/8 — exact replay established only now: the
+        // retained destination decoded, canonically validated,
+        // signature-checked, compared with the requested template/current
+        // ORS snapshot, and rebound against a re-read current ORS head.
+        watchdog_publication_observe("watchdog.publication replay retained");
+    }
 
     // Retirement begins only after the new exact current bundle is durable.
     let observed = scan_host_watchdog_publications(host_state_root)?;
