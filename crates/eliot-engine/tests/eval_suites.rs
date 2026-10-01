@@ -3,8 +3,8 @@ use eliot_engine::{
     EvalRunnerService, EvalSuiteInput, EvalSuiteService, EvalVerdictService,
 };
 use eliot_types::{
-    EvalCase, EvalCaseId, EvalCaseStatus, EvalDatasetManifest, EvalFamily, EvalRun, EvalRunProfile,
-    EvalRunStatus, EvalSuite, EvalVerdictStatus, ProjectId, TaskId,
+    EvalCase, EvalCaseId, EvalCaseStatus, EvalDatasetManifest, EvalFamily, EvalMeasurementKind,
+    EvalRun, EvalRunProfile, EvalRunStatus, EvalSuite, EvalVerdictStatus, ProjectId, TaskId,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -46,7 +46,7 @@ fn eval_run_schema_exists() {
 #[test]
 fn eval_verdict_schema_exists() {
     let (_, _, _, _, _, verdict) = artifacts();
-    assert_eq!(verdict.status, EvalVerdictStatus::Pass);
+    assert_eq!(verdict.status, EvalVerdictStatus::Inconclusive);
     assert!(!verdict.grants_authority);
     assert!(!verdict.mutates_current_truth);
 }
@@ -109,68 +109,68 @@ fn eval_runner_blocks_mutation_attempt() {
 }
 
 #[test]
-fn eval_understand_case_passes() {
-    family_passes(EvalFamily::Understand);
+fn eval_understand_case_stays_inconclusive_without_runtime_evidence() {
+    family_is_inconclusive_without_runtime_evidence(EvalFamily::Understand);
 }
 
 #[test]
-fn eval_hallucination_case_passes() {
-    family_passes(EvalFamily::Hallucination);
+fn eval_hallucination_case_stays_inconclusive_without_runtime_evidence() {
+    family_is_inconclusive_without_runtime_evidence(EvalFamily::Hallucination);
 }
 
 #[test]
-fn eval_negative_case_passes() {
-    family_passes(EvalFamily::Negative);
+fn eval_negative_case_stays_inconclusive_without_runtime_evidence() {
+    family_is_inconclusive_without_runtime_evidence(EvalFamily::Negative);
 }
 
 #[test]
-fn eval_done_case_passes() {
-    family_passes(EvalFamily::Done);
+fn eval_done_case_stays_inconclusive_without_runtime_evidence() {
+    family_is_inconclusive_without_runtime_evidence(EvalFamily::Done);
 }
 
 #[test]
-fn eval_context_case_passes() {
-    family_passes(EvalFamily::Context);
+fn eval_context_case_stays_inconclusive_without_runtime_evidence() {
+    family_is_inconclusive_without_runtime_evidence(EvalFamily::Context);
 }
 
 #[test]
-fn eval_compaction_case_passes() {
-    family_passes(EvalFamily::Compaction);
+fn eval_compaction_case_stays_inconclusive_without_runtime_evidence() {
+    family_is_inconclusive_without_runtime_evidence(EvalFamily::Compaction);
 }
 
 #[test]
-fn eval_tool_case_passes() {
-    family_passes(EvalFamily::Tool);
+fn eval_tool_case_stays_inconclusive_without_runtime_evidence() {
+    family_is_inconclusive_without_runtime_evidence(EvalFamily::Tool);
 }
 
 #[test]
-fn eval_memory_case_passes() {
-    family_passes(EvalFamily::Memory);
+fn eval_memory_case_stays_inconclusive_without_runtime_evidence() {
+    family_is_inconclusive_without_runtime_evidence(EvalFamily::Memory);
 }
 
 #[test]
-fn eval_forget_case_passes() {
-    family_passes(EvalFamily::Forget);
+fn eval_forget_case_stays_inconclusive_without_runtime_evidence() {
+    family_is_inconclusive_without_runtime_evidence(EvalFamily::Forget);
 }
 
 #[test]
-fn eval_dream_case_passes() {
-    family_passes(EvalFamily::Dream);
+fn eval_dream_case_stays_inconclusive_without_runtime_evidence() {
+    family_is_inconclusive_without_runtime_evidence(EvalFamily::Dream);
 }
 
 #[test]
-fn eval_skill_case_passes() {
-    family_passes(EvalFamily::Skill);
+fn eval_skill_case_stays_inconclusive_without_runtime_evidence() {
+    family_is_inconclusive_without_runtime_evidence(EvalFamily::Skill);
 }
 
 #[test]
-fn eval_trace_case_passes() {
-    family_passes(EvalFamily::Trace);
+fn eval_trace_case_stays_inconclusive_without_runtime_evidence() {
+    family_is_inconclusive_without_runtime_evidence(EvalFamily::Trace);
 }
 
 #[test]
-fn eval_bench_case_passes() {
-    family_passes(EvalFamily::Bench);
+fn eval_bench_case_stays_inconclusive_without_runtime_evidence() {
+    family_is_inconclusive_without_runtime_evidence(EvalFamily::Bench);
 }
 
 #[test]
@@ -193,6 +193,12 @@ fn eval_failure_cluster_generated_for_fixture_failure() {
 }
 
 #[test]
+fn declaration_only_cases_do_not_emit_measured_failure_clusters() {
+    let (_, _, _, _, run, _) = artifacts();
+    assert!(EvalVerdictService::failure_clusters(&run).is_empty());
+}
+
+#[test]
 fn benchmark_integrity_detects_checksum_mismatch() {
     let (_, suite, manifest, _, _, _) = artifacts();
     let receipt = EvalDatasetManifestService::checksum_mismatch(&suite, &manifest);
@@ -205,7 +211,7 @@ fn doctor_reports_eval_status() {
     let (_, _, _, profile, run, verdict) = artifacts();
     assert!(EvalRunnerService::profile_is_safe(&profile));
     assert_eq!(run.status, EvalRunStatus::Completed);
-    assert_eq!(verdict.status, EvalVerdictStatus::Pass);
+    assert_eq!(verdict.status, EvalVerdictStatus::Inconclusive);
 }
 
 #[test]
@@ -218,16 +224,125 @@ fn incident_lockdown_blocks_mutating_eval() {
 fn accumulated_capabilities_non_regression() {
     let (_, _, _, _, run, verdict) = artifacts();
     assert_eq!(run.status, EvalRunStatus::Completed);
-    assert_eq!(verdict.status, EvalVerdictStatus::Pass);
+    assert_eq!(verdict.status, EvalVerdictStatus::Inconclusive);
 }
 
-fn family_passes(family: EvalFamily) {
+fn family_is_inconclusive_without_runtime_evidence(family: EvalFamily) {
+    // #1922 TASK and accepted history preserve NYI for declaration-only
+    // cases until a real runtime artifact is observed.
     let (_, _, _, _, run, _) = artifacts();
-    assert!(
-        run.case_results
-            .iter()
-            .any(|result| result.family == family && result.status == EvalCaseStatus::Passed)
-    );
+    let result = run
+        .case_results
+        .iter()
+        .find(|result| result.family == family)
+        .expect("core-smoke suite includes each runnable family");
+    assert_eq!(result.status, EvalCaseStatus::NotYetImplemented);
+    assert!(result.measurements.iter().any(|measurement| {
+        measurement
+            .observed
+            .starts_with("not yet implemented:")
+            && measurement.evidence_refs.is_empty()
+    }));
+}
+
+#[test]
+fn structural_block_observation_does_not_promote_a_declaration_only_case() {
+    let (cases, _, _, _, run, verdict) = artifacts();
+    let result = run
+        .case_results
+        .iter()
+        .find(|result| result.family == EvalFamily::Done)
+        .expect("Done case is part of core-smoke");
+    let structural_spec = cases
+        .into_iter()
+        .find(|case| case.family == EvalFamily::Done)
+        .and_then(|case| {
+            case.measurement_specs
+                .into_iter()
+                .find(|spec| spec.kind == EvalMeasurementKind::MustBlockAction)
+        })
+        .expect("Done case declares a structural block measurement");
+    let observation = result
+        .measurements
+        .iter()
+        .find(|measurement| measurement.measurement_id == structural_spec.measurement_id)
+        .expect("runner records its structural block observation");
+    assert!(observation.passed);
+    assert!(observation.observed.starts_with("structural self-check: runner gate blocked"));
+    assert!(observation.evidence_refs.is_empty());
+    assert_eq!(result.status, EvalCaseStatus::NotYetImplemented);
+    assert_eq!(verdict.status, EvalVerdictStatus::Inconclusive);
+}
+
+#[test]
+fn eval_runner_rejects_missing_suite_case_output() {
+    let (mut cases, suite, manifest, profile, _, _) = artifacts();
+    cases.pop();
+    let run = EvalRunnerService::run(EvalRunInput {
+        project_id: suite.project_id,
+        suite,
+        cases,
+        manifest,
+        profile,
+        mutation_attempt: None,
+    });
+    assert_eq!(run.status, EvalRunStatus::BlockedInvalidDataset);
+    assert!(run.case_results.is_empty());
+    assert_eq!(EvalVerdictService::verdict(&run).status, EvalVerdictStatus::Blocked);
+}
+
+#[test]
+fn eval_runner_rejects_tampered_fixture_manifest() {
+    let (cases, suite, mut manifest, profile, _, _) = artifacts();
+    manifest.fixture_checksums[0].checksum.push_str("-tampered");
+    let run = EvalRunnerService::run(EvalRunInput {
+        project_id: suite.project_id,
+        suite,
+        cases,
+        manifest,
+        profile,
+        mutation_attempt: None,
+    });
+    assert_eq!(run.status, EvalRunStatus::BlockedInvalidDataset);
+    assert!(run.case_results.is_empty());
+}
+
+#[test]
+fn eval_runner_rejects_foreign_product_case_output() {
+    let (mut cases, suite, manifest, profile, _, _) = artifacts();
+    cases[0].project_id = ProjectId::new_v7();
+    let run = EvalRunnerService::run(EvalRunInput {
+        project_id: suite.project_id,
+        suite,
+        cases,
+        manifest,
+        profile,
+        mutation_attempt: None,
+    });
+    assert_eq!(run.status, EvalRunStatus::BlockedInvalidDataset);
+    assert!(run.case_results.is_empty());
+}
+
+#[test]
+fn eval_verdict_rejects_empty_result_output() {
+    let (_, _, _, _, mut run, _) = artifacts();
+    run.case_results.clear();
+    let verdict = EvalVerdictService::verdict(&run);
+    assert_eq!(verdict.status, EvalVerdictStatus::Inconclusive);
+    assert!(verdict.reasons.iter().any(|reason| reason.contains("empty output")));
+}
+
+#[test]
+fn eval_verdict_rejects_pass_claim_without_observed_evidence() {
+    let (_, _, _, _, mut run, _) = artifacts();
+    for result in &mut run.case_results {
+        result.status = EvalCaseStatus::Passed;
+    }
+    let verdict = EvalVerdictService::verdict(&run);
+    assert_eq!(verdict.status, EvalVerdictStatus::Inconclusive);
+    assert!(verdict.reasons.iter().any(|reason| {
+        reason.contains("lacks complete observed measurement evidence")
+    }));
 }
 
 fn case_for(family: EvalFamily) -> TestResult<EvalCase> {
@@ -249,9 +364,10 @@ fn artifacts() -> (
     EvalRun,
     eliot_types::EvalVerdict,
 ) {
-    let cases = cases();
+    let project_id = project_id();
+    let cases = EvalCaseService::k0_core_cases(project_id, Some(TaskId::new_v7()));
     let mut suite = EvalSuiteService::create(EvalSuiteInput {
-        project_id: project_id(),
+        project_id,
         name: "core-smoke".to_owned(),
         purpose: "test deterministic no-mutation suite".to_owned(),
         cases: cases.iter().map(|case| case.eval_case_id).collect(),
@@ -263,7 +379,7 @@ fn artifacts() -> (
     let manifest = EvalDatasetManifestService::manifest(&suite, &cases);
     let profile = EvalRunnerService::deterministic_no_mutation_profile();
     let run = EvalRunnerService::run(EvalRunInput {
-        project_id: project_id(),
+        project_id,
         suite: suite.clone(),
         cases: cases.clone(),
         manifest: manifest.clone(),

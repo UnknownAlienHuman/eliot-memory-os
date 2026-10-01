@@ -597,7 +597,7 @@ pub struct EvalSuiteService;
 
 impl EvalSuiteService {
     pub fn create(input: EvalSuiteInput) -> EvalSuite {
-        let checksum = checksum_text(&format!("{}:{:?}", input.name, input.cases));
+        let checksum = Self::checksum(&input.name, &input.cases, input.fixed);
         EvalSuite {
             eval_suite_id: EvalSuiteId::new_v7(),
             project_id: input.project_id,
@@ -609,7 +609,11 @@ impl EvalSuiteService {
             integrity_checksum: checksum,
             created_from_refs: input.created_from_refs,
             created_at: OffsetDateTime::now_utc(),
-            frozen_at: None,
+            frozen_at: if input.fixed {
+                Some(OffsetDateTime::now_utc())
+            } else {
+                None
+            },
         }
     }
 
@@ -621,7 +625,7 @@ impl EvalSuiteService {
         }
         if !suite.cases.contains(&case_id) {
             suite.cases.push(case_id);
-            suite.integrity_checksum = checksum_text(&format!("{}:{:?}", suite.name, suite.cases));
+            suite.integrity_checksum = Self::checksum(&suite.name, &suite.cases, suite.fixed);
         }
         Ok(())
     }
@@ -629,8 +633,12 @@ impl EvalSuiteService {
     pub fn freeze(suite: &mut EvalSuite) {
         suite.fixed = true;
         suite.frozen_at = Some(OffsetDateTime::now_utc());
-        suite.integrity_checksum =
-            checksum_text(&format!("{}:{:?}:fixed", suite.name, suite.cases));
+        suite.integrity_checksum = Self::checksum(&suite.name, &suite.cases, suite.fixed);
+    }
+
+    fn checksum(name: &str, cases: &[EvalCaseId], fixed: bool) -> String {
+        let freeze_marker = if fixed { ":fixed" } else { "" };
+        checksum_text(&format!("{name}:{cases:?}{freeze_marker}"))
     }
 }
 
@@ -638,21 +646,8 @@ pub struct EvalDatasetManifestService;
 
 impl EvalDatasetManifestService {
     pub fn manifest(suite: &EvalSuite, cases: &[EvalCase]) -> EvalDatasetManifest {
-        let fixture_checksums = cases
-            .iter()
-            .filter(|case| suite.cases.contains(&case.eval_case_id))
-            .map(|case| EvalFixtureChecksum {
-                fixture_ref: case.fixture_ref.clone(),
-                checksum: checksum_text(&format!(
-                    "{}:{}:{:?}",
-                    case.fixture_ref, case.name, case.family
-                )),
-            })
-            .collect::<Vec<_>>();
-        let manifest_checksum = checksum_text(&format!(
-            "{}:{}:{fixture_checksums:?}",
-            suite.name, suite.integrity_checksum
-        ));
+        let fixture_checksums = Self::fixture_checksums(suite, cases);
+        let manifest_checksum = Self::manifest_checksum(suite, &fixture_checksums);
         EvalDatasetManifest {
             eval_dataset_manifest_id: EvalDatasetManifestId::new_v7(),
             suite_id: suite.eval_suite_id,
@@ -666,10 +661,11 @@ impl EvalDatasetManifestService {
     }
 
     pub fn verify(suite: &EvalSuite, manifest: &EvalDatasetManifest) -> BenchmarkIntegrityReceipt {
+        let expected_checksum = Self::manifest_checksum(suite, &manifest.fixture_checksums);
         Self::receipt(
             suite,
             manifest,
-            manifest.manifest_checksum.clone(),
+            expected_checksum,
             manifest.manifest_checksum.clone(),
         )
     }
@@ -678,12 +674,61 @@ impl EvalDatasetManifestService {
         suite: &EvalSuite,
         manifest: &EvalDatasetManifest,
     ) -> BenchmarkIntegrityReceipt {
+        let expected_checksum = Self::manifest_checksum(suite, &manifest.fixture_checksums);
         Self::receipt(
             suite,
             manifest,
-            manifest.manifest_checksum.clone(),
-            checksum_text(&format!("{}:mismatch", manifest.manifest_checksum)),
+            expected_checksum.clone(),
+            checksum_text(&format!("{expected_checksum}:mismatch")),
         )
+    }
+
+    fn fixture_checksums(suite: &EvalSuite, cases: &[EvalCase]) -> Vec<EvalFixtureChecksum> {
+        cases
+            .iter()
+            .filter(|case| suite.cases.contains(&case.eval_case_id))
+            .map(|case| EvalFixtureChecksum {
+                fixture_ref: case.fixture_ref.clone(),
+                checksum: checksum_text(&format!("{case:?}")),
+            })
+            .collect()
+    }
+
+    fn manifest_checksum(suite: &EvalSuite, fixture_checksums: &[EvalFixtureChecksum]) -> String {
+        checksum_text(&format!(
+            "{}:{}:{fixture_checksums:?}",
+            suite.name, suite.integrity_checksum
+        ))
+    }
+
+    fn verify_case_set(
+        suite: &EvalSuite,
+        manifest: &EvalDatasetManifest,
+        cases: &[EvalCase],
+        project_id: ProjectId,
+    ) -> BenchmarkIntegrityReceipt {
+        let mut receipt = Self::verify(suite, manifest);
+        let suite_case_ids = suite.cases.iter().copied().collect::<BTreeSet<_>>();
+        let supplied_case_ids = cases
+            .iter()
+            .map(|case| case.eval_case_id)
+            .collect::<BTreeSet<_>>();
+        let exact_case_set = !suite.cases.is_empty()
+            && suite_case_ids.len() == suite.cases.len()
+            && supplied_case_ids.len() == cases.len()
+            && suite_case_ids == supplied_case_ids;
+        let product_identity_matches = project_id == suite.project_id
+            && cases.iter().all(|case| case.project_id == suite.project_id);
+        let fixture_checksums_match =
+            Self::fixture_checksums(suite, cases) == manifest.fixture_checksums;
+        if !exact_case_set || !product_identity_matches || !fixture_checksums_match {
+            receipt.valid = false;
+            receipt.mismatch_detected = true;
+            receipt.blocked_run = true;
+            receipt.expected_checksum = "exact suite cases and Product Identity".to_owned();
+            receipt.actual_checksum = "case coverage or Product Identity mismatch".to_owned();
+        }
+        receipt
     }
 
     fn receipt(
@@ -692,9 +737,21 @@ impl EvalDatasetManifestService {
         expected_checksum: String,
         actual_checksum: String,
     ) -> BenchmarkIntegrityReceipt {
-        let valid = expected_checksum == actual_checksum
+        let expected_suite_checksum =
+            EvalSuiteService::checksum(&suite.name, &suite.cases, suite.fixed);
+        let suite_integrity_valid = suite.integrity_checksum == expected_suite_checksum
+            && suite.fixed == suite.frozen_at.is_some();
+        let valid = suite_integrity_valid
+            && expected_checksum == actual_checksum
             && manifest.suite_id == suite.eval_suite_id
+            && manifest.suite_name == suite.name
+            && !suite.cases.is_empty()
             && manifest.case_count == suite.cases.len()
+            && manifest.fixture_checksums.len() == suite.cases.len()
+            && manifest
+                .fixture_checksums
+                .iter()
+                .all(|fixture| !fixture.fixture_ref.trim().is_empty() && !fixture.checksum.is_empty())
             && manifest.holdout_preserved == suite.holdout;
         BenchmarkIntegrityReceipt {
             benchmark_integrity_receipt_id: BenchmarkIntegrityReceiptId::new_v7(),
@@ -839,7 +896,12 @@ impl EvalRunnerService {
 
     pub fn run(input: EvalRunInput) -> EvalRun {
         let started_at = OffsetDateTime::now_utc();
-        let integrity = EvalDatasetManifestService::verify(&input.suite, &input.manifest);
+        let integrity = EvalDatasetManifestService::verify_case_set(
+            &input.suite,
+            &input.manifest,
+            &input.cases,
+            input.project_id,
+        );
         let unsafe_profile = !Self::profile_is_safe(&input.profile);
         let mutation_attempts_blocked = input
             .mutation_attempt
@@ -852,7 +914,6 @@ impl EvalRunnerService {
                 input
                     .cases
                     .iter()
-                    .filter(|case| input.suite.cases.contains(&case.eval_case_id))
                     .map(EvalMeasurementService::evaluate_case)
                     .collect::<Vec<_>>()
             } else {
@@ -921,7 +982,10 @@ const STRUCTURAL_ONLY_PROOF_CEILING: &str = "STRUCTURAL_ONLY";
 /// additionally flow from their real sources (`ORACLE_VERSION` and
 /// [`eval_product_identity`).
 const HARNESS_FINGERPRINT: &str = "eliot-engine-eval-case-schema";
-const EVALUATOR_PATH: &str = concat!(module_path!(), "::EvalMeasurementService");
+const EVALUATOR_PATH: &str = concat!(
+    module_path!(),
+    "::EvalMeasurementService::runtime-artifact-required-v2"
+);
 const ENVIRONMENT_FINGERPRINT: &str = "not-captured:structural-evaluator-process";
 const ACTUAL_ROUTE: &str = concat!(module_path!(), "::evaluate_case");
 const REQUESTED_ROUTE: &str = "runtime artifact/effect observation";
@@ -1477,17 +1541,38 @@ impl EvalBaselineService {
                 "eval baseline requires fixed suite".to_owned(),
             ));
         }
-        if !integrity.valid || integrity.blocked_run {
+        let verified_integrity = EvalDatasetManifestService::verify(suite, manifest);
+        if !integrity.valid
+            || integrity.blocked_run
+            || integrity.mismatch_detected
+            || integrity.suite_id != suite.eval_suite_id
+            || integrity.manifest_checksum != manifest.manifest_checksum
+            || !verified_integrity.valid
+        {
             return Err(EngineError::WriteRejected(
                 "eval baseline requires passing benchmark integrity receipt".to_owned(),
+            ));
+        }
+        let derived_verdict = EvalVerdictService::verdict(run);
+        if run.suite_id != suite.eval_suite_id
+            || run.project_id != suite.project_id
+            || run.dataset_manifest_id != manifest.eval_dataset_manifest_id
+            || verdict.eval_run_id != run.eval_run_id
+            || !eval_run_covers_suite(suite, run)
+            || verdict.status != derived_verdict.status
+            || verdict.family_scores != derived_verdict.family_scores
+        {
+            return Err(EngineError::WriteRejected(
+                "eval baseline requires a matching verdict and complete suite run".to_owned(),
             ));
         }
         // A baseline records the observed reference outcome of a real
         // completed run; it is not a validity claim (issue #1922
         // reachability). `Inconclusive` verdicts (NYI-gated runs) are
         // retained honestly with `overall_status: Inconclusive`: downstream
-        // gates still block them via family thresholds, and drift still
-        // marks them `Stale`. Observed failure can never anchor a baseline.
+        // gates block them because no measured comparison can be produced,
+        // and drift still marks them `Stale`. Observed failure can never
+        // anchor a baseline.
         if run.status != EvalRunStatus::Completed {
             return Err(EngineError::WriteRejected(
                 "eval baseline requires completed eval run".to_owned(),
@@ -1577,44 +1662,7 @@ impl EvalComparisonService {
         candidate_run: &EvalRun,
         candidate_git_commit: &str,
     ) -> EvalCandidateComparison {
-        let baseline_scores = baseline_score_map(baseline);
-        let candidate_scores = run_score_map(candidate_run);
-        let mut families = baseline_scores.keys().copied().collect::<BTreeSet<_>>();
-        families.extend(candidate_scores.keys().copied());
-        let family_deltas = families
-            .into_iter()
-            .map(|family| {
-                let baseline_score = baseline_scores.get(&family).copied().unwrap_or(0.0);
-                let candidate_score = candidate_scores.get(&family).copied().unwrap_or(0.0);
-                let delta = candidate_score - baseline_score;
-                EvalFamilyDelta {
-                    family,
-                    baseline_score,
-                    candidate_score,
-                    delta,
-                    severity: delta_severity(family, delta),
-                }
-            })
-            .collect::<Vec<_>>();
-        let newly_failed_cases = candidate_run
-            .case_results
-            .iter()
-            .filter(|result| {
-                result.status != EvalCaseStatus::Passed
-                    && baseline_scores.get(&result.family).copied().unwrap_or(0.0) >= 100.0
-            })
-            .map(|result| result.eval_case_id.to_string())
-            .collect::<Vec<_>>();
-        let newly_passing_cases = candidate_run
-            .case_results
-            .iter()
-            .filter(|result| {
-                result.status == EvalCaseStatus::Passed
-                    && baseline_scores.get(&result.family).copied().unwrap_or(0.0) < 100.0
-            })
-            .map(|result| result.eval_case_id.to_string())
-            .collect::<Vec<_>>();
-        let verdict = {
+        let (verdict, family_deltas, newly_failed_cases, newly_passing_cases) = {
             // Automatic stale marking (issue #1922 W6b): the comparison
             // depends on BOTH the baseline's unanimously retained identity
             // and every candidate result's retained set. Proven drift on
@@ -1623,8 +1671,9 @@ impl EvalComparisonService {
             // marks the comparison `Stale`, and gates always block stale
             // dependents. Unknown provenance (`None` on either side) stays
             // `Inconclusive` per the accepted contract: pre-retention,
-            // empty, or mixed-product inputs are non-evidence, gated by
-            // `allow_inconclusive`. Fresh inputs flow unchanged.
+            // empty, incomplete, unmeasured, or mixed-product inputs are
+            // non-evidence. A declared status or matching fingerprint is
+            // not an observed artifact.
             // Re-execution clears staleness operationally: a baseline or
             // candidate re-executed under current identity matches
             // `current` and is not stale. No declared-equivalence proof
@@ -1647,20 +1696,83 @@ impl EvalComparisonService {
                 Some(recorded) if recorded.is_stale_against(&current)
             );
             let baseline_unknown = baseline.integrity_fingerprints.is_none();
-            // The comparison's I18.47 validity state, projected onto the
-            // comparison verdict below: fresh-but-unmeasured inputs stay
-            // `Inconclusive`, exactly like a freshly built receipt.
-            let integrity_status = if candidate_drifted || baseline_drifted {
-                EvaluationIntegrityStatus::Stale
+            let inputs_match = baseline.suite_id == suite.eval_suite_id.to_string()
+                && baseline.manifest_ref == candidate_run.dataset_manifest_id.to_string()
+                && baseline.overall_status == EvalVerdictStatus::Pass
+                && eval_run_covers_suite(suite, candidate_run)
+                && eval_run_has_fresh_measured_results(candidate_run)
+                && matches!(
+                    candidate_run.status,
+                    EvalRunStatus::Completed | EvalRunStatus::Failed
+                );
+            if candidate_drifted || baseline_drifted {
+                (
+                    EvalComparisonVerdict::Stale,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+            } else if candidate_unknown || baseline_unknown || !inputs_match {
+                (
+                    EvalComparisonVerdict::Inconclusive,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
             } else {
-                EvaluationIntegrityStatus::Inconclusive
-            };
-            if integrity_status == EvaluationIntegrityStatus::Stale {
-                EvalComparisonVerdict::Stale
-            } else if candidate_unknown || baseline_unknown {
-                EvalComparisonVerdict::Inconclusive
-            } else {
-                comparison_verdict(&family_deltas, candidate_run.status)
+                let baseline_scores = baseline_score_map(baseline);
+                let candidate_scores = run_score_map(candidate_run);
+                let mut families = baseline_scores.keys().copied().collect::<BTreeSet<_>>();
+                families.extend(candidate_scores.keys().copied());
+                let family_deltas = families
+                    .into_iter()
+                    .map(|family| {
+                        let baseline_score =
+                            baseline_scores.get(&family).copied().unwrap_or(0.0);
+                        let candidate_score =
+                            candidate_scores.get(&family).copied().unwrap_or(0.0);
+                        let delta = candidate_score - baseline_score;
+                        EvalFamilyDelta {
+                            family,
+                            baseline_score,
+                            candidate_score,
+                            delta,
+                            severity: delta_severity(family, delta),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let newly_failed_cases = candidate_run
+                    .case_results
+                    .iter()
+                    .filter(|result| {
+                        result.status == EvalCaseStatus::Failed
+                            && baseline_scores
+                                .get(&result.family)
+                                .copied()
+                                .unwrap_or(0.0)
+                                >= 100.0
+                    })
+                    .map(|result| result.eval_case_id.to_string())
+                    .collect::<Vec<_>>();
+                let newly_passing_cases = candidate_run
+                    .case_results
+                    .iter()
+                    .filter(|result| {
+                        result.status == EvalCaseStatus::Passed
+                            && baseline_scores
+                                .get(&result.family)
+                                .copied()
+                                .unwrap_or(0.0)
+                                < 100.0
+                    })
+                    .map(|result| result.eval_case_id.to_string())
+                    .collect::<Vec<_>>();
+                (
+                    comparison_verdict(&family_deltas, candidate_run.status),
+                    family_deltas,
+                    newly_failed_cases,
+                    newly_passing_cases,
+                )
             }
         };
         EvalCandidateComparison {
@@ -1839,6 +1951,28 @@ impl EvalRegressionGateService {
                 vec!["repair or refreeze benchmark manifest before gating".to_owned()],
             );
         }
+        if comparison.verdict == EvalComparisonVerdict::Inconclusive {
+            return gate_decision(
+                profile,
+                Some(comparison.comparison_id.clone()),
+                comparison.candidate_run_id.clone(),
+                EvalGateDecisionKind::Block,
+                vec!["eval comparison is inconclusive and cannot carry a regression gate".to_owned()],
+                warnings,
+                vec!["obtain complete measured case outputs before gating".to_owned()],
+            );
+        }
+        if comparison.verdict == EvalComparisonVerdict::Stale {
+            return gate_decision(
+                profile,
+                Some(comparison.comparison_id.clone()),
+                comparison.candidate_run_id.clone(),
+                EvalGateDecisionKind::Block,
+                vec!["eval comparison is stale and cannot carry a regression gate".to_owned()],
+                warnings,
+                vec!["re-execute both baseline and candidate under current evaluator identity".to_owned()],
+            );
+        }
         let families = comparison
             .family_deltas
             .iter()
@@ -1891,10 +2025,6 @@ impl EvalRegressionGateService {
                 "new eval failures {new_failures} exceed limit {}",
                 profile.max_new_failures
             ));
-        }
-        if comparison.verdict == EvalComparisonVerdict::Inconclusive && !profile.allow_inconclusive
-        {
-            blocking_reasons.push("eval comparison is inconclusive".to_owned());
         }
         // Proven identity drift (issue #1922 W6b): a stale comparison can
         // never promote, regardless of `allow_inconclusive`. Only
@@ -1953,6 +2083,17 @@ impl EvalRegressionGateService {
                 vec!["benchmark integrity receipt failed".to_owned()],
                 Vec::new(),
                 vec!["repair or refreeze benchmark manifest before gating".to_owned()],
+            );
+        }
+        if !eval_run_has_fresh_measured_results(run) {
+            return gate_decision(
+                profile,
+                None,
+                run.eval_run_id.to_string(),
+                EvalGateDecisionKind::Block,
+                vec!["eval run lacks complete fresh measurement evidence".to_owned()],
+                Vec::new(),
+                vec!["obtain complete measured case outputs before gating".to_owned()],
             );
         }
         let scores = run_score_map(run);
@@ -2040,11 +2181,23 @@ impl EvalTrendService {
             .map(|family| {
                 let scores = runs
                     .iter()
-                    .map(|run| run_score_map(run).get(&family).copied().unwrap_or(0.0))
-                    .collect::<Vec<_>>();
+                    .map(|run| {
+                        if eval_run_covers_suite(suite, run)
+                            && eval_run_has_fresh_measured_results(run)
+                        {
+                            run_score_map(run).get(&family).copied()
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Option<Vec<_>>>();
+                let (direction, scores) = match scores {
+                    Some(scores) => (trend_direction(&scores), scores),
+                    None => (EvalTrendDirection::InsufficientData, Vec::new()),
+                };
                 EvalFamilyTrend {
                     family,
-                    direction: trend_direction(&scores),
+                    direction,
                     scores,
                 }
             })
@@ -2072,11 +2225,17 @@ impl EvalFixtureStabilityService {
             .collect::<Vec<_>>();
         let mut by_case: BTreeMap<String, Vec<EvalCaseStatus>> = BTreeMap::new();
         for run in runs {
+            let run_is_measured = eval_run_covers_suite(suite, run)
+                && eval_run_has_fresh_measured_results(run);
             for result in &run.case_results {
                 by_case
                     .entry(result.eval_case_id.to_string())
                     .or_default()
-                    .push(result.status);
+                    .push(if run_is_measured && case_result_has_measurement_evidence(result) {
+                        result.status
+                    } else {
+                        EvalCaseStatus::NotYetImplemented
+                    });
             }
         }
         let mut stable_cases = Vec::new();
@@ -2087,7 +2246,9 @@ impl EvalFixtureStabilityService {
             if statuses.iter().any(|status| {
                 matches!(
                     status,
-                    EvalCaseStatus::Blocked | EvalCaseStatus::NotYetImplemented
+                    EvalCaseStatus::Blocked
+                        | EvalCaseStatus::Skipped
+                        | EvalCaseStatus::NotYetImplemented
                 )
             }) {
                 blocked_cases.push(case_id);
@@ -2747,7 +2908,10 @@ fn run_score_map(run: &EvalRun) -> BTreeMap<EvalFamily, f64> {
     }
     by_family
         .into_iter()
-        .map(|(family, results)| {
+        .filter_map(|(family, results)| {
+            if results.iter().any(|result| !case_result_has_measurement_evidence(result)) {
+                return None;
+            }
             let total = u32::try_from(results.len()).unwrap_or(u32::MAX);
             let passed = u32::try_from(
                 results
@@ -2761,9 +2925,73 @@ fn run_score_map(run: &EvalRun) -> BTreeMap<EvalFamily, f64> {
             } else {
                 (f64::from(passed) / f64::from(total)) * 100.0
             };
-            (family, score)
+            Some((family, score))
         })
         .collect()
+}
+
+fn eval_run_covers_suite(suite: &EvalSuite, run: &EvalRun) -> bool {
+    let suite_case_ids = suite.cases.iter().copied().collect::<BTreeSet<_>>();
+    let result_case_ids = run
+        .case_results
+        .iter()
+        .map(|result| result.eval_case_id)
+        .collect::<BTreeSet<_>>();
+    run.project_id == suite.project_id
+        && run.suite_id == suite.eval_suite_id
+        && !suite.cases.is_empty()
+        && suite_case_ids.len() == suite.cases.len()
+        && result_case_ids.len() == run.case_results.len()
+        && result_case_ids == suite_case_ids
+}
+
+fn case_result_has_measurement_evidence(result: &EvalCaseResult) -> bool {
+    let outcome_matches_measurements = match result.status {
+        EvalCaseStatus::Passed => result.measurements.iter().all(|measurement| measurement.passed),
+        EvalCaseStatus::Failed => result.measurements.iter().any(|measurement| !measurement.passed),
+        _ => false,
+    };
+    outcome_matches_measurements
+        && !result.measurements.is_empty()
+        && result.measurements.iter().all(|measurement| {
+            !measurement.observed.trim().is_empty()
+                && !measurement
+                    .observed
+                    .starts_with(NOT_YET_IMPLEMENTED_OBSERVATION_PREFIX)
+                && !measurement.evidence_refs.is_empty()
+                && measurement
+                    .evidence_refs
+                    .iter()
+                    .all(|reference| !reference.trim().is_empty())
+        })
+}
+
+fn eval_run_has_fresh_measured_results(run: &EvalRun) -> bool {
+    let all_results_measured = !run.case_results.is_empty()
+        && run
+            .case_results
+            .iter()
+            .all(case_result_has_measurement_evidence);
+    let run_status_matches_results = match run.status {
+        EvalRunStatus::Completed => run
+            .case_results
+            .iter()
+            .all(|result| result.status == EvalCaseStatus::Passed),
+        EvalRunStatus::Failed => run
+            .case_results
+            .iter()
+            .any(|result| result.status == EvalCaseStatus::Failed),
+        _ => false,
+    };
+    let current = current_eval_fingerprints(&run.project_id);
+    all_results_measured
+        && run_status_matches_results
+        && run.case_results.iter().all(|result| {
+            matches!(
+                &result.integrity_fingerprints,
+                Some(recorded) if recorded == &current
+            )
+        })
 }
 
 fn delta_severity(family: EvalFamily, delta: f64) -> EvalRegressionSeverity {
@@ -2896,6 +3124,9 @@ fn trend_direction(scores: &[f64]) -> EvalTrendDirection {
 fn case_stability(runs: &[EvalRun]) -> (Vec<String>, Vec<String>) {
     let mut by_case: BTreeMap<String, Vec<EvalCaseStatus>> = BTreeMap::new();
     for run in runs {
+        if !eval_run_has_fresh_measured_results(run) {
+            continue;
+        }
         for result in &run.case_results {
             by_case
                 .entry(result.eval_case_id.to_string())

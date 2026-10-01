@@ -60,11 +60,12 @@ fn coverage_matrix_marks_placeholder_families_honestly() {
 }
 
 #[test]
-fn baseline_created_from_passing_fixed_suite() {
+fn baseline_retains_inconclusive_fixed_suite_without_promoting_it() {
     let artifacts = artifacts();
     let baseline = baseline(&artifacts);
-    assert_eq!(baseline.overall_status, EvalVerdictStatus::Pass);
+    assert_eq!(baseline.overall_status, EvalVerdictStatus::Inconclusive);
     assert_eq!(baseline.eval_run_id, artifacts.run.eval_run_id.to_string());
+    assert!(baseline.integrity_fingerprints.is_some());
 }
 
 #[test]
@@ -110,7 +111,10 @@ fn baseline_requires_benchmark_integrity() {
 fn candidate_comparison_generated() {
     let artifacts = artifacts();
     let comparison = clean_comparison(&artifacts);
-    assert_eq!(comparison.verdict, EvalComparisonVerdict::Equivalent);
+    assert_eq!(comparison.verdict, EvalComparisonVerdict::Inconclusive);
+    assert!(comparison.family_deltas.is_empty());
+    assert!(comparison.newly_failed_cases.is_empty());
+    assert!(comparison.newly_passing_cases.is_empty());
     assert_eq!(
         comparison.candidate_run_id,
         artifacts.run.eval_run_id.to_string()
@@ -118,19 +122,20 @@ fn candidate_comparison_generated() {
 }
 
 #[test]
-fn comparison_detects_new_failure() {
+fn comparison_does_not_claim_new_failure_without_measured_baseline() {
     let artifacts = artifacts();
     let baseline = baseline(&artifacts);
     let failed =
         EvalComparisonService::run_with_failed_family(&artifacts.run, EvalFamily::Understand);
     let comparison =
         EvalComparisonService::compare(&artifacts.suite, &baseline, &failed, "test-git");
-    assert!(!comparison.newly_failed_cases.is_empty());
-    assert_eq!(comparison.verdict, EvalComparisonVerdict::RegressedCritical);
+    assert!(comparison.newly_failed_cases.is_empty());
+    assert!(comparison.family_deltas.is_empty());
+    assert_eq!(comparison.verdict, EvalComparisonVerdict::Inconclusive);
 }
 
 #[test]
-fn comparison_detects_new_pass() {
+fn comparison_does_not_claim_new_pass_from_unmeasured_outputs() {
     let artifacts = artifacts();
     let failed = EvalComparisonService::run_with_failed_family(&artifacts.run, EvalFamily::Context);
     let failed_verdict = EvalVerdictService::verdict(&failed);
@@ -147,22 +152,20 @@ fn comparison_detects_new_pass() {
         &artifacts.run,
         "test-git",
     );
-    assert!(!comparison.newly_passing_cases.is_empty());
+    assert!(comparison.newly_passing_cases.is_empty());
+    assert!(comparison.family_deltas.is_empty());
+    assert_eq!(comparison.verdict, EvalComparisonVerdict::Inconclusive);
 }
 
 #[test]
-fn comparison_reports_family_delta() {
+fn comparison_does_not_emit_family_delta_without_measured_results() {
     let artifacts = artifacts();
     let baseline = baseline(&artifacts);
     let failed = EvalComparisonService::run_with_failed_family(&artifacts.run, EvalFamily::Bench);
     let comparison =
         EvalComparisonService::compare(&artifacts.suite, &baseline, &failed, "test-git");
-    assert!(
-        comparison
-            .family_deltas
-            .iter()
-            .any(|delta| { delta.family == EvalFamily::Bench && delta.delta < 0.0 })
-    );
+    assert!(comparison.family_deltas.is_empty());
+    assert_eq!(comparison.verdict, EvalComparisonVerdict::Inconclusive);
 }
 
 #[test]
@@ -183,17 +186,17 @@ fn gate_profiles_created() {
 }
 
 #[test]
-fn fast_deterministic_gate_passes() {
+fn fast_deterministic_gate_blocks_inconclusive_suite() {
     let artifacts = artifacts();
     let profile = profile("fast-deterministic");
     let comparison = clean_comparison(&artifacts);
     let decision =
         EvalRegressionGateService::evaluate_comparison(&profile, &comparison, &artifacts.integrity);
-    assert_eq!(decision.decision, EvalGateDecisionKind::Allow);
+    assert_eq!(decision.decision, EvalGateDecisionKind::Block);
 }
 
 #[test]
-fn fast_deterministic_gate_blocks_critical_regression_fixture() {
+fn fast_deterministic_gate_blocks_unmeasured_regression_fixture() {
     let artifacts = artifacts();
     let profile = profile("fast-deterministic");
     let baseline = baseline(&artifacts);
@@ -271,14 +274,52 @@ fn trend_report_generated() {
 }
 
 #[test]
-fn trend_detects_degrading_family_fixture() {
+fn trend_does_not_report_degradation_from_unmeasured_family_fixture() {
     let artifacts = artifacts();
     let failed =
         EvalComparisonService::run_with_failed_family(&artifacts.run, EvalFamily::Understand);
     let trend = EvalTrendService::trend(&artifacts.suite, &[artifacts.run.clone(), failed]);
-    assert!(trend.family_trends.iter().any(|family| {
-        family.family == EvalFamily::Understand && family.direction == EvalTrendDirection::Degrading
-    }));
+    let understand = trend
+        .family_trends
+        .iter()
+        .find(|family| family.family == EvalFamily::Understand)
+        .expect("Understand case appears in the declared suite");
+    assert_eq!(understand.direction, EvalTrendDirection::InsufficientData);
+    assert!(understand.scores.is_empty());
+    assert!(trend.flaky_cases.is_empty());
+    assert!(trend.persistent_failures.is_empty());
+}
+
+#[test]
+fn stale_candidate_evidence_is_refused_by_comparison_and_gate() {
+    let artifacts = artifacts();
+    let baseline = baseline(&artifacts);
+    let mut stale_candidate = artifacts.run.clone();
+    let result = stale_candidate
+        .case_results
+        .first_mut()
+        .expect("core-smoke run contains cases");
+    let fingerprints = result
+        .integrity_fingerprints
+        .as_mut()
+        .expect("current runner retains evaluator fingerprints");
+    fingerprints.oracle_version.push_str("-stale");
+
+    let comparison = EvalComparisonService::compare(
+        &artifacts.suite,
+        &baseline,
+        &stale_candidate,
+        "test-git",
+    );
+    assert_eq!(comparison.verdict, EvalComparisonVerdict::Stale);
+    assert!(comparison.family_deltas.is_empty());
+
+    let decision = EvalRegressionGateService::evaluate_comparison(
+        &profile("fast-deterministic"),
+        &comparison,
+        &artifacts.integrity,
+    );
+    assert_eq!(decision.decision, EvalGateDecisionKind::Block);
 }
 
 #[test]
@@ -289,16 +330,19 @@ fn fixture_stability_report_generated() {
         &[artifacts.run.clone(), artifacts.run.clone()],
     );
     assert!(!report.report_id.is_empty());
-    assert!(!report.stable_cases.is_empty());
+    assert_eq!(report.blocked_cases.len(), artifacts.cases.len());
+    assert!(report.stable_cases.is_empty());
+    assert!(report.flaky_cases.is_empty());
 }
 
 #[test]
-fn fixture_stability_detects_flaky_case_fixture() {
+fn fixture_stability_does_not_call_unmeasured_case_flaky() {
     let artifacts = artifacts();
     let failed = EvalComparisonService::run_with_failed_family(&artifacts.run, EvalFamily::Context);
     let report =
         EvalFixtureStabilityService::report(&artifacts.suite, &[artifacts.run.clone(), failed]);
-    assert!(!report.flaky_cases.is_empty());
+    assert_eq!(report.blocked_cases.len(), artifacts.cases.len());
+    assert!(report.flaky_cases.is_empty());
 }
 
 #[test]
@@ -330,6 +374,14 @@ fn doctor_reports_eval_status() {
         status.get("component").and_then(|value| value.as_str()),
         Some("eval_doctor_status")
     );
+    assert_eq!(
+        status
+            .get("last_eval_gate_decision")
+            .and_then(|value| value.as_str()),
+        Some("block")
+    );
+    assert_eq!(baseline.overall_status, EvalVerdictStatus::Inconclusive);
+    assert_eq!(decision.decision, EvalGateDecisionKind::Block);
 }
 
 #[test]
@@ -346,7 +398,7 @@ fn incident_lockdown_blocks_suite_mutation() {
 fn accumulated_capabilities_non_regression() {
     let artifacts = artifacts();
     assert_eq!(artifacts.run.status, EvalRunStatus::Completed);
-    assert_eq!(artifacts.verdict.status, EvalVerdictStatus::Pass);
+    assert_eq!(artifacts.verdict.status, EvalVerdictStatus::Inconclusive);
 }
 
 struct Artifacts {
@@ -412,7 +464,7 @@ fn baseline(artifacts: &Artifacts) -> EvalBaseline {
         "test",
     ) {
         Ok(baseline) => baseline,
-        Err(error) => panic!("expected passing integration-smoke baseline: {error}"),
+        Err(error) => panic!("expected retained integration-smoke baseline: {error}"),
     }
 }
 

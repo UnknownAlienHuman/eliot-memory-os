@@ -23,14 +23,41 @@ pub struct EvalVerdictService;
 
 impl EvalVerdictService {
     pub fn verdict(run: &EvalRun) -> EvalVerdict {
-        let all_passed = run
-            .case_results
-            .iter()
-            .all(|result| result.status == EvalCaseStatus::Passed);
+        let has_no_cases = run.case_results.is_empty();
+        let has_unobserved_pass = run.case_results.iter().any(|result| {
+            result.status == EvalCaseStatus::Passed
+                && (result.measurements.is_empty()
+                    || result.measurements.iter().any(|measurement| {
+                        !measurement.passed
+                            || measurement.observed.trim().is_empty()
+                            || measurement
+                                .observed
+                                .starts_with("not yet implemented:")
+                            || measurement.evidence_refs.is_empty()
+                            || measurement
+                                .evidence_refs
+                                .iter()
+                                .any(|reference| reference.trim().is_empty())
+                    }))
+        });
+        let all_passed = !has_no_cases
+            && !has_unobserved_pass
+            && run
+                .case_results
+                .iter()
+                .all(|result| result.status == EvalCaseStatus::Passed);
         let has_inconclusive_case = run
             .case_results
             .iter()
             .any(|result| result.status == EvalCaseStatus::NotYetImplemented);
+        let has_blocked_case = run
+            .case_results
+            .iter()
+            .any(|result| result.status == EvalCaseStatus::Blocked);
+        let has_skipped_case = run
+            .case_results
+            .iter()
+            .any(|result| result.status == EvalCaseStatus::Skipped);
         // Automatic stale marking (issue #1922): a retained fingerprint set
         // recorded under older evaluator identity can never support a fresh
         // verdict. Fresh results carry current fingerprints (never stale);
@@ -57,15 +84,38 @@ impl EvalVerdictService {
             EvalRunStatus::BlockedInvalidDataset
             | EvalRunStatus::BlockedMutationAttempt
             | EvalRunStatus::BlockedUnsafeProfile => EvalVerdictStatus::Blocked,
+            _ if has_blocked_case => EvalVerdictStatus::Blocked,
+            _ if has_no_cases => EvalVerdictStatus::Inconclusive,
+            _ if has_unobserved_pass => EvalVerdictStatus::Inconclusive,
             _ if has_stale_case => EvalVerdictStatus::Inconclusive,
             _ if has_unknown_case => EvalVerdictStatus::Inconclusive,
-            EvalRunStatus::Completed | EvalRunStatus::Failed if has_inconclusive_case => {
+            EvalRunStatus::Completed | EvalRunStatus::Failed
+                if has_inconclusive_case || has_skipped_case =>
+            {
                 EvalVerdictStatus::Inconclusive
             }
             EvalRunStatus::Completed | EvalRunStatus::Failed => EvalVerdictStatus::Fail,
             _ => EvalVerdictStatus::Inconclusive,
         };
         let mut reasons = vec!["eval verdict is report-only and grants no authority".to_owned()];
+        if has_no_cases {
+            reasons.push(
+                "run contains no case results; empty output cannot establish an evaluation verdict"
+                    .to_owned(),
+            );
+        }
+        if has_unobserved_pass {
+            reasons.push(
+                "at least one Passed result lacks complete observed measurement evidence; a status claim alone cannot produce PASS"
+                    .to_owned(),
+            );
+        }
+        if has_blocked_case {
+            reasons.push("at least one case was blocked before a measured outcome".to_owned());
+        }
+        if has_skipped_case {
+            reasons.push("at least one case was skipped and remains non-evidence".to_owned());
+        }
         if has_stale_case {
             reasons.push(
                 "at least one retained integrity fingerprint set predates current evaluator identity; the run cannot support a fresh verdict"
@@ -105,7 +155,10 @@ impl EvalVerdictService {
     pub fn failure_clusters(run: &EvalRun) -> Vec<EvalFailureCluster> {
         run.case_results
             .iter()
-            .filter(|result| result.status != EvalCaseStatus::Passed)
+            .filter(|result| {
+                result.status == EvalCaseStatus::Failed
+                    && super::case_result_has_measurement_evidence(result)
+            })
             .map(|result| EvalFailureCluster {
                 eval_failure_cluster_id: EvalFailureClusterId::new_v7(),
                 eval_run_id: run.eval_run_id,
