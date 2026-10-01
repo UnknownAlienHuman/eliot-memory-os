@@ -126,7 +126,7 @@ impl CanonicalEvidenceProvider for KernelRouteEvidence {
 /// path instead.
 pub struct KernelRouteStoreFixture {
     store: Arc<RedbRecoveryStore>,
-    dir: PathBuf,
+    dir: KernelFixtureDirectory,
 }
 
 impl KernelRouteStoreFixture {
@@ -151,13 +151,7 @@ impl KernelRouteStoreFixture {
 
     /// Returns the fixture temp directory holding `ors.redb`.
     pub fn path(&self) -> &Path {
-        &self.dir
-    }
-}
-
-impl Drop for KernelRouteStoreFixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+        self.dir.as_ref()
     }
 }
 
@@ -183,13 +177,35 @@ pub fn kernel_route_writer_epoch(lineage_id: &str, epoch: u64) -> Result<EpochLi
 /// Creates one unique temp-root directory for a Kernel ORS fixture.
 ///
 /// Shared by every fixture constructor in this module so directory naming,
-/// label validation, and sanitization stay identical: the label names the
-/// directory only, grants nothing, and is never stored. A blank label or one
-/// containing control characters fails before any filesystem work; all other
-/// non-filename characters are flattened to `-`. Uniqueness is monotonic, not
-/// clock-derived: a process-wide counter disambiguates two same-label fixtures
-/// even when the wall clock repeats.
-pub fn kernel_fixture_dir(label: &str) -> Result<PathBuf, OrsError> {
+/// label validation, sanitization, and ownership stay identical: the label
+/// names the directory only, grants nothing, and is never stored. A blank
+/// label or one containing control characters fails before any filesystem
+/// work; all other non-filename characters are flattened to `-`. The directory
+/// is created exclusively and returned only after this call owns it; a name
+/// collision retries with a new serial and UUID rather than reusing the path.
+pub struct KernelFixtureDirectory(PathBuf);
+
+impl AsRef<Path> for KernelFixtureDirectory {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for KernelFixtureDirectory {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for KernelFixtureDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+pub fn kernel_fixture_dir(label: &str) -> Result<KernelFixtureDirectory, OrsError> {
     static NEXT_KERNEL_FIXTURE: AtomicU64 = AtomicU64::new(1);
     if label.trim().is_empty() || label.chars().any(char::is_control) {
         return Err(OrsError::InvalidField {
@@ -197,10 +213,6 @@ pub fn kernel_fixture_dir(label: &str) -> Result<PathBuf, OrsError> {
             reason: "must be non-blank text without control characters",
         });
     }
-    let serial = NEXT_KERNEL_FIXTURE.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
     let safe_label: String = label
         .chars()
         .map(|cell| {
@@ -211,14 +223,23 @@ pub fn kernel_fixture_dir(label: &str) -> Result<PathBuf, OrsError> {
             }
         })
         .collect();
-    let dir = std::env::temp_dir().join(format!(
-        "eliot-kernel-ors-{safe_label}-{}-{serial}-{nanos}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).map_err(|error| {
-        OrsError::Storage(format!("kernel fixture temp root is not writable: {error}"))
-    })?;
-    Ok(dir)
+    loop {
+        let serial = NEXT_KERNEL_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "eliot-kernel-ors-{safe_label}-{}-{serial}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(KernelFixtureDirectory(dir)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(OrsError::Storage(format!(
+                    "kernel fixture temp root is not writable: {error}"
+                )));
+            }
+        }
+    }
 }
 
 /// Installs one typed handoff persistence failpoint on a test-owned store.

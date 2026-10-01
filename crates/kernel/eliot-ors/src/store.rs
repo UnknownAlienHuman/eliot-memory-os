@@ -37363,21 +37363,42 @@ mod host_request_result_tests {
         }
     }
 
-    fn temp_store() -> (RedbRecoveryStore, std::path::PathBuf) {
-        let path = std::env::temp_dir().join(format!(
-            "eliot-host-request-result-{}-{}.redb",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |duration| duration.as_nanos())
-        ));
+    struct OwnedTempStore {
+        _directory: crate::test_support::KernelFixtureDirectory,
+        path: std::path::PathBuf,
+    }
+
+    impl std::ops::Deref for OwnedTempStore {
+        type Target = std::path::Path;
+
+        fn deref(&self) -> &Self::Target {
+            &self.path
+        }
+    }
+
+    impl AsRef<std::path::Path> for OwnedTempStore {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    fn temp_store() -> (OwnedTempStore, RedbRecoveryStore) {
+        let directory = crate::test_support::kernel_fixture_dir("host-request-result")
+            .expect("host request result temp directory is exclusively owned");
+        let path = directory.join("host-request-result.redb");
         let store = RedbRecoveryStore::open(&path).expect("temp store opens");
-        (store, path)
+        (
+            OwnedTempStore {
+                _directory: directory,
+                path,
+            },
+            store,
+        )
     }
 
     #[test]
     fn persist_result_is_exact_replay_and_rejects_changed_body() -> Result<(), OrsError> {
-        let (store, path) = temp_store();
+        let (path, store) = temp_store();
         let digest = "d".repeat(64);
         let operation =
             OperationIdentity::new(format!("hostreq:{digest}")).expect("valid operation");
@@ -37389,7 +37410,7 @@ mod host_request_result_tests {
         assert_eq!(admitted.state, HostRequestState::Admitted);
 
         // A `Requested` operation must never receive a result before admission.
-        let (early_store, early_path) = temp_store();
+        let (early_path, early_store) = temp_store();
         let early_digest = "e".repeat(64);
         let early_op =
             OperationIdentity::new(format!("hostreq:{early_digest}")).expect("valid operation");
@@ -37405,7 +37426,7 @@ mod host_request_result_tests {
             ),
             Err(OrsError::InvalidTransition)
         ));
-        let _ = std::fs::remove_file(early_path);
+        let _ = std::fs::remove_file(early_path.as_ref());
 
         let body = json!({
             "request_id": "req-1",
@@ -37477,13 +37498,13 @@ mod host_request_result_tests {
         ));
 
         drop(store);
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.as_ref());
         Ok(())
     }
 
     #[test]
     fn legacy_digest_only_row_completes_with_exact_body() -> Result<(), OrsError> {
-        let (store, path) = temp_store();
+        let (path, store) = temp_store();
         let digest = "d".repeat(64);
         let operation =
             OperationIdentity::new(format!("hostreq:{digest}")).expect("valid operation");
@@ -37551,7 +37572,7 @@ mod host_request_result_tests {
         ));
 
         drop(store);
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.as_ref());
         Ok(())
     }
 
@@ -37631,7 +37652,7 @@ mod host_request_result_tests {
     /// A live grant is consumed exactly once, and the marker is durable (#2883).
     #[test]
     fn succession_grant_is_consumed_exactly_once_and_persists() -> Result<(), OrsError> {
-        let (store, path) = temp_store();
+        let (path, store) = temp_store();
         let now = 1_000_000_000_u64;
         let grant = BackupVerifySuccessionGrant {
             grant_id: "1".repeat(64),
@@ -37670,7 +37691,7 @@ mod host_request_result_tests {
             "the consumed marker is durable across a reopen, not in-memory only"
         );
         drop(reopened);
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.as_ref());
         Ok(())
     }
 
@@ -37679,7 +37700,7 @@ mod host_request_result_tests {
     /// (#2883 instruction 4 - the entropy-unavailable path).
     #[test]
     fn succession_grant_absent_row_is_not_consumable() -> Result<(), OrsError> {
-        let (store, path) = temp_store();
+        let (path, store) = temp_store();
         let row = grant_row(None);
         let key = row.record_key()?;
         store.stage_backup_verification_result(&row)?;
@@ -37688,7 +37709,7 @@ mod host_request_result_tests {
             "a row carrying no grant must never be consumable"
         );
         drop(store);
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.as_ref());
         Ok(())
     }
 
