@@ -532,18 +532,46 @@ pub struct ExperienceRangePage {
     /// like the audit range.
     #[serde(default)]
     pub next_cursor: Option<String>,
+    /// Fence the owner projected this page under, echoed back by
+    /// [`Self::payload`] under [`EXPERIENCE_PAGE_STATE_FENCE`].
+    ///
+    /// #1144 A5. This field exists because the projector emitted that key
+    /// while this struct did not declare it: the envelope is `deny_unknown_fields`,
+    /// so every produced page — memory, Surreal adapter and this owner's
+    /// own [`ExperienceRangePage`] coverage gate — failed to decode, and the
+    /// owner's truncated-coverage arm could therefore never execute. The
+    /// decode side and the project side of one contract are one shape, so the
+    /// fence the owner already publishes is declared here rather than the
+    /// projector being narrowed to a lie.
+    pub state_fence: StateFence,
 }
 
 impl ExperienceRangePage {
     /// Builds the closed page object bound into read payloads.
-    pub fn payload(&self, state_fence: &StateFence) -> serde_json::Value {
-        serde_json::json!({
+    ///
+    /// The page's own [`state_fence`](Self::state_fence) is the fence this
+    /// method publishes, so the projected envelope and the decoding struct
+    /// are one shape: the argument is accepted so a caller cannot project a
+    /// page under a fence other than the one it decoded, and it is refused
+    /// when it disagrees with the page.
+    /// # Errors
+    ///
+    /// Returns [`StoreError::FenceMismatch`] when `state_fence` disagrees with
+    /// the fence this page carries. The check is ENFORCED rather than asserted:
+    /// a `debug_assert` would vanish in a release build, which is exactly how a
+    /// page could be projected under a fence other than the one it was read
+    /// under - the very substitution this field exists to prevent.
+    pub fn payload(&self, state_fence: &StateFence) -> Result<serde_json::Value, StoreError> {
+        if &self.state_fence != state_fence {
+            return Err(StoreError::FenceMismatch);
+        }
+        Ok(serde_json::json!({
             EXPERIENCE_PAGE_RECORDS: self.records,
             EXPERIENCE_PAGE_MATCHED_TOTAL: self.matched_total,
             EXPERIENCE_PAGE_TRUNCATED: self.truncated,
             EXPERIENCE_PAGE_NEXT_CURSOR: self.next_cursor,
-            EXPERIENCE_PAGE_STATE_FENCE: state_fence,
-        })
+            EXPERIENCE_PAGE_STATE_FENCE: self.state_fence,
+        }))
     }
 }
 

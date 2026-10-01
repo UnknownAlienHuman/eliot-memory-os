@@ -2457,6 +2457,7 @@ fn experience_range_payload(
             matched_total,
             truncated,
             next_cursor,
+            state_fence: fence.clone(),
         }
         .payload(fence),
     )
@@ -2560,6 +2561,7 @@ fn learning_range_payload(
             matched_total,
             truncated,
             next_cursor,
+            state_fence: fence.clone(),
         }
         .payload(fence),
     )
