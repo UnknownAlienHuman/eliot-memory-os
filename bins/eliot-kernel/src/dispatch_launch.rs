@@ -1634,7 +1634,7 @@ pub(crate) async fn submit_testd_owner_job(
         request.process_tool.observation.nextest_sha256.clone(),
         profile.fixed_argv.clone(),
         source_root.to_string_lossy().into_owned(),
-        environment,
+        environment.clone(),
         ResourceLimits::new(
             profile.wall_timeout_ms,
             profile.cpu_time_ms,
@@ -1667,7 +1667,7 @@ pub(crate) async fn submit_testd_owner_job(
         generation,
     )?;
     let process = process_gateway
-        .issue_testd_process_request(&process_owner, process_admission)
+        .issue_testd_process_request(&process_owner, process_admission, identity)
         .await
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let process_request = KernelProcessAdmissionRequest {
@@ -1690,6 +1690,8 @@ pub(crate) async fn submit_testd_owner_job(
         project_id: request.submission.project_id.clone(),
         invocation: request.submission.invocation.clone(),
         stage_request: Some(stage_request.clone()),
+        provider_tool_observation: request.process_tool.observation.clone(),
+        provider_environment_projection: environment,
         target_roots,
         target_layout: Some(target_layout),
         // Issue #1897 (AUD1): the lane is now allocated from the admitted

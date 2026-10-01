@@ -727,6 +727,11 @@ pub fn disposition_for_parts(
                 rule: format!("{instrument}: profile identity slot is unbound or drifted"),
             }
         }
+        crate::registry::RegistryError::MissingFreshnessInput { field } => {
+            ProviderDisposition::Unavailable {
+                rule: format!("{instrument}: missing {field} currentness fingerprint"),
+            }
+        }
     }
 }
 
