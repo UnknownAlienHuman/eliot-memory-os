@@ -35,7 +35,11 @@ pub const MAX_ATTRIBUTION_REF_LEN: usize = 256;
 /// handshake deadline/route from the hello, and the Authority Epoch plus
 /// State Fence agreed across all three. Visibility, privacy class, and the
 /// swarm leg of the budget have no typed field on the admitted halves, so
-/// they are not projected here (see the issue record).
+/// they ride as explicit `None` legs below (never defaulted, never inferred
+/// in-bin): the envelope names each dimension at every boundary, and the
+/// unbound legs stay governed by their owners (harness/installation
+/// boundary per A12.2, source privacy owner, swarm publisher + Governor
+/// ledger) until a typed wire source exists.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JobEnvelope {
     /// Authenticated principal reference from the registration.
@@ -77,6 +81,24 @@ pub struct JobEnvelope {
     /// Replay stream identity bound to the claim generation, when the v2
     /// executable join carries one.
     pub replay_stream_id: Option<String>,
+    /// Visibility leg: explicitly unbound. No admitted half
+    /// (`WorkerHello`/`NativeWorkerClaim`/`NativeWorkerRegistration`/
+    /// `NativeWorkerExecutableBinding`/`BudgetEnvelope`) carries a typed
+    /// visibility field, so there is no sourced value to project; the leg
+    /// stays `None` and stays governed by the harness/installation boundary
+    /// (A12.2). Locator-only when a future owner publishes one; never
+    /// defaulted or inferred in-bin.
+    pub visibility_ref: Option<String>,
+    /// Privacy-class leg: explicitly unbound. No admitted half carries a
+    /// typed privacy-class field, so the leg stays `None` and stays governed
+    /// by the source privacy owner. Locator-only when published; never
+    /// derived from `route_class`/`route_ref` in-bin.
+    pub privacy_class_ref: Option<String>,
+    /// Swarm-budget leg: explicitly unbound. No swarm identity is published
+    /// to any worker wire type, so the leg stays `None` and stays governed
+    /// by the swarm publisher + Governor ledger. Locator-only when
+    /// published; never invented in-bin.
+    pub swarm_budget_ref: Option<String>,
 }
 
 /// Requires the explicit job envelope for one admitted presentation.
@@ -174,6 +196,14 @@ pub fn require_job_envelope(
             .executable_binding
             .as_ref()
             .map(|join| join.replay_stream_id.clone()),
+        // Issue #1912 W1: the three legs above have no typed source on any
+        // admitted half (zero `visibility`/`privacy`/`swarm` fields on the
+        // wire types), so the envelope carries their explicit absence rather
+        // than an invented value. Each stays governed by its owner until a
+        // typed wire field exists to project.
+        visibility_ref: None,
+        privacy_class_ref: None,
+        swarm_budget_ref: None,
     })
 }
 
@@ -213,8 +243,9 @@ pub fn require_paid_start_eligible(
 /// task/job/claim/attempt/operation identities must equal the admitted
 /// claim's. Cost accounting stays Governor-side (A14.7): this record is
 /// the attribution binding, never a ledger. No swarm identity exists on
-/// the admitted claim, so the swarm leg is not bound here (see the issue
-/// record).
+/// the admitted claim, so the swarm leg rides as an explicit `None`
+/// (`swarm_ref`) governed by the swarm publisher until a typed wire source
+/// exists; a `Some` swarm leg is refused as foreign.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConsumptionAttribution {
     /// Opaque provider reference from the consumption receipt.
@@ -233,11 +264,18 @@ pub struct ConsumptionAttribution {
     pub attempt_id: AttemptId,
     /// Exact external-effect operation identity the receipt is attributed to.
     pub operation_id: OperationId,
+    /// Swarm leg: explicitly unbound (`None`) until the swarm publisher owns
+    /// a typed swarm identity on the claim. Locator-only when published;
+    /// never invented in-bin.
+    pub swarm_ref: Option<String>,
 }
 
 /// Requires one consumption receipt to bind its originating task/job.
 ///
-/// Validates the opaque reference shapes, then requires the typed
+/// Validates the opaque reference shapes, requires the explicit swarm leg to
+/// stay unbound (`None`: the admitted claim carries no swarm identity, so a
+/// `Some` leg has no owner-typed source and is refused rather than
+/// invented around), then requires the typed
 /// task/job/claim/attempt/operation identities to equal the admitted
 /// claim's. A foreign receipt is refused before any result submit.
 ///
@@ -262,6 +300,12 @@ pub fn require_consumption_attribution(
                 "consumption attribution field '{field}' is missing, oversized, or malformed"
             )));
         }
+    }
+    if attribution.swarm_ref.is_some() {
+        return Err(NativeWorkerError::KernelAdmissionRequired(
+            "consumption receipt swarm leg is unbound: the admitted claim carries no swarm identity, so a swarm-bound receipt has no owner-typed source"
+                .to_owned(),
+        ));
     }
     if attribution.task_id != claim.task_id
         || attribution.parent_job_id != claim.parent_job_id
