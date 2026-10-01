@@ -746,6 +746,9 @@ fn hello(connection: &str, request: &str) -> WorkerHello {
         ),
         route_ref: "route-1".to_owned(),
         requested_capabilities: ["inspect".to_owned()].into_iter().collect(),
+        visibility: None,
+        privacy_class: None,
+        swarm_id: None,
     }
 }
 
@@ -1913,6 +1916,9 @@ fn claim_for(
         ),
         wire_version: NATIVE_WORKER_CLAIM_WIRE_VERSION,
         executable_binding: Some(join),
+        visibility: None,
+        privacy_class: None,
+        swarm_id: None,
         binding_digest: String::new(),
     };
     draft.with_computed_digest().expect("claim digest")

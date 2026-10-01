@@ -47,19 +47,35 @@
 //! composed Kernel advertises the exact testd wire. The Drive path below
 //! already derives its executable binding from the admitted profile registry.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use eliot_blob_api::wire::{
+    BlobProcessStreamCallToken, BlobProcessStreamKernelOperationRequest,
+    BlobProcessStreamKernelOutcome, BlobProcessStreamKernelRequest,
+    BlobProcessStreamKernelResponse, BlobProcessStreamOperationResponse,
+    ProcessStreamSinkBindingRef, ProcessStreamSinkCapabilityRef, ProcessStreamSinkWireResponse,
+};
 use eliot_cli::kernel_client::{KernelClient, KernelClientError};
 use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
 use eliot_instrument_api::{InstrumentInvocation, InstrumentKind};
 use eliot_process::{ProcessEvidenceSink, ProcessExecutionError, ProcessExecutor, ProcessRequest};
+use eliot_process::{
+    ProcessStreamEvidence, ProcessStreamSinkAbortRequest, ProcessStreamSinkAppend,
+    ProcessStreamSinkAppendDisposition, ProcessStreamSinkClient, ProcessStreamSinkError,
+    ProcessStreamSinkFinalizeRequest, ProcessStreamSinkFuture, ProcessStreamSinkOpenRequest,
+    ProcessStreamSinkReadback, ProcessStreamSinkSession, ProcessStreamSinkSessionView,
+    ProcessStreamSinkState, ProcessStreamSinkTerminal, ProcessStreamSinkUnknownOutcome,
+};
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use eliot_testd_core::{
     KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider, KernelProcessAdmissionRequest,
-    TestJob, TestdError, TestdTerminalCompletionNotice, TestdVerifierDispatchBinding,
-    verification_receipt_sha256,
+    TestJob, TestdBlobProcessStreamCallOutcome, TestdBlobProcessStreamGrantResolution,
+    TestdBlobProcessStreamReadyReceipt, TestdBlobProcessStreamReserve,
+    TestdBlobProcessStreamTokenRef, TestdError, TestdStore, TestdTerminalCompletionNotice,
+    TestdVerifierDispatchBinding, verification_receipt_sha256,
 };
 use serde::{Deserialize, Serialize};
 
@@ -196,6 +212,11 @@ pub enum TestdIpcError {
     /// The exchange violated the closed contract before any effect.
     #[error("kernel testd exchange violated the closed contract: {0}")]
     Contract(String),
+    /// The current one-use Blob token is already bound to another exact
+    /// operation body. Only the SourceReadback caller may resolve a completed
+    /// prior call and then use the Kernel-issued successor for a fresh read.
+    #[error("current Blob call token is bound to a different exact operation")]
+    BlobCallOperationConflict,
     /// The submit reply was lost: the request may have reached the Kernel,
     /// but its outcome was not proven by an exact typed reply. Carry the
     /// exact submit identity so a later invocation can reconcile under the
@@ -610,7 +631,7 @@ struct RetainedTestdAdmission {
 /// idempotent intent check against the retained admission. It mints no
 /// permit, builds no [`ProcessRequest`], and executes nothing.
 pub struct KernelTestdIpcClient {
-    client: KernelClient,
+    client: Arc<Mutex<KernelClient>>,
     #[allow(
         dead_code,
         reason = "dispatch contour retains the live epoch for the lineage-aware binding once the delivery seam lands"
@@ -638,7 +659,7 @@ impl KernelTestdIpcClient {
         require_health_open(&health)?;
         let live_epoch = parse_live_epoch(&health)?;
         Ok(Self {
-            client,
+            client: Arc::new(Mutex::new(client)),
             live_epoch: Some(live_epoch),
             retained: None,
         })
@@ -649,6 +670,29 @@ impl KernelTestdIpcClient {
     #[must_use]
     pub fn live_epoch(&self) -> Option<&EpochId> {
         self.live_epoch.as_ref()
+    }
+
+    /// Exchanges one exact closed Blob stream operation through the
+    /// authenticated TestD→Kernel capability path. The opaque capability and
+    /// single-use token are the only authority-bearing inputs; TestD never
+    /// creates a RequestIdentity or retries an unknown transport result.
+    pub fn blob_process_stream_exchange(
+        &mut self,
+        capability: ProcessStreamSinkCapabilityRef,
+        call_token: BlobProcessStreamCallToken,
+        operation: BlobProcessStreamKernelOperationRequest,
+        job_id: &str,
+    ) -> Result<BlobProcessStreamKernelResponse, TestdIpcError> {
+        self.blob_stream_client()
+            .exchange(capability, call_token, operation, job_id)
+    }
+
+    /// Returns a cloneable handle to this already-authenticated Kernel session
+    /// for the concurrent stdout/stderr sink and readback adapters.
+    pub fn blob_stream_client(&self) -> KernelTestdBlobStreamClient {
+        KernelTestdBlobStreamClient {
+            client: self.client.clone(),
+        }
     }
 
     /// Sends the immutable terminal receipt reference through the existing
@@ -689,18 +733,22 @@ impl KernelTestdIpcClient {
                     request_digest: request.request_digest.clone(),
                 });
             }
-            self.client.set_request_identity(identity.clone());
             let payload = serde_json::json!({"request": &request});
-            let value = self
-                .client
-                .transact_json(TESTD_TERMINAL_COMPLETION_OPERATION, payload)
-                .map_err(|error| match error {
-                    KernelClientError::UnknownOutcome(_) => TestdIpcError::UnknownOutcome {
-                        job_id: notice.job_id.clone(),
-                        request_digest: request.request_digest.clone(),
-                    },
-                    other => TestdIpcError::Transport(other.to_string()),
+            let value = {
+                let mut client = self.client.lock().map_err(|_| {
+                    TestdIpcError::Transport("Kernel client lock poisoned".to_owned())
                 })?;
+                client.set_request_identity(identity.clone());
+                client
+                    .transact_json(TESTD_TERMINAL_COMPLETION_OPERATION, payload)
+                    .map_err(|error| match error {
+                        KernelClientError::UnknownOutcome(_) => TestdIpcError::UnknownOutcome {
+                            job_id: notice.job_id.clone(),
+                            request_digest: request.request_digest.clone(),
+                        },
+                        other => TestdIpcError::Transport(other.to_string()),
+                    })?
+            };
             let response: TestdTerminalCompletionResponse = serde_json::from_value(value)
                 .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
             match response {
@@ -842,6 +890,1318 @@ impl KernelTestdIpcClient {
             invocation_id: invocation_id.to_owned(),
             invocation_digest: admission.invocation_digest.clone(),
         });
+    }
+}
+
+/// Cloneable handle for the single authenticated Kernel session shared by
+/// concurrent process-stream persistence pumps.
+#[derive(Clone)]
+pub struct KernelTestdBlobStreamClient {
+    client: Arc<Mutex<KernelClient>>,
+}
+
+impl KernelTestdBlobStreamClient {
+    /// Exchanges one exact closed capability operation, consuming the
+    /// supplied one-use token and preserving unknown outcomes without retry.
+    pub fn exchange(
+        &self,
+        capability: ProcessStreamSinkCapabilityRef,
+        call_token: BlobProcessStreamCallToken,
+        operation: BlobProcessStreamKernelOperationRequest,
+        job_id: &str,
+    ) -> Result<BlobProcessStreamKernelResponse, TestdIpcError> {
+        let request = BlobProcessStreamKernelRequest::new(capability, call_token, operation)
+            .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+        let op_digest = request.operation_sha256.clone();
+        let response = self
+            .client
+            .lock()
+            .map_err(|_| TestdIpcError::Transport("Kernel client lock poisoned".to_owned()))?
+            .blob_process_stream_exchange(request.clone())
+            .map_err(|error| match error {
+                KernelClientError::UnknownOutcome(_) => TestdIpcError::UnknownOutcome {
+                    job_id: job_id.to_owned(),
+                    request_digest: op_digest.clone(),
+                },
+                other => TestdIpcError::Transport(other.to_string()),
+            })?;
+        response
+            .validate_for_request(&request)
+            .map_err(|_| TestdIpcError::UnknownOutcome {
+                job_id: job_id.to_owned(),
+                request_digest: op_digest,
+            })?;
+        Ok(response)
+    }
+}
+
+/// A bounded one-use token sequence shared by the sink and source-readback
+/// adapters for one job. Tokens are consumed before a call and never put back,
+/// including when transport outcome is unknown.
+#[derive(Clone)]
+pub struct KernelBlobStreamCallSequence {
+    client: KernelTestdBlobStreamClient,
+    capability: ProcessStreamSinkCapabilityRef,
+    sequence_lock: Arc<Mutex<()>>,
+    tokens: Arc<Mutex<VecDeque<BlobProcessStreamCallToken>>>,
+    job_id: String,
+    store: TestdStore,
+    process_binding_sha256: String,
+    grant_deadline_ms: u64,
+}
+
+impl KernelBlobStreamCallSequence {
+    /// Binds the authenticated session to the exact material projection after
+    /// the caller has compared it with the durable TestdStore grant.
+    pub fn new(
+        client: KernelTestdBlobStreamClient,
+        capability_ref: &str,
+        tokens: &[TestdBlobProcessStreamTokenRef],
+        job_id: &str,
+        store: TestdStore,
+        grant_deadline_ms: u64,
+    ) -> Result<Self, TestdIpcError> {
+        let capability = ProcessStreamSinkCapabilityRef {
+            reference: capability_ref.to_owned(),
+        };
+        capability
+            .validate()
+            .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+        let process_binding_sha256 = match store
+            .resolve_blob_process_stream_grant(job_id, capability_ref)
+            .map_err(|error| TestdIpcError::Contract(error.to_string()))?
+        {
+            TestdBlobProcessStreamGrantResolution::Active(grant) => grant.process_binding_sha256,
+            TestdBlobProcessStreamGrantResolution::NotFound
+            | TestdBlobProcessStreamGrantResolution::Revoked => {
+                return Err(TestdIpcError::Contract(
+                    "Blob process-stream grant is not active".to_owned(),
+                ));
+            }
+        };
+        if tokens.is_empty() || tokens.len() > 8_336 || grant_deadline_ms == 0 {
+            return Err(TestdIpcError::Contract(
+                "Blob process-stream grant has no bounded token sequence".to_owned(),
+            ));
+        }
+        let mut values = VecDeque::with_capacity(tokens.len());
+        for (index, token) in tokens.iter().enumerate() {
+            if token.ordinal == 0
+                || (index > 0 && token.ordinal != tokens[index - 1].ordinal.saturating_add(1))
+                || token.reference.trim().is_empty()
+                || token.reference.len() > 128
+                || token.reference.chars().any(char::is_control)
+                || tokens[..index]
+                    .iter()
+                    .any(|previous| previous.reference == token.reference)
+            {
+                return Err(TestdIpcError::Contract(
+                    "Blob call tokens are malformed or out of sequence".to_owned(),
+                ));
+            }
+            values.push_back(BlobProcessStreamCallToken {
+                reference: token.reference.clone(),
+                ordinal: token.ordinal,
+            });
+        }
+        Ok(Self {
+            client,
+            capability,
+            sequence_lock: Arc::new(Mutex::new(())),
+            tokens: Arc::new(Mutex::new(values)),
+            job_id: job_id.to_owned(),
+            store,
+            process_binding_sha256,
+            grant_deadline_ms,
+        })
+    }
+
+    /// Looks up the exact retained CompleteSource Finalize receipt by all
+    /// independently read source/session/terminal selectors.
+    pub fn lookup_retained_ready_finalize_receipt(
+        &self,
+        session_id: &str,
+        source_id: &str,
+        terminal_id: &str,
+        ready_receipt_ref: &str,
+    ) -> Result<Option<TestdBlobProcessStreamReadyReceipt>, TestdIpcError> {
+        let Some(proof) = self
+            .store
+            .resolve_blob_process_stream_ready_receipt(
+                &self.job_id,
+                &self.capability.reference,
+                &self.process_binding_sha256,
+                session_id,
+                source_id,
+                terminal_id,
+                ready_receipt_ref,
+            )
+            .map_err(|error| TestdIpcError::Contract(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        proof
+            .validate()
+            .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+
+        // The local row is only a selector. Re-read the exact Kernel ORS
+        // outcome using the original consumed token and operation digest;
+        // this path is observe-only and cannot repeat the Store effect.
+        let response = self.reconcile(
+            BlobProcessStreamCallToken {
+                reference: proof.token.reference.clone(),
+                ordinal: proof.token.ordinal,
+            },
+            &proof.operation_sha256,
+        )?;
+        let response_ref = match &response.outcome {
+            BlobProcessStreamKernelOutcome::Completed {
+                response_ref,
+                operation_sha256,
+                original_terminal_operation_sha256,
+                ..
+            } if operation_sha256 == &proof.operation_sha256
+                && original_terminal_operation_sha256.as_deref()
+                    == Some(proof.operation_sha256.as_str()) =>
+            {
+                response_ref
+            }
+            _ => {
+                return Err(TestdIpcError::UnknownOutcome {
+                    job_id: self.job_id.clone(),
+                    request_digest: proof.operation_sha256,
+                });
+            }
+        };
+        let exact_response_bytes = canonical_json_bytes(&response)
+            .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+        if response_ref != &proof.response_ref
+            || sha256_hex(&exact_response_bytes) != proof.response_sha256
+            || completed_ready_receipt(None, &response, &self.process_binding_sha256)
+                != Some(proof.ready_receipt.clone())
+        {
+            return Err(TestdIpcError::Contract(
+                "the retained Kernel Finalize outcome differs from its durable Ready receipt proof"
+                    .to_owned(),
+            ));
+        }
+        Ok(Some(proof.ready_receipt))
+    }
+
+    /// Derives a short operation deadline no later than the Kernel-issued
+    /// launch-grant expiry.
+    pub fn deadline_for_budget(&self, budget_ms: u64) -> Result<u64, TestdIpcError> {
+        let now = unix_ms();
+        let deadline = now
+            .saturating_add(budget_ms.max(1))
+            .min(self.grant_deadline_ms);
+        if deadline <= now {
+            return Err(TestdIpcError::Transport(
+                "Kernel-issued Blob capability has expired".to_owned(),
+            ));
+        }
+        Ok(deadline)
+    }
+
+    /// Sends one validated semantic operation with its next distinct owner
+    /// token. No transport, Unknown, or Unavailable result is retried.
+    pub fn exchange(
+        &self,
+        operation: BlobProcessStreamKernelOperationRequest,
+    ) -> Result<BlobProcessStreamKernelResponse, TestdIpcError> {
+        let _sequence = self.sequence_lock.lock().map_err(|_| {
+            TestdIpcError::Transport("Blob operation sequence lock poisoned".to_owned())
+        })?;
+        self.exchange_under_sequence(operation)
+    }
+
+    fn exchange_under_sequence(
+        &self,
+        operation: BlobProcessStreamKernelOperationRequest,
+    ) -> Result<BlobProcessStreamKernelResponse, TestdIpcError> {
+        operation
+            .validate()
+            .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+        let deadline_ms = match &operation {
+            BlobProcessStreamKernelOperationRequest::SinkOpen { deadline_ms, .. }
+            | BlobProcessStreamKernelOperationRequest::SinkAppend { deadline_ms, .. }
+            | BlobProcessStreamKernelOperationRequest::SinkFinalize { deadline_ms, .. }
+            | BlobProcessStreamKernelOperationRequest::SinkAbort { deadline_ms, .. }
+            | BlobProcessStreamKernelOperationRequest::SinkReadback { deadline_ms, .. }
+            | BlobProcessStreamKernelOperationRequest::SinkReconcile { deadline_ms, .. } => {
+                *deadline_ms
+            }
+            BlobProcessStreamKernelOperationRequest::SourceReadback { request } => {
+                request.deadline_ms
+            }
+        };
+        if deadline_ms > self.grant_deadline_ms || unix_ms() >= deadline_ms {
+            return Err(TestdIpcError::Transport(
+                "Blob operation deadline exceeds its Kernel-issued grant".to_owned(),
+            ));
+        }
+        // Keep one lock across token consumption and the authenticated
+        // exchange. Stdout, stderr, and readback share this sequence, so a
+        // successor token can never overtake the operation that issued it.
+        let mut tokens = self.tokens.lock().map_err(|_| {
+            TestdIpcError::Transport("Blob token sequence lock poisoned".to_owned())
+        })?;
+        let token = tokens.pop_front().ok_or_else(|| {
+            TestdIpcError::Transport("Blob call token sequence exhausted".to_owned())
+        })?;
+        let request = BlobProcessStreamKernelRequest::new(
+            self.capability.clone(),
+            token.clone(),
+            operation.clone(),
+        )
+        .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+        let operation_sha256 = request.operation_sha256.clone();
+        if let Some(existing) = self
+            .store
+            .resolve_blob_process_stream_call_at_token_head(
+                &self.job_id,
+                &self.capability.reference,
+            )
+            .map_err(|error| TestdIpcError::Contract(error.to_string()))?
+        {
+            drop(tokens);
+            // A current token with an existing call row has already been
+            // consumed or reserved. Recover only that exact retained result;
+            // never bind the token to this newly constructed semantic body.
+            if existing.operation_sha256 != operation_sha256 {
+                return Err(TestdIpcError::BlobCallOperationConflict);
+            }
+            return self.reconcile_exact(
+                BlobProcessStreamCallToken {
+                    reference: existing.token_ref,
+                    ordinal: existing.ordinal,
+                },
+                &existing.operation_sha256,
+            );
+        }
+        let call_state = self
+            .store
+            .reserve_blob_process_stream_call(
+                &self.job_id,
+                &self.capability.reference,
+                &token.reference,
+                token.ordinal,
+                &operation_sha256,
+            )
+            .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+        match call_state {
+            TestdBlobProcessStreamReserve::Reserved => {
+                self.store
+                    .mark_blob_process_stream_call_dispatched(
+                        &self.job_id,
+                        &self.capability.reference,
+                        &token.reference,
+                        token.ordinal,
+                        &operation_sha256,
+                    )
+                    .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+            }
+            TestdBlobProcessStreamReserve::Replay(_) => {
+                drop(tokens);
+                return self.reconcile_exact(token, &operation_sha256);
+            }
+        }
+        let operation_for_receipt = operation.clone();
+        let response = self.client.exchange(
+            self.capability.clone(),
+            token.clone(),
+            operation,
+            &self.job_id,
+        )?;
+        let compact_outcome = match &response.outcome {
+            BlobProcessStreamKernelOutcome::Completed { response_ref, .. } => {
+                let response_bytes = canonical_json_bytes(&response)
+                    .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+                TestdBlobProcessStreamCallOutcome::Completed {
+                    response_sha256: sha256_hex(&response_bytes),
+                    response_ref: Some(response_ref.clone()),
+                    ready_receipt: completed_ready_receipt(
+                        Some(&operation_for_receipt),
+                        &response,
+                        &self.process_binding_sha256,
+                    ),
+                }
+            }
+            BlobProcessStreamKernelOutcome::NotStarted { .. } => {
+                TestdBlobProcessStreamCallOutcome::NotStarted
+            }
+            BlobProcessStreamKernelOutcome::Unavailable { .. } => {
+                TestdBlobProcessStreamCallOutcome::Unavailable
+            }
+            BlobProcessStreamKernelOutcome::Unknown { .. } => {
+                TestdBlobProcessStreamCallOutcome::Unknown
+            }
+        };
+        if let Some(next_token) = response.next_call_token.as_ref() {
+            self.store
+                .complete_blob_process_stream_call_and_advance(
+                    &self.job_id,
+                    &self.capability.reference,
+                    &token.reference,
+                    token.ordinal,
+                    &operation_sha256,
+                    compact_outcome,
+                    TestdBlobProcessStreamTokenRef {
+                        reference: next_token.reference.clone(),
+                        ordinal: next_token.ordinal,
+                    },
+                )
+                .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+            tokens.push_back(next_token.clone());
+        } else {
+            self.store
+                .complete_blob_process_stream_call(
+                    &self.job_id,
+                    &self.capability.reference,
+                    &token.reference,
+                    token.ordinal,
+                    &operation_sha256,
+                    compact_outcome,
+                )
+                .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+        }
+        Ok(response)
+    }
+
+    /// Observes the retained Kernel result for this exact previously consumed
+    /// call. This method never sends the original Store operation.
+    pub fn reconcile(
+        &self,
+        token: BlobProcessStreamCallToken,
+        operation_sha256: &str,
+    ) -> Result<BlobProcessStreamKernelResponse, TestdIpcError> {
+        let _sequence = self.sequence_lock.lock().map_err(|_| {
+            TestdIpcError::Transport("Blob operation sequence lock poisoned".to_owned())
+        })?;
+        self.reconcile_under_sequence(token, operation_sha256)
+    }
+
+    fn reconcile_under_sequence(
+        &self,
+        token: BlobProcessStreamCallToken,
+        operation_sha256: &str,
+    ) -> Result<BlobProcessStreamKernelResponse, TestdIpcError> {
+        let request = eliot_blob_api::wire::BlobProcessStreamKernelReconcileRequest {
+            wire_id: eliot_blob_api::wire::BLOB_PROCESS_STREAM_RECONCILE_WIRE_ID.to_owned(),
+            wire_revision: eliot_blob_api::wire::BLOB_PROCESS_STREAM_RECONCILE_WIRE_REVISION,
+            capability: self.capability.clone(),
+            call_token: token,
+            operation_sha256: operation_sha256.to_owned(),
+        };
+        request
+            .validate()
+            .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+        let response = self
+            .client
+            .lock()
+            .map_err(|_| TestdIpcError::Transport("Kernel client lock poisoned".to_owned()))?
+            .blob_process_stream_reconcile(request.clone())
+            .map_err(|error| match error {
+                KernelClientError::UnknownOutcome(_) => TestdIpcError::UnknownOutcome {
+                    job_id: self.job_id.clone(),
+                    request_digest: operation_sha256.to_owned(),
+                },
+                other => TestdIpcError::Transport(other.to_string()),
+            })?;
+        response
+            .validate_for_reconcile(&request)
+            .map_err(|_| TestdIpcError::UnknownOutcome {
+                job_id: self.job_id.clone(),
+                request_digest: operation_sha256.to_owned(),
+            })?;
+        Ok(response)
+    }
+
+    /// Reconciles the exact call attached to the durable current token head.
+    /// No semantic operation is constructed or dispatched on this path.
+    pub fn reconcile_current_call(&self) -> Result<BlobProcessStreamKernelResponse, TestdIpcError> {
+        let _sequence = self.sequence_lock.lock().map_err(|_| {
+            TestdIpcError::Transport("Blob operation sequence lock poisoned".to_owned())
+        })?;
+        self.reconcile_current_call_under_sequence()
+    }
+
+    fn reconcile_current_call_under_sequence(
+        &self,
+    ) -> Result<BlobProcessStreamKernelResponse, TestdIpcError> {
+        let _tokens = self.tokens.lock().map_err(|_| {
+            TestdIpcError::Transport("Blob token sequence lock poisoned".to_owned())
+        })?;
+        let record = self
+            .store
+            .resolve_blob_process_stream_call_at_token_head(
+                &self.job_id,
+                &self.capability.reference,
+            )
+            .map_err(|error| TestdIpcError::Contract(error.to_string()))?
+            .ok_or_else(|| {
+                TestdIpcError::Transport(
+                    "the durable current Blob token has no consumed call to reconcile".to_owned(),
+                )
+            })?;
+        drop(_tokens);
+        self.reconcile_exact(
+            BlobProcessStreamCallToken {
+                reference: record.token_ref,
+                ordinal: record.ordinal,
+            },
+            &record.operation_sha256,
+        )
+    }
+
+    /// Resolves an old consumed call before issuing a fresh SourceReadback
+    /// when a restart changed only its operation deadline. This path is
+    /// specific to the owner-backed read operation: it first observes the
+    /// exact retained token/digest, requires a Completed result and its
+    /// Kernel-issued successor, then uses that successor for a new fresh
+    /// read. It never resends the old operation or reuses old response bytes.
+    pub fn read_source_chunk(
+        &self,
+        request: eliot_blob_api::wire::BlobProcessStreamKernelSourceReadbackRequest,
+    ) -> Result<BlobProcessStreamKernelResponse, TestdIpcError> {
+        let _sequence = self.sequence_lock.lock().map_err(|_| {
+            TestdIpcError::Transport("Blob operation sequence lock poisoned".to_owned())
+        })?;
+        let operation = BlobProcessStreamKernelOperationRequest::SourceReadback {
+            request: Box::new(request.clone()),
+        };
+        match self.exchange_under_sequence(operation.clone()) {
+            Err(TestdIpcError::BlobCallOperationConflict) => {
+                // The exact original call must remain reconcilable under the
+                // live Kernel grant/fence before allocating a fresh read.
+                self.deadline_for_budget(1)?;
+                let retained = self.reconcile_current_call_under_sequence()?;
+                match &retained.outcome {
+                    BlobProcessStreamKernelOutcome::Completed { .. }
+                        if retained.next_call_token.is_some() => {}
+                    BlobProcessStreamKernelOutcome::Unknown { operation_sha256 } => {
+                        return Err(TestdIpcError::UnknownOutcome {
+                            job_id: self.job_id.clone(),
+                            request_digest: operation_sha256.clone(),
+                        });
+                    }
+                    _ => {
+                        return Err(TestdIpcError::Contract(
+                            "the prior Blob call has no completed owner result and successor token"
+                                .to_owned(),
+                        ));
+                    }
+                }
+                self.exchange_under_sequence(operation)
+            }
+            result => result,
+        }
+    }
+
+    fn reconcile_exact(
+        &self,
+        token: BlobProcessStreamCallToken,
+        operation_sha256: &str,
+    ) -> Result<BlobProcessStreamKernelResponse, TestdIpcError> {
+        let response =
+            self.client
+                .reconcile(self.capability.clone(), token.clone(), operation_sha256)?;
+        let compact_outcome = match &response.outcome {
+            BlobProcessStreamKernelOutcome::Completed { response_ref, .. } => {
+                let response_bytes = canonical_json_bytes(&response)
+                    .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+                TestdBlobProcessStreamCallOutcome::Completed {
+                    response_sha256: sha256_hex(&response_bytes),
+                    response_ref: Some(response_ref.clone()),
+                    ready_receipt: completed_ready_receipt(
+                        None,
+                        &response,
+                        &self.process_binding_sha256,
+                    ),
+                }
+            }
+            BlobProcessStreamKernelOutcome::NotStarted { .. } => {
+                TestdBlobProcessStreamCallOutcome::NotStarted
+            }
+            BlobProcessStreamKernelOutcome::Unavailable { .. } => {
+                TestdBlobProcessStreamCallOutcome::Unknown
+            }
+            BlobProcessStreamKernelOutcome::Unknown { .. } => {
+                TestdBlobProcessStreamCallOutcome::Unknown
+            }
+        };
+        if let Some(next_token) = response.next_call_token.as_ref() {
+            self.store
+                .complete_blob_process_stream_call_and_advance(
+                    &self.job_id,
+                    &self.capability.reference,
+                    &token.reference,
+                    token.ordinal,
+                    operation_sha256,
+                    compact_outcome,
+                    TestdBlobProcessStreamTokenRef {
+                        reference: next_token.reference.clone(),
+                        ordinal: next_token.ordinal,
+                    },
+                )
+                .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+            let mut tokens = self.tokens.lock().map_err(|_| {
+                TestdIpcError::Transport("Blob token sequence lock poisoned".to_owned())
+            })?;
+            tokens.clear();
+            tokens.push_back(next_token.clone());
+        } else {
+            self.store
+                .complete_blob_process_stream_call(
+                    &self.job_id,
+                    &self.capability.reference,
+                    &token.reference,
+                    token.ordinal,
+                    operation_sha256,
+                    compact_outcome,
+                )
+                .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+        }
+        Ok(response)
+    }
+}
+
+/// Authenticated provider-neutral process-stream sink backed by the Kernel's
+/// opaque capability and one-use call-token sequence.
+#[derive(Clone)]
+pub struct KernelProcessStreamSinkClient {
+    calls: KernelBlobStreamCallSequence,
+    /// Exact Store-issued binding references returned by Open, retained only
+    /// as a bounded live-session optimization. Restart recovery resolves the
+    /// original persisted intent through the Kernel owner path.
+    bindings: Arc<Mutex<BTreeMap<String, ProcessStreamSinkBindingRef>>>,
+}
+
+impl KernelProcessStreamSinkClient {
+    /// Uses the same authenticated session and retained one-use token sequence
+    /// as source readback.
+    pub fn new(calls: KernelBlobStreamCallSequence) -> Self {
+        Self {
+            calls,
+            bindings: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    fn open_sync(
+        &self,
+        request: ProcessStreamSinkOpenRequest,
+    ) -> Result<ProcessStreamSinkSession, ProcessStreamSinkError> {
+        request.validate()?;
+        let body = Box::new(serde_json::to_value(&request).map_err(|_| sink_invalid())?);
+        let deadline_ms = self
+            .calls
+            .deadline_for_budget(5_000)
+            .map_err(map_sink_ipc_error)?;
+        let response = self
+            .calls
+            .exchange(BlobProcessStreamKernelOperationRequest::SinkOpen { body, deadline_ms })
+            .map_err(map_sink_ipc_error)?;
+        let owner = completed_sink_response(response)?;
+        let ProcessStreamSinkWireResponse::Opened { binding } = owner else {
+            return Err(ProcessStreamSinkError::ProviderUnavailable);
+        };
+        let session = ProcessStreamSinkSession::from_open_request(request)?;
+        ensure_binding_ref(&binding, &session)?;
+        let mut bindings = self
+            .bindings
+            .lock()
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        if bindings.len() >= 2 && !bindings.contains_key(session.session_id().as_str()) {
+            return Err(ProcessStreamSinkError::ProviderUnavailable);
+        }
+        bindings.insert(session.session_id().as_str().to_owned(), binding);
+        Ok(session)
+    }
+
+    fn append_sync(
+        &self,
+        session: ProcessStreamSinkSession,
+        request: ProcessStreamSinkAppend,
+    ) -> Result<ProcessStreamSinkAppendDisposition, ProcessStreamSinkError> {
+        session.validate_append(&request)?;
+        let expected_sequence = request
+            .sequence()
+            .checked_add(1)
+            .ok_or(ProcessStreamSinkError::InvalidBinding)?;
+        let expected_offset = request
+            .offset()
+            .checked_add(request.byte_length())
+            .ok_or(ProcessStreamSinkError::InvalidBinding)?;
+        let operation = BlobProcessStreamKernelOperationRequest::SinkAppend {
+            binding: self.binding_for_session(&session)?,
+            body: Box::new(serde_json::to_value(&request).map_err(|_| sink_invalid())?),
+            deadline_ms: self
+                .calls
+                .deadline_for_budget(request.wait_budget_ms())
+                .map_err(map_sink_ipc_error)?,
+        };
+        let owner =
+            completed_sink_response(self.calls.exchange(operation).map_err(map_sink_ipc_error)?)?;
+        let ProcessStreamSinkWireResponse::AppendDisposition { body } = owner else {
+            return Err(ProcessStreamSinkError::ProviderUnavailable);
+        };
+        let disposition: ProcessStreamSinkAppendDisposition =
+            serde_json::from_value(*body).map_err(|_| sink_invalid())?;
+        match &disposition {
+            ProcessStreamSinkAppendDisposition::Accepted {
+                next_sequence,
+                next_offset,
+            }
+            | ProcessStreamSinkAppendDisposition::Replayed {
+                next_sequence,
+                next_offset,
+            } if *next_sequence == expected_sequence && *next_offset == expected_offset => {
+                Ok(disposition)
+            }
+            ProcessStreamSinkAppendDisposition::Accepted { .. }
+            | ProcessStreamSinkAppendDisposition::Replayed { .. } => {
+                Err(ProcessStreamSinkError::InvalidBinding)
+            }
+            other => Ok(other),
+        }
+    }
+
+    fn finalize_sync(
+        &self,
+        session: ProcessStreamSinkSession,
+        request: ProcessStreamSinkFinalizeRequest,
+    ) -> Result<ProcessStreamSinkTerminal, ProcessStreamSinkError> {
+        session.validate_finalize(&request)?;
+        let operation = BlobProcessStreamKernelOperationRequest::SinkFinalize {
+            binding: self.binding_for_session(&session)?,
+            body: Box::new(serde_json::to_value(&request).map_err(|_| sink_invalid())?),
+            deadline_ms: self
+                .calls
+                .deadline_for_budget(request.wait_budget_ms())
+                .map_err(map_sink_ipc_error)?,
+        };
+        let response = self
+            .calls
+            .exchange(operation.clone())
+            .map_err(map_sink_ipc_error)?;
+        let (owner, original_terminal) = completed_sink_response_with_terminal(response)?;
+        if original_terminal
+            .as_ref()
+            .is_some_and(|original| original != &operation)
+        {
+            return Err(ProcessStreamSinkError::ProviderUnavailable);
+        }
+        let ProcessStreamSinkWireResponse::Finalized {
+            body,
+            blob_ready_receipt_json,
+            blob_ready_receipt_sha256,
+        } = owner
+        else {
+            return Err(ProcessStreamSinkError::ProviderUnavailable);
+        };
+        // The immediate exchange is already validated against `operation`;
+        // use that exact locally retained request when the owner omits its
+        // optional echo. A conflicting echo is refused above. Restart
+        // reconciliation has no such local request and remains fail-closed
+        // unless Kernel returns its durable original terminal request.
+        let terminal =
+            terminal_from_projection(&session, TerminalCommand::Finalize(request), *body)?;
+        validate_finalized_blob_ready_receipt(
+            &terminal,
+            blob_ready_receipt_json.as_deref(),
+            blob_ready_receipt_sha256.as_deref(),
+        )?;
+        Ok(terminal)
+    }
+
+    fn abort_sync(
+        &self,
+        session: ProcessStreamSinkSession,
+        request: ProcessStreamSinkAbortRequest,
+    ) -> Result<ProcessStreamSinkTerminal, ProcessStreamSinkError> {
+        session.validate_abort(&request)?;
+        let operation = BlobProcessStreamKernelOperationRequest::SinkAbort {
+            binding: self.binding_for_session(&session)?,
+            body: Box::new(serde_json::to_value(&request).map_err(|_| sink_invalid())?),
+            deadline_ms: self
+                .calls
+                .deadline_for_budget(request.wait_budget_ms())
+                .map_err(map_sink_ipc_error)?,
+        };
+        let response = self
+            .calls
+            .exchange(operation.clone())
+            .map_err(map_sink_ipc_error)?;
+        let (owner, original_terminal) = completed_sink_response_with_terminal(response)?;
+        if original_terminal
+            .as_ref()
+            .is_some_and(|original| original != &operation)
+        {
+            return Err(ProcessStreamSinkError::ProviderUnavailable);
+        }
+        let ProcessStreamSinkWireResponse::Aborted { body } = owner else {
+            return Err(ProcessStreamSinkError::ProviderUnavailable);
+        };
+        terminal_from_projection(&session, TerminalCommand::Abort(request), *body)
+    }
+
+    fn readback_sync(
+        &self,
+        session: ProcessStreamSinkSession,
+    ) -> Result<ProcessStreamSinkReadback, ProcessStreamSinkError> {
+        let operation = BlobProcessStreamKernelOperationRequest::SinkReadback {
+            binding: self.binding_for_session(&session)?,
+            deadline_ms: self
+                .calls
+                .deadline_for_budget(2_000)
+                .map_err(map_sink_ipc_error)?,
+        };
+        let response = self.calls.exchange(operation).map_err(map_sink_ipc_error)?;
+        let (owner, original_terminal) = completed_sink_response_with_terminal(response)?;
+        let ProcessStreamSinkWireResponse::Readback { body } = owner else {
+            return Err(ProcessStreamSinkError::ProviderUnavailable);
+        };
+        readback_from_projection(&session, original_terminal.as_ref(), *body)
+    }
+
+    fn reconcile_sync(
+        &self,
+        session: ProcessStreamSinkSession,
+        outcome: ProcessStreamSinkUnknownOutcome,
+    ) -> Result<ProcessStreamSinkReadback, ProcessStreamSinkError> {
+        outcome.validate_against_session(&session)?;
+        let response = self
+            .calls
+            .reconcile_current_call()
+            .map_err(map_sink_ipc_error)?;
+        match response.outcome {
+            BlobProcessStreamKernelOutcome::Unknown { .. }
+            | BlobProcessStreamKernelOutcome::NotStarted { .. }
+            | BlobProcessStreamKernelOutcome::Unavailable { .. } => {
+                Ok(ProcessStreamSinkReadback::UnknownOutcome { outcome })
+            }
+            BlobProcessStreamKernelOutcome::Completed {
+                response,
+                operation_sha256,
+                original_terminal_request,
+                original_terminal_operation_sha256,
+                ..
+            } => {
+                let original_terminal = original_terminal_request.map(|request| *request);
+                let owner = match response.operation {
+                    BlobProcessStreamOperationResponse::SourceReadback { .. } => {
+                        return Err(ProcessStreamSinkError::BindingMismatch);
+                    }
+                    BlobProcessStreamOperationResponse::Sink { response } => response,
+                };
+                match owner {
+                    ProcessStreamSinkWireResponse::Finalized {
+                        body,
+                        blob_ready_receipt_json,
+                        blob_ready_receipt_sha256,
+                    } => {
+                        if original_terminal_operation_sha256.as_deref()
+                            != Some(operation_sha256.as_str())
+                        {
+                            return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+                        }
+                        let operation = original_terminal
+                            .as_ref()
+                            .ok_or(ProcessStreamSinkError::ProviderUnavailable)?;
+                        if !matches!(
+                            operation,
+                            BlobProcessStreamKernelOperationRequest::SinkFinalize { .. }
+                        ) {
+                            return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+                        }
+                        let terminal =
+                            terminal_from_retained_operation(&session, operation, *body)?;
+                        validate_finalized_blob_ready_receipt(
+                            &terminal,
+                            blob_ready_receipt_json.as_deref(),
+                            blob_ready_receipt_sha256.as_deref(),
+                        )?;
+                        Ok(ProcessStreamSinkReadback::Terminal { terminal })
+                    }
+                    ProcessStreamSinkWireResponse::Aborted { body } => {
+                        if original_terminal_operation_sha256.as_deref()
+                            != Some(operation_sha256.as_str())
+                        {
+                            return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+                        }
+                        let operation = original_terminal
+                            .as_ref()
+                            .ok_or(ProcessStreamSinkError::ProviderUnavailable)?;
+                        if !matches!(
+                            operation,
+                            BlobProcessStreamKernelOperationRequest::SinkAbort { .. }
+                        ) {
+                            return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+                        }
+                        let terminal =
+                            terminal_from_retained_operation(&session, operation, *body)?;
+                        Ok(ProcessStreamSinkReadback::Terminal { terminal })
+                    }
+                    ProcessStreamSinkWireResponse::Readback { body } => {
+                        readback_from_projection(&session, original_terminal.as_ref(), *body)
+                    }
+                    ProcessStreamSinkWireResponse::AppendDisposition { body } => {
+                        // The exact completed append response is retained by
+                        // Kernel, but it is not a full session observation.
+                        // Use the distinct successor token for a read-only
+                        // sink readback before returning reconciled state.
+                        let _: ProcessStreamSinkAppendDisposition =
+                            serde_json::from_value(*body).map_err(|_| sink_invalid())?;
+                        self.readback_sync(session)
+                    }
+                    ProcessStreamSinkWireResponse::Opened { binding } => {
+                        ensure_binding_ref(&binding, &session)?;
+                        self.readback_sync(session)
+                    }
+                    ProcessStreamSinkWireResponse::Unavailable { .. } => {
+                        Ok(ProcessStreamSinkReadback::UnknownOutcome { outcome })
+                    }
+                }
+            }
+        }
+    }
+
+    fn binding_for_session(
+        &self,
+        session: &ProcessStreamSinkSession,
+    ) -> Result<ProcessStreamSinkBindingRef, ProcessStreamSinkError> {
+        let binding = self
+            .bindings
+            .lock()
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?
+            .get(session.session_id().as_str())
+            .cloned()
+            .ok_or(ProcessStreamSinkError::BindingMismatch)?;
+        ensure_binding_ref(&binding, session)?;
+        Ok(binding)
+    }
+}
+
+impl ProcessStreamSinkClient for KernelProcessStreamSinkClient {
+    fn open(
+        &self,
+        request: ProcessStreamSinkOpenRequest,
+    ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkSession> {
+        let client = self.clone();
+        blocking_sink_future(5_000, move || client.open_sync(request))
+    }
+
+    fn append(
+        &self,
+        session: ProcessStreamSinkSession,
+        request: ProcessStreamSinkAppend,
+    ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkAppendDisposition> {
+        let budget_ms = request.wait_budget_ms();
+        let client = self.clone();
+        blocking_sink_future(budget_ms, move || client.append_sync(session, request))
+    }
+
+    fn finalize(
+        &self,
+        session: ProcessStreamSinkSession,
+        request: ProcessStreamSinkFinalizeRequest,
+    ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkTerminal> {
+        let budget_ms = request.wait_budget_ms();
+        let client = self.clone();
+        blocking_sink_future(budget_ms, move || client.finalize_sync(session, request))
+    }
+
+    fn abort(
+        &self,
+        session: ProcessStreamSinkSession,
+        request: ProcessStreamSinkAbortRequest,
+    ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkTerminal> {
+        let budget_ms = request.wait_budget_ms();
+        let client = self.clone();
+        blocking_sink_future(budget_ms, move || client.abort_sync(session, request))
+    }
+
+    fn readback(
+        &self,
+        session: ProcessStreamSinkSession,
+    ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkReadback> {
+        let client = self.clone();
+        blocking_sink_future(2_000, move || client.readback_sync(session))
+    }
+
+    fn reconcile(
+        &self,
+        session: ProcessStreamSinkSession,
+        outcome: ProcessStreamSinkUnknownOutcome,
+    ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkReadback> {
+        let client = self.clone();
+        blocking_sink_future(2_000, move || client.reconcile_sync(session, outcome))
+    }
+}
+
+fn blocking_sink_future<T, F>(budget_ms: u64, operation: F) -> ProcessStreamSinkFuture<'static, T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, ProcessStreamSinkError> + Send + 'static,
+{
+    Box::pin(async move {
+        let blocking = tokio::task::spawn_blocking(operation);
+        match tokio::time::timeout(Duration::from_millis(budget_ms.max(1)), blocking).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) | Err(_) => Err(ProcessStreamSinkError::UnknownOutcome),
+        }
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TerminalProjection {
+    session_id: serde_json::Value,
+    source_id: serde_json::Value,
+    terminal_id: serde_json::Value,
+    open_request_sha256: String,
+    state: ProcessStreamSinkState,
+    final_sequence: u64,
+    final_offset: u64,
+    admitted_chunks: u64,
+    admitted_bytes: u64,
+    admitted_sha256: String,
+    command_identity: serde_json::Value,
+    evidence: ProcessStreamEvidence,
+    terminal_sha256: String,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+enum ReadbackProjection {
+    Session {
+        view: ProcessStreamSinkSessionView,
+    },
+    Terminal {
+        terminal: serde_json::Value,
+    },
+    UnknownOutcome {
+        outcome: ProcessStreamSinkUnknownOutcome,
+    },
+}
+
+fn ensure_binding_ref(
+    binding: &ProcessStreamSinkBindingRef,
+    session: &ProcessStreamSinkSession,
+) -> Result<(), ProcessStreamSinkError> {
+    binding
+        .validate()
+        .map_err(|_| ProcessStreamSinkError::InvalidBinding)?;
+    if binding.session_id != session.session_id().as_str()
+        || binding.source_id != session.source_id().as_str()
+        || binding.terminal_id != session.terminal_id().as_str()
+        || binding.open_request_sha256 != session.open_request_sha256()
+        || binding.binding_ref.trim().is_empty()
+    {
+        return Err(ProcessStreamSinkError::BindingMismatch);
+    }
+    Ok(())
+}
+
+fn completed_sink_response(
+    response: BlobProcessStreamKernelResponse,
+) -> Result<ProcessStreamSinkWireResponse, ProcessStreamSinkError> {
+    match response.outcome {
+        BlobProcessStreamKernelOutcome::Completed { response, .. } => match response.operation {
+            BlobProcessStreamOperationResponse::Sink { response } => Ok(response),
+            BlobProcessStreamOperationResponse::SourceReadback { .. } => {
+                Err(ProcessStreamSinkError::UnknownOutcome)
+            }
+        },
+        BlobProcessStreamKernelOutcome::Unknown { .. } => {
+            Err(ProcessStreamSinkError::UnknownOutcome)
+        }
+        BlobProcessStreamKernelOutcome::NotStarted { .. }
+        | BlobProcessStreamKernelOutcome::Unavailable { .. } => {
+            Err(ProcessStreamSinkError::ProviderUnavailable)
+        }
+    }
+}
+
+fn completed_sink_response_with_terminal(
+    response: BlobProcessStreamKernelResponse,
+) -> Result<
+    (
+        ProcessStreamSinkWireResponse,
+        Option<BlobProcessStreamKernelOperationRequest>,
+    ),
+    ProcessStreamSinkError,
+> {
+    match response.outcome {
+        BlobProcessStreamKernelOutcome::Completed {
+            response,
+            original_terminal_request,
+            ..
+        } => match response.operation {
+            BlobProcessStreamOperationResponse::Sink { response } => {
+                Ok((response, original_terminal_request.map(|request| *request)))
+            }
+            BlobProcessStreamOperationResponse::SourceReadback { .. } => {
+                Err(ProcessStreamSinkError::UnknownOutcome)
+            }
+        },
+        BlobProcessStreamKernelOutcome::Unknown { .. } => {
+            Err(ProcessStreamSinkError::UnknownOutcome)
+        }
+        BlobProcessStreamKernelOutcome::NotStarted { .. }
+        | BlobProcessStreamKernelOutcome::Unavailable { .. } => {
+            Err(ProcessStreamSinkError::ProviderUnavailable)
+        }
+    }
+}
+
+enum TerminalCommand {
+    Finalize(ProcessStreamSinkFinalizeRequest),
+    Abort(ProcessStreamSinkAbortRequest),
+}
+
+fn terminal_from_projection(
+    session: &ProcessStreamSinkSession,
+    command: TerminalCommand,
+    body: serde_json::Value,
+) -> Result<ProcessStreamSinkTerminal, ProcessStreamSinkError> {
+    let projection: TerminalProjection =
+        serde_json::from_value(*body).map_err(|_| sink_invalid())?;
+    if projection.session_id
+        != serde_json::to_value(session.session_id()).map_err(|_| sink_invalid())?
+        || projection.source_id
+            != serde_json::to_value(session.source_id()).map_err(|_| sink_invalid())?
+        || projection.terminal_id
+            != serde_json::to_value(session.terminal_id()).map_err(|_| sink_invalid())?
+        || projection.open_request_sha256 != session.open_request_sha256()
+        || projection.admitted_chunks != projection.final_sequence
+        || projection.admitted_bytes != projection.final_offset
+    {
+        return Err(ProcessStreamSinkError::BindingMismatch);
+    }
+    let terminal = match command {
+        TerminalCommand::Finalize(request) => ProcessStreamSinkTerminal::from_finalize(
+            session.clone(),
+            request,
+            projection.state,
+            projection.final_sequence,
+            projection.final_offset,
+            projection.admitted_sha256,
+            projection.evidence,
+        )?,
+        TerminalCommand::Abort(request) => ProcessStreamSinkTerminal::from_abort(
+            session.clone(),
+            request,
+            projection.state,
+            projection.final_sequence,
+            projection.final_offset,
+            projection.admitted_sha256,
+            projection.evidence,
+        )?,
+    };
+    terminal.validate()?;
+    if terminal.identity_sha256() != projection.terminal_sha256
+        || serde_json::to_value(terminal.command_identity()).map_err(|_| sink_invalid())?
+            != projection.command_identity
+        || serde_json::to_value(&terminal).map_err(|_| sink_invalid())? != body
+    {
+        return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+    }
+    Ok(terminal)
+}
+
+fn completed_ready_receipt(
+    requested_operation: Option<&BlobProcessStreamKernelOperationRequest>,
+    response: &BlobProcessStreamKernelResponse,
+    process_binding_sha256: &str,
+) -> Option<TestdBlobProcessStreamReadyReceipt> {
+    let BlobProcessStreamKernelOutcome::Completed {
+        response,
+        operation_sha256,
+        original_terminal_request,
+        original_terminal_operation_sha256,
+        ..
+    } = &response.outcome
+    else {
+        return None;
+    };
+    let original = match (
+        original_terminal_request.as_deref(),
+        original_terminal_operation_sha256.as_deref(),
+    ) {
+        (Some(original), Some(original_sha256)) if original_sha256 == operation_sha256 => original,
+        (None, None) => {
+            let requested = requested_operation?;
+            if sha256_hex(&canonical_json_bytes(requested).ok()?).as_str()
+                != operation_sha256.as_str()
+            {
+                return None;
+            }
+            requested
+        }
+        _ => return None,
+    };
+    if requested_operation.is_some_and(|requested| requested != original) {
+        return None;
+    }
+    let BlobProcessStreamKernelOperationRequest::SinkFinalize { binding, .. } = original else {
+        return None;
+    };
+    let BlobProcessStreamOperationResponse::Sink {
+        response:
+            ProcessStreamSinkWireResponse::Finalized {
+                body,
+                blob_ready_receipt_json: Some(receipt_json),
+                blob_ready_receipt_sha256: Some(receipt_sha256),
+            },
+    } = &response.operation
+    else {
+        return None;
+    };
+    let projection: TerminalProjection = serde_json::from_value((**body).clone()).ok()?;
+    if projection.state != ProcessStreamSinkState::CompleteSource
+        || projection.session_id.as_str()? != binding.session_id
+        || projection.source_id.as_str()? != binding.source_id
+        || projection.terminal_id.as_str()? != binding.terminal_id
+        || projection.open_request_sha256 != binding.open_request_sha256
+    {
+        return None;
+    }
+    let binding_bytes = canonical_json_bytes(projection.evidence.binding()).ok()?;
+    if sha256_hex(&binding_bytes) != process_binding_sha256 {
+        return None;
+    }
+    let source = projection.evidence.source()?;
+    let receipt = TestdBlobProcessStreamReadyReceipt {
+        process_binding_sha256: process_binding_sha256.to_owned(),
+        binding_ref: binding.binding_ref.clone(),
+        session_id: binding.session_id.clone(),
+        source_id: binding.source_id.clone(),
+        terminal_id: binding.terminal_id.clone(),
+        ready_receipt_ref: source.ready_receipt_ref().to_owned(),
+        source_sha256: source.sha256().to_owned(),
+        source_byte_length: source.byte_length(),
+        receipt_json: receipt_json.clone(),
+        receipt_sha256: receipt_sha256.clone(),
+    };
+    receipt.validate().ok()?;
+    Some(receipt)
+}
+
+fn terminal_from_retained_operation(
+    session: &ProcessStreamSinkSession,
+    operation: &BlobProcessStreamKernelOperationRequest,
+    body: serde_json::Value,
+) -> Result<ProcessStreamSinkTerminal, ProcessStreamSinkError> {
+    match operation {
+        BlobProcessStreamKernelOperationRequest::SinkFinalize {
+            binding,
+            body: request_body,
+            ..
+        } => {
+            ensure_binding_ref(binding, session)?;
+            let request: ProcessStreamSinkFinalizeRequest =
+                serde_json::from_value((**request_body).clone()).map_err(|_| sink_invalid())?;
+            terminal_from_projection(session, TerminalCommand::Finalize(request), body)
+        }
+        BlobProcessStreamKernelOperationRequest::SinkAbort {
+            binding,
+            body: request_body,
+            ..
+        } => {
+            ensure_binding_ref(binding, session)?;
+            let request: ProcessStreamSinkAbortRequest =
+                serde_json::from_value((**request_body).clone()).map_err(|_| sink_invalid())?;
+            terminal_from_projection(session, TerminalCommand::Abort(request), body)
+        }
+        _ => Err(ProcessStreamSinkError::ProviderUnavailable),
+    }
+}
+
+fn validate_finalized_blob_ready_receipt(
+    terminal: &ProcessStreamSinkTerminal,
+    receipt_json: Option<&str>,
+    receipt_sha256: Option<&str>,
+) -> Result<(), ProcessStreamSinkError> {
+    let is_complete_source = terminal.state() == ProcessStreamSinkState::CompleteSource;
+    match (is_complete_source, receipt_json, receipt_sha256) {
+        (true, Some(receipt_json), Some(receipt_sha256)) => {
+            let value: serde_json::Value =
+                serde_json::from_str(receipt_json).map_err(|_| sink_invalid())?;
+            let canonical =
+                eliot_contracts::canonical_json_bytes(&value).map_err(|_| sink_invalid())?;
+            if String::from_utf8(canonical.clone()).ok().as_deref() != Some(receipt_json)
+                || sha256_hex(&canonical) != receipt_sha256
+            {
+                return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+            }
+            let receipt_identity = value
+                .pointer("/receipt/identity/receipt_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(ProcessStreamSinkError::TerminalIdentityConflict)?;
+            let source = terminal
+                .evidence()
+                .source()
+                .ok_or(ProcessStreamSinkError::TerminalIdentityConflict)?;
+            let plaintext_sha256 = value
+                .get("plaintext_sha256")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(ProcessStreamSinkError::TerminalIdentityConflict)?;
+            let plaintext_length = value
+                .get("plaintext_length")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or(ProcessStreamSinkError::TerminalIdentityConflict)?;
+            if receipt_identity != source.ready_receipt_ref()
+                || plaintext_sha256 != source.sha256()
+                || plaintext_length != source.byte_length()
+            {
+                return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+            }
+            Ok(())
+        }
+        (false, None, None) => Ok(()),
+        _ => Err(ProcessStreamSinkError::TerminalIdentityConflict),
+    }
+}
+
+fn readback_from_projection(
+    session: &ProcessStreamSinkSession,
+    original_terminal: Option<&BlobProcessStreamKernelOperationRequest>,
+    body: serde_json::Value,
+) -> Result<ProcessStreamSinkReadback, ProcessStreamSinkError> {
+    match serde_json::from_value::<ReadbackProjection>(body.clone()).map_err(|_| sink_invalid())? {
+        ReadbackProjection::Session { view } => {
+            if view.session_id() != session.session_id()
+                || view.source_id() != session.source_id()
+                || view.terminal_id() != session.terminal_id()
+                || view.open_request_sha256() != session.open_request_sha256()
+            {
+                return Err(ProcessStreamSinkError::BindingMismatch);
+            }
+            Ok(ProcessStreamSinkReadback::Session { view })
+        }
+        ReadbackProjection::Terminal { terminal } => {
+            let operation = original_terminal.ok_or(ProcessStreamSinkError::ProviderUnavailable)?;
+            let terminal = terminal_from_retained_operation(session, operation, terminal)?;
+            Ok(ProcessStreamSinkReadback::Terminal { terminal })
+        }
+        ReadbackProjection::UnknownOutcome { outcome } => {
+            outcome.validate_against_session(session)?;
+            Ok(ProcessStreamSinkReadback::UnknownOutcome { outcome })
+        }
+    }
+}
+
+fn map_sink_ipc_error(error: TestdIpcError) -> ProcessStreamSinkError {
+    match error {
+        TestdIpcError::UnknownOutcome { .. } => ProcessStreamSinkError::UnknownOutcome,
+        _ => ProcessStreamSinkError::ProviderUnavailable,
+    }
+}
+
+fn sink_invalid() -> ProcessStreamSinkError {
+    ProcessStreamSinkError::InvalidRequest {
+        reason: "Kernel sink response did not match its closed projection",
     }
 }
 
@@ -1370,7 +2730,7 @@ mod tests {
         KernelClient::load()
             .ok()
             .map(|client| KernelTestdIpcClient {
-                client,
+                client: Arc::new(Mutex::new(client)),
                 live_epoch,
                 retained: None,
             })

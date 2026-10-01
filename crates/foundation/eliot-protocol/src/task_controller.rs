@@ -16,17 +16,15 @@ use crate::{HARD_STRUCTURED_RESPONSE_BYTES, MAX_FRAME_BYTES, ProtocolError};
 pub const TASK_CONTROLLER_INVOCATION_WIRE_ID: &str = "eliot.protocol.task-controller-invocation";
 /// Current Task Controller invocation wire version.
 ///
-/// `2` adds the required `context_campaign_recipe_catalogue` member: an
-/// invocation that names a Context recipe must also name the owner recipe
-/// configuration that recipe is resolved from (#1724 W1/W2). A `1` payload
-/// cannot decode into this shape, so the missing member is refused by version
-/// and by field rather than defaulted into an instance that was compiled under
-/// no approved recipe.
-pub const TASK_CONTROLLER_INVOCATION_WIRE_VERSION: u16 = 2;
+/// `3` adds the task-free initial `BIND_SCOPE` action. `PROPOSE` and `APPLY`
+/// still require task, scope, and all recipe fields; only `BIND_SCOPE` may
+/// omit them. Version 2 added the Context recipe catalogue required by W1/W2.
+pub const TASK_CONTROLLER_INVOCATION_WIRE_VERSION: u16 = 3;
 /// Stable wire identity for the Kernel-issued Task Controller attempt.
 pub const TASK_CONTROLLER_ATTEMPT_WIRE_ID: &str = "eliot.protocol.task-controller-attempt";
-/// Current Task Controller attempt wire version.
-pub const TASK_CONTROLLER_ATTEMPT_WIRE_VERSION: u16 = 1;
+/// Current Task Controller attempt wire version. Version 2 permits absent
+/// task/scope only for the task-free initial `BIND_SCOPE` claim.
+pub const TASK_CONTROLLER_ATTEMPT_WIRE_VERSION: u16 = 2;
 /// Stable wire identity for the Task Controller result body.
 pub const TASK_CONTROLLER_RESULT_BODY_WIRE_ID: &str = "eliot.protocol.task-controller-result-body";
 /// Current Task Controller result-body wire version.
@@ -97,6 +95,10 @@ pub enum TaskControllerAction {
     Propose,
     /// Apply an exact command to an existing task.
     Apply,
+    /// Bind an observed explicit workspace to the retained task's `WorkScope`.
+    /// The daemon validates this action through the authenticated initial
+    /// owner-admission path; the caller supplies no owner receipt or binding.
+    BindScope,
 }
 
 /// Owner-native material bundle used only for a complete campaign-owner
@@ -140,24 +142,32 @@ pub struct TaskControllerInvocation {
     pub wire_version: u16,
     /// Create or update operation selected by the admitted caller.
     pub action: TaskControllerAction,
-    /// Exact native task identity from the admitted request.
-    pub task_id: TaskId,
-    /// Exact work scope from the admitted request identity.
-    pub work_scope_id: String,
+    /// Exact native task identity from the admitted request. `None` is
+    /// permitted only for the task-free initial `BIND_SCOPE` action.
+    #[serde(default)]
+    pub task_id: Option<TaskId>,
+    /// Exact work scope from the admitted request. `None` is permitted only
+    /// for the task-free initial `BIND_SCOPE` action.
+    #[serde(default)]
+    pub work_scope_id: Option<String>,
     /// Native proposal for `PROPOSE` or command-plus-context bundle for `APPLY`.
     pub task_input: Value,
     /// Owner-native `LearningStateViewRecipe` selected for this task route.
-    pub learning_state_view_recipe: Value,
+    #[serde(default)]
+    pub learning_state_view_recipe: Option<Value>,
     /// Owner recipe configuration the Context recipe is resolved from: the
     /// approved candidate revisions, this compilation's applicability
     /// dimensions and compiler-generation profile, and the independent
     /// governing requirements they are validated against. The Context owner
     /// resolves exactly one of them; the protocol only carries it.
-    pub context_campaign_recipe_catalogue: Value,
+    #[serde(default)]
+    pub context_campaign_recipe_catalogue: Option<Value>,
     /// Rich `ContextRecipe` selected for the current Context admission.
-    pub context_campaign_recipe: Value,
+    #[serde(default)]
+    pub context_campaign_recipe: Option<Value>,
     /// Exact `ContextInput` admitted for the current Context compilation.
-    pub context_input: Value,
+    #[serde(default)]
+    pub context_input: Option<Value>,
     /// Optional selector for the persisted prior delivery snapshot. This is a
     /// lookup selector only and is never evidence or source authority.
     pub prior_delivery_selector: Option<Value>,
@@ -169,6 +179,76 @@ pub struct TaskControllerInvocation {
 }
 
 impl TaskControllerInvocation {
+    fn validate_action_specific_fields(&self) -> Result<(), ProtocolError> {
+        match self.action {
+            TaskControllerAction::BindScope => {
+                if self.task_id.is_some()
+                    || self.work_scope_id.is_some()
+                    || self.learning_state_view_recipe.is_some()
+                    || self.context_campaign_recipe_catalogue.is_some()
+                    || self.context_campaign_recipe.is_some()
+                    || self.context_input.is_some()
+                    || self.prior_delivery_selector.is_some()
+                    || self.campaign_owner_materials.is_some()
+                {
+                    return Err(ProtocolError::InvalidField {
+                        field: "task_controller_invocation",
+                        reason: "BIND_SCOPE is a task-free initial owner action",
+                    });
+                }
+                validate_initial_scope_bind_input(&self.task_input)?;
+            }
+            TaskControllerAction::Propose | TaskControllerAction::Apply => {
+                bounded_text(
+                    self.task_id
+                        .as_ref()
+                        .ok_or(ProtocolError::InvalidField {
+                            field: "task_controller_invocation.task_id",
+                            reason: "is required for PROPOSE and APPLY",
+                        })?
+                        .as_str(),
+                    "task_controller_invocation.task_id",
+                )?;
+                bounded_text(
+                    self.work_scope_id
+                        .as_deref()
+                        .ok_or(ProtocolError::InvalidField {
+                            field: "task_controller_invocation.work_scope_id",
+                            reason: "is required for PROPOSE and APPLY",
+                        })?,
+                    "task_controller_invocation.work_scope_id",
+                )?;
+                for (value, field) in [
+                    (
+                        &self.learning_state_view_recipe,
+                        "task_controller_invocation.learning_state_view_recipe",
+                    ),
+                    (
+                        &self.context_campaign_recipe_catalogue,
+                        "task_controller_invocation.context_campaign_recipe_catalogue",
+                    ),
+                    (
+                        &self.context_campaign_recipe,
+                        "task_controller_invocation.context_campaign_recipe",
+                    ),
+                    (
+                        &self.context_input,
+                        "task_controller_invocation.context_input",
+                    ),
+                ] {
+                    structured_object(
+                        value.as_ref().ok_or(ProtocolError::InvalidField {
+                            field,
+                            reason: "is required for PROPOSE and APPLY",
+                        })?,
+                        field,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Validates the transport envelope and bounded JSON object fields.
     /// Semantic field/identity validation remains with the daemon owners.
     pub fn validate(&self) -> Result<(), ProtocolError> {
@@ -180,32 +260,8 @@ impl TaskControllerInvocation {
                 reason: "unsupported Task Controller invocation",
             });
         }
-        bounded_text(self.task_id.as_str(), "task_controller_invocation.task_id")?;
-        bounded_text(
-            &self.work_scope_id,
-            "task_controller_invocation.work_scope_id",
-        )?;
-        for (value, field) in [
-            (&self.task_input, "task_controller_invocation.task_input"),
-            (
-                &self.learning_state_view_recipe,
-                "task_controller_invocation.learning_state_view_recipe",
-            ),
-            (
-                &self.context_campaign_recipe_catalogue,
-                "task_controller_invocation.context_campaign_recipe_catalogue",
-            ),
-            (
-                &self.context_campaign_recipe,
-                "task_controller_invocation.context_campaign_recipe",
-            ),
-            (
-                &self.context_input,
-                "task_controller_invocation.context_input",
-            ),
-        ] {
-            structured_object(value, field)?;
-        }
+        structured_object(&self.task_input, "task_controller_invocation.task_input")?;
+        self.validate_action_specific_fields()?;
         if let Some(selector) = &self.prior_delivery_selector {
             structured_object(
                 selector,
@@ -256,6 +312,40 @@ impl TaskControllerInvocation {
     }
 }
 
+fn validate_initial_scope_bind_input(value: &Value) -> Result<(), ProtocolError> {
+    let object = value.as_object().ok_or(ProtocolError::InvalidField {
+        field: "task_controller_invocation.task_input",
+        reason: "must be a closed BIND_SCOPE object",
+    })?;
+    if object.len() != 4
+        || object.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "explicit_root" | "descriptor" | "sources" | "privacy"
+            )
+        })
+        || object
+            .get("explicit_root")
+            .and_then(Value::as_str)
+            .is_none_or(|root| root.trim().is_empty())
+    {
+        return Err(ProtocolError::InvalidField {
+            field: "task_controller_invocation.task_input",
+            reason: "must contain exactly explicit_root, descriptor, sources, and privacy",
+        });
+    }
+    for field in ["descriptor", "sources", "privacy"] {
+        structured_object(
+            object.get(field).ok_or(ProtocolError::InvalidField {
+                field: "task_controller_invocation.task_input",
+                reason: "is missing a required BIND_SCOPE object",
+            })?,
+            "task_controller_invocation.task_input",
+        )?;
+    }
+    Ok(())
+}
+
 /// Kernel-issued fenced attempt bound to one Task Controller operation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -275,13 +365,15 @@ pub struct TaskControllerAttempt {
     /// Authority epoch observed when the Kernel issued the attempt.
     pub authority_epoch: EpochId,
     /// Exact admitted work scope.
-    pub scope_id: String,
+    #[serde(default)]
+    pub scope_id: Option<String>,
     /// Absolute attempt expiry in Unix milliseconds.
     pub expires_at_unix_ms: u64,
     /// Remaining result submissions permitted by the Kernel.
     pub use_budget: u32,
     /// Exact native task identity bound to the admitted operation.
-    pub task_id: TaskId,
+    #[serde(default)]
+    pub task_id: Option<TaskId>,
     /// Exact state fence admitted for this operation.
     pub state_fence: StateFence,
 }
@@ -317,8 +409,12 @@ impl TaskControllerAttempt {
             field: "task_controller_attempt.authority_epoch",
             reason: "authority epoch is not valid",
         })?;
-        bounded_text(&self.scope_id, "task_controller_attempt.scope_id")?;
-        bounded_text(self.task_id.as_str(), "task_controller_attempt.task_id")?;
+        if let Some(scope_id) = &self.scope_id {
+            bounded_text(scope_id, "task_controller_attempt.scope_id")?;
+        }
+        if let Some(task_id) = &self.task_id {
+            bounded_text(task_id.as_str(), "task_controller_attempt.task_id")?;
+        }
         self.state_fence
             .validate()
             .map_err(ProtocolError::Foundation)?;

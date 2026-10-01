@@ -494,6 +494,10 @@ pub mod kernel_client {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
+    use eliot_blob_api::wire::{
+        BlobProcessStreamKernelReconcileRequest, BlobProcessStreamKernelRequest,
+        BlobProcessStreamKernelResponse,
+    };
     use eliot_contracts::{EpochId, RequestId};
     use eliot_ipc::{
         DeliveryOutcome, NamedPipeTransport, TransportLimits, client_hello_frame,
@@ -806,6 +810,62 @@ pub mod kernel_client {
             }
         }
 
+        /// Sends the single closed capability-scoped Blob stream operation
+        /// over the authenticated Kernel session. This exchange deliberately
+        /// has no `RequestIdentity`; Kernel authenticates the TestD session,
+        /// validates the opaque grant/token and issues its Store identity.
+        /// It is not a general identity-free send surface.
+        pub fn blob_process_stream_exchange(
+            &mut self,
+            request: BlobProcessStreamKernelRequest,
+        ) -> Result<BlobProcessStreamKernelResponse, KernelClientError> {
+            request
+                .validate()
+                .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
+            #[cfg(not(windows))]
+            {
+                let _ = request;
+                Err(KernelClientError::FrontDoorClosed(
+                    "Windows authenticated Kernel front door",
+                ))
+            }
+            #[cfg(windows)]
+            {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
+                runtime.block_on(self.blob_process_stream_exchange_async(request))
+            }
+        }
+
+        /// Reads the retained result of one exact consumed Blob token. This
+        /// closed authenticated selector can only observe Kernel's durable
+        /// call ledger; it never resends the Store operation.
+        pub fn blob_process_stream_reconcile(
+            &mut self,
+            request: BlobProcessStreamKernelReconcileRequest,
+        ) -> Result<BlobProcessStreamKernelResponse, KernelClientError> {
+            request
+                .validate()
+                .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
+            #[cfg(not(windows))]
+            {
+                let _ = request;
+                Err(KernelClientError::FrontDoorClosed(
+                    "Windows authenticated Kernel front door",
+                ))
+            }
+            #[cfg(windows)]
+            {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
+                runtime.block_on(self.blob_process_stream_reconcile_async(request))
+            }
+        }
+
         #[cfg(windows)]
         async fn connect(
             &self,
@@ -900,6 +960,112 @@ pub mod kernel_client {
                 .await
                 .map_err(|error| KernelClientError::UnknownOutcome(error.to_string()))?;
             validate_result_response(&self.config.connection_id, &request_id, &response)
+        }
+
+        #[cfg(windows)]
+        async fn blob_process_stream_exchange_async(
+            &self,
+            request: BlobProcessStreamKernelRequest,
+        ) -> Result<BlobProcessStreamKernelResponse, KernelClientError> {
+            request
+                .validate()
+                .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
+            let (mut transport, limits) = self.connect().await?;
+            let token_digest = format!(
+                "{:x}",
+                Sha256::digest(request.call_token.reference.as_bytes())
+            );
+            let request_id = RequestId::new(format!(
+                "blob-stream-{}-{token_digest}",
+                request.call_token.ordinal
+            ))
+            .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
+            let payload = serde_json::to_value(&request)
+                .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
+            let frame = Frame {
+                protocol_version: ProtocolVersion::CURRENT,
+                encoding_profile: EncodingProfile::JsonV1,
+                connection_id: self.config.connection_id.clone(),
+                request_id: Some(request_id.clone()),
+                kind: FrameKind::Request,
+                message_type: MessageType::Execute,
+                request_identity: None,
+                payload: ProtocolPayload::Json(payload),
+                trace_context: BTreeMap::new(),
+            };
+            require_delivery(
+                transport.send_frame(&frame, limits).await,
+                "Kernel Blob process-stream capability exchange",
+            )?;
+            let response = transport
+                .receive_frame(limits)
+                .await
+                .map_err(|error| KernelClientError::UnknownOutcome(error.to_string()))?;
+            let value =
+                validate_result_response(&self.config.connection_id, &request_id, &response)?;
+            let typed: BlobProcessStreamKernelResponse =
+                serde_json::from_value(value).map_err(|error| {
+                    KernelClientError::UnknownOutcome(format!(
+                        "Kernel Blob process-stream reply is not a closed response: {error}"
+                    ))
+                })?;
+            typed
+                .validate_for_request(&request)
+                .map_err(|error| KernelClientError::UnknownOutcome(error.to_string()))?;
+            Ok(typed)
+        }
+
+        #[cfg(windows)]
+        async fn blob_process_stream_reconcile_async(
+            &self,
+            request: BlobProcessStreamKernelReconcileRequest,
+        ) -> Result<BlobProcessStreamKernelResponse, KernelClientError> {
+            request
+                .validate()
+                .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
+            let (mut transport, limits) = self.connect().await?;
+            let token_digest = format!(
+                "{:x}",
+                Sha256::digest(request.call_token.reference.as_bytes())
+            );
+            let request_id = RequestId::new(format!(
+                "blob-reconcile-{}-{token_digest}",
+                request.call_token.ordinal
+            ))
+            .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
+            let payload = serde_json::to_value(&request)
+                .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
+            let frame = Frame {
+                protocol_version: ProtocolVersion::CURRENT,
+                encoding_profile: EncodingProfile::JsonV1,
+                connection_id: self.config.connection_id.clone(),
+                request_id: Some(request_id.clone()),
+                kind: FrameKind::Request,
+                message_type: MessageType::Execute,
+                request_identity: None,
+                payload: ProtocolPayload::Json(payload),
+                trace_context: BTreeMap::new(),
+            };
+            require_delivery(
+                transport.send_frame(&frame, limits).await,
+                "Kernel Blob process-stream result reconciliation",
+            )?;
+            let response = transport
+                .receive_frame(limits)
+                .await
+                .map_err(|error| KernelClientError::UnknownOutcome(error.to_string()))?;
+            let value =
+                validate_result_response(&self.config.connection_id, &request_id, &response)?;
+            let typed: BlobProcessStreamKernelResponse =
+                serde_json::from_value(value).map_err(|error| {
+                    KernelClientError::UnknownOutcome(format!(
+                        "Kernel Blob reconciliation reply is not a closed response: {error}"
+                    ))
+                })?;
+            typed
+                .validate_for_reconcile(&request)
+                .map_err(|error| KernelClientError::UnknownOutcome(error.to_string()))?;
+            Ok(typed)
         }
     }
 

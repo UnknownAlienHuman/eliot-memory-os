@@ -944,6 +944,10 @@ enum SetupCommand {
         /// Confirmed privacy mode: `local_only` or `standard`.
         #[arg(long)]
         privacy: String,
+        /// Explicit canonical JSON for the S-04 Blob policy and full six-domain
+        /// residency template admitted into the signed Config snapshot.
+        #[arg(long)]
+        blob_process_policy_json: String,
         /// Dreamer route kind: `unassigned`, `local`, `economy`, or `paid`.
         #[arg(long)]
         dreamer_route: Option<String>,
@@ -1088,6 +1092,7 @@ fn run_setup(command: SetupCommand) -> Result<i32> {
             authority_sequence,
             resource_generation,
             privacy,
+            blob_process_policy_json,
             dreamer_route,
             watchdog_route,
             dreamer_displayed,
@@ -1109,6 +1114,7 @@ fn run_setup(command: SetupCommand) -> Result<i32> {
             authority_sequence,
             resource_generation,
             privacy,
+            blob_process_policy_json,
             dreamer_route,
             watchdog_route,
             dreamer_displayed,

@@ -29,11 +29,15 @@ use eliot_instrument_api::{InstrumentInvocation, InstrumentKind};
 use eliot_instrument_cargo::{
     CONTRACT_NAME as CARGO_CONTRACT_NAME, CONTRACT_VERSION as CARGO_CONTRACT_VERSION,
 };
-use eliot_instrument_dotnet::{CONTRACT_ID as DOTNET_CONTRACT_ID, DOTNET_EXECUTABLE};
+use eliot_instrument_dotnet::{
+    CONTRACT_ID as DOTNET_CONTRACT_ID, DOTNET_EXECUTABLE, OUTPUT_EVALUATOR_ID,
+    OUTPUT_PARSER_ID,
+};
 use eliot_instrument_nextest::{MAX_NEXTEST_OUTPUT_BYTES, NEXTEST_INSTRUMENT};
-use eliot_instrument_rustc::{MAX_RUSTC_OUTPUT_BYTES, RUSTC_EXECUTABLE, RUSTC_INSTRUMENT};
+use eliot_instrument_rustc::{MAX_RUSTC_OUTPUT_BYTES, RUSTC_INSTRUMENT};
 use eliot_instrument_rustfmt::{MAX_RUSTFMT_OUTPUT_BYTES, RUSTFMT_INSTRUMENT};
 use eliot_instrument_scip::{MAX_SCIP_BYTES, SCIP_INSTRUMENT};
+use eliot_module_registry::VerifiedModuleCatalogGeneration;
 use eliot_verifier::CONTRACT_NAME as VERIFIER_CONTRACT_NAME;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -180,6 +184,12 @@ pub enum RegistryError {
         /// The drifted identity slot.
         slot: IdentitySlot,
     },
+    /// A current provider registry was built without one required invalidation input.
+    #[error("provider registry is missing the {field} currentness fingerprint")]
+    MissingFreshnessInput {
+        /// Missing invalidation input.
+        field: FingerprintField,
+    },
 }
 
 /// Exact cause of a [`RegistryError::Stale`] rejection.
@@ -292,6 +302,20 @@ pub struct InvalidationSet {
 }
 
 impl InvalidationSet {
+    fn first_missing(&self) -> Option<FingerprintField> {
+        [
+            (&self.source, FingerprintField::Source),
+            (&self.lock, FingerprintField::Lock),
+            (&self.toolchain, FingerprintField::Toolchain),
+            (&self.env, FingerprintField::Env),
+            (&self.exe, FingerprintField::Exe),
+            (&self.profile, FingerprintField::Profile),
+            (&self.parser, FingerprintField::Parser),
+        ]
+        .into_iter()
+        .find_map(|(value, field)| value.trim().is_empty().then_some(field))
+    }
+
     /// Returns the first moved slot in deterministic field order, if any.
     ///
     /// Field order is fixed (source, lock, toolchain, env, exe, profile,
@@ -887,6 +911,14 @@ pub struct RegistryEntry {
     pub normalizer: ContractId,
     /// Evaluator contract identity.
     pub evaluator: ContractId,
+    /// Exact evaluator implementation version owned by this provider entry.
+    pub evaluator_version: ContractVersion,
+    /// Normative-pair digest of the ProviderRegistry snapshot that owns this entry.
+    ///
+    /// `ProviderRegistry::ready` records the registry-wide owner input before
+    /// calling `build`; the shared builder preserves this value and rejects a
+    /// mismatch instead of repairing it.
+    pub normative_pair_digest: String,
     /// Verifier contract identity.
     pub verifier: ContractId,
     /// Fingerprints this entry was validated against.
@@ -1018,6 +1050,9 @@ pub struct ProviderRegistry {
     entries: BTreeMap<(String, String), RegistryEntry>,
     generation: u64,
     normative_pair_digest: String,
+    /// Present only when a current accepted Module Catalog readback issued
+    /// this registry. Fixture and legacy in-process registries stay unproven.
+    lifecycle: Option<VerifiedModuleCatalogGeneration>,
 }
 
 impl ProviderRegistry {
@@ -1036,7 +1071,9 @@ impl ProviderRegistry {
     /// instrument/adapter pair, [`RegistryError::IdentitySlotBlank`] when a
     /// required profile identity slot is blank, or
     /// [`RegistryError::IdentitySlotDrift`] when a retained identity differs
-    /// from its corresponding entry field.
+    /// from its corresponding entry field, [`RegistryError::MissingFreshnessInput`]
+    /// when an invalidation slot is empty, or [`RegistryError::Stale`] when an
+    /// entry's normative-pair digest differs from the registry owner input.
     pub fn build(
         entries: Vec<RegistryEntry>,
         generation: u64,
@@ -1047,7 +1084,18 @@ impl ProviderRegistry {
             entry.kinds.sort_by_key(|kind| kind_rank(*kind));
             entry.kinds.dedup();
             entry.verify_profile_identities()?;
+            if let Some(field) = entry.invalidation.first_missing() {
+                return Err(RegistryError::MissingFreshnessInput { field });
+            }
             let instrument = entry.instrument.as_str().to_owned();
+            if normative_pair_digest.trim().is_empty()
+                || entry.normative_pair_digest != normative_pair_digest
+            {
+                return Err(RegistryError::Stale {
+                    instrument,
+                    reason: StaleReason::NormativePair,
+                });
+            }
             let key = (instrument.clone(), entry.adapter.clone());
             if map.insert(key, entry).is_some() {
                 return Err(RegistryError::Duplicate { instrument });
@@ -1057,7 +1105,27 @@ impl ProviderRegistry {
             entries: map,
             generation,
             normative_pair_digest,
+            lifecycle: None,
         })
+    }
+
+    /// Assembles the one provider registry against a current accepted module
+    /// catalog lifecycle. The catalog semantic revision supplies the provider
+    /// generation domain; runtime activation and ProfileRegistry generations
+    /// are not accepted here.
+    ///
+    /// The `fingerprints` must be independently observed by the caller for
+    /// this run. This constructor preserves those exact values in the registry
+    /// and refuses any missing axis through [`ProviderRegistry::ready`].
+    pub fn ready_for_catalog_generation(
+        lifecycle: VerifiedModuleCatalogGeneration,
+        normative_pair_digest: String,
+        fingerprints: &InvalidationSet,
+    ) -> Result<Self, RegistryError> {
+        let generation = lifecycle.provider_registry_generation();
+        let mut registry = Self::ready(generation, normative_pair_digest, fingerprints)?;
+        registry.lifecycle = Some(lifecycle);
+        Ok(registry)
     }
 
     /// Assembles the six ready provider entries.
@@ -1073,8 +1141,11 @@ impl ProviderRegistry {
     /// is a decoder over emitted index bytes (`ScipIndex::decode`, no
     /// `ProcessExecutor` use) and is bound to inspect with no executable.
     ///
-    /// Fingerprints are caller-attested and cloned into every entry; exact
-    /// per-executable digests remain follow-up work with the environment owner.
+    /// Fingerprints are caller-attested and cloned into every entry. The
+    /// registry-wide normative-pair digest is recorded on each entry by this
+    /// closed producer before the shared builder validates it. Empty
+    /// freshness values refuse to construct; exact per-executable digests
+    /// remain follow-up work with the environment owner.
     ///
     /// # Errors
     ///
@@ -1086,7 +1157,7 @@ impl ProviderRegistry {
         normative_pair_digest: String,
         fingerprints: &InvalidationSet,
     ) -> Result<Self, RegistryError> {
-        let entries = vec![
+        let mut entries = vec![
             cargo_entry(fingerprints, generation)?,
             rustc_entry(fingerprints, generation)?,
             rustfmt_entry(fingerprints, generation)?,
@@ -1094,6 +1165,11 @@ impl ProviderRegistry {
             scip_entry(fingerprints, generation)?,
             dotnet_entry(fingerprints, generation)?,
         ];
+        for entry in &mut entries {
+            entry
+                .normative_pair_digest
+                .clone_from(&normative_pair_digest);
+        }
         let registry = Self::build(entries, generation, normative_pair_digest)?;
         registry.verify_profile_identities()?;
         crate::package_disposition::verify_disposition_coverage(&registry)?;
@@ -1278,6 +1354,13 @@ impl ProviderRegistry {
         &self.normative_pair_digest
     }
 
+    /// The exact accepted Module Catalog lifecycle that issued this registry,
+    /// when the production owner-readback constructor was used.
+    #[must_use]
+    pub fn lifecycle_binding(&self) -> Option<&VerifiedModuleCatalogGeneration> {
+        self.lifecycle.as_ref()
+    }
+
     /// Verifies the declared profile identities of every registered entry.
     ///
     /// `ready` runs this before returning, so a caller that assembles entries
@@ -1381,9 +1464,11 @@ fn cargo_entry(
         environment_class: ISOLATED_PROCESS.to_owned(),
         resource_contract: resource_contract.to_owned(),
         cancellation_contract: cancellation_contract.to_owned(),
-        parser: diagnostic_id()?,
+        parser: contract_id(CARGO_CONTRACT_NAME)?,
         normalizer: diagnostic_id()?,
-        evaluator: diagnostic_id()?,
+        evaluator: contract_id(CARGO_CONTRACT_NAME)?,
+        evaluator_version: ContractVersion::new(1, 0, 0),
+        normative_pair_digest: String::new(),
         verifier: verifier_id()?,
         invalidation: fingerprints.clone(),
         identities: ProfileIdentities::new(ProfileIdentityParams {
@@ -1406,9 +1491,9 @@ fn cargo_entry(
 
 /// Rustc entry: build only.
 ///
-/// Kind and executable follow `RustcAdapter::launch` and `RUSTC_EXECUTABLE`;
-/// the parser and evaluator follow the in-adapter `parse_jsonl` projection
-/// and `RustcReport::execution_status` algebra.
+/// The compiler profile's Rustc-class stage is the exact Cargo Clippy command
+/// from `builtin_specs`; the parser is Clippy's JSON projection over that
+/// process stream.
 fn rustc_entry(
     fingerprints: &InvalidationSet,
     generation: u64,
@@ -1425,11 +1510,16 @@ fn rustc_entry(
         kinds: vec![InstrumentKind::Build],
         adapter: RUSTC_INSTRUMENT.to_owned(),
         adapter_version: ContractVersion::new(1, 0, 0),
+        // The admitted compiler profile resolves this Rustc-class stage to
+        // the exact Cargo Clippy command in builtin_specs (cargo clippy
+        // --message-format=json ...). Keep the provider executable identity
+        // aligned with that registered command; rustc is the semantic
+        // subject, not the executable process launched for this stage.
         executable: ExecutableIdentity::process(
-            RUSTC_EXECUTABLE,
-            "rust-toolchain (rustc distribution)",
+            "cargo",
+            "rust-toolchain composition-root port request for the admitted Clippy stage",
         ),
-        toolchain: "rustc".to_owned(),
+        toolchain: "cargo (rust toolchain)".to_owned(),
         targets: worktree_targets(),
         environment_class: ISOLATED_PROCESS.to_owned(),
         resource_contract: resource_contract.clone(),
@@ -1437,19 +1527,21 @@ fn rustc_entry(
         parser: contract_id(RUSTC_INSTRUMENT)?,
         normalizer: diagnostic_id()?,
         evaluator: contract_id(RUSTC_INSTRUMENT)?,
+        evaluator_version: ContractVersion::new(1, 0, 0),
+        normative_pair_digest: String::new(),
         verifier: verifier_id()?,
         invalidation: fingerprints.clone(),
         identities: ProfileIdentities::new(ProfileIdentityParams {
             source: fingerprints.source.clone(),
             lock: fingerprints.lock.clone(),
-            toolchain: "rustc".to_owned(),
-            executable: RUSTC_EXECUTABLE.to_owned(),
+            toolchain: "cargo (rust toolchain)".to_owned(),
+            executable: "cargo".to_owned(),
             features: ADMITTED_FEATURES.to_owned(),
             environment: ISOLATED_PROCESS.to_owned(),
             artifact: "rustc emits no artifact; diagnostics stream through the raw evidence handle"
                 .to_owned(),
             fence: ADMITTED_FENCE.to_owned(),
-            operation: "P-03 OperationId for the admitted rustc stage".to_owned(),
+            operation: "P-03 OperationId for the admitted cargo clippy stage".to_owned(),
             timeout: ADMITTED_TIMEOUT.to_owned(),
             cancellation: cancellation_contract.to_owned(),
             resource: resource_contract,
@@ -1492,6 +1584,8 @@ fn rustfmt_entry(
         parser: contract_id(RUSTFMT_INSTRUMENT)?,
         normalizer: diagnostic_id()?,
         evaluator: contract_id(RUSTFMT_INSTRUMENT)?,
+        evaluator_version: ContractVersion::new(1, 0, 0),
+        normative_pair_digest: String::new(),
         verifier: verifier_id()?,
         invalidation: fingerprints.clone(),
         identities: ProfileIdentities::new(ProfileIdentityParams {
@@ -1537,8 +1631,8 @@ fn nextest_entry(
         adapter: NEXTEST_INSTRUMENT.to_owned(),
         adapter_version: ContractVersion::new(1, 0, 0),
         executable: ExecutableIdentity::process(
-            "cargo",
-            "rust-toolchain plus nextest binary; exact command mirrors NextestCommand::run (cargo nextest run --profile <profile>)",
+            "cargo-nextest",
+            "selected rust-toolchain's cargo-nextest executable; exact command mirrors NextestCommand::run (cargo-nextest run --profile <profile>)",
         ),
         toolchain: "cargo (rust toolchain)".to_owned(),
         targets: worktree_targets(),
@@ -1548,13 +1642,15 @@ fn nextest_entry(
         parser: contract_id(NEXTEST_INSTRUMENT)?,
         normalizer: diagnostic_id()?,
         evaluator: contract_id(NEXTEST_INSTRUMENT)?,
+        evaluator_version: ContractVersion::new(1, 0, 0),
+        normative_pair_digest: String::new(),
         verifier: verifier_id()?,
         invalidation: fingerprints.clone(),
         identities: ProfileIdentities::new(ProfileIdentityParams {
             source: fingerprints.source.clone(),
             lock: fingerprints.lock.clone(),
             toolchain: "cargo (rust toolchain)".to_owned(),
-            executable: "cargo".to_owned(),
+            executable: "cargo-nextest".to_owned(),
             features: ADMITTED_FEATURES.to_owned(),
             environment: ISOLATED_PROCESS.to_owned(),
             artifact: "nextest test binaries under the admitted target layout; the run report is raw evidence".to_owned(),
@@ -1602,6 +1698,8 @@ fn scip_entry(
         parser: contract_id(SCIP_INSTRUMENT)?,
         normalizer: contract_id(SCIP_INSTRUMENT)?,
         evaluator: contract_id(SCIP_INSTRUMENT)?,
+        evaluator_version: ContractVersion::new(1, 0, 0),
+        normative_pair_digest: String::new(),
         verifier: verifier_id()?,
         invalidation: fingerprints.clone(),
         identities: ProfileIdentities::new(ProfileIdentityParams {
@@ -1659,9 +1757,11 @@ fn dotnet_entry(
         environment_class: ISOLATED_PROCESS.to_owned(),
         resource_contract: resource_contract.to_owned(),
         cancellation_contract: cancellation_contract.to_owned(),
-        parser: diagnostic_id()?,
+        parser: contract_id(OUTPUT_PARSER_ID)?,
         normalizer: diagnostic_id()?,
-        evaluator: diagnostic_id()?,
+        evaluator: contract_id(OUTPUT_EVALUATOR_ID)?,
+        evaluator_version: ContractVersion::new(1, 0, 0),
+        normative_pair_digest: String::new(),
         verifier: verifier_id()?,
         invalidation: fingerprints.clone(),
         identities: ProfileIdentities::new(ProfileIdentityParams {

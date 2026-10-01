@@ -82,6 +82,7 @@ use std::path::{Path, PathBuf};
 
 use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
 use eliot_process::{ActionLeaseRef, FencingToken, Generation};
+use eliot_testd_core::{InstrumentStageRequest, StageExecutionKind};
 use serde::{Deserialize, Serialize};
 
 /// Bins-local dispatch file name, read from the executable directory only.
@@ -216,6 +217,10 @@ pub struct TestdMaterialAdmission {
     /// fields. The per-host installed artifact digest binds later at Drive
     /// time through the intent's `executable_sha256`.
     pub profile_binding_digest: String,
+    /// Exact runner-admitted stage loaded from the durable Kernel owner row.
+    /// It is covered by this admission digest and the launch grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_request: Option<InstrumentStageRequest>,
     /// Exact non-secret environment bindings carried by the Kernel receipt.
     pub environment: Vec<(String, String)>,
     /// Whether the job was admitted cancelled; cancelled admissions never
@@ -227,14 +232,27 @@ pub struct TestdMaterialAdmission {
     pub admission_digest: String,
 }
 
+/// Opaque Kernel-issued Blob stream references copied into launch material.
+/// The authenticated TestD worker must compare this projection to the durable
+/// grant retained on its owner row before using any token.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdMaterialBlobStreamGrant {
+    pub capability_ref: String,
+    pub tokens: Vec<eliot_testd_core::TestdBlobProcessStreamTokenRef>,
+}
+
 /// Bins-local dispatch file envelope (NOT a wire contract change): the exact
-/// seven keys the kernel contour writes.
+/// keys the kernel contour writes, including the optional opaque stream
+/// references required by productive attempts.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TestdMaterialFile {
     request: TestdMaterialRequest,
     envelope: TestdMaterialEnvelope,
     admission: TestdMaterialAdmission,
+    #[serde(default)]
+    blob_stream: Option<TestdMaterialBlobStreamGrant>,
     epoch: EpochId,
     generation: u64,
     nonce: String,
@@ -262,6 +280,10 @@ pub struct ValidatedTestdMaterial {
     pub sealed_slot_suffix: Vec<String>,
     /// Canonical definition digest over the static admitted profile fields.
     pub profile_binding_digest: String,
+    /// Exact stored runner-admitted stage, when this is a productive job.
+    pub stage_request: Option<InstrumentStageRequest>,
+    /// Opaque stream references; the durable owner row remains authority.
+    pub blob_stream: Option<TestdMaterialBlobStreamGrant>,
     /// Exact non-secret environment bindings admitted for this profile.
     pub environment: Vec<(String, String)>,
     /// Canonical digest of the exact admitted request envelope.
@@ -452,8 +474,14 @@ fn validate_material(
         ));
     }
     validate_admission(&file.admission, &file.request)?;
+    validate_blob_stream_material(&file.admission, file.blob_stream.as_ref())?;
     validate_session_binding(&file)?;
-    let (fence, _lease) = validate_grant(&file.grant, &file.admission, now_unix_ms)?;
+    let (fence, _lease) = validate_grant(
+        &file.grant,
+        &file.admission,
+        file.blob_stream.as_ref(),
+        now_unix_ms,
+    )?;
     let owner_store_path = file
         .grant
         .testd_owner_store_path
@@ -479,6 +507,8 @@ fn validate_material(
         profile: file.admission.profile.clone(),
         sealed_slot_suffix: file.admission.sealed_slot_suffix.clone(),
         profile_binding_digest: file.admission.profile_binding_digest.clone(),
+        stage_request: file.admission.stage_request.clone(),
+        blob_stream: file.blob_stream,
         environment: file.admission.environment.clone(),
         request_digest: file.admission.request_digest,
         admission_digest: file.admission.admission_digest,
@@ -548,6 +578,34 @@ fn validate_admission(
             "testd admits only registered probe or productive nextest profiles".to_owned(),
         ));
     }
+    let productive_executor = eliot_testd_core::is_testd_executor_profile(&admission.profile);
+    if productive_executor && admission.stage_request.is_none()
+    {
+        return Err(TestdMaterialError::Contract(
+            "productive testd material is missing its durable stage identity".to_owned(),
+        ));
+    }
+    if productive_executor
+        && admission
+            .stage_request
+            .as_ref()
+            .is_some_and(|stage| stage.provider_freshness.is_none())
+    {
+        return Err(TestdMaterialError::Contract(
+            "productive testd material is missing its provider freshness issuer record".to_owned(),
+        ));
+    }
+    if productive_executor
+        && admission
+            .stage_request
+            .as_ref()
+            .is_some_and(|stage| stage.provider_catalog_lifecycle.is_none())
+    {
+        return Err(TestdMaterialError::Contract(
+            "productive testd material is missing its accepted Module Catalog lifecycle record"
+                .to_owned(),
+        ));
+    }
     validate_wire_digest(
         &admission.profile_binding_digest,
         "testd_material.profile_binding_digest",
@@ -572,10 +630,21 @@ fn validate_admission(
             "testd_material.profile_binding_digest mismatch".to_owned(),
         ));
     }
-    let expected_environment = if admission.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE
-        || admission.profile == eliot_testd_core::TESTD_LIST_PROFILE
-        || admission.profile == eliot_testd_core::TESTD_SCOPED_PROFILE
-    {
+    if let Some(stage) = &admission.stage_request {
+        stage.validate().map_err(|error| {
+            TestdMaterialError::Contract(format!(
+                "testd_material.stage_request is invalid: {}",
+                truncate_detail(&error.to_string())
+            ))
+        })?;
+        if stage.execution != StageExecutionKind::Process {
+            return Err(TestdMaterialError::Contract(
+                "testd_material.stage_request cannot be decoder-only in process dispatch"
+                    .to_owned(),
+            ));
+        }
+    }
+    let expected_environment = if productive_executor {
         eliot_testd_core::TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT
             .iter()
             .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
@@ -611,6 +680,49 @@ fn validate_admission(
     if admission.compute_digest()? != admission.admission_digest {
         return Err(TestdMaterialError::Contract(
             "testd_material.admission_digest mismatch".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_blob_stream_material(
+    admission: &TestdMaterialAdmission,
+    stream: Option<&TestdMaterialBlobStreamGrant>,
+) -> Result<(), TestdMaterialError> {
+    if eliot_testd_core::is_testd_executor_profile(&admission.profile) {
+        let stream = stream.ok_or_else(|| {
+            TestdMaterialError::Contract(
+                "productive testd material is missing its Kernel-issued Blob stream grant"
+                    .to_owned(),
+            )
+        })?;
+        validate_wire_text(
+            &stream.capability_ref,
+            "testd_material.blob_stream.capability_ref",
+        )?;
+        if stream.tokens.is_empty() || stream.tokens.len() > 8_336 {
+            return Err(TestdMaterialError::Contract(
+                "productive testd Blob stream grant has no bounded call-token table".to_owned(),
+            ));
+        }
+        for (index, token) in stream.tokens.iter().enumerate() {
+            validate_wire_text(
+                &token.reference,
+                "testd_material.blob_stream.token.reference",
+            )?;
+            if token.ordinal as usize != index + 1
+                || stream.tokens[..index]
+                    .iter()
+                    .any(|previous| previous.reference == token.reference)
+            {
+                return Err(TestdMaterialError::Contract(
+                    "productive testd Blob call tokens must be unique and ordered".to_owned(),
+                ));
+            }
+        }
+    } else if stream.is_some() {
+        return Err(TestdMaterialError::Contract(
+            "non-productive testd material cannot carry a Blob stream grant".to_owned(),
         ));
     }
     Ok(())
@@ -663,6 +775,7 @@ fn validate_session_binding(file: &TestdMaterialFile) -> Result<(), TestdMateria
 fn validate_grant(
     grant: &DispatchGrant,
     admission: &TestdMaterialAdmission,
+    blob_stream: Option<&TestdMaterialBlobStreamGrant>,
     now_unix_ms: u64,
 ) -> Result<(FencingToken, ActionLeaseRef), TestdMaterialError> {
     validate_wire_digest(&grant.grant_digest, "testd_material.grant_digest")?;
@@ -686,7 +799,8 @@ fn validate_grant(
     .map_err(|error| TestdMaterialError::Contract(truncate_detail(&error.to_string())))?;
     let lease = ActionLeaseRef::new(grant.idempotency_key.clone())
         .map_err(|error| TestdMaterialError::Contract(truncate_detail(&error.to_string())))?;
-    if recomputed_grant_digest(grant, &admission.request_digest)? != grant.grant_digest {
+    let identity_digest = testd_material_identity_digest(admission, blob_stream)?;
+    if recomputed_grant_digest(grant, &identity_digest)? != grant.grant_digest {
         return Err(TestdMaterialError::Contract(
             "testd_material.grant_digest mismatch".to_owned(),
         ));
@@ -699,8 +813,24 @@ fn validate_grant(
     Ok((fence, lease))
 }
 
+fn testd_material_identity_digest(
+    admission: &TestdMaterialAdmission,
+    blob_stream: Option<&TestdMaterialBlobStreamGrant>,
+) -> Result<String, TestdMaterialError> {
+    if blob_stream.is_none() {
+        return Ok(admission.admission_digest.clone());
+    }
+    canonical_json_bytes(&(admission.admission_digest.as_str(), blob_stream))
+        .map(|bytes| sha256_hex(&bytes))
+        .map_err(|_| {
+            TestdMaterialError::Contract(
+                "testd_material Blob stream identity cannot canonicalize".to_owned(),
+            )
+        })
+}
+
 /// Recomputes the grant digest over the exact kernel binding
-/// (`identity_digest | epoch_json | fence_generation | fence_nonce |
+/// (`admission_digest | epoch_json | fence_generation | fence_nonce |
 /// idempotency_key | expires_at`, canonical owner: `dispatch_grant_for` in
 /// `bins/eliot-kernel/src/dispatch_launch.rs`). The epoch serializes via the
 /// same `serde_json::to_string` over the same `EpochId` shape, so equal
@@ -777,6 +907,7 @@ impl TestdMaterialAdmission {
             operation_id: &'a str,
             profile: &'a str,
             profile_binding_digest: &'a str,
+            stage_request: &'a Option<InstrumentStageRequest>,
             environment: &'a [(String, String)],
             cancelled: bool,
             admitted_at_unix_nanos: u64,
@@ -789,6 +920,7 @@ impl TestdMaterialAdmission {
             operation_id: &self.operation_id,
             profile: &self.profile,
             profile_binding_digest: &self.profile_binding_digest,
+            stage_request: &self.stage_request,
             environment: &self.environment,
             cancelled: self.cancelled,
             admitted_at_unix_nanos: self.admitted_at_unix_nanos,

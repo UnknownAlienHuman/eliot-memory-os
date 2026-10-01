@@ -124,6 +124,7 @@ mod approved_generation_registry;
 mod canary_removal;
 mod credential_provision;
 mod guard_containment;
+mod initial_config_snapshot;
 mod installation_registry;
 mod integration_discovery;
 mod managed_change_plan;
@@ -176,6 +177,11 @@ use approved_generation_registry::{
     active_phase_b_rebind_intent_digest, active_phase_b_rebind_receipt_digest,
 };
 
+pub use initial_config_snapshot::{
+    InitialSnapshotKeyRecord, ProtectedInitialSnapshotSigner,
+    create_or_reopen_initial_snapshot_signer, load_verified_initial_config_snapshot,
+    open_retained_initial_snapshot_signer, publish_verified_initial_config_snapshot,
+};
 pub(crate) use integration_discovery::WindowsPathIdentity;
 pub use integration_discovery::{
     AcceptedCatalogueContext, AcceptedInstallationSurvey, AcceptedIntegrationCatalogue,

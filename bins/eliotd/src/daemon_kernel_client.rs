@@ -38,6 +38,10 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use eliot_agent_coordinator::OwnerLoadedClaimRow;
+use eliot_blob_api::wire::{
+    BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_ID, BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_REVISION,
+    BlobProcessStreamOwnerFactsPullRequest, BlobProcessStreamOwnerFactsPullResponse,
+};
 #[cfg(windows)]
 use eliot_contracts::{ArtifactId, ContractId};
 use eliot_contracts::{
@@ -46,7 +50,6 @@ use eliot_contracts::{
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError};
 use eliot_kernel_service::PROVIDER_CAPABILITY_WIRE_VERSION;
-use eliot_learning_contracts::LearningStateViewRecipe;
 use eliot_ors::OperationIdentity;
 use eliot_protocol::{
     AgentActivationClaimRequest, AgentActivationKernelOwnerReadback, AgentActivationOwnerReadback,
@@ -423,8 +426,27 @@ pub struct TaskControllerClaimedInvocation {
     pub envelope: HostRequestEnvelope,
     pub tool: serde_json::Value,
     pub request_identity: RequestIdentity,
+    /// Original Kernel-authenticated transport peer persisted with the `Host`
+    /// request. This is distinct from caller payload identity and remains
+    /// available after Kernel restart/claim rehydration.
+    pub authenticated_peer: eliot_ors::HostRequestKernelAuthenticatedPeer,
+    /// Digest carried by the Kernel's durable Host owner row.
+    pub authenticated_peer_sha256: String,
     pub operation_id: OperationId,
     pub attempt: TaskControllerAttempt,
+    /// Kernel-selected, ORS-validated first-setup predecessor for a genuine
+    /// task-free BindScope action. Ordinary task actions carry no value.
+    pub initial_setup_authority: Option<InitialWorkScopeClaimAuthority>,
+}
+
+/// Exact Kernel-retained Policy lineage and its deterministic WorkScope
+/// successor causal binding. The record is evidence only; callers still
+/// verify the signed setup envelope through the independent Installation
+/// trust anchor before using its source approval.
+#[derive(Clone, Debug)]
+pub struct InitialWorkScopeClaimAuthority {
+    pub record: eliot_ors::InitialSetupAuthorityRecord,
+    pub work_scope_causal: eliot_receipts::CausalBinding,
 }
 
 /// Typed outcome of one `task_controller_result` submit.
@@ -506,60 +528,6 @@ fn canonical_kernel_request_digest(
     Ok(sha256_hex(&bytes))
 }
 
-fn derive_task_controller_request_identity(
-    invocation: &TaskControllerInvocation,
-    envelope: &HostRequestEnvelope,
-) -> Result<RequestIdentity, String> {
-    let recipe: LearningStateViewRecipe =
-        serde_json::from_value(invocation.learning_state_view_recipe.clone())
-            .map_err(|error| format!("Task Controller learning recipe does not decode: {error}"))?;
-    recipe
-        .validate()
-        .map_err(|error| format!("Task Controller learning recipe is invalid: {error}"))?;
-    if recipe.binding.task_id != invocation.task_id
-        || recipe.binding.scope.as_str()
-            != envelope
-                .identity
-                .work_scope_id
-                .as_deref()
-                .unwrap_or_default()
-        || recipe.binding.state_fence != envelope.state_fence
-        || recipe.binding.request_id.as_str() != envelope.identity.request_id.as_str()
-    {
-        return Err(
-            "Task Controller invocation is not bound to the admitted recipe/envelope".to_owned(),
-        );
-    }
-    let session_id = envelope
-        .identity
-        .session_id
-        .clone()
-        .map(|value| SessionId::new(value).map_err(|error| error.to_string()))
-        .transpose()?;
-    let metadata = RequestMetadata {
-        request_id: recipe.binding.request_id.clone(),
-        session_id,
-        task_id: Some(recipe.binding.task_id.clone()),
-        product_id: recipe.binding.product_id.clone(),
-        source_id: recipe.binding.source.owner.clone(),
-        state_fence: envelope.state_fence.clone(),
-        clock: ClockReading::default(),
-    };
-    let identity = RequestIdentity {
-        request: RequestBinding {
-            metadata,
-            state_fence: envelope.state_fence.clone(),
-        },
-        idempotency_key: envelope.identity.idempotency_key.clone(),
-        deadline_unix_ms: envelope.identity.deadline_unix_ms,
-        cancellation_id: envelope.identity.cancellation_id.clone(),
-    };
-    identity
-        .validate()
-        .map_err(|error| format!("derived Task Controller identity is invalid: {error}"))?;
-    Ok(identity)
-}
-
 /// Parses one unwrapped Task Controller poll answer into its exact admitted
 /// invocation and Kernel-issued attempt.
 pub fn parse_task_controller_claimed_pair(
@@ -590,14 +558,27 @@ pub fn parse_task_controller_claimed_pair(
         .validate()
         .map_err(|error| format!("Kernel Task Controller envelope is invalid: {error}"))?;
     let tool = decode("tool")?;
-    let request_identity: RequestIdentity = match pair.get("identity") {
-        Some(value) => serde_json::from_value(value.clone())
-            .map_err(|error| format!("Kernel Task Controller identity does not decode: {error}"))?,
-        None => derive_task_controller_request_identity(&invocation, &envelope)?,
-    };
+    let request_identity: RequestIdentity = serde_json::from_value(decode("identity")?)
+        .map_err(|error| format!("Kernel Task Controller identity does not decode: {error}"))?;
     request_identity
         .validate()
         .map_err(|error| format!("Kernel Task Controller identity is invalid: {error}"))?;
+    let authenticated_peer: eliot_ors::HostRequestKernelAuthenticatedPeer =
+        serde_json::from_value(decode("authenticated_peer")?).map_err(|error| {
+            format!("Kernel Task Controller authenticated peer does not decode: {error}")
+        })?;
+    authenticated_peer.validate().map_err(|error| {
+        format!("Kernel Task Controller authenticated peer is invalid: {error}")
+    })?;
+    let authenticated_peer_sha256 = decode("authenticated_peer_sha256")?
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "Kernel Task Controller authenticated peer digest is not text".to_owned())?;
+    if sha256_hex(&canonical_json_bytes(&authenticated_peer).map_err(|error| error.to_string())?)
+        != authenticated_peer_sha256
+    {
+        return Err("Kernel Task Controller authenticated peer digest mismatch".to_owned());
+    }
     let operation_id: OperationId = serde_json::from_value(decode("operation_id")?)
         .map_err(|error| format!("Kernel Task Controller operation id does not decode: {error}"))?;
     let attempt: TaskControllerAttempt = serde_json::from_value(decode("attempt")?)
@@ -605,6 +586,14 @@ pub fn parse_task_controller_claimed_pair(
     attempt
         .validate()
         .map_err(|error| format!("Kernel Task Controller attempt is invalid: {error}"))?;
+    let initial_setup_authority = serde_json::from_value::<
+        Option<(eliot_ors::InitialSetupAuthorityRecord, eliot_receipts::CausalBinding)>,
+    >(decode("initial_setup_authority")?)
+    .map_err(|error| format!("Kernel initial setup authority does not decode: {error}"))?
+    .map(|(record, work_scope_causal)| InitialWorkScopeClaimAuthority {
+        record,
+        work_scope_causal,
+    });
 
     let tool_name = tool.get("name").and_then(serde_json::Value::as_str);
     let tool_invocation = tool
@@ -612,21 +601,43 @@ pub fn parse_task_controller_claimed_pair(
         .cloned()
         .and_then(|arguments| serde_json::from_value::<TaskControllerInvocation>(arguments).ok());
     let expected_operation = host_request_operation_id(&envelope);
+    let task_free_bind = invocation.action == eliot_protocol::TaskControllerAction::BindScope;
+    let identity_task_matches = if task_free_bind {
+        invocation.task_id.is_none()
+            && envelope.identity.task_id.is_none()
+            && request_identity.request.metadata.task_id.is_none()
+    } else {
+        invocation.task_id.as_ref().map(|task_id| task_id.as_str())
+            == envelope.identity.task_id.as_deref()
+            && request_identity.request.metadata.task_id.as_ref() == invocation.task_id.as_ref()
+    };
+    let identity_scope_matches = if task_free_bind {
+        invocation.work_scope_id.is_none() && envelope.identity.work_scope_id.is_none()
+    } else {
+        invocation.work_scope_id == envelope.identity.work_scope_id
+    };
     if envelope.kind != eliot_protocol::HostRequestKind::Invocation
         || envelope.identity.capability != "eliot.task-controller"
         || envelope.identity.payload_schema_id != "eliot.task-controller.invoke.v1"
         || tool_name != Some("eliot.task-controller")
         || tool_invocation.as_ref() != Some(&invocation)
-        || invocation.task_id.as_str() != envelope.identity.task_id.as_deref().unwrap_or_default()
-        || invocation.work_scope_id
-            != envelope
-                .identity
-                .work_scope_id
-                .as_deref()
-                .unwrap_or_default()
+        || !identity_task_matches
+        || !identity_scope_matches
+        || authenticated_peer.connection_id != envelope.connection_id
+        || request_identity.request.metadata.request_id.as_str()
+            != envelope.identity.request_id.as_str()
+        || request_identity
+            .request
+            .metadata
+            .session_id
+            .as_ref()
+            .map(|id| id.as_str())
+            != envelope.identity.session_id.as_deref()
+        || request_identity.idempotency_key != envelope.identity.idempotency_key
+        || request_identity.cancellation_id != envelope.identity.cancellation_id
+        || request_identity.deadline_unix_ms != envelope.identity.deadline_unix_ms
         || request_identity.request.state_fence != envelope.state_fence
         || request_identity.request.metadata.state_fence != envelope.state_fence
-        || request_identity.request.metadata.task_id.as_ref() != Some(&invocation.task_id)
         || operation_id.as_str() != expected_operation
         || attempt.operation_id != expected_operation
         || attempt.task_id != invocation.task_id
@@ -634,16 +645,64 @@ pub fn parse_task_controller_claimed_pair(
         || attempt.state_fence != envelope.state_fence
         || attempt.authority_epoch != envelope.state_fence.authority_epoch
         || attempt.expires_at_unix_ms != envelope.identity.deadline_unix_ms
+        || task_free_bind != initial_setup_authority.is_some()
     {
         return Err("Kernel Task Controller pair does not bind its admitted envelope".to_owned());
+    }
+    if let Some(bundle) = &initial_setup_authority {
+        bundle
+            .record
+            .validate()
+            .map_err(|error| format!("Kernel initial setup authority is invalid: {error}"))?;
+        let record = &bundle.record;
+        let policy_receipt = record
+            .policy_write_receipt
+            .as_ref()
+            .ok_or_else(|| "Kernel initial setup authority lacks committed Policy receipt".to_owned())?;
+        let policy_envelope = policy_receipt
+            .envelope
+            .as_ref()
+            .ok_or_else(|| "Kernel Policy receipt lacks its canonical envelope".to_owned())?;
+        let expected_sequence = policy_envelope
+            .core
+            .causal
+            .transaction_sequence
+            .value()
+            .checked_add(1)
+            .ok_or_else(|| "Kernel Policy causal sequence is exhausted".to_owned())?;
+        let receipt_id = &policy_envelope.identity.receipt_id;
+        let policy_identity: RequestIdentity = serde_json::from_str(&record.policy_request_identity_json)
+            .map_err(|_| "Kernel setup Policy RequestIdentity is invalid".to_owned())?;
+        policy_identity
+            .validate()
+            .map_err(|_| "Kernel setup Policy RequestIdentity failed validation".to_owned())?;
+        if record.phase != eliot_ors::InitialSetupAuthorityPhase::PolicyCommitted
+            || record.state_fence != envelope.state_fence
+            || policy_receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+            || policy_receipt.state_fence != envelope.state_fence
+            || policy_identity.request.state_fence != envelope.state_fence
+            || policy_identity.request.metadata.state_fence != envelope.state_fence
+            || policy_identity.request.metadata.product_id != request_identity.request.metadata.product_id
+            || policy_identity.request.metadata.source_id != request_identity.request.metadata.source_id
+            || policy_identity.request.metadata.session_id != request_identity.request.metadata.session_id
+            || bundle.work_scope_causal.state_fence != envelope.state_fence
+            || bundle.work_scope_causal.transaction_sequence.value() != expected_sequence
+            || bundle.work_scope_causal.parent_receipt_id.as_ref() != Some(receipt_id)
+            || bundle.work_scope_causal.predecessor_receipt_ids.as_slice() != [receipt_id]
+        {
+            return Err("Kernel initial setup authority does not match the claimed BindScope".to_owned());
+        }
     }
     Ok(Some(TaskControllerClaimedInvocation {
         invocation,
         envelope,
         tool,
         request_identity,
+        authenticated_peer,
+        authenticated_peer_sha256,
         operation_id,
         attempt,
+        initial_setup_authority,
     }))
 }
 
@@ -3288,6 +3347,9 @@ pub(super) const TESTD_OWNER_BIND_DISPATCH_OPERATION: &str =
 pub(super) const TESTD_OWNER_PENDING_TERMINALS_OPERATION: &str =
     "eliot.kernel.testd-owner-pending-terminals";
 pub(super) const TESTD_OWNER_ACK_TERMINAL_OPERATION: &str = "eliot.kernel.testd-owner-ack-terminal";
+pub(super) const TESTD_BLOB_OWNER_FACTS_PENDING_OPERATION: &str = "testd_blob_owner_facts_pending";
+pub(super) const TESTD_BLOB_OWNER_FACTS_COMPLETE_OPERATION: &str =
+    "testd_blob_owner_facts_complete";
 pub(super) const TESTD_OWNER_WIRE_VERSION: u16 = 1;
 /// Bound for one owner poll. Matches the Kernel owner limit exactly; a wider
 /// poll is refused before any transport is touched.
@@ -3366,6 +3428,34 @@ pub(super) struct TestdOwnerAckTerminalResponse {
     pub receipt: WriteReceipt,
 }
 
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct TestdBlobOwnerFactsPendingRequest {
+    wire_id: String,
+    wire_revision: u16,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct TestdBlobOwnerFactsCompleteRequest {
+    wire_id: String,
+    wire_revision: u16,
+    response: BlobProcessStreamOwnerFactsPullResponse,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TestdBlobOwnerFactsPendingResponse {
+    request: Option<BlobProcessStreamOwnerFactsPullRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TestdBlobOwnerFactsCompleteResponse {
+    pull_ref: String,
+    response_sha256: String,
+}
+
 fn testd_owner_limit(limit: u16) -> Result<u16, KernelPortError> {
     if limit == 0 || limit > 64 {
         return Err(KernelPortError::Contract(
@@ -3441,6 +3531,72 @@ fn testd_owner_ack_request_digest(
 }
 
 impl DaemonKernelClient {
+    /// Polls one exact Kernel-owned durable blob owner-facts pull through this
+    /// already authenticated daemon session. The Kernel owns correlation and
+    /// durability; this client only decodes the typed request.
+    pub async fn next_testd_blob_owner_facts_request_async(
+        &self,
+    ) -> Result<Option<BlobProcessStreamOwnerFactsPullRequest>, KernelPortError> {
+        let request = TestdBlobOwnerFactsPendingRequest {
+            wire_id: BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_ID.to_owned(),
+            wire_revision: BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_REVISION,
+        };
+        let value = self
+            .transact_async(
+                TESTD_BLOB_OWNER_FACTS_PENDING_OPERATION,
+                serde_json::json!({ "request": request }),
+            )
+            .await
+            .map_err(kernel_port_error)?;
+        let value = super::kind_value(&value, "testd_blob_owner_facts_pending")?;
+        let response: TestdBlobOwnerFactsPendingResponse = serde_json::from_value(value)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if let Some(pull) = &response.request {
+            pull.validate()
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        }
+        Ok(response.request)
+    }
+
+    /// Completes the Kernel-owned pull with the daemon's exact typed owner
+    /// response. Kernel revalidates durable correlation and fence before
+    /// recording completion.
+    pub async fn complete_testd_blob_owner_facts_request_async(
+        &self,
+        pull: &BlobProcessStreamOwnerFactsPullRequest,
+        response: BlobProcessStreamOwnerFactsPullResponse,
+    ) -> Result<(), KernelPortError> {
+        response
+            .validate_for_request(pull)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        let response_sha256 = sha256_hex(
+            &canonical_json_bytes(&response)
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?,
+        );
+        let request = TestdBlobOwnerFactsCompleteRequest {
+            wire_id: BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_ID.to_owned(),
+            wire_revision: BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_REVISION,
+            response,
+        };
+        let value = self
+            .transact_async(
+                TESTD_BLOB_OWNER_FACTS_COMPLETE_OPERATION,
+                serde_json::json!({ "request": request }),
+            )
+            .await
+            .map_err(kernel_port_error)?;
+        let value = super::kind_value(&value, "testd_blob_owner_facts_complete")?;
+        let ack: TestdBlobOwnerFactsCompleteResponse = serde_json::from_value(value)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if ack.pull_ref != pull.pull_ref || ack.response_sha256 != response_sha256 {
+            return Err(KernelPortError::Contract(
+                "Kernel owner-facts completion does not bind the exact pull and response"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Polls the Kernel-owned pending verifier dispatches. The response
     /// carries the full durable job plus the exact admitted frame identity;
     /// the daemon computes the canonical plan binding from its Governor

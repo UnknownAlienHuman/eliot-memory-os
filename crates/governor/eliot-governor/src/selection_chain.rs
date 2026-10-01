@@ -860,6 +860,8 @@ pub fn selection_chain_security_context(
         transformation_lineage: Vec::new(),
         influence_closure: None,
         purge_entry: None,
+        authority_binding: None,
+        causal_binding: None,
         selection_integrity: Some(receipt.clone()),
         selection_chain_head: Some(head),
         selection_chain_seal: Some(seal),

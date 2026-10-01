@@ -23,7 +23,7 @@
 //!   evaluation remain separate closed axes: admitting a stream sets no
 //!   parser/evaluator status, and parser success sets no evaluator status.
 
-use eliot_contracts::{ClockReading, StateFence};
+use eliot_contracts::{ClockReading, EpochId, StateFence, canonical_json_bytes};
 use eliot_process::{
     DurableStreamLocatorKind, DurableStreamRepresentation, ProcessEvidence,
     ProcessExecutionBinding, ProcessStreamEvidence, ProcessStreamKind, ProcessStreamPolicyBinding,
@@ -31,6 +31,8 @@ use eliot_process::{
     StreamTransportStatus,
 };
 use serde::{Deserialize, Serialize};
+use std::future::Future;
+use std::pin::Pin;
 use thiserror::Error;
 
 use super::{TestdError, sha256_hex};
@@ -508,16 +510,23 @@ impl TestdEvaluatorSlot {
 
 /// Attempt context the composition supplies for one readback resolution.
 ///
-/// The job/attempt/invocation identities and the current [`StateFence`] come
-/// from the durable attempt owner, never from the evidence bytes.
+/// The job/attempt/invocation and exact process binding come from the durable
+/// admitted attempt, never from evidence bytes. Store StateFence selection is
+/// Kernel-owned and is deliberately absent from this Testd context.
 #[derive(Clone, Debug)]
 pub struct TestdReadbackContext {
     /// Durable job identity the resolution serves.
     pub job_id: String,
     /// Instrument invocation identity the resolution serves.
     pub invocation_id: String,
-    /// Current State Fence the readback must satisfy.
-    pub fence: StateFence,
+    /// Exact operation identity from the durable process admission.
+    pub expected_operation_id: String,
+    /// Exact process-tree identity from the durable process admission.
+    pub expected_process_tree_id: String,
+    /// Exact process generation from the durable process admission.
+    pub expected_process_generation: u64,
+    /// Exact authority epoch from the durable process admission.
+    pub expected_authority_epoch: EpochId,
     /// Maximum source bytes the caller accepts. Must cover the admitted
     /// source length; anything larger fails closed.
     pub max_bytes: u64,
@@ -552,8 +561,6 @@ pub struct ProcessStreamSourceReadbackRequest {
     pub expected_byte_length: u64,
     /// Policy/privacy/visibility/retention binding fixed before persistence.
     pub policy: ProcessStreamPolicyBinding,
-    /// State Fence the readback must satisfy.
-    pub fence: StateFence,
     /// Maximum source bytes the caller accepts.
     pub max_bytes: u64,
     /// Unix-millisecond deadline the provider must meet.
@@ -605,12 +612,6 @@ impl ProcessStreamSourceReadbackRequest {
                 reason: "the provider deadline must be non-zero",
             });
         }
-        self.fence
-            .validate()
-            .map_err(|_| TestdEvidenceError::ReadbackRequestInvalid {
-                field: "fence",
-                reason: "the readback fence must carry a non-zero resource generation",
-            })?;
         Ok(())
     }
 }
@@ -646,6 +647,151 @@ pub struct ProcessStreamSourceReadbackObservation {
     pub observed_at: ClockReading,
     /// Availability/integrity outcome of the readback.
     pub disposition: TestdStreamDisposition,
+    /// Fresh Kernel owner facts and catalog admission that authorized this
+    /// read. Ephemeral only; never copied to a durable TestD receipt.
+    #[serde(skip)]
+    pub replay_owner_readback: Option<TestdReplayOwnerReadback>,
+}
+
+/// Canonical owner-facts and catalog-admission payloads returned with a fresh
+/// authenticated source readback. These JSON values are carried only to the
+/// replay authority, which performs the typed owner-specific validation.
+#[derive(Clone, Eq, PartialEq)]
+pub struct TestdReplayOwnerReadback {
+    /// Exact pending/ready process-source-admission record for this stream.
+    pub process_source_admission_readback_json: String,
+    /// SHA-256 of the exact canonical process-source-admission bytes.
+    pub process_source_admission_readback_sha256: String,
+    /// Exact Store WriteReceipt for the revision-2 Ready CAS.
+    pub source_admission_write_receipt_json: String,
+    /// SHA-256 of the exact canonical Ready-CAS WriteReceipt bytes.
+    pub source_admission_write_receipt_sha256: String,
+    /// Exact BlobReadyReceipt pair retained with the original CompleteSource
+    /// Finalize call in TestdStore's token/op-bound call record.
+    pub finalized_blob_ready_receipt_json: Option<String>,
+    /// SHA-256 of the retained original Finalize BlobReadyReceipt JSON.
+    pub finalized_blob_ready_receipt_sha256: Option<String>,
+    /// Canonical verified WorkScope/source/policy owner facts.
+    pub owner_facts_json: String,
+    /// SHA-256 of the exact canonical owner-facts JSON bytes.
+    pub owner_facts_sha256: String,
+    /// Canonical current Module Catalog owner readback.
+    pub module_catalog_owner_readback_json: String,
+    /// SHA-256 of the exact canonical catalog readback bytes.
+    pub module_catalog_owner_readback_sha256: String,
+    /// Canonical accepted GenerationAdmission.
+    pub generation_admission_json: String,
+    /// SHA-256 of the exact canonical GenerationAdmission bytes.
+    pub generation_admission_sha256: String,
+}
+
+impl std::fmt::Debug for TestdReplayOwnerReadback {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TestdReplayOwnerReadback")
+            .field("owner_facts_sha256", &self.owner_facts_sha256)
+            .field(
+                "module_catalog_owner_readback_sha256",
+                &self.module_catalog_owner_readback_sha256,
+            )
+            .field(
+                "generation_admission_sha256",
+                &self.generation_admission_sha256,
+            )
+            .field(
+                "finalized_blob_ready_receipt_sha256",
+                &self.finalized_blob_ready_receipt_sha256,
+            )
+            .finish()
+    }
+}
+
+impl TestdReplayOwnerReadback {
+    /// Validates exact canonical JSON and SHA-256 pairings for the per-stream
+    /// source-admission readback, its Ready-CAS receipt, and all three
+    /// authenticated owner readbacks.
+    pub fn validate(&self) -> Result<(), TestdEvidenceError> {
+        for (json_field, json, digest_field, digest) in [
+            (
+                "source_readback.process_source_admission_readback_json",
+                self.process_source_admission_readback_json.as_str(),
+                "source_readback.process_source_admission_readback_sha256",
+                self.process_source_admission_readback_sha256.as_str(),
+            ),
+            (
+                "source_readback.source_admission_write_receipt_json",
+                self.source_admission_write_receipt_json.as_str(),
+                "source_readback.source_admission_write_receipt_sha256",
+                self.source_admission_write_receipt_sha256.as_str(),
+            ),
+            (
+                "source_readback.owner_facts_json",
+                self.owner_facts_json.as_str(),
+                "source_readback.owner_facts_sha256",
+                self.owner_facts_sha256.as_str(),
+            ),
+            (
+                "source_readback.module_catalog_owner_readback_json",
+                self.module_catalog_owner_readback_json.as_str(),
+                "source_readback.module_catalog_owner_readback_sha256",
+                self.module_catalog_owner_readback_sha256.as_str(),
+            ),
+            (
+                "source_readback.generation_admission_json",
+                self.generation_admission_json.as_str(),
+                "source_readback.generation_admission_sha256",
+                self.generation_admission_sha256.as_str(),
+            ),
+        ] {
+            let value: serde_json::Value =
+                serde_json::from_str(json).map_err(|_| TestdEvidenceError::BindingMismatch {
+                    reason: "fresh replay owner facts are not valid JSON",
+                })?;
+            let canonical =
+                canonical_json_bytes(&value).map_err(|_| TestdEvidenceError::BindingMismatch {
+                    reason: "fresh replay owner facts cannot be canonically serialized",
+                })?;
+            if String::from_utf8(canonical.clone()).ok().as_deref() != Some(json)
+                || sha256_hex(&canonical) != digest
+            {
+                let _ = (json_field, digest_field);
+                return Err(TestdEvidenceError::BindingMismatch {
+                    reason: "fresh replay owner facts disagree with their canonical digest",
+                });
+            }
+        }
+        match (
+            self.finalized_blob_ready_receipt_json.as_deref(),
+            self.finalized_blob_ready_receipt_sha256.as_deref(),
+        ) {
+            (Some(json), Some(digest)) => {
+                let value: serde_json::Value = serde_json::from_str(json).map_err(|_| {
+                    TestdEvidenceError::BindingMismatch {
+                        reason: "retained Finalize Ready receipt is not valid JSON",
+                    }
+                })?;
+                let canonical = canonical_json_bytes(&value).map_err(|_| {
+                    TestdEvidenceError::BindingMismatch {
+                        reason: "retained Finalize Ready receipt cannot be canonically serialized",
+                    }
+                })?;
+                if String::from_utf8(canonical.clone()).ok().as_deref() != Some(json)
+                    || sha256_hex(&canonical) != digest
+                {
+                    return Err(TestdEvidenceError::BindingMismatch {
+                        reason: "retained Finalize Ready receipt disagrees with its canonical digest",
+                    });
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(TestdEvidenceError::BindingMismatch {
+                    reason: "retained Finalize Ready receipt requires its exact digest pair",
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for ProcessStreamSourceReadbackObservation {
@@ -663,6 +809,7 @@ impl std::fmt::Debug for ProcessStreamSourceReadbackObservation {
             .field("observed_fence", &self.observed_fence)
             .field("observed_at", &self.observed_at)
             .field("disposition", &self.disposition)
+            .field("replay_owner_readback", &self.replay_owner_readback)
             .finish()
     }
 }
@@ -698,7 +845,15 @@ impl ProcessStreamSourceReadbackObservation {
             observed_fence,
             observed_at,
             disposition,
+            replay_owner_readback: None,
         }
+    }
+
+    /// Adds the exact fresh owner PULL payloads associated with this readback.
+    #[must_use]
+    pub fn with_replay_owner_readback(mut self, owner: TestdReplayOwnerReadback) -> Self {
+        self.replay_owner_readback = Some(owner);
+        self
     }
 
     /// Borrows the ephemeral source bytes for immediate parser input.
@@ -784,6 +939,12 @@ impl ProcessStreamSourceReadbackObservation {
                 reason: "the provider returned more bytes than the admitted bound",
             });
         }
+        let Some(owner_readback) = self.replay_owner_readback.as_ref() else {
+            return Err(TestdEvidenceError::BindingMismatch {
+                reason: "source readback omitted fresh authenticated replay owner facts",
+            });
+        };
+        owner_readback.validate()?;
         if self.locator_kind != request.locator_kind
             || self.locator != request.locator
             || self.ready_receipt_ref != request.ready_receipt_ref
@@ -793,12 +954,12 @@ impl ProcessStreamSourceReadbackObservation {
                 reason: "the readback names a different locator or ready receipt",
             });
         }
-        if !self.observed_fence.is_compatible_with(&request.fence) {
-            return Err(TestdEvidenceError::SourceStale {
+        self.observed_fence
+            .validate()
+            .map_err(|_| TestdEvidenceError::SourceStale {
                 stream,
-                reason: "the readback fence is incompatible with the attempt fence",
-            });
-        }
+                reason: "the owner-returned readback fence is invalid",
+            })?;
         validate_reference(
             "readback_receipt_id",
             Some(self.readback_receipt_id.as_str()),
@@ -849,18 +1010,41 @@ pub trait ProcessStreamSourceReadbackPort: Send + Sync {
     ) -> Result<ProcessStreamSourceReadbackObservation, TestdEvidenceError>;
 }
 
+/// Future returned by the asynchronous source-readback boundary.
+pub type ProcessStreamSourceReadbackFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<ProcessStreamSourceReadbackObservation, TestdEvidenceError>>
+            + Send
+            + 'a,
+    >,
+>;
+
+/// Asynchronous provider-neutral immutable-source readback port.
+///
+/// Production storage clients are asynchronous. This boundary lets Testd
+/// await their owner-produced bytes and receipt directly instead of blocking
+/// a daemon/runtime thread or fabricating a synchronous observation.
+pub trait AsyncProcessStreamSourceReadbackPort: Send + Sync {
+    /// Resolves one admitted immutable source without blocking its caller.
+    fn resolve<'a>(
+        &'a self,
+        request: &'a ProcessStreamSourceReadbackRequest,
+    ) -> ProcessStreamSourceReadbackFuture<'a>;
+}
+
 /// Ephemeral resolved source bytes for immediate parser input.
 ///
 /// Deliberately not serializable, so resolved bytes cannot be embedded in a
 /// durable job or receipt by construction. The [`Debug`] projection reports
 /// only the length, never the bytes.
-pub struct EphemeralSourceBytes(Vec<u8>);
+pub struct EphemeralSourceBytes(Vec<u8>, TestdReplayOwnerReadback);
 
 impl std::fmt::Debug for EphemeralSourceBytes {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("EphemeralSourceBytes")
             .field("len", &self.0.len())
+            .field("replay_owner_readback", &self.1)
             .finish()
     }
 }
@@ -870,6 +1054,14 @@ impl EphemeralSourceBytes {
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
         &self.0
+    }
+
+    /// Borrows the fresh authenticated owner readbacks paired with these
+    /// bytes. This metadata is ephemeral and must be revalidated by the
+    /// runner's verified replay-context constructor before use.
+    #[must_use]
+    pub fn replay_owner_readback(&self) -> &TestdReplayOwnerReadback {
+        &self.1
     }
 
     /// Returns the resolved byte length.
@@ -1278,8 +1470,49 @@ impl TestdStreamEvidenceBinding {
                 reason: "a never-emitted stream has no binding record",
             });
         }
+        // Wave B (issue #456): a source-less disposition can never carry a
+        // readback binding. Admit/resolve paths never set one, and this rule
+        // keeps even crafted wire bytes from upgrading a legacy, unavailable,
+        // policy-prohibited, or redaction-failed record into a resolvable one.
+        if matches!(
+            self.disposition,
+            TestdStreamDisposition::SourceUnavailable
+                | TestdStreamDisposition::PolicyProhibited
+                | TestdStreamDisposition::RedactionFailed
+                | TestdStreamDisposition::LegacyMigrationRequired
+        ) && (self.readback_receipt_id.is_some()
+            || self.fence.is_some()
+            || self.readback_observed_at.is_some())
+        {
+            return Err(TestdEvidenceError::BindingMismatch {
+                reason: "a source-less disposition cannot carry a readback binding",
+            });
+        }
         self.parser.validate()?;
         self.evaluator.validate()?;
+        // An executed parser or an assessed evaluator proves a verified
+        // readback happened: both apply paths require this source's readback
+        // receipt before recording, so rest-state records must retain the
+        // binding. Idle and stale slots are exempt: they name no result.
+        let parser_executed = matches!(
+            self.parser.status,
+            TestdParsingStatus::Parsed
+                | TestdParsingStatus::ParseFailed
+                | TestdParsingStatus::NotApplicable
+        );
+        let evaluator_assessed = matches!(
+            self.evaluator.status,
+            TestdEvaluationStatus::Pass
+                | TestdEvaluationStatus::Fail
+                | TestdEvaluationStatus::Inconclusive
+        );
+        if (parser_executed || evaluator_assessed)
+            && (self.readback_receipt_id.is_none() || self.fence.is_none())
+        {
+            return Err(TestdEvidenceError::BindingMismatch {
+                reason: "an executed parser or assessed evaluator requires a verified readback binding",
+            });
+        }
         match &self.artifact_binding {
             TestdArtifactBinding::Unbound => {}
             TestdArtifactBinding::BoundExact(artifact)
@@ -1311,6 +1544,31 @@ impl TestdStreamEvidenceBinding {
         port: &dyn ProcessStreamSourceReadbackPort,
         context: &TestdReadbackContext,
     ) -> Result<EphemeralSourceBytes, TestdEvidenceError> {
+        self.ensure_readback_eligible()?;
+        let request = self.readback_request(context)?;
+        request.validate()?;
+        let observation = port.resolve(&request)?;
+        self.apply_readback_observation(context, &request, observation)
+    }
+
+    /// Resolves and verifies source bytes through the asynchronous owner port.
+    ///
+    /// The same disposition, fence, ready-receipt, digest, and exact-length
+    /// checks as [`resolve_source`](Self::resolve_source) run before bytes are
+    /// returned to a parser. The provider future is awaited directly.
+    pub async fn resolve_source_async(
+        &mut self,
+        port: &dyn AsyncProcessStreamSourceReadbackPort,
+        context: &TestdReadbackContext,
+    ) -> Result<EphemeralSourceBytes, TestdEvidenceError> {
+        self.ensure_readback_eligible()?;
+        let request = self.readback_request(context)?;
+        request.validate()?;
+        let observation = port.resolve(&request).await?;
+        self.apply_readback_observation(context, &request, observation)
+    }
+
+    fn ensure_readback_eligible(&self) -> Result<(), TestdEvidenceError> {
         match self.disposition {
             TestdStreamDisposition::ReadbackPending
             | TestdStreamDisposition::PartialSource
@@ -1366,14 +1624,20 @@ impl TestdStreamEvidenceBinding {
                 });
             }
         }
-        let request = self.readback_request(context)?;
-        request.validate()?;
-        let observation = port.resolve(&request)?;
-        if let Err(error) = observation.verify_against(&request) {
+        Ok(())
+    }
+
+    fn apply_readback_observation(
+        &mut self,
+        context: &TestdReadbackContext,
+        request: &ProcessStreamSourceReadbackRequest,
+        observation: ProcessStreamSourceReadbackObservation,
+    ) -> Result<EphemeralSourceBytes, TestdEvidenceError> {
+        if let Err(error) = observation.verify_against(request) {
             self.disposition = disposition_for_readback_error(&error);
             return Err(error);
         }
-        self.fence = Some(context.fence.clone());
+        self.fence = Some(observation.observed_fence.clone());
         self.readback_receipt_id = Some(observation.readback_receipt_id.clone());
         self.readback_observed_at = Some(observation.observed_at);
         self.disposition = if self.transport == StreamTransportStatus::Complete
@@ -1384,7 +1648,14 @@ impl TestdStreamEvidenceBinding {
         } else {
             TestdStreamDisposition::PartialSource
         };
-        Ok(EphemeralSourceBytes(observation.bytes.clone()))
+        Ok(EphemeralSourceBytes(
+            observation.bytes.clone(),
+            observation.replay_owner_readback.clone().ok_or(
+                TestdEvidenceError::BindingMismatch {
+                    reason: "source readback omitted fresh authenticated replay owner facts",
+                },
+            )?,
+        ))
     }
 
     /// Builds the readback request from the admitted source fields.
@@ -1393,6 +1664,19 @@ impl TestdStreamEvidenceBinding {
         context: &TestdReadbackContext,
     ) -> Result<ProcessStreamSourceReadbackRequest, TestdEvidenceError> {
         let stream = self.stream;
+        if self.binding.job_id().as_str() != context.job_id
+            || self.binding.operation_id().as_str() != context.expected_operation_id
+            || self.binding.process_tree_id().as_str() != context.expected_process_tree_id
+            || self.binding.state_fence().generation().get() != context.expected_process_generation
+            || !self
+                .binding
+                .authority_epoch()
+                .is_same_authority(&context.expected_authority_epoch)
+        {
+            return Err(TestdEvidenceError::BindingMismatch {
+                reason: "the source binding disagrees with the admitted process context",
+            });
+        }
         let (
             Some(locator_kind),
             Some(locator),
@@ -1423,7 +1707,6 @@ impl TestdStreamEvidenceBinding {
             expected_sha256,
             expected_byte_length,
             policy: self.policy.clone(),
-            fence: context.fence.clone(),
             max_bytes: context.max_bytes,
             deadline_ms: context.deadline_ms,
         })
@@ -1840,6 +2123,47 @@ impl TestdProcessEvidenceBundle {
         Ok(())
     }
 
+    /// Applies parser and evaluator observations to one exact stream binding.
+    ///
+    /// The caller must pass the post-readback binding snapshot from this
+    /// bundle. Equality is checked before either slot is mutated, so stale
+    /// replay work cannot overwrite a newer source resolution or fence.
+    pub fn apply_replay_observations(
+        &mut self,
+        expected: &TestdStreamEvidenceBinding,
+        parsing: &TestdParsingObservation,
+        evaluation: Option<&TestdEvaluationObservation>,
+    ) -> Result<(), TestdEvidenceError> {
+        if expected.binding != self.binding {
+            return Err(TestdEvidenceError::BindingMismatch {
+                reason: "replay binding changed after verified source readback",
+            });
+        }
+        let slot = match expected.stream {
+            ProcessStreamKind::Stdout => &mut self.stdout,
+            ProcessStreamKind::Stderr => &mut self.stderr,
+        };
+        let Some(binding) = slot.binding.as_mut() else {
+            return Err(TestdEvidenceError::BindingMismatch {
+                reason: "replay refers to a stream slot without an admitted binding",
+            });
+        };
+        if binding != expected {
+            return Err(TestdEvidenceError::BindingMismatch {
+                reason: "replay binding changed after verified source readback",
+            });
+        }
+        let mut updated = binding.clone();
+        updated.apply_parsing(parsing)?;
+        if let Some(observation) = evaluation {
+            updated.apply_evaluation(observation)?;
+        }
+        slot.disposition = updated.disposition;
+        slot.binding = Some(updated);
+        self.disposition = derive_evidence_disposition(&self.stdout, &self.stderr);
+        self.validate()
+    }
+
     /// Resolves every pending slot through the injected port.
     ///
     /// Each slot yields an explicit per-stream outcome; refusal and failure
@@ -1858,6 +2182,19 @@ impl TestdProcessEvidenceBundle {
         self.disposition = derive_evidence_disposition(&self.stdout, &self.stderr);
         outcomes
     }
+
+    /// Asynchronously resolves both explicit stream slots through the
+    /// provider port, preserving stdout/stderr independently and in order.
+    pub async fn resolve_pending_async(
+        &mut self,
+        port: &dyn AsyncProcessStreamSourceReadbackPort,
+        context: &TestdReadbackContext,
+    ) -> Vec<TestdStreamResolution> {
+        let stdout = resolve_slot_async(&mut self.stdout, port, context).await;
+        let stderr = resolve_slot_async(&mut self.stderr, port, context).await;
+        self.disposition = derive_evidence_disposition(&self.stdout, &self.stderr);
+        vec![stdout, stderr]
+    }
 }
 
 /// Explicit per-stream outcome of one readback resolution.
@@ -1868,6 +2205,8 @@ pub enum TestdStreamResolution {
     Resolved {
         /// Resolved physical stream.
         stream: ProcessStreamKind,
+        /// Exact admitted and readback-bound source evidence.
+        source: TestdStreamEvidenceBinding,
         /// Ephemeral source bytes.
         bytes: EphemeralSourceBytes,
     },
@@ -1910,6 +2249,98 @@ fn resolve_slot(
                 slot.disposition = binding.disposition;
                 TestdStreamResolution::Resolved {
                     stream: slot.stream,
+                    source: binding.clone(),
+                    bytes,
+                }
+            }
+            Err(error) => {
+                slot.disposition = binding.disposition;
+                TestdStreamResolution::Refused {
+                    stream: slot.stream,
+                    error,
+                }
+            }
+        };
+    }
+    let error = match binding.disposition {
+        TestdStreamDisposition::LegacyMigrationRequired => {
+            TestdEvidenceError::LegacyStreamEvidenceUnavailable {
+                stream: slot.stream,
+                reason: "a legacy reference can never be expanded or satisfy verification",
+            }
+        }
+        TestdStreamDisposition::SourceUnavailable | TestdStreamDisposition::StreamNotEmitted => {
+            TestdEvidenceError::SourceUnavailable {
+                stream: slot.stream,
+                reason: "no durable source is admitted for this stream",
+            }
+        }
+        TestdStreamDisposition::PolicyProhibited => TestdEvidenceError::SourcePolicyProhibited {
+            stream: slot.stream,
+            reason: "policy forbids readback before any provider call",
+        },
+        TestdStreamDisposition::RedactionFailed => TestdEvidenceError::SourceRedactionFailed {
+            stream: slot.stream,
+            reason: "redaction failed before any provider call",
+        },
+        TestdStreamDisposition::Purged => TestdEvidenceError::SourcePurged {
+            stream: slot.stream,
+            reason: "the admitted source is already purged",
+        },
+        TestdStreamDisposition::RetentionBlocked => TestdEvidenceError::SourceRetentionBlocked {
+            stream: slot.stream,
+            reason: "retention still blocks readback of the admitted source",
+        },
+        TestdStreamDisposition::IntegrityBroken => TestdEvidenceError::SourceIntegrityBroken {
+            stream: slot.stream,
+            reason: "the admitted source already failed integrity verification",
+        },
+        TestdStreamDisposition::Stale => TestdEvidenceError::SourceStale {
+            stream: slot.stream,
+            reason: "the admitted source is already stale",
+        },
+        TestdStreamDisposition::ReadbackPending
+        | TestdStreamDisposition::PartialSource
+        | TestdStreamDisposition::CompleteSource
+        | TestdStreamDisposition::UnknownOutcome => TestdEvidenceError::SourceUnknownOutcome {
+            stream: slot.stream,
+            reason: "unreachable resolvable disposition",
+        },
+    };
+    TestdStreamResolution::Refused {
+        stream: slot.stream,
+        error,
+    }
+}
+
+/// Async counterpart to `resolve_slot`; it never blocks the caller while the
+/// durable owner resolves immutable source bytes.
+async fn resolve_slot_async(
+    slot: &mut TestdStreamSlot,
+    port: &dyn AsyncProcessStreamSourceReadbackPort,
+    context: &TestdReadbackContext,
+) -> TestdStreamResolution {
+    let Some(binding) = slot.binding.as_mut() else {
+        return TestdStreamResolution::Refused {
+            stream: slot.stream,
+            error: TestdEvidenceError::SourceUnavailable {
+                stream: slot.stream,
+                reason: "the requested stream was never emitted",
+            },
+        };
+    };
+    if binding.needs_readback()
+        || matches!(
+            binding.disposition,
+            TestdStreamDisposition::CompleteSource | TestdStreamDisposition::UnknownOutcome
+        )
+    {
+        return match binding.resolve_source_async(port, context).await {
+            Ok(bytes) => {
+                slot.disposition = binding.disposition;
+                TestdStreamResolution::Resolved {
+                    stream: slot.stream,
+                    source: binding.clone(),
                     bytes,
                 }
             }

@@ -365,6 +365,9 @@ fn hello() -> WorkerHello {
         state_fence: fence(),
         route_ref: "route-1".to_owned(),
         requested_capabilities: BTreeSet::from(["inspect".to_owned()]),
+        visibility: None,
+        privacy_class: None,
+        swarm_id: None,
     }
 }
 
@@ -495,6 +498,9 @@ fn claim_with(
         state_fence: fence(),
         wire_version: NATIVE_WORKER_CLAIM_WIRE_VERSION,
         executable_binding: Some(join),
+        visibility: None,
+        privacy_class: None,
+        swarm_id: None,
         binding_digest: String::new(),
     };
     load(draft.with_computed_digest())

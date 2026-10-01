@@ -961,6 +961,7 @@ name = "eliot-blob-api"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "eliot-contracts",
  "eliot-platform",
  "eliot-receipts",
  "eliot-security-contracts",
@@ -1039,6 +1040,7 @@ dependencies = [
 name = "eliot-cli"
 version = "0.1.0"
 dependencies = [
+ "eliot-blob-api",
  "eliot-bootstrap",
  "eliot-contracts",
  "eliot-ipc",
@@ -1101,6 +1103,7 @@ name = "eliot-config"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "eliot-blob-api",
  "eliot-contracts",
  "eliot-runtime-contracts",
  "eliot-security-contracts",
@@ -2228,6 +2231,7 @@ dependencies = [
 name = "eliot-instrument-runner"
 version = "0.1.0"
 dependencies = [
+ "eliot-bootstrap",
  "eliot-build-test-graph",
  "eliot-contracts",
  "eliot-instrument-api",
@@ -2237,6 +2241,7 @@ dependencies = [
  "eliot-instrument-rustc",
  "eliot-instrument-rustfmt",
  "eliot-instrument-scip",
+ "eliot-module-registry",
  "eliot-process",
  "eliot-process-executor",
  "eliot-receipts",
@@ -2244,6 +2249,7 @@ dependencies = [
  "eliot-test-selection",
  "eliot-testd-core",
  "eliot-verifier",
+ "eliot-workscope",
  "serde",
  "serde_json",
  "thiserror",
@@ -2312,8 +2318,10 @@ dependencies = [
  "eliot-artifact",
  "eliot-authority",
  "eliot-backup",
+ "eliot-blob-api",
  "eliot-contracts",
  "eliot-installation",
+ "eliot-instrument-runner",
  "eliot-ipc",
  "eliot-kernel-core",
  "eliot-kernel-service",
@@ -2373,6 +2381,7 @@ dependencies = [
 name = "eliot-kernel-service"
 version = "0.1.0"
 dependencies = [
+ "eliot-blob-api",
  "eliot-canonical",
  "eliot-contracts",
  "eliot-doctor-core",
@@ -3256,6 +3265,7 @@ version = "0.1.0"
 dependencies = [
  "eliot-backup",
  "eliot-blob",
+ "eliot-blob-api",
  "eliot-contracts",
  "eliot-installation",
  "eliot-ipc",
@@ -3263,6 +3273,7 @@ dependencies = [
  "eliot-observability-runtime",
  "eliot-platform",
  "eliot-platform-windows",
+ "eliot-process",
  "eliot-protocol",
  "eliot-runtime-contracts",
  "eliot-store-api",
@@ -3355,9 +3366,12 @@ dependencies = [
 name = "eliot-testd"
 version = "0.1.0"
 dependencies = [
+ "eliot-blob-api",
+ "eliot-bootstrap",
  "eliot-cli",
  "eliot-contracts",
  "eliot-instrument-api",
+ "eliot-instrument-runner",
  "eliot-platform",
  "eliot-platform-windows",
  "eliot-process",
@@ -3369,6 +3383,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

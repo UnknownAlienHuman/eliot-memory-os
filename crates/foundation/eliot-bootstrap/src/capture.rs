@@ -27,10 +27,14 @@ use crate::{
     CONFORMANCE_CONTRACT_VERSION, CurrentSystemEvidenceCompiler, CurrentSystemEvidenceSnapshot,
     CurrentSystemEvidenceSource, DomainCoverage, EvidenceDomain, EvidenceEvaluation,
     EvidenceRecord, NormativePair, SourceProjection, SupportObservationState,
-    normative::{self, parse_normative_pair_receipt},
+    normative::{
+        self, NormativePairReceiptIdentity, parse_normative_pair_receipt,
+        parse_normative_pair_receipt_identity,
+    },
 };
 
 const SNAPSHOT_TEMP_CREATE_ATTEMPTS: usize = 128;
+const DOCS_SHARD_RENDERED_BYTE_LIMIT: usize = 48_000;
 static SNAPSHOT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// Immutable receipt proving which snapshot was emitted.
@@ -185,6 +189,353 @@ pub fn load_normative_pair(repository_root: &Path) -> Result<NormativePair, Capt
         path: canonical_path,
         detail: error.to_string(),
     })
+}
+
+/// One document admitted by the repository's accepted sharded normative-pair
+/// receipt and reconstructed from its current manifest-listed source shards.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NormativePairSourceDocument {
+    /// Normative role of this reconstructed source.
+    pub role: NormativePairSourceRole,
+    /// Exact manifest path declared by the accepted pair receipt.
+    pub source_ref: String,
+    /// Exact generated entry path declared by the accepted pair receipt.
+    pub entry_ref: String,
+    /// Exact compatibility-map path declared by the accepted pair receipt.
+    pub compatibility_ref: String,
+    /// SHA-256 of the reconstructed normalized source byte stream.
+    pub content_sha256: String,
+}
+
+/// Closed roles carried by a reconstructed normative source document.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NormativePairSourceRole {
+    /// Adopted Architecture source.
+    Architecture,
+    /// Adopted Implementation source.
+    Implementation,
+}
+
+/// Source facts reconstructed against the accepted normative-pair receipt.
+///
+/// This is evidence for an existing WorkScope/source-admission owner to
+/// evaluate. It does not admit or promote a source by itself.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct NormativePairSourceCapture {
+    /// Validated pair identity and its exact repository source handles.
+    pub receipt: NormativePairReceiptIdentity,
+    /// Reconstructed Architecture source.
+    pub architecture: NormativePairSourceDocument,
+    /// Reconstructed Implementation source.
+    pub implementation: NormativePairSourceDocument,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShardedNormativeManifest {
+    schema_version: String,
+    source_key: String,
+    entry_path: String,
+    source_sha256: String,
+    source_bytes: usize,
+    source_characters: usize,
+    source_lines: usize,
+    fragment_count: usize,
+    fragments: Vec<ShardedNormativeFragment>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShardedNormativeFragment {
+    order: usize,
+    path: String,
+    source_start_char: usize,
+    source_end_char: usize,
+    source_sha256: String,
+    rendered_sha256: String,
+    source_bytes: usize,
+    rendered_bytes: usize,
+    #[serde(default)]
+    navigation_rewrites: Vec<ShardedNavigationRewrite>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShardedNavigationRewrite {
+    rendered_start: usize,
+    rendered_end: usize,
+    original: String,
+    replacement: String,
+}
+
+/// Reconstructs both accepted normative documents through the canonical shard
+/// manifests and verifies their exact source identities against the accepted
+/// pair receipt. The result is suitable as input to a separate source-admission
+/// owner; it is not an admission decision.
+pub fn capture_normative_pair_sources(
+    repository_root: &Path,
+) -> Result<NormativePairSourceCapture, CaptureError> {
+    let canonical_root = canonical_repository_root(repository_root)?;
+    let receipt_path = canonical_root.join("docs/normative-pair.toml");
+    let receipt_bytes = read_bounded_normative_receipt(&canonical_root, &receipt_path)?;
+    let receipt = parse_normative_pair_receipt_identity(&receipt_bytes).map_err(|error| {
+        CaptureError::NormativePairReceipt {
+            path: receipt_path.clone(),
+            detail: error.to_string(),
+        }
+    })?;
+    let architecture = capture_normative_source_document(
+        &canonical_root,
+        NormativePairSourceRole::Architecture,
+        &receipt.architecture_path,
+        &receipt.architecture_entry_path,
+        &receipt.architecture_compatibility_path,
+        &receipt.pair.architecture_sha256,
+        "architecture",
+    )?;
+    let implementation = capture_normative_source_document(
+        &canonical_root,
+        NormativePairSourceRole::Implementation,
+        &receipt.implementation_path,
+        &receipt.implementation_entry_path,
+        &receipt.implementation_compatibility_path,
+        &receipt.pair.implementation_sha256,
+        "implementation",
+    )?;
+    Ok(NormativePairSourceCapture {
+        receipt,
+        architecture,
+        implementation,
+    })
+}
+
+fn canonical_repository_root(repository_root: &Path) -> Result<PathBuf, CaptureError> {
+    if !repository_root.is_absolute() {
+        return Err(CaptureError::RepositoryRootNotAbsolute(
+            repository_root.to_owned(),
+        ));
+    }
+    if !repository_root.is_dir() {
+        return Err(CaptureError::RepositoryRootMissing(
+            repository_root.to_owned(),
+        ));
+    }
+    fs::canonicalize(repository_root).map_err(CaptureError::Io)
+}
+
+fn read_bounded_normative_receipt(
+    canonical_root: &Path,
+    receipt_path: &Path,
+) -> Result<Vec<u8>, CaptureError> {
+    let canonical_path =
+        fs::canonicalize(receipt_path).map_err(|error| CaptureError::NormativePairReceipt {
+            path: receipt_path.to_owned(),
+            detail: error.to_string(),
+        })?;
+    if !canonical_path.starts_with(canonical_root) {
+        return Err(CaptureError::NormativePairReceipt {
+            path: canonical_path,
+            detail: "receipt resolves outside the canonical repository root".to_owned(),
+        });
+    }
+    let mut bytes = Vec::with_capacity(normative::MAX_NORMATIVE_PAIR_RECEIPT_BYTES + 1);
+    File::open(&canonical_path)
+        .map_err(|error| CaptureError::NormativePairReceipt {
+            path: canonical_path.clone(),
+            detail: error.to_string(),
+        })?
+        .take((normative::MAX_NORMATIVE_PAIR_RECEIPT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| CaptureError::NormativePairReceipt {
+            path: canonical_path.clone(),
+            detail: error.to_string(),
+        })?;
+    Ok(bytes)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn capture_normative_source_document(
+    canonical_root: &Path,
+    role: NormativePairSourceRole,
+    manifest_ref: &str,
+    entry_ref: &str,
+    compatibility_ref: &str,
+    expected_source_sha256: &str,
+    expected_source_key: &str,
+) -> Result<NormativePairSourceDocument, CaptureError> {
+    let manifest_path = safe_repository_file(canonical_root, manifest_ref)?;
+    let manifest_bytes =
+        fs::read(&manifest_path).map_err(|error| CaptureError::NormativePairReceipt {
+            path: manifest_path.clone(),
+            detail: error.to_string(),
+        })?;
+    let manifest: ShardedNormativeManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|error| {
+            CaptureError::NormativePairReceipt {
+                path: manifest_path.clone(),
+                detail: format!("shard manifest JSON is invalid: {error}"),
+            }
+        })?;
+    if manifest.schema_version != "eliot-doc-shards-v1"
+        || manifest.source_key != expected_source_key
+        || manifest.entry_path != entry_ref
+        || manifest.source_sha256 != expected_source_sha256
+        || manifest.fragment_count != manifest.fragments.len()
+        || manifest.fragments.is_empty()
+    {
+        return Err(normative_capture_error(
+            &manifest_path,
+            "manifest identity does not match the accepted pair receipt",
+        ));
+    }
+    // The entry and compatibility refs are identity handles in the receipt;
+    // require their exact files to exist as regular files under this root.
+    safe_repository_file(canonical_root, entry_ref)?;
+    safe_repository_file(canonical_root, compatibility_ref)?;
+
+    // `source_bytes` is supplied by the mutable manifest. Do not let it
+    // choose an allocation before the reconstructed bytes have been checked.
+    let mut reconstructed = String::new();
+    let mut expected_order = 0usize;
+    let mut expected_start = 0usize;
+    let mut seen_paths = std::collections::BTreeSet::new();
+    for fragment in &manifest.fragments {
+        if fragment.order != expected_order
+            || fragment.source_start_char != expected_start
+            || fragment.source_end_char <= fragment.source_start_char
+            || !seen_paths.insert(fragment.path.as_str())
+        {
+            return Err(normative_capture_error(
+                &manifest_path,
+                "fragment order, range, or uniqueness is invalid",
+            ));
+        }
+        let fragment_path = safe_repository_file(canonical_root, &fragment.path)?;
+        // The shard contract owns a 48,000-byte rendered-source bound. Read
+        // only one byte past it so an oversized mutable shard cannot force an
+        // unbounded allocation before the length and digest checks below.
+        let mut rendered_bytes = Vec::new();
+        File::open(&fragment_path)
+            .map_err(|error| CaptureError::NormativePairReceipt {
+                path: fragment_path.clone(),
+                detail: error.to_string(),
+            })?
+            .take((DOCS_SHARD_RENDERED_BYTE_LIMIT + 1) as u64)
+            .read_to_end(&mut rendered_bytes)
+            .map_err(|error| CaptureError::NormativePairReceipt {
+                path: fragment_path.clone(),
+                detail: error.to_string(),
+            })?;
+        if rendered_bytes.len() > DOCS_SHARD_RENDERED_BYTE_LIMIT {
+            return Err(normative_capture_error(
+                &fragment_path,
+                "rendered shard exceeds the docs-shards rendered-byte bound",
+            ));
+        }
+        let rendered = String::from_utf8(rendered_bytes).map_err(|error| {
+            CaptureError::NormativePairReceipt {
+                path: fragment_path.clone(),
+                detail: error.to_string(),
+            }
+        })?;
+        if rendered.len() != fragment.rendered_bytes
+            || sha256_hex(rendered.as_bytes()) != fragment.rendered_sha256
+        {
+            return Err(normative_capture_error(
+                &fragment_path,
+                "rendered shard size or digest differs from its manifest",
+            ));
+        }
+        let source = reverse_shard_navigation_rewrites(&rendered, &fragment.navigation_rewrites)
+            .map_err(|detail| normative_capture_error(&fragment_path, &detail))?;
+        let source_characters = source.chars().count();
+        if source.len() != fragment.source_bytes
+            || sha256_hex(source.as_bytes()) != fragment.source_sha256
+            || fragment.source_start_char.saturating_add(source_characters)
+                != fragment.source_end_char
+        {
+            return Err(normative_capture_error(
+                &fragment_path,
+                "reconstructed shard source differs from its manifest",
+            ));
+        }
+        expected_start = fragment.source_end_char;
+        expected_order = expected_order.saturating_add(1);
+        reconstructed.push_str(&source);
+    }
+    if reconstructed.len() != manifest.source_bytes
+        || reconstructed.chars().count() != manifest.source_characters
+        || count_source_lines(&reconstructed) != manifest.source_lines
+        || expected_start != manifest.source_characters
+        || sha256_hex(reconstructed.as_bytes()) != expected_source_sha256
+    {
+        return Err(normative_capture_error(
+            &manifest_path,
+            "reconstructed normative source differs from the accepted receipt",
+        ));
+    }
+    Ok(NormativePairSourceDocument {
+        role,
+        source_ref: manifest_ref.to_owned(),
+        entry_ref: entry_ref.to_owned(),
+        compatibility_ref: compatibility_ref.to_owned(),
+        content_sha256: expected_source_sha256.to_owned(),
+    })
+}
+
+fn safe_repository_file(root: &Path, relative: &str) -> Result<PathBuf, CaptureError> {
+    let path = Path::new(relative);
+    if !root_relative_regular_file(root, path)? {
+        return Err(normative_capture_error(
+            &root.join(path),
+            "normative source reference is absent, non-regular, or traverses a symlink",
+        ));
+    }
+    let canonical = fs::canonicalize(root.join(path)).map_err(CaptureError::Io)?;
+    if !canonical.starts_with(root) {
+        return Err(normative_capture_error(
+            &canonical,
+            "normative source reference resolves outside the canonical repository root",
+        ));
+    }
+    Ok(canonical)
+}
+
+fn reverse_shard_navigation_rewrites(
+    rendered: &str,
+    rewrites: &[ShardedNavigationRewrite],
+) -> Result<String, String> {
+    let mut value = rendered.chars().collect::<Vec<_>>();
+    let mut ordered = rewrites.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|rewrite| std::cmp::Reverse(rewrite.rendered_start));
+    for rewrite in ordered {
+        if rewrite.rendered_start > rewrite.rendered_end || rewrite.rendered_end > value.len() {
+            return Err("navigation rewrite range is outside the rendered shard".to_owned());
+        }
+        let replacement = rewrite.replacement.chars().collect::<Vec<_>>();
+        if value[rewrite.rendered_start..rewrite.rendered_end] != replacement {
+            return Err("navigation rewrite replacement no longer matches the shard".to_owned());
+        }
+        value.splice(
+            rewrite.rendered_start..rewrite.rendered_end,
+            rewrite.original.chars(),
+        );
+    }
+    Ok(value.into_iter().collect())
+}
+
+fn count_source_lines(source: &str) -> usize {
+    source
+        .chars()
+        .filter(|character| *character == '\n')
+        .count()
+        + usize::from(!source.ends_with('\n'))
+}
+
+fn normative_capture_error(path: &Path, detail: &str) -> CaptureError {
+    CaptureError::NormativePairReceipt {
+        path: path.to_owned(),
+        detail: detail.to_owned(),
+    }
 }
 
 /// I17.3 product-identity digests observable from one capture root.

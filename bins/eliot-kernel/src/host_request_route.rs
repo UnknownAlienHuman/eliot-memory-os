@@ -67,9 +67,9 @@ use eliot_kernel_service::{
 use eliot_observability_runtime::{ModuleIdentity, WorkClass};
 use eliot_ors::{
     CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestAttempt, HostRequestEffectEvidence,
-    HostRequestKind as OrsHostRequestKind, HostRequestRecord, HostRequestRetainedLineage,
-    HostRequestRetainedResultClass, HostRequestRetainedSourceRevision, HostRequestState,
-    OpaqueLabel, OperationIdentity, OrsError, RedbRecoveryStore,
+    HostRequestKernelRequestIdentity, HostRequestKind as OrsHostRequestKind, HostRequestRecord,
+    HostRequestRetainedLineage, HostRequestRetainedResultClass, HostRequestRetainedSourceRevision,
+    HostRequestState, OpaqueLabel, OperationIdentity, OrsError, RedbRecoveryStore,
 };
 use eliot_protocol::{
     AGENT_BRIDGE_PROCESS_BINDING_WIRE_ID, AGENT_HOST_REQUEST_FAILURE_WIRE_ID,
@@ -78,7 +78,7 @@ use eliot_protocol::{
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HOST_REQUEST_PAYLOAD_SCHEMA_ID,
     HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestAdmissionReceipt, HostRequestEnvelope,
     HostRequestInvokeReadPayload, HostRequestKind, HostRequestResultBody, LocalReadAttempt,
-    WatchdogIntentKind, WatchdogSpoolEntryKind, WatchdogSpoolEntryOutcome,
+    RequestIdentity, WatchdogIntentKind, WatchdogSpoolEntryKind, WatchdogSpoolEntryOutcome,
     WatchdogSpoolExportBatchPayload, WatchdogSpoolExportOutcomeSubmission,
     WatchdogSpoolExportResultPayload, WatchdogSpoolExportSubmission,
     WatchdogSpoolIntentBatchPayload, WatchdogSpoolIntentSubmission, host_request_operation_id,
@@ -1670,8 +1670,10 @@ impl KernelComposition {
     /// production from here via [`Self::invoke_admitted_binder_leg`].
     pub fn invoke_read_host_request(
         &self,
+        session: &Session,
         envelope: &HostRequestEnvelope,
         tool: &serde_json::Value,
+        request_identity: &RequestIdentity,
     ) -> Result<(HostRequestAdmissionReceipt, HostRequestRecord), TransportError> {
         if envelope.kind != HostRequestKind::Invocation {
             return Err(TransportError::SessionFenced);
@@ -1685,19 +1687,35 @@ impl KernelComposition {
         .validate()
         .map_err(|_| TransportError::SessionFenced)?;
         let _transition = self.agent_bridge_transition_read()?;
-        // Issue #77 W2: Kernel-owned bind/dispatch leg runs BEFORE the
-        // route's own admit staging. The binder's `admit_and_stage` advances
-        // `Requested -> Admitted` itself, and only the call that stages first
-        // reaches `Fresh` and therefore `build_application` — the single
-        // product construction of the Kernel-owned `RequestIdentity`
-        // (authority epoch, admitted operation identity, absolute deadline)
-        // and `EffectCeiling::CandidateOnly`. A route-first staging would
-        // reduce every fresh envelope to a replay inside `invoke_admitted`,
-        // so the Kernel-owned identity would never be minted. The leg is
-        // fail-closed: any non-dispatched disposition falls through to the
-        // existing admit-and-queue path below unchanged.
-        let binder_dispatched = self.invoke_admitted_binder_leg(envelope, tool);
-        let (receipt, mut record) = self.admit_host_request_envelope_under_transition(envelope)?;
+        let task_relative_tool = check_task_controller_admission(envelope, tool)
+            .ok()
+            .and_then(|()| {
+                serde_json::from_value::<eliot_protocol::TaskControllerInvocation>(
+                    tool.get("arguments")?.clone(),
+                )
+                .ok()
+            })
+            .map(|invocation| invocation.action != eliot_protocol::TaskControllerAction::BindScope);
+        let binder_dispatched = task_relative_tool != Some(false)
+            && self.invoke_admitted_binder_leg(envelope, tool);
+        let (receipt, mut record) = self
+            .admit_host_request_envelope_with_tool_binding_under_transition(
+                envelope,
+                task_relative_tool,
+            )?;
+        let identity = host_request_kernel_identity_binding(session, envelope, request_identity)?;
+        self.generation_gateway
+            .ors
+            .bind_host_request_kernel_identity(
+                &record.operation_id,
+                &record.request_digest,
+                &identity,
+            )
+            .map_err(|error| match error {
+                OrsError::HostRequestIdentityConflict { .. } => TransportError::IdentityConflict,
+                _ => TransportError::SessionFenced,
+            })?
+            .ok_or(TransportError::SessionFenced)?;
         // A dispatched leg stored its bounded answer through the single ORS
         // durability owner, so reload the owner-stored record: an answered
         // operation is never queued twice.
@@ -1711,6 +1729,7 @@ impl KernelComposition {
                 .map_err(|_| TransportError::SessionFenced)?
                 .ok_or(TransportError::SessionFenced)?;
         }
+
         // Queue each admitted shape in its Kernel-owned lane. Query and Skill
         // lifecycle pairs use the authenticated local-read poller; a packet is
         // never handed to that queue or selector derivation.
@@ -3218,12 +3237,18 @@ impl KernelComposition {
     /// (daemon-leg memory only — the durable ORS record is untouched). A full
     /// queue of claimed/in-flight attempts returns backpressure rather than
     /// silently stealing a live attempt.
+    ///
+    /// Returns the carrier form actually retained, as
+    /// [`Self::enqueue_local_read_pair_under_transition`] does: the enqueue
+    /// resolves the form ONCE from the two closed admission owners, so a
+    /// caller that routes or audits from this answer is reading the same
+    /// disposition the carrier was tagged with (issue #2564).
     #[cfg(test)]
     pub(crate) fn enqueue_local_read_pair(
         &self,
         envelope: &HostRequestEnvelope,
         tool: &serde_json::Value,
-    ) -> Result<(), TransportError> {
+    ) -> Result<LocalReadPairKind, TransportError> {
         let _transition = self.agent_bridge_transition_read()?;
         self.enqueue_local_read_pair_under_transition(envelope, tool)
     }
@@ -3648,7 +3673,7 @@ impl KernelComposition {
         &self,
         envelope: &HostRequestEnvelope,
         pending: &super::AgentActivationPendingState,
-        task_relative_tool: bool,
+        task_relative_tool: Option<bool>,
     ) -> Result<bool, TransportError> {
         let retained = {
             let connections = self
@@ -3660,8 +3685,9 @@ impl KernelComposition {
                 .and_then(|state| state.activated_binding.clone())
         };
         let task_relative = envelope.kind == HostRequestKind::Invocation
-            && (task_relative_tool
-                || host_request_capability_is_task_relative(envelope.identity.capability.as_str()));
+            && task_relative_tool.unwrap_or_else(|| {
+                host_request_capability_is_task_relative(envelope.identity.capability.as_str())
+            });
         let session_id = if let Some(retained) = retained.as_ref() {
             if !self.activation_result_still_retained(pending, retained, &envelope.connection_id) {
                 return Ok(false);
@@ -3833,7 +3859,7 @@ impl KernelComposition {
                 if activation_deadline_expired(now, envelope.identity.deadline_unix_ms) {
                     continue;
                 }
-                if !self.application_binding_live_for_claim(envelope, &admission_owner, false)? {
+                if !self.application_binding_live_for_claim(envelope, &admission_owner, None)? {
                     continue;
                 }
                 // Revalidate the exact retained envelope/tool pair before a
@@ -4044,7 +4070,7 @@ impl KernelComposition {
         let Some(envelope) = candidate.local_read_envelope.as_ref() else {
             return Ok(None);
         };
-        if !self.application_binding_live_for_claim(envelope, pending, false)? {
+        if !self.application_binding_live_for_claim(envelope, pending, None)? {
             return Ok(None);
         }
         let attempt = candidate.local_read_attempt.clone();
@@ -5663,7 +5689,7 @@ impl KernelComposition {
                 if !self.application_binding_live_for_claim(
                     envelope,
                     &admission_owner,
-                    task_relative_tool,
+                    Some(task_relative_tool),
                 )? {
                     position += 1;
                     continue;
@@ -6609,6 +6635,7 @@ pub(crate) fn requested_host_request_record(
         contract_version: ORS_CONTRACT_VERSION,
         send_claim_protocol_version: 0,
         transport_channel_binding_sha256: None,
+        kernel_request_identity: None,
         operation_id: OperationIdentity::new(host_request_operation_id(envelope))
             .map_err(|_| TransportError::SessionFenced)?,
         kind: match envelope.kind {
@@ -6647,6 +6674,135 @@ pub(crate) fn requested_host_request_record(
         result_lineage: None,
         commit_order: 0,
     })
+}
+
+fn host_request_kernel_identity_binding(
+    session: &Session,
+    envelope: &HostRequestEnvelope,
+    identity: &RequestIdentity,
+) -> Result<HostRequestKernelRequestIdentity, TransportError> {
+    identity
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    if identity.request.metadata.request_id.as_str() != envelope.identity.request_id
+        || identity
+            .request
+            .metadata
+            .session_id
+            .as_ref()
+            .map(|id| id.as_str())
+            != envelope.identity.session_id.as_deref()
+        || identity
+            .request
+            .metadata
+            .task_id
+            .as_ref()
+            .map(|id| id.as_str())
+            != envelope.identity.task_id.as_deref()
+        || identity.request.state_fence != envelope.state_fence
+        || identity.request.metadata.state_fence != envelope.state_fence
+        || identity.idempotency_key != envelope.identity.idempotency_key
+        || identity.cancellation_id != envelope.identity.cancellation_id
+        || identity.deadline_unix_ms != envelope.identity.deadline_unix_ms
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    if session.connection_id != envelope.connection_id
+        || session.session_epoch == 0
+        || session.launch_nonce.trim().is_empty()
+        || !session
+            .module_generation
+            .state_fence
+            .is_compatible_with(&envelope.state_fence)
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    let authenticated_peer = match &session.peer {
+        PeerIdentity::Authenticated {
+            process_id,
+            user_identity,
+            session_identity,
+            ..
+        } if *process_id != 0
+            && !user_identity.trim().is_empty()
+            && !session_identity.trim().is_empty() =>
+        {
+            eliot_ors::HostRequestKernelAuthenticatedPeer {
+                connection_id: session.connection_id.clone(),
+                process_id: *process_id,
+                user_identity: user_identity.clone(),
+                session_identity: session_identity.clone(),
+                transport_session_epoch: session.session_epoch,
+                launch_nonce_sha256: eliot_contracts::sha256_hex(session.launch_nonce.as_bytes()),
+            }
+        }
+        _ => return Err(TransportError::PeerIdentityUnavailable),
+    };
+    authenticated_peer
+        .validate()
+        .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+    let value = serde_json::to_value(identity).map_err(|_| TransportError::SessionFenced)?;
+    let bytes =
+        eliot_contracts::canonical_json_bytes(&value).map_err(|_| TransportError::SessionFenced)?;
+    let canonical_json = String::from_utf8(bytes).map_err(|_| TransportError::SessionFenced)?;
+    let sha256 = eliot_contracts::sha256_hex(canonical_json.as_bytes());
+    let authenticated_peer_sha256 = eliot_contracts::sha256_hex(
+        &eliot_contracts::canonical_json_bytes(&authenticated_peer)
+            .map_err(|_| TransportError::SessionFenced)?,
+    );
+    Ok(HostRequestKernelRequestIdentity {
+        canonical_json,
+        sha256,
+        authenticated_peer: Some(authenticated_peer),
+        authenticated_peer_sha256: Some(authenticated_peer_sha256),
+    })
+}
+
+fn host_request_kernel_identity_matches(
+    envelope: &HostRequestEnvelope,
+    identity: &RequestIdentity,
+    retained: &HostRequestKernelRequestIdentity,
+) -> Result<bool, TransportError> {
+    identity
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    retained
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    let peer = retained
+        .authenticated_peer
+        .as_ref()
+        .ok_or(TransportError::PeerIdentityUnavailable)?;
+    if peer.connection_id != envelope.connection_id
+        || identity.request.metadata.request_id.as_str() != envelope.identity.request_id
+        || identity
+            .request
+            .metadata
+            .session_id
+            .as_ref()
+            .map(|id| id.as_str())
+            != envelope.identity.session_id.as_deref()
+        || identity
+            .request
+            .metadata
+            .task_id
+            .as_ref()
+            .map(|id| id.as_str())
+            != envelope.identity.task_id.as_deref()
+        || identity.request.state_fence != envelope.state_fence
+        || identity.request.metadata.state_fence != envelope.state_fence
+        || identity.idempotency_key != envelope.identity.idempotency_key
+        || identity.cancellation_id != envelope.identity.cancellation_id
+        || identity.deadline_unix_ms != envelope.identity.deadline_unix_ms
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    let value = serde_json::to_value(identity).map_err(|_| TransportError::SessionFenced)?;
+    let bytes =
+        eliot_contracts::canonical_json_bytes(&value).map_err(|_| TransportError::SessionFenced)?;
+    let canonical_json = String::from_utf8(bytes).map_err(|_| TransportError::SessionFenced)?;
+    Ok(canonical_json == retained.canonical_json
+        && eliot_contracts::sha256_hex(canonical_json.as_bytes()) == retained.sha256)
 }
 
 /// Derives the exact ORS key of the parent operation targeted by a
@@ -6841,6 +6997,7 @@ impl KernelComposition {
             operation,
             &envelope,
             &payload,
+            identity,
             frame.protocol_version,
         )
     }
@@ -6852,6 +7009,7 @@ impl KernelComposition {
         operation: &str,
         envelope: &HostRequestEnvelope,
         payload: &serde_json::Value,
+        request_identity: &RequestIdentity,
         protocol_version: eliot_protocol::ProtocolVersion,
     ) -> Result<KernelFrameAction, TransportError> {
         let outcome = (|| -> Result<serde_json::Value, TransportError> {
@@ -6890,7 +7048,8 @@ impl KernelComposition {
                 }
                 AGENT_HOST_REQUEST_INVOKE_READ_OPERATION => {
                     let tool = host_request_tool_from_payload(payload)?;
-                    let (receipt, record) = self.invoke_read_host_request(envelope, &tool)?;
+                    let (receipt, record) =
+                        self.invoke_read_host_request(session, envelope, &tool, request_identity)?;
                     // The durable record carries the result pair when the
                     // operation already received its bounded answer, so the
                     // admitted shape is the result-bearing response: no second
@@ -8825,6 +8984,7 @@ fn watchdog_export_projection_record(
         contract_version: ORS_CONTRACT_VERSION,
         send_claim_protocol_version: 0,
         transport_channel_binding_sha256: None,
+        kernel_request_identity: None,
         operation_id: operation_id.clone(),
         kind: OrsHostRequestKind::Reconciliation,
         // The request identity is the derived export reconciliation key: one
@@ -9071,6 +9231,7 @@ fn watchdog_intent_projection_record(
         contract_version: ORS_CONTRACT_VERSION,
         send_claim_protocol_version: 0,
         transport_channel_binding_sha256: None,
+        kernel_request_identity: None,
         operation_id: operation_id.clone(),
         kind: OrsHostRequestKind::Reconciliation,
         // The request identity is the derived reconciliation key: one spool
@@ -10945,6 +11106,12 @@ mod invoke_read_tool_tests {
             local_read_tool: None,
             local_read_held_bytes: 0,
             local_read_attempt: LocalReadAttemptState::default(),
+            // An unoccupied placeholder owns no bounded read at all, so it
+            // carries no carrier form. `None` on an unoccupied slot is never
+            // served: the claim gate reads the tag only behind a present
+            // `local_read_envelope`, and a tagged-but-empty row is not a shape
+            // the enqueue gate can produce.
+            local_read_pair_kind: None,
             observe_envelope: None,
             observe_tool: None,
             observe_reservation: None,
@@ -10979,7 +11146,16 @@ mod invoke_read_tool_tests {
             &envelope,
             &tool,
             bytes,
+            // The fixture stages an `eliot.query` tool, so the carrier form is
+            // `Query` by the same admission-derived rule the enqueue gate
+            // uses (`of_admission` maps the query/Skill form to `Query`).
+            LocalReadPairKind::Query,
             LocalReadAttemptState::default(),
+        );
+        assert_eq!(
+            row.local_read_pair_kind,
+            Some(LocalReadPairKind::Query),
+            "a staged bounded read carries the form it was admitted as"
         );
         row
     }
@@ -11147,7 +11323,16 @@ mod invoke_read_tool_tests {
             &envelope,
             &tool,
             13,
+            // Same `eliot.query` form as the fixture that charged this row: the
+            // replacement must re-tag the carrier form, not leave the row
+            // claiming a bounded read under no form at all.
+            LocalReadPairKind::Query,
             LocalReadAttemptState::default(),
+        );
+        assert_eq!(
+            row.local_read_pair_kind,
+            Some(LocalReadPairKind::Query),
+            "a replaced bounded read re-stages under its admitted form"
         );
         assert_eq!(
             kernel.hot_spine.held_local_read_capacity().expect("ledger"),

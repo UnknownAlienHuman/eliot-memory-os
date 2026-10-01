@@ -43,12 +43,14 @@ use thiserror::Error;
 mod architecture_self_model;
 mod backup_io;
 mod blackboard;
+pub mod blob_process_source_admission;
 pub mod canonical_event;
 mod dreamer_job;
 pub mod epistemic_revision;
 pub mod erasure_admission;
 pub mod experience_store;
 pub mod learning_store;
+mod mailbox;
 mod named_mutation_receipt;
 mod notification_state;
 mod payload_authority;
@@ -91,6 +93,11 @@ pub use blackboard::{
     BLACKBOARD_ITEM_MUTATION_NAME, BLACKBOARD_ITEM_READ_NAME, BLACKBOARD_ITEM_SCHEMA_V1,
     BlackboardItemRecord, BlackboardItemRevision, blackboard_item_read_request,
     blackboard_item_request, decode_blackboard_item,
+};
+
+pub use mailbox::{
+    MAILBOX_ITEM_MUTATION_NAME, MAILBOX_ITEM_SCHEMA_V1, MAX_MAILBOX_BODY_BYTES,
+    MailboxItemAdmission, MailboxItemRecord, decode_mailbox_item, mailbox_item_request,
 };
 
 pub use canonical_event::{
@@ -3831,6 +3838,11 @@ pub enum NamedReadOperation {
     /// persisted nothing at that exact revision; it never answers with an empty
     /// set, and no consumer may synthesize the set locally.
     GetTaskContractAcceptanceSet,
+    /// Exact fenced lookup of one process-stream admission / Ready commitment.
+    GetBlobProcessSourceAdmission,
+    /// Exact fenced lookup of the fixed `owner/policy` recovery record,
+    /// preserving physical row absence as distinct from an unavailable read.
+    GetPolicyOwnerSnapshot,
 }
 
 /// Schema identifier of the neutral `TaskContract` acceptance-set payload.
@@ -4051,6 +4063,17 @@ pub enum NamedMutationOperation {
     /// opaque bytes and only arbitrates the fixed `owner/module_registry`
     /// revision. Admission currentness remains a Governor readback decision.
     RecordModuleCatalogSnapshot,
+    /// Persists the Governor-owned WorkScope binding and original admitted
+    /// source closure through a fenced owner revision CAS. Store treats the
+    /// complete snapshot as opaque bytes; Governor validates its source and
+    /// guard semantics before issuing the transition and after named readback.
+    RecordWorkScopeSnapshot,
+    /// Persists the Governor-owned Policy snapshot and complete signed
+    /// initial-config envelope through a fenced owner revision CAS.
+    RecordPolicySnapshot,
+    /// Persists a process-stream admission and attaches its whole-object Ready
+    /// commitment through separate revisions of one keyed owner row.
+    RecordBlobProcessSourceAdmission,
     AppendAuditEvent,
     /// Durable authority-revocation record (issue #686). Known-but-
     /// unsupported until a store-owned slice activates its catalogue row
@@ -4126,6 +4149,11 @@ pub enum NamedMutationOperation {
     /// ceiling; it does not perform decisions, truth promotion, acceptance,
     /// or write-authority changes.
     ApplyBlackboardItem,
+    /// Canonical typed mailbox admission persistence (issue #1820).
+    /// Persists a Kernel-admitted mailbox message with its stream-head
+    /// compare-and-set under the candidate-only ceiling; it does not perform
+    /// delivery, acknowledgement, routing, or expiry.
+    AdmitMailboxMessage,
     /// Canonical learning-record commit (issue #1868, I12.24).
     ///
     /// Durable learning-record persistence only: the prepared transition
@@ -4190,6 +4218,7 @@ impl NamedMutationOperation {
             | Self::CommitExperienceBank
             | Self::CommitAgentFeedback
             | Self::ApplyBlackboardItem
+            | Self::AdmitMailboxMessage
             | Self::RecordCapabilityEvidenceRecord => TransitionClass::CaptureCandidate,
             Self::ApplyEpistemicRevision => TransitionClass::Epistemic,
             Self::UpdateTaskState
@@ -4200,6 +4229,9 @@ impl NamedMutationOperation {
             | Self::RecordFinishDecision
             | Self::RecordFinishEvidence
             | Self::RecordModuleCatalogSnapshot
+            | Self::RecordWorkScopeSnapshot
+            | Self::RecordPolicySnapshot
+            | Self::RecordBlobProcessSourceAdmission
             | Self::RecordAuthorityRevocation
             | Self::ApplyProblemOwnerState => TransitionClass::RecoverySchema,
             Self::ApplyErasure => TransitionClass::Erasure,
@@ -4271,6 +4303,43 @@ pub struct NamedReadResponse {
     pub state_fence: StateFence,
     pub revision_heads: Vec<RevisionHead>,
     pub payload: Value,
+}
+
+/// Closed result of the fixed `owner/policy` recovery-owner lookup.
+///
+/// `Absent` is returned only after a successful Store query under the
+/// enclosing `NamedReadResponse::state_fence`; query/provider errors are
+/// errors and never become this value. The key is included so a consumer can
+/// validate that the owner did not answer for a different recovery record.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PolicyOwnerSnapshotReadResult {
+    /// Store confirmed that no physical `owner/policy` recovery row exists.
+    Absent { record_key: RecoveryRecordKey },
+    /// Store returned the one exact, current `owner/policy` recovery row.
+    Bound { record: RecoveryRecord },
+}
+
+impl PolicyOwnerSnapshotReadResult {
+    /// Validates the closed key/schema/fence and content-addressed owner row.
+    pub fn validate(&self, expected_fence: &StateFence) -> Result<(), StoreError> {
+        expected_fence.validate().map_err(StoreError::Foundation)?;
+        let expected_key = RecoveryRecordKey::new("owner", "policy")?;
+        match self {
+            Self::Absent { record_key } if record_key == &expected_key => Ok(()),
+            Self::Absent { .. } => Err(StoreError::IdentityConflict),
+            Self::Bound { record } => {
+                record.validate()?;
+                if record.record_key() != expected_key
+                    || record.schema != OWNER_SNAPSHOT_SCHEMA
+                    || record.state_fence != *expected_fence
+                {
+                    return Err(StoreError::IdentityConflict);
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 impl NamedReadResponse {
@@ -4474,6 +4543,20 @@ pub struct SecurityContext {
     pub transformation_lineage: Vec<TransformationLineage>,
     pub influence_closure: Option<InfluenceDependencyClosure>,
     pub purge_entry: Option<PurgeLedgerEntry>,
+    /// Original operation authority retained by the owner and carried
+    /// unchanged into the Store receipt (issue #1927).
+    ///
+    /// The paired field is optional only for legacy, unbound transitions.
+    /// Missing fields stay omitted when re-serialized so original staged
+    /// plans keep their exact canonical bytes and remain visible to recovery
+    /// without being translated under this contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_binding: Option<AuthorityBinding>,
+    /// Original causal parent and sequence carried unchanged from the owner
+    /// decision into the Store receipt (issue #1927). This must be present
+    /// exactly when `authority_binding` is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causal_binding: Option<CausalBinding>,
     pub selection_integrity: Option<SelectionIntegrityReceipt>,
     /// Rebuildable head of the selection chain this transition appends to
     /// (issue #1728 step 4).
@@ -4498,8 +4581,52 @@ pub struct SecurityContext {
 }
 
 impl SecurityContext {
-    /// Validates the direct C0-12 provider closure and fence alignment.
+    /// Validates the direct C0-12 provider closure, optional owner-bound
+    /// authority/causal pair, and fence alignment.
     pub fn validate(&self, state_fence: &StateFence) -> Result<(), StoreError> {
+        match (&self.authority_binding, &self.causal_binding) {
+            (Some(authority), Some(causal)) => {
+                ensure_same_fence(state_fence, &authority.state_fence)?;
+                ensure_same_fence(state_fence, &causal.state_fence)?;
+                validate_text(&authority.authority_owner, "authority.authority_owner")?;
+                if !state_fence
+                    .authority_epoch
+                    .is_same_authority(&authority.authority_epoch)
+                {
+                    return Err(StoreError::FenceMismatch);
+                }
+                unique(
+                    causal.predecessor_receipt_ids.iter().cloned(),
+                    "security.causal_binding.predecessor_receipt_ids",
+                )?;
+                if let Some(parent) = &causal.parent_receipt_id
+                    && !causal
+                        .predecessor_receipt_ids
+                        .iter()
+                        .any(|predecessor| predecessor == parent)
+                {
+                    return Err(StoreError::InvalidField {
+                        field: "security.causal_binding.parent_receipt_id",
+                        reason: "causal parent must also be a predecessor",
+                    });
+                }
+                if causal.transaction_sequence.value() > 1
+                    && causal.parent_receipt_id.is_none()
+                {
+                    return Err(StoreError::InvalidField {
+                        field: "security.causal_binding.parent_receipt_id",
+                        reason: "non-genesis causal binding requires a parent",
+                    });
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(StoreError::InvalidField {
+                    field: "security.authority_causal_binding",
+                    reason: "authority and causal bindings must be present together",
+                });
+            }
+        }
         for source in &self.source_assurance {
             source.validate().map_err(StoreError::Security)?;
             ensure_same_fence(state_fence, &source.state_fence)?;
@@ -5022,6 +5149,19 @@ impl PreparedTransition {
             operation.operation == NamedMutationOperation::ApplySwarmOwnerRevisions
         }) {
             validate_swarm_owner_revision_transition(self)?;
+        }
+        if let Some(authority) = &self.security.authority_binding {
+            if !effect_is_at_most(self.requested_effect_ceiling, authority.allowed_effect) {
+                return Err(StoreError::TransitionClassExceeded);
+            }
+            if !proof_ceiling_for(self.requested_effect_ceiling)
+                .is_at_most(authority.proof_ceiling)
+            {
+                return Err(StoreError::InvalidField {
+                    field: "security.authority_binding.proof_ceiling",
+                    reason: "authority proof ceiling is below the requested effect",
+                });
+            }
         }
         // Issue #18: the bound decision/plan digests are recomputed from the
         // carried content and compared; any divergence (including a
@@ -5827,6 +5967,37 @@ pub fn issue_store_receipt_envelope(
     let operation_id = transition.identity.operation_id.clone();
     let operation_kind = operation_kind(transition.transition_class);
     let proof_ceiling = proof_ceiling_for(transition.requested_effect_ceiling);
+    let causal = transition
+        .security
+        .causal_binding
+        .clone()
+        .unwrap_or_else(|| CausalBinding {
+            state_fence: state_fence.clone(),
+            // Legacy, unbound plans have no recorded owner predecessor.
+            // New authorized plans carry the original causal binding above
+            // and never pass through this compatibility projection.
+            transaction_sequence: TransactionSequence::genesis(),
+            parent_receipt_id: None,
+            predecessor_receipt_ids: Vec::new(),
+        });
+    let authority = match &transition.security.authority_binding {
+        Some(authority) => authority.clone(),
+        None => AuthorityBinding {
+            // Legacy, unbound plans have no recorded operation authority.
+            // New authorized plans carry the original binding above and never
+            // derive authority from the manifest or request source.
+            authority_id: ContractId::new(format!(
+                "eliot-store-manifest:{}",
+                transition.operation_manifest_digest
+            ))
+            .map_err(StoreError::Foundation)?,
+            authority_owner: context.source_id.to_string(),
+            authority_epoch: state_fence.authority_epoch.clone(),
+            state_fence: state_fence.clone(),
+            allowed_effect: transition.requested_effect_ceiling,
+            proof_ceiling,
+        },
+    };
 
     ReceiptEnvelope::issue(ReceiptCore {
         contract: receipt_contract_identity().map_err(StoreError::Receipt)?,
@@ -5840,15 +6011,7 @@ pub fn issue_store_receipt_envelope(
         },
         task,
         session,
-        causal: CausalBinding {
-            state_fence: state_fence.clone(),
-            // Store commit order is bound by the plan artifact above.  The
-            // receipt causal chain remains a valid genesis chain because the
-            // current store plan has no authoritative predecessor receipt id.
-            transaction_sequence: TransactionSequence::genesis(),
-            parent_receipt_id: None,
-            predecessor_receipt_ids: Vec::new(),
-        },
+        causal,
         request: RequestBinding {
             metadata: context.clone(),
             state_fence: state_fence.clone(),
@@ -5861,18 +6024,7 @@ pub fn issue_store_receipt_envelope(
             effect: transition.requested_effect_ceiling,
             state_fence: state_fence.clone(),
         },
-        authority: AuthorityBinding {
-            authority_id: ContractId::new(format!(
-                "eliot-store-manifest:{}",
-                transition.operation_manifest_digest
-            ))
-            .map_err(StoreError::Foundation)?,
-            authority_owner: context.source_id.to_string(),
-            authority_epoch: state_fence.authority_epoch.clone(),
-            state_fence: state_fence.clone(),
-            allowed_effect: transition.requested_effect_ceiling,
-            proof_ceiling,
-        },
+        authority,
         artifacts,
         verifier: None,
         problem: None,

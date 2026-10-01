@@ -91,6 +91,7 @@ thread_local! {
     };
 }
 
+pub mod blob_store_platform;
 mod directory_publication;
 mod event_log;
 mod installer_authority_key;
@@ -2883,7 +2884,7 @@ impl Drop for OwnedSecurityDescriptor {
 pub struct WindowsPlatform {
     root: PathBuf,
     #[cfg(windows)]
-    _root_pin: std::fs::File,
+    root_pin: std::fs::File,
 }
 
 impl WindowsPlatform {
@@ -2901,7 +2902,7 @@ impl WindowsPlatform {
         Ok(Self {
             root,
             #[cfg(windows)]
-            _root_pin: root_pin,
+            root_pin,
         })
     }
 
@@ -3897,6 +3898,7 @@ fn unknown_provider() -> eliot_platform::ProviderError {
 fn provider_from_io(error: &std::io::Error) -> eliot_platform::ProviderError {
     use std::io::ErrorKind;
     let code = match error.kind() {
+        ErrorKind::StorageFull => eliot_platform::ProviderErrorCode::StorageFull,
         ErrorKind::PermissionDenied => eliot_platform::ProviderErrorCode::PermissionDenied,
         ErrorKind::NotFound => eliot_platform::ProviderErrorCode::Unavailable,
         ErrorKind::TimedOut => eliot_platform::ProviderErrorCode::Timeout,
@@ -4171,6 +4173,11 @@ pub(crate) fn flush_directory_handle(_file: &std::fs::File) -> Result<(), u32> {
 }
 
 #[cfg(windows)]
+fn flush_directory(pins: &[std::fs::File]) -> Result<(), u32> {
+    pins.last().map_or(Ok(()), flush_directory_handle)
+}
+
+#[cfg(not(windows))]
 fn flush_directory(pins: &[std::fs::File]) -> Result<(), u32> {
     pins.last().map_or(Ok(()), flush_directory_handle)
 }

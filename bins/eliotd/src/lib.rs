@@ -45,6 +45,7 @@ pub mod campaign_evaluation_owner;
 pub mod campaign_owner_matrix;
 pub mod campaign_packet;
 pub mod campaign_task_controller;
+pub mod initial_work_scope_source_owner;
 
 pub use campaign_context_owner::build_context_owner_publications;
 pub use campaign_evaluation_owner::build_product_evaluation_publications;
@@ -160,6 +161,7 @@ pub mod supervision_progress;
 pub mod swarm_composition;
 pub mod task_binding_admission;
 mod task_lifecycle_adapters;
+pub mod testd_scope_admission;
 pub mod testd_terminal_completion;
 
 pub use activation_projection::AgentActivationResolver;
@@ -1311,6 +1313,56 @@ impl DaemonComposition {
         Ok(receipt)
     }
 
+    /// Commits only the closed process-source admission mutation through the
+    /// retained Kernel canonical gateway after the current WorkScope guard
+    /// and original governing-source closure have been revalidated.
+    pub(crate) async fn commit_blob_process_source_admission(
+        &self,
+        identity: &RequestIdentity,
+        envelope: eliot_canonical::CanonicalWriteEnvelope,
+        observed_work_scope: &eliot_governor::ScopeBinding,
+        sources: &eliot_governor::GoverningSourceSet,
+        privacy: &eliot_governor::PrivacyProfile,
+    ) -> Result<eliot_store_api::WriteReceipt, String> {
+        identity
+            .validate()
+            .map_err(|error| format!("invalid source-admission RequestIdentity: {error}"))?;
+        if envelope.request != identity.request.metadata
+            || envelope.idempotency_key != identity.idempotency_key
+            || envelope.request.state_fence != identity.request.state_fence
+            || envelope.transition_class != eliot_store_api::TransitionClass::RecoverySchema
+            || envelope.semantic_commands.len() != 1
+            || envelope.semantic_commands[0].operation
+                != eliot_store_api::NamedMutationOperation::RecordBlobProcessSourceAdmission
+        {
+            return Err(
+                "canonical source-admission transition differs from its exact identity or operation"
+                    .to_owned(),
+            );
+        }
+        self.governor
+            .check_canonical_write_work_scope(
+                envelope.scope_id.as_str(),
+                observed_work_scope,
+                Some((sources, privacy)),
+            )
+            .map_err(|error| format!("WorkScope source-admission gate refused: {error}"))?;
+        let manifests = eliot_store_api::generated_operation_manifests()
+            .map_err(|error| format!("read current named-operation catalogue: {error}"))?;
+        let prepared = envelope
+            .prepare()
+            .map_err(|error| format!("prepare source-admission transition: {error}"))?;
+        prepared
+            .validate_against_catalogue(&manifests)
+            .map_err(|error| {
+                format!("source-admission transition is not currently admitted: {error}")
+            })?;
+        self.governor
+            .commit_canonical(identity, envelope)
+            .await
+            .map_err(|error| format!("commit source-admission transition through Kernel: {error}"))
+    }
+
     /// Requires the cached revision fence to match the live Kernel fence
     /// exactly (issue #18 W6/A5).
     ///
@@ -1985,6 +2037,260 @@ impl DaemonComposition {
     #[must_use]
     pub fn policy_owner(&self) -> Option<&eliot_governor::PolicyOwner> {
         self.governor.owners().policy.as_ref()
+    }
+
+    /// Revalidates the one current Governor WorkScope binding for a blob
+    /// owner-facts pull. This returns only the matched snapshot; callers must
+    /// resolve source, policy, residency, causal, and authority facts from
+    /// their own current owners before reporting `Available`.
+    pub fn current_testd_blob_work_scope(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<Option<eliot_governor::WorkScopeBindingSnapshot>, String> {
+        state_fence
+            .validate()
+            .map_err(|error| format!("invalid owner-facts fence: {error}"))?;
+        if self.governor.kernel_snapshot().state_fence() != *state_fence {
+            return Err("owner-facts fence is not the current Governor fence".to_owned());
+        }
+        let Some(snapshot) = self
+            .governor
+            .read_current_work_scope_owner_readback(state_fence)
+            .map_err(|error| format!("current WorkScope owner read failed: {error}"))?
+        else {
+            return Ok(None);
+        };
+        snapshot
+            .validate()
+            .map_err(|error| format!("current WorkScope guard is invalid: {error}"))?;
+        if snapshot.guard_receipt.disposition != eliot_governor::ScopeBindingDisposition::Matched {
+            return Ok(None);
+        }
+        Ok(Some(snapshot))
+    }
+
+    /// Freshly reads WorkScope with the Store-issued revision and original
+    /// payload digest retained for a downstream process-source admission CAS.
+    pub fn current_testd_blob_work_scope_readback(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<Option<eliot_governor::WorkScopeOwnerReadback>, String> {
+        state_fence
+            .validate()
+            .map_err(|error| format!("invalid owner-facts fence: {error}"))?;
+        if self.governor.kernel_snapshot().state_fence() != *state_fence {
+            return Err("owner-facts fence is not the current Governor fence".to_owned());
+        }
+        let Some(readback) = self
+            .governor
+            .read_current_work_scope_owner_readback_with_provenance(state_fence)
+            .map_err(|error| format!("current WorkScope owner read failed: {error}"))?
+        else {
+            return Ok(None);
+        };
+        readback
+            .snapshot
+            .validate()
+            .map_err(|error| format!("current WorkScope guard is invalid: {error}"))?;
+        if readback.snapshot.guard_receipt.disposition
+            != eliot_governor::ScopeBindingDisposition::Matched
+        {
+            return Ok(None);
+        }
+        Ok(Some(readback))
+    }
+
+    /// Fresh named WorkScope read preserving the exact Empty-owner CAS
+    /// predecessor as well as a bound snapshot. Empty is a durable row, not
+    /// evidence that the owner record is physically absent.
+    pub fn current_testd_blob_work_scope_snapshot_readback(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<eliot_governor::WorkScopeOwnerSnapshotReadback, String> {
+        state_fence
+            .validate()
+            .map_err(|error| format!("invalid owner-facts fence: {error}"))?;
+        if self.governor.kernel_snapshot().state_fence() != *state_fence {
+            return Err("owner-facts fence is not the current Governor fence".to_owned());
+        }
+        let readback = self
+            .governor
+            .read_current_work_scope_owner_snapshot_with_provenance(state_fence)
+            .map_err(|error| format!("current WorkScope owner read failed: {error}"))?;
+        if let eliot_governor::WorkScopeOwnerSnapshotReadback::Bound(bound) = &readback {
+            bound
+                .snapshot
+                .validate()
+                .map_err(|error| format!("current WorkScope guard is invalid: {error}"))?;
+            if bound.snapshot.guard_receipt.disposition
+                != eliot_governor::ScopeBindingDisposition::Matched
+            {
+                return Err("current WorkScope guard is not matched".to_owned());
+            }
+        }
+        Ok(readback)
+    }
+
+    /// Builds the receipt contract's WorkScope leg only from the product
+    /// retained in the fresh, matched WorkScope source-admission owner.
+    /// `expected_product_id` is a selector check; it never supplies the value
+    /// serialized into the binding.
+    pub fn current_testd_blob_work_scope_receipt_binding(
+        &self,
+        state_fence: &StateFence,
+        expected_product_id: &eliot_contracts::ProductId,
+    ) -> Result<(eliot_receipts::WorkScopeBinding, String, String), String> {
+        let readback = self.current_testd_blob_work_scope_snapshot_readback(state_fence)?;
+        let eliot_governor::WorkScopeOwnerSnapshotReadback::Bound(readback) = readback else {
+            return Err("current WorkScope owner is durably empty".to_owned());
+        };
+        let snapshot = &readback.snapshot;
+        if snapshot.state_fence != *state_fence
+            || readback.state_fence != *state_fence
+            || snapshot.owner_revision != readback.owner_revision
+        {
+            return Err("current WorkScope snapshot provenance is inconsistent".to_owned());
+        }
+        let admission = snapshot
+            .source_admission()
+            .ok_or_else(|| "current WorkScope owner lacks admitted source provenance".to_owned())?;
+        let product_id = admission.product_id.as_ref().ok_or_else(|| {
+            "current WorkScope owner lacks its admitted product identity".to_owned()
+        })?;
+        if product_id != expected_product_id {
+            return Err(
+                "current WorkScope product differs from the authenticated selector".to_owned(),
+            );
+        }
+        let work_scope = eliot_receipts::WorkScopeBinding {
+            scope_id: eliot_receipts::WorkScopeId::new(snapshot.binding.scope.scope_ref.clone())
+                .map_err(|error| format!("invalid current WorkScope identifier: {error}"))?,
+            product_id: product_id.clone(),
+            resource_generation: state_fence.resource_generation.clone(),
+            state_fence: state_fence.clone(),
+        };
+        let bytes = eliot_contracts::canonical_json_bytes(&work_scope)
+            .map_err(|error| format!("WorkScope binding cannot be canonically encoded: {error}"))?;
+        let digest = eliot_contracts::sha256_hex(&bytes);
+        let json = String::from_utf8(bytes)
+            .map_err(|error| format!("WorkScope binding JSON is not UTF-8: {error}"))?;
+        Ok((work_scope, json, digest))
+    }
+
+    /// Resolves the exact TaskBinding revision from the retained canonical
+    /// Task owner for one authenticated owner-facts pull. A task selector is
+    /// never enough by itself: the TaskRecord must exist at the same current
+    /// fence and carry a non-zero owner revision.
+    pub fn current_testd_blob_task_binding(
+        &self,
+        task_ref: &str,
+        state_fence: &StateFence,
+    ) -> Result<eliot_receipts::TaskBinding, String> {
+        state_fence
+            .validate()
+            .map_err(|error| format!("invalid TaskBinding fence: {error}"))?;
+        if self.governor.kernel_snapshot().state_fence() != *state_fence {
+            return Err("TaskBinding fence is not the current Governor fence".to_owned());
+        }
+        let task_id = eliot_contracts::TaskId::new(task_ref.to_owned())
+            .map_err(|error| format!("invalid TaskBinding task ID: {error}"))?;
+        let record = self
+            .governor
+            .owners()
+            .task
+            .task(&task_id)
+            .ok_or_else(|| "Task owner has no record for the selected task".to_owned())?;
+        if record.task_id != task_id || record.revision == 0 || record.state_fence != *state_fence {
+            return Err(
+                "Task owner record is stale or differs from the exact task/fence".to_owned(),
+            );
+        }
+        Ok(eliot_receipts::TaskBinding {
+            task_id,
+            task_revision: record.revision,
+            state_fence: state_fence.clone(),
+        })
+    }
+
+    /// Resolves the exact SessionBinding from the retained canonical Session
+    /// owner. A session selector is never accepted as proof by itself.
+    pub fn current_testd_blob_session_binding(
+        &self,
+        session_ref: &str,
+        state_fence: &StateFence,
+    ) -> Result<eliot_receipts::SessionBinding, String> {
+        state_fence
+            .validate()
+            .map_err(|error| format!("invalid SessionBinding fence: {error}"))?;
+        if self.governor.kernel_snapshot().state_fence() != *state_fence {
+            return Err("SessionBinding fence is not the current Governor fence".to_owned());
+        }
+        let session_id = eliot_contracts::SessionId::new(session_ref.to_owned())
+            .map_err(|error| format!("invalid SessionBinding session ID: {error}"))?;
+        let record = self
+            .governor
+            .owners()
+            .session
+            .session(&session_id)
+            .ok_or_else(|| "Session owner has no record for the selected session".to_owned())?;
+        if record.session_id != session_id
+            || record.status.terminal()
+            || record.state_fence != *state_fence
+            || record.authority_epoch != state_fence.authority_epoch
+        {
+            return Err(
+                "Session owner record is terminal, stale, or differs from the exact session/fence"
+                    .to_owned(),
+            );
+        }
+        Ok(eliot_receipts::SessionBinding {
+            session_id,
+            authority_epoch: record.authority_epoch.clone(),
+            state_fence: state_fence.clone(),
+        })
+    }
+
+    /// Freshly resolves the exact process-stream admission row selected by
+    /// WorkScope, session, stream source ID, and ProcessExecutionBinding
+    /// digest. The Governor joins it to the current named WorkScope owner's
+    /// stored revision and original digest; callers must still validate the
+    /// returned Pending/Ready phase against the operation they are serving.
+    pub fn current_testd_blob_process_source_admission(
+        &self,
+        identity: &eliot_store_api::blob_process_source_admission::BlobProcessSourceAdmissionIdentity,
+        state_fence: &StateFence,
+    ) -> Result<
+        Option<eliot_store_api::blob_process_source_admission::BlobProcessSourceAdmissionReadback>,
+        String,
+    > {
+        self.governor
+            .read_current_blob_process_source_admission(identity, state_fence)
+            .map_err(|error| format!("fresh process-source admission read failed: {error}"))
+    }
+
+    /// Independently reads the canonical Module Registry owner for an
+    /// authenticated owner-facts pull. The returned outer revision and
+    /// semantic snapshot come from one fresh Kernel named read and are
+    /// cross-checked by Governor against its current live owner.
+    pub fn current_testd_blob_module_catalog_owner_readback(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<eliot_governor::ModuleCatalogOwnerReadback, String> {
+        self.governor
+            .read_current_module_catalog_owner_readback(state_fence)
+            .map_err(|error| format!("fresh Module Registry owner read failed: {error}"))
+    }
+
+    /// Re-reads the current semantic Policy owner through Kernel's named
+    /// owner transport. This does not imply a Blob-specific retention or
+    /// residency policy is present in the generic Config/Policy schema.
+    pub fn current_testd_blob_policy_owner_readback(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<Option<eliot_governor::PolicyOwner>, String> {
+        self.governor
+            .read_current_policy_owner_readback(state_fence)
+            .map_err(|error| format!("fresh Policy owner read failed: {error}"))
     }
 
     /// Returns the retained protected daemon state root.

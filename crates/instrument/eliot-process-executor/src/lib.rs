@@ -1520,7 +1520,29 @@ impl WindowsProcessExecutor {
         sink: Arc<dyn ProcessEvidenceSink>,
         outer_binding: RecoverableJobBinding,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
-        self.start_inner(request, sink, Some(outer_binding), None, false)
+        self.start_inner(request, sink, Some(outer_binding), None, false, None)
+    }
+
+    /// Starts one admitted Kernel child with a sink scoped to this exact
+    /// launch. The caller must build the client from the launch's already
+    /// admitted identity and execution binding; this method only injects the
+    /// provider-neutral sink for the duration of the start operation.
+    #[cfg(windows)]
+    pub fn start_with_kernel_outer_job_binding_and_stream_sink(
+        &self,
+        request: ProcessRequest,
+        sink: Arc<dyn ProcessEvidenceSink>,
+        outer_binding: RecoverableJobBinding,
+        stream_sink: Arc<dyn ProcessStreamSinkClient>,
+    ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
+        self.start_inner(
+            request,
+            sink,
+            Some(outer_binding),
+            None,
+            false,
+            Some(stream_sink),
+        )
     }
 
     /// Starts one Kernel child with the exact one-shot standard-input bytes the
@@ -1545,7 +1567,7 @@ impl WindowsProcessExecutor {
         sink: Arc<dyn ProcessEvidenceSink>,
         stdin_payload: Option<&[u8]>,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
-        self.start_inner(request, sink, None, stdin_payload, false)
+        self.start_inner(request, sink, None, stdin_payload, false, None)
     }
 
     /// Starts one admitted Kernel child with a retained live standard-input
@@ -1562,7 +1584,7 @@ impl WindowsProcessExecutor {
         sink: Arc<dyn ProcessEvidenceSink>,
         outer_binding: RecoverableJobBinding,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
-        self.start_inner(request, sink, Some(outer_binding), None, true)
+        self.start_inner(request, sink, Some(outer_binding), None, true, None)
     }
 
     /// Queues one complete, already-encoded EBP frame for the exact running
@@ -2152,6 +2174,7 @@ impl WindowsProcessExecutor {
         outer_binding: Option<KernelOuterJobBinding>,
         stdin_payload: Option<&[u8]>,
         retain_stdin_writer: bool,
+        stream_sink_override: Option<Arc<dyn ProcessStreamSinkClient>>,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
         request.validate()?;
         if retain_stdin_writer && stdin_payload.is_some() {
@@ -2175,6 +2198,7 @@ impl WindowsProcessExecutor {
                 outer_binding,
                 stdin_payload,
                 retain_stdin_writer,
+                stream_sink_override,
             );
             return Err(unavailable(
                 "Windows ProcessExecutor is unavailable on this target",
@@ -2394,14 +2418,15 @@ impl WindowsProcessExecutor {
             // the legacy `SourceUnavailable` path applies (provider failure
             // never claims a complete source).
             let stream_binding = state.view().binding().clone();
+            let stream_sink = stream_sink_override.as_ref().or(self.stream_sink.as_ref());
             let stdout_pump = open_stream_pump(
-                self.stream_sink.as_ref(),
+                stream_sink,
                 &stream_binding,
                 ProcessStreamKind::Stdout,
                 stdout_requested,
             );
             let stderr_pump = open_stream_pump(
-                self.stream_sink.as_ref(),
+                stream_sink,
                 &stream_binding,
                 ProcessStreamKind::Stderr,
                 stderr_requested,
@@ -2947,7 +2972,7 @@ impl ProcessExecutor for WindowsProcessExecutor {
         request: ProcessRequest,
         sink: Arc<dyn ProcessEvidenceSink>,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
-        self.start_inner(request, sink, None, None, false)
+        self.start_inner(request, sink, None, None, false, None)
     }
 
     async fn inspect(

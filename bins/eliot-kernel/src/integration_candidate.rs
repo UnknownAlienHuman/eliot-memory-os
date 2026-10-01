@@ -33,6 +33,18 @@
 //! slices register on the Store bridge; they are declared here so the names
 //! cannot drift between the Kernel surface and the bridge registration.
 //!
+//! # Live status
+//!
+//! [`create_integration_candidate`] has no caller. Measured on this tree, no
+//! code in any crate names it other than its defining line and the prose above,
+//! and the daemon front door registers no `INTEGRATION_CANDIDATE_CREATE_NAME`
+//! key — only `INTEGRATION_BRIDGE_APPLY_NAME` is dispatched — so the
+//! create-then-read chain this paragraph describes is not compiled. The read
+//! and queue halves are reached: the W2 lease path and the W3 bridge-apply path
+//! both call [`read_integration_candidate`], and the owner advance calls
+//! [`project_integration_queue`]. The create half is the unwired one; no
+//! caller was invented to close it.
+//!
 //! # What this deliberately does not do
 //!
 //! No lease path, no verifier execution, no bridge apply, no

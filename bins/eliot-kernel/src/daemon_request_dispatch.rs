@@ -102,6 +102,11 @@ pub(crate) const DAEMON_STARTUP_EVIDENCE_OPERATION: &str = "daemon_startup_evide
 /// through the single timing owner and always answers with its exact durable
 /// head so the producer converges after renewals on any path.
 pub(crate) const DAEMON_SUPERVISION_PROGRESS_OPERATION: &str = "daemon_supervision_progress";
+/// Authenticated eliotd poll for one pending Kernel-issued Blob owner-facts read.
+pub(crate) const TESTD_BLOB_OWNER_FACTS_PENDING_OPERATION: &str = "testd_blob_owner_facts_pending";
+/// Authenticated eliotd completion for one exact Blob owner-facts pull.
+pub(crate) const TESTD_BLOB_OWNER_FACTS_COMPLETE_OPERATION: &str =
+    "testd_blob_owner_facts_complete";
 /// Authenticated Governor publish operation carrying one live-derivation
 /// projection (issue #1935 AUD1, I7.16). The Governor-owned derivation
 /// publishes its exact revision, exact active fingerprint, and exact
@@ -3348,6 +3353,95 @@ impl KernelComposition {
         self.require_current_daemon_session(session)?;
         let result = match operation {
             #[cfg(windows)]
+            TESTD_BLOB_OWNER_FACTS_PENDING_OPERATION => {
+                let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+                identity
+                    .validate()
+                    .map_err(|_| TransportError::SessionFenced)?;
+                if identity.request.state_fence != session.module_generation.state_fence {
+                    return Err(TransportError::SessionFenced);
+                }
+                let pending = self
+                    .p07_ors
+                    .next_blob_process_stream_owner_facts_pull()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .map(|record| {
+                        serde_json::from_str::<
+                            eliot_blob_api::wire::BlobProcessStreamOwnerFactsPullRequest,
+                        >(&record.request_json)
+                        .map_err(|_| TransportError::SessionFenced)
+                    })
+                    .transpose()?;
+                Ok(serde_json::json!({
+                    "kind": TESTD_BLOB_OWNER_FACTS_PENDING_OPERATION,
+                    "request": pending,
+                }))
+            }
+            #[cfg(windows)]
+            TESTD_BLOB_OWNER_FACTS_COMPLETE_OPERATION => {
+                let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+                identity
+                    .validate()
+                    .map_err(|_| TransportError::SessionFenced)?;
+                if identity.request.state_fence != session.module_generation.state_fence {
+                    return Err(TransportError::SessionFenced);
+                }
+                let Some(fields) = payload.as_object() else {
+                    return Err(TransportError::SessionFenced);
+                };
+                if fields.len() != 2
+                    || fields.get("kind").and_then(serde_json::Value::as_str)
+                        != Some(TESTD_BLOB_OWNER_FACTS_COMPLETE_OPERATION)
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                let response: eliot_blob_api::wire::BlobProcessStreamOwnerFactsPullResponse =
+                    serde_json::from_value(
+                        fields
+                            .get("request")
+                            .cloned()
+                            .ok_or(TransportError::SessionFenced)?,
+                    )
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let pending = self
+                    .p07_ors
+                    .load_blob_process_stream_owner_facts_pull(&response.pull_ref)
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .ok_or(TransportError::SessionFenced)?;
+                let pull_request: eliot_blob_api::wire::BlobProcessStreamOwnerFactsPullRequest =
+                    serde_json::from_str(&pending.request_json)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                response
+                    .validate_for_request(&pull_request)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                if pending.state != eliot_ors::BlobProcessStreamOwnerFactsPullState::Pending
+                    || response.observed_state_fence != identity.request.state_fence
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                let response_json =
+                    serde_json::to_string(&response).map_err(|_| TransportError::SessionFenced)?;
+                let response_sha256 = sha256_hex(response_json.as_bytes());
+                let completed = eliot_ors::BlobProcessStreamOwnerFactsPullRecord {
+                    state: eliot_ors::BlobProcessStreamOwnerFactsPullState::Completed,
+                    response_json: Some(response_json),
+                    response_sha256: Some(response_sha256.clone()),
+                    ..pending
+                };
+                let retained = self
+                    .p07_ors
+                    .complete_blob_process_stream_owner_facts_pull(&completed)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let retained_sha256 = retained
+                    .response_sha256
+                    .ok_or(TransportError::SessionFenced)?;
+                Ok(serde_json::json!({
+                    "kind": TESTD_BLOB_OWNER_FACTS_COMPLETE_OPERATION,
+                    "pull_ref": retained.pull_ref,
+                    "response_sha256": retained_sha256,
+                }))
+            }
+            #[cfg(windows)]
             scan_disclosure_route::OPERATION => {
                 self.scan_disclosure_owner_operation(session, payload)
             }
@@ -4335,13 +4429,26 @@ impl KernelComposition {
                     }
                     self.claim_task_controller_pair(session)
                         .map(|pair| match pair {
-                            Some((envelope, tool, invocation, attempt)) => serde_json::json!({
+                            Some((
+                                envelope,
+                                tool,
+                                invocation,
+                                attempt,
+                                identity,
+                                authenticated_peer,
+                                authenticated_peer_sha256,
+                                initial_setup_authority,
+                            )) => serde_json::json!({
                                 "status": "known",
                                 "value": {
                                     "pair": {
                                         "invocation": invocation,
                                         "envelope": envelope,
                                         "tool": tool,
+                                        "identity": identity,
+                                        "authenticated_peer": authenticated_peer,
+                                        "authenticated_peer_sha256": authenticated_peer_sha256,
+                                        "initial_setup_authority": initial_setup_authority,
                                         "operation_id": attempt.operation_id,
                                         "attempt": attempt,
                                     }
@@ -9636,6 +9743,7 @@ impl KernelComposition {
             verified_correction = None;
         }
         super::blackboard::validate_blackboard_transition(session, &operation.transition)?;
+        validate_mailbox_transition(session, &operation.transition)?;
         let gateway = self.retained_store_gateway()?;
         if let Some(replayed) = self
             .replay_committed_apply_receipt(
@@ -9781,6 +9889,20 @@ impl KernelComposition {
         // enumerates, revalidates by the envelope's recorded hash, and reconciles
         // by operation identity into either the canonical receipt or a durable
         // Recovery Problem whenever ORS does hold one.
+        // A ReadyAttach pull, when present, retains the exact prepared
+        // transition and canonical request hash before this normal apply
+        // reaches the Store. This is only an expected-request commitment; it
+        // does not claim the W3 reserved-write protocol ran.
+        if let Err(error) = self.p07_ors.bind_blob_process_stream_ready_write(
+            operation.transition.identity.operation_id.as_str(),
+            &operation.transition,
+        ) {
+            return Ok(Self::store_staging_refusal_response(
+                "write_receipt",
+                operation.transition.identity.operation_id.as_str(),
+                &error.to_string(),
+            ));
+        }
         match gateway
             .apply(
                 &operation.context,
@@ -12522,6 +12644,124 @@ fn validate_origin_inspection(
         super::dispatch_launch::ComposedDispatchContour::installation_id,
     );
     if live.trim().is_empty() || request.installation_id() != live {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(())
+}
+
+/// Mechanically admits an `AdmitMailboxMessage` operation in an existing
+/// owner-prepared transition (issue #1820).
+///
+/// This is the Kernel mailbox dispatch hook beside the blackboard gate in
+/// `store_apply_operation`: the owner-prepared transition carries exactly one
+/// named `AdmitMailboxMessage` mutation; the hook decodes it through the store
+/// contract, rebuilds the mailbox message draft and the caller-read-back
+/// record view from the carried `expected_head`, and runs the mechanical
+/// `admit_mailbox_message` admission over them. The admitted record must be
+/// the carried record, so the hook agrees with the exact bytes the store leg
+/// below persists and the batch runs draft -> admit -> store mutation ->
+/// receipt with one admission vocabulary. Typed refusals stay typed: a reused
+/// identity naming a different message is `TransportError::IdentityConflict`
+/// and every other refusal is `TransportError::SessionFenced`. Transitions
+/// without a mailbox operation pass through untouched, exactly like the
+/// blackboard gate.
+#[cfg(windows)]
+fn validate_mailbox_transition(
+    session: &Session,
+    transition: &PreparedTransition,
+) -> Result<(), TransportError> {
+    let Some(operation) = transition.named_operations.iter().find(|operation| {
+        operation.operation == eliot_store_api::NamedMutationOperation::AdmitMailboxMessage
+    }) else {
+        return Ok(());
+    };
+    if transition.named_operations.len() != 1
+        || transition.transition_class != eliot_store_api::TransitionClass::CaptureCandidate
+        || transition.requested_effect_ceiling != eliot_store_api::EffectClass::Candidate
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    let admission =
+        eliot_store_api::decode_mailbox_item(operation.operation, &operation.parameters)
+            .map_err(|_| TransportError::SessionFenced)?;
+    let record = &admission.record;
+    if transition.task_id.as_deref() != Some(record.task_id.as_str())
+        || record.state_fence != transition.state_fence
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    let principal = match &session.peer {
+        PeerIdentity::Authenticated { user_identity, .. }
+            if !user_identity.trim().is_empty() && !user_identity.chars().any(char::is_control) =>
+        {
+            user_identity
+        }
+        PeerIdentity::Authenticated { .. } => return Err(TransportError::SessionFenced),
+        PeerIdentity::Unavailable { .. } => {
+            return Err(TransportError::PeerIdentityUnavailable);
+        }
+    };
+    if record.submitter_principal.as_str() != principal.as_str() {
+        return Err(TransportError::SessionFenced);
+    }
+    let expected = super::coordination_mailbox::CoordinationMailboxRecord {
+        message_id: record.message_id.clone(),
+        recipient_id: record.recipient_id.clone(),
+        task_id: record.task_id.clone(),
+        sender_principal: record.sender_principal.clone(),
+        submitter_principal: record.submitter_principal.clone(),
+        provenance: record.provenance.clone(),
+        privacy_class: record.privacy_class.clone(),
+        disclosure: record.disclosure.clone(),
+        body: record.body.clone(),
+        requires_acknowledgement: record.requires_acknowledgement,
+        state_fence: record.state_fence.clone(),
+        submitted_at_unix_ms: record.submitted_at_unix_ms,
+        sequence: record.sequence,
+    };
+    let draft = super::coordination_mailbox::MailboxMessageDraft {
+        message_id: expected.message_id.clone(),
+        recipient_id: expected.recipient_id.clone(),
+        task_id: expected.task_id.clone(),
+        sender_principal: expected.sender_principal.clone(),
+        submitter_principal: expected.submitter_principal.clone(),
+        provenance: expected.provenance.clone(),
+        privacy_class: expected.privacy_class.clone(),
+        disclosure: expected.disclosure.clone(),
+        body: expected.body.clone(),
+        requires_acknowledgement: expected.requires_acknowledgement,
+        state_fence: expected.state_fence.clone(),
+        submitted_at_unix_ms: expected.submitted_at_unix_ms,
+    };
+    let existing: Vec<super::coordination_mailbox::CoordinationMailboxRecord> = admission
+        .expected_head
+        .iter()
+        .map(
+            |head| super::coordination_mailbox::CoordinationMailboxRecord {
+                message_id: head.message_id.clone(),
+                recipient_id: head.recipient_id.clone(),
+                task_id: head.task_id.clone(),
+                sender_principal: head.sender_principal.clone(),
+                submitter_principal: head.submitter_principal.clone(),
+                provenance: head.provenance.clone(),
+                privacy_class: head.privacy_class.clone(),
+                disclosure: head.disclosure.clone(),
+                body: head.body.clone(),
+                requires_acknowledgement: head.requires_acknowledgement,
+                state_fence: head.state_fence.clone(),
+                submitted_at_unix_ms: head.submitted_at_unix_ms,
+                sequence: head.sequence,
+            },
+        )
+        .collect();
+    let admitted = match super::coordination_mailbox::admit_mailbox_message(draft, &existing) {
+        Ok(admitted) => admitted,
+        Err(super::coordination_mailbox::CoordinationMailboxError::IdentityConflict { .. }) => {
+            return Err(TransportError::IdentityConflict);
+        }
+        Err(_) => return Err(TransportError::SessionFenced),
+    };
+    if admitted.record != expected {
         return Err(TransportError::SessionFenced);
     }
     Ok(())

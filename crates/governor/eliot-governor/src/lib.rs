@@ -79,7 +79,9 @@ pub use finish_attempt::{
     PreparedKernelExchange,
 };
 pub use governor_authority_projection::{GovernorAuthorityProjection, LiveGovernorAuthority};
-pub use module_registry_admission::{ModuleCatalogOwnerReadback, ModuleRegistryAdmissionError};
+pub use module_registry_admission::{
+    ModuleCatalogOwnerReadback, ModuleRegistryAdmissionError, VerifiedModuleCatalogGeneration,
+};
 pub use negative_memory_activation::{
     NegativeMemoryActivationDocument, NegativeMemoryActivationEvidence,
     NegativeMemoryActivationReceipt, NegativeMemoryActivationRefusal,
@@ -147,6 +149,7 @@ mod swarm_plan_attachment_ownership;
 mod swarm_plan_attachment_service;
 mod task_lifecycle;
 mod wasm_resolution;
+mod work_scope_source_admission;
 
 pub use activation_outcome::*;
 pub use campaign_source_publishers::{
@@ -330,6 +333,13 @@ pub use task_lifecycle::{
 pub use wasm_resolution::{
     CONFORMANCE_COMPONENT, CONFORMANCE_INPUT, CONFORMANCE_SEED, ContourAdmission,
     GovernorWasmAdmission, PromotionExpectations,
+};
+pub use work_scope_source_admission::{
+    ApprovedNormativeSource, GoverningSourceApproval, InitialSetupEffect,
+    InitialSetupMutationConsent, InitialWorkScopeAdmissionAuthority,
+    InitialWorkScopeSourceDiscoveryLease, PreparedWorkScopeSourceAdmission,
+    VerifiedGoverningSourceApproval, WorkScopeSourceAdmissionError,
+    issue_initial_work_scope_source_discovery_lease, prepare_initial_work_scope_source_admission,
 };
 
 use std::collections::BTreeMap;

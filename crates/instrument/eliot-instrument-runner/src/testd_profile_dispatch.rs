@@ -1,211 +1,219 @@
-//! Closed Testd profile to instrument contract dispatch for the retained
-//! Instrument Plane packages.
+//! Closed Testd profile-stage to instrument dispatch verification.
 //!
-//! Issue #1140 requires that every retained Instrument package resolves one
-//! Testd profile it is actually dispatched under. The provider registry names
-//! its entries by *instrument contract* (`eliot.instrument.nextest`), while
-//! `eliot-testd-core` names the profiles its worker admits by *dispatch name*
-//! (`cargo-nextest`, `cargo-nextest-list`, `cargo-nextest-scoped`,
-//! `cargo-test`). Before this module no product code related the two
-//! vocabularies, so the recorded "one live Testd profile per package" claim was
-//! unfalsifiable: a package could name a contract identity Testd never
-//! dispatches and the registry would still assemble.
-//!
-//! This module closes that gap by binding the two closed vocabularies together
-//! in one direction. [`instrument_contract_for_testd_profile`] maps a Testd
-//! dispatch name to the single instrument contract the Testd worker executes it
-//! as. There is no reverse fallback, no string surgery, and no caller-supplied
-//! profile: a profile outside the `eliot-testd-core` admitted set cannot be
-//! named.
-//!
-//! The recorded table is the *expected* set and is declared independently of
-//! the package disposition ledger
-//! ([`PACKAGE_DISPOSITIONS`](crate::package_disposition::PACKAGE_DISPOSITIONS)),
-//! so [`verify_testd_dispatch`] compares two independently declared sources
-//! rather than one caller-supplied list against a copy of itself. It runs inside
-//! [`ProviderRegistry::ready`](crate::registry::ProviderRegistry::ready), which
-//! means a live package naming a profile the Testd worker cannot dispatch, or a
-//! profile Testd dispatches that the table leaves unbound, fails registry
-//! assembly closed.
-//!
-//! The check proves *name resolution only*. It grants no execution, admits no
-//! task, owns no Finish, and cannot create a verifier verdict: the launch still
-//! runs through the governed `ProcessExecutor` contour owned by issue #20/#100,
-//! and evaluation still belongs to `eliot-verifier`.
+//! The runner profiles are DAGs, not one-profile/one-provider aliases. This
+//! module binds each admitted stage of each productive Testd runner profile to
+//! its owning instrument contract, then verifies the binding against the
+//! independently compiled profile registry and the assembled provider
+//! registry. The older direct Nextest profile names remain a closed one-stage
+//! compatibility surface; they do not stand in for the runner DAGs.
 
+use eliot_instrument_api::InstrumentKind;
+use eliot_instrument_cargo::CONTRACT_NAME as CARGO_INSTRUMENT;
 use eliot_instrument_nextest::NEXTEST_INSTRUMENT;
-use eliot_testd_core::{TESTD_LIST_PROFILE, TESTD_PRODUCTIVE_PROFILE, TESTD_SCOPED_PROFILE};
+use eliot_instrument_rustc::RUSTC_INSTRUMENT;
+use eliot_instrument_rustfmt::RUSTFMT_INSTRUMENT;
+use eliot_testd_core::{
+    TESTD_LIST_PROFILE, TESTD_PRODUCTIVE_PROFILE, TESTD_SCOPED_PROFILE,
+    StageExecutionKind, is_productive_testd_profile,
+};
 use thiserror::Error;
 
-use crate::registry::ProviderRegistry;
+use crate::{
+    profile::{
+        BUNDLE_VERIFICATION_ROUTE, COMPILER_PROFILE, InstrumentRegistry, PACKAGE_VERIFICATION_ROUTE,
+        ProfileCompiler, TEST_PROFILE, VERIFICATION_REGISTRY_GENERATION,
+    },
+    registry::ProviderRegistry,
+    testd_port::adapter_stage_dispatchable,
+};
 
-/// One closed Testd dispatch profile and the instrument contract it runs as.
+/// One closed Testd profile stage and the instrument contract it executes as.
 ///
-/// The pair is recorded once, in the owners' own vocabulary: the dispatch name
-/// is an `eliot-testd-core` constant and the contract name is the owning adapter
-/// crate's published contract identity, so neither half can drift from the
-/// crate that publishes it.
+/// `stage_id` is `None` only for the three legacy direct Nextest profiles,
+/// which predate runner DAGs and are admitted by their exact Testd constants.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TestdDispatchBinding {
-    /// The Testd dispatch profile name `eliot-testd-core` admits.
+    /// The Testd dispatch profile name.
     pub testd_profile: &'static str,
-    /// The instrument contract identity Testd executes this profile as.
+    /// Exact stage identity in the compiled runner profile, if it is a DAG.
+    pub stage_id: Option<&'static str>,
+    /// Instrument contract identity selected by that stage.
     pub instrument_contract: &'static str,
 }
 
-/// Every Testd profile this plane dispatches as a productive run, with the
-/// instrument contract each one runs as.
-///
-/// The three profiles are the `eliot-testd-core` productive nextest profiles:
-/// the unscoped run, the list, and the scoped run. All three execute as
-/// `eliot.instrument.nextest`, which is why one contract legitimately owns
-/// several profiles. The admitted `cargo-test` probe is deliberately *not*
-/// bound: it launches the cargo tool for `--version` and produces no test
-/// report, so it proves the tool resolved rather than that a package ran.
-pub const TESTD_DISPATCH_BINDINGS: [TestdDispatchBinding; 3] = [
+/// Complete stage dispatch surface for legacy Nextest and the four admitted
+/// runner profiles. This is checked against the compiled DAG, not used as a
+/// command or executable map.
+pub const TESTD_DISPATCH_BINDINGS: [TestdDispatchBinding; 12] = [
     TestdDispatchBinding {
         testd_profile: TESTD_PRODUCTIVE_PROFILE,
+        stage_id: None,
         instrument_contract: NEXTEST_INSTRUMENT,
     },
     TestdDispatchBinding {
         testd_profile: TESTD_LIST_PROFILE,
+        stage_id: None,
         instrument_contract: NEXTEST_INSTRUMENT,
     },
     TestdDispatchBinding {
         testd_profile: TESTD_SCOPED_PROFILE,
+        stage_id: None,
+        instrument_contract: NEXTEST_INSTRUMENT,
+    },
+    TestdDispatchBinding {
+        testd_profile: COMPILER_PROFILE,
+        stage_id: Some("cargo-metadata"),
+        instrument_contract: CARGO_INSTRUMENT,
+    },
+    TestdDispatchBinding {
+        testd_profile: COMPILER_PROFILE,
+        stage_id: Some("rustc-build"),
+        instrument_contract: RUSTC_INSTRUMENT,
+    },
+    TestdDispatchBinding {
+        testd_profile: TEST_PROFILE,
+        stage_id: Some("nextest-list"),
+        instrument_contract: NEXTEST_INSTRUMENT,
+    },
+    TestdDispatchBinding {
+        testd_profile: TEST_PROFILE,
+        stage_id: Some("nextest-run"),
+        instrument_contract: NEXTEST_INSTRUMENT,
+    },
+    TestdDispatchBinding {
+        testd_profile: PACKAGE_VERIFICATION_ROUTE,
+        stage_id: Some("package-compile"),
+        instrument_contract: RUSTC_INSTRUMENT,
+    },
+    TestdDispatchBinding {
+        testd_profile: PACKAGE_VERIFICATION_ROUTE,
+        stage_id: Some("package-test"),
+        instrument_contract: NEXTEST_INSTRUMENT,
+    },
+    TestdDispatchBinding {
+        testd_profile: PACKAGE_VERIFICATION_ROUTE,
+        stage_id: Some("package-format"),
+        instrument_contract: RUSTFMT_INSTRUMENT,
+    },
+    TestdDispatchBinding {
+        testd_profile: BUNDLE_VERIFICATION_ROUTE,
+        stage_id: Some("bundle-compile"),
+        instrument_contract: RUSTC_INSTRUMENT,
+    },
+    TestdDispatchBinding {
+        testd_profile: BUNDLE_VERIFICATION_ROUTE,
+        stage_id: Some("bundle-test"),
         instrument_contract: NEXTEST_INSTRUMENT,
     },
 ];
 
-/// The instrument contract the Testd worker executes one admitted profile as.
+/// Returns every productive Testd profile, including runner profiles whose
+/// stage DAGs are compiled by this registry.
+#[must_use]
+pub fn dispatched_testd_profiles() -> Vec<&'static str> {
+    eliot_testd_core::PRODUCTIVE_TESTD_PROFILE_NAMES
+        .into_iter()
+        .filter(|profile| is_productive_testd_profile(profile))
+        .collect()
+}
+
+/// Resolves the single instrument contract for a one-provider profile.
 ///
-/// # Errors
-///
-/// Returns [`TestdDispatchError::UndispatchableProfile`] for any profile the
-/// recorded table does not bind, so a caller cannot name a profile the Testd
-/// worker would refuse at its own admission gate.
+/// Multi-instrument runner profiles intentionally have no singular contract;
+/// use their exact compiled stage identities instead.
 pub fn instrument_contract_for_testd_profile(
     profile: &str,
 ) -> Result<&'static str, TestdDispatchError> {
-    TESTD_DISPATCH_BINDINGS
+    let mut contracts = TESTD_DISPATCH_BINDINGS
         .iter()
-        .find(|binding| binding.testd_profile == profile)
-        .map(|binding| binding.instrument_contract)
+        .filter(|binding| binding.testd_profile == profile)
+        .map(|binding| binding.instrument_contract);
+    let first = contracts
+        .next()
         .ok_or_else(|| TestdDispatchError::UndispatchableProfile {
             profile: profile.to_owned(),
-        })
+        })?;
+    if contracts.any(|contract| contract != first) {
+        return Err(TestdDispatchError::MultiContractProfile {
+            profile: profile.to_owned(),
+        });
+    }
+    Ok(first)
 }
 
-/// The Testd profiles this plane dispatches as productive runs.
-///
-/// This is the expected denominator the coverage check compares against. The
-/// candidate names and the membership test both come from `eliot-testd-core`,
-/// the profile admission owner (issue #20), so widening the recorded table to
-/// name a profile Testd does not dispatch — or narrowing it to hide one Testd
-/// does dispatch — fails closed instead of being silently accepted.
-#[must_use]
-pub fn dispatched_testd_profiles() -> Vec<&'static str> {
-    [
-        TESTD_PRODUCTIVE_PROFILE,
-        TESTD_LIST_PROFILE,
-        TESTD_SCOPED_PROFILE,
-    ]
-    .into_iter()
-    .filter(|profile| eliot_testd_core::is_productive_testd_profile(profile))
-    .collect()
-}
-
-/// Why a Testd dispatch name could not be resolved to an instrument contract.
+/// Failure while checking the admitted Testd profile-stage dispatch surface.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum TestdDispatchError {
-    /// The named profile is not one this plane dispatches.
+    /// The named profile is not a productive Testd profile.
     #[error("testd dispatches no profile named '{profile}'")]
-    UndispatchableProfile {
-        /// The refused profile name.
-        profile: String,
-    },
-    /// Two recorded bindings claim the same Testd profile.
-    #[error("testd profile '{profile}' is bound twice in the recorded dispatch table")]
-    DuplicateTestdProfile {
-        /// The duplicated Testd profile name.
+    UndispatchableProfile { profile: String },
+    /// A profile consists of multiple instrument contracts and has no single
+    /// profile-level contract answer.
+    #[error("testd profile '{profile}' has multiple stage instrument contracts")]
+    MultiContractProfile { profile: String },
+    /// Two bindings claim the same profile and stage.
+    #[error("testd profile '{profile}' stage '{stage_id}' is bound more than once")]
+    DuplicateStageBinding {
         profile: &'static str,
+        stage_id: &'static str,
     },
-    /// A recorded binding names a profile `eliot-testd-core` does not admit.
-    #[error("the dispatch table binds testd profile '{profile}', which testd does not admit")]
-    UnadmittedBinding {
-        /// The undispatchable recorded profile.
+    /// A productive profile or one of its compiled stages has no binding.
+    #[error("testd profile '{profile}' has no dispatch binding for stage '{stage_id}'")]
+    UnboundStage { profile: String, stage_id: String },
+    /// A declared binding does not correspond to the compiled runner DAG.
+    #[error("testd dispatch binding for '{profile}'/'{stage_id}' differs from the compiled profile")]
+    StageBindingMismatch {
         profile: &'static str,
+        stage_id: &'static str,
     },
-    /// A profile Testd dispatches is bound to no instrument contract.
-    #[error(
-        "testd dispatches profile '{profile}' but the dispatch table binds no instrument contract"
-    )]
-    UnboundDispatchProfile {
-        /// The unbound Testd profile name.
+    /// A binding names a profile or stage not found in the independently
+    /// compiled runner registry.
+    #[error("testd dispatch binding names an uncompiled stage '{profile}'/'{stage_id}'")]
+    UnknownStage {
         profile: &'static str,
+        stage_id: &'static str,
     },
-    /// A recorded package names a profile the Testd worker cannot dispatch.
-    #[error(
-        "instrument package '{package}' records testd dispatch profile '{profile}', which testd cannot dispatch"
-    )]
+    /// No ready provider entry supports the bound profile stage.
+    #[error("no ready provider entry accepts '{profile}'/'{stage_id}' as '{contract}'")]
+    UnsupportedStage {
+        profile: &'static str,
+        stage_id: &'static str,
+        contract: &'static str,
+    },
+    /// A package disposition names an unsupported Testd dispatch profile.
+    #[error("instrument package '{package}' records unsupported Testd profile '{profile}'")]
     UndispatchableDisposition {
-        /// The package whose recorded profile cannot dispatch.
         package: &'static str,
-        /// The undispatchable recorded profile.
         profile: &'static str,
-    },
-    /// A package records a dispatch profile no registry entry backs.
-    #[error(
-        "instrument package '{package}' records testd dispatch profile '{profile}' but no registry entry claims '{instrument_contract}'"
-    )]
-    UnregisteredDispatchContract {
-        /// The package whose dispatch profile has no registry entry.
-        package: &'static str,
-        /// The recorded Testd dispatch profile.
-        profile: &'static str,
-        /// The instrument contract the profile dispatches.
-        instrument_contract: &'static str,
     },
 }
 
-/// Verifies the recorded dispatch table against Testd's own admission surface
-/// and the assembled provider registry.
-///
-/// Three independent comparisons run. Every recorded profile must be unique.
-/// The recorded table must cover exactly the profiles Testd dispatches as
-/// productive runs, compared against [`dispatched_testd_profiles`] rather than
-/// against itself. Finally each recorded package dispatch profile must resolve
-/// to an instrument contract the assembled registry actually claims.
-///
-/// # Errors
-///
-/// Returns [`TestdDispatchError::DuplicateTestdProfile`] for a self-contradictory
-/// table, [`TestdDispatchError::UnadmittedBinding`] for a bound profile Testd
-/// does not admit, [`TestdDispatchError::UnboundDispatchProfile`] for a profile
-/// Testd dispatches that the table leaves unbound,
-/// [`TestdDispatchError::UndispatchableDisposition`] for a recorded package
-/// naming an undispatchable profile, or
-/// [`TestdDispatchError::UnregisteredDispatchContract`] for a recorded dispatch
-/// profile whose contract no registry entry claims.
+/// Verifies profile names, every stage in the compiled DAGs, and the actual
+/// selected provider/execution lanes. The compiled registry uses its own
+/// fixed generation and complete spec/profile set; the Testd request cannot
+/// supply either identity.
 pub fn verify_testd_dispatch(registry: &ProviderRegistry) -> Result<(), TestdDispatchError> {
     verify_binding_uniqueness()?;
+    let profiles = InstrumentRegistry::with_verification_route_profiles(
+        VERIFICATION_REGISTRY_GENERATION,
+        Vec::new(),
+    )
+    .map_err(|_| TestdDispatchError::UnboundStage {
+        profile: COMPILER_PROFILE.to_owned(),
+        stage_id: "<builtin-registry>".to_owned(),
+    })?;
+    verify_compiled_stages(registry, &profiles)?;
     verify_dispatch_denominator()?;
-    verify_disposition_profiles(registry)
+    verify_disposition_profiles()
 }
 
-/// Requires every recorded profile to be bound exactly once.
-///
-/// One instrument contract may legitimately own several profiles — the three
-/// nextest profiles all execute as `eliot.instrument.nextest` — so only the
-/// profile side is required to be unique. A duplicated contract is instead
-/// caught where it would matter, by [`verify_disposition_profiles`] requiring
-/// the registry to claim it.
 fn verify_binding_uniqueness() -> Result<(), TestdDispatchError> {
     for (index, binding) in TESTD_DISPATCH_BINDINGS.iter().enumerate() {
         for other in &TESTD_DISPATCH_BINDINGS[index + 1..] {
-            if binding.testd_profile == other.testd_profile {
-                return Err(TestdDispatchError::DuplicateTestdProfile {
+            if binding.testd_profile == other.testd_profile && binding.stage_id == other.stage_id {
+                return Err(TestdDispatchError::DuplicateStageBinding {
                     profile: binding.testd_profile,
+                    stage_id: binding.stage_id.unwrap_or("<legacy>"),
                 });
             }
         }
@@ -213,57 +221,139 @@ fn verify_binding_uniqueness() -> Result<(), TestdDispatchError> {
     Ok(())
 }
 
-/// Requires the recorded table to cover exactly the profiles Testd dispatches.
-///
-/// The expected set is [`dispatched_testd_profiles`], derived from the
-/// `eliot-testd-core` owner predicate, so the table is compared against
-/// content the caller does not control rather than against itself. Both
-/// directions are checked: a profile Testd dispatches that the table leaves
-/// unbound, and a profile the table binds that Testd does not admit.
 fn verify_dispatch_denominator() -> Result<(), TestdDispatchError> {
     for profile in dispatched_testd_profiles() {
-        if instrument_contract_for_testd_profile(profile).is_ok() {
+        if TESTD_DISPATCH_BINDINGS
+            .iter()
+            .any(|binding| binding.testd_profile == profile)
+        {
             continue;
         }
-        return Err(TestdDispatchError::UnboundDispatchProfile { profile });
+        return Err(TestdDispatchError::UndispatchableProfile {
+            profile: profile.to_owned(),
+        });
     }
     for binding in TESTD_DISPATCH_BINDINGS {
-        if eliot_testd_core::is_productive_testd_profile(binding.testd_profile) {
-            continue;
+        if !is_productive_testd_profile(binding.testd_profile) {
+            return Err(TestdDispatchError::UndispatchableProfile {
+                profile: binding.testd_profile.to_owned(),
+            });
         }
-        return Err(TestdDispatchError::UnadmittedBinding {
-            profile: binding.testd_profile,
-        });
     }
     Ok(())
 }
 
-/// Requires each recorded dispatch profile to resolve to a contract the
-/// registry actually claims.
-fn verify_disposition_profiles(registry: &ProviderRegistry) -> Result<(), TestdDispatchError> {
+fn verify_compiled_stages(
+    providers: &ProviderRegistry,
+    profiles: &InstrumentRegistry,
+) -> Result<(), TestdDispatchError> {
+    for profile in profiles
+        .iter()
+        .filter(|profile| is_productive_testd_profile(&profile.name))
+    {
+        let compiled = ProfileCompiler::new(profiles)
+            .compile_exact(&profile.name, profile.revision)
+            .map_err(|_| TestdDispatchError::UnboundStage {
+                profile: profile.name.clone(),
+                stage_id: profile.name.clone(),
+            })?;
+        for stage in compiled.stages {
+            let binding = TESTD_DISPATCH_BINDINGS
+                .iter()
+                .find(|binding| {
+                    binding.testd_profile == profile.name
+                        && binding.stage_id.as_deref() == Some(stage.stage_id.as_str())
+                });
+            let Some(binding) = binding else {
+                return Err(TestdDispatchError::UnboundStage {
+                    profile: profile.name.clone(),
+                    stage_id: stage.stage_id,
+                });
+            };
+            if binding.instrument_contract != stage.spec.as_str() {
+                return Err(TestdDispatchError::StageBindingMismatch {
+                    profile: binding.testd_profile,
+                    stage_id: binding.stage_id.unwrap_or("<legacy>"),
+                });
+            }
+        }
+    }
+    for binding in TESTD_DISPATCH_BINDINGS {
+        let Some(stage_id) = binding.stage_id else {
+            let supported = providers.iter().any(|entry| {
+                entry.instrument.as_str() == binding.instrument_contract
+                    && entry.supports(InstrumentKind::Test)
+                    && adapter_stage_dispatchable(
+                        &entry.adapter,
+                        InstrumentKind::Test,
+                        StageExecutionKind::Process,
+                    )
+            });
+            if supported {
+                continue;
+            }
+            return Err(TestdDispatchError::UnsupportedStage {
+                profile: binding.testd_profile,
+                stage_id: "<legacy>",
+                contract: binding.instrument_contract,
+            });
+        };
+        let compiled = ProfileCompiler::new(profiles)
+            .compile_exact(binding.testd_profile, 1)
+            .map_err(|_| TestdDispatchError::UnknownStage {
+                profile: binding.testd_profile,
+                stage_id,
+            })?;
+        let stage = compiled
+            .stages
+            .iter()
+            .find(|stage| stage.stage_id == stage_id)
+            .ok_or(TestdDispatchError::UnknownStage {
+                profile: binding.testd_profile,
+                stage_id,
+            })?;
+        if stage.spec.as_str() != binding.instrument_contract {
+            return Err(TestdDispatchError::StageBindingMismatch {
+                profile: binding.testd_profile,
+                stage_id,
+            });
+        }
+        let execution = if stage.external {
+            StageExecutionKind::Process
+        } else {
+            StageExecutionKind::DecoderOnly
+        };
+        let supported = providers.iter().any(|entry| {
+            entry.instrument == stage.spec
+                && entry.supports(stage.kind)
+                && (entry.executable.is_decoder_only()) == (execution == StageExecutionKind::DecoderOnly)
+                && adapter_stage_dispatchable(&entry.adapter, stage.kind, execution)
+        });
+        if !supported {
+            return Err(TestdDispatchError::UnsupportedStage {
+                profile: binding.testd_profile,
+                stage_id,
+                contract: binding.instrument_contract,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn verify_disposition_profiles() -> Result<(), TestdDispatchError> {
     for record in crate::package_disposition::PACKAGE_DISPOSITIONS {
-        if record.testd_dispatch_profile.trim().is_empty() {
+        if record.testd_dispatch_profile.is_empty() {
             continue;
         }
-        let Ok(instrument_contract) =
-            instrument_contract_for_testd_profile(record.testd_dispatch_profile)
-        else {
+        if !TESTD_DISPATCH_BINDINGS
+            .iter()
+            .any(|binding| binding.testd_profile == record.testd_dispatch_profile)
+        {
             return Err(TestdDispatchError::UndispatchableDisposition {
                 package: record.package,
                 profile: record.testd_dispatch_profile,
             });
-        };
-        if registry
-            .iter()
-            .any(|entry| entry.instrument.as_str() == instrument_contract)
-        {
-            continue;
         }
-        return Err(TestdDispatchError::UnregisteredDispatchContract {
-            package: record.package,
-            profile: record.testd_dispatch_profile,
-            instrument_contract,
-        });
     }
     Ok(())
 }

@@ -251,6 +251,13 @@ pub enum ProviderDisposition {
         /// Requested instrument class.
         kind: InstrumentKind,
     },
+    /// The resolved provider refused the retained typed stage binding.
+    /// This keeps a malformed stage visible in the denominator without
+    /// relabeling it as an unmapped provider or a successful dispatch.
+    StageBindingRejected {
+        /// Exact bounded reason returned by the stage admission owner.
+        detail: &'static str,
+    },
     /// Two entries claim the same instrument and class.
     Ambiguous {
         /// Contested instrument contract name.
@@ -293,6 +300,9 @@ impl fmt::Display for ProviderDisposition {
                     f,
                     "unsupported-by-testd: {adapter} with {kind:?} is not dispatchable via testd"
                 )
+            }
+            Self::StageBindingRejected { detail } => {
+                write!(f, "stage-binding-rejected: {detail}")
             }
             Self::Ambiguous {
                 instrument,
@@ -725,6 +735,11 @@ pub fn disposition_for_parts(
         | crate::registry::RegistryError::IdentitySlotDrift { instrument, .. } => {
             ProviderDisposition::Unavailable {
                 rule: format!("{instrument}: profile identity slot is unbound or drifted"),
+            }
+        }
+        crate::registry::RegistryError::MissingFreshnessInput { field } => {
+            ProviderDisposition::Unavailable {
+                rule: format!("{instrument}: missing {field} currentness fingerprint"),
             }
         }
     }

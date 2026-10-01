@@ -2404,6 +2404,7 @@ fn map_provider_error(provider: ProviderId, error: ProviderError) -> NotifyError
         ProviderErrorCode::PermissionDenied => ProviderErrorCode::PermissionDenied,
         ProviderErrorCode::InvalidRequest => ProviderErrorCode::InvalidRequest,
         ProviderErrorCode::Timeout => ProviderErrorCode::Timeout,
+        ProviderErrorCode::StorageFull => ProviderErrorCode::StorageFull,
         ProviderErrorCode::Failed => ProviderErrorCode::Failed,
     };
     NotifyError::ProviderFailure {
@@ -3842,6 +3843,7 @@ mod tests {
             ProviderErrorCode::PermissionDenied,
             ProviderErrorCode::InvalidRequest,
             ProviderErrorCode::Timeout,
+            ProviderErrorCode::StorageFull,
             ProviderErrorCode::Failed,
         ]
         .into_iter()

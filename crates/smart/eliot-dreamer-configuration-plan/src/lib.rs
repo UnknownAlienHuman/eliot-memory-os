@@ -2682,11 +2682,21 @@ fn typed_emit_candidate(
 
 /// Complete typed A-42 candidate-only planner.
 ///
-/// This is the production entry point for the full issue denominator.  Every
-/// input is an immutable, caller-supplied observation.  The function derives
-/// one in-memory snapshot and returns an inert candidate; it never reads an
-/// ambient snapshot, parses prose into a patch, publishes, executes, reserves,
+/// Every input is an immutable, caller-supplied observation.  The function
+/// derives one in-memory snapshot and returns an inert candidate; it never reads
+/// an ambient snapshot, parses prose into a patch, publishes, executes, reserves,
 /// or grants anything.
+///
+/// # Live status
+///
+/// No production caller. Measured on this tree, the only names of this function
+/// outside its defining line are a `use` and one call inside this crate's own
+/// test module, so the earlier wording that "this is the production entry point
+/// for the full issue denominator" asserted a route that does not exist and has
+/// been corrected. The contract it documents still holds exactly as written; what
+/// is unbuilt is the caller that would supply those observations. Whether an
+/// owner wires the denominator through this entry point or the entry point is
+/// retired is an owner decision; no caller was added to close the gap.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
 pub fn propose_typed_configuration_change(

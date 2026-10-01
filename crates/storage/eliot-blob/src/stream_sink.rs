@@ -17,19 +17,20 @@
 //! * `open` pins the sink session (operation binding, stream kind, policy,
 //!   limits, open digest). A reopened request with the same open digest
 //!   returns the same session; a different digest is `OpenDigestMismatch`.
-//! * `append` admits exact sequence/offset chunks into a staging buffer
-//!   bounded by the session ceilings, with exact-replay acknowledgement and
-//!   an explicit backpressure contract. Appends never touch storage, never
-//!   wait and never retry.
+//! * `append` persists one AEAD-sealed chunk and its exact append commitment
+//!   under the Blob owner before acknowledging the bounded sequence/offset.
+//!   Restart resolves the same encrypted append records and terminal.
+//!   The final immutable source still crosses the existing single Blob stage
+//!   operation after the staged prefix is complete.
 //! * Backpressure isolation (issue #267 W5): the RETAINED bytes this session
 //!   will keep and the QUEUED / IN-FLIGHT bytes it is holding right now are
 //!   two separate accountings against two separate declared ceilings, and both
 //!   are enforced. See [`PersistenceQueueBound`].
 //! * The declared overflow disposition is `Backpressured`: a full persistence
-//!   queue REFUSES the append, stages nothing and charges nothing, and the
-//!   caller applies backpressure at its own end. This adapter holds no wait
-//!   on the append path, so persistence pressure can never stall the pipe
-//!   drain.
+//!   queue REFUSES the append before the owner call, stages nothing and
+//!   charges nothing, and the caller applies backpressure at its own end. A
+//!   single unresolved owner call is bounded per session and never holds a
+//!   process-wide queue or lock while awaiting storage.
 //! * `finalize` publishes only a gap-free, transport-complete source through
 //!   one durable stage call, verifies the ready receipt, reads the object
 //!   back, and only then mints the `COMPLETE_SOURCE` terminal. Anything else
@@ -54,11 +55,10 @@
 //! * The real ready receipt and its exact byte commitment are retained
 //!   immediately after `stage` returns and before the next await, so a failed
 //!   readback resumes the read and never stages again.
-//! * A failure whose effect provably cannot have occurred (stale/revoked
-//!   admission, unclaimed key, invalid contract) releases the handoff back to
-//!   `Reserved`; every other failure retains `StageOutcomeUnknown` so a lost
-//!   response or a dropped future stays `UnknownOutcome` until owner evidence
-//!   settles it.
+//! * Once the sink hands the request to the Blob owner it retains
+//!   `StageOutcomeUnknown` for every returned error or dropped future. Only
+//!   the owner's durable exact-operation lookup may prove `NotStarted`; a
+//!   local error type cannot authorize replay.
 //! * `reconcile` resolves the *original* stage identity against the injected
 //!   owner. The owner is idempotent under its own operation identity, so an
 //!   exact replay returns the same object and never a second one; a cache miss
@@ -128,13 +128,12 @@
 //! identity (issue #297). No policy identifier or transformation enum was
 //! invented here to fill that gap.
 //!
-//! Owner boundary still open elsewhere: the append-only *temporary* object
-//! required by I10.8.5 needs an `append`-shaped operation on the one blob
-//! owner (issue #297, `eliot-blob-api` + `eliot-blob` service). The bound
-//! `stage` context here is a single operation identity, so a per-chunk append
-//! cannot be expressed through it without inventing a second operation
-//! identity space. This adapter therefore stages once, at finalization, and
-//! never claims a durable per-chunk frontier.
+//! Durable append operations retain their exact owner-issued session and
+//! sequence commitments; reopening restores the verified owner snapshot rather
+//! than rebuilding the prefix from a caller-supplied local buffer.
+//! The durable staging API has its own exact stream/sequence request
+//! commitment. The final immutable source still crosses the existing single
+//! Blob stage operation after the staged prefix is complete.
 //!
 //! Governing fragments: I5.12 (single-owner CAS, BYTES-only durability),
 //! I10.8.5 (bounded preview, append-only temporary evidence, final
@@ -147,20 +146,48 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use serde::Serialize;
 
 use eliot_blob_api::{
-    BlobError, BlobHash, BlobPolicyBinding, BlobReadRequest, BlobReadyReceipt, BlobReceiptContext,
-    BlobRootLease, BlobStageRequest, BlobStoreClient, ObjectResidencyKey, VersionedContentDigest,
+    BlobCapacityCause, BlobCapacityEffect, BlobCapacityStage, BlobCasFailure, BlobError, BlobHash,
+    BlobPolicyBinding, BlobProcessStreamSourceBinding, BlobProcessStreamStageTerminal,
+    BlobReadRequest, BlobReadyReceipt, BlobReceiptContext, BlobRootLease,
+    BlobStageRecovery, BlobStageRecoveryRequest, BlobStageRequest, BlobStoreClient,
+    BlobProcessStreamStageAppendRequest, BlobProcessStreamStageOpenRequest,
+    BlobProcessStreamStageSnapshot, BlobProcessStreamStageResumeRequest,
+    ObjectResidencyKey, VersionedContentDigest,
 };
 use eliot_process::{
-    DurableProcessStreamSource, DurableStreamLocatorKind, DurableStreamRepresentation,
-    PROCESS_STREAM_SINK_SCHEMA_VERSION, ProcessStreamDigestAlgorithm, ProcessStreamEvidence,
-    ProcessStreamPrefixPreview, ProcessStreamSinkAbortReason, ProcessStreamSinkAbortRequest,
-    ProcessStreamSinkAppend, ProcessStreamSinkAppendDisposition, ProcessStreamSinkClient,
-    ProcessStreamSinkError, ProcessStreamSinkFinalizeRequest, ProcessStreamSinkFuture,
-    ProcessStreamSinkOpenRequest, ProcessStreamSinkReadback, ProcessStreamSinkSession,
-    ProcessStreamSinkSessionView, ProcessStreamSinkState, ProcessStreamSinkTerminal,
-    ProcessStreamSinkTerminalCommandIdentity, ProcessStreamSinkUnknownOutcome,
-    ProcessStreamTransformationBinding, StreamByteRange, StreamEvidenceGap,
-    StreamPersistenceStatus, StreamPreviewRepresentation, StreamTransportStatus,
+    DurableProcessStreamSource,
+    DurableStreamLocatorKind,
+    DurableStreamRepresentation,
+    PROCESS_STREAM_SINK_SCHEMA_VERSION,
+    ProcessStreamDigestAlgorithm,
+    ProcessStreamEvidence,
+    ProcessStreamKind,
+    ProcessStreamPrefixPreview,
+    ProcessStreamSinkAbortReason,
+    ProcessStreamSinkAbortRequest,
+    ProcessStreamSinkAppend,
+    ProcessStreamSinkAppendDisposition,
+    ProcessStreamSinkCapacityCause,
+    ProcessStreamSinkClient,
+    ProcessStreamSinkError,
+    ProcessStreamSinkFenceReason,
+    ProcessStreamSinkFinalizeRequest,
+    ProcessStreamSinkFuture,
+    ProcessStreamSinkIntegrityReason,
+    ProcessStreamSinkOpenRequest,
+    ProcessStreamSinkReadback,
+    ProcessStreamSinkSession,
+    ProcessStreamSinkSessionView,
+    ProcessStreamSinkState,
+    ProcessStreamSinkTerminal,
+    ProcessStreamSinkTerminalCommandIdentity,
+    ProcessStreamSinkUnknownOutcome,
+    ProcessStreamTransformationBinding,
+    StreamByteRange,
+    StreamEvidenceGap,
+    StreamPersistenceStatus,
+    StreamPreviewRepresentation,
+    StreamTransportStatus,
 };
 use eliot_receipts::EffectClass;
 use sha2::{Digest, Sha256};
@@ -416,9 +443,17 @@ struct SinkState {
     /// See [`PersistenceQueueBound`] for what each side bounds and why the
     /// overflow disposition is a refusal rather than a block.
     persistence_queue: PersistenceQueueBound,
+    /// One append sent to the durable owner but not yet settled locally. An
+    /// unknown result retains this exact commitment and its queue charge so a
+    /// retry can reconcile the same owner operation without double-charging.
+    pending_append: Option<PendingAppendReservation>,
     next_sequence: u64,
     next_offset: u64,
     terminal: Option<ProcessStreamSinkTerminal>,
+    /// Exact owner-issued Blob receipt retained with a successful terminal.
+    /// This is a bounded typed receipt, not a second plaintext or authority
+    /// source; later consumers still validate it against the durable owner.
+    ready_receipt: Option<BlobReadyReceipt>,
     terminal_command: Option<ProcessStreamSinkTerminalCommandIdentity>,
     /// The one bounded phase record of the one reserved terminal command.
     finalization: Option<FinalizeReservation>,
@@ -495,6 +530,16 @@ struct AdmittedChunk {
     sha256: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingAppendReservation {
+    sequence: u64,
+    offset: u64,
+    length: u64,
+    sha256: String,
+    in_flight: bool,
+    charged_bytes: u64,
+}
+
 /// The two INDEPENDENT accountings this adapter now keeps for one session.
 ///
 /// They are deliberately separate quantities and neither is derived from the
@@ -508,16 +553,15 @@ struct AdmittedChunk {
 ///   released byte is never re-spendable and the total over a session's life
 ///   is bounded by the session, not by instantaneous occupancy.
 /// * **QUEUED / IN-FLIGHT** is the declared `max_in_flight_chunks` and
-///   `max_in_flight_bytes`. It is charged when an append is admitted and
-///   released when the session's terminal is recorded. Until then the charge
-///   is real memory this adapter is holding, so a full queue refuses the
-///   *next* append immediately instead of waiting for room to appear.
+///   `max_in_flight_bytes`. It is reserved before an append reaches the owner
+///   and released only after a definite owner result. An unknown result keeps
+///   the exact reservation until the same append identity is reconciled.
 ///
 /// The overflow disposition is `ProcessStreamSinkAppendDisposition::
 /// Backpressured`: the append is REFUSED, nothing is staged, and the caller
 /// applies backpressure at its own end and records the shed byte range as a
 /// `StreamEvidenceGap`. This adapter never blocks, never sleeps, never retries
-/// and never queues behind a provider call, so a full persistence queue
+/// and never queues behind another provider call, so a full persistence queue
 /// cannot stall the pipe drain.
 ///
 /// Every dimension here is a ceiling this crate already READS from the
@@ -552,6 +596,24 @@ impl PersistenceQueueBound {
         let fixed = 4 * U64_SERIALIZED_BYTES;
         let digest = u64::try_from(sha256_hex_len).unwrap_or(u64::MAX);
         fixed.saturating_add(digest).saturating_add(length)
+    }
+
+    fn reserve(&mut self, max_chunks: u32, max_bytes: u64, charge: u64) -> bool {
+        if self.overflowed
+            || u64::from(self.queued_chunks).saturating_add(1) > u64::from(max_chunks)
+            || self.queued_bytes.saturating_add(charge) > max_bytes
+        {
+            self.overflowed = true;
+            return false;
+        }
+        self.queued_chunks = self.queued_chunks.saturating_add(1);
+        self.queued_bytes = self.queued_bytes.saturating_add(charge);
+        true
+    }
+
+    fn release(&mut self, charge: u64) {
+        self.queued_chunks = self.queued_chunks.saturating_sub(1);
+        self.queued_bytes = self.queued_bytes.saturating_sub(charge);
     }
 }
 
@@ -610,6 +672,9 @@ enum PublishStep {
     /// stage operation identity. The bytes are a clone of what the session
     /// still retains, so a dropped publication future stays recoverable.
     Stage { staged: Vec<u8> },
+    /// The previous stage handoff may have taken effect. Query only the same
+    /// owner operation; `Unknown` never falls through to another stage call.
+    Recover { staged: Vec<u8> },
     /// The owner already returned a real ready receipt; resume the readback
     /// only. `stage` must not be called again for this command.
     Readback { ready: Box<BlobReadyReceipt> },
@@ -763,9 +828,11 @@ impl SinkState {
                 queued_bytes: 0,
                 overflowed: false,
             },
+            pending_append: None,
             next_sequence: 0,
             next_offset: 0,
             terminal: None,
+            ready_receipt: None,
             terminal_command: None,
             finalization: None,
             finalization_incarnation: 0,
@@ -956,6 +1023,258 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn stage_session_request(
+        &self,
+        session: &ProcessStreamSinkSession,
+    ) -> Result<BlobProcessStreamStageOpenRequest, ProcessStreamSinkError> {
+        let process_binding_json = serde_json::to_string(session.binding()).map_err(|error| {
+            ProcessStreamSinkError::Serialization {
+                field: "process_binding",
+                reason: error.to_string(),
+            }
+        })?;
+        let policy_json = serde_json::to_string(session.policy()).map_err(|error| {
+            ProcessStreamSinkError::Serialization {
+                field: "process_policy",
+                reason: error.to_string(),
+            }
+        })?;
+        let process_source_binding = BlobProcessStreamSourceBinding {
+            process_binding_sha256: sha256_hex(process_binding_json.as_bytes()),
+            process_binding_json,
+            stream_kind: match session.stream() {
+                ProcessStreamKind::Stdout => "STDOUT",
+                ProcessStreamKind::Stderr => "STDERR",
+            }
+            .to_owned(),
+            policy_sha256: sha256_hex(policy_json.as_bytes()),
+            policy_json,
+        };
+        let limits = session.limits();
+        let request = BlobProcessStreamStageOpenRequest {
+            session_id: session.session_id().as_str().to_owned(),
+            source_id: session.source_id().as_str().to_owned(),
+            terminal_id: session.terminal_id().as_str().to_owned(),
+            open_request_sha256: session.open_request_sha256().to_owned(),
+            stage_context: self.binding.stage_context().clone(),
+            read_context: self.binding.read_context().clone(),
+            root_lease: self.binding.root_lease().clone(),
+            policy: self.binding.policy().clone(),
+            residency: self.binding.residency().clone(),
+            process_source_binding,
+            max_bytes: limits.max_total_admitted_bytes(),
+            max_chunk_bytes: limits.max_chunk_bytes(),
+            max_chunks: limits.max_chunks(),
+        };
+        request.validate().map_err(|error| map_blob_error(&error))?;
+        Ok(request)
+    }
+
+    fn restore_stage_snapshot(
+        state: &mut SinkState,
+        session: ProcessStreamSinkSession,
+        snapshot: BlobProcessStreamStageSnapshot,
+    ) -> Result<(), ProcessStreamSinkError> {
+        snapshot.validate().map_err(|error| map_blob_error(&error))?;
+        if snapshot.session.session_id != session.session_id().as_str()
+            || snapshot.session.source_id != session.source_id().as_str()
+            || snapshot.session.terminal_id != session.terminal_id().as_str()
+            || snapshot.session.open_request_sha256 != session.open_request_sha256()
+        {
+            return Err(ProcessStreamSinkError::SessionMismatch);
+        }
+        let terminal = snapshot
+            .terminal
+            .as_ref()
+            .map(|record| {
+                serde_json::from_str::<ProcessStreamSinkTerminal>(&record.terminal_json)
+                    .map_err(|error| ProcessStreamSinkError::Serialization {
+                        field: "durable_process_terminal",
+                        reason: error.to_string(),
+                    })
+            })
+            .transpose()?;
+        if let Some(terminal) = &terminal {
+            terminal.validate()?;
+            if terminal.session_id().as_str() != session.session_id().as_str()
+                || terminal.source_id().as_str() != session.source_id().as_str()
+                || terminal.terminal_id().as_str() != session.terminal_id().as_str()
+                || terminal.open_request_sha256() != session.open_request_sha256()
+                || terminal.final_sequence() != snapshot.next_sequence
+                || terminal.final_offset() != snapshot.next_offset
+                || terminal.admitted_sha256() != snapshot.sha256
+            {
+                return Err(ProcessStreamSinkError::EvidenceInvariant {
+                    reason: "durable terminal differs from the exact append frontier".to_owned(),
+                });
+            }
+        }
+        let preview_ceiling = session.limits().max_preview_bytes();
+        state.bind_measure_revisions(&session);
+        state.session = Some(session);
+        state.staged = if terminal.is_some() {
+            Vec::new()
+        } else {
+            snapshot.bytes.clone()
+        };
+        if terminal.is_none() {
+            state.transport.absorb(&snapshot.bytes);
+            state.preview.absorb(&snapshot.bytes, preview_ceiling);
+        }
+        state.admitted_chunks = snapshot
+            .append_receipts
+            .into_iter()
+            .map(|receipt| AdmittedChunk {
+                sequence: receipt.sequence,
+                offset: receipt.offset,
+                length: receipt.byte_length,
+                sha256: receipt.chunk_sha256,
+            })
+            .collect();
+        state.next_sequence = snapshot.next_sequence;
+        state.next_offset = snapshot.next_offset;
+        state.persistence_queue.queued_chunks = 0;
+        state.persistence_queue.queued_bytes = 0;
+        state.pending_append = None;
+        if let Some(terminal) = terminal {
+            let ready = snapshot
+                .terminal
+                .as_ref()
+                .and_then(|record| record.ready_receipt.clone());
+            let publication = if let Some(ready) = &ready {
+                let source = terminal
+                    .evidence()
+                    .source()
+                    .ok_or(ProcessStreamSinkError::ProviderUnavailable)?;
+                if source.sha256() != ready.plaintext_sha256()
+                    || source.byte_length() != ready.plaintext_length()
+                    || source.ready_receipt_ref()
+                        != ready.receipt().identity.receipt_id.as_str()
+                {
+                    return Err(ProcessStreamSinkError::EvidenceInvariant {
+                        reason: "durable Blob receipt differs from process terminal".to_owned(),
+                    });
+                }
+                Self::publication_of(source.sha256(), ready)?
+            } else {
+                BlobStreamPublication::Unavailable {
+                    reason: match terminal.state() {
+                        ProcessStreamSinkState::PolicyProhibited => {
+                            BlobStreamUnavailableReason::PolicyProhibited
+                        }
+                        ProcessStreamSinkState::RedactionFailed => {
+                            BlobStreamUnavailableReason::RedactionFailed
+                        }
+                        _ => unavailable_reason(terminal.evidence().gaps()),
+                    },
+                }
+            };
+            if terminal.state() == ProcessStreamSinkState::CompleteSource && ready.is_none() {
+                return Err(ProcessStreamSinkError::EvidenceInvariant {
+                    reason: "complete durable terminal has no owner ready receipt".to_owned(),
+                });
+            }
+            state.ready_receipt = ready;
+            state.terminal_command = Some(terminal.command_identity().clone());
+            state.publication = Some(publication);
+            state.terminal = Some(terminal);
+        }
+        Ok(())
+    }
+
+    async fn persist_terminal(
+        &self,
+        session: &ProcessStreamSinkSession,
+        terminal: &ProcessStreamSinkTerminal,
+        ready_receipt: Option<&BlobReadyReceipt>,
+    ) -> Result<(), ProcessStreamSinkError> {
+        let terminal_bytes = eliot_contracts::canonical_json_bytes(terminal).map_err(|error| {
+            ProcessStreamSinkError::Serialization {
+                field: "durable_process_terminal",
+                reason: error.to_string(),
+            }
+        })?;
+        let terminal_record = BlobProcessStreamStageTerminal {
+            terminal_json: String::from_utf8(terminal_bytes.clone()).map_err(|error| {
+                ProcessStreamSinkError::Serialization {
+                    field: "durable_process_terminal",
+                    reason: error.to_string(),
+                }
+            })?,
+            terminal_json_sha256: sha256_hex(&terminal_bytes),
+            ready_receipt: ready_receipt.cloned(),
+        };
+        self.store
+            .record_process_stream_stage_terminal(
+                BlobProcessStreamStageResumeRequest {
+                    session_id: session.session_id().as_str().to_owned(),
+                    source_id: session.source_id().as_str().to_owned(),
+                    terminal_id: session.terminal_id().as_str().to_owned(),
+                    open_request_sha256: session.open_request_sha256().to_owned(),
+                },
+                terminal_record,
+            )
+            .await
+            .map_err(|error| map_blob_error(&error))
+    }
+
+    fn durable_append_request(
+        session: &ProcessStreamSinkSession,
+        request: &ProcessStreamSinkAppend,
+    ) -> BlobProcessStreamStageAppendRequest {
+        BlobProcessStreamStageAppendRequest {
+            session_id: session.session_id().as_str().to_owned(),
+            source_id: session.source_id().as_str().to_owned(),
+            terminal_id: session.terminal_id().as_str().to_owned(),
+            open_request_sha256: session.open_request_sha256().to_owned(),
+            sequence: request.sequence(),
+            offset: request.offset(),
+            bytes: request.bytes().to_vec(),
+            chunk_sha256: request.sha256().to_owned(),
+        }
+    }
+
+    /// Returns the exact Blob owner receipt retained for this successful
+    /// terminal. A terminal's digest/locator projection alone is insufficient
+    /// to create the later source-admission Ready revision.
+    pub fn finalized_ready_receipt(
+        &self,
+        session: &ProcessStreamSinkSession,
+        terminal: &ProcessStreamSinkTerminal,
+    ) -> Result<BlobReadyReceipt, ProcessStreamSinkError> {
+        let state = self.lock();
+        let existing = Self::check_session(&state, session)?;
+        if terminal.state() != ProcessStreamSinkState::CompleteSource
+            || terminal.session_id() != existing.session_id()
+            || terminal.source_id() != existing.source_id()
+            || terminal.terminal_id() != existing.terminal_id()
+            || terminal.open_request_sha256() != existing.open_request_sha256()
+            || state.terminal.as_ref() != Some(terminal)
+        {
+            return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+        }
+        let ready = state
+            .ready_receipt
+            .as_ref()
+            .ok_or(ProcessStreamSinkError::ProviderUnavailable)?;
+        ready.validate().map_err(|error| map_blob_error(&error))?;
+        let source = terminal
+            .evidence()
+            .source()
+            .ok_or(ProcessStreamSinkError::ProviderUnavailable)?;
+        if source.sha256() != ready.plaintext_sha256()
+            || source.byte_length() != ready.plaintext_length()
+            || source.ready_receipt_ref() != ready.receipt().identity.receipt_id.as_str()
+            || source.locator() != format!("{BLOB_SOURCE_LOCATOR_SCHEME}:{}", ready.locator().hash)
+        {
+            return Err(ProcessStreamSinkError::EvidenceInvariant {
+                reason: "retained Blob ready receipt differs from the exact terminal source"
+                    .to_owned(),
+            });
+        }
+        Ok(ready.clone())
+    }
+
     fn ready<T: Send + 'static>(
         result: Result<T, ProcessStreamSinkError>,
     ) -> ProcessStreamSinkFuture<'static, T> {
@@ -1122,6 +1441,73 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         PersistenceQueueBound::record_bytes(request.byte_length(), request.sha256().len())
     }
 
+    /// Reserves bounded in-flight capacity before the durable owner is called.
+    /// A retry may reuse only the exact unresolved append commitment.
+    fn reserve_append(
+        state: &mut SinkState,
+        session: &ProcessStreamSinkSession,
+        request: &ProcessStreamSinkAppend,
+    ) -> Result<bool, ProcessStreamSinkError> {
+        let matches = |pending: &PendingAppendReservation| {
+            pending.sequence == request.sequence()
+                && pending.offset == request.offset()
+                && pending.length == request.byte_length()
+                && pending.sha256 == request.sha256()
+        };
+        if let Some(pending) = state.pending_append.as_mut() {
+            if !matches(pending) {
+                return Err(ProcessStreamSinkError::MismatchedReplay);
+            }
+            if pending.in_flight {
+                return Err(ProcessStreamSinkError::PossibleEffectUnknown {
+                    operation: "blob-process-stream-append",
+                });
+            }
+            pending.in_flight = true;
+            return Ok(true);
+        }
+        let charge = Self::queue_charge_bytes(request);
+        if !state.persistence_queue.reserve(
+            session.limits().max_in_flight_chunks(),
+            session.limits().max_in_flight_bytes(),
+            charge,
+        ) {
+            return Ok(false);
+        }
+        state.pending_append = Some(PendingAppendReservation {
+            sequence: request.sequence(),
+            offset: request.offset(),
+            length: request.byte_length(),
+            sha256: request.sha256().to_owned(),
+            in_flight: true,
+            charged_bytes: charge,
+        });
+        Ok(true)
+    }
+
+    /// Settles a definite no-effect failure. Possible effects keep both the
+    /// exact request commitment and its bounded charge for same-operation
+    /// reconciliation.
+    fn settle_append_error(
+        state: &mut SinkState,
+        possible_effect: bool,
+    ) {
+        if let Some(pending) = state.pending_append.as_mut() {
+            pending.in_flight = false;
+            if !possible_effect {
+                let charge = pending.charged_bytes;
+                state.pending_append = None;
+                state.persistence_queue.release(charge);
+            }
+        }
+    }
+
+    fn settle_append_commit(state: &mut SinkState) {
+        if let Some(pending) = state.pending_append.take() {
+            state.persistence_queue.release(pending.charged_bytes);
+        }
+    }
+
     fn append_locked(
         state: &mut SinkState,
         session: &ProcessStreamSinkSession,
@@ -1180,49 +1566,10 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         {
             return Err(ProcessStreamSinkError::TotalLimitExceeded);
         }
-        // PERSISTENCE QUEUE BOUND (issue #267 W5). This is the half of the
-        // accounting the RETAINED ceiling above cannot express. `next_offset`
-        // answers "how much will this session keep"; the ledger below answers
-        // "how much is this adapter holding right now for persistence", and
-        // the two have separate ceilings because a caller can be refused long
-        // before its retained total is reached.
-        //
-        // The check is BEFORE any charge and before `staged` is extended, so a
-        // refused append stages nothing, digests nothing and advances no
-        // cursor: a shed byte can never reach the staged plaintext, the
-        // transport digest or the admitted count, and therefore can never be
-        // counted as covered.
-        //
-        // `retry_after_ms` is a hint, never a promise. This adapter holds no
-        // wait on the append path — it never sleeps, never retries, never
-        // queues behind a provider call — so `0` states the truth that room
-        // only appears as a terminal or abort releases it. A caller that
-        // retries immediately still gets an immediate, identical refusal
-        // instead of a block, and the drain therefore cannot stall here.
-        let charged_bytes = Self::queue_charge_bytes(request);
-        if state.persistence_queue.overflowed
-            || u64::from(state.persistence_queue.queued_chunks).saturating_add(1)
-                > u64::from(limits.max_in_flight_chunks())
-            || state
-                .persistence_queue
-                .queued_bytes
-                .saturating_add(charged_bytes)
-                > limits.max_in_flight_bytes()
-        {
-            // Latched, never cleared: once persistence has overflowed, every
-            // later append sheds too. That is what makes the drain immune to
-            // a stalled provider — a caller cannot grind through a full queue
-            // by retrying, and a caller's failure to stop retrying costs it a
-            // refusal per chunk, never the pipe.
-            state.persistence_queue.overflowed = true;
-            return Ok(ProcessStreamSinkAppendDisposition::Backpressured { retry_after_ms: 0 });
-        }
-        state.persistence_queue.queued_chunks =
-            state.persistence_queue.queued_chunks.saturating_add(1);
-        state.persistence_queue.queued_bytes = state
-            .persistence_queue
-            .queued_bytes
-            .saturating_add(charged_bytes);
+        // The owner has already committed this exact append before this local
+        // reconstruction. The total byte and chunk ceilings bound the
+        // in-memory finalize view; the durable AEAD chunk remains the restart
+        // authority and is never recreated from a caller-supplied prefix.
         state.admitted_chunks.push(AdmittedChunk {
             sequence: request.sequence(),
             offset: request.offset(),
@@ -1239,6 +1586,31 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             next_sequence: state.next_sequence,
             next_offset: state.next_offset,
         })
+    }
+
+    fn ready_append_replay(
+        state: &SinkState,
+        request: &ProcessStreamSinkAppend,
+    ) -> Result<ProcessStreamSinkAppendDisposition, ProcessStreamSinkError> {
+        let matches_admitted_chunk = usize::try_from(request.sequence())
+            .ok()
+            .and_then(|index| state.admitted_chunks.get(index))
+            .is_some_and(|chunk| {
+                chunk.sequence == request.sequence()
+                    && chunk.offset == request.offset()
+                    && chunk.length == request.byte_length()
+                    && chunk.sha256 == request.sha256()
+                    && Self::admitted_prefix(state, chunk.offset, chunk.length)
+                        == Some(request.bytes())
+            });
+        if matches_admitted_chunk {
+            Ok(ProcessStreamSinkAppendDisposition::Replayed {
+                next_sequence: state.next_sequence,
+                next_offset: state.next_offset,
+            })
+        } else {
+            Err(ProcessStreamSinkError::MismatchedReplay)
+        }
     }
 
     fn abort_state(reason: ProcessStreamSinkAbortReason) -> ProcessStreamSinkState {
@@ -1276,6 +1648,11 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         // non-publishing terminal may be minted for the same terminal id.
         if state.finalization.is_some() {
             return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+        }
+        if state.pending_append.is_some() {
+            return Err(ProcessStreamSinkError::PossibleEffectUnknown {
+                operation: "blob-process-stream-append",
+            });
         }
         existing.validate_abort(&request)?;
         Self::check_sequence_offset(
@@ -1363,29 +1740,75 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         Ok(request)
     }
 
-    /// Hands the exact bytes to the one owner for the first time under this
-    /// reservation, after marking the outcome as possibly having taken effect.
-    /// The mark happens before the await so a dropped future stays unknown.
+    fn stage_recovery_request(
+        &self,
+        session: &ProcessStreamSinkSession,
+        request: &ProcessStreamSinkFinalizeRequest,
+        identity: &ProcessStreamSinkTerminalCommandIdentity,
+        stage: &BlobStageRequest,
+    ) -> Result<BlobStageRecoveryRequest, ProcessStreamSinkError> {
+        if request.command_identity()? != *identity {
+            return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+        }
+        let process_binding_json = serde_json::to_string(session.binding()).map_err(|error| {
+            ProcessStreamSinkError::Serialization {
+                field: "process_binding",
+                reason: error.to_string(),
+            }
+        })?;
+        let policy_json = serde_json::to_string(session.policy()).map_err(|error| {
+            ProcessStreamSinkError::Serialization {
+                field: "process_policy",
+                reason: error.to_string(),
+            }
+        })?;
+        let process_source_binding = BlobProcessStreamSourceBinding {
+            process_binding_sha256: sha256_hex(process_binding_json.as_bytes()),
+            process_binding_json,
+            stream_kind: match session.stream() {
+                ProcessStreamKind::Stdout => "STDOUT",
+                ProcessStreamKind::Stderr => "STDERR",
+            }
+            .to_owned(),
+            policy_sha256: sha256_hex(policy_json.as_bytes()),
+            policy_json,
+        };
+        Ok(BlobStageRecoveryRequest {
+            session_id: session.session_id().as_str().to_owned(),
+            terminal_id: identity.terminal_id().as_str().to_owned(),
+            open_request_sha256: session.open_request_sha256().to_owned(),
+            terminal_command_sha256: identity.request_sha256().to_owned(),
+            stage_context: self.binding.stage_context().clone(),
+            read_context: self.binding.read_context().clone(),
+            root_lease: self.binding.root_lease().clone(),
+            expected_content_hash: stage.residency.content_digest.digest.clone(),
+            expected_plaintext_sha256: sha256_hex(&stage.bytes),
+            expected_plaintext_length: stage.bytes.len() as u64,
+            policy: self.binding.policy().clone(),
+            residency: stage.residency.clone(),
+            process_source_binding,
+            expected_ready_receipt_id: None,
+        })
+    }
+
+    /// Hands the exact bytes to the owner only after its durable intent lookup
+    /// proves this exact session/finalize operation is NotStarted, or resolves
+    /// an existing ready result. The local phase is marked before the await so
+    /// a dropped future stays unknown.
     async fn stage_once(
         &self,
+        session: &ProcessStreamSinkSession,
+        request: &ProcessStreamSinkFinalizeRequest,
         identity: &ProcessStreamSinkTerminalCommandIdentity,
         incarnation: u64,
         staged: &[u8],
     ) -> Result<BlobReadyReceipt, ProcessStreamSinkError> {
+        let stage = self.stage_request(staged)?;
+        let recovery = self.stage_recovery_request(session, request, identity, &stage)?;
         self.mark_stage_handoff(identity, incarnation)?;
-        let request = self.stage_request(staged)?;
-        match self.store.stage(request).await {
+        match self.store.stage_with_recovery(stage, recovery).await {
             Ok(ready) => self.retain_ready(identity, incarnation, staged, ready),
-            Err(error) => {
-                // Only a provably pre-effect refusal may clear the handoff
-                // mark. Every other outcome keeps the possible effect, so the
-                // reservation stays reconcilable instead of becoming a
-                // permanently reserved command.
-                if !possible_blob_effect(&error) {
-                    self.clear_stage_handoff(identity, incarnation);
-                }
-                Err(map_blob_error(&error))
-            }
+            Err(error) => Err(map_blob_error(&error)),
         }
     }
 
@@ -1407,23 +1830,6 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         }
         reservation.phase = FinalizePhase::StageOutcomeUnknown;
         Ok(())
-    }
-
-    /// Clears a handoff mark that provably never reached a durable effect,
-    /// returning the reservation to its resumable reserved phase.
-    fn clear_stage_handoff(
-        &self,
-        identity: &ProcessStreamSinkTerminalCommandIdentity,
-        incarnation: u64,
-    ) {
-        let mut state = self.lock();
-        if let Some(reservation) = state.finalization.as_mut()
-            && reservation.identity == *identity
-            && reservation.incarnation == incarnation
-            && matches!(reservation.phase, FinalizePhase::StageOutcomeUnknown)
-        {
-            reservation.phase = FinalizePhase::Reserved;
-        }
     }
 
     /// Retains the real ready receipt and its exact byte commitment
@@ -1464,6 +1870,76 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         };
         state.staged = Vec::new();
         Ok(ready)
+    }
+
+    /// Retains a ready receipt recovered from the owner's durable operation
+    /// journal. No caller-provided receipt data is accepted, and the exact
+    /// process byte commitment is checked before the sink advances.
+    fn retain_recovered_ready(
+        &self,
+        identity: &ProcessStreamSinkTerminalCommandIdentity,
+        incarnation: u64,
+        ready: BlobReadyReceipt,
+        expected_sha256: &str,
+        expected_length: u64,
+    ) -> Result<BlobReadyReceipt, ProcessStreamSinkError> {
+        ready.validate().map_err(|error| map_blob_error(&error))?;
+        if ready.plaintext_sha256() != expected_sha256
+            || ready.plaintext_length() != expected_length
+        {
+            return Err(ProcessStreamSinkError::EvidenceInvariant {
+                reason: "recovered ready receipt does not match the retained stream commitment"
+                    .to_owned(),
+            });
+        }
+        let mut state = self.lock();
+        let Some(reservation) = state.finalization.as_mut() else {
+            return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+        };
+        if reservation.identity != *identity
+            || reservation.incarnation != incarnation
+            || !matches!(reservation.phase, FinalizePhase::StageOutcomeUnknown)
+        {
+            return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+        }
+        reservation.phase = FinalizePhase::ReadbackPending {
+            ready: Box::new(ready.clone()),
+        };
+        state.staged.clear();
+        Ok(ready)
+    }
+
+    async fn recover_stage_once(
+        &self,
+        session: &ProcessStreamSinkSession,
+        request: &ProcessStreamSinkFinalizeRequest,
+        identity: &ProcessStreamSinkTerminalCommandIdentity,
+        incarnation: u64,
+        staged: &[u8],
+    ) -> Result<BlobReadyReceipt, ProcessStreamSinkError> {
+        let stage = self.stage_request(staged)?;
+        let recovery = self.stage_recovery_request(session, request, identity, &stage)?;
+        let ready = match self.store.recover_stage(recovery.clone()).await {
+            Ok(BlobStageRecovery::Ready(ready)) => *ready,
+            Ok(BlobStageRecovery::NotStarted) => self
+                .store
+                .stage_with_recovery(stage, recovery)
+                .await
+                .map_err(|error| map_blob_error(&error))?,
+            Ok(BlobStageRecovery::Unknown) => {
+                return Err(ProcessStreamSinkError::PossibleEffectUnknown {
+                    operation: "blob-stage",
+                });
+            }
+            Err(error) => return Err(map_blob_error(&error)),
+        };
+        self.retain_recovered_ready(
+            identity,
+            incarnation,
+            ready,
+            &sha256_hex(staged),
+            staged.len() as u64,
+        )
     }
 
     /// Reads the retained object back and proves it is the very object the
@@ -1574,6 +2050,11 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
                 Err(ProcessStreamSinkError::TerminalIdentityConflict)
             };
         }
+        if state.pending_append.is_some() {
+            return Err(ProcessStreamSinkError::PossibleEffectUnknown {
+                operation: "blob-process-stream-append",
+            });
+        }
         existing.validate_finalize(request)?;
         Self::check_sequence_offset(
             &state,
@@ -1633,7 +2114,12 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
                 Some(ready) => PublishStep::Readback {
                     ready: Box::new(ready),
                 },
-                None => PublishStep::Stage {
+                None if matches!(reservation.phase, FinalizePhase::Reserved) => {
+                    PublishStep::Stage {
+                        staged: state.staged.clone(),
+                    }
+                }
+                None => PublishStep::Recover {
                     staged: state.staged.clone(),
                 },
             };
@@ -1830,10 +2316,26 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
                 // to the owner and dropped when the call returns, so no
                 // second simultaneous copy of the stream exists at any point.
                 let ready = self
-                    .stage_once(&ticket.identity, ticket.incarnation, &staged)
+                    .stage_once(
+                        &ticket.session,
+                        &ticket.request,
+                        &ticket.identity,
+                        ticket.incarnation,
+                        &staged,
+                    )
                     .await?;
                 drop(staged);
                 ready
+            }
+            PublishStep::Recover { staged } => {
+                self.recover_stage_once(
+                    &ticket.session,
+                    &ticket.request,
+                    &ticket.identity,
+                    ticket.incarnation,
+                    &staged,
+                )
+                .await?
             }
         };
         self.verify_readback(&ready).await?;
@@ -1844,6 +2346,7 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             &ticket.admitted_sha256,
             &ready,
         )?;
+        let terminal_session = ticket.session.clone();
         let terminal = ProcessStreamSinkTerminal::from_finalize(
             ticket.session,
             ticket.request,
@@ -1853,7 +2356,11 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             ticket.admitted_sha256,
             evidence,
         )?;
-        Self::record_locked(&mut self.lock(), ticket.identity, publication, terminal)
+        self.persist_terminal(&terminal_session, &terminal, Some(&ready))
+            .await?;
+        let mut state = self.lock();
+        state.ready_receipt = Some(ready);
+        Self::record_locked(&mut state, ticket.identity, publication, terminal)
     }
 
     /// Mints the withheld (never-published) terminal for a gapped,
@@ -1861,7 +2368,7 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
     ///
     /// The recorded outcome is exactly `Unavailable { reason }`: no durable
     /// source exists, and no raw byte was staged to manufacture coverage.
-    fn withhold_reserved(
+    async fn withhold_reserved(
         &self,
         ticket: WithheldTicket,
     ) -> Result<ProcessStreamSinkTerminal, ProcessStreamSinkError> {
@@ -1877,6 +2384,7 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             None,
             ticket.request.gaps().to_vec(),
         )?;
+        let terminal_session = ticket.session.clone();
         let terminal = ProcessStreamSinkTerminal::from_finalize(
             ticket.session,
             ticket.request,
@@ -1886,6 +2394,8 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             ticket.admitted_sha256,
             evidence,
         )?;
+        self.persist_terminal(&terminal_session, &terminal, None)
+            .await?;
         Self::record_locked(
             &mut self.lock(),
             ticket.identity,
@@ -1902,7 +2412,7 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         let plan = self.plan_finalize(&session, &request)?;
         match plan {
             FinalizePlan::Recorded(terminal) => Ok(*terminal),
-            FinalizePlan::Withheld(ticket) => self.withhold_reserved(*ticket),
+            FinalizePlan::Withheld(ticket) => self.withhold_reserved(*ticket).await,
             FinalizePlan::Publish(ticket) => {
                 let hold = FinalizeHold {
                     sink: self,
@@ -1916,10 +2426,9 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
 
     /// Reconciles an uncertain provider effect under the original stage
     /// identity. Existing publication evidence is resolved first: a retained
-    /// ready receipt resumes the readback without a second stage, and an
-    /// unsettled handoff re-issues the exact original stage request, which the
-    /// single owner resolves under its own idempotency identity. A cache miss
-    /// is never treated as proof of non-publication.
+    /// ready receipt resumes the readback, while a lost stage response asks
+    /// the owner for its durable same-operation disposition. An unresolved
+    /// lookup remains unknown and never triggers another stage call.
     async fn reconcile_async(
         &self,
         session: ProcessStreamSinkSession,
@@ -2100,6 +2609,20 @@ fn possible_blob_effect(error: &BlobError) -> bool {
     )
 }
 
+fn possible_append_effect(error: &BlobError) -> bool {
+    match error {
+        BlobError::StorageCapacity { failure } => !matches!(
+            failure.evidence.effect,
+            BlobCapacityEffect::NotAttempted
+                | BlobCapacityEffect::DurabilityUnconfirmed {
+                    possible_effect: false,
+                    ..
+                }
+        ),
+        _ => possible_blob_effect(error),
+    }
+}
+
 /// Maps a blob-layer failure onto the sink contract.
 ///
 /// The mapping keeps the two vocabulary axes the contract already separates.
@@ -2117,12 +2640,94 @@ fn possible_blob_effect(error: &BlobError) -> bool {
 /// return `Err` before any terminal exists.
 fn map_blob_error(error: &BlobError) -> ProcessStreamSinkError {
     match error {
-        BlobError::IntegrityMismatch | BlobError::MetadataPayloadMismatch => {
-            ProcessStreamSinkError::EvidenceInvariant {
-                reason: error.to_string(),
+        BlobError::UnknownStreamAppendOutcome { .. } => {
+            ProcessStreamSinkError::PossibleEffectUnknown {
+                operation: "blob-process-stream-append",
+            }
+        }
+        BlobError::StorageCapacity { failure } => {
+            let cause = match failure.evidence.cause {
+                BlobCapacityCause::IoStorageFull => ProcessStreamSinkCapacityCause::StorageFull,
+                BlobCapacityCause::PosixEnospc { code } => {
+                    ProcessStreamSinkCapacityCause::PosixEnospc { code }
+                }
+                BlobCapacityCause::WindowsErrorDiskFull { code } => {
+                    ProcessStreamSinkCapacityCause::WindowsDiskFull { code }
+                }
+                BlobCapacityCause::WindowsErrorHandleDiskFull { code } => {
+                    ProcessStreamSinkCapacityCause::WindowsHandleDiskFull { code }
+                }
+            };
+            ProcessStreamSinkError::StorageCapacity {
+                stage: capacity_stage_name(failure.stage),
+                cause,
+                attempted_bytes: failure.evidence.attempted_bytes,
+                possible_effect: !matches!(
+                    failure.evidence.effect,
+                    BlobCapacityEffect::NotAttempted
+                ) && !matches!(
+                    failure.evidence.effect,
+                    BlobCapacityEffect::DurabilityUnconfirmed {
+                        possible_effect: false,
+                        ..
+                    }
+                ),
+            }
+        }
+        BlobError::StaleFence => ProcessStreamSinkError::AdmissionFenced {
+            reason: ProcessStreamSinkFenceReason::StaleOrRevoked,
+        },
+        BlobError::OwnerConflict => ProcessStreamSinkError::AdmissionFenced {
+            reason: ProcessStreamSinkFenceReason::OwnerConflict,
+        },
+        BlobError::IntegrityMismatch => ProcessStreamSinkError::IntegrityFailure {
+            reason: ProcessStreamSinkIntegrityReason::AuthenticationOrDigest,
+        },
+        BlobError::MetadataPayloadMismatch | BlobError::IdempotencyConflict => {
+            ProcessStreamSinkError::IntegrityFailure {
+                reason: ProcessStreamSinkIntegrityReason::MetadataPayloadBinding,
+            }
+        }
+        BlobError::UnknownPublishOutcome { .. } | BlobError::UnknownGcOutcome { .. } => {
+            ProcessStreamSinkError::PossibleEffectUnknown {
+                operation: "blob-publication",
+            }
+        }
+        BlobError::CasFailure { failure }
+            if matches!(
+                failure.as_ref(),
+                BlobCasFailure::UnknownOutcome { .. }
+                    | BlobCasFailure::DurabilityUnconfirmed { .. }
+            ) =>
+        {
+            ProcessStreamSinkError::PossibleEffectUnknown {
+                operation: "blob-stage-intent-cas",
+            }
+        }
+        BlobError::ProviderUnavailable(_) | BlobError::PlanGap(_) | BlobError::Provider(_) => {
+            ProcessStreamSinkError::PossibleEffectUnknown {
+                operation: "blob-stage-or-readback",
             }
         }
         _ => ProcessStreamSinkError::ProviderUnavailable,
+    }
+}
+
+fn capacity_stage_name(stage: BlobCapacityStage) -> &'static str {
+    match stage {
+        BlobCapacityStage::RootLeaseCreate => "root-lease-create",
+        BlobCapacityStage::RootLeaseHeartbeat => "root-lease-heartbeat",
+        BlobCapacityStage::JournalWrite => "journal-write",
+        BlobCapacityStage::PayloadWrite => "payload-write",
+        BlobCapacityStage::MetadataWrite => "metadata-write",
+        BlobCapacityStage::FileFlush => "file-flush",
+        BlobCapacityStage::DirectoryFlush => "directory-flush",
+        BlobCapacityStage::PayloadPublication => "payload-publication",
+        BlobCapacityStage::MetadataPublication => "metadata-publication",
+        BlobCapacityStage::CommitWrite => "commit-write",
+        BlobCapacityStage::Cleanup => "cleanup",
+        BlobCapacityStage::CasJournal => "cas-journal",
+        BlobCapacityStage::GcCleanup => "gc-cleanup",
     }
 }
 
@@ -2131,20 +2736,46 @@ impl<C: BlobStoreClient> ProcessStreamSinkClient for BlobStoreStreamSink<C> {
         &self,
         request: ProcessStreamSinkOpenRequest,
     ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkSession> {
-        let mut state = self.lock();
-        let result = match state.session.as_ref() {
-            Some(existing) if existing.open_request_sha256() == request.open_request_sha256() => {
-                Ok(existing.clone())
+        Box::pin(async move {
+            request.validate()?;
+            let existing = self.lock().session.clone();
+            let session = match existing {
+                Some(existing) => {
+                    if existing.open_request_sha256() != request.open_request_sha256() {
+                        return Err(ProcessStreamSinkError::OpenDigestMismatch);
+                    }
+                    existing
+                }
+                None => ProcessStreamSinkSession::from_open_request(request)?,
+            };
+            let store_request = self.stage_session_request(&session)?;
+            let snapshot = self
+                .store
+                .open_process_stream_stage(store_request)
+                .await
+                .map_err(|error| map_blob_error(&error))?;
+            let mut state = self.lock();
+            if state.pending_append.is_some() {
+                return Err(ProcessStreamSinkError::PossibleEffectUnknown {
+                    operation: "blob-process-stream-append",
+                });
             }
-            Some(_) => Err(ProcessStreamSinkError::OpenDigestMismatch),
-            None => ProcessStreamSinkSession::from_open_request(request).inspect(|session| {
-                // The measures this session will be stamped with are bound
-                // to the revisions its own open request declared.
-                state.session = Some(session.clone());
-                state.bind_measure_revisions(session);
-            }),
-        };
-        Self::ready(result)
+            if let Some(retained) = state.session.as_ref() {
+                if retained != &session {
+                    return Err(ProcessStreamSinkError::OpenDigestMismatch);
+                }
+                if snapshot.next_sequence < state.next_sequence
+                    || snapshot.next_offset < state.next_offset
+                    || !snapshot.bytes.starts_with(&state.staged)
+                {
+                    return Err(ProcessStreamSinkError::EvidenceInvariant {
+                        reason: "durable Blob append frontier regressed or changed".to_owned(),
+                    });
+                }
+            }
+            Self::restore_stage_snapshot(&mut state, session.clone(), snapshot)?;
+            Ok(session)
+        })
     }
 
     fn append(
@@ -2152,10 +2783,92 @@ impl<C: BlobStoreClient> ProcessStreamSinkClient for BlobStoreStreamSink<C> {
         session: ProcessStreamSinkSession,
         request: ProcessStreamSinkAppend,
     ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkAppendDisposition> {
-        let mut state = self.lock();
-        let result = Self::check_session(&state, &session)
-            .and_then(|existing| Self::append_locked(&mut state, &existing, &request));
-        Self::ready(result)
+        Box::pin(async move {
+            let durable_request = Self::durable_append_request(&session, &request);
+            let stage_request = self.stage_session_request(&session)?;
+            {
+                let mut state = self.lock();
+                let existing = Self::check_session(&state, &session)?;
+                if let Some(terminal) = &state.terminal {
+                    return Ok(ProcessStreamSinkAppendDisposition::Terminal {
+                        state: terminal.state(),
+                        terminal_sha256: terminal.terminal_sha256().to_owned(),
+                    });
+                }
+                if state.finalization.is_some() {
+                    return Err(ProcessStreamSinkError::AppendAfterFinalizing);
+                }
+                existing.validate_append(&request)?;
+                if request.sequence() < state.next_sequence {
+                    return Self::ready_append_replay(&state, &request);
+                }
+                if request.sequence() > state.next_sequence {
+                    return Err(ProcessStreamSinkError::SequenceGap {
+                        expected: state.next_sequence,
+                        observed: request.sequence(),
+                    });
+                }
+                if request.offset() != state.next_offset {
+                    return Err(ProcessStreamSinkError::OffsetMismatch {
+                        expected: state.next_offset,
+                        observed: request.offset(),
+                    });
+                }
+                if state.next_sequence >= existing.limits().max_chunks() {
+                    return Err(ProcessStreamSinkError::ChunkCountLimitExceeded);
+                }
+                if request.byte_length()
+                    > existing
+                        .limits()
+                        .max_total_admitted_bytes()
+                        .saturating_sub(state.next_offset)
+                {
+                    return Err(ProcessStreamSinkError::TotalLimitExceeded);
+                }
+                if !Self::reserve_append(&mut state, &session, &request)? {
+                    return Ok(ProcessStreamSinkAppendDisposition::Backpressured {
+                        retry_after_ms: 0,
+                    });
+                }
+            }
+            let receipt = match self
+                .store
+                .append_process_stream_stage(durable_request)
+                .await
+            {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    let possible_effect = possible_append_effect(&error);
+                    let mapped = map_blob_error(&error);
+                    let mut state = self.lock();
+                    Self::settle_append_error(&mut state, possible_effect);
+                    return Err(mapped);
+                }
+            };
+            if let Err(error) = receipt.validate_for(
+                &stage_request,
+                &Self::durable_append_request(&session, &request),
+            ) {
+                let mut state = self.lock();
+                Self::settle_append_error(&mut state, true);
+                return Err(map_blob_error(&error));
+            }
+            let mut state = self.lock();
+            let existing = Self::check_session(&state, &session)?;
+            match Self::append_locked(&mut state, &existing, &request) {
+                Ok(accepted @ ProcessStreamSinkAppendDisposition::Accepted { .. })
+                | Ok(accepted @ ProcessStreamSinkAppendDisposition::Replayed { .. }) => {
+                    Self::settle_append_commit(&mut state);
+                    Ok(accepted)
+                }
+                Ok(_) | Err(_) => {
+                    Self::settle_append_error(&mut state, true);
+                    Err(ProcessStreamSinkError::PossibleEffectUnknown {
+                        operation: "blob-process-stream-append",
+                    })
+                }
+            }
+        })
     }
 
     fn finalize(
@@ -2181,9 +2894,14 @@ impl<C: BlobStoreClient> ProcessStreamSinkClient for BlobStoreStreamSink<C> {
         session: ProcessStreamSinkSession,
         request: ProcessStreamSinkAbortRequest,
     ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkTerminal> {
-        let mut state = self.lock();
-        let result = Self::abort_locked(&mut state, session, request);
-        Self::ready(result)
+        Box::pin(async move {
+            let terminal = {
+                let mut state = self.lock();
+                Self::abort_locked(&mut state, session.clone(), request)?
+            };
+            self.persist_terminal(&session, &terminal, None).await?;
+            Ok(terminal)
+        })
     }
 
     fn readback(

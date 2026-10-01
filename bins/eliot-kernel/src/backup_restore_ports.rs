@@ -847,17 +847,27 @@ impl RestorePorts<'_> {
     /// a value here: a Kernel-minted record would be a Host binding the Kernel
     /// never observed, which is the very thing the gate refuses to accept.
     ///
-    /// The honest difference between the two callers is therefore made by the
-    /// owner, not guessed here: a caller that holds Host admission calls this
-    /// method and proceeds; a caller that does not is refused and has no
-    /// destination to import into. This method never invents an evidence value to
-    /// fill the gap, and it never clears an existing one.
+    /// The honest difference between the two admitted shapes is therefore made
+    /// by the owner, not guessed here: a caller that holds Host admission would
+    /// call this method and proceed; a caller that does not is refused and has
+    /// no destination to import into. This method never invents an evidence
+    /// value to fill the gap, and it never clears an existing one.
     ///
     /// The rehearsal flag is deliberately NOT a reason to refuse. A rehearsal that
     /// *does* hold Host admission is a supported shape: it carries this evidence,
     /// pins it at prepare, and is still structurally unable to become a cutover
     /// candidate, because [`PinnedDestinationAdmission`] pins the rehearsal posture
     /// beside the evidence and refuses a continuation that changes either.
+    ///
+    /// # Live status
+    ///
+    /// `caller: NONE`. There is no production caller: `git grep -n
+    /// with_owner_destination_evidence` returns only this definition. The live
+    /// import path is `restore_with_owner`, which refuses a bundle whose
+    /// `manifest_evidence` is `None` rather than having the Kernel mint the
+    /// record this method would mint, and `KernelIsolatedDestination::open`
+    /// consumes evidence the Host issued. Whether this builder is wired to a
+    /// call site or retired is an owner decision.
     pub fn with_owner_destination_evidence(
         &self,
         manifest_digest: &str,

@@ -71,16 +71,19 @@ use crate::{
     AuthorityActivationReceipt, AuthorityHandoffBegin, AuthorityHandoffRecord,
     AuthorityHandoffState, AuthorityRevocation, AuthorityRevocationReceipt,
     AuthoritySnapshotReceipt, BACKUP_VERIFICATION_RESULT_RECORD_TYPE,
-    BackupVerificationDisposition, BackupVerificationResultRecord, CanonicalDisposition,
-    CanonicalReconciliation, CapabilityGrantActivation, CapabilityGrantProjection,
-    CapabilityGrantRevocation, CapabilityIntroductionActivation, CapabilityIntroductionFence,
-    CapabilityIntroductionProjection, CapabilityIntroductionReceipt, DeliveryAcknowledgement,
-    DeliveryCursorReceipt, DeliveryCursorState, EpochIdentity, EpochLineage,
-    GenerationCutoverReceipt, GenerationCutoverRecord, GenerationCutoverSnapshot,
+    BackupVerificationDisposition, BackupVerificationResultRecord, BlobProcessStreamCallRecord,
+    BlobProcessStreamCallState, BlobProcessStreamGrantRecord, BlobProcessStreamGrantState,
+    BlobProcessStreamOwnerFactsPullRecord, BlobProcessStreamOwnerFactsPullState,
+    CanonicalDisposition, CanonicalReconciliation, CapabilityGrantActivation,
+    CapabilityGrantProjection, CapabilityGrantRevocation, CapabilityIntroductionActivation,
+    CapabilityIntroductionFence, CapabilityIntroductionProjection, CapabilityIntroductionReceipt,
+    DeliveryAcknowledgement, DeliveryCursorReceipt, DeliveryCursorState, EpochIdentity,
+    EpochLineage, GenerationCutoverReceipt, GenerationCutoverRecord, GenerationCutoverSnapshot,
     GenerationTransition, GenerationTransitionReceipt, GrantClosureCommit,
     GrantClosureCommitReceipt, GrantClosureFenceReceipt, GrantClosureFenceRequest,
     GrantClosureProjection, GrantClosureState, HostRequestRecord, HostRequestState, JobCheckpoint,
-    KernelAuthoritySnapshot, LegacyFenceBoundBackupVerificationClass,
+    InitialSetupAuthorityPhase, InitialSetupAuthorityRecord, KernelAuthoritySnapshot,
+    LegacyFenceBoundBackupVerificationClass,
     LegacyTwoValueRelationBackupVerificationClass, LegacyUnscopedBackupVerificationClass,
     MaintenanceTriggerStagingReceipt, MaintenanceTriggerStagingRequest, NativeWorkerClaimAdmission,
     NativeWorkerClaimRecord, NativeWorkerClaimStageOutcome, NativeWorkerClaimState, OpaqueLabel,
@@ -156,6 +159,16 @@ const RECOVERY_INBOX_HISTORY: TableDefinition<&str, &str> =
     TableDefinition::new("ors_recovery_inbox_history_v1");
 const PROCESS_START_REPLAY: TableDefinition<&str, &str> =
     TableDefinition::new("ors_process_start_replay_v1");
+const BLOB_PROCESS_STREAM_GRANTS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_blob_process_stream_grants_v1");
+const BLOB_PROCESS_STREAM_CALLS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_blob_process_stream_calls_v1");
+const BLOB_PROCESS_STREAM_OWNER_FACTS_PULLS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_blob_process_stream_owner_facts_pulls_v1");
+const INITIAL_SETUP_AUTHORITIES: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_initial_setup_authorities_v1");
+const INITIAL_SETUP_AUTHORITY_POLICY_RECEIPTS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_initial_setup_authority_policy_receipts_v1");
 const AUTHORITY_HANDOFFS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_authority_handoffs_v1");
 const PROCESS_EVIDENCE: TableDefinition<&str, &str> =
@@ -3533,6 +3546,8 @@ const PROCESS_STREAM_RECOVERY_FAMILY_REVISION: &str = "process_stream_recovery_f
 /// cannot look like versioned-artifact movement and refuse an unrelated
 /// continuation.
 const VERSIONED_ARTIFACT_FAMILY_REVISION: &str = "versioned_artifact_family_revision";
+/// Revision of the cursor-paged initial setup authority forensic family.
+const INITIAL_SETUP_AUTHORITY_FAMILY_REVISION: &str = "initial_setup_authority_family_revision";
 
 struct ClosureRowPlan {
     key: String,
@@ -4881,6 +4896,392 @@ pub struct RuntimeLeaseCensusRows {
 }
 
 impl RedbRecoveryStore {
+    /// Retains the Policy's exact root grant and paired receipt bindings
+    /// before the first canonical Policy Store effect.
+    ///
+    /// An exact retry returns the existing row at its current phase; changed
+    /// authority, causal, request or grant evidence under the same operation
+    /// identity is an immutable conflict. This is Kernel provenance, not an
+    /// ORS authority decision.
+    pub fn stage_initial_setup_authority(
+        &self,
+        prepared: &InitialSetupAuthorityRecord,
+    ) -> Result<InitialSetupAuthorityRecord, OrsError> {
+        prepared.validate()?;
+        if prepared.phase != InitialSetupAuthorityPhase::Prepared {
+            return Err(OrsError::InvalidField {
+                field: "initial_setup_authority_phase",
+                reason: "initial setup authority must be retained before the Policy effect",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let mut family_moved = false;
+        let result = {
+            let grants = write.open_table(OPERATIONAL_CURRENT).map_err(storage)?;
+            let grant_key = Self::operational_key(
+                OperationalKind::CapabilityGrant,
+                &prepared.root_grant_subject_id,
+            );
+            let grant: DurableOperationalRecord = grants
+                .get(grant_key.as_str())
+                .map_err(storage)?
+                .map(|value| decode_named(value.value(), "operational_current"))
+                .transpose()?
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "initial_setup_authority",
+                    reason: "referenced setup-root grant is not retained".to_owned(),
+                })?;
+            if grant.kind != OperationalKind::CapabilityGrant
+                || grant.input.subject_id != prepared.root_grant_subject_id
+                || grant.phase != OperationalPhase::Active
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "initial_setup_authority",
+                    reason: "referenced setup-root grant is not active".to_owned(),
+                });
+            }
+            grant.input.validate()?;
+            if Self::receipt_for(&grant)? != prepared.root_grant_receipt {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "initial_setup_authority",
+                    reason: "setup-root grant receipt does not match its current ORS row"
+                        .to_owned(),
+                });
+            }
+            let mut authorities = write
+                .open_table(INITIAL_SETUP_AUTHORITIES)
+                .map_err(storage)?;
+            let key = prepared.policy_operation.operation_id.as_str();
+            match authorities.get(key).map_err(storage)? {
+                Some(value) => {
+                    let existing: InitialSetupAuthorityRecord = decode_named(
+                        value.value(),
+                        "initial_setup_authority",
+                    )?;
+                    existing.validate()?;
+                    if !existing.same_setup(prepared) {
+                        return Err(OrsError::DuplicateConflict);
+                    }
+                    existing
+                }
+                None => {
+                    let payload = encode(prepared)?;
+                    authorities.insert(key, payload.as_str()).map_err(storage)?;
+                    family_moved = true;
+                    prepared.clone()
+                }
+            }
+        };
+        if family_moved {
+            Self::advance_initial_setup_authority_family_revision(&write)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(result)
+    }
+
+    /// Attaches the actual committed canonical Policy receipt to the exact
+    /// retained pre-effect setup authority row.
+    pub fn commit_initial_setup_policy(
+        &self,
+        committed: &InitialSetupAuthorityRecord,
+    ) -> Result<InitialSetupAuthorityRecord, OrsError> {
+        committed.validate()?;
+        if committed.phase != InitialSetupAuthorityPhase::PolicyCommitted {
+            return Err(OrsError::InvalidField {
+                field: "initial_setup_authority_phase",
+                reason: "Policy completion requires the PolicyCommitted phase",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let result = {
+            let mut authorities = write
+                .open_table(INITIAL_SETUP_AUTHORITIES)
+                .map_err(storage)?;
+            let key = committed.policy_operation.operation_id.as_str();
+            let existing: InitialSetupAuthorityRecord = authorities
+                .get(key)
+                .map_err(storage)?
+                .map(|value| decode_named(value.value(), "initial_setup_authority"))
+                .transpose()?
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "initial_setup_authority",
+                    reason: "Policy receipt has no pre-effect authority row".to_owned(),
+                })?;
+            existing.validate()?;
+            if !existing.same_setup(committed) {
+                return Err(OrsError::DuplicateConflict);
+            }
+            match existing.phase {
+                InitialSetupAuthorityPhase::Prepared => {}
+                InitialSetupAuthorityPhase::PolicyCommitted
+                | InitialSetupAuthorityPhase::WorkScopePrepared
+                | InitialSetupAuthorityPhase::WorkScopeCommitted
+                    if existing.policy_write_receipt == committed.policy_write_receipt =>
+                {
+                    return Ok(existing);
+                }
+                _ => return Err(OrsError::DuplicateConflict),
+            }
+            let receipt = committed
+                .policy_write_receipt
+                .as_ref()
+                .ok_or(OrsError::InvalidReceipt)?;
+            committed.validate_policy_receipt(receipt)?;
+            let payload = encode(committed)?;
+            authorities
+                .insert(key, payload.as_str())
+                .map_err(storage)?;
+            let receipt_id = receipt
+                .envelope
+                .as_ref()
+                .ok_or(OrsError::InvalidReceipt)?
+                .identity
+                .receipt_id
+                .as_str();
+            let mut receipt_index = write
+                .open_table(INITIAL_SETUP_AUTHORITY_POLICY_RECEIPTS)
+                .map_err(storage)?;
+            match receipt_index.get(receipt_id).map_err(storage)? {
+                Some(value) if value.value() != key => {
+                    return Err(OrsError::DuplicateConflict);
+                }
+                Some(_) => {}
+                None => {
+                    receipt_index
+                        .insert(receipt_id, key)
+                        .map_err(storage)?;
+                }
+            }
+            committed.clone()
+        };
+        Self::advance_initial_setup_authority_family_revision(&write)?;
+        write.commit().map_err(storage)?;
+        Ok(result)
+    }
+
+    /// Retains the exact WorkScope successor write before its Store effect.
+    /// The only accepted predecessor is the committed Policy phase; retries
+    /// must carry the same operation, identity, request bytes and causal link.
+    pub fn prepare_initial_setup_work_scope(
+        &self,
+        prepared: &InitialSetupAuthorityRecord,
+    ) -> Result<InitialSetupAuthorityRecord, OrsError> {
+        prepared.validate()?;
+        if prepared.phase != InitialSetupAuthorityPhase::WorkScopePrepared {
+            return Err(OrsError::InvalidField {
+                field: "initial_setup_authority_phase",
+                reason: "WorkScope preparation requires the WorkScopePrepared phase",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let result = {
+            let mut authorities = write
+                .open_table(INITIAL_SETUP_AUTHORITIES)
+                .map_err(storage)?;
+            let key = prepared.policy_operation.operation_id.as_str();
+            let existing: InitialSetupAuthorityRecord = authorities
+                .get(key)
+                .map_err(storage)?
+                .map(|value| decode_named(value.value(), "initial_setup_authority"))
+                .transpose()?
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "initial_setup_authority",
+                    reason: "WorkScope preparation has no retained Policy authority row".to_owned(),
+                })?;
+            existing.validate()?;
+            if !existing.same_setup(prepared)
+                || existing.policy_write_receipt != prepared.policy_write_receipt
+            {
+                return Err(OrsError::DuplicateConflict);
+            }
+            match existing.phase {
+                InitialSetupAuthorityPhase::PolicyCommitted => {}
+                InitialSetupAuthorityPhase::WorkScopePrepared
+                | InitialSetupAuthorityPhase::WorkScopeCommitted
+                    if existing.same_work_scope_request(prepared) =>
+                {
+                    return Ok(existing);
+                }
+                _ => return Err(OrsError::DuplicateConflict),
+            }
+            let payload = encode(prepared)?;
+            authorities
+                .insert(key, payload.as_str())
+                .map_err(storage)?;
+            prepared.clone()
+        };
+        Self::advance_initial_setup_authority_family_revision(&write)?;
+        write.commit().map_err(storage)?;
+        Ok(result)
+    }
+
+    /// Attaches the exact normal WorkScope receipt to its retained pre-effect
+    /// request and causal successor.
+    pub fn commit_initial_setup_work_scope(
+        &self,
+        committed: &InitialSetupAuthorityRecord,
+    ) -> Result<InitialSetupAuthorityRecord, OrsError> {
+        committed.validate()?;
+        if committed.phase != InitialSetupAuthorityPhase::WorkScopeCommitted {
+            return Err(OrsError::InvalidField {
+                field: "initial_setup_authority_phase",
+                reason: "WorkScope completion requires the WorkScopeCommitted phase",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let result = {
+            let mut authorities = write
+                .open_table(INITIAL_SETUP_AUTHORITIES)
+                .map_err(storage)?;
+            let key = committed.policy_operation.operation_id.as_str();
+            let existing: InitialSetupAuthorityRecord = authorities
+                .get(key)
+                .map_err(storage)?
+                .map(|value| decode_named(value.value(), "initial_setup_authority"))
+                .transpose()?
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "initial_setup_authority",
+                    reason: "WorkScope receipt has no retained Policy authority row".to_owned(),
+                })?;
+            existing.validate()?;
+            if !existing.same_setup(committed)
+                || !existing.same_work_scope_request(committed)
+            {
+                return Err(OrsError::DuplicateConflict);
+            }
+            match existing.phase {
+                InitialSetupAuthorityPhase::WorkScopePrepared => {}
+                InitialSetupAuthorityPhase::WorkScopeCommitted
+                    if existing.work_scope_write_receipt == committed.work_scope_write_receipt =>
+                {
+                    return Ok(existing);
+                }
+                _ => return Err(OrsError::DuplicateConflict),
+            }
+            let payload = encode(committed)?;
+            authorities
+                .insert(key, payload.as_str())
+                .map_err(storage)?;
+            committed.clone()
+        };
+        Self::advance_initial_setup_authority_family_revision(&write)?;
+        write.commit().map_err(storage)?;
+        Ok(result)
+    }
+
+    /// Loads the exact setup lineage by its original Policy operation id.
+    pub fn load_initial_setup_authority(
+        &self,
+        policy_operation_id: &str,
+    ) -> Result<Option<InitialSetupAuthorityRecord>, OrsError> {
+        crate::model::validate_text(policy_operation_id, "initial_setup_policy_operation_id")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let authorities = read
+            .open_table(INITIAL_SETUP_AUTHORITIES)
+            .map_err(storage)?;
+        authorities
+            .get(policy_operation_id)
+            .map_err(storage)?
+            .map(|value| {
+                let record: InitialSetupAuthorityRecord =
+                    decode_named(value.value(), "initial_setup_authority")?;
+                record.validate()?;
+                if record.policy_operation.operation_id.as_str() != policy_operation_id {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "initial_setup_authority",
+                        reason: "Policy operation id does not match its ORS key".to_owned(),
+                    });
+                }
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Resolves the unique setup lineage named by the actual Policy receipt id.
+    pub fn load_initial_setup_authority_by_policy_receipt_id(
+        &self,
+        policy_receipt_id: &str,
+    ) -> Result<Option<InitialSetupAuthorityRecord>, OrsError> {
+        crate::model::validate_text(policy_receipt_id, "initial_setup_policy_receipt_id")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let receipt_index = read
+            .open_table(INITIAL_SETUP_AUTHORITY_POLICY_RECEIPTS)
+            .map_err(storage)?;
+        let Some(operation_id) = receipt_index
+            .get(policy_receipt_id)
+            .map_err(storage)?
+        else {
+            return Ok(None);
+        };
+        let operation_id = operation_id.value().to_owned();
+        let authorities = read
+            .open_table(INITIAL_SETUP_AUTHORITIES)
+            .map_err(storage)?;
+        let record: InitialSetupAuthorityRecord = authorities
+            .get(operation_id.as_str())
+            .map_err(storage)?
+            .map(|value| decode_named(value.value(), "initial_setup_authority"))
+            .transpose()?
+            .ok_or_else(|| OrsError::IntegrityProblem {
+                record_type: "initial_setup_authority",
+                reason: "Policy receipt index names a missing setup authority".to_owned(),
+            })?;
+        record.validate()?;
+        let receipt = record
+            .policy_write_receipt
+            .as_ref()
+            .and_then(|receipt| receipt.envelope.as_ref())
+            .map(|envelope| envelope.identity.receipt_id.as_str());
+        if record.policy_operation.operation_id.as_str() != operation_id
+            || receipt != Some(policy_receipt_id)
+            || record.phase == InitialSetupAuthorityPhase::Prepared
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "initial_setup_authority",
+                reason: "Policy receipt index does not match a committed lineage".to_owned(),
+            });
+        }
+        Ok(Some(record))
+    }
+
+    /// Loads the unique committed initial-setup Policy predecessor for one
+    /// exact live fence. This selector is used only by the task-free first
+    /// WorkScope claim: it never chooses by recency, product label, or a
+    /// caller-supplied receipt. Multiple committed setup lineages at the same
+    /// fence are treated as an integrity conflict.
+    pub fn load_unique_initial_setup_authority_for_fence(
+        &self,
+        state_fence: &eliot_contracts::StateFence,
+    ) -> Result<Option<InitialSetupAuthorityRecord>, OrsError> {
+        state_fence.validate()?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let authorities = read
+            .open_table(INITIAL_SETUP_AUTHORITIES)
+            .map_err(storage)?;
+        let mut selected: Option<InitialSetupAuthorityRecord> = None;
+        for entry in authorities.iter().map_err(storage)? {
+            let (key, value) = entry.map_err(storage)?;
+            let record: InitialSetupAuthorityRecord =
+                decode_named(value.value(), "initial_setup_authority")?;
+            record.validate()?;
+            if record.policy_operation.operation_id.as_str() != key.value()
+                || record.state_fence != *state_fence
+                || record.phase == InitialSetupAuthorityPhase::Prepared
+            {
+                continue;
+            }
+            if selected.is_some() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "initial_setup_authority",
+                    reason: "multiple committed setup roots share the exact State Fence"
+                        .to_owned(),
+                });
+            }
+            selected = Some(record);
+        }
+        Ok(selected)
+    }
+
     /// Exports one coherent backup page under a single read transaction.
     ///
     /// Delegates to the ORS-owned `backup_snapshot` projection; binds the
@@ -4958,6 +5359,17 @@ impl RedbRecoveryStore {
         backup_snapshot::open_backup_family(
             &self.database,
             crate::backup_snapshot::RowFamilyKind::VersionedArtifacts,
+        )
+    }
+
+    /// Opens the typed initial-setup authority forensic family cursor.
+    /// Exported rows are evidence only and have no restore-to-authority path.
+    pub fn open_backup_initial_setup_authority_family(
+        &self,
+    ) -> Result<crate::backup_snapshot::OrsFamilyCursor, OrsError> {
+        backup_snapshot::open_backup_family(
+            &self.database,
+            crate::backup_snapshot::RowFamilyKind::InitialSetupAuthority,
         )
     }
 
@@ -5701,6 +6113,782 @@ impl RedbRecoveryStore {
             ProcessStartReplayAbort::NotReleased
         };
         drop(table);
+        write.commit().map_err(storage)?;
+        Ok(result)
+    }
+
+    /// Persists one immutable verified Kernel grant. Exact replay is
+    /// idempotent; changed authority/facts under a capability reference is a
+    /// durable conflict.
+    pub fn persist_blob_process_stream_grant(
+        &self,
+        grant: &BlobProcessStreamGrantRecord,
+    ) -> Result<BlobProcessStreamGrantRecord, OrsError> {
+        grant.validate()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = grant.capability_ref.as_str();
+        let result = {
+            let mut table = write
+                .open_table(BLOB_PROCESS_STREAM_GRANTS)
+                .map_err(storage)?;
+            match table.get(key).map_err(storage)? {
+                Some(value) => {
+                    let existing: BlobProcessStreamGrantRecord = decode(value.value())?;
+                    existing.validate()?;
+                    if !existing.same_binding(grant)
+                        || (existing.state != grant.state
+                            && existing.state != BlobProcessStreamGrantState::Active)
+                        || grant.next_ordinal < existing.next_ordinal
+                    {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: "blob_process_stream_grant",
+                            reason: "capability binding or monotonic grant state conflicts"
+                                .to_owned(),
+                        });
+                    }
+                    if &existing != grant {
+                        let payload = encode(grant)?;
+                        table.insert(key, payload.as_str()).map_err(storage)?;
+                    }
+                    grant.clone()
+                }
+                None => {
+                    let payload = encode(grant)?;
+                    table.insert(key, payload.as_str()).map_err(storage)?;
+                    grant.clone()
+                }
+            }
+        };
+        write.commit().map_err(storage)?;
+        Ok(result)
+    }
+
+    /// Loads one retained Kernel grant by its opaque capability reference.
+    pub fn load_blob_process_stream_grant(
+        &self,
+        capability_ref: &str,
+    ) -> Result<Option<BlobProcessStreamGrantRecord>, OrsError> {
+        crate::model::validate_text(capability_ref, "blob_process_stream_capability_ref")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read
+            .open_table(BLOB_PROCESS_STREAM_GRANTS)
+            .map_err(storage)?;
+        table
+            .get(capability_ref)
+            .map_err(storage)?
+            .map(|value| {
+                let record: BlobProcessStreamGrantRecord = decode(value.value())?;
+                record.validate()?;
+                if record.capability_ref != capability_ref {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "blob_process_stream_grant",
+                        reason: "grant reference does not match its table key".to_owned(),
+                    });
+                }
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Durably publishes one exact Kernel-to-daemon owner-facts pull before
+    /// the authenticated daemon poll loop can observe it.
+    pub fn persist_blob_process_stream_owner_facts_pull(
+        &self,
+        pull: &BlobProcessStreamOwnerFactsPullRecord,
+    ) -> Result<BlobProcessStreamOwnerFactsPullRecord, OrsError> {
+        pull.validate()?;
+        if pull.state != BlobProcessStreamOwnerFactsPullState::Pending {
+            return Err(OrsError::InvalidField {
+                field: "blob_process_stream_pull_state",
+                reason: "new owner-facts pull must start pending",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let result = {
+            let mut table = write
+                .open_table(BLOB_PROCESS_STREAM_OWNER_FACTS_PULLS)
+                .map_err(storage)?;
+            match table.get(pull.pull_ref.as_str()).map_err(storage)? {
+                Some(value) => {
+                    let existing: BlobProcessStreamOwnerFactsPullRecord = decode(value.value())?;
+                    existing.validate()?;
+                    if !existing.same_request(pull) {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: "blob_process_stream_owner_facts_pull",
+                            reason: "pull reference conflicts with a different exact request"
+                                .to_owned(),
+                        });
+                    }
+                    existing
+                }
+                None => {
+                    let payload = encode(pull)?;
+                    table
+                        .insert(pull.pull_ref.as_str(), payload.as_str())
+                        .map_err(storage)?;
+                    pull.clone()
+                }
+            }
+        };
+        write.commit().map_err(storage)?;
+        Ok(result)
+    }
+
+    /// Returns the lexicographically first pending pull for the authenticated
+    /// daemon poll route. Completed pulls are never reissued as fresh work.
+    pub fn next_blob_process_stream_owner_facts_pull(
+        &self,
+    ) -> Result<Option<BlobProcessStreamOwnerFactsPullRecord>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read
+            .open_table(BLOB_PROCESS_STREAM_OWNER_FACTS_PULLS)
+            .map_err(storage)?;
+        for row in table.iter().map_err(storage)? {
+            let (key, value) = row.map_err(storage)?;
+            let record: BlobProcessStreamOwnerFactsPullRecord = decode(value.value())?;
+            record.validate()?;
+            if key.value() != record.pull_ref {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "blob_process_stream_owner_facts_pull",
+                    reason: "pull reference does not match its table key".to_owned(),
+                });
+            }
+            if record.state == BlobProcessStreamOwnerFactsPullState::Pending {
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Loads one durable pull by its opaque correlation reference.
+    pub fn load_blob_process_stream_owner_facts_pull(
+        &self,
+        pull_ref: &str,
+    ) -> Result<Option<BlobProcessStreamOwnerFactsPullRecord>, OrsError> {
+        crate::model::validate_text(pull_ref, "blob_process_stream_pull_ref")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read
+            .open_table(BLOB_PROCESS_STREAM_OWNER_FACTS_PULLS)
+            .map_err(storage)?;
+        table
+            .get(pull_ref)
+            .map_err(storage)?
+            .map(|value| {
+                let record: BlobProcessStreamOwnerFactsPullRecord = decode(value.value())?;
+                record.validate()?;
+                if record.pull_ref != pull_ref {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "blob_process_stream_owner_facts_pull",
+                        reason: "pull reference does not match its table key".to_owned(),
+                    });
+                }
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Retains the exact normal prepared transition for a matching pending
+    /// ReadyAttach pull before its canonical Store effect is dispatched.
+    /// This records the expected canonical request commitment only; it does
+    /// not claim that a reserved-write protocol was used.
+    pub fn bind_blob_process_stream_ready_write(
+        &self,
+        operation_id: &str,
+        prepared: &eliot_store_api::PreparedTransition,
+    ) -> Result<Option<BlobProcessStreamOwnerFactsPullRecord>, OrsError> {
+        crate::model::validate_text(operation_id, "blob_ready_operation_id")?;
+        prepared.validate().map_err(|error| {
+            OrsError::Contract(format!(
+                "ReadyAttach prepared transition is invalid: {error}"
+            ))
+        })?;
+        if prepared.identity.operation_id.as_str() != operation_id {
+            return Err(OrsError::InvalidField {
+                field: "blob_ready_operation_id",
+                reason: "must equal the prepared transition operation identity",
+            });
+        }
+        if prepared.named_operations.len() != 1
+            || prepared.named_operations[0].operation
+                != eliot_store_api::NamedMutationOperation::RecordBlobProcessSourceAdmission
+        {
+            return Err(OrsError::InvalidField {
+                field: "blob_ready_prepared_transition",
+                reason: "ReadyAttach must be the exact single source-admission CAS",
+            });
+        }
+        let ready_json = prepared.named_operations[0]
+            .parameters
+            .get("snapshot_json")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(OrsError::InvalidField {
+                field: "blob_ready_prepared_transition",
+                reason: "source-admission CAS lacks its exact snapshot bytes",
+            })?;
+        let ready: eliot_store_api::blob_process_source_admission::BlobProcessSourceAdmission =
+            serde_json::from_str(ready_json).map_err(|_| OrsError::InvalidField {
+                field: "blob_ready_prepared_transition",
+                reason: "source-admission snapshot is not the closed typed record",
+            })?;
+        ready.validate().map_err(|_| OrsError::InvalidField {
+            field: "blob_ready_prepared_transition",
+            reason: "source-admission Ready snapshot does not validate",
+        })?;
+        if ready.phase
+            != eliot_store_api::blob_process_source_admission::BlobProcessSourceAdmissionPhase::Ready
+            || ready.ready.as_ref().map(|receipt| receipt.ready_operation_id.as_str())
+                != Some(operation_id)
+            || ready.state_fence != prepared.state_fence
+        {
+            return Err(OrsError::InvalidField {
+                field: "blob_ready_prepared_transition",
+                reason: "source-admission snapshot does not bind this exact Ready CAS",
+            });
+        }
+        let prepared_json = serde_json::to_string(prepared)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let prepared_sha256 = sha256_hex(prepared_json.as_bytes());
+        let request_hash = prepared.identity.canonical_request_hash.clone();
+        let write = self.database.begin_write().map_err(storage)?;
+        let result = {
+            let mut table = write
+                .open_table(BLOB_PROCESS_STREAM_OWNER_FACTS_PULLS)
+                .map_err(storage)?;
+            let mut matching: Option<BlobProcessStreamOwnerFactsPullRecord> = None;
+            for row in table.iter().map_err(storage)? {
+                let (key, value) = row.map_err(storage)?;
+                let record: BlobProcessStreamOwnerFactsPullRecord = decode(value.value())?;
+                record.validate()?;
+                if key.value() != record.pull_ref {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "blob_process_stream_owner_facts_pull",
+                        reason: "pull reference does not match its table key".to_owned(),
+                    });
+                }
+                let request: serde_json::Value = serde_json::from_str(&record.request_json)
+                    .map_err(|_| OrsError::InvalidField {
+                        field: "blob_process_stream_pull_request_json",
+                        reason: "must remain a typed object",
+                    })?;
+                let is_match = request.get("purpose").and_then(serde_json::Value::as_str)
+                    == Some("READY_ATTACH")
+                    && request
+                        .get("ready_operation_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(operation_id);
+                if is_match {
+                    if matching.replace(record).is_some() {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: "blob_process_stream_owner_facts_pull",
+                            reason: "ReadyAttach operation matches more than one pull".to_owned(),
+                        });
+                    }
+                }
+            }
+            let Some(mut record) = matching else {
+                return Ok(None);
+            };
+            if record.state != BlobProcessStreamOwnerFactsPullState::Pending {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "blob_process_stream_owner_facts_pull",
+                    reason: "ReadyAttach write cannot be bound after pull completion".to_owned(),
+                });
+            }
+            match (
+                &record.prepared_write_transition_json,
+                &record.prepared_write_transition_sha256,
+                &record.prepared_write_canonical_request_hash,
+            ) {
+                (None, None, None) => {
+                    record.prepared_write_transition_json = Some(prepared_json);
+                    record.prepared_write_transition_sha256 = Some(prepared_sha256);
+                    record.prepared_write_canonical_request_hash = Some(request_hash);
+                    record.validate()?;
+                    let payload = encode(&record)?;
+                    table
+                        .insert(record.pull_ref.as_str(), payload.as_str())
+                        .map_err(storage)?;
+                }
+                (Some(existing_json), Some(existing_sha256), Some(existing_hash))
+                    if existing_json == &prepared_json
+                        && existing_sha256 == &prepared_sha256
+                        && existing_hash == &request_hash => {}
+                _ => {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "blob_process_stream_owner_facts_pull",
+                        reason: "ReadyAttach prepared request changed during replay".to_owned(),
+                    });
+                }
+            }
+            record
+        };
+        write.commit().map_err(storage)?;
+        Ok(Some(result))
+    }
+
+    /// Completes one pending owner-facts pull with the exact bounded typed
+    /// response JSON. Idempotent same-response acknowledgement is safe.
+    pub fn complete_blob_process_stream_owner_facts_pull(
+        &self,
+        completed: &BlobProcessStreamOwnerFactsPullRecord,
+    ) -> Result<BlobProcessStreamOwnerFactsPullRecord, OrsError> {
+        completed.validate()?;
+        if completed.state != BlobProcessStreamOwnerFactsPullState::Completed {
+            return Err(OrsError::InvalidField {
+                field: "blob_process_stream_pull_state",
+                reason: "owner-facts completion requires completed state",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let result = {
+            let mut table = write
+                .open_table(BLOB_PROCESS_STREAM_OWNER_FACTS_PULLS)
+                .map_err(storage)?;
+            let existing = table
+                .get(completed.pull_ref.as_str())
+                .map_err(storage)?
+                .map(|value| decode::<BlobProcessStreamOwnerFactsPullRecord>(value.value()))
+                .transpose()?
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "blob_process_stream_owner_facts_pull",
+                    reason: "pull disappeared before owner completion".to_owned(),
+                })?;
+            existing.validate()?;
+            if existing.pull_ref != completed.pull_ref
+                || !existing.same_request(completed)
+                || existing.prepared_write_transition_json
+                    != completed.prepared_write_transition_json
+                || existing.prepared_write_transition_sha256
+                    != completed.prepared_write_transition_sha256
+                || existing.prepared_write_canonical_request_hash
+                    != completed.prepared_write_canonical_request_hash
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "blob_process_stream_owner_facts_pull",
+                    reason: "completion does not match the exact durable pull".to_owned(),
+                });
+            }
+            let next = match existing.state {
+                BlobProcessStreamOwnerFactsPullState::Pending => completed.clone(),
+                BlobProcessStreamOwnerFactsPullState::Completed if existing == *completed => {
+                    existing
+                }
+                BlobProcessStreamOwnerFactsPullState::Completed => {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "blob_process_stream_owner_facts_pull",
+                        reason: "completed pull response changed during replay".to_owned(),
+                    });
+                }
+            };
+            if existing != next {
+                let payload = encode(&next)?;
+                table
+                    .insert(completed.pull_ref.as_str(), payload.as_str())
+                    .map_err(storage)?;
+            }
+            next
+        };
+        write.commit().map_err(storage)?;
+        Ok(result)
+    }
+
+    /// Allocates and persists one one-based call token before it is exposed to
+    /// TestD. Allocation and ordinal advancement share a single ORS transaction.
+    pub fn issue_blob_process_stream_call_token(
+        &self,
+        capability_ref: &str,
+        token_ref: &str,
+    ) -> Result<BlobProcessStreamCallRecord, OrsError> {
+        crate::model::validate_text(capability_ref, "blob_process_stream_capability_ref")?;
+        crate::model::validate_text(token_ref, "blob_process_stream_token_ref")?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let result = {
+            let mut grants = write
+                .open_table(BLOB_PROCESS_STREAM_GRANTS)
+                .map_err(storage)?;
+            let mut calls = write
+                .open_table(BLOB_PROCESS_STREAM_CALLS)
+                .map_err(storage)?;
+            let mut grant: BlobProcessStreamGrantRecord = grants
+                .get(capability_ref)
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "blob_process_stream_grant",
+                    reason: "call token allocation has no retained capability".to_owned(),
+                })?;
+            grant.validate()?;
+            if grant.state != BlobProcessStreamGrantState::Active
+                || calls.get(token_ref).map_err(storage)?.is_some()
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "blob_process_stream_call",
+                    reason: "capability is inactive or token reference already exists".to_owned(),
+                });
+            }
+            let ordinal = grant.next_ordinal;
+            grant.next_ordinal = ordinal.checked_add(1).ok_or(OrsError::PayloadTooLarge)?;
+            let token = BlobProcessStreamCallRecord {
+                contract_version: crate::BLOB_PROCESS_STREAM_ORS_VERSION,
+                capability_ref: capability_ref.to_owned(),
+                token_ref: token_ref.to_owned(),
+                ordinal,
+                operation_sha256: None,
+                operation_projection_json: None,
+                request_identity_json: None,
+                request_identity_sha256: None,
+                state: BlobProcessStreamCallState::Issued,
+                response_sha256: None,
+                response_projection_json: None,
+                response_ref: None,
+                owner_receipt_ref: None,
+            };
+            token.validate()?;
+            let token_payload = encode(&token)?;
+            calls
+                .insert(token_ref, token_payload.as_str())
+                .map_err(storage)?;
+            let grant_payload = encode(&grant)?;
+            grants
+                .insert(capability_ref, grant_payload.as_str())
+                .map_err(storage)?;
+            token
+        };
+        write.commit().map_err(storage)?;
+        Ok(result)
+    }
+
+    /// Loads one token and checks its full capability/ordinal binding.
+    pub fn load_blob_process_stream_call(
+        &self,
+        capability_ref: &str,
+        token_ref: &str,
+        ordinal: u32,
+    ) -> Result<Option<BlobProcessStreamCallRecord>, OrsError> {
+        crate::model::validate_text(capability_ref, "blob_process_stream_capability_ref")?;
+        crate::model::validate_text(token_ref, "blob_process_stream_token_ref")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read
+            .open_table(BLOB_PROCESS_STREAM_CALLS)
+            .map_err(storage)?;
+        table
+            .get(token_ref)
+            .map_err(storage)?
+            .map(|value| {
+                let record: BlobProcessStreamCallRecord = decode(value.value())?;
+                record.validate()?;
+                if record.capability_ref != capability_ref
+                    || record.token_ref != token_ref
+                    || record.ordinal != ordinal
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "blob_process_stream_call",
+                        reason: "call token does not match its retained capability/ordinal"
+                            .to_owned(),
+                    });
+                }
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Binds an issued token to one exact operation digest and Kernel-created
+    /// Store identity. It never stores the operation body or any Blob bytes.
+    pub fn reserve_blob_process_stream_call(
+        &self,
+        reserved: &BlobProcessStreamCallRecord,
+    ) -> Result<BlobProcessStreamCallRecord, OrsError> {
+        reserved.validate()?;
+        if reserved.state != BlobProcessStreamCallState::Reserved {
+            return Err(OrsError::InvalidField {
+                field: "blob_process_stream_call_state",
+                reason: "reservation requires RESERVED state",
+            });
+        }
+        self.transition_blob_process_stream_call(reserved)
+    }
+
+    /// Persists the pre-transport dispatch fence. Replaying a Dispatched row
+    /// never authorizes the caller to send the Store effect again.
+    pub fn mark_blob_process_stream_call_dispatched(
+        &self,
+        dispatched: &BlobProcessStreamCallRecord,
+    ) -> Result<BlobProcessStreamCallRecord, OrsError> {
+        dispatched.validate()?;
+        if dispatched.state != BlobProcessStreamCallState::Dispatched {
+            return Err(OrsError::InvalidField {
+                field: "blob_process_stream_call_state",
+                reason: "dispatch fence requires DISPATCHED state",
+            });
+        }
+        self.transition_blob_process_stream_call(dispatched)
+    }
+
+    /// Atomically wins the sole right to send one reserved call to Store.
+    ///
+    /// Returns `true` only for the caller that changes Reserved to Dispatched.
+    /// Concurrent callers and replays observe `false`; they must return the
+    /// retained outcome or Unknown and must never send the same Store effect.
+    pub fn claim_blob_process_stream_call_dispatch(
+        &self,
+        dispatched: &BlobProcessStreamCallRecord,
+    ) -> Result<bool, OrsError> {
+        dispatched.validate()?;
+        if dispatched.state != BlobProcessStreamCallState::Dispatched {
+            return Err(OrsError::InvalidField {
+                field: "blob_process_stream_call_state",
+                reason: "dispatch claim requires DISPATCHED state",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let won = {
+            let mut table = write
+                .open_table(BLOB_PROCESS_STREAM_CALLS)
+                .map_err(storage)?;
+            let existing = table
+                .get(dispatched.token_ref.as_str())
+                .map_err(storage)?
+                .map(|value| decode::<BlobProcessStreamCallRecord>(value.value()))
+                .transpose()?
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "blob_process_stream_call",
+                    reason: "call token disappeared before dispatch claim".to_owned(),
+                })?;
+            existing.validate()?;
+            if !existing.same_binding(dispatched) {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "blob_process_stream_call",
+                    reason: "dispatch claim changed the exact call binding".to_owned(),
+                });
+            }
+            if existing.state != BlobProcessStreamCallState::Reserved {
+                false
+            } else {
+                let payload = encode(dispatched)?;
+                table
+                    .insert(dispatched.token_ref.as_str(), payload.as_str())
+                    .map_err(storage)?;
+                true
+            }
+        };
+        write.commit().map_err(storage)?;
+        Ok(won)
+    }
+
+    /// Persists one owner-observed completion or explicit unknown disposition.
+    pub fn complete_blob_process_stream_call(
+        &self,
+        terminal: &BlobProcessStreamCallRecord,
+    ) -> Result<BlobProcessStreamCallRecord, OrsError> {
+        terminal.validate()?;
+        if !matches!(
+            terminal.state,
+            BlobProcessStreamCallState::Completed
+                | BlobProcessStreamCallState::NotStarted
+                | BlobProcessStreamCallState::Unknown
+                | BlobProcessStreamCallState::Unavailable
+        ) {
+            return Err(OrsError::InvalidField {
+                field: "blob_process_stream_call_state",
+                reason: "completion requires a terminal call disposition",
+            });
+        }
+        self.transition_blob_process_stream_call(terminal)
+    }
+
+    /// Atomically retains one exact completed response and allocates its next
+    /// one-use token. The successor cannot be lost between the completed call
+    /// projection and grant ordinal advancement.
+    pub fn complete_blob_process_stream_call_with_next_token(
+        &self,
+        terminal: &BlobProcessStreamCallRecord,
+        next_token_ref: &str,
+    ) -> Result<(BlobProcessStreamCallRecord, BlobProcessStreamCallRecord), OrsError> {
+        terminal.validate()?;
+        if terminal.state != BlobProcessStreamCallState::Completed {
+            return Err(OrsError::InvalidField {
+                field: "blob_process_stream_call_state",
+                reason: "successor allocation requires a completed call",
+            });
+        }
+        crate::model::validate_text(next_token_ref, "blob_process_stream_next_token_ref")?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let result = {
+            let mut grants = write
+                .open_table(BLOB_PROCESS_STREAM_GRANTS)
+                .map_err(storage)?;
+            let mut calls = write
+                .open_table(BLOB_PROCESS_STREAM_CALLS)
+                .map_err(storage)?;
+            let existing = calls
+                .get(terminal.token_ref.as_str())
+                .map_err(storage)?
+                .map(|value| decode::<BlobProcessStreamCallRecord>(value.value()))
+                .transpose()?
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "blob_process_stream_call",
+                    reason: "call token disappeared before completion".to_owned(),
+                })?;
+            existing.validate()?;
+            if existing.state != BlobProcessStreamCallState::Dispatched
+                || !existing.same_binding(terminal)
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "blob_process_stream_call",
+                    reason: "completion does not match the sole dispatched call".to_owned(),
+                });
+            }
+            let mut grant: BlobProcessStreamGrantRecord = grants
+                .get(terminal.capability_ref.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "blob_process_stream_grant",
+                    reason: "successor allocation has no retained capability".to_owned(),
+                })?;
+            grant.validate()?;
+            if grant.state != BlobProcessStreamGrantState::Active
+                || terminal.ordinal.checked_add(1) != Some(grant.next_ordinal)
+                || calls.get(next_token_ref).map_err(storage)?.is_some()
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "blob_process_stream_call",
+                    reason: "capability is inactive or successor identity conflicts".to_owned(),
+                });
+            }
+            let next = BlobProcessStreamCallRecord {
+                contract_version: crate::model::BLOB_PROCESS_STREAM_ORS_VERSION,
+                capability_ref: terminal.capability_ref.clone(),
+                token_ref: next_token_ref.to_owned(),
+                ordinal: grant.next_ordinal,
+                operation_sha256: None,
+                operation_projection_json: None,
+                request_identity_json: None,
+                request_identity_sha256: None,
+                state: BlobProcessStreamCallState::Issued,
+                response_sha256: None,
+                response_projection_json: None,
+                response_ref: None,
+                owner_receipt_ref: None,
+            };
+            next.validate()?;
+            grant.next_ordinal = grant
+                .next_ordinal
+                .checked_add(1)
+                .ok_or(OrsError::PayloadTooLarge)?;
+            grant.validate()?;
+            let terminal_payload = encode(terminal)?;
+            let next_payload = encode(&next)?;
+            let grant_payload = encode(&grant)?;
+            calls
+                .insert(terminal.token_ref.as_str(), terminal_payload.as_str())
+                .map_err(storage)?;
+            calls
+                .insert(next_token_ref, next_payload.as_str())
+                .map_err(storage)?;
+            grants
+                .insert(terminal.capability_ref.as_str(), grant_payload.as_str())
+                .map_err(storage)?;
+            (terminal.clone(), next)
+        };
+        write.commit().map_err(storage)?;
+        Ok(result)
+    }
+
+    fn transition_blob_process_stream_call(
+        &self,
+        desired: &BlobProcessStreamCallRecord,
+    ) -> Result<BlobProcessStreamCallRecord, OrsError> {
+        let write = self.database.begin_write().map_err(storage)?;
+        let result = {
+            let mut table = write
+                .open_table(BLOB_PROCESS_STREAM_CALLS)
+                .map_err(storage)?;
+            let existing = table
+                .get(desired.token_ref.as_str())
+                .map_err(storage)?
+                .map(|value| decode::<BlobProcessStreamCallRecord>(value.value()))
+                .transpose()?
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "blob_process_stream_call",
+                    reason: "call token disappeared before state transition".to_owned(),
+                })?;
+            existing.validate()?;
+            if existing.capability_ref != desired.capability_ref
+                || existing.token_ref != desired.token_ref
+                || existing.ordinal != desired.ordinal
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "blob_process_stream_call",
+                    reason: "call transition token binding mismatch".to_owned(),
+                });
+            }
+            let next = if existing.state == BlobProcessStreamCallState::Issued
+                && desired.state == BlobProcessStreamCallState::Reserved
+            {
+                if desired.operation_sha256.is_none()
+                    || desired.request_identity_json.is_none()
+                    || desired.request_identity_sha256.is_none()
+                {
+                    return Err(OrsError::InvalidField {
+                        field: "blob_process_stream_call_request",
+                        reason: "reservation requires the exact operation and identity digest",
+                    });
+                }
+                desired.clone()
+            } else if existing.same_binding(desired) && existing.state == desired.state {
+                if existing == *desired {
+                    existing
+                } else {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "blob_process_stream_call",
+                        reason: "same-state call replay changed its outcome".to_owned(),
+                    });
+                }
+            } else if existing.same_binding(desired)
+                && matches!(
+                    (existing.state, desired.state),
+                    (
+                        BlobProcessStreamCallState::Reserved,
+                        BlobProcessStreamCallState::Dispatched
+                    ) | (
+                        BlobProcessStreamCallState::Dispatched,
+                        BlobProcessStreamCallState::Completed
+                    ) | (
+                        BlobProcessStreamCallState::Dispatched,
+                        BlobProcessStreamCallState::Unknown
+                    ) | (
+                        BlobProcessStreamCallState::Unknown,
+                        BlobProcessStreamCallState::Completed
+                    ) | (
+                        BlobProcessStreamCallState::Unknown,
+                        BlobProcessStreamCallState::NotStarted
+                    ) | (
+                        BlobProcessStreamCallState::Reserved,
+                        BlobProcessStreamCallState::NotStarted
+                    ) | (
+                        BlobProcessStreamCallState::Reserved,
+                        BlobProcessStreamCallState::Unavailable
+                    )
+                )
+            {
+                desired.clone()
+            } else {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "blob_process_stream_call",
+                    reason: "call identity conflict or non-monotonic state transition".to_owned(),
+                });
+            };
+            if existing != next {
+                let payload = encode(&next)?;
+                table
+                    .insert(desired.token_ref.as_str(), payload.as_str())
+                    .map_err(storage)?;
+            }
+            next
+        };
         write.commit().map_err(storage)?;
         Ok(result)
     }
@@ -7470,6 +8658,76 @@ impl RedbRecoveryStore {
         };
         write.commit().map_err(storage)?;
         Ok(disposition)
+    }
+
+    /// Spends the owner-issued succession grant on one stored verification row,
+    /// exactly once (#2883 instruction 4).
+    ///
+    /// The read, the marker and the write are ONE redb transaction, which is the
+    /// whole point: two concurrent successors that both observe an open grant
+    /// cannot both spend it, because the second write transaction begins after
+    /// the first has committed and re-reads the consumed marker. There is no
+    /// check-then-act window.
+    ///
+    /// It returns `Ok(false)` — and writes nothing — when the key is absent,
+    /// when the row carries no grant at all, or when the grant is already
+    /// consumed. Every one of those is the caller's own fail-closed answer, not
+    /// an error: the successor path refuses all three identically, and none of
+    /// them may mint a replacement.
+    ///
+    /// The window is NOT checked here. ORS holds no clock it may compare
+    /// against an owner-issued window, and the caller is the owner seam that
+    /// does; this method's only decision is the one only the store can make
+    /// atomically, which is "has this grant already been spent".
+    ///
+    /// `consumed_at_unix_ms` is the caller's own clock reading, which the
+    /// caller must take from the same owner seam that issued the grant. It is
+    /// range-checked by
+    /// [`BackupVerifySuccessionGrant::validate`] against the grant's own window
+    /// before the row is written, so a caller cannot consume a grant with a
+    /// marker outside the window it was issued under.
+    pub fn consume_backup_verification_succession_grant(
+        &self,
+        key: &str,
+        consumed_at_unix_ms: u64,
+    ) -> Result<bool, OrsError> {
+        let write = self.database.begin_write().map_err(storage)?;
+        let consumed = {
+            let mut table = write
+                .open_table(BACKUP_VERIFICATION_RESULTS)
+                .map_err(storage)?;
+            let Some(bytes) = table
+                .get(key)
+                .map_err(storage)?
+                .map(|value| value.value().to_owned())
+            else {
+                return Ok(false);
+            };
+            let mut record: BackupVerificationResultRecord = decode(&bytes)?;
+            record.validate()?;
+            if record.record_key()? != key {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: BACKUP_VERIFICATION_RESULT_RECORD_TYPE,
+                    reason: "table key does not match the row's own namespace digest".to_owned(),
+                });
+            }
+            let Some(grant) = record.succession_grant.as_mut() else {
+                return Ok(false);
+            };
+            if grant.is_consumed() {
+                return Ok(false);
+            }
+            grant.consumed_at_unix_ms = Some(consumed_at_unix_ms);
+            // The consumed row must itself still be a valid row, so a marker the
+            // grant's own window forbids is refused before anything is written
+            // rather than persisted into an unreadable row.
+            record.validate()?;
+            let payload = encode(&record)?;
+            table.insert(key, payload.as_str()).map_err(storage)?;
+            true
+        };
+        write.commit().map_err(storage)?;
+        Ok(consumed)
     }
 
     /// Stages one P-04 host-request operation before any acknowledgement.
@@ -10192,7 +11450,7 @@ impl RedbRecoveryStore {
             return Ok(None);
         };
         existing.validate()?;
-        if existing.operation_id != *operation_id || existing.request_digest != request_digest {
+        if &existing.operation_id != operation_id || existing.request_digest != request_digest {
             return Err(OrsError::HostRequestIdentityConflict {
                 operation_id: operation_id.as_str().to_owned(),
                 request_digest: request_digest.to_owned(),
@@ -11254,6 +12512,68 @@ impl RedbRecoveryStore {
         }
         let mut next = existing.clone();
         next.payload_body = Some(body.clone());
+        next.validate()?;
+        let payload = encode(&next)?;
+        {
+            let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(Some(next))
+    }
+
+    /// Persists the exact front-door `RequestIdentity` before a Task
+    /// Controller claim is exposed. An exact replay returns the retained
+    /// identity; a changed or late identity conflicts and never replaces it.
+    pub fn bind_host_request_kernel_identity(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        identity: &crate::HostRequestKernelRequestIdentity,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        identity.validate()?;
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing: Option<crate::HostRequestRecord> = {
+            let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode::<crate::HostRequestRecord>(value.value()))
+                .transpose()?
+        };
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
+        existing.validate()?;
+        if existing.operation_id != *operation_id || existing.request_digest != request_digest {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        if let Some(retained) = &existing.kernel_request_identity {
+            if retained == identity {
+                return Ok(Some(existing));
+            }
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        if !matches!(
+            existing.state,
+            crate::HostRequestState::Requested | crate::HostRequestState::Admitted
+        ) || existing.attempt.is_some()
+            || existing.result_digest.is_some()
+            || existing.result_response.is_some()
+        {
+            return Err(OrsError::InvalidTransition);
+        }
+        let mut next = existing;
+        next.kernel_request_identity = Some(identity.clone());
         next.validate()?;
         let payload = encode(&next)?;
         {
@@ -29418,6 +30738,53 @@ impl RedbRecoveryStore {
         Ok(revision)
     }
 
+    /// Reads the revision of the initial setup authority forensic family.
+    pub(super) fn initial_setup_authority_family_revision(
+        read: &redb::ReadTransaction,
+    ) -> Result<u64, OrsError> {
+        let meta = read.open_table(META).map_err(storage)?;
+        let revision = meta
+            .get(INITIAL_SETUP_AUTHORITY_FAMILY_REVISION)
+            .map_err(storage)?
+            .map(|value| value.value().parse::<u64>())
+            .transpose()
+            .map_err(|error| OrsError::IntegrityProblem {
+                record_type: "ors_meta_v1",
+                reason: error.to_string(),
+            })?
+            .unwrap_or(0);
+        Ok(revision)
+    }
+
+    /// Advances the forensic family revision in the same transaction as each
+    /// setup-lineage row change. The rows remain export-only and are never
+    /// imported as authority.
+    fn advance_initial_setup_authority_family_revision(
+        write: &redb::WriteTransaction,
+    ) -> Result<u64, OrsError> {
+        let mut meta = write.open_table(META).map_err(storage)?;
+        let prior = meta
+            .get(INITIAL_SETUP_AUTHORITY_FAMILY_REVISION)
+            .map_err(storage)?
+            .map(|value| value.value().parse::<u64>())
+            .transpose()
+            .map_err(|error| OrsError::IntegrityProblem {
+                record_type: "ors_meta_v1",
+                reason: error.to_string(),
+            })?
+            .unwrap_or(0);
+        let next = prior.checked_add(1).ok_or_else(|| OrsError::IntegrityProblem {
+            record_type: "ors_meta_v1",
+            reason: "initial setup authority family revision counter exhausted".to_owned(),
+        })?;
+        meta.insert(
+            INITIAL_SETUP_AUTHORITY_FAMILY_REVISION,
+            next.to_string().as_str(),
+        )
+        .map_err(storage)?;
+        Ok(next)
+    }
+
     /// Advances the versioned-artifact family revision in the caller's open
     /// write transaction (issue #1971).
     ///
@@ -37237,8 +38604,9 @@ mod process_start_abort_tests {
 )]
 mod host_request_result_tests {
     use super::*;
+    use crate::model::{BackupVerifyRequestIdentity, BackupVerifySuccessionGrant};
     use crate::{HostRequestKind, HostRequestState, OpaqueLabel, OperationIdentity};
-    use eliot_contracts::{EpochId, EpochLineageId};
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
     use serde_json::json;
 
     const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -37257,6 +38625,7 @@ mod host_request_result_tests {
             contract_version: crate::CONTRACT_VERSION,
             send_claim_protocol_version: 0,
             transport_channel_binding_sha256: None,
+            kernel_request_identity: None,
             operation_id: OperationIdentity::new(operation.to_owned()).expect("valid operation"),
             kind: HostRequestKind::Invocation,
             request_id: label("req-1"),
@@ -37466,6 +38835,176 @@ mod host_request_result_tests {
         drop(store);
         let _ = std::fs::remove_file(path);
         Ok(())
+    }
+
+    /// Builds a stored backup-verification row carrying one succession grant, so
+    /// the store-side grant tests can exercise consumption without a live
+    /// session (#2883).
+    ///
+    /// Every field is one the record's own `validate()` demands: the four
+    /// `BACKUP_VERIFY_*` profile constants are the real ones, every digest is 64
+    /// lowercase hex, and the flat answer fields repeat the nested identity
+    /// values they are drift-checked against. The grant is NOT part of the
+    /// identity, so the durable key is identical whether the row carries a grant
+    /// or not, which is exactly what makes a grant consumable on a row that is
+    /// already committed under its own identity.
+    fn grant_row(grant: Option<BackupVerifySuccessionGrant>) -> BackupVerificationResultRecord {
+        let archive_sha256 = "a".repeat(64);
+        let identity = BackupVerifyRequestIdentity {
+            profile_id: crate::model::BACKUP_VERIFY_PROFILE_ID.to_owned(),
+            profile_version: crate::model::BACKUP_VERIFY_PROFILE_VERSION,
+            domain_separator: "eliot.kernel.backup-verify.request".to_owned(),
+            idempotency_namespace: format!(
+                "{}/v{}",
+                crate::model::BACKUP_VERIFY_PROFILE_ID,
+                crate::model::BACKUP_VERIFY_PROFILE_VERSION
+            ),
+            canonical_encoding_version: 1,
+            semantic_command_kind: "backup.verify".to_owned(),
+            principal: "S-1-5-21-1001".to_owned(),
+            session_id: "4294967312".to_owned(),
+            capability: "backup.restore.v1".to_owned(),
+            scope_id: "scope-a".to_owned(),
+            resource_generation: ResourceGeneration::new(1).expect("nonzero test generation"),
+            authority_epoch: test_epoch(),
+            operation_id: "op-1".to_owned(),
+            archive_sha256: archive_sha256.clone(),
+            archive_owner_contract: "eliot.backup-capture/v1".to_owned(),
+            archive_source_installation: "install-a".to_owned(),
+            archive_export_fence_digest: "b".repeat(64),
+            archived_fence_digest: "c".repeat(64),
+            observed_fence_digest: "d".repeat(64),
+            evidenced_class: "full_recovery".to_owned(),
+            capture_receipt: None,
+            archive_handle: None,
+            capture_receipt_digest: None,
+            validity_attestation_digest: None,
+            retention_and_collision_window: crate::model::BACKUP_VERIFY_RETENTION_WINDOW.to_owned(),
+            identity_digest: String::new(),
+        }
+        .with_computed_digest()
+        .expect("test identity digest must compute");
+        BackupVerificationResultRecord {
+            contract_version: crate::CONTRACT_VERSION,
+            request_digest: identity.identity_digest.clone(),
+            archive_sha256,
+            backup_id: "backup-1".to_owned(),
+            class: "full_recovery".to_owned(),
+            class_ceiling: "full_recovery".to_owned(),
+            verification_level: "owner_attested".to_owned(),
+            archive_fence_relation: "exact_match".to_owned(),
+            archive_fence_proof: "structural-only".to_owned(),
+            archive_fence_restrictions: Vec::new(),
+            archive_fence_relation_contract_version: 1,
+            target_compatibility: None,
+            event_count: 1,
+            receipt_count: 1,
+            blob_count: 1,
+            capture_receipt: None,
+            archive_handle: None,
+            capture_receipt_digest: None,
+            validity_attestation_digest: None,
+            reply_digest: "e".repeat(64),
+            succession_grant: grant,
+            identity,
+        }
+    }
+
+    /// A live grant is consumed exactly once, and the marker is durable (#2883).
+    #[test]
+    fn succession_grant_is_consumed_exactly_once_and_persists() -> Result<(), OrsError> {
+        let (store, path) = temp_store();
+        let now = 1_000_000_000_u64;
+        let grant = BackupVerifySuccessionGrant {
+            grant_id: "1".repeat(64),
+            principal: "S-1-5-21-1001".to_owned(),
+            scope_id: "scope-a".to_owned(),
+            authority_lineage_id: TEST_LINEAGE.to_owned(),
+            issued_at_unix_ms: now - 1,
+            not_before_unix_ms: now,
+            expires_at_unix_ms: now + 300_000,
+            consumed_at_unix_ms: None,
+        };
+        grant
+            .validate()
+            .expect("a fresh grant inside its own window must validate");
+        let key = grant_row(None).record_key()?;
+        store.stage_backup_verification_result(&grant_row(Some(grant)))?;
+
+        assert!(
+            store.consume_backup_verification_succession_grant(&key, now)?,
+            "the first reconciliation consumes the grant"
+        );
+        assert!(
+            !store.consume_backup_verification_succession_grant(&key, now + 1)?,
+            "a replay of the same grant must NOT be consumable a second time"
+        );
+
+        drop(store);
+        let reopened = RedbRecoveryStore::open(&path).expect("store reopens");
+        let stored = reopened
+            .load_backup_verification_result(&key)?
+            .expect("the row is still stored");
+        assert!(
+            stored
+                .succession_grant
+                .is_some_and(|grant| grant.is_consumed()),
+            "the consumed marker is durable across a reopen, not in-memory only"
+        );
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    /// A row whose grant could not be issued stays unreconcilable: consuming
+    /// against it must fail closed rather than fall back to any other authority
+    /// (#2883 instruction 4 - the entropy-unavailable path).
+    #[test]
+    fn succession_grant_absent_row_is_not_consumable() -> Result<(), OrsError> {
+        let (store, path) = temp_store();
+        let row = grant_row(None);
+        let key = row.record_key()?;
+        store.stage_backup_verification_result(&row)?;
+        assert!(
+            !store.consume_backup_verification_succession_grant(&key, 1_000_000_000_u64)?,
+            "a row carrying no grant must never be consumable"
+        );
+        drop(store);
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    /// A consumption marker outside the grant's own window is refused, so a
+    /// spent grant cannot be made to look live by an out-of-range marker.
+    #[test]
+    fn succession_grant_rejects_consumption_outside_its_window() {
+        let now = 1_000_000_000_u64;
+        let base = BackupVerifySuccessionGrant {
+            grant_id: "1".repeat(64),
+            principal: "S-1-5-21-1001".to_owned(),
+            scope_id: "scope-a".to_owned(),
+            authority_lineage_id: TEST_LINEAGE.to_owned(),
+            issued_at_unix_ms: now - 1,
+            not_before_unix_ms: now,
+            expires_at_unix_ms: now + 300_000,
+            consumed_at_unix_ms: None,
+        };
+        let before_window = BackupVerifySuccessionGrant {
+            consumed_at_unix_ms: Some(now - 1),
+            ..base.clone()
+        };
+        let after_window = BackupVerifySuccessionGrant {
+            consumed_at_unix_ms: Some(now + 300_000),
+            ..base
+        };
+        assert!(
+            before_window.validate().is_err(),
+            "consumption before the window opens is refused"
+        );
+        assert!(
+            after_window.validate().is_err(),
+            "consumption at or after expiry is refused"
+        );
     }
 }
 

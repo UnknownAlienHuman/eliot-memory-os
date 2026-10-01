@@ -286,7 +286,7 @@ struct ActivatedReadDescriptor {
 /// against (issue #325 P1, I7.9: the obligation set belongs to the task's own
 /// contract rather than to a caller's scope, and it must be read at one exact
 /// contract revision rather than at whatever happens to be current).
-const ACTIVATED_READS: [ActivatedReadDescriptor; 23] = [
+const ACTIVATED_READS: [ActivatedReadDescriptor; 25] = [
     ActivatedReadDescriptor {
         operation: NamedReadOperation::GetCurrentEpistemicPosition,
         requires_scope_id: true,
@@ -402,11 +402,21 @@ const ACTIVATED_READS: [ActivatedReadDescriptor; 23] = [
         requires_scope_id: false,
         scope_kind: SCOPE_KIND_NONE,
     },
+    ActivatedReadDescriptor {
+        operation: NamedReadOperation::GetBlobProcessSourceAdmission,
+        requires_scope_id: false,
+        scope_kind: SCOPE_KIND_NONE,
+    },
+    ActivatedReadDescriptor {
+        operation: NamedReadOperation::GetPolicyOwnerSnapshot,
+        requires_scope_id: false,
+        scope_kind: SCOPE_KIND_NONE,
+    },
 ];
 
 /// Returns the activated read operations in canonical declaration order.
 #[must_use]
-pub const fn activated_read_operations() -> [NamedReadOperation; 23] {
+pub const fn activated_read_operations() -> [NamedReadOperation; 25] {
     [
         ACTIVATED_READS[0].operation,
         ACTIVATED_READS[1].operation,
@@ -431,6 +441,8 @@ pub const fn activated_read_operations() -> [NamedReadOperation; 23] {
         ACTIVATED_READS[20].operation,
         ACTIVATED_READS[21].operation,
         ACTIVATED_READS[22].operation,
+        ACTIVATED_READS[23].operation,
+        ACTIVATED_READS[24].operation,
     ]
 }
 
@@ -468,7 +480,10 @@ struct ActivatedMutationDescriptor {
 /// experience-bank/feedback rows with the closed experience typed
 /// contract); `ApplyBlackboardItem` persists `Candidate` through the same
 /// family (issue #1822: a Kernel-admitted typed candidate revision with its
-/// closed blackboard contract); `RecordLearningRecord` persists `Candidate`
+/// closed blackboard contract); `AdmitMailboxMessage` persists `Candidate`
+/// through the same family (issue #1820: a Kernel-admitted mailbox message
+/// with its stream-head compare-and-set and closed mailbox contract);
+/// `RecordLearningRecord` persists `Candidate`
 /// through the `CaptureCandidate` family (issue #1868, I12.24: Store-owned
 /// durable learning rows keyed `(record_kind, handle, record_digest)` with the
 /// closed learning typed contract; the only Kernel-owned learning surface, so
@@ -495,7 +510,7 @@ struct ActivatedMutationDescriptor {
 /// activated mutation rows address no store scope, mirroring the scope-free read
 /// descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 22] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 23] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
@@ -545,6 +560,24 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 22] = [
         // Owner snapshots are bounded at 512 KiB. The existing 2 MiB bulk
         // parameter bound covers canonical JSON string escaping and the
         // remaining fixed parameters without broadening the payload bound.
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::RecordWorkScopeSnapshot,
+        transition_classes: &[TransitionClass::RecoverySchema],
+        maximum_effect: EffectClass::ReversibleMutation,
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::RecordPolicySnapshot,
+        transition_classes: &[TransitionClass::RecoverySchema],
+        maximum_effect: EffectClass::ReversibleMutation,
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::RecordBlobProcessSourceAdmission,
+        transition_classes: &[TransitionClass::RecoverySchema],
+        maximum_effect: EffectClass::ReversibleMutation,
         max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
     },
     ActivatedMutationDescriptor {
@@ -629,6 +662,12 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 22] = [
     },
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyBlackboardItem,
+        transition_classes: &[TransitionClass::CaptureCandidate],
+        maximum_effect: EffectClass::Candidate,
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::AdmitMailboxMessage,
         transition_classes: &[TransitionClass::CaptureCandidate],
         maximum_effect: EffectClass::Candidate,
         max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
@@ -901,6 +940,24 @@ pub fn validate_read_against_catalogue(
 /// named `ApplyErasure` operation (`ERASURE_STATE_IRREVERSIBLE`, enforced
 /// below): no generic reversible-effect executor admits the erasure class
 /// through this gate.
+/// Checks an operation-less transition against the genesis manifest.
+fn check_genesis_manifest(
+    transition: &PreparedTransition,
+    entries: &[NamedOperationManifest],
+) -> Result<(), StoreError> {
+    let entry = find_entry(entries, GENESIS_MANIFEST_NAME)?;
+    if transition.operation_manifest_digest != entry.digest {
+        return Err(StoreError::ManifestMismatch);
+    }
+    if !entry.admits(
+        transition.transition_class,
+        transition.requested_effect_ceiling,
+    ) {
+        return Err(StoreError::TransitionClassExceeded);
+    }
+    Ok(())
+}
+
 pub fn validate_transition_against_catalogue(
     transition: &PreparedTransition,
     entries: &[NamedOperationManifest],
@@ -918,17 +975,7 @@ pub fn validate_transition_against_catalogue(
         }
     }
     if transition.named_operations.is_empty() {
-        let entry = find_entry(entries, GENESIS_MANIFEST_NAME)?;
-        if transition.operation_manifest_digest != entry.digest {
-            return Err(StoreError::ManifestMismatch);
-        }
-        if !entry.admits(
-            transition.transition_class,
-            transition.requested_effect_ceiling,
-        ) {
-            return Err(StoreError::TransitionClassExceeded);
-        }
-        return Ok(());
+        return check_genesis_manifest(transition, entries);
     }
     validate_named_plan_manifest_and_erasure(transition, entries)?;
     for command in &transition.named_operations {
@@ -950,12 +997,16 @@ pub fn validate_transition_against_catalogue(
             | NamedMutationOperation::RecordFinishDecision
             | NamedMutationOperation::RecordFinishEvidence
             | NamedMutationOperation::RecordModuleCatalogSnapshot
+            | NamedMutationOperation::RecordPolicySnapshot
             | NamedMutationOperation::UpdateTaskState
             | NamedMutationOperation::ApplyEpistemicRevision
             | NamedMutationOperation::ApplyErasure
             | NamedMutationOperation::ApplySwarmOwnerRevisions
             | NamedMutationOperation::ApplyInstrumentRegistryState => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+                if command.operation == NamedMutationOperation::RecordPolicySnapshot {
+                    validate_policy_snapshot_transition(transition, &command.parameters)?;
+                }
             }
             NamedMutationOperation::ApplyNotificationState => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
@@ -977,6 +1028,9 @@ pub fn validate_transition_against_catalogue(
             }
             NamedMutationOperation::ApplyBlackboardItem => {
                 validate_blackboard_transition(transition, &command.parameters)?;
+            }
+            NamedMutationOperation::AdmitMailboxMessage => {
+                validate_mailbox_transition(transition, &command.parameters)?;
             }
             NamedMutationOperation::RecordLearningRecord => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
@@ -1001,6 +1055,246 @@ pub fn validate_transition_against_catalogue(
             }
         }
         validate_parameter_size(&command.parameters, entry.max_input_bytes)?;
+    }
+    Ok(())
+}
+
+fn validate_policy_snapshot_transition(
+    transition: &PreparedTransition,
+    parameters: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<(), StoreError> {
+    let text = |name: &'static str| {
+        parameters
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "policy.snapshot",
+                reason: "missing required text parameter",
+            })
+    };
+    let optional_text = |name: &'static str| {
+        parameters
+            .get(name)
+            .map(|value| {
+                value.as_str().ok_or(StoreError::InvalidField {
+                    field: "policy.snapshot",
+                    reason: "optional parameter must be text",
+                })
+            })
+            .transpose()
+    };
+    let state = text("expected_policy_state")?;
+    let (expected_revision, expected_digest) = match state {
+        "physical_absence" => {
+            if optional_text("expected_policy_revision")?.is_some()
+                || optional_text("expected_policy_digest")?.is_some()
+            {
+                return Err(StoreError::InvalidField {
+                    field: "policy.expected_state",
+                    reason: "physical absence cannot carry revision or digest sentinels",
+                });
+            }
+            let response_json =
+                optional_text("absence_read_response_json")?.ok_or(StoreError::InvalidField {
+                    field: "policy.absence_read_response_json",
+                    reason: "physical absence requires the exact named-read response",
+                })?;
+            let response_digest =
+                optional_text("absence_read_response_sha256")?.ok_or(StoreError::InvalidField {
+                    field: "policy.absence_read_response_sha256",
+                    reason: "physical absence requires the exact response digest",
+                })?;
+            validate_digest(response_digest, "policy.absence_read_response_sha256")?;
+            let response_value: serde_json::Value =
+                serde_json::from_str(response_json).map_err(|_| StoreError::InvalidField {
+                    field: "policy.absence_read_response_json",
+                    reason: "must be canonical named-read response JSON",
+                })?;
+            if !response_value.is_object()
+                || canonical_json_bytes(&response_value)
+                    .map_err(|error| StoreError::Serialization(error.to_string()))?
+                    != response_json.as_bytes()
+                || sha256_hex(response_json.as_bytes()) != response_digest
+            {
+                return Err(StoreError::InvalidField {
+                    field: "policy.absence_read_response_json",
+                    reason: "must match its canonical named-read response digest",
+                });
+            }
+            let response: NamedReadResponse =
+                serde_json::from_value(response_value).map_err(|_| StoreError::InvalidField {
+                    field: "policy.absence_read_response_json",
+                    reason: "must be a closed named-read response",
+                })?;
+            if response.operation != NamedReadOperation::GetPolicyOwnerSnapshot
+                || response.state_fence != transition.state_fence
+            {
+                return Err(StoreError::InvalidField {
+                    field: "policy.absence_read_response_json",
+                    reason: "must be the exact policy-owner read under this transition fence",
+                });
+            }
+            let result: PolicyOwnerSnapshotReadResult = serde_json::from_value(response.payload)
+                .map_err(|_| StoreError::InvalidField {
+                    field: "policy.absence_read_response_json",
+                    reason: "must carry the typed policy owner lookup result",
+                })?;
+            result.validate(&transition.state_fence)?;
+            if !matches!(result, PolicyOwnerSnapshotReadResult::Absent { .. }) {
+                return Err(StoreError::InvalidField {
+                    field: "policy.absence_read_response_json",
+                    reason: "must prove physical owner-row absence",
+                });
+            }
+            (None, None)
+        }
+        "existing" => {
+            if optional_text("absence_read_response_json")?.is_some()
+                || optional_text("absence_read_response_sha256")?.is_some()
+            {
+                return Err(StoreError::InvalidField {
+                    field: "policy.expected_state",
+                    reason: "existing-row CAS cannot carry physical-absence proof",
+                });
+            }
+            let revision = text("expected_policy_revision")?
+                .parse::<u64>()
+                .map_err(|_| StoreError::InvalidField {
+                    field: "policy.expected_revision",
+                    reason: "must be the exact non-zero decimal revision returned by the named owner read",
+                })?;
+            if revision == 0 {
+                return Err(StoreError::InvalidField {
+                    field: "policy.expected_revision",
+                    reason: "must name the current non-zero Policy owner revision",
+                });
+            }
+            let digest = text("expected_policy_digest")?;
+            validate_digest(digest, "policy.expected_digest")?;
+            (Some(revision), Some(digest.to_owned()))
+        }
+        _ => {
+            return Err(StoreError::InvalidField {
+                field: "policy.expected_state",
+                reason: "must select physical_absence or existing",
+            });
+        }
+    };
+    let snapshot_json = text("snapshot_json")?;
+    let row: serde_json::Value =
+        serde_json::from_str(snapshot_json).map_err(|_| StoreError::InvalidField {
+            field: "policy.snapshot_json",
+            reason: "must be canonical JSON",
+        })?;
+    if !row.is_object()
+        || canonical_json_bytes(&row)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?
+            != snapshot_json.as_bytes()
+    {
+        return Err(StoreError::InvalidField {
+            field: "policy.snapshot_json",
+            reason: "must be a canonical JSON object",
+        });
+    }
+    let revision = row
+        .get("revision")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or(StoreError::InvalidField {
+            field: "policy.revision",
+            reason: "must be a positive integer",
+        })?;
+    let next_revision = match expected_revision {
+        Some(revision) => revision.checked_add(1).ok_or(StoreError::InvalidField {
+            field: "policy.revision",
+            reason: "revision overflow",
+        })?,
+        None => 1,
+    };
+    let expected_fence = serde_json::to_value(&transition.state_fence)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    if revision != next_revision || row.get("state_fence") != Some(&expected_fence) {
+        return Err(StoreError::FenceMismatch);
+    }
+    let policy = row.get("snapshot").ok_or(StoreError::InvalidField {
+        field: "policy.snapshot",
+        reason: "complete ConfigPolicySnapshot is required",
+    })?;
+    let policy_bytes = canonical_json_bytes(policy)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    let policy_digest = row
+        .get("policy_digest")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(StoreError::InvalidField {
+            field: "policy.policy_digest",
+            reason: "canonical snapshot digest is required",
+        })?;
+    if sha256_hex(&policy_bytes) != policy_digest {
+        return Err(StoreError::InvalidField {
+            field: "policy.policy_digest",
+            reason: "must bind the exact nested policy snapshot",
+        });
+    }
+
+    let envelope_json = row
+        .get("signed_initial_config_envelope_json")
+        .and_then(serde_json::Value::as_str);
+    let envelope_sha = row
+        .get("signed_initial_config_envelope_sha256")
+        .and_then(serde_json::Value::as_str);
+    let approval_setting = policy
+        .get("settings")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|settings| {
+            settings.iter().any(|setting| {
+                setting.get("key").and_then(serde_json::Value::as_str)
+                    == Some("governing_source.approval")
+            })
+        });
+    match (envelope_json, envelope_sha) {
+        (Some(envelope_json), Some(envelope_sha)) => {
+            validate_digest(envelope_sha, "policy.initial_config_envelope_sha256")?;
+            let envelope: serde_json::Value =
+                serde_json::from_str(envelope_json).map_err(|_| StoreError::InvalidField {
+                    field: "policy.initial_config_envelope_json",
+                    reason: "must be canonical signed-envelope JSON",
+                })?;
+            if !envelope.is_object()
+                || canonical_json_bytes(&envelope)
+                    .map_err(|error| StoreError::Serialization(error.to_string()))?
+                    != envelope_json.as_bytes()
+                || sha256_hex(
+                    &canonical_json_bytes(&envelope)
+                        .map_err(|error| StoreError::Serialization(error.to_string()))?,
+                ) != envelope_sha
+                || envelope.pointer("/payload/snapshot") != Some(policy)
+            {
+                return Err(StoreError::InvalidField {
+                    field: "policy.initial_config_envelope_json",
+                    reason: "must canonically bind this exact Policy snapshot and digest",
+                });
+            }
+        }
+        (None, None) if !approval_setting => {}
+        _ => {
+            return Err(StoreError::InvalidField {
+                field: "policy.initial_config_envelope_json",
+                reason: "signed envelope and digest are required together for approved sources",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_digest(value: &str, field: &'static str) -> Result<(), StoreError> {
+    if value.len() != 64
+        || value
+            .bytes()
+            .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(StoreError::InvalidField {
+            field,
+            reason: "must be lowercase SHA-256",
+        });
     }
     Ok(())
 }
@@ -1083,6 +1377,24 @@ fn validate_blackboard_transition(
     if transition.task_id.as_deref() != Some(revision.record.task_id.as_str()) {
         return Err(StoreError::InvalidField {
             field: "blackboard.task_id",
+            reason: "must match the prepared transition task",
+        });
+    }
+    Ok(())
+}
+
+fn validate_mailbox_transition(
+    transition: &PreparedTransition,
+    parameters: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<(), StoreError> {
+    let admission =
+        crate::decode_mailbox_item(NamedMutationOperation::AdmitMailboxMessage, parameters)?;
+    if admission.record.state_fence != transition.state_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    if transition.task_id.as_deref() != Some(admission.record.task_id.as_str()) {
+        return Err(StoreError::InvalidField {
+            field: "mailbox.task_id",
             reason: "must match the prepared transition task",
         });
     }

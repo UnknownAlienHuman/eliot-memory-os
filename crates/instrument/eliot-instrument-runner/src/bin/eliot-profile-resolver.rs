@@ -114,12 +114,16 @@ use eliot_contracts::{
     RequestMetadata, ResourceGeneration, SourceId, StateFence, sha256_hex,
 };
 use eliot_instrument_api::{InstrumentContractError, InstrumentInvocation};
+use eliot_instrument_runner::registry::InvalidationSet;
 use eliot_instrument_runner::{
-    ADMITTED_SCOPE_CLASS, AdmittedProfile, DeclaredEnvironmentDependency, ISOLATED_PROCESS_CLASS,
-    InstrumentRegistry, InstrumentRequestPort, InstrumentRunner, InstrumentSpec, ParityVerdict,
-    PlannedStage, ProfileAggregate, ProfileCompiler, RunnerError, StageEnvironment, StageEvidence,
-    StageLauncher, StageOrchestrator, SupplyChainReceipt, TargetLayout, VerificationProfileReceipt,
-    VerificationRouteRequest, WorkScope, admitted_profile_for_alias, parity_summary,
+    ADMITTED_SCOPE_CLASS, AdmittedProfile, AvailabilityInputs, DeclaredEnvironmentDependency,
+    ISOLATED_PROCESS_CLASS, InstrumentRegistry, InstrumentRequestPort, InstrumentRunner,
+    InstrumentSpec, ParityVerdict, PlannedStage, ProfileAggregate, ProfileCompiler,
+    ProviderDispatch, ProviderRegistry, RegistryEntry, RunnerError, StageEnvironment,
+    StageEvidence, StageLauncher, StageOrchestrator, SupplyChainReceipt, TargetLayout,
+    VERIFICATION_REGISTRY_GENERATION, VerificationProfileReceipt, VerificationRouteRequest,
+    WorkScope, admitted_profile_for_alias, compose_provider_dispatch, host_platform,
+    parity_summary,
     profile::{PROFILE_ALIASES, TOOLCHAIN_PATH_ENV, builtin_specs},
     resolve_verification_route, verify_profile_parity,
 };
@@ -150,14 +154,6 @@ const EXIT_REFUSED: i32 = 1;
 /// The one-shot context shape the `eliot-verifier-selfchange` bootstrap stores;
 /// no other revision is ever admitted here.
 const VALIDATION_REVISION: u64 = 1;
-
-/// Registry generation the shared verification registry is admitted at.
-///
-/// The route profiles ship at revision 1, and a supply-chain receipt is validated
-/// against the admitted spec digest at exactly the generation the registry is
-/// assembled with, so one fixed generation keeps an attested receipt and its
-/// registry bound together on either side of a parity comparison.
-const VERIFICATION_REGISTRY_GENERATION: u64 = 1;
 
 /// Authority epoch lineage of this one-shot resolution process.
 ///
@@ -483,6 +479,7 @@ fn resolve_route(request: &Request) -> Result<VerificationProfileReceipt, CliErr
     let route = admitted_profile_for_alias(&request.alias, &registry)?.clone();
     let compiler = ProfileCompiler::new(&registry);
     let admitted = compiler.compile_exact(&route.name, route.revision)?;
+    let provider_entries = provider_entries_for_profile(&admitted)?;
 
     let epoch = process_epoch()?;
     let clock = observation_clock(now_unix_ms());
@@ -545,6 +542,7 @@ fn resolve_route(request: &Request) -> Result<VerificationProfileReceipt, CliErr
         epoch,
         clock,
         layout: layout.clone(),
+        provider_entries,
         port,
     };
     // The live registry is REQUIRED here, not optional. `launch_plan_live`
@@ -613,6 +611,60 @@ fn resolve_route(request: &Request) -> Result<VerificationProfileReceipt, CliErr
 /// refusal is dropped to reach it: a run that launched at least one stage still
 /// reports no per-stage reasons here, because this is a zero-launch guard and
 /// not a general stage report.
+/// Resolves every declared stage to the exact ready provider entry the live
+/// runner will bind into its stage request.
+///
+/// The provider invalidation slots remain empty because this entrypoint has no
+/// caller-attested source/lock fingerprint inputs for that registry. The live
+/// profile registry still checks its own generation, profile, spec, parser,
+/// and supply-chain receipt before launch; no provider freshness claim is
+/// added by filling those absent slots with recomputed identities.
+fn provider_entries_for_profile(
+    admitted: &AdmittedProfile,
+) -> Result<BTreeMap<String, Result<RegistryEntry, String>>, CliError> {
+    let fingerprints = InvalidationSet {
+        source: String::new(),
+        lock: String::new(),
+        toolchain: String::new(),
+        env: String::new(),
+        exe: String::new(),
+        profile: String::new(),
+        parser: String::new(),
+    };
+    let providers = ProviderRegistry::ready(
+        VERIFICATION_REGISTRY_GENERATION,
+        String::new(),
+        &fingerprints,
+    )
+    .map_err(|error| CliError::Contract(format!("provider registry refused: {error}")))?;
+    let inputs = AvailabilityInputs {
+        generation: VERIFICATION_REGISTRY_GENERATION,
+        normative_pair_digest: "",
+        fingerprints: &fingerprints,
+        platform: host_platform(),
+    };
+    let plan = StageOrchestrator::plan(admitted);
+    Ok(plan
+        .stages
+        .iter()
+        .map(|planned| {
+            let stage_id = planned.route.stage().stage_id.clone();
+            let entry = match compose_provider_dispatch(
+                &providers,
+                &planned.stage.spec,
+                planned.stage.kind,
+                &inputs,
+            ) {
+                ProviderDispatch::Dispatch { entry } => Ok(*entry),
+                ProviderDispatch::Refused { disposition } => Err(format!(
+                    "provider stage is refused by the ready registry: {disposition:?}"
+                )),
+            };
+            (stage_id, entry)
+        })
+        .collect())
+}
+
 fn require_launched_stage(
     admitted: &AdmittedProfile,
     aggregate: &ProfileAggregate,
@@ -1618,6 +1670,8 @@ struct StageRoute {
     clock: ClockReading,
     /// Admitted layout the stage working directory comes from.
     layout: TargetLayout,
+    /// Exact provider entries selected for the admitted profile stages.
+    provider_entries: BTreeMap<String, Result<RegistryEntry, String>>,
     /// Admitted stage launch provisions the orchestrator binds each stage
     /// through: the per-stage permit source, the evidence sink, and the exact
     /// sealed request already issued for the stage being launched.
@@ -1909,6 +1963,19 @@ impl StageLauncher for StageRoute {
         // launch another stage's child: the request each stage receives is the
         // one sealed for that stage's own admitted identity.
         &self.port
+    }
+
+    fn provider_entry(&self, stage: &PlannedStage) -> Result<&RegistryEntry, RunnerError> {
+        let stage_id = stage.route.stage().stage_id.as_str();
+        match self.provider_entries.get(stage_id) {
+            Some(Ok(entry)) => Ok(entry),
+            Some(Err(reason)) => Err(RunnerError::Binding(format!(
+                "stage '{stage_id}' has no dispatchable provider: {reason}"
+            ))),
+            None => Err(RunnerError::Binding(format!(
+                "stage '{stage_id}' has no provider registry selection"
+            ))),
+        }
     }
 
     fn sink(&self, _stage: &PlannedStage) -> Arc<dyn ProcessEvidenceSink> {

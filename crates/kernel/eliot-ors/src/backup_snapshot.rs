@@ -442,6 +442,10 @@ pub enum RowFamilyKind {
     /// installation can read a prior installation's verification answer back as
     /// its own.
     BackupVerificationResults,
+    /// Initial setup authority lineage is retained as forensic evidence only.
+    /// Import must never restore its setup-root grant, Policy authority, or
+    /// WorkScope admission as live authority.
+    InitialSetupAuthority,
 }
 /// Backup disposition of one row family.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -479,7 +483,8 @@ impl RowFamilyKind {
             // authority — is the one that actually holds. Listing it explicitly
             // is what makes that true rather than merely stated: a new trailing
             // variant would otherwise silently fall through to `Restorable`.
-            | Self::ProcessEvidence => RowDisposition::ForensicOnly,
+            | Self::ProcessEvidence
+            | Self::InitialSetupAuthority => RowDisposition::ForensicOnly,
             Self::AuthorityHandoffs
             | Self::HostRequests
             | Self::ActivationLifecycle
@@ -530,7 +535,10 @@ impl RowFamilyKind {
     /// family's own durable-key order and the entry `order` reports the
     /// generation as a reporting value only.
     pub const fn uses_family_cursor(self) -> bool {
-        matches!(self, Self::ProcessStreamRecovery | Self::VersionedArtifacts)
+        matches!(
+            self,
+            Self::ProcessStreamRecovery | Self::VersionedArtifacts | Self::InitialSetupAuthority
+        )
     }
 }
 
@@ -1271,6 +1279,8 @@ pub struct OrsBackupRequest {
     /// The versioned-artifact family's rows carry no operation order at all, so
     /// the operational `after_order` window is never reused for it either.
     pub versioned_artifact_cursor: Option<OrsFamilyCursor>,
+    /// Typed continuation for initial setup authority forensic evidence.
+    pub initial_setup_authority_cursor: Option<OrsFamilyCursor>,
 }
 impl OrsBackupRequest {
     /// The exact family continuation this request declares for `family`, or
@@ -1284,6 +1294,7 @@ impl OrsBackupRequest {
         match family {
             RowFamilyKind::ProcessStreamRecovery => self.process_stream_recovery_cursor.as_ref(),
             RowFamilyKind::VersionedArtifacts => self.versioned_artifact_cursor.as_ref(),
+            RowFamilyKind::InitialSetupAuthority => self.initial_setup_authority_cursor.as_ref(),
             _ => None,
         }
     }
@@ -1323,6 +1334,7 @@ impl OrsBackupRequest {
             operational_cursor: None,
             process_stream_recovery_cursor: None,
             versioned_artifact_cursor: None,
+            initial_setup_authority_cursor: None,
         })
     }
     /// Binds one typed operational continuation to this request (issue #2967).
@@ -1409,6 +1421,21 @@ impl OrsBackupRequest {
             });
         }
         self.versioned_artifact_cursor = Some(cursor);
+        Ok(self)
+    }
+    /// Binds the initial setup authority forensic-evidence continuation.
+    pub fn with_initial_setup_authority_cursor(
+        mut self,
+        cursor: OrsFamilyCursor,
+    ) -> Result<Self, OrsError> {
+        cursor.validate()?;
+        if cursor.identity.family != RowFamilyKind::InitialSetupAuthority {
+            return Err(OrsError::InvalidField {
+                field: "backup_initial_setup_authority_cursor",
+                reason: "cursor names a different row family",
+            });
+        }
+        self.initial_setup_authority_cursor = Some(cursor);
         Ok(self)
     }
     /// Deterministic binding token for source, fence, and page cursor.
@@ -1648,6 +1675,8 @@ pub struct OrsBackupPage {
     /// one field per family is what keeps a page from carrying a continuation
     /// under the wrong family's denominator.
     pub versioned_artifact_continuation: Option<OrsFamilyContinuation>,
+    /// Initial setup authority forensic-evidence continuation.
+    pub initial_setup_authority_continuation: Option<OrsFamilyContinuation>,
 }
 impl OrsBackupPage {
     /// The one digest derivation over a page's own content (issue #953).
@@ -1690,7 +1719,7 @@ impl OrsBackupPage {
     #[must_use]
     pub fn expected_page_digest(&self) -> String {
         let mut material = format!(
-            "eliot.ors.backup_page.v5|{}|{}|{}|{}|{}|{}|",
+            "eliot.ors.backup_page.v6|{}|{}|{}|{}|{}|{}|",
             self.fence_token,
             self.page_index,
             self.is_last,
@@ -1712,6 +1741,11 @@ impl OrsBackupPage {
             &mut material,
             "artifact-family",
             self.versioned_artifact_continuation.as_ref(),
+        );
+        push_family_continuation_material(
+            &mut material,
+            "initial-setup-authority-family",
+            self.initial_setup_authority_continuation.as_ref(),
         );
         material.push(':');
         for entry in &self.entries {
@@ -1767,6 +1801,9 @@ impl OrsBackupPage {
             continuation.validate()?;
         }
         if let Some(continuation) = &self.versioned_artifact_continuation {
+            continuation.validate()?;
+        }
+        if let Some(continuation) = &self.initial_setup_authority_continuation {
             continuation.validate()?;
         }
         if self.expected_page_digest() != self.page_digest {
@@ -1924,6 +1961,10 @@ pub struct OrsBackupSnapshot {
     /// Exact versioned-artifact continuation that resumes an incomplete family
     /// export, or `None` when no such continuation is outstanding.
     pub next_versioned_artifact_cursor: Option<OrsFamilyCursor>,
+    /// Frozen initial setup authority evidence snapshot.
+    pub initial_setup_authority_family: Option<OrsFamilySnapshotIdentity>,
+    /// Exact continuation for that forensic-only family.
+    pub next_initial_setup_authority_cursor: Option<OrsFamilyCursor>,
 }
 impl OrsBackupSnapshot {
     /// Recompute the denominator digest over source, fence, family and page
@@ -2010,6 +2051,22 @@ impl OrsBackupSnapshot {
             }
             None => material.push_str("artifact_next:none:"),
         }
+        match &self.initial_setup_authority_family {
+            Some(identity) => {
+                material.push_str("initial_setup_authority_family:");
+                material.push_str(&identity.fence_token());
+                material.push(':');
+            }
+            None => material.push_str("initial_setup_authority_family:none:"),
+        }
+        match &self.next_initial_setup_authority_cursor {
+            Some(next) => {
+                material.push_str("initial_setup_authority_next:");
+                material.push_str(&next.fence_token());
+                material.push(':');
+            }
+            None => material.push_str("initial_setup_authority_next:none:"),
+        }
         for page in &self.pages {
             material.push_str(&page.page_digest);
             material.push(':');
@@ -2033,6 +2090,11 @@ impl OrsBackupSnapshot {
                 &mut material,
                 "artifact-family",
                 page.versioned_artifact_continuation.as_ref(),
+            );
+            push_family_continuation_material(
+                &mut material,
+                "initial-setup-authority-family",
+                page.initial_setup_authority_continuation.as_ref(),
             );
             for entry in &page.entries {
                 material.push_str(&entry.payload_digest);
@@ -2083,6 +2145,8 @@ impl OrsBackupSnapshot {
         let last_recovery = last_page.and_then(|page| page.family_continuation.as_ref());
         let last_artifact =
             last_page.and_then(|page| page.versioned_artifact_continuation.as_ref());
+        let last_initial_setup =
+            last_page.and_then(|page| page.initial_setup_authority_continuation.as_ref());
         // The declared family state must be the state the last page actually
         // reported, for EACH family independently, so a snapshot cannot claim an
         // outstanding continuation the pages do not carry, nor a finished family
@@ -2103,6 +2167,14 @@ impl OrsBackupSnapshot {
             last_artifact,
             "backup_versioned_artifact_family",
             "backup_next_versioned_artifact_cursor",
+        )?;
+        check_declared_family(
+            RowFamilyKind::InitialSetupAuthority,
+            self.initial_setup_authority_family.as_ref(),
+            self.next_initial_setup_authority_cursor.as_ref(),
+            last_initial_setup,
+            "backup_initial_setup_authority_family",
+            "backup_next_initial_setup_authority_cursor",
         )?;
         if matches!(self.completeness, BackupCompleteness::Complete) {
             check_complete_denominators(self)?;
@@ -2161,6 +2233,11 @@ impl OrsBackupSnapshot {
             RowFamilyKind::VersionedArtifacts,
             self.versioned_artifact_family.as_ref(),
         )?;
+        check_family_pages(
+            &self.pages,
+            RowFamilyKind::InitialSetupAuthority,
+            self.initial_setup_authority_family.as_ref(),
+        )?;
         if counted != self.entry_count {
             return Err(OrsError::InvalidField {
                 field: "backup_entry_count",
@@ -2186,6 +2263,7 @@ impl OrsBackupSnapshot {
             &self.operational_history,
             self.process_stream_recovery_family.as_ref(),
             self.versioned_artifact_family.as_ref(),
+            self.initial_setup_authority_family.as_ref(),
         )
     }
     /// The member identities this snapshot's own pages declare, as the expected
@@ -2280,8 +2358,15 @@ fn check_complete_denominators(snapshot: &OrsBackupSnapshot) -> Result<(), OrsEr
             reason: "a complete snapshot must carry a versioned-artifact family denominator",
         });
     }
+    if snapshot.initial_setup_authority_family.is_none() {
+        return Err(OrsError::InvalidField {
+            field: "backup_completeness",
+            reason: "a complete snapshot must carry an initial setup authority family denominator",
+        });
+    }
     if snapshot.next_process_stream_recovery_cursor.is_some()
         || snapshot.next_versioned_artifact_cursor.is_some()
+        || snapshot.next_initial_setup_authority_cursor.is_some()
     {
         return Err(OrsError::InvalidField {
             field: "backup_completeness",
@@ -2684,6 +2769,7 @@ fn page_family_continuation(
     match family {
         RowFamilyKind::ProcessStreamRecovery => page.family_continuation.as_ref(),
         RowFamilyKind::VersionedArtifacts => page.versioned_artifact_continuation.as_ref(),
+        RowFamilyKind::InitialSetupAuthority => page.initial_setup_authority_continuation.as_ref(),
         _ => None,
     }
 }
@@ -2776,6 +2862,7 @@ fn check_family_successor(
 fn family_continuation_field(family: RowFamilyKind) -> &'static str {
     match family {
         RowFamilyKind::VersionedArtifacts => "backup_versioned_artifact_family_continuation",
+        RowFamilyKind::InitialSetupAuthority => "backup_initial_setup_authority_family_continuation",
         _ => "backup_family_continuation",
     }
 }
@@ -2944,6 +3031,10 @@ fn check_page_shape(
         || page
             .versioned_artifact_continuation
             .as_ref()
+            .is_some_and(OrsFamilyContinuation::family_open)
+        || page
+            .initial_setup_authority_continuation
+            .as_ref()
             .is_some_and(OrsFamilyContinuation::family_open);
     if page.is_last && (operational_open || family_open) {
         return Err(OrsError::InvalidField {
@@ -2971,6 +3062,7 @@ fn check_completeness(
     operational_history: &OrsOperationalSnapshotIdentity,
     recovery_family: Option<&OrsFamilySnapshotIdentity>,
     artifact_family: Option<&OrsFamilySnapshotIdentity>,
+    initial_setup_authority_family: Option<&OrsFamilySnapshotIdentity>,
 ) -> Result<(), OrsError> {
     match completeness {
         BackupCompleteness::Complete => {
@@ -3008,6 +3100,11 @@ fn check_completeness(
             check_declared_operational_members(operational_history, pages)?;
             check_declared_members(RowFamilyKind::ProcessStreamRecovery, recovery_family, pages)?;
             check_declared_members(RowFamilyKind::VersionedArtifacts, artifact_family, pages)?;
+            check_declared_members(
+                RowFamilyKind::InitialSetupAuthority,
+                initial_setup_authority_family,
+                pages,
+            )?;
             // Digest shapes are required only now, and only for members whose
             // payload was actually obtained. A member that declares its payload
             // unavailable carries no digest at all, so demanding a 64-hex value

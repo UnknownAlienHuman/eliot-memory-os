@@ -78,6 +78,7 @@ use eliotd::testd_terminal_completion::{
     emit_testd_owner_drain_skip, query_testd_owner_pending_dispatches,
     query_testd_owner_terminal_evidence,
 };
+use eliotd::testd_scope_admission::resolve_blob_owner_facts;
 use eliotd::{
     ActivationClaim, ActivationSubmitError, AgentActivationResolver, DaemonComposition,
     DaemonConfig, DaemonKernelClient, DaemonStatus, FinishSubmitOutcome,
@@ -7049,6 +7050,23 @@ async fn run_testd_owner_drain(
         );
     }
     let mut outcome = TestdOwnerDrainOutcome::default();
+    // One bounded authenticated Kernel pull per drain tick. Governor owner
+    // reads happen under the composition guard; completion uses the same
+    // retained daemon/Kernel client after that guard is released.
+    if let Some(request) = kernel
+        .next_testd_blob_owner_facts_request_async()
+        .await
+        .map_err(|error| format!("TestD blob owner-facts poll: {error}"))?
+    {
+        let response = {
+            let guard = composition.lock().await;
+            resolve_blob_owner_facts(&guard, &request).await?
+        };
+        kernel
+            .complete_testd_blob_owner_facts_request_async(&request, response)
+            .await
+            .map_err(|error| format!("TestD blob owner-facts completion: {error}"))?;
+    }
     // (b) no guard: the first bounded owner poll.
     let pending = query_testd_owner_pending_dispatches(kernel)
         .await

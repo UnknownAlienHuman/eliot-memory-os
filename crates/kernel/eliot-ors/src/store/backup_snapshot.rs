@@ -348,8 +348,9 @@ use crate::backup_snapshot::{
     StoredEffectClass, check_canonical_frozen, validate_import_binding,
 };
 use crate::{
-    ArtifactGenerationState, OperationalPhase, OrsError, ProcessStreamRecoveryProjection,
-    ProcessStreamRecoveryWriteOutcome, RecoveryProblem, StreamRecoveryActivation,
+    ArtifactGenerationState, InitialSetupAuthorityRecord, OperationalPhase, OrsError,
+    ProcessStreamRecoveryProjection, ProcessStreamRecoveryWriteOutcome, RecoveryProblem,
+    StreamRecoveryActivation,
     StreamRecoveryReconciliation, StreamRecoveryReconciliationState, VersionedArtifactEntry,
 };
 
@@ -745,6 +746,9 @@ pub(super) fn row_family_denominator() -> Vec<RowFamilyDisposition> {
         // a restored installation can never read a prior installation's
         // verification answer back as its own.
         RowFamilyDisposition::of(RowFamilyKind::BackupVerificationResults),
+        // Initial setup authority lineage is retained for forensics only; it
+        // never reconstructs a live setup grant or owner after restore.
+        RowFamilyDisposition::of(RowFamilyKind::InitialSetupAuthority),
     ]
 }
 
@@ -915,9 +919,9 @@ struct DispositionedTable {
 /// and there it comes from redb, not from this file.
 ///
 /// Counted against `store.rs`, `store/restore_journal.rs` and `status.rs` at the
-/// time of writing: 75 distinct declared tables, of which 46 back a dispositioned
-/// row family and 29 are explicit source-bound exclusions.
-/// `row_family_denominator` carries 43 families and every one of them is now bound
+/// time of writing: 80 distinct declared tables, of which 47 back a dispositioned
+/// row family and 33 are explicit source-bound exclusions.
+/// `row_family_denominator` carries 44 families and every one of them is now bound
 /// to a table by this census.
 ///
 /// That count is a MEASUREMENT, not an enforced invariant, and the difference
@@ -934,7 +938,7 @@ struct DispositionedTable {
 /// in this issue. Until it exists, a table added to `store.rs` is on the author.
 ///
 /// Split in four so no half can grow past the point where a reader stops
-/// checking it: 46 table-backed tables and 28 source-bound exclusions.
+/// checking it: 47 table-backed tables and 33 source-bound exclusions.
 fn dispositioned_tables() -> Vec<DispositionedTable> {
     let mut tables = family_backed_tables();
     tables.extend(source_bound_exclusions());
@@ -969,7 +973,7 @@ fn excluded(
     }
 }
 
-/// The 45 tables that back a dispositioned row family.
+/// The 47 tables that back a dispositioned row family.
 fn family_backed_tables() -> Vec<DispositionedTable> {
     let mut tables = canonical_family_tables();
     tables.extend(supervision_and_replay_family_tables());
@@ -977,7 +981,7 @@ fn family_backed_tables() -> Vec<DispositionedTable> {
     tables
 }
 
-/// The 22 tables backing the canonical operational and recovery row families.
+/// The 23 tables backing the canonical operational and recovery row families.
 fn canonical_family_tables() -> Vec<DispositionedTable> {
     vec![
         family(super::ENVELOPES, RowFamilyKind::Envelopes),
@@ -1042,6 +1046,10 @@ fn canonical_family_tables() -> Vec<DispositionedTable> {
         family(
             super::VERSIONED_ARTIFACTS,
             RowFamilyKind::VersionedArtifacts,
+        ),
+        family(
+            super::INITIAL_SETUP_AUTHORITIES,
+            RowFamilyKind::InitialSetupAuthority,
         ),
         family(
             super::ACTIVATION_LIFECYCLES,
@@ -1142,7 +1150,7 @@ fn restore_journal_family_tables() -> Vec<DispositionedTable> {
     ]
 }
 
-/// The 28 tables that are explicitly NOT backup row families, each with the
+/// The 29 tables that are explicitly NOT backup row families, each with the
 /// disposition and the reason that excludes it.
 ///
 /// Grouped by what makes a table un-restorable rather than alphabetically, so
@@ -1207,6 +1215,11 @@ fn owner_state_exclusions() -> Vec<DispositionedTable> {
             RowDisposition::NonrestorableHistorical,
             "a derived lookup index over HOST_REQUESTS; it is rebuilt from those rows and holds no row of its own",
         ),
+        excluded(
+            super::INITIAL_SETUP_AUTHORITY_POLICY_RECEIPTS,
+            RowDisposition::ForensicOnly,
+            "a derived lookup index over INITIAL_SETUP_AUTHORITIES; the full authority lineage rows are exported as forensic evidence and the index is rebuilt from their committed Policy receipt identities",
+        ),
         // ---- Explicit source-bound exclusions: superseded or committed ----
         // Superseded by `GRANT_CLOSURE_CURRENT` (v2). Its bytes are an explicit
         // startup-migration input and are removed by that migration, so a
@@ -1223,6 +1236,25 @@ fn owner_state_exclusions() -> Vec<DispositionedTable> {
             super::GRANT_CLOSURE_SECOND_PHASE_CURRENT,
             RowDisposition::ForensicOnly,
             "committed second-phase closure links are evidence that an order was placed; no import path re-authorizes one and the owner re-derives them at its own write time",
+        ),
+        // Process-stream grants and their one-use identities are live Kernel
+        // authority, bound to one admitted TestD job, current fence, and Store
+        // session. A restored row could authorize an effect in a different
+        // installation; there is deliberately no import path for these rows.
+        excluded(
+            super::BLOB_PROCESS_STREAM_GRANTS,
+            RowDisposition::ForensicOnly,
+            "process-stream grants are installation-bound Kernel authority for one admitted job and current Store session; restoring them would revive capabilities without their live issuer",
+        ),
+        excluded(
+            super::BLOB_PROCESS_STREAM_CALLS,
+            RowDisposition::ForensicOnly,
+            "process-stream call records are tied to one installation's Store request identities and owner outcomes; they are forensic evidence only and cannot authorize replay after restore",
+        ),
+        excluded(
+            super::BLOB_PROCESS_STREAM_OWNER_FACTS_PULLS,
+            RowDisposition::ForensicOnly,
+            "owner-facts pulls are correlated to one installation's authenticated daemon session and current authority fence; restored responses cannot serve as current owner evidence",
         ),
     ]
 }
@@ -1521,7 +1553,7 @@ fn purge_ledger_exclusions() -> Vec<DispositionedTable> {
 ///    advertise a quarantined import path for a table that has no family and
 ///    therefore no import path.
 ///
-/// Cost is one `list_tables` plus a 71-entry linear scan, both bounded and both
+/// Cost is one `list_tables` plus a 78-entry linear scan, both bounded and both
 /// independent of store size: it is a schema census, not a data scan. It runs
 /// once per export entrypoint and once per quarantined import, never per page.
 ///
@@ -1610,6 +1642,7 @@ fn family_table_definition(family: RowFamilyKind) -> Result<FamilyTable, OrsErro
     match family {
         RowFamilyKind::ProcessStreamRecovery => Ok(super::PROCESS_STREAM_RECOVERY),
         RowFamilyKind::VersionedArtifacts => Ok(super::VERSIONED_ARTIFACTS),
+        RowFamilyKind::InitialSetupAuthority => Ok(super::INITIAL_SETUP_AUTHORITIES),
         _ => Err(OrsError::InvalidField {
             field: "backup_family",
             reason: "family is not paged through a typed family cursor",
@@ -1626,6 +1659,7 @@ fn family_record_type(family: RowFamilyKind) -> Result<&'static str, OrsError> {
     match family {
         RowFamilyKind::ProcessStreamRecovery => Ok("process_stream_recovery"),
         RowFamilyKind::VersionedArtifacts => Ok("versioned_artifact_entry"),
+        RowFamilyKind::InitialSetupAuthority => Ok("initial_setup_authority"),
         _ => Err(OrsError::InvalidField {
             field: "backup_family",
             reason: "family is not paged through a typed family cursor",
@@ -1647,6 +1681,9 @@ fn family_revision(read: &ReadTransaction, family: RowFamilyKind) -> Result<u64,
         }
         RowFamilyKind::VersionedArtifacts => {
             super::RedbRecoveryStore::versioned_artifact_family_revision(read)
+        }
+        RowFamilyKind::InitialSetupAuthority => {
+            super::RedbRecoveryStore::initial_setup_authority_family_revision(read)
         }
         _ => Err(OrsError::InvalidField {
             field: "backup_family",
@@ -2141,9 +2178,17 @@ fn family_cursor_mismatch_error(
                 expected_emitted_rows,
             }
         }
-        _ => OrsError::InvalidField {
+        RowFamilyKind::VersionedArtifacts => OrsError::InvalidField {
             field: "backup_versioned_artifact_family_cursor",
             reason: "cursor must name the owner-emitted durable-key prefix",
+        },
+        RowFamilyKind::InitialSetupAuthority => OrsError::InvalidField {
+            field: "backup_initial_setup_authority_family_cursor",
+            reason: "cursor must name the owner-emitted durable-key prefix",
+        },
+        _ => OrsError::InvalidField {
+            field: "backup_family_cursor",
+            reason: "family is not paged through a typed family cursor",
         },
     }
 }
@@ -2910,17 +2955,22 @@ fn composite_state_digest(read: &ReadTransaction) -> Result<String, OrsError> {
     let recovery = family_identity(read, RowFamilyKind::ProcessStreamRecovery)?;
     let artifact_revision = family_revision(read, RowFamilyKind::VersionedArtifacts)?;
     let artifact = family_identity(read, RowFamilyKind::VersionedArtifacts)?;
+    let setup_revision = family_revision(read, RowFamilyKind::InitialSetupAuthority)?;
+    let setup = family_identity(read, RowFamilyKind::InitialSetupAuthority)?;
     let mut material = String::new();
     let _ = write!(
         material,
-        "eliot.ors.composite_state.v3|operational_high_water={}|operational_root={operational}|recovery_family_revision={recovery_revision}|recovery_family_root={}|recovery_rows={}|recovery_bytes={}|artifact_family_revision={artifact_revision}|artifact_family_root={}|artifact_rows={}|artifact_bytes={}",
+        "eliot.ors.composite_state.v4|operational_high_water={}|operational_root={operational}|recovery_family_revision={recovery_revision}|recovery_family_root={}|recovery_rows={}|recovery_bytes={}|artifact_family_revision={artifact_revision}|artifact_family_root={}|artifact_rows={}|artifact_bytes={}|initial_setup_authority_revision={setup_revision}|initial_setup_authority_root={}|initial_setup_authority_rows={}|initial_setup_authority_bytes={}",
         observation.high_water_order,
         recovery.family_root_digest,
         recovery.family_row_count,
         recovery.family_total_bytes,
         artifact.family_root_digest,
         artifact.family_row_count,
-        artifact.family_total_bytes
+        artifact.family_total_bytes,
+        setup.family_root_digest,
+        setup.family_row_count,
+        setup.family_total_bytes
     );
     Ok(crate::model::sha256_hex(material.as_bytes()))
 }
@@ -3110,6 +3160,17 @@ fn family_page(
             // family's own decision is total, so one enumeration serves both.
             |entry| Ok(versioned_artifact_entry(entry)),
         ),
+        RowFamilyKind::InitialSetupAuthority => family_segment::<InitialSetupAuthorityRecord>(
+            family,
+            &table,
+            cursor,
+            row_budget,
+            byte_budget,
+            request.max_bytes,
+            // Forensic rows have no execution effect class; a terminal backup
+            // label is evidence only and the family disposition forbids restore.
+            |_| Ok((0, StoredEffectClass::Terminal)),
+        ),
         _ => Err(OrsError::InvalidField {
             field: "backup_family",
             reason: "family is not paged through a typed family cursor",
@@ -3128,6 +3189,8 @@ struct PageFamilySegments {
     recovery: Option<OrsFamilyContinuation>,
     /// Versioned-artifact continuation, or `None` when none was declared.
     artifacts: Option<OrsFamilyContinuation>,
+    /// Initial setup authority forensic-evidence continuation.
+    initial_setup_authority: Option<OrsFamilyContinuation>,
     /// True when ANY declared family still has rows behind its frontier.
     open: bool,
 }
@@ -3166,11 +3229,21 @@ fn family_page_segments(
         charged_entries + recovery_entries.len(),
         spent,
     )?;
-    // The running total is read here, so the two family segments together are
+    let spent = spent
+        .checked_add(artifact_bytes)
+        .ok_or(OrsError::ProjectionLimitExceeded)?;
+    let (setup_entries, initial_setup_authority, setup_bytes) = family_page(
+        read,
+        request,
+        RowFamilyKind::InitialSetupAuthority,
+        charged_entries + recovery_entries.len() + artifact_entries.len(),
+        spent,
+    )?;
+    // The running total is read here, so the three family segments together are
     // asserted to leave the page inside the caller's declared byte budget rather
     // than the last charge being accumulated and discarded.
     let page_bytes = spent
-        .checked_add(artifact_bytes)
+        .checked_add(setup_bytes)
         .ok_or(OrsError::ProjectionLimitExceeded)?;
     if page_bytes > request.max_bytes {
         return Err(OrsError::ProjectionLimitExceeded);
@@ -3180,13 +3253,18 @@ fn family_page_segments(
         .is_some_and(OrsFamilyContinuation::family_open)
         || artifacts
             .as_ref()
+            .is_some_and(OrsFamilyContinuation::family_open)
+        || initial_setup_authority
+            .as_ref()
             .is_some_and(OrsFamilyContinuation::family_open);
     let mut entries = recovery_entries;
     entries.extend(artifact_entries);
+    entries.extend(setup_entries);
     Ok(PageFamilySegments {
         entries,
         recovery,
         artifacts,
+        initial_setup_authority,
         open,
     })
 }
@@ -3205,6 +3283,9 @@ fn attach_family_cursor(
     match cursor.identity.family {
         RowFamilyKind::ProcessStreamRecovery => request.with_process_stream_recovery_cursor(cursor),
         RowFamilyKind::VersionedArtifacts => request.with_versioned_artifact_cursor(cursor),
+        RowFamilyKind::InitialSetupAuthority => {
+            request.with_initial_setup_authority_cursor(cursor)
+        }
         _ => Err(OrsError::InvalidField {
             field: "backup_family",
             reason: "family is not paged through a typed family cursor",
@@ -3399,6 +3480,7 @@ fn export_page_in(
         operational_continuation: operational.continuation,
         family_continuation: families.recovery,
         versioned_artifact_continuation: families.artifacts,
+        initial_setup_authority_continuation: families.initial_setup_authority,
     };
     page.page_digest = page.expected_page_digest();
     page.validate_binding()?;
@@ -3426,6 +3508,8 @@ struct SnapshotPages {
     outstanding_recovery: Option<OrsFamilyCursor>,
     /// Exact continuation resuming the versioned-artifact family, if owed.
     outstanding_artifact: Option<OrsFamilyCursor>,
+    /// Exact continuation resuming the initial setup authority evidence family.
+    outstanding_initial_setup_authority: Option<OrsFamilyCursor>,
     /// The request as the loop left it, carrying each axis's final cursor.
     continuing: OrsBackupRequest,
 }
@@ -3475,6 +3559,10 @@ fn export_pages_in(
             .versioned_artifact_continuation
             .as_ref()
             .map(|continuation| continuation.frontier().clone());
+        let next_initial_setup_authority = page
+            .initial_setup_authority_continuation
+            .as_ref()
+            .map(|continuation| continuation.frontier().clone());
         last_page_was_final = page.is_last;
         pages.push(page);
         if last_page_was_final {
@@ -3485,6 +3573,9 @@ fn export_pages_in(
             continuing = attach_family_cursor(continuing, next)?;
         }
         if let Some(next) = next_artifact {
+            continuing = attach_family_cursor(continuing, next)?;
+        }
+        if let Some(next) = next_initial_setup_authority {
             continuing = attach_family_cursor(continuing, next)?;
         }
     }
@@ -3501,6 +3592,9 @@ fn export_pages_in(
         page.and_then(|page| match family {
             RowFamilyKind::ProcessStreamRecovery => page.family_continuation.as_ref(),
             RowFamilyKind::VersionedArtifacts => page.versioned_artifact_continuation.as_ref(),
+            RowFamilyKind::InitialSetupAuthority => {
+                page.initial_setup_authority_continuation.as_ref()
+            }
             _ => None,
         })
         .and_then(OrsFamilyContinuation::open_cursor)
@@ -3512,6 +3606,8 @@ fn export_pages_in(
             .and_then(|page| page.operational_continuation.open_cursor().cloned()),
         outstanding_recovery: outstanding_of(last, RowFamilyKind::ProcessStreamRecovery),
         outstanding_artifact: outstanding_of(last, RowFamilyKind::VersionedArtifacts),
+        outstanding_initial_setup_authority:
+            outstanding_of(last, RowFamilyKind::InitialSetupAuthority),
         pages,
         entry_count,
         last_page_was_final,
@@ -3558,6 +3654,7 @@ fn snapshot_completeness(
     last_operational: &OrsOperationalContinuation,
     last_recovery: Option<&OrsFamilyContinuation>,
     last_artifact: Option<&OrsFamilyContinuation>,
+    last_initial_setup: Option<&OrsFamilyContinuation>,
     continuing: &OrsBackupRequest,
     entry_count: u64,
     last_page_was_final: bool,
@@ -3593,6 +3690,11 @@ fn snapshot_completeness(
             reason: family_outstanding(next, RowFamilyKind::VersionedArtifacts),
         });
     }
+    if let Some(next) = last_initial_setup.and_then(OrsFamilyContinuation::open_cursor) {
+        return Ok(BackupCompleteness::Partial {
+            reason: family_outstanding(next, RowFamilyKind::InitialSetupAuthority),
+        });
+    }
     if continuing.process_stream_recovery_cursor.is_none() {
         return Ok(BackupCompleteness::Partial {
             reason: BackupPartialReason::NoFamilyDenominator {
@@ -3604,6 +3706,13 @@ fn snapshot_completeness(
         return Ok(BackupCompleteness::Partial {
             reason: BackupPartialReason::NoFamilyDenominator {
                 family: RowFamilyKind::VersionedArtifacts,
+            },
+        });
+    }
+    if continuing.initial_setup_authority_cursor.is_none() {
+        return Ok(BackupCompleteness::Partial {
+            reason: BackupPartialReason::NoFamilyDenominator {
+                family: RowFamilyKind::InitialSetupAuthority,
             },
         });
     }
@@ -3623,7 +3732,12 @@ fn snapshot_completeness(
     };
     let recovery_exhausted = family_exhausted(last_recovery);
     let artifact_exhausted = family_exhausted(last_artifact);
-    if !(operational_exhausted && recovery_exhausted && artifact_exhausted) {
+    let initial_setup_exhausted = family_exhausted(last_initial_setup);
+    if !(operational_exhausted
+        && recovery_exhausted
+        && artifact_exhausted
+        && initial_setup_exhausted)
+    {
         return Err(OrsError::IntegrityProblem {
             record_type: "backup_axis_exhaustion",
             reason: "a complete snapshot requires every required axis to be explicitly exhausted at the denominator it was opened with".to_owned(),
@@ -3766,6 +3880,9 @@ pub(super) fn export_snapshot(
     if let Some(cursor) = request.family_cursor(RowFamilyKind::VersionedArtifacts) {
         check_family_revision_frozen(&read, cursor)?;
     }
+    if let Some(cursor) = request.family_cursor(RowFamilyKind::InitialSetupAuthority) {
+        check_family_revision_frozen(&read, cursor)?;
+    }
     // PRE witness, INSIDE the capture snapshot: the composite state as it stood
     // when the capture began. It folds both cursor-paged families.
     let frozen_pre = composite_state_digest(&read)?;
@@ -3788,6 +3905,7 @@ pub(super) fn export_snapshot(
         outstanding_operational,
         outstanding_recovery,
         outstanding_artifact,
+        outstanding_initial_setup_authority,
         continuing,
     } = paged;
     // Byte budget is re-summed from the pages so the snapshot total is a
@@ -3809,13 +3927,20 @@ pub(super) fn export_snapshot(
     // last page's three outgoing STATES are carried beside it for the same reason
     // (issue #953): `Complete` is a statement about exhaustion, not about row
     // presence.
-    let (operational_history, last_operational, last_recovery, last_artifact) = {
+    let (
+        operational_history,
+        last_operational,
+        last_recovery,
+        last_artifact,
+        last_initial_setup,
+    ) = {
         let last = pages.last().ok_or(OrsError::ProjectionLimitExceeded)?;
         (
             last.operational_continuation.cursor.identity.clone(),
             last.operational_continuation.clone(),
             last.family_continuation.clone(),
             last.versioned_artifact_continuation.clone(),
+            last.initial_setup_authority_continuation.clone(),
         )
     };
     // `Complete` is derived from EXHAUSTION on every axis, never from row presence
@@ -3826,6 +3951,7 @@ pub(super) fn export_snapshot(
         &last_operational,
         last_recovery.as_ref(),
         last_artifact.as_ref(),
+        last_initial_setup.as_ref(),
         &continuing,
         entry_count,
         last_page_was_final,
@@ -3850,6 +3976,11 @@ pub(super) fn export_snapshot(
             .as_ref()
             .map(|cursor| cursor.identity.clone()),
         next_versioned_artifact_cursor: outstanding_artifact,
+        initial_setup_authority_family: continuing
+            .initial_setup_authority_cursor
+            .as_ref()
+            .map(|cursor| cursor.identity.clone()),
+        next_initial_setup_authority_cursor: outstanding_initial_setup_authority,
     };
     snapshot.denominator_digest = snapshot.snapshot_digest();
     // THE producer runs its own contract before handing the archive over

@@ -43,7 +43,7 @@
 //! * [`trigger_admitted_doctor_launch`] is the T6-D2 front-door trigger:
 //!   pre-admit through the composed gate, derive the launch material from
 //!   the composed registry (admitted manifest revision plus installed
-//!   executable digest — never caller bytes), then delegate to the launch
+//!   executable digest â€” never caller bytes), then delegate to the launch
 //!   seam above. The absolute child anchor arrives from the owning
 //!   composition ([`DoctorChildBinding`]).
 //! * a launched-but-unreconciled attempt reconciles by its original
@@ -55,7 +55,7 @@
 //!
 //! Delivery contract (I7.5/I15.2): each launched child receives a launch
 //! nonce plus a launch grant delivered over the protected dispatch file
-//! next to its executable — never via the command line, stdin, or the
+//! next to its executable â€” never via the command line, stdin, or the
 //! environment. The Doctor file carries exactly what
 //! `bins/eliot-doctor/src/dispatched_material.rs::read_dispatched_material_from`
 //! validates (envelope bytes plus canonical digest, parsed closed request
@@ -121,14 +121,15 @@ use eliot_process::{OperationId, ProcessRequest};
 use eliot_protocol::dreamer_job::{DurableJobResponse, JobState};
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use eliot_testd_core::{
-    BUILD_ROOT_DIRECTORY, BuildClass, BuildFingerprint, BuildMode, GovernedWorkEnvelope, JobClass,
-    JobState as TestdJobState, JobSubmissionMetadata, KernelProcessAdmissionEvidence,
-    KernelProcessAdmissionProvider, KernelProcessAdmissionRequest, LaneIdentity, ProcessAdmission,
-    ResourceWeight, RetryPolicy, TARGET_LAYOUT_REVISION, TESTD_OWNER_SUBMIT_OPERATION,
-    TESTD_OWNER_SUBMIT_WIRE_VERSION, TESTD_PRODUCTIVE_PROFILE, TargetLayoutBinding, TargetRoots,
-    TestResourceProfile, TestdOwnerSubmitDirective, TestdOwnerSubmitRequest,
+    BUILD_ROOT_DIRECTORY, BuildClass, BuildFingerprint, BuildMode, GovernedWorkEnvelope,
+    InstrumentStageRequest, JobClass, JobState as TestdJobState, JobSubmissionMetadata,
+    KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider, KernelProcessAdmissionRequest,
+    LaneIdentity, ProcessAdmission, ResourceWeight, RetryPolicy, StageExecutionKind,
+    TARGET_LAYOUT_REVISION, TESTD_OWNER_SUBMIT_OPERATION, TESTD_OWNER_SUBMIT_WIRE_VERSION,
+    TargetLayoutBinding, TargetRoots, TestResourceProfile, TestdBlobProcessStreamGrant,
+    TestdBlobProcessStreamTokenRef, TestdOwnerSubmitDirective, TestdOwnerSubmitRequest,
     TestdOwnerSubmitResponse, TestdStore, TestdVerifierDispatchBinding, TestdVerifierJobSubmission,
-    issue_process_admission, testd_profile_binding, verification_receipt_sha256,
+    issue_process_admission, testd_productive_stage_resource_limits, verification_receipt_sha256,
     verify_envelope_layout_binding,
 };
 use serde::{Deserialize, Serialize};
@@ -156,7 +157,7 @@ use super::{
     ActionLeaseRef, EnvironmentInheritance, EnvironmentProjection, FencingToken, Generation,
     ImageId, JobId, KernelComposition, ProcessExecutionAdmissionRequest, ProcessExecutionError,
     ProcessIntent, ProcessOwnerBinding, ProcessStartReceipt, ProcessTreeId, RequestIdentity,
-    ResourceLimits, SessionId,
+    ResourceLimits, SessionId, TestdOuterProcessStreamAdmission,
 };
 
 /// One-shot worker kind served by the dispatch-launch contour.
@@ -298,23 +299,23 @@ impl DispatchedWorkerKind {
 ///   "expires_at": 1750000060000
 /// }
 /// ```
-/// * `grant_digest: String` — lowercase SHA-256 over the canonical grant
+/// * `grant_digest: String` â€” lowercase SHA-256 over the canonical grant
 ///   binding (identity digest + epoch + generation + fence nonce +
 ///   idempotency key + expiry); carried as the child-side `one_shot_nonce`
 ///   plus the `launch-grant` revision-head value (both require opaque/hex
 ///   shape, which hex satisfies).
-/// * `authority_epoch: EpochId` — canonical lineage-aware epoch
+/// * `authority_epoch: EpochId` â€” canonical lineage-aware epoch
 ///   (`eliot_contracts::EpochId`); the child calls
 ///   `FencingToken::new(authority_epoch, Generation, fence_nonce)`.
-/// * `fence_generation: u64` — non-zero live activation generation; the
+/// * `fence_generation: u64` â€” non-zero live activation generation; the
 ///   child calls `Generation::new(fence_generation)`.
-/// * `fence_nonce: String` — deterministic per-identity fence nonce
+/// * `fence_nonce: String` â€” deterministic per-identity fence nonce
 ///   (`<operation_prefix>-fence-<short_identity>`); the child passes it to
 ///   `FencingToken::new`.
-/// * `idempotency_key: String` — deterministic per-identity lease
+/// * `idempotency_key: String` â€” deterministic per-identity lease
 ///   (`<operation_prefix>-lease-<short_identity>`); the child calls
 ///   `ActionLeaseRef::new(idempotency_key)`.
-/// * `expires_at: u64` — Unix milliseconds
+/// * `expires_at: u64` â€” Unix milliseconds
 ///   (`admitted_at_ms.saturating_add(60_000)`); the child passes it as
 ///   `PermitIssuance::new(..., issued_at = now_ms, expires_at, ...)`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -386,8 +387,9 @@ impl DispatchGrant {
 ///
 /// Inputs are all Kernel-side live authority plus the durable admission
 /// identity: `identity_digest` is the admission-bound digest
-/// (`attempt_digest` for Doctor, `request_digest` for testd,
-/// `binding_digest` for native — all lowercase SHA-256 by contract),
+/// (`attempt_digest` for Doctor, the stage-bearing TestD admission digest
+/// for TestD, and `binding_digest` for native â€” all lowercase SHA-256 by
+/// contract),
 /// `authority_epoch`/`generation` are the live values bound at admission,
 /// and `admitted_at_unix_nanos` is the durable admission time (for native,
 /// `admitted_at_unix_ms * 1_000_000`). Derivations are replay-stable, so an
@@ -754,6 +756,12 @@ struct TestdLaunchOwnerBinding {
     process: ProcessAdmission,
     invocation_sha256: String,
     verifier_dispatch: Option<TestdVerifierDispatchBinding>,
+    /// Exact stage identity retained in the durable owner row and copied to
+    /// the protected dispatch material.
+    stage_request: Option<InstrumentStageRequest>,
+    /// Kernel-issued opaque Blob capability and one-use tokens, retained in
+    /// the durable owner row and projected into protected launch material.
+    blob_process_stream_grant: Option<TestdBlobProcessStreamGrant>,
 }
 
 /// Retained launch records. The durable attempt/effect ledger stays the
@@ -965,7 +973,7 @@ pub fn compose_dispatch_contour(installation_id: String) -> Result<(), DispatchL
 /// Composes the production Doctor front-door state: the durable recovery
 /// ledger plus the immutable recipe registry.
 ///
-/// The ledger is any live [`DoctorRecoveryLedger`] implementation — the
+/// The ledger is any live [`DoctorRecoveryLedger`] implementation â€” the
 /// production redb store once its slice lands, or the faithful contract
 /// ledger in tests. The registry is the supplier-built immutable revision
 /// (content authority stays with the supplying composition). Requires the
@@ -1001,7 +1009,7 @@ pub fn compose_doctor_front_door<L: DoctorRecoveryLedger + 'static>(
 ///
 /// `installed_doctor_digest` is the installed Doctor package artifact
 /// digest (lowercase SHA-256) from the installation manifest through the
-/// Host injection — never minted here. A malformed digest fails closed
+/// Host injection â€” never minted here. A malformed digest fails closed
 /// with [`DispatchLaunchError::InvalidMaterial`] before any cell is
 /// touched; otherwise this delegates to [`compose_doctor_front_door`],
 /// so the contour-first, non-empty-registry, and set-once rules hold
@@ -1021,7 +1029,7 @@ pub fn compose_production_doctor_front_door(
 ///
 /// `installed_testd_digest` is the installed testd package artifact digest
 /// (lowercase SHA-256) from the installation manifest through the Host
-/// injection — never minted here. Testd admission is stateless (wire plus
+/// injection â€” never minted here. Testd admission is stateless (wire plus
 /// live authority only), so no ledger composition is required: this records
 /// the verified digest on the contour cell from
 /// [`compose_dispatch_contour`] as the production-composed marker the
@@ -1058,7 +1066,7 @@ pub fn compose_production_testd_front_door(
 ///
 /// `installed_native_worker_digest` is the installed native-worker package
 /// artifact digest (lowercase SHA-256) from the installation manifest
-/// through the Host injection — never minted here. Native-worker admission
+/// through the Host injection â€” never minted here. Native-worker admission
 /// runs through live service authority plus the ORS claim table, so no
 /// ledger composition is required: this records the verified digest on the
 /// contour cell from [`compose_dispatch_contour`] as the
@@ -1161,7 +1169,7 @@ pub fn doctor_repair_advertised() -> bool {
 ///
 /// True exactly when the dispatch contour cell is composed: testd admission
 /// is stateless (wire plus live authority only), so no ledger composition
-/// is required — only the contour cell from [`compose_dispatch_contour`]
+/// is required â€” only the contour cell from [`compose_dispatch_contour`]
 /// for the Kernel-owned principal. The inert
 /// `TESTD_ADMISSION_ADVERTISED` default never flips in place; this path
 /// flips only through the composed contour, via
@@ -1242,7 +1250,7 @@ pub(crate) fn admit_doctor_repair_cancellation(
 /// live service authority.
 ///
 /// Testd admission is stateless: the answer derives from the presented wire
-/// plus live authority only, so no ledger composition is required — only
+/// plus live authority only, so no ledger composition is required â€” only
 /// the contour cell from [`compose_dispatch_contour`] for the
 /// Kernel-owned principal. Fails closed until it lands; mechanical
 /// failures surface as [`DispatchLaunchError::Gate`]; every typed refusal
@@ -1318,6 +1326,24 @@ pub(crate) async fn submit_testd_owner_job(
     {
         return Err(DispatchLaunchError::Gate(
             "TestD owner submission does not match the authenticated request identity".to_owned(),
+        ));
+    }
+    let stage_request = request.submission.stage_request.as_ref().ok_or_else(|| {
+        DispatchLaunchError::Gate(
+            "productive TestD owner submission requires the runner-admitted stage identity"
+                .to_owned(),
+        )
+    })?;
+    if stage_request.invocation != request.submission.invocation
+        || stage_request.execution != StageExecutionKind::Process
+        || stage_request.kind != request.submission.invocation.kind
+        || stage_request.profile_name != request.submission.invocation.profile
+        || !eliot_testd_core::is_testd_executor_profile(&stage_request.profile_name)
+        || stage_request.validate().is_err()
+    {
+        return Err(DispatchLaunchError::Gate(
+            "productive TestD owner requires the exact admitted process stage and command"
+                .to_owned(),
         ));
     }
     let task_id_present = identity.request.metadata.task_id.is_some();
@@ -1414,7 +1440,7 @@ pub(crate) async fn submit_testd_owner_job(
     // Issue #1897 (AUD1): resolve the lane's admitted identity BEFORE the
     // layout. `workspace_component` comes from the Governor-issued project
     // identity and `checkout_component` from the canonical, verified source
-    // root above, so the lane runs under the real admitted checkout — no Git
+    // root above, so the lane runs under the real admitted checkout â€” no Git
     // worktree is created because a historical field is named `worktree_id`.
     let workspace_component =
         TargetLayoutBinding::derive_workspace_component(&request.submission.project_id)
@@ -1591,11 +1617,28 @@ pub(crate) async fn submit_testd_owner_job(
         .validate_for_roots(&lane_envelope)
         .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
 
-    let profile = testd_profile_binding(
-        TESTD_PRODUCTIVE_PROFILE,
-        &request.process_tool.observation.nextest_sha256,
-    )
-    .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let stage_command = stage_request.stage_command.as_ref().ok_or_else(|| {
+        DispatchLaunchError::Gate(
+            "productive TestD stage has no sealed registered command".to_owned(),
+        )
+    })?;
+    let (executable_path, executable_sha256) = match stage_command.executable.as_str() {
+        "cargo" => (
+            request.process_tool.observation.cargo_path.clone(),
+            request.process_tool.observation.cargo_sha256.clone(),
+        ),
+        "cargo-nextest" => (
+            request.process_tool.observation.nextest_path.clone(),
+            request.process_tool.observation.nextest_sha256.clone(),
+        ),
+        _ => {
+            return Err(DispatchLaunchError::Gate(
+                "productive TestD stage command has an unknown executable selector".to_owned(),
+            ));
+        }
+    };
+    let limits = testd_productive_stage_resource_limits()
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let process_tree_id = ProcessTreeId::new(format!("testd-tree-{}", &job_digest[..32]))
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let process_session_id = SessionId::new(format!("testd-session-{}", &job_digest[..32]))
@@ -1605,24 +1648,16 @@ pub(crate) async fn submit_testd_owner_job(
             .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?,
         process_tree_id,
         JobId::new(job_id.clone()).map_err(|error| DispatchLaunchError::Gate(error.to_string()))?,
-        ImageId::new("testd-profile-cargo-nextest")
+        ImageId::new(format!("testd-profile-{}", stage_request.profile_name))
             .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?,
         process_session_id,
         generation,
-        request.process_tool.observation.nextest_path.clone(),
-        request.process_tool.observation.nextest_sha256.clone(),
-        profile.fixed_argv.clone(),
+        executable_path,
+        executable_sha256,
+        stage_command.argv.clone(),
         source_root.to_string_lossy().into_owned(),
-        environment,
-        ResourceLimits::new(
-            profile.wall_timeout_ms,
-            profile.cpu_time_ms,
-            profile.memory_bytes,
-            profile.stdout_bytes,
-            profile.stderr_bytes,
-            profile.max_descendants,
-        )
-        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?,
+        environment.clone(),
+        limits.clone(),
     )
     .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let fence = FencingToken::new(
@@ -1637,7 +1672,7 @@ pub(crate) async fn submit_testd_owner_job(
         ActionLeaseRef::new(format!("testd-owner-lease-{}", &job_digest[..32]))
             .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?,
         fence,
-        now_unix_ms.saturating_add(profile.wall_timeout_ms),
+        now_unix_ms.saturating_add(limits.wall_timeout_ms()),
     )
     .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let process_owner = launch_owner_binding(
@@ -1646,9 +1681,103 @@ pub(crate) async fn submit_testd_owner_job(
         generation,
     )?;
     let process = process_gateway
-        .issue_testd_process_request(&process_owner, process_admission)
+        .issue_testd_process_request(&process_owner, process_admission, identity)
         .await
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let expected_catalog = stage_request
+        .provider_catalog_lifecycle
+        .as_ref()
+        .ok_or_else(|| {
+            DispatchLaunchError::Gate(
+                "productive TestD stage has no accepted catalog selectors for owner pull"
+                    .to_owned(),
+            )
+        })?;
+    let process_deadline_ms = now_unix_ms.saturating_add(limits.wall_timeout_ms());
+    let source_root_identity_sha256 = sha256_hex(target_roots.source_root.as_bytes());
+    let stream_grant = kernel
+        .issue_testd_blob_process_stream_grant(
+            &process_owner,
+            &process,
+            identity,
+            operation_id,
+            &source_root_identity_sha256,
+            Some(expected_catalog.module_id.clone()),
+            Some(expected_catalog.generation_id.clone()),
+            process_deadline_ms,
+        )
+        .await
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let owner_projection = &stream_grant.owner_projection;
+    let owner_facts: eliot_blob_api::wire::BlobProcessStreamVerifiedOwnerFacts =
+        serde_json::from_str(&owner_projection.owner_facts_json)
+            .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    owner_facts
+        .validate()
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    if sha256_hex(owner_projection.owner_facts_json.as_bytes())
+        != owner_projection.owner_facts_sha256
+        || owner_facts.work_scope_binding_sha256 != owner_projection.work_scope_snapshot_sha256
+        || owner_facts.policy_sha256 != owner_projection.policy_sha256
+        || owner_facts.currentness_sha256 != owner_projection.owner_currentness_sha256
+    {
+        return Err(DispatchLaunchError::Gate(
+            "Kernel owner projection does not bind its exact owner-facts, WorkScope, policy, and currentness domains"
+                .to_owned(),
+        ));
+    }
+    let profile_registry = eliot_instrument_runner::testd_builtin_profile_registry()
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let replay_context =
+        eliot_instrument_runner::VerifiedTestdReplayContext::from_canonical_owner_readback_json(
+            profile_registry,
+            &stream_grant.owner_facts_response.observed_state_fence,
+            owner_projection
+                .module_catalog_owner_readback_json
+                .as_bytes(),
+            &owner_projection.module_catalog_owner_readback_sha256,
+            owner_projection.generation_admission_json.as_bytes(),
+            &owner_projection.generation_admission_sha256,
+            owner_facts.work_scope_binding_json.as_bytes(),
+            &owner_facts.work_scope_binding_sha256,
+        )
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    replay_context
+        .validate_registered_stage(stage_request)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let verified_catalog = replay_context.accepted_catalog_lifecycle();
+    let provider_freshness = stage_request.provider_freshness.as_ref().ok_or_else(|| {
+        DispatchLaunchError::Gate(
+            "productive TestD stage has no provider freshness tuple".to_owned(),
+        )
+    })?;
+    let job_currentness_bytes = canonical_json_bytes(&(
+        provider_freshness,
+        &verified_catalog,
+        &request.process_tool.observation,
+        &environment,
+    ))
+    .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let job_currentness_sha256 = sha256_hex(&job_currentness_bytes);
+    let blob_process_stream_grant = TestdBlobProcessStreamGrant {
+        capability_ref: stream_grant.capability.reference.clone(),
+        process_binding_sha256: owner_projection.process_binding_sha256.clone(),
+        fence_sha256: owner_projection.fence_sha256.clone(),
+        policy_sha256: owner_projection.policy_sha256.clone(),
+        owner_facts_sha256: owner_projection.owner_facts_sha256.clone(),
+        work_scope_snapshot_sha256: owner_projection.work_scope_snapshot_sha256.clone(),
+        module_catalog_owner_readback_sha256: owner_projection
+            .module_catalog_owner_readback_sha256
+            .clone(),
+        generation_admission_sha256: owner_projection.generation_admission_sha256.clone(),
+        owner_currentness_sha256: owner_projection.owner_currentness_sha256.clone(),
+        job_currentness_sha256,
+        revoked_at_ms: None,
+        tokens: vec![TestdBlobProcessStreamTokenRef {
+            reference: stream_grant.initial_call_token.reference.clone(),
+            ordinal: stream_grant.initial_call_token.ordinal,
+        }],
+    };
     let process_request = KernelProcessAdmissionRequest {
         job_id: job_id.clone(),
         project_id: request.submission.project_id.clone(),
@@ -1668,6 +1797,9 @@ pub(crate) async fn submit_testd_owner_job(
         job_id,
         project_id: request.submission.project_id.clone(),
         invocation: request.submission.invocation.clone(),
+        stage_request: Some(stage_request.clone()),
+        provider_tool_observation: request.process_tool.observation.clone(),
+        provider_environment_projection: environment,
         target_roots,
         target_layout: Some(target_layout),
         // Issue #1897 (AUD1): the lane is now allocated from the admitted
@@ -1689,6 +1821,9 @@ pub(crate) async fn submit_testd_owner_job(
     submission
         .validate()
         .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    blob_process_stream_grant
+        .validate()
+        .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
 
     let owner_path = testd_owner_store_path(&work_root);
     let owner_parent = owner_path.parent().ok_or_else(|| {
@@ -1700,6 +1835,9 @@ pub(crate) async fn submit_testd_owner_job(
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let job = store
         .submit_productive_verifier(submission, identity.clone(), permit, now_unix_ms)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let job = store
+        .persist_blob_process_stream_grant(&job.job_id, blob_process_stream_grant)
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let response = TestdOwnerSubmitResponse::Admitted {
         wire_id: TESTD_OWNER_SUBMIT_OPERATION.to_owned(),
@@ -1717,12 +1855,10 @@ pub(crate) async fn submit_testd_owner_job(
     Ok(response)
 }
 
-/// Environment class the productive `TestD` profile runs under.
+/// Environment class the productive runner stage runs under.
 ///
-/// A declaration, not a measurement: the productive profile is the closed
-/// non-inheriting `cargo nextest run` binding
-/// ([`TESTD_PRODUCTIVE_PROFILE_ARGV`](eliot_testd_core::TESTD_PRODUCTIVE_PROFILE_ARGV)),
-/// so its build environment is the lane-local one
+/// A declaration, not a measurement: each admitted stage uses its runner-sealed
+/// executable and argv under the non-inheriting environment, so its build environment is the lane-local one
 /// ([`TestdProcessToolIntent::validate_for_roots`](eliot_testd_core::TestdProcessToolIntent))
 /// and never the caller's ambient environment. It is named here so the
 /// fingerprint records the class it actually ran in.
@@ -1941,7 +2077,26 @@ fn capture_testd_launch_owner_binding(
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let invocation_sha256 = sha256_hex(&invocation_bytes);
     let verifier_dispatch = job.verifier_dispatch.clone();
-    if admission.profile == TESTD_PRODUCTIVE_PROFILE {
+    let stage_request = job.stage_request.clone();
+    let blob_process_stream_grant = job.blob_process_stream_grant.clone();
+    if eliot_testd_core::is_testd_executor_profile(&admission.profile) {
+        let stage = stage_request.as_ref().ok_or_else(|| {
+            DispatchLaunchError::Gate(
+                "productive TestD owner row is missing its admitted stage identity".to_owned(),
+            )
+        })?;
+        if stage.invocation != job.invocation
+            || stage.invocation.request.request_id.as_str() != admission.operation_id
+            || stage.execution != StageExecutionKind::Process
+            || stage.kind != job.invocation.kind
+            || stage.profile_name != job.invocation.profile
+            || stage.stage_command.is_none()
+        {
+            return Err(DispatchLaunchError::Gate(
+                "durable TestD stage identity does not bind the admitted process invocation"
+                    .to_owned(),
+            ));
+        }
         let binding = verifier_dispatch.as_ref().ok_or_else(|| {
             DispatchLaunchError::Gate(
                 "productive TestD launch has no persisted verifier-plan binding".to_owned(),
@@ -1950,9 +2105,58 @@ fn capture_testd_launch_owner_binding(
         binding
             .validate_for_job(&job)
             .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
-    } else if verifier_dispatch.is_some() {
+        let grant = blob_process_stream_grant.as_ref().ok_or_else(|| {
+            DispatchLaunchError::Gate(
+                "productive TestD launch has no persisted Kernel Blob stream grant".to_owned(),
+            )
+        })?;
+        grant
+            .validate()
+            .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+        let stage_freshness = stage.provider_freshness.as_ref().ok_or_else(|| {
+            DispatchLaunchError::Gate(
+                "productive TestD launch has no provider freshness record".to_owned(),
+            )
+        })?;
+        let tool_observation = job.provider_tool_observation.as_ref().ok_or_else(|| {
+            DispatchLaunchError::Gate(
+                "productive TestD launch has no retained provider tool observation".to_owned(),
+            )
+        })?;
+        let environment = job
+            .provider_environment_projection
+            .as_ref()
+            .ok_or_else(|| {
+                DispatchLaunchError::Gate(
+                    "productive TestD launch has no retained provider environment".to_owned(),
+                )
+            })?;
+        let catalog_lifecycle = stage.provider_catalog_lifecycle.as_ref().ok_or_else(|| {
+            DispatchLaunchError::Gate(
+                "productive TestD launch has no accepted Module Catalog lifecycle record"
+                    .to_owned(),
+            )
+        })?;
+        let currentness_bytes = canonical_json_bytes(&(
+            stage_freshness,
+            catalog_lifecycle,
+            tool_observation,
+            environment,
+        ))
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+        if sha256_hex(&currentness_bytes) != grant.currentness_sha256 {
+            return Err(DispatchLaunchError::Gate(
+                "durable TestD Blob grant is bound to different provider currentness material"
+                    .to_owned(),
+            ));
+        }
+    } else if verifier_dispatch.is_some()
+        || stage_request.is_some()
+        || blob_process_stream_grant.is_some()
+    {
         return Err(DispatchLaunchError::Gate(
-            "non-productive TestD launch carries a verifier-plan binding".to_owned(),
+            "non-productive TestD launch carries productive stage, verifier, or Blob bindings"
+                .to_owned(),
         ));
     }
     Ok(TestdLaunchOwnerBinding {
@@ -1961,6 +2165,8 @@ fn capture_testd_launch_owner_binding(
         process: job.process,
         invocation_sha256,
         verifier_dispatch,
+        stage_request,
+        blob_process_stream_grant,
     })
 }
 
@@ -2028,7 +2234,7 @@ pub(crate) fn read_testd_terminal_completion(
             "retained TestD launch is outside the live Kernel fence".to_owned(),
         ));
     }
-    if admission.profile != TESTD_PRODUCTIVE_PROFILE {
+    if !eliot_testd_core::is_testd_executor_profile(&admission.profile) {
         return Err(DispatchLaunchError::Gate(
             "terminal verifier completion requires the admitted productive profile".to_owned(),
         ));
@@ -2063,9 +2269,10 @@ pub(crate) fn read_testd_terminal_completion(
     let invocation_bytes = canonical_json_bytes(&job.invocation)
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let invocation_digest = sha256_hex(&invocation_bytes);
-    if job.invocation.profile != TESTD_PRODUCTIVE_PROFILE
+    if !eliot_testd_core::is_testd_executor_profile(&job.invocation.profile)
         || binding.operation_id != job.process.operation_id.as_str()
         || owner_binding.verifier_dispatch.as_ref() != Some(binding)
+        || owner_binding.stage_request.as_ref() != job.stage_request.as_ref()
         || job.process != owner_binding.process
         || invocation_digest != owner_binding.invocation_sha256
         || job.job_id != admission.job_id
@@ -2211,7 +2418,7 @@ fn require_digest(value: &str, what: &'static str) -> Result<(), DispatchLaunchE
 ///
 /// `request_json` must equal the parse of `attempt.closed_request_json`
 /// (byte-identity, re-proved before any write); `manifest_json` is the
-/// exact admitted manifest revision carried through opaquely — the child
+/// exact admitted manifest revision carried through opaquely â€” the child
 /// validates the request against it fail-closed, since this contour mints
 /// no recipe authority. The executable binding (path, digest, working
 /// directory) is supplied by the owning composition like the approved
@@ -2302,7 +2509,7 @@ pub enum DoctorLaunchOutcome {
         receipt: Box<ProcessStartReceipt>,
     },
     /// The spawn outcome is unknown: the attempt was admitted and the
-    /// launch was retained as unreconciled under its original identity —
+    /// launch was retained as unreconciled under its original identity â€”
     /// reconcile later, never blind-retry as a new attempt.
     LaunchUnknown {
         /// The admission for the original attempt identity.
@@ -2329,8 +2536,8 @@ pub enum DoctorLaunchOutcome {
 /// The envelope object holds the wire attempt, the parsed closed request
 /// (byte-identical to the envelope bytes, re-proved by the caller), the
 /// admitted manifest revision, the live epoch, the fence-bound generation,
-/// and the session nonce — the six fields
-/// `read_dispatched_material_from` checks — plus a seventh `grant` object
+/// and the session nonce â€” the six fields
+/// `read_dispatched_material_from` checks â€” plus a seventh `grant` object
 /// carrying the launch-grant material the child needs to construct its own
 /// local `DispatchPermitAuthority` (`grant_digest`, `authority_epoch`,
 /// `fence_generation`, `fence_nonce`, `idempotency_key`, `expires_at`).
@@ -2379,28 +2586,33 @@ fn doctor_material_bytes(
 ///   "request": TestdAdmissionAttemptRequest,
 ///   "envelope": TestdAdmissionEnvelope,
 ///   "admission": TestdAdmission,
+///   "blob_stream": {"capability_ref": "opaque", "tokens": []},
 ///   "epoch": EpochId,
 ///   "generation": 1,
 ///   "nonce": "testd-dispatch-<hex>",
 ///   "grant": DispatchGrant
 /// }
 /// ```
-/// * `request` — the full wire envelope the contour admitted
+/// * `request` â€” the full wire envelope the contour admitted
 ///   (`job_id`, `attempt_seq`, `closed_request_json`, digests).
-/// * `envelope` — the parsed `closed_request_json`
+/// * `envelope` â€” the parsed `closed_request_json`
 ///   (`TestdAdmissionEnvelope`: `job_id`, `operation_id`, `cancellation`,
 ///   `fence`); derived Kernel-side by re-parsing, never taken as extra
 ///   caller bytes beyond the already-admitted `request`.
-/// * `admission` — the Kernel-issued receipt (`TestdAdmission`); its
+/// * `admission` â€” the Kernel-issued receipt (`TestdAdmission`); its
 ///   `operation_id` is the bounded evidence handle the child maps to
 ///   `PresentedAdmission.evidence_ref`, and `cancelled` maps to
 ///   `PresentedAdmission.cancelled`.
-/// * `epoch` — the live authority epoch (maps to
+/// * `blob_stream` â€” productive jobs carry only the opaque capability and
+///   ordered one-use token references copied from the durable TestD owner row;
+///   the launch-grant digest binds this projection and the worker rechecks it
+///   against that row before use. Non-productive profiles carry `null`.
+/// * `epoch` â€” the live authority epoch (maps to
 ///   `PresentedAdmission.epoch`; never envelope bytes).
-/// * `generation` — the live activation generation (the child proves its
+/// * `generation` â€” the live activation generation (the child proves its
 ///   fence generation against this).
-/// * `nonce` — the I7.5/I15.2 session nonce.
-/// * `grant` — the shared `DispatchGrant` object (see its docs).
+/// * `nonce` â€” the I7.5/I15.2 session nonce.
+/// * `grant` â€” the shared `DispatchGrant` object (see its docs).
 ///
 /// The concrete `ProcessRequest` is never serialized (it is
 /// `Serialize`-only by design on the child side and `Clone`-only here);
@@ -2409,6 +2621,34 @@ fn doctor_material_bytes(
 /// `ProcessRequest::new`. No executable bytes are taken from caller input:
 /// the child binding (path/digest/workdir) stays composition-pinned like
 /// Doctor.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct TestdMaterialBlobStreamGrant {
+    capability_ref: String,
+    tokens: Vec<TestdBlobProcessStreamTokenRef>,
+}
+
+fn project_testd_blob_stream_grant(
+    grant: &TestdBlobProcessStreamGrant,
+) -> TestdMaterialBlobStreamGrant {
+    TestdMaterialBlobStreamGrant {
+        capability_ref: grant.capability_ref.clone(),
+        tokens: grant.tokens.clone(),
+    }
+}
+
+fn testd_material_identity_digest(
+    admission: &TestdAdmission,
+    blob_stream_grant: Option<&TestdBlobProcessStreamGrant>,
+) -> Result<String, DispatchLaunchError> {
+    let Some(blob_stream_grant) = blob_stream_grant else {
+        return Ok(admission.admission_digest.clone());
+    };
+    let projection = project_testd_blob_stream_grant(blob_stream_grant);
+    let bytes = canonical_json_bytes(&(admission.admission_digest.as_str(), projection))
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    Ok(sha256_hex(&bytes))
+}
+
 fn testd_material_bytes(
     request: &TestdAdmissionAttemptRequest,
     envelope: &TestdAdmissionEnvelope,
@@ -2417,11 +2657,14 @@ fn testd_material_bytes(
     generation: u64,
     nonce: &str,
     grant: &DispatchGrant,
+    blob_stream_grant: Option<&TestdBlobProcessStreamGrant>,
 ) -> Result<Vec<u8>, DispatchLaunchError> {
+    let blob_stream = blob_stream_grant.map(project_testd_blob_stream_grant);
     let body = serde_json::json!({
         "request": request,
         "envelope": envelope,
         "admission": admission,
+        "blob_stream": blob_stream,
         "epoch": epoch,
         "generation": generation,
         "nonce": nonce,
@@ -2451,15 +2694,15 @@ fn testd_material_bytes(
 ///   "grant": DispatchGrant
 /// }
 /// ```
-/// * `request` — the exact `NativeWorkerClaimRequest` the contour admitted
+/// * `request` â€” the exact `NativeWorkerClaimRequest` the contour admitted
 ///   (existing `eliot-kernel-service` vocabulary; never a parallel type).
-/// * `receipt` — the Kernel-issued `NativeWorkerClaimReceipt` (existing
+/// * `receipt` â€” the Kernel-issued `NativeWorkerClaimReceipt` (existing
 ///   vocabulary; its `receipt_digest` is the admission identity).
-/// * `epoch`/`generation` — the live authority bound at admission.
-/// * `nonce` — the I7.5/I15.2 session nonce (must equal the v2
+/// * `epoch`/`generation` â€” the live authority bound at admission.
+/// * `nonce` â€” the I7.5/I15.2 session nonce (must equal the v2
 ///   executable-join launch nonce when the join is present; the caller
 ///   request already binds it, and the child re-proves binding).
-/// * `grant` — the shared `DispatchGrant` object.
+/// * `grant` â€” the shared `DispatchGrant` object.
 ///
 /// The concrete `ProcessRequest` plus the composed provider ports arrive
 /// only with the execution context the child builds in-process from `grant`
@@ -2622,7 +2865,7 @@ fn launches_table(
 ///
 /// Sequence: validate the caller material (attempt shape plus canonical
 /// digest, closed-request byte-identity, child binding); admit through the
-/// composed owner (exact replays rebuild the original admission — the
+/// composed owner (exact replays rebuild the original admission â€” the
 /// lost-reply rule); skip cancelled admissions and terminal effects
 /// without spawning; reserve the original identity single-flight; mint the
 /// replay-stable nonce; write exactly what the child reader validates.
@@ -2748,7 +2991,7 @@ pub fn prepare_doctor_launch(
     )?;
     // Launch eligibility against the durable truth: the just-issued
     // admission must match the staged row, and an already-reported effect
-    // is terminal — nothing to drive.
+    // is terminal â€” nothing to drive.
     {
         let ledger = doctor_ledger(contour)?;
         let attempt_key = OperationIdentity::new(&admission.attempt_digest)
@@ -2970,8 +3213,8 @@ fn require_live_activation_for_doctor_launch(
 
 /// Spawns one prepared Doctor launch through the admitted process gateway.
 ///
-/// The child admission carries an empty argv — the attempt material travels
-/// only over the protected dispatch file — plus a secret-free environment
+/// The child admission carries an empty argv â€” the attempt material travels
+/// only over the protected dispatch file â€” plus a secret-free environment
 /// and bounded resource limits, mirroring the approved `eliotd` launch
 /// contour. The path proof pins the composition-supplied executable
 /// binding; the owner binds the Kernel principal. An unknown spawn outcome
@@ -2999,6 +3242,7 @@ pub async fn start_ready_doctor_launch(
             generation: ready.generation,
             authority_epoch: &ready.authority_epoch,
             material_path: Some(ready.material_path.as_path()),
+            testd_outer_stream_admission: None,
         },
     )
     .await?
@@ -3022,7 +3266,7 @@ pub enum ChildStartOutcome {
     /// dwarf the unknown outcome).
     Started(Box<SpawnedChild>),
     /// The spawn outcome is unknown; the caller must retain the launch as
-    /// unreconciled under its original identity and reconcile later —
+    /// unreconciled under its original identity and reconcile later â€”
     /// never blind-retry as a new attempt.
     Unknown(UncertainSpawn),
 }
@@ -3041,7 +3285,7 @@ pub struct SpawnedChild {
 
 /// A spawn whose outcome is unknown: admitted and possibly started, but
 /// unproven. The caller must retain it as unreconciled under its original
-/// identity and reconcile later — never blind-retry as a new attempt.
+/// identity and reconcile later â€” never blind-retry as a new attempt.
 pub struct UncertainSpawn {
     /// Child process operation identity.
     pub operation_id: OperationId,
@@ -3075,8 +3319,8 @@ struct SpawnInputs<'a> {
     native_worker_attempt_id: Option<&'a str>,
     /// The EXACT State Fence the admitted native-worker claim was staged under.
     /// The launch gate presents it to the ORS owner so the reservation is
-    /// verified against the claim's OWN original recorded fence — the fence the
-    /// claim route validated and the reservation was staged under — not a fence
+    /// verified against the claim's OWN original recorded fence â€” the fence the
+    /// claim route validated and the reservation was staged under â€” not a fence
     /// recomputed here. `None` for the contours that stage no reservation.
     native_worker_state_fence: Option<&'a StateFence>,
     executable: &'a Path,
@@ -3085,6 +3329,9 @@ struct SpawnInputs<'a> {
     generation: Generation,
     authority_epoch: &'a EpochId,
     material_path: Option<&'a Path>,
+    /// Present only for a productive TestD worker, from its durable verifier
+    /// dispatch row rather than protected worker material.
+    testd_outer_stream_admission: Option<&'a TestdOuterProcessStreamAdmission>,
 }
 
 /// The exact process admission shared by Doctor, testd, and native-worker
@@ -3208,7 +3455,7 @@ fn stage_pending_native_worker_process_start(
 ///
 /// * A contour that stages no admission reservation (Doctor, testd, Dreamer)
 ///   has no `work_item_id`/`attempt` pair to verify, so the gate is a no-op
-///   pass — the gate resolves no reservation and returns `Ok(None)`. It never
+///   pass â€” the gate resolves no reservation and returns `Ok(None)`. It never
 ///   stages one, because a second reservation scheme is exactly what #1678
 ///   forbids.
 /// * A contour that DOES carry one (the native-worker claim, whose reservation
@@ -3219,8 +3466,8 @@ fn stage_pending_native_worker_process_start(
 ///
 /// A refusal is surfaced as [`DispatchLaunchError::Inconsistent`] carrying the
 /// owner's own state discriminant, so the launch caller sees WHICH state blocked
-/// the launch — `STAGED`, `RELEASED`, `EXPIRED`, `RECONCILING`, `STALE_FENCE`,
-/// `FOREIGN_OWNER`, `IDENTITY_CONFLICT`, `MISSING`, or `UNREADABLE:<tag>` — and
+/// the launch â€” `STAGED`, `RELEASED`, `EXPIRED`, `RECONCILING`, `STALE_FENCE`,
+/// `FOREIGN_OWNER`, `IDENTITY_CONFLICT`, `MISSING`, or `UNREADABLE:<tag>` â€” and
 /// never a bare "launch denied". It is returned BEFORE the gateway, so a
 /// non-admissible reservation cannot spawn a child.
 fn require_dispatch_launch_reservation(
@@ -3316,7 +3563,7 @@ async fn spawn_ready_child(
     // carries an ORS claim reservation (the native-worker contour), the gate
     // resolves the reservation that binds THIS claim's work item and proposed
     // attempt and refuses unless the owner verifier returns its sealed `Active`
-    // typestate — naming `STAGED`, `RELEASED`, `EXPIRED`, `RECONCILING`,
+    // typestate â€” naming `STAGED`, `RELEASED`, `EXPIRED`, `RECONCILING`,
     // `STALE_FENCE`, `FOREIGN_OWNER`, `IDENTITY_CONFLICT`, `MISSING` or an
     // unreadable row by the owner's own discriminant. The Doctor/testd/Dreamer
     // contours stage no reservation, so the gate resolves none and the launch
@@ -3348,7 +3595,15 @@ async fn spawn_ready_child(
     );
     let pending_native_worker_claim =
         stage_pending_native_worker_process_start(inputs, &admission, executable_file_identity)?;
-    match gateway.start(&owner, admission, proof, outer_binding).await {
+    let started = match inputs.testd_outer_stream_admission {
+        Some(stream_admission) => {
+            gateway
+                .start_testd_outer_stream(&owner, admission, proof, outer_binding, stream_admission)
+                .await
+        }
+        None => gateway.start(&owner, admission, proof, outer_binding).await,
+    };
+    match started {
         Ok(receipt) => Ok(SpawnOutcome::Started(
             Box::new(receipt),
             executable_file_identity,
@@ -3524,7 +3779,7 @@ pub async fn launch_admitted_doctor_attempt(
 /// input the dispatch contour cannot derive: the contour owns the
 /// principal, the ledger, the immutable registry (including the installed
 /// artifact digest bound into the admitted executable binding), and the
-/// live epoch/generation — but the absolute installed-generation root is
+/// live epoch/generation â€” but the absolute installed-generation root is
 /// Host installation state. The production composition root supplies it
 /// from Host injection through the installation manifest
 /// (manager-serialized `main` call-in); this struct only carries it.
@@ -3543,7 +3798,7 @@ pub struct DoctorChildBinding<'a> {
 
 /// Contour-derived Doctor launch material: the admitted manifest revision
 /// plus the admitted executable digest, both read back from the composed
-/// registry — never caller bytes.
+/// registry â€” never caller bytes.
 #[allow(
     dead_code,
     reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
@@ -3582,7 +3837,7 @@ fn composed_doctor_registry(
 /// composed registry for one admitted attempt.
 ///
 /// Fail-closed: the admission must bind this contour's manifest revision
-/// (`admission.manifest_digest` equals the composed registry digest — a
+/// (`admission.manifest_digest` equals the composed registry digest â€” a
 /// stale or foreign admission is `Inconsistent`, never staged), and the
 /// admitted operation must resolve to an executable binding in the
 /// composed manifest (an unknown or forged operation is
@@ -3630,7 +3885,7 @@ fn contour_doctor_material(
 /// admitted effect through the existing launch seam: the T6-D2 front-door
 /// trigger (issue #461, plan slice 5).
 ///
-/// Owner: the dispatch contour owns this trigger — not the frame dispatch
+/// Owner: the dispatch contour owns this trigger â€” not the frame dispatch
 /// arm and not the front-door driver pump. The frame arm
 /// (`frame_dispatch::execute_doctor_request`) admits and replies but never
 /// spawns, keeping the admission and execution axes separate (I14.6); the
@@ -3639,7 +3894,7 @@ fn contour_doctor_material(
 /// (owner plus ledger plus principal), reserve, nonce, material-write,
 /// spawn, and reconcile-by-identity, so the trigger lives here: pre-admit
 /// through the composed gate, derive the launch material from the composed
-/// contour (admitted manifest revision plus installed executable digest —
+/// contour (admitted manifest revision plus installed executable digest â€”
 /// never caller bytes), then delegate to
 /// [`launch_admitted_doctor_attempt`] (prepare, start-ready, and launch
 /// through the admitted executor; no second launch path). Reconcile stays
@@ -3650,11 +3905,11 @@ fn contour_doctor_material(
 /// with no file staged and no slot retained; a forged operation or a stale
 /// manifest binding errors before staging any file; a replay rebuilds the
 /// original admission (the lost-reply rule) and the delegated prepare
-/// single-flights it (`LaunchInFlight`) instead of spawning twice — the
+/// single-flights it (`LaunchInFlight`) instead of spawning twice â€” the
 /// concurrent-duplicate case included, since reservation happens inside the
 /// delegated prepare. The absolute child anchor comes from the owning
 /// composition ([`DoctorChildBinding`], supplied by Host injection through
-/// the installation manifest) — never from the wire, argv, or the
+/// the installation manifest) â€” never from the wire, argv, or the
 /// environment.
 ///
 /// Production call-in (manager-serialized, outside this slice): the
@@ -4436,7 +4691,7 @@ pub enum TestdLaunchOutcome {
         receipt: Box<ProcessStartReceipt>,
     },
     /// The spawn outcome is unknown: retained as unreconciled under the
-    /// original job identity — reconcile later, never blind-retry.
+    /// original job identity â€” reconcile later, never blind-retry.
     LaunchUnknown {
         /// The admission for the job identity.
         admission: Box<TestdAdmission>,
@@ -4537,13 +4792,13 @@ pub fn prepare_testd_launch(
             "live activation generation is unavailable".to_owned(),
         ));
     }
-    let admission = match response {
-        TestdAdmissionResponse::Admitted(admission) => admission,
+    let mut admission = match response {
+        TestdAdmissionResponse::Admitted(admission) => *admission,
         refused => return Ok(PreparedTestdLaunch::Refused(refused)),
     };
     if admission.cancelled {
         return Ok(PreparedTestdLaunch::Skipped {
-            admission,
+            admission: Box::new(admission),
             skip: TestdLaunchSkip::CancelledAdmission,
         });
     }
@@ -4558,6 +4813,24 @@ pub fn prepare_testd_launch(
         &authority_epoch,
         generation,
     )?;
+    if eliot_testd_core::is_testd_executor_profile(&admission.profile) {
+        let stored_stage = owner_binding.stage_request.as_ref().ok_or_else(|| {
+            DispatchLaunchError::Gate(
+                "productive TestD owner row is missing its admitted stage identity".to_owned(),
+            )
+        })?;
+        admission.stage_request = Some(stored_stage.clone());
+        admission = admission
+            .with_computed_digest()
+            .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    } else if owner_binding.stage_request.is_some() {
+        return Err(DispatchLaunchError::Gate(
+            "non-productive TestD row carries a productive stage identity".to_owned(),
+        ));
+    }
+    admission
+        .validate()
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let nonce = mint_dispatch_nonce(
         DispatchedWorkerKind::Testd,
         &admission.request_digest,
@@ -4589,6 +4862,12 @@ pub fn prepare_testd_launch(
                 )));
             }
             if let Some(retained) = existing.testd_admission.clone() {
+                if retained.admission_digest != admission.admission_digest {
+                    return Err(DispatchLaunchError::ChangedTerms(format!(
+                        "job {} presents a different persisted stage identity under one request",
+                        admission.job_id
+                    )));
+                }
                 return Ok(PreparedTestdLaunch::ReplayOriginal {
                     admission: Box::new(retained),
                 });
@@ -4607,7 +4886,7 @@ pub fn prepare_testd_launch(
                 nonce: nonce.clone(),
                 operation_id: operation_id_string(&operation_id),
                 phase: LaunchPhase::Reserved,
-                testd_admission: Some((*admission).clone()),
+                testd_admission: Some(admission.clone()),
                 native_receipt: None,
                 native_request: None,
             },
@@ -4632,7 +4911,10 @@ pub fn prepare_testd_launch(
         })?;
     let grant = dispatch_grant_for(
         DispatchedWorkerKind::Testd,
-        &admission.request_digest,
+        &testd_material_identity_digest(
+            &admission,
+            owner_binding.blob_process_stream_grant.as_ref(),
+        )?,
         &authority_epoch,
         generation,
         admission.admitted_at_unix_nanos,
@@ -4649,6 +4931,7 @@ pub fn prepare_testd_launch(
         generation.get(),
         &nonce,
         &grant,
+        owner_binding.blob_process_stream_grant.as_ref(),
     );
     let bytes = match bytes {
         Ok(bytes) => bytes,
@@ -4667,7 +4950,7 @@ pub fn prepare_testd_launch(
         record.material_path = Some(material_path.clone());
     }
     Ok(PreparedTestdLaunch::Ready(Box::new(ReadyTestdLaunch {
-        admission,
+        admission: Box::new(admission),
         nonce,
         operation_id,
         executable: material.executable.to_path_buf(),
@@ -4691,6 +4974,35 @@ pub async fn start_ready_testd_launch(
     kernel: &KernelComposition,
     ready: &ReadyTestdLaunch,
 ) -> Result<ChildStartOutcome, DispatchLaunchError> {
+    let outer_stream_admission = match (
+        ready.owner_binding.verifier_dispatch.as_ref(),
+        ready.owner_binding.stage_request.as_ref(),
+    ) {
+        (Some(dispatch), Some(stage)) => {
+            let lifecycle = stage.provider_catalog_lifecycle.as_ref().ok_or_else(|| {
+                DispatchLaunchError::Gate(
+                    "productive TestD process capture lacks the admitted catalog lifecycle"
+                        .to_owned(),
+                )
+            })?;
+            Some(
+                TestdOuterProcessStreamAdmission::new(
+                    dispatch.request_identity.clone(),
+                    dispatch.operation_id.clone(),
+                    sha256_hex(ready.owner_binding.source_root.to_string_lossy().as_bytes()),
+                    lifecycle.module_id.clone(),
+                    lifecycle.generation_id.clone(),
+                )
+                .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?,
+            )
+        }
+        (None, None) => None,
+        _ => {
+            return Err(DispatchLaunchError::Gate(
+                "TestD outer capture owner and stage bindings disagree".to_owned(),
+            ));
+        }
+    };
     match spawn_ready_child(
         kernel,
         &SpawnInputs {
@@ -4705,6 +5017,7 @@ pub async fn start_ready_testd_launch(
             generation: ready.generation,
             authority_epoch: &ready.authority_epoch,
             material_path: Some(ready.material_path.as_path()),
+            testd_outer_stream_admission: outer_stream_admission.as_ref(),
         },
     )
     .await?
@@ -4828,7 +5141,7 @@ pub async fn launch_admitted_testd_attempt(
 /// else stays unreconciled for a later call. Unknown job identities
 /// report unknown instead of inventing state.
 ///
-/// Note: this proves the front-door admission still binds — durable job
+/// Note: this proves the front-door admission still binds â€” durable job
 /// terminality lives in the testd owner's store, so an operator release
 /// through [`release_launched_attempt`] (or a process restart) is the
 /// only slot release besides this reconcile.
@@ -4863,13 +5176,35 @@ pub fn reconcile_launched_testd_attempt(
                 "testd closed request envelope is not JSON".to_owned(),
             )
         })?;
+    let owner_binding = retained.testd_owner_binding.as_ref().ok_or_else(|| {
+        DispatchLaunchError::Gate("retained TestD owner binding is absent".to_owned())
+    })?;
+    let store = TestdStore::open(&owner_binding.owner_store_path, RetryPolicy::default())
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let durable_stage_matches = store
+        .get(job_id)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?
+        .is_some_and(|job| {
+            job.stage_request.as_ref() == owner_binding.stage_request.as_ref()
+                && admission.stage_request.as_ref() == owner_binding.stage_request.as_ref()
+        });
+    // Re-prove the original front-door terms separately from the durable
+    // stage binding. The stage was copied from the Kernel-owned TestD row,
+    // so stripping it here reconstructs only the original request admission;
+    // exact stage identity is checked against the same row above.
+    let mut frontdoor_admission = admission.clone();
+    frontdoor_admission.stage_request = None;
+    frontdoor_admission = frontdoor_admission
+        .with_computed_digest()
+        .map_err(gate_error)?;
     let live_epoch = kernel
         .service
         .lock()
         .map_err(|_| DispatchLaunchError::Gate("kernel service lock poisoned".to_owned()))?
         .authority_epoch();
-    let binds = reconcile_testd_admission(&admission, request, &envelope, &live_epoch)
-        .map_err(gate_error)?;
+    let binds = durable_stage_matches
+        && reconcile_testd_admission(&frontdoor_admission, request, &envelope, &live_epoch)
+            .map_err(gate_error)?;
     if binds {
         if let Some(path) = retained.material_path.as_deref() {
             reap_material_file(path);
@@ -5040,7 +5375,7 @@ pub enum NativeWorkerLaunchOutcome {
         receipt_process: Box<ProcessStartReceipt>,
     },
     /// The spawn outcome is unknown: retained as unreconciled under the
-    /// original claim identity — reconcile later, never blind-retry.
+    /// original claim identity â€” reconcile later, never blind-retry.
     LaunchUnknown {
         /// The receipt for the claim identity.
         receipt: Box<NativeWorkerClaimReceipt>,
@@ -5079,7 +5414,7 @@ struct NativeWorkerLaunchAttempt {
 ///
 /// Sequence: validate the child binding plus the closed claim shape and
 /// canonical digest; admit through live service authority plus the ORS
-/// claim table (`KernelService::admit_native_worker_claim` — the existing
+/// claim table (`KernelService::admit_native_worker_claim` â€” the existing
 /// vocabulary, never a parallel one; exact replays rebuild the original
 /// receipt); reserve the original claim identity single-flight (changed
 /// terms under one identity refuse with `ChangedTerms`); mint the
@@ -5335,6 +5670,7 @@ pub async fn start_ready_native_worker_launch(
             generation: ready.generation,
             authority_epoch: &ready.authority_epoch,
             material_path: Some(ready.material_path.as_path()),
+            testd_outer_stream_admission: None,
         },
     )
     .await?
@@ -5742,7 +6078,7 @@ pub enum DreamerLaunchOutcome {
         receipt: Box<ProcessStartReceipt>,
     },
     /// The spawn outcome is unknown: retained as unreconciled under the
-    /// original job identity — reconcile later, never blind-retry.
+    /// original job identity â€” reconcile later, never blind-retry.
     LaunchUnknown {
         /// The launch nonce retained for the session proof.
         nonce: String,
@@ -6024,6 +6360,7 @@ pub async fn start_ready_dreamer_launch(
             generation: ready.generation,
             authority_epoch: &ready.authority_epoch,
             material_path: Some(ready.material_path.as_path()),
+            testd_outer_stream_admission: None,
         },
     )
     .await
@@ -6123,7 +6460,7 @@ pub async fn launch_admitted_dreamer_attempt(
 /// Note: durable job terminality lives in the Store Dreamer ledger, so an
 /// operator release through
 /// [`dreamer_dispatch_launch::release_dreamer_launch`] (or a process
-/// restart) is the only slot release besides this reconcile — the same
+/// restart) is the only slot release besides this reconcile â€” the same
 /// shape as the testd arm.
 #[allow(
     dead_code,
@@ -6305,7 +6642,7 @@ mod tests {
     }
 
     /// Drives one production composition to `Ready` at the standalone live
-    /// epoch (lineage `550e…`, sequence 1), so session binds prove exact
+    /// epoch (lineage `550eâ€¦`, sequence 1), so session binds prove exact
     /// authority agreement.
     fn ready_kernel(root: &Path) -> KernelComposition {
         let kernel = KernelComposition::new(KernelConfig::new(root)).expect("kernel composition");
@@ -6609,6 +6946,9 @@ mod tests {
             authority_epoch: test_epoch(1),
             state_fence: native_live_fence(),
             executable_binding: Some(native_executable_join_for(claim_id, operation_id)),
+            visibility: None,
+            privacy_class: None,
+            swarm_id: None,
             binding_digest: String::new(),
             request_digest: String::new(),
         };
@@ -7267,7 +7607,7 @@ mod tests {
         // derived contour material (admitted manifest revision plus
         // installed executable digest, read back from the composed
         // registry) flows through the real prepare seam, which refuses
-        // the shape request typed — proving the trigger constructs
+        // the shape request typed â€” proving the trigger constructs
         // exactly what prepare validates.
         let trigger_child_dir = root.join("doctor-trigger-child");
         std::fs::create_dir_all(&trigger_child_dir).expect("trigger child dir");
@@ -7887,13 +8227,13 @@ mod tests {
 
     /// Slice of #1678 (I14.6): the Doctor launch boundary requires the live
     /// Kernel activation receipt. A prepared admission presented to a Kernel
-    /// without one — or with a receipt that no longer matches the prepared
-    /// epoch/generation — is rejected before any child effect. Removing the
+    /// without one â€” or with a receipt that no longer matches the prepared
+    /// epoch/generation â€” is rejected before any child effect. Removing the
     /// gate lets the same calls fall through to the executor error instead.
     /// Gate scope is receipt-match only (prepared epoch/generation against
     /// the live receipt); attempt-budget, cooldown, and receipt linkage
-    /// stay remainder. Every rejection — and the executor-boundary
-    /// fall-through — is asserted effect-free: no material artifact is
+    /// stay remainder. Every rejection â€” and the executor-boundary
+    /// fall-through â€” is asserted effect-free: no material artifact is
     /// created and no child handle exists.
     #[tokio::test]
     async fn doctor_launch_requires_live_activation_receipt() {
@@ -8413,8 +8753,8 @@ mod tests {
         let _ = lease;
     }
 
-    /// The trigger derives its launch material from the composed registry —
-    /// never caller bytes — and refuses forgeries before staging anything.
+    /// The trigger derives its launch material from the composed registry â€”
+    /// never caller bytes â€” and refuses forgeries before staging anything.
     ///
     /// Global-state-free: the registry is built locally from the installed
     /// digest through the real production builders, and the admission is a

@@ -26,6 +26,7 @@ mod dev_fast;
 pub mod package_disposition;
 pub mod process_owner;
 pub mod profile;
+pub mod profile_replay;
 pub mod profile_run;
 pub mod provider_denominator;
 pub mod registry;
@@ -61,6 +62,7 @@ pub use eliot_build_test_graph::{
     BUILD_ROOT_DIRECTORY, BuildMode, CARGO_HOME_ENV, CARGO_TARGET_DIR_ENV, CandidateIdentity,
     GovernedWorkEnvelope, LaneIdentity, RuntimeEnvironmentLease, WorkEnvelopeError,
 };
+pub use eliot_module_registry::VerifiedModuleCatalogGeneration;
 pub use eliot_test_selection::{FrozenSelection, TestSelectionReceipt};
 pub use package_disposition::{
     CAPABILITY_OWNER_UNIVERSE, CONSUMER_CRATE_UNIVERSE, DISPOSITION_REVIEWED_ON, DispositionError,
@@ -81,9 +83,14 @@ pub use profile::{
     PACKAGE_VERIFICATION_ALIAS, PACKAGE_VERIFICATION_ROUTE, PROFILE_ALIASES, ProfileAlias,
     ProfileCompiler, ProfileError, ProfileScopeClasses, REGISTRY_SNAPSHOT_SCHEMA,
     REGISTRY_SNAPSHOT_SCHEMA_VERSION, ResolvedProfile, ResolvedStage, ResourceLimits, StageDag,
-    StageDecl, StageEnvironment, TEST_PROFILE, TOOLCHAIN_PATH_ENV, TargetLayout, WorkScope,
-    admitted_profile_for_alias, bundle_verification_profile, compiler_profile,
-    package_verification_profile, test_profile,
+    StageDecl, StageEnvironment, TEST_PROFILE, TOOLCHAIN_PATH_ENV, TargetLayout,
+    VERIFICATION_REGISTRY_GENERATION, WorkScope, admitted_profile_for_alias,
+    bundle_verification_profile, compiler_profile, package_verification_profile, test_profile,
+};
+pub use profile_replay::{
+    ProfileReplayError, ProfileReplayReceipt, ReplayObservedInputs, VerifiedTestdReplayContext,
+    current_testd_provider_registry, observed_invalidation_set, replay_profile_stream,
+    testd_builtin_profile_registry,
 };
 pub use profile_run::{
     AggregateStatus, InstrumentRun, MappedStageLauncher, PlannedStage, ProfileAggregate,
@@ -99,9 +106,10 @@ pub use provider_denominator::{
     disposition_for_parts, host_platform,
 };
 pub use registry::{
-    ATTESTED_IDENTITY_SLOTS, ExecutableIdentityCause, IdentitySlot, PROFILE_IDENTITY_SLOTS,
-    ProfileIdentities, ProfileIdentityParams, ProviderRegistry, REQUIRED_IDENTITY_SLOTS,
-    RegistryEntry, RegistryError, ResolvedExecutableIdentity, SupplyChainReceipt, SupplyChainTable,
+    ATTESTED_IDENTITY_SLOTS, ExecutableIdentityCause, IdentitySlot, InvalidationSet,
+    PROFILE_IDENTITY_SLOTS, ProfileIdentities, ProfileIdentityParams, ProviderRegistry,
+    REQUIRED_IDENTITY_SLOTS, RegistryEntry, RegistryError, RegistryFreshness,
+    ResolvedExecutableIdentity, SupplyChainReceipt, SupplyChainTable,
 };
 pub use testd_port::{
     OmissionReason, RawEvidence, TestdAdmission, TestdAdmissionPort, TestdPortError,

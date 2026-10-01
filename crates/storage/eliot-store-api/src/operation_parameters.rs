@@ -172,6 +172,8 @@ pub enum ParameterShape {
     BlackboardItemLookup,
     /// Closed typed blackboard item revision and predecessor CAS for issue #1822.
     BlackboardItemRevision,
+    /// Closed typed mailbox admission and stream-head CAS for issue #1820.
+    MailboxItemAdmission,
     /// Opaque, versioned `InstrumentRegistry` snapshot emitted by `persist`.
     InstrumentRegistrySnapshot,
     /// Closed canonical Problem candidate record for issue #1759 I2: the
@@ -203,6 +205,7 @@ impl ParameterShape {
             Self::SwarmOwnerRevision => "eliot.swarm.owner-revision.v1",
             Self::BlackboardItemLookup => "eliot.blackboard.item-lookup.v1",
             Self::BlackboardItemRevision => "eliot.blackboard.item-revision.v1",
+            Self::MailboxItemAdmission => "eliot.mailbox.item-admission.v1",
             Self::InstrumentRegistrySnapshot => "eliot.instrument.registry-snapshot@1.0.0",
             Self::ProblemOwnerState => crate::PROBLEM_OWNER_STATE_SCHEMA_V1,
             Self::TaskContractAcceptanceRecord => crate::TASK_CONTRACT_ACCEPTANCE_RECORD_SCHEMA_V1,
@@ -456,6 +459,59 @@ static RECORD_MODULE_CATALOG_SNAPSHOT_PARAMETERS: [ParameterDeclaration; 2] = [
         name: "expected_module_registry_revision",
         shape: ParameterShape::Subject,
         required: true,
+    },
+    ParameterDeclaration {
+        name: "snapshot_json",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+];
+/// The exact matched WorkScope owner image, committed against both its prior
+/// durable revision and prior canonical value digest.
+static RECORD_WORK_SCOPE_SNAPSHOT_PARAMETERS: [ParameterDeclaration; 3] = [
+    ParameterDeclaration {
+        name: "expected_work_scope_revision",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "expected_work_scope_digest",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "snapshot_json",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+];
+/// The initial signed Config/Policy owner image, committed against both its
+/// prior named-owner revision and original canonical value digest.
+static RECORD_POLICY_SNAPSHOT_PARAMETERS: [ParameterDeclaration; 6] = [
+    ParameterDeclaration {
+        name: "expected_policy_state",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "expected_policy_revision",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "expected_policy_digest",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "absence_read_response_json",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "absence_read_response_sha256",
+        shape: ParameterShape::Subject,
+        required: false,
     },
     ParameterDeclaration {
         name: "snapshot_json",
@@ -1260,6 +1316,50 @@ static GET_TASK_CONTRACT_ACCEPTANCE_SET_PARAMETERS: [ParameterDeclaration; 2] = 
         required: true,
     },
 ];
+static GET_BLOB_PROCESS_SOURCE_ADMISSION_PARAMETERS: [ParameterDeclaration; 4] = [
+    ParameterDeclaration {
+        name: "work_scope_ref",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "session_id",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "source_id",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "process_binding_sha256",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+];
+static RECORD_BLOB_PROCESS_SOURCE_ADMISSION_PARAMETERS: [ParameterDeclaration; 4] = [
+    ParameterDeclaration {
+        name: "admission_ref",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "expected_revision",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "expected_digest",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "snapshot_json",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+];
 static BLACKBOARD_ITEM_LOOKUP_PARAMETERS: [ParameterDeclaration; 2] = [
     ParameterDeclaration {
         name: "task_id",
@@ -1275,6 +1375,11 @@ static BLACKBOARD_ITEM_LOOKUP_PARAMETERS: [ParameterDeclaration; 2] = [
 static APPLY_BLACKBOARD_ITEM_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
     name: "revision",
     shape: ParameterShape::BlackboardItemRevision,
+    required: true,
+}];
+static ADMIT_MAILBOX_ITEM_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
+    name: "admission",
+    shape: ParameterShape::MailboxItemAdmission,
     required: true,
 }];
 
@@ -1313,6 +1418,8 @@ pub const fn named_read_operation_name(operation: NamedReadOperation) -> &'stati
         NamedReadOperation::GetAuthorityRevocationHistory => "GetAuthorityRevocationHistory",
         NamedReadOperation::GetCapabilityEvidenceRecordRange => "GetCapabilityEvidenceRecordRange",
         NamedReadOperation::GetTaskContractAcceptanceSet => "GetTaskContractAcceptanceSet",
+        NamedReadOperation::GetBlobProcessSourceAdmission => "GetBlobProcessSourceAdmission",
+        NamedReadOperation::GetPolicyOwnerSnapshot => "GetPolicyOwnerSnapshot",
     }
 }
 
@@ -1354,6 +1461,8 @@ pub const fn named_read_operation_by_name(name: &str) -> Option<NamedReadOperati
             Some(NamedReadOperation::GetCapabilityEvidenceRecordRange)
         }
         b"GetTaskContractAcceptanceSet" => Some(NamedReadOperation::GetTaskContractAcceptanceSet),
+        b"GetBlobProcessSourceAdmission" => Some(NamedReadOperation::GetBlobProcessSourceAdmission),
+        b"GetPolicyOwnerSnapshot" => Some(NamedReadOperation::GetPolicyOwnerSnapshot),
         _ => None,
     }
 }
@@ -1372,6 +1481,11 @@ pub const fn named_mutation_operation_name(operation: NamedMutationOperation) ->
         NamedMutationOperation::RecordFinishDecision => "RecordFinishDecision",
         NamedMutationOperation::RecordFinishEvidence => "RecordFinishEvidence",
         NamedMutationOperation::RecordModuleCatalogSnapshot => "RecordModuleCatalogSnapshot",
+        NamedMutationOperation::RecordWorkScopeSnapshot => "RecordWorkScopeSnapshot",
+        NamedMutationOperation::RecordPolicySnapshot => "RecordPolicySnapshot",
+        NamedMutationOperation::RecordBlobProcessSourceAdmission => {
+            "RecordBlobProcessSourceAdmission"
+        }
         NamedMutationOperation::AppendAuditEvent => "AppendAuditEvent",
         NamedMutationOperation::RecordAuthorityRevocation => "RecordAuthorityRevocation",
         NamedMutationOperation::ApplyErasure => "ApplyErasure",
@@ -1383,6 +1497,7 @@ pub const fn named_mutation_operation_name(operation: NamedMutationOperation) ->
         NamedMutationOperation::CommitExperienceBank => "CommitExperienceBank",
         NamedMutationOperation::CommitAgentFeedback => "CommitAgentFeedback",
         NamedMutationOperation::ApplyBlackboardItem => "ApplyBlackboardItem",
+        NamedMutationOperation::AdmitMailboxMessage => "AdmitMailboxMessage",
         NamedMutationOperation::RecordLearningRecord => "RecordLearningRecord",
         NamedMutationOperation::RecordCapabilityEvidenceRecord => "RecordCapabilityEvidenceRecord",
         NamedMutationOperation::RecordTaskContractAcceptanceSet => {
@@ -1405,6 +1520,11 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
         b"RecordFinishDecision" => Some(NamedMutationOperation::RecordFinishDecision),
         b"RecordFinishEvidence" => Some(NamedMutationOperation::RecordFinishEvidence),
         b"RecordModuleCatalogSnapshot" => Some(NamedMutationOperation::RecordModuleCatalogSnapshot),
+        b"RecordWorkScopeSnapshot" => Some(NamedMutationOperation::RecordWorkScopeSnapshot),
+        b"RecordPolicySnapshot" => Some(NamedMutationOperation::RecordPolicySnapshot),
+        b"RecordBlobProcessSourceAdmission" => {
+            Some(NamedMutationOperation::RecordBlobProcessSourceAdmission)
+        }
         b"AppendAuditEvent" => Some(NamedMutationOperation::AppendAuditEvent),
         b"RecordAuthorityRevocation" => Some(NamedMutationOperation::RecordAuthorityRevocation),
         b"ApplyErasure" => Some(NamedMutationOperation::ApplyErasure),
@@ -1418,6 +1538,7 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
         b"CommitExperienceBank" => Some(NamedMutationOperation::CommitExperienceBank),
         b"CommitAgentFeedback" => Some(NamedMutationOperation::CommitAgentFeedback),
         b"ApplyBlackboardItem" => Some(NamedMutationOperation::ApplyBlackboardItem),
+        b"AdmitMailboxMessage" => Some(NamedMutationOperation::AdmitMailboxMessage),
         b"RecordLearningRecord" => Some(NamedMutationOperation::RecordLearningRecord),
         b"RecordCapabilityEvidenceRecord" => {
             Some(NamedMutationOperation::RecordCapabilityEvidenceRecord)
@@ -1504,6 +1625,10 @@ pub const fn declared_read_parameters(
         NamedReadOperation::GetTaskContractAcceptanceSet => {
             &GET_TASK_CONTRACT_ACCEPTANCE_SET_PARAMETERS
         }
+        NamedReadOperation::GetBlobProcessSourceAdmission => {
+            &GET_BLOB_PROCESS_SOURCE_ADMISSION_PARAMETERS
+        }
+        NamedReadOperation::GetPolicyOwnerSnapshot => &NO_PARAMETERS,
         NamedReadOperation::GetRevisionHeads
         | NamedReadOperation::GetScopeRevisionView
         | NamedReadOperation::GetOrderingHeads
@@ -1559,6 +1684,8 @@ pub const fn declared_read_parameters(
 /// variant, digest re-proof at the Governor read edge);
 /// `ApplyBlackboardItem` declares the required typed `revision` candidate
 /// and predecessor CAS (issue #1822);
+/// `AdmitMailboxMessage` declares the required typed `admission` message
+/// and stream-head CAS (issue #1820);
 /// `RecordLearningRecord` declares the seven required commit fields
 /// (`record_kind` over the closed learning-kind set, `handle`,
 /// `record_json`, `record_digest`, `scope_digest`, `fence_digest`,
@@ -1584,9 +1711,15 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::RecordModuleCatalogSnapshot => {
             &RECORD_MODULE_CATALOG_SNAPSHOT_PARAMETERS
         }
+        NamedMutationOperation::RecordWorkScopeSnapshot => &RECORD_WORK_SCOPE_SNAPSHOT_PARAMETERS,
+        NamedMutationOperation::RecordPolicySnapshot => &RECORD_POLICY_SNAPSHOT_PARAMETERS,
+        NamedMutationOperation::RecordBlobProcessSourceAdmission => {
+            &RECORD_BLOB_PROCESS_SOURCE_ADMISSION_PARAMETERS
+        }
         NamedMutationOperation::UpdateTaskState => &UPDATE_TASK_STATE_PARAMETERS,
         NamedMutationOperation::ApplySwarmOwnerRevisions => &APPLY_SWARM_OWNER_REVISION_PARAMETERS,
         NamedMutationOperation::ApplyBlackboardItem => &APPLY_BLACKBOARD_ITEM_PARAMETERS,
+        NamedMutationOperation::AdmitMailboxMessage => &ADMIT_MAILBOX_ITEM_PARAMETERS,
         NamedMutationOperation::RecordAuthorityRevocation => {
             &RECORD_AUTHORITY_REVOCATION_PARAMETERS
         }
@@ -1693,6 +1826,7 @@ pub fn verify_declaration_holds_no_payload_encoding(
         | ParameterShape::CampaignViewLookup
         | ParameterShape::SwarmOwnerRevision
         | ParameterShape::BlackboardItemRevision
+        | ParameterShape::MailboxItemAdmission
         | ParameterShape::InstrumentRegistrySnapshot
         | ParameterShape::ProblemOwnerState
         | ParameterShape::TaskContractAcceptanceRecord => true,
@@ -1856,6 +1990,11 @@ fn check_declared_shape(
             let revision: crate::BlackboardItemRevision = serde_json::from_value(value.clone())
                 .map_err(|error| StoreError::Serialization(error.to_string()))?;
             revision.validate()
+        }
+        ParameterShape::MailboxItemAdmission => {
+            let admission: crate::MailboxItemAdmission = serde_json::from_value(value.clone())
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            admission.validate()
         }
         ParameterShape::ProblemOwnerState => {
             // The candidate record's own bindings are compared by the

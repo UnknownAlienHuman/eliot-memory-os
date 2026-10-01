@@ -22,7 +22,11 @@
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
-use eliot_ors::{HostRequestState, OperationIdentity, OrsError};
+use eliot_ors::{
+    HostRequestState, InitialSetupAuthorityPhase, InitialSetupAuthorityRecord,
+    OperationIdentity, OrsError,
+};
+use eliot_receipts::CausalBinding;
 use eliot_protocol::{
     FinishAttempt, FinishResultBody, HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope,
     HostRequestInvokeReadPayload, HostRequestResultBody, TaskControllerAttempt,
@@ -334,7 +338,11 @@ impl KernelComposition {
                     continue;
                 }
                 campaign_packet_admission(envelope, tool)?;
-                if !self.application_binding_live_for_claim(envelope, &admission_owner, true)? {
+                if !self.application_binding_live_for_claim(
+                    envelope,
+                    &admission_owner,
+                    Some(true),
+                )? {
                     continue;
                 }
                 if !candidate.campaign_packet_attempt.is_owned_by(session) {
@@ -375,12 +383,16 @@ impl KernelComposition {
         &self,
         session: &Session,
     ) -> Result<
-        Option<(
-            HostRequestEnvelope,
-            serde_json::Value,
-            TaskControllerInvocation,
-            TaskControllerAttempt,
-        )>,
+            Option<(
+                HostRequestEnvelope,
+                serde_json::Value,
+                TaskControllerInvocation,
+                TaskControllerAttempt,
+                eliot_protocol::RequestIdentity,
+                eliot_ors::HostRequestKernelAuthenticatedPeer,
+                String,
+                Option<(InitialSetupAuthorityRecord, CausalBinding)>,
+            )>,
         TransportError,
     > {
         let _transition = self.agent_bridge_transition_read()?;
@@ -405,7 +417,106 @@ impl KernelComposition {
                     continue;
                 }
                 let invocation = task_controller_admission(envelope, tool)?;
-                if !self.application_binding_live_for_claim(envelope, &admission_owner, true)? {
+                let durable = self
+                    .generation_gateway
+                    .ors
+                    .load_host_request(&candidate.operation_id, &envelope.envelope_sha256)
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .ok_or(TransportError::SessionFenced)?;
+                let identity_binding = durable
+                    .kernel_request_identity
+                    .as_ref()
+                    .ok_or(TransportError::SessionFenced)?;
+                let request_identity: eliot_protocol::RequestIdentity =
+                    serde_json::from_str(&identity_binding.canonical_json)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                request_identity
+                    .validate()
+                    .map_err(|_| TransportError::SessionFenced)?;
+                if !super::host_request_kernel_identity_matches(
+                    envelope,
+                    &request_identity,
+                    identity_binding,
+                )? {
+                    return Err(TransportError::SessionFenced);
+                }
+                let authenticated_peer = identity_binding
+                    .authenticated_peer
+                    .clone()
+                    .ok_or(TransportError::PeerIdentityUnavailable)?;
+                let authenticated_peer_sha256 = identity_binding
+                    .authenticated_peer_sha256
+                    .clone()
+                    .ok_or(TransportError::PeerIdentityUnavailable)?;
+                let initial_setup_authority = if invocation.action
+                    == eliot_protocol::TaskControllerAction::BindScope
+                {
+                    let Some(record) = self
+                        .generation_gateway
+                        .ors
+                        .load_unique_initial_setup_authority_for_fence(&envelope.state_fence)
+                        .map_err(|_| TransportError::SessionFenced)?
+                    else {
+                        return Err(TransportError::SessionFenced);
+                    };
+                    let policy_receipt = record
+                        .policy_write_receipt
+                        .as_ref()
+                        .ok_or(TransportError::SessionFenced)?;
+                    let policy_envelope = policy_receipt
+                        .envelope
+                        .as_ref()
+                        .ok_or(TransportError::SessionFenced)?;
+                    let policy_identity: eliot_protocol::RequestIdentity =
+                        serde_json::from_str(&record.policy_request_identity_json)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                    policy_identity
+                        .validate()
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    if record.phase != InitialSetupAuthorityPhase::PolicyCommitted
+                        || policy_receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+                        || policy_receipt.state_fence != envelope.state_fence
+                        || policy_envelope.core.authority != record.authority_binding
+                        || policy_envelope.core.causal != record.policy_causal_binding
+                        || policy_identity.request.state_fence != envelope.state_fence
+                        || policy_identity.request.metadata.state_fence != envelope.state_fence
+                        || policy_identity.request.metadata.product_id
+                            != request_identity.request.metadata.product_id
+                        || policy_identity.request.metadata.source_id
+                            != request_identity.request.metadata.source_id
+                        || policy_identity.request.metadata.session_id
+                            != request_identity.request.metadata.session_id
+                    {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    let sequence = policy_envelope
+                        .core
+                        .causal
+                        .transaction_sequence
+                        .value()
+                        .checked_add(1)
+                        .ok_or(TransportError::SessionFenced)?;
+                    let receipt_id = policy_envelope.identity.receipt_id.clone();
+                    Some((
+                        record,
+                        CausalBinding {
+                            state_fence: envelope.state_fence.clone(),
+                            transaction_sequence: eliot_contracts::TransactionSequence::new(
+                                sequence,
+                            )
+                            .map_err(|_| TransportError::SessionFenced)?,
+                            parent_receipt_id: Some(receipt_id.clone()),
+                            predecessor_receipt_ids: vec![receipt_id],
+                        },
+                    ))
+                } else {
+                    None
+                };
+                if !self.application_binding_live_for_claim(
+                    envelope,
+                    &admission_owner,
+                    Some(invocation.action != eliot_protocol::TaskControllerAction::BindScope),
+                )? {
                     continue;
                 }
                 if !candidate.task_controller_attempt.is_owned_by(session) {
@@ -427,17 +538,19 @@ impl KernelComposition {
                         owner_session_epoch: session.session_epoch,
                     };
                 }
+                let bind_scope =
+                    invocation.action == eliot_protocol::TaskControllerAction::BindScope;
                 let task_id = envelope
                     .identity
                     .task_id
                     .as_deref()
-                    .and_then(|value| value.parse().ok())
-                    .ok_or(TransportError::SessionFenced)?;
-                let scope_id = envelope
-                    .identity
-                    .work_scope_id
-                    .as_deref()
-                    .ok_or(TransportError::SessionFenced)?;
+                    .map(str::parse)
+                    .transpose()
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let scope_id = envelope.identity.work_scope_id.clone();
+                if bind_scope != (task_id.is_none() && scope_id.is_none()) {
+                    return Err(TransportError::SessionFenced);
+                }
                 let session_id = envelope
                     .identity
                     .session_id
@@ -451,7 +564,7 @@ impl KernelComposition {
                     fencing_generation: candidate.task_controller_attempt.generation,
                     session_id: session_id.to_owned(),
                     authority_epoch: envelope.state_fence.authority_epoch.clone(),
-                    scope_id: scope_id.to_owned(),
+                    scope_id,
                     expires_at_unix_ms: envelope.identity.deadline_unix_ms,
                     use_budget: 1,
                     task_id,
@@ -460,7 +573,16 @@ impl KernelComposition {
                 attempt
                     .validate()
                     .map_err(|_| TransportError::SessionFenced)?;
-                return Ok(Some((envelope.clone(), tool.clone(), invocation, attempt)));
+                return Ok(Some((
+                    envelope.clone(),
+                    tool.clone(),
+                    invocation,
+                    attempt,
+                    request_identity,
+                    authenticated_peer,
+                    authenticated_peer_sha256,
+                    initial_setup_authority,
+                )));
             }
         }
         Ok(None)
@@ -598,7 +720,11 @@ impl KernelComposition {
                     continue;
                 }
                 finish_admission(envelope, tool)?;
-                if !self.application_binding_live_for_claim(envelope, &admission_owner, true)? {
+                if !self.application_binding_live_for_claim(
+                    envelope,
+                    &admission_owner,
+                    Some(true),
+                )? {
                     continue;
                 }
                 if !candidate.finish_attempt.is_owned_by(session) {
@@ -1040,20 +1166,8 @@ fn task_controller_stale_attempt(
     if body.attempt.operation_id != body.operation_id
         || body.attempt.attempt_id != state.attempt_id
         || body.attempt.fencing_generation != state.generation
-        || body.attempt.task_id.as_str()
-            != envelope
-                .identity
-                .task_id
-                .as_deref()
-                .ok_or(TransportError::SessionFenced)
-                .ok()?
-        || body.attempt.scope_id
-            != envelope
-                .identity
-                .work_scope_id
-                .as_deref()
-                .ok_or(TransportError::SessionFenced)
-                .ok()?
+        || body.attempt.task_id.as_ref().map(ToString::to_string) != envelope.identity.task_id
+        || body.attempt.scope_id != envelope.identity.work_scope_id
         || body.attempt.session_id
             != envelope
                 .identity
@@ -1360,21 +1474,19 @@ fn task_controller_admission(
     invocation
         .validate()
         .map_err(|_| TransportError::SessionFenced)?;
-    if invocation.task_id.as_str()
-        != envelope
-            .identity
-            .task_id
-            .as_deref()
-            .ok_or(TransportError::SessionFenced)?
-        || invocation.work_scope_id
-            != envelope
-                .identity
-                .work_scope_id
-                .as_deref()
-                .ok_or(TransportError::SessionFenced)?
-        || envelope.state_fence.task_revision.is_none()
-        || envelope.identity.session_id.is_none()
-    {
+    let bind_scope = invocation.action == eliot_protocol::TaskControllerAction::BindScope;
+    let identity_shape_matches = if bind_scope {
+        invocation.task_id.is_none()
+            && invocation.work_scope_id.is_none()
+            && envelope.identity.task_id.is_none()
+            && envelope.identity.work_scope_id.is_none()
+            && envelope.state_fence.task_revision.is_none()
+    } else {
+        invocation.task_id.as_ref().map(ToString::to_string) == envelope.identity.task_id
+            && invocation.work_scope_id == envelope.identity.work_scope_id
+            && envelope.state_fence.task_revision.is_some()
+    };
+    if !identity_shape_matches || envelope.identity.session_id.is_none() {
         return Err(TransportError::SessionFenced);
     }
     Ok(invocation)

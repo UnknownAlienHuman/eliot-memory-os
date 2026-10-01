@@ -5,8 +5,8 @@ use eliot_contracts::{
 use eliot_platform::{PlatformHandle, SecretReference};
 use eliot_process::ProcessStreamKind;
 use eliot_receipts::{
-    AuthorityBinding, GrantClosureAuthorityReceiptRef, GrantClosureDeclaration, ProofCeiling,
-    ReceiptDisposition, ReceiptEnvelope, ReceiptIdentity,
+    AuthorityBinding, CausalBinding, GrantClosureAuthorityReceiptRef, GrantClosureDeclaration,
+    ProofCeiling, ReceiptDisposition, ReceiptEnvelope, ReceiptIdentity,
 };
 pub use eliot_receipts::{
     GRANT_CLOSURE_SCHEMA, GRANT_CLOSURE_VERSION, GrantClosureAlternatePath,
@@ -1160,6 +1160,577 @@ pub enum ProcessStartReplayState {
     Completed,
     Unknown,
 }
+
+/// Durable Kernel grant for the narrow authenticated process-stream exchange.
+///
+/// This row contains only opaque references and verified binding digests. It
+/// never contains stream bytes, Blob leases/contexts, or semantic policy
+/// material. The Kernel authority owner validates the facts before admitting
+/// this record; ORS preserves the exact grant identity and revocation state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobProcessStreamGrantRecord {
+    /// ORS record revision.
+    pub contract_version: u16,
+    /// Opaque capability reference issued to the retained TestD job.
+    pub capability_ref: String,
+    /// Durable TestD job identity.
+    pub job_id: String,
+    /// Invocation identity bound to the job.
+    pub invocation_id: String,
+    /// Digest of the exact admitted process execution binding.
+    pub process_binding_sha256: String,
+    /// Digest of the authenticated Store session identity binding.
+    pub store_session_binding_sha256: String,
+    /// Digest of the complete verified Blob owner facts retained by Kernel.
+    pub owner_facts_sha256: String,
+    /// Exact completed owner-facts pull supplying that metadata-only proof.
+    pub owner_facts_pull_ref: String,
+    /// Current Authority Epoch lineage identity.
+    pub authority_lineage_id: String,
+    /// Authority epoch sequence captured at issue time.
+    pub authority_epoch: u64,
+    /// Resource generation captured at issue time.
+    pub generation: u64,
+    /// Digest of the exact state fence.
+    pub state_fence_sha256: String,
+    /// Absolute expiry in Unix milliseconds.
+    pub expires_at_unix_ms: u64,
+    /// Monotonic next one-based ordinal allocated by ORS.
+    pub next_ordinal: u32,
+    /// Current grant disposition.
+    pub state: BlobProcessStreamGrantState,
+}
+
+impl BlobProcessStreamGrantRecord {
+    /// Validates exact identity, fence and expiry fields.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != BLOB_PROCESS_STREAM_ORS_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        for (value, field) in [
+            (&self.capability_ref, "blob_process_stream_capability_ref"),
+            (&self.job_id, "blob_process_stream_job_id"),
+            (&self.invocation_id, "blob_process_stream_invocation_id"),
+            (
+                &self.authority_lineage_id,
+                "blob_process_stream_authority_lineage",
+            ),
+        ] {
+            validate_text(value, field)?;
+        }
+        for (value, field) in [
+            (
+                &self.process_binding_sha256,
+                "blob_process_stream_process_binding",
+            ),
+            (
+                &self.store_session_binding_sha256,
+                "blob_process_stream_store_session",
+            ),
+            (&self.owner_facts_sha256, "blob_process_stream_owner_facts"),
+            (&self.state_fence_sha256, "blob_process_stream_state_fence"),
+        ] {
+            validate_digest(value, field)?;
+        }
+        validate_text(
+            &self.owner_facts_pull_ref,
+            "blob_process_stream_owner_facts_pull_ref",
+        )?;
+        if self.authority_epoch == 0
+            || self.generation == 0
+            || self.expires_at_unix_ms == 0
+            || self.next_ordinal == 0
+        {
+            return Err(OrsError::InvalidField {
+                field: "blob_process_stream_grant_counters",
+                reason: "epoch, generation, expiry, and next ordinal must be non-zero",
+            });
+        }
+        Ok(())
+    }
+
+    /// Compares immutable admission bindings while permitting ORS-owned
+    /// ordinal/state progression.
+    pub fn same_binding(&self, other: &Self) -> bool {
+        self.contract_version == other.contract_version
+            && self.capability_ref == other.capability_ref
+            && self.job_id == other.job_id
+            && self.invocation_id == other.invocation_id
+            && self.process_binding_sha256 == other.process_binding_sha256
+            && self.store_session_binding_sha256 == other.store_session_binding_sha256
+            && self.owner_facts_sha256 == other.owner_facts_sha256
+            && self.owner_facts_pull_ref == other.owner_facts_pull_ref
+            && self.authority_lineage_id == other.authority_lineage_id
+            && self.authority_epoch == other.authority_epoch
+            && self.generation == other.generation
+            && self.state_fence_sha256 == other.state_fence_sha256
+            && self.expires_at_unix_ms == other.expires_at_unix_ms
+    }
+}
+
+/// Monotonic state of a retained process-stream capability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BlobProcessStreamGrantState {
+    Active,
+    Revoked,
+    Expired,
+}
+
+/// Durable state of one authenticated Kernel-to-daemon Blob facts pull.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BlobProcessStreamOwnerFactsPullState {
+    Pending,
+    Completed,
+}
+
+/// Correlated owner-facts pull and its bounded proof-reference response.
+///
+/// These rows persist only the closed DTO envelopes and their digests. The
+/// daemon-resolved contexts, leases, source bytes and policy material remain
+/// with their respective owners; only an opaque resolver reference crosses
+/// the pull response.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobProcessStreamOwnerFactsPullRecord {
+    /// ORS record revision.
+    pub contract_version: u16,
+    /// Kernel-generated lookup identity.
+    pub pull_ref: String,
+    /// Durable TestD job identity.
+    pub job_id: String,
+    /// Exact typed request JSON, bounded and digest-bound.
+    pub request_json: String,
+    /// SHA-256 of `request_json`.
+    pub request_sha256: String,
+    /// Pending/completed disposition.
+    pub state: BlobProcessStreamOwnerFactsPullState,
+    /// Exact typed response JSON, populated after daemon owner readback.
+    pub response_json: Option<String>,
+    /// SHA-256 of `response_json`.
+    pub response_sha256: Option<String>,
+    /// Exact normal prepared transition retained before a matching ReadyAttach
+    /// effect is sent to the Store. This is an expected-request commitment,
+    /// not evidence that a reserved-write protocol was used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_write_transition_json: Option<String>,
+    /// SHA-256 of the exact canonical prepared transition above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_write_transition_sha256: Option<String>,
+    /// Canonical request hash carried by that exact prepared transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_write_canonical_request_hash: Option<String>,
+}
+
+impl BlobProcessStreamOwnerFactsPullRecord {
+    /// Validates request/response canonical JSON, digest and transition shape.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != BLOB_PROCESS_STREAM_ORS_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        validate_text(&self.pull_ref, "blob_process_stream_pull_ref")?;
+        validate_text(&self.job_id, "blob_process_stream_pull_job")?;
+        validate_digest(&self.request_sha256, "blob_process_stream_pull_request")?;
+        validate_bounded_canonical_json(
+            &self.request_json,
+            MAX_BLOB_PROCESS_STREAM_OWNER_FACTS_JSON_BYTES,
+            "blob_process_stream_pull_request_json",
+        )?;
+        if sha256_hex(self.request_json.as_bytes()) != self.request_sha256 {
+            return Err(OrsError::InvalidField {
+                field: "blob_process_stream_pull_request_sha256",
+                reason: "request digest does not match exact request JSON",
+            });
+        }
+        match (
+            &self.prepared_write_transition_json,
+            &self.prepared_write_transition_sha256,
+            &self.prepared_write_canonical_request_hash,
+        ) {
+            (None, None, None) => {}
+            (Some(transition), Some(transition_sha256), Some(request_hash)) => {
+                validate_digest(
+                    transition_sha256,
+                    "blob_process_stream_prepared_write_transition_sha256",
+                )?;
+                validate_digest(
+                    request_hash,
+                    "blob_process_stream_prepared_write_canonical_request_hash",
+                )?;
+                validate_bounded_canonical_json(
+                    transition,
+                    MAX_BLOB_PROCESS_STREAM_OWNER_FACTS_JSON_BYTES,
+                    "blob_process_stream_prepared_write_transition_json",
+                )?;
+                if sha256_hex(transition.as_bytes()) != transition_sha256 {
+                    return Err(OrsError::InvalidField {
+                        field: "blob_process_stream_prepared_write_transition_sha256",
+                        reason: "transition digest does not match exact JSON",
+                    });
+                }
+                let prepared: eliot_store_api::PreparedTransition =
+                    serde_json::from_str(transition).map_err(|_| OrsError::InvalidField {
+                        field: "blob_process_stream_prepared_write_transition_json",
+                        reason: "must decode as a prepared transition",
+                    })?;
+                prepared.validate().map_err(|_| OrsError::InvalidField {
+                    field: "blob_process_stream_prepared_write_transition_json",
+                    reason: "prepared transition must validate",
+                })?;
+                if prepared.identity.canonical_request_hash != *request_hash {
+                    return Err(OrsError::InvalidField {
+                        field: "blob_process_stream_prepared_write_canonical_request_hash",
+                        reason: "does not match prepared transition identity",
+                    });
+                }
+                let request: serde_json::Value =
+                    serde_json::from_str(&self.request_json).map_err(|_| {
+                        OrsError::InvalidField {
+                            field: "blob_process_stream_pull_request_json",
+                            reason: "must remain a typed object",
+                        }
+                    })?;
+                if request.get("purpose").and_then(serde_json::Value::as_str)
+                    != Some("READY_ATTACH")
+                    || request
+                        .get("ready_operation_id")
+                        .and_then(serde_json::Value::as_str)
+                        != Some(prepared.identity.operation_id.as_str())
+                {
+                    return Err(OrsError::InvalidField {
+                        field: "blob_process_stream_prepared_write_transition_json",
+                        reason: "must bind the ReadyAttach pull's exact operation identity",
+                    });
+                }
+            }
+            _ => {
+                return Err(OrsError::InvalidField {
+                    field: "blob_process_stream_prepared_write_transition_json",
+                    reason: "prepared write commitment fields must be present together",
+                });
+            }
+        }
+        match (&self.state, &self.response_json, &self.response_sha256) {
+            (BlobProcessStreamOwnerFactsPullState::Pending, None, None) => {}
+            (BlobProcessStreamOwnerFactsPullState::Completed, Some(response), Some(digest)) => {
+                validate_digest(digest, "blob_process_stream_pull_response")?;
+                validate_bounded_canonical_json(
+                    response,
+                    MAX_BLOB_PROCESS_STREAM_OWNER_FACTS_JSON_BYTES,
+                    "blob_process_stream_pull_response_json",
+                )?;
+                if sha256_hex(response.as_bytes()) != digest.as_str() {
+                    return Err(OrsError::InvalidField {
+                        field: "blob_process_stream_pull_response_sha256",
+                        reason: "response digest does not match exact response JSON",
+                    });
+                }
+            }
+            _ => {
+                return Err(OrsError::InvalidField {
+                    field: "blob_process_stream_pull_state",
+                    reason: "pending/completed state and response fields disagree",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Tests the immutable correlated request binding.
+    pub fn same_request(&self, other: &Self) -> bool {
+        self.contract_version == other.contract_version
+            && self.pull_ref == other.pull_ref
+            && self.job_id == other.job_id
+            && self.request_json == other.request_json
+            && self.request_sha256 == other.request_sha256
+    }
+}
+
+fn validate_bounded_canonical_json(
+    value: &str,
+    max_bytes: usize,
+    field: &'static str,
+) -> Result<(), OrsError> {
+    if value.len() > max_bytes {
+        return Err(OrsError::PayloadTooLarge);
+    }
+    let decoded: Value = serde_json::from_str(value).map_err(|_| OrsError::InvalidField {
+        field,
+        reason: "must be a bounded JSON object",
+    })?;
+    if !matches!(&decoded, Value::Object(_))
+        || serde_json::to_string(&decoded).as_bytes() != value.as_bytes()
+    {
+        return Err(OrsError::InvalidField {
+            field,
+            reason: "must be canonical JSON object bytes",
+        });
+    }
+    Ok(())
+}
+
+/// ORS state for one Kernel-issued one-use process-stream call token.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BlobProcessStreamCallState {
+    Issued,
+    Reserved,
+    Dispatched,
+    Completed,
+    NotStarted,
+    Unknown,
+    Unavailable,
+}
+
+/// Durable one-use call identity and outcome projection.
+///
+/// `request_identity_json` contains only the exact Kernel-created Store
+/// `RequestIdentity`, never the Blob operation body. Large source/output bytes
+/// remain in their owner-controlled immutable storage. Once state reaches
+/// `Dispatched`, ORS will not authorize another Store effect for this token;
+/// a missing completion is `Unknown` and requires owner reconciliation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobProcessStreamCallRecord {
+    /// ORS record revision.
+    pub contract_version: u16,
+    /// Parent capability reference.
+    pub capability_ref: String,
+    /// Opaque one-use call reference returned to TestD.
+    pub token_ref: String,
+    /// One-based Kernel-assigned call ordinal.
+    pub ordinal: u32,
+    /// Exact typed operation digest, absent until the token is reserved.
+    pub operation_sha256: Option<String>,
+    /// Small exact typed operation projection retained only for Open,
+    /// Finalize, and Abort so a restarted Kernel can recover the original
+    /// Store binding/terminal identity. Append bodies and source bytes are
+    /// never retained here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_projection_json: Option<String>,
+    /// Canonical exact Store RequestIdentity JSON, absent until reservation.
+    pub request_identity_json: Option<String>,
+    /// Digest of `request_identity_json`.
+    pub request_identity_sha256: Option<String>,
+    /// Call state.
+    pub state: BlobProcessStreamCallState,
+    /// Digest of the bounded exact response projection, when available.
+    pub response_sha256: Option<String>,
+    /// Bounded metadata-only response projection for Opened/terminal outcomes.
+    /// Chunk bytes and arbitrary Blob payloads are forbidden by the owner that
+    /// supplies this projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_projection_json: Option<String>,
+    /// Optional immutable owner-issued reference from which a response can be
+    /// reconciled; append dispositions may have no separate owner receipt.
+    pub response_ref: Option<String>,
+    /// Owner receipt reference proving a completed Store operation/readback,
+    /// when the operation has a receipt-bearing result.
+    pub owner_receipt_ref: Option<String>,
+}
+
+impl BlobProcessStreamCallRecord {
+    /// Validates one-use token identity, exact request binding, and state/result
+    /// coherence.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != BLOB_PROCESS_STREAM_ORS_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        for (value, field) in [
+            (&self.capability_ref, "blob_process_stream_call_capability"),
+            (&self.token_ref, "blob_process_stream_call_token"),
+        ] {
+            validate_text(value, field)?;
+        }
+        if let Some(json) = &self.operation_projection_json {
+            if json.len() > MAX_BLOB_PROCESS_STREAM_PROJECTION_JSON_BYTES
+                || !matches!(
+                    serde_json::from_str::<serde_json::Value>(json),
+                    Ok(serde_json::Value::Object(_))
+                )
+                || serde_json::to_string(&serde_json::from_str::<serde_json::Value>(json).map_err(
+                    |_| OrsError::InvalidField {
+                        field: "blob_process_stream_call_operation_projection",
+                        reason: "must be a bounded canonical JSON object",
+                    },
+                )?)
+                .as_bytes()
+                    != json.as_bytes()
+                || self
+                    .operation_sha256
+                    .as_deref()
+                    .is_none_or(|digest| sha256_hex(json.as_bytes()) != digest)
+            {
+                return Err(OrsError::InvalidField {
+                    field: "blob_process_stream_call_operation_projection",
+                    reason: "must be canonical, bounded, and match operation digest",
+                });
+            }
+        }
+        if let Some(json) = &self.response_projection_json {
+            if json.len() > MAX_BLOB_PROCESS_STREAM_PROJECTION_JSON_BYTES
+                || !matches!(
+                    serde_json::from_str::<serde_json::Value>(json),
+                    Ok(serde_json::Value::Object(_))
+                )
+                || serde_json::to_string(&serde_json::from_str::<serde_json::Value>(json).map_err(
+                    |_| OrsError::InvalidField {
+                        field: "blob_process_stream_call_response_projection",
+                        reason: "must be a bounded canonical JSON object",
+                    },
+                )?)
+                .as_bytes()
+                    != json.as_bytes()
+                || self
+                    .response_sha256
+                    .as_deref()
+                    .is_none_or(|digest| sha256_hex(json.as_bytes()) != digest)
+            {
+                return Err(OrsError::InvalidField {
+                    field: "blob_process_stream_call_response_projection",
+                    reason: "must be canonical, bounded, and match response digest",
+                });
+            }
+        }
+        if self.ordinal == 0 {
+            return Err(OrsError::InvalidField {
+                field: "blob_process_stream_call_ordinal",
+                reason: "must be one-based",
+            });
+        }
+        for (value, field) in [
+            (&self.operation_sha256, "blob_process_stream_call_operation"),
+            (
+                &self.request_identity_sha256,
+                "blob_process_stream_call_identity",
+            ),
+            (&self.response_sha256, "blob_process_stream_call_response"),
+        ] {
+            if let Some(value) = value {
+                validate_digest(value, field)?;
+            }
+        }
+        if let Some(json) = &self.request_identity_json {
+            if json.len() > MAX_BLOB_PROCESS_STREAM_IDENTITY_JSON_BYTES
+                || !matches!(
+                    serde_json::from_str::<serde_json::Value>(json),
+                    Ok(serde_json::Value::Object(_))
+                )
+                || serde_json::to_string(&serde_json::from_str::<serde_json::Value>(json).map_err(
+                    |_| OrsError::InvalidField {
+                        field: "blob_process_stream_call_identity_json",
+                        reason: "must be a bounded JSON object",
+                    },
+                )?)
+                .as_bytes()
+                    != json.as_bytes()
+            {
+                return Err(OrsError::InvalidField {
+                    field: "blob_process_stream_call_identity_json",
+                    reason: "must be a bounded canonical JSON object",
+                });
+            }
+            let digest = sha256_hex(json.as_bytes());
+            if self.request_identity_sha256.as_deref() != Some(digest.as_str()) {
+                return Err(OrsError::InvalidField {
+                    field: "blob_process_stream_call_identity_sha256",
+                    reason: "identity JSON digest mismatch",
+                });
+            }
+        } else if self.request_identity_sha256.is_some() {
+            return Err(OrsError::InvalidField {
+                field: "blob_process_stream_call_identity_json",
+                reason: "identity digest requires exact identity JSON",
+            });
+        }
+        for (value, field) in [
+            (&self.response_ref, "blob_process_stream_call_response_ref"),
+            (
+                &self.owner_receipt_ref,
+                "blob_process_stream_call_owner_receipt",
+            ),
+        ] {
+            if let Some(value) = value {
+                validate_text(value, field)?;
+            }
+        }
+        if self.response_sha256.is_none()
+            && (self.response_ref.is_some()
+                || self.response_projection_json.is_some()
+                || self.owner_receipt_ref.is_some())
+        {
+            return Err(OrsError::InvalidField {
+                field: "blob_process_stream_call_response",
+                reason: "response references require a response digest",
+            });
+        }
+        let reserved = self.operation_sha256.is_some()
+            && self.request_identity_json.is_some()
+            && self.request_identity_sha256.is_some();
+        let completed = self.response_sha256.is_some();
+        match self.state {
+            BlobProcessStreamCallState::Issued if reserved || completed => {
+                Err(OrsError::InvalidField {
+                    field: "blob_process_stream_call_state",
+                    reason: "issued token cannot carry a request or result",
+                })
+            }
+            BlobProcessStreamCallState::Reserved if !reserved || completed => {
+                Err(OrsError::InvalidField {
+                    field: "blob_process_stream_call_state",
+                    reason: "reserved call requires exact request and no result",
+                })
+            }
+            BlobProcessStreamCallState::Dispatched if !reserved || completed => {
+                Err(OrsError::InvalidField {
+                    field: "blob_process_stream_call_state",
+                    reason: "dispatched call requires exact request and no result",
+                })
+            }
+            BlobProcessStreamCallState::Completed if !reserved || !completed => {
+                Err(OrsError::InvalidField {
+                    field: "blob_process_stream_call_state",
+                    reason: "completed call requires exact request and response digest",
+                })
+            }
+            BlobProcessStreamCallState::NotStarted
+            | BlobProcessStreamCallState::Unknown
+            | BlobProcessStreamCallState::Unavailable
+                if !reserved || completed =>
+            {
+                Err(OrsError::InvalidField {
+                    field: "blob_process_stream_call_state",
+                    reason: "terminal refusal/unknown state requires request without result",
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Tests immutable identity for one call reference.
+    pub fn same_binding(&self, other: &Self) -> bool {
+        self.contract_version == other.contract_version
+            && self.capability_ref == other.capability_ref
+            && self.token_ref == other.token_ref
+            && self.ordinal == other.ordinal
+            && self.operation_sha256 == other.operation_sha256
+            && self.operation_projection_json == other.operation_projection_json
+            && self.request_identity_json == other.request_identity_json
+            && self.request_identity_sha256 == other.request_identity_sha256
+    }
+}
+
+/// Current record revision for Kernel Blob process-stream grants and calls.
+pub const BLOB_PROCESS_STREAM_ORS_VERSION: u16 = 1;
+/// Maximum persisted request/response envelope for the small owner-facts
+/// reference exchange. No Blob bytes or resolved owner contexts are retained.
+pub const MAX_BLOB_PROCESS_STREAM_OWNER_FACTS_JSON_BYTES: usize = 64 * 1024;
+/// Maximum serialized Kernel-created Store identity retained in ORS.
+pub const MAX_BLOB_PROCESS_STREAM_IDENTITY_JSON_BYTES: usize = 16 * 1024;
+/// Maximum exact operation projection retained for restart binding recovery.
+pub const MAX_BLOB_PROCESS_STREAM_PROJECTION_JSON_BYTES: usize = 16 * 1024;
 
 /// Durable one-shot authority handoff disposition.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -3275,6 +3846,380 @@ impl CapabilityGrantProjection {
     /// Returns the store-issued integrity receipt for this row.
     pub const fn receipt(&self) -> &OperationalMutationReceipt {
         &self.receipt
+    }
+}
+
+/// Durable stage for the one first-run Policy owner lineage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum InitialSetupAuthorityPhase {
+    /// The exact Kernel-reserved Policy write is prepared, before Store effect.
+    Prepared,
+    /// The normal Policy write committed and its original receipt is retained.
+    PolicyCommitted,
+    /// The exact WorkScope child write is prepared, before its Store effect.
+    WorkScopePrepared,
+    /// The initial WorkScope write committed with its Policy-receipt successor.
+    WorkScopeCommitted,
+}
+
+/// Non-semantic ORS binding between the signed setup-root grant and the first
+/// Policy/WorkScope writes.
+///
+/// ORS does not interpret the opaque grant payload or create authority. It
+/// retains exact operation/request identities, the paired receipt bindings,
+/// the active grant's store-issued receipt tuple, and the actual canonical
+/// Policy receipt. Kernel independently loads the referenced capability grant
+/// and compares the exact bindings before either effect is admitted.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InitialSetupAuthorityRecord {
+    /// ORS contract version.
+    pub contract_version: u16,
+    /// State progression for this one immutable setup lineage.
+    pub phase: InitialSetupAuthorityPhase,
+    /// Exact Policy operation/idempotency/request hash reserved by Kernel.
+    pub policy_operation: eliot_store_api::OperationIdentity,
+    /// Exact canonical authenticated Policy RequestIdentity bytes.
+    pub policy_request_identity_json: String,
+    /// SHA-256 of `policy_request_identity_json`.
+    pub policy_request_identity_sha256: String,
+    /// Exact canonical Kernel-to-Store Policy request bytes.
+    pub policy_request_json: String,
+    /// SHA-256 of `policy_request_json`.
+    pub policy_request_sha256: String,
+    /// Exact fence shared by the setup grant and first two writes.
+    pub state_fence: StateFence,
+    /// Existing ORS capability-grant subject selected by Governor's checked
+    /// setup-root decision. It is a lookup reference, not authority by itself.
+    pub root_grant_subject_id: OpaqueLabel,
+    /// Exact existing store-issued receipt from the root capability grant.
+    pub root_grant_receipt: OperationalMutationReceipt,
+    /// Exact root AuthorityBinding carried by the Policy transition.
+    pub authority_binding: AuthorityBinding,
+    /// Exact genesis CausalBinding carried by the Policy transition.
+    pub policy_causal_binding: CausalBinding,
+    /// Actual normal canonical Policy WriteReceipt, absent until commit.
+    pub policy_write_receipt: Option<eliot_store_api::WriteReceipt>,
+    /// SHA-256 of the canonical exact `policy_write_receipt` bytes.
+    pub policy_write_receipt_sha256: Option<String>,
+    /// Exact CausalBinding of the initial WorkScope successor, absent until
+    /// that normal write commits.
+    pub work_scope_causal_binding: Option<CausalBinding>,
+    /// Exact WorkScope operation/idempotency/request hash reserved by Kernel.
+    pub work_scope_operation: Option<eliot_store_api::OperationIdentity>,
+    /// Exact canonical authenticated WorkScope RequestIdentity bytes.
+    pub work_scope_request_identity_json: Option<String>,
+    /// SHA-256 of `work_scope_request_identity_json`.
+    pub work_scope_request_identity_sha256: Option<String>,
+    /// Exact canonical Kernel-to-Store WorkScope request bytes.
+    pub work_scope_request_json: Option<String>,
+    /// SHA-256 of `work_scope_request_json`.
+    pub work_scope_request_sha256: Option<String>,
+    /// Actual normal canonical WorkScope WriteReceipt, absent until commit.
+    pub work_scope_write_receipt: Option<eliot_store_api::WriteReceipt>,
+}
+
+impl InitialSetupAuthorityRecord {
+    /// Validates canonical request bytes, original grant tuple and phase shape.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != crate::CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        self.policy_operation.validate().map_err(|_| OrsError::IntegrityProblem {
+            record_type: "initial_setup_authority",
+            reason: "Policy operation identity is malformed".to_owned(),
+        })?;
+        self.state_fence.validate()?;
+        validate_bounded_canonical_json(
+            &self.policy_request_identity_json,
+            MAX_BLOB_PROCESS_STREAM_OWNER_FACTS_JSON_BYTES,
+            "initial_setup_policy_request_identity_json",
+        )?;
+        validate_digest(
+            &self.policy_request_identity_sha256,
+            "initial_setup_policy_request_identity_sha256",
+        )?;
+        validate_digest(&self.policy_request_sha256, "initial_setup_policy_request_sha256")?;
+        validate_bounded_canonical_json(
+            &self.policy_request_json,
+            MAX_BLOB_PROCESS_STREAM_OWNER_FACTS_JSON_BYTES,
+            "initial_setup_policy_request_json",
+        )?;
+        if sha256_hex(self.policy_request_identity_json.as_bytes())
+            != self.policy_request_identity_sha256
+            || sha256_hex(self.policy_request_json.as_bytes()) != self.policy_request_sha256
+        {
+            return Err(OrsError::InvalidField {
+                field: "initial_setup_policy_request_digest",
+                reason: "request bytes or operation digest disagree",
+            });
+        }
+        validate_text(
+            self.root_grant_subject_id.as_str(),
+            "initial_setup_root_grant_subject_id",
+        )?;
+        if self.root_grant_receipt.subject_id() != &self.root_grant_subject_id
+            || self.root_grant_receipt.phase() != OperationalPhase::Active
+            || self.root_grant_receipt.operation_order() == 0
+        {
+            return Err(OrsError::InvalidField {
+                field: "initial_setup_root_grant",
+                reason: "setup root must reference an active retained grant",
+            });
+        }
+        validate_digest(
+            self.root_grant_receipt.state_sha256(),
+            "initial_setup_root_grant_state_sha256",
+        )?;
+        if self.authority_binding.state_fence != self.state_fence
+            || self.policy_causal_binding.state_fence != self.state_fence
+            || self.policy_causal_binding.parent_receipt_id.is_some()
+            || !self.policy_causal_binding.predecessor_receipt_ids.is_empty()
+            || self.policy_causal_binding.transaction_sequence.value() != 1
+        {
+            return Err(OrsError::FenceMismatch);
+        }
+        match (
+            self.phase,
+            self.policy_write_receipt.as_ref(),
+            self.policy_write_receipt_sha256.as_ref(),
+            self.work_scope_causal_binding.as_ref(),
+            self.work_scope_operation.as_ref(),
+            self.work_scope_request_identity_json.as_ref(),
+            self.work_scope_request_identity_sha256.as_ref(),
+            self.work_scope_request_json.as_ref(),
+            self.work_scope_request_sha256.as_ref(),
+            self.work_scope_write_receipt.as_ref(),
+        ) {
+            (
+                InitialSetupAuthorityPhase::Prepared,
+                None, None, None, None, None, None, None, None, None,
+            ) => {}
+            (
+                InitialSetupAuthorityPhase::PolicyCommitted,
+                Some(receipt),
+                Some(digest),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ) => {
+                self.validate_policy_receipt_digest(receipt, digest)?;
+                self.validate_policy_receipt(receipt)?;
+            }
+            (
+                InitialSetupAuthorityPhase::WorkScopePrepared,
+                Some(receipt),
+                Some(digest),
+                Some(child),
+                Some(operation),
+                Some(identity_json),
+                Some(identity_digest),
+                Some(request_json),
+                Some(request_digest),
+                None,
+            ) => {
+                self.validate_policy_receipt_digest(receipt, digest)?;
+                self.validate_policy_receipt(receipt)?;
+                self.validate_work_scope_request(
+                    receipt,
+                    child,
+                    operation,
+                    identity_json,
+                    identity_digest,
+                    request_json,
+                    request_digest,
+                )?;
+            }
+            (
+                InitialSetupAuthorityPhase::WorkScopeCommitted,
+                Some(receipt),
+                Some(digest),
+                Some(child),
+                Some(operation),
+                Some(identity_json),
+                Some(identity_digest),
+                Some(request_json),
+                Some(request_digest),
+                Some(work_scope_receipt),
+            ) => {
+                self.validate_policy_receipt_digest(receipt, digest)?;
+                self.validate_policy_receipt(receipt)?;
+                self.validate_work_scope_request(
+                    receipt,
+                    child,
+                    operation,
+                    identity_json,
+                    identity_digest,
+                    request_json,
+                    request_digest,
+                )?;
+                work_scope_receipt
+                    .validate()
+                    .map_err(|_| OrsError::InvalidReceipt)?;
+                let child_envelope = work_scope_receipt
+                    .envelope
+                    .as_ref()
+                    .ok_or(OrsError::InvalidReceipt)?;
+                if work_scope_receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+                    || work_scope_receipt.operation_id != operation.operation_id
+                    || work_scope_receipt.idempotency_key != operation.idempotency_key
+                    || work_scope_receipt.canonical_request_hash != operation.canonical_request_hash
+                    || work_scope_receipt.state_fence != self.state_fence
+                    || child_envelope.core.authority != self.authority_binding
+                    || child_envelope.core.causal != *child
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "initial_setup_authority",
+                        reason: "WorkScope receipt does not match the retained successor binding"
+                            .to_owned(),
+                    });
+                }
+            }
+            _ => {
+                return Err(OrsError::InvalidField {
+                    field: "initial_setup_authority_phase",
+                    reason: "phase and committed receipts disagree",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_work_scope_request(
+        &self,
+        policy_receipt: &eliot_store_api::WriteReceipt,
+        child: &CausalBinding,
+        operation: &eliot_store_api::OperationIdentity,
+        identity_json: &str,
+        identity_digest: &str,
+        request_json: &str,
+        request_digest: &str,
+    ) -> Result<(), OrsError> {
+        operation.validate().map_err(|_| OrsError::IntegrityProblem {
+            record_type: "initial_setup_authority",
+            reason: "WorkScope operation identity is malformed".to_owned(),
+        })?;
+        validate_bounded_canonical_json(
+            identity_json,
+            MAX_BLOB_PROCESS_STREAM_OWNER_FACTS_JSON_BYTES,
+            "initial_setup_work_scope_request_identity_json",
+        )?;
+        validate_bounded_canonical_json(
+            request_json,
+            MAX_BLOB_PROCESS_STREAM_OWNER_FACTS_JSON_BYTES,
+            "initial_setup_work_scope_request_json",
+        )?;
+        validate_digest(identity_digest, "initial_setup_work_scope_request_identity_sha256")?;
+        validate_digest(request_digest, "initial_setup_work_scope_request_sha256")?;
+        if sha256_hex(identity_json.as_bytes()) != identity_digest
+            || sha256_hex(request_json.as_bytes()) != request_digest
+        {
+            return Err(OrsError::InvalidField {
+                field: "initial_setup_work_scope_request_digest",
+                reason: "request bytes and their digests disagree",
+            });
+        }
+        let parent = policy_receipt
+            .envelope
+            .as_ref()
+            .ok_or(OrsError::InvalidReceipt)?
+            .identity
+            .receipt_id
+            .clone();
+        if child.state_fence != self.state_fence
+            || child.parent_receipt_id.as_ref() != Some(&parent)
+            || child.predecessor_receipt_ids.as_slice() != [parent]
+            || child.transaction_sequence.value()
+                != self
+                    .policy_causal_binding
+                    .transaction_sequence
+                    .value()
+                    .checked_add(1)
+                    .ok_or(OrsError::PayloadTooLarge)?
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "initial_setup_authority",
+                reason: "WorkScope causal binding is not the exact Policy successor".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Checks the exact committed Policy receipt against the staged operation.
+    pub fn validate_policy_receipt(
+        &self,
+        receipt: &eliot_store_api::WriteReceipt,
+    ) -> Result<(), OrsError> {
+        receipt.validate().map_err(|_| OrsError::InvalidReceipt)?;
+        let envelope = receipt.envelope.as_ref().ok_or(OrsError::InvalidReceipt)?;
+        if receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+            || receipt.operation_id != self.policy_operation.operation_id
+            || receipt.idempotency_key != self.policy_operation.idempotency_key
+            || receipt.canonical_request_hash != self.policy_operation.canonical_request_hash
+            || receipt.state_fence != self.state_fence
+            || envelope.core.authority != self.authority_binding
+            || envelope.core.causal != self.policy_causal_binding
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "initial_setup_authority",
+                reason: "Policy receipt does not match the exact staged authority lineage"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_policy_receipt_digest(
+        &self,
+        receipt: &eliot_store_api::WriteReceipt,
+        digest: &str,
+    ) -> Result<(), OrsError> {
+        validate_digest(digest, "initial_setup_policy_write_receipt_sha256")?;
+        let bytes = canonical_json_bytes(receipt).map_err(|error| OrsError::IntegrityProblem {
+            record_type: "initial_setup_authority",
+            reason: format!("Policy receipt cannot be canonically encoded: {error}"),
+        })?;
+        if sha256_hex(&bytes) != digest {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "initial_setup_authority",
+                reason: "Policy receipt digest does not match the canonical receipt".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Identifies immutable setup inputs while permitting the owner phase to advance.
+    pub fn same_setup(&self, other: &Self) -> bool {
+        self.contract_version == other.contract_version
+            && self.policy_operation == other.policy_operation
+            && self.policy_request_identity_json == other.policy_request_identity_json
+            && self.policy_request_identity_sha256 == other.policy_request_identity_sha256
+            && self.policy_request_json == other.policy_request_json
+            && self.policy_request_sha256 == other.policy_request_sha256
+            && self.state_fence == other.state_fence
+            && self.root_grant_subject_id == other.root_grant_subject_id
+            && self.root_grant_receipt == other.root_grant_receipt
+            && self.authority_binding == other.authority_binding
+            && self.policy_causal_binding == other.policy_causal_binding
+    }
+
+    /// Compares exact retained WorkScope operation material while allowing
+    /// the owner phase to move from prepared to committed.
+    pub fn same_work_scope_request(&self, other: &Self) -> bool {
+        self.same_setup(other)
+            && self.policy_write_receipt == other.policy_write_receipt
+            && self.work_scope_causal_binding == other.work_scope_causal_binding
+            && self.work_scope_operation == other.work_scope_operation
+            && self.work_scope_request_identity_json == other.work_scope_request_identity_json
+            && self.work_scope_request_identity_sha256
+                == other.work_scope_request_identity_sha256
+            && self.work_scope_request_json == other.work_scope_request_json
+            && self.work_scope_request_sha256 == other.work_scope_request_sha256
     }
 }
 
@@ -5453,6 +6398,143 @@ struct LegacyUnscopedBackupVerificationRow {
     request_digest: String,
 }
 
+/// Owner-issued, one-shot succession grant for one stored `backup.verify`
+/// operation (#2883 instruction 4).
+///
+/// This is the explicit owner-authorized succession/recovery contract a fresh
+/// session must hold before it may reconcile a prior operation. It is NOT
+/// `ActivationSuccessorBinding`, and the reason is stated rather than assumed:
+/// that type is a PREDECESSOR reference plus a due time, carried by the
+/// successor itself, and it names an activation TICKET. It has no issuer
+/// signature of its own, no expiry, and no consumption state, because the
+/// activation path gets one-shotness from the ticket lifecycle's
+/// `successor_ticket_id` column instead. `backup.verify` has no ticket
+/// lifecycle, so one-shotness and expiry would have nowhere to live in that
+/// type. This type therefore carries them, and it lives beside its only
+/// durable owner rather than being spread across the activation family.
+///
+/// Every field is OWNER DATA, not a capability to read data:
+///
+/// - `grant_id` is 32 bytes of OS RNG material drawn by the capture owner at
+///   stage time. It is stored, never returned on the wire, and a caller that
+///   did not receive it cannot produce it. This is the whole reason a
+///   reconciliation is not replayable: the predecessor's `ok` reply carries
+///   `request_digest` and `operation_namespace`, so a replay of the pair is
+///   possible, but it carries no grant id.
+/// - `principal` and `scope_id` are the authenticated owner values the grant
+///   was issued to. A grant is bound to ONE principal in ONE `WorkScope`.
+/// - `authority_lineage_id` is the authority the grant was issued under. The
+///   sequence is deliberately absent: a rotation is the same authority observed
+///   later, exactly as on `successor_may_observe`, and a grant survives a
+///   rotation but not a lineage change.
+/// - `not_before_unix_ms` and `expires_at_unix_ms` are the owner's own due
+///   window. `expires_at_unix_ms` MUST be strictly greater than
+///   `not_before_unix_ms`, so a grant always has a positive lifetime and can
+///   never be born already expired.
+/// - `issued_at_unix_ms` is the owner's clock reading at issuance and is what
+///   `validate()` range-checks the other two against, so a row cannot carry a
+///   window the owner could not have issued.
+/// - `consumed_at_unix_ms` is the one-shot marker. It is `None` while the
+///   grant is open and is set to a value strictly greater than
+///   `not_before_unix_ms` by the single transaction that consumes it. A second
+///   reconciliation finds it non-`None` and is refused, which is what makes
+///   replaying the same bundle unable to mint or reuse a fresh grant.
+///
+/// `validate()` is shape only, matching how this module treats every other
+/// closed owner spelling: it does not interpret the window or the lineage. The
+/// SUCCESSOR PATH decides whether the window is open and the lineage is the
+/// caller's; ORS's job is to fail a malformed row closed on read, exactly as
+/// it does for the rest of this record.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupVerifySuccessionGrant {
+    /// OS-RNG material drawn once by the capture owner at stage time. Never
+    /// projected onto the wire and never derivable from any value the
+    /// predecessor's `ok` reply already carried.
+    pub grant_id: String,
+    /// Bare authenticated principal this grant was issued to.
+    ///
+    /// This is the SAME principal value the stored row's
+    /// `BackupVerifyRequestIdentity::principal` and the per-principal key use
+    /// (the authenticated user identity alone, NOT the composite
+    /// `user@session` carried on `CaptureCallerAuth`). The successor path
+    /// compares the grant against the live authenticated principal, so the two
+    /// definitions must be identical or no reconciliation could ever match.
+    pub principal: String,
+    /// `WorkScope` owner value this grant was issued under.
+    pub scope_id: String,
+    /// Authority LINEAGE this grant was issued under. The epoch sequence is
+    /// ambient for the same reason it is ambient in
+    /// [`BackupVerifyRequestIdentity`]: a rotation observes the same authority
+    /// later and must not revoke a reconciliation.
+    pub authority_lineage_id: String,
+    /// The owner's clock at issuance.
+    pub issued_at_unix_ms: u64,
+    /// Earliest reconciliation this grant authorizes. Never equal to
+    /// [`Self::expires_at_unix_ms`], so every grant has a positive lifetime.
+    pub not_before_unix_ms: u64,
+    /// Exclusive end of the owner's authorization window.
+    pub expires_at_unix_ms: u64,
+    /// Set by the single consuming transaction and `None` on every row the
+    /// capture owner writes. Non-`None` means the one reconciliation this
+    /// grant authorized has already happened.
+    pub consumed_at_unix_ms: Option<u64>,
+}
+
+impl BackupVerifySuccessionGrant {
+    /// Validates one incoming or persisted succession grant row.
+    ///
+    /// Shape only, and deliberately not a decision: it proves the row is a
+    /// well-formed owner grant, never that the grant is still open for this
+    /// caller. The window, the lineage and the consumption marker are compared
+    /// by the successor path against live values, because only that path holds
+    /// them.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_digest(&self.grant_id, "backup_verify_succession_grant_id")?;
+        validate_text(&self.principal, "backup_verify_succession_grant_principal")?;
+        validate_text(&self.scope_id, "backup_verify_succession_grant_scope_id")?;
+        validate_text(
+            &self.authority_lineage_id,
+            "backup_verify_succession_grant_authority_lineage_id",
+        )?;
+        if self.not_before_unix_ms <= self.issued_at_unix_ms {
+            return Err(OrsError::InvalidField {
+                field: "backup_verify_succession_grant_not_before_unix_ms",
+                reason: "grant due time must be after the owner's issuance clock",
+            });
+        }
+        if self.expires_at_unix_ms <= self.not_before_unix_ms {
+            return Err(OrsError::InvalidField {
+                field: "backup_verify_succession_grant_expires_at_unix_ms",
+                reason: "grant expiry must be strictly after its due time",
+            });
+        }
+        // A consumption marker must fall INSIDE the grant's own window: not
+        // before it opens, and not at or after it expires. A marker outside the
+        // window would otherwise pass validation and make a spent grant look
+        // live, so both bounds are checked here rather than trusting the writer.
+        match self.consumed_at_unix_ms {
+            Some(consumed_at_unix_ms)
+                if consumed_at_unix_ms < self.not_before_unix_ms
+                    || consumed_at_unix_ms >= self.expires_at_unix_ms =>
+            {
+                return Err(OrsError::InvalidField {
+                    field: "backup_verify_succession_grant_consumed_at_unix_ms",
+                    reason: "grant consumption must fall inside its own authorization window",
+                });
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Returns whether this grant has already spent its one reconciliation.
+    #[must_use]
+    pub const fn is_consumed(&self) -> bool {
+        self.consumed_at_unix_ms.is_some()
+    }
+}
+
 /// Durable owner-backed result of one `backup.verify` operation (issue #2802,
 /// rescoped by #2883).
 ///
@@ -5606,6 +6688,30 @@ pub struct BackupVerificationResultRecord {
     /// recomputes it, so a row that cannot rebuild the answer it claims to hold
     /// fails closed instead of projecting one it never produced.
     pub reply_digest: String,
+    /// #2883 instruction 4: the OWNER-ISSUED succession grant a fresh session
+    /// must hold before it may reconcile THIS operation through
+    /// `successor_of`. `None` means the capture owner issued none, which is its
+    /// own answer and never a placeholder: on a build with no OS entropy seam
+    /// the grant is absent and every reconciliation is refused, which is the
+    /// fail-closed direction.
+    ///
+    /// The field holds the grant DATA, not a capability to read it: a 32-byte
+    /// OS-RNG `grant_id` the predecessor's `ok` reply never carried, the
+    /// principal and scope it is bound to, the authority lineage it was issued
+    /// under, the owner's own due window, and the consumption marker that makes
+    /// it one-shot. Because `grant_id` is owner-drawn and never projected, an
+    /// identical `(namespace, identity_digest)` pair plus an identical bundle
+    /// can no longer reconcile from any further session: there is no second
+    /// occurrence to compare against, so a replay cannot present the id and
+    /// cannot cause a fresh one to be minted.
+    ///
+    /// It is deliberately NOT part of `identity`, so it is in neither the
+    /// canonical request hash nor the durable key. That is what makes a grant
+    /// issuable and consumable on a row that is already committed under its own
+    /// identity: adding it to the preimage would make every consumption a
+    /// different operation identity and would move the key.
+    #[serde(default)]
+    pub succession_grant: Option<BackupVerifySuccessionGrant>,
 }
 
 impl BackupVerificationResultRecord {
@@ -5782,6 +6888,15 @@ impl BackupVerificationResultRecord {
         }
         if let Some(digest) = &self.validity_attestation_digest {
             validate_digest(digest, "backup_verification_validity_attestation_digest")?;
+        }
+        // #2883 instruction 4: the owner-issued succession grant is shape-checked
+        // on every load, exactly as the three owner-evidence references above
+        // are. It is a CLOSED owner spelling with a real clock window and a
+        // consumption marker, so a bit-rotted or hand-edited grant must fail the
+        // row closed rather than be handed to the successor path as an open
+        // authorization it is not.
+        if let Some(grant) = &self.succession_grant {
+            grant.validate()?;
         }
         validate_digest(&self.request_digest, "backup_verification_request_digest")?;
         validate_digest(&self.archive_sha256, "backup_verification_archive_sha256")?;
@@ -7757,6 +8872,12 @@ pub struct HostRequestRecord {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transport_channel_binding_sha256: Option<String>,
+    /// Exact authenticated Kernel request identity retained before a
+    /// Task Controller claim is exposed to the daemon. Legacy rows omit this
+    /// pair and remain unusable for task-free `BindScope` admission.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kernel_request_identity: Option<HostRequestKernelRequestIdentity>,
     pub operation_id: OperationIdentity,
     pub kind: HostRequestKind,
     pub request_id: OpaqueLabel,
@@ -7886,6 +9007,114 @@ pub struct HostRequestRecord {
     pub commit_order: u64,
 }
 
+/// Canonical authenticated Kernel request identity retained with a Host
+/// request row. This is owner metadata, never caller-supplied payload content.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRequestKernelRequestIdentity {
+    /// Canonical serialized `RequestIdentity` supplied by the authenticated
+    /// Kernel frame and preserved byte-for-byte for restart recovery.
+    pub canonical_json: String,
+    /// SHA-256 of the exact canonical bytes.
+    pub sha256: String,
+    /// Authenticated operating-system peer observed on the original `Host`
+    /// connection. This is retained alongside the semantic request identity
+    /// so a task-free setup claim can be resolved after process restart
+    /// without deriving a host identity from request payload fields.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authenticated_peer: Option<HostRequestKernelAuthenticatedPeer>,
+    /// SHA-256 of the canonical authenticated peer projection. Present
+    /// exactly when `authenticated_peer` is present.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authenticated_peer_sha256: Option<String>,
+}
+
+/// Bounded `Kernel` projection of the authenticated transport peer that
+/// presented one Host request. It contains no process handle or credential;
+/// it preserves the identity values that the platform adapter verified.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRequestKernelAuthenticatedPeer {
+    /// Original `Host` transport connection identifier.
+    pub connection_id: String,
+    /// Platform-observed process id for the authenticated peer.
+    pub process_id: u32,
+    /// Platform-observed user principal (for example the Windows SID).
+    pub user_identity: String,
+    /// Platform-observed operating-system session identity.
+    pub session_identity: String,
+    /// Monotonic transport-session generation observed by `Kernel`.
+    pub transport_session_epoch: u64,
+    /// SHA-256 of the transport launch nonce. The nonce itself is not retained
+    /// or exposed through the daemon claim.
+    pub launch_nonce_sha256: String,
+}
+
+impl HostRequestKernelAuthenticatedPeer {
+    /// Validates the retained, non-secret platform identity projection.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        for (value, field) in [
+            (&self.connection_id, "host_request_peer_connection_id"),
+            (&self.user_identity, "host_request_peer_user_identity"),
+            (&self.session_identity, "host_request_peer_session_identity"),
+        ] {
+            validate_text(value, field)?;
+        }
+        if self.process_id == 0 || self.transport_session_epoch == 0 {
+            return Err(OrsError::InvalidField {
+                field: "host_request_authenticated_peer",
+                reason: "process and transport session identities must be non-zero",
+            });
+        }
+        validate_digest(
+            &self.launch_nonce_sha256,
+            "host_request_peer_launch_nonce_sha256",
+        )
+    }
+}
+
+impl HostRequestKernelRequestIdentity {
+    /// Validates bounded canonical JSON bytes and their exact digest.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_digest(&self.sha256, "host_request_kernel_identity_sha256")?;
+        validate_bounded_canonical_json(
+            &self.canonical_json,
+            MAX_HOST_REQUEST_RESULT_RESPONSE_BYTES,
+            "host_request_kernel_identity_json",
+        )?;
+        if sha256_hex(self.canonical_json.as_bytes()) != self.sha256 {
+            return Err(OrsError::InvalidField {
+                field: "host_request_kernel_identity_sha256",
+                reason: "digest does not match exact canonical identity bytes",
+            });
+        }
+        match (&self.authenticated_peer, &self.authenticated_peer_sha256) {
+            (Some(peer), Some(peer_sha256)) => {
+                peer.validate()?;
+                validate_digest(peer_sha256, "host_request_peer_sha256")?;
+                let bytes = canonical_json_bytes(peer)
+                    .map_err(|error| OrsError::Encoding(error.to_string()))?;
+                if sha256_hex(&bytes) != *peer_sha256 {
+                    return Err(OrsError::InvalidField {
+                        field: "host_request_peer_sha256",
+                        reason: "digest does not match the exact peer projection",
+                    });
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_authenticated_peer",
+                    reason: "peer and digest must be present together",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 impl HostRequestRecord {
     /// Returns the durable key binding one operation to one exact request.
     pub fn record_key(&self) -> String {
@@ -7951,6 +9180,78 @@ impl HostRequestRecord {
         }
         validate_text(self.capability_ref.as_str(), "host_request_capability_ref")?;
         validate_digest(&self.fence_digest, "host_request_fence_digest")?;
+        if let Some(identity) = &self.kernel_request_identity {
+            identity.validate()?;
+            if identity
+                .authenticated_peer
+                .as_ref()
+                .is_some_and(|peer| peer.connection_id != self.connection_ref.as_str())
+            {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_authenticated_peer.connection_id",
+                    reason: "must match the retained Host connection",
+                });
+            }
+            let value: Value = serde_json::from_str(&identity.canonical_json).map_err(|_| {
+                OrsError::InvalidField {
+                    field: "host_request_kernel_identity_json",
+                    reason: "must decode as a JSON object",
+                }
+            })?;
+            let metadata = value
+                .get("request")
+                .and_then(|request| request.get("metadata"))
+                .ok_or(OrsError::InvalidField {
+                    field: "host_request_kernel_identity_json",
+                    reason: "must contain request metadata",
+                })?;
+            let request_id = metadata.get("request_id").and_then(Value::as_str).ok_or(
+                OrsError::InvalidField {
+                    field: "host_request_kernel_identity_json",
+                    reason: "must contain a request id",
+                },
+            )?;
+            let idempotency_key = value.get("idempotency_key").and_then(Value::as_str).ok_or(
+                OrsError::InvalidField {
+                    field: "host_request_kernel_identity_json",
+                    reason: "must contain an idempotency key",
+                },
+            )?;
+            let cancellation_id = value.get("cancellation_id").and_then(Value::as_str).ok_or(
+                OrsError::InvalidField {
+                    field: "host_request_kernel_identity_json",
+                    reason: "must contain a cancellation id",
+                },
+            )?;
+            let deadline = value
+                .get("deadline_unix_ms")
+                .and_then(Value::as_u64)
+                .ok_or(OrsError::InvalidField {
+                    field: "host_request_kernel_identity_json",
+                    reason: "must contain a positive deadline",
+                })?;
+            let state_fence = value
+                .get("request")
+                .and_then(|request| request.get("state_fence"))
+                .ok_or(OrsError::InvalidField {
+                    field: "host_request_kernel_identity_json",
+                    reason: "must contain the request state fence",
+                })?;
+            if request_id != self.request_id.as_str()
+                || idempotency_key != self.idempotency_key.as_str()
+                || cancellation_id != self.cancellation_id.as_str()
+                || deadline != self.deadline_unix_ms
+                || sha256_hex(
+                    &canonical_json_bytes(state_fence)
+                        .map_err(|error| OrsError::Encoding(error.to_string()))?,
+                ) != self.fence_digest
+            {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_kernel_identity_json",
+                    reason: "request identity does not match its admitted Host row",
+                });
+            }
+        }
         // `EpochId` is always validated; only generation retains a scalar check.
         if self.generation == 0 {
             return Err(OrsError::InvalidField {

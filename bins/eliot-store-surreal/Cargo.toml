@@ -22,6 +22,8 @@ path = "src/main.rs"
 # is not in this root's `forbidden_exact` list.
 eliot-backup = { path = "../../crates/storage/eliot-backup", version = "0.1.0" }
 eliot-blob.workspace = true
+eliot-blob-api.workspace = true
+eliot-process.workspace = true
 eliot-contracts.workspace = true
 eliot-kernel-service.workspace = true
 eliot-ipc.workspace = true

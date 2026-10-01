@@ -41,42 +41,57 @@ use blake3::Hasher;
 pub use eliot_blob_api::{
     BlobCapacityCause, BlobCapacityCleanup, BlobCapacityEffect, BlobCapacityEvidence,
     BlobCapacityFailure, BlobCapacityIdentity, BlobCapacityRecovery, BlobCapacityStage, BlobError,
-    BlobPublicationFence, BlobPublicationObligation, PublishState,
+    BlobProcessStreamReadbackRequest, BlobProcessStreamSourceBinding, BlobPublicationFence,
+    BlobPublicationObligation, BlobStageRecovery, BlobStageRecoveryRequest, PublishState,
 };
 pub mod backup_io;
+pub mod compression_port;
 pub use backup_io::{
     BACKUP_MAX_PLAINTEXT_BYTES, CaptureOutcome, CapturePorts, ConsumerEvidencePack, ExportedPage,
     PageInterrupt, PlaintextFetch, RestoreBinding, SealedMember, SealedStage, bind_restore_set,
     complete_export, export_page, open_member, run_capture, seal_associated_data, seal_member,
     seal_nonce_context, verify_capture_record, verify_destination_scope,
 };
+pub use compression_port::{
+    RLE_COMPRESSION_ALGORITHM, RLE_COMPRESSION_VERSION, RleCompressionPort,
+};
 pub mod demand;
 pub mod key_ports;
+pub mod live_set;
+pub mod platform_port;
 pub mod publication_owner;
 pub mod stream_sink;
+pub mod stream_sink_factory;
 pub use demand::{
     ApprovedBlobView, BlobGenerationProbe, BlobProbeError, StoreBlobDemand,
     classify_capture_payload, garbage_collection_demand, probe_blob_generation,
     staged_recovery_demand,
 };
 use eliot_blob_api::{
-    BlobCasCapability, BlobCasDurability, BlobCasFailure, BlobCasOutcome, BlobCasReceipt,
-    BlobCasRequest, BlobCasState, BlobCasSuccessKind, BlobFuture, BlobGcReceipt, BlobGcRequest,
-    BlobHash, BlobHealth, BlobId, BlobIssuerTrustAnchor, BlobKeyOperation, BlobKeyRecoveryCeiling,
-    BlobLiveSetProof, BlobLocator, BlobPolicyBinding, BlobReachabilityRequest,
-    BlobReachabilityView, BlobReadChunk, BlobReadRequest, BlobReadyReceipt, BlobReceiptBinding,
-    BlobReceiptContext, BlobReferenceObservation, BlobReferenceRequest, BlobRootLease,
-    BlobStageRequest, BlobStoreClient, CompressionDescriptor, CryptoDescriptor, GcState,
-    SealedBlobRead, SignedBlobReceiptWire, VerifiedBlobReceipt, metadata_path, payload_path,
-    verify_receipt,
+    BlobCasCapability, BlobCasDurability, BlobCasFailure, BlobCasNamespace, BlobCasOutcome,
+    BlobCasReceipt, BlobCasRequest, BlobCasState, BlobCasSuccessKind, BlobFuture, BlobGcReceipt,
+    BlobGcRequest, BlobHash, BlobHealth, BlobId, BlobIssuerTrustAnchor, BlobKeyOperation,
+    BlobKeyRecoveryCeiling, BlobLiveSetProof, BlobLocator, BlobPolicyBinding,
+    BlobProcessStreamReadbackRequest, BlobProcessStreamSourceBinding,
+    BlobProcessStreamStageAppendReceipt, BlobProcessStreamStageAppendRequest,
+    BlobProcessStreamStageOpenRequest, BlobProcessStreamStageResumeRequest,
+    BlobProcessStreamStageSnapshot, BlobProcessStreamStageTerminal, BlobReachabilityRequest,
+    BlobReachabilityView, BlobReadChunk,
+    BlobReadRequest, BlobReadyReceipt, BlobReceiptBinding, BlobReceiptContext,
+    BlobReferenceObservation, BlobReferenceRequest, BlobRootLease, BlobStageRequest,
+    BlobStoreClient, CompressionDescriptor, CryptoDescriptor, GcState, SealedBlobRead,
+    SignedBlobReceiptWire, VerifiedBlobReceipt, metadata_path, payload_path, verify_receipt,
 };
-use eliot_platform::WorkScopePath;
+use eliot_platform::{PlatformHandle, WorkScopePath};
 use eliot_receipts::{
     ArtifactBinding, OperationId, ProofCeiling, Receipt, ReceiptCore, ReceiptDisposition,
     ReceiptKind, contract_identity,
 };
 pub use key_ports::{DpapiUserAeadPort, DpapiUserKeyPort, KEY_PORT_ALGORITHM, KEY_PORT_VERSION};
+pub use live_set::UnavailableBlobLiveSetPort;
+pub use platform_port::WindowsBlobPlatformPort;
 pub use publication_owner::{BlobArchivePublicationBinding, BlobArchivePublicationOwner};
+pub use stream_sink_factory::BlobStreamSinkFactory;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 pub use stream_sink::{
@@ -91,6 +106,8 @@ const MAX_BLOB_ENVELOPE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_BLOB_PLAINTEXT_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_METADATA_BYTES: u64 = 64 * 1024;
 const MAX_JOURNAL_BYTES: u64 = 64 * 1024;
+const PROCESS_STREAM_STAGE_DIR: &str = ".eliot-process-stream-stage-v1";
+const PROCESS_STREAM_STAGE_RECORD_MAX_BYTES: u64 = 64 * 1024;
 const SHARD_COUNT: usize = 64;
 const ROOT_LEASE_FILE: &str = ".eliot-root.lock";
 const ROOT_LEASE_VERSION: u32 = 1;
@@ -466,6 +483,36 @@ impl BlobRootOwner {
             .lock()
             .ok()
             .and_then(|failure| failure.clone())
+    }
+
+    /// Derives the service lease from this retained root owner and one
+    /// already-authenticated request binding. The request fence remains the
+    /// caller's authority evidence; this method contributes only the root,
+    /// owner, lease identity, and its generation. It does not mint request or
+    /// policy authority.
+    pub fn lease_for_request(
+        &self,
+        fence_binding: eliot_receipts::RequestBinding,
+    ) -> Result<BlobRootLease, BlobError> {
+        if let Some(error) = self.heartbeat_failure() {
+            return Err(error);
+        }
+        let root_id = PlatformHandle::new(self.root_id.clone())
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        let lease_id = BlobId::new(format!(
+            "owner-lease-{}",
+            sha256_hex(self.lease.token.as_bytes())
+        ))?;
+        let root_generation = fence_binding.state_fence.resource_generation.value();
+        let lease = BlobRootLease {
+            root_id,
+            owner_id: self.owner_id.clone(),
+            lease_id,
+            root_generation,
+            fence_binding,
+        };
+        lease.validate()?;
+        Ok(lease)
     }
 }
 
@@ -1408,7 +1455,8 @@ pub trait BlobPlatformPort: Send + Sync {
 /// Provider evidence for one conditional journal operation. The service binds
 /// this physical result to the authority-issued request and receipt before it
 /// exposes success to its caller.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlobCasProviderResult {
     pub operation_id: String,
     pub request_commitment_sha256: String,
@@ -1676,6 +1724,125 @@ impl StoredMetadata {
             self.crypto.clone(),
             self.policy.clone(),
         )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StageIntent {
+    request: BlobStageRecoveryRequest,
+    revision: u64,
+    phase: StageIntentPhase,
+    /// Physical root object generation captured by the current pinned CAS
+    /// backend when the original intent was reserved.
+    root_backend_generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessStreamStageSessionRecord {
+    version: u32,
+    session: BlobProcessStreamStageOpenRequest,
+    session_key_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessStreamStageTerminalRecord {
+    version: u32,
+    session_key_sha256: String,
+    terminal: BlobProcessStreamStageTerminal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum ProcessStreamAppendPhase {
+    Pending,
+    Committed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessStreamAppendRecord {
+    version: u32,
+    session_key_sha256: String,
+    sequence: u64,
+    offset: u64,
+    byte_length: u64,
+    chunk_sha256: String,
+    request_commitment_sha256: String,
+    crypto: CryptoDescriptor,
+    ciphertext_sha256: Option<String>,
+    phase: ProcessStreamAppendPhase,
+}
+
+impl ProcessStreamAppendRecord {
+    fn validate(&self) -> Result<(), BlobError> {
+        validate_sha256(&self.session_key_sha256, "stream.session_key_sha256")?;
+        validate_sha256(&self.chunk_sha256, "stream.chunk_sha256")?;
+        validate_sha256(
+            &self.request_commitment_sha256,
+            "stream.request_commitment_sha256",
+        )?;
+        self.crypto.validate()?;
+        if self.version != 1 || self.byte_length > MAX_BLOB_PLAINTEXT_BYTES {
+            return Err(BlobError::IntegrityMismatch);
+        }
+        if let Some(ciphertext_sha256) = &self.ciphertext_sha256 {
+            validate_sha256(ciphertext_sha256, "stream.ciphertext_sha256")?;
+        }
+        if self.phase == ProcessStreamAppendPhase::Committed
+            && self.ciphertext_sha256.is_none()
+        {
+            return Err(BlobError::IntegrityMismatch);
+        }
+        Ok(())
+    }
+
+    fn receipt(&self, session_id: &str) -> Result<BlobProcessStreamStageAppendReceipt, BlobError> {
+        if self.phase != ProcessStreamAppendPhase::Committed {
+            return Err(BlobError::UnknownStreamAppendOutcome {
+                session_id: session_id.to_owned(),
+                sequence: self.sequence,
+                request_commitment_sha256: self.request_commitment_sha256.clone(),
+            });
+        }
+        let receipt = BlobProcessStreamStageAppendReceipt {
+            session_key_sha256: self.session_key_sha256.clone(),
+            request_commitment_sha256: self.request_commitment_sha256.clone(),
+            sequence: self.sequence,
+            offset: self.offset,
+            byte_length: self.byte_length,
+            chunk_sha256: self.chunk_sha256.clone(),
+            next_sequence: self.sequence.saturating_add(1),
+            next_offset: self.offset.saturating_add(self.byte_length),
+        };
+        Ok(receipt)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum StageIntentPhase {
+    Reserved,
+    Dispatched,
+}
+
+impl StageIntent {
+    fn validate(&self) -> Result<(), BlobError> {
+        self.request.validate()?;
+        if self.root_backend_generation == 0 {
+            return Err(BlobError::StaleFence);
+        }
+        let revision_is_valid = match self.phase {
+            StageIntentPhase::Reserved => self.revision.is_multiple_of(2),
+            StageIntentPhase::Dispatched => !self.revision.is_multiple_of(2),
+        };
+        if revision_is_valid {
+            Ok(())
+        } else {
+            Err(BlobError::MetadataPayloadMismatch)
+        }
     }
 }
 
@@ -2849,16 +3016,41 @@ where
             || lease.owner_id != self.owner.lease.owner_id
             || lease.lease_id != self.owner.lease.lease_id
             || lease.root_generation != self.owner.lease.root_generation
-            || lease.fence_binding.state_fence != self.owner.lease.fence_binding.state_fence
         {
             return Err(BlobError::StaleFence);
         }
-        let observed = self.platform_read()?.inspect_root(lease)?;
-        observed.validate(lease)?;
+        // The service owner lease pins physical root generation and exclusive
+        // ownership. Per-operation leases may carry newer task/session fence
+        // components for that same root generation; their request contexts
+        // are separately checked by `validate_context` at each operation.
+        self.ensure_current_owner()
+    }
+
+    /// Validate the current retained physical root claim independently from
+    /// any operation lease. This is used only after recovery has matched a
+    /// persisted owner record; it never authorizes a fresh effect by itself.
+    fn ensure_current_owner(&self) -> Result<(), BlobError> {
+        self.owner.lease.validate()?;
+        let observed = self.platform_read()?.inspect_root(&self.owner.lease)?;
+        observed.validate(&self.owner.lease)?;
         if observed != self.owner.claim {
             return Err(BlobError::OwnerConflict);
         }
         Ok(())
+    }
+
+    /// Restart readback may use an original lease only when it came from the
+    /// durable owner intent. Keep its full generation and fence binding exact,
+    /// and independently require the currently pinned exclusive root claim.
+    fn ensure_recovery_lease(&self, lease: &BlobRootLease) -> Result<(), BlobError> {
+        lease.validate()?;
+        if lease.root_id != self.owner.lease.root_id
+            || lease.owner_id != self.owner.lease.owner_id
+            || lease.root_generation != self.owner.lease.root_generation
+        {
+            return Err(BlobError::StaleFence);
+        }
+        self.ensure_current_owner()
     }
 
     fn contained(&self, path: &WorkScopePath) -> Result<(), BlobError> {
@@ -2869,6 +3061,696 @@ where
         }
         self.platform_read()?
             .prove_contained(&self.owner.lease, path)
+    }
+
+    fn process_stream_stage_path(
+        session_key_sha256: &str,
+        suffix: &str,
+    ) -> Result<WorkScopePath, BlobError> {
+        validate_sha256(session_key_sha256, "stream.session_key_sha256")?;
+        if suffix.is_empty()
+            || !suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'.')
+        {
+            return Err(BlobError::InvalidContract(
+                "process stream stage suffix is not a closed owner name".to_owned(),
+            ));
+        }
+        WorkScopePath::new(format!(
+            "transactions/{PROCESS_STREAM_STAGE_DIR}-{session_key_sha256}.{suffix}"
+        ))
+        .map_err(|error| BlobError::InvalidContract(error.to_string()))
+    }
+
+    fn process_stream_stage_record<T: for<'de> Deserialize<'de> + Serialize>(
+        &self,
+        path: &WorkScopePath,
+    ) -> Result<Option<T>, BlobError> {
+        self.contained(path)?;
+        match self.platform_stat(path)? {
+            BlobPathState::Missing => Ok(None),
+            BlobPathState::File { length, .. }
+                if length <= PROCESS_STREAM_STAGE_RECORD_MAX_BYTES =>
+            {
+                let bytes = self.read_bounded_file(path, PROCESS_STREAM_STAGE_RECORD_MAX_BYTES)?;
+                let value: T = serde_json::from_slice(&bytes)
+                    .map_err(|_| BlobError::MetadataPayloadMismatch)?;
+                let canonical = serde_json::to_vec(&value)
+                    .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+                if canonical != bytes {
+                    return Err(BlobError::IdempotencyConflict);
+                }
+                Ok(Some(value))
+            }
+            BlobPathState::File { .. }
+            | BlobPathState::Directory
+            | BlobPathState::ReparsePoint
+            | BlobPathState::Other => Err(BlobError::MetadataPayloadMismatch),
+        }
+    }
+
+    fn process_stream_stage_write_new<T: Serialize>(
+        &self,
+        path: &WorkScopePath,
+        value: &T,
+    ) -> Result<(), BlobError> {
+        let bytes = serde_json::to_vec(value)
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        if bytes.len() as u64 > PROCESS_STREAM_STAGE_RECORD_MAX_BYTES {
+            return Err(BlobError::InvalidContract(
+                "process stream stage owner record exceeds its contract ceiling".to_owned(),
+            ));
+        }
+        self.contained(path)?;
+        self.platform_write_new(path, &bytes)
+    }
+
+    fn process_stream_stage_replace<T: Serialize>(
+        &self,
+        path: &WorkScopePath,
+        value: &T,
+    ) -> Result<(), BlobError> {
+        let bytes = serde_json::to_vec(value)
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        if bytes.len() as u64 > PROCESS_STREAM_STAGE_RECORD_MAX_BYTES {
+            return Err(BlobError::InvalidContract(
+                "process stream stage owner record exceeds its contract ceiling".to_owned(),
+            ));
+        }
+        self.contained(path)?;
+        self.platform_replace(path, &bytes)
+    }
+
+    fn process_stream_stage_aad(
+        session_key_sha256: &str,
+        sequence: u64,
+        request_commitment_sha256: &str,
+    ) -> Result<Vec<u8>, BlobError> {
+        validate_sha256(session_key_sha256, "stream.session_key_sha256")?;
+        validate_sha256(request_commitment_sha256, "stream.request_commitment_sha256")?;
+        serde_json::to_vec(&(
+            "eliot-blob-process-stream-stage-v1",
+            session_key_sha256,
+            sequence,
+            request_commitment_sha256,
+        ))
+        .map_err(|error| BlobError::InvalidContract(error.to_string()))
+    }
+
+    fn process_stream_stage_snapshot_locked(
+        &self,
+        session: BlobProcessStreamStageOpenRequest,
+    ) -> Result<BlobProcessStreamStageSnapshot, BlobError> {
+        session.validate()?;
+        self.ensure_recovery_lease(&session.root_lease)?;
+        let session_key = session.session_key_sha256()?;
+        let mut bytes = Vec::new();
+        let mut append_receipts = Vec::new();
+        for sequence in 0..session.max_chunks {
+            let record_path = Self::process_stream_stage_path(
+                &session_key,
+                &format!("append-{sequence:020}"),
+            )?;
+            let Some(record) = self.process_stream_stage_record::<ProcessStreamAppendRecord>(
+                &record_path,
+            )? else {
+                // A later sequence behind a hole is corruption, not a shorter
+                // successful prefix.
+                for later in sequence.saturating_add(1)..session.max_chunks {
+                    let later_path = Self::process_stream_stage_path(
+                        &session_key,
+                        &format!("append-{later:020}"),
+                    )?;
+                    if self.platform_stat(&later_path)? != BlobPathState::Missing {
+                        return Err(BlobError::IntegrityMismatch);
+                    }
+                }
+                break;
+            };
+            record.validate()?;
+            if record.session_key_sha256 != session_key || record.sequence != sequence {
+                return Err(BlobError::IdempotencyConflict);
+            }
+            if record.phase == ProcessStreamAppendPhase::Pending {
+                return Err(BlobError::UnknownStreamAppendOutcome {
+                    session_id: session.session_id.clone(),
+                    sequence,
+                    request_commitment_sha256: record.request_commitment_sha256,
+                });
+            }
+            let ciphertext_path = Self::process_stream_stage_path(
+                &session_key,
+                &format!("chunk-{sequence:020}"),
+            )?;
+            let ciphertext = match self.read_bounded_file(
+                &ciphertext_path,
+                session.max_chunk_bytes.saturating_add(4096),
+            ) {
+                Ok(ciphertext) => ciphertext,
+                Err(BlobError::NotFound) => {
+                    return Err(BlobError::UnknownStreamAppendOutcome {
+                        session_id: session.session_id.clone(),
+                        sequence,
+                        request_commitment_sha256: record.request_commitment_sha256,
+                    });
+                }
+                Err(error) => return Err(error),
+            };
+            let ciphertext_sha256 = sha256_hex(&ciphertext);
+            if record.ciphertext_sha256.as_deref() != Some(ciphertext_sha256.as_str()) {
+                return Err(BlobError::IntegrityMismatch);
+            }
+            let key = self.keys_resolve(&record.crypto)?;
+            if key.crypto != record.crypto {
+                return Err(BlobError::IntegrityMismatch);
+            }
+            let aad = Self::process_stream_stage_aad(
+                &session_key,
+                sequence,
+                &record.request_commitment_sha256,
+            )?;
+            let nonce_context = aad.clone();
+            let plaintext = self.aead_open(AeadOpenRequest {
+                key: &key,
+                nonce_context: &nonce_context,
+                associated_data: &aad,
+                ciphertext: &ciphertext,
+            })?;
+            if plaintext.len() as u64 != record.byte_length
+                || sha256_hex(&plaintext) != record.chunk_sha256
+                || record.offset != bytes.len() as u64
+            {
+                return Err(BlobError::IntegrityMismatch);
+            }
+            let receipt = record.receipt(&session.session_id)?;
+            receipt.validate_for(
+                &session,
+                &BlobProcessStreamStageAppendRequest {
+                    session_id: session.session_id.clone(),
+                    source_id: session.source_id.clone(),
+                    terminal_id: session.terminal_id.clone(),
+                    open_request_sha256: session.open_request_sha256.clone(),
+                    sequence,
+                    offset: record.offset,
+                    bytes: plaintext.clone(),
+                    chunk_sha256: record.chunk_sha256.clone(),
+                },
+            )?;
+            bytes.extend_from_slice(&plaintext);
+            append_receipts.push(receipt);
+        }
+        if bytes.len() as u64 > session.max_bytes {
+            return Err(BlobError::IntegrityMismatch);
+        }
+        let terminal = self
+            .process_stream_stage_record::<ProcessStreamStageTerminalRecord>(
+                &Self::process_stream_stage_path(&session_key, "terminal")?,
+            )?
+            .map(|record| {
+                if record.version != 1 || record.session_key_sha256 != session_key {
+                    return Err(BlobError::IdempotencyConflict);
+                }
+                record.terminal.validate()?;
+                Self::validate_process_stream_terminal_for_session(&session, &record.terminal)?;
+                let parsed: eliot_process::ProcessStreamSinkTerminal =
+                    serde_json::from_str(&record.terminal.terminal_json)
+                        .map_err(|_| BlobError::MetadataPayloadMismatch)?;
+                if parsed.final_sequence() != append_receipts.len() as u64
+                    || parsed.final_offset() != bytes.len() as u64
+                    || parsed.admitted_sha256() != sha256_hex(&bytes)
+                {
+                    return Err(BlobError::MetadataPayloadMismatch);
+                }
+                Ok(record.terminal)
+            })
+            .transpose()?;
+        let snapshot = BlobProcessStreamStageSnapshot {
+            session,
+            next_sequence: append_receipts.len() as u64,
+            next_offset: bytes.len() as u64,
+            sha256: sha256_hex(&bytes),
+            append_receipts,
+            bytes,
+            terminal,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    fn validate_process_stream_terminal_for_session(
+        session: &BlobProcessStreamStageOpenRequest,
+        terminal: &BlobProcessStreamStageTerminal,
+    ) -> Result<(), BlobError> {
+        let parsed: eliot_process::ProcessStreamSinkTerminal =
+            serde_json::from_str(&terminal.terminal_json)
+                .map_err(|_| BlobError::InvalidContract("invalid process terminal".to_owned()))?;
+        parsed
+            .validate()
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        let expected_binding: eliot_process::ProcessExecutionBinding =
+            serde_json::from_str(&session.process_source_binding.process_binding_json)
+                .map_err(|_| BlobError::MetadataPayloadMismatch)?;
+        let expected_policy: eliot_process::ProcessStreamPolicyBinding =
+            serde_json::from_str(&session.process_source_binding.policy_json)
+                .map_err(|_| BlobError::MetadataPayloadMismatch)?;
+        let expected_stream = match session.process_source_binding.stream_kind.as_str() {
+            "STDOUT" => eliot_process::ProcessStreamKind::Stdout,
+            "STDERR" => eliot_process::ProcessStreamKind::Stderr,
+            _ => return Err(BlobError::MetadataPayloadMismatch),
+        };
+        if parsed.session_id().as_str() != session.session_id
+            || parsed.source_id().as_str() != session.source_id
+            || parsed.terminal_id().as_str() != session.terminal_id
+            || parsed.open_request_sha256() != session.open_request_sha256
+            || parsed.evidence().binding() != &expected_binding
+            || parsed.evidence().policy() != &expected_policy
+            || parsed.evidence().stream() != expected_stream
+        {
+            return Err(BlobError::IdempotencyConflict);
+        }
+        match (
+            &terminal.ready_receipt,
+            parsed.evidence().source(),
+            parsed.state(),
+        ) {
+            (Some(ready), Some(source), eliot_process::ProcessStreamSinkState::CompleteSource) => {
+                if ready.root_generation() != session.root_lease.root_generation
+                    || ready.receipt().identity.receipt_id.as_str() != source.ready_receipt_ref()
+                    || ready.plaintext_sha256() != source.sha256()
+                    || ready.plaintext_length() != source.byte_length()
+                    || source.locator() != format!("blob:{}", ready.locator().hash)
+                {
+                    return Err(BlobError::MetadataPayloadMismatch);
+                }
+            }
+            (None, None, state) if state != eliot_process::ProcessStreamSinkState::CompleteSource => {}
+            _ => return Err(BlobError::MetadataPayloadMismatch),
+        }
+        Ok(())
+    }
+
+    fn is_same_stage_session_after_root_reclaim(
+        persisted: &BlobProcessStreamStageOpenRequest,
+        presented: &BlobProcessStreamStageOpenRequest,
+    ) -> bool {
+        if persisted.root_lease.root_id != presented.root_lease.root_id
+            || persisted.root_lease.owner_id != presented.root_lease.owner_id
+            || persisted.root_lease.root_generation != presented.root_lease.root_generation
+        {
+            return false;
+        }
+        // The OS owner lease ID changes when the Store process reclaims the
+        // same physical root after restart. Every semantic stream/open field,
+        // including both receipt contexts and the admitted root generation,
+        // remains exact; only the lease token is rebound to the current
+        // exclusive root claim.
+        let mut rebound = presented.clone();
+        rebound.root_lease = persisted.root_lease.clone();
+        rebound == *persisted
+    }
+
+    fn open_process_stream_stage_sync(
+        &self,
+        session: BlobProcessStreamStageOpenRequest,
+    ) -> Result<BlobProcessStreamStageSnapshot, BlobError> {
+        session.validate()?;
+        self.ensure_lease(&session.root_lease)?;
+        let session_key = session.session_key_sha256()?;
+        let _guard = self.lock_shards(&[operation_shard(
+            &session.session_id,
+            &session.open_request_sha256,
+        )])?;
+        let path = Self::process_stream_stage_path(&session_key, "session")?;
+        let persisted_session = match self
+            .process_stream_stage_record::<ProcessStreamStageSessionRecord>(&path)?
+        {
+            Some(record) => {
+                if record.version != 1
+                    || record.session_key_sha256 != session_key
+                    || !Self::is_same_stage_session_after_root_reclaim(&record.session, &session)
+                {
+                    return Err(BlobError::IdempotencyConflict);
+                }
+                self.ensure_recovery_lease(&record.session.root_lease)?;
+                record.session
+            }
+            None => {
+                let record = ProcessStreamStageSessionRecord {
+                    version: 1,
+                    session: session.clone(),
+                    session_key_sha256: session_key,
+                };
+                match self.process_stream_stage_write_new(&path, &record) {
+                    Ok(()) => session,
+                    Err(BlobError::IdempotencyConflict) => {
+                        let observed = self
+                            .process_stream_stage_record::<ProcessStreamStageSessionRecord>(&path)?
+                            .ok_or(BlobError::ProviderUnavailable(
+                                "process stream open outcome remains unknown",
+                            ))?;
+                        if observed.version != 1
+                            || observed.session_key_sha256 != session_key
+                            || !Self::is_same_stage_session_after_root_reclaim(
+                                &observed.session,
+                                &session,
+                            )
+                        {
+                            return Err(BlobError::IdempotencyConflict);
+                        }
+                        self.ensure_recovery_lease(&observed.session.root_lease)?;
+                        observed.session
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        };
+        self.process_stream_stage_snapshot_locked(persisted_session)
+    }
+
+    fn append_process_stream_stage_sync(
+        &self,
+        request: BlobProcessStreamStageAppendRequest,
+    ) -> Result<BlobProcessStreamStageAppendReceipt, BlobError> {
+        request.validate()?;
+        let resume = BlobProcessStreamStageResumeRequest {
+            session_id: request.session_id.clone(),
+            source_id: request.source_id.clone(),
+            terminal_id: request.terminal_id.clone(),
+            open_request_sha256: request.open_request_sha256.clone(),
+        };
+        let _guard = self.lock_shards(&[operation_shard(
+            &request.session_id,
+            &request.open_request_sha256,
+        )])?;
+        let session_path = Self::process_stream_stage_path(
+            &hex_sha256(
+                &serde_json::to_vec(&(
+                    &request.session_id,
+                    &request.source_id,
+                    &request.terminal_id,
+                    &request.open_request_sha256,
+                ))
+                .map_err(|error| BlobError::InvalidContract(error.to_string()))?,
+            ),
+            "session",
+        )?;
+        let session_record = self
+            .process_stream_stage_record::<ProcessStreamStageSessionRecord>(&session_path)?
+            .ok_or(BlobError::NotFound)?;
+        if session_record.session_key_sha256 != session_record.session.session_key_sha256()?
+            || session_record.session.session_id != resume.session_id
+            || session_record.session.source_id != resume.source_id
+            || session_record.session.terminal_id != resume.terminal_id
+            || session_record.session.open_request_sha256 != resume.open_request_sha256
+        {
+            return Err(BlobError::IdempotencyConflict);
+        }
+        let session = session_record.session;
+        session.validate()?;
+        self.ensure_recovery_lease(&session.root_lease)?;
+        if request.sequence >= session.max_chunks
+            || request.bytes.len() as u64 > session.max_chunk_bytes
+        {
+            return Err(BlobError::InvalidContract(
+                "process stream append exceeds its admitted sequence or chunk ceiling".to_owned(),
+            ));
+        }
+        let session_key = session.session_key_sha256()?;
+        let request_commitment_sha256 = request.request_commitment_sha256()?;
+        let record_path = Self::process_stream_stage_path(
+            &session_key,
+            &format!("append-{:020}", request.sequence),
+        )?;
+        let ciphertext_path = Self::process_stream_stage_path(
+            &session_key,
+            &format!("chunk-{:020}", request.sequence),
+        )?;
+        if let Some(existing) = self.process_stream_stage_record::<ProcessStreamAppendRecord>(
+            &record_path,
+        )? {
+            existing.validate()?;
+            if existing.session_key_sha256 != session_key
+                || existing.request_commitment_sha256 != request_commitment_sha256
+                || existing.sequence != request.sequence
+                || existing.offset != request.offset
+                || existing.byte_length != request.bytes.len() as u64
+                || existing.chunk_sha256 != request.chunk_sha256
+            {
+                return Err(BlobError::IdempotencyConflict);
+            }
+            if existing.phase == ProcessStreamAppendPhase::Committed {
+                return existing.receipt(&session.session_id);
+            }
+            let snapshot = self.process_stream_stage_snapshot_locked(session.clone());
+            if !matches!(snapshot, Err(BlobError::UnknownStreamAppendOutcome { sequence, .. }) if sequence == request.sequence)
+            {
+                return Err(BlobError::IntegrityMismatch);
+            }
+            return self.finish_process_stream_pending_append(
+                session,
+                request,
+                existing,
+                &record_path,
+                &ciphertext_path,
+                request_commitment_sha256,
+            );
+        }
+        let prefix = self.process_stream_stage_snapshot_locked(session.clone())?;
+        if request.sequence != prefix.next_sequence || request.offset != prefix.next_offset {
+            return Err(BlobError::InvalidContract(
+                "process stream append is not the exact next sequence and offset".to_owned(),
+            ));
+        }
+        let end = request
+            .offset
+            .checked_add(request.bytes.len() as u64)
+            .ok_or(BlobError::IntegrityMismatch)?;
+        if end > session.max_bytes {
+            return Err(BlobError::InvalidContract(
+                "process stream append exceeds its admitted byte ceiling".to_owned(),
+            ));
+        }
+        let key = self.keys_current()?;
+        key.crypto.validate()?;
+        let mut pending = ProcessStreamAppendRecord {
+            version: 1,
+            session_key_sha256: session_key.clone(),
+            sequence: request.sequence,
+            offset: request.offset,
+            byte_length: request.bytes.len() as u64,
+            chunk_sha256: request.chunk_sha256.clone(),
+            request_commitment_sha256: request_commitment_sha256.clone(),
+            crypto: key.crypto.clone(),
+            ciphertext_sha256: None,
+            phase: ProcessStreamAppendPhase::Pending,
+        };
+        // Select and persist the exact key lineage before the chunk effect.
+        self.process_stream_stage_write_new(&record_path, &pending)?;
+        let aad = Self::process_stream_stage_aad(
+            &session_key,
+            request.sequence,
+            &request_commitment_sha256,
+        )?;
+        let ciphertext = self.aead_seal(AeadSealRequest {
+            key: &key,
+            nonce_context: &aad,
+            associated_data: &aad,
+            plaintext: &request.bytes,
+        })?;
+        self.contained(&ciphertext_path)?;
+        match self.platform_write_new(&ciphertext_path, &ciphertext) {
+            Ok(()) => {}
+            Err(BlobError::IdempotencyConflict) => {
+                let observed = self.read_bounded_file(
+                    &ciphertext_path,
+                    session.max_chunk_bytes.saturating_add(4096),
+                )?;
+                if sha256_hex(&observed) != pending.ciphertext_sha256.as_deref().unwrap_or_default()
+                {
+                    return Err(BlobError::UnknownStreamAppendOutcome {
+                        session_id: session.session_id,
+                        sequence: request.sequence,
+                        request_commitment_sha256,
+                    });
+                }
+            }
+            Err(_) => {
+                return Err(BlobError::UnknownStreamAppendOutcome {
+                    session_id: session.session_id,
+                    sequence: request.sequence,
+                    request_commitment_sha256,
+                });
+            }
+        }
+        pending.phase = ProcessStreamAppendPhase::Committed;
+        self.process_stream_stage_replace(&record_path, &pending)?;
+        pending.receipt(&session.session_id)
+    }
+
+    fn finish_process_stream_pending_append(
+        &self,
+        session: BlobProcessStreamStageOpenRequest,
+        request: BlobProcessStreamStageAppendRequest,
+        mut pending: ProcessStreamAppendRecord,
+        record_path: &WorkScopePath,
+        ciphertext_path: &WorkScopePath,
+        request_commitment_sha256: String,
+    ) -> Result<BlobProcessStreamStageAppendReceipt, BlobError> {
+        let key = self.keys_resolve(&pending.crypto)?;
+        if key.crypto != pending.crypto {
+            return Err(BlobError::IntegrityMismatch);
+        }
+        let aad = Self::process_stream_stage_aad(
+            &pending.session_key_sha256,
+            pending.sequence,
+            &pending.request_commitment_sha256,
+        )?;
+        let ciphertext = match self.platform_stat(ciphertext_path)? {
+            BlobPathState::Missing => {
+                let ciphertext = self.aead_seal(AeadSealRequest {
+                    key: &key,
+                    nonce_context: &aad,
+                    associated_data: &aad,
+                    plaintext: &request.bytes,
+                })?;
+                self.platform_write_new(ciphertext_path, &ciphertext)?;
+                ciphertext
+            }
+            BlobPathState::File { .. } => self.read_bounded_file(
+                ciphertext_path,
+                session.max_chunk_bytes.saturating_add(4096),
+            )?,
+            _ => return Err(BlobError::MetadataPayloadMismatch),
+        };
+        if pending
+            .ciphertext_sha256
+            .as_deref()
+            .is_some_and(|expected| expected != sha256_hex(&ciphertext))
+        {
+            return Err(BlobError::UnknownStreamAppendOutcome {
+                session_id: session.session_id,
+                sequence: request.sequence,
+                request_commitment_sha256,
+            });
+        }
+        let plaintext = self.aead_open(AeadOpenRequest {
+            key: &key,
+            nonce_context: &aad,
+            associated_data: &aad,
+            ciphertext: &ciphertext,
+        })?;
+        if plaintext != request.bytes
+            || pending.offset != request.offset
+            || pending.byte_length != request.bytes.len() as u64
+            || pending.chunk_sha256 != request.chunk_sha256
+        {
+            return Err(BlobError::IdempotencyConflict);
+        }
+        pending.ciphertext_sha256 = Some(sha256_hex(&ciphertext));
+        pending.phase = ProcessStreamAppendPhase::Committed;
+        self.process_stream_stage_replace(record_path, &pending)?;
+        pending.receipt(&session.session_id)
+    }
+
+    fn resume_process_stream_stage_sync(
+        &self,
+        request: BlobProcessStreamStageResumeRequest,
+    ) -> Result<BlobProcessStreamStageSnapshot, BlobError> {
+        let session_key = hex_sha256(
+            &serde_json::to_vec(&(
+                &request.session_id,
+                &request.source_id,
+                &request.terminal_id,
+                &request.open_request_sha256,
+            ))
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?,
+        );
+        let path = Self::process_stream_stage_path(&session_key, "session")?;
+        let session = self
+            .process_stream_stage_record::<ProcessStreamStageSessionRecord>(&path)?
+            .ok_or(BlobError::NotFound)?;
+        if session.session_key_sha256 != session_key
+            || session.session.session_id != request.session_id
+            || session.session.source_id != request.source_id
+            || session.session.terminal_id != request.terminal_id
+            || session.session.open_request_sha256 != request.open_request_sha256
+        {
+            return Err(BlobError::IdempotencyConflict);
+        }
+        let _guard = self.lock_shards(&[operation_shard(
+            &request.session_id,
+            &request.open_request_sha256,
+        )])?;
+        self.process_stream_stage_snapshot_locked(session.session)
+    }
+
+    fn record_process_stream_stage_terminal_sync(
+        &self,
+        request: BlobProcessStreamStageResumeRequest,
+        terminal: BlobProcessStreamStageTerminal,
+    ) -> Result<(), BlobError> {
+        terminal.validate()?;
+        let session_key = hex_sha256(
+            &serde_json::to_vec(&(
+                &request.session_id,
+                &request.source_id,
+                &request.terminal_id,
+                &request.open_request_sha256,
+            ))
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?,
+        );
+        let _guard = self.lock_shards(&[operation_shard(
+            &request.session_id,
+            &request.open_request_sha256,
+        )])?;
+        let session_path = Self::process_stream_stage_path(&session_key, "session")?;
+        let session = self
+            .process_stream_stage_record::<ProcessStreamStageSessionRecord>(&session_path)?
+            .ok_or(BlobError::NotFound)?;
+        if session.version != 1
+            || session.session_key_sha256 != session_key
+            || session.session.session_id != request.session_id
+            || session.session.source_id != request.source_id
+            || session.session.terminal_id != request.terminal_id
+            || session.session.open_request_sha256 != request.open_request_sha256
+        {
+            return Err(BlobError::IdempotencyConflict);
+        }
+        self.ensure_recovery_lease(&session.session.root_lease)?;
+        Self::validate_process_stream_terminal_for_session(&session.session, &terminal)?;
+        let staged = self.process_stream_stage_snapshot_locked(session.session.clone())?;
+        let parsed: eliot_process::ProcessStreamSinkTerminal =
+            serde_json::from_str(&terminal.terminal_json)
+                .map_err(|_| BlobError::MetadataPayloadMismatch)?;
+        if parsed.final_sequence() != staged.next_sequence
+            || parsed.final_offset() != staged.next_offset
+            || parsed.admitted_sha256() != staged.sha256
+        {
+            return Err(BlobError::MetadataPayloadMismatch);
+        }
+        let record = ProcessStreamStageTerminalRecord {
+            version: 1,
+            session_key_sha256: session_key.clone(),
+            terminal,
+        };
+        let path = Self::process_stream_stage_path(&session_key, "terminal")?;
+        match self.process_stream_stage_write_new(&path, &record) {
+            Ok(()) => Ok(()),
+            Err(BlobError::IdempotencyConflict) => {
+                let existing = self
+                    .process_stream_stage_record::<ProcessStreamStageTerminalRecord>(&path)?
+                    .ok_or(BlobError::ProviderUnavailable(
+                        "process stream terminal outcome remains unknown",
+                    ))?;
+                if existing == record {
+                    Ok(())
+                } else {
+                    Err(BlobError::IdempotencyConflict)
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn read_bounded_file(
@@ -4208,6 +5090,22 @@ where
     ) -> Result<(BlobReadyReceipt, Vec<u8>, Vec<u8>), BlobError> {
         request.validate()?;
         self.ensure_lease(&request.root_lease)?;
+        self.read_verified_inner(request)
+    }
+
+    fn read_verified_recovery(
+        &self,
+        request: &BlobReadRequest,
+    ) -> Result<(BlobReadyReceipt, Vec<u8>, Vec<u8>), BlobError> {
+        request.validate()?;
+        self.ensure_recovery_lease(&request.root_lease)?;
+        self.read_verified_inner(request)
+    }
+
+    fn read_verified_inner(
+        &self,
+        request: &BlobReadRequest,
+    ) -> Result<(BlobReadyReceipt, Vec<u8>, Vec<u8>), BlobError> {
         // The request names a locator but no residency scope; the caller
         // proves the intended scope with the exact metadata digest it holds.
         // Resolution is byte-exact across every stored scope — never a
@@ -4300,6 +5198,435 @@ where
         );
         let _guards = self.lock_shards(&[content_idx, op_idx])?;
         self.stage_locked(request, hash)
+    }
+
+    fn stage_intent_path(request: &BlobStageRecoveryRequest) -> Result<WorkScopePath, BlobError> {
+        WorkScopePath::new(format!(
+            "transactions/process-source-{}.intent",
+            request.process_source_intent_key()?
+        ))
+        .map_err(|error| BlobError::InvalidContract(error.to_string()))
+    }
+
+    fn read_stage_intent(
+        &self,
+        request: &BlobStageRecoveryRequest,
+    ) -> Result<Option<(StageIntent, Vec<u8>)>, BlobError> {
+        let path = Self::stage_intent_path(request)?;
+        let Some((intent, bytes)) = self.read_stage_intent_at(&path)? else {
+            return Ok(None);
+        };
+        if intent.request != *request {
+            return Err(BlobError::IdempotencyConflict);
+        }
+        Ok(Some((intent, bytes)))
+    }
+
+    fn read_stage_intent_at(
+        &self,
+        path: &WorkScopePath,
+    ) -> Result<Option<(StageIntent, Vec<u8>)>, BlobError> {
+        self.contained(path)?;
+        match self.platform_stat(path)? {
+            BlobPathState::Missing => Ok(None),
+            BlobPathState::File { length, .. } if length <= MAX_JOURNAL_BYTES => {
+                let bytes = self.read_bounded_file(path, MAX_JOURNAL_BYTES)?;
+                let intent: StageIntent = serde_json::from_slice(&bytes)
+                    .map_err(|_| BlobError::MetadataPayloadMismatch)?;
+                intent.validate()?;
+                if intent.root_backend_generation != self.platform_backend_generation()? {
+                    return Err(BlobError::StaleFence);
+                }
+                let canonical = serde_json::to_vec(&intent)
+                    .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+                if canonical != bytes {
+                    return Err(BlobError::IdempotencyConflict);
+                }
+                Ok(Some((intent, bytes)))
+            }
+            BlobPathState::File { .. }
+            | BlobPathState::Directory
+            | BlobPathState::ReparsePoint
+            | BlobPathState::Other => Err(BlobError::MetadataPayloadMismatch),
+        }
+    }
+
+    fn stage_intent_cas(
+        &self,
+        request: &BlobStageRecoveryRequest,
+        path: &WorkScopePath,
+        expected: BlobCasState,
+        intent: &StageIntent,
+    ) -> Result<(), BlobError> {
+        intent.validate()?;
+        let bytes = serde_json::to_vec(intent)
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        let generation = self.platform_backend_generation()?;
+        let identity_material = serde_json::to_vec(&(
+            "blob-stage-intent-cas-v1",
+            request,
+            path.normalized_identity(),
+            intent.revision,
+            intent.phase,
+        ))
+        .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        let identity = format!(
+            "blob-stage-intent-{}",
+            &sha256_hex(&identity_material)[..32]
+        );
+        let mut context = request.stage_context.clone();
+        context.operation.operation_id = OperationId::new(identity.clone())
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        context.operation.idempotency_key = identity;
+        context.operation.operation_kind = "blob-stage-intent-cas".to_owned();
+        let cas = BlobCasRequest::new(
+            context,
+            request.root_lease.clone(),
+            BlobCasNamespace::StageJournal,
+            path.clone(),
+            expected,
+            sha256_hex(&bytes),
+            bytes.len() as u64,
+            generation,
+            BlobCasDurability::Requested,
+        )?;
+        self.platform_compare_and_replace(&cas, &bytes)
+    }
+
+    fn reserve_stage_intent_locked(
+        &self,
+        request: &BlobStageRecoveryRequest,
+    ) -> Result<StageIntent, BlobError> {
+        if let Some((intent, _)) = self.read_stage_intent(request)? {
+            return Ok(intent);
+        }
+        let intent = StageIntent {
+            request: request.clone(),
+            revision: 0,
+            phase: StageIntentPhase::Reserved,
+            root_backend_generation: self.platform_backend_generation()?,
+        };
+        let path = Self::stage_intent_path(request)?;
+        match self.stage_intent_cas(request, &path, BlobCasState::Missing, &intent) {
+            Ok(()) => Ok(intent),
+            Err(error)
+                if matches!(
+                    &error,
+                    BlobError::CasFailure { failure }
+                        if matches!(failure.as_ref(), BlobCasFailure::ExpectedStateConflict { .. })
+                ) =>
+            {
+                self.read_stage_intent(request)?
+                    .map(|(intent, _)| intent)
+                    .ok_or(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn advance_stage_intent_locked(
+        &self,
+        request: &BlobStageRecoveryRequest,
+        current: &StageIntent,
+        phase: StageIntentPhase,
+    ) -> Result<StageIntent, BlobError> {
+        let path = Self::stage_intent_path(request)?;
+        let current_bytes = serde_json::to_vec(current)
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        let next = StageIntent {
+            request: request.clone(),
+            revision: current
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| BlobError::PlanGap("stage intent revision overflow".to_owned()))?,
+            phase,
+            root_backend_generation: current.root_backend_generation,
+        };
+        self.stage_intent_cas(
+            request,
+            &path,
+            BlobCasState::Digest(sha256_hex(&current_bytes)),
+            &next,
+        )?;
+        Ok(next)
+    }
+
+    fn recover_stage_locked(
+        &self,
+        request: &BlobStageRecoveryRequest,
+    ) -> Result<BlobStageRecovery, BlobError> {
+        self.recover_stage_locked_inner(request, false)
+    }
+
+    fn recover_stage_locked_readback(
+        &self,
+        request: &BlobStageRecoveryRequest,
+    ) -> Result<BlobStageRecovery, BlobError> {
+        self.recover_stage_locked_inner(request, true)
+    }
+
+    fn recover_stage_locked_inner(
+        &self,
+        request: &BlobStageRecoveryRequest,
+        recovery_read_only: bool,
+    ) -> Result<BlobStageRecovery, BlobError> {
+        let Some((intent, _)) = self.read_stage_intent(request)? else {
+            return Ok(BlobStageRecovery::Unknown);
+        };
+        let operation_id = request.stage_context.operation.operation_id.as_str();
+        let idempotency_key = request.stage_context.operation.idempotency_key.as_str();
+        let commit_path = Self::operation_path(&request.stage_context, "commit")?;
+        self.contained(&commit_path)?;
+        let mut commit_state = self.platform_stat(&commit_path)?;
+        if commit_state == BlobPathState::Missing {
+            let journal_path = Self::operation_path(&request.stage_context, "stage")?;
+            self.contained(&journal_path)?;
+            let journal_state = self.platform_stat(&journal_path)?;
+            if journal_state != BlobPathState::Missing {
+                if intent.phase != StageIntentPhase::Dispatched {
+                    return Ok(BlobStageRecovery::Unknown);
+                }
+                if let Err(error) = self.reconcile_stage_path(&journal_path) {
+                    if matches!(&error, BlobError::UnknownPublishOutcome { .. }) {
+                        return Ok(BlobStageRecovery::Unknown);
+                    }
+                    return Err(error);
+                }
+                commit_state = self.platform_stat(&commit_path)?;
+            }
+            if commit_state == BlobPathState::Missing {
+                return Ok(if intent.phase == StageIntentPhase::Reserved {
+                    BlobStageRecovery::NotStarted
+                } else {
+                    BlobStageRecovery::Unknown
+                });
+            }
+        } else if intent.phase != StageIntentPhase::Dispatched {
+            return Ok(BlobStageRecovery::Unknown);
+        }
+        let commit_bytes = self.read_bounded_file(&commit_path, MAX_JOURNAL_BYTES)?;
+        let commit = decode_commit(&commit_bytes)?;
+        if commit.operation_id != operation_id || commit.idempotency_key != idempotency_key {
+            return Err(BlobError::IdempotencyConflict);
+        }
+        if commit.locator.root_generation != request.root_lease.root_generation
+            || commit.locator.residency != request.residency
+            || commit.locator.hash != request.expected_content_hash
+        {
+            return Err(BlobError::IdempotencyConflict);
+        }
+
+        let scope = ResidencyScope {
+            digest: commit.residency_sha256.clone(),
+        };
+        let (stored, metadata_bytes) = self.load_metadata(&commit.locator, &scope)?;
+        if sha256_hex(&metadata_bytes) != commit.metadata_sha256
+            || stored.policy != request.policy
+            || stored.plaintext_sha256 != request.expected_plaintext_sha256
+            || stored.plaintext_length != request.expected_plaintext_length
+        {
+            return Err(BlobError::IdempotencyConflict);
+        }
+        let verified = self.verify_metadata_receipt(&stored)?;
+        let ready = stored.ready(
+            verified,
+            &self.issuer_anchor,
+            commit.metadata_sha256.clone(),
+        )?;
+        let receipt_id = ready.receipt().identity.receipt_id.to_string();
+        if request
+            .expected_ready_receipt_id
+            .as_ref()
+            .is_some_and(|expected| expected != &receipt_id)
+        {
+            return Err(BlobError::MetadataPayloadMismatch);
+        }
+        let read = BlobReadRequest {
+            context: request.read_context.clone(),
+            root_lease: request.root_lease.clone(),
+            locator: ready.locator().clone(),
+            expected_metadata_sha256: ready.metadata_sha256().to_owned(),
+            expected_ready_receipt_id: receipt_id,
+            max_bytes: ready.plaintext_length().max(1),
+        };
+        let (observed_ready, plaintext, _) = if recovery_read_only {
+            self.read_verified_recovery(&read)?
+        } else {
+            self.read_verified(&read)?
+        };
+        if observed_ready != ready
+            || plaintext.len() as u64 != request.expected_plaintext_length
+            || sha256_hex(&plaintext) != request.expected_plaintext_sha256
+        {
+            return Err(BlobError::IntegrityMismatch);
+        }
+        Ok(BlobStageRecovery::Ready(Box::new(ready)))
+    }
+
+    /// Read-only owner reconciliation. Missing intent is unknown; it never
+    /// creates evidence that could authorize a retry.
+    fn recover_stage_sync(
+        &self,
+        request: BlobStageRecoveryRequest,
+    ) -> Result<BlobStageRecovery, BlobError> {
+        request.validate()?;
+        self.ensure_lease(&request.root_lease)?;
+        let operation_id = request.stage_context.operation.operation_id.as_str();
+        let idempotency_key = request.stage_context.operation.idempotency_key.as_str();
+        let _operation_guard =
+            self.lock_shards(&[operation_shard(operation_id, idempotency_key)])?;
+        self.recover_stage_locked(&request)
+    }
+
+    /// Resolves process source identity only from the durable owner intent,
+    /// then reads through the exact lease/read context retained there. No
+    /// caller-supplied Blob path, receipt context, or lease is accepted.
+    fn read_process_stream_source_sync(
+        &self,
+        request: BlobProcessStreamReadbackRequest,
+        current_read: BlobReadRequest,
+    ) -> Result<BlobReadChunk, BlobError> {
+        self.read_process_stream_source_authorized_context_sync(
+            request,
+            current_read.context,
+            current_read.root_lease,
+        )
+    }
+
+    /// Resolves all original object identity from the durable Blob owner
+    /// intent. Only the current read context and root lease come from the
+    /// present authority resolver; the original locator, metadata digest and
+    /// ready receipt are never accepted from the readback caller.
+    fn read_process_stream_source_authorized_context_sync(
+        &self,
+        request: BlobProcessStreamReadbackRequest,
+        current_context: BlobReceiptContext,
+        current_root_lease: BlobRootLease,
+    ) -> Result<BlobReadChunk, BlobError> {
+        request.validate()?;
+        current_context.validate_for(eliot_receipts::EffectClass::Read)?;
+        self.ensure_lease(&current_root_lease)?;
+        let path = WorkScopePath::new(format!(
+            "transactions/process-source-{}.intent",
+            request.process_source_intent_key()?
+        ))
+        .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        let Some((observed, _)) = self.read_stage_intent_at(&path)? else {
+            return Err(BlobError::NotFound);
+        };
+        let persisted_phase = observed.phase;
+        let recovery = observed.request;
+        if recovery.session_id != request.session_id
+            || recovery.terminal_id != request.terminal_id
+            || recovery.open_request_sha256 != request.open_request_sha256
+            || recovery.process_source_binding != request.process_source_binding
+            || recovery.expected_content_hash != request.expected_content_hash
+            || recovery.expected_plaintext_sha256 != request.expected_plaintext_sha256
+            || recovery.expected_plaintext_length != request.expected_plaintext_length
+        {
+            return Err(BlobError::IdempotencyConflict);
+        }
+        self.ensure_recovery_lease(&recovery.root_lease)?;
+        if persisted_phase != StageIntentPhase::Dispatched {
+            return Err(BlobError::NotFound);
+        }
+        let operation_id = recovery.stage_context.operation.operation_id.as_str();
+        let idempotency_key = recovery.stage_context.operation.idempotency_key.as_str();
+        let content_idx = content_shard(&request.expected_content_hash);
+        let operation_idx = operation_shard(operation_id, idempotency_key);
+        let _guards = self.lock_shards(&[content_idx, operation_idx])?;
+        let Some((current, _)) = self.read_stage_intent_at(&path)? else {
+            return Err(BlobError::NotFound);
+        };
+        if current.request != recovery {
+            return Err(BlobError::IdempotencyConflict);
+        }
+        if current.phase != StageIntentPhase::Dispatched {
+            return Err(BlobError::NotFound);
+        }
+        let commit_path = Self::operation_path(&recovery.stage_context, "commit")?;
+        self.contained(&commit_path)?;
+        if self.platform_stat(&commit_path)? == BlobPathState::Missing {
+            return Err(BlobError::ProviderUnavailable(
+                "process source has no durable commit record",
+            ));
+        }
+        let ready = match self.recover_stage_locked_readback(&recovery)? {
+            BlobStageRecovery::Ready(ready) => *ready,
+            BlobStageRecovery::NotStarted => return Err(BlobError::NotFound),
+            BlobStageRecovery::Unknown => {
+                return Err(BlobError::ProviderUnavailable(
+                    "process source publication outcome remains unknown",
+                ));
+            }
+        };
+        if ready.receipt().identity.receipt_id.as_str() != request.ready_receipt_id
+            || ready.locator().hash != request.expected_content_hash
+            || ready.plaintext_sha256() != request.expected_plaintext_sha256
+            || ready.plaintext_length() != request.expected_plaintext_length
+        {
+            return Err(BlobError::MetadataPayloadMismatch);
+        }
+        drop(_guards);
+        self.read_sync(&BlobReadRequest {
+            context: current_context,
+            root_lease: current_root_lease,
+            locator: ready.locator().clone(),
+            expected_metadata_sha256: ready.metadata_sha256().to_owned(),
+            expected_ready_receipt_id: request.ready_receipt_id,
+            max_bytes: request.max_bytes.max(1),
+        })
+    }
+
+    fn stage_with_recovery_sync(
+        &self,
+        stage: BlobStageRequest,
+        recovery: BlobStageRecoveryRequest,
+    ) -> Result<BlobReadyReceipt, BlobError> {
+        stage.validate()?;
+        recovery.validate()?;
+        if stage.context != recovery.stage_context
+            || stage.root_lease != recovery.root_lease
+            || stage.policy != recovery.policy
+            || stage.residency != recovery.residency
+            || BlobHash::new(blake3::hash(&stage.bytes).to_hex().to_string())?
+                != recovery.expected_content_hash
+            || stage.bytes.len() as u64 != recovery.expected_plaintext_length
+            || sha256_hex(&stage.bytes) != recovery.expected_plaintext_sha256
+        {
+            return Err(BlobError::IdempotencyConflict);
+        }
+        self.ensure_lease(&recovery.root_lease)?;
+        let hash = BlobHash::new(blake3::hash(&stage.bytes).to_hex().to_string())?;
+        let operation_id = recovery.stage_context.operation.operation_id.as_str();
+        let idempotency_key = recovery.stage_context.operation.idempotency_key.as_str();
+        let content_idx = content_shard(&hash);
+        let operation_idx = operation_shard(operation_id, idempotency_key);
+        let _guards = self.lock_shards(&[content_idx, operation_idx])?;
+
+        let mut intent = self.reserve_stage_intent_locked(&recovery)?;
+        match self.recover_stage_locked(&recovery)? {
+            BlobStageRecovery::Ready(ready) => return Ok(*ready),
+            BlobStageRecovery::NotStarted => {}
+            BlobStageRecovery::Unknown => {
+                return Err(BlobError::ProviderUnavailable(
+                    "same-operation Blob stage outcome remains unknown",
+                ));
+            }
+        }
+        if intent.phase != StageIntentPhase::Reserved {
+            return Err(BlobError::ProviderUnavailable(
+                "same-operation Blob stage is already dispatched",
+            ));
+        }
+        self.advance_stage_intent_locked(&recovery, &intent, StageIntentPhase::Dispatched)?;
+        // Once Dispatched is durable, even a typed error from a later layer
+        // cannot prove that no filesystem effect happened: an error may be
+        // reported after the platform accepted a write. Keep the intent
+        // Dispatched and let exact-operation recovery inspect the durable
+        // transaction evidence. This can conservatively retain Unknown, but
+        // never converts an ambiguous result into permission to replay.
+        self.stage_locked(stage, hash)
     }
 
     fn read_sync(&self, request: &BlobReadRequest) -> Result<BlobReadChunk, BlobError> {
@@ -5056,6 +6383,16 @@ where
     pub fn reconcile(&self, lease: &BlobRootLease) -> Result<(), BlobError> {
         self.core.reconcile(lease)
     }
+
+    /// Recovers only an owner-committed stage matching the original operation
+    /// identity and expected byte commitment. `Unknown` never authorizes a
+    /// second stage request.
+    pub fn recover_stage(
+        &self,
+        request: BlobStageRecoveryRequest,
+    ) -> Result<BlobStageRecovery, BlobError> {
+        self.core.recover_stage_sync(request)
+    }
 }
 
 impl<P, C, K, A, L> BlobStoreClient for BlobStoreService<P, C, K, A, L>
@@ -5069,6 +6406,92 @@ where
     fn stage(&self, request: BlobStageRequest) -> BlobFuture<'_, BlobReadyReceipt> {
         let core = Arc::clone(&self.core);
         Box::pin(async move { core.stage_sync(request) })
+    }
+
+    fn open_process_stream_stage(
+        &self,
+        request: BlobProcessStreamStageOpenRequest,
+    ) -> BlobFuture<'_, BlobProcessStreamStageSnapshot> {
+        let core = Arc::clone(&self.core);
+        Box::pin(async move { core.open_process_stream_stage_sync(request) })
+    }
+
+    fn append_process_stream_stage(
+        &self,
+        request: BlobProcessStreamStageAppendRequest,
+    ) -> BlobFuture<'_, BlobProcessStreamStageAppendReceipt> {
+        let core = Arc::clone(&self.core);
+        Box::pin(async move { core.append_process_stream_stage_sync(request) })
+    }
+
+    fn resume_process_stream_stage(
+        &self,
+        request: BlobProcessStreamStageResumeRequest,
+    ) -> BlobFuture<'_, BlobProcessStreamStageSnapshot> {
+        let core = Arc::clone(&self.core);
+        Box::pin(async move { core.resume_process_stream_stage_sync(request) })
+    }
+
+    fn record_process_stream_stage_terminal(
+        &self,
+        session: BlobProcessStreamStageResumeRequest,
+        terminal: BlobProcessStreamStageTerminal,
+    ) -> BlobFuture<'_, ()> {
+        let core = Arc::clone(&self.core);
+        Box::pin(async move { core.record_process_stream_stage_terminal_sync(session, terminal) })
+    }
+
+    fn recover_stage(
+        &self,
+        request: BlobStageRecoveryRequest,
+    ) -> BlobFuture<'_, BlobStageRecovery> {
+        let core = Arc::clone(&self.core);
+        Box::pin(async move { core.recover_stage_sync(request) })
+    }
+
+    fn read_process_stream_source(
+        &self,
+        _request: BlobProcessStreamReadbackRequest,
+    ) -> BlobFuture<'_, BlobReadChunk> {
+        Box::pin(async {
+            Err(BlobError::PlanGap(
+                "process-source recovery requires a separate current read authority".to_owned(),
+            ))
+        })
+    }
+
+    fn read_process_stream_source_authorized(
+        &self,
+        request: BlobProcessStreamReadbackRequest,
+        current_read: BlobReadRequest,
+    ) -> BlobFuture<'_, BlobReadChunk> {
+        let core = Arc::clone(&self.core);
+        Box::pin(async move { core.read_process_stream_source_sync(request, current_read) })
+    }
+
+    fn read_process_stream_source_authorized_context(
+        &self,
+        request: BlobProcessStreamReadbackRequest,
+        current_context: BlobReceiptContext,
+        current_root_lease: BlobRootLease,
+    ) -> BlobFuture<'_, BlobReadChunk> {
+        let core = Arc::clone(&self.core);
+        Box::pin(async move {
+            core.read_process_stream_source_authorized_context_sync(
+                request,
+                current_context,
+                current_root_lease,
+            )
+        })
+    }
+
+    fn stage_with_recovery(
+        &self,
+        request: BlobStageRequest,
+        recovery: BlobStageRecoveryRequest,
+    ) -> BlobFuture<'_, BlobReadyReceipt> {
+        let core = Arc::clone(&self.core);
+        Box::pin(async move { core.stage_with_recovery_sync(request, recovery) })
     }
 
     fn read(&self, request: BlobReadRequest) -> BlobFuture<'_, BlobReadChunk> {

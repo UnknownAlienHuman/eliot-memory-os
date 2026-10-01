@@ -1250,6 +1250,41 @@ impl ProcessRequest {
         )
     }
 
+    /// Projects the exact Kernel-issued permit and immutable intent into the
+    /// expected execution binding before launch.
+    ///
+    /// This is an evidence projection only: it does not consume the permit,
+    /// validate current Kernel authority, or grant permission to execute. The
+    /// projection is refused when the admitted permit lacks the validation
+    /// revision that a consumed `ValidatedDispatch` would bind.
+    pub fn expected_execution_binding(&self) -> Result<ProcessExecutionBinding, ContractError> {
+        self.validate()?;
+        let validation_revision = self.permit.validation_revision.ok_or(
+            ContractError::InvalidValue {
+                field: "validation_revision",
+                reason: "expected execution binding requires an admitted validation revision",
+            },
+        )?;
+        let binding = ProcessExecutionBinding {
+            operation_id: self.intent.operation_id.clone(),
+            process_tree_id: self.intent.process_tree_id.clone(),
+            job_id: self.intent.job_id.clone(),
+            image_id: self.intent.image_id.clone(),
+            session_id: self.intent.session_id.clone(),
+            generation: self.intent.generation,
+            action_lease_ref: self.permit.action_lease_ref.clone(),
+            authority_id: self.permit.authority_id.clone(),
+            authority_epoch: self.permit.state_fence.authority_epoch.clone(),
+            state_fence: self.permit.state_fence.clone(),
+            request_digest: self.invocation_digest.clone(),
+            permit_digest: self.permit.permit_digest.clone(),
+            effect_digest: self.intent.effect_digest.clone(),
+            validation_revision,
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
     fn compute_digest(&self) -> Result<String, ContractError> {
         #[derive(Serialize)]
         struct UnsignedRequest<'a> {
@@ -1539,6 +1574,11 @@ impl ProcessExecutionBinding {
     /// Returns the session identity.
     pub const fn session_id(&self) -> &SessionId {
         &self.session_id
+    }
+
+    /// Returns the Kernel authority identity bound to this process execution.
+    pub const fn authority_id(&self) -> &DispatchAuthorityId {
+        &self.authority_id
     }
 
     /// Returns the authenticated state fence.
@@ -1904,6 +1944,23 @@ impl ExitStatus {
     /// Returns the physical disposition.
     pub const fn disposition(&self) -> ExitDisposition {
         self.disposition
+    }
+
+    /// Returns the observed root exit code only for a normal process exit.
+    /// Callers must retain the disposition alongside this value and may not
+    /// infer success from `Some(0)` without the relevant profile evaluator.
+    pub const fn code(&self) -> Option<i32> {
+        self.code
+    }
+
+    /// Returns the observed platform signal, when the root was signalled.
+    pub const fn signal(&self) -> Option<i32> {
+        self.signal
+    }
+
+    /// Returns the clock at which the root exit was observed.
+    pub const fn observed_at_unix_ms(&self) -> u64 {
+        self.observed_at_unix_ms
     }
 }
 

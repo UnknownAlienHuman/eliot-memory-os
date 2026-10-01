@@ -11,22 +11,27 @@ use super::restore_journal::{
     RESTORE_JOURNAL_INTENTS, RESTORE_JOURNAL_META, RESTORE_JOURNAL_RESULTS,
 };
 use super::{
-    ACTIVATION_LIFECYCLES, AUTHORITY_HANDOFFS, BRIDGE_EVENT_CURSORS, BRIDGE_EVENT_GAPS,
-    BRIDGE_EVENT_HANDOFFS, BRIDGE_EVENT_OWNER_MAINTENANCE_CURSORS, BRIDGE_EVENT_PROJECTIONS,
-    BRIDGE_EVENT_RECORDS, CAMPAIGN_SOURCE_PENDING, COLD_START_READINESS_BINDINGS,
-    COLD_START_READINESS_HEADS, COLD_START_READINESS_RECORDS, CUTOVER_OWNERSHIP, DOCTOR_ATTEMPTS,
-    DOCTOR_EFFECTS, DurableInboxRecord, DurableOperationalRecord, EFFECT_OPERATION_LEASES,
-    EFFECT_REPLAY_RECONCILIATIONS, HOST_REQUEST_LOGICAL_KEYS, HOST_REQUESTS, META,
-    NATIVE_WORKER_CLAIMS, OPERATIONAL_CURRENT, PROCESS_START_REPLAY, PROCESS_STREAM_RECOVERY,
-    RECOVERY_INBOX, RECOVERY_PROBLEMS, REPLAY_ACKS, REPLAY_EVENTS, RESERVATIONS,
-    RUNTIME_LEASE_CURRENT, RedbRecoveryStore, SCAN_DISCLOSURE_RECORDS, STORE_FAILURE_RETENTION,
-    STORE_REBIND_REPLAY, SUPERVISION_LEASE_CURRENT, SUPERVISION_LEASE_STAGED,
-    UNKNOWN_COMMIT_RECOVERY, decode, decode_named, read_store_object_identity, storage,
+    ACTIVATION_LIFECYCLES, AUTHORITY_HANDOFFS, BLOB_PROCESS_STREAM_CALLS,
+    BLOB_PROCESS_STREAM_GRANTS, BLOB_PROCESS_STREAM_OWNER_FACTS_PULLS, BRIDGE_EVENT_CURSORS,
+    BRIDGE_EVENT_GAPS, BRIDGE_EVENT_HANDOFFS, BRIDGE_EVENT_OWNER_MAINTENANCE_CURSORS,
+    BRIDGE_EVENT_PROJECTIONS, BRIDGE_EVENT_RECORDS, CAMPAIGN_SOURCE_PENDING,
+    COLD_START_READINESS_BINDINGS, COLD_START_READINESS_HEADS, COLD_START_READINESS_RECORDS,
+    CUTOVER_OWNERSHIP, DOCTOR_ATTEMPTS, DOCTOR_EFFECTS, DurableInboxRecord,
+    DurableOperationalRecord, EFFECT_OPERATION_LEASES, EFFECT_REPLAY_RECONCILIATIONS,
+    HOST_REQUEST_LOGICAL_KEYS, HOST_REQUESTS, META, NATIVE_WORKER_CLAIMS, OPERATIONAL_CURRENT,
+    PROCESS_START_REPLAY, PROCESS_STREAM_RECOVERY, RECOVERY_INBOX, RECOVERY_PROBLEMS, REPLAY_ACKS,
+    REPLAY_EVENTS, RESERVATIONS, RUNTIME_LEASE_CURRENT, RedbRecoveryStore, SCAN_DISCLOSURE_RECORDS,
+    STORE_FAILURE_RETENTION, STORE_REBIND_REPLAY, SUPERVISION_LEASE_CURRENT,
+    SUPERVISION_LEASE_STAGED, UNKNOWN_COMMIT_RECOVERY, decode, decode_named,
+    read_store_object_identity, storage,
 };
 use crate::model::{SupervisionLeaseSnapshot, SupervisionLeaseStageReceipt};
 use crate::{
-    AdmissionReservationState, HostRequestRecord, KernelReconciliationItem, OperationalPhase,
-    RecoveryInboxDisposition, RecoveryProblem, ReservationRecord, UnknownCommitRecord,
+    AdmissionReservationState, BlobProcessStreamCallRecord, BlobProcessStreamCallState,
+    BlobProcessStreamGrantRecord, BlobProcessStreamGrantState,
+    BlobProcessStreamOwnerFactsPullRecord, BlobProcessStreamOwnerFactsPullState, HostRequestRecord,
+    KernelReconciliationItem, OperationalPhase, RecoveryInboxDisposition, RecoveryProblem,
+    ReservationRecord, UnknownCommitRecord,
 };
 use eliot_contracts::StateFence;
 use eliot_runtime_contracts::RuntimeLease;
@@ -64,6 +69,12 @@ pub struct StoreStopObligationCounts {
     pub host_requests: u64,
     /// Process-stream records whose owning operation or coverage is unresolved.
     pub process_stream_recovery: u64,
+    /// Active Kernel capabilities for process-stream Blob operations.
+    pub blob_process_stream_grants: u64,
+    /// Process-stream Blob calls with an issued, reserved, dispatched, or unresolved outcome.
+    pub blob_process_stream_calls: u64,
+    /// Owner-facts pulls not yet answered by the authenticated daemon owner.
+    pub blob_process_stream_owner_facts_pulls: u64,
     /// Pending Store rebind operations without their committed owner receipt.
     pub store_rebinds: u64,
     /// Unknown-outcome Store failures without a reconciling receipt.
@@ -121,6 +132,9 @@ impl StoreStopObligationCounts {
             self.effect_reconciliations,
             self.host_requests,
             self.process_stream_recovery,
+            self.blob_process_stream_grants,
+            self.blob_process_stream_calls,
+            self.blob_process_stream_owner_facts_pulls,
             self.store_rebinds,
             self.unresolved_store_failures,
             self.prepared_scan_disclosures,
@@ -165,6 +179,9 @@ impl StoreStopObligationCounts {
             && self.effect_reconciliations == 0
             && self.host_requests == 0
             && self.process_stream_recovery == 0
+            && self.blob_process_stream_grants == 0
+            && self.blob_process_stream_calls == 0
+            && self.blob_process_stream_owner_facts_pulls == 0
             && self.store_rebinds == 0
             && self.unresolved_store_failures == 0
             && self.prepared_scan_disclosures == 0
@@ -328,6 +345,10 @@ pub(super) fn census_in_read(
     observe_host_request_logical_keys(read, &mut builder)?;
 
     observe_process_stream_recovery(read, &mut builder)?;
+
+    observe_blob_process_stream(read, &mut builder)?;
+
+    observe_blob_process_stream_owner_facts_pulls(read, &mut builder)?;
 
     observe_campaign_source_pending(read, &mut builder)?;
 
@@ -910,6 +931,98 @@ fn observe_process_stream_recovery(
         {
             builder.counts.process_stream_recovery =
                 increment(builder.counts.process_stream_recovery)?;
+        }
+    }
+    Ok(())
+}
+
+fn observe_blob_process_stream(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let grants = read
+        .open_table(BLOB_PROCESS_STREAM_GRANTS)
+        .map_err(storage)?;
+    for row in grants.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let grant: BlobProcessStreamGrantRecord = decode(value.value())?;
+        grant.validate()?;
+        if key.value() != grant.capability_ref {
+            return Err(integrity(
+                "blob_process_stream_grant",
+                "capability reference does not match its table key",
+            ));
+        }
+        builder.observe("blob_process_stream_grant", key.value(), value.value());
+        if grant.state == BlobProcessStreamGrantState::Active {
+            builder.counts.blob_process_stream_grants =
+                increment(builder.counts.blob_process_stream_grants)?;
+        }
+    }
+
+    let calls = read
+        .open_table(BLOB_PROCESS_STREAM_CALLS)
+        .map_err(storage)?;
+    for row in calls.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let call: BlobProcessStreamCallRecord = decode(value.value())?;
+        call.validate()?;
+        if key.value() != call.token_ref {
+            return Err(integrity(
+                "blob_process_stream_call",
+                "token reference does not match its table key",
+            ));
+        }
+        if grants
+            .get(call.capability_ref.as_str())
+            .map_err(storage)?
+            .is_none()
+        {
+            return Err(integrity(
+                "blob_process_stream_call",
+                "call references a missing capability grant",
+            ));
+        }
+        builder.observe("blob_process_stream_call", key.value(), value.value());
+        if matches!(
+            call.state,
+            BlobProcessStreamCallState::Issued
+                | BlobProcessStreamCallState::Reserved
+                | BlobProcessStreamCallState::Dispatched
+                | BlobProcessStreamCallState::Unknown
+        ) {
+            builder.counts.blob_process_stream_calls =
+                increment(builder.counts.blob_process_stream_calls)?;
+        }
+    }
+    Ok(())
+}
+
+fn observe_blob_process_stream_owner_facts_pulls(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let table = read
+        .open_table(BLOB_PROCESS_STREAM_OWNER_FACTS_PULLS)
+        .map_err(storage)?;
+    for row in table.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let pull: BlobProcessStreamOwnerFactsPullRecord = decode(value.value())?;
+        pull.validate()?;
+        if key.value() != pull.pull_ref {
+            return Err(integrity(
+                "blob_process_stream_owner_facts_pull",
+                "pull reference does not match its table key",
+            ));
+        }
+        builder.observe(
+            "blob_process_stream_owner_facts_pull",
+            key.value(),
+            value.value(),
+        );
+        if pull.state == BlobProcessStreamOwnerFactsPullState::Pending {
+            builder.counts.blob_process_stream_owner_facts_pulls =
+                increment(builder.counts.blob_process_stream_owner_facts_pulls)?;
         }
     }
     Ok(())

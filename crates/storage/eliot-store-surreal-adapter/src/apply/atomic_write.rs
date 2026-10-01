@@ -9,6 +9,10 @@
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
+use super::blob_process_source_admission::append_blob_process_source_admission;
+use super::recovery_owner_update::{
+    append_policy_owner_statement, append_work_scope_owner_statement,
+};
 use super::surreal_automation::{AutomationWrites, automation_write_statements};
 use super::surreal_experience::{ExperienceWrites, experience_write_statements};
 use super::surreal_instrument_registry::{
@@ -137,7 +141,7 @@ const ALLOCATION_CONFLICT_MARKERS: &[&str] = &[
 /// epistemic position, revision head, ordering head, or owner-row
 /// predecessor (notification, reactive, automation, experience, learning,
 /// finish/canonical/module-registry/capability-evidence owners, swarm,
-/// blackboard, task-contract acceptance).
+/// blackboard, mailbox, task-contract acceptance).
 ///
 /// Each of these proves the admitted operation's semantic input moved under
 /// it. The apply loop never retries them as allocation contention and never
@@ -161,6 +165,8 @@ const SEMANTIC_CONFLICT_MARKERS: &[&str] = &[
     "capability_evidence_create_conflict",
     "swarm_owner_revision_conflict",
     "blackboard_item_revision_conflict",
+    "mailbox_item_identity_conflict",
+    "mailbox_item_admission_conflict",
     "task_contract_acceptance_revision_conflict",
     "notification_revision_conflict",
     "reactive_session_conflict",
@@ -962,6 +968,7 @@ fn build_apply_statements(
     append_experience_statements(&mut sql, &mut bindings, experience)?;
     append_swarm_owner_revision_statements(&mut sql, &mut bindings, transition)?;
     append_blackboard_item_statements(&mut sql, &mut bindings, transition)?;
+    append_mailbox_item_statements(&mut sql, &mut bindings, transition)?;
     append_task_contract_acceptance_statements(&mut sql, &mut bindings, transition)?;
     // #1868 learning-record writes commit atomically beside the experience
     // rows under the same create-or-converge contract.
@@ -973,6 +980,9 @@ fn build_apply_statements(
     // rows under the same fenced compare-and-set contract.
     append_capability_evidence_owner_statements(&mut sql, &mut bindings, transition)?;
     append_module_registry_owner_statement(&mut sql, &mut bindings, transition)?;
+    append_work_scope_owner_statement(&mut sql, &mut bindings, transition)?;
+    append_policy_owner_statement(&mut sql, &mut bindings, transition)?;
+    append_blob_process_source_admission(&mut sql, &mut bindings, transition)?;
     append_finish_evidence_owner_statement(&mut sql, &mut bindings, transition)?;
     append_finish_owner_statement(&mut sql, &mut bindings, transition)?;
 
@@ -1566,6 +1576,26 @@ fn append_blackboard_item_statements(
         if bindings.insert(name.clone(), value).is_some() {
             return Err(AdapterError::Serialization(
                 "blackboard binding collided with a canonical binding".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Appends the named admitted message and stream-head CAS to this canonical
+/// transition, preserving immutable identity rows and candidate-only scope.
+fn append_mailbox_item_statements(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    transition: &eliot_store_api::PreparedTransition,
+) -> Result<(), AdapterError> {
+    let (fragment, fragment_bindings) =
+        crate::surreal_mailbox::mailbox_item_statements(transition)?;
+    sql.push_str(&fragment);
+    for (name, value) in fragment_bindings {
+        if bindings.insert(name.clone(), value).is_some() {
+            return Err(AdapterError::Serialization(
+                "mailbox binding collided with a canonical binding".to_owned(),
             ));
         }
     }

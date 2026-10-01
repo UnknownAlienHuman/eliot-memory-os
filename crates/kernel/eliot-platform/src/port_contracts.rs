@@ -77,6 +77,8 @@ pub enum ProviderErrorCode {
     PermissionDenied,
     InvalidRequest,
     Timeout,
+    /// Filesystem provider reported its native storage-full condition.
+    StorageFull,
     Failed,
 }
 

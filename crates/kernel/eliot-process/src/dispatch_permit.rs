@@ -63,6 +63,7 @@ impl KernelDispatchKey {
     /// consumed directly by the sibling authority instance. This is used by
     /// the Kernel origin authority, which shares the credential but uses a
     /// separate domain and replay ledger.
+    #[must_use]
     pub fn clone_for_sibling_authority(&self) -> Self {
         Self(self.0)
     }

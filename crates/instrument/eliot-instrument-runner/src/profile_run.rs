@@ -36,7 +36,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::admission_submission::submit_admission_snapshot;
-use crate::profile::{AdmissionError, AdmittedProfile, AdmittedStage, InstrumentRegistry};
+use crate::profile::{
+    AdmissionError, AdmittedProfile, AdmittedStage, InstrumentRegistry, ProfileCompiler,
+};
 use crate::registry::{
     RegistryEntry, RegistryError, ResolvedExecutableIdentity, SupplyChainReceipt,
 };
@@ -44,6 +46,11 @@ use crate::testd_port::{TestdAdmission, TestdAdmissionPort, TestdPortError, test
 use crate::{
     InstrumentBinding, InstrumentRequestPort, InstrumentRunner, InstrumentStartReceipt,
     RunnerError, bridge_executor_observation,
+};
+use eliot_module_registry::VerifiedModuleCatalogGeneration;
+use eliot_testd_core::{
+    InstrumentStageRequest, StageExecutionKind, TestdProviderCatalogLifecycle,
+    TestdProviderFingerprints, TestdProviderRegistryFreshness,
 };
 
 /// Failures raised while planning or recording profile runs.
@@ -212,11 +219,9 @@ impl TestExecutionPlaneRoute {
         self.external
     }
 
-    /// Whether live `testd` can dispatch this stage class today.
-    ///
-    /// Only [`InstrumentKind::Test`] dispatches; every other class resolves
-    /// through the registry but stays non-dispatchable via `testd`, reported
-    /// here instead of failing the whole plan.
+    /// Whether any retained ready adapter has a Testd stage lane for this
+    /// class. Exact adapter and process/decoder lane support is checked after
+    /// resolving the unique registry entry.
     pub fn dispatchable_via_testd(&self) -> bool {
         crate::testd_port::testd_dispatchable(self.kind)
     }
@@ -299,11 +304,80 @@ pub trait StageLauncher: Send + Sync {
     /// orchestrator records the stage as missing instead of failing the plan.
     fn invocation(&self, stage: &PlannedStage) -> Result<InstrumentInvocation, RunnerError>;
 
+    /// Returns the already freshness-resolved provider entry for one stage.
+    ///
+    /// Composition roots supply this exact entry so the runner can bind the
+    /// stage request to the selected adapter. The default fails closed when a
+    /// caller has not composed provider admission into its launch path.
+    fn provider_entry(&self, _stage: &PlannedStage) -> Result<&RegistryEntry, RunnerError> {
+        Err(RunnerError::Binding(
+            "no live provider entry was supplied for the planned stage".to_owned(),
+        ))
+    }
+
+    /// Binds the admitted typed stage to its existing sealed process request.
+    ///
+    /// The default consumer accepts only a stage admission carrying the same
+    /// invocation and then delegates to the existing adapter request port.
+    /// It does not create or modify process authority.
+    fn bind_admitted_stage(
+        &self,
+        stage: &PlannedStage,
+        invocation: &InstrumentInvocation,
+        admission: &TestdAdmission,
+    ) -> Result<ProcessRequest, RunnerError> {
+        match admission.stage.as_ref() {
+            Some(request)
+                if request.invocation == *invocation
+                    && request.execution == StageExecutionKind::Process =>
+            {
+                self.port(stage).bind(invocation)
+            }
+            _ => Err(RunnerError::Binding(
+                "Testd stage admission is not a process request for this invocation".to_owned(),
+            )),
+        }
+    }
+
+    /// Consumes a decoder-only stage against its exact stored input artifacts.
+    ///
+    /// Implementations may decode only the immutable artifact handles carried
+    /// by the accepted request. The default refuses because this composition
+    /// has no in-process decoder or artifact readback port.
+    fn decode_admitted_stage(
+        &self,
+        _stage: &PlannedStage,
+        admission: &TestdAdmission,
+    ) -> Result<InstrumentRun, RunnerError> {
+        let Some(request) = admission.stage.as_ref() else {
+            return Err(RunnerError::Binding(
+                "decoder admission has no typed stage request".to_owned(),
+            ));
+        };
+        if request.execution != StageExecutionKind::DecoderOnly
+            || request.invocation.input_artifacts.is_empty()
+        {
+            return Err(RunnerError::Binding(
+                "decoder admission lacks exact stored artifact lineage".to_owned(),
+            ));
+        }
+        Err(RunnerError::Binding(
+            "no in-process decoder consumer is bound".to_owned(),
+        ))
+    }
+
     /// Returns the admitted request port for one planned stage.
     fn port(&self, stage: &PlannedStage) -> &dyn InstrumentRequestPort;
 
     /// Returns the governed evidence sink for one planned stage.
     fn sink(&self, stage: &PlannedStage) -> Arc<dyn ProcessEvidenceSink>;
+
+    /// Current accepted Module Catalog lifecycle that issued the provider
+    /// registry used for this launch. Implementations without owner readback
+    /// provenance return `None`, which fails closed before process launch.
+    fn provider_catalog_lifecycle(&self) -> Option<&VerifiedModuleCatalogGeneration> {
+        None
+    }
 }
 
 /// Raw evidence state carried by one [`InstrumentRun`].
@@ -1261,7 +1335,55 @@ impl StageOrchestrator {
         if let Some(reason) = Self::invocation_skew_reason(route, &planned.stage, &invocation) {
             return InstrumentRun::missing(route, reason);
         }
-        let process_request = match launcher.port(planned).bind(&invocation) {
+        let entry = match launcher.provider_entry(planned) {
+            Ok(entry) => entry,
+            Err(error) => {
+                return InstrumentRun::missing(route, format!("stage admission refused: {error}"));
+            }
+        };
+        let lifecycle = match launcher.provider_catalog_lifecycle() {
+            Some(lifecycle) => lifecycle,
+            None => {
+                return InstrumentRun::missing(
+                    route,
+                    "stage admission refused: selected provider registry has no accepted Module Catalog owner readback",
+                );
+            }
+        };
+        let stage_request = match stage_request(plan, planned, &invocation, entry, lifecycle) {
+            Ok(request) => request,
+            Err(error) => {
+                return InstrumentRun::missing(route, format!("stage admission refused: {error}"));
+            }
+        };
+        let admission = match TestdPlaneAdmission.admit_stage(&stage_request, entry) {
+            Ok(admission) => admission,
+            Err(error) => {
+                return InstrumentRun::missing(route, format!("stage admission refused: {error}"));
+            }
+        };
+        if stage_request.execution == StageExecutionKind::DecoderOnly {
+            return match launcher.decode_admitted_stage(planned, &admission) {
+                Ok(run)
+                    if run.stage.profile == route.stage().profile
+                        && run.stage.profile_revision == route.stage().profile_revision
+                        && run.stage.stage_id == route.stage().stage_id
+                        && run.executable_digest.is_none()
+                        && run.grant_digest.is_none() =>
+                {
+                    run
+                }
+                Ok(_) => InstrumentRun::missing(
+                    route,
+                    "decoder result does not retain the admitted artifact stage identity",
+                ),
+                Err(error) => InstrumentRun::missing(
+                    route,
+                    format!("decoder stage admission refused: {error}"),
+                ),
+            };
+        }
+        let process_request = match launcher.bind_admitted_stage(planned, &invocation, &admission) {
             Ok(request) => request,
             Err(error) => {
                 return InstrumentRun::missing(route, format!("stage admission refused: {error}"));
@@ -1348,6 +1470,132 @@ impl StageOrchestrator {
     }
 }
 
+/// Copies an admitted plan, stage, invocation, and selected entry into the
+/// consumer-owned closed request without recomputing any identities.
+///
+/// # Errors
+///
+/// Returns a typed stage-binding failure if the planned and selected records
+/// disagree before the request reaches Testd.
+pub fn stage_request(
+    plan: &StagePlan,
+    planned: &PlannedStage,
+    invocation: &InstrumentInvocation,
+    entry: &RegistryEntry,
+    lifecycle: &VerifiedModuleCatalogGeneration,
+) -> Result<InstrumentStageRequest, TestdPortError> {
+    let stage = &planned.stage;
+    let route = planned.route.stage();
+    let testd_executor_profile = eliot_testd_core::is_testd_executor_profile(&plan.profile);
+    if testd_executor_profile {
+        let current_registry =
+            crate::profile_replay::testd_builtin_profile_registry().map_err(|_| {
+                TestdPortError::StageBinding {
+                    detail: "current Testd builtin profile registry could not be assembled",
+                }
+            })?;
+        if plan.registry_generation != current_registry.generation()
+            || plan.registry_digest != current_registry.digest()
+        {
+            return Err(TestdPortError::StageBinding {
+                detail: "stage plan does not match the independently owned current Testd registry",
+            });
+        }
+        let current_profile = ProfileCompiler::new(&current_registry)
+            .compile_exact(&plan.profile, plan.revision)
+            .map_err(|_| TestdPortError::StageBinding {
+                detail: "stage plan profile is not admitted by the current Testd registry",
+            })?;
+        let current_stage = current_profile
+            .stages
+            .iter()
+            .find(|candidate| candidate.stage_id == stage.stage_id);
+        if plan.profile_digest != current_profile.profile_digest
+            || plan.dag_digest != current_profile.dag_digest
+            || current_stage != Some(stage)
+        {
+            return Err(TestdPortError::StageBinding {
+                detail: "planned stage does not match the current admitted profile and DAG",
+            });
+        }
+    }
+    if plan.profile != route.profile
+        || plan.revision != route.profile_revision
+        || stage.profile != route.profile
+        || stage.profile_revision != route.profile_revision
+        || stage.stage_id != route.stage_id
+        || invocation.profile != route.profile
+        || invocation.instrument.as_str() != stage.spec.as_str()
+        || invocation.kind != stage.kind
+        || invocation.arguments != stage.argument_template
+        || entry.instrument.as_str() != stage.spec.as_str()
+        || !entry.supports(stage.kind)
+        || lifecycle.provider_registry_generation() != entry.generation
+        || lifecycle.state_fence() != &invocation.request.state_fence
+    {
+        return Err(TestdPortError::StageBinding {
+            detail: "planned stage, invocation, and selected entry identities disagree",
+        });
+    }
+    Ok(InstrumentStageRequest {
+        invocation: invocation.clone(),
+        profile_name: plan.profile.clone(),
+        profile_revision: plan.revision,
+        profile_digest: plan.profile_digest.clone(),
+        dag_digest: plan.dag_digest.clone(),
+        registry_generation: plan.registry_generation,
+        registry_digest: plan.registry_digest.clone(),
+        provider_freshness: Some(TestdProviderRegistryFreshness {
+            generation: entry.generation,
+            normative_pair_digest: entry.normative_pair_digest.clone(),
+            fingerprints: TestdProviderFingerprints {
+                source: entry.invalidation.source.clone(),
+                lock: entry.invalidation.lock.clone(),
+                toolchain: entry.invalidation.toolchain.clone(),
+                env: entry.invalidation.env.clone(),
+                exe: entry.invalidation.exe.clone(),
+                profile: entry.invalidation.profile.clone(),
+                parser: entry.invalidation.parser.clone(),
+            },
+        }),
+        provider_catalog_lifecycle: Some(TestdProviderCatalogLifecycle {
+            owner_revision: lifecycle.owner_revision(),
+            catalog_revision: lifecycle.catalog_revision(),
+            catalog_digest: lifecycle.catalog_digest().to_owned(),
+            state_fence: lifecycle.state_fence().clone(),
+            module_id: lifecycle.module_id().to_string(),
+            generation_id: lifecycle.generation_id().to_string(),
+            artifact_digest: lifecycle.artifact_digest().to_owned(),
+            config_digest: lifecycle.config_digest().to_owned(),
+            protocol_digest: lifecycle.protocol_digest().to_owned(),
+            manifest_digest: lifecycle.manifest_digest().to_owned(),
+            admission_receipt: lifecycle.admission_receipt().to_owned(),
+        }),
+        stage_id: stage.stage_id.clone(),
+        spec: stage.spec.clone(),
+        spec_revision: stage.spec_revision,
+        spec_digest: stage.spec_digest.clone(),
+        kind: stage.kind,
+        parser: stage.parser.clone(),
+        parser_generation: stage.parser_generation,
+        evaluator: entry.evaluator.clone(),
+        adapter: entry.adapter.clone(),
+        adapter_version: entry.adapter_version,
+        execution: if entry.executable.is_decoder_only() {
+            StageExecutionKind::DecoderOnly
+        } else {
+            StageExecutionKind::Process
+        },
+        stage_command: (testd_executor_profile && !entry.executable.is_decoder_only()).then(|| {
+            eliot_testd_core::InstrumentStageCommand {
+                executable: stage.command.executable.clone(),
+                argv: stage.command.argv.clone(),
+                spec_digest: stage.spec_digest.clone(),
+            }
+        }),
+    })
+}
+
 impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
     /// Runs one admitted profile end to end: plan, launch, aggregate.
     ///
@@ -1377,6 +1625,7 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
 /// command or a silently skipped stage.
 pub struct MappedStageLauncher<'p> {
     invocations: BTreeMap<String, InstrumentInvocation>,
+    provider_entries: BTreeMap<String, RegistryEntry>,
     port: &'p dyn InstrumentRequestPort,
     sink: Arc<dyn ProcessEvidenceSink>,
 }
@@ -1390,9 +1639,24 @@ impl<'p> MappedStageLauncher<'p> {
     ) -> Self {
         Self {
             invocations,
+            provider_entries: BTreeMap::new(),
             port,
             sink,
         }
+    }
+
+    /// Binds the exact current provider entry to each durable stage identity.
+    ///
+    /// Entries must already have passed the composition root's freshness and
+    /// platform resolution; the runner rechecks their stage identity before
+    /// any process request is bound.
+    #[must_use]
+    pub fn with_provider_entries(
+        mut self,
+        provider_entries: BTreeMap<String, RegistryEntry>,
+    ) -> Self {
+        self.provider_entries = provider_entries;
+        self
     }
 }
 
@@ -1408,6 +1672,15 @@ impl StageLauncher for MappedStageLauncher<'_> {
         self.port
     }
 
+    fn provider_entry(&self, stage: &PlannedStage) -> Result<&RegistryEntry, RunnerError> {
+        let stage_id = stage.route.stage().stage_id.as_str();
+        self.provider_entries.get(stage_id).ok_or_else(|| {
+            RunnerError::Binding(format!(
+                "no current provider entry is bound to stage '{stage_id}'"
+            ))
+        })
+    }
+
     fn sink(&self, _stage: &PlannedStage) -> Arc<dyn ProcessEvidenceSink> {
         Arc::clone(&self.sink)
     }
@@ -1415,16 +1688,15 @@ impl StageLauncher for MappedStageLauncher<'_> {
 
 /// Production [`TestdAdmissionPort`] behind the test execution plane (I10.8.15).
 ///
-/// External build/test stages resolve through the provider registry first;
-/// this admission records which of them live `eliot-testd` can dispatch
-/// today. Only [`InstrumentKind::Test`] dispatches: every other class keeps
-/// its registry resolution and is reported as the typed
-/// [`TestdPortError::UnsupportedByTestd`] refusal instead of failing the plan.
+/// External stages resolve through the provider registry first; this admission
+/// binds the exact typed stage request to the selected adapter. Only documented
+/// ready adapter/kind/execution tuples dispatch. Lint stays unsupported, while
+/// SCIP Inspect uses a decoder-only lane with no process executable.
 pub struct TestdPlaneAdmission;
 
 impl TestdPlaneAdmission {
-    /// Admits one admitted `(instrument, kind)` pair behind the test execution
-    /// plane without an invocation.
+    /// Admits one admitted `(instrument, kind)` pair against the ready adapter
+    /// surface without fabricating an invocation.
     ///
     /// This is the exact [`TestdAdmissionPort::admit`] decision over the
     /// admitted stage identity instead of a full provider-neutral invocation,
@@ -1434,7 +1706,7 @@ impl TestdPlaneAdmission {
     /// never fabricate invocation authority material such as a State Fence,
     /// session, or lease. The receipt still binds the registry-selected
     /// adapter and generation; only the invocation clone is absent, and no
-    /// governed claim may rest on that absence.
+    /// execution claim may rest on that absence.
     pub fn admit_parts(
         instrument: &eliot_contracts::ContractId,
         kind: InstrumentKind,
@@ -1452,10 +1724,79 @@ impl TestdPlaneAdmission {
                 kind,
             }));
         }
-        if !testd_dispatchable(kind) {
+        if !testd_dispatchable(kind)
+            || !crate::testd_port::adapter_stage_dispatchable(
+                &entry.adapter,
+                kind,
+                if entry.executable.is_decoder_only() {
+                    StageExecutionKind::DecoderOnly
+                } else {
+                    StageExecutionKind::Process
+                },
+            )
+        {
             return Err(TestdPortError::UnsupportedByTestd { kind });
         }
         Ok((entry.adapter.clone(), entry.generation))
+    }
+
+    /// Admits a typed stage request against the single selected registry entry.
+    ///
+    /// The comparison copies the durable profile/stage/parser/adapter
+    /// identities from their existing owners; this method computes no new
+    /// identity and grants no process authority.
+    pub fn admit_stage_parts(
+        request: &InstrumentStageRequest,
+        entry: &RegistryEntry,
+    ) -> Result<TestdAdmission, TestdPortError> {
+        request
+            .validate()
+            .map_err(|_| TestdPortError::StageBinding {
+                detail: "request shape is invalid",
+            })?;
+        entry.verify_profile_identities()?;
+        if request.invocation.instrument.as_str() != request.spec.as_str()
+            || request.invocation.kind != request.kind
+            || request.invocation.profile != request.profile_name
+        {
+            return Err(TestdPortError::StageBinding {
+                detail: "invocation differs from the admitted stage identity",
+            });
+        }
+        if request.spec.as_str() != entry.instrument.as_str()
+            || !entry.supports(request.kind)
+            || request.adapter != entry.adapter
+            || request.adapter_version != entry.adapter_version
+            || request.evaluator != entry.evaluator
+        {
+            return Err(TestdPortError::StageBinding {
+                detail: "stage identity differs from the selected registry entry",
+            });
+        }
+        let entry_execution = if entry.executable.is_decoder_only() {
+            StageExecutionKind::DecoderOnly
+        } else {
+            StageExecutionKind::Process
+        };
+        if request.execution != entry_execution {
+            return Err(TestdPortError::StageBinding {
+                detail: "stage execution lane differs from the selected registry entry",
+            });
+        }
+        if !testd_dispatchable(request.kind)
+            || !crate::testd_port::adapter_stage_dispatchable(
+                &entry.adapter,
+                request.kind,
+                request.execution,
+            )
+        {
+            return Err(TestdPortError::UnsupportedAdapterStage {
+                adapter: entry.adapter.clone(),
+                kind: request.kind,
+                execution: request.execution,
+            });
+        }
+        Ok(TestdAdmission::for_stage(request.clone(), entry))
     }
 
     /// Refuses a pure in-process stage without an explicitly registered pure
@@ -1478,7 +1819,20 @@ impl TestdAdmissionPort for TestdPlaneAdmission {
         entry: &RegistryEntry,
     ) -> Result<TestdAdmission, TestdPortError> {
         Self::admit_parts(&invocation.instrument, invocation.kind, entry)?;
+        if entry.executable.is_decoder_only() {
+            return Err(TestdPortError::StageBinding {
+                detail: "decoder-only admission requires a typed stage request with artifact lineage",
+            });
+        }
         Ok(TestdAdmission::new(invocation.clone(), entry))
+    }
+
+    fn admit_stage(
+        &self,
+        request: &InstrumentStageRequest,
+        entry: &RegistryEntry,
+    ) -> Result<TestdAdmission, TestdPortError> {
+        Self::admit_stage_parts(request, entry)
     }
 }
 
@@ -1581,6 +1935,14 @@ pub fn compose_provider_dispatch(
                 adapter: entry.adapter.clone(),
                 kind,
             },
+        },
+        Err(TestdPortError::UnsupportedAdapterStage { adapter, kind, .. }) => {
+            ProviderDispatch::Refused {
+                disposition: crate::ProviderDisposition::UnsupportedByTestd { adapter, kind },
+            }
+        }
+        Err(TestdPortError::StageBinding { detail }) => ProviderDispatch::Refused {
+            disposition: crate::ProviderDisposition::StageBindingRejected { detail },
         },
         Err(TestdPortError::Registry(error)) => ProviderDispatch::Refused {
             disposition: crate::disposition_for_parts(instrument.as_str(), kind, &error),

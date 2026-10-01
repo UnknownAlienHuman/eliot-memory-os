@@ -58,6 +58,7 @@
 //! external reactor. The production dispatch launch seam owns the runtime
 //! decision when the admitted drive goes live.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
@@ -66,13 +67,15 @@ use std::time::Duration;
 use eliot_contracts::ClockReading;
 use eliot_instrument_api::{ExecutionStatus, KernelProcessAdmissionRequest};
 use eliot_process::{
-    ExitDisposition, OperationId, ProcessEvidence, ProcessEvidenceSink, ProcessExecutionView,
-    ProcessExecutor, ProcessLifecycle, ProcessRequest,
+    ExitDisposition, ExitStatus, OperationId, ProcessEvidence, ProcessEvidenceSink,
+    ProcessExecutionView, ProcessExecutor, ProcessLifecycle, ProcessRequest,
+    ProcessStreamSinkOpenRequest,
 };
 use eliot_testd_core::{
-    EvidenceCollector, JobState, KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider,
-    Lease, NormalizedEvidence, RawArtifactStream, SourceObservationGitPort, TestJob, TestdError,
-    TestdSourceObservation, TestdSourceObservationRange, TestdStore, TestdToolObservation,
+    AsyncProcessStreamSourceReadbackPort, EphemeralSourceBytes, EvidenceCollector, JobState,
+    KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider, Lease,
+    SourceObservationGitPort, TestJob, TestdError, TestdReadbackContext, TestdSourceObservation,
+    TestdSourceObservationRange, TestdStore, TestdStreamEvidenceBinding, TestdToolObservation,
     evaluate_testd_verification, issue_process_admission,
 };
 
@@ -100,15 +103,6 @@ const SUPERVISION_CANCEL_GRACE_MS: u64 = 5_000;
 /// deterministic rule that produced the disposition.
 const MAX_REASON_CHARS: usize = 512;
 
-/// Prefix for raw-artifact handles synthesized from inline stream previews.
-///
-/// Inline previews have no durable locator; the handle only keys the exact
-/// retained bytes inside this shot's receipt. Resolving `Blob` /
-/// `OmittedPayload` durable locators into handles is future work that changes
-/// no semantics here: unresolvable streams are simply not recorded, and every
-/// recorded artifact keeps exactly one normalized reference either way.
-const INLINE_STREAM_HANDLE_PREFIX: &str = "testd-inline-stream";
-
 /// The governed physical-process contour for one admitted shot.
 ///
 /// The tool child and the terminal source observation are launched by the SAME
@@ -126,12 +120,376 @@ pub struct GovernedContour<'a, E: ?Sized> {
     executor: &'a E,
     /// The same executor, presented as the physical Git port.
     git: Option<&'a dyn SourceObservationGitPort>,
+    /// Stored-source readback port used before immutable terminal evidence is
+    /// written. The port returns only verified ephemeral bytes.
+    readback: Option<&'a dyn AsyncProcessStreamSourceReadbackPort>,
+    /// Independently verified current-registry replay context.
+    replay: Option<&'a dyn VerifiedStreamReplayPort>,
+}
+
+/// Authenticated currentness owner for replaying stored process bytes.
+/// Implementations must source their registries from an accepted live catalog
+/// owner readback, never from the retained stage alone.
+pub trait VerifiedStreamReplayPort: Send + Sync {
+    /// Replays one exact stored stream under its retained runner stage.
+    fn replay_stream(
+        &self,
+        stage: &eliot_testd_core::InstrumentStageRequest,
+        source: &TestdStreamEvidenceBinding,
+        bytes: &EphemeralSourceBytes,
+        observations: &TestdReplayObservedInputs,
+        terminal: Option<&ExitStatus>,
+        started_at: ClockReading,
+        finished_at: ClockReading,
+    ) -> Result<eliot_instrument_runner::ProfileReplayReceipt, String>;
+}
+
+/// Builds a fresh parser/evaluator context from the authenticated owner facts
+/// that accompanied this exact stored-byte readback. No launch-time registry
+/// object or scalar stage projection is reused as current authority.
+pub struct KernelReadbackVerifiedReplay;
+
+impl VerifiedStreamReplayPort for KernelReadbackVerifiedReplay {
+    fn replay_stream(
+        &self,
+        stage: &eliot_testd_core::InstrumentStageRequest,
+        source: &TestdStreamEvidenceBinding,
+        bytes: &EphemeralSourceBytes,
+        observations: &TestdReplayObservedInputs,
+        terminal: Option<&ExitStatus>,
+        started_at: ClockReading,
+        finished_at: ClockReading,
+    ) -> Result<eliot_instrument_runner::ProfileReplayReceipt, String> {
+        let owner = bytes.replay_owner_readback();
+        owner.validate().map_err(|error| {
+            format!("fresh owner readback failed canonical validation: {error}")
+        })?;
+        let owner_facts: eliot_blob_api::wire::BlobProcessStreamVerifiedOwnerFacts =
+            serde_json::from_str(&owner.owner_facts_json)
+                .map_err(|error| format!("fresh Kernel owner facts are not typed JSON: {error}"))?;
+        owner_facts
+            .validate()
+            .map_err(|error| format!("fresh Kernel owner facts were refused: {error}"))?;
+        validate_ready_process_source_admission(source, bytes, owner, &owner_facts)?;
+        let owner_grant = observations
+            .blob_process_stream_grant
+            .as_ref()
+            .ok_or_else(|| "productive job has no durable Blob owner grant".to_owned())?;
+        let job_currentness = eliot_contracts::canonical_json_bytes(&(
+            &stage.provider_freshness,
+            &stage.provider_catalog_lifecycle,
+            &observations.tools,
+            &observations.submitted_environment,
+        ))
+        .map_err(|error| format!("job currentness tuple is not canonical: {error}"))?;
+        let process_binding_sha256 = sha256_hex(
+            &eliot_contracts::canonical_json_bytes(&source.binding)
+                .map_err(|error| format!("process binding is not canonical: {error}"))?,
+        );
+        let fence_sha256 = sha256_hex(
+            &eliot_contracts::canonical_json_bytes(source.binding.state_fence())
+                .map_err(|error| format!("process fence is not canonical: {error}"))?,
+        );
+        if owner.owner_facts_sha256 != owner_grant.owner_facts_sha256
+            || owner.work_scope_binding_sha256 != owner_grant.work_scope_snapshot_sha256
+            || owner.module_catalog_owner_readback_sha256
+                != owner_grant.module_catalog_owner_readback_sha256
+            || owner.generation_admission_sha256 != owner_grant.generation_admission_sha256
+            || owner_facts.currentness_sha256 != owner_grant.owner_currentness_sha256
+            || owner_facts.policy_sha256 != owner_grant.policy_sha256
+            || process_binding_sha256 != owner_grant.process_binding_sha256
+            || fence_sha256 != owner_grant.fence_sha256
+            || sha256_hex(&job_currentness) != owner_grant.job_currentness_sha256
+        {
+            return Err("fresh owner PULL no longer matches the immutable launch grant".to_owned());
+        }
+        let expected_fence = source.binding.state_fence();
+        let profile_registry = eliot_instrument_runner::testd_builtin_profile_registry()
+            .map_err(|error| format!("current closed TestD profile registry refused: {error}"))?;
+        let replay = eliot_instrument_runner::VerifiedTestdReplayContext::from_canonical_owner_readback_json(
+            profile_registry,
+            expected_fence,
+            owner.module_catalog_owner_readback_json.as_bytes(),
+            &owner.module_catalog_owner_readback_sha256,
+            owner.generation_admission_json.as_bytes(),
+            &owner.generation_admission_sha256,
+            owner_facts.work_scope_binding_json.as_bytes(),
+            &owner_facts.work_scope_binding_sha256,
+        )
+        .map_err(|error| format!("fresh owner/catalog replay context refused: {error}"))?;
+        let replay_observations = eliot_instrument_runner::ReplayObservedInputs {
+            source: observations.source.clone(),
+            tools: observations.tools.clone(),
+            environment: observations.environment.clone(),
+            cargo_lock_sha256: observations.cargo_lock_sha256.clone(),
+            lane_fingerprint_digest: observations.lane_fingerprint_digest.clone(),
+            normative_pair_receipt: observations.normative_pair_receipt.clone(),
+            required_test_ids: observations.required_test_ids.clone(),
+        };
+        replay
+            .replay_stream(
+                stage,
+                source,
+                bytes,
+                terminal,
+                started_at,
+                finished_at,
+                &replay_observations,
+            )
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn validate_ready_process_source_admission(
+    source: &TestdStreamEvidenceBinding,
+    bytes: &EphemeralSourceBytes,
+    owner: &eliot_testd_core::TestdReplayOwnerReadback,
+    owner_facts: &eliot_blob_api::wire::BlobProcessStreamVerifiedOwnerFacts,
+) -> Result<(), String> {
+    use eliot_store_api::blob_process_source_admission::{
+        BlobProcessSourceAdmissionIdentity, BlobProcessSourceAdmissionPhase,
+        BlobProcessSourceAdmissionReadback,
+    };
+
+    let readback: BlobProcessSourceAdmissionReadback =
+        serde_json::from_str(&owner.process_source_admission_readback_json)
+            .map_err(|error| format!("process source admission is not typed JSON: {error}"))?;
+    let work_scope: serde_json::Value = serde_json::from_str(&owner_facts.work_scope_binding_json)
+        .map_err(|error| format!("fresh WorkScope snapshot is not JSON: {error}"))?;
+    let scope_ref = work_scope
+        .pointer("/binding/scope/scope_ref")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "fresh WorkScope snapshot omitted its exact scope identity".to_owned())?;
+    let work_scope_revision = work_scope
+        .get("owner_revision")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "fresh WorkScope snapshot omitted its owner revision".to_owned())?;
+    let work_scope_snapshot_sha256 =
+        eliot_testd_core::sha256_hex(owner_facts.work_scope_binding_json.as_bytes());
+    let work_scope_fence: eliot_contracts::StateFence = serde_json::from_value(
+        work_scope
+            .get("state_fence")
+            .cloned()
+            .ok_or_else(|| "fresh WorkScope snapshot omitted its fence".to_owned())?,
+    )
+    .map_err(|error| format!("fresh WorkScope fence is not typed: {error}"))?;
+    work_scope_fence
+        .validate()
+        .map_err(|error| format!("fresh WorkScope fence is invalid: {error}"))?;
+
+    let admission = &readback.admission;
+    let open: ProcessStreamSinkOpenRequest = serde_json::from_str(&admission.open_request_json)
+        .map_err(|error| format!("retained process Open request is not typed: {error}"))?;
+    open.validate()
+        .map_err(|error| format!("retained process Open request is invalid: {error}"))?;
+    let binding_bytes = eliot_contracts::canonical_json_bytes(&source.binding)
+        .map_err(|error| format!("process binding is not canonical: {error}"))?;
+    let binding_sha256 = eliot_testd_core::sha256_hex(&binding_bytes);
+    let identity = BlobProcessSourceAdmissionIdentity {
+        work_scope_ref: scope_ref.to_owned(),
+        session_id: open.session_id().as_str().to_owned(),
+        source_id: open.source_id().as_str().to_owned(),
+        process_binding_sha256: binding_sha256.clone(),
+    };
+    readback
+        .validate_for(&identity, source.binding.state_fence())
+        .map_err(|error| {
+            format!("process source admission failed exact identity/fence validation: {error}")
+        })?;
+
+    let canonical_open = eliot_contracts::canonical_json_bytes(&open)
+        .map_err(|error| format!("retained process Open request is not canonical: {error}"))?;
+    let work_scope_fence_matches = work_scope_fence == *source.binding.state_fence();
+    let expected_source_sha256 = source
+        .source_sha256
+        .as_deref()
+        .ok_or_else(|| "replayed source binding omitted its whole-source digest".to_owned())?;
+    let expected_source_byte_length = source
+        .source_byte_length
+        .ok_or_else(|| "replayed source binding omitted its whole-source length".to_owned())?;
+    let ready = admission
+        .ready
+        .as_ref()
+        .ok_or_else(|| "process source admission has no Ready commitment".to_owned())?;
+    let ready_write_receipt: eliot_store_api::WriteReceipt =
+        serde_json::from_str(&owner.source_admission_write_receipt_json).map_err(|error| {
+            format!("Ready CAS receipt is not a typed Store WriteReceipt: {error}")
+        })?;
+    ready_write_receipt
+        .validate()
+        .map_err(|error| format!("Ready CAS WriteReceipt failed owner validation: {error}"))?;
+    let ready_write_receipt_envelope = ready_write_receipt
+        .require_reconciliation_envelope()
+        .map_err(|error| {
+            format!("Ready CAS WriteReceipt lacks its committed receipt envelope: {error}")
+        })?;
+    let ready_request_identity: eliot_protocol::RequestIdentity =
+        serde_json::from_str(&ready.ready_request_identity_json)
+            .map_err(|error| format!("Ready CAS request identity is not typed: {error}"))?;
+    ready_request_identity
+        .validate()
+        .map_err(|error| format!("Ready CAS request identity is invalid: {error}"))?;
+    let ready_request_identity_bytes =
+        eliot_contracts::canonical_json_bytes(&ready_request_identity)
+            .map_err(|error| format!("Ready CAS request identity is not canonical: {error}"))?;
+    if ready_request_identity_bytes != ready.ready_request_identity_json.as_bytes()
+        || eliot_testd_core::sha256_hex(&ready_request_identity_bytes)
+            != ready.ready_request_identity_sha256
+    {
+        return Err(
+            "Ready CAS request identity differs from its retained canonical commitment".to_owned(),
+        );
+    }
+    let ready_request_binding = serde_json::to_value(&ready_request_identity.request)
+        .map_err(|error| format!("Ready CAS request binding is invalid: {error}"))?;
+    let receipt_request_binding = serde_json::to_value(&ready_write_receipt_envelope.core.request)
+        .map_err(|error| format!("Ready CAS receipt request binding is invalid: {error}"))?;
+    let receipt_operation_id =
+        serde_json::to_value(&ready_write_receipt_envelope.core.operation.operation_id)
+            .map_err(|error| format!("Ready CAS receipt operation identity is invalid: {error}"))?;
+    let receipt_operation_request_id =
+        serde_json::to_value(&ready_write_receipt_envelope.core.operation.request_id)
+            .map_err(|error| format!("Ready CAS receipt request identity is invalid: {error}"))?;
+    let expected_request_id =
+        serde_json::to_value(&ready_request_identity.request.metadata.request_id)
+            .map_err(|error| format!("Ready CAS request identity is invalid: {error}"))?;
+    let receipt_idempotency_key = &ready_write_receipt_envelope.core.operation.idempotency_key;
+    let expected_ready_operation_id = serde_json::Value::String(ready.ready_operation_id.clone());
+    let write_receipt_operation_id = serde_json::to_value(&ready_write_receipt.operation_id)
+        .map_err(|error| {
+            format!("Ready CAS WriteReceipt operation identity is invalid: {error}")
+        })?;
+    let ready_receipt: serde_json::Value = serde_json::from_str(&ready.blob_ready_receipt_json)
+        .map_err(|error| format!("retained Blob Ready receipt is not JSON: {error}"))?;
+    let receipt_id = ready_receipt
+        .pointer("/receipt/identity/receipt_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "retained Blob Ready receipt omitted its identity".to_owned())?;
+    let expected_receipt_ref = source
+        .ready_receipt_ref
+        .as_deref()
+        .ok_or_else(|| "replayed source binding omitted its Ready receipt identity".to_owned())?;
+
+    let canonical_binding = String::from_utf8(binding_bytes)
+        .map_err(|error| format!("canonical process binding is not UTF-8: {error}"))?;
+    let canonical_open = String::from_utf8(canonical_open)
+        .map_err(|error| format!("canonical Open request is not UTF-8: {error}"))?;
+
+    if admission.phase != BlobProcessSourceAdmissionPhase::Ready
+        || readback.owner_revision != 2
+        || admission.owner_revision != 2
+        || admission.work_scope_owner_revision != work_scope_revision
+        || admission.work_scope_owner_digest != work_scope_snapshot_sha256
+        || admission.state_fence != *source.binding.state_fence()
+        || !work_scope_fence_matches
+        || admission.owner_facts_sha256 != owner.owner_facts_sha256
+        || admission.owner_facts_json != owner.owner_facts_json
+        || admission.process_binding_sha256 != binding_sha256
+        || admission.process_binding_json != canonical_binding
+        || admission.open_request_sha256 != open.open_request_sha256()
+        || admission.open_request_json != canonical_open
+        || open.binding() != &source.binding
+        || open.policy() != &source.policy
+        || open.stream() != source.stream
+        || ready.whole_source_sha256 != expected_source_sha256
+        || ready.whole_source_byte_length != expected_source_byte_length
+        || owner.finalized_blob_ready_receipt_json.as_deref()
+            != Some(ready.blob_ready_receipt_json.as_str())
+        || owner.finalized_blob_ready_receipt_sha256.as_deref()
+            != Some(ready.blob_ready_receipt_sha256.as_str())
+        || ready_write_receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+        || write_receipt_operation_id != expected_ready_operation_id
+        || receipt_operation_id != expected_ready_operation_id
+        || receipt_operation_request_id != expected_request_id
+        || ready_write_receipt.idempotency_key != ready_request_identity.idempotency_key
+        || receipt_idempotency_key != &ready_request_identity.idempotency_key
+        || receipt_request_binding != ready_request_binding
+        || ready_write_receipt.state_fence != *source.binding.state_fence()
+        || expected_source_byte_length != bytes.len() as u64
+        || expected_source_sha256 != eliot_testd_core::sha256_hex(bytes.bytes())
+        || receipt_id != expected_receipt_ref
+    {
+        return Err(
+            "Ready process source admission does not bind this exact stream, WorkScope, receipt, and stored bytes"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+/// Actual replay-time observations supplied by the productive TestD worker.
+/// Registry/profile freshness values are intentionally absent; the replay
+/// owner combines these measured inputs with its authenticated catalog and
+/// normative-pair readback.
+#[derive(Clone, Debug)]
+pub struct TestdReplayObservedInputs {
+    /// Source before/after observation from the same governed Git executor.
+    pub source: TestdSourceObservationRange,
+    /// Tool files and selected toolchain remeasured at the finish boundary.
+    pub tools: TestdToolObservation,
+    /// Exact secret-safe child environment from the sealed launch request.
+    pub environment: eliot_process::EnvironmentProjection,
+    /// Secret-safe environment projection from the exact sealed
+    /// `ProcessRequest` immediately before launch. This is kept distinct from
+    /// the durable submit-time provider projection above so replay cannot
+    /// relabel old owner data as a fresh observation.
+    pub submitted_environment: eliot_process::EnvironmentProjection,
+    /// SHA-256 of the exact current Cargo.lock bytes at the admitted root.
+    pub cargo_lock_sha256: String,
+    /// Exact bounded repository normative-pair receipt bytes. The replay
+    /// owner parses these through `eliot-bootstrap` and compares the
+    /// independently admitted pair key.
+    pub normative_pair_receipt: Vec<u8>,
+    /// Original plan-required test IDs parsed from the canonical owner binding.
+    pub required_test_ids: BTreeSet<String>,
+    /// Exact admitted lane fingerprint digest, rederived from the durable
+    /// work envelope and paired with the fresh before/after Git observation.
+    pub lane_fingerprint_digest: String,
+    /// Exact immutable owner projection persisted on the claimed job. Fresh
+    /// readback values are compared to it before context construction.
+    pub blob_process_stream_grant: Option<eliot_testd_core::TestdBlobProcessStreamGrant>,
 }
 
 impl<'a, E: ?Sized> GovernedContour<'a, E> {
     /// Binds one executor as both the launch contour and the Git port.
     pub const fn new(executor: &'a E, git: Option<&'a dyn SourceObservationGitPort>) -> Self {
-        Self { executor, git }
+        Self {
+            executor,
+            git,
+            readback: None,
+            replay: None,
+        }
+    }
+
+    /// Adds the Kernel-authenticated stored-source reader for productive
+    /// capture. It is awaited outside the collector lock and before finish.
+    pub const fn with_readback_port(
+        executor: &'a E,
+        git: Option<&'a dyn SourceObservationGitPort>,
+        readback: &'a dyn AsyncProcessStreamSourceReadbackPort,
+    ) -> Self {
+        Self {
+            executor,
+            git,
+            readback: Some(readback),
+            replay: None,
+        }
+    }
+
+    /// Binds stored-source readback and independently verified replay into
+    /// one finish path.
+    pub const fn with_readback_and_replay(
+        executor: &'a E,
+        git: Option<&'a dyn SourceObservationGitPort>,
+        readback: &'a dyn AsyncProcessStreamSourceReadbackPort,
+        replay: &'a dyn VerifiedStreamReplayPort,
+    ) -> Self {
+        Self {
+            executor,
+            git,
+            readback: Some(readback),
+            replay: Some(replay),
+        }
     }
 
     /// The admitted executor that owns the Job Object contour.
@@ -142,6 +500,17 @@ impl<'a, E: ?Sized> GovernedContour<'a, E> {
     /// The same executor presented as the physical Git port.
     pub const fn git(&self) -> Option<&'a dyn SourceObservationGitPort> {
         self.git
+    }
+
+    /// The authenticated immutable-source readback port, when productive
+    /// capture is composed for this attempt.
+    pub const fn readback(&self) -> Option<&'a dyn AsyncProcessStreamSourceReadbackPort> {
+        self.readback
+    }
+
+    /// The authenticated live replay context, when the Kernel supplied one.
+    pub const fn replay(&self) -> Option<&'a dyn VerifiedStreamReplayPort> {
+        self.replay
     }
 }
 
@@ -247,9 +616,25 @@ pub(crate) fn drive_admitted_one_shot_from_store<E: ProcessExecutor + 'static>(
     drive_claimed(store, &job, &mut lease, presented, contour, owner, lease_ms)
 }
 
+fn receipt_or_corrupt(
+    store: &TestdStore,
+    job: &TestJob,
+    context: &'static str,
+) -> Result<TestReceipt, TestdError> {
+    Ok(crate::receipt(
+        &store
+            .get(&job.job_id)?
+            .ok_or_else(|| TestdError::Corrupt(context.to_owned()))?,
+    ))
+}
+
 /// Drives one claimed job against the presented admission to a deterministic
 /// disposition. The job is already leased to this shot; every path below ends
 /// in `finish` or `cancel` so the lease is always released.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "DISPATCH-LIVE residual: one admitted-shot context (composition, store, job, lease, presented material, executor, owner, now); a params-struct refactor is deferred until the dispatch-launch seam fixes the call shape, never a bare allow"
+)]
 fn drive_claimed<E: ProcessExecutor + 'static>(
     store: &TestdStore,
     job: &TestJob,
@@ -267,15 +652,11 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
             &EvidenceCollector::default(),
             format!("refused foreign or stale presentation without executing: {binding}"),
         )?;
-        return Ok(crate::receipt(&store.get(&job.job_id)?.ok_or_else(
-            || TestdError::Corrupt("job disappeared after refusal".to_owned()),
-        )?));
+        return receipt_or_corrupt(store, job, "job disappeared after refusal");
     }
     if presented.cancelled {
         store.cancel(&job.job_id, Some(lease), owner, current_clock_ms())?;
-        return Ok(crate::receipt(&store.get(&job.job_id)?.ok_or_else(
-            || TestdError::Corrupt("job disappeared after cancellation".to_owned()),
-        )?));
+        return receipt_or_corrupt(store, job, "job disappeared after cancellation");
     }
     // Fresh bound admission: rebuild the Kernel request from the CLAIMED
     // durable job and seal it with the single-use replay of the presented
@@ -312,14 +693,16 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
                 &EvidenceCollector::default(),
                 format!("fresh admission refused without executing: {error}"),
             )?;
-            return Ok(crate::receipt(&store.get(&job.job_id)?.ok_or_else(
-                || TestdError::Corrupt("job disappeared after admission refusal".to_owned()),
-            )?));
+            return receipt_or_corrupt(store, job, "job disappeared after admission refusal");
         }
     };
-    let collector = Arc::new(EvidenceCollector::default());
+    // Internally built from this exact attempt (#456 Wave B): admits only
+    // records carrying the presented operation; start refuses other sinks.
+    let collector = Arc::new(EvidenceCollector::for_operation(operation_id.clone()));
+    let mut process_environment = None;
     if eliot_testd_core::is_productive_testd_profile(&job.invocation.profile) {
-        let observation = match observe_tool_identity(permit.request()) {
+        let (observation, launch_environment) = match observe_tool_identity(&job, permit.request())
+        {
             Ok(observation) => observation,
             Err(error) => {
                 finish_unknown(
@@ -331,14 +714,12 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
                         "productive tool identity was not owner-observed; no process started: {error}"
                     ),
                 )?;
-                return Ok(crate::receipt(&store.get(&job.job_id)?.ok_or_else(
-                    || TestdError::Corrupt("job disappeared after tool observation".to_owned()),
-                )?));
+                return receipt_or_corrupt(store, job, "job disappeared after tool observation");
             }
         };
         collector.record_tool_observation(observation)?;
+        process_environment = Some(launch_environment);
     }
-    let sink: Arc<dyn eliot_process::ProcessEvidenceSink> = collector.clone();
     // The consuming start proves nothing about the outcome by itself:
     // `start_claimed` maps every executor failure (including the
     // executor-owned `UnknownOutcome`) onto `TestdError`, so the single
@@ -351,7 +732,7 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
         current_clock_ms(),
         permit,
         contour.executor(),
-        sink,
+        &collector,
     ));
     let started_at = start_result
         .as_ref()
@@ -370,6 +751,7 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
         &collector,
         SupervisionInput::for_start(operation_id, start_note, lease_ms),
         started_at,
+        process_environment,
     )?;
     Ok(crate::receipt(&store.get(&job.job_id)?.ok_or_else(
         || TestdError::Corrupt("job disappeared after finish".to_owned()),
@@ -380,31 +762,106 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
 /// ProcessRequest immediately before the consuming start. The resolver has
 /// already selected cargo/rustc through rustup; this readback binds the
 /// resulting files and nextest executable into the durable receipt.
-fn observe_tool_identity(request: &ProcessRequest) -> Result<TestdToolObservation, TestdError> {
-    let environment = request.environment().non_secret();
+fn observe_tool_identity(
+    job: &TestJob,
+    request: &ProcessRequest,
+) -> Result<(TestdToolObservation, eliot_process::EnvironmentProjection), TestdError> {
+    let observation = job
+        .provider_tool_observation
+        .clone()
+        .ok_or(TestdError::Invalid {
+            field: "tool_environment",
+            reason: "productive job has no durable owner-observed tool identities",
+        })?;
+    observation.validate()?;
+    let stage_command = job
+        .stage_request
+        .as_ref()
+        .and_then(|stage| stage.stage_command.as_ref())
+        .ok_or(TestdError::Invalid {
+            field: "stage_request.stage_command",
+            reason: "productive job has no sealed registered command",
+        })?;
+    let (selected_path, selected_sha256) = match stage_command.executable.as_str() {
+        "cargo" => (&observation.cargo_path, &observation.cargo_sha256),
+        "cargo-nextest" => (&observation.nextest_path, &observation.nextest_sha256),
+        "dotnet" => observation
+            .dotnet_path
+            .as_ref()
+            .zip(observation.dotnet_sha256.as_ref())
+            .ok_or(TestdError::Invalid {
+                field: "stage_request.stage_command.executable",
+                reason: "dotnet stage has no separately observed dotnet identity",
+            })?,
+        _ => {
+            return Err(TestdError::Invalid {
+                field: "stage_request.stage_command.executable",
+                reason: "productive command selector is not admitted",
+            });
+        }
+    };
+    if request.executable() != selected_path.as_str()
+        || request.executable_sha256() != selected_sha256.as_str()
+    {
+        return Err(TestdError::InvalidBinding);
+    }
+    let process_environment = eliot_process::EnvironmentProjection::new(
+        request.environment().non_secret().clone(),
+        request.environment().secret_refs().to_vec(),
+        request.environment().inheritance(),
+    )
+    .map_err(|error| TestdError::Contract(error.to_string()))?;
+    let environment = process_environment.non_secret();
     let required = |key: &'static str| {
         environment.get(key).cloned().ok_or(TestdError::Invalid {
             field: "tool_environment",
             reason: "productive process request is missing owner-observed tool identity",
         })
     };
-    let nextest_path = request.executable().to_owned();
-    let nextest_sha256 = request.executable_sha256().to_owned();
-    let cargo_path = required(crate::TESTD_ENV_CARGO)?;
-    let cargo_sha256 = required(crate::TESTD_ENV_CARGO_SHA256)?;
-    let rustc_path = required(crate::TESTD_ENV_RUSTC)?;
-    let rustc_sha256 = required(crate::TESTD_ENV_RUSTC_SHA256)?;
-    let selected_toolchain = required(crate::TESTD_ENV_TOOLCHAIN)?;
-    let observation = TestdToolObservation {
-        nextest_path,
-        nextest_sha256,
-        cargo_path,
-        cargo_sha256,
-        rustc_path,
-        rustc_sha256,
-        selected_toolchain,
-    };
-    observation.validate()?;
+    for (key, expected) in [
+        (crate::TESTD_ENV_NEXTEST, observation.nextest_path.as_str()),
+        (
+            crate::TESTD_ENV_NEXTEST_SHA256,
+            observation.nextest_sha256.as_str(),
+        ),
+        (crate::TESTD_ENV_CARGO, observation.cargo_path.as_str()),
+        (
+            crate::TESTD_ENV_CARGO_SHA256,
+            observation.cargo_sha256.as_str(),
+        ),
+        (crate::TESTD_ENV_RUSTC, observation.rustc_path.as_str()),
+        (
+            crate::TESTD_ENV_RUSTC_SHA256,
+            observation.rustc_sha256.as_str(),
+        ),
+        (
+            crate::TESTD_ENV_TOOLCHAIN,
+            observation.selected_toolchain.as_str(),
+        ),
+    ] {
+        if required(key)? != expected {
+            return Err(TestdError::InvalidBinding);
+        }
+    }
+    match (
+        observation.dotnet_path.as_deref(),
+        observation.dotnet_sha256.as_deref(),
+    ) {
+        (Some(path), Some(digest)) => {
+            if required(crate::TESTD_ENV_DOTNET)? != path
+                || required(crate::TESTD_ENV_DOTNET_SHA256)? != digest
+            {
+                return Err(TestdError::InvalidBinding);
+            }
+        }
+        (None, None) if !environment.contains_key(crate::TESTD_ENV_DOTNET) => {}
+        _ => return Err(TestdError::InvalidBinding),
+    }
+    reobserve_tool_files(&observation)?;
+    Ok((observation, process_environment))
+}
+
+fn reobserve_tool_files(observation: &TestdToolObservation) -> Result<(), TestdError> {
     for (path, expected) in [
         (
             observation.nextest_path.as_str(),
@@ -430,7 +887,22 @@ fn observe_tool_identity(request: &ProcessRequest) -> Result<TestdToolObservatio
             });
         }
     }
-    Ok(observation)
+    if let (Some(path), Some(expected)) = (
+        observation.dotnet_path.as_deref(),
+        observation.dotnet_sha256.as_deref(),
+    ) {
+        let bytes = std::fs::read(path).map_err(|_| TestdError::Invalid {
+            field: "tool_environment",
+            reason: "owner-observed dotnet tool cannot be reread before execution",
+        })?;
+        if eliot_testd_core::sha256_hex(&bytes) != expected {
+            return Err(TestdError::Invalid {
+                field: "tool_environment",
+                reason: "owner-observed dotnet tool changed before execution",
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Supervises the started operation to a bounded terminal observation and
@@ -451,6 +923,7 @@ fn observe_and_finish<E: ProcessExecutor + 'static>(
     collector: &EvidenceCollector,
     supervision: SupervisionInput,
     started_at: ClockReading,
+    process_environment: Option<eliot_process::EnvironmentProjection>,
 ) -> Result<(), TestdError> {
     let started_at_ms = clock_ms(&started_at).unwrap_or_else(current_clock_ms);
     let lease_ms = supervision.lease_ms;
@@ -499,6 +972,7 @@ fn observe_and_finish<E: ProcessExecutor + 'static>(
         },
         outcome,
         started_at,
+        process_environment,
     )
 }
 
@@ -530,6 +1004,9 @@ impl SupervisionInput {
 
 struct SupervisionOutcome {
     execution: ExecutionStatus,
+    /// Exact physical terminal observation from the admitted executor. This
+    /// never substitutes for parser/evaluator evidence.
+    exit_status: Option<ExitStatus>,
     reason: String,
     reconcile_note: Option<String>,
     durable_cancelled: bool,
@@ -553,6 +1030,7 @@ fn supervise_operation<E: ProcessExecutor + 'static>(
         lease_ms,
     } = input;
     let mut execution = ExecutionStatus::Unknown;
+    let mut exit_status = None;
     let mut reason =
         "terminal observation did not prove an outcome; reconcile by exact identity".to_owned();
     let mut reconcile_note = None;
@@ -590,6 +1068,7 @@ fn supervise_operation<E: ProcessExecutor + 'static>(
         match block_on_one_shot(executor.inspect(operation_id.clone())) {
             Ok(view) if view.lifecycle().is_terminal() => {
                 execution = classify_observation(&view);
+                exit_status = view.exit().cloned();
                 reason = observation_reason(&view).to_owned();
                 // A terminal inspect is only a lifecycle observation. The
                 // executor's reconcile owner joins the real stdout/stderr
@@ -634,6 +1113,7 @@ fn supervise_operation<E: ProcessExecutor + 'static>(
 
     Ok(SupervisionOutcome {
         execution,
+        exit_status,
         reason,
         reconcile_note,
         durable_cancelled,
@@ -693,6 +1173,115 @@ fn observe_terminal_source<E: ProcessExecutor + 'static>(
     }
 }
 
+fn build_replay_observed_inputs(
+    job: &TestJob,
+    source: &TestdSourceObservationRange,
+    process_environment: Option<eliot_process::EnvironmentProjection>,
+) -> Result<TestdReplayObservedInputs, TestdError> {
+    source.validate()?;
+    if source.before.repository_root != job.target_roots.source_root
+        || source.after.repository_root != job.target_roots.source_root
+    {
+        return Err(TestdError::InvalidBinding);
+    }
+    let tools = job
+        .provider_tool_observation
+        .clone()
+        .ok_or(TestdError::InvalidBinding)?;
+    tools.validate()?;
+    reobserve_tool_files(&tools)?;
+    let submitted_environment = job
+        .provider_environment_projection
+        .clone()
+        .ok_or(TestdError::InvalidBinding)?;
+    eliot_process::EnvironmentProjection::new(
+        submitted_environment.non_secret().clone(),
+        submitted_environment.secret_refs().to_vec(),
+        submitted_environment.inheritance(),
+    )
+    .map_err(|error| TestdError::Contract(error.to_string()))?;
+    let process_environment = process_environment.ok_or(TestdError::Invalid {
+        field: "provider_currentness.environment",
+        reason: "the exact sealed launch environment was not observed before execution",
+    })?;
+    let mut expected_process_environment = submitted_environment.non_secret().clone();
+    expected_process_environment.insert(
+        "CARGO_TARGET_DIR".to_owned(),
+        job.target_roots.target_root.clone(),
+    );
+    expected_process_environment
+        .insert("CARGO_HOME".to_owned(), job.target_roots.cache_root.clone());
+    let expected_process_environment = eliot_process::EnvironmentProjection::new(
+        expected_process_environment,
+        submitted_environment.secret_refs().to_vec(),
+        submitted_environment.inheritance(),
+    )
+    .map_err(|error| TestdError::Contract(error.to_string()))?;
+    if process_environment != expected_process_environment {
+        return Err(TestdError::InvalidBinding);
+    }
+    let lock_path = Path::new(&job.target_roots.source_root).join("Cargo.lock");
+    let lock_bytes = std::fs::read(lock_path).map_err(|_| TestdError::Invalid {
+        field: "provider_currentness.lock",
+        reason: "the exact admitted Cargo.lock cannot be reread before replay",
+    })?;
+    if lock_bytes.is_empty() {
+        return Err(TestdError::Invalid {
+            field: "provider_currentness.lock",
+            reason: "the admitted Cargo.lock is empty at replay time",
+        });
+    }
+    let normative_pair_receipt =
+        std::fs::read(Path::new(&job.target_roots.source_root).join("docs/normative-pair.toml"))
+            .map_err(|_| TestdError::Invalid {
+                field: "provider_currentness.normative_pair",
+                reason: "the exact normative-pair receipt cannot be reread before replay",
+            })?;
+    if normative_pair_receipt.is_empty()
+        || normative_pair_receipt.len()
+            > eliot_bootstrap::normative::MAX_NORMATIVE_PAIR_RECEIPT_BYTES
+    {
+        return Err(TestdError::Invalid {
+            field: "provider_currentness.normative_pair",
+            reason: "the normative-pair receipt is empty or exceeds its 16 KiB bound",
+        });
+    }
+    let verifier_dispatch = job
+        .verifier_dispatch
+        .as_ref()
+        .ok_or(TestdError::InvalidBinding)?;
+    let required_test_ids = verifier_dispatch
+        .required_test_ids_for_job(job)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if required_test_ids.is_empty() {
+        return Err(TestdError::InvalidBinding);
+    }
+    let lane_fingerprint_digest = job
+        .work_envelope
+        .as_ref()
+        .ok_or(TestdError::InvalidBinding)?
+        .fingerprint
+        .digest()
+        .map_err(|_| TestdError::InvalidBinding)?;
+    let blob_process_stream_grant = Some(
+        job.blob_process_stream_grant
+            .clone()
+            .ok_or(TestdError::InvalidBinding)?,
+    );
+    Ok(TestdReplayObservedInputs {
+        source: source.clone(),
+        tools,
+        environment: process_environment,
+        submitted_environment,
+        cargo_lock_sha256: eliot_testd_core::sha256_hex(&lock_bytes),
+        normative_pair_receipt,
+        required_test_ids,
+        lane_fingerprint_digest,
+        blob_process_stream_grant,
+    })
+}
+
 /// Captures terminal evidence and finishes the already-revalidated attempt.
 ///
 /// The terminal source observation is taken through `contour`'s physical Git
@@ -726,52 +1315,133 @@ fn finish_observed_attempt<E: ProcessExecutor + 'static>(
     inputs: &FinishInputs<'_>,
     outcome: SupervisionOutcome,
     started_at: ClockReading,
+    process_environment: Option<eliot_process::EnvironmentProjection>,
 ) -> Result<(), TestdError> {
     let FinishInputs { claimed, observed } = *inputs;
     let SupervisionOutcome {
         mut execution,
+        exit_status,
         mut reason,
         reconcile_note,
         ..
     } = outcome;
     let finished_at = observation_clock(current_clock_ms());
-    let records = collector.snapshot();
-    let synthetic = match capture_inline_previews(
-        collector,
-        &claimed.invocation.profile,
-        &records,
-        finished_at,
-    ) {
-        Ok(synthetic) => synthetic,
-        Err(error) => {
-            finish_unknown(
-                store,
-                claimed,
-                lease,
-                collector,
-                format!(
-                    "raw capture failed after execution; outcome rescheduled as unknown: {error}"
-                ),
-            )?;
-            return Ok(());
-        }
-    };
     let (source_observation, observation_fault) =
         observe_terminal_source(observed, contour, &mut execution);
     if let Some(message) = observation_fault {
         reason = message;
     }
+    let replay_observed_inputs = match source_observation.as_ref() {
+        Some(source) => match build_replay_observed_inputs(claimed, source, process_environment) {
+            Ok(inputs) => Some(inputs),
+            Err(error) => {
+                execution = ExecutionStatus::Unknown;
+                reason = format!("replay-time source/tool currentness observation failed: {error}");
+                None
+            }
+        },
+        None => None,
+    };
+    if let Some(port) = contour.readback() {
+        let context = TestdReadbackContext {
+            job_id: claimed.job_id.clone(),
+            invocation_id: claimed.invocation.request.request_id.clone(),
+            expected_operation_id: claimed.process.operation_id.clone(),
+            expected_process_tree_id: claimed.process.process_tree_id.clone(),
+            expected_process_generation: claimed.process.generation,
+            expected_authority_epoch: claimed.process.authority_epoch.clone(),
+            max_bytes: eliot_blob_api::BLOB_MAX_PLAINTEXT_BYTES as u64,
+            deadline_ms: current_clock_ms().saturating_add(30_000),
+        };
+        match block_on_one_shot(collector.resolve_typed_sources_async(port, &context)) {
+            Err(error) => {
+                execution = ExecutionStatus::Unknown;
+                reason = format!("stored-source readback did not complete safely: {error}");
+            }
+            Ok(groups) => {
+                let mut resolved_streams = 0usize;
+                let mut replay_fault = None;
+                let replay_context = contour.replay();
+                let stage = claimed.stage_request.as_ref();
+                for resolution in groups.into_iter().flatten() {
+                    match resolution {
+                        eliot_testd_core::TestdStreamResolution::Resolved {
+                            source, bytes, ..
+                        } => {
+                            resolved_streams += 1;
+                            let Some(replay_context) = replay_context else {
+                                replay_fault.get_or_insert_with(|| {
+                                    "no authenticated current replay context was supplied"
+                                        .to_owned()
+                                });
+                                continue;
+                            };
+                            let Some(stage) = stage else {
+                                replay_fault.get_or_insert_with(|| {
+                                    "the productive job has no retained runner stage".to_owned()
+                                });
+                                continue;
+                            };
+                            let Some(observations) = replay_observed_inputs.as_ref() else {
+                                replay_fault.get_or_insert_with(|| {
+                                    "replay-time source/tool currentness observations are unavailable".to_owned()
+                                });
+                                continue;
+                            };
+                            let replayed = match replay_context.replay_stream(
+                                stage,
+                                &source,
+                                &bytes,
+                                observations,
+                                exit_status.as_ref(),
+                                started_at,
+                                finished_at,
+                            ) {
+                                Ok(replayed) => replayed,
+                                Err(error) => {
+                                    replay_fault.get_or_insert_with(|| {
+                                        format!("current parser/evaluator replay refused: {error}")
+                                    });
+                                    continue;
+                                }
+                            };
+                            let Some(parsing) = replayed.parsing.as_ref() else {
+                                replay_fault.get_or_insert_with(|| {
+                                    "replay returned no executed parser observation".to_owned()
+                                });
+                                continue;
+                            };
+                            if let Err(error) = collector.apply_stream_replay(
+                                &source,
+                                parsing,
+                                replayed.evaluation.as_ref(),
+                            ) {
+                                replay_fault.get_or_insert_with(|| {
+                                    format!("replay evidence no longer matches its stream: {error}")
+                                });
+                            }
+                        }
+                        eliot_testd_core::TestdStreamResolution::Refused { error, .. } => {
+                            replay_fault.get_or_insert_with(|| {
+                                format!("stored-source readback refused a stream: {error}")
+                            });
+                        }
+                    }
+                }
+                if let Some(error) = replay_fault {
+                    execution = ExecutionStatus::Unknown;
+                    reason = error;
+                } else if resolved_streams == 0 {
+                    execution = ExecutionStatus::Unknown;
+                    reason =
+                        "productive process emitted no readback-bound stream evidence".to_owned();
+                }
+            }
+        }
+    }
     let mut receipt =
         collector.verification_receipt_at(claimed, execution, started_at, finished_at);
     receipt.source_observation = source_observation;
-    for handle in &synthetic {
-        receipt.normalized.push(NormalizedEvidence {
-            kind: "process.observation".to_owned(),
-            summary: format!("one-shot worker observed inline stream {handle}"),
-            raw_handles: vec![handle.clone()],
-            execution,
-        });
-    }
     if receipt.validate(claimed).is_err() {
         finish_unknown(
             store,
@@ -908,66 +1578,6 @@ fn observation_reason(view: &ProcessExecutionView) -> &'static str {
             "one-shot admitted drive mapped a non-terminal observation without effect"
         }
     }
-}
-
-/// Captures inline stream previews observed on the evidence sink as raw
-/// artifacts, preserving the exact bytes plus the truncated flag.
-///
-/// Raw capture is bytes-first: the digest stored with each artifact is always
-/// over the retained bytes, never over handle text. Streams with no retained
-/// bytes and no truncation carry nothing and are skipped; streams whose bytes
-/// live behind a durable `Blob` / omitted locator (or are withheld by
-/// policy) are left for future handle resolution and change no semantics.
-/// Returns the synthesized handles so the caller can reference each exactly
-/// once from normalized evidence.
-fn capture_inline_previews(
-    collector: &EvidenceCollector,
-    profile: &str,
-    records: &[ProcessEvidence],
-    captured_at: ClockReading,
-) -> Result<Vec<String>, TestdError> {
-    let mut synthetic = Vec::new();
-    for (index, record) in records.iter().enumerate() {
-        for (stream, evidence) in [("stdout", record.stdout()), ("stderr", record.stderr())]
-            .into_iter()
-            .filter_map(|(stream, evidence)| evidence.map(|evidence| (stream, evidence)))
-        {
-            let preview = evidence.preview();
-            let bytes = preview.bytes();
-            if bytes.is_empty() && !preview.is_truncated() {
-                continue;
-            }
-            let handle = format!("{INLINE_STREAM_HANDLE_PREFIX}-{index}-{stream}");
-            let stream_kind = if stream == "stdout" {
-                RawArtifactStream::Stdout
-            } else {
-                RawArtifactStream::Stderr
-            };
-            // Content domains stay disjoint per profile: discovery
-            // stdout is inventory, never run events, so it must never
-            // reach the run-event parser. Literals mirror the nextest
-            // owner's content-type constants without a dependency.
-            let content_type = if stream_kind == RawArtifactStream::Stdout {
-                if profile == eliot_testd_core::TESTD_LIST_PROFILE {
-                    "application/x-nextest-list-json"
-                } else {
-                    "application/x-nextest-libtest-json-plus"
-                }
-            } else {
-                "text/plain"
-            };
-            collector.record_raw_artifact_at(
-                handle.clone(),
-                content_type,
-                bytes.to_vec(),
-                preview.is_truncated(),
-                stream_kind,
-                captured_at,
-            )?;
-            synthetic.push(handle);
-        }
-    }
-    Ok(synthetic)
 }
 
 fn observation_clock(now: u64) -> ClockReading {
@@ -1127,178 +1737,5 @@ pub(crate) fn block_on_one_shot<F: Future>(future: F) -> F::Output {
             Poll::Ready(output) => return output,
             Poll::Pending => std::thread::yield_now(),
         }
-    }
-}
-
-#[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    reason = "test fixtures intentionally panic when construction invariants fail"
-)]
-mod tests {
-    use super::*;
-    use std::collections::BTreeMap;
-    use std::num::NonZeroU64;
-
-    use eliot_contracts::{EpochId, EpochLineageId};
-    use eliot_instrument_api::EvidenceAxes;
-    use eliot_platform::ClockObservation;
-    use eliot_process::{
-        ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, DispatchValidationContext,
-        EnvironmentInheritance, EnvironmentProjection, FencingToken, Generation, ImageId, JobId,
-        KernelDispatchKey, PermitIssuance, PhysicalProcessBinding, ProcessHealth,
-        ProcessHealthStatus, ProcessId, ProcessIntent, ProcessState, ProcessStreamEvidence,
-        ProcessStreamKind, ProcessStreamPolicyBinding, ProcessStreamPrefixPreview, ProcessTreeId,
-        ResourceLimits, SessionId, StreamEvidenceGap, StreamPersistenceStatus,
-        StreamTransportStatus, SuspendedProcessIdentity,
-    };
-
-    fn admitted_test_view() -> ProcessExecutionView {
-        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
-            .expect("canonical test lineage");
-        let epoch = EpochId::new(lineage, NonZeroU64::new(7).expect("non-zero test sequence"))
-            .expect("valid test epoch");
-        let generation = Generation::new(1).expect("non-zero test generation");
-        let fence =
-            FencingToken::new(epoch.clone(), generation, "fence-1").expect("valid test fence");
-        let heads = BTreeMap::from([
-            ("authority".to_owned(), "a".repeat(64)),
-            ("state".to_owned(), "b".repeat(64)),
-        ]);
-        let intent = ProcessIntent::new(
-            OperationId::new("operation-1").expect("valid test operation"),
-            ProcessTreeId::new("tree-1").expect("valid test tree"),
-            JobId::new("job-1").expect("valid test job"),
-            ImageId::new("image-1").expect("valid test image"),
-            SessionId::new("session-1").expect("valid test session"),
-            generation,
-            "C:\\tools\\worker.exe",
-            "c".repeat(64),
-            vec!["--check".to_owned()],
-            "C:\\work",
-            EnvironmentProjection::new(
-                BTreeMap::from([("PATH".to_owned(), "C:\\Windows".to_owned())]),
-                Vec::new(),
-                EnvironmentInheritance::None,
-            )
-            .expect("valid test environment"),
-            ResourceLimits::new(10_000, Some(5_000), Some(1_048_576), 4096, 4096, 4)
-                .expect("valid test limits"),
-        )
-        .expect("valid test intent");
-        let authority_id = DispatchAuthorityId::new("authority-1").expect("valid test authority");
-        let key = KernelDispatchKey::from_secret_bytes([0x5a; 32]).expect("valid test key");
-        let mut authority = DispatchPermitAuthority::activate(authority_id, key);
-        let issuance = PermitIssuance::new(
-            ActionLeaseRef::new("lease-1").expect("valid test lease"),
-            fence.clone(),
-            heads.clone(),
-            100,
-            200,
-            "nonce-1",
-        )
-        .expect("valid test issuance");
-        let permit = authority
-            .issue(&intent, issuance)
-            .expect("authority issues the test permit");
-        let observed = SuspendedProcessIdentity::new(
-            ProcessId::new("process-1").expect("valid test process"),
-            ProcessTreeId::new("tree-1").expect("valid test tree"),
-            JobId::new("job-1").expect("valid test job"),
-            ImageId::new("image-1").expect("valid test image"),
-            SessionId::new("session-1").expect("valid test session"),
-            generation,
-            PhysicalProcessBinding::new(
-                4242,
-                11,
-                "C:\\tools\\worker.exe",
-                "Local\\Eliot-Process-Test",
-            )
-            .expect("valid physical binding"),
-            120,
-            "c".repeat(64),
-        )
-        .expect("valid observed identity");
-        let context = DispatchValidationContext::new(
-            ClockObservation {
-                valid_time_ms: Some(150),
-                known_time_ms: Some(150),
-                transaction_sequence: None,
-                monotonic_ns: Some(1),
-            },
-            fence,
-            epoch,
-            heads,
-            41,
-        )
-        .expect("valid validation context");
-        let request = ProcessRequest::new(intent, permit).expect("valid test process request");
-        let validated = authority
-            .validate_and_consume(request, observed, &context)
-            .expect("consumed test dispatch validates");
-        let mut state = ProcessState::from_validated(&validated);
-        state
-            .mark_resumed(
-                151,
-                ProcessHealth::new(ProcessHealthStatus::Healthy, true, 151, None)
-                    .expect("valid test health"),
-            )
-            .expect("test child resumes");
-        state.view()
-    }
-
-    #[test]
-    fn legacy_bearing_evidence_still_yields_native_synthetic_handle() {
-        let view = admitted_test_view();
-        let binding = view.binding().clone();
-        let stdout_bytes = b"inline-stdout-bytes".to_vec();
-        let stdout_total = u64::try_from(stdout_bytes.len()).expect("preview length fits u64");
-        let stdout = ProcessStreamEvidence::new_raw(
-            binding.clone(),
-            ProcessStreamKind::Stdout,
-            ProcessStreamPolicyBinding::new(
-                "p04:stream-policy:transport-preview-v1",
-                "p04:privacy:raw-transport-preview",
-                "p04:visibility:operation-diagnostic",
-                "p04:retention:bounded-prefix-only",
-                "p04:redaction:none-raw-preview",
-            )
-            .expect("valid test stream policy"),
-            StreamTransportStatus::Complete,
-            StreamPersistenceStatus::SourceUnavailable,
-            eliot_testd_core::sha256_hex(&stdout_bytes),
-            stdout_total,
-            ProcessStreamPrefixPreview::from_transport_prefix(stdout_bytes, stdout_total)
-                .expect("valid test preview"),
-            None,
-            vec![StreamEvidenceGap::PersistenceUnavailable],
-        )
-        .expect("valid inline stdout evidence");
-        let stderr = ProcessStreamEvidence::new_legacy_raw_reference(
-            binding,
-            ProcessStreamKind::Stderr,
-            "raw:legacy-stderr",
-        )
-        .expect("valid legacy stderr evidence");
-        let evidence =
-            ProcessEvidence::new_typed(view, Some(stdout), Some(stderr), EvidenceAxes::observed())
-                .expect("mixed legacy-bearing evidence validates");
-        assert_eq!(evidence.stdout_ref(), None);
-        assert_eq!(evidence.stderr_ref(), Some("raw:legacy-stderr"));
-
-        let collector = EvidenceCollector::default();
-        let synthetic = capture_inline_previews(
-            &collector,
-            eliot_testd_core::TESTD_PRODUCTIVE_PROFILE,
-            std::slice::from_ref(&evidence),
-            observation_clock(current_clock_ms()),
-        )
-        .expect("inline capture succeeds");
-        assert_eq!(synthetic, vec!["testd-inline-stream-0-stdout".to_owned()]);
-        assert!(
-            !synthetic.iter().any(|handle| handle == "raw:legacy-stderr"),
-            "synthetic handles stay on the native path; legacy text never becomes a handle"
-        );
     }
 }

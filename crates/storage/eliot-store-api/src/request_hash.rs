@@ -5,7 +5,8 @@
 //! operation/idempotency identity; the authenticated [`RequestMeta`] (which
 //! carries the State Fence); scope/task/class/effect ceiling; the
 //! contract-set and operation-manifest digests; named operations plus
-//! event/projection/relation intents; the security/provenance closure plus
+//! event/projection/relation intents; the security/provenance closure,
+//! including any original paired authority and causal bindings, plus
 //! proof/approval refs; the expected revision and ordering heads; and the
 //! carried ordering scopes bound as set-like input.
 //!
@@ -145,7 +146,8 @@ pub struct CanonicalRequestView {
     pub semantic_commands: Vec<NamedMutationRequest>,
     /// Event, projection, and typed-relation intents committed atomically.
     pub event_projection_relation_intents: EventProjectionRelationIntents,
-    /// Provenance, disclosure, taint, and influence metadata (ordered chains).
+    /// Provenance, disclosure, taint, influence, and any original paired
+    /// operation-authority/causal bindings (ordered chains where applicable).
     pub security: SecurityContext,
     /// Exact proof or approval handles required by this transition.
     pub required_proof_and_approval_refs: Vec<String>,
@@ -568,6 +570,8 @@ mod tests {
             transformation_lineage: Vec::new(),
             influence_closure: None,
             purge_entry: None,
+            authority_binding: None,
+            causal_binding: None,
             selection_integrity: None,
             selection_chain_head: None,
             selection_chain_seal: None,

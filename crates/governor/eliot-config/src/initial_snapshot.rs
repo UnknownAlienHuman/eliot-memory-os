@@ -21,7 +21,10 @@ use thiserror::Error;
 use eliot_contracts::{ContractVersion, StateFence, canonical_json_bytes, sha256_hex};
 
 use crate::first_run::FirstRunDecision;
-use crate::{ConfigPolicySnapshot, HumanOwner, PolicyFence, PolicyRevision, SourceCompleteness};
+use crate::{
+    BlobProcessPolicyValue, ConfigPolicySnapshot, HumanOwner, PolicyFence, PolicyRevision,
+    SourceCompleteness,
+};
 
 /// Stable schema marker for the signed initial configuration snapshot.
 pub const INITIAL_SNAPSHOT_SCHEMA: &str = "eliot.initial-config-snapshot.v1";
@@ -38,6 +41,11 @@ pub const INITIAL_SNAPSHOT_SIGNATURE_BYTES: usize = 64;
 pub const INITIAL_SNAPSHOT_WIRE_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
 /// Setting key carrying the confirmed privacy mode selection.
 pub const PRIVACY_MODE_KEY: &str = "privacy.mode";
+/// Setting key retaining the signed governing-source approval in Policy.
+pub const GOVERNING_SOURCE_APPROVAL_KEY: &str = "governing_source.approval";
+/// Versioned literal prefix for the canonical governing-source approval.
+pub const GOVERNING_SOURCE_APPROVAL_LITERAL_PREFIX: &str =
+    "literal:eliot.governing-source-approval.v1:";
 
 /// The privacy mode selected during deterministic setup (I3.2 milestone 5).
 ///
@@ -162,6 +170,54 @@ pub fn prepare_initial_snapshot_payload(
     privacy: PrivacyChoice,
     first_run: &FirstRunDecision,
 ) -> Result<InitialSnapshotPayload, InitialSnapshotError> {
+    prepare_initial_snapshot_payload_inner(identity, privacy, first_run, None, None)
+}
+
+/// Builds the first signed configuration payload with an explicit
+/// Human-admitted process Blob policy and full six-domain residency template.
+/// This is the production setup path for installations that will admit
+/// process-stream Blob capture; no policy or domain is selected by default.
+pub fn prepare_initial_snapshot_payload_with_blob_policy(
+    identity: &InitialSnapshotIdentity,
+    privacy: PrivacyChoice,
+    first_run: &FirstRunDecision,
+    blob_process_policy: &BlobProcessPolicyValue,
+) -> Result<InitialSnapshotPayload, InitialSnapshotError> {
+    prepare_initial_snapshot_payload_inner(
+        identity,
+        privacy,
+        first_run,
+        Some(blob_process_policy),
+        None,
+    )
+}
+
+/// Builds the first signed Config payload with the canonical governing-source
+/// approval retained both in the signed outer payload and in the nested
+/// ConfigPolicySnapshot that the existing Policy owner stores.
+pub fn prepare_initial_snapshot_payload_with_source_approval(
+    identity: &InitialSnapshotIdentity,
+    privacy: PrivacyChoice,
+    first_run: &FirstRunDecision,
+    blob_process_policy: &BlobProcessPolicyValue,
+    governing_source_approval_json: &str,
+) -> Result<InitialSnapshotPayload, InitialSnapshotError> {
+    prepare_initial_snapshot_payload_inner(
+        identity,
+        privacy,
+        first_run,
+        Some(blob_process_policy),
+        Some(governing_source_approval_json),
+    )
+}
+
+fn prepare_initial_snapshot_payload_inner(
+    identity: &InitialSnapshotIdentity,
+    privacy: PrivacyChoice,
+    first_run: &FirstRunDecision,
+    blob_process_policy: Option<&BlobProcessPolicyValue>,
+    governing_source_approval_json: Option<&str>,
+) -> Result<InitialSnapshotPayload, InitialSnapshotError> {
     identity.validate()?;
     if matches!(privacy, PrivacyChoice::LocalOnly) && first_run.has_paid_route() {
         return Err(InitialSnapshotError::PrivacyChoiceConflict {
@@ -171,6 +227,21 @@ pub fn prepare_initial_snapshot_payload(
     let revision = PolicyRevision::genesis();
     let mut settings = crate::first_run::to_settings(first_run, &identity.owner_ref);
     settings.push(privacy.to_setting(&identity.owner_ref));
+    if let Some(policy) = blob_process_policy {
+        settings.push(
+            policy
+                .to_setting(&identity.owner_ref, &identity.scope_id)
+                .map_err(|error| invalid_field("blob_process_policy", error.to_string()))?,
+        );
+    }
+    if let Some(approval_json) = governing_source_approval_json {
+        validate_canonical_json_object(approval_json, "governing_source_approval_json")?;
+        settings.push(crate::Setting {
+            key: GOVERNING_SOURCE_APPROVAL_KEY.to_owned(),
+            value_ref: format!("{GOVERNING_SOURCE_APPROVAL_LITERAL_PREFIX}{approval_json}"),
+            owner_ref: identity.owner_ref.clone(),
+        });
+    }
     let snapshot = ConfigPolicySnapshot {
         snapshot_id: identity.snapshot_id.clone(),
         machine_id: identity.machine_id.clone(),
@@ -204,6 +275,7 @@ pub fn prepare_initial_snapshot_payload(
         key_identity: identity.key_identity.clone(),
         runtime_state_roots_digest: identity.runtime_state_roots_digest.clone(),
         setup_revision: identity.setup_revision,
+        governing_source_approval_json: governing_source_approval_json.map(str::to_owned),
     };
     payload.validate()?;
     Ok(payload)
@@ -237,6 +309,12 @@ pub struct InitialSnapshotPayload {
     pub runtime_state_roots_digest: String,
     /// Setup binding revision at milestone 7.
     pub setup_revision: u64,
+    /// Canonical Governor-owned approval of the exact governing source pair.
+    /// When present, the bytes are covered by the existing detached signature.
+    /// Legacy payloads without approval remain readable but cannot establish
+    /// WorkScope source authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governing_source_approval_json: Option<String>,
 }
 
 impl InitialSnapshotPayload {
@@ -259,6 +337,40 @@ impl InitialSnapshotPayload {
         )?;
         if self.setup_revision == 0 {
             return Err(invalid_field("setup_revision", "must be non-zero"));
+        }
+        if let Some(approval_json) = &self.governing_source_approval_json {
+            validate_canonical_json_object(approval_json, "governing_source_approval_json")?;
+            let mut approval_settings = self
+                .snapshot
+                .settings
+                .iter()
+                .filter(|setting| setting.key == GOVERNING_SOURCE_APPROVAL_KEY);
+            let setting = approval_settings.next().ok_or_else(|| {
+                invalid_field(
+                    "snapshot.settings.governing_source_approval",
+                    "signed approval must also be retained in the Policy owner snapshot",
+                )
+            })?;
+            if approval_settings.next().is_some()
+                || setting.owner_ref != self.owner_ref
+                || setting.value_ref
+                    != format!("{GOVERNING_SOURCE_APPROVAL_LITERAL_PREFIX}{approval_json}")
+            {
+                return Err(invalid_field(
+                    "snapshot.settings.governing_source_approval",
+                    "must exactly match the signed approval JSON and owner",
+                ));
+            }
+        } else if self
+            .snapshot
+            .settings
+            .iter()
+            .any(|setting| setting.key == GOVERNING_SOURCE_APPROVAL_KEY)
+        {
+            return Err(invalid_field(
+                "snapshot.settings.governing_source_approval",
+                "a Policy owner approval Setting requires the matching signed payload field",
+            ));
         }
         self.snapshot
             .validate()
@@ -328,6 +440,23 @@ impl InitialSnapshotPayload {
         })?;
         PrivacyChoice::parse(value)
     }
+}
+
+fn validate_canonical_json_object(
+    json: &str,
+    field: &'static str,
+) -> Result<(), InitialSnapshotError> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|error| invalid_field(field, format!("invalid JSON object: {error}")))?;
+    if !value.is_object() {
+        return Err(invalid_field(field, "must encode a JSON object"));
+    }
+    let canonical = canonical_json_bytes(&value)
+        .map_err(|error| InitialSnapshotError::Canonicalization(error.to_string()))?;
+    if canonical != json.as_bytes() {
+        return Err(invalid_field(field, "must use canonical JSON encoding"));
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -829,6 +958,9 @@ pub enum InitialSnapshotError {
     /// Canonical JSON serialization failed.
     #[error("initial snapshot canonicalization failed: {0}")]
     Canonicalization(String),
+    /// The retained protected signer refused one canonical preimage.
+    #[error("initial snapshot signer failed: {0}")]
+    SigningFailure(String),
     /// Signature algorithm is not admitted.
     #[error("unsupported initial snapshot signature algorithm: {0}")]
     UnsupportedAlgorithm(String),

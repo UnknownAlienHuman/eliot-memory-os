@@ -290,6 +290,15 @@ impl InstallationScanDisclosureStore {
     /// # Errors
     ///
     /// Returns the handle validation error when the handle is malformed.
+    ///
+    /// # Live status
+    ///
+    /// `caller: NONE`. There is no production caller: `git grep -n
+    /// diagnostic_view` returns only this definition. The live readback of a
+    /// stored receipt goes through the composition methods that take
+    /// `&InstallationScanDisclosureStore`; none of them projects a diagnostic
+    /// view. Whether this projection is wired to a diagnostic surface or
+    /// retired is an owner decision.
     pub fn diagnostic_view(
         &self,
         handle: &ScanReceiptHandle,
