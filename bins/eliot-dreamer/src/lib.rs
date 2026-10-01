@@ -733,7 +733,14 @@ fn run_admitted_pipeline(
         },
         job.job_class,
         Some(&validated),
-        dispatch_stage::PipelineOrientationRecords::new(&grounding_request, &validated),
+        // Non-Curation reached this line, so the pipeline genuinely ran and the
+        // record is the exact grounding request and validated draft this chain
+        // produced. Curation returns through `dispatch_curation` above and never
+        // reaches this call.
+        Some(dispatch_stage::PipelineOrientationRecords::new(
+            &grounding_request,
+            &validated,
+        )),
     )
 }
 

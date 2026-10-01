@@ -191,7 +191,7 @@ fn orientation_pipeline_threads_screen_to_packet_receipt() {
         },
         JobClass::Orientation,
         Some(&validated),
-        PipelineOrientationRecords::new(&grounding, &validated),
+        Some(PipelineOrientationRecords::new(&grounding, &validated)),
     );
     let Ok(DreamResult::Packet(packet)) = result else {
         panic!("orientation dispatch must project, got {result:?}");
@@ -275,6 +275,13 @@ fn curation_pipeline_routes_a31_without_class_refusal() {
         },
         JobClass::Curation,
         None,
+        // Unconstructible for Curation, not merely omitted: the A-05 gate
+        // rejects `JobClass::Curation` unconditionally
+        // (`eliot-dreamer-candidate-validation/src/structured/validate.rs`,
+        // `validate_family` → `UnsupportedJobShape`), so no Curation job ever
+        // yields a `ValidatedGroundingCandidate` and this record cannot be
+        // built. Supplying one would mean fabricating a receipt the owner
+        // refuses to issue.
         None,
     );
     assert!(
@@ -507,6 +514,13 @@ fn submit_chain_curation_stops_before_generic_stages_without_carrier() {
         },
         JobClass::Curation,
         None,
+        // Unconstructible for Curation, not merely omitted: the A-05 gate
+        // rejects `JobClass::Curation` unconditionally
+        // (`eliot-dreamer-candidate-validation/src/structured/validate.rs`,
+        // `validate_family` → `UnsupportedJobShape`), so no Curation job ever
+        // yields a `ValidatedGroundingCandidate` and this record cannot be
+        // built. Supplying one would mean fabricating a receipt the owner
+        // refuses to issue.
         None,
     );
     let Err(error) = refused else {
