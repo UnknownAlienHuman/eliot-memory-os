@@ -1375,10 +1375,7 @@ impl ModuleCheckpoint {
     /// Validates the stored checkpoint identity shape.
     pub fn validate(&self) -> Result<(), ProtocolError> {
         text(&self.checkpoint_id, "module_checkpoint.checkpoint_id")?;
-        text(
-            self.request_id.as_str(),
-            "module_checkpoint.request_id",
-        )?;
+        text(self.request_id.as_str(), "module_checkpoint.request_id")?;
         text(&self.idempotency_key, "module_checkpoint.idempotency_key")?;
         if self.checkpoint_id != self.request_id.as_str() {
             return Err(ProtocolError::InvalidField {
@@ -1481,14 +1478,13 @@ impl ModuleLifecycle {
     }
 
     fn control_identity(frame: &Frame) -> Result<&RequestIdentity, ProtocolError> {
-        let identity =
-            frame
-                .request_identity
-                .as_ref()
-                .ok_or(ProtocolError::InvalidField {
-                    field: "request_identity",
-                    reason: "required for lifecycle control requests",
-                })?;
+        let identity = frame
+            .request_identity
+            .as_ref()
+            .ok_or(ProtocolError::InvalidField {
+                field: "request_identity",
+                reason: "required for lifecycle control requests",
+            })?;
         identity.validate()?;
         if frame.request_id.is_none() {
             return Err(ProtocolError::InvalidField {
@@ -1519,14 +1515,13 @@ impl ModuleLifecycle {
                 reason: "checkpoint requires the quiesced phase",
             });
         }
-        let request_id =
-            frame
-                .request_id
-                .clone()
-                .ok_or(ProtocolError::InvalidField {
-                    field: "request_id",
-                    reason: "required for lifecycle control requests",
-                })?;
+        let request_id = frame
+            .request_id
+            .clone()
+            .ok_or(ProtocolError::InvalidField {
+                field: "request_id",
+                reason: "required for lifecycle control requests",
+            })?;
         let checkpoint = ModuleCheckpoint {
             checkpoint_id: request_id.as_str().to_owned(),
             request_id,
@@ -1545,10 +1540,13 @@ impl ModuleLifecycle {
                 reason: "restore requires the quiesced phase",
             });
         }
-        let checkpoint = self.checkpoint.as_ref().ok_or(ProtocolError::InvalidField {
-            field: "module_lifecycle.checkpoint",
-            reason: "restore requires a retained checkpoint",
-        })?;
+        let checkpoint = self
+            .checkpoint
+            .as_ref()
+            .ok_or(ProtocolError::InvalidField {
+                field: "module_lifecycle.checkpoint",
+                reason: "restore requires a retained checkpoint",
+            })?;
         checkpoint.validate()?;
         Ok(ModuleControlEffect::CheckpointRestored(checkpoint.clone()))
     }
