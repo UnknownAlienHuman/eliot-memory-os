@@ -7916,7 +7916,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
 
         let policy_snapshot = self.current_initial_scope_policy_snapshot(&fence)?;
 
-        let (principal_ref, _) = authenticated_identity;
+        let (principal_ref, _) = request.authenticated_identity;
         let is_policy_owner = principal_ref == policy_snapshot.policy_owner.owner_ref;
         self.validate_initial_scope_privacy_authority(
             request.now,
