@@ -796,8 +796,20 @@ impl KernelComposition {
             .load_host_request(&parent_operation, &request.parent_request_digest)
             .map_err(|_| TransportError::SessionFenced)?
             .ok_or(TransportError::UnknownRequest)?;
+        let retained_fence_digest = super::sha256_json(&retained_parent.request.state_fence)
+            .map_err(|_| TransportError::SessionFenced)?;
         if parent_record.kind != eliot_ors::HostRequestKind::SelectedSourceCapture
+            || parent_record.state != eliot_ors::HostRequestState::Routed
             || parent_record.request_digest != request.parent_request_digest
+            || parent_record.deadline_unix_ms <= super::unix_ms()
+            || parent_record.request_id.as_str()
+                != retained_parent.request.metadata.request_id.as_str()
+            || parent_record.idempotency_key.as_str() != retained_parent.idempotency_key
+            || parent_record.cancellation_id.as_str() != retained_parent.cancellation_id
+            || parent_record.deadline_unix_ms != retained_parent.deadline_unix_ms
+            || parent_record.authority_epoch
+                != retained_parent.request.state_fence.authority_epoch
+            || parent_record.fence_digest != retained_fence_digest
             || parent_record.capability_ref.as_str() != eliot_protocol::SELECTED_SOURCE_CAPTURE_CAPABILITY
             || parent_record.payload_schema_id.as_ref().map(|value| value.as_str())
                 != Some(eliot_protocol::SELECTED_SOURCE_CAPTURE_PAYLOAD_SCHEMA_ID)
@@ -935,6 +947,7 @@ impl KernelComposition {
                 == retained_parent.request.metadata.request_id
             || request.child_request_identity.idempotency_key == retained_parent.idempotency_key
             || request.child_request_identity.cancellation_id == retained_parent.cancellation_id
+            || request.child_request_identity.deadline_unix_ms > retained_parent.deadline_unix_ms
             || parent_identity.request.metadata.task_id
                 != request.child_request_identity.request.metadata.task_id
             || parent_identity.request.metadata.session_id
@@ -943,6 +956,37 @@ impl KernelComposition {
                 != request.child_request_identity.request.metadata.product_id
             || parent_identity.request.metadata.source_id
                 != request.child_request_identity.request.metadata.source_id
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        let parent_operation = OrsOperationIdentity::new(&request.parent_operation_id)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let parent_record = self
+            .generation_gateway
+            .ors
+            .load_host_request(&parent_operation, &request.parent_request_digest)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::UnknownRequest)?;
+        let retained_fence_digest = super::sha256_json(&retained_parent.request.state_fence)
+            .map_err(|_| TransportError::SessionFenced)?;
+        if parent_record.kind != eliot_ors::HostRequestKind::SelectedSourceCapture
+            || parent_record.state != eliot_ors::HostRequestState::Routed
+            || parent_record.request_digest != request.parent_request_digest
+            || parent_record.deadline_unix_ms <= super::unix_ms()
+            || parent_record.request_id.as_str()
+                != retained_parent.request.metadata.request_id.as_str()
+            || parent_record.idempotency_key.as_str() != retained_parent.idempotency_key
+            || parent_record.cancellation_id.as_str() != retained_parent.cancellation_id
+            || parent_record.deadline_unix_ms != retained_parent.deadline_unix_ms
+            || parent_record.authority_epoch
+                != retained_parent.request.state_fence.authority_epoch
+            || parent_record.fence_digest != retained_fence_digest
+            || parent_record.capability_ref.as_str()
+                != eliot_protocol::SELECTED_SOURCE_CAPTURE_CAPABILITY
+            || parent_record.payload_schema_id.as_ref().map(|value| value.as_str())
+                != Some(eliot_protocol::SELECTED_SOURCE_CAPTURE_PAYLOAD_SCHEMA_ID)
+            || parent_record.scope_ref.as_ref().map(|value| value.as_str())
+                != Some(request.work_scope_id.as_str())
         {
             return Err(TransportError::IdentityConflict);
         }
@@ -993,6 +1037,8 @@ impl KernelComposition {
             now_unix_ms,
         )
         .map_err(|_| TransportError::IdentityConflict)?;
+        let staged_expiry_unix_ms = u64::try_from(staged.record().expires_at_ms)
+            .map_err(|_| TransportError::SessionFenced)?;
         if staged.record().work_item_id != work_item_id
             || staged.record().proposed_attempt_id != proposed_attempt_id
             || staged.record().claims != claims
@@ -1001,6 +1047,7 @@ impl KernelComposition {
             || staged.record().stage_operation_id
                 != stage_operation_identity(&reservation_id)
                     .map_err(|_| TransportError::SessionFenced)?
+            || staged_expiry_unix_ms > request.child_request_identity.deadline_unix_ms
         {
             return Err(TransportError::IdentityConflict);
         }
