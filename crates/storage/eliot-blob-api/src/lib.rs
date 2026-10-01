@@ -3880,6 +3880,22 @@ pub trait BlobStoreClient: Send + Sync {
             ))
         })
     }
+    /// Reads a previously committed process source using the persisted
+    /// original operation proof and a separately authenticated current read
+    /// authority. The current request's context and lease must be active now;
+    /// the owner independently resolves the exact original lease from its
+    /// durable intent before permitting recovery inspection.
+    fn read_process_stream_source_authorized(
+        &self,
+        _request: BlobProcessStreamReadbackRequest,
+        _current_read: BlobReadRequest,
+    ) -> BlobFuture<'_, BlobReadChunk> {
+        Box::pin(async {
+            Err(BlobError::PlanGap(
+                "Blob owner does not expose authorized persisted process-source lookup".to_owned(),
+            ))
+        })
+    }
     /// Submits bytes only after the same owner has durably reserved and
     /// reconciled the exact process finalization identity.
     fn stage_with_recovery(
@@ -3906,6 +3922,70 @@ pub trait BlobStoreClient: Send + Sync {
     ) -> BlobFuture<'_, BlobReachabilityView>;
     fn gc(&self, request: BlobGcRequest) -> BlobFuture<'_, BlobGcReceipt>;
     fn health(&self) -> BlobFuture<'_, BlobHealth>;
+}
+
+/// Shared handle forwarding keeps one retained owner service usable by
+/// adapters that own per-session state, such as the process-stream sink.
+impl<T> BlobStoreClient for std::sync::Arc<T>
+where
+    T: BlobStoreClient + ?Sized,
+{
+    fn stage(&self, request: BlobStageRequest) -> BlobFuture<'_, BlobReadyReceipt> {
+        (**self).stage(request)
+    }
+
+    fn recover_stage(
+        &self,
+        request: BlobStageRecoveryRequest,
+    ) -> BlobFuture<'_, BlobStageRecovery> {
+        (**self).recover_stage(request)
+    }
+
+    fn read_process_stream_source(
+        &self,
+        request: BlobProcessStreamReadbackRequest,
+    ) -> BlobFuture<'_, BlobReadChunk> {
+        (**self).read_process_stream_source(request)
+    }
+
+    fn read_process_stream_source_authorized(
+        &self,
+        request: BlobProcessStreamReadbackRequest,
+        current_read: BlobReadRequest,
+    ) -> BlobFuture<'_, BlobReadChunk> {
+        (**self).read_process_stream_source_authorized(request, current_read)
+    }
+
+    fn stage_with_recovery(
+        &self,
+        request: BlobStageRequest,
+        recovery: BlobStageRecoveryRequest,
+    ) -> BlobFuture<'_, BlobReadyReceipt> {
+        (**self).stage_with_recovery(request, recovery)
+    }
+
+    fn read(&self, request: BlobReadRequest) -> BlobFuture<'_, BlobReadChunk> {
+        (**self).read(request)
+    }
+
+    fn read_sealed(&self, request: BlobReadRequest) -> BlobFuture<'_, SealedBlobRead> {
+        (**self).read_sealed(request)
+    }
+
+    fn reachability(
+        &self,
+        request: BlobReachabilityRequest,
+    ) -> BlobFuture<'_, BlobReachabilityView> {
+        (**self).reachability(request)
+    }
+
+    fn gc(&self, request: BlobGcRequest) -> BlobFuture<'_, BlobGcReceipt> {
+        (**self).gc(request)
+    }
+
+    fn health(&self) -> BlobFuture<'_, BlobHealth> {
+        (**self).health()
+    }
 }
 
 /// Computes the canonical relative payload path for a locator. The adapter
