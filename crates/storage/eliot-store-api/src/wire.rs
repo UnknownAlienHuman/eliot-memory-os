@@ -41,11 +41,22 @@ pub const CAPABILITY_APPLY: &str = "store.apply";
 /// (issue #991).
 ///
 /// The wire variant selects this capability through
-/// [`StoreRequest::capability`], but it is deliberately absent from
-/// [`CAPABILITIES`]: that array is a static baseline both the store handshake
-/// and the Kernel `ClientHello` consume unchanged, so it can only name
-/// capabilities every store process can serve, and this one is served only
-/// by an adapter that owns a concurrent execution generation.
+/// [`StoreRequest::capability`]. The store bridge no longer reads its
+/// advertisement from a static array alone: `StoreComposition`
+/// (`bins/eliot-store-surreal/src/lib.rs`) advertises this name exactly when
+/// its composed adapter's own predicate answers `Some`, which happens only
+/// while a concurrent execution generation owns that adapter and is the same
+/// predicate the reserved-write dispatch gate refuses on. An advertisement is
+/// therefore never a name the store's own write path would refuse.
+///
+/// The name is still absent from [`CAPABILITIES`], and that is a measured
+/// statement about the canonical store rather than about the array: the only
+/// way this store can serve a reserved write is to install the concurrent
+/// execution generation, and that generation refuses every unreserved
+/// canonical apply (`eliot-store-surreal-adapter/src/apply.rs`,
+/// `unreserved_apply_admission`), which is the path the live Kernel canonical
+/// write route still uses. The name joins [`CAPABILITIES`] in the same change
+/// that moves that route onto the reserved write, not before.
 pub const CAPABILITY_RESERVED_WRITE: &str = "store.reserved_write";
 /// Capability for the backup operation (issue #975).
 ///

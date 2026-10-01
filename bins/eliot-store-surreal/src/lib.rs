@@ -32,15 +32,15 @@ use eliot_protocol::{
     ProtocolVersion, ServerHello,
 };
 use eliot_store_api::{
-    BackupOperationReconciliation, CAPABILITIES, CanonicalRequestView, CanonicalRestoreBatch,
-    CanonicalSnapshotPort, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS,
-    ExactJsonBytes, IsolatedDestination, IsolatedDestinationReceipt, IsolatedRestorePort,
-    NamedReadRequest, NamedReadResponse, OperationId, OperationIdentity, OrderingHead,
-    OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta,
-    ReservedWriteRequest, RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation,
-    RevisionKey, SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle,
-    SnapshotPage, StoreBackupStatus, StoreBackupStatusOutcome, StoreError, StoreHealth,
-    WriteReceipt, decode_request_frame_with_authority, generated_operation_manifests,
+    BackupOperationReconciliation, CAPABILITIES, CAPABILITY_RESERVED_WRITE, CanonicalRequestView,
+    CanonicalRestoreBatch, CanonicalSnapshotPort, CanonicalStoreClient,
+    CanonicalValidationSnapshot, EFFECTS, ExactJsonBytes, IsolatedDestination,
+    IsolatedDestinationReceipt, IsolatedRestorePort, NamedReadRequest, NamedReadResponse,
+    OperationId, OperationIdentity, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
+    PreparedTransition, RequestMeta, ReservedWriteRequest, RestoreValidationReceipt, RevisionHead,
+    RevisionHeadExpectation, RevisionKey, SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt,
+    SnapshotHandle, SnapshotPage, StoreBackupStatus, StoreBackupStatusOutcome, StoreError,
+    StoreHealth, WriteReceipt, decode_request_frame_with_authority, generated_operation_manifests,
     genesis_manifest, verify_canonical_request_hash,
 };
 pub use eliot_store_api::{
@@ -513,6 +513,26 @@ impl StoreComposition {
     #[must_use]
     pub(crate) fn store_adapter(&self) -> &SurrealStoreAdapter {
         &self.store
+    }
+
+    /// The one advertisement answer for this composition: the reserved-write
+    /// capability name exactly when the composed adapter can serve a reserved
+    /// write, and nothing else.
+    ///
+    /// This is the store bridge's advertisement owner (issue #1925). It reads
+    /// the single existing predicate,
+    /// [`SurrealStoreAdapter::reserved_write_capability`], which answers
+    /// `Some` only while a concurrent execution generation owns the adapter —
+    /// the same owner the reserved-write dispatch gate refuses on
+    /// (`apply::apply_reserved_write`). The advertisement and the refusal are
+    /// therefore one predicate: this store can never answer with a capability
+    /// its own write path would refuse, and it never answers with a literal
+    /// name of its own. A composition with no installed execution generation
+    /// (the current production launch) answers `None`, which is the honest
+    /// answer for a store that serves ordinary applies only.
+    #[must_use]
+    pub fn reserved_write_capability(&self) -> Option<&'static str> {
+        self.store.reserved_write_capability()
     }
 
     /// Bounded adapter/provider health observation.
@@ -1491,12 +1511,19 @@ impl StoreEbpSession {
 /// Admits the only supported S-03 `ClientHello` over an authenticated pipe
 /// peer and binds the peer and complete generation/fence/epoch lineage to the
 /// resulting session.
+///
+/// `composition` is the advertisement authority (issue #1925): the session
+/// admits exactly the capabilities this running store serves, so the
+/// `ServerHello` can never name a capability the composed write path refuses.
+/// The production binary is the only caller and always passes the composition
+/// it is serving.
 pub fn admit_authenticated_handshake(
     frame: Frame,
     limits: TransportLimits,
     config: &StoreLaunchConfig,
     identity: &StoreHandshakeIdentity,
     authenticated_peer: &PeerIdentity,
+    composition: &StoreComposition,
 ) -> Result<(StoreEbpSession, ServerHello), String> {
     config.validate()?;
     let authenticated_peer = AuthenticatedStorePeer::admit(authenticated_peer, config)?;
@@ -1508,6 +1535,7 @@ pub fn admit_authenticated_handshake(
         identity,
         Some(authenticated_peer),
         session_principal_binding,
+        composition.reserved_write_capability(),
     )
 }
 
@@ -1516,6 +1544,10 @@ pub fn admit_authenticated_handshake(
 /// This admits no caller identity, so request validation rejects the returned
 /// session in production. The production binary enters only through
 /// [`admit_authenticated_handshake`].
+///
+/// No execution generation owns a fixture, so the fixture session advertises
+/// no conditionally served capability: `None` is the served answer here, not
+/// an unverified default.
 pub fn admit_handshake(
     frame: Frame,
     limits: TransportLimits,
@@ -1529,7 +1561,57 @@ pub fn admit_handshake(
         identity,
         None,
         store_server_principal_binding()?,
+        None,
     )
+}
+
+/// The capabilities this store admits for one session: its own served set,
+/// narrowed by exactly what the client offered.
+///
+/// The static baseline is the ceiling every canonical store process serves. The
+/// reserved-write name joins that ceiling exactly when
+/// `served_reserved_write` carries the one declared reserved-write capability,
+/// which [`StoreComposition::reserved_write_capability`] answers only while a
+/// concurrent execution generation owns the composed adapter (issue #1925).
+/// The name therefore comes from the store's own served-state owner and never
+/// from a literal here, so a store that cannot serve a reserved write can
+/// never admit one, and the client's own offer can only narrow the result.
+fn admitted_capabilities(
+    hello: &ClientHello,
+    served_reserved_write: Option<&'static str>,
+) -> Vec<String> {
+    let mut served: Vec<&'static str> = CAPABILITIES.to_vec();
+    if served_reserved_write == Some(CAPABILITY_RESERVED_WRITE) {
+        served.push(CAPABILITY_RESERVED_WRITE);
+    }
+    served
+        .into_iter()
+        .filter(|capability| hello.capabilities.iter().any(|value| value == capability))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Refuses a client that requires a capability this session does not admit.
+///
+/// This is the EBP admission the generic handshake layer already enforces
+/// (`eliot_ipc::establish_with_server`): a narrowed session must be a typed
+/// refusal, never a silent narrowing the client goes on to believe it holds.
+/// It is the fail-closed half of the advertisement — the moment a client
+/// requires something this store does not serve, the handshake says so.
+fn require_admitted_capabilities(
+    hello: &ClientHello,
+    capabilities: &[String],
+) -> Result<(), String> {
+    hello
+        .module_contract
+        .required_capabilities
+        .iter()
+        .find(|required| !capabilities.iter().any(|value| value == *required))
+        .map_or(Ok(()), |required| {
+            Err(format!(
+                "ClientHello requires a capability this Store does not admit: {required}"
+            ))
+        })
 }
 
 fn admit_handshake_inner(
@@ -1539,6 +1621,7 @@ fn admit_handshake_inner(
     identity: &StoreHandshakeIdentity,
     authenticated_peer: Option<AuthenticatedStorePeer>,
     session_principal_binding: String,
+    served_reserved_write: Option<&'static str>,
 ) -> Result<(StoreEbpSession, ServerHello), String> {
     config.validate()?;
     frame
@@ -1593,11 +1676,10 @@ fn admit_handshake_inner(
     if usize::try_from(hello.max_frame).unwrap_or(usize::MAX) > limits.max_frame_bytes {
         return Err("ClientHello max_frame exceeds the bounded transport limit".to_owned());
     }
-    let capabilities: Vec<String> = CAPABILITIES
-        .iter()
-        .filter(|capability| hello.capabilities.iter().any(|value| value == **capability))
-        .map(|capability| (*capability).to_owned())
-        .collect();
+    // The advertised set is this store's served set rather than a static array
+    // read back unchanged, and a client can only narrow it further.
+    let capabilities = admitted_capabilities(&hello, served_reserved_write);
+    require_admitted_capabilities(&hello, &capabilities)?;
     let effects: Vec<String> = EFFECTS.iter().map(|effect| (*effect).to_owned()).collect();
     let server_hello = ServerHello {
         selected_protocol: protocol_version,

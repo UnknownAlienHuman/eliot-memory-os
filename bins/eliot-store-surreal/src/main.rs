@@ -569,6 +569,7 @@ async fn serve_handshake_loop(
         config,
         &handshake_identity,
         &authenticated_peer,
+        composition,
     ) {
         Ok(admitted) => {
             let mut events = BoundedEventLog::new();
