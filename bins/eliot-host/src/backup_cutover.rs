@@ -1220,8 +1220,11 @@ pub enum CutoverError {
 //     admitted backup request, and it is the only place a failed
 //     `PrepareIsolatedRestore` / `AdmitCutover` / `RestoreStatus` /
 //     `ReconcileRestore` produced by the closed dispatch table is decided. It
-//     calls only `HostComposition::backup_dispatch_reconcile`, which arms no
-//     guard of its own, so at most one guard is ever armed for one operation.
+//     calls only `HostComposition::backup_owner_prepare` (which delegates to
+//     `HostComposition::prepare_backup_destination`, arming nothing itself),
+//     `HostComposition::backup_owner_prepare_outcome` and
+//     `HostComposition::backup_dispatch_reconcile`, none of which arms a guard
+//     of its own, so at most one guard is ever armed for one operation.
 //   - `HostComposition::backup_dispatch_cutover`,
 //     `HostComposition::backup_dispatch_cutover_disposition`,
 //     `HostComposition::backup_dispatch_cutover_retire` and

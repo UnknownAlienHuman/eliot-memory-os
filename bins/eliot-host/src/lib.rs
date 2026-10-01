@@ -6046,6 +6046,31 @@ fn retained_backup_operation(
     })
 }
 
+/// Names the preparation operation identity this Host keys one admitted backup
+/// operation's durable preparation record by.
+///
+/// It is the admitted `#954` body identity digest, which is the same identity
+/// [`retained_backup_operation`] names in the owner result and the same
+/// identity the owner-issued preparation credential is issued for. One
+/// function serves the write path and every read, so a preparation written under
+/// one selector can never be read under another — a mismatch there would report
+/// an admitted operation as absent and invite a second destination under an
+/// identity that already owns one. It is a digest over the whole authenticated
+/// identity, not a caller-chosen operation name and not a counter a caller can
+/// increment.
+#[cfg(windows)]
+fn preparation_operation_id(
+    request: &eliot_host_control_endpoint::BackupRuntimeControlRequest,
+) -> Result<String, BackupDispatchRefusal> {
+    crate::backup_preparation::admitted_preparation_operation_id(request).map_err(|_| {
+        BackupDispatchRefusal::new(
+            request.operation,
+            "the admitted backup request carries no nameable isolated-restore preparation \
+             operation identity",
+        )
+    })
+}
+
 /// The bounded handoff state shared by the registered owner and the composition.
 #[cfg(windows)]
 struct BackupDispatchHandoff {
@@ -6173,15 +6198,21 @@ impl HostBackupDispatchQueue {
 /// The owner operation that answers is
 /// [`HostComposition::backup_dispatch_reconcile`] for `RESTORE_STATUS` and
 /// `RECONCILE_RESTORE`: a real read of the preparation this Host retained,
-/// through the same durable sink a prepare writes. The two effect arms,
-/// [`HostComposition::backup_dispatch_prepare`] and
-/// [`HostComposition::backup_dispatch_cutover`], still refuse — and each names
-/// the exact owner obligation that is absent rather than being a blanket
-/// error: retained Host state carries no owner-issued isolated-restore staging
-/// parent for a prepare to write into, and the Host cutover-intent owner has
-/// issued no separately admitted cutover body. Both refusals are pre-effect:
-/// each is decided before its arm is entered, so neither leaves an unresolved
-/// effect that would have to be reconciled.
+/// through the same durable sink a prepare writes, keyed by the admitted
+/// `#954` identity digest that same prepare wrote it under.
+/// `PREPARE_ISOLATED_RESTORE` reaches
+/// [`HostComposition::backup_owner_prepare`], which issues the owner-issued
+/// preparation credential from this composition's own registry, lease,
+/// generation, fence and manifest records, runs
+/// [`HostComposition::prepare_backup_destination`] once through the same durable
+/// sink, and answers `Admitted` over the retained operation or `PossibleEffect`
+/// when the journal cannot establish the effect.
+/// `ADMIT_CUTOVER` still refuses before its arm is entered, naming the exact
+/// owner obligation that is absent: the Host cutover-intent owner has issued no
+/// separately admitted cutover body, and A13.7 keeps cutover authority out of an
+/// isolated-restore preparation credential entirely. That refusal is
+/// pre-effect, so it leaves no unresolved effect that would have to be
+/// reconciled.
 #[cfg(windows)]
 pub struct HostBackupDispatchOwner {
     /// The live composition's bounded handoff. This is the owner's real state,
@@ -6302,16 +6333,25 @@ impl HostComposition {
     }
 
     /// Prepares one isolated backup destination through registry-committed
-    /// owner evidence (B-BACKUP-HOST-PREP #958).
+    /// owner evidence (B-BACKUP-HOST-PREP #958; caller-credential half #2569 BK3).
     ///
-    /// Binds the delegation sink to live composition authority: the
-    /// presented caller passes the
-    /// [`BackupCallerAuth`](crate::backup_preparation::BackupCallerAuth)
-    /// owner gate (held lease covers the launch installation, presented
-    /// source equals it), and the destination is prepared from inspected
-    /// owner evidence through this composition's own durable Host journal sink.
-    /// The sink returns alongside the destination so the caller can reconcile,
-    /// cancel, or clean up the same operation later.
+    /// Binds the delegation sink to live composition authority: the presented
+    /// caller passes the
+    /// [`BackupCallerAuth`](crate::backup_preparation::BackupCallerAuth) gate
+    /// against the **owner-issued**
+    /// [`OwnerPreparationCredential`](crate::backup_preparation::OwnerPreparationCredential),
+    /// and the lease/installation gate still requires the held owner lease to
+    /// cover the launch installation and the installation the credential
+    /// admitted to equal it. The presentation itself is no longer an argument:
+    /// [`DelegatedPreparation::prepare`](crate::backup_preparation::DelegatedPreparation::prepare)
+    /// reads it out of the credential, so no caller-supplied path, build,
+    /// profile, generation or state fence reaches this owner chain at all.
+    ///
+    /// Returns the **bounded** owner handle rather than the path-carrying
+    /// `PreparedDestination`: `BackupOwnerOutcome` requires a produced
+    /// destination to travel as a bounded immutable handle and never as a path,
+    /// a URL, or an inline body. The sink returns alongside the handle so the
+    /// caller can reconcile, cancel, or clean up the same operation later.
     ///
     /// The sink is
     /// [`HostStatePreparationJournal`](crate::backup_preparation::HostStatePreparationJournal),
@@ -6321,49 +6361,59 @@ impl HostComposition {
     /// request resolves the original preparation across a process or Host
     /// restart instead of starting a second one. The port deliberately does not
     /// accept a caller-supplied sink, which would let a caller choose how
-    /// durable this operation's admission is. Caller-channel authentication
-    /// beyond this installation binding stays parameterized pending
-    /// role-bound control contracts.
+    /// durable this operation's admission is.
     ///
     /// # Errors
     ///
     /// Returns [`PreparationError`](crate::backup_preparation::PreparationError)
-    /// when the caller gate, lease/installation binding, owner evidence,
-    /// admission, or journal persistence fails closed.
+    /// when the caller gate, lease/installation binding, registry-revision
+    /// fence, owner evidence, admission, or journal persistence fails closed.
     pub fn prepare_backup_destination(
         &self,
         caller: &crate::backup_preparation::BackupCallerAuth,
-        request: &crate::backup_preparation::PresentedPreparationRequest,
+        credential: &crate::backup_preparation::OwnerPreparationCredential,
+        evidence: &crate::backup_preparation::OwnerEvidence,
     ) -> Result<
         (
             crate::backup_preparation::DelegatedPreparation<
                 crate::backup_preparation::HostStatePreparationJournal<'_>,
             >,
-            crate::backup_preparation::PreparedDestination,
+            crate::backup_preparation::PreparedDestinationHandle,
         ),
         crate::backup_preparation::PreparationError,
     > {
         use crate::backup_preparation::{
-            DelegatedPreparation, HostStatePreparationJournal, OwnerEvidence, PreparationError,
+            DelegatedPreparation, HostStatePreparationJournal, PreparationError,
+            PreparedDestinationHandle,
         };
-        caller.authenticate_for_owner(
-            &self.owner_lease,
-            self.launch_options.installation(),
-            &request.source_installation_id,
-        )?;
-        let evidence = OwnerEvidence::inspect(&self.registry_host_root)?;
+        // The owner-issued credential half first: no credential, a credential
+        // whose digests are not this owner's, or a credential whose authenticated
+        // caller no longer admits the operation, is refused before anything is
+        // inspected and before any effect.
+        caller.authenticate(Some(credential))?;
         // Registry-revision fence (A13.9 short-lived reads): the owner evidence
-        // above was read at one CAS revision, and preparing against a registry
-        // that moved since would mix owner generations. Refuse with no effect.
+        // the credential was issued from was read at one CAS revision, and
+        // preparing against a registry that moved since would mix owner
+        // generations. Refuse with no effect.
         if evidence.revision() != self.registry.revision() {
             return Err(PreparationError::InvalidRequest {
                 field: "owner_evidence_revision",
                 reason: "owner registry moved between inspection and preparation".to_owned(),
             });
         }
+        caller.authenticate_for_owner(
+            &self.owner_lease,
+            self.launch_options.installation(),
+            credential.source_installation_id(),
+        )?;
+        // The bounded handle the owner publishes carries the same owner-issued
+        // manifest binding the credential was issued against, re-read here
+        // through the one accessor that implements that projection.
+        let manifest = evidence.owner_manifest_binding()?;
         let mut sink = DelegatedPreparation::new(HostStatePreparationJournal::new(&self.journal));
-        let prepared = sink.prepare(&evidence, request)?;
-        Ok((sink, prepared))
+        let prepared = sink.prepare(evidence, credential)?;
+        let handle = PreparedDestinationHandle::issue(&manifest, &prepared)?;
+        Ok((sink, handle))
     }
 
     /// Accepted backup dispatch table (#954 envelope/method bridge, #962).
@@ -6517,15 +6567,18 @@ impl HostComposition {
     /// only frame that decides this operation's success or typed refusal — so the
     /// guard spans exactly the operation.
     ///
-    /// The non-overlap is structural, not cached: the only owner call below is
-    /// [`Self::backup_dispatch_reconcile`], which arms no guard, and none of the
-    /// four armed admitted ports (`backup_dispatch_prepare`,
-    /// `backup_dispatch_cutover`, `backup_dispatch_cutover_disposition`,
-    /// `backup_dispatch_cutover_retire`) is reachable from here. At most one
-    /// `HostTerminalGuard` is therefore armed for one operation, so no second
-    /// emitter exists to suppress and no process-wide "already reported" set is
-    /// needed. The leaf `backup_preparation` phase/refusal records stay
-    /// nonterminal and correlate beneath the armed guard by emission order.
+    /// The non-overlap is structural, not cached: the only owner calls below are
+    /// [`Self::backup_owner_prepare`] (which delegates to
+    /// [`Self::prepare_backup_destination`], arming nothing itself) and
+    /// [`Self::backup_owner_prepare_outcome`] / [`Self::backup_dispatch_reconcile`]
+    /// (which arm nothing), and none of the four armed admitted ports
+    /// (`backup_dispatch_prepare`, `backup_dispatch_cutover`,
+    /// `backup_dispatch_cutover_disposition`, `backup_dispatch_cutover_retire`)
+    /// is reachable from here. At most one `HostTerminalGuard` is therefore armed
+    /// for one operation, so no second emitter exists to suppress and no
+    /// process-wide "already reported" set is needed. The leaf
+    /// `backup_preparation` phase/refusal records stay nonterminal and correlate
+    /// beneath the armed guard by emission order.
     ///
     /// The pipe ingress
     /// `HostBackupDispatchOwner::dispatch_backup_operation` deliberately arms
@@ -6549,9 +6602,9 @@ impl HostComposition {
     ) -> Result<BackupOwnerOutcome, BackupDispatchRefusal> {
         // Armed on entry, disarmed only where this composition reached a real
         // owner success, so every other outcome — the closed-table miss, the
-        // reconciliation read's possible-effect and refusal arms, and the two
-        // named owner refusals for the prepare and cutover arms — emits exactly
-        // one terminal record for this operation.
+        // reconciliation read's possible-effect and refusal arms, a refused or
+        // unestablished owner preparation, and the named cutover refusal —
+        // emits exactly one terminal record for this operation.
         let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_BACKUP_DISPATCH_TERMINAL);
         let operation = request.operation;
         let Some(target) = HostComposition::backup_dispatch_target(operation) else {
@@ -6562,12 +6615,15 @@ impl HostComposition {
         };
         let outcome = match target {
             // The status/reconciliation read. The operation identity is the
-            // admitted request's own authenticated `request_id`, and it is a
-            // READ selector only: the owner re-derives the record from its own
-            // durable journal, and no destination, epoch or digest is taken from
-            // it. It never calls prepare or cutover again.
+            // admitted request's own authenticated `#954` identity digest
+            // ([`preparation_operation_id`]), the same identity the preparation
+            // was written under and the same one [`retained_backup_operation`]
+            // names, and it is a READ selector only: the owner re-derives the
+            // record from its own durable journal, and no destination, epoch or
+            // digest is taken from it. It never calls prepare or cutover again.
             BackupDispatchTarget::Reconcile => {
-                match self.backup_dispatch_reconcile(request.request_id.as_str()) {
+                let operation_id = preparation_operation_id(request)?;
+                match self.backup_dispatch_reconcile(&operation_id) {
                     // The owner re-verified this operation's recorded result
                     // against the live root. This is the owner's own read
                     // result, so it is reported as the owner retained the
@@ -6661,54 +6717,69 @@ impl HostComposition {
                     }),
                 }
             }
-            // Named owner refusal, not a blanket error, and PRE-EFFECT: this
-            // arm refuses before `prepare_backup_destination` is entered.
+            // The owner preparation, run ONCE per admitted operation.
             //
-            // It is no longer refused for want of a destination parent. The
-            // isolated-restore staging parent is now owner-issued:
-            // `RuntimeStateRoots::isolated_restore_root`
-            // (`crates/kernel/eliot-installation/src/runtime_root_contract.rs`)
-            // declares it one leaf below the profile root, as a SIBLING of
-            // `installations` and of the installer's package staging root, so it
-            // is outside the source installation and is not a second owner of
-            // `<profile_root>\packages`. The installer creates it as one admitted
-            // leaf of that same owner's root hierarchy, so it exists before any
-            // preparation may name it, and
-            // `backup_preparation::resolve_owner_staging_parent` reads it from
-            // the manifest-bound owner record while
-            // `DelegatedPreparation::prepare` refuses any presented parent that
-            // is not that exact root. `admit_staging_parent` keeps refusing a
-            // parent that is or is nested under the source, and still proves the
-            // admitted one through the protected-root owner.
+            // Nothing here is refused any more. The chain is:
+            // authenticated caller (the request the endpoint already admitted)
+            // -> owner-issued preparation credential
+            // (`backup_owner_prepare`, which issues it from this composition's
+            // own registry/lease/generation/fence/manifest records)
+            // -> `prepare_backup_destination`, which authenticates against it
+            // and runs `DelegatedPreparation::prepare` on the owner-built
+            // presentation -> the durable Host journal, which writes the
+            // operation's intent and result as the owner's
+            // `BackupPreparationRecord` -> the bounded owner handle.
             //
-            // The remaining absent owner is the CALLER, not a path, and it is a
-            // different obligation from A2's destination allocation:
-            // `prepare_backup_destination` takes a `BackupCallerAuth` whose two
-            // digests are documented as owner-issued, and no owner reachable
-            // from this composition produces one — `BackupCallerAuth::authenticate`
-            // is the standing always-refuse stub and
-            // `authenticate_for_owner` grants nothing from those two values.
-            // The second question is a frozen `#954` interface decision, not a
-            // wiring gap: `BackupOwnerOutcome` says a produced destination
-            // "travels as a bounded immutable handle, never as a path, a URL, or
-            // an inline body", and the accepted owner-method table carries no
-            // path at all.
+            // Every value the effect depends on is owner-issued: the staging
+            // parent is `RuntimeStateRoots::isolated_restore_root` (declared
+            // beside `installations` and the package staging root, so it is
+            // outside the source installation), the build handle and profile
+            // token are the approved generation's, the authority generation is
+            // the committed activation fence's, the manifest binding is
+            // `OwnerEvidence::owner_manifest_binding`, and the operation identity
+            // is the admitted `#954` identity digest. No caller-supplied path,
+            // caller string or caller-incremented epoch reaches it, and
+            // `admit_staging_parent` still proves the parent through the
+            // protected-root owner and refuses one that is or is nested under the
+            // source.
             //
-            // No destination is created, so a refusal here still means no effect.
-            BackupDispatchTarget::Prepare => Err(BackupDispatchRefusal::new(
-                operation,
-                "preparation is admitted up to its destination parent, which the installation root contract now declares outside the source; what is still absent is an owner-issued caller credential, and how a prepared destination may be named across this seam is a frozen #954 interface decision",
-            )),
-            // Named owner refusal, also PRE-EFFECT: it refuses before
-            // `backup_dispatch_cutover` is entered. A cutover needs a separately
-            // admitted `CutoverRequest` body that the closed `#954` envelope does
-            // not carry and that the Host cutover-intent owner has issued no
-            // record of, so no body can be constructed here without fabricating
-            // one. Nothing is activated, so a refusal here still means no
-            // effect.
+            // The success answer is `Admitted`, NOT `Completed`, and it is
+            // deliberately the same answer the retained-read arm above gives a
+            // re-proved preparation. A `Completed` outcome carries a `#954`
+            // `BackupPhaseAttestation` whose `owner_role` must equal the
+            // SEPARATELY AUTHENTICATED role and must be an attesting role for
+            // this phase; this Host is no attested backup role for its own
+            // phase, so minting one here would be exactly the fabricated owner
+            // receipt the audit forbids, and the endpoint would refuse it at
+            // re-validation. What the owner can state truthfully is that it
+            // retains this exact operation with a durable result, so the
+            // requester reads that retained preparation instead of
+            // resubmitting — which is precisely what `Admitted` means.
+            //
+            // The handle is proved against the journal before the answer is
+            // given: a retained record that does not carry this exact
+            // destination identity, pinned OS identity, admission digest and
+            // configuration projection digest is not this preparation's
+            // evidence, and the owner says the effect is unestablished rather
+            // than answering as if it were.
+            BackupDispatchTarget::Prepare => {
+                let prepared = self.backup_owner_prepare(request);
+                self.backup_owner_prepare_outcome(request, prepared)
+            }
+            // Named owner refusal, still PRE-EFFECT, and it STAYS refused
+            // (A13.7: "Cutover requires separate authority. Old sessions,
+            // leases, approvals, and epochs do not revive."). A cutover needs a
+            // separately admitted `CutoverRequest` body that the closed `#954`
+            // envelope does not carry and that the Host cutover-intent owner has
+            // issued no record of, so no body can be constructed here without
+            // fabricating one. Nothing in the preparation credential above
+            // carries cutover authority — a `PreparedDestinationHandle` states
+            // what this Host admitted and created, and nothing more — so
+            // preparing a destination cannot advance this arm. Nothing is
+            // activated, so a refusal here still means no effect.
             BackupDispatchTarget::Cutover => Err(BackupDispatchRefusal::new(
                 operation,
-                "no separately admitted cutover body is retained by the Host cutover-intent owner for this operation",
+                "no separately admitted cutover body is retained by the Host cutover-intent owner for this operation; A13.7 requires separate authority for cutover and an isolated-restore preparation credential grants none",
             )),
         };
         // Only a real owner success releases the terminal record. An
@@ -6720,6 +6791,162 @@ impl HostComposition {
             host_terminal.disarm();
         }
         outcome
+    }
+
+    /// Runs the one owner preparation an admitted isolated-restore request
+    /// resolved to, and publishes the bounded owner handle (#962; #2569 BK3).
+    ///
+    /// Real owner calls, in order, and no reimplementation of any of them:
+    /// `AdmittedBackupCaller::from_admitted_request` reads the authenticated
+    /// principal, session, role, capability and operation identity out of the
+    /// request the endpoint already admitted and validated, refusing if the
+    /// envelope's own header/body joins disagree;
+    /// [`crate::backup_preparation::OwnerEvidence::inspect`] binds this
+    /// composition's own protected source root and committed installation
+    /// registry;
+    /// [`crate::backup_preparation::OwnerEvidence::issue_preparation_credential`]
+    /// then issues the OWNER-ISSUED credential — the authenticated
+    /// principal/capability bound to the retained protected-root lease, the
+    /// committed activation generation and manifest binding, the owner-approved
+    /// build handle and profile token, the owner-issued authority generation and
+    /// staging parent, and the owner manifest binding — refusing anything whose
+    /// role/capability does not admit preparation or whose source is not the
+    /// lease-bound installation; and [`Self::prepare_backup_destination`]
+    /// authenticates the presented caller digests against that credential,
+    /// re-proves the registry-revision fence and the lease/installation binding,
+    /// and runs
+    /// [`crate::backup_preparation::DelegatedPreparation::prepare`] once through
+    /// this composition's own durable Host journal sink.
+    ///
+    /// So the destination identity, the preparation-scope lineage marker, the
+    /// staging parent and the configuration evidence are all owner-derived: no
+    /// caller-supplied path, caller string or caller-incremented epoch reaches
+    /// the effect, and the operation identity is the admitted `#954` identity
+    /// digest rather than a counter.
+    ///
+    /// It is deliberately NOT [`Self::backup_dispatch_prepare`]: that port arms
+    /// the `backup-prepare.terminal` guard, and this boundary's caller
+    /// ([`Self::dispatch_backup_owner_operation`]) already owns the single
+    /// terminal record for one admitted operation, so calling it from here would
+    /// arm two guards over one operation. Delegating to
+    /// [`Self::prepare_backup_destination`] keeps that non-overlap structural.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::backup_preparation::PreparationError`] when the admitted
+    /// caller projection, the owner-issued credential, the caller gate, the
+    /// lease/installation binding, the registry-revision fence, the owner
+    /// evidence, the admission, or the journal refuses. The caller decides the
+    /// answer from the journal afterwards, because a refusal after the durable
+    /// intent was recorded may or may not have taken effect.
+    #[cfg(windows)]
+    fn backup_owner_prepare(
+        &self,
+        request: &eliot_host_control_endpoint::BackupRuntimeControlRequest,
+    ) -> Result<
+        crate::backup_preparation::PreparedDestinationHandle,
+        crate::backup_preparation::PreparationError,
+    > {
+        use crate::backup_preparation::{AdmittedBackupCaller, BackupCallerAuth, OwnerEvidence};
+        let admitted = AdmittedBackupCaller::from_admitted_request(request)?;
+        let evidence = OwnerEvidence::inspect(&self.registry_host_root)?;
+        let credential =
+            evidence.issue_preparation_credential(&admitted, self.launch_options.installation())?;
+        // The presented caller control carries exactly the credential's two
+        // owner-issued digests; `authenticate` refuses anything else, so a caller
+        // auth minted elsewhere on this contour cannot be substituted.
+        let caller = BackupCallerAuth {
+            lease_digest: credential.lease_digest().to_owned(),
+            fence_digest: credential.fence_digest().to_owned(),
+        };
+        let (_sink, handle) = self.prepare_backup_destination(&caller, &credential, &evidence)?;
+        Ok(handle)
+    }
+
+    /// Turns what one owner preparation reached into the answer the pipe carries,
+    /// using only the durable Host journal to decide whether an effect exists
+    /// (#962; #2569 BK3).
+    ///
+    /// A refusal is NOT taken at face value in either direction. The owner
+    /// preparation writes its durable intent before the root is created, so:
+    ///
+    /// - a preparation that SUCCEEDED answers `Admitted` only when the retained
+    ///   record still carries the exact handle it published — same operation, same
+    ///   destination identity, same pinned OS identity, same admission digest,
+    ///   same configuration projection digest. Anything else (a reclaimed root, a
+    ///   record that does not match, a failed read) means the effect is
+    ///   unestablished, so the answer is `PossibleEffect` over the retained
+    ///   operation;
+    /// - a preparation that was REFUSED is answered from the journal alone:
+    ///   `ReconcileDisposition::Absent` proves nothing was ever admitted, so a
+    ///   pre-effect refusal is exact; `AdmittedWithoutResult` and `Uncertain` are
+    ///   the owner's UNKNOWN outcome and are reported as `PossibleEffect`, never
+    ///   collapsed into an absence, a success or a retry; `Reclaimed` means the
+    ///   owner observed the root's absence, so the operation is finished.
+    ///
+    /// This method arms no terminal guard: its caller already owns the single
+    /// terminal record for one admitted operation.
+    #[cfg(windows)]
+    fn backup_owner_prepare_outcome(
+        &self,
+        request: &eliot_host_control_endpoint::BackupRuntimeControlRequest,
+        prepared: Result<
+            crate::backup_preparation::PreparedDestinationHandle,
+            crate::backup_preparation::PreparationError,
+        >,
+    ) -> Result<BackupOwnerOutcome, BackupDispatchRefusal> {
+        use crate::backup_preparation::ReconcileDisposition;
+        let operation = request.operation;
+        match prepared {
+            Ok(handle) => {
+                let operation_id = handle.operation_id().to_owned();
+                match self.backup_dispatch_reconcile(&operation_id) {
+                    Ok(ReconcileDisposition::Current(recorded)) if handle.proves(&recorded) => {
+                        Ok(BackupOwnerOutcome::Admitted {
+                            retained: retained_backup_operation(request)?,
+                        })
+                    }
+                    // The reclamation protocol completed: this owner observed the
+                    // absence of the exact root it created, so nothing is
+                    // outstanding and nothing may be retried.
+                    Ok(ReconcileDisposition::Reclaimed) => Err(BackupDispatchRefusal::new(
+                        operation,
+                        "this Host reclaimed the admitted operation's isolated-restore \
+                         destination and observed its absence: the operation is finished, its \
+                         root is gone, and there is nothing to preserve and nothing to retry",
+                    )),
+                    // A retained record that does not carry the handle this
+                    // preparation issued, or a read that failed outright: the
+                    // effect is unestablished, so the operation is preserved and
+                    // reconciled, never deleted and never retried blindly.
+                    Ok(_) | Err(_) => Ok(BackupOwnerOutcome::PossibleEffect {
+                        retained: retained_backup_operation(request)?,
+                    }),
+                }
+            }
+            Err(_) => {
+                let operation_id = preparation_operation_id(request)?;
+                match self.backup_dispatch_reconcile(&operation_id) {
+                    Ok(ReconcileDisposition::Absent) => Err(BackupDispatchRefusal::new(
+                        operation,
+                        "this Host admitted no isolated-restore destination for the admitted \
+                         operation: the refusal is pre-effect",
+                    )),
+                    Ok(ReconcileDisposition::Reclaimed) => Err(BackupDispatchRefusal::new(
+                        operation,
+                        "this Host already reclaimed the admitted operation's isolated-restore \
+                         destination and observed its absence: the operation is finished, its \
+                         root is gone, and there is nothing to preserve and nothing to retry",
+                    )),
+                    // `AdmittedWithoutResult`, `Uncertain`, a `Current` record
+                    // after a refused call, and a failed read all carry the same
+                    // obligation: reconcile the ORIGINAL operation.
+                    Ok(_) | Err(_) => Ok(BackupOwnerOutcome::PossibleEffect {
+                        retained: retained_backup_operation(request)?,
+                    }),
+                }
+            }
+        }
     }
 
     /// Reconciles one admitted backup operation against the preparation this
@@ -6908,27 +7135,29 @@ impl HostComposition {
 
     /// Dispatches one accepted preparation through the existing owner chain
     /// (#962). This delegates to
-    /// [`HostComposition::prepare_backup_destination`], which authenticates
-    /// the caller, inspects owner evidence, and runs
-    /// [`DelegatedPreparation::prepare`](crate::backup_preparation::DelegatedPreparation::prepare);
-    /// the production caller chain is preserved and no algorithm is
-    /// reimplemented here.
+    /// [`HostComposition::prepare_backup_destination`], which authenticates the
+    /// caller against the owner-issued preparation credential, re-proves the
+    /// lease/installation binding and the registry-revision fence, and runs
+    /// [`DelegatedPreparation::prepare`](crate::backup_preparation::DelegatedPreparation::prepare)
+    /// with the owner-built presentation the credential carries; the production
+    /// caller chain is preserved and no algorithm is reimplemented here.
     ///
     /// # Errors
     ///
     /// Returns [`PreparationError`](crate::backup_preparation::PreparationError)
-    /// when the caller gate, lease/installation binding, owner evidence,
-    /// admission, or journal persistence fails closed.
+    /// when the caller gate, lease/installation binding, registry-revision
+    /// fence, owner evidence, admission, or journal persistence fails closed.
     pub fn backup_dispatch_prepare(
         &self,
         caller: &crate::backup_preparation::BackupCallerAuth,
-        request: &crate::backup_preparation::PresentedPreparationRequest,
+        credential: &crate::backup_preparation::OwnerPreparationCredential,
+        evidence: &crate::backup_preparation::OwnerEvidence,
     ) -> Result<
         (
             crate::backup_preparation::DelegatedPreparation<
                 crate::backup_preparation::HostStatePreparationJournal<'_>,
             >,
-            crate::backup_preparation::PreparedDestination,
+            crate::backup_preparation::PreparedDestinationHandle,
         ),
         crate::backup_preparation::PreparationError,
     > {
@@ -6943,7 +7172,7 @@ impl HostComposition {
         // preparation must resolve without cutover admission, cutover with
         // it, and rehearsal completion to no entry.
         Self::validate_backup_dispatch_prepare_routing(Self::register_backup_dispatch());
-        let prepared = self.prepare_backup_destination(caller, request)?;
+        let prepared = self.prepare_backup_destination(caller, credential, evidence)?;
         host_terminal.disarm();
         Ok(prepared)
     }

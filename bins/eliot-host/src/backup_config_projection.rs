@@ -92,10 +92,9 @@
 //! defaulted to an absent marker, and it is never defaulted to a presented
 //! value.
 //!
-//! The presented source installation identity is bounded presented text. The
-//! only owner-issued installation identity on this contour is the launch
-//! installation handle, and it is proved against the presented value by
-//! `BackupCallerAuth::authenticate_for_owner` at
+//! The source installation identity is owner-issued text, not presented: the
+//! owner-issued preparation credential admits the launch installation handle
+//! itself, and it is re-proved by `BackupCallerAuth::authenticate_for_owner` at
 //! `HostComposition::prepare_backup_destination` before any projection runs.
 //! The projector itself performs no installation-identity comparison, and the
 //! source root bound next to it in the prepared-destination receipt is the

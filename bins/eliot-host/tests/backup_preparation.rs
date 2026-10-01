@@ -1059,12 +1059,17 @@ fn preparation_guard_excludes_registry_restore_and_cutover() {
             fence_digest: HEX_E.to_owned(),
         };
         caller.check_shapes().expect("shapes hold");
+        // No owner-issued preparation credential exists for this caller on this
+        // contour, so `authenticate` refuses before any destination effect. The
+        // credential itself needs a real OwnerEvidence bundle (real protected
+        // root plus a committed registry), which this fixture has none of, so
+        // `None` is the exact input an unissued caller presents.
         assert!(
             matches!(
-                caller.authenticate(),
+                caller.authenticate(None),
                 Err(PreparationError::InvalidRequest { field, .. }) if field == "caller_auth"
             ),
-            "unauthenticated delegation refused pending #954"
+            "an unissued caller is refused at the caller gate"
         );
         return;
     }
@@ -1098,12 +1103,15 @@ fn preparation_guard_excludes_registry_restore_and_cutover() {
         fence_digest: HEX_E.to_owned(),
     };
     caller.check_shapes().expect("shapes hold");
+    // See the non-Windows arm above: no owner-issued preparation credential
+    // exists without a real OwnerEvidence bundle, so the caller gate refuses
+    // before any destination effect.
     assert!(
         matches!(
-            caller.authenticate(),
+            caller.authenticate(None),
             Err(PreparationError::InvalidRequest { field, .. }) if field == "caller_auth"
         ),
-        "unauthenticated delegation refused pending #954"
+        "an unissued caller is refused at the caller gate"
     );
     // Closed class set: exhaustive match over every variant (compile-checked;
     // adding a cutover variant breaks this test until its case exists).

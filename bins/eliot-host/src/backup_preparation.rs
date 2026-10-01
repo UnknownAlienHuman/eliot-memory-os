@@ -94,21 +94,29 @@
 //!    `RuntimeStateRoots::isolated_restore_root`, a root the installation owner
 //!    declares beside `installations` and beside the package staging root, and
 //!    `DelegatedPreparation::prepare` refuses any presented parent that is not
-//!    that exact root. The remaining absent owner is the CALLER, not a path:
-//!    `HostComposition::prepare_backup_destination` takes a
-//!    [`BackupCallerAuth`] whose two digests are documented as owner-issued and
-//!    which no owner reachable from this contour produces, and
-//!    [`BackupCallerAuth::authenticate`] is the standing always-refuse stub. That
-//!    is a different obligation from A2's destination allocation, so it is named
-//!    there rather than answered here.
+//!    that exact root. The remaining absent owner was the CALLER, not a path,
+//!    and #2569 BK3 closes it: [`OwnerEvidence::issue_preparation_credential`]
+//!    is the owner-issued credential that binds the authenticated
+//!    principal/capability of one admitted `#954` request to this owner's own
+//!    registry, lease, generation, fence and manifest records, and
+//!    `DelegatedPreparation::prepare` now takes that credential instead of a
+//!    presented request. Every field of the presentation is therefore
+//!    owner-issued or an explicit absence, so no caller-chosen path, build,
+//!    profile, generation or state fence reaches the effect, and
+//!    [`BackupCallerAuth::authenticate`] compares its two digests against the
+//!    credential's owner-issued values instead of refusing unconditionally.
 //!
-//!    The second thing that arm would need is an answer to a `#954` interface
-//!    question, not a change in this module: `BackupOwnerOutcome` states that a
-//!    produced destination "travels as a bounded immutable handle, never as a
-//!    path, a URL, or an inline body", and
-//!    `crates/kernel/eliot-host-control-endpoint/src/backup.rs` contains no
-//!    occurrence of "path" at all, so whether the prepared destination can be
-//!    named across the seam is `eliot-protocol`'s decision, not this issue's.
+//!    What the owner publishes across the seam is
+//!    [`PreparedDestinationHandle`], which is deliberately NOT the
+//!    path-carrying [`PreparedDestination`]: it is the bounded, owner-issued
+//!    identity, epoch, OS identity, admission digest, configuration projection
+//!    digest and manifest binding, with no path, URL or inline body. The
+//!    `#954` owner outcome still carries no field that can transport it (see
+//!    `crates/kernel/eliot-host-control-endpoint/src/backup.rs`, which contains
+//!    no occurrence of "path" at all), so the Kernel side that resolves it into
+//!    a `DestinationManifestAdmission` remains that consumer's own interface
+//!    decision; this side answers "what did this Host admit and create, and with
+//!    which manifest evidence" and nothing more.
 //!
 //! Writing an owner allocation seam in `crates/kernel/eliot-installation` while
 //! none of these can call it would add a public function with no caller, which
@@ -192,24 +200,28 @@
 //! The source-identity proof is real and lives at its owner:
 //! `HostComposition::prepare_backup_destination` calls
 //! [`BackupCallerAuth::authenticate_for_owner`] with the held owner lease and
-//! the launch installation handle before any preparation runs, so the presented
-//! source installation identity is compared against owner-issued evidence
-//! there. The delegated port itself is owner-bound too: [`OwnerEvidence`] has
-//! all-private fields and only [`OwnerEvidence::inspect`] can build one, so
-//! [`DelegatedPreparation::prepare`] cannot be entered without a real
-//! protected root and a committed registry behind it.
+//! the launch installation handle before any preparation runs, so the
+//! installation identity the credential admitted is compared against owner-issued
+//! evidence there. The delegated port itself is owner-bound twice over now:
+//! [`OwnerEvidence`] has all-private fields and only [`OwnerEvidence::inspect`]
+//! can build one, and [`DelegatedPreparation::prepare`] takes an
+//! [`OwnerPreparationCredential`] that only
+//! [`OwnerEvidence::issue_preparation_credential`] can mint — so the port cannot
+//! be entered without a real protected root, a committed registry, a validated
+//! active generation and a committed activation fence behind it, and cannot be
+//! entered at all with a caller-shaped request.
 //!
 //! What is NOT proved here: [`prepare_isolated_destination`] and
 //! [`DestinationAdmission`] are `pub` with all-public fields, so a caller that
 //! bypasses the delegated port can reach the effect step with a fabricated
 //! source root and staging parent. Narrowing that port means making it
-//! crate-private, which the declared 958 suite calls directly, and the
-//! authenticated-caller control itself has no Host-side port
-//! ([`BackupCallerAuth::authenticate`] fails closed against it). The module
-//! holds no registry writer, no archive import, no store-recovery rewrite and
-//! no cutover arm, so the closed [`PreparationClass`] set plus those absences
-//! are what exclude a second installer/registry, same-installation
-//! Store-recovery rewrite, archive restore and cutover today.
+//! crate-private, which the declared 958 suite calls directly. The module holds
+//! no registry writer, no archive import, no store-recovery rewrite and no
+//! cutover arm, so the closed [`PreparationClass`] set plus those absences are
+//! what exclude a second installer/registry, same-installation Store-recovery
+//! rewrite, archive restore and cutover today. Cutover is a separate owner
+//! question that A13.7 keeps out of a preparation credential entirely: nothing
+//! in a [`PreparedDestinationHandle`] is cutover authority.
 //!
 //! # Cleanup ownership, custody and retirement state
 //!
@@ -384,6 +396,7 @@ use crate::backup_config_projection::{
     ApprovedBuildBinding, AuditFenceNote, BackupConfigProjection, BackupConfigRequest,
     ProjectionError, bind_approved_build, hash_field, project_backup_config_owner_bound,
 };
+use eliot_host_service::runtime_control::BackupRuntimeControlRequest;
 use eliot_host_state::{
     BackupPreparationRecord, BackupPreparationState, HostState, HostStateRecord,
     IdempotencyIdentity, ProductionHostStateJournal, RecordFence,
@@ -398,6 +411,7 @@ use eliot_platform_windows::{
     ProtectedRootRemovalOutcome, ProtectedRootRemovalProof, ProtectedRuntimePathLease,
     windows_paths_equal,
 };
+use eliot_protocol::backup::{BackupCapability, BackupOperationKind, BackupRole};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -602,8 +616,8 @@ pub enum PreparationError {
 // (pure passthroughs; the inner operation owns the record),
 // `OwnerEvidence::approved_binding` (mapping adapter covered by the inner bind
 // and outer delegate records), `BackupCallerAuth::{check_shapes, authenticate}`
-// (the former surfaces through `authenticate_for_owner`; the latter is the
-// always-refuse stub with no production path),
+// (both surface through `authenticate`/`authenticate_for_owner` on the
+// production preparation path),
 // `conflict_field`/`admission_digest`/`derive_*`/`hash_path`
 // /`reject_reparse`/`reverify_recorded_destination`/`protected_path_to_preparation`
 // /`projection_to_preparation`/`intent_json`/`result_json`/`cleanup_transition_json`
@@ -644,6 +658,7 @@ const OP_STAGING_PARENT: &str = "staging_parent";
 const OP_STAGING_LEASE: &str = "staging_lease";
 const OP_DESTINATION_LEASE: &str = "destination_lease";
 const OP_CALLER_AUTH: &str = "caller_auth";
+const OP_PREPARATION_CREDENTIAL: &str = "preparation_credential";
 /// The durable Host-state journal sink this module writes intent/result through.
 const OP_JOURNAL_SINK: &str = "journal_sink";
 
@@ -943,6 +958,172 @@ pub struct PreparedDestination {
     /// refused, never rendered into a receipt. See
     /// [`DestinationAdmission::audit_fence_note`].
     pub audit_fence_note: Option<String>,
+}
+
+/// The bounded handle this owner publishes for one prepared isolated
+/// destination (issue #2569 BK3; #954; I5.13 `full_recovery`; A13.7).
+///
+/// This is what crosses the owner seam, and it is deliberately **not** a
+/// [`PreparedDestination`]: that receipt carries
+/// [`PreparedDestination::root`], a filesystem path, and A13.7 plus the closed
+/// `#954` owner outcome both require a produced destination to travel as a
+/// bounded immutable handle and never as a path, a URL, or an inline body. So
+/// every member here is owner-issued identity or a digest:
+///
+/// - `operation_id` is the admitted `#954` request-identity digest, which is the
+///   key the durable [`BackupPreparationRecord`] is indexed by, so the handle
+///   and the journal record cannot name different operations;
+/// - `destination_id`, `destination_epoch` and `root_identity` are the
+///   owner-derived identity, the preparation-scope lineage marker and the
+///   protected-root owner's pinned OS identity for the exact directory this
+///   operation created. `destination_epoch` is preparation scope and never an
+///   Authority Epoch;
+/// - `admission_digest` and `config_projection_digest` are the owner's own
+///   receipts for the admitted inputs and the proved configuration evidence;
+/// - `manifest` is the owner-issued active-manifest binding
+///   ([`OwnerEvidence::owner_manifest_binding`]) the Kernel's
+///   `DestinationManifestAdmission` is resolved from. It is a projection of the
+///   Host's own registry record, not a second binding, and the roots themselves
+///   are deliberately not carried.
+///
+/// No member is caller-presented and there is no constructor outside this
+/// module other than [`Self::issue`], which needs the owner's own manifest
+/// binding and a destination this owner produced. A caller cannot forge one, and
+/// nothing here grants authority: the handle states what this Host admitted and
+/// created, and cutover authority is a separate owner question A13.7 keeps out
+/// of it entirely.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedDestinationHandle {
+    operation_id: String,
+    destination_id: String,
+    destination_epoch: u64,
+    root_identity: RootIdentity,
+    admission_digest: String,
+    config_projection_digest: String,
+    manifest: HostManifestBinding,
+}
+
+impl PreparedDestinationHandle {
+    /// Publishes the bounded handle for one destination this owner produced.
+    ///
+    /// The two inputs are both owner-issued: the manifest binding this bundle
+    /// re-proved at issue time, and the destination [`Self::issue`]'s caller
+    /// just produced through [`DelegatedPreparation::prepare`]. The handle is
+    /// refused when any of its own digests is malformed, so a broken owner
+    /// record fails at the owner boundary instead of after it has been carried
+    /// into a restore.
+    pub(crate) fn issue(
+        manifest: &HostManifestBinding,
+        prepared: &PreparedDestination,
+    ) -> Result<Self, PreparationError> {
+        let issued = (|| -> Result<Self, PreparationError> {
+            let handle = Self {
+                operation_id: prepared.operation_id.clone(),
+                destination_id: prepared.destination_id.clone(),
+                destination_epoch: prepared.destination_epoch,
+                root_identity: prepared.root_identity.clone(),
+                admission_digest: prepared.admission_digest.clone(),
+                config_projection_digest: prepared.config_projection_digest.clone(),
+                manifest: manifest.clone(),
+            };
+            handle.validate()?;
+            Ok(handle)
+        })();
+        match issued {
+            Ok(handle) => {
+                observe_prepare_progress(
+                    OP_PREPARATION_CREDENTIAL,
+                    "handle",
+                    "published",
+                    0,
+                    handle.destination_epoch,
+                );
+                Ok(handle)
+            }
+            Err(error) => Err(note_prepare_error(
+                OP_PREPARATION_CREDENTIAL,
+                "handle",
+                error,
+                0,
+            )),
+        }
+    }
+
+    /// Shape-checks this handle's own owner-issued values.
+    fn validate(&self) -> Result<(), PreparationError> {
+        check_identity(&self.operation_id, "handle_operation_id")?;
+        check_identity(&self.destination_id, "handle_destination_id")?;
+        check_digest(&self.admission_digest, "handle_admission_digest")?;
+        check_digest(
+            &self.config_projection_digest,
+            "handle_config_projection_digest",
+        )?;
+        check_identity(&self.root_identity.identity, "handle_root_identity")?;
+        self.manifest.validate()
+    }
+
+    /// Whether the durable record the journal still retains for this operation
+    /// is the exact destination this handle names.
+    ///
+    /// This is the publication check the owner runs before answering: a handle
+    /// whose operation was re-derived but whose retained record carries a
+    /// different destination identity, a different pinned OS identity or a
+    /// different admission digest is not proof of anything, and the owner says
+    /// so rather than answering as if it were.
+    pub fn proves(&self, prepared: &PreparedDestination) -> bool {
+        self.operation_id == prepared.operation_id
+            && self.destination_id == prepared.destination_id
+            && self.destination_epoch == prepared.destination_epoch
+            && self.root_identity == prepared.root_identity
+            && self.admission_digest == prepared.admission_digest
+            && self.config_projection_digest == prepared.config_projection_digest
+    }
+
+    /// The admitted preparation operation identity this handle names.
+    #[must_use]
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    /// The owner-derived destination identity, never a caller- or
+    /// archive-selected value.
+    #[must_use]
+    pub fn destination_id(&self) -> &str {
+        &self.destination_id
+    }
+
+    /// The preparation-scope lineage marker. **Not** an Authority Epoch: no
+    /// Authority Epoch is issued here, and nothing may read it as one.
+    #[must_use]
+    pub const fn destination_epoch(&self) -> u64 {
+        self.destination_epoch
+    }
+
+    /// The protected-root owner's pinned OS identity for the created directory.
+    #[must_use]
+    pub const fn root_identity(&self) -> &RootIdentity {
+        &self.root_identity
+    }
+
+    /// The owner's admission digest over every admitted input.
+    #[must_use]
+    pub fn admission_digest(&self) -> &str {
+        &self.admission_digest
+    }
+
+    /// The owner-issued configuration projection digest this destination was
+    /// admitted under.
+    #[must_use]
+    pub fn config_projection_digest(&self) -> &str {
+        &self.config_projection_digest
+    }
+
+    /// The owner-issued active-manifest binding this destination was admitted
+    /// under, which is what the Kernel resolves into its destination admission.
+    #[must_use]
+    pub const fn manifest_binding(&self) -> &HostManifestBinding {
+        &self.manifest
+    }
 }
 
 /// Reconcile disposition for one operation (issue #958, cases 958/12, 958/14).
@@ -3765,13 +3946,15 @@ pub struct PresentedPreparationRequest {
 ///
 /// This is the exact sink interface the `HostComposition` owner binds: it owns
 /// the installation/Host journal sink (`J`), takes inspected owner evidence
-/// ([`OwnerEvidence`]) plus one presented request, and runs the full
-/// owner-bound preparation lifecycle. [`OwnerEvidence`] has all-private fields
-/// and only [`OwnerEvidence::inspect`] can build one, so this port cannot be
-/// entered without a real protected root and a committed registry behind it.
-/// The caller-role half of authentication has no Host-side port and stays a
-/// real fail-closed refusal ([`BackupCallerAuth::authenticate`]), while the
-/// source-identity half is proved by
+/// ([`OwnerEvidence`]) plus the owner-issued preparation credential
+/// ([`OwnerPreparationCredential`]), and runs the full owner-bound preparation
+/// lifecycle. [`OwnerEvidence`] has all-private fields and only
+/// [`OwnerEvidence::inspect`] can build one, and a credential can only be minted
+/// from one, so this port cannot be entered without a real protected root, a
+/// committed registry, a validated active generation and a committed activation
+/// fence behind it, and cannot be entered with a caller-shaped request at all.
+/// The caller-role half is proved by [`BackupCallerAuth::authenticate`] against
+/// that credential, and the source-identity half by
 /// [`BackupCallerAuth::authenticate_for_owner`] at the composition port. Every
 /// owner or presented-evidence failure maps to a typed [`PreparationError`]
 /// without echoing owner internals.
@@ -3786,45 +3969,57 @@ impl<J: PreparationJournal> DelegatedPreparation<J> {
     }
 
     /// Prepares one isolated destination from owner evidence plus one
-    /// presented request.
+    /// owner-issued preparation credential.
+    ///
+    /// The presentation is no longer a parameter at all (issue #2569 BK3): it is
+    /// read out of `credential`, which only
+    /// [`OwnerEvidence::issue_preparation_credential`] can produce and which
+    /// builds every field from owner evidence. So the "presented" comparisons
+    /// below still run — a caller can no longer reach them at all — but they now
+    /// guard the credential's own construction rather than substituting for it,
+    /// and the guarantee they used to give is stronger: there is no longer any
+    /// caller-chosen staging parent, build, profile, generation, nonce or state
+    /// fence that reaches this effect.
     ///
     /// Order: bind the active approved generation from the inspected
-    /// evidence, approve the presented target build and profile against that
+    /// evidence, approve the credential's target build and profile against that
     /// owner record, project the bounded owner-issued configuration evidence
     /// through the owner-bound projector, resolve the manifest-bound owner
     /// source root, then admit and prepare idempotently. The projection is a
-    /// precondition, not an observation: a presented purge-ledger revision or
-    /// forensic note is refused outright, a presented owner lease reference that
-    /// is not the owner-issued one is refused as stale, and a stale or mixed
-    /// generation or configuration/build digest is refused, all before any
-    /// filesystem observation. The projected owner configuration digest plus the
-    /// projection digest are admitted so the prepared-destination receipt binds
-    /// the exact configuration evidence that was proved. The caller never
-    /// chooses the manifest digest, the projection digest, the owner lease
-    /// reference, or the approved-build digest set.
+    /// precondition, not an observation, and it refuses before any filesystem
+    /// observation: a stale or mixed generation or configuration/build digest is
+    /// refused, and a lease reference that is not the owner-issued one is
+    /// refused as stale. The credential carries no purge-ledger claim and no
+    /// forensic note, and the projector binds the owner's own values for both
+    /// either way. The projected owner configuration digest plus the projection
+    /// digest are admitted so the prepared-destination receipt binds the exact
+    /// configuration evidence that was proved. The caller never chooses the
+    /// manifest digest, the projection digest, the owner lease reference, the
+    /// staging parent, or the approved-build digest set.
     ///
     /// The admitted `authority_generation` is the owner-issued one from
-    /// [`OwnerEvidence::authority_generation`], so the presented
+    /// [`OwnerEvidence::authority_generation`], so the credential's
     /// `approved_generation` is admitted only if it matches committed owner
-    /// evidence, and the presented `request.authority_generation` is not an
-    /// input to that decision at all. The presented `staging_parent` is a claim
-    /// about the owner-issued isolated restore root
-    /// ([`resolve_owner_staging_parent`]): it must equal that exact root or the
-    /// preparation is refused, and the parent actually admitted is the
-    /// owner-issued one, which is then proved by the protected-root owner inside
-    /// the preparation. A client-supplied arbitrary path is therefore refused
-    /// twice over — once for not being the owner's root and once, at
-    /// [`admit_staging_parent`], for not being a protected, reparse-free parent
-    /// outside the source. The presented target build
-    /// and profile are compared against the owner-issued approved-generation
-    /// handle and approved profile token of the same validated record, so a
-    /// build or profile the owner has not approved is refused rather than
-    /// accepted.
+    /// evidence, and the credential's `authority_generation` is not an input to
+    /// that decision at all. The credential's `staging_parent` is the
+    /// owner-issued isolated restore root
+    /// ([`resolve_owner_staging_parent`]): it is compared against that exact root
+    /// and the preparation is refused when it is not, and the parent actually
+    /// admitted is the owner-issued one, which is then proved by the
+    /// protected-root owner inside the preparation. A client-supplied arbitrary
+    /// path is therefore unreachable on this path at all, and a parent that is
+    /// not protected, reparse-free and outside the source is still refused at
+    /// [`admit_staging_parent`]. The credential's target build and profile are
+    /// compared against the owner-issued approved-generation handle and approved
+    /// profile token of the same validated record, so a build or profile the
+    /// owner has not approved is refused rather than accepted.
     pub fn prepare(
         &mut self,
         evidence: &OwnerEvidence,
-        request: &PresentedPreparationRequest,
+        credential: &OwnerPreparationCredential,
     ) -> Result<PreparedDestination, PreparationError> {
+        // Owner-built, never presented: see this method's documentation.
+        let request = credential.presentation();
         let binding: ApprovedBuildBinding = evidence
             .approved_binding()
             .map_err(|error| note_prepare_error(OP_DELEGATE, "bind_build", error, 0))?;
@@ -5020,6 +5215,171 @@ impl OwnerEvidence {
         self.registry.revision()
     }
 
+    /// Issues the **owner-issued** preparation credential for one admitted
+    /// isolated-restore preparation request (issue #2569 BK3; #954; A13.7).
+    ///
+    /// This is the seam that makes the preparation effect reachable without ever
+    /// trusting a caller. It can only be reached with an `OwnerEvidence` bundle
+    /// in hand, and that bundle exists only when a real protected source root
+    /// answered a real retained lease and a committed installation registry
+    /// answered a real active approved generation and activation fence. So the
+    /// credential below is *issued*, not presented, and it binds:
+    ///
+    /// - the **authenticated** principal/session/role/capability and the
+    ///   admitted operation identity, re-checked here against the closed
+    ///   [`BackupRole`] projection for [`BackupOperationKind::PrepareIsolatedRestore`]
+    ///   so a payload value grants no role;
+    /// - the **owner-issued** source installation: `source_installation` must
+    ///   equal the installation the composition's held owner lease covers, or
+    ///   the credential is refused;
+    /// - the owner-resolved staging parent, the owner-approved build handle and
+    ///   profile token, and the owner-issued authority generation — every value
+    ///   the admission would otherwise take from a presented request. (The
+    ///   source root is re-derived from the same evidence inside
+    ///   [`DelegatedPreparation::prepare`] rather than carried, so it cannot go
+    ///   stale between issue and effect.)
+    /// - the owner-issued manifest binding the published
+    ///   [`PreparedDestinationHandle`] carries;
+    /// - the two digests [`BackupCallerAuth::authenticate`] compares against.
+    ///
+    /// Order matters and is fail-closed at every step: caller admission first
+    /// (before any owner read is turned into a receipt), then the owner records,
+    /// then the presentation. No filesystem observation and no destination
+    /// effect happens here — this issues a credential; the effect is
+    /// [`DelegatedPreparation::prepare`], which consumes it.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed with a typed [`PreparationError`]: an unauthenticated or
+    /// capability-less caller, a source installation that is not the
+    /// lease-bound one, and whatever the owner reads themselves refuse (a stale
+    /// lease, a moved registry, a profile with no isolated restore root). The
+    /// outcome is observed once and no owner text, path or record body is
+    /// echoed.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the ordered issuance chain stays in one fail-closed boundary so no owner refusal observation can be skipped between neighbours"
+    )]
+    pub fn issue_preparation_credential(
+        &self,
+        caller: &AdmittedBackupCaller,
+        source_installation: &PlatformHandle,
+    ) -> Result<OwnerPreparationCredential, PreparationError> {
+        let issued = (|| -> Result<OwnerPreparationCredential, PreparationError> {
+            if caller.operation() != BackupOperationKind::PrepareIsolatedRestore {
+                return Err(PreparationError::InvalidRequest {
+                    field: "caller_auth",
+                    reason: "the admitted operation is not an isolated-restore preparation"
+                        .to_owned(),
+                });
+            }
+            // The separately authenticated role/capability pair is compared
+            // against the closed `#954` projection here, at issue, rather than
+            // trusted: a payload value never grants a role.
+            if !caller.role().permits(caller.operation())
+                || !caller.role().capabilities().contains(&caller.capability())
+            {
+                return Err(PreparationError::InvalidRequest {
+                    field: "caller_auth",
+                    reason: "the authenticated caller capability does not admit isolated-restore \
+                             preparation"
+                        .to_owned(),
+                });
+            }
+            if caller.source_installation() != source_installation.as_str() {
+                return Err(PreparationError::InvalidRequest {
+                    field: "caller_auth",
+                    reason: "the admitted source installation is not the lease-bound owner \
+                             installation"
+                        .to_owned(),
+                });
+            }
+            check_identity(caller.principal(), "caller_principal")?;
+            check_identity(caller.session_id(), "caller_session")?;
+            check_identity(source_installation.as_str(), "source_installation")?;
+            // Owner records. Every one of these is read from a record this
+            // bundle already validated, and none of them is derived from a
+            // presented value.
+            let binding = self.approved_binding()?;
+            let manifest = self.owner_manifest_binding()?;
+            let owner_lease_ref = self.owner_lease_ref()?;
+            let lease_digest = sha_hex(&[
+                DESTINATION_ID_DOMAIN.as_bytes(),
+                b"\0caller-lease\0",
+                owner_lease_ref.as_bytes(),
+            ]);
+            // The committed activation generation handle and the manifest binding
+            // are the owner-issued fence identity for this preparation. It is a
+            // preparation-scope binding only: nothing reads it as an Authority
+            // Epoch, and I5.13/A13.7 keep any new epoch lineage to the cutover
+            // owner.
+            let fence_digest = sha_hex(&[
+                DESTINATION_ID_DOMAIN.as_bytes(),
+                b"\0caller-activation-fence\0",
+                self.fence.generation.as_str().as_bytes(),
+                b"\0",
+                manifest.manifest_digest.as_bytes(),
+                b"\0",
+                manifest.roots_digest.as_bytes(),
+            ]);
+            let presentation = PresentedPreparationRequest {
+                // The admitted `#954` identity digest, not a caller-chosen
+                // operation name and not a counter.
+                operation_id: caller.operation_identity().to_owned(),
+                class: PreparationClass::IsolatedRestoreRehearsal,
+                source_installation_id: source_installation.as_str().to_owned(),
+                staging_parent: resolve_owner_staging_parent(self.runtime_roots())?,
+                target_build: binding.generation_handle.clone(),
+                target_profile: binding.approved_profile.clone(),
+                approved_generation: self.authority_generation(),
+                authority_generation: self.authority_generation(),
+                owner_lease_ref: owner_lease_ref,
+                // No purge-ledger claim: the revision is owner-issued by the ORS
+                // owner and is bound into the projection digest whether or not a
+                // claim was made, so an explicit absence is the honest value.
+                purge_ledger_revision: 0,
+                // No caller build-digest subset. The projector binds the complete
+                // owner-issued approved artifact set either way.
+                build_digests: Vec::new(),
+                // No forensic note: a note is forensic and optional under I5.13,
+                // and this path never renders one into a receipt.
+                audit_fence_note: None,
+                // Fresh transport entropy, carried as presented entropy only.
+                // It is not an input to the destination identity or the
+                // preparation-scope lineage marker.
+                authority_nonce: caller.nonce().to_owned(),
+                state_fence_digest: fence_digest.clone(),
+            };
+            Ok(OwnerPreparationCredential {
+                operation_id: presentation.operation_id.clone(),
+                caller: caller.clone(),
+                source_installation_id: presentation.source_installation_id.clone(),
+                lease_digest,
+                fence_digest,
+                manifest,
+                presentation,
+            })
+        })();
+        match issued {
+            Ok(credential) => {
+                observe_prepare_progress(
+                    OP_PREPARATION_CREDENTIAL,
+                    "issue",
+                    "issued",
+                    self.authority_generation(),
+                    0,
+                );
+                Ok(credential)
+            }
+            Err(error) => Err(note_prepare_error(
+                OP_PREPARATION_CREDENTIAL,
+                "issue",
+                error,
+                0,
+            )),
+        }
+    }
+
     /// Returns the owner-issued runtime authority resource generation.
     ///
     /// This is the value [`ActivationCommitFence::authority_generation`] the
@@ -5077,30 +5437,267 @@ pub fn verify_staging_parent_lease(
     Ok(verified)
 }
 
-/// Authenticated caller control for one delegated preparation (issue #958).
+/// The authenticated caller projection of one admitted backup control request
+/// (issue #2569 BK3; #954).
+///
+/// Every member is read out of the request the runtime-control endpoint already
+/// admitted and validated: the transport-authenticated role and capability, the
+/// `#954` body identity they are bound to, and the transport correlation fields.
+/// The fields are private and the only constructor reads an admitted
+/// [`BackupRuntimeControlRequest`], so this projection cannot be written by hand.
+/// It grants nothing on its own either: an owner-issued
+/// [`OwnerPreparationCredential`] additionally requires a real `OwnerEvidence`
+/// bundle, so a self-consistent envelope still reaches no effect.
+///
+/// The operation identity is the one thing downstream keys on, and it is the
+/// admitted body's own `#954` `identity_digest`: a digest over the whole
+/// authenticated identity, so two different operations cannot collide and a
+/// caller cannot increment, reuse or choose it as a counter. It is also exactly
+/// what `crate::HostComposition`'s `retained_backup_operation` names in the owner
+/// result, so the durable preparation record, the owner's retained operation and
+/// the owner-issued credential all name the same operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdmittedBackupCaller {
+    principal: String,
+    session_id: String,
+    role: BackupRole,
+    capability: BackupCapability,
+    operation: BackupOperationKind,
+    operation_identity: String,
+    source_installation: String,
+    nonce: String,
+}
+
+impl AdmittedBackupCaller {
+    /// Reads the authenticated caller projection out of one admitted request.
+    ///
+    /// The envelope's own header/body joins are re-asserted here rather than
+    /// assumed: a caller projection that let the header name one role or session
+    /// while the committed body names another would be a second, self-consistent
+    /// claim about a different operation. The endpoint validates the same joins
+    /// before it admits the request; repeating them costs nothing and keeps this
+    /// projection honest if it is ever read from anywhere else.
+    pub fn from_admitted_request(
+        request: &BackupRuntimeControlRequest,
+    ) -> Result<Self, PreparationError> {
+        let identity = request.body.identity();
+        if identity.principal.role != request.role
+            || identity.principal.session_id != request.session_id.as_str()
+        {
+            return Err(PreparationError::InvalidRequest {
+                field: "caller_auth",
+                reason: "the admitted envelope's role and session do not match the carried \
+                         operation body's authenticated principal"
+                    .to_owned(),
+            });
+        }
+        check_identity(&identity.principal.principal, "caller_principal")?;
+        check_identity(&identity.principal.session_id, "caller_session")?;
+        check_digest(&identity.identity_digest, "operation_identity")?;
+        check_identity(request.source.as_str(), "source_installation")?;
+        check_identity(request.nonce.as_str(), "authority_nonce")?;
+        Ok(Self {
+            principal: identity.principal.principal.clone(),
+            session_id: identity.principal.session_id.clone(),
+            role: request.role,
+            capability: request.capability,
+            operation: request.operation,
+            operation_identity: identity.identity_digest.clone(),
+            source_installation: request.source.as_str().to_owned(),
+            nonce: request.nonce.as_str().to_owned(),
+        })
+    }
+
+    /// The authenticated principal identity the transport reported.
+    pub(crate) const fn principal(&self) -> &str {
+        &self.principal
+    }
+
+    /// The authenticated session the transport reported.
+    pub(crate) const fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// The separately authenticated role projection.
+    pub(crate) const fn role(&self) -> BackupRole {
+        self.role
+    }
+
+    /// The separately authenticated capability projection.
+    pub(crate) const fn capability(&self) -> BackupCapability {
+        self.capability
+    }
+
+    /// The operation this caller was admitted for.
+    pub(crate) const fn operation(&self) -> BackupOperationKind {
+        self.operation
+    }
+
+    /// The admitted `#954` request-identity digest: the preparation operation
+    /// identity.
+    pub(crate) fn operation_identity(&self) -> &str {
+        &self.operation_identity
+    }
+
+    /// The source installation the admitted request named.
+    pub(crate) fn source_installation(&self) -> &str {
+        &self.source_installation
+    }
+
+    /// The fresh transport nonce the admitted request carried. Carried as
+    /// opaque presented entropy only: it is deliberately not an input to the
+    /// destination identity or the preparation-scope lineage marker.
+    pub(crate) fn nonce(&self) -> &str {
+        &self.nonce
+    }
+}
+
+/// The preparation operation identity this Host keys one admitted backup
+/// operation's durable preparation record by.
+///
+/// One function, so the write path and every read of that record name the same
+/// key: a preparation written under one selector and read under another would
+/// report an admitted operation as absent and invite a second destination under
+/// an identity that already has one.
+pub fn admitted_preparation_operation_id(
+    request: &BackupRuntimeControlRequest,
+) -> Result<String, PreparationError> {
+    Ok(AdmittedBackupCaller::from_admitted_request(request)?
+        .operation_identity()
+        .to_owned())
+}
+
+/// The **owner-issued** preparation credential: the binding of one
+/// authenticated principal/capability to the owner evidence this preparation is
+/// admitted against (issue #2569 BK3; #954; I5.13; A13.7).
+///
+/// All fields are private and the only constructor is
+/// [`OwnerEvidence::issue_preparation_credential`], so a credential cannot
+/// exist without a real protected source root, a committed installation
+/// registry, a validated active generation and a committed activation fence
+/// behind it. What it binds:
+///
+/// - the **authenticated** principal, session, role, capability and admitted
+///   operation identity, read from the request the endpoint already admitted and
+///   checked again at issue against the operation's own closed role/capability
+///   projection. A payload value never grants a role, so the role is re-checked
+///   against [`BackupRole::permits`] here rather than trusted as a claim;
+/// - the **owner-issued** source installation, refused unless the admitted
+///   request's own source equals the installation the composition's held owner
+///   lease covers;
+/// - the owner-resolved staging parent
+///   ([`resolve_owner_staging_parent`]) and the owner-approved build handle and
+///   profile token ([`OwnerEvidence::approved_binding`]) — never a
+///   caller-named path, a caller-selected build or a caller-incremented epoch;
+/// - the owner-issued authority generation from the committed activation fence
+///   ([`OwnerEvidence::authority_generation`]), so the generation the admission
+///   carries is compared against owner evidence rather than against a second
+///   value the same caller chose;
+/// - the owner-issued manifest binding
+///   ([`OwnerEvidence::owner_manifest_binding`]) that the published
+///   [`PreparedDestinationHandle`] carries to the Kernel;
+/// - the two digests [`BackupCallerAuth`] compares against: one over the
+///   retained protected-root lease reference this owner still proves, one over
+///   the committed activation generation and the manifest binding. Both are
+///   derived from owner records this bundle validated, so neither is a caller
+///   string, and neither is an epoch a caller can increment.
+///
+/// The presentation it carries is **built here**, not presented: every field
+/// [`DelegatedPreparation::prepare`] needs is owner-issued or is an explicit
+/// absence (no forensic note, no purge-ledger claim, no caller build-digest
+/// subset). The owner-resolved source root is re-derived from the same evidence
+/// inside `prepare` rather than carried, so it cannot go stale between issue and
+/// effect. A caller therefore cannot reach the preparation effect with a path, a
+/// string or an epoch of its own, which is the whole point of the credential.
+pub struct OwnerPreparationCredential {
+    caller: AdmittedBackupCaller,
+    operation_id: String,
+    source_installation_id: String,
+    lease_digest: String,
+    fence_digest: String,
+    manifest: HostManifestBinding,
+    presentation: PresentedPreparationRequest,
+}
+
+impl OwnerPreparationCredential {
+    /// The preparation operation identity this credential was issued for.
+    #[must_use]
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    /// The owner-issued source installation this credential admitted.
+    #[must_use]
+    pub fn source_installation_id(&self) -> &str {
+        &self.source_installation_id
+    }
+
+    /// The owner-issued digest over the retained protected-root lease.
+    #[must_use]
+    pub fn lease_digest(&self) -> &str {
+        &self.lease_digest
+    }
+
+    /// The owner-issued digest over the committed activation generation and the
+    /// manifest binding.
+    #[must_use]
+    pub fn fence_digest(&self) -> &str {
+        &self.fence_digest
+    }
+
+    /// The owner-issued active-manifest binding this preparation was admitted
+    /// under, which is what the Kernel resolves into its destination admission.
+    #[must_use]
+    pub const fn manifest_binding(&self) -> &HostManifestBinding {
+        &self.manifest
+    }
+
+    /// The authenticated caller this credential is bound to.
+    pub(crate) const fn caller(&self) -> &AdmittedBackupCaller {
+        &self.caller
+    }
+
+    /// The owner-built presentation this credential admitted.
+    pub(crate) const fn presentation(&self) -> &PresentedPreparationRequest {
+        &self.presentation
+    }
+}
+
+/// Authenticated caller control for one delegated preparation (issue #958;
+/// caller-credential half closed by #2569 BK3).
 ///
 /// Shape carries the owner-issued caller lease digest and the caller fence
-/// digest so refusals and (later) admissions bind them into the audit trail.
-/// Caller authentication itself has no Host-side verification to run against:
-/// [`BackupCallerAuth::authenticate`] fails closed, and no destination effect
-/// is reachable through it. #954 is not the open item — it merged
-/// (`5e71386a`, PR #2572) and defines the role/operation contract in
-/// `crates/foundation/eliot-protocol/src/backup.rs`, but that contract carries
-/// no caller credential or token this contour can verify a lease or fence
-/// digest against, and its own doc states that a payload value never grants a
-/// role.
+/// digest so refusals and admissions bind them into the audit trail. Both are
+/// now **compared**, not merely shape-checked:
+/// [`BackupCallerAuth::authenticate`] requires them to equal the values on the
+/// [`OwnerPreparationCredential`] this owner issued, so a caller auth built for a
+/// different retained lease, a different committed activation generation or a
+/// different manifest binding is refused by exact equality. The authority itself
+/// is the credential — the binding of one authenticated principal/capability to
+/// this owner's own registry, lease, generation, fence and manifest records —
+/// and neither digest is a path, a caller string or an epoch a caller can
+/// increment.
+///
+/// #954 is not the open item: it merged (`5e71386a`, PR #2572) and defines the
+/// role/operation contract in `crates/foundation/eliot-protocol/src/backup.rs`.
+/// What that contract does not supply is a credential, and its own doc states
+/// that a payload value never grants a role — which is why the role is
+/// re-checked against the closed projection at both issue and authentication.
 ///
 /// The live source-identity proof is
 /// [`BackupCallerAuth::authenticate_for_owner`], which
 /// `HostComposition::prepare_backup_destination` runs before any preparation
-/// and which compares the presented source installation identity against the
-/// owner-issued launch installation handle covered by the held owner lease. See
-/// the module documentation for exactly what is proved there and what is not.
+/// and which compares the installation identity the credential admitted against
+/// the owner-issued launch installation handle covered by the held owner lease.
+/// See the module documentation for exactly what is proved there and what is
+/// not.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BackupCallerAuth {
-    /// Owner-issued caller lease digest (hex64; shape-checked only).
+    /// Owner-issued caller lease digest (hex64), compared against the
+    /// credential's owner-issued value.
     pub lease_digest: String,
-    /// Caller-observed fence digest bound into the receipt (hex64).
+    /// Owner-issued caller fence digest (hex64), compared against the
+    /// credential's owner-issued value.
     pub fence_digest: String,
 }
 
@@ -5114,45 +5711,119 @@ impl BackupCallerAuth {
 
     /// Authenticates the caller against owner-issued control evidence.
     ///
-    /// Fail-closed because there is no owner-issued caller token to verify
-    /// against: no installation record, approved generation, commit fence,
-    /// owner lease or host-state record reachable from this contour carries a
-    /// caller credential, so every caller is refused here before any
-    /// destination effect. This is a real refusal, not a placeholder for a
-    /// passing check: no destination can be prepared through the
-    /// authenticated-caller path until such an owner exists, and no code path
-    /// relaxes it. The implementation that fills it must not change this
-    /// method's signature or callers.
+    /// This is the caller-role/credential half, and it is now a real comparison
+    /// against an owner-issued credential rather than an unconditional refusal
+    /// (issue #2569 BK3). What it checks, in order:
     ///
-    /// #954 is NOT the missing owner. It merged (`5e71386a`, PR #2572) and
-    /// supplies the role/operation *contract* in
-    /// `crates/foundation/eliot-protocol/src/backup.rs`; what it does not
-    /// supply is a credential this contour can verify, and its own doc states
-    /// that validators always compare a presented value against a separately
-    /// passed role argument because a payload value never grants a role.
+    /// 1. **The owner issued a credential at all.** `None` is refused here
+    ///    before any destination effect, with the module's static reason: an
+    ///    owner that has issued no preparation credential for this caller has
+    ///    authenticated nothing. That is the same fail-closed answer this
+    ///    method gave before, and it is now reachable only when no owner issued
+    ///    one.
+    /// 2. **The presented digests are the owner-issued ones.** `lease_digest`
+    ///    must equal the credential's digest over the retained protected-root
+    ///    lease this owner still proves, and `fence_digest` must equal the
+    ///    credential's digest over the committed activation generation and the
+    ///    validated manifest binding. Both are derived from owner records, so a
+    ///    caller auth built for a different lease, a different committed
+    ///    generation or a different manifest is refused by exact equality
+    ///    rather than admitted by shape. This is also what finally makes the
+    ///    two digest fields more than audit-trail text: before, no owner digest
+    ///    scheme bound them and they granted nothing; now there is an owner
+    ///    value for each to be compared against.
+    /// 3. **The credential's authenticated caller still admits this
+    ///    operation.** The credential's role/capability pair is re-checked
+    ///    against the closed `#954` projection — [`BackupRole::permits`] for the
+    ///    admitted operation and [`BackupRole::capabilities`] for the admitted
+    ///    capability — so a credential whose authenticated principal stopped
+    ///    admitting isolated-restore preparation is refused at authentication
+    ///    rather than at issuance alone.
     ///
-    /// The owner-issued source-identity proof that does exist today is
-    /// [`BackupCallerAuth::authenticate_for_owner`]; this method covers the
-    /// caller-role/credential half, which no owner issues.
-    pub fn authenticate(&self) -> Result<(), PreparationError> {
-        Err(PreparationError::InvalidRequest {
-            field: "caller_auth",
-            reason: "no owner-issued caller credential exists on this contour; unauthenticated \
-                     preparation refused"
-                .to_owned(),
-        })
+    /// What it deliberately does NOT do: it never grants a role from a payload
+    /// value (the `#954` contract's own rule), it never accepts a caller-named
+    /// destination parent, build, profile or generation, and it is not the
+    /// cutover authority A13.7 keeps separate — that arm is still refused with
+    /// no admitted body. The owner-issued source-identity half is
+    /// [`BackupCallerAuth::authenticate_for_owner`].
+    ///
+    /// #954 supplied the role/operation contract, not a credential; the
+    /// credential is issued by this owner's own registry-committed evidence
+    /// ([`OwnerEvidence::issue_preparation_credential`]).
+    pub fn authenticate(
+        &self,
+        credential: Option<&OwnerPreparationCredential>,
+    ) -> Result<(), PreparationError> {
+        let Some(credential) = credential else {
+            return Err(note_prepare_error(
+                OP_CALLER_AUTH,
+                "authenticate",
+                PreparationError::InvalidRequest {
+                    field: "caller_auth",
+                    reason: "this owner issued no preparation credential for the presented \
+                             caller; unauthenticated preparation refused"
+                        .to_owned(),
+                },
+                0,
+            ));
+        };
+        self.check_shapes()
+            .map_err(|error| note_prepare_error(OP_CALLER_AUTH, "authenticate", error, 0))?;
+        if self.lease_digest != credential.lease_digest {
+            return Err(note_prepare_error(
+                OP_CALLER_AUTH,
+                "authenticate",
+                PreparationError::InvalidRequest {
+                    field: "caller_auth",
+                    reason: "presented caller lease digest is not the owner-issued one".to_owned(),
+                },
+                0,
+            ));
+        }
+        if self.fence_digest != credential.fence_digest {
+            return Err(note_prepare_error(
+                OP_CALLER_AUTH,
+                "authenticate",
+                PreparationError::InvalidRequest {
+                    field: "caller_auth",
+                    reason: "presented caller fence digest is not the owner-issued one".to_owned(),
+                },
+                0,
+            ));
+        }
+        // Re-proved here rather than trusted from issuance: a payload value never
+        // grants a role, so the authenticated role/capability pair this credential
+        // carries is compared against the closed projection for this operation.
+        let caller = credential.caller();
+        if !caller.role().permits(caller.operation())
+            || !caller.role().capabilities().contains(&caller.capability())
+        {
+            return Err(note_prepare_error(
+                OP_CALLER_AUTH,
+                "authenticate",
+                PreparationError::InvalidRequest {
+                    field: "caller_auth",
+                    reason: "the authenticated caller capability does not admit the admitted \
+                             operation"
+                        .to_owned(),
+                },
+                0,
+            ));
+        }
+        check_identity(caller.principal(), "caller_principal")?;
+        check_identity(caller.session_id(), "caller_session")?;
+        observe_prepare_progress(OP_CALLER_AUTH, "authenticate", "authenticated", 0, 0);
+        Ok(())
     }
 
     /// Authenticates the caller against held owner facts without minting
     /// authority.
     ///
-    /// Verifies digest shapes, then requires the held owner lease to cover
-    /// the launch installation and the presented source to equal it. The
-    /// lease/fence digests stay shape-checked audit-trail evidence: no owner
-    /// digest scheme binds them yet, so they grant nothing here.
-    /// Caller-channel (control-plane principal) authentication has no owner on
-    /// this contour and is reported as backlog, not assumed; see
-    /// [`BackupCallerAuth::authenticate`].
+    /// Verifies digest shapes, then requires the held owner lease to cover the
+    /// launch installation and the source the owner-issued credential admitted
+    /// to equal it. The credential half is
+    /// [`BackupCallerAuth::authenticate`]; this method is the source-identity
+    /// half, and it still grants nothing on its own.
     pub fn authenticate_for_owner(
         &self,
         lease: &HostOwnerLease,
