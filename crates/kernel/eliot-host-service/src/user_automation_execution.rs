@@ -176,6 +176,13 @@ where
                 })
             }
             UserAutomationHostExecutionOperation::ReadCancellationBatch { request } => {
+                // Exact owner readback for the original cancellation operation
+                // (issue #2970): the adapter settles only a batch committed
+                // under this exact operation and request commitment, exposes a
+                // foreign or contradictory batch as `IdentityConflict`, and
+                // leaves every inconclusive outcome — absent, unbound, or
+                // unreadable — as `UnknownOutcome` so the original operation
+                // stays reconciling. The typed result crosses below unchanged.
                 let channel_binding_sha256 = session.authenticated_channel_binding_digest()?;
                 let readback = self
                     .wake
