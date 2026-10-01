@@ -74,7 +74,9 @@
       "transformation_lineage": [],
       "influence_closure": null,
       "purge_entry": null,
-      "selection_integrity": null
+      "selection_integrity": null,
+      "selection_chain_head": null,
+      "selection_chain_seal": null
     },
     "required_proof_and_approval_refs": []
   },
@@ -85,8 +87,8 @@
     "operation_id": "op-991-k1",
     "idempotency_key": "idem-991-k1",
     "canonical_request_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "prepared_transition_digest": "d4011f0169070f1ade0d99d498c4813602513999c37ed6334d37d56d0105c660",
-    "reservation_token_digest": "2c372efbdbc0909af20186297ecdbdbd58f3f058a11d3a23ee57b87256646899",
+    "prepared_transition_digest": "7cb99829ed3fef160817147f2c82c7d52ceaab0859022494145aa031968ca384",
+    "reservation_token_digest": "309ec1576564d63509b890f2c758e314b13e09f83fb551324902ce97d8e38d98",
     "scopes": [
       {
         "scope": "scope-991-k1",
