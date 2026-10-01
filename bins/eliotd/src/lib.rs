@@ -134,6 +134,7 @@ pub mod notification_board_attach;
 mod notification_plan_admission;
 pub mod notification_state_emit;
 mod observation_adapters;
+mod observe_claim_ownership;
 mod owner_feed;
 mod process_origin;
 mod provider_admission;
@@ -333,6 +334,14 @@ pub use notification_state_emit::{
 };
 #[cfg(windows)]
 pub use observation_adapters::WatchdogExportDrainStep;
+pub use observe_claim_ownership::{
+    OBSERVE_CLAIM_FENCE_REPLACED, OBSERVE_CLAIM_PHASE_NOT_DURABLE, OBSERVE_CLAIM_STALE_ATTEMPT,
+    ObserveClaimAbsence, ObserveClaimIdentity, ObserveClaimPreservedEffect, ObserveClaimRefusal,
+    PreservedEffectReconciliation, observe_claim_absence, observe_claim_identity,
+    observe_claim_owner_operation, observe_claim_ownership_preserved,
+    observe_claim_phase_admits_effect, observe_claim_phase_is_durable, observe_phase_is_pre_effect,
+    resolve_observe_claim_currency,
+};
 pub use owner_feed::{
     KernelOwnerPublishPort, OwnerFeedPlan, OwnerFeedTrigger, capture_owner_feed_plan,
     maintain_owner_feed,
