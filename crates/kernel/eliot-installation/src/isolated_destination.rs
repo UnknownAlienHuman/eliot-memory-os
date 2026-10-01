@@ -1817,10 +1817,10 @@ pub fn materialise_prepared_isolated_destination(
         // created it, including a concurrent create race, is not owned
         // by this operation.
         DirectoryPublicationError::AlreadyExists => {
-            IsolatedDestinationRefusal::DestinationNotAbsent
+            IsolatedDestinationRefusal::DestinationNotAbsent.into()
         }
         DirectoryPublicationError::ReparsePoint => {
-            IsolatedDestinationRefusal::ForeignInstallationOwner
+            IsolatedDestinationRefusal::ForeignInstallationOwner.into()
         }
         other => IsolatedDestinationError::Installation(InstallationError::Platform(format!(
             "the installation authority could not create the isolated destination: {other}"
