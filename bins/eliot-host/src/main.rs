@@ -725,7 +725,10 @@ fn run_console() -> (bool, Option<HostLaunchOptions>) {
         &launch_options,
         stop_attempted,
     );
-    (console_run_ok(!primary_failed, drained), Some(launch_options))
+    (
+        console_run_ok(!primary_failed, drained),
+        Some(launch_options),
+    )
 }
 
 /// Runs the one admitted current-user profile supervisor.

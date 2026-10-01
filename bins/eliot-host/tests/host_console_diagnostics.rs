@@ -109,10 +109,9 @@ fn host_service_entry_projections_carry_no_payloads() {
         "env::",
         "nonce",
     ];
-    for line in MAIN
-        .lines()
-        .filter(|l| l.contains("observe_service_entry_failure") || l.contains("observe_terminal_error"))
-    {
+    for line in MAIN.lines().filter(|l| {
+        l.contains("observe_service_entry_failure") || l.contains("observe_terminal_error")
+    }) {
         for token in REFUSED {
             assert!(!line.contains(token), "payload on diagnostic line: {line}");
         }
