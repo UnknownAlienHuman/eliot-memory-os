@@ -18,6 +18,7 @@ mod effect_operation_lease;
 mod execution_manifest;
 mod maintenance_trigger_staging;
 mod model;
+mod owner_evidence;
 mod process_stream_recovery;
 mod purge_ledger;
 mod reservation_model;
@@ -105,6 +106,7 @@ pub use maintenance_trigger_staging::{
 };
 pub use model::ProviderCapabilityLookup;
 pub use model::*;
+pub use owner_evidence::OwnerOrderingHeadEvidence;
 pub use process_stream_recovery::{
     MAX_STREAM_RECOVERY_GAPS, MAX_STREAM_RECOVERY_OMITTED_RANGES, ProcessStreamObservation,
     ProcessStreamRecoveryBinding, ProcessStreamRecoveryFence, ProcessStreamRecoveryLoadError,

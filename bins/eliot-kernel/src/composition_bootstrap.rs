@@ -587,15 +587,31 @@ impl KernelComposition {
 
     /// Opens the production ORS at the exact configured object path and binds
     /// it to the Host installation identity when the authenticated Host
-    /// launch binding is present. Unbound development compositions retain
-    /// their existing open path, but cannot issue an installation contour.
+    /// launch binding is present.
+    ///
+    /// Issue #1925, package W, join (1): the installation-scoped open now binds
+    /// the owner-backed ordering-head provider
+    /// (`eliot_ors::OwnerOrderingHeadEvidence`) instead of ORS's internal
+    /// rejecting default, so `stage_and_reserve` verifies the requested heads
+    /// against a real canonical Store read rather than refusing every correct
+    /// seed before it can reserve. The provider is the same allocation the ORS
+    /// holds, so the async reserved-write path arms the store that consumes the
+    /// evidence.
+    ///
+    /// An unbound development composition has no Host installation identity to
+    /// bind, and ORS exposes no owner-evidence open for that case: it keeps the
+    /// existing open path and therefore keeps failing closed at
+    /// `verify_ordering_heads`. It still cannot issue an installation contour.
     fn open_ors_for_config(
         config: &KernelConfig,
         ors_path: &Path,
     ) -> Result<RedbRecoveryStore, KernelBuildError> {
         let result = if let Some(binding) = config.eliotd_receipt_binding.as_ref() {
-            RedbRecoveryStore::open_for_installation(ors_path, binding.installation_id())
-                .map(|(store, _identity)| store)
+            RedbRecoveryStore::open_for_installation_with_owner_evidence(
+                ors_path,
+                binding.installation_id(),
+            )
+            .map(|(store, _evidence, _identity)| store)
         } else {
             RedbRecoveryStore::open(ors_path)
         };

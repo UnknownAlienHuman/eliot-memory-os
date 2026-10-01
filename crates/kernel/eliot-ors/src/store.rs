@@ -4568,6 +4568,13 @@ pub trait OperationalRecoveryStore: Send + Sync {
 pub struct RedbRecoveryStore {
     database: Database,
     evidence: Arc<dyn CanonicalEvidenceProvider>,
+    /// The typed handle to the owner-backed ordering-head provider, present
+    /// exactly when this store was opened through
+    /// [`Self::open_for_installation_with_owner_evidence`]. It is the same
+    /// allocation as `evidence`, retained so the async caller can arm it
+    /// before the short synchronous reservation transaction. `None` for every
+    /// other open, where no owner-backed ordering evidence exists.
+    pub(crate) owner_evidence: Option<Arc<crate::OwnerOrderingHeadEvidence>>,
     #[cfg(feature = "test-support")]
     authority_handoff_failpoint:
         std::sync::Mutex<Option<Arc<crate::test_support::AuthorityHandoffPersistenceFailpoint>>>,
@@ -27573,6 +27580,32 @@ impl RedbRecoveryStore {
         Ok(store)
     }
 
+    /// Opens the production installation-scoped ORS with the owner-backed
+    /// ordering-head provider and returns the typed handle that arms it.
+    ///
+    /// This is the production composition's open site (issue #1925, package W,
+    /// join (1)). It binds the same installation identity and durable
+    /// object-generation checks as [`Self::open_for_installation`]; the only
+    /// difference is that the bound provider is
+    /// [`OwnerOrderingHeadEvidence`](crate::OwnerOrderingHeadEvidence) instead
+    /// of the rejecting default, so a correct seed reaches
+    /// `verify_ordering_heads` with real owner evidence instead of being
+    /// refused before it can reserve.
+    ///
+    /// The returned `Arc` is the SAME allocation the store holds as its
+    /// `CanonicalEvidenceProvider`, so the async caller that arms it is arming
+    /// the store that will consume the evidence.
+    pub fn open_for_installation_with_owner_evidence(
+        path: impl AsRef<Path>,
+        installation_id: &str,
+    ) -> Result<(Self, Arc<crate::OwnerOrderingHeadEvidence>, OrsStoreIdentity), OrsError> {
+        let evidence = Arc::new(crate::OwnerOrderingHeadEvidence::new());
+        let provider: Arc<dyn CanonicalEvidenceProvider> = Arc::clone(&evidence);
+        let (mut store, record) = Self::open_inner(path, provider, Some(installation_id))?;
+        store.owner_evidence = Some(Arc::clone(&evidence));
+        Ok((store, evidence, record.installed_identity()?))
+    }
+
     /// Reads the installed identity and object generation from durable ORS metadata.
     ///
     /// This is a readback of the store-owned binding, not a cached or caller-
@@ -27596,6 +27629,7 @@ impl RedbRecoveryStore {
         let store = Self {
             database,
             evidence,
+            owner_evidence: None,
             #[cfg(feature = "test-support")]
             authority_handoff_failpoint: std::sync::Mutex::new(None),
         };
