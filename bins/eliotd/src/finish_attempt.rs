@@ -312,7 +312,9 @@ pub async fn serve_finish_claim(
     // expired attempt.
     let deadline_expired = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(true, |now| now.as_millis() >= u128::from(claimed.attempt.expires_at_unix_ms));
+        .map_or(true, |now| {
+            now.as_millis() >= u128::from(claimed.attempt.expires_at_unix_ms)
+        });
     if deadline_expired {
         return rejected_finish_result_with_detail(
             &claimed,
