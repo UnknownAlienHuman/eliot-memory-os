@@ -4,6 +4,7 @@ use eliot_platform::PlatformHandle;
 
 use crate::{
     AppendReceipt, EpochRetirementObservation, EpochRetirementQuery, EpochRetirementQueryError,
+    HostProcessIncarnationRegistration,
     HostInstallationEpoch, HostState, HostStateJournal, HostStateRecord, JournalAppendObserver,
     JournalBackend, JournalError, PreparedAppend, ReactiveContextEnqueueReceipt,
     ReactiveContextOperationQuery, ReactiveContextPrepareRequest, ReactiveContextPrepareResult,
@@ -56,6 +57,21 @@ impl<B: JournalBackend> HostStateJournalService<B> {
 
     pub fn append(&self, record: HostStateRecord) -> Result<AppendReceipt, JournalError> {
         self.journal.append(record)
+    }
+
+    /// Registers native Host self-process facts through the original journal
+    /// owner and returns its committed exact-record readback.
+    pub fn register_host_process_birth(
+        &self,
+        process_id: u32,
+        process_start_time_100ns: u64,
+        process_image_path: String,
+    ) -> Result<HostProcessIncarnationRegistration, JournalError> {
+        self.journal.register_host_process_birth(
+            process_id,
+            process_start_time_100ns,
+            process_image_path,
+        )
     }
 
     pub fn append_readiness_observation(

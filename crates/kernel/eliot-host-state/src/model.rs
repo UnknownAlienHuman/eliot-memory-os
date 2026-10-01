@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
-use eliot_contracts::{EpochContractError, EpochId as EpochIdentity, EpochTransition, StateFence};
+use eliot_contracts::{
+    EpochContractError, EpochId as EpochIdentity, EpochTransition, ResourceGeneration, StateFence,
+};
 use eliot_observation_contracts::ObservationRecordEnvelope;
 use eliot_platform::{HostProcessNonce, KernelActivationNonce, PlatformHandle, PortOutcome};
 use eliot_runtime_contracts::{
@@ -2977,6 +2979,146 @@ impl ModuleBuildProvenanceRecord {
     }
 }
 
+/// Original Host-owner registration for one OS-observed Host process birth.
+///
+/// `generation` is a HostStateJournal-owned diagnostic counter. It is not an
+/// Authority Epoch, activation generation, module generation, PID, or process
+/// start time, and grants no process or effect authority. The physical facts
+/// bind this registration to the observed birth; the retained Host nonce
+/// distinguishes it within the installation lineage.
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostProcessIncarnationRecord {
+    fence: RecordFence,
+    operation: IdempotencyIdentity,
+    host_process_nonce: HostProcessNonce,
+    process_id: u32,
+    process_start_time_100ns: u64,
+    process_image_path: String,
+    generation: ResourceGeneration,
+}
+
+impl fmt::Debug for HostProcessIncarnationRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HostProcessIncarnationRecord")
+            .field("fence", &self.fence)
+            .field("operation", &self.operation)
+            .field("host_process_nonce", &self.host_process_nonce)
+            .field("process_id", &self.process_id)
+            .field("process_start_time_100ns", &self.process_start_time_100ns)
+            .field("process_image_path", &"<redacted>")
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+impl HostProcessIncarnationRecord {
+    pub(crate) fn new(
+        fence: RecordFence,
+        process_id: u32,
+        process_start_time_100ns: u64,
+        process_image_path: String,
+        generation: ResourceGeneration,
+    ) -> Result<Self, JournalError> {
+        let host_process_nonce = fence.host.host_process_nonce();
+        let operation_key = format!(
+            "host-process-incarnation:{}:{}:{}",
+            host_process_nonce.as_handle().as_str(),
+            process_id,
+            process_start_time_100ns
+        );
+        let operation = IdempotencyIdentity {
+            operation_id: PlatformHandle::new(operation_key.clone())
+                .map_err(|error| JournalError::Invalid(error.to_string()))?,
+            idempotency_key: PlatformHandle::new(operation_key)
+                .map_err(|error| JournalError::Invalid(error.to_string()))?,
+        };
+        let record = Self {
+            fence,
+            operation,
+            host_process_nonce,
+            process_id,
+            process_start_time_100ns,
+            process_image_path,
+            generation,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    fn validate(&self) -> Result<(), JournalError> {
+        self.fence.validate()?;
+        self.operation.validate()?;
+        if self.host_process_nonce != self.fence.host.host_process_nonce()
+            || self.process_id == 0
+            || self.process_start_time_100ns == 0
+            || self.process_image_path.trim().is_empty()
+            || self.process_image_path.chars().any(char::is_control)
+        {
+            return Err(JournalError::Invalid(
+                "Host process incarnation must bind the current Host nonce and observed physical birth".into(),
+            ));
+        }
+        let expected_key = format!(
+            "host-process-incarnation:{}:{}:{}",
+            self.host_process_nonce.as_handle().as_str(),
+            self.process_id,
+            self.process_start_time_100ns
+        );
+        if self.operation.operation_id.as_str() != expected_key
+            || self.operation.idempotency_key.as_str() != expected_key
+        {
+            return Err(JournalError::Invalid(
+                "Host process incarnation operation identity differs from its original birth".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub const fn fence(&self) -> &RecordFence {
+        &self.fence
+    }
+
+    pub const fn operation(&self) -> &IdempotencyIdentity {
+        &self.operation
+    }
+
+    pub const fn host_process_nonce(&self) -> &HostProcessNonce {
+        &self.host_process_nonce
+    }
+
+    pub const fn process_id(&self) -> u32 {
+        self.process_id
+    }
+
+    pub const fn process_start_time_100ns(&self) -> u64 {
+        self.process_start_time_100ns
+    }
+
+    pub fn process_image_path(&self) -> &str {
+        &self.process_image_path
+    }
+
+    pub const fn generation(&self) -> ResourceGeneration {
+        self.generation
+    }
+
+    pub(crate) fn same_birth(
+        &self,
+        process_id: u32,
+        process_start_time_100ns: u64,
+        process_image_path: &str,
+        host: &HostInstallationEpoch,
+    ) -> bool {
+        self.fence.host == *host
+            && self.host_process_nonce == host.host_process_nonce()
+            && self.process_id == process_id
+            && self.process_start_time_100ns == process_start_time_100ns
+            && self.process_image_path == process_image_path
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)]
@@ -3003,6 +3145,8 @@ pub enum HostStateRecord {
     /// A separate variant, not another `CutoverIntent`: preparation produces a
     /// fenced destination and stops, cutover activates an approved generation.
     BackupPreparation(BackupPreparationRecord),
+    /// Original-owner generation for one observed Host process birth.
+    HostProcessIncarnation(HostProcessIncarnationRecord),
 }
 
 impl HostStateRecord {
@@ -3024,6 +3168,7 @@ impl HostStateRecord {
             Self::ModuleBuildProvenance(value) => value.validate(),
             Self::CutoverIntent(value) => value.validate(),
             Self::BackupPreparation(value) => value.validate(),
+            Self::HostProcessIncarnation(value) => value.validate(),
         }
     }
 
@@ -3053,6 +3198,7 @@ impl HostStateRecord {
             Self::ModuleBuildProvenance(value) => &value.fence,
             Self::CutoverIntent(value) => &value.fence,
             Self::BackupPreparation(value) => &value.fence,
+            Self::HostProcessIncarnation(value) => &value.fence,
         }
     }
 
@@ -3074,6 +3220,7 @@ impl HostStateRecord {
             Self::ModuleBuildProvenance(value) => &value.operation,
             Self::CutoverIntent(value) => &value.operation,
             Self::BackupPreparation(value) => &value.operation,
+            Self::HostProcessIncarnation(value) => &value.operation,
         }
     }
 }
@@ -3152,6 +3299,10 @@ pub struct HostState {
     /// can be admitted.
     #[serde(default)]
     pub module_build_provenance: Vec<ModuleBuildProvenanceRecord>,
+    /// Current original Host process-incarnation registration, rebuilt from
+    /// the owner journal and never an independent authority source.
+    #[serde(default)]
+    pub host_process_incarnation: Option<HostProcessIncarnationRecord>,
     pub clean_marker: Option<CleanMarker>,
     pub retained_epochs: Vec<EpochEvidence>,
     pub retired_epochs: Vec<HostInstallationEpoch>,
@@ -3274,6 +3425,10 @@ impl HostState {
             pending_cutover: projection.pending_cutover,
             backup_preparations: projection.backup_preparations,
             module_build_provenance: projection.module_build_provenance,
+            // Self-process registration is retained only by the operational
+            // journal projection; the lossy read-model projection cannot
+            // recreate its native-observation binding.
+            host_process_incarnation: None,
             clean_marker: projection.clean_marker,
             retained_epochs: projection.retained_epochs,
             retired_epochs: projection.retired_epochs,
@@ -3304,6 +3459,7 @@ impl HostState {
             pending_cutover: None,
             backup_preparations: Vec::new(),
             module_build_provenance: Vec::new(),
+            host_process_incarnation: None,
             clean_marker: None,
             retained_epochs,
             retired_epochs: Vec::new(),
