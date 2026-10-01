@@ -127,7 +127,6 @@ pub(crate) mod table {
     ///   machine-links these consts to this module's DDL strings, so a declared
     ///   name that no baseline DDL ever creates is dispositioned and passed
     ///   like any other. `automation_failure`, `automation_last_failure`, and
-    ///   `automation_failure`, `automation_last_failure`, and
     ///   `automation_continuation` are declared without generation DDL;
     ///   failure tables are ensured on their explicit owner path and
     ///   continuations create their schemaless table only during explicit
