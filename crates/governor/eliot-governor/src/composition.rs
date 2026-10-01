@@ -6356,7 +6356,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 continue;
             }
             let candidate = eliot_change_monitor::AnchorCandidate::from_admitted_after_state(
-                &item.original_target, after, None, false,
+                &item.original_target,
+                after,
+                None,
+                false,
             )
             .map_err(|error| {
                 CompositionError::Recovery(format!(
