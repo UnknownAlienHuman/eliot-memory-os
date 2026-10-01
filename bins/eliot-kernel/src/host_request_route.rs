@@ -409,6 +409,9 @@ pub(crate) struct HostRequestOperationRef {
     pub(crate) finish_envelope: Option<HostRequestEnvelope>,
     pub(crate) finish_tool: Option<serde_json::Value>,
     pub(crate) finish_attempt: LocalReadAttemptState,
+    /// Exact finish result already persisted in ORS; retain the original
+    /// envelope/draft/attempt tuple for bounded historical receipt replay.
+    pub(crate) finish_result_received: bool,
 }
 
 /// Governed attempt ownership record for one queued local-read pair.
@@ -2819,9 +2822,11 @@ impl KernelComposition {
         descriptor: &AgentBridgeAdmissionDescriptor,
     ) -> Result<(), TransportError> {
         let retained = self.retained_parent_request_binding(envelope)?;
-        // Serialize cancellation's parent transition against Observe queue
-        // publication. Submit admission uses the same transition-read then
-        // pending-owner order for its final durable-state reread and fill.
+        // This Kernel read boundary preserves the activation owner while the
+        // cancellation envelope is validated. Finish claim/cancel
+        // linearization belongs to the atomic ORS row transaction: Finish
+        // claims persist their attempt before returning, and ORS refuses a
+        // claim after cancellation has closed the Routed row.
         let admission_owner = self
             .agent_activation_pending
             .lock()
@@ -2978,6 +2983,7 @@ impl KernelComposition {
                 finish_envelope: None,
                 finish_tool: None,
                 finish_attempt: LocalReadAttemptState::default(),
+                finish_result_received: false,
             });
         }
         Ok(())
@@ -3216,6 +3222,7 @@ impl KernelComposition {
                 finish_envelope: None,
                 finish_tool: None,
                 finish_attempt: LocalReadAttemptState::default(),
+                finish_result_received: false,
             });
         }
         // Issue #1837: durable audit evidence for queue admission.
@@ -4897,6 +4904,7 @@ impl KernelComposition {
                 finish_envelope: None,
                 finish_tool: None,
                 finish_attempt: LocalReadAttemptState::default(),
+                finish_result_received: false,
             });
         Ok(ObserveQueueReservation::Reserved {
             token,
@@ -6141,7 +6149,7 @@ pub(crate) fn requested_host_request_record(
 /// The parent operation handle deterministically carries the parent envelope
 /// digest after its prefix; the digest is re-validated before any lookup so a
 /// malformed reference is reported as an unknown operation.
-fn parent_operation_key(
+pub(crate) fn parent_operation_key(
     envelope: &HostRequestEnvelope,
 ) -> Result<(OperationIdentity, String), TransportError> {
     let parent = envelope
@@ -10432,6 +10440,7 @@ mod invoke_read_tool_tests {
             finish_envelope: None,
             finish_tool: None,
             finish_attempt: LocalReadAttemptState::default(),
+            finish_result_received: false,
         }
     }
 

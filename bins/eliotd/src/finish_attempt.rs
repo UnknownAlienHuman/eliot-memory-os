@@ -16,6 +16,7 @@ use eliot_receipts::ProofCeiling;
 use eliot_store_api::{TransitionClass, WriteReceiptStatus};
 use serde::Serialize;
 use serde_json::json;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     DaemonComposition, DaemonKernelClient,
@@ -303,6 +304,24 @@ pub async fn serve_finish_claim(
             ProofCeiling::ScopedVerification,
         )?;
         return finish_result_body(&claimed, response);
+    }
+
+    // The history lookup above is the only owner work allowed after the
+    // admitted absolute deadline. A retry with no exact committed Finish
+    // receipt cannot start a new plan/evidence/decision transition under an
+    // expired attempt.
+    let deadline_expired = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(true, |now| now.as_millis() >= u128::from(claimed.attempt.expires_at_unix_ms));
+    if deadline_expired {
+        return rejected_finish_result_with_detail(
+            &claimed,
+            "finish deadline expired and no exact committed decision receipt was found; no new owner work was started",
+            (
+                AgentResponseDisposition::RecoveryRequired,
+                "RECOVERY_REQUIRED",
+            ),
+        );
     }
 
     // Issue #1782 (I11.11 line 42, I14.24 line 23): "Any request to continue
