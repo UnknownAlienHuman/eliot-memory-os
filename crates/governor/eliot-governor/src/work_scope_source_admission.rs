@@ -187,7 +187,15 @@ impl GoverningSourceApproval {
         state_fence: &StateFence,
         authenticated_approver_principal_ref: &str,
     ) -> Result<(), WorkScopeSourceAdmissionError> {
-        self.validate()?;
+        self.validate_live_context(
+            explicit_root_identity,
+            product_id,
+            source_id,
+            privacy,
+            scope_privacy_class,
+            state_fence,
+            authenticated_approver_principal_ref,
+        )?;
         let architecture_matches = self.architecture.source_ref == capture.architecture.source_ref
             && self.architecture.entry_ref == capture.architecture.entry_ref
             && self.architecture.compatibility_ref == capture.architecture.compatibility_ref
@@ -206,6 +214,34 @@ impl GoverningSourceApproval {
             || self.implementation.content_sha256
                 != capture.receipt.pair.implementation_sha256
             || self.explicit_root_identity != explicit_root_identity
+            || &self.product_id != product_id
+            || &self.source_id != source_id
+            || &self.privacy != privacy
+            || self.scope_privacy_class != scope_privacy_class
+            || &self.state_fence != state_fence
+            || self.approver_principal_ref != authenticated_approver_principal_ref
+        {
+            return Err(WorkScopeSourceAdmissionError::SourceApprovalBindingMismatch);
+        }
+        Ok(())
+    }
+
+    /// Validate the signed setup approval against the admitted request before
+    /// issuing the exact-root discovery lease. This deliberately does not read
+    /// source bytes; those reads are legal only after the lease exists.
+    #[allow(clippy::too_many_arguments)]
+    fn validate_live_context(
+        &self,
+        explicit_root_identity: &str,
+        product_id: &ProductId,
+        source_id: &SourceId,
+        privacy: &PrivacyProfile,
+        scope_privacy_class: eliot_security_contracts::PrivacyClass,
+        state_fence: &StateFence,
+        authenticated_approver_principal_ref: &str,
+    ) -> Result<(), WorkScopeSourceAdmissionError> {
+        self.validate()?;
+        if self.explicit_root_identity != explicit_root_identity
             || &self.product_id != product_id
             || &self.source_id != source_id
             || &self.privacy != privacy
@@ -277,6 +313,7 @@ impl GoverningSourceApproval {
     fn admit_signed_candidates_for_discovery(
         &self,
         capture: &NormativePairSourceCapture,
+        lease: &eliot_workscope::DiscoveryReadLease,
         explicit_root_identity: &str,
         product_id: &ProductId,
         source_id: &SourceId,
@@ -313,23 +350,6 @@ impl GoverningSourceApproval {
                 "discovery lease root differs from the verified source root".to_owned(),
             ));
         }
-        let allowed_reads = vec![DiscoveryRead::GoverningSourceCandidates];
-        let consumption_limit = u32::try_from(allowed_reads.len()).map_err(|_| {
-            WorkScopeSourceAdmissionError::SourceAdmission(
-                "source discovery lease read count is invalid".to_owned(),
-            )
-        })?;
-        let lease = issue_discovery_lease(&DiscoveryLeaseRequest {
-            proposer_ref: lease_key.proposer_ref.clone(),
-            session_ref: lease_key.session_ref.clone(),
-            host_ref: lease_key.host_ref.clone(),
-            candidate_root_ref: explicit_root_identity.to_owned(),
-            root_filesystem_identity_ref: lease_key.root_filesystem_identity_ref.clone(),
-            allowed_reads,
-            consumption_limit,
-            deadline: expires_at,
-        })
-        .map_err(|error| WorkScopeSourceAdmissionError::SourceAdmission(error.to_string()))?;
         if !lease.key_matches(
             &lease_key.proposer_ref,
             &lease_key.session_ref,
@@ -356,7 +376,7 @@ impl GoverningSourceApproval {
             )?;
             GoverningSourceCandidate::from_discovery_lease(
                 params,
-                &lease,
+                lease,
                 explicit_root_identity,
                 now,
             )
@@ -384,6 +404,7 @@ impl GoverningSourceApproval {
     fn derive_work_scope_sources(
         &self,
         capture: &NormativePairSourceCapture,
+        lease: &eliot_workscope::DiscoveryReadLease,
         explicit_root_identity: &str,
         product_id: &ProductId,
         source_id: &SourceId,
@@ -409,6 +430,7 @@ impl GoverningSourceApproval {
         )?;
         self.admit_signed_candidates_for_discovery(
             capture,
+            lease,
             explicit_root_identity,
             product_id,
             source_id,
@@ -626,6 +648,7 @@ impl VerifiedGoverningSourceApproval {
     pub fn derive_work_scope_sources(
         &self,
         capture: &NormativePairSourceCapture,
+        lease: &eliot_workscope::DiscoveryReadLease,
         explicit_root_identity: &str,
         product_id: &ProductId,
         source_id: &SourceId,
@@ -640,6 +663,7 @@ impl VerifiedGoverningSourceApproval {
     ) -> Result<GoverningSourceSet, WorkScopeSourceAdmissionError> {
         self.approval.derive_work_scope_sources(
             capture,
+            lease,
             explicit_root_identity,
             product_id,
             source_id,
@@ -763,7 +787,7 @@ pub fn prepare_initial_work_scope_source_admission(
     approval: &VerifiedGoverningSourceApproval,
     owner_readback: &WorkScopeOwnerSnapshotReadback,
     lease_key: &DiscoveryLeaseKey,
-    now: u64,
+    owner_clock: impl Fn() -> u64,
 ) -> Result<PreparedWorkScopeSourceAdmission, WorkScopeSourceAdmissionError> {
     identity
         .validate()
@@ -794,11 +818,8 @@ pub fn prepare_initial_work_scope_source_admission(
         approved.scope_privacy_class,
         governing_source_generation,
     )?;
-    let capture = eliot_bootstrap::capture::capture_normative_pair_sources(Path::new(
-        &binding.scope.root_identity,
-    ))
-    .map_err(|error| WorkScopeSourceAdmissionError::SourceCapture(error.to_string()))?;
-    if now > identity.deadline_unix_ms {
+    let now_before_lease = owner_clock();
+    if now_before_lease > identity.deadline_unix_ms {
         return Err(WorkScopeSourceAdmissionError::SourceAdmission(
             "request deadline has elapsed".to_owned(),
         ));
@@ -824,8 +845,56 @@ pub fn prepare_initial_work_scope_source_admission(
             "discovery lease key differs from the authenticated request or approved root".to_owned(),
         ));
     }
+    approved.validate_live_context(
+        &binding.scope.root_identity,
+        &identity.request.metadata.product_id,
+        &identity.request.metadata.source_id,
+        &approved.privacy,
+        approved.scope_privacy_class,
+        fence,
+        &approved.approver_principal_ref,
+    )?;
+    let allowed_reads = vec![DiscoveryRead::GoverningSourceCandidates];
+    let consumption_limit = u32::try_from(allowed_reads.len()).map_err(|_| {
+        WorkScopeSourceAdmissionError::SourceAdmission(
+            "source discovery lease read count is invalid".to_owned(),
+        )
+    })?;
+    let lease = issue_discovery_lease(&DiscoveryLeaseRequest {
+        proposer_ref: lease_key.proposer_ref.clone(),
+        session_ref: lease_key.session_ref.clone(),
+        host_ref: lease_key.host_ref.clone(),
+        candidate_root_ref: binding.scope.root_identity.clone(),
+        root_filesystem_identity_ref: lease_key.root_filesystem_identity_ref.clone(),
+        allowed_reads,
+        consumption_limit,
+        deadline: identity.deadline_unix_ms,
+    })
+    .map_err(|error| WorkScopeSourceAdmissionError::SourceAdmission(error.to_string()))?;
+    if !lease.key_matches(
+        &lease_key.proposer_ref,
+        &lease_key.session_ref,
+        &lease_key.host_ref,
+        &lease_key.root_filesystem_identity_ref,
+    ) {
+        return Err(WorkScopeSourceAdmissionError::SourceAdmission(
+            "issued discovery lease does not match the authenticated request".to_owned(),
+        ));
+    }
+    // The discovery lease exists before any governed source bytes are read.
+    let capture = eliot_bootstrap::capture::capture_normative_pair_sources(Path::new(
+        &binding.scope.root_identity,
+    ))
+    .map_err(|error| WorkScopeSourceAdmissionError::SourceCapture(error.to_string()))?;
+    let now_after_capture = owner_clock();
+    if now_after_capture > identity.deadline_unix_ms {
+        return Err(WorkScopeSourceAdmissionError::SourceAdmission(
+            "request deadline elapsed while capturing governing sources".to_owned(),
+        ));
+    }
     let sources = approval.derive_work_scope_sources(
         &capture,
+        &lease,
         &binding.scope.root_identity,
         &identity.request.metadata.product_id,
         &identity.request.metadata.source_id,
@@ -835,7 +904,7 @@ pub fn prepare_initial_work_scope_source_admission(
         fence,
         &binding.scope.scope_ref,
         governing_source_generation,
-        now,
+        now_after_capture,
         identity.deadline_unix_ms,
     )?;
     let (expected_revision, expected_digest) = match owner_readback {
