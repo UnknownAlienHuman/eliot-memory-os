@@ -40,8 +40,19 @@ use eliot_platform_windows::reconcile_agent_bridge_stage;
 // receipt, or cleanup. There is no mutable global dedup cache and no
 // terminal emission here: one terminal per failed operation is owned by the
 // single outermost contour (`lib.rs` `HostTerminalGuard` / Unknown
-// terminals), while these inner phases correlate by stage order only
-// (case 22).
+// terminals).
+//
+// F-LOG-HOST-5 (#980): the authority contour extends this same projection
+// instead of inventing a second scheme. `PhaseBAuthorityIdentity` is a field
+// group of `PhaseBObservation`, rendered by `phase_b_observe_bound` through
+// the same #889 facade, so a Phase-B authority record carries the operation
+// identity its owner already holds (installation, live Host epoch, current
+// activation generation, the authority record's own Host epoch, State Fence,
+// verified declared descriptor digest, physical descriptor digest, and the
+// committed durable descriptor digest) or an EXPLICIT `unavailable`
+// missing-evidence disposition where the owner holds none yet. It never adds
+// a read, a probe, or a validation pass; it decides nothing and owns no
+// authority.
 #[cfg(windows)]
 fn phase_b_observe(detail: &str) {
     // Sink disposition is load-bearing for this record: the canonical bounded
@@ -65,6 +76,157 @@ fn phase_b_pending_state_label(state: &PendingActivationState) -> &'static str {
     }
 }
 
+/// Frozen missing-evidence disposition for an identity slot the semantic owner
+/// does not hold at this call site (F-LOG-HOST-5 #980). Never a placeholder
+/// identity and never a fabricated literal.
+#[cfg(windows)]
+const PHASE_B_IDENTITY_UNAVAILABLE: &str = "unavailable";
+
+/// One nonsecret identity slot of a Phase-B observation (F-LOG-HOST-5 #980).
+///
+/// `Bound` carries an exact value the semantic owner already produced at this
+/// call site. `Unavailable` records the explicit missing-evidence disposition
+/// so a record never implies a pairing that was not proven, and never carries
+/// a payload, a raw path, a credential value, or arbitrary error text.
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum PhaseBIdentity<'a> {
+    Bound(&'a str),
+    Unavailable,
+}
+
+/// Renders one exact `(lineage, sequence)` epoch tuple (F-LOG-HOST-5 #980).
+///
+/// Only the public lineage label and the monotonic sequence are projected; the
+/// Host process nonce stays redacted and is never formatted.
+#[cfg(windows)]
+fn phase_b_epoch_identity_label(epoch: &EpochIdentity) -> String {
+    format!("{}/{}", epoch.lineage_id.as_str(), epoch.sequence.get())
+}
+
+/// F-LOG-HOST-5 (#980): the authority-contour identity group bound to one
+/// Phase-B observation.
+///
+/// This is the same `PhaseBObservation` projection the materialization
+/// contours already use, extended with the authority slots and rendered by
+/// `phase_b_observe_bound` through the same #889 facade — no second
+/// observation scheme. Every slot holds a value the semantic owner already
+/// produced for this exact operation, or `PhaseBIdentity::Unavailable` while
+/// the owner holds none.
+///
+/// It is a projection, never a second authority owner: no descriptor or
+/// credential bytes, no payload, no raw path, no Host process nonce, no
+/// `Debug`/error text, no extra read, probe, or validation pass, and it
+/// decides nothing.
+#[cfg(windows)]
+pub(super) struct PhaseBAuthorityIdentity {
+    installation: Option<String>,
+    live_host_epoch: Option<String>,
+    live_activation: Option<String>,
+    host_epoch: Option<String>,
+    state_fence: Option<String>,
+    declared_descriptor: Option<String>,
+    authority_descriptor: Option<String>,
+    durable_authority_descriptor: Option<String>,
+}
+
+#[cfg(windows)]
+impl PhaseBAuthorityIdentity {
+    /// Binds the operation identity the caller already holds before it enters
+    /// the authority contour: the installation identity, the live Host epoch,
+    /// and the current activation generation. Every remaining slot stays
+    /// explicitly unavailable until its own owner computes it.
+    pub(super) fn new(
+        host: &HostInstallationEpoch,
+        activation_generation: &EpochIdentity,
+    ) -> Self {
+        Self {
+            installation: Some(host.installation.as_str().to_owned()),
+            live_host_epoch: Some(phase_b_epoch_identity_label(&host.epoch.current)),
+            live_activation: Some(phase_b_epoch_identity_label(activation_generation)),
+            host_epoch: None,
+            state_fence: None,
+            declared_descriptor: None,
+            authority_descriptor: None,
+            durable_authority_descriptor: None,
+        }
+    }
+
+    /// Binds the exact `(lineage, sequence)` Host epoch of the authority
+    /// record under observation. A historical/destination record binds its own
+    /// prior epoch; a live incoming descriptor binds its State Fence epoch.
+    pub(super) fn bind_host_epoch(&mut self, epoch: &EpochIdentity) {
+        self.host_epoch = Some(phase_b_epoch_identity_label(epoch));
+    }
+
+    /// Binds the descriptor State Fence as
+    /// `authority-lineage/sequence@resource-generation`. The authority epoch
+    /// is projected under `fence` only; the `host_epoch` slot stays unbound
+    /// until the owner proves the record's own Host epoch.
+    pub(super) fn bind_state_fence(&mut self, state_fence: &StateFence) {
+        self.state_fence = Some(format!(
+            "{}/{}@{}",
+            state_fence.authority_epoch.lineage_id.as_str(),
+            state_fence.authority_epoch.sequence.get(),
+            state_fence.resource_generation.value()
+        ));
+    }
+
+    /// Binds the descriptor's own declared digest. Only valid once the
+    /// descriptor owner verified it through exact structure validation, so it
+    /// is never projected from an unverified claim.
+    pub(super) fn bind_declared_descriptor(
+        &mut self,
+        descriptor: &ProcessAuthorityHandoffDescriptor,
+    ) {
+        self.declared_descriptor = Some(descriptor.descriptor_sha256.clone());
+    }
+
+    /// Binds the exact physical digest of the authority descriptor bytes this
+    /// contour admitted.
+    pub(super) fn bind_authority_descriptor(&mut self, digest: &PlatformHandle) {
+        self.authority_descriptor = Some(digest.as_str().to_owned());
+    }
+
+    /// Binds the committed durable `authority_descriptor_digest` an observed
+    /// historical binding must equal exactly.
+    pub(super) fn bind_durable_authority_descriptor(&mut self, digest: &PlatformHandle) {
+        self.durable_authority_descriptor = Some(digest.as_str().to_owned());
+    }
+
+    /// Renders the frozen authority key set. `preparation` is always
+    /// unavailable: the authority contour runs before any
+    /// `HostPhaseBPreparedMaterialization` record exists, so its
+    /// transaction/effect/request/receipt identities are recorded as absent
+    /// instead of being implied by a static sentence.
+    fn slots(&self) -> [(&'static str, PhaseBIdentity<'_>); 9] {
+        [
+            ("installation", self.slot(self.installation.as_deref())),
+            ("live_host_epoch", self.slot(self.live_host_epoch.as_deref())),
+            ("live_activation", self.slot(self.live_activation.as_deref())),
+            ("host_epoch", self.slot(self.host_epoch.as_deref())),
+            ("fence", self.slot(self.state_fence.as_deref())),
+            ("declared", self.slot(self.declared_descriptor.as_deref())),
+            ("authority", self.slot(self.authority_descriptor.as_deref())),
+            (
+                "durable_authority",
+                self.slot(self.durable_authority_descriptor.as_deref()),
+            ),
+            ("preparation", PhaseBIdentity::Unavailable),
+        ]
+    }
+
+    /// Projects one slot as the exact bound value or the explicit
+    /// missing-evidence disposition; never a fabricated literal.
+    fn slot<'a>(&'a self, value: Option<&'a str>) -> PhaseBIdentity<'a> {
+        if let Some(text) = value {
+            PhaseBIdentity::Bound(text)
+        } else {
+            PhaseBIdentity::Unavailable
+        }
+    }
+}
+
 /// Current nonsecret identities bound to one Phase-B observation
 /// (F-LOG-HOST-2 W1). Every field projects a fact the semantic owner already
 /// produced for the live manifest, pending activation, preparation, or
@@ -83,6 +245,11 @@ struct PhaseBObservation<'a> {
     request: Option<&'a str>,
     state: Option<&'static str>,
     receipt: Option<&'a str>,
+    /// F-LOG-HOST-5 (#980): the authority-contour identity group. `None` for
+    /// every materialization/rebind contour, whose record stays exactly as
+    /// before; `Some` renders the authority slots below through the same
+    /// emitter.
+    authority: Option<&'a PhaseBAuthorityIdentity>,
 }
 
 #[cfg(windows)]
@@ -102,6 +269,7 @@ impl<'a> PhaseBObservation<'a> {
             request: None,
             state: None,
             receipt: None,
+            authority: None,
         }
     }
 
@@ -152,6 +320,7 @@ impl<'a> PhaseBObservation<'a> {
             request: None,
             state: Some(phase_b_pending_state_label(&pending.state)),
             receipt: None,
+            authority: None,
         }
     }
 
@@ -201,6 +370,21 @@ impl<'a> PhaseBObservation<'a> {
         }
         observation
     }
+
+    /// Binds one authority-contour record (F-LOG-HOST-5 #980): the manifest
+    /// identities, the validated manifest digest once its owner computes it,
+    /// and the authority identity group the authority owner already holds.
+    fn for_authority(
+        label: &'static str,
+        manifest: &'a CandidateManifest,
+        manifest_digest: Option<&'a str>,
+        authority: &'a PhaseBAuthorityIdentity,
+    ) -> Self {
+        let mut observation = Self::for_manifest(label, manifest);
+        observation.manifest = manifest_digest;
+        observation.authority = Some(authority);
+        observation
+    }
 }
 
 /// Emits one identity-bound Phase-B observation through the #889 facade.
@@ -209,6 +393,11 @@ impl<'a> PhaseBObservation<'a> {
 /// matching; the current identities follow as `k=v` pairs. Length stays
 /// under the facade's detail bound for pinned handle shapes, and any longer
 /// input is cut by that bound with its truncation honesty record.
+///
+/// F-LOG-HOST-5 (#980): an authority record additionally renders the frozen
+/// authority key set, whose absent slots carry the explicit `unavailable`
+/// missing-evidence disposition rather than being dropped, so one operation's
+/// authority record can never be confused with another's.
 #[cfg(windows)]
 fn phase_b_observe_bound(observation: &PhaseBObservation) {
     let mut detail = String::from(observation.label);
@@ -223,14 +412,49 @@ fn phase_b_observe_bound(observation: &PhaseBObservation) {
         ("state", observation.state),
         ("receipt", observation.receipt),
     ] {
+        // Materialization/rebind slots stay omitted when the owner holds
+        // none; the authority group below states its own absences explicitly.
         if let Some(text) = value {
-            detail.push(' ');
-            detail.push_str(key);
-            detail.push('=');
-            detail.push_str(text);
+            push_phase_b_identity(&mut detail, key, PhaseBIdentity::Bound(text));
+        }
+    }
+    if let Some(authority) = observation.authority {
+        for (key, value) in authority.slots() {
+            push_phase_b_identity(&mut detail, key, value);
         }
     }
     phase_b_observe(&detail);
+}
+
+/// Appends one projected identity slot as `key=value`, or `key=unavailable`
+/// for the explicit missing-evidence disposition (F-LOG-HOST-5 #980).
+#[cfg(windows)]
+fn push_phase_b_identity(detail: &mut String, key: &str, value: PhaseBIdentity<'_>) {
+    detail.push(' ');
+    detail.push_str(key);
+    detail.push('=');
+    if let PhaseBIdentity::Bound(text) = value {
+        detail.push_str(text);
+    } else {
+        detail.push_str(PHASE_B_IDENTITY_UNAVAILABLE);
+    }
+}
+
+/// Emits one authority-contour record through the same projection, emitter,
+/// and facade as every other Phase-B observation (F-LOG-HOST-5 #980).
+#[cfg(windows)]
+pub(super) fn phase_b_observe_authority(
+    label: &'static str,
+    manifest: &CandidateManifest,
+    manifest_digest: Option<&str>,
+    authority: &PhaseBAuthorityIdentity,
+) {
+    phase_b_observe_bound(&PhaseBObservation::for_authority(
+        label,
+        manifest,
+        manifest_digest,
+        authority,
+    ));
 }
 
 impl HostComposition {
@@ -355,12 +579,19 @@ impl HostComposition {
             profile,
             portable_root.as_ref(),
         )?;
+        // F-LOG-HOST-5 (#980): the historical/destination contour keeps its
+        // own identity group. It is seeded from the live operation identity
+        // the caller already holds and then extended only with what the
+        // previous-binding owner itself proves.
+        let mut previous_authority_identity =
+            PhaseBAuthorityIdentity::new(&self.host, &self.activation_generation.current);
         let observed_previous_binding = phase_b_observe_previous_binding(
             manifest,
             &self.host,
             &self.activation_generation.current,
             portable_root.as_ref(),
             &authority_path,
+            &mut previous_authority_identity,
         )?;
         let durable_manifest_digest = phase_b_manifest_digest(manifest)?;
         let previous_binding = if let Some(durable) = durable_prior_binding {
@@ -372,7 +603,13 @@ impl HostComposition {
             }
             match observed_previous_binding {
                 Some(observed) => {
-                    phase_b_validate_durable_previous_binding(&observed, durable)?;
+                    phase_b_validate_durable_previous_binding(
+                        &observed,
+                        durable,
+                        manifest,
+                        durable_manifest_digest.as_str(),
+                        &mut previous_authority_identity,
+                    )?;
                     Some(observed)
                 }
                 None => None,
@@ -394,12 +631,18 @@ impl HostComposition {
                 )));
             }
         };
+        // F-LOG-HOST-5 (#980): the live/current authority contour gets its OWN
+        // identity group, never the historical one, so a current admission
+        // record can never be read as a previous-binding readback.
+        let mut current_authority_identity =
+            PhaseBAuthorityIdentity::new(&self.host, &self.activation_generation.current);
         let (authority, manifest_digest, authority_descriptor_digest) = phase_b_validate_authority(
             manifest,
             &self.host,
             &self.activation_generation.current,
             &input.authority_descriptor_bytes,
             allow_expired_exact_replay,
+            &mut current_authority_identity,
         )?;
         let previous_authority_digests = previous_binding
             .as_ref()
@@ -412,10 +655,12 @@ impl HostComposition {
             ));
         }
         // WORK_UNIT_CASE: 893/2 — admission/validation passed; preparation begins.
-        phase_b_observe_bound(&PhaseBObservation::for_manifest_digest(
+        current_authority_identity.bind_authority_descriptor(&authority_descriptor_digest);
+        phase_b_observe_bound(&PhaseBObservation::for_authority(
             "host.phase-b-materialize admitted contour",
             manifest,
-            manifest_digest.as_str(),
+            Some(manifest_digest.as_str()),
+            &current_authority_identity,
         ));
 
         let config_path = approved_locator(
