@@ -1240,6 +1240,14 @@ impl JobAdmissionUpdate {
             lowercase_digest(digest, "admission.superseded_attempt_outcome_digest")?;
         }
         if self.superseded_attempt_outcome_digest.is_some()
+            && self.admission_state == WorkAdmissionState::DeferredCapacity
+        {
+            return Err(DurableJobError::InvalidField {
+                field: "admission.superseded_attempt_outcome_digest",
+                reason: "DEFERRED_CAPACITY precedes admission and supersedes no attempt",
+            });
+        }
+        if self.superseded_attempt_outcome_digest.is_some()
             && self.admission_state == WorkAdmissionState::Admitted
         {
             return Err(DurableJobError::InvalidField {
@@ -1349,6 +1357,14 @@ impl JobAdmissionRevision {
         }
         if let Some(digest) = &self.superseded_attempt_outcome_digest {
             lowercase_digest(digest, "admission.superseded_attempt_outcome_digest")?;
+        }
+        if self.superseded_attempt_outcome_digest.is_some()
+            && self.admission_state == WorkAdmissionState::DeferredCapacity
+        {
+            return Err(DurableJobError::InvalidField {
+                field: "admission.superseded_attempt_outcome_digest",
+                reason: "DEFERRED_CAPACITY precedes admission and supersedes no attempt",
+            });
         }
         if self.superseded_attempt_outcome_digest.is_some()
             && self.admission_state == WorkAdmissionState::Admitted
@@ -2064,6 +2080,32 @@ impl DurableJobResponse {
             .map_or(OutputApplicabilityNextAction::ReconcileOwner, |revision| {
                 revision.next_action
             })
+    }
+
+    /// Returns the latest admission state, or `None` when no admission
+    /// revision was ever recorded. Missing history is a legacy record
+    /// without admission proof, never an active admission.
+    #[must_use]
+    pub fn current_admission_state(&self) -> Option<WorkAdmissionState> {
+        self.admission_history
+            .last()
+            .map(|revision| revision.admission_state)
+    }
+
+    /// Returns the capacity observation that keeps this work out of
+    /// admission, or `None` unless the latest revision is
+    /// `DEFERRED_CAPACITY`. The reason, reset horizon, reset source and
+    /// alternatives ride on the returned observation; no external
+    /// attempt exists while it is reported.
+    #[must_use]
+    pub fn capacity_deferral(&self) -> Option<&CapacityDeferral> {
+        self.admission_history.last().and_then(|revision| {
+            if revision.admission_state == WorkAdmissionState::DeferredCapacity {
+                revision.deferral.as_ref()
+            } else {
+                None
+            }
+        })
     }
 
     /// Validates response shape without binding it to a request.
