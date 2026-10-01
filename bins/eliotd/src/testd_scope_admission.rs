@@ -254,6 +254,28 @@ fn available_launch_owner_facts(
     {
         return Err("Kernel causal or authority binding differs from the authenticated fence".to_owned());
     }
+    let task_binding = match request.task_id.as_deref() {
+        Some(task_ref) => Some(
+            composition.current_testd_blob_task_binding(task_ref, &request.state_fence)?,
+        ),
+        None => None,
+    };
+    let session_binding = match request.session_id.as_deref() {
+        Some(session_ref) => Some(
+            composition.current_testd_blob_session_binding(session_ref, &request.state_fence)?,
+        ),
+        None => None,
+    };
+    let task_binding_bytes = task_binding
+        .as_ref()
+        .map(canonical_json_bytes)
+        .transpose()
+        .map_err(|error| format!("TaskBinding encoding failed: {error}"))?;
+    let session_binding_bytes = session_binding
+        .as_ref()
+        .map(canonical_json_bytes)
+        .transpose()
+        .map_err(|error| format!("SessionBinding encoding failed: {error}"))?;
     let facts = BlobProcessStreamVerifiedOwnerFacts {
         work_scope_binding_sha256: scope.work_scope_snapshot_sha256.clone(),
         work_scope_binding_json: scope.work_scope_snapshot_json.clone(),
@@ -270,6 +292,18 @@ fn available_launch_owner_facts(
         authority_binding_json: request.kernel_authority_binding_json.clone(),
         authority_binding_sha256: request.kernel_authority_binding_sha256.clone(),
         currentness_sha256: String::new(),
+        task_binding_sha256: task_binding_bytes.as_ref().map(|bytes| sha256_hex(bytes)),
+        task_binding_json: task_binding_bytes
+            .as_ref()
+            .map(|bytes| String::from_utf8(bytes.clone()))
+            .transpose()
+            .map_err(|error| format!("TaskBinding is not UTF-8: {error}"))?,
+        session_binding_sha256: session_binding_bytes.as_ref().map(|bytes| sha256_hex(bytes)),
+        session_binding_json: session_binding_bytes
+            .as_ref()
+            .map(|bytes| String::from_utf8(bytes.clone()))
+            .transpose()
+            .map_err(|error| format!("SessionBinding is not UTF-8: {error}"))?,
     };
     #[derive(Serialize)]
     struct Currentness<'a> {
@@ -288,6 +322,8 @@ fn available_launch_owner_facts(
         authority_binding_sha256: &'a str,
         process_binding_sha256: &'a str,
         source_root_identity_sha256: &'a str,
+        task_binding_sha256: Option<&'a str>,
+        session_binding_sha256: Option<&'a str>,
     }
     let currentness_bytes = canonical_json_bytes(&Currentness {
         state_fence: &request.state_fence,
@@ -305,6 +341,8 @@ fn available_launch_owner_facts(
         authority_binding_sha256: &request.kernel_authority_binding_sha256,
         process_binding_sha256: &request.process_binding_sha256,
         source_root_identity_sha256: &request.source_root_identity_sha256,
+        task_binding_sha256: facts.task_binding_sha256.as_deref(),
+        session_binding_sha256: facts.session_binding_sha256.as_deref(),
     })
     .map_err(|error| format!("currentness input encoding failed: {error}"))?;
     let currentness_sha256 = sha256_hex(&currentness_bytes);
