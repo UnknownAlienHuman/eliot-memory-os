@@ -155,7 +155,7 @@ pub(crate) fn verify_compiled_schedule(
 ) -> Result<VerifiedScheduleCompilation, UserAutomationError> {
     let mut source = schedule.clone();
     source.next_occurrences.clear();
-    source.normalization_receipt = Box::new(ScheduleNormalizationReceipt::default());
+    *source.normalization_receipt = ScheduleNormalizationReceipt::default();
     let expected = normalize_schedule(&source, schedule.next_occurrences.len())?;
     if expected.next_occurrences != schedule.next_occurrences {
         return Err(UserAutomationError::Invalid(UNRELATED_PROJECTION));

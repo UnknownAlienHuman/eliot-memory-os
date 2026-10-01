@@ -5526,36 +5526,7 @@ impl KernelComposition {
             eliot_kernel_core::UserAutomationOperation::NormalizeSchedule { .. }
                 | eliot_kernel_core::UserAutomationOperation::MigrateLegacySchedule { .. }
         ) {
-            let (revision, normalization_receipt_envelope) =
-                match eliot_kernel_service::KernelStoreGateway::normalize_user_automation_schedule(
-                    &request,
-                ) {
-                    Ok(result) => result,
-                    Err(eliot_kernel_service::UserAutomationExecutionError::Contract(error)) => {
-                        return Self::bind_user_automation_operator_response(
-                            &request,
-                            &Self::user_automation_precommit_refusal_response(&request, &error),
-                        );
-                    }
-                    Err(_) => {
-                        return Self::bind_user_automation_operator_response(
-                            &request,
-                            &Self::user_automation_runtime_error_response(
-                                UserAutomationRuntimeError::UnknownOutcome(
-                                    "user_automation_normalization_result_unavailable".to_owned(),
-                                ),
-                            ),
-                        );
-                    }
-                };
-            let envelope =
-                eliot_kernel_service::UserAutomationOperatorResultEnvelope::from_normalized_schedule(
-                    &request,
-                    revision,
-                    normalization_receipt_envelope,
-                )
-                .map_err(|_| TransportError::SessionFenced)?;
-            return serde_json::to_value(envelope).map_err(|_| TransportError::SessionFenced);
+            return Self::user_automation_normalization_response(&request);
         }
         let transition = match self
             .dispatch_user_automation_operator_transition(session, &request)
@@ -5595,6 +5566,42 @@ impl KernelComposition {
                 ),
             );
         };
+        serde_json::to_value(envelope).map_err(|_| TransportError::SessionFenced)
+    }
+
+    #[cfg(windows)]
+    fn user_automation_normalization_response(
+        request: &eliot_kernel_service::UserAutomationServiceRequest,
+    ) -> Result<serde_json::Value, TransportError> {
+        let (revision, normalization_receipt_envelope) =
+            match eliot_kernel_service::KernelStoreGateway::normalize_user_automation_schedule(
+                request,
+            ) {
+                Ok(result) => result,
+                Err(eliot_kernel_service::UserAutomationExecutionError::Contract(error)) => {
+                    return Self::bind_user_automation_operator_response(
+                        request,
+                        &Self::user_automation_precommit_refusal_response(request, &error),
+                    );
+                }
+                Err(_) => {
+                    return Self::bind_user_automation_operator_response(
+                        request,
+                        &Self::user_automation_runtime_error_response(
+                            UserAutomationRuntimeError::UnknownOutcome(
+                                "user_automation_normalization_result_unavailable".to_owned(),
+                            ),
+                        ),
+                    );
+                }
+            };
+        let envelope =
+            eliot_kernel_service::UserAutomationOperatorResultEnvelope::from_normalized_schedule(
+                request,
+                revision,
+                normalization_receipt_envelope,
+            )
+            .map_err(|_| TransportError::SessionFenced)?;
         serde_json::to_value(envelope).map_err(|_| TransportError::SessionFenced)
     }
 

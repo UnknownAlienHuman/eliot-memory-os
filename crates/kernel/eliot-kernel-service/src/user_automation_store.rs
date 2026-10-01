@@ -1841,64 +1841,9 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
         request: &UserAutomationStoreRequest,
     ) -> Result<BTreeMap<String, Value>, StoreError> {
         match &request.intent.operation {
-            UserAutomationOperation::Create {
-                revision,
-                normalization_receipt_envelope,
-            } => {
-                // Create retains the exact envelope returned by the
-                // authenticated normalization operation. This path verifies
-                // that envelope against an independently compiled projection;
-                // it never mints or substitutes receipt bytes.
-                let revision = &**revision;
-                let (verified_revision, envelope) = revision_with_owner_normalization_receipt(
-                    revision,
-                    normalization_receipt_envelope,
-                    eliot_kernel_core::user_automation::USER_AUTOMATION_NORMALIZATION_OPERATION_KIND,
-                )?;
-                let document = serde_json::to_string(&verified_revision)
-                    .map_err(|error| StoreError::Serialization(error.to_string()))?;
-                Ok(with_automation_normalization_receipt(
-                    automation_create_params(
-                        revision.automation_id.clone(),
-                        revision.revision.clone(),
-                        state_wire(revision.configuration_state),
-                        document,
-                    ),
-                    retained_normalization_envelope(&envelope)?,
-                ))
-            }
-            UserAutomationOperation::Edit {
-                previous_revision,
-                revision,
-                normalization_receipt_envelope,
-            } => {
-                let revision = &**revision;
-                let operation_kind = if previous_revision.validate().is_err()
-                    && previous_revision
-                        .validate_legacy_for_schedule_migration()
-                        .is_ok()
-                {
-                    USER_AUTOMATION_LEGACY_MIGRATION_OPERATION_KIND
-                } else {
-                    eliot_kernel_core::user_automation::USER_AUTOMATION_NORMALIZATION_OPERATION_KIND
-                };
-                let (verified_revision, envelope) = revision_with_owner_normalization_receipt(
-                    revision,
-                    normalization_receipt_envelope,
-                    operation_kind,
-                )?;
-                let document = serde_json::to_string(&verified_revision)
-                    .map_err(|error| StoreError::Serialization(error.to_string()))?;
-                Ok(with_automation_normalization_receipt(
-                    automation_edit_params(
-                        revision.automation_id.clone(),
-                        previous_revision.revision.clone(),
-                        revision.revision.clone(),
-                        state_wire(revision.configuration_state),
-                        document,
-                    ),
-                    retained_normalization_envelope(&envelope)?,
-                ))
+            operation @ (UserAutomationOperation::Create { .. }
+            | UserAutomationOperation::Edit { .. }) => {
+                normalized_revision_mutation_parameters(operation)
             }
             UserAutomationOperation::Pause {
                 automation_id,
@@ -2030,49 +1975,16 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
             UserAutomationOperation::Create {
                 revision,
                 normalization_receipt_envelope,
-            } => {
-                let verified_revision = revision_with_owner_normalization_receipt(
-                    revision,
-                    normalization_receipt_envelope,
-                    eliot_kernel_core::user_automation::USER_AUTOMATION_NORMALIZATION_OPERATION_KIND,
-                )?
-                .0;
-                let stored = self
-                    .read_revision_document(
-                        &request.context.state_fence,
-                        &revision.automation_id,
-                        &revision.revision,
-                    )
-                    .await?;
-                if stored != verified_revision {
-                    return Err(StoreError::InvalidField {
-                        field: "automation.revision",
-                        reason: "stored revision diverged from the admitted revision",
-                    });
-                }
-                Ok(UserAutomationMutationResult::Revision {
-                    revision: stored,
-                    cancelled_wake_ids: Vec::new(),
-                })
             }
-            UserAutomationOperation::Edit {
-                previous_revision,
+            | UserAutomationOperation::Edit {
                 revision,
                 normalization_receipt_envelope,
+                ..
             } => {
-                let operation_kind = if previous_revision.validate().is_err()
-                    && previous_revision
-                        .validate_legacy_for_schedule_migration()
-                        .is_ok()
-                {
-                    USER_AUTOMATION_LEGACY_MIGRATION_OPERATION_KIND
-                } else {
-                    eliot_kernel_core::user_automation::USER_AUTOMATION_NORMALIZATION_OPERATION_KIND
-                };
                 let verified_revision = revision_with_owner_normalization_receipt(
                     revision,
                     normalization_receipt_envelope,
-                    operation_kind,
+                    submitted_normalization_operation_kind(&request.intent.operation)?,
                 )?
                 .0;
                 let stored = self
@@ -2436,6 +2348,77 @@ fn issue_owner_normalization_receipt(
         .schedule
         .project_normalization_receipt_envelope(&envelope, revision)?;
     Ok((declared, envelope))
+}
+
+/// Selects the original receipt kind for the closed Create/Edit operation.
+fn submitted_normalization_operation_kind(
+    operation: &UserAutomationOperation,
+) -> Result<&'static str, StoreError> {
+    match operation {
+        UserAutomationOperation::Create { .. } => Ok(USER_AUTOMATION_NORMALIZATION_OPERATION_KIND),
+        UserAutomationOperation::Edit {
+            previous_revision, ..
+        } => {
+            if previous_revision.validate().is_err()
+                && previous_revision
+                    .validate_legacy_for_schedule_migration()
+                    .is_ok()
+            {
+                Ok(USER_AUTOMATION_LEGACY_MIGRATION_OPERATION_KIND)
+            } else {
+                Ok(USER_AUTOMATION_NORMALIZATION_OPERATION_KIND)
+            }
+        }
+        _ => Err(StoreError::UnknownOperation),
+    }
+}
+
+/// Compiles the Create/Edit parameter map from the exact validated owner result.
+/// Original receipt bytes are retained through the existing canonical writer.
+fn normalized_revision_mutation_parameters(
+    operation: &UserAutomationOperation,
+) -> Result<BTreeMap<String, Value>, StoreError> {
+    let (revision, envelope) = match operation {
+        UserAutomationOperation::Create {
+            revision,
+            normalization_receipt_envelope,
+        }
+        | UserAutomationOperation::Edit {
+            revision,
+            normalization_receipt_envelope,
+            ..
+        } => (revision, normalization_receipt_envelope),
+        _ => return Err(StoreError::UnknownOperation),
+    };
+    let (verified_revision, envelope) = revision_with_owner_normalization_receipt(
+        revision,
+        envelope,
+        submitted_normalization_operation_kind(operation)?,
+    )?;
+    let document = serde_json::to_string(&verified_revision)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    let parameters = match operation {
+        UserAutomationOperation::Create { .. } => automation_create_params(
+            revision.automation_id.clone(),
+            revision.revision.clone(),
+            state_wire(revision.configuration_state),
+            document,
+        ),
+        UserAutomationOperation::Edit {
+            previous_revision, ..
+        } => automation_edit_params(
+            revision.automation_id.clone(),
+            previous_revision.revision.clone(),
+            revision.revision.clone(),
+            state_wire(revision.configuration_state),
+            document,
+        ),
+        _ => return Err(StoreError::UnknownOperation),
+    };
+    Ok(with_automation_normalization_receipt(
+        parameters,
+        retained_normalization_envelope(&envelope)?,
+    ))
 }
 
 /// Verifies a submitted revision against its original normalization envelope.
