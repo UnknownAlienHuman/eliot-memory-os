@@ -64,6 +64,7 @@ fn store_build_error_code(error: &KernelBuildError) -> &'static str {
         KernelBuildError::Service(_) => "SERVICE",
         KernelBuildError::StoreBootstrapRequired => "STORE_BOOTSTRAP_REQUIRED",
         KernelBuildError::StoreAlreadyConnected => "STORE_ALREADY_CONNECTED",
+        KernelBuildError::StoreRouteOwnerRefused(_) => "STORE_ROUTE_OWNER_REFUSED",
         KernelBuildError::Principal(_) => "PRINCIPAL",
     }
 }
@@ -462,16 +463,19 @@ impl KernelComposition {
                             refusal.reason_code()
                         ),
                     );
-                    // The same typed composition refusal the route-mismatch
-                    // check above returns: this composition may not hold the
-                    // canonical Store writer for a generation the durable route
-                    // owner does not name. `KernelBuildError` owns no
-                    // route-owner variant, and inventing one here would be a
-                    // second error scheme beside the existing one, so the
-                    // typed `CanonicalStoreWriterRefusal` is rendered into the
-                    // route refusal whose Display already names the governed
-                    // `I5.11` stage-8 cutover as the path to use instead.
-                    return Err(KernelBuildError::Core(refusal.to_string()));
+                    // The typed refusal travels to the operator as
+                    // `KernelBuildError::StoreRouteOwnerRefused`, not as prose
+                    // inside `Core`. Rendering it with `to_string()` made the
+                    // three refusable facts the enum keeps apart — an owner
+                    // that could not be read, an owner that does not exist,
+                    // and an owner that names a different generation — one
+                    // free-text line at this layer, so a reader had to parse
+                    // the sentence to learn which fact failed. The variant
+                    // keeps the decision typed across the layer boundary and
+                    // gives `store_build_error_code` a stable bounded code.
+                    // This composition check is the one decision; the rebind
+                    // transaction returns the same variant.
+                    return Err(KernelBuildError::StoreRouteOwnerRefused(refusal));
                 }
             };
         observe_entrypoint_with_detail(

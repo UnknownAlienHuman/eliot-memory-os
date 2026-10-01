@@ -2314,6 +2314,66 @@ impl KernelComposition {
                 "store rebind does not match active Kernel store route".to_owned(),
             ));
         }
+        // I5.11 stage 8 / A12.3 / A0.3 fail-closed "a second ungoverned
+        // canonical owner or write path" (issue #1872, item W5, second
+        // construction site).
+        //
+        // This is the SECOND place that mints a live canonical Store writer
+        // for the composition. `rebind_store` does not go through
+        // `connect_canonical_store_inner`, so the admission added on the
+        // connect path did not cover it: a rebind to a generation the durable
+        // `canonical_store` route owner does not name used to be stopped only
+        // at the Store layer by `require_active_store_generation`, after this
+        // function had already loaded the durable rebind replay record, begun
+        // a rebind transaction and RETAINED the swapped gateway. A dead Store
+        // path is not an absent bridge, which is the gap the item forbids.
+        //
+        // It is the SAME function, on the SAME ORS handle, comparing the SAME
+        // candidate against the SAME durable owner, so there is one admission
+        // decision with two callers rather than a second scheme: the
+        // composition is permitted to hold the canonical Store writer exactly
+        // when the durable route owner names the generation, and
+        // `KernelComposition::rebind_store` cannot become a way around
+        // `KernelComposition::connect_canonical_store_inner`.
+        //
+        // Placement is deliberate. Everything above is self-referential — the
+        // route, the bootstrap requirement and the Host descriptor all descend
+        // from the same Host-supplied generation, so the tuple equality just
+        // proved the composition agrees with itself; the durable route owner
+        // is the one fact that is not the caller's claim. This check therefore
+        // runs immediately after that tuple check and BEFORE `requirement_digest`
+        // and the ORS durable-replay load below, so a candidate that may not
+        // become the writer never stages any ORS rebind state.
+        let admission =
+            match eliot_kernel_service::StorageReplacement::canonical_store_writer_admission(
+                &self.generation_gateway.ors,
+                route.active_generation(),
+            ) {
+                Ok(admission) => admission,
+                Err(refusal) => {
+                    // Diagnostic reason codes only: the refusal's own
+                    // generation material is never logged, and the operator
+                    // reads the typed refusal through the returned error.
+                    crate::kernel_diagnostics::observe_entrypoint_with_detail(
+                        crate::kernel_diagnostics::EntrypointStage::StoreBootstrap,
+                        &format!(
+                            "kernel.store.rebind_rejected:canonical_store_writer_admission:{}",
+                            refusal.reason_code()
+                        ),
+                    );
+                    return Err(KernelBuildError::StoreRouteOwnerRefused(refusal));
+                }
+            };
+        // Only the fixed bridge name plus the numeric generation the durable
+        // owner named is emitted, mirroring the connect path, so an admitted
+        // rebind is auditable without re-reading ORS.
+        crate::kernel_diagnostics::observe_entrypoint_with_detail(
+            crate::kernel_diagnostics::EntrypointStage::StoreBootstrap,
+            &format!(
+                "kernel.store.rebind_writer_admitted:store_bridge:generation={}",
+                admission.durable_owner_generation.value()
+            ),
+        );
         let requirement_digest = {
             let bytes = serde_json::to_vec(&handoff.requirement)
                 .map_err(|e| KernelBuildError::Service(e.to_string()))?;

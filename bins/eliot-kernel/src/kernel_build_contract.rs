@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use super::{AuthorityHandoffRecord, KernelDispatchKey, is_lower_sha256};
 use crate::kernel_diagnostics::{EntrypointStage, observe_entrypoint_with_detail};
-use eliot_kernel_service::ProcessAuthorityHandoffDescriptor;
+use eliot_kernel_service::{CanonicalStoreWriterRefusal, ProcessAuthorityHandoffDescriptor};
 use eliot_platform::PortError;
 #[cfg(windows)]
 use eliot_runtime_contracts::ProvisionedSupervisionAuthority;
@@ -185,6 +185,24 @@ pub enum KernelBuildError {
     StoreBootstrapRequired,
     /// This composition already owns its one canonical-store client/gateway.
     StoreAlreadyConnected,
+    /// The durable `canonical_store` route owner refused this composition the
+    /// canonical Store writer for the candidate generation.
+    ///
+    /// The typed refusal travels with the error instead of being rendered into
+    /// a string, because the three refusable facts it distinguishes — an owner
+    /// that could not be read, an owner that does not exist, and an owner that
+    /// names a different generation — are different operator actions. Flattening
+    /// them into [`KernelBuildError::Core`] text made the decision auditable
+    /// only by reading prose, which is exactly what a fail-closed owner
+    /// decision must not be. This is the same decision on both Store-bridge
+    /// construction sites (connect and rebind), so it is one variant with one
+    /// bounded code rather than two call-site-shaped error schemes.
+    ///
+    /// [`A0.3`](../../docs/architecture/A00-03-hard-boundaries.md) lists "a
+    /// second ungoverned canonical owner or write path" in its fail-closed
+    /// class, and [`I5.11`](../../docs/architecture/I05-11-storage-replacement.md)
+    /// stage 8 is the only path that moves the owner.
+    StoreRouteOwnerRefused(CanonicalStoreWriterRefusal),
     /// The platform could not bind the authenticated local front door.
     Principal(String),
 }
@@ -262,6 +280,10 @@ impl fmt::Display for KernelBuildError {
             Self::StoreAlreadyConnected => {
                 write!(f, "canonical-store client/gateway is already connected")
             }
+            Self::StoreRouteOwnerRefused(refusal) => write!(
+                f,
+                "durable canonical_store route owner refused the writer: {refusal}"
+            ),
             Self::Principal(error) => write!(f, "principal composition failed: {error}"),
         }
     }

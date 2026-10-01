@@ -206,6 +206,7 @@ fn kernel_build_error_code(error: &KernelBuildError) -> &'static str {
         KernelBuildError::Service(_) => "SERVICE",
         KernelBuildError::StoreBootstrapRequired => "STORE_BOOTSTRAP_REQUIRED",
         KernelBuildError::StoreAlreadyConnected => "STORE_ALREADY_CONNECTED",
+        KernelBuildError::StoreRouteOwnerRefused(_) => "STORE_ROUTE_OWNER_REFUSED",
         KernelBuildError::Principal(_) => "PRINCIPAL",
     }
 }
