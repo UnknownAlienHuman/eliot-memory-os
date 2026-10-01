@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use eliot_contracts::{ArtifactId, ClockReading, StateFence, sha256_hex};
 use eliot_instrument_api::{EvidenceCoverage, RawEvidence, RawEvidenceSource, VerificationOutcome};
-use eliot_process::{ExitDisposition, ExitStatus};
+use eliot_process::{EnvironmentProjection, ExitDisposition, ExitStatus};
 use eliot_instrument_nextest::{
     NEXTEST_INSTRUMENT, NEXTEST_STDOUT_CONTENT_TYPE, parse_jsonl, parse_list_json,
 };
@@ -14,8 +14,10 @@ use eliot_instrument_rustfmt::{RUSTFMT_INSTRUMENT, parse_output as parse_rustfmt
 use eliot_testd_core::{
     EphemeralSourceBytes, InstrumentStageRequest, StageExecutionKind, TestdEvaluationObservation,
     TestdEvaluationStatus, TestdParsingObservation, TestdParsingStatus,
-    TestdProviderCatalogLifecycle, TestdStreamDisposition, TestdStreamEvidenceBinding,
+    TestdProviderCatalogLifecycle, TestdSourceObservationRange, TestdStreamDisposition,
+    TestdStreamEvidenceBinding, TestdToolObservation,
 };
+use eliot_bootstrap::{NormativePair, normative::parse_normative_pair_receipt};
 use thiserror::Error;
 
 use crate::{
@@ -23,29 +25,48 @@ use crate::{
     registry::{InvalidationSet, ProviderRegistry, RegistryEntry, RegistryError, RegistryFreshness},
 };
 
+/// Exact independent observations available at the governed process finish
+/// boundary. The worker fills this from its actual source/tool/environment
+/// re-observation, not from the retained stage projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplayObservedInputs {
+    /// Before/after Git source observations around the exact process.
+    pub source: TestdSourceObservationRange,
+    /// Owner-measured tool paths and byte digests revalidated at finish.
+    pub tools: TestdToolObservation,
+    /// Exact process environment projection passed to the executor.
+    pub environment: EnvironmentProjection,
+    /// SHA-256 of the exact Cargo.lock bytes read at finish.
+    pub cargo_lock_sha256: String,
+    /// Existing lane fingerprint digest retained by the governed envelope.
+    pub lane_fingerprint_digest: String,
+    /// Exact current `docs/normative-pair.toml` bytes read at finish.
+    pub normative_pair_receipt: Vec<u8>,
+    /// Test IDs retained by the independently validated verifier plan.
+    pub required_test_ids: BTreeSet<String>,
+}
+
 /// Kernel/owner-issued replay context bound to one exact accepted catalog row
-/// and one independently observed provider fingerprint set.
+/// and one independently admitted Bootstrap normative pair.
 ///
 /// The context is deliberately not constructible from a Testd material
 /// projection. Callers mint it from a current `ModuleCatalogOwnerReadback`,
-/// the corresponding accepted `GenerationAdmission`, and current fingerprint
-/// observations, then retain the required profile/provider IDs separately
-/// from the stage projection.
+/// the corresponding accepted `GenerationAdmission`, and the original
+/// `NormativePair` from the admitted Bootstrap source/catalogue. Required
+/// profile/provider denominators come from the complete profile DAG and the
+/// single current provider registry.
 #[derive(Clone, Debug)]
 pub struct VerifiedTestdReplayContext {
     profile_registry: InstrumentRegistry,
-    provider_registry: ProviderRegistry,
-    fingerprints: InvalidationSet,
-    required_profile_ids: BTreeSet<String>,
-    required_provider_ids: BTreeSet<(String, String)>,
-    required_test_ids: BTreeSet<String>,
+    lifecycle: eliot_module_registry::VerifiedModuleCatalogGeneration,
+    original_normative_pair: NormativePair,
 }
 
 impl VerifiedTestdReplayContext {
     /// Issues a replay context only after the exact current catalog readback
-    /// revalidates its accepted module generation. `required_provider_ids`
-    /// are `(instrument, adapter)` identities selected independently by the
-    /// caller; they are not derived from Testd's stage material.
+    /// revalidates its accepted module generation. The original pair is
+    /// supplied by the authenticated Bootstrap owner-facts record, never by
+    /// Testd material or the currently read repository file.
     pub fn from_owner_readback(
         profile_registry: InstrumentRegistry,
         readback: &eliot_module_registry::ModuleCatalogOwnerReadback,
@@ -53,11 +74,7 @@ impl VerifiedTestdReplayContext {
         expected_catalog_revision: u64,
         expected_state_fence: &StateFence,
         admission: &eliot_module_registry::GenerationAdmission,
-        normative_pair_digest: String,
-        fingerprints: InvalidationSet,
-        required_profile_ids: BTreeSet<String>,
-        required_provider_ids: BTreeSet<(String, String)>,
-        required_test_ids: BTreeSet<String>,
+        original_normative_pair: NormativePair,
     ) -> Result<Self, ProfileReplayError> {
         let lifecycle = readback.verify_generation_admission(
             expected_owner_revision,
@@ -65,24 +82,15 @@ impl VerifiedTestdReplayContext {
             expected_state_fence,
             admission,
         )?;
-        if required_profile_ids.is_empty() {
-            return Err(ProfileReplayError::EmptyRequiredProfiles);
+        if !valid_sha256_text(&original_normative_pair.architecture_sha256)
+            || !valid_sha256_text(&original_normative_pair.implementation_sha256)
+        {
+            return Err(ProfileReplayError::NormativePairMismatch);
         }
-        if required_provider_ids.is_empty() {
-            return Err(ProfileReplayError::EmptyRequiredProviders);
-        }
-        let provider_registry = ProviderRegistry::ready_for_catalog_generation(
-            lifecycle,
-            normative_pair_digest,
-            &fingerprints,
-        )?;
         Ok(Self {
             profile_registry,
-            provider_registry,
-            fingerprints,
-            required_profile_ids,
-            required_provider_ids,
-            required_test_ids,
+            lifecycle,
+            original_normative_pair,
         })
     }
 
@@ -97,27 +105,176 @@ impl VerifiedTestdReplayContext {
         terminal: Option<&ExitStatus>,
         started_at: ClockReading,
         finished_at: ClockReading,
+        observations: &ReplayObservedInputs,
     ) -> Result<ProfileReplayReceipt, ProfileReplayError> {
+        observations
+            .source
+            .validate()
+            .map_err(|error| ProfileReplayError::CurrentnessObservation(error.to_string()))?;
+        if !observations.source.unchanged()
+            || observations.source.before.repository_root != observations.source.after.repository_root
+            || !valid_sha256_text(&observations.cargo_lock_sha256)
+            || !valid_sha256_text(&observations.lane_fingerprint_digest)
+        {
+            return Err(ProfileReplayError::CurrentnessObservation(
+                "source, lockfile, or lane identity moved or is malformed".to_owned(),
+            ));
+        }
+        observations
+            .tools
+            .validate()
+            .map_err(|error| ProfileReplayError::CurrentnessObservation(error.to_string()))?;
+        let (provider_registry, fingerprints) = current_testd_provider_registry(
+            self.lifecycle.clone(),
+            &self.profile_registry,
+            &self.original_normative_pair,
+            observations,
+        )?;
+        let (required_profile_ids, required_provider_ids) =
+            required_registry_denominator(&self.profile_registry, &provider_registry)?;
         let provider_freshness = RegistryFreshness {
-            generation: self.provider_registry.generation(),
-            normative_pair_digest: self.provider_registry.normative_pair_digest(),
-            fingerprints: &self.fingerprints,
+            generation: provider_registry.generation(),
+            normative_pair_digest: provider_registry.normative_pair_digest(),
+            fingerprints: &fingerprints,
         };
         replay_profile_stream_admitted(
             &self.profile_registry,
-            &self.provider_registry,
+            &provider_registry,
             &provider_freshness,
             stage,
             source,
             bytes,
             &self.required_profile_ids,
             &self.required_provider_ids,
-            &self.required_test_ids,
+            &observations.required_test_ids,
             terminal,
             started_at,
             finished_at,
         )
     }
+}
+
+/// Builds the current seven-axis fingerprint set only from live observations
+/// and the complete admitted profile/parser registries.
+pub fn observed_invalidation_set(
+    profile_registry: &InstrumentRegistry,
+    observations: &ReplayObservedInputs,
+) -> Result<InvalidationSet, ProfileReplayError> {
+    let environment_bytes = serde_json::to_vec(&observations.environment)
+        .map_err(|error| ProfileReplayError::CurrentnessObservation(error.to_string()))?;
+    let executable_bytes = serde_json::to_vec(&observations.tools)
+        .map_err(|error| ProfileReplayError::CurrentnessObservation(error.to_string()))?;
+    Ok(InvalidationSet {
+        source: observations.lane_fingerprint_digest.clone(),
+        lock: observations.cargo_lock_sha256.clone(),
+        toolchain: observations.tools.selected_toolchain.clone(),
+        env: sha256_hex(&environment_bytes),
+        exe: sha256_hex(&executable_bytes),
+        profile: profile_registry.digest(),
+        parser: profile_registry.parser_contract_digest(),
+    })
+}
+
+/// Constructs the one current Testd provider registry from a verified catalog
+/// lifecycle, the original admitted Bootstrap pair, and the exact independent
+/// process/source/environment observations. The same function is used by the
+/// admission side and at replay so all seven invalidation axes have one owner.
+pub fn current_testd_provider_registry(
+    lifecycle: eliot_module_registry::VerifiedModuleCatalogGeneration,
+    profile_registry: &InstrumentRegistry,
+    original_normative_pair: &NormativePair,
+    observations: &ReplayObservedInputs,
+) -> Result<(ProviderRegistry, InvalidationSet), ProfileReplayError> {
+    observations
+        .source
+        .validate()
+        .map_err(|error| ProfileReplayError::CurrentnessObservation(error.to_string()))?;
+    if !observations.source.unchanged()
+        || !valid_sha256_text(&observations.cargo_lock_sha256)
+        || !valid_sha256_text(&observations.lane_fingerprint_digest)
+    {
+        return Err(ProfileReplayError::CurrentnessObservation(
+            "source, lockfile, or lane identity moved or is malformed".to_owned(),
+        ));
+    }
+    observations
+        .tools
+        .validate()
+        .map_err(|error| ProfileReplayError::CurrentnessObservation(error.to_string()))?;
+    let current_pair = parse_normative_pair_receipt(&observations.normative_pair_receipt)
+        .map_err(|error| ProfileReplayError::CurrentnessObservation(error.to_string()))?;
+    if &current_pair != original_normative_pair {
+        return Err(ProfileReplayError::NormativePairMismatch);
+    }
+    let fingerprints = observed_invalidation_set(profile_registry, observations)?;
+    let registry = ProviderRegistry::ready_for_catalog_generation(
+        lifecycle,
+        normative_pair_key(&current_pair),
+        &fingerprints,
+    )?;
+    Ok((registry, fingerprints))
+}
+
+fn normative_pair_key(pair: &NormativePair) -> String {
+    let material = [
+        b"eliot-normative-pair-v1\0".as_slice(),
+        pair.architecture_sha256.as_bytes(),
+        b"\0".as_slice(),
+        pair.implementation_sha256.as_bytes(),
+        b"\0".as_slice(),
+    ]
+    .concat();
+    format!("sha256:{}", sha256_hex(&material))
+}
+
+fn valid_sha256_text(value: &str) -> bool {
+    let hex = value.strip_prefix("sha256:").unwrap_or(value);
+    hex.len() == 64
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Derives the full required profile/provider denominator from the admitted
+/// profile DAGs and the one current provider registry. It cannot be narrowed
+/// by Testd material or by a caller-provided list.
+fn required_registry_denominator(
+    profile_registry: &InstrumentRegistry,
+    provider_registry: &ProviderRegistry,
+) -> Result<(BTreeSet<String>, BTreeSet<(String, String)>), ProfileReplayError> {
+    let mut required_profiles = BTreeSet::new();
+    let mut required_providers = BTreeSet::new();
+    for profile in profile_registry.iter() {
+        required_profiles.insert(profile.name.clone());
+        for stage in &profile.dag {
+            let mut matches = provider_registry
+                .iter()
+                .filter(|entry| entry.instrument.as_str() == stage.spec.as_str())
+                .filter(|entry| entry.supports(stage.kind));
+            let Some(entry) = matches.next() else {
+                return Err(ProfileReplayError::MissingRequiredProvider {
+                    profile: profile.name.clone(),
+                    stage: stage.stage_id.clone(),
+                    instrument: stage.spec.as_str().to_owned(),
+                });
+            };
+            if matches.next().is_some() {
+                return Err(ProfileReplayError::AmbiguousRequiredProvider {
+                    profile: profile.name.clone(),
+                    stage: stage.stage_id.clone(),
+                    instrument: stage.spec.as_str().to_owned(),
+                });
+            }
+            required_providers.insert((entry.instrument.as_str().to_owned(), entry.adapter.clone()));
+        }
+    }
+    if required_profiles.is_empty() {
+        return Err(ProfileReplayError::EmptyRequiredProfiles);
+    }
+    if required_providers.is_empty() {
+        return Err(ProfileReplayError::EmptyRequiredProviders);
+    }
+    Ok((required_profiles, required_providers))
 }
 
 /// Parser/evaluator identities and result from replaying one immutable source.
@@ -166,12 +323,40 @@ pub enum ProfileReplayError {
     /// Exact catalog readback failed its owner-revision/admission checks.
     #[error(transparent)]
     Catalog(#[from] eliot_module_registry::ModuleRegistryAdmissionError),
+    /// Independently re-observed source, lockfile, tool, or environment inputs
+    /// are incomplete, malformed, or moved across the execution boundary.
+    #[error("replay currentness observation is invalid: {0}")]
+    CurrentnessObservation(String),
+    /// Current repository normative receipt differs from the original
+    /// authenticated Bootstrap pair used by the admitted provider registry.
+    #[error("current normative pair differs from the admitted Bootstrap pair")]
+    NormativePairMismatch,
     /// Production replay context omitted its independently retained profile set.
     #[error("replay context has no required profile IDs")]
     EmptyRequiredProfiles,
     /// Production replay context omitted its independently retained provider set.
     #[error("replay context has no required provider IDs")]
     EmptyRequiredProviders,
+    /// An admitted profile stage has no matching provider-registry entry.
+    #[error("profile {profile} stage {stage} has no provider for {instrument}")]
+    MissingRequiredProvider {
+        /// Exact admitted profile.
+        profile: String,
+        /// Exact admitted stage.
+        stage: String,
+        /// Exact stage instrument contract.
+        instrument: String,
+    },
+    /// An admitted profile stage has multiple matching provider-registry entries.
+    #[error("profile {profile} stage {stage} has multiple providers for {instrument}")]
+    AmbiguousRequiredProvider {
+        /// Exact admitted profile.
+        profile: String,
+        /// Exact admitted stage.
+        stage: String,
+        /// Exact stage instrument contract.
+        instrument: String,
+    },
     /// Stage profile is outside the independently retained required profile set.
     #[error("retained profile is not in the required profile set")]
     UnrequiredProfile,
@@ -266,7 +451,7 @@ fn replay_profile_stream_admitted(
         Some(required_profile_ids),
         Some(required_provider_ids),
         required_test_ids,
-        Some(terminal),
+        terminal,
         started_at,
         finished_at,
     )

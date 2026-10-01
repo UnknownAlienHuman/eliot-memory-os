@@ -1717,6 +1717,14 @@ impl InstrumentRegistry {
         self.profiles.is_empty()
     }
 
+    /// Profiles in stable name/revision order.
+    ///
+    /// Production denominators are derived from this admitted registry rather
+    /// than from a caller-supplied profile-name list.
+    pub fn iter(&self) -> std::collections::btree_map::Values<'_, (String, u64), InstrumentProfile> {
+        self.profiles.values()
+    }
+
     /// Registry generation the admission was validated against.
     pub fn generation(&self) -> u64 {
         self.generation
@@ -1736,6 +1744,24 @@ impl InstrumentRegistry {
         }
         material.push_str(&self.supply_chain.digest());
         material.push('\0');
+        sha256_hex(material.as_bytes())
+    }
+
+    /// Digest of the parser contracts currently admitted by this registry.
+    ///
+    /// This remains a separate invalidation axis from the complete
+    /// profile/spec registry digest and is re-derived from the sorted current
+    /// specs at replay time.
+    pub fn parser_contract_digest(&self) -> String {
+        let mut material = String::new();
+        for spec in self.specs.values() {
+            material.push_str(spec.kind_key());
+            material.push('\0');
+            material.push_str(spec.parser.as_str());
+            material.push('\0');
+            material.push_str(&spec.parser_generation.to_string());
+            material.push('\0');
+        }
         sha256_hex(material.as_bytes())
     }
 
