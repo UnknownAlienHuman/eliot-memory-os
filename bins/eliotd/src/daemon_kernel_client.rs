@@ -1261,14 +1261,23 @@ fn validate_observe_claim_lineage(
         "HOST_PEER" => {
             attempt.wire_version == eliot_protocol::LOCAL_READ_ATTEMPT_HOST_ORIGIN_CONTRACT_VERSION
                 && attempt.session_id.is_none()
-                && record.scope_ref.as_ref().map(|scope| scope.as_str())
+                && record
+                    .scope_ref
+                    .as_ref()
+                    .map(eliot_ors::OpaqueLabel::as_str)
                     == Some(attempt.scope_id.as_str())
         }
         "APPLICATION_SESSION" => {
             attempt.wire_version == LocalReadAttempt::CONTRACT_VERSION
                 && attempt.session_id.as_deref()
-                    == binding.session_ref.as_ref().map(|session| session.as_str())
-                && record.scope_ref.as_ref().map(|scope| scope.as_str())
+                    == binding
+                        .session_ref
+                        .as_ref()
+                        .map(eliot_ors::OpaqueLabel::as_str)
+                && record
+                    .scope_ref
+                    .as_ref()
+                    .map(eliot_ors::OpaqueLabel::as_str)
                     == Some(attempt.scope_id.as_str())
         }
         _ => false,
