@@ -526,12 +526,41 @@ fn composed_headroom_refusal(
 /// single selection of this crate — plus the rank-trace join the traced
 /// entrypoints promise. The two governance screens and their order are
 /// documented there and are not restated or reordered here.
+///
+/// # DO NOT "restore" by-value parameters here as a reuse guard
+///
+/// These two parameters were by value in the first delivery of this composition,
+/// and it is tempting to read that as the thing stopping one downstream
+/// reservation from backing two admissions. It never was, and restoring it would
+/// buy nothing while making the signature lie about what enforces the rule.
+///
+/// `DownstreamReservation::Reserved` holds a `&HeadroomContext`, and
+/// `HeadroomContext` is plain shared references plus a `u64`: no interior
+/// mutability, no `consume`/`take`, and the enum is public and not
+/// `#[non_exhaustive]`. A caller holding one `&HeadroomContext` can therefore
+/// write `DownstreamReservation::Reserved(ctx)` once per call and drive any
+/// number of admissions from it. By-value moves the TOKEN, not the RESERVATION,
+/// so it never prevented that — `admit_context_traced_with_headroom` below
+/// already mints a fresh token from a borrowed context on every call.
+/// `LearningGovernance` is weaker still: `PresentedLearning` is `Copy` with
+/// all-public fields, so it is re-constructible from its own parts.
+///
+/// The by-value signature was therefore a SPELLING of the requirement, not an
+/// enforcement of it. Enforcement lives in the owner-side check that
+/// `check_headroom` runs on every call:
+/// `DownstreamHeadroomResult::validate_against` re-derives this compilation's
+/// request digest and binding, compares the binding against the live fence, and
+/// requires every granted permit to carry the live authority epoch and
+/// requesting generation and to be unexpired at the caller's `now_ms`. A reused
+/// or superseded reservation fails there on its own facts. Anyone restoring
+/// by-value should restore the comment's reasoning with it: the guarantee is
+/// re-verification per admission, not ownership of a token.
 pub fn admit_context_governed<'a>(
     input: &AdmissionInput,
-    learning: LearningGovernance<'a>,
-    reservation: DownstreamReservation<'a>,
+    learning: &LearningGovernance<'a>,
+    reservation: &DownstreamReservation<'a>,
 ) -> Result<HeadroomAdmissionOutcome, ContextError> {
-    match admit_context_composed(input, &learning, &reservation)? {
+    match admit_context_composed(input, learning, reservation)? {
         ComposedAdmission::Admitted { result, check } => {
             let traces = trace_material(input, &result)?;
             Ok(HeadroomAdmissionOutcome::Admitted {
@@ -573,8 +602,8 @@ pub fn admit_context_traced_with_headroom(
 ) -> Result<HeadroomAdmissionOutcome, ContextError> {
     admit_context_governed(
         input,
-        LearningGovernance::Unpresented,
-        DownstreamReservation::Reserved(headroom),
+        &LearningGovernance::Unpresented,
+        &DownstreamReservation::Reserved(headroom),
     )
 }
 
@@ -810,8 +839,8 @@ pub fn admit_context_traced(
     // already produced rather than rebuilding them through `admit_context`.
     match admit_context_governed(
         input,
-        LearningGovernance::Unpresented,
-        DownstreamReservation::NotReserved,
+        &LearningGovernance::Unpresented,
+        &DownstreamReservation::NotReserved,
     )? {
         HeadroomAdmissionOutcome::Admitted { result, traces, .. } => Ok((*result, traces)),
         HeadroomAdmissionOutcome::Refused(refusal) => Err(refusal.error),
