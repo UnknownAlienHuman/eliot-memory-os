@@ -469,7 +469,7 @@ impl OperationIdentityIssuer {
     #[cfg(test)]
     #[must_use]
     pub(crate) fn issued_count(&self) -> usize {
-        self.ledger.len()
+        self.issued.len()
     }
 
     /// Returns the launch lineage log (caller request to transport identity).
@@ -1730,6 +1730,8 @@ mod tests {
     use serde_json::json;
 
     const BINDING_DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const REGISTRATION_DIGEST: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+    const USER_BROKER_EPOCH: u64 = 4;
     const NOW: u64 = 1_786_000_000_000;
 
     fn test_fence() -> Value {
@@ -1748,6 +1750,19 @@ mod tests {
     fn issuer() -> OperationIdentityIssuer {
         OperationIdentityIssuer::bound(BINDING_DIGEST.to_owned(), test_fence())
             .expect("test issuer")
+    }
+
+    fn bind_test_registration(issuer: &mut OperationIdentityIssuer) {
+        issuer
+            .note_registration_binding(
+                REGISTRATION_DIGEST,
+                USER_BROKER_EPOCH,
+                &json!({
+                    "lineage_id": "01234567-89ab-cdef-0123-456789abcdef",
+                    "sequence": 7,
+                }),
+            )
+            .expect("test registration generation");
     }
 
     fn fence_of(issued: &IssuedIdentity) -> Value {
@@ -1774,15 +1789,16 @@ mod tests {
         let register = issuer
             .issue_register(&register_payload("nonce-1"), NOW)
             .expect("register identity");
+        bind_test_registration(&mut issuer);
         let heartbeat_one = issuer
             .issue_heartbeat(
-                &json!({"registration_digest": "digest-1", "observed_at": NOW}),
+                &json!({"registration_digest": REGISTRATION_DIGEST, "observed_at": NOW}),
                 NOW,
             )
             .expect("heartbeat one identity");
         let heartbeat_two = issuer
             .issue_heartbeat(
-                &json!({"registration_digest": "digest-1", "observed_at": NOW + 1_000}),
+                &json!({"registration_digest": REGISTRATION_DIGEST, "observed_at": NOW + 1_000}),
                 NOW + 1_000,
             )
             .expect("heartbeat two identity");
@@ -1790,7 +1806,7 @@ mod tests {
             .issue_authorize_launch(
                 "caller-req-1",
                 "caller-key-1",
-                &json!({"registration_digest": "digest-1", "launch": 1}),
+                &json!({"registration_digest": REGISTRATION_DIGEST, "launch": 1}),
                 NOW,
             )
             .expect("launch one identity");
@@ -1798,13 +1814,13 @@ mod tests {
             .issue_authorize_launch(
                 "caller-req-2",
                 "caller-key-2",
-                &json!({"registration_digest": "digest-1", "launch": 2}),
+                &json!({"registration_digest": REGISTRATION_DIGEST, "launch": 2}),
                 NOW,
             )
             .expect("launch two identity");
         let fence = issuer
             .issue_fence(
-                &json!({"registration_digest": "digest-1", "status": "CLOSED"}),
+                &json!({"registration_digest": REGISTRATION_DIGEST, "status": "CLOSED"}),
                 NOW,
             )
             .expect("fence identity");
@@ -1882,14 +1898,15 @@ mod tests {
             second.identity.deadline_unix_ms
         );
 
-        let heartbeat = json!({"registration_digest": "digest-r", "observed_at": NOW});
+        bind_test_registration(&mut issuer);
+        let heartbeat = json!({"registration_digest": REGISTRATION_DIGEST, "observed_at": NOW});
         let heartbeat_first = issuer.issue_heartbeat(&heartbeat, NOW).expect("hb first");
         let heartbeat_retry = issuer
             .issue_heartbeat(&heartbeat, NOW + 250)
             .expect("hb retry");
         assert_eq!(heartbeat_first.request_id, heartbeat_retry.request_id);
 
-        let fence = json!({"registration_digest": "digest-r", "status": "CLOSED"});
+        let fence = json!({"registration_digest": REGISTRATION_DIGEST, "status": "CLOSED"});
         let fence_first = issuer.issue_fence(&fence, NOW).expect("fence first");
         let fence_retry = issuer.issue_fence(&fence, NOW + 250).expect("fence retry");
         assert_eq!(fence_first.request_id, fence_retry.request_id);
@@ -1898,15 +1915,16 @@ mod tests {
     #[test]
     fn next_heartbeat_revision_mints_a_new_identity() {
         let mut issuer = issuer();
+        bind_test_registration(&mut issuer);
         let first = issuer
             .issue_heartbeat(
-                &json!({"registration_digest": "digest-h", "observed_at": NOW}),
+                &json!({"registration_digest": REGISTRATION_DIGEST, "observed_at": NOW}),
                 NOW,
             )
             .expect("first revision");
         let second = issuer
             .issue_heartbeat(
-                &json!({"registration_digest": "digest-h", "observed_at": NOW + 1_000}),
+                &json!({"registration_digest": REGISTRATION_DIGEST, "observed_at": NOW + 1_000}),
                 NOW + 1_000,
             )
             .expect("next revision");
@@ -1920,10 +1938,11 @@ mod tests {
     #[test]
     fn idempotency_key_reuse_across_operations_conflicts() {
         let mut issuer = issuer();
-        let heartbeat = json!({"registration_digest": "digest-c", "observed_at": NOW});
+        bind_test_registration(&mut issuer);
+        let heartbeat = json!({"registration_digest": REGISTRATION_DIGEST, "observed_at": NOW});
         let heartbeat_issued = issuer.issue_heartbeat(&heartbeat, NOW).expect("heartbeat");
         let foreign_key = heartbeat_issued.identity.idempotency_key.clone();
-        let launch_payload = json!({"registration_digest": "digest-c", "launch": 9});
+        let launch_payload = json!({"registration_digest": REGISTRATION_DIGEST, "launch": 9});
         let conflict = issuer.issue_with_idempotency_key(
             BrokerOperation::AuthorizeLaunch,
             &launch_payload,
@@ -1942,6 +1961,7 @@ mod tests {
     #[test]
     fn caller_launch_key_reuse_with_different_bytes_conflicts() {
         let mut issuer = issuer();
+        bind_test_registration(&mut issuer);
         issuer
             .issue_authorize_launch(
                 "caller-req-a",
@@ -1979,11 +1999,12 @@ mod tests {
             .issue_register(&register_payload("nonce-x"), NOW)
             .expect("first");
         assert!(first.identity.deadline_unix_ms > NOW);
+        bind_test_registration(&mut issuer);
         // A later operation succeeds with a fresh deadline even after the
         // first transport deadline has passed.
         let later = issuer
             .issue_heartbeat(
-                &json!({"registration_digest": "digest-x", "observed_at": NOW + OPERATION_IDENTITY_TTL_MS + 1}),
+                &json!({"registration_digest": REGISTRATION_DIGEST, "observed_at": NOW + OPERATION_IDENTITY_TTL_MS + 1}),
                 NOW + OPERATION_IDENTITY_TTL_MS + 1,
             )
             .expect("later operation");
@@ -2047,11 +2068,12 @@ mod tests {
     #[test]
     fn launch_lineage_links_without_collapsing_identities() {
         let mut issuer = issuer();
+        bind_test_registration(&mut issuer);
         let authorization = issuer
             .issue_authorize_launch(
                 "caller-req-lineage",
                 "caller-key-lineage",
-                &json!({"launch": "lineage"}),
+                &json!({"registration_digest": REGISTRATION_DIGEST, "launch": "lineage"}),
                 NOW,
             )
             .expect("launch identity");
@@ -2090,12 +2112,13 @@ mod tests {
     #[test]
     fn heartbeat_and_fence_races_reconcile_by_exact_identity() {
         let mut issuer = issuer();
-        let heartbeat = json!({"registration_digest": "digest-race", "observed_at": NOW});
+        bind_test_registration(&mut issuer);
+        let heartbeat = json!({"registration_digest": REGISTRATION_DIGEST, "observed_at": NOW});
         let first_beat = issuer.issue_heartbeat(&heartbeat, NOW).expect("beat");
         // A retried heartbeat (lost reply) reconciles to the exact identity.
         let retried_beat = issuer.issue_heartbeat(&heartbeat, NOW + 50).expect("retry");
         assert_eq!(first_beat.request_id, retried_beat.request_id);
-        let fence = json!({"registration_digest": "digest-race", "status": "CLOSED"});
+        let fence = json!({"registration_digest": REGISTRATION_DIGEST, "status": "CLOSED"});
         let fence_issued = issuer.issue_fence(&fence, NOW + 60).expect("fence");
         assert_ne!(first_beat.request_id, fence_issued.request_id);
         // Re-fencing the same closed registration is idempotent.
@@ -2114,11 +2137,11 @@ mod tests {
             "sequence": 8,
         });
         issuer
-            .note_registration_binding(BINDING_DIGEST, 1, &next)
+            .note_registration_binding(REGISTRATION_DIGEST, USER_BROKER_EPOCH, &next)
             .expect("registration binding sync");
         let after = issuer
             .issue_heartbeat(
-                &json!({"registration_digest": "digest-e", "observed_at": NOW + 1}),
+                &json!({"registration_digest": REGISTRATION_DIGEST, "observed_at": NOW + 1}),
                 NOW + 1,
             )
             .expect("heartbeat after sync");
