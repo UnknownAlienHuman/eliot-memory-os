@@ -1936,6 +1936,47 @@ impl TestdProcessEvidenceBundle {
         Ok(())
     }
 
+    /// Applies parser and evaluator observations to one exact stream binding.
+    ///
+    /// The caller must pass the post-readback binding snapshot from this
+    /// bundle. Equality is checked before either slot is mutated, so stale
+    /// replay work cannot overwrite a newer source resolution or fence.
+    pub fn apply_replay_observations(
+        &mut self,
+        expected: &TestdStreamEvidenceBinding,
+        parsing: &TestdParsingObservation,
+        evaluation: Option<&TestdEvaluationObservation>,
+    ) -> Result<(), TestdEvidenceError> {
+        if expected.binding != self.binding {
+            return Err(TestdEvidenceError::BindingMismatch {
+                reason: "replay binding changed after verified source readback",
+            });
+        }
+        let slot = match expected.stream {
+            ProcessStreamKind::Stdout => &mut self.stdout,
+            ProcessStreamKind::Stderr => &mut self.stderr,
+        };
+        let Some(binding) = slot.binding.as_mut() else {
+            return Err(TestdEvidenceError::BindingMismatch {
+                reason: "replay refers to a stream slot without an admitted binding",
+            });
+        };
+        if binding != expected {
+            return Err(TestdEvidenceError::BindingMismatch {
+                reason: "replay binding changed after verified source readback",
+            });
+        }
+        let mut updated = binding.clone();
+        updated.apply_parsing(parsing)?;
+        if let Some(observation) = evaluation {
+            updated.apply_evaluation(observation)?;
+        }
+        slot.disposition = updated.disposition;
+        slot.binding = Some(updated);
+        self.disposition = derive_evidence_disposition(&self.stdout, &self.stderr);
+        self.validate()
+    }
+
     /// Resolves every pending slot through the injected port.
     ///
     /// Each slot yields an explicit per-stream outcome; refusal and failure

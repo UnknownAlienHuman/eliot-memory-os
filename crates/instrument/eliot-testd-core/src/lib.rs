@@ -3128,6 +3128,48 @@ impl EvidenceCollector {
             .map_or_else(|_| Vec::new(), |items| items.clone())
     }
 
+    /// Commits replay observations only onto the exact post-readback stream
+    /// snapshot supplied to the parser/evaluator.
+    ///
+    /// The snapshot includes process identity, stream identity, source digest,
+    /// readback receipt, and fence. A concurrent re-resolution therefore
+    /// refuses the stale result instead of allowing it to certify new bytes.
+    pub fn apply_stream_replay(
+        &self,
+        expected: &TestdStreamEvidenceBinding,
+        parsing: &TestdParsingObservation,
+        evaluation: Option<&TestdEvaluationObservation>,
+    ) -> Result<(), TestdError> {
+        let mut bundles = self
+            .typed
+            .lock()
+            .map_err(|_| TestdError::Contract("evidence collector lock poisoned".to_owned()))?;
+        let matches = bundles
+            .iter()
+            .enumerate()
+            .filter(|(_, bundle)| {
+                if bundle.binding != expected.binding {
+                    return false;
+                }
+                match expected.stream {
+                    eliot_process::ProcessStreamKind::Stdout => {
+                        bundle.stdout.binding.as_ref() == Some(expected)
+                    }
+                    eliot_process::ProcessStreamKind::Stderr => {
+                        bundle.stderr.binding.as_ref() == Some(expected)
+                    }
+                }
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(TestdError::InvalidBinding);
+        }
+        bundles[matches[0]]
+            .apply_replay_observations(expected, parsing, evaluation)
+            .map_err(|error| TestdError::Contract(error.to_string()))
+    }
+
     /// Resolves every pending typed bundle through the injected immutable-
     /// source readback port.
     ///
