@@ -56,6 +56,7 @@ mod blob_store_controller;
 mod canonical_store_runtime;
 mod composition_bootstrap;
 mod control_plane;
+pub mod coordination_mailbox;
 /// Kernel problem-diagnostic projection (issue #1844; I16.7): the bounded
 /// `LogWindowRef`/`DiagnosticBrief` compiler over the canonical audit chain
 /// and the captured operational log windows. It emits references, gaps, and
