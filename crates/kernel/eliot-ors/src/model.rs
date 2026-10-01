@@ -10652,8 +10652,10 @@ impl BackupVerifySuccessionGrant {
         ] {
             validate_digest(value, field)?;
         }
-        let expected_id =
-            format!("{BACKUP_VERIFY_SUCCESSION_GRANT_KEY_PREFIX}{}", self.grant_digest);
+        let expected_id = format!(
+            "{BACKUP_VERIFY_SUCCESSION_GRANT_KEY_PREFIX}{}",
+            self.grant_digest
+        );
         if self.grant_id != expected_id {
             return Err(OrsError::InvalidField {
                 field: "backup_verify_succession_grant_id",
