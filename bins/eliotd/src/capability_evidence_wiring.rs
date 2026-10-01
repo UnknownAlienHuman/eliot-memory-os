@@ -1334,7 +1334,9 @@ pub async fn commit_production_observation<P>(
 where
     P: KernelGenerationPort + ?Sized,
 {
-    receipt.validate().map_err(EvidenceBridgeError::Observation)?;
+    receipt
+        .validate()
+        .map_err(EvidenceBridgeError::Observation)?;
     if skill_id.trim().is_empty()
         || skill_id.chars().any(char::is_control)
         || skill_id.len() > MAX_CAPABILITY_EVIDENCE_SKILL_ID_BYTES
