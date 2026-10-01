@@ -2097,8 +2097,13 @@ impl KernelContextReadClient {
     ///
     /// #1862: `campaign_view` is the validated immutable
     /// `CampaignLearningStateView` this compilation is bound to, and
-    /// `context_recipe_body_digest` is the Context owner's own re-derivation of
-    /// the exact recipe body its publication validator accepted. The candidate
+    /// `context_recipe_record_digest` is the Context owner's own re-derivation,
+    /// through its own publication, of the immutable owner-ROW digest of the
+    /// exact recipe body its publication validator accepted. That row digest is
+    /// the object the view records for its `ContextRecipe` source resolution, so
+    /// it is the only value the three cells can compare that row against; the
+    /// recipe-body digest describes a different object and is used only for the
+    /// stored document body comparison on the campaign route. The candidate
     /// cell already joined the view to `request` through
     /// `eliot_context_candidates::check_campaign_learning_state_view`; here the
     /// admission and assembly cells each re-derive the same join from the
@@ -2119,14 +2124,14 @@ impl KernelContextReadClient {
     fn require_campaign_view_for_admission(
         request: &CandidateRequest,
         campaign_view: &CampaignLearningStateView,
-        context_recipe_body_digest: &str,
+        context_recipe_record_digest: &str,
         floor: &SafetyFloorIdentity,
         recipe: &ContextRecipe,
     ) -> Result<(), PacketCompositionError> {
         check_campaign_view_for_admission(
             &request.binding,
             campaign_view,
-            context_recipe_body_digest,
+            context_recipe_record_digest,
             floor,
             recipe,
         )
@@ -2141,9 +2146,9 @@ impl KernelContextReadClient {
     fn require_campaign_view_for_assembly(
         admitted: &AdmittedContextSet,
         campaign_view: &CampaignLearningStateView,
-        context_recipe_body_digest: &str,
+        context_recipe_record_digest: &str,
     ) -> Result<(), PacketCompositionError> {
-        check_campaign_view_for_assembly(admitted, campaign_view, context_recipe_body_digest)
+        check_campaign_view_for_assembly(admitted, campaign_view, context_recipe_record_digest)
             .map_err(|error| PacketCompositionError::Assembly(Box::new(error)))
     }
 
@@ -2194,7 +2199,7 @@ impl KernelContextReadClient {
         recipe: &ContextRecipe,
         policy: &CandidatePolicy,
         campaign_view: &CampaignLearningStateView,
-        context_recipe_body_digest: &str,
+        context_recipe_record_digest: &str,
         floor: &SafetyFloorIdentity,
         headroom_join: PacketHeadroomJoin<'_>,
         headroom_request: &DownstreamHeadroomRequest,
@@ -2250,7 +2255,7 @@ impl KernelContextReadClient {
         Self::require_campaign_view_for_admission(
             request,
             campaign_view,
-            context_recipe_body_digest,
+            context_recipe_record_digest,
             floor,
             recipe,
         )?;
@@ -2328,7 +2333,7 @@ impl KernelContextReadClient {
         Self::require_campaign_view_for_assembly(
             &admitted,
             campaign_view,
-            context_recipe_body_digest,
+            context_recipe_record_digest,
         )?;
         // The admitted set now exists, so the scorecard owner is asked for the
         // card that grades exactly this admitted set and its rendered output.
