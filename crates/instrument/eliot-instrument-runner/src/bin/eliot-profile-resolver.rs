@@ -115,13 +115,14 @@ use eliot_contracts::{
 };
 use eliot_instrument_api::{InstrumentContractError, InstrumentInvocation};
 use eliot_instrument_runner::{
-    ADMITTED_SCOPE_CLASS, AdmittedProfile, DeclaredEnvironmentDependency, ISOLATED_PROCESS_CLASS,
-    InstrumentRegistry, InstrumentRequestPort, InstrumentRunner, InstrumentSpec, ParityVerdict,
-    PlannedStage, ProfileAggregate, ProfileCompiler, RunnerError, StageEnvironment, StageEvidence,
-    StageLauncher, StageOrchestrator, SupplyChainReceipt, TargetLayout, VerificationProfileReceipt,
+    ADMITTED_SCOPE_CLASS, AdmittedProfile, CARGO_HOME_ENV, CARGO_TARGET_DIR_ENV,
+    DeclaredEnvironmentDependency, ISOLATED_PROCESS_CLASS, InstrumentRegistry,
+    InstrumentRequestPort, InstrumentRunner, InstrumentSpec, ParityVerdict, PlannedStage,
+    ProfileAggregate, ProfileCompiler, RunnerError, StageEnvironment, StageEvidence, StageLauncher,
+    StageOrchestrator, SupplyChainReceipt, TargetLayout, VerificationProfileReceipt,
     VerificationRouteRequest, WorkScope, admitted_profile_for_alias, parity_summary,
-    profile::{PROFILE_ALIASES, TOOLCHAIN_PATH_ENV, builtin_specs},
-    resolve_verification_route, verify_profile_parity,
+    profile::{PROFILE_ALIASES, TOOLCHAIN_PATH_ENV, builtin_specs}, resolve_verification_route,
+    verify_profile_parity,
 };
 use eliot_process::{
     ActionLeaseRef, CancellationReceipt, DispatchAuthorityId, DispatchPermitAuthority,
@@ -652,7 +653,7 @@ fn stage_refusals(aggregate: &ProfileAggregate) -> String {
             StageEvidence::Missing { reason } | StageEvidence::Omitted { reason } => {
                 format!("{reason} (evidence missing, execution {:?})", run.execution)
             }
-            StageEvidence::Retained { .. } => {
+            StageEvidence::Retained { .. } | StageEvidence::RetainedProcessStreams { .. } => {
                 format!("launched (execution {:?})", run.execution)
             }
         };
@@ -785,7 +786,7 @@ fn selected_toolchain_root(source_root: &str) -> Result<PathBuf, CliError> {
         "rustup settings",
     )?;
     let host = toml_string_value(&settings, "default_host_triple");
-    let requested = read_toolchain_override(Path::new(&source_root))
+    let requested = read_toolchain_override(Path::new(&source_root))?
         .or_else(|| toml_string_value(&settings, "default_toolchain"))
         .ok_or_else(|| {
             CliError::Contract(format!(
@@ -895,25 +896,82 @@ fn current_source_root(source_root: &str) -> Result<String, CliError> {
 /// owner's selected toolchain. The same two override file names and the same
 /// `channel` key `eliot-testd` honours are used, so both surfaces select the
 /// same toolchain for the same workspace.
-fn read_toolchain_override(source_root: &Path) -> Option<String> {
+fn read_toolchain_override(source_root: &Path) -> Result<Option<String>, CliError> {
     for name in ["rust-toolchain.toml", "rust-toolchain"] {
         let path = source_root.join(name);
-        if !path.is_file() {
-            continue;
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(CliError::Contract(format!(
+                    "rust-toolchain override {} cannot be inspected: {error}",
+                    path.display()
+                )));
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(CliError::Contract(format!(
+                "rust-toolchain override {} is not a regular non-symlink file",
+                path.display()
+            )));
         }
-        let text = read_bounded_metadata(&path, "rust-toolchain override").ok()?;
-        let value = if name.eq_ignore_ascii_case(".toml") {
-            toml_string_value(&text, "channel").or_else(|| toml_string_value(&text, "toolchain"))
+        let text = read_bounded_metadata(&path, "rust-toolchain override")?;
+        let value = if name.ends_with(".toml") {
+            let document = toml::from_str::<toml::Value>(&text).map_err(|error| {
+                CliError::Contract(format!(
+                    "rust-toolchain override {} is invalid TOML: {error}",
+                    path.display()
+                ))
+            })?;
+            let toolchain = document
+                .get("toolchain")
+                .and_then(toml::Value::as_table)
+                .ok_or_else(|| {
+                    CliError::Contract(format!(
+                        "rust-toolchain override {} has no [toolchain] table",
+                        path.display()
+                    ))
+                })?;
+            let channel = toolchain.get("channel").and_then(toml::Value::as_str);
+            let legacy_toolchain = toolchain.get("toolchain").and_then(toml::Value::as_str);
+            match (channel, legacy_toolchain) {
+                (Some(channel), Some(alias)) if channel != alias => {
+                    return Err(CliError::Contract(format!(
+                        "rust-toolchain override {} names conflicting channels",
+                        path.display()
+                    )));
+                }
+                (Some(channel), _) => Some(channel.to_owned()),
+                (_, Some(alias)) => Some(alias.to_owned()),
+                _ => None,
+            }
         } else {
-            text.lines()
+            let selected = text
+                .lines()
                 .map(str::trim)
-                .find(|line| !line.is_empty() && !line.starts_with('#'))
-                .map(ToOwned::to_owned)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .collect::<Vec<_>>();
+            match selected.as_slice() {
+                [channel] => Some((*channel).to_owned()),
+                _ => {
+                    return Err(CliError::Contract(format!(
+                        "rust-toolchain override {} must select exactly one channel",
+                        path.display()
+                    )));
+                }
+            }
         };
         return value
-            .filter(|value| !value.trim().is_empty() && !value.chars().any(char::is_control));
+            .filter(|value| !value.trim().is_empty() && !value.chars().any(char::is_control))
+            .map(Some)
+            .ok_or_else(|| {
+                CliError::Contract(format!(
+                    "rust-toolchain override {} has no selected channel",
+                    path.display()
+                ))
+            });
     }
-    None
+    Ok(None)
 }
 
 /// Reads one small owner metadata file under a fixed size bound.
@@ -1051,7 +1109,11 @@ fn await_terminal_view(
 /// path adds is that the text it returns is the stdout this process's own
 /// executor really captured under a Kernel-validated permit, not bytes an
 /// ungoverned child wrote.
-fn observed_tool_version(executable: &Path, epoch: &EpochId) -> Result<String, CliError> {
+fn observed_tool_version(
+    executable: &Path,
+    epoch: &EpochId,
+    layout: &TargetLayout,
+) -> Result<String, CliError> {
     // The read gets its own `DispatchCell` because a P-07 dispatch permit is
     // one-shot: the `--version` child is a distinct launch from the stage that
     // follows it, so it can never consume the stage's permit or its stored
@@ -1063,7 +1125,7 @@ fn observed_tool_version(executable: &Path, epoch: &EpochId) -> Result<String, C
     // `start` registered on; a second executor would read an empty registry and
     // refuse `NotFound`, which says nothing about the operation.
     let executor = StageExecutor::with(&cell);
-    let request = seal_version_request(&cell, epoch, executable)?;
+    let request = seal_version_request(&cell, epoch, executable, layout)?;
     let receipt = block_on(executor.start(
         request,
         Arc::new(RetainedEvidenceSink::default()) as Arc<dyn ProcessEvidenceSink>,
@@ -1142,8 +1204,9 @@ fn seal_version_request(
     cell: &DispatchCell,
     epoch: &EpochId,
     executable: &Path,
+    layout: &TargetLayout,
 ) -> Result<ProcessRequest, CliError> {
-    let projection = isolated_projection()?;
+    let projection = isolated_projection(layout)?;
     let argv = vec!["--version".to_owned()];
     // The operation identity is derived from the same real tool bytes the stage
     // launch pins, so the read and the stage it precedes are bound to one
@@ -1730,12 +1793,12 @@ fn seal_stage_request(
     argv: &[String],
 ) -> Result<ProcessRequest, CliError> {
     let executable = resolve_tool(executable_name, &layout.source_root)?;
-    let projection = isolated_projection()?;
+    let projection = isolated_projection(layout)?;
     let observed = ExecutableObservation::observe_at_path(
         &executable,
         argv.to_vec(),
         environment_projection_digest(&projection),
-        Some(observed_tool_version(&executable, epoch)?),
+        Some(observed_tool_version(&executable, epoch, layout)?),
     )
     .map_err(|error| CliError::Contract(format!("executable observation refused: {error}")))?;
     if !observed.is_complete() {
@@ -1797,31 +1860,35 @@ fn seal_stage_request(
 /// locates its own `rustc`, its `rustup` shim, and any build-script interpreter
 /// through `PATH`, and `scripts/verify.ps1` already resolves the resolver's own
 /// executable through that same `PATH`; with nothing declared, such a command had
-/// no toolchain at all and could not be a verification. Only `PATH` is declared,
-/// and its value is read from the real process environment rather than
-/// synthesised, so the projection states a fact that already holds instead of
-/// inventing a search path.
+/// no toolchain at all and could not be a verification. `PATH` is read from the
+/// real process environment rather than synthesised. Cargo's target and home
+/// directories come from the admitted target/cache roots, not ambient variables,
+/// so every child receives exactly the roots bound by this run's layout.
 ///
 /// This is the minimal set, not an inherited environment. I18.21:10 is why the
 /// value is named on the projection and hashed rather than leaked: the executor
 /// binds `environment_projection_digest` of exactly this projection as the
-/// stage's environment identity, so the permitted toolchain environment is now
-/// a declared, digest-bound, reviewable property of every admitted stage instead
-/// of an invisible ambient fact. Nothing switches to
+/// stage's environment identity, so the permitted toolchain and admitted build
+/// roots are declared, digest-bound, reviewable properties of every stage instead
+/// of invisible ambient facts. Nothing switches to
 /// `EnvironmentInheritance::Allowlisted`, and every other ambient variable stays
 /// out.
 ///
 /// A machine that publishes no `PATH` cannot run an admitted verification
 /// command at all, so that is refused here rather than sealed as a child that
 /// would fail for a reason the receipt could not explain.
-fn isolated_projection() -> Result<EnvironmentProjection, CliError> {
+fn isolated_projection(layout: &TargetLayout) -> Result<EnvironmentProjection, CliError> {
     let path = std::env::var(TOOLCHAIN_PATH_ENV).map_err(|error| {
         CliError::Contract(format!(
             "explicitly permitted toolchain environment is unavailable: {TOOLCHAIN_PATH_ENV} is unset ({error})"
         ))
     })?;
     Ok(EnvironmentProjection::new(
-        BTreeMap::from([(TOOLCHAIN_PATH_ENV.to_owned(), path)]),
+        BTreeMap::from([
+            (TOOLCHAIN_PATH_ENV.to_owned(), path),
+            (CARGO_TARGET_DIR_ENV.to_owned(), layout.target_root.clone()),
+            (CARGO_HOME_ENV.to_owned(), layout.cache_root.clone()),
+        ]),
         Vec::new(),
         EnvironmentInheritance::None,
     )?)
@@ -1956,5 +2023,122 @@ impl ProcessEvidenceSink for RetainedEvidenceSink {
             })?
             .push(bytes);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct TempSourceRoot(PathBuf);
+
+    impl TempSourceRoot {
+        fn new() -> Self {
+            static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
+            let path = std::env::temp_dir().join(format!(
+                "eliot-profile-resolver-{}-{}",
+                std::process::id(),
+                NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).expect("create isolated resolver test root");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempSourceRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn toolchain_override_reads_toml_and_plain_channel_files() {
+        let toml_root = TempSourceRoot::new();
+        std::fs::write(
+            toml_root.0.join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"1.91.0\"\ncomponents = [\"rustfmt\"]\n",
+        )
+        .expect("write pinned TOML toolchain");
+        assert_eq!(
+            read_toolchain_override(&toml_root.0).expect("read TOML pin"),
+            Some("1.91.0".to_owned())
+        );
+
+        let plain_root = TempSourceRoot::new();
+        std::fs::write(
+            plain_root.0.join("rust-toolchain"),
+            "# pinned by the workspace\n\n1.91.0\n",
+        )
+        .expect("write pinned plain toolchain");
+        assert_eq!(
+            read_toolchain_override(&plain_root.0).expect("read plain pin"),
+            Some("1.91.0".to_owned())
+        );
+    }
+
+    #[test]
+    fn missing_toolchain_override_is_absent() {
+        let root = TempSourceRoot::new();
+        assert_eq!(
+            read_toolchain_override(&root.0).expect("read absent pin"),
+            None
+        );
+    }
+
+    #[test]
+    fn invalid_existing_toolchain_override_is_a_refusal() {
+        let root = TempSourceRoot::new();
+        std::fs::write(
+            root.0.join("rust-toolchain.toml"),
+            "[toolchain]\ncomponents = [\n",
+        )
+        .expect("write invalid existing pin");
+        assert!(matches!(
+            read_toolchain_override(&root.0),
+            Err(CliError::Contract(_))
+        ));
+    }
+
+    #[test]
+    fn cargo_roots_are_explicit_and_part_of_the_environment_digest() {
+        let first = TargetLayout::new(
+            r"C:\source".to_owned(),
+            r"D:\runs\first\target".to_owned(),
+            r"E:\runs\first\cargo".to_owned(),
+        )
+        .expect("first admitted layout");
+        let second = TargetLayout::new(
+            r"C:\source".to_owned(),
+            r"D:\runs\second\target".to_owned(),
+            r"E:\runs\second\cargo".to_owned(),
+        )
+        .expect("second admitted layout");
+        let first_projection = isolated_projection(&first).expect("first environment");
+        let second_projection = isolated_projection(&second).expect("second environment");
+
+        assert_eq!(
+            first_projection.non_secret().get(TOOLCHAIN_PATH_ENV),
+            std::env::var(TOOLCHAIN_PATH_ENV).ok().as_ref()
+        );
+        assert_eq!(
+            first_projection
+                .non_secret()
+                .get(CARGO_TARGET_DIR_ENV)
+                .map(String::as_str),
+            Some(first.target_root.as_str())
+        );
+        assert_eq!(
+            first_projection.non_secret().get(CARGO_HOME_ENV).map(String::as_str),
+            Some(first.cache_root.as_str())
+        );
+        assert_eq!(
+            first_projection.inheritance(),
+            EnvironmentInheritance::None
+        );
+        assert_ne!(
+            environment_projection_digest(&first_projection),
+            environment_projection_digest(&second_projection)
+        );
     }
 }

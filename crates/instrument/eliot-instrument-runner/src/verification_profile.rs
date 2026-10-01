@@ -45,11 +45,19 @@ use eliot_receipts::{
     ProofCeiling, ReceiptCore, ReceiptDisposition, ReceiptEnvelope, ReceiptError, ReceiptKind,
     RequestBinding, VerifierBinding, WorkScopeBinding, WorkScopeId, contract_identity, sha256_hex,
 };
+use eliot_instrument_api::{ExecutionStatus, VerificationOutcome};
+use eliot_process::{
+    ExitDisposition, ProcessEvidence, ProcessExecutionBinding, ProcessLifecycle,
+    ProcessStreamEvidence,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::profile::{AdmittedProfile, ProfileError, ProfileScopeClasses, StageEnvironment};
-use crate::profile_run::{AggregateStatus, ProfileAggregate, RetainedToolIdentity, StageEvidence};
+use crate::profile_run::{
+    AggregateStatus, ProfileAggregate, RetainedProcessStreamIdentity, RetainedToolIdentity,
+    StageEvidence,
+};
 use crate::registry::SupplyChainReceipt;
 
 /// Stable verifier identity recorded in every profile verification receipt.
@@ -317,14 +325,24 @@ pub fn check_declared_environment_dependencies(
 pub struct ProfileRunEvidence {
     /// Durable stage identity.
     pub stage_id: String,
+    /// Exact operation identity admitted for the stage launch.
+    pub operation_id: Option<String>,
     /// Execution axis class of the run.
     pub execution: String,
+    /// Parser/evaluator result, separate from the physical execution axis.
+    pub verification: Option<VerificationOutcome>,
     /// Raw evidence state for the stage.
     pub evidence: StageEvidenceRecord,
     /// Machine-derived executable identity digest, when one was recorded.
     pub executable_digest: Option<String>,
     /// Pre-launch admission grant digest, when the stage was admitted.
     pub grant_digest: Option<String>,
+    /// Exact owner-reconciled process binding, terminal view, and original
+    /// raw stream evidence. Stream bytes remain in the immutable source owner.
+    pub terminal_process_evidence: Option<ProcessEvidence>,
+    /// Last executor observation retained when terminal reconciliation was
+    /// not reached, or the exact reconciled terminal view otherwise.
+    pub last_process_observation: Option<eliot_process::ProcessExecutionView>,
 }
 
 /// Raw evidence state for one receipt-recorded stage run.
@@ -347,6 +365,15 @@ pub enum StageEvidenceRecord {
         byte_len: u64,
         /// Exact tool identity that produced the retained bytes.
         tool: RetainedToolIdentity,
+    },
+    /// Exact stdout and stderr sources verified by the owning readback path.
+    RetainedProcessStreams {
+        /// Owner-read-back stdout identity.
+        stdout: RetainedProcessStreamIdentity,
+        /// Owner-read-back stderr identity.
+        stderr: RetainedProcessStreamIdentity,
+        /// Exact executable, argv, environment projection, and terminal exit.
+        tool: Option<RetainedToolIdentity>,
     },
     /// Material output absent for an explicit, typed reason.
     Omitted {
@@ -372,6 +399,15 @@ impl From<&StageEvidence> for StageEvidenceRecord {
                 byte_len: *byte_len,
                 tool: tool.clone(),
             },
+            StageEvidence::RetainedProcessStreams {
+                stdout,
+                stderr,
+                tool,
+            } => Self::RetainedProcessStreams {
+                stdout: stdout.clone(),
+                stderr: stderr.clone(),
+                tool: tool.clone(),
+            },
             StageEvidence::Omitted { reason } => Self::Omitted {
                 reason: reason.clone(),
             },
@@ -382,7 +418,65 @@ impl From<&StageEvidence> for StageEvidenceRecord {
     }
 }
 
+impl StageEvidenceRecord {
+    fn has_complete_verified_sources(&self) -> bool {
+        match self {
+            Self::RetainedProcessStreams {
+                stdout,
+                stderr,
+                tool: Some(tool),
+            } => {
+                stdout.stream() == eliot_process::ProcessStreamKind::Stdout
+                    && stderr.stream() == eliot_process::ProcessStreamKind::Stderr
+                    && stdout.is_complete_owner_readback()
+                    && stderr.is_complete_owner_readback()
+                    && tool.exit.disposition == eliot_process::ExitDisposition::Completed
+                    && tool.exit.code == Some(0)
+            }
+            Self::RetainedProcessStreams { .. }
+            | Self::Retained { .. }
+            | Self::Omitted { .. }
+            | Self::Missing { .. } => false,
+        }
+    }
+}
+
 impl ProfileRunEvidence {
+    fn is_successful_verified_pass(&self) -> bool {
+        self.evidence.has_complete_verified_sources()
+            && self.verification == Some(VerificationOutcome::Pass)
+            && self.execution == format!("{:?}", ExecutionStatus::Succeeded)
+            && self.grant_digest.as_deref().is_some_and(|digest| {
+                validate_digest(digest, "grant_digest").is_ok()
+            })
+            && self.terminal_process_is_successful()
+    }
+
+    fn terminal_process_is_successful(&self) -> bool {
+        let (Some(operation_id), Some(process)) =
+            (self.operation_id.as_deref(), self.terminal_process_evidence.as_ref())
+        else {
+            return false;
+        };
+        if process.validate().is_err()
+            || process.operation_id().as_str() != operation_id
+            || process.view().lifecycle() != ProcessLifecycle::Exited
+            || self.last_process_observation.as_ref() != Some(process.view())
+            || !process.view().exit().is_some_and(|exit| {
+                exit.disposition() == ExitDisposition::Completed
+                    && serialized_exit_code(exit) == Some(0)
+            })
+        {
+            return false;
+        }
+        let StageEvidenceRecord::RetainedProcessStreams { stdout, stderr, .. } = &self.evidence
+        else {
+            return false;
+        };
+        stream_identity_matches_evidence(stdout, process.stdout(), process.binding())
+            && stream_identity_matches_evidence(stderr, process.stderr(), process.binding())
+    }
+
     /// Deterministic identity over one raw stage run.
     pub fn digest(&self) -> String {
         let evidence = match &self.evidence {
@@ -393,19 +487,67 @@ impl ProfileRunEvidence {
             } => {
                 format!("retained\0{artifact}\0{byte_len}\0{}", tool.digest())
             }
+            StageEvidenceRecord::RetainedProcessStreams {
+                stdout,
+                stderr,
+                tool,
+            } => format!(
+                "retained_process_streams\0{}\0{}\0{}",
+                stdout.digest(),
+                stderr.digest(),
+                tool.as_ref().map_or_else(String::new, RetainedToolIdentity::digest),
+            ),
             StageEvidenceRecord::Omitted { reason } => format!("omitted\0{reason}"),
             StageEvidenceRecord::Missing { reason } => format!("missing\0{reason}"),
         };
+        let terminal_digest = self
+            .terminal_process_evidence
+            .as_ref()
+            .and_then(|process| serde_json::to_vec(process).ok())
+            .map(sha256_hex)
+            .unwrap_or_default();
+        let observation_digest = self
+            .last_process_observation
+            .as_ref()
+            .and_then(|observation| serde_json::to_vec(observation).ok())
+            .map(sha256_hex)
+            .unwrap_or_default();
         let material = format!(
-            "{}\0{}\0{}\0{}\0{}",
+            "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{:?}",
             self.stage_id,
+            self.operation_id.as_deref().unwrap_or(""),
             self.execution,
             evidence,
             self.executable_digest.as_deref().unwrap_or(""),
             self.grant_digest.as_deref().unwrap_or(""),
+            terminal_digest,
+            observation_digest,
+            self.verification,
         );
         sha256_hex(material.as_bytes())
     }
+}
+
+fn serialized_exit_code(exit: &eliot_process::ExitStatus) -> Option<i32> {
+    serde_json::to_value(exit)
+        .ok()?
+        .get("code")?
+        .as_i64()
+        .and_then(|code| i32::try_from(code).ok())
+}
+
+fn stream_identity_matches_evidence(
+    identity: &RetainedProcessStreamIdentity,
+    evidence: Option<&ProcessStreamEvidence>,
+    binding: &ProcessExecutionBinding,
+) -> bool {
+    evidence.is_some_and(|evidence| {
+        evidence.stream() == identity.stream()
+            && evidence.binding() == identity.binding()
+            && evidence.binding() == binding
+            && evidence.identity_sha256().is_ok_and(|digest| digest == identity.evidence_digest())
+            && evidence.source() == Some(identity.source())
+    })
 }
 
 /// Digest/provenance receipt for one external tool (I18.21).
@@ -489,14 +631,12 @@ pub const RECEIPT_SCHEMA: &str = "eliot.instrument.verification-profile-receipt"
 /// does not change the receipt schema, and a schema change is exactly what a
 /// local/CI pair must refuse.
 ///
-/// `2.0.0` makes the retained-evidence change wire-breaking on purpose: a
-/// `StageEvidenceRecord::Retained` value now carries the required tool identity
-/// (executable, argument vector, environment projection digest, exit outcome),
-/// so a `1.x` retained record that names no tool identity can no longer be read
-/// as a retained run. It is refused rather than upgraded, because inventing the
-/// missing identity after the fact is exactly the reconstruction this schema
-/// exists to prevent.
-pub const RECEIPT_SCHEMA_VERSION: &str = "2.0.0";
+/// `3.0.0` records the terminal parser result, owner-read-back stdout/stderr
+/// identities, and the exact reconciled process binding and view. A PASS
+/// receipt requires complete exact stream sources, the original terminal
+/// zero-exit observation, and the launch grant; a bare retained artifact is
+/// insufficient.
+pub const RECEIPT_SCHEMA_VERSION: &str = "3.0.0";
 
 /// The one receipt schema shared by local and CI profile runs (I18.21).
 ///
@@ -564,16 +704,16 @@ impl VerificationProfileReceipt {
     /// [`build_verification_profile_receipt`], so both issuance and parity
     /// must run this gate first. The proof ceiling is pinned to
     /// [`PROFILE_PROOF_CEILING`], and a PASS outcome additionally requires
-    /// every recorded run to carry retained evidence plus a recorded tool
-    /// identity — omission and absence stay explicit and can never become a
-    /// successful outcome.
+    /// every recorded run to carry terminal PASS, complete stdout/stderr
+    /// owner readbacks, and a zero-exit tool identity — omission and
+    /// absence stay explicit and can never become a successful outcome.
     ///
     /// # Errors
     ///
     /// Returns [`VerificationProfileError::ProofCeilingMismatch`] when the
     /// receipt claims any other ceiling,
     /// [`VerificationProfileError::PassWithoutRetainedEvidence`] when a PASS
-    /// receipt records a run with no retained evidence, and
+    /// receipt records a run without complete verified source readbacks, and
     /// [`VerificationProfileError::MissingExecutableIdentity`] when a PASS
     /// receipt records a run with no tool identity.
     pub fn validate(&self) -> Result<(), VerificationProfileError> {
@@ -586,7 +726,7 @@ impl VerificationProfileReceipt {
             return Ok(());
         }
         for run in &self.runs {
-            if !matches!(run.evidence, StageEvidenceRecord::Retained { .. }) {
+            if !run.is_successful_verified_pass() {
                 return Err(VerificationProfileError::PassWithoutRetainedEvidence {
                     stage: run.stage_id.clone(),
                 });
@@ -1006,7 +1146,7 @@ fn verifier_binding(
 /// # Errors
 ///
 /// Returns [`VerificationProfileError::PassWithoutRetainedEvidence`] when a
-/// `PASS` receipt records a run with no retained evidence.
+/// `PASS` receipt records a run without complete verified stream readbacks.
 fn disposition_for(
     receipt: &VerificationProfileReceipt,
 ) -> Result<ReceiptDisposition, VerificationProfileError> {
@@ -1014,7 +1154,7 @@ fn disposition_for(
     let unretained = receipt
         .runs
         .iter()
-        .filter(|run| !matches!(run.evidence, StageEvidenceRecord::Retained { .. }))
+        .filter(|run| !run.is_successful_verified_pass())
         .collect::<Vec<_>>();
     let unresolved = unretained
         .iter()
@@ -1086,10 +1226,14 @@ pub fn build_verification_profile_receipt(
         .iter()
         .map(|run| ProfileRunEvidence {
             stage_id: run.stage.stage_id.clone(),
+            operation_id: run.stage.operation_id.clone(),
             execution: format!("{:?}", run.execution),
+            verification: run.verification,
             evidence: StageEvidenceRecord::from(&run.evidence),
             executable_digest: run.executable_digest.clone(),
             grant_digest: run.grant_digest.clone(),
+            terminal_process_evidence: run.terminal_process_evidence.clone(),
+            last_process_observation: run.last_process_observation.clone(),
         })
         .collect::<Vec<_>>();
     Ok(VerificationProfileReceipt {
@@ -1340,5 +1484,57 @@ pub fn parity_summary(verdict: &ParityVerdict) -> String {
             let _ = write!(line, "{reason}");
             line
         }
+    }
+}
+
+#[cfg(test)]
+mod terminal_receipt_tests {
+    use super::*;
+    use crate::profile_run::{RetainedExitOutcome, RetainedToolIdentity};
+
+    #[test]
+    fn pass_receipt_rejects_a_bare_retained_artifact() {
+        let tool = RetainedToolIdentity::sealed(
+            "cargo",
+            &["build".to_owned()],
+            &"a".repeat(64),
+            RetainedExitOutcome {
+                disposition: eliot_process::ExitDisposition::Completed,
+                code: Some(0),
+            },
+        )
+        .expect("valid tool identity");
+        let receipt = VerificationProfileReceipt {
+            schema: VerificationProfileReceipt::schema_identity(),
+            profile: "package-verification-compile-only".to_owned(),
+            profile_revision: 1,
+            profile_digest: "b".repeat(64),
+            dag_digest: "c".repeat(64),
+            aggregate_digest: "d".repeat(64),
+            environment_dependencies: Vec::new(),
+            tool_identities: Vec::new(),
+            runs: vec![ProfileRunEvidence {
+                stage_id: "package-compile".to_owned(),
+                operation_id: None,
+                execution: format!("{:?}", ExecutionStatus::Succeeded),
+                verification: Some(VerificationOutcome::Pass),
+                evidence: StageEvidenceRecord::Retained {
+                    artifact: "raw:stage".to_owned(),
+                    byte_len: 1,
+                    tool,
+                },
+                executable_digest: Some("e".repeat(64)),
+                grant_digest: Some("f".repeat(64)),
+                terminal_process_evidence: None,
+                last_process_observation: None,
+            }],
+            outcome: AggregateOutcome::Pass,
+            proof_ceiling: PROFILE_PROOF_CEILING,
+        };
+
+        assert!(matches!(
+            receipt.validate(),
+            Err(VerificationProfileError::PassWithoutRetainedEvidence { .. })
+        ));
     }
 }
