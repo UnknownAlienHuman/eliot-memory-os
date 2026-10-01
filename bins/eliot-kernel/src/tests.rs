@@ -263,6 +263,11 @@ fn real_executor_admission(
     environment: BTreeMap<String, String>,
 ) -> ProcessExecutionAdmissionRequest {
     let generation = Generation::new(1).expect("generation");
+    // The real executor canonicalizes the sealed path before CreateProcess;
+    // KernelPathAdmission then compares that requested path against the
+    // immutable ProcessRequest. Seal the same path form so its original
+    // dispatch permit authorizes the suspended launch it will actually see.
+    let executable = std::fs::canonicalize(executable).expect("canonical test executable");
     let working_directory = executable.parent().expect("test executable parent");
     let intent = ProcessIntent::new(
         OperationId::new(operation).expect("operation id"),
