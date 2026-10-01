@@ -1584,9 +1584,14 @@ fn derive_slot_completeness(
             continue;
         };
         if !required_ids.contains(spec.slot_id.as_str()) {
-            classify_optional_disposition(slot.disposition, &mut stale, &mut partial);
+            classify_optional_disposition(
+                slot.disposition,
+                !slot.evidence.is_empty() && spec.declared_members.is_empty(),
+                &mut stale,
+                &mut partial,
+            );
             for member in &slot.members {
-                classify_optional_disposition(member.disposition, &mut stale, &mut partial);
+                classify_optional_disposition(member.disposition, false, &mut stale, &mut partial);
             }
             continue;
         }
@@ -1610,12 +1615,14 @@ fn derive_slot_completeness(
 
 fn classify_optional_disposition(
     disposition: SlotDisposition,
+    evidenced_empty: bool,
     stale: &mut bool,
     partial: &mut bool,
 ) {
     match disposition {
         SlotDisposition::Current => {}
         SlotDisposition::Stale => *stale = true,
+        SlotDisposition::KnownEmpty if evidenced_empty => {}
         SlotDisposition::Blocked
         | SlotDisposition::Unavailable
         | SlotDisposition::Historical
