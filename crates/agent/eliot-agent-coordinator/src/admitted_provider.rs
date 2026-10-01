@@ -168,12 +168,18 @@ impl OwnerLoadedClaimRow {
     ) -> Result<Self, CoordinatorError> {
         for (slot, field) in [
             (&admission_payload_sha256, "loaded_admission_payload_sha256"),
-            (&cancellation_payload_sha256, "loaded_cancellation_payload_sha256"),
+            (
+                &cancellation_payload_sha256,
+                "loaded_cancellation_payload_sha256",
+            ),
             (
                 &worker_fence_payload_sha256,
                 "loaded_worker_fence_payload_sha256",
             ),
-            (&reassignment_payload_sha256, "loaded_reassignment_payload_sha256"),
+            (
+                &reassignment_payload_sha256,
+                "loaded_reassignment_payload_sha256",
+            ),
             (&result_payload_sha256, "loaded_result_payload_sha256"),
             (
                 &unknown_outcome_payload_sha256,

@@ -363,7 +363,9 @@ impl ProviderCapabilityContext {
         // the row and the epoch is the freshly re-queried live authority
         // epoch.
         let loaded_canonical_payload_sha256: &str = match kind {
-            ProviderProofKind::Admission => row.receipt_payloads.admission_payload_sha256.as_deref(),
+            ProviderProofKind::Admission => {
+                row.receipt_payloads.admission_payload_sha256.as_deref()
+            }
             ProviderProofKind::Cancellation => {
                 row.receipt_payloads.cancellation_payload_sha256.as_deref()
             }
@@ -374,9 +376,10 @@ impl ProviderCapabilityContext {
                 row.receipt_payloads.reassignment_payload_sha256.as_deref()
             }
             ProviderProofKind::Result => row.receipt_payloads.result_payload_sha256.as_deref(),
-            ProviderProofKind::UnknownOutcome => {
-                row.receipt_payloads.unknown_outcome_payload_sha256.as_deref()
-            }
+            ProviderProofKind::UnknownOutcome => row
+                .receipt_payloads
+                .unknown_outcome_payload_sha256
+                .as_deref(),
             // The ORS receipt column covers the six receipt kinds only: the
             // exact-start correlation carries no retained payload, so this
             // leg passes on no owner evidence.
