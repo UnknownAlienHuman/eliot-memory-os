@@ -1229,7 +1229,7 @@ async fn cancellation_timeout_after_possible_send_scoped_uncertainty() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let writer = tokio::task::spawn_local({
+            let mut writer = tokio::task::spawn_local({
                 let adapter_shared = adapter_shared.clone();
                 async move {
                     CanonicalStoreClient::apply_prepared(
@@ -1242,7 +1242,19 @@ async fn cancellation_timeout_after_possible_send_scoped_uncertainty() {
                     .await
                 }
             });
-            rendezvous.wait().await;
+            tokio::time::timeout(Duration::from_millis(profile_u64("rendezvous_ms")), async {
+                tokio::select! {
+                    // If both are ready, the barrier proves the writer
+                    // reached the post-admission transaction boundary.
+                    biased;
+                    _ = rendezvous.wait() => {}
+                    result = &mut writer => panic!(
+                        "writer completed before reaching the transaction rendezvous: {result:?}"
+                    ),
+                }
+            })
+            .await
+            .expect("writer must reach the transaction rendezvous before cancellation");
             adapter.disarm_tx_rendezvous();
             tokio::task::yield_now().await;
             writer.abort();
