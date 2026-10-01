@@ -1372,13 +1372,16 @@ fn finish_decision_task_binding(
             reason: "must contain canonical Finish decision receipts",
         })
     })?;
-    let mut admitted_receipts = receipts.iter().filter(|receipt| {
-        receipt.get("attempt_id").and_then(Value::as_str) == Some(attempt_id)
-    });
-    let receipt = admitted_receipts.next().ok_or(AdapterError::Store(StoreError::InvalidField {
-        field: "finish.receipt_json",
-        reason: "missing Finish decision receipt for the admitted attempt",
-    }))?;
+    let mut admitted_receipts = receipts
+        .iter()
+        .filter(|receipt| receipt.get("attempt_id").and_then(Value::as_str) == Some(attempt_id));
+    let receipt =
+        admitted_receipts
+            .next()
+            .ok_or(AdapterError::Store(StoreError::InvalidField {
+                field: "finish.receipt_json",
+                reason: "missing Finish decision receipt for the admitted attempt",
+            }))?;
     if admitted_receipts.next().is_some() {
         return Err(AdapterError::Store(StoreError::InvalidField {
             field: "finish.receipt_json",
@@ -1404,7 +1407,7 @@ fn finish_decision_task_binding(
     Ok((task_id.to_owned(), task_revision))
 }
 
-/// Appends an atomic assertion against the same typed TaskControl projection
+/// Appends an atomic assertion against the same typed `TaskControl` projection
 /// used by `GetTaskState`. Every canonical write first CASes the shared
 /// canonical fence, so this comparison and the owner writes share the
 /// serialization point with every `UpdateTaskState` commit.
@@ -1421,7 +1424,7 @@ fn append_finish_task_owner_guard(
             reason: "Finish owner payload does not match the admitted task",
         }));
     }
-    let prior_revision = task_revision.checked_sub(1).ok_or_else(|| {
+    let prior_revision = task_revision.checked_sub(1).ok_or({
         AdapterError::Store(StoreError::InvalidField {
             field: "finish.task_revision",
             reason: "revision has no TaskControl predecessor",
@@ -1431,10 +1434,7 @@ fn append_finish_task_owner_guard(
         "finish_task_scope".to_owned(),
         json!(transition.scope_id.as_str()),
     );
-    bindings.insert(
-        "finish_task_id".to_owned(),
-        json!(task_id),
-    );
+    bindings.insert("finish_task_id".to_owned(), json!(task_id));
     bindings.insert(
         "finish_task_expected_revision".to_owned(),
         json!(prior_revision.to_string()),
