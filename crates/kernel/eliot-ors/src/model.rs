@@ -1184,6 +1184,8 @@ pub struct BlobProcessStreamGrantRecord {
     pub store_session_binding_sha256: String,
     /// Digest of the complete verified Blob owner facts retained by Kernel.
     pub owner_facts_sha256: String,
+    /// Exact completed owner-facts pull supplying that metadata-only proof.
+    pub owner_facts_pull_ref: String,
     /// Current Authority Epoch lineage identity.
     pub authority_lineage_id: String,
     /// Authority epoch sequence captured at issue time.
@@ -1222,6 +1224,7 @@ impl BlobProcessStreamGrantRecord {
         ] {
             validate_digest(value, field)?;
         }
+        validate_text(&self.owner_facts_pull_ref, "blob_process_stream_owner_facts_pull_ref")?;
         if self.authority_epoch == 0
             || self.generation == 0
             || self.expires_at_unix_ms == 0
@@ -1245,6 +1248,7 @@ impl BlobProcessStreamGrantRecord {
             && self.process_binding_sha256 == other.process_binding_sha256
             && self.store_session_binding_sha256 == other.store_session_binding_sha256
             && self.owner_facts_sha256 == other.owner_facts_sha256
+            && self.owner_facts_pull_ref == other.owner_facts_pull_ref
             && self.authority_lineage_id == other.authority_lineage_id
             && self.authority_epoch == other.authority_epoch
             && self.generation == other.generation
@@ -1428,9 +1432,11 @@ pub struct BlobProcessStreamCallRecord {
     /// supplies this projection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_projection_json: Option<String>,
-    /// Immutable owner-issued reference from which a response can be reconciled.
+    /// Optional immutable owner-issued reference from which a response can be
+    /// reconciled; append dispositions may have no separate owner receipt.
     pub response_ref: Option<String>,
-    /// Owner receipt reference proving a completed Store operation/readback.
+    /// Owner receipt reference proving a completed Store operation/readback,
+    /// when the operation has a receipt-bearing result.
     pub owner_receipt_ref: Option<String>,
 }
 
@@ -1526,12 +1532,20 @@ impl BlobProcessStreamCallRecord {
                 validate_text(value, field)?;
             }
         }
+        if self.response_sha256.is_none()
+            && (self.response_ref.is_some()
+                || self.response_projection_json.is_some()
+                || self.owner_receipt_ref.is_some())
+        {
+            return Err(OrsError::InvalidField {
+                field: "blob_process_stream_call_response",
+                reason: "response references require a response digest",
+            });
+        }
         let reserved = self.operation_sha256.is_some()
             && self.request_identity_json.is_some()
             && self.request_identity_sha256.is_some();
-        let completed = self.response_sha256.is_some()
-            && self.response_ref.is_some()
-            && self.owner_receipt_ref.is_some();
+        let completed = self.response_sha256.is_some();
         match self.state {
             BlobProcessStreamCallState::Issued if reserved || completed => Err(OrsError::InvalidField {
                 field: "blob_process_stream_call_state",
@@ -1547,7 +1561,7 @@ impl BlobProcessStreamCallRecord {
             }),
             BlobProcessStreamCallState::Completed if !reserved || !completed => Err(OrsError::InvalidField {
                 field: "blob_process_stream_call_state",
-                reason: "completed call requires exact request and owner result reference",
+                reason: "completed call requires exact request and response digest",
             }),
             BlobProcessStreamCallState::NotStarted
             | BlobProcessStreamCallState::Unknown
