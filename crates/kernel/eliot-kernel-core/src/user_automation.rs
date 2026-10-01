@@ -4086,14 +4086,15 @@ impl UserAutomationOperation {
                 normalization_receipt_envelope,
             } => {
                 revision.validate()?;
-                if normalization_receipt_envelope.core.operation.operation_kind
+                let envelope = normalization_receipt_envelope;
+                if envelope.core.operation.operation_kind
                     != USER_AUTOMATION_NORMALIZATION_OPERATION_KIND
                 {
                     return Err(UserAutomationError::ReceiptBinding);
                 }
                 revision.schedule.validate_normalization_receipt_envelope(
                     &revision.schedule.normalization_receipt,
-                    normalization_receipt_envelope,
+                    envelope,
                     revision,
                 )
             }

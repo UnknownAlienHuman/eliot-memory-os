@@ -2368,17 +2368,17 @@ fn submitted_normalization_operation_kind(
 fn normalized_revision_mutation_parameters(
     operation: &UserAutomationOperation,
 ) -> Result<BTreeMap<String, Value>, StoreError> {
-    let (revision, envelope) = match operation {
-        UserAutomationOperation::Create {
-            revision,
-            normalization_receipt_envelope,
-        }
-        | UserAutomationOperation::Edit {
-            revision,
-            normalization_receipt_envelope,
-            ..
-        } => (revision, normalization_receipt_envelope),
-        _ => return Err(StoreError::UnknownOperation),
+    let (UserAutomationOperation::Create {
+        revision,
+        normalization_receipt_envelope: envelope,
+    }
+    | UserAutomationOperation::Edit {
+        revision,
+        normalization_receipt_envelope: envelope,
+        ..
+    }) = operation
+    else {
+        return Err(StoreError::UnknownOperation);
     };
     let (verified_revision, envelope) = revision_with_owner_normalization_receipt(
         revision,
