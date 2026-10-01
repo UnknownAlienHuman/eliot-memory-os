@@ -128,7 +128,7 @@ pub struct GovernedContour<'a, E: ?Sized> {
 /// Authenticated currentness owner for replaying stored process bytes.
 /// Implementations must source their registries from an accepted live catalog
 /// owner readback, never from the retained stage alone.
-pub(crate) trait VerifiedStreamReplayPort: Send + Sync {
+pub trait VerifiedStreamReplayPort: Send + Sync {
     /// Replays one exact stored stream under its retained runner stage.
     fn replay_stream(
         &self,
@@ -169,7 +169,7 @@ impl<'a, E: ?Sized> GovernedContour<'a, E> {
 
     /// Binds stored-source readback and independently verified replay into
     /// one finish path.
-    pub(crate) const fn with_readback_and_replay(
+    pub const fn with_readback_and_replay(
         executor: &'a E,
         git: Option<&'a dyn SourceObservationGitPort>,
         readback: &'a dyn AsyncProcessStreamSourceReadbackPort,
@@ -479,7 +479,9 @@ fn observe_tool_identity(
             });
         }
     };
-    if request.executable() != selected_path || request.executable_sha256() != selected_sha256 {
+    if request.executable() != selected_path.as_str()
+        || request.executable_sha256() != selected_sha256.as_str()
+    {
         return Err(TestdError::InvalidBinding);
     }
     let environment = request.environment().non_secret();

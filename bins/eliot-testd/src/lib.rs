@@ -2351,7 +2351,7 @@ pub async fn drive_validated_dispatch_material(
     source_root: &str,
     now_unix_ms: u64,
 ) -> Result<ValidatedDispatchDriveOutcome, TestdError> {
-    drive_validated_dispatch_material_inner(material, source_root, now_unix_ms, None).await
+    drive_validated_dispatch_material_inner(material, source_root, now_unix_ms, None, None).await
 }
 
 async fn drive_validated_dispatch_material_inner(
@@ -2359,6 +2359,7 @@ async fn drive_validated_dispatch_material_inner(
     source_root: &str,
     now_unix_ms: u64,
     blob_client: Option<crate::kernel_client::KernelTestdBlobStreamClient>,
+    replay_context: Option<&dyn worker::VerifiedStreamReplayPort>,
 ) -> Result<ValidatedDispatchDriveOutcome, TestdError> {
     if material.cancelled {
         return Ok(ValidatedDispatchDriveOutcome::Cancelled {
@@ -2433,32 +2434,31 @@ async fn drive_validated_dispatch_material_inner(
     // one-shot nonces, so neither can be replayed, and both children are
     // owned by one Job Object contour.
     let presented = present_dispatch_admission(&job, material, &intent, &authority, now_unix_ms)?;
-    let receipt = if let Some(readback) = readback_port.as_ref() {
-        worker::drive_admitted_one_shot_from_store(
-            &store,
-            presented,
-            &worker::GovernedContour::with_readback_port(
-                executor.as_ref(),
-                Some(&*git as &dyn SourceObservationGitPort),
-                readback,
-            ),
-            SERVICE_NAME,
-            ADMITTED_WORKER_LEASE_MS,
-            now_unix_ms,
-        )?
-    } else {
-        worker::drive_admitted_one_shot_from_store(
-            &store,
-            presented,
-            &worker::GovernedContour::new(
-                executor.as_ref(),
-                Some(&*git as &dyn SourceObservationGitPort),
-            ),
-            SERVICE_NAME,
-            ADMITTED_WORKER_LEASE_MS,
-            now_unix_ms,
-        )?
+    let contour = match (readback_port.as_ref(), replay_context) {
+        (Some(readback), Some(replay)) => worker::GovernedContour::with_readback_and_replay(
+            executor.as_ref(),
+            Some(&*git as &dyn SourceObservationGitPort),
+            readback,
+            replay,
+        ),
+        (Some(readback), None) => worker::GovernedContour::with_readback_port(
+            executor.as_ref(),
+            Some(&*git as &dyn SourceObservationGitPort),
+            readback,
+        ),
+        (None, _) => worker::GovernedContour::new(
+            executor.as_ref(),
+            Some(&*git as &dyn SourceObservationGitPort),
+        ),
     };
+    let receipt = worker::drive_admitted_one_shot_from_store(
+        &store,
+        presented,
+        &contour,
+        SERVICE_NAME,
+        ADMITTED_WORKER_LEASE_MS,
+        now_unix_ms,
+    )?;
     project_dispatch_receipt_state(&receipt)
 }
 
@@ -2472,11 +2472,48 @@ pub async fn drive_validated_dispatch_material_with_terminal_publisher(
     now_unix_ms: u64,
     client: &mut crate::kernel_client::KernelTestdIpcClient,
 ) -> Result<ValidatedDispatchDriveOutcome, TestdError> {
+    drive_validated_dispatch_material_with_replay_port(
+        material,
+        source_root,
+        now_unix_ms,
+        client,
+        None,
+    )
+    .await
+}
+
+/// Production one-shot entry with the independently verified live replay
+/// context delivered by the authenticated Kernel owner-facts pull.
+pub async fn drive_validated_dispatch_material_with_verified_replay(
+    material: &crate::testd_material::ValidatedTestdMaterial,
+    source_root: &str,
+    now_unix_ms: u64,
+    client: &mut crate::kernel_client::KernelTestdIpcClient,
+    replay: &dyn worker::VerifiedStreamReplayPort,
+) -> Result<ValidatedDispatchDriveOutcome, TestdError> {
+    drive_validated_dispatch_material_with_replay_port(
+        material,
+        source_root,
+        now_unix_ms,
+        client,
+        Some(replay),
+    )
+    .await
+}
+
+async fn drive_validated_dispatch_material_with_replay_port(
+    material: &crate::testd_material::ValidatedTestdMaterial,
+    source_root: &str,
+    now_unix_ms: u64,
+    client: &mut crate::kernel_client::KernelTestdIpcClient,
+    replay: Option<&dyn worker::VerifiedStreamReplayPort>,
+) -> Result<ValidatedDispatchDriveOutcome, TestdError> {
     let outcome = drive_validated_dispatch_material_inner(
         material,
         source_root,
         now_unix_ms,
         Some(client.blob_stream_client()),
+        replay,
     )
     .await?;
     let job_id = match &outcome {
@@ -2492,7 +2529,7 @@ pub async fn drive_validated_dispatch_material_with_terminal_publisher(
     let job = store
         .get(job_id)?
         .ok_or_else(|| TestdError::Corrupt("terminal TestD job disappeared".to_owned()))?;
-    if eliot_testd_core::is_productive_testd_profile(&job.invocation.profile) {
+    if eliot_testd_core::is_testd_executor_profile(&job.invocation.profile) {
         let binding = job
             .verifier_dispatch
             .as_ref()
