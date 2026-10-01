@@ -2592,10 +2592,8 @@ mod tests {
     fn stage_dir(name: &str) -> std::path::PathBuf {
         loop {
             let sequence = NEXT_STAGE_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-            let dir = std::env::temp_dir().join(format!(
-                "{name}-{}-{sequence}",
-                std::process::id()
-            ));
+            let dir =
+                std::env::temp_dir().join(format!("{name}-{}-{sequence}", std::process::id()));
             match std::fs::create_dir(&dir) {
                 Ok(()) => return dir,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
