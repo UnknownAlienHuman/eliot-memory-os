@@ -1883,10 +1883,18 @@ impl KernelStoreGateway {
     /// another generation or authority never reaches ORS. A composition with no
     /// bound ORS refuses explicitly instead of reporting an empty clean scan.
     ///
+    /// `recovery_owner` is the composition's declared recovery-owner identity
+    /// for this pass (issue #1925, audit 5856193606 item 3). The gateway does
+    /// not choose it: it forwards the caller's declaration so the pass can
+    /// close only the reservations that owner actually owns. A record owned by
+    /// another owner, or retaining no admitted write identity, is reported
+    /// pending and left untouched.
+    ///
     /// `limit` is the whole-scan ceiling for the reservation scan and the
     /// retained-problem listing.
     pub async fn reconcile_staged_writes(
         &self,
+        recovery_owner: &eliot_ors::RecoveryOwner,
         fence: &StateFence,
         limit: u16,
     ) -> Result<StagedWriteRecovery, String> {
@@ -1901,7 +1909,11 @@ impl KernelStoreGateway {
         })?;
         let owner = self.bind_reservation_owner_for_fence(&commit_ors, fence)?;
         crate::store_write_reservation::reconcile_staged_writes_at_startup(
-            &owner, fence, self, limit,
+            &owner,
+            recovery_owner,
+            fence,
+            self,
+            limit,
         )
         .await
         .map_err(|error| error.to_string())

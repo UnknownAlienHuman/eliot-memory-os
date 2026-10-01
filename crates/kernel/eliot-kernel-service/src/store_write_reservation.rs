@@ -102,8 +102,15 @@
 //! ## Startup recovery over the same envelopes
 //!
 //! [`reconcile_staged_writes_at_startup`] is the read side of the envelope
-//! [`reserve_for_transition`] stages, and it is the I1.11 step 6 owner for it:
-//! every unresolved reservation is enumerated by operation identity, observed
+//! [`reserve_for_transition`] stages, and it is the I1.11 step 6 owner for it.
+//! It is OWNED, not merely addressed by a name: the composition declares which
+//! recovery owner it is ([`admit_reserved_write_recovery_owner`]), and the pass
+//! closes only the reservations whose token carries that same owner AND an
+//! admitted write identity read back from the token
+//! ([`admitted_write_binding`]). A foreign owner's row is reported, never
+//! observed and never closed. The owner is bound into the report digest.
+//!
+//! Every unresolved reservation is enumerated by operation identity, observed
 //! against its exact canonical Store receipt through the same named
 //! authenticated gateway ([`StartupReceiptRoute`]) every other receipt
 //! observation in this crate uses, and revalidated through
@@ -144,9 +151,9 @@ use eliot_ors::{
     CanonicalDisposition, CanonicalReconciliation, CanonicalScopeObservation, EpochIdentity,
     EpochLineage, ExpectedOrderingHead, OpaqueLabel, OperationIdentity as OrsOperationIdentity,
     OperationalRecoveryStore, RecoveryAccessClass, RecoveryCursor, RecoveryEnvelopeContext,
-    RecoveryOwner, RecoveryPage, RecoveryPayloadEnvelope, RedbRecoveryStore, ReservationRecord,
-    ReservationRequest, ReservationState, ScopeReservationRequest, StateFenceSnapshot,
-    WriterReservationToken,
+    RecoveryOwner, RecoveryPage, RecoveryPayloadEnvelope, RecoveryWriteBinding, RedbRecoveryStore,
+    ReservationRecord, ReservationRequest, ReservationState, ScopeReservationRequest,
+    StateFenceSnapshot, WriterReservationToken,
 };
 use eliot_platform::SecretReference;
 use eliot_receipts::ReceiptDispositionKind;
@@ -1572,6 +1579,9 @@ pub enum StartupReconciliationReadiness {
 pub struct StartupReconciliation {
     /// Live fence the scan ran under; Kernel matches it exactly.
     pub fence: StateFence,
+    /// Recovery owner identity this pass ran under. Every row it closed
+    /// carried this owner; every row it reported foreign kept its own.
+    pub recovery_owner: RecoveryOwner,
     /// Digest over the fence, both scan sources, every cursor coverage field
     /// and every returned reservation identity/outcome and control obligation
     /// reference.
@@ -1657,6 +1667,81 @@ impl StartupReconciliation {
     }
 }
 
+/// Returns the admitted write identity ORS retained for one reservation.
+///
+/// This is the read side of the binding the reserved write stages, and its
+/// value is never derived here. The real source is
+/// [`WriterReservationToken::write_binding`], the field ORS itself persisted
+/// in `RedbRecoveryStore::stage_and_reserve` by copying the admitted
+/// `RecoveryPayloadEnvelope::write_binding` out of the `ReservationRequest`
+/// it committed, and the field it re-checks against the same envelope and the
+/// write-idempotency index on every later read. Nothing is recomputed,
+/// substituted, or defaulted: a retained row without that field has no admitted
+/// write identity to reconcile, so it refuses.
+///
+/// The retained value is checked with the owner's own
+/// [`RecoveryWriteBinding::validate`] over the ORIGINAL recorded bytes, and
+/// then against the token's own operation identity and prepared-transition
+/// digest. A binding that validates but names a different operation is a
+/// substituted identity and is refused as such, never reconciled.
+pub fn admitted_write_binding(
+    token: &WriterReservationToken,
+) -> Result<&RecoveryWriteBinding, ReservationWriteError> {
+    let operation_id = token.operation_id.as_str();
+    let binding = token.write_binding.as_ref().ok_or_else(|| {
+        ReservationWriteError::Binding {
+            operation_id: operation_id.to_owned(),
+            detail: "the persisted reservation retains no admitted write identity, so its \
+                     staged envelope cannot be reconciled by operation identity"
+                .to_owned(),
+        }
+    })?;
+    binding.validate().map_err(ReservationWriteError::Ors)?;
+    if binding.operation_id != token.operation_id
+        || binding.prepared_transition_sha256 != token.prepared_transition_sha256
+    {
+        return Err(ReservationWriteError::Binding {
+            operation_id: operation_id.to_owned(),
+            detail: "the retained admitted write identity does not bind this reservation's \
+                     operation and prepared transition"
+                .to_owned(),
+        });
+    }
+    Ok(binding)
+}
+
+/// Admits one persisted reservation to the named recovery owner.
+///
+/// The recovery owner is the composition's OWN declared identity, passed in by
+/// the composition root; it is a claim about who is reconciling, never
+/// authority and never evidence about a payload. What makes it a check rather
+/// than a name comparison is the second half: the token's own recorded
+/// `recovery_owner` must equal it, and the token must additionally carry the
+/// admitted write identity that binds its staged envelope to that same
+/// operation. A reservation staged by another owner, or a legacy row with no
+/// admitted write identity, is refused before any Store receipt observation, so
+/// the startup owner can never close another owner's reservation.
+///
+/// I5.7 requires the reservation token to bind "expiry and recovery owner", and
+/// A0.3 makes a second ungoverned write path a hard boundary. Before this gate
+/// the startup pass compared nothing: [`reconcile_receipt`] copied the token's
+/// own owner into the reconciliation it then submitted, so ORS's owner equality
+/// check compared the token against itself and every reservation looked owned.
+pub fn admit_reserved_write_recovery_owner(
+    token: &WriterReservationToken,
+    recovery_owner: &RecoveryOwner,
+) -> Result<(), ReservationWriteError> {
+    if token.recovery_owner != *recovery_owner {
+        return Err(ReservationWriteError::Binding {
+            operation_id: token.operation_id.as_str().to_owned(),
+            detail: "the persisted reservation is owned by another recovery owner, so this \
+                     owner must not observe its receipt or close its reservation"
+                .to_owned(),
+        });
+    }
+    admitted_write_binding(token).map(|_| ())
+}
+
 /// Per-record outcome of one startup reconciliation step.
 enum StartupRecordOutcome {
     /// Exact receipt observed, reconciled and finalized: no report entry.
@@ -1669,8 +1754,10 @@ enum StartupRecordOutcome {
 
 /// Observes the exact Store receipt for one persisted reservation and
 /// reconciles it where the receipt resolves. Records minted under a
-/// different writer epoch than the bound owner are never touched. A
-/// failed check (transport/ORS) is an error, never a guessed outcome.
+/// different writer epoch than the bound owner, records owned by another
+/// recovery owner, and records with no admitted write identity are never
+/// touched. A failed check (transport/ORS) is an error, never a guessed
+/// outcome.
 ///
 /// The receipt is read through the named authenticated gateway
 /// ([`StartupReceiptRoute`]), never through the raw `CanonicalStoreClient`
@@ -1678,8 +1765,15 @@ enum StartupRecordOutcome {
 /// (issue #1713, item 6). A gateway refusal is a failed check and propagates
 /// as an error; it is never reported as an absent receipt, a rejection, or a
 /// safely absent operation.
+///
+/// `recovery_owner` is the composition's declared identity for this pass
+/// (issue #1925, audit 5856193606 item 3). It gates every record BEFORE the
+/// first Store observation, so a foreign owner's reservation is never read and
+/// never closed by this owner; see
+/// [`admit_reserved_write_recovery_owner`].
 async fn reconcile_one_record(
     owner: &CompositionReservation,
+    recovery_owner: &RecoveryOwner,
     route: &dyn StartupReceiptRoute,
     record: &ReservationRecord,
 ) -> Result<StartupRecordOutcome, ReservationWriteError> {
@@ -1695,9 +1789,20 @@ async fn reconcile_one_record(
             reason: "fence mismatch".to_owned(),
         });
     }
-    let operation_id = OperationId::new(token.operation_id.as_str()).map_err(|error| {
+    // Same-owner rule: the composition may only close the reservations it
+    // owns AND whose staged envelope carries an admitted write identity. The
+    // admitted identity is read, never derived, and its own recorded operation
+    // is the identity the receipt below is observed under.
+    let admitted = match admit_reserved_write_recovery_owner(token, recovery_owner) {
+        Ok(()) => admitted_write_binding(token)?,
+        Err(ReservationWriteError::Binding { detail, .. }) => {
+            return Ok(StartupRecordOutcome::Pending { reason: detail });
+        }
+        Err(error) => return Err(error),
+    };
+    let operation_id = OperationId::new(admitted.operation_id.as_str()).map_err(|error| {
         ReservationWriteError::Binding {
-            operation_id: token.operation_id.as_str().to_owned(),
+            operation_id: admitted.operation_id.as_str().to_owned(),
             detail: format!("startup scan cannot address the reservation: {error}"),
         }
     })?;
@@ -2046,7 +2151,15 @@ fn append_control_coverage_digest(encoded: &mut String, control: &StartupControl
 /// trace in the report. Records minted under a different writer epoch
 /// than the bound owner are reported pending with `fence mismatch` and
 /// never touched — cross-epoch disposition belongs to the
-/// cutover/rebind owner, not to startup. A missing receipt, a refused
+/// cutover/rebind owner, not to startup.
+///
+/// `recovery_owner` is the composition's declared identity for this pass and
+/// gates every record BEFORE the first Store observation: a record owned by a
+/// different recovery owner, and a legacy record retaining no admitted write
+/// identity, is reported pending and never observed or closed here. The owner
+/// is bound into the report digest, so two owners' passes over the same rows
+/// are never digest-indistinguishable (issue #1925, audit 5856193606 item 3).
+/// A missing receipt, a refused
 /// reconciliation, or a gateway/ORS failure of the check itself is
 /// reported honestly: unknown outcomes stay unresolved, and a failed
 /// check is an error, never a synthetic empty report.
@@ -2065,6 +2178,7 @@ fn append_control_coverage_digest(encoded: &mut String, control: &StartupControl
 /// closed in either scan.
 pub async fn reconcile_pending_at_startup(
     owner: &CompositionReservation,
+    recovery_owner: &RecoveryOwner,
     fence: &StateFence,
     route: &dyn StartupReceiptRoute,
     limit: u16,
@@ -2083,8 +2197,11 @@ pub async fn reconcile_pending_at_startup(
             .map(|scope| scope.scope.as_str().to_owned())
             .collect();
         scopes.sort_unstable();
-        let recovery_owner = token.recovery_owner.as_str().to_owned();
-        let entry = reconcile_one_record(owner, route, record).await?;
+        // The report restates the row's OWN recorded owner, which is the
+        // evidence a foreign-owner row is judged against; it is not restated
+        // from the composition's claim.
+        let recorded_recovery_owner = token.recovery_owner.as_str().to_owned();
+        let entry = reconcile_one_record(owner, recovery_owner, route, record).await?;
         let outcome_for_digest = match &entry {
             StartupRecordOutcome::Resolved => "resolved".to_owned(),
             StartupRecordOutcome::Pending { reason } => format!("pending:{reason}"),
@@ -2102,7 +2219,7 @@ pub async fn reconcile_pending_at_startup(
                 reservation_order: token.reservation_order,
                 scopes,
                 state: record.state,
-                recovery_owner,
+                recovery_owner: recorded_recovery_owner,
                 reason,
             }),
             StartupRecordOutcome::Unknown { reason } => unknown.push(StartupUnknownOperation {
@@ -2110,7 +2227,7 @@ pub async fn reconcile_pending_at_startup(
                 reservation_order: token.reservation_order,
                 scopes,
                 state: record.state,
-                recovery_owner,
+                recovery_owner: recorded_recovery_owner,
                 reason,
             }),
         }
@@ -2120,6 +2237,10 @@ pub async fn reconcile_pending_at_startup(
     let mut digest_input = String::new();
     for field in [
         STARTUP_RESERVATION_SCAN_SOURCE.to_owned(),
+        // The owner that RAN the pass is bound into the digest, not only the
+        // owner each row records: two owners' passes over the same rows must
+        // never produce the same report digest.
+        recovery_owner.as_str().to_owned(),
         fence.authority_epoch.lineage_id.as_str().to_owned(),
         fence.authority_epoch.sequence.get().to_string(),
         fence.resource_generation.value().to_string(),
@@ -2145,6 +2266,7 @@ pub async fn reconcile_pending_at_startup(
     let digest = sha256_hex(digest_input.as_bytes());
     Ok(StartupReconciliation {
         fence: fence.clone(),
+        recovery_owner: recovery_owner.clone(),
         digest,
         scanned,
         scan_source: STARTUP_RESERVATION_SCAN_SOURCE,
@@ -2335,11 +2457,13 @@ impl StagedWriteRecovery {
 /// a key, or deletes a staged record.
 pub async fn reconcile_staged_writes_at_startup(
     owner: &CompositionReservation,
+    recovery_owner: &RecoveryOwner,
     fence: &StateFence,
     route: &dyn StartupReceiptRoute,
     limit: u16,
 ) -> Result<StagedWriteRecovery, ReservationWriteError> {
-    let reservations = reconcile_pending_at_startup(owner, fence, route, limit).await?;
+    let reservations =
+        reconcile_pending_at_startup(owner, recovery_owner, fence, route, limit).await?;
     let mut envelopes = Vec::new();
     let mut problems = Vec::new();
     // Pending and unknown are the same operation population read from the two

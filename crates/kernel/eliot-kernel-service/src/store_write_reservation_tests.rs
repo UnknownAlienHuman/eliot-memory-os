@@ -3632,7 +3632,26 @@ fn reserved_submission_rejects_post_reservation_mutation() {
 use crate::store_write_reservation::{
     StartupReconciliationReadiness, reconcile_pending_at_startup, unresolved_reservations,
 };
-use crate::{EbpCanonicalStoreClient, HostStoreBootstrapRequirement};
+use crate::{
+    EbpCanonicalStoreClient, HostStoreBootstrapRequirement,
+    admit_reserved_write_recovery_owner, admitted_write_binding,
+};
+
+/// The recovery owner the fixture's seeds record, read from the frozen
+/// fixture rather than repeated as a literal, so the startup pass runs as the
+/// owner that actually staged the rows.
+fn fixture_recovery_owner() -> eliot_ors::RecoveryOwner {
+    OpaqueLabel::new(fixture_992().recovery_owner).expect("992 recovery owner label")
+}
+
+/// A recovery owner that staged nothing: the foreign-owner instrument.
+fn foreign_recovery_owner() -> eliot_ors::RecoveryOwner {
+    OpaqueLabel::new(format!(
+        "{}-foreign",
+        fixture_992().recovery_owner
+    ))
+    .expect("992 foreign recovery owner label")
+}
 
 /// Startup-reconciliation proof harness (I1.11 step 6): a real named-pipe
 /// EBP connection to a scripted responder. The responder answers
@@ -4016,7 +4035,13 @@ async fn startup_reconciliation_finalizes_resolved_pending_work() {
         let mut guard = answers.committed.lock().unwrap();
         *guard = committed;
     }
-    let report = reconcile_pending_at_startup(&owner, &fence(), &route.client, 64)
+    let report = reconcile_pending_at_startup(
+        &owner,
+        &fixture_recovery_owner(),
+        &fence(),
+        &route.client,
+        64,
+    )
         .await
         .expect("startup scan completes");
     assert_eq!(report.scanned, 2);
@@ -4051,7 +4076,13 @@ async fn startup_reconciliation_keeps_unknown_outcome_unresolved() {
         .lock()
         .unwrap()
         .insert(sealed.token.operation_id.as_str().to_owned(), None);
-    let report = reconcile_pending_at_startup(&owner, &fence(), &route.client, 64)
+    let report = reconcile_pending_at_startup(
+        &owner,
+        &fixture_recovery_owner(),
+        &fence(),
+        &route.client,
+        64,
+    )
         .await
         .expect("startup scan completes");
     assert_eq!(report.scanned, 1);
@@ -4095,7 +4126,13 @@ async fn startup_reconciliation_refuses_foreign_epoch_tokens() {
             .expect("startup stale owner binds");
     let stale_fence = stale_fence_with(&fixture_992);
     let (route, _answers) = startup_route("fence").await;
-    let report = reconcile_pending_at_startup(&stale_owner, &stale_fence, &route.client, 64)
+    let report = reconcile_pending_at_startup(
+        &stale_owner,
+        &fixture_recovery_owner(),
+        &stale_fence,
+        &route.client,
+        64,
+    )
         .await
         .expect("startup scan completes");
     assert_eq!(report.scanned, 1);
@@ -4143,7 +4180,13 @@ async fn startup_reconciliation_reports_truncation_bounded() {
             .unwrap()
             .insert(transition.identity.operation_id.as_str().to_owned(), None);
     }
-    let report = reconcile_pending_at_startup(&owner, &fence(), &route.client, 2)
+    let report = reconcile_pending_at_startup(
+        &owner,
+        &fixture_recovery_owner(),
+        &fence(),
+        &route.client,
+        2,
+    )
         .await
         .expect("startup scan completes");
     assert_eq!(report.scanned, 2);
@@ -4214,7 +4257,13 @@ async fn startup_reconciliation_rejects_substituted_receipt_identity() {
             )),
         );
     }
-    let error = reconcile_pending_at_startup(&owner, &fence(), &route.client, 64)
+    let error = reconcile_pending_at_startup(
+        &owner,
+        &fixture_recovery_owner(),
+        &fence(),
+        &route.client,
+        64,
+    )
         .await
         .expect_err("substituted answers fail the scan");
     assert!(
@@ -4275,7 +4324,13 @@ async fn startup_reconciliation_refuses_mismatched_receipts() {
             Some(y_receipt),
         );
     }
-    let report = reconcile_pending_at_startup(&owner, &fence(), &route.client, 64)
+    let report = reconcile_pending_at_startup(
+        &owner,
+        &fixture_recovery_owner(),
+        &fence(),
+        &route.client,
+        64,
+    )
         .await
         .unwrap_or_else(|error| panic!("startup mismatch scan failed: {error:?}"));
     assert_eq!(report.scanned, 2);
@@ -4300,3 +4355,254 @@ async fn startup_reconciliation_refuses_mismatched_receipts() {
     assert_eq!(rest.len(), 2, "refused tokens stay unresolved");
     finish_startup_route(route).await;
 }
+
+/// Builds the admitted write identity ORS would retain for one sealed
+/// reservation, from the SAME owner-computed values the reservation was staged
+/// with.
+///
+/// Every field is derived, never invented: the operation identity, the
+/// canonical request digest, the prepared-transition digest, the ordering-scope
+/// set and the admission/manifest digests are read off the admitted
+/// `PreparedTransition` and the reserved scopes, and the payload bindings and
+/// key reference are the ones the seed actually staged. The point of the
+/// fixture is that the recovery owner reads this value back rather than
+/// recomputing it, so a test that recomputed it would prove nothing.
+fn admitted_binding_for(
+    transition: &PreparedTransition,
+    token_scopes: &[eliot_ors::ReservedScope],
+    writer_epoch: &EpochLineage,
+    seed: &ReservationSeed,
+) -> eliot_ors::RecoveryWriteBinding {
+    let access_class = eliot_ors::RecoveryAccessClass {
+        privacy: eliot_security_contracts::PrivacyClass::Private,
+        visibility: OpaqueLabel::new(seed.visibility.clone()).expect("992 binding visibility"),
+        instruction_taint: eliot_security_contracts::InstructionTaint::CommandLike,
+    };
+    let mut scopes: Vec<String> = token_scopes
+        .iter()
+        .map(|scope| scope.scope.as_str().to_owned())
+        .collect();
+    scopes.sort();
+    eliot_ors::RecoveryWriteBinding {
+        // The write-envelope protocol version is the owner constant, not a
+        // literal, so the fixture cannot drift from `eliot-canonical`.
+        write_envelope_protocol_version: eliot_canonical::WRITE_ENVELOPE_PROTOCOL_VERSION,
+        recovery_envelope_contract_version: eliot_ors::CONTRACT_VERSION,
+        recovery_access_class: access_class,
+        payload_created_at_ms: seed.created_at_ms,
+        payload_known_at_ms: seed.known_at_ms,
+        payload_expires_at_ms: Some(seed.expires_at_ms),
+        operation_id: eliot_ors::OperationIdentity::new(
+            transition.identity.operation_id.as_str(),
+        )
+        .expect("992 binding operation identity"),
+        // Fixture-derived: the stable intent label the test drives, from the
+        // same frozen namespace the idempotency key prefix comes from.
+        write_intent_id: OpaqueLabel::new(format!(
+            "{}{}",
+            fixture_992().idempotency_key_prefix,
+            transition.identity.operation_id.as_str()
+        ))
+        .expect("992 binding write intent"),
+        idempotency_key: OpaqueLabel::new(transition.identity.idempotency_key.clone())
+            .expect("992 binding idempotency key"),
+        canonical_request_sha256: transition.identity.canonical_request_hash.clone(),
+        prepared_transition_sha256: eliot_store_api::prepared_transition_digest(transition)
+            .expect("992 binding prepared transition digest"),
+        ordering_scopes: scopes
+            .into_iter()
+            .map(|scope| OpaqueLabel::new(scope).expect("992 binding scope"))
+            .collect(),
+        admission_contract_set_digest: transition.admission_contract_set_digest.clone(),
+        operation_manifest_digest: OpaqueLabel::new(
+            transition.operation_manifest_digest.as_str().to_owned(),
+        )
+        .expect("992 binding manifest digest"),
+        authority_epoch: writer_epoch.clone(),
+        state_fence: eliot_ors::StateFenceSnapshot::capture(
+            &transition.state_fence,
+            writer_epoch.current.epoch,
+        )
+        .expect("992 binding fence snapshot"),
+        protected_payload_sha256: eliot_store_api::sha256_hex(&seed.payload_bytes),
+        protected_payload_length: seed.payload_bytes.len() as u64,
+        payload_key_reference: eliot_platform::SecretReference::new(
+            seed.key_provider.clone(),
+            seed.key_name.clone(),
+        )
+        .expect("992 binding key reference"),
+    }
+}
+
+/// Builds one persisted `WriterReservationToken` carrying a real admitted
+/// write identity, so the recovery owner's own gate is exercised on the value
+/// ORS would actually hold.
+fn token_with_admitted_binding(
+    tag: &str,
+    scope: &str,
+    recovery_owner: &eliot_ors::RecoveryOwner,
+) -> (PreparedTransition, ReservationSeed, eliot_ors::WriterReservationToken) {
+    let fixture = fixture_992();
+    let context = context_for(tag);
+    let mut transition = transition_for(tag, &[scope]);
+    let (revision, ordering) = heads_for(tag, &[scope]);
+    seal(&context, &mut transition, &revision, &ordering);
+    let seed = seed_with_heads(
+        tag,
+        transition.identity.operation_id.as_str(),
+        observed_seq(&[scope], fixture.expected_sequence, ""),
+    );
+    let epoch = writer_epoch();
+    let fence_snapshot = eliot_ors::StateFenceSnapshot::capture(
+        &transition.state_fence,
+        epoch.current.epoch,
+    )
+    .expect("token fence snapshot");
+    let scopes = vec![eliot_ors::ReservedScope {
+        scope: OpaqueLabel::new(scope.to_owned()).expect("token scope"),
+        reserved_sequence: fixture.expected_sequence,
+        expected_head: eliot_ors::ExpectedOrderingHead {
+            sequence: fixture.expected_sequence,
+            head_sha256: fixture.head_digest_a.clone(),
+            revision_head: None,
+        },
+    }];
+    let binding = admitted_binding_for(&transition, &scopes, &epoch, &seed);
+    let token = eliot_ors::WriterReservationToken {
+        reservation_id: OpaqueLabel::new(format!("{}{tag}", fixture.reservation_id_prefix))
+            .expect("token reservation id"),
+        operation_id: eliot_ors::OperationIdentity::new(
+            transition.identity.operation_id.as_str(),
+        )
+        .expect("token operation id"),
+        writer_epoch: epoch,
+        state_fence: fence_snapshot,
+        reservation_order: 1,
+        scopes,
+        prepared_transition_sha256: binding.prepared_transition_sha256.clone(),
+        write_binding: Some(binding),
+        expires_at_ms: fixture.expires_at_ms,
+        recovery_owner: recovery_owner.clone(),
+    };
+    (transition, seed, token)
+}
+
+// WORK_UNIT_CASE: 1925/recovery-owner-admitted-binding
+#[test]
+fn admitted_write_binding_returns_the_original_recorded_identity() {
+    // Positive case: the accessor hands back the value ORS recorded, byte for
+    // byte, and its operation identity is the token's own. Nothing is
+    // recomputed, so this is the same value the reservation was staged with.
+    let fixture = fixture_992();
+    let owner = fixture_recovery_owner();
+    let (transition, _seed, token) = token_with_admitted_binding("awb1", &fixture.scope_a, &owner);
+    let binding = admitted_write_binding(&token).expect("admitted binding reads back");
+    assert_eq!(
+        binding.operation_id.as_str(),
+        transition.identity.operation_id.as_str(),
+        "the ORIGINAL operation identity is what the recovery owner reads"
+    );
+    assert_eq!(
+        binding.canonical_request_sha256, transition.identity.canonical_request_hash,
+        "the recorded canonical request digest is restated, never recomputed"
+    );
+    assert_eq!(
+        binding.prepared_transition_sha256, token.prepared_transition_sha256,
+        "the recorded prepared-transition digest is restated"
+    );
+    // The exact original operation identity is preserved for replay: the token
+    // the recovery owner reconciles under is the one the write side bound.
+    admit_reserved_write_recovery_owner(&token, &owner)
+        .expect("the staging owner may reconcile its own reservation");
+}
+
+// WORK_UNIT_CASE: 1925/recovery-owner-substituted-identity
+#[test]
+fn admitted_write_binding_refuses_a_substituted_operation_identity() {
+    // Refusal case: a binding that names a different operation is a substituted
+    // identity. It is refused, not reconciled and not repaired.
+    let fixture = fixture_992();
+    let owner = fixture_recovery_owner();
+    let (transition, seed, mut token) =
+        token_with_admitted_binding("awb2", &fixture.scope_a, &owner);
+    let foreign_operation = format!("{}{}", fixture.operation_id_prefix, "foreign");
+    token.write_binding.as_mut().expect("binding present").operation_id =
+        eliot_ors::OperationIdentity::new(foreign_operation).expect("foreign operation identity");
+    let error = admitted_write_binding(&token)
+        .expect_err("a substituted operation identity must not be read back");
+    assert!(
+        matches!(error, ReservationWriteError::Binding { .. }),
+        "substitution is a typed binding refusal, got {error:?}"
+    );
+    assert!(
+        error.to_string().contains(transition.identity.operation_id.as_str()),
+        "the refusal preserves the reservation's own operation identity: {error}"
+    );
+    // The same substituted token is refused by the owner gate too, so the
+    // recovery owner cannot reach the receipt step with it.
+    let owner_error = admit_reserved_write_recovery_owner(&token, &owner)
+        .expect_err("a substituted identity is not this owner's to close");
+    assert!(
+        matches!(owner_error, ReservationWriteError::Binding { .. }),
+        "owner gate refuses substitution, got {owner_error:?}"
+    );
+    // The staged payload the substituted token claims is untouched: refusing
+    // the identity never rewrote the seed's protected bytes.
+    assert!(!seed.payload_bytes.is_empty());
+}
+
+// WORK_UNIT_CASE: 1925/recovery-owner-foreign-owner
+#[test]
+fn recovery_owner_refuses_a_reservation_owned_by_another_owner() {
+    // Refusal case: a foreign recovery owner stages the row, so THIS owner must
+    // not observe its receipt or close it. The token keeps its own recorded
+    // owner; nothing is rebound to make the check pass.
+    let fixture = fixture_992();
+    let foreign = foreign_recovery_owner();
+    assert_ne!(
+        foreign.as_str(),
+        fixture.recovery_owner,
+        "the foreign owner is a different owner, not a relabelling"
+    );
+    let (_transition, _seed, token) = token_with_admitted_binding("ro1", &fixture.scope_a, &foreign);
+    let error = admit_reserved_write_recovery_owner(&token, &fixture_recovery_owner())
+        .expect_err("a foreign owner's reservation is not ours to close");
+    assert!(
+        matches!(error, ReservationWriteError::Binding { .. }),
+        "foreign owner is a typed binding refusal, got {error:?}"
+    );
+    assert_eq!(
+        token.recovery_owner.as_str(),
+        foreign.as_str(),
+        "the foreign token keeps its OWN recorded owner; nothing was rebound"
+    );
+    // The admitted identity is still readable on its own: the refusal is about
+    // ownership, not about the binding being absent or malformed.
+    admitted_write_binding(&token).expect("the foreign owner's own binding is intact");
+}
+
+// WORK_UNIT_CASE: 1925/recovery-owner-legacy-no-binding
+#[test]
+fn recovery_owner_refuses_a_legacy_reservation_with_no_admitted_binding() {
+    // Refusal case: a retained row with no admitted write identity cannot be
+    // reconciled by operation identity, so it is refused rather than defaulted.
+    // This is the exact legacy shape `WriterReservationToken::write_binding`
+    // documents as "absent only on legacy retained rows".
+    let fixture = fixture_992();
+    let owner = fixture_recovery_owner();
+    let (_transition, _seed, mut token) = token_with_admitted_binding("ro2", &fixture.scope_a, &owner);
+    token.write_binding = None;
+    let error = admitted_write_binding(&token)
+        .expect_err("a legacy row with no admitted identity must not be reconciled");
+    assert!(
+        matches!(error, ReservationWriteError::Binding { .. }),
+        "absent admitted identity is a typed binding refusal, got {error:?}"
+    );
+    let owner_error = admit_reserved_write_recovery_owner(&token, &owner)
+        .expect_err("no admitted identity means the owner cannot prove it owns the envelope");
+    assert!(
+        matches!(owner_error, ReservationWriteError::Binding { .. }),
+        "owner gate refuses an unbound row, got {owner_error:?}"
+    );
+}
+
