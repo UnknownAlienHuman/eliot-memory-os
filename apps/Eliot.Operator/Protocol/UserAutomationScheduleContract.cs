@@ -954,7 +954,11 @@ public sealed record UserAutomationOutcome(
 /// Identity retained by the Operator for the exact request whose response is
 /// being decoded. The transport correlation is deliberately a separate,
 /// optional field: this client does not expose its JSON-RPC identifier, so it
-/// remains null rather than being inferred from the operation key.
+/// remains null rather than being inferred from the operation key. The expected
+/// State Fence is likewise optional: it carries the exact canonical bytes of
+/// the submitted/current fence when the submitting handoff retains them, and
+/// stays null while no such comparand exists. A present fence is compared by
+/// exact serialized equality; it is never re-serialized here.
 /// </summary>
 public sealed record UserAutomationResultValidationContext
 {
@@ -967,18 +971,25 @@ public sealed record UserAutomationResultValidationContext
     // UnverifiedOwnerAnswer.
     private const string SupportedUserAutomationResultSchemaSha256 = "c71ee40384dba3eaebac57d4c92c9e7406a342d6901e532ee362c163e8f7cf1c";
 
+    // A submitted State Fence serializes to a few hundred bytes (five closed
+    // members around one lineage UUID). This bound only rejects absurd input;
+    // it never widens the owner wire.
+    private const int MaxExpectedStateFenceChars = 4_096;
+
     private UserAutomationResultValidationContext(
         string expectedOperationId,
         string expectedIdempotencyKey,
         string expectedResultWireId,
         int supportedResultWireVersion,
-        string? transportCorrelationId)
+        string? transportCorrelationId,
+        string? expectedStateFenceJson)
     {
         ExpectedOperationId = expectedOperationId;
         ExpectedIdempotencyKey = expectedIdempotencyKey;
         ExpectedResultWireId = expectedResultWireId;
         SupportedResultWireVersion = supportedResultWireVersion;
         TransportCorrelationId = transportCorrelationId;
+        ExpectedStateFenceJson = expectedStateFenceJson;
     }
 
     public string ExpectedOperationId { get; }
@@ -998,15 +1009,33 @@ public sealed record UserAutomationResultValidationContext
     public string? TransportCorrelationId { get; }
 
     /// <summary>
+    /// Exact canonical bytes of the submitted/current State Fence the answer
+    /// must bind to, or null while the submitting handoff retains no fence
+    /// comparand. The fence carries no Operator-minted scalar, so member order
+    /// is significant and these bytes are compared as-is, never re-serialized.
+    /// </summary>
+    public string? ExpectedStateFenceJson { get; }
+
+    /// <summary>True when a submitted/current fence comparand was retained.</summary>
+    public bool HasExpectedStateFence => ExpectedStateFenceJson is not null;
+
+    /// <summary>
     /// Creates validation context from the same request value that is sent or
     /// retained for recovery. It preserves the exact retry key; the retained
     /// request reader deliberately does not rederive it through today's
     /// serializer. A newly minted request has already derived its key in
     /// <see cref="UserAutomationOperatorRequest.Create"/>.
+    /// The optional expected fence carries the exact canonical fence bytes the
+    /// submitting handoff observed for this request. It must already be the
+    /// owner's closed fence shape: it is validated against the generated
+    /// State Fence mirror and refused by name otherwise. Kernel-minted
+    /// correlation values the client cannot independently know are never
+    /// accepted here.
     /// </summary>
     public static UserAutomationResultValidationContext FromRequest(
         UserAutomationOperatorRequest request,
-        string? transportCorrelationId = null)
+        string? transportCorrelationId = null,
+        string? expectedStateFenceJson = null)
     {
         ArgumentNullException.ThrowIfNull(request);
         request.Validate();
@@ -1018,12 +1047,21 @@ public sealed record UserAutomationResultValidationContext
             throw new ArgumentException("transport correlation identifier is malformed", nameof(transportCorrelationId));
         }
 
+        if (expectedStateFenceJson is not null
+            && (expectedStateFenceJson.Length > MaxExpectedStateFenceChars
+                || expectedStateFenceJson.Any(char.IsControl)
+                || !UserAutomationOutcomeClassifier.IsClosedStateFenceJson(expectedStateFenceJson)))
+        {
+            throw new ArgumentException("submitted State Fence comparand is malformed", nameof(expectedStateFenceJson));
+        }
+
         return new UserAutomationResultValidationContext(
             $"user-automation-operation:{request.IdempotencyKey}",
             request.IdempotencyKey,
             OperatorScheduleContract.USER_AUTOMATION_RESULT_WIRE_ID,
             OperatorScheduleContract.USER_AUTOMATION_RESULT_WIRE_VERSION,
-            transportCorrelationId);
+            transportCorrelationId,
+            expectedStateFenceJson);
     }
 
     /// <summary>Rejects a context that does not name the current closed wire contract.</summary>
@@ -1269,6 +1307,21 @@ public static class UserAutomationOutcomeClassifier
         if (recovery.ValueKind != JsonValueKind.Null
             || !HasUserAutomationTransitionProperties(value, context, answer))
         {
+            // A body that binds the submitted operation yet carries another
+            // fence is not this operation's current result. It fails closed
+            // into the existing unverified disposition and is named as a
+            // foreign/stale-fence candidate for historical/reconciliation
+            // handling only; its projection is never rendered as current.
+            if (recovery.ValueKind == JsonValueKind.Null
+                && BindsSubmittedOperationWithForeignFence(value, context, answer))
+            {
+                return UnverifiedOwnerAnswer(
+                    action,
+                    "the known owner transition binds the submitted operation identity but carries a foreign/stale State Fence; "
+                    + "it is not this operation's current result and is retained only as a historical/reconciliation candidate — "
+                    + "reconcile this same operation before any new submission");
+            }
+
             return UnverifiedOwnerAnswer(
                 action,
                 "the known owner transition does not bind the expected operation identity, current transition wire version, and matching nested/envelope State Fence");
@@ -1280,9 +1333,12 @@ public static class UserAutomationOutcomeClassifier
             return new UserAutomationOutcome(
                 UserAutomationOutcomeClass.OwnerBoundTransitionScheduleUnverified,
                 $"UserAutomation {action} answered — schedule normalization unverified",
-                "The owner reports a known transition under its reported State Fence. "
-                + "The Operator has no independent submitted/current-fence comparand. "
-                + DescribeUnverifiedScheduleProjection(projection),
+                context.HasExpectedStateFence
+                    ? "The owner reports a known transition whose State Fence exactly equals the submitted/current fence retained for this operation. "
+                        + DescribeUnverifiedScheduleProjection(projection)
+                    : "The owner reports a known transition under its reported State Fence. "
+                        + "The Operator has no independent submitted/current-fence comparand. "
+                        + DescribeUnverifiedScheduleProjection(projection),
                 RefusalKind: null,
                 RefusalText: null,
                 ScheduleProjection: null);
@@ -1291,10 +1347,15 @@ public static class UserAutomationOutcomeClassifier
         return new UserAutomationOutcome(
             UserAutomationOutcomeClass.OwnerBoundTransitionScheduleUnverified,
             $"UserAutomation {action} answered — schedule not verified",
-            "The owner reports a known transition under its reported State Fence, but the Operator has no independent submitted/current-fence comparand. "
-            + "This answer carries no decodable "
-            + $"{OperatorScheduleContract.NORMALIZED_OCCURRENCE_ENCODING} occurrence projection, "
-            + "so the Operator does not report the schedule as normalized",
+            context.HasExpectedStateFence
+                ? "The owner reports a known transition whose State Fence exactly equals the submitted/current fence retained for this operation. "
+                    + "This answer carries no decodable "
+                    + $"{OperatorScheduleContract.NORMALIZED_OCCURRENCE_ENCODING} occurrence projection, "
+                    + "so the Operator does not report the schedule as normalized"
+                : "The owner reports a known transition under its reported State Fence, but the Operator has no independent submitted/current-fence comparand. "
+                    + "This answer carries no decodable "
+                    + $"{OperatorScheduleContract.NORMALIZED_OCCURRENCE_ENCODING} occurrence projection, "
+                    + "so the Operator does not report the schedule as normalized",
             RefusalKind: null,
             RefusalText: null,
             ScheduleProjection: null);
@@ -1392,6 +1453,9 @@ public static class UserAutomationOutcomeClassifier
     /// <summary>
     /// Admits only the current transition nested in the versioned result
     /// wrapper. No wire version is inferred from a familiar member census.
+    /// When the validation context retains a submitted/current fence, the
+    /// envelope fence must equal it by exact serialized equality; a
+    /// foreign/stale fence fails this gate even when every other member binds.
     /// </summary>
     private static bool HasUserAutomationTransitionProperties(
         JsonElement value,
@@ -1406,7 +1470,8 @@ public static class UserAutomationOutcomeClassifier
         && TryGetObject(transition, "state_fence", out var stateFence)
         && IsClosedStateFence(stateFence)
         && TryGetObject(answer, "state_fence", out var envelopeFence)
-        && SameSerializedFence(stateFence, envelopeFence);
+        && SameSerializedFence(stateFence, envelopeFence)
+        && MatchesExpectedStateFence(answer, context);
 
     private static bool HasCurrentResultEnvelope(
         JsonElement answer,
@@ -1451,7 +1516,7 @@ public static class UserAutomationOutcomeClassifier
         && versionValue.TryGetInt32(out var version)
         && version == OperatorScheduleContract.USER_AUTOMATION_TRANSITION_WIRE_VERSION
         && TryGetObject(transition, "identity", out var identity)
-        && HasExactProperties(identity, "operation_id", "canonical_request_hash", "idempotency_key")
+        && HasExactProperties(identity, OperatorScheduleContract.USER_AUTOMATION_OPERATION_IDENTITY_MEMBERS)
         && TryReadBoundedText(identity, "operation_id", MaxOperationIdChars, out _)
         && TryReadBoundedText(identity, "canonical_request_hash", 64, out var canonicalHash)
         && IsLowerHexSha256(canonicalHash)
@@ -2259,6 +2324,78 @@ public static class UserAutomationOutcomeClassifier
     private static bool SameSerializedFence(JsonElement left, JsonElement right) =>
         string.Equals(left.GetRawText(), right.GetRawText(), StringComparison.Ordinal);
 
+    /// <summary>
+    /// Requires the envelope State Fence to equal the submitted/current fence
+    /// retained in the validation context, by exact serialized equality. The
+    /// expected member already carries the owner's canonical bytes and the
+    /// fence holds no Operator-minted scalar, so no re-serialization is
+    /// attempted. A null comparand (no submitted fence is retained yet)
+    /// disables this conjunct without weakening any other check.
+    /// </summary>
+    private static bool MatchesExpectedStateFence(
+        JsonElement answer,
+        UserAutomationResultValidationContext context)
+    {
+        var expected = context.ExpectedStateFenceJson;
+        if (expected is null)
+        {
+            return true;
+        }
+
+        return TryGetObject(answer, "state_fence", out var envelopeFence)
+            && string.Equals(envelopeFence.GetRawText(), expected, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// True when the known body binds the submitted operation identity and is
+    /// internally fence-consistent, yet disagrees with the submitted/current
+    /// fence in the validation context. The caller reports this as an explicit
+    /// foreign/stale-fence disposition instead of the generic unverified shape.
+    /// </summary>
+    private static bool BindsSubmittedOperationWithForeignFence(
+        JsonElement value,
+        UserAutomationResultValidationContext context,
+        JsonElement answer)
+    {
+        var expected = context.ExpectedStateFenceJson;
+        if (expected is null)
+        {
+            return false;
+        }
+
+        return HasExactProperties(value, OperatorScheduleContract.USER_AUTOMATION_TRANSITION_VALUE_MEMBERS)
+            && TryGetObject(value, "transition", out var transition)
+            && HasCurrentTransitionShape(transition)
+            && HasCurrentInspectionProjection(value)
+            && TryGetObject(transition, "identity", out var identity)
+            && MatchesOperationIdentity(identity, context, CanonicalRequestHashMember)
+            && TryGetObject(transition, "state_fence", out var stateFence)
+            && IsClosedStateFence(stateFence)
+            && TryGetObject(answer, "state_fence", out var envelopeFence)
+            && IsClosedStateFence(envelopeFence)
+            && SameSerializedFence(stateFence, envelopeFence)
+            && !string.Equals(envelopeFence.GetRawText(), expected, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Validates candidate submitted-fence bytes for the validation context:
+    /// they must parse as one JSON object with the generated closed State
+    /// Fence shape. Used once at context construction so a malformed comparand
+    /// is refused by name instead of silently failing every later comparison.
+    /// </summary>
+    internal static bool IsClosedStateFenceJson(string rawJson)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(rawJson);
+            return IsClosedStateFence(document.RootElement);
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
     private static UserAutomationOutcome ReadAttemptRefusal(
         string action,
         JsonElement value,
@@ -2378,15 +2515,16 @@ public static class UserAutomationOutcomeClassifier
 
     private static bool IsClosedStateFence(JsonElement stateFence)
     {
+        // The member census is the generated owner mirror, not a second
+        // hand-maintained list: a Rust fence change fails the mirror gate
+        // until this decoder is regenerated and reviewed with it.
         if (!HasExactProperties(
                 stateFence,
-                "authority_epoch",
-                "resource_generation",
-                "task_revision",
-                "policy_revision",
-                "integration_revision")
+                OperatorScheduleContract.USER_AUTOMATION_STATE_FENCE_MEMBERS)
             || !TryGetObject(stateFence, "authority_epoch", out var authorityEpoch)
-            || !HasExactProperties(authorityEpoch, "lineage_id", "sequence")
+            || !HasExactProperties(
+                authorityEpoch,
+                OperatorScheduleContract.USER_AUTOMATION_EPOCH_ID_MEMBERS)
             || !TryReadBoundedText(authorityEpoch, "lineage_id", 36, out var lineageId)
             || !IsLowercaseUuid(lineageId)
             || !stateFence.TryGetProperty("resource_generation", out var resourceGeneration)
