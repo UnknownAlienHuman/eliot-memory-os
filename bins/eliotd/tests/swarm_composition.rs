@@ -15,7 +15,9 @@
 //! Covered, in order: attach one admitted plan through the vended port;
 //! launch two children with persist-before-launch order (one success, one
 //! slot-local budget-exhausted failure); revoked route blocked with no
-//! ledger effect; daemon restart (drop everything but the owners, rehydrate
+//! ledger effect; exact child replay idempotent (returns the persisted intent,
+//! no second append, no second runner call) against changed same-identity
+//! input conflicting; daemon restart (drop everything but the owners, rehydrate
 //! from the sealed attachment, reconcile-before-relaunch enforced, unknown
 //! stays unknown, no launched child lost); cancel drain to `terminal_ready`;
 //! unknown blocking the false terminal; second-job conflict naming the
@@ -296,19 +298,38 @@ fn attach_launches_two_children_with_persist_before_launch_order() {
     ));
     assert_eq!(ledger.intents().len(), intents_before);
 
-    // Reusing a slot that already carries a persisted intent is refused:
-    // changed input needs a new identity, never a silent relaunch.
-    assert!(matches!(
-        composition.launch_child(
+    // Exact child replay is idempotent (A6): the same slot with the same
+    // dispatch envelope returns the PERSISTED intent — not a refusal and not a
+    // second mint — with no second durable append and no second runner call, so
+    // the dispatched child stays one entry in accounting.
+    let intents_before_replay = ledger.intents().len();
+    let launches_before_replay = runner
+        .launched
+        .lock()
+        .expect("fake runner lock holds")
+        .len();
+    let replayed = composition
+        .launch_child(
             "slot-a",
             RegistryRouteStatus::Admitted,
             "native-worker",
             3,
             ADAPTER_DIGEST,
-            GENERATION_FINGERPRINT
-        ),
-        Err(SwarmCompositionError::DuplicateSlot { .. })
-    ));
+            GENERATION_FINGERPRINT,
+        )
+        .expect("exact child replay is idempotent");
+    assert_eq!(replayed, first, "replay returns the persisted intent");
+    assert_eq!(ledger.intents().len(), intents_before_replay);
+    assert_eq!(
+        runner
+            .launched
+            .lock()
+            .expect("fake runner lock holds")
+            .len(),
+        launches_before_replay,
+        "exact replay must not call the runner a second time"
+    );
+    assert_eq!(composition.launched().len(), 2);
 }
 
 #[test]
@@ -438,7 +459,9 @@ fn restart_rehydrates_and_reconciles_before_any_relaunch() {
         .rehydrate_after_restart(&sealed)
         .expect("true sealed attachment recovers");
     assert_eq!(recovered.plan, sealed);
-    // slot-c is a new identity, so it may launch; reusing slot-a is refused.
+    // slot-c is a new identity, so it may launch; an exact replay of the
+    // already-dispatched slot-a after restart is idempotent and returns the
+    // persisted intent without a second append or runner call.
     restarted
         .launch_child(
             "slot-c",
@@ -449,17 +472,213 @@ fn restart_rehydrates_and_reconciles_before_any_relaunch() {
             GENERATION_FINGERPRINT,
         )
         .expect("new slot launches after reconcile");
-    assert!(matches!(
-        restarted.launch_child(
+    let persisted_slot_a = ledger
+        .intents()
+        .into_iter()
+        .find(|intent| intent.slot == "slot-a")
+        .expect("slot-a is persisted across restart");
+    let intents_before_replay = ledger.intents().len();
+    let launches_before_replay = runner
+        .launched
+        .lock()
+        .expect("fake runner lock holds")
+        .len();
+    let replayed = restarted
+        .launch_child(
             "slot-a",
             RegistryRouteStatus::Admitted,
             "native-worker",
             3,
             ADAPTER_DIGEST,
-            GENERATION_FINGERPRINT
-        ),
-        Err(SwarmCompositionError::DuplicateSlot { .. })
-    ));
+            GENERATION_FINGERPRINT,
+        )
+        .expect("exact child replay after restart is idempotent");
+    assert_eq!(replayed, persisted_slot_a);
+    assert_eq!(ledger.intents().len(), intents_before_replay);
+    assert_eq!(
+        runner
+            .launched
+            .lock()
+            .expect("fake runner lock holds")
+            .len(),
+        launches_before_replay,
+        "exact replay must not call the runner a second time"
+    );
+}
+
+/// Extracts the drifted-field names a `PayloadConflict` detail renders, so the
+/// assertion pins the exact field set rather than a substring that two fields
+/// could both satisfy.
+fn drifted_fields(detail: &str) -> Vec<&str> {
+    detail
+        .split_once("disagrees on ")
+        .expect("conflict detail names the drifted fields")
+        .1
+        .split(", ")
+        .collect()
+}
+
+/// A6, second half: changed same-identity child input conflicts, while the
+/// exact repeat of the same slot is idempotent.
+#[test]
+fn changed_same_identity_child_input_conflicts_while_exact_replay_is_idempotent() {
+    let log = EventLog::default();
+    let attachment = SwarmAttachmentComposition::new(SwarmPlanAttachmentService::new());
+    let ledger = FakeLedger::new(&log);
+    let runner = FakeRunner::new(&log);
+    let mut composition = composition(&attachment, &ledger, &runner);
+    attach(&mut composition);
+
+    let first = composition
+        .launch_child(
+            "slot-a",
+            RegistryRouteStatus::Admitted,
+            "native-worker",
+            3,
+            ADAPTER_DIGEST,
+            GENERATION_FINGERPRINT,
+        )
+        .expect("slot-a launches");
+    let intents_after_first = ledger.intents().len();
+    let launches_after_first = runner
+        .launched
+        .lock()
+        .expect("fake runner lock holds")
+        .len();
+
+    // Exact repeat of the same slot, byte for byte: idempotent. The persisted
+    // intent comes back unchanged and nothing is appended or launched again.
+    let exact = composition
+        .launch_child(
+            "slot-a",
+            RegistryRouteStatus::Admitted,
+            "native-worker",
+            3,
+            ADAPTER_DIGEST,
+            GENERATION_FINGERPRINT,
+        )
+        .expect("exact repeat is idempotent");
+    assert_eq!(exact, first);
+    assert_eq!(ledger.intents().len(), intents_after_first);
+    assert_eq!(
+        runner
+            .launched
+            .lock()
+            .expect("fake runner lock holds")
+            .len(),
+        launches_after_first,
+        "the idempotent arm must not reach the runner again"
+    );
+
+    // Changed input under the same identity never silently relaunches: the same
+    // slot carrying different pinned dispatch material is a conflict, and it
+    // leaves the durable record and the runner untouched.
+    //
+    // Both cases present a route class with no pin yet. A class already pinned
+    // by slot-a is refused one step earlier, by the A8 stale-route gate, so the
+    // replay conflict is what remains to prove for changed input.
+    match composition
+        .launch_child(
+            "slot-a",
+            RegistryRouteStatus::Admitted,
+            "native-worker-fingerprint-drift",
+            3,
+            ADAPTER_DIGEST,
+            [0xF2; 32],
+        )
+        .expect_err("changed same-identity input must conflict")
+    {
+        SwarmCompositionError::PayloadConflict { slot, detail } => {
+            assert_eq!(slot, "slot-a");
+            assert_eq!(
+                drifted_fields(&detail),
+                ["route_class", "generation_fingerprint"],
+                "the conflict names exactly the drifted field: {detail}"
+            );
+        }
+        other => panic!("changed same-identity input must conflict, got {other:?}"),
+    }
+    assert_eq!(ledger.intents().len(), intents_after_first);
+    assert_eq!(
+        runner
+            .launched
+            .lock()
+            .expect("fake runner lock holds")
+            .len(),
+        launches_after_first,
+        "the conflict arm must not reach the runner"
+    );
+
+    // The same holds for a changed adapter-entry digest under one identity.
+    match composition
+        .launch_child(
+            "slot-a",
+            RegistryRouteStatus::Admitted,
+            "native-worker-digest-drift",
+            3,
+            [0xA2; 32],
+            GENERATION_FINGERPRINT,
+        )
+        .expect_err("changed adapter-entry digest must conflict")
+    {
+        SwarmCompositionError::PayloadConflict { slot, detail } => {
+            assert_eq!(slot, "slot-a");
+            assert_eq!(
+                drifted_fields(&detail),
+                ["route_class", "adapter_entry_digest"],
+                "the conflict names exactly the drifted field: {detail}"
+            );
+        }
+        other => panic!("changed adapter-entry digest must conflict, got {other:?}"),
+    }
+    assert_eq!(ledger.intents().len(), intents_after_first);
+    assert_eq!(
+        runner
+            .launched
+            .lock()
+            .expect("fake runner lock holds")
+            .len(),
+        launches_after_first,
+        "the conflict arm must not reach the runner"
+    );
+
+    // A changed route generation is the third pinned field, and it conflicts the
+    // same way: same slot identity, never a second durable record.
+    match composition
+        .launch_child(
+            "slot-a",
+            RegistryRouteStatus::Admitted,
+            "native-worker-generation-drift",
+            4,
+            ADAPTER_DIGEST,
+            GENERATION_FINGERPRINT,
+        )
+        .expect_err("changed route generation must conflict")
+    {
+        SwarmCompositionError::PayloadConflict { slot, detail } => {
+            assert_eq!(slot, "slot-a");
+            assert_eq!(
+                drifted_fields(&detail),
+                ["route_class", "generation"],
+                "the conflict names exactly the drifted field: {detail}"
+            );
+        }
+        other => panic!("changed route generation must conflict, got {other:?}"),
+    }
+
+    // Across all of it: exactly one durable record and one runner call for
+    // slot-a. The conflict arms appended nothing and launched nothing.
+    assert_eq!(ledger.intents().len(), intents_after_first);
+    assert_eq!(
+        runner
+            .launched
+            .lock()
+            .expect("fake runner lock holds")
+            .len(),
+        launches_after_first,
+        "a conflicting replay must not reach the runner"
+    );
+    assert_eq!(composition.launched().len(), 1);
 }
 
 #[test]
