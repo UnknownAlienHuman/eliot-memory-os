@@ -1414,7 +1414,7 @@ mod tests {
         // `"a".repeat(64)` is a placeholder (proof below: it never equals the
         // recomputed digest), so the new validators bind the recomputed value.
         // Cross-crate stability: this uses the same `canonical_request_hash`
-// whose Slice A golden vector is pinned in
+        // whose Slice A golden vector is pinned in
         // `eliot-store-api`'s `request_hash.rs`
         // (`golden_request_hash_is_stable_across_crates`).
         //
