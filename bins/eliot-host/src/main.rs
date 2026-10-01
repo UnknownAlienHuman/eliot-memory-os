@@ -598,8 +598,11 @@ fn run_console() -> (bool, Option<HostLaunchOptions>) {
         service: SERVICE_NAME,
         protocol: PROTOCOL_VERSION,
     }) {
-        let drained = finish_console_shutdown(&mut host, "ready response failed", &launch_options);
-        return (drained, Some(launch_options));
+        // Defect 1 (#982 audit 5910117501): the Ready write is the primary
+        // console outcome; cleanup still drains exactly once below but must
+        // not promote this protocol failure into success.
+        finish_console_shutdown(&mut host, "ready response failed", &launch_options);
+        return (false, Some(launch_options));
     }
     // F-LOG-HOST-7 B7 (issue #982): Ready bytes unchanged; this record never
     // promotes Ready into durable/global readiness (I01.10).
@@ -608,6 +611,11 @@ fn run_console() -> (bool, Option<HostLaunchOptions>) {
         "ready_written",
     );
     observe_console_ready(&host, &launch_options);
+    // Defect 1 (#982 audit 5910117501): the primary console outcome stays
+    // separate from cleanup. `console_failed` records a read/write/protocol
+    // failure; the single drain below still runs exactly once, but a recorded
+    // failure remains failure even when cleanup succeeds.
+    let mut console_failed = false;
     for line in io::stdin().lock().lines() {
         let (response, terminate, served) = match line {
             // Blank input still skips silently by design: not a failure, so
@@ -617,6 +625,9 @@ fn run_console() -> (bool, Option<HostLaunchOptions>) {
             Err(error) => {
                 // F-LOG-HOST-7 B8 (issue #982): read failure keeps Error plus
                 // terminate; the raw error text stays out of diagnostics.
+                // Defect 1: this is a primary console failure, so it must
+                // remain failure even when the drain below succeeds.
+                console_failed = true;
                 eliot_host::host_diagnostics::observe_entrypoint_with_detail(
                     eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
                     "console_read_failed",
@@ -646,6 +657,9 @@ fn run_console() -> (bool, Option<HostLaunchOptions>) {
                 eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
                 "response_write_failed",
             );
+            // Defect 1: a response that never reached the peer is a primary
+            // console failure, even when the drain below succeeds.
+            console_failed = true;
             // #889 projection: the served response never reached the peer.
             let mut unwritten = HostRequestProjection::failed_without_reason(
                 eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
@@ -662,7 +676,7 @@ fn run_console() -> (bool, Option<HostLaunchOptions>) {
         }
     }
     let drained = finish_console_shutdown(&mut host, "console input ended", &launch_options);
-    (drained, Some(launch_options))
+    (drained && !console_failed, Some(launch_options))
 }
 
 /// Runs the one admitted current-user profile supervisor.
