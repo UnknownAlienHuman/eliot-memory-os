@@ -1243,7 +1243,7 @@ impl NativeWorkerClaimConflict {
 )]
 pub enum NativeWorkerClaimResponse {
     /// The claim was admitted; the receipt is the admission proof.
-    Admitted(NativeWorkerClaimReceipt),
+    Admitted(Box<NativeWorkerClaimReceipt>),
     /// The claim was refused for the named typed reason.
     Rejected(NativeWorkerClaimRejection),
     /// The claim identity conflicts with admitted bound work.
