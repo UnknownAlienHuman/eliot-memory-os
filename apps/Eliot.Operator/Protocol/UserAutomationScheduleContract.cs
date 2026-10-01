@@ -911,6 +911,16 @@ public enum UserAutomationOutcomeClass
     /// </summary>
     OwnerBoundTransitionScheduleUnverified,
 
+    /// <summary>
+    /// The known body is owner-shaped and carries this operation's exact
+    /// operation identity, but its own records name another lineage, generation
+    /// or revision: a configuration receipt, wake readback, horizon or
+    /// orchestration record that does not belong to the transition it is
+    /// presented under. It is refused before any schedule projection is read,
+    /// and it never renders as the current operation's result.
+    /// </summary>
+    OwnerBoundTransitionForeignLineage,
+
     /// <summary>The owner reports non-retention, but no independent current-fence comparison is available.</summary>
     OwnerReportedNotRetainedFenceUnverified,
 
@@ -956,6 +966,23 @@ public sealed record UserAutomationOutcome(
 /// optional field: this client does not expose its JSON-RPC identifier, so it
 /// remains null rather than being inferred from the operation key.
 /// </summary>
+/// <remarks>
+/// <para>
+/// Every field here is something this client genuinely holds at submit time.
+/// It deliberately does NOT carry a submitted State Fence: the closed
+/// <see cref="UserAutomationOperatorRequest"/> wire has exactly two members,
+/// <c>operation</c> and <c>idempotency_key</c>, and the Kernel mints the
+/// authenticated fence server-side from the route context and echoes it back on
+/// the envelope (<c>UserAutomationOperatorResultEnvelope.state_fence</c> is
+/// <c>request.context.state_fence</c>). The echoed fence is therefore
+/// owner-observed, not submitted, and comparing an answer against it proves
+/// only that the owner was self-consistent — never that the answer belongs to
+/// the request this client sent. That residual is why the lineage, generation
+/// and revision joins below are enforced against the transition's OWN fence
+/// rather than against a fence held here, and why the absence is stated rather
+/// than papered over with a synthesized value.
+/// </para>
+/// </remarks>
 public sealed record UserAutomationResultValidationContext
 {
     // A reviewed decoder change must explicitly acknowledge the Rust result schema.
@@ -967,15 +994,33 @@ public sealed record UserAutomationResultValidationContext
     // UnverifiedOwnerAnswer.
     private const string SupportedUserAutomationResultSchemaSha256 = "c71ee40384dba3eaebac57d4c92c9e7406a342d6901e532ee362c163e8f7cf1c";
 
+    /// <summary>
+    /// The one operation-ID derivation both sides verify without the submitted
+    /// State Fence, mirroring the Kernel owner's `expected_operation_id`. It is
+    /// declared once and used by both the minting and the self-check below: two
+    /// copies of this literal could drift apart, and a drifted self-check would
+    /// refuse every answer while the minting half still looked correct.
+    /// </summary>
+    private const string OperationIdPrefix = "user-automation-operation:";
+
+    /// <summary>
+    /// The same bounded identity width the classifier reads a submitted
+    /// idempotency key at, so a retained operation identity is admitted under
+    /// exactly the rule the answer it must match is read under.
+    /// </summary>
+    private const int MaxRetainedOperationIdChars = 256;
+
     private UserAutomationResultValidationContext(
         string expectedOperationId,
         string expectedIdempotencyKey,
+        string retainedOperationId,
         string expectedResultWireId,
         int supportedResultWireVersion,
         string? transportCorrelationId)
     {
         ExpectedOperationId = expectedOperationId;
         ExpectedIdempotencyKey = expectedIdempotencyKey;
+        RetainedOperationId = retainedOperationId;
         ExpectedResultWireId = expectedResultWireId;
         SupportedResultWireVersion = supportedResultWireVersion;
         TransportCorrelationId = transportCorrelationId;
@@ -984,6 +1029,16 @@ public sealed record UserAutomationResultValidationContext
     public string ExpectedOperationId { get; }
 
     public string ExpectedIdempotencyKey { get; }
+
+    /// <summary>
+    /// The submitted operation identity durably retained beside the transmitted
+    /// request, as read back from the pending-operation journal. Retaining it
+    /// here rather than comparing it at the call site means the decoder itself
+    /// refuses an answer whose request no longer binds the retained operation,
+    /// so no other caller can reach <see cref="UserAutomationOutcomeClassifier.Read"/>
+    /// without carrying that proof.
+    /// </summary>
+    public string RetainedOperationId { get; }
 
     /// <summary>The versioned result contract this decoder admits.</summary>
     public string ExpectedResultWireId { get; }
@@ -999,17 +1054,26 @@ public sealed record UserAutomationResultValidationContext
 
     /// <summary>
     /// Creates validation context from the same request value that is sent or
-    /// retained for recovery. It preserves the exact retry key; the retained
-    /// request reader deliberately does not rederive it through today's
-    /// serializer. A newly minted request has already derived its key in
+    /// retained for recovery, together with the submitted operation identity the
+    /// pending-operation journal retained for it. It preserves the exact retry
+    /// key; the retained request reader deliberately does not rederive it through
+    /// today's serializer. A newly minted request has already derived its key in
     /// <see cref="UserAutomationOperatorRequest.Create"/>.
     /// </summary>
     public static UserAutomationResultValidationContext FromRequest(
         UserAutomationOperatorRequest request,
+        string retainedOperationId,
         string? transportCorrelationId = null)
     {
         ArgumentNullException.ThrowIfNull(request);
         request.Validate();
+        if (string.IsNullOrWhiteSpace(retainedOperationId)
+            || retainedOperationId.Length > MaxRetainedOperationIdChars
+            || retainedOperationId.Any(char.IsControl))
+        {
+            throw new ArgumentException("retained submitted operation identity is malformed", nameof(retainedOperationId));
+        }
+
         if (transportCorrelationId is not null
             && (string.IsNullOrWhiteSpace(transportCorrelationId)
                 || transportCorrelationId.Length > 256
@@ -1019,8 +1083,9 @@ public sealed record UserAutomationResultValidationContext
         }
 
         return new UserAutomationResultValidationContext(
-            $"user-automation-operation:{request.IdempotencyKey}",
+            OperationIdPrefix + request.IdempotencyKey,
             request.IdempotencyKey,
+            retainedOperationId,
             OperatorScheduleContract.USER_AUTOMATION_RESULT_WIRE_ID,
             OperatorScheduleContract.USER_AUTOMATION_RESULT_WIRE_VERSION,
             transportCorrelationId);
@@ -1030,8 +1095,9 @@ public sealed record UserAutomationResultValidationContext
     public bool IsValid() =>
         string.Equals(
             ExpectedOperationId,
-            $"user-automation-operation:{ExpectedIdempotencyKey}",
+            OperationIdPrefix + ExpectedIdempotencyKey,
             StringComparison.Ordinal)
+        && string.Equals(RetainedOperationId, ExpectedIdempotencyKey, StringComparison.Ordinal)
         && string.Equals(
             ExpectedResultWireId,
             OperatorScheduleContract.USER_AUTOMATION_RESULT_WIRE_ID,
@@ -1088,7 +1154,9 @@ public static class UserAutomationOutcomeClassifier
         ArgumentNullException.ThrowIfNull(context);
         if (!context.IsValid())
         {
-            return UnverifiedOwnerAnswer(action, "the submitted result-validation context is unsupported");
+            return UnverifiedOwnerAnswer(
+                action,
+                "the submitted result-validation context does not name the current closed wire contract and the durably retained submitted operation");
         }
         if (answer.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null)
         {
@@ -1267,11 +1335,22 @@ public static class UserAutomationOutcomeClassifier
         // answer is described, and a nested projection never compensates for a
         // foreign parent result.
         if (recovery.ValueKind != JsonValueKind.Null
-            || !HasUserAutomationTransitionProperties(value, context, answer))
+            || !TryReadKnownTransition(value, context, answer, out var transition, out var parent))
         {
             return UnverifiedOwnerAnswer(
                 action,
                 "the known owner transition does not bind the expected operation identity, current transition wire version, and matching nested/envelope State Fence");
+        }
+
+        // A body that passed its own identity and envelope fence can still carry
+        // records from another lineage, generation or revision. Those records are
+        // refused here with their own typed disposition rather than folded into
+        // the shape failure above, because the mismatch class and the recovery
+        // action are different: the answer answered this operation, and something
+        // inside it does not belong to it.
+        if (!HasCurrentPhasesBoundToParent(transition, parent))
+        {
+            return ForeignLineageRefusal(action);
         }
 
         var projection = FindScheduleProjection(answer);
@@ -1359,7 +1438,8 @@ public static class UserAutomationOutcomeClassifier
                 ScheduleProjection: null);
         }
 
-        if (HasUserAutomationTransitionProperties(value, context, answer)
+        if (TryReadKnownTransition(value, context, answer, out var unknownTransition, out var unknownParent)
+            && HasCurrentPhasesBoundToParent(unknownTransition, unknownParent)
             && HasExactProperties(recovery, "kind", "reason")
             && TryReadBoundedText(recovery, "kind", 64, out var transitionRecoveryKind)
             && (string.Equals(transitionRecoveryKind, "unknown_outcome", StringComparison.Ordinal)
@@ -1393,20 +1473,212 @@ public static class UserAutomationOutcomeClassifier
     /// Admits only the current transition nested in the versioned result
     /// wrapper. No wire version is inferred from a familiar member census.
     /// </summary>
-    private static bool HasUserAutomationTransitionProperties(
+    /// <remarks>
+    /// The order is the proof, not a style choice. The transition's own closed
+    /// shape is settled first, then its exact operation identity against the
+    /// submitted context, then its State Fence, and only then — in the separate
+    /// <see cref="HasCurrentPhasesBoundToParent"/> pass — are the nested phase
+    /// records read, joined to that one identity and that one fence. A record
+    /// that belongs to another lineage, generation or revision is therefore
+    /// refused before any schedule projection is scanned and before an
+    /// "answered" summary is produced.
+    /// </remarks>
+    private static bool TryReadKnownTransition(
         JsonElement value,
         UserAutomationResultValidationContext context,
-        JsonElement answer) =>
-        HasExactProperties(value, OperatorScheduleContract.USER_AUTOMATION_TRANSITION_VALUE_MEMBERS)
-        && TryGetObject(value, "transition", out var transition)
-        && HasCurrentTransitionShape(transition)
-        && HasCurrentInspectionProjection(value)
-        && TryGetObject(transition, "identity", out var identity)
-        && MatchesOperationIdentity(identity, context, CanonicalRequestHashMember)
-        && TryGetObject(transition, "state_fence", out var stateFence)
-        && IsClosedStateFence(stateFence)
-        && TryGetObject(answer, "state_fence", out var envelopeFence)
-        && SameSerializedFence(stateFence, envelopeFence);
+        JsonElement answer,
+        out JsonElement transition,
+        out UserAutomationParentBinding parent)
+    {
+        transition = default;
+        parent = default;
+        return HasExactProperties(value, OperatorScheduleContract.USER_AUTOMATION_TRANSITION_VALUE_MEMBERS)
+            && TryGetObject(value, "transition", out transition)
+            && HasCurrentTransitionShape(transition)
+            && HasCurrentInspectionProjection(value)
+            && TryReadParentBinding(transition, context, out parent)
+            && TryGetObject(answer, "state_fence", out var envelopeFence)
+            && SameSerializedFence(parent.StateFence, envelopeFence);
+    }
+
+    /// <summary>
+    /// The one parent every nested record in a known transition must belong to:
+    /// the transition's own exact Store operation identity and its own State
+    /// Fence. This is the comparand this client genuinely holds for the lineage,
+    /// generation and revision of a result. It is NOT a submitted fence — see
+    /// <see cref="UserAutomationResultValidationContext"/> — so it proves the
+    /// body is one operation's own self-consistent record and never that the
+    /// body answers the request this client sent.
+    /// </summary>
+    private readonly record struct UserAutomationParentBinding(
+        string OperationId,
+        string IdempotencyKey,
+        string CanonicalRequestHash,
+        JsonElement StateFence);
+
+    /// <summary>
+    /// Reads the transition's parent identity and fence together, so a later
+    /// comparison cannot bind a phase record to a fence taken from a different
+    /// member than the identity it was checked beside.
+    /// </summary>
+    private static bool TryReadParentBinding(
+        JsonElement transition,
+        UserAutomationResultValidationContext context,
+        out UserAutomationParentBinding parent)
+    {
+        parent = default;
+        if (!TryGetObject(transition, "identity", out var identity)
+            || !MatchesOperationIdentity(identity, context, CanonicalRequestHashMember)
+            || !TryReadBoundedText(identity, "operation_id", MaxOperationIdChars, out var operationId)
+            || !TryReadBoundedText(identity, "idempotency_key", MaxIdentityChars, out var idempotencyKey)
+            || !TryReadBoundedText(identity, CanonicalRequestHashMember, 64, out var canonicalRequestHash)
+            || !IsLowerHexSha256(canonicalRequestHash)
+            || !TryGetObject(transition, "state_fence", out var stateFence)
+            || !IsClosedStateFence(stateFence))
+        {
+            return false;
+        }
+
+        parent = new UserAutomationParentBinding(
+            operationId,
+            idempotencyKey,
+            canonicalRequestHash,
+            stateFence);
+        return true;
+    }
+
+    /// <summary>
+    /// Every nested phase record of a known transition must name the transition's
+    /// own operation identity and its own State Fence. The Kernel owner already
+    /// refuses a body whose receipt, readback or obligation belongs to another
+    /// parent (`UserAutomationOperatorTransition::validate_phase_joins`), so this
+    /// is not a second semantic rule: it is the same join enforced at the
+    /// decoder, which is where a substituted fixture, a spliced body or a
+    /// transport defect that never passed the owner would otherwise be caught by
+    /// nothing but a familiar member census.
+    /// </summary>
+    private static bool HasCurrentPhasesBoundToParent(
+        JsonElement transition,
+        UserAutomationParentBinding parent)
+    {
+        if (!TryGetObject(transition, "configuration", out var configuration)
+            || !TryGetObject(transition, "wake", out var wake)
+            || !TryGetObject(transition, "execution", out var execution)
+            || !HasCurrentConfigurationPhase(configuration, parent)
+            || !HasCurrentWakePhase(wake, parent)
+            || !HasCurrentExecutionPhase(execution)
+        {
+            return false;
+        }
+
+        var committed = TryReadCommittedRevisionBinding(configuration);
+
+        if (transition.TryGetProperty("horizon", out var horizon)
+            && (!OptionalRecordIsAbsentOrObject(transition, "horizon")
+                || !HasCurrentHorizonPhase(horizon, committed)))
+        {
+            return false;
+        }
+
+        return !transition.TryGetProperty(OptionalOrchestrationMember, out var orchestration)
+            || (OptionalRecordIsAbsentOrObject(transition, OptionalOrchestrationMember)
+                && HasCurrentOrchestrationRecord(orchestration, parent, committed));
+    }
+
+    /// <summary>
+    /// The automation identity of the committed revision this transition carries,
+    /// when it carries one. A transition that mutates a revision is the only one
+    /// whose horizon and orchestration records are joined to it by the owner, so
+    /// an absent binding is not a gap: there is nothing for those joins to
+    /// compare against.
+    /// </summary>
+    private readonly record struct UserAutomationCommittedRevision(string AutomationId, string Revision);
+
+    private static bool TryReadCommittedRevisionBinding(
+        JsonElement configuration,
+        out UserAutomationCommittedRevision committed)
+    {
+        committed = default;
+        if (!TryReadClosedValue(
+                configuration,
+                "kind",
+                OperatorScheduleContract.USER_AUTOMATION_CONFIGURATION_PHASE_KINDS,
+                out var kind)
+            || kind is not ("committed" or "replayed")
+            || !TryGetObject(configuration, "result", out var result)
+            || !TryReadBoundedText(result, "kind", 64, out var resultKind)
+            || !string.Equals(resultKind, "revision", StringComparison.Ordinal)
+            || !TryGetObject(result, "revision", out var revision)
+            || !TryReadBoundedText(revision, "automation_id", MaxIdentityChars, out var automationId)
+            || !TryReadBoundedText(revision, "revision", MaxIdentityChars, out var revisionId))
+        {
+            return false;
+        }
+
+        committed = new UserAutomationCommittedRevision(automationId, revisionId);
+        return true;
+    }
+
+    /// <summary>
+    /// Exact text equality against the parent operation identity, for the one
+    /// projection that carries the identity as a nested closed object (the
+    /// orchestration record's parent and the transition's own identity).
+    /// </summary>
+    private static bool IsParentOperationIdentity(
+        JsonElement identity,
+        UserAutomationParentBinding parent) =>
+        TryReadBoundedText(identity, "operation_id", MaxOperationIdChars, out var operationId)
+        && string.Equals(operationId, parent.OperationId, StringComparison.Ordinal)
+        && TryReadBoundedText(identity, "idempotency_key", MaxIdentityChars, out var idempotencyKey)
+        && string.Equals(idempotencyKey, parent.IdempotencyKey, StringComparison.Ordinal)
+        && TryReadBoundedText(identity, CanonicalRequestHashMember, 64, out var canonicalRequestHash)
+        && string.Equals(canonicalRequestHash, parent.CanonicalRequestHash, StringComparison.Ordinal);
+
+    /// <summary>
+    /// The same equality for a record that projects the identity as three
+    /// sibling members instead of one nested object. Each is read under the
+    /// bound the classifier already used for it, and each is compared exactly;
+    /// the canonical request hash member is read at the 64-character digest
+    /// bound because that is what makes it the same Store commitment.
+    /// </summary>
+    private static bool IsParentOperationTriple(
+        JsonElement record,
+        string operationIdMember,
+        string idempotencyKeyMember,
+        int idempotencyKeyBound,
+        UserAutomationParentBinding parent) =>
+        TryReadBoundedText(record, operationIdMember, MaxOperationIdChars, out var operationId)
+        && string.Equals(operationId, parent.OperationId, StringComparison.Ordinal)
+        && TryReadBoundedText(record, idempotencyKeyMember, idempotencyKeyBound, out var idempotencyKey)
+        && string.Equals(idempotencyKey, parent.IdempotencyKey, StringComparison.Ordinal)
+        && TryReadBoundedText(record, CanonicalRequestHashMember, 64, out var canonicalRequestHash)
+        && string.Equals(canonicalRequestHash, parent.CanonicalRequestHash, StringComparison.Ordinal);
+
+    /// <summary>
+    /// Serialized equality against the parent State Fence. Comparing the raw
+    /// serialized object rather than three selected members is deliberate: it
+    /// settles the lineage, the generation and every revision member at once, so
+    /// a receipt or an orchestration record from an adjacent generation is
+    /// refused even though it is individually a well-formed closed fence.
+    /// </summary>
+    private static bool IsParentStateFence(JsonElement stateFence, UserAutomationParentBinding parent) =>
+        SameSerializedFence(stateFence, parent.StateFence);
+
+    /// <summary>
+    /// The automation-identity join the owner applies to a horizon or
+    /// orchestration record when the transition carries a committed revision.
+    /// A transition that carries no committed revision (a read, or a `run_now`
+    /// with no revision mutation) has nothing to compare, exactly as the owner's
+    /// `committed_revision` returns `None` for those cases and the join is
+    /// skipped rather than invented.
+    /// </summary>
+    private static bool IsCommittedRevisionOf(
+        UserAutomationCommittedRevision committed,
+        string automationId,
+        string automationRevision) =>
+        committed.AutomationId is null
+        || (string.Equals(committed.AutomationId, automationId, StringComparison.Ordinal)
+            && string.Equals(committed.Revision, automationRevision, StringComparison.Ordinal));
 
     private static bool HasCurrentResultEnvelope(
         JsonElement answer,
@@ -1439,6 +1711,13 @@ public static class UserAutomationOutcomeClassifier
         && TryReadBoundedText(correlation, "idempotency_key", MaxIdentityChars, out var idempotencyKey)
         && string.Equals(idempotencyKey, context.ExpectedIdempotencyKey, StringComparison.Ordinal);
 
+    /// <summary>
+    /// The closed shape of the transition itself: its own wire identity and
+    /// version, and the bounded shape of its own identity and State Fence. It
+    /// settles nothing about the phase records; those are read separately,
+    /// joined to the parent this method is applied to, so a familiar shape can
+    /// never stand in for a parent binding.
+    /// </summary>
     private static bool HasCurrentTransitionShape(JsonElement transition) =>
         HasAllowedAndRequiredProperties(
             transition,
@@ -1451,24 +1730,18 @@ public static class UserAutomationOutcomeClassifier
         && versionValue.TryGetInt32(out var version)
         && version == OperatorScheduleContract.USER_AUTOMATION_TRANSITION_WIRE_VERSION
         && TryGetObject(transition, "identity", out var identity)
-        && HasExactProperties(identity, "operation_id", "canonical_request_hash", "idempotency_key")
+        && HasExactProperties(identity, "operation_id", CanonicalRequestHashMember, "idempotency_key")
         && TryReadBoundedText(identity, "operation_id", MaxOperationIdChars, out _)
-        && TryReadBoundedText(identity, "canonical_request_hash", 64, out var canonicalHash)
+        && TryReadBoundedText(identity, CanonicalRequestHashMember, 64, out var canonicalHash)
         && IsLowerHexSha256(canonicalHash)
         && TryReadBoundedText(identity, "idempotency_key", MaxIdentityChars, out _)
         && TryGetObject(transition, "state_fence", out var stateFence)
         && IsClosedStateFence(stateFence)
-        && TryGetObject(transition, "configuration", out var configuration)
-        && HasCurrentConfigurationPhase(configuration)
-        && TryGetObject(transition, "wake", out var wake)
-        && HasCurrentWakePhase(wake)
-        && TryGetObject(transition, "execution", out var execution)
-        && HasCurrentExecutionPhase(execution)
+        && TryGetObject(transition, "configuration", out _)
+        && TryGetObject(transition, "wake", out _)
+        && TryGetObject(transition, "execution", out _)
         && OptionalRecordIsAbsentOrObject(transition, "horizon")
-        && (!transition.TryGetProperty("horizon", out var horizon) || HasCurrentHorizonPhase(horizon))
-        && OptionalRecordIsAbsentOrObject(transition, OptionalOrchestrationMember)
-        && (!transition.TryGetProperty(OptionalOrchestrationMember, out var orchestration)
-            || HasCurrentOrchestrationRecord(orchestration));
+        && OptionalRecordIsAbsentOrObject(transition, OptionalOrchestrationMember);
 
     // Rust serializes both Option records with skip_serializing_if=None. An
     // absent member means None; explicit null is outside the current wire.
@@ -1476,7 +1749,17 @@ public static class UserAutomationOutcomeClassifier
         !value.TryGetProperty(propertyName, out var optional)
         || optional.ValueKind == JsonValueKind.Object;
 
-    private static bool HasCurrentConfigurationPhase(JsonElement phase)
+    /// <summary>
+    /// The configuration phase, joined to its parent. A committed or replayed
+    /// phase carries the Store's own receipt for this operation, so its
+    /// identity and State Fence must be the parent's. The owner refuses this
+    /// join at `validate_phase_joins`; refusing it here as well is what keeps a
+    /// foreign receipt from rendering, because a body that never passed the
+    /// owner reaches this decoder unchanged.
+    /// </summary>
+    private static bool HasCurrentConfigurationPhase(
+        JsonElement phase,
+        UserAutomationParentBinding parent)
     {
         if (!TryReadClosedValue(
                 phase,
@@ -1494,9 +1777,9 @@ public static class UserAutomationOutcomeClassifier
                 && HasCurrentReadResult(readResult),
             "committed" or "replayed" => HasExactProperties(phase, "kind", "receipt", "result")
                 && TryGetObject(phase, "receipt", out var receipt)
-                && HasCurrentWriteReceipt(receipt)
+                && HasCurrentWriteReceipt(receipt, parent)
                 && TryGetObject(phase, "result", out var mutationResult)
-                && HasCurrentMutationResult(mutationResult),
+                && HasCurrentMutationResult(mutationResult, parent),
             _ => false
         };
     }
@@ -1676,17 +1959,19 @@ public static class UserAutomationOutcomeClassifier
         return true;
     }
 
-    private static bool HasCurrentWriteReceipt(JsonElement receipt) =>
+    private static bool HasCurrentWriteReceipt(JsonElement receipt, UserAutomationParentBinding parent) =>
         HasExactProperties(receipt, OperatorScheduleContract.USER_AUTOMATION_WRITE_RECEIPT_MEMBERS)
-        && TryReadBoundedText(receipt, "operation_id", MaxOperationIdChars, out _)
-        && TryReadBoundedText(receipt, "idempotency_key", OperatorScheduleContract.MAX_TEXT_BYTES, out _)
-        && TryReadBoundedText(receipt, "canonical_request_hash", 64, out var requestHash)
-        && IsLowerHexSha256(requestHash)
+        && IsParentOperationTriple(
+            receipt,
+            "operation_id",
+            "idempotency_key",
+            MaxIdentityChars,
+            parent)
         && TryReadClosedValue(receipt, "transition_class", OperatorScheduleContract.USER_AUTOMATION_TRANSITION_CLASSES, out _)
         && TryReadClosedValue(receipt, "status", OperatorScheduleContract.USER_AUTOMATION_WRITE_RECEIPT_STATUS_VALUES, out _)
         && HasOptionalBoundedText(receipt, "commit_id", OperatorScheduleContract.MAX_TEXT_BYTES)
         && TryGetObject(receipt, "state_fence", out var receiptFence)
-        && IsClosedStateFence(receiptFence)
+        && IsParentStateFence(receiptFence, parent)
         && HasObjectArray(receipt, "ordering_sequences")
         && HasObjectArray(receipt, "revision_before_after")
         && HasBoundedStringArray(receipt, "applied_command_ids", OperatorScheduleContract.MAX_TEXT_BYTES)
@@ -1706,20 +1991,35 @@ public static class UserAutomationOutcomeClassifier
         && HasOptionalBoundedText(receipt, "committed_at", OperatorScheduleContract.MAX_TEXT_BYTES)
         && OptionalRecordIsAbsentOrObject(receipt, "envelope");
 
-    private static bool HasCurrentWakeIntent(JsonElement intent) =>
+    private static bool HasCurrentWakeIntent(
+        JsonElement intent,
+        UserAutomationParentBinding parent) =>
         HasExactProperties(intent, OperatorScheduleContract.USER_AUTOMATION_WAKE_INTENT_MEMBERS)
         && TryReadBoundedText(intent, "wake_id", OperatorScheduleContract.MAX_TEXT_BYTES, out _)
         && TryReadBoundedText(intent, "reason", OperatorScheduleContract.MAX_TEXT_BYTES, out _)
         && TryGetObject(intent, "state_fence", out var fence)
-        && IsClosedStateFence(fence)
+        && IsParentStateFence(fence, parent)
         && TryReadClosedValue(intent, "state", OperatorScheduleContract.USER_AUTOMATION_WAKE_INTENT_STATE_VALUES, out _);
 
-    private static bool HasCurrentWakeReadback(JsonElement readback) =>
+    /// <summary>
+    /// The wake owner's readback, joined to its parent. The readback names the
+    /// operation it published under; the owner refuses a readback whose identity
+    /// is not its committed parent (`wake readback identity does not match its
+    /// committed parent`), so a readback published for another operation is
+    /// refused here rather than read as this occurrence's published wake.
+    /// </summary>
+    private static bool HasCurrentWakeReadback(
+        JsonElement readback,
+        UserAutomationParentBinding parent) =>
         HasExactProperties(readback, OperatorScheduleContract.USER_AUTOMATION_WAKE_READBACK_MEMBERS)
         && TryGetObject(readback, "intent", out var intent)
-        && HasCurrentWakeIntent(intent)
-        && TryReadBoundedText(readback, "operation_id", MaxOperationIdChars, out _)
-        && TryReadBoundedText(readback, "idempotency_key", OperatorScheduleContract.MAX_TEXT_BYTES, out _)
+        && HasCurrentWakeIntent(intent, parent)
+        && IsParentOperationTriple(
+            readback,
+            "operation_id",
+            "idempotency_key",
+            OperatorScheduleContract.MAX_TEXT_BYTES,
+            parent)
         && TryReadBoundedText(readback, "record_checksum", 64, out var checksum)
         && IsLowerHexSha256(checksum);
 
@@ -1816,7 +2116,15 @@ public static class UserAutomationOutcomeClassifier
             : HasExactProperties(reason, "kind");
     }
 
-    private static bool HasCurrentMutationResult(JsonElement result)
+    /// <summary>
+    /// The mutation result, joined to its parent. A committed `run_now` intent
+    /// is an owner record of this operation's occurrence, so its State Fence
+    /// must be the parent's; the owner refuses exactly that at
+    /// `RunNow phases are not bound to the committed occurrence`.
+    /// </summary>
+    private static bool HasCurrentMutationResult(
+        JsonElement result,
+        UserAutomationParentBinding parent)
     {
         if (!TryReadClosedValue(
                 result,
@@ -1837,12 +2145,12 @@ public static class UserAutomationOutcomeClassifier
                 && TryGetObject(result, "invocation", out var invocation)
                 && HasCurrentInvocation(invocation)
                 && TryGetObject(result, "wake_intent", out var wakeIntent)
-                && HasCurrentWakeIntent(wakeIntent),
+                && HasCurrentWakeIntent(wakeIntent, parent),
             _ => false
         };
     }
 
-    private static bool HasCurrentWakePhase(JsonElement phase)
+    private static bool HasCurrentWakePhase(JsonElement phase, UserAutomationParentBinding parent)
     {
         if (!TryReadClosedValue(phase, "kind", OperatorScheduleContract.USER_AUTOMATION_WAKE_PHASE_KINDS, out var kind))
         {
@@ -1855,7 +2163,7 @@ public static class UserAutomationOutcomeClassifier
                 && TryReadBoundedText(phase, "reason", MaxRecoveryReasonChars, out _),
             "published" => HasExactProperties(phase, "kind", "readback")
                 && TryGetObject(phase, "readback", out var readback)
-                && HasCurrentWakeReadback(readback),
+                && HasCurrentWakeReadback(readback, parent),
             "cancelled" => HasExactProperties(phase, "kind", "cancelled_wake_ids")
                 && HasBoundedStringArray(phase, "cancelled_wake_ids", OperatorScheduleContract.MAX_TEXT_BYTES),
             "unknown_outcome" or "unavailable" => HasExactProperties(phase, "kind", "reason")
@@ -1901,15 +2209,27 @@ public static class UserAutomationOutcomeClassifier
         };
     }
 
-    private static bool HasCurrentHorizonPhase(JsonElement phase)
+    /// <summary>
+    /// The horizon phase, joined to the committed revision it publishes for when
+    /// this transition carries one. The owner refuses a horizon naming another
+    /// automation or another revision (`horizon belongs to another committed
+    /// revision`), so a horizon for a different revision is refused here instead
+    /// of rendering as this operation's publication result. When the transition
+    /// carries no committed revision there is nothing to compare, and the
+    /// horizon is read for its closed shape alone.
+    /// </summary>
+    private static bool HasCurrentHorizonPhase(
+        JsonElement phase,
+        UserAutomationCommittedRevision committed)
     {
         if (!HasAllowedAndRequiredProperties(
                 phase,
                 OperatorScheduleContract.USER_AUTOMATION_HORIZON_PHASE_MEMBERS,
                 OperatorScheduleContract.USER_AUTOMATION_HORIZON_PHASE_MEMBERS)
             || !TryReadClosedValue(phase, "trigger", OperatorScheduleContract.USER_AUTOMATION_HORIZON_TRIGGER_VALUES, out _)
-            || !TryReadBoundedText(phase, "automation_id", MaxIdentityChars, out _)
-            || !TryReadBoundedText(phase, "automation_revision", MaxIdentityChars, out _)
+            || !TryReadBoundedText(phase, "automation_id", MaxIdentityChars, out var automationId)
+            || !TryReadBoundedText(phase, "automation_revision", MaxIdentityChars, out var automationRevision)
+            || !IsCommittedRevisionOf(committed, automationId, automationRevision)
             || !TryReadBoundedText(phase, "revision_digest", 64, out var revisionDigest)
             || !IsLowerHexSha256(revisionDigest)
             || !HasBoundedStringArray(phase, "requested_occurrence_ids", OperatorScheduleContract.MAX_TEXT_BYTES)
@@ -1934,22 +2254,40 @@ public static class UserAutomationOutcomeClassifier
         };
     }
 
-    private static bool HasCurrentOrchestrationRecord(JsonElement record)
+    /// <summary>
+    /// The post-commit orchestration record, joined to the parent operation.
+    /// The owner refuses a record whose `parent` identity or `state_fence` is not
+    /// this transition's own (`a post-commit orchestration record is not bound to
+    /// this parent operation and State Fence`), so a record belonging to another
+    /// parent is refused here rather than read as this operation's durable
+    /// runtime-obligation record.
+    /// </summary>
+    /// <remarks>
+    /// The record's `committed_receipt_digest` and each obligation's
+    /// `owner_operation_id` are deliberately NOT recomputed here. Both are
+    /// derived values — a Store receipt evidence digest, and a canonical-JSON
+    /// derivation over the parent identity, the obligation kind and the subject
+    /// set — so reproducing them would mean a UI decoder owning the owner's
+    /// canonical encoding. The owner computes and enforces both. What this
+    /// decoder adds is the exact parent join that decides whether the record is
+    /// about this operation at all.
+    /// </remarks>
+    private static bool HasCurrentOrchestrationRecord(
+        JsonElement record,
+        UserAutomationParentBinding parent,
+        UserAutomationCommittedRevision committed)
     {
         if (!HasAllowedAndRequiredProperties(
                 record,
                 OperatorScheduleContract.USER_AUTOMATION_ORCHESTRATION_RECORD_MEMBERS,
                 OperatorScheduleContract.USER_AUTOMATION_ORCHESTRATION_RECORD_MEMBERS)
-            || !TryGetObject(record, "parent", out var parent)
-            || !HasExactProperties(parent, "operation_id", "canonical_request_hash", "idempotency_key")
-            || !TryReadBoundedText(parent, "operation_id", MaxOperationIdChars, out _)
-            || !TryReadBoundedText(parent, "canonical_request_hash", 64, out var parentHash)
-            || !IsLowerHexSha256(parentHash)
-            || !TryReadBoundedText(parent, "idempotency_key", MaxIdentityChars, out _)
+            || !TryGetObject(record, "parent", out var parentIdentity)
+            || !IsParentOperationIdentity(parentIdentity, parent)
             || !TryGetObject(record, "state_fence", out var stateFence)
-            || !IsClosedStateFence(stateFence)
-            || !TryReadBoundedText(record, "automation_id", MaxIdentityChars, out _)
-            || !TryReadBoundedText(record, "automation_revision", MaxIdentityChars, out _)
+            || !IsParentStateFence(stateFence, parent)
+            || !TryReadBoundedText(record, "automation_id", MaxIdentityChars, out var automationId)
+            || !TryReadBoundedText(record, "automation_revision", MaxIdentityChars, out var automationRevision)
+            || !IsCommittedRevisionOf(committed, automationId, automationRevision)
             || !TryReadBoundedText(record, "revision_digest", 64, out var revisionDigest)
             || !IsLowerHexSha256(revisionDigest)
             || !TryReadBoundedText(record, "committed_receipt_digest", 64, out var receiptDigest)
@@ -1966,6 +2304,12 @@ public static class UserAutomationOutcomeClassifier
                     OperatorScheduleContract.USER_AUTOMATION_RUNTIME_OBLIGATION_MEMBERS,
                     OperatorScheduleContract.USER_AUTOMATION_RUNTIME_OBLIGATION_MEMBERS)
                 || !TryReadClosedValue(obligation, "kind", OperatorScheduleContract.USER_AUTOMATION_RUNTIME_OBLIGATION_KINDS, out _)
+                // The obligation's owner operation id is digest-derived
+                // (`PREFIX:kind:sha256` over the parent identity triple, the
+                // kind and the exact subject set), so it is not string-comparable
+                // to the parent operation id and is not recomputed here; see the
+                // remarks on this method. The record's own parent join above is
+                // what binds the whole obligation set to this operation.
                 || !TryReadBoundedText(obligation, "owner_operation_id", MaxOperationIdChars, out _)
                 || !TryReadBoundedText(obligation, "request_digest", 64, out var requestDigest)
                 || !IsLowerHexSha256(requestDigest)
@@ -2506,6 +2850,26 @@ public static class UserAutomationOutcomeClassifier
             $"UserAutomation {action} answered — outcome unverified",
             $"{reason}. The operation remains unknown and must be reconciled under its same identity; the Operator does not claim commit or noncommit.",
             RefusalKind: null,
+            RefusalText: null,
+            ScheduleProjection: null);
+
+    /// <summary>
+    /// The typed fault for a known body that answers this operation while
+    /// carrying a record from another lineage, generation or revision. It names
+    /// the mismatch class and the recovery action without naming the foreign
+    /// values, and it never renders a schedule projection: an inner projection
+    /// cannot compensate for a foreign parent record.
+    /// </summary>
+    private static UserAutomationOutcome ForeignLineageRefusal(string action) =>
+        new(
+            UserAutomationOutcomeClass.OwnerBoundTransitionForeignLineage,
+            $"UserAutomation {action} answered — result belongs to another lineage",
+            "This answer carries this operation's exact identity, but a configuration receipt, wake readback, "
+            + "horizon or orchestration record inside it names another lineage, generation or revision, so it is not "
+            + "this operation's result and is not rendered as one. The pending operation stays unresolved under its "
+            + "own identity. Action: reconcile this same operation against the owner's current record before any new "
+            + "submission; do not resubmit on the strength of this answer.",
+            RefusalKind: "foreign_lineage",
             RefusalText: null,
             ScheduleProjection: null);
 

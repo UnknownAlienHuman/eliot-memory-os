@@ -888,7 +888,10 @@ public sealed class MainViewModel : INotifyPropertyChanged
         {
             // Fail closed without touching the pending record: the answer is
             // kept for exact inspection, but it is not decoded as the retained
-            // operation's result and authorizes nothing.
+            // operation's result and authorizes nothing. The same proof is also
+            // carried inside the validation context below, so a caller that
+            // reaches the classifier with an unbound request is refused there
+            // rather than only here.
             ResultSummary = $"{action}: the owner answer was not decoded because the request being displayed no longer binds the retained submitted operation; the record stays reconciling under its own identity.";
             SetBanner(
                 "UserAutomation result not bound to the submitted operation",
@@ -896,7 +899,9 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 OperatorBannerSeverity.Warning);
             return;
         }
-        var validationContext = UserAutomationResultValidationContext.FromRequest(request);
+        var validationContext = UserAutomationResultValidationContext.FromRequest(
+            request,
+            retainedOperationId);
         var outcome = UserAutomationOutcomeClassifier.Read(action, answer, validationContext);
         ResultSummary = outcome.Detail;
         SetBanner(
