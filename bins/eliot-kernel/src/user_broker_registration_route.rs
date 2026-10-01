@@ -70,7 +70,7 @@ struct UserBrokerHeartbeatPayload {
 struct UserBrokerAuthorizeLaunchPayload {
     registration: RegistrationReceipt,
     request: LaunchRequest,
-    /// I1.6 WorkScope the caller claims this execution for. The claim is
+    /// I1.6 `WorkScope` the caller claims this execution for. The claim is
     /// never trusted: the route re-derives the expected scope from the live
     /// registration and refuses anything else.
     work_scope: String,
