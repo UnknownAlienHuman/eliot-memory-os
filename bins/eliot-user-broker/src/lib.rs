@@ -49,6 +49,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 mod bridge_contract;
+mod implementation_deviation_registry;
 mod kernel_authority_port;
 #[cfg(windows)]
 mod native_resource_resolver;
@@ -59,6 +60,10 @@ mod operation_identity;
 mod own_generation_job;
 mod protected_launch_config;
 use bridge_contract::{user_broker_contract, validate_user_broker_contract};
+pub use implementation_deviation_registry::{
+    DeviationRegistration, DeviationRegistrationState, DeviationRegistryError,
+    ImplementationDeviationRegistry,
+};
 use kernel_authority_port::{
     KernelAuthorityPort, OperatorSessionTokenGrant, OperatorSessionTokenRequest,
 };
