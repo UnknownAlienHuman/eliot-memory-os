@@ -11103,12 +11103,14 @@ impl RedbRecoveryStore {
             // from the observation history. Earlier observations are never
             // rewritten and an existing `ResponseReceived` observation is
             // never duplicated.
-            let response_already_observed = current.transport_observations.last().is_some_and(
-                |observation| {
-                    observation.boundary
-                        == crate::HostRequestTransportBoundary::ResponseReceived
-                },
-            );
+            let response_already_observed =
+                current
+                    .transport_observations
+                    .last()
+                    .is_some_and(|observation| {
+                        observation.boundary
+                            == crate::HostRequestTransportBoundary::ResponseReceived
+                    });
             if !response_already_observed {
                 if current.transport_observations.len() >= 3 {
                     return Err(OrsError::ProjectionLimitExceeded);
@@ -11130,9 +11132,7 @@ impl RedbRecoveryStore {
                     payload_commitment_sha256: record.payload_digest.clone(),
                     delivery_receipt: None,
                     response_commitment_sha256: Some(evidence.result_commitment_sha256.clone()),
-                    response_source: Some(
-                        crate::HostRequestResponseSource::AuthenticatedTransport,
-                    ),
+                    response_source: Some(crate::HostRequestResponseSource::AuthenticatedTransport),
                     no_send_proof: None,
                 };
                 observation.validate_for(&record, &current)?;

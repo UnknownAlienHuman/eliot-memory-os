@@ -9163,9 +9163,7 @@ fn decode_retained_cancellation_answer(
             request_sha256,
             state_fence,
             wake_ids,
-        }) = serde_json::from_value::<UserAutomationHostExecutionResponse>(
-            result_response.clone(),
-        )
+        }) = serde_json::from_value::<UserAutomationHostExecutionResponse>(result_response.clone())
         else {
             return Err(unretained_cancellation_answer_reason(
                 automation_revision,
