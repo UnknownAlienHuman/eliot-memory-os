@@ -21,7 +21,10 @@ use thiserror::Error;
 use eliot_contracts::{ContractVersion, StateFence, canonical_json_bytes, sha256_hex};
 
 use crate::first_run::FirstRunDecision;
-use crate::{ConfigPolicySnapshot, HumanOwner, PolicyFence, PolicyRevision, SourceCompleteness};
+use crate::{
+    BlobProcessPolicyValue, ConfigPolicySnapshot, HumanOwner, PolicyFence, PolicyRevision,
+    SourceCompleteness,
+};
 
 /// Stable schema marker for the signed initial configuration snapshot.
 pub const INITIAL_SNAPSHOT_SCHEMA: &str = "eliot.initial-config-snapshot.v1";
@@ -162,6 +165,33 @@ pub fn prepare_initial_snapshot_payload(
     privacy: PrivacyChoice,
     first_run: &FirstRunDecision,
 ) -> Result<InitialSnapshotPayload, InitialSnapshotError> {
+    prepare_initial_snapshot_payload_inner(identity, privacy, first_run, None)
+}
+
+/// Builds the first signed configuration payload with an explicit
+/// Human-admitted process Blob policy and full six-domain residency template.
+/// This is the production setup path for installations that will admit
+/// process-stream Blob capture; no policy or domain is selected by default.
+pub fn prepare_initial_snapshot_payload_with_blob_policy(
+    identity: &InitialSnapshotIdentity,
+    privacy: PrivacyChoice,
+    first_run: &FirstRunDecision,
+    blob_process_policy: &BlobProcessPolicyValue,
+) -> Result<InitialSnapshotPayload, InitialSnapshotError> {
+    prepare_initial_snapshot_payload_inner(
+        identity,
+        privacy,
+        first_run,
+        Some(blob_process_policy),
+    )
+}
+
+fn prepare_initial_snapshot_payload_inner(
+    identity: &InitialSnapshotIdentity,
+    privacy: PrivacyChoice,
+    first_run: &FirstRunDecision,
+    blob_process_policy: Option<&BlobProcessPolicyValue>,
+) -> Result<InitialSnapshotPayload, InitialSnapshotError> {
     identity.validate()?;
     if matches!(privacy, PrivacyChoice::LocalOnly) && first_run.has_paid_route() {
         return Err(InitialSnapshotError::PrivacyChoiceConflict {
@@ -171,6 +201,13 @@ pub fn prepare_initial_snapshot_payload(
     let revision = PolicyRevision::genesis();
     let mut settings = crate::first_run::to_settings(first_run, &identity.owner_ref);
     settings.push(privacy.to_setting(&identity.owner_ref));
+    if let Some(policy) = blob_process_policy {
+        settings.push(
+            policy
+                .to_setting(&identity.owner_ref, &identity.scope_id)
+                .map_err(|error| invalid_field("blob_process_policy", error.to_string()))?,
+        );
+    }
     let snapshot = ConfigPolicySnapshot {
         snapshot_id: identity.snapshot_id.clone(),
         machine_id: identity.machine_id.clone(),

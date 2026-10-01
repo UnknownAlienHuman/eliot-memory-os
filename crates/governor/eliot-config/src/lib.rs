@@ -7,6 +7,12 @@
 
 pub mod initial_snapshot;
 pub mod legacy_capability_import;
+pub mod blob_process_policy;
+
+pub use blob_process_policy::{
+    BLOB_PROCESS_POLICY_LITERAL_PREFIX, BLOB_PROCESS_POLICY_SCHEMA,
+    BLOB_PROCESS_POLICY_SETTING_KEY, BlobProcessPolicyError, BlobProcessPolicyValue,
+};
 
 use eliot_contracts::{PolicyRevision, StateFence};
 use eliot_security_contracts::PolicyFence;
@@ -24,6 +30,7 @@ pub use initial_snapshot::{
     InitialSnapshotIdentity, InitialSnapshotPayload, InitialSnapshotSigner,
     InitialSnapshotVerificationContext, PRIVACY_MODE_KEY, PrivacyChoice,
     SignedInitialConfigSnapshot, VerifiedInitialConfigSnapshot, prepare_initial_snapshot_payload,
+    prepare_initial_snapshot_payload_with_blob_policy,
 };
 
 pub const CONTRACT_NAME: &str = "eliot.governor.config";
@@ -141,6 +148,12 @@ impl ConfigPolicySnapshot {
             }
             keys.push(setting.key.clone());
         }
+        crate::blob_process_policy::selection_from_settings(
+            &self.settings,
+            &self.policy_owner.owner_ref,
+            &self.scope_id,
+        )
+        .map_err(|_| ConfigError::InvalidSnapshot("blob process policy"))?;
         if let Some(parent) = &self.parent_snapshot_id {
             non_blank(parent, "parent_snapshot_id")?;
         }
@@ -148,6 +161,21 @@ impl ConfigPolicySnapshot {
             non_blank(rollback, "rollback_of")?;
         }
         Ok(())
+    }
+
+    /// Returns the one Human-owned Blob policy and full residency value
+    /// carried by this exact immutable Config snapshot. Absence is preserved
+    /// as `None`; Blob callers that require the policy must refuse on `None`.
+    pub fn blob_process_policy(
+        &self,
+    ) -> Result<Option<BlobProcessPolicyValue>, BlobProcessPolicyError> {
+        self.validate()
+            .map_err(|error| BlobProcessPolicyError::InvalidValue(error.to_string()))?;
+        crate::blob_process_policy::selection_from_settings(
+            &self.settings,
+            &self.policy_owner.owner_ref,
+            &self.scope_id,
+        )
     }
 }
 
