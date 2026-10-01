@@ -3743,8 +3743,7 @@ impl KernelHostRequestPort for KernelHostRequestClient {
             return Err(PortFailure::IdempotencyConflict);
         }
         if let Some((_, _intent_record)) = decode_admitted_reply(&reply, &envelope) {
-            let outcome =
-                self.resolve_cancellation_parent_disposition(&parent, &facts, &session);
+            let outcome = self.resolve_cancellation_parent_disposition(&parent, &facts, &session);
             self.record_settled(parent.request_base.as_str(), outcome)
         } else {
             let outcome = self.resolve_retained_cancellation(
