@@ -4411,7 +4411,7 @@ mod tests {
                 if reason.contains("wire 22.0.0")
         ));
 
-        let bytes = br#"{"wire_version":{"major":23,"minor":0,"patch":0},"transaction":{},"unexpected":true}"#;
+        let bytes = br#"{"wire_version":{"major":26,"minor":0,"patch":0},"transaction":{},"unexpected":true}"#;
         assert!(matches!(
             decode(bytes),
             Err(InstallationError::CorruptRegistry { reason })

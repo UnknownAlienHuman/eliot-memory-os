@@ -200,10 +200,9 @@ impl InstallationRoots {
         &self,
         profile: InstallationProfile,
     ) -> Result<(), InstallationError> {
-        let profile_root = self.runtime_state_roots.installer_profile_root()?;
-        let profile_root = WindowsPathIdentity::parse_root(
-            profile_root.as_str(),
-            "runtime_state_roots.profile_root",
+        let runtime_installation_root = WindowsPathIdentity::parse_root(
+            self.runtime_state_roots.installation_root.as_str(),
+            "runtime_state_roots.installation_root",
         )?;
         let durable = WindowsPathIdentity::parse_root(&self.durable_data, "durable_data")?;
         match profile {
@@ -216,8 +215,8 @@ impl InstallationRoots {
                     "durable_data",
                 )?;
                 if durable != expected_durable
-                    || durable == profile_root
-                    || !durable.contains(&profile_root)
+                    || durable == runtime_installation_root
+                    || !durable.contains(&runtime_installation_root)
                 {
                     return Err(InstallationError::ProfileViolation(
                         "runtime installation root must sit strictly below the I3.1 durable-data root"
@@ -248,8 +247,8 @@ impl InstallationRoots {
                 if durable != expected_data
                     || user_config != expected_config
                     || user_cache != expected_cache
-                    || durable == profile_root
-                    || !durable.contains(&profile_root)
+                    || durable == runtime_installation_root
+                    || !durable.contains(&runtime_installation_root)
                 {
                     return Err(InstallationError::ProfileViolation(
                         "UserMode data, config, cache, and runtime roots must preserve the I3.1 sibling layout"
@@ -260,5 +259,76 @@ impl InstallationRoots {
             InstallationProfile::PortableDev => {}
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durable_runtime_join_uses_the_exact_installation_root() {
+        let program_data = crate::protected_program_data_root()
+            .expect("SystemService test requires the proved ProgramData anchor");
+        let program_data_handle = crate::PlatformHandle::new(
+            program_data.to_string_lossy().into_owned(),
+        )
+        .expect("ProgramData path is a valid handle");
+        let anchors = crate::ProfileRootAnchors {
+            program_files: Some(
+                crate::PlatformHandle::new(r"C:\Program Files")
+                    .expect("Program Files path is a valid handle"),
+            ),
+            program_data: Some(program_data_handle.clone()),
+            local_app_data: crate::PlatformHandle::new(r"C:\Users\eliot\AppData\Local")
+                .expect("LocalAppData path is a valid handle"),
+            repository_root: None,
+        };
+        let profile = InstallationProfile::SystemService;
+        let governed = crate::select_profile_roots(
+            profile,
+            "eliot-host",
+            "1.0.0",
+            None,
+            &anchors,
+        )
+        .expect("I3.1 SystemService roots should resolve from explicit anchors");
+        let valid_runtime_roots = RuntimeStateRoots::derive_profiled(
+            profile,
+            program_data_handle.clone(),
+            &"b".repeat(64),
+        )
+        .expect("normal profiled runtime roots should derive below ProgramData");
+        let durable = WindowsPathIdentity::parse_root(&governed.durable_data, "durable_data")
+            .expect("selected I3.1 durable root is canonical");
+        let installation = WindowsPathIdentity::parse_root(
+            valid_runtime_roots.installation_root.as_str(),
+            "runtime_state_roots.installation_root",
+        )
+        .expect("derived installation root is canonical");
+        assert!(durable.contains(&installation));
+        assert_ne!(durable, installation);
+        governed
+            .clone()
+            .into_installation_roots(valid_runtime_roots)
+            .expect("selected durable root must admit its exact derived installation child");
+
+        let foreign_installation_root = crate::PlatformHandle::new(format!(
+            r"{}\Other\Eliot\installations\{}",
+            program_data_handle.as_str(),
+            "c".repeat(64)
+        ))
+        .expect("foreign installation path is a valid handle");
+        let foreign_runtime_roots = RuntimeStateRoots::derived(
+            profile,
+            program_data_handle,
+            foreign_installation_root,
+        )
+        .expect("runtime topology remains valid under the explicit profile anchor");
+        assert!(matches!(
+            governed.into_installation_roots(foreign_runtime_roots),
+            Err(InstallationError::ProfileViolation(reason))
+                if reason.contains("runtime installation root must sit strictly below")
+        ));
     }
 }
