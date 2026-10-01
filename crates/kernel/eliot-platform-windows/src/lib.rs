@@ -2862,7 +2862,7 @@ impl WindowsPlatform {
         Ok(Self {
             root,
             #[cfg(windows)]
-            root_pin: root_pin,
+            root_pin,
         })
     }
 

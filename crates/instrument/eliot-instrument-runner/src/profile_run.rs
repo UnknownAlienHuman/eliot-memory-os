@@ -40,18 +40,18 @@ use crate::registry::{
     RegistryEntry, RegistryError, ResolvedExecutableIdentity, SupplyChainReceipt,
 };
 use crate::testd_port::{TestdAdmission, TestdAdmissionPort, TestdPortError, testd_dispatchable};
+use crate::{
+    InstrumentBinding, InstrumentRequestPort, InstrumentRunner, InstrumentStartReceipt,
+    RunnerError, bridge_executor_observation,
+};
 use eliot_module_registry::VerifiedModuleCatalogGeneration;
 use eliot_testd_core::{
     InstrumentStageRequest, StageExecutionKind, TestdProviderCatalogLifecycle,
     TestdProviderFingerprints, TestdProviderRegistryFreshness,
 };
-use crate::{
-    InstrumentBinding, InstrumentRequestPort, InstrumentRunner, InstrumentStartReceipt,
-    RunnerError, bridge_executor_observation,
-};
 use eliot_testd_core::{
-    InstrumentStageRequest, StageExecutionKind, TestdProviderCatalogLifecycle, TestdProviderFingerprints,
-    TestdProviderRegistryFreshness,
+    InstrumentStageRequest, StageExecutionKind, TestdProviderCatalogLifecycle,
+    TestdProviderFingerprints, TestdProviderRegistryFreshness,
 };
 
 /// Failures raised while planning or recording profile runs.

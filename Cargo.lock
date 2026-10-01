@@ -2238,6 +2238,7 @@ dependencies = [
  "eliot-instrument-rustc",
  "eliot-instrument-rustfmt",
  "eliot-instrument-scip",
+ "eliot-module-registry",
  "eliot-process",
  "eliot-process-executor",
  "eliot-receipts",

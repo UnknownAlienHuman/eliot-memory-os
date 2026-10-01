@@ -2013,11 +2013,14 @@ fn capture_testd_launch_owner_binding(
                 "productive TestD launch has no retained provider tool observation".to_owned(),
             )
         })?;
-        let environment = job.provider_environment_projection.as_ref().ok_or_else(|| {
-            DispatchLaunchError::Gate(
-                "productive TestD launch has no retained provider environment".to_owned(),
-            )
-        })?;
+        let environment = job
+            .provider_environment_projection
+            .as_ref()
+            .ok_or_else(|| {
+                DispatchLaunchError::Gate(
+                    "productive TestD launch has no retained provider environment".to_owned(),
+                )
+            })?;
         let catalog_lifecycle = stage.provider_catalog_lifecycle.as_ref().ok_or_else(|| {
             DispatchLaunchError::Gate(
                 "productive TestD launch has no accepted Module Catalog lifecycle record"
@@ -2030,7 +2033,7 @@ fn capture_testd_launch_owner_binding(
             tool_observation,
             environment,
         ))
-            .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
         if sha256_hex(&currentness_bytes) != grant.currentness_sha256 {
             return Err(DispatchLaunchError::Gate(
                 "durable TestD Blob grant is bound to different provider currentness material"

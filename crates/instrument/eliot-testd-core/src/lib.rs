@@ -190,17 +190,38 @@ impl TestdProviderCatalogLifecycle {
             .map_err(|error| TestdError::Contract(error.to_string()))?;
         for (field, value) in [
             ("provider_catalog.module_id", self.module_id.as_str()),
-            ("provider_catalog.generation_id", self.generation_id.as_str()),
-            ("provider_catalog.admission_receipt", self.admission_receipt.as_str()),
+            (
+                "provider_catalog.generation_id",
+                self.generation_id.as_str(),
+            ),
+            (
+                "provider_catalog.admission_receipt",
+                self.admission_receipt.as_str(),
+            ),
         ] {
             validate_text(value, field)?;
         }
         for (field, value) in [
-            ("provider_catalog.catalog_digest", self.catalog_digest.as_str()),
-            ("provider_catalog.artifact_digest", self.artifact_digest.as_str()),
-            ("provider_catalog.config_digest", self.config_digest.as_str()),
-            ("provider_catalog.protocol_digest", self.protocol_digest.as_str()),
-            ("provider_catalog.manifest_digest", self.manifest_digest.as_str()),
+            (
+                "provider_catalog.catalog_digest",
+                self.catalog_digest.as_str(),
+            ),
+            (
+                "provider_catalog.artifact_digest",
+                self.artifact_digest.as_str(),
+            ),
+            (
+                "provider_catalog.config_digest",
+                self.config_digest.as_str(),
+            ),
+            (
+                "provider_catalog.protocol_digest",
+                self.protocol_digest.as_str(),
+            ),
+            (
+                "provider_catalog.manifest_digest",
+                self.manifest_digest.as_str(),
+            ),
         ] {
             if !is_binding_digest(value) {
                 return Err(TestdError::Invalid {
@@ -4174,6 +4195,7 @@ impl TestdStore {
             serde_json::to_vec(&job).map_err(|error| TestdError::Corrupt(error.to_string()))?;
         let mut table = write.open_table(JOBS).map_err(database)?;
         table.insert(job_id, encoded.as_slice()).map_err(database)?;
+        drop(table);
         write.commit().map_err(database)?;
         Ok(job)
     }

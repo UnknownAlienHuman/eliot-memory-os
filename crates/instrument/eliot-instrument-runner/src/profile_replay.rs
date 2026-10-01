@@ -8,10 +8,9 @@ use eliot_instrument_nextest::{
     NEXTEST_INSTRUMENT, NEXTEST_STDOUT_CONTENT_TYPE, parse_jsonl, parse_list_json,
 };
 use eliot_testd_core::{
-    EphemeralSourceBytes, InstrumentStageRequest, StageExecutionKind, TestdEvaluationObservation,
-    TestdEvaluationStatus, TestdParsingObservation, TestdParsingStatus,
+    EphemeralSourceBytes, InstrumentStageRequest, StageExecutionKind, TESTD_LIST_PROFILE,
+    TestdEvaluationObservation, TestdEvaluationStatus, TestdParsingObservation, TestdParsingStatus,
     TestdProviderCatalogLifecycle, TestdStreamDisposition, TestdStreamEvidenceBinding,
-    TESTD_LIST_PROFILE,
 };
 use thiserror::Error;
 
@@ -153,22 +152,24 @@ fn current_selection<'a>(
     freshness: &RegistryFreshness<'_>,
     stage: &InstrumentStageRequest,
 ) -> Result<(&'a RegistryEntry, String), ProfileReplayError> {
-    let lifecycle = provider_registry
-        .lifecycle_binding()
-        .ok_or(ProfileReplayError::StageMismatch {
-            field: "provider_catalog_lifecycle",
-        })?;
+    let lifecycle =
+        provider_registry
+            .lifecycle_binding()
+            .ok_or(ProfileReplayError::StageMismatch {
+                field: "provider_catalog_lifecycle",
+            })?;
     if lifecycle.provider_registry_generation() != provider_registry.generation() {
         return Err(ProfileReplayError::StageMismatch {
             field: "provider_catalog_generation",
         });
     }
-    let retained_lifecycle = stage
-        .provider_catalog_lifecycle
-        .as_ref()
-        .ok_or(ProfileReplayError::StageMismatch {
-            field: "provider_catalog_lifecycle",
-        })?;
+    let retained_lifecycle =
+        stage
+            .provider_catalog_lifecycle
+            .as_ref()
+            .ok_or(ProfileReplayError::StageMismatch {
+                field: "provider_catalog_lifecycle",
+            })?;
     if !lifecycle_matches(retained_lifecycle, lifecycle) {
         return Err(ProfileReplayError::StageMismatch {
             field: "provider_catalog_lifecycle",

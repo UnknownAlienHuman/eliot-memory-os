@@ -60,6 +60,7 @@ pub use eliot_build_test_graph::{
     BUILD_ROOT_DIRECTORY, BuildMode, CARGO_HOME_ENV, CARGO_TARGET_DIR_ENV, CandidateIdentity,
     GovernedWorkEnvelope, LaneIdentity, RuntimeEnvironmentLease, WorkEnvelopeError,
 };
+pub use eliot_module_registry::VerifiedModuleCatalogGeneration;
 pub use eliot_test_selection::{FrozenSelection, TestSelectionReceipt};
 pub use package_disposition::{
     CAPABILITY_OWNER_UNIVERSE, CONSUMER_CRATE_UNIVERSE, DISPOSITION_REVIEWED_ON, DispositionError,
@@ -85,7 +86,6 @@ pub use profile::{
     package_verification_profile, test_profile,
 };
 pub use profile_replay::{ProfileReplayError, ProfileReplayReceipt, replay_profile_stream};
-pub use eliot_module_registry::VerifiedModuleCatalogGeneration;
 pub use profile_run::{
     AggregateStatus, InstrumentRun, MappedStageLauncher, PlannedStage, ProfileAggregate,
     ProfileRunError, ProviderDispatch, RetainedExitOutcome, RetainedToolIdentity, StageEvidence,
