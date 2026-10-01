@@ -1996,12 +1996,13 @@ impl DaemonComposition {
         if self.governor.kernel_snapshot().state_fence() != *state_fence {
             return Err("owner-facts fence is not the current Governor fence".to_owned());
         }
-        let Some(owner) = self.governor.owners().work_scope.as_ref() else {
+        let Some(snapshot) = self
+            .governor
+            .read_current_work_scope_owner_readback(state_fence)
+            .map_err(|error| format!("current WorkScope owner read failed: {error}"))?
+        else {
             return Ok(None);
         };
-        let snapshot = owner
-            .read_current(state_fence)
-            .map_err(|error| format!("current WorkScope guard is unavailable: {error}"))?;
         snapshot
             .validate()
             .map_err(|error| format!("current WorkScope guard is invalid: {error}"))?;
@@ -2009,6 +2010,31 @@ impl DaemonComposition {
             return Ok(None);
         }
         Ok(Some(snapshot))
+    }
+
+    /// Independently reads the canonical Module Registry owner for an
+    /// authenticated owner-facts pull. The returned outer revision and
+    /// semantic snapshot come from one fresh Kernel named read and are
+    /// cross-checked by Governor against its current live owner.
+    pub fn current_testd_blob_module_catalog_owner_readback(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<eliot_governor::ModuleCatalogOwnerReadback, String> {
+        self.governor
+            .read_current_module_catalog_owner_readback(state_fence)
+            .map_err(|error| format!("fresh Module Registry owner read failed: {error}"))
+    }
+
+    /// Re-reads the current semantic Policy owner through Kernel's named
+    /// owner transport. This does not imply a Blob-specific retention or
+    /// residency policy is present in the generic Config/Policy schema.
+    pub fn current_testd_blob_policy_owner_readback(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<Option<eliot_governor::PolicyOwner>, String> {
+        self.governor
+            .read_current_policy_owner_readback(state_fence)
+            .map_err(|error| format!("fresh Policy owner read failed: {error}"))
     }
 
     /// Returns the retained protected daemon state root.

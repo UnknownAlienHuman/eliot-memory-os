@@ -75,7 +75,10 @@ pub use finish_attempt::{
     PreparedKernelExchange,
 };
 pub use governor_authority_projection::{GovernorAuthorityProjection, LiveGovernorAuthority};
-pub use module_registry_admission::{ModuleCatalogOwnerReadback, ModuleRegistryAdmissionError};
+pub use module_registry_admission::{
+    ModuleCatalogOwnerReadback, ModuleRegistryAdmissionError,
+    VerifiedModuleCatalogGeneration,
+};
 pub use negative_memory_activation::{
     NegativeMemoryActivationDocument, NegativeMemoryActivationEvidence,
     NegativeMemoryActivationReceipt, NegativeMemoryActivationRefusal,

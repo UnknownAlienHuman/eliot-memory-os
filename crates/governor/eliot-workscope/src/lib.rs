@@ -466,6 +466,26 @@ pub struct WorkScopeBindingSnapshot {
     pub owner_revision: u64,
     pub binding: ScopeBinding,
     pub guard_receipt: ScopeBindingGuardReceipt,
+    /// Exact admitted source closure that produced the matched guard. Older
+    /// owner rows may omit this field; those rows remain readable for identity
+    /// checks but cannot attest a current canonical source admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_admission: Option<WorkScopeSourceAdmission>,
+}
+
+/// Canonical WorkScope owner projection of one admitted governing-source set.
+///
+/// This preserves the exact admitted source records and privacy profile used
+/// by the guard. Source identities and digests remain those of the original
+/// source owner; this projection does not mint a second receipt identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkScopeSourceAdmission {
+    /// Exact owner-admitted sources, including their source references,
+    /// content digests, assurance and authority bases.
+    pub sources: GoverningSourceSet,
+    /// Exact privacy profile against which the source closure was admitted.
+    pub privacy: PrivacyProfile,
 }
 
 /// The canonical owner for one current `WorkScope` binding.
@@ -3143,9 +3163,39 @@ impl WorkScopeBindingSnapshot {
             owner_revision,
             binding,
             guard_receipt,
+            source_admission: None,
         };
         snapshot.validate()?;
         Ok(snapshot)
+    }
+
+    /// Constructs a current binding and retains the exact already-admitted
+    /// source closure used to produce its matched guard receipt.
+    pub fn new_with_source_admission(
+        state_fence: StateFence,
+        owner_revision: u64,
+        binding: ScopeBinding,
+        guard_receipt: ScopeBindingGuardReceipt,
+        sources: GoverningSourceSet,
+        privacy: PrivacyProfile,
+    ) -> Result<Self, WorkScopeError> {
+        let mut snapshot = Self::new(state_fence, owner_revision, binding, guard_receipt)?;
+        let source_admission = WorkScopeSourceAdmission::new(
+            &snapshot.state_fence,
+            &snapshot.binding,
+            &snapshot.guard_receipt,
+            sources,
+            privacy,
+        )?;
+        snapshot.source_admission = Some(source_admission);
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    /// Returns the exact source admission retained with this owner snapshot.
+    #[must_use]
+    pub fn source_admission(&self) -> Option<&WorkScopeSourceAdmission> {
+        self.source_admission.as_ref()
     }
 
     /// Validates the complete closed snapshot before construction or recovery.
@@ -3181,6 +3231,53 @@ impl WorkScopeBindingSnapshot {
         {
             return Err(WorkScopeError::BindingReceiptMismatch);
         }
+        if let Some(source_admission) = &self.source_admission {
+            source_admission.validate_for(
+                &self.state_fence,
+                &self.binding,
+                &self.guard_receipt,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl WorkScopeSourceAdmission {
+    fn new(
+        state_fence: &StateFence,
+        binding: &ScopeBinding,
+        guard_receipt: &ScopeBindingGuardReceipt,
+        sources: GoverningSourceSet,
+        privacy: PrivacyProfile,
+    ) -> Result<Self, WorkScopeError> {
+        sources.validate_for(&binding.scope, &privacy)?;
+        if sources.generation != binding.governing_source_generation
+            || guard_receipt.disposition != ScopeBindingDisposition::Matched
+            || guard_receipt.source_generation != sources.generation
+            || ScopeBindingGuard.check(binding, binding, &sources, &privacy) != *guard_receipt
+        {
+            return Err(WorkScopeError::SourceSetMismatch);
+        }
+        let _ = (state_fence, binding);
+        Ok(Self { sources, privacy })
+    }
+
+    fn validate_for(
+        &self,
+        state_fence: &StateFence,
+        binding: &ScopeBinding,
+        guard_receipt: &ScopeBindingGuardReceipt,
+    ) -> Result<(), WorkScopeError> {
+        self.sources.validate_for(&binding.scope, &self.privacy)?;
+        if self.sources.generation != binding.governing_source_generation
+            || guard_receipt.disposition != ScopeBindingDisposition::Matched
+            || guard_receipt.source_generation != self.sources.generation
+            || ScopeBindingGuard.check(binding, binding, &self.sources, &self.privacy)
+                != *guard_receipt
+        {
+            return Err(WorkScopeError::SourceSetMismatch);
+        }
+        let _ = state_fence;
         Ok(())
     }
 }
@@ -3192,6 +3289,8 @@ struct WorkScopeBindingSnapshotWire {
     owner_revision: u64,
     binding: ScopeBinding,
     guard_receipt: ScopeBindingGuardReceipt,
+    #[serde(default)]
+    source_admission: Option<WorkScopeSourceAdmission>,
 }
 
 impl<'de> Deserialize<'de> for WorkScopeBindingSnapshot {
@@ -3200,13 +3299,16 @@ impl<'de> Deserialize<'de> for WorkScopeBindingSnapshot {
         D: serde::Deserializer<'de>,
     {
         let wire = WorkScopeBindingSnapshotWire::deserialize(deserializer)?;
-        Self::new(
+        let mut snapshot = Self::new(
             wire.state_fence,
             wire.owner_revision,
             wire.binding,
             wire.guard_receipt,
         )
-        .map_err(serde::de::Error::custom)
+        .map_err(serde::de::Error::custom)?;
+        snapshot.source_admission = wire.source_admission;
+        snapshot.validate().map_err(serde::de::Error::custom)?;
+        Ok(snapshot)
     }
 }
 

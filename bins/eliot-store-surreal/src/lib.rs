@@ -23,9 +23,10 @@ use eliot_blob_api::{
 };
 use eliot_blob::BlobStoreStreamSink;
 use eliot_blob_api::wire::{
-    ProcessStreamSourceReadbackRequest, ProcessStreamSourceReadbackResponse,
+    BlobProcessStreamVerifiedOwnerFacts, ProcessStreamSourceReadbackRequest,
+    ProcessStreamSourceReadbackResponse,
 };
-use eliot_contracts::StateFence;
+use eliot_contracts::{StateFence, canonical_json_bytes};
 use eliot_installation::{
     InstallationProfile, ValidatedRuntimeRootLeases, WindowsRuntimeRootLease,
     WindowsRuntimeRootLeaseProvider,
@@ -352,6 +353,7 @@ pub trait BlobStreamAuthorityResolver: Send + Sync {
         owner: &BlobRootOwner,
         identity: &RequestIdentity,
         request: &ProcessStreamSinkOpenRequest,
+        owner_facts: &BlobProcessStreamVerifiedOwnerFacts,
     ) -> Result<Option<BlobStreamSinkStoreBinding>, String>;
 
     /// Resolves fresh current read authority for one immutable-source
@@ -371,6 +373,7 @@ struct RetainedBlobStreamSink {
     binding_ref: String,
     open_request_sha256: String,
     owner_facts_sha256: String,
+    binding_context_sha256: String,
     session: ProcessStreamSinkSession,
     sink: Arc<BlobStoreStreamSink<Arc<dyn BlobStoreClient>>>,
 }
@@ -647,10 +650,14 @@ impl StoreComposition {
         transport: &StoreEbpSession,
         identity: &RequestIdentity,
         capability_ref: &str,
+        owner_facts: &BlobProcessStreamVerifiedOwnerFacts,
         request: ProcessStreamSinkOpenRequest,
     ) -> Result<(String, ProcessStreamSinkSession), ProcessStreamSinkError> {
         validate_blob_sink_transport(transport, identity, capability_ref)?;
         request.validate()?;
+        owner_facts
+            .validate()
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
         self.prepare_blob_process_stream_demand(transport, identity)
             .await
             .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
@@ -664,7 +671,7 @@ impl StoreComposition {
             return Err(ProcessStreamSinkError::ProviderUnavailable);
         };
         let binding = resolver
-            .resolve_open(&self.blob, identity, &request)
+            .resolve_open(&self.blob, identity, &request, owner_facts)
             .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
         let Some(binding) = binding else {
             return Err(ProcessStreamSinkError::ProviderUnavailable);
@@ -677,7 +684,10 @@ impl StoreComposition {
             });
         }
         let connection_id = transport.connection_id().to_owned();
-        let owner_facts = serde_json::to_vec(&(
+        let owner_facts_bytes = canonical_json_bytes(owner_facts)
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let owner_facts_sha256 = format!("{:x}", Sha256::digest(owner_facts_bytes));
+        let binding_context = serde_json::to_vec(&(
             binding.root_lease(),
             binding.stage_context(),
             binding.read_context(),
@@ -685,7 +695,7 @@ impl StoreComposition {
             binding.residency(),
         ))
         .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
-        let owner_facts_sha256 = format!("{:x}", Sha256::digest(owner_facts));
+        let binding_context_sha256 = format!("{:x}", Sha256::digest(binding_context));
         let mut material = Vec::with_capacity(
             connection_id.len() + capability_ref.len() + request.open_request_sha256().len() + 2,
         );
@@ -701,6 +711,7 @@ impl StoreComposition {
             if existing.capability_ref != capability_ref
                 || existing.open_request_sha256 != request.open_request_sha256()
                 || existing.owner_facts_sha256 != owner_facts_sha256
+                || existing.binding_context_sha256 != binding_context_sha256
             {
                 return Err(ProcessStreamSinkError::OpenDigestMismatch);
             }
@@ -721,6 +732,7 @@ impl StoreComposition {
                 binding_ref: binding_ref.clone(),
                 open_request_sha256: session.open_request_sha256().to_owned(),
                 owner_facts_sha256,
+                binding_context_sha256,
                 session: session.clone(),
                 sink,
             },
@@ -795,6 +807,10 @@ impl StoreComposition {
             .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
         validate_blob_sink_transport(transport, identity, &request.capability.reference)?;
         request
+            .validate()
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        request
+            .owner_facts
             .validate()
             .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
         if request.locator_kind != eliot_blob_api::wire::DurableStreamLocatorKind::Blob
