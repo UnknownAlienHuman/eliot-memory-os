@@ -216,10 +216,12 @@ fn local_read_claim_submit_roundtrip_with_exact_replay_conflict_and_expiry() {
         .enqueue_local_read_pair(&envelope, &tool)
         .expect("replay enqueue must stay idempotent");
 
-    let (claimed_envelope, claimed_tool, attempt) = kernel
+    let claimed = kernel
         .claim_local_read_pair(&daemon_session)
         .expect("claim must not fail")
         .expect("queued pair must claim");
+    let (claimed_envelope, claimed_tool, attempt) =
+        (claimed.envelope, claimed.tool, claimed.attempt);
     assert_eq!(
         claimed_envelope.envelope_sha256, envelope.envelope_sha256,
         "the claim returns the exact admitted envelope"
@@ -234,10 +236,11 @@ fn local_read_claim_submit_roundtrip_with_exact_replay_conflict_and_expiry() {
         .expect("the minted capability must validate");
     // A re-claim by the same owner session returns the identical current
     // capability: lost-answer retry without a new identity.
-    let (_, _, reattempt) = kernel
+    let reattempt = kernel
         .claim_local_read_pair(&daemon_session)
-        .expect("re-claim must not fail")
-        .expect("the owned pair must re-claim");
+        .expect("claim must not fail")
+        .expect("the retained pair must claim")
+        .attempt;
     assert_eq!(
         reattempt.attempt_id, attempt.attempt_id,
         "same-owner re-claim returns the identical attempt"
@@ -331,10 +334,11 @@ fn local_read_claim_submit_roundtrip_with_exact_replay_conflict_and_expiry() {
     kernel
         .enqueue_local_read_pair(&envelope, &tool)
         .expect("re-enqueue after retire must succeed");
-    let (_, _, fresh) = kernel
+    let fresh = kernel
         .claim_local_read_pair(&daemon_session)
-        .expect("fresh claim must not fail")
-        .expect("re-enqueued pair must claim");
+        .expect("claim must not fail")
+        .expect("the retained pair must claim")
+        .attempt;
     assert_ne!(
         fresh.attempt_id, attempt.attempt_id,
         "a new claim mints a fresh attempt identity"
@@ -438,15 +442,17 @@ fn governed_claim_replacement(
     kernel
         .enqueue_local_read_pair(&envelope, &tool)
         .expect("enqueue must succeed");
-    let (_, _, first) = kernel
+    let first = kernel
         .claim_local_read_pair(owner)
-        .expect("owner claim must not fail")
-        .expect("pair must claim");
+        .expect("claim must not fail")
+        .expect("the retained pair must claim")
+        .attempt;
     assert_eq!(first.fencing_generation, 1);
-    let (_, _, second) = kernel
+    let second = kernel
         .claim_local_read_pair(rival)
-        .expect("rival claim must not fail")
-        .expect("pair must re-claim");
+        .expect("claim must not fail")
+        .expect("the retained pair must claim")
+        .attempt;
     assert_eq!(
         second.fencing_generation, 2,
         "reassignment bumps the fencing generation"
@@ -532,10 +538,11 @@ fn governed_revocation_roundtrip(kernel: &KernelComposition, fence: &StateFence,
     kernel
         .enqueue_local_read_pair(&revoked, &revoked_tool)
         .expect("enqueue must succeed");
-    let (_, _, revoked_attempt) = kernel
+    let revoked_attempt = kernel
         .claim_local_read_pair(owner)
         .expect("claim must not fail")
-        .expect("pair must claim");
+        .expect("the retained pair must claim")
+        .attempt;
     kernel.fence_host_requests_for_connection("conn-test-1");
     let revoked_body = body_with_revision(&revoked, revoked_attempt, 5);
     match kernel
@@ -562,10 +569,11 @@ fn governed_revocation_roundtrip(kernel: &KernelComposition, fence: &StateFence,
     kernel
         .enqueue_local_read_pair(&revoked, &revoked_tool)
         .expect("re-enqueue after revoke must succeed");
-    let (_, _, fresh) = kernel
+    let fresh = kernel
         .claim_local_read_pair(owner)
-        .expect("fresh claim must not fail")
-        .expect("re-enqueued pair must claim");
+        .expect("claim must not fail")
+        .expect("the retained pair must claim")
+        .attempt;
     let fresh_body = body_with_revision(&revoked, fresh, 6);
     assert!(
         matches!(
