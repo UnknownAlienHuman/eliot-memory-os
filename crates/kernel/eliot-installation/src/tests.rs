@@ -1282,7 +1282,7 @@ fn v21_and_missing_secret_proof_require_explicit_migration() {
     assert!(matches!(
         validate_installation_transaction_json(&missing_bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("creation proof") && reason.contains("v25")
+            if reason.contains("creation proof") && reason.contains("v26")
     ));
 }
 
@@ -2009,7 +2009,13 @@ fn system_registration_transaction() -> InstallationTransaction {
         generation: manifest.generation.clone(),
         manifest: package_manifest.clone(),
         staging_root: staging_root.clone(),
-        destination_root: None,
+        destination_root: Some(test_handle(
+            manifest
+                .runtime_launch
+                .profile_governed_roots
+                .immutable_binaries
+                .clone(),
+        )),
         expected_file_digests: Vec::new(),
         candidate_manifest_digest: must(candidate_manifest_digest(&manifest)),
         package_manifest_digest: must(PlatformHandle::new(package_manifest.canonical_digest())),
@@ -2699,6 +2705,21 @@ fn planned_transaction() -> InstallationTransaction {
         transaction.precondition_evidence,
         transaction.recovery_command,
     ))
+}
+
+fn refresh_test_candidate_generation(manifest: &mut CandidateManifest) {
+    let launch = &mut manifest.runtime_launch;
+    launch.generation = manifest.generation.clone();
+    if launch.profile == InstallationProfile::PortableDev {
+        let root = std::path::Path::new(launch.portable_root.as_ref().unwrap().as_str());
+        launch.profile_governed_roots.immutable_binaries = root
+            .join("target")
+            .join("eliot-dev")
+            .join(manifest.generation.as_str())
+            .to_string_lossy()
+            .into_owned();
+    }
+    *launch = must(launch.clone().with_computed_digest());
 }
 
 fn absent_with_file_index(
@@ -7950,9 +7971,7 @@ fn staging_new_generation_clears_active_phase_b_rebind_before_commit() {
 
     let mut upgrade = first.candidate_manifest.clone();
     upgrade.generation = test_handle("generation-after-active-rebind");
-    upgrade.runtime_launch.generation = upgrade.generation.clone();
-    upgrade.runtime_launch.descriptor_digest =
-        test_handle(sha256_hex(&must(upgrade.runtime_launch.unsigned_bytes())));
+    refresh_test_candidate_generation(&mut upgrade);
     must(upgrade.validate());
     let upgrade_transaction_id = test_handle("transaction:after-active-rebind");
     let upgrade_plan_digest = test_handle("d".repeat(64));
@@ -8004,9 +8023,7 @@ fn registry_rejects_pending_and_active_coexistence_via_validate_and_both_orders(
         .unwrap_or_else(|| unreachable!());
     let mut upgrade = first.candidate_manifest.clone();
     upgrade.generation = test_handle("generation-coexist-pending-upgrade");
-    upgrade.runtime_launch.generation = upgrade.generation.clone();
-    upgrade.runtime_launch.descriptor_digest =
-        test_handle(sha256_hex(&must(upgrade.runtime_launch.unsigned_bytes())));
+    refresh_test_candidate_generation(&mut upgrade);
     must(upgrade.validate());
     let prior_terminal_digest = must(activation_terminal_digest(&committed));
     must(registry.stage_pending_activation(
@@ -8072,11 +8089,7 @@ fn registry_rejects_active_rebind_while_pending_is_active() {
     ));
     let mut pending = registering_transaction();
     pending.candidate_manifest.generation = test_handle("generation-pending-blocks-active");
-    pending.candidate_manifest.runtime_launch.generation =
-        pending.candidate_manifest.generation.clone();
-    pending.candidate_manifest.runtime_launch.descriptor_digest = test_handle(sha256_hex(&must(
-        pending.candidate_manifest.runtime_launch.unsigned_bytes(),
-    )));
+    refresh_test_candidate_generation(&mut pending.candidate_manifest);
     must(pending.candidate_manifest.validate());
     let mut pending_registry = registry.clone();
     must(pending_registry.stage_pending_activation(
@@ -8183,10 +8196,8 @@ fn registry_rejects_pending_while_active_rebind_is_active() {
         &intent,
     ));
     let mut upgrade = transaction.candidate_manifest.clone();
-    upgrade.generation = test_handle("generation:active-blocks-pending");
-    upgrade.runtime_launch.generation = upgrade.generation.clone();
-    upgrade.runtime_launch.descriptor_digest =
-        test_handle(sha256_hex(&must(upgrade.runtime_launch.unsigned_bytes())));
+    upgrade.generation = test_handle("generation-active-blocks-pending");
+    refresh_test_candidate_generation(&mut upgrade);
     must(upgrade.validate());
     let upgrade_tx = test_handle("transaction:active-blocks-pending");
     let upgrade_plan = test_handle("f".repeat(64));
@@ -8531,9 +8542,7 @@ fn upgrade_failure_preserves_prior_active_and_rejects_binding_substitution() {
 
     let mut upgrade = first.candidate_manifest.clone();
     upgrade.generation = test_handle("generation-upgrade");
-    upgrade.runtime_launch.generation = upgrade.generation.clone();
-    upgrade.runtime_launch.descriptor_digest =
-        test_handle(sha256_hex(&must(upgrade.runtime_launch.unsigned_bytes())));
+    refresh_test_candidate_generation(&mut upgrade);
     must(upgrade.validate());
     let upgrade_tx = test_handle("transaction:upgrade");
     let upgrade_plan = test_handle("a".repeat(64));
