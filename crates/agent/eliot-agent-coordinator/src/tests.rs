@@ -2759,7 +2759,9 @@ fn forged_binding_rejects_at_intake() -> TestResult {
         wrong_request.result.actual_route.compute_digest()?;
     let events_before_wrong_request = coordinator.events().len();
     assert_eq!(
-        coordinator.submit_result(context.clone(), wrong_request).err(),
+        coordinator
+            .submit_result(context.clone(), wrong_request)
+            .err(),
         Some(CoordinatorError::IdentityConflict("execution_binding"))
     );
     assert_eq!(coordinator.events().len(), events_before_wrong_request);
@@ -3997,7 +3999,12 @@ fn production_verifier_reconciles_unknown_outcome() -> TestResult {
     coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
     let binding = coordinator.bind_provider_execution(
         context.clone(),
-        binding_submission("prod-unknown", &lane, "unit-prod-unknown", "scope-prod-unknown")?,
+        binding_submission(
+            "prod-unknown",
+            &lane,
+            "unit-prod-unknown",
+            "scope-prod-unknown",
+        )?,
     )?;
     let mut submission =
         result_submission("prod-unknown", &lane, ResultDisposition::UnknownOutcome)?;
