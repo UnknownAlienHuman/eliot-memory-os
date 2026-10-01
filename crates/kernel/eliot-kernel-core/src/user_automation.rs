@@ -856,12 +856,18 @@ impl NormalizedSchedule {
         let disposition =
             parse_occurrence_disposition(fields[8], "schedule.occurrence_key.disposition")?;
         require_declared_disposition(disposition, self.dst_fold, self.dst_gap)?;
-        let requested_local =
-            parse_civil_wall_clock(fields[3], "schedule.occurrence_key.requested_local")?;
-        let resolved_local =
-            parse_civil_wall_clock(fields[4], "schedule.occurrence_key.resolved_local")?;
-        let offset_minutes = parse_utc_offset(fields[5], "schedule.occurrence_key.offset")?;
-        let instant_seconds = parse_utc_instant(fields[6], "schedule.occurrence_key.instant")?;
+        let requested_local = parse_civil_wall_clock(
+            fields[3].as_bytes(),
+            "schedule.occurrence_key.requested_local",
+        )?;
+        let resolved_local = parse_civil_wall_clock(
+            fields[4].as_bytes(),
+            "schedule.occurrence_key.resolved_local",
+        )?;
+        let offset_minutes =
+            parse_utc_offset(fields[5].as_bytes(), "schedule.occurrence_key.offset")?;
+        let instant_seconds =
+            parse_utc_instant(fields[6].as_bytes(), "schedule.occurrence_key.instant")?;
         let transition =
             parse_transition_window(fields[7], disposition, "schedule.occurrence_key.transition")?;
         require_resolved_instant(
@@ -1070,17 +1076,21 @@ fn days_in_civil_month(year: u32, month: u32) -> u32 {
 }
 
 /// Returns whether a canonical numeric field spells a decimal digit at `index`.
-fn is_decimal_digit(value: &str, index: usize) -> bool {
-    value.as_bytes()[index].is_ascii_digit()
+///
+/// The calendar parsers below take the UTF-8 bytes of the field rather than the
+/// field itself, so an index here is a byte offset into a `[u8]` and never a
+/// `str` index that could fall inside a multibyte character.
+fn is_decimal_digit(value: &[u8], index: usize) -> bool {
+    value[index].is_ascii_digit()
 }
 
 /// Reads the two decimal digits at `start` of a validated canonical field.
-fn decimal_pair(value: &str, start: usize) -> u32 {
-    u32::from(value.as_bytes()[start] - b'0') * 10 + u32::from(value.as_bytes()[start + 1] - b'0')
+fn decimal_pair(value: &[u8], start: usize) -> u32 {
+    u32::from(value[start] - b'0') * 10 + u32::from(value[start + 1] - b'0')
 }
 
 /// Reads the four decimal digits at the start of a validated canonical field.
-fn decimal_quad(value: &str) -> u32 {
+fn decimal_quad(value: &[u8]) -> u32 {
     decimal_pair(value, 0) * 100 + decimal_pair(value, 2)
 }
 
@@ -1091,13 +1101,19 @@ fn decimal_quad(value: &str) -> u32 {
 /// because its bytes look like a date. Fractional seconds, a lower case `t`,
 /// and a leap second are refused: only the canonical spelling of an exact civil
 /// second is an owner-normalized value.
+///
+/// The caller passes the field's UTF-8 bytes. Every byte position this parser
+/// admits is a literal ASCII digit or separator, so a field whose nineteenth
+/// byte is the continuation of a multibyte character fails the canonical shape
+/// check and is refused by name here, instead of reaching an unchecked string
+/// slice. The parser never indexes a `str` at a byte offset, so no input shape
+/// can turn this check into an abort.
 fn parse_civil_wall_clock(
-    value: &str,
+    value: &[u8],
     field: &'static str,
 ) -> Result<CivilDateTime, UserAutomationError> {
-    let bytes = value.as_bytes();
-    let canonical = bytes.len() == CIVIL_WALL_CLOCK_BYTES
-        && bytes.iter().enumerate().all(|(index, byte)| match index {
+    let canonical = value.len() == CIVIL_WALL_CLOCK_BYTES
+        && value.iter().enumerate().all(|(index, byte)| match index {
             4 | 7 => *byte == b'-',
             10 => *byte == b'T',
             13 | 16 => *byte == b':',
@@ -1138,12 +1154,12 @@ fn parse_civil_wall_clock(
 /// The offset is range-checked against the largest civil offset the time zone
 /// database contains, so `+99`, a minute field above `59`, and a negative zero
 /// offset are refused instead of being admitted as a spelled offset that names
-/// no instant.
-fn parse_utc_offset(value: &str, field: &'static str) -> Result<i32, UserAutomationError> {
-    let bytes = value.as_bytes();
-    let canonical = bytes.len() == UTC_OFFSET_BYTES
-        && matches!(bytes[0], b'+' | b'-')
-        && bytes[3] == b':'
+/// no instant. The value is the field's UTF-8 bytes, for the same reason as
+/// [`parse_civil_wall_clock`].
+fn parse_utc_offset(value: &[u8], field: &'static str) -> Result<i32, UserAutomationError> {
+    let canonical = value.len() == UTC_OFFSET_BYTES
+        && matches!(value[0], b'+' | b'-')
+        && value[3] == b':'
         && is_decimal_digit(value, 1)
         && is_decimal_digit(value, 2)
         && is_decimal_digit(value, 4)
@@ -1157,12 +1173,12 @@ fn parse_utc_offset(value: &str, field: &'static str) -> Result<i32, UserAutomat
         return Err(UserAutomationError::Invalid(field));
     }
     let total_minutes = hours * 60 + minutes;
-    if (total_minutes == 0 && bytes[0] == b'-') || total_minutes > MAX_CIVIL_UTC_OFFSET_MINUTES {
+    if (total_minutes == 0 && value[0] == b'-') || total_minutes > MAX_CIVIL_UTC_OFFSET_MINUTES {
         return Err(UserAutomationError::Invalid(field));
     }
     let total_minutes =
         i32::try_from(total_minutes).map_err(|_| UserAutomationError::Invalid(field))?;
-    Ok(if bytes[0] == b'+' {
+    Ok(if value[0] == b'+' {
         total_minutes
     } else {
         -total_minutes
@@ -1172,9 +1188,11 @@ fn parse_utc_offset(value: &str, field: &'static str) -> Result<i32, UserAutomat
 /// Parses the resolved UTC instant field of one occurrence record.
 ///
 /// The canonical spelling is the civil UTC value with a `Z` suffix, so one
-/// instant always has exactly one byte representation.
-fn parse_utc_instant(value: &str, field: &'static str) -> Result<i64, UserAutomationError> {
-    if value.len() != UTC_INSTANT_BYTES || !value.ends_with('Z') {
+/// instant always has exactly one byte representation. The value is the field's
+/// UTF-8 bytes: the exact byte length and the literal `Z` are checked before the
+/// civil prefix is split out of them.
+fn parse_utc_instant(value: &[u8], field: &'static str) -> Result<i64, UserAutomationError> {
+    if value.len() != UTC_INSTANT_BYTES || value[CIVIL_WALL_CLOCK_BYTES] != b'Z' {
         return Err(UserAutomationError::Invalid(field));
     }
     Ok(parse_civil_wall_clock(&value[..CIVIL_WALL_CLOCK_BYTES], field)?.unix_seconds())
@@ -1185,13 +1203,24 @@ fn parse_utc_instant(value: &str, field: &'static str) -> Result<i64, UserAutoma
 /// `start_at` and `end_at` are instants rather than wall clocks, so the offset
 /// is applied here: `2026-01-01T00:00:00+14:00` is correctly later than
 /// `2026-01-01T00:00:00Z` even though it sorts before it as text.
+///
+/// The length guard below is a byte-length test only, so it cannot be the thing
+/// that decides whether the split is meaningful. Both halves are therefore cut
+/// out of the field's UTF-8 bytes, never out of the `str`: a value whose
+/// nineteenth byte is the continuation of a multibyte character keeps that byte
+/// in the civil prefix, where [`parse_civil_wall_clock`] refuses it by name,
+/// rather than panicking on an unchecked string slice. `start_at` and `end_at`
+/// are validated by the same schedule contract as every occurrence, so an
+/// invalid instant is an explicit `UserAutomationError::Invalid` refusal and
+/// never an abort of the validating caller.
 fn parse_civil_instant(value: &str, field: &'static str) -> Result<i64, UserAutomationError> {
-    if value.len() < CIVIL_WALL_CLOCK_BYTES + 1 {
+    let bytes = value.as_bytes();
+    if bytes.len() < CIVIL_WALL_CLOCK_BYTES + 1 {
         return Err(UserAutomationError::Invalid(field));
     }
-    let civil = parse_civil_wall_clock(&value[..CIVIL_WALL_CLOCK_BYTES], field)?;
-    let offset = &value[CIVIL_WALL_CLOCK_BYTES..];
-    let offset_minutes = if offset == "Z" {
+    let civil = parse_civil_wall_clock(&bytes[..CIVIL_WALL_CLOCK_BYTES], field)?;
+    let offset = &bytes[CIVIL_WALL_CLOCK_BYTES..];
+    let offset_minutes = if offset == b"Z" {
         0
     } else {
         parse_utc_offset(offset, field)?
@@ -1239,8 +1268,8 @@ fn parse_transition_window(
     let Some((before, after)) = value.split_once('~') else {
         return Err(UserAutomationError::Invalid(field));
     };
-    let pre = parse_utc_offset(before, field)?;
-    let post = parse_utc_offset(after, field)?;
+    let pre = parse_utc_offset(before.as_bytes(), field)?;
+    let post = parse_utc_offset(after.as_bytes(), field)?;
     let step = pre.abs_diff(post);
     if step == 0 || step > MAX_TRANSITION_STEP_MINUTES {
         return Err(UserAutomationError::Invalid(field));
