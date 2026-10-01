@@ -984,6 +984,11 @@ pub fn resolve_review_anchor(
         )?;
     }
     let candidate_count = u32::try_from(candidates.len()).unwrap_or(u32::MAX);
+    let unattached = |status: AnchorResolutionStatus| ReviewResolution {
+        status,
+        current: None,
+        candidate_count,
+    };
     // Tier 1: full-identity match.
     let exact: Vec<usize> = candidates
         .iter()
@@ -1060,7 +1065,11 @@ pub fn resolve_review_anchor(
         } else {
             AnchorResolutionStatus::Moved
         };
-        return Ok(attached(status, current));
+        return Ok(ReviewResolution {
+            status,
+            current: Some(current.clone()),
+            candidate_count,
+        });
     }
     if fingerprinted.len() > 1 {
         return Ok(unattached(AnchorResolutionStatus::Ambiguous));
