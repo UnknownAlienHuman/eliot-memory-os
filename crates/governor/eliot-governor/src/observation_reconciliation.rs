@@ -430,6 +430,17 @@ fn observation_envelope(
         operation_id: observation_operation.clone(),
         request: identity.request.metadata.clone(),
         idempotency_key: identity.idempotency_key.clone(),
+        // #1925: this leg's stable intent is the owner-issued observation
+        // record it publishes. `record_id` is the durable row identity, so a
+        // typed correction of the same observation redeclares the same intent
+        // while the operation identity and idempotency key still rotate.
+        write_intent_id: crate::write_intent::admission_write_intent(
+            "observation-journal-capture",
+            submission.record.record_id.as_str(),
+        )
+        .ok_or_else(|| owner_refused("observation record has no owner-issued subject"))?,
+        write_envelope_protocol_version:
+            crate::write_intent::GOVERNOR_ADMISSION_WRITE_ENVELOPE_PROTOCOL_VERSION,
         scope_id: ScopeId::new(GOVERNOR_SCOPE_ID)
             .map_err(|error| owner_refused(error.to_string()))?,
         task_id: identity
@@ -517,6 +528,16 @@ fn recovery_envelope(
         operation_id: operation_id.clone(),
         request: identity.request.metadata.clone(),
         idempotency_key: identity.idempotency_key.clone(),
+        // #1925: the recovery leg's stable intent is the independently
+        // verified observation it binds, addressed by its durable record id
+        // and the problem it is bound to.
+        write_intent_id: crate::write_intent::admission_write_intent(
+            "observation-independent-verification",
+            &format!("{observation_record_id}@{problem_id}"),
+        )
+        .ok_or_else(|| owner_refused("verified observation has no owner-issued subject"))?,
+        write_envelope_protocol_version:
+            crate::write_intent::GOVERNOR_ADMISSION_WRITE_ENVELOPE_PROTOCOL_VERSION,
         scope_id: ScopeId::new(GOVERNOR_SCOPE_ID)
             .map_err(|error| owner_refused(error.to_string()))?,
         task_id: identity
@@ -803,6 +824,15 @@ fn maintenance_observation_envelope(
         operation_id: observation_operation.clone(),
         request: identity.request.metadata.clone(),
         idempotency_key: submission.idempotency_key.clone(),
+        // #1925: the maintenance leg's stable intent is the owner-issued
+        // maintenance record it publishes, addressed by its durable record id.
+        write_intent_id: crate::write_intent::admission_write_intent(
+            "observation-maintenance-result",
+            record.record_id.as_str(),
+        )
+        .ok_or_else(|| owner_refused("maintenance record has no owner-issued subject"))?,
+        write_envelope_protocol_version:
+            crate::write_intent::GOVERNOR_ADMISSION_WRITE_ENVELOPE_PROTOCOL_VERSION,
         scope_id: ScopeId::new(work_scope).map_err(|error| owner_refused(error.to_string()))?,
         task_id: identity
             .request
@@ -1401,6 +1431,15 @@ fn negative_memory_gate_envelope(
         operation_id: observation_operation.clone(),
         request: identity.request.metadata.clone(),
         idempotency_key: submission.idempotency_key.clone(),
+        // #1925: the gate leg's stable intent is the owner-issued gate outcome
+        // record it publishes, addressed by its recorded digest.
+        write_intent_id: crate::write_intent::admission_write_intent(
+            "negative-memory-gate-observation",
+            outcome.record_digest.as_str(),
+        )
+        .ok_or_else(|| owner_refused("gate outcome has no owner-issued subject"))?,
+        write_envelope_protocol_version:
+            crate::write_intent::GOVERNOR_ADMISSION_WRITE_ENVELOPE_PROTOCOL_VERSION,
         scope_id: ScopeId::new(GOVERNOR_SCOPE_ID)
             .map_err(|error| owner_refused(error.to_string()))?,
         task_id: identity
@@ -1786,6 +1825,19 @@ fn watchdog_observation_envelope(
         operation_id: observation_operation.clone(),
         request: identity.request.metadata.clone(),
         idempotency_key: submission.idempotency_key.clone(),
+        // #1925: the watchdog spool leg's stable intent is the owner-issued
+        // spool entry it publishes, addressed by that entry's record digest.
+        // The batch and the sequence are deliberately NOT part of the subject:
+        // the same entry re-presented in a later batch at a later sequence is
+        // the same stable intent, while its per-attempt operation identity
+        // still rotates.
+        write_intent_id: crate::write_intent::admission_write_intent(
+            "watchdog-spool-observation",
+            entry.record_digest.as_str(),
+        )
+        .ok_or_else(|| owner_refused("watchdog spool entry has no owner-issued subject"))?,
+        write_envelope_protocol_version:
+            crate::write_intent::GOVERNOR_ADMISSION_WRITE_ENVELOPE_PROTOCOL_VERSION,
         scope_id: ScopeId::new(GOVERNOR_SCOPE_ID)
             .map_err(|error| owner_refused(error.to_string()))?,
         task_id: identity

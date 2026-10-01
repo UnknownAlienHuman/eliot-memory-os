@@ -638,6 +638,18 @@ fn problem_owner_envelope(
         operation_id: operation_id.clone(),
         request: identity.request.metadata.clone(),
         idempotency_key: identity.idempotency_key.clone(),
+        // #1925: this leg's stable intent is the owner-issued problem-owner
+        // candidate record it commits, exactly the record the transition's
+        // admission digest and proof refs already bind.
+        write_intent_id: crate::write_intent::admission_write_intent(
+            "problem-owner-transition",
+            &record_digest,
+        )
+        .ok_or_else(|| {
+            owner_refused("problem owner candidate has no owner-issued subject to declare")
+        })?,
+        write_envelope_protocol_version:
+            crate::write_intent::GOVERNOR_ADMISSION_WRITE_ENVELOPE_PROTOCOL_VERSION,
         scope_id: ScopeId::new(PROBLEM_SCOPE_ID)
             .map_err(|error| owner_refused(error.to_string()))?,
         task_id: identity

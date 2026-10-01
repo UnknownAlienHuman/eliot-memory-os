@@ -13035,6 +13035,10 @@ mod tests {
             operation_id: OperationId::new(operation_id).expect("operation id"),
             request: metadata,
             idempotency_key: idempotency_key.to_owned(),
+            // The fixture's own stable intent, distinct from both identities.
+            write_intent_id: "intent-t1-2-1".to_owned(),
+            write_envelope_protocol_version:
+                crate::write_intent::GOVERNOR_ADMISSION_WRITE_ENVELOPE_PROTOCOL_VERSION,
             scope_id: ScopeId::new("governor").expect("scope"),
             task_id: None,
             transition_class: TransitionClass::TaskControl,
