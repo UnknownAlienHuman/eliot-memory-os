@@ -64,17 +64,17 @@ fn validate_digest(field: &'static str, value: &str) -> Result<(), ProcessStream
     Ok(())
 }
 
-/// Rejects a digest algorithm this contract revision cannot verify.
+/// Whether this contract revision can verify a digest made by `algorithm`.
 ///
 /// The match is exhaustive over [`ProcessStreamDigestAlgorithm`], so a new
 /// member cannot be recorded as a durable identity until its digest shape and
-/// version are stated here. A transport or source digest is therefore always
-/// a digest of a named, versioned algorithm rather than an unnamed hash.
-fn validate_digest_algorithm(
-    algorithm: types::ProcessStreamDigestAlgorithm,
-) -> Result<(), ProcessStreamSinkError> {
+/// version are stated here. A transport or source digest is therefore always a
+/// digest of a named, versioned algorithm rather than an unnamed hash, and an
+/// algorithm this revision cannot verify is refused with a typed error by every
+/// entry point instead of being recorded.
+fn digest_algorithm_is_verifiable(algorithm: types::ProcessStreamDigestAlgorithm) -> bool {
     match algorithm {
-        types::ProcessStreamDigestAlgorithm::Sha256 => Ok(()),
+        types::ProcessStreamDigestAlgorithm::Sha256 => true,
     }
 }
 

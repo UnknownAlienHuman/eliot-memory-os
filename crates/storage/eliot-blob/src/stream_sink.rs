@@ -85,12 +85,12 @@ use eliot_blob_api::{
 };
 use eliot_process::{
     DurableProcessStreamSource, DurableStreamLocatorKind, PROCESS_STREAM_SINK_SCHEMA_VERSION,
-    ProcessStreamEvidence, ProcessStreamPersistenceDisposition, ProcessStreamPrefixPreview,
-    ProcessStreamSinkAbortReason, ProcessStreamSinkAbortRequest, ProcessStreamSinkAppend,
-    ProcessStreamSinkAppendDisposition, ProcessStreamSinkClient, ProcessStreamSinkError,
-    ProcessStreamSinkFinalizeRequest, ProcessStreamSinkFuture, ProcessStreamSinkOpenRequest,
-    ProcessStreamSinkReadback, ProcessStreamSinkSession, ProcessStreamSinkSessionView,
-    ProcessStreamSinkState, ProcessStreamSinkTerminal, ProcessStreamSinkTerminalCommandIdentity,
+    ProcessStreamEvidence, ProcessStreamPersistenceDisposition, ProcessStreamSinkAbortReason,
+    ProcessStreamSinkAbortRequest, ProcessStreamSinkAppend, ProcessStreamSinkAppendDisposition,
+    ProcessStreamSinkClient, ProcessStreamSinkError, ProcessStreamSinkFinalizeRequest,
+    ProcessStreamSinkFuture, ProcessStreamSinkOpenRequest, ProcessStreamSinkReadback,
+    ProcessStreamSinkSession, ProcessStreamSinkSessionView, ProcessStreamSinkState,
+    ProcessStreamSinkTerminal, ProcessStreamSinkTerminalCommandIdentity,
     ProcessStreamSinkUnknownOutcome, ProcessStreamTransportPrefixIdentity, StreamEvidenceGap,
     StreamPersistenceStatus, StreamPreviewRepresentation, StreamTransportStatus,
 };
@@ -450,7 +450,10 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
     /// The admissible set is a prefix of the physical stream, so the byte
     /// counts alone decide coverage; the digest equality for equal lengths is
     /// enforced by the contract in `ProcessStreamSinkTerminal`.
-    fn coverage_complete(state: &SinkState, observed_bytes: u64) -> Result<bool, ProcessStreamSinkError> {
+    fn coverage_complete(
+        state: &SinkState,
+        observed_bytes: u64,
+    ) -> Result<bool, ProcessStreamSinkError> {
         if state.admitted.byte_length() > observed_bytes {
             return Err(ProcessStreamSinkError::OffsetMismatch {
                 expected: observed_bytes,
@@ -1092,8 +1095,7 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             && matches!(
                 named_state,
                 ProcessStreamSinkState::CompleteSource | ProcessStreamSinkState::PartialSource
-            )
-        {
+            ) {
             ProcessStreamSinkState::SourceUnavailable
         } else {
             named_state

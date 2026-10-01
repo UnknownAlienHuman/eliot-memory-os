@@ -71,8 +71,16 @@ impl ProcessStreamSinkSession {
             });
         }
         validate_binding(&self.binding)?;
-        super::validate_digest_algorithm(self.transport_digest_algorithm)?;
-        super::validate_digest_algorithm(self.source_digest_algorithm)?;
+        // The session re-checks the same version gate, so a live capability
+        // cannot carry a digest algorithm the contract cannot verify even if
+        // the request that minted it was checked elsewhere.
+        if !super::digest_algorithm_is_verifiable(self.transport_digest_algorithm)
+            || !super::digest_algorithm_is_verifiable(self.source_digest_algorithm)
+        {
+            return Err(ProcessStreamSinkError::InvalidRequest {
+                reason: "unsupported process-stream digest algorithm",
+            });
+        }
         validate_digest("open_request_sha256", &self.open_request_sha256)
     }
 
@@ -590,9 +598,7 @@ fn validate_admitted_coverage<R: CommandRequest>(
             observed: admitted_bytes,
         });
     }
-    if admitted_bytes == request.observed_bytes()
-        && admitted_sha256 != request.observed_sha256()
-    {
+    if admitted_bytes == request.observed_bytes() && admitted_sha256 != request.observed_sha256() {
         return Err(ProcessStreamSinkError::EvidenceInvariant {
             reason: "equal-length admissible and physical identities must share one digest"
                 .to_owned(),
