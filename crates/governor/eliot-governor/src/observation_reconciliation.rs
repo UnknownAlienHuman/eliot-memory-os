@@ -108,15 +108,14 @@
 //! verifier is implemented here and no repair is executed: endorsement
 //! consumes evidence produced outside the effect executor.
 //!
-//! Named prerequisite (#1759) — **no production
-//! [`OwnerLeaseIssuer`](eliot_problem::OwnerLeaseIssuer) exists in this
-//! tree.** The trait is declared in `eliot-problem/src/ownership.rs` and its
-//! only implementation anywhere is a `#[cfg(test)]` issuer inside that crate's
-//! own unit tests, so
-//! [`AuthenticatedOwnerLease`](eliot_problem::AuthenticatedOwnerLease) is
-//! unreachable from `eliot-governor`. This Governor holds problem identities
-//! and revisions only (`ProblemOwner` is a `BTreeMap<String, u64>`), never
-//! records and never leases. Consequently the
+//! Named prerequisite (#1759) — `ProblemReadback` now implements a production
+//! [`OwnerLeaseIssuer`](eliot_problem::OwnerLeaseIssuer) over full grants and
+//! revocations retained in complete committed owner-transition history. Its
+//! authority is omitted from serialized readbacks. The issuer can authenticate
+//! only the grant exactly retained by the current assigned head; initial and
+//! successor grant admission is still absent. This Governor's shared
+//! `ProblemOwner` projection still holds identities and revisions only
+//! (`BTreeMap<String, u64>`), never records or leases. Consequently the
 //! two Problem/Incident scratch probes that used to live here — a
 //! `Verifying -> Resolved` probe and a watchdog-gap `Candidate` Incident probe,
 //! both built from a literal `owner: OwnerRef { principal: GOVERNOR_SCOPE_ID }`
@@ -140,16 +139,12 @@
 //! from this owner through
 //! [`GovernorObservationReconciliation::commit_problem_owner_transition`], which
 //! reuses this same gateway and the same `problem:{problem_id}` revision-head
-//! namespace. That entry currently has **no caller anywhere in the tree** — not
-//! a production entry and not a test — so the whole nine-verb path is reached
-//! from nothing. It is type-sound and its preparation is exercised through the
-//! same gateway as every other canonical write here; what is missing is a caller,
-//! and the caller cannot be written until the lease owner exists, because the
-//! entry takes an `AuthenticatedOwnerLease` and nothing outside `eliot-problem`'s
-//! own test module can construct one. Both facts are stated here rather than
-//! worked around: no principal string is accepted on that path, no Problem or
-//! Incident literal is constructed in this module, and no alias or wrapper was
-//! added to make the missing caller appear to exist.
+//! namespace. The production `commit_problem_owner_transition_from_readback`
+//! caller authenticates the lease from the exact complete committed record it
+//! advances. This does not bootstrap a new Problem owner: authenticated initial
+//! and successor lease admission remains outstanding, so the path still refuses
+//! when no committed owner grant is available. No principal string is accepted
+//! as a substitute.
 
 #![forbid(unsafe_code)]
 
@@ -2184,13 +2179,11 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
     /// candidate, the retained closure of a `Waive`/`Supersede` transition, and
     /// the store's own receipt.
     ///
-    /// This entry has no caller anywhere in the tree today, and no production
-    /// [`OwnerLeaseIssuer`](eliot_problem::OwnerLeaseIssuer) exists either, so
-    /// no caller could present the
-    /// [`AuthenticatedOwnerLease`](eliot_problem::AuthenticatedOwnerLease) this
-    /// takes: every verb is type-sound here and production-unreachable until the
-    /// lease owner issues one. A caller was deliberately not written, because a
-    /// caller that cannot construct its own argument is not a caller.
+    /// For callers that already hold an authenticated lease, the companion
+    /// [`Self::commit_problem_owner_transition_from_readback`] obtains that
+    /// value from the exact complete committed Problem readback. Initial and
+    /// successor lease admission remain separate owner work; this entry never
+    /// accepts a principal string or turns a presented grant into authority.
     ///
     /// # Errors
     ///

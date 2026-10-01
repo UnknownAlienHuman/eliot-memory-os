@@ -65,22 +65,14 @@
 //! return value. A readback through the committed-only `GetAttentionAndProblems`
 //! projection therefore reflects exactly the transitions that committed.
 //!
-//! Honesty about reachability: no production
-//! [`OwnerLeaseIssuer`](eliot_problem::OwnerLeaseIssuer) exists in this tree, so
-//! [`AuthenticatedOwnerLease`] is unreachable from the Governor and every
-//! transition here is type-sound but production-unreachable until the lease owner
-//! supplies one. That is the designed state, not a gap worked around: no
-//! principal string is accepted anywhere on this path.
-//!
-//! Two consequences are recorded here rather than left for a reader to
-//! rediscover. First, the entry point that reaches this module,
-//! [`GovernorObservationReconciliation::commit_problem_owner_transition`](crate::GovernorObservationReconciliation),
-//! has no caller of its own anywhere in the tree, so this preparation path is
-//! reached from nothing at all — not from production and not from a test. It is
-//! type-sound and correct; it is simply not yet wired to an entry. Second,
-//! because the only construction path for [`AuthenticatedOwnerLease`] needs an
-//! issuer, no caller could reach this module even if one were added, until the
-//! lease owner exists. Both gaps are the same gap seen from two ends.
+//! Reachability is limited to already-issued ownership. The Governor's
+//! `ProblemReadback` is a production issuer over full grant/revocation evidence
+//! in a fresh, complete committed read; its serde representation drops that
+//! capability. The readback caller authenticates the exact lease retained by
+//! the current Problem head before invoking the ordinary transition entry.
+//! There is still no authenticated initial/successor grant-admission route in
+//! this crate, so `CREATE` and reassignment cannot mint authority from a
+//! principal string or from an untrusted presented grant.
 
 #![forbid(unsafe_code)]
 
