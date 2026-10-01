@@ -3473,20 +3473,18 @@ impl KernelComposition {
             // foreign row either, which would hand this caller an authorization
             // over an operation it is not the owner of.
             Ok(BackupVerificationDisposition::ForeignOperation) => {
-                return foreign_operation_reply(idempotency_key);
+                foreign_operation_reply(idempotency_key)
             }
             // The write's durable outcome is not observable here, which is
             // precisely I14.21's third arm. See
             // [`Self::answer_unknown_verify_outcome`].
-            Err(error) => {
-                return self.answer_unknown_verify_outcome(
-                    session,
-                    identity,
-                    fresh,
-                    idempotency_key,
-                    &error,
-                );
-            }
+            Err(error) => self.answer_unknown_verify_outcome(
+                session,
+                identity,
+                fresh,
+                idempotency_key,
+                &error,
+            ),
         }
     }
 
@@ -3548,10 +3546,15 @@ impl KernelComposition {
             issued_by_session_id,
             crate::unix_ms(),
         );
+        // Load-bearing fail-closed: if the owner ever issues for the `unknown`
+        // arm, this route reports NO verification result rather than answering
+        // `ok` beside a row nobody can explain. A refusal here is the safe
+        // direction, so it is the `if` branch and the failed stage is the tail.
         if succession.is_ok() {
-            return verification_not_recorded_reply(idempotency_key);
+            verification_not_recorded_reply(idempotency_key)
+        } else {
+            answer_failed_stage(&fresh.request_digest, idempotency_key, error)
         }
-        answer_failed_stage(&fresh.request_digest, idempotency_key, error)
     }
 }
 
