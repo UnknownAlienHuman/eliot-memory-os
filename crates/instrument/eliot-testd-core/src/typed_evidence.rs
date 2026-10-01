@@ -694,8 +694,8 @@ impl std::fmt::Debug for TestdReplayOwnerReadback {
 }
 
 impl TestdReplayOwnerReadback {
-    /// Validates exact canonical JSON and SHA-256 pairings for all three
-    /// authenticated owner readbacks.
+    /// Validates exact canonical JSON and SHA-256 pairings for the per-stream
+    /// source-admission readback and all three authenticated owner readbacks.
     pub fn validate(&self) -> Result<(), TestdEvidenceError> {
         for (json_field, json, digest_field, digest) in [
             (
