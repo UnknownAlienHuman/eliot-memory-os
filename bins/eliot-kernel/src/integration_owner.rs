@@ -30,12 +30,15 @@
 //! Store bridge slice registers; they are declared here so the names cannot
 //! drift between the Kernel surface and the bridge registration.
 //!
-//! The production caller is [`serve_integration_owner_request`]: it admits
-//! the typed advance request, drives [`advance_integration_owner`], and
+//! The intended production caller is
+//! [`serve_integration_owner_request`]: it admits the typed advance request,
+//! drives [`advance_integration_owner`], and
 //! encodes the [`IntegrationOwnerResponse`] carrying the outcome, the lease
 //! when granted, the exact transitioned records the bridge must persist, and
 //! the pressure projection. Dispatch wiring stays with the owning slice per
-//! the all-code-first owner order; no caller outside this module is claimed.
+//! the all-code-first owner order; no caller outside this module is claimed, and
+//! live status: that serve entry point currently has no production caller, so
+//! the route described here is contract rather than reached code.
 //!
 //! # What this deliberately does not do
 //!
@@ -373,9 +376,20 @@ pub fn advance_integration_owner(
 /// Serves one typed owner-path request: admits the advance request, drives
 /// [`advance_integration_owner`], and encodes the [`IntegrationOwnerResponse`]
 /// with the outcome, the lease when granted, the exact transitioned records
-/// the bridge must persist, and the pressure projection. This is the
-/// production caller of the owner advance; dispatch wiring stays with the
-/// owning slice per the all-code-first owner order.
+/// the bridge must persist, and the pressure projection. Dispatch wiring stays
+/// with the owning slice per the all-code-first owner order.
+///
+/// # Live status
+///
+/// No production caller. Measured on this tree, no code in any crate names this
+/// function other than its defining line, so the module header's earlier claim
+/// that "the production caller is [`serve_integration_owner_request`]" was false
+/// and has been corrected. The inner leg it drives is equally unbuilt:
+/// [`advance_integration_owner`] is named only by its own defining line and by
+/// this function, so the whole owner-advance surface is currently unreachable
+/// rather than half-wired. Whether the owning slice wires dispatch to it or this
+/// surface is retired is an owner decision; no caller was added to close the
+/// gap.
 pub fn serve_integration_owner_request(
     candidates: &[IntegrationCandidate],
     active_leases: &[IntegrationOwnerLease],

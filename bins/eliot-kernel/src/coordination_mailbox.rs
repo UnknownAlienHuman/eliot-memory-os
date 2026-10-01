@@ -794,11 +794,12 @@ pub fn rebuild_coordination_map_view(
 // never mints a second identity scheme: the Governor `payload_handle` text in
 // `eliot-coordination` is Governor semantics and is not interpreted here.
 //
-// Production chain: the Store bridge / delivery slice reads the bytes through
-// the artifact owner, then calls [`resolve_mailbox_payload_handle`] with the
-// owner-supplied bytes for the pure digest-plus-length check. That read lives
-// in the bridge/dispatch seam outside this file, so the production caller is
-// STITCH. Typed failures stay typed: every rejection is a
+// Intended production chain: the Store bridge / delivery slice reads the bytes
+// through the artifact owner, then calls [`resolve_mailbox_payload_handle`]
+// with the owner-supplied bytes for the pure digest-plus-length check. That read
+// belongs in the bridge/dispatch seam outside this file. Live status: no
+// production caller is built; see the `# Live status` section on that function.
+// Typed failures stay typed: every rejection is a
 // [`CoordinationMailboxError`].
 //
 // Out of scope here: map view (map-view slice above), route capabilities
@@ -897,11 +898,24 @@ pub fn detach_mailbox_payload_handle(
 
 /// Resolves a handle to the owner-supplied bytes.
 ///
-/// `bytes` are the exact bytes the production caller read through the
-/// artifact owner (`ArtifactOwner::read` via the injected
-/// `ArtifactBlobReader`); this function verifies length and digest and
-/// returns the same slice, never a copy beside the handle. Mismatches are
-/// typed rejections, never silent truncation.
+/// `bytes` are the exact bytes the caller read through the artifact owner
+/// (`ArtifactOwner::read` via the injected `ArtifactBlobReader`); this function
+/// verifies length and digest and returns the same slice, never a copy beside
+/// the handle. Mismatches are typed rejections, never silent truncation.
+///
+/// # Live status
+///
+/// No production caller. Measured on this tree, no code in any crate names this
+/// function other than its defining line, so the earlier wording that named "the
+/// production caller" as an existing fact was false and has been corrected to a
+/// description of the intended contract. The owner seam this contract describes
+/// is real and separately owned, but the read-and-resolve route is not built:
+/// the sibling attach/detach pair ([`attach_mailbox_payload_handle`],
+/// [`detach_mailbox_payload_handle`]) and the rest of the mailbox route are
+/// likewise uncalled, so this is the unused resolve half of that unwired
+/// surface, not a live step inside a working chain. Whether the bridge/dispatch
+/// seam is wired to it or this accessor is retired is an owner decision; no
+/// caller was added to close the gap.
 pub fn resolve_mailbox_payload_handle<'a>(
     handle: &MailboxPayloadHandle,
     bytes: &'a [u8],
