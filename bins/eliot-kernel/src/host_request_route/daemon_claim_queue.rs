@@ -424,17 +424,18 @@ impl KernelComposition {
                         owner_session_epoch: session.session_epoch,
                     };
                 }
+                let bind_scope = invocation.action == eliot_protocol::TaskControllerAction::BindScope;
                 let task_id = envelope
                     .identity
                     .task_id
                     .as_deref()
-                    .and_then(|value| value.parse().ok())
-                    .ok_or(TransportError::SessionFenced)?;
-                let scope_id = envelope
-                    .identity
-                    .work_scope_id
-                    .as_deref()
-                    .ok_or(TransportError::SessionFenced)?;
+                    .map(str::parse)
+                    .transpose()
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let scope_id = envelope.identity.work_scope_id.clone();
+                if bind_scope != (task_id.is_none() && scope_id.is_none()) {
+                    return Err(TransportError::SessionFenced);
+                }
                 let session_id = envelope
                     .identity
                     .session_id
@@ -448,7 +449,7 @@ impl KernelComposition {
                     fencing_generation: candidate.task_controller_attempt.generation,
                     session_id: session_id.to_owned(),
                     authority_epoch: envelope.state_fence.authority_epoch.clone(),
-                    scope_id: scope_id.to_owned(),
+                    scope_id,
                     expires_at_unix_ms: envelope.identity.deadline_unix_ms,
                     use_budget: 1,
                     task_id,
@@ -1024,20 +1025,9 @@ fn task_controller_stale_attempt(
     if body.attempt.operation_id != body.operation_id
         || body.attempt.attempt_id != state.attempt_id
         || body.attempt.fencing_generation != state.generation
-        || body.attempt.task_id.as_str()
-            != envelope
-                .identity
-                .task_id
-                .as_deref()
-                .ok_or(TransportError::SessionFenced)
-                .ok()?
-        || body.attempt.scope_id
-            != envelope
-                .identity
-                .work_scope_id
-                .as_deref()
-                .ok_or(TransportError::SessionFenced)
-                .ok()?
+        || body.attempt.task_id.as_ref().map(ToString::to_string)
+            != envelope.identity.task_id
+        || body.attempt.scope_id != envelope.identity.work_scope_id
         || body.attempt.session_id
             != envelope
                 .identity
@@ -1296,21 +1286,20 @@ fn task_controller_admission(
     invocation
         .validate()
         .map_err(|_| TransportError::SessionFenced)?;
-    if invocation.task_id.as_str()
-        != envelope
-            .identity
-            .task_id
-            .as_deref()
-            .ok_or(TransportError::SessionFenced)?
-        || invocation.work_scope_id
-            != envelope
-                .identity
-                .work_scope_id
-                .as_deref()
-                .ok_or(TransportError::SessionFenced)?
-        || envelope.state_fence.task_revision.is_none()
-        || envelope.identity.session_id.is_none()
-    {
+    let bind_scope = invocation.action == eliot_protocol::TaskControllerAction::BindScope;
+    let identity_shape_matches = if bind_scope {
+        invocation.task_id.is_none()
+            && invocation.work_scope_id.is_none()
+            && envelope.identity.task_id.is_none()
+            && envelope.identity.work_scope_id.is_none()
+            && envelope.state_fence.task_revision.is_none()
+    } else {
+        invocation.task_id.as_ref().map(ToString::to_string)
+            == envelope.identity.task_id
+            && invocation.work_scope_id == envelope.identity.work_scope_id
+            && envelope.state_fence.task_revision.is_some()
+    };
+    if !identity_shape_matches || envelope.identity.session_id.is_none() {
         return Err(TransportError::SessionFenced);
     }
     Ok(invocation)
