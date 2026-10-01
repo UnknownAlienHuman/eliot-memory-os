@@ -3057,10 +3057,13 @@ impl KernelComposition {
                             .load_bridge_event_observation_page_checked(&query)
                             .is_ok_and(|page| page == *retained_page)
                     }) && snapshot.streams.len() == snapshot.roster.owners.len();
-                // An ORS race or source change cannot authorize a positive
-                // projection. A fresh negative revision remains safe and
-                // narrows authority under the exact current adapter key.
-                let _source_still_matches = source_still_matches;
+                if !source_still_matches {
+                    // Refuse this AVAILABLE projection without consuming its
+                    // readback. The daemon can reset cursors and retry with
+                    // null selectors, which takes the explicit negative
+                    // source-loss path below.
+                    return Err(TransportError::SessionFenced);
+                }
                 consumed_readback = Some(readback.clone());
             }
             (None, _) => {
@@ -3086,21 +3089,25 @@ impl KernelComposition {
             _ => return Err(TransportError::SessionFenced),
         }
 
-        if let Some(readback) = consumed_readback.as_ref() {
-            self.startup_coordinator
-                .lock()
-                .map_err(|_| TransportError::SessionFenced)?
-                .mark_governor_authority_observation_published(readback, operation.revision)
-                .map_err(|_| TransportError::SessionFenced)?;
-        }
-        self.record_governor_issued_coverage_projection(
-            operation.revision,
-            operation.fingerprint,
-            operation.verified,
-            operation.authorizes_enforcement,
-            operation.authorizes_complete_coverage_ops,
-        )
-        .map_err(|_| TransportError::SessionFenced)
+        let record_result = if let Some(readback) = consumed_readback.as_ref() {
+            self.record_governor_issued_coverage_projection_with_observation(
+                operation.revision,
+                operation.fingerprint,
+                operation.verified,
+                operation.authorizes_enforcement,
+                operation.authorizes_complete_coverage_ops,
+                readback,
+            )
+        } else {
+            self.record_governor_issued_coverage_projection(
+                operation.revision,
+                operation.fingerprint,
+                operation.verified,
+                operation.authorizes_enforcement,
+                operation.authorizes_complete_coverage_ops,
+            )
+        };
+        record_result.map_err(|_| TransportError::SessionFenced)
     }
 
     /// Reads one bounded page from original ORS bridge-event owners. The
