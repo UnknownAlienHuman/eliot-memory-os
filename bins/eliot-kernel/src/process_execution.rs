@@ -2973,8 +2973,6 @@ impl ProcessExecutionGateway {
         };
         use eliot_receipts::{AuthorityBinding, CausalBinding, EffectClass, ProofCeiling};
 
-        static NEXT_BLOB_OWNER_PULL_NONCE: AtomicU64 = AtomicU64::new(1);
-
         identity
             .validate()
             .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
@@ -3064,12 +3062,13 @@ impl ProcessExecutionGateway {
                 "Blob owner-facts deadline elapsed before pull".to_owned(),
             ));
         }
-        let nonce = NEXT_BLOB_OWNER_PULL_NONCE.fetch_add(1, Ordering::Relaxed);
         let pull_seed = canonical_json_bytes(&(
             process_binding_sha256.as_str(),
             identity.request.metadata.request_id.as_str(),
-            now,
-            nonce,
+            invocation_id,
+            source_root_identity_sha256,
+            expected_module_id.as_deref(),
+            expected_generation_id.as_deref(),
         ))
         .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
         let pull_ref = format!("blob-owner-facts-{}", &sha256_hex(&pull_seed)[..32]);
@@ -3112,6 +3111,8 @@ impl ProcessExecutionGateway {
             owner_update_identity_sha256: None,
             source_admission_json: None,
             source_admission_sha256: None,
+            source_admission_write_receipt_json: None,
+            source_admission_write_receipt_sha256: None,
             state_fence,
             deadline_ms,
         };
@@ -3859,8 +3860,6 @@ impl KernelComposition {
             BlobProcessStreamGrantState,
         };
 
-        static NEXT_BLOB_GRANT_NONCE: AtomicU64 = AtomicU64::new(1);
-
         let response = self
             .pull_testd_blob_process_stream_owner_facts(
                 owner,
@@ -3932,13 +3931,10 @@ impl KernelComposition {
                 "Blob grant deadline elapsed before durable issue".to_owned(),
             ));
         }
-        let nonce = NEXT_BLOB_GRANT_NONCE.fetch_add(1, Ordering::Relaxed);
         let capability_seed = canonical_json_bytes(&(
             response.pull_ref.as_str(),
             sha256_hex(&binding_json),
             sha256_hex(&identity_json),
-            now,
-            nonce,
         ))
         .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
         let capability_ref = format!("blob-cap-{}", &sha256_hex(&capability_seed)[..40]);
@@ -3990,11 +3986,34 @@ impl KernelComposition {
             .validate()
             .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
         let ors = &self.p07_ors;
-        ors.persist_blob_process_stream_grant(&grant)
-            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
-        let token = ors
-            .issue_blob_process_stream_call_token(&capability_ref, &token_ref)
-            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        let token = match ors
+            .load_blob_process_stream_grant(&capability_ref)
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?
+        {
+            Some(existing) => {
+                if !existing.same_binding(&grant)
+                    || existing.state != BlobProcessStreamGrantState::Active
+                    || existing.expires_at_unix_ms <= now
+                {
+                    return Err(ProcessExecutionError::Unavailable(
+                        "retained Blob grant conflicts with the exact launch admission".to_owned(),
+                    ));
+                }
+                ors.load_blob_process_stream_call(&capability_ref, &token_ref, 1)
+                    .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?
+                    .ok_or_else(|| {
+                        ProcessExecutionError::Unavailable(
+                            "retained Blob grant lacks its original one-use token".to_owned(),
+                        )
+                    })?
+            }
+            None => {
+                ors.persist_blob_process_stream_grant(&grant)
+                    .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+                ors.issue_blob_process_stream_call_token(&capability_ref, &token_ref)
+                    .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?
+            }
+        };
         let initial_call_token = BlobProcessStreamCallToken {
             reference: token.token_ref,
             ordinal: token.ordinal,

@@ -151,6 +151,10 @@ async fn dispatch_blob_process_stream_sink(
             capability,
             body,
             owner_facts,
+            process_source_admission_readback_json,
+            process_source_admission_readback_sha256,
+            source_admission_write_receipt_json,
+            source_admission_write_receipt_sha256,
             fence,
             deadline_ms,
         } => {
@@ -167,6 +171,10 @@ async fn dispatch_blob_process_stream_sink(
                     identity,
                     &capability.reference,
                     &owner_facts,
+                    &process_source_admission_readback_json,
+                    &process_source_admission_readback_sha256,
+                    &source_admission_write_receipt_json,
+                    &source_admission_write_receipt_sha256,
                     open,
                 )
                 .await
