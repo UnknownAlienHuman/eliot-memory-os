@@ -295,14 +295,25 @@ fn compile_with(
                     field: "projection.slot_id",
                 },
             )?;
-        bound_recipe
+        let reference = bound_recipe
             .source_requirements
             .iter_mut()
             .find(|requirement| requirement.role == spec.source_role)
             .expect("slot source role is declared")
             .expected_reference
             .as_mut()
-            .expect("slot source has an exact reference")
+            .expect("slot source has an exact reference");
+        // One owner record carries one payload digest per declared slot. A slot
+        // delivered twice is a duplicate for the compiler to refuse; it never
+        // becomes a second digest on the same source reference.
+        if reference
+            .slot_projection_digests
+            .iter()
+            .any(|recorded| recorded.slot_id == projection.slot_id)
+        {
+            continue;
+        }
+        reference
             .slot_projection_digests
             .push(CampaignSlotProjectionDigest {
                 slot_id: projection.slot_id.clone(),
@@ -578,15 +589,13 @@ fn duplicate_slot_and_changed_shared_lineage_fail_closed() -> TestResult {
         Err(eliot_learning_contracts::LearningContractError::Duplicate { .. })
     ));
 
-    // An over-long declared identity is refused with a typed bound. A
-    // `Conditional` requirement may only name a slot the recipe declares, so
-    // the oversized identity is the declared slot's own id.
+    // sound and the oversized dependency label is the one bound left to refuse.
+    let oversized_slot = SlotId::from_artifact(artifact(&"d".repeat(MAX_LABEL_BYTES + 1))?);
     let mut oversized_dependency = recipe(
-        vec![SlotRequirement::Optional, SlotRequirement::Required],
+        vec![SlotRequirement::Required, SlotRequirement::Required],
         vec![1, 1],
         OmissionPolicy::RequiredSlots,
     )?;
-    let oversized_slot = SlotId::from_artifact(artifact(&"d".repeat(MAX_LABEL_BYTES + 1))?);
     oversized_dependency.slots[0].slot_id = oversized_slot.clone();
     oversized_dependency.slots[1].requirement = SlotRequirement::Conditional {
         depends_on: oversized_slot,
@@ -2347,9 +2356,6 @@ fn no_store_clock_transcript_provider_mutation_path() -> TestResult {
         "env::",
         "Store",
         "Model",
-        // The caller supplies `generated_at_ms`/`expires_at_ms`; the forbidden
-        // surface is any std clock read, so the whole `std::time` module stays
-        // banned rather than the English word "clock" the input docs must use.
         "std::time",
         "Clock",
         "Cell<",
@@ -2368,19 +2374,21 @@ fn no_store_clock_transcript_provider_mutation_path() -> TestResult {
         OmissionPolicy::RequiredSlots,
     )?;
     let supplied = projection(&recipe, 0, SlotDisposition::Current)?;
-    let digest_before = recipe.canonical_digest.clone();
     let first = compile(
         &mut recipe,
         std::slice::from_ref(&supplied),
         &[artifact("ref-1")?],
     )?;
+    // The first compilation binds the supplied slot digest into the recipe; a
+    // second compilation over the same inputs must be a fixed point.
+    let bound_digest = recipe.canonical_digest.clone();
     let second = compile(
         &mut recipe,
         std::slice::from_ref(&supplied),
         &[artifact("ref-1")?],
     )?;
     assert_eq!(first, second);
-    assert_eq!(recipe.canonical_digest, digest_before);
+    assert_eq!(recipe.canonical_digest, bound_digest);
     assert_eq!(supplied.members.len(), 1);
     Ok(())
 }

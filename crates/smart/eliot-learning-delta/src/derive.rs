@@ -31,11 +31,14 @@ pub fn derive_attempt_learning_outcome(
     policy.validate()?;
     phase_preflight(state_view, input, context, optional_refiner_draft, policy)?;
     input.validate_shape(policy)?;
-    // The exact view refusals are answered before the contract-wide view
-    // check, so an invalidated or disputed view reports the precise typed
-    // delta refusal instead of the coarser contract coverage error.
-    phase_validate_view(state_view, input)?;
+    // The contract-wide view check runs FIRST: a view that does not reconcile
+    // with the bound recipe is `Contract(IncompleteCoverage)`, and that is the
+    // refusal every downstream phase and every caller already expects. The exact
+    // view refusals are then answered on a view that is known to reconcile, so
+    // `phase_validate_view` reports the precise typed delta refusal instead of
+    // inheriting a coarser error from a view that was never valid.
     state_view.validate_against(&input.recipe)?;
+    phase_validate_view(state_view, input)?;
     phase_validate_status(input)?;
     phase_validate_records(input, context, policy, optional_refiner_draft)?;
     phase_validate_dependencies(input)?;
