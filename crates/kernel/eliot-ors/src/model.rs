@@ -8228,6 +8228,12 @@ pub struct HostRequestRecord {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transport_channel_binding_sha256: Option<String>,
+    /// Exact authenticated Kernel request identity retained before a
+    /// Task Controller claim is exposed to the daemon. Legacy rows omit this
+    /// pair and remain unusable for task-free `BindScope` admission.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kernel_request_identity: Option<HostRequestKernelRequestIdentity>,
     pub operation_id: OperationIdentity,
     pub kind: HostRequestKind,
     pub request_id: OpaqueLabel,
@@ -8357,6 +8363,111 @@ pub struct HostRequestRecord {
     pub commit_order: u64,
 }
 
+/// Canonical authenticated Kernel request identity retained with a Host
+/// request row. This is owner metadata, never caller-supplied payload content.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRequestKernelRequestIdentity {
+    /// Canonical serialized `RequestIdentity` supplied by the authenticated
+    /// Kernel frame and preserved byte-for-byte for restart recovery.
+    pub canonical_json: String,
+    /// SHA-256 of the exact canonical bytes.
+    pub sha256: String,
+    /// Authenticated operating-system peer observed on the original Host
+    /// connection. This is retained alongside the semantic request identity
+    /// so a task-free setup claim can be resolved after process restart
+    /// without deriving a host identity from request payload fields.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authenticated_peer: Option<HostRequestKernelAuthenticatedPeer>,
+    /// SHA-256 of the canonical authenticated peer projection. Present
+    /// exactly when `authenticated_peer` is present.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authenticated_peer_sha256: Option<String>,
+}
+
+/// Bounded Kernel projection of the authenticated transport peer that
+/// presented one Host request. It contains no process handle or credential;
+/// it preserves the identity values that the platform adapter verified.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRequestKernelAuthenticatedPeer {
+    /// Original Host transport connection identifier.
+    pub connection_id: String,
+    /// Platform-observed process id for the authenticated peer.
+    pub process_id: u32,
+    /// Platform-observed user principal (for example the Windows SID).
+    pub user_identity: String,
+    /// Platform-observed operating-system session identity.
+    pub session_identity: String,
+    /// Monotonic transport-session generation observed by Kernel.
+    pub transport_session_epoch: u64,
+    /// SHA-256 of the transport launch nonce. The nonce itself is not retained
+    /// or exposed through the daemon claim.
+    pub launch_nonce_sha256: String,
+}
+
+impl HostRequestKernelAuthenticatedPeer {
+    /// Validates the retained, non-secret platform identity projection.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        for (value, field) in [
+            (&self.connection_id, "host_request_peer_connection_id"),
+            (&self.user_identity, "host_request_peer_user_identity"),
+            (&self.session_identity, "host_request_peer_session_identity"),
+        ] {
+            validate_text(value, field)?;
+        }
+        if self.process_id == 0 || self.transport_session_epoch == 0 {
+            return Err(OrsError::InvalidField {
+                field: "host_request_authenticated_peer",
+                reason: "process and transport session identities must be non-zero",
+            });
+        }
+        validate_digest(&self.launch_nonce_sha256, "host_request_peer_launch_nonce_sha256")
+    }
+}
+
+impl HostRequestKernelRequestIdentity {
+    /// Validates bounded canonical JSON bytes and their exact digest.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_digest(&self.sha256, "host_request_kernel_identity_sha256")?;
+        validate_bounded_canonical_json(
+            &self.canonical_json,
+            MAX_HOST_REQUEST_RESULT_RESPONSE_BYTES,
+            "host_request_kernel_identity_json",
+        )?;
+        if sha256_hex(self.canonical_json.as_bytes()) != self.sha256 {
+            return Err(OrsError::InvalidField {
+                field: "host_request_kernel_identity_sha256",
+                reason: "digest does not match exact canonical identity bytes",
+            });
+        }
+        match (&self.authenticated_peer, &self.authenticated_peer_sha256) {
+            (Some(peer), Some(peer_sha256)) => {
+                peer.validate()?;
+                validate_digest(peer_sha256, "host_request_peer_sha256")?;
+                let bytes = canonical_json_bytes(peer)
+                    .map_err(|error| OrsError::Encoding(error.to_string()))?;
+                if sha256_hex(&bytes) != *peer_sha256 {
+                    return Err(OrsError::InvalidField {
+                        field: "host_request_peer_sha256",
+                        reason: "digest does not match the exact peer projection",
+                    });
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_authenticated_peer",
+                    reason: "peer and digest must be present together",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 impl HostRequestRecord {
     /// Returns the durable key binding one operation to one exact request.
     pub fn record_key(&self) -> String {
@@ -8422,6 +8533,81 @@ impl HostRequestRecord {
         }
         validate_text(self.capability_ref.as_str(), "host_request_capability_ref")?;
         validate_digest(&self.fence_digest, "host_request_fence_digest")?;
+        if let Some(identity) = &self.kernel_request_identity {
+            identity.validate()?;
+            if identity
+                .authenticated_peer
+                .as_ref()
+                .is_some_and(|peer| peer.connection_id != self.connection_ref.as_str())
+            {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_authenticated_peer.connection_id",
+                    reason: "must match the retained Host connection",
+                });
+            }
+            let value: Value = serde_json::from_str(&identity.canonical_json).map_err(|_| {
+                OrsError::InvalidField {
+                    field: "host_request_kernel_identity_json",
+                    reason: "must decode as a JSON object",
+                }
+            })?;
+            let metadata = value
+                .get("request")
+                .and_then(|request| request.get("metadata"))
+                .ok_or(OrsError::InvalidField {
+                    field: "host_request_kernel_identity_json",
+                    reason: "must contain request metadata",
+                })?;
+            let request_id = metadata
+                .get("request_id")
+                .and_then(Value::as_str)
+                .ok_or(OrsError::InvalidField {
+                    field: "host_request_kernel_identity_json",
+                    reason: "must contain a request id",
+                })?;
+            let idempotency_key = value
+                .get("idempotency_key")
+                .and_then(Value::as_str)
+                .ok_or(OrsError::InvalidField {
+                    field: "host_request_kernel_identity_json",
+                    reason: "must contain an idempotency key",
+                })?;
+            let cancellation_id = value
+                .get("cancellation_id")
+                .and_then(Value::as_str)
+                .ok_or(OrsError::InvalidField {
+                    field: "host_request_kernel_identity_json",
+                    reason: "must contain a cancellation id",
+                })?;
+            let deadline = value
+                .get("deadline_unix_ms")
+                .and_then(Value::as_u64)
+                .ok_or(OrsError::InvalidField {
+                    field: "host_request_kernel_identity_json",
+                    reason: "must contain a positive deadline",
+                })?;
+            let state_fence = value
+                .get("request")
+                .and_then(|request| request.get("state_fence"))
+                .ok_or(OrsError::InvalidField {
+                    field: "host_request_kernel_identity_json",
+                    reason: "must contain the request state fence",
+                })?;
+            if request_id != self.request_id.as_str()
+                || idempotency_key != self.idempotency_key.as_str()
+                || cancellation_id != self.cancellation_id.as_str()
+                || deadline != self.deadline_unix_ms
+                || sha256_hex(
+                    &canonical_json_bytes(state_fence)
+                        .map_err(|error| OrsError::Encoding(error.to_string()))?,
+                ) != self.fence_digest
+            {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_kernel_identity_json",
+                    reason: "request identity does not match its admitted Host row",
+                });
+            }
+        }
         // `EpochId` is always validated; only generation retains a scalar check.
         if self.generation == 0 {
             return Err(OrsError::InvalidField {
