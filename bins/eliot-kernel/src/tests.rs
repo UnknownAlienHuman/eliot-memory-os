@@ -238,7 +238,11 @@ fn real_process_gateway(
         codec,
     )));
     let platform = Arc::new(
-        WindowsPlatform::new(containment_root.to_path_buf()).expect("real gateway platform root"),
+        WindowsPlatform::new(
+            std::fs::canonicalize(containment_root)
+                .expect("canonical real gateway platform root"),
+        )
+        .expect("real gateway platform root"),
     );
     let path_admission = Arc::new(KernelPathAdmission::new(Arc::clone(&platform)));
     let test_authority = Arc::new(RealExecutorTestAuthority::new(
@@ -5420,6 +5424,7 @@ async fn c183_probe_ready_shares_store_rebind_gate_and_requires_committed_public
         unix_ms()
     ));
     std::fs::create_dir_all(&dir).unwrap();
+    let dir = std::fs::canonicalize(&dir).unwrap();
     let requirement = HostStoreBootstrapRequirement {
         route_identity: PlatformHandle::new("store_bridge").unwrap(),
         canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store").unwrap(),
@@ -5433,9 +5438,67 @@ async fn c183_probe_ready_shares_store_rebind_gate_and_requires_committed_public
         approved_config_hash: PlatformHandle::new("b".repeat(64)).unwrap(),
         timeout_ms: 5000,
     };
-    let kernel =
-        KernelComposition::new(KernelConfig::new(&dir).with_store_bootstrap(requirement.clone()))
-            .unwrap();
+    let incarnation = supervision_incarnation();
+    let root_lease = eliot_platform_windows::UserOwnedRootLease::open_existing(&dir)
+        .expect("retain PortableDev repository root");
+    let repository_root_identity = root_lease.identity();
+    drop(root_lease);
+    let supervision_key_request =
+        eliot_platform_windows::PortableDevSupervisionAuthorityKeyRequest {
+            transaction_id: format!("c183-key-transaction-{}", std::process::id()),
+            effect_id: format!("c183-key-effect-{}", std::process::id()),
+            installation_id: "installation-1".to_owned(),
+            candidate_generation: "c183-candidate".to_owned(),
+            authority_generation: ResourceGeneration::genesis(),
+            supervision_lease_scope_id: incarnation.supervision_lease_scope_id.clone(),
+            signer_id: format!("c183-signer-{}", std::process::id()),
+            key_id: format!("c183-key-{}", std::process::id()),
+            repository_root: dir.clone(),
+            repository_root_identity,
+            relative_path: format!(
+                ".eliot-dev/state/supervision/c183-supervision-{}.key",
+                std::process::id()
+            ),
+        };
+    let portable_key_provider =
+        eliot_platform_windows::WindowsPortableDevSupervisionAuthorityKeyProvider::new();
+    let prepared_supervision_key = portable_key_provider
+        .prepare(supervision_key_request)
+        .expect("prepare disposable PortableDev supervision key");
+    let authority_receipt = match portable_key_provider
+        .write_prepared(prepared_supervision_key)
+        .expect("persist disposable PortableDev supervision key")
+    {
+        eliot_platform_windows::PortableDevSupervisionAuthorityKeyWriteOutcome::Created {
+            receipt,
+        } => receipt,
+        eliot_platform_windows::PortableDevSupervisionAuthorityKeyWriteOutcome::Unknown {
+            ..
+        } => panic!("PortableDev supervision key writeback is unknown"),
+    };
+    let provisioned_authority = ProvisionedSupervisionAuthority::new(
+        incarnation.supervision_lease_scope_id.clone(),
+        authority_receipt.request.candidate_generation.clone(),
+        authority_receipt.request.authority_generation.clone(),
+        eliot_runtime_contracts::PortableDevSupervisionKeyReference::new(
+            authority_receipt.request.relative_path.clone(),
+        )
+        .expect("PortableDev supervision key reference"),
+        authority_receipt.trust_anchor.clone(),
+    )
+    .expect("provisioned PortableDev supervision authority");
+    let supervision_authority_config = SupervisionLeaseAuthorityConfig {
+        authority: provisioned_authority,
+    };
+    let portable_dev_repository = Some((dir.clone(), repository_root_identity));
+    let kernel_config = KernelConfig::new(&dir)
+        .with_store_bootstrap(requirement.clone())
+        .with_supervision_lease_authority(supervision_authority_config.clone())
+        .with_supervision_installation_profile(
+            eliot_installation::InstallationProfile::PortableDev,
+            portable_dev_repository.clone(),
+        );
+    let kernel = KernelComposition::new(kernel_config).unwrap();
     let candidate = {
         let mut svc = kernel.service.lock().unwrap();
         let cand = HostKernelCandidateBinding {
@@ -5512,6 +5575,92 @@ async fn c183_probe_ready_shares_store_rebind_gate_and_requires_committed_public
         svc.publish_ready(ready).unwrap();
         cand
     };
+    let signer = ProtectedSupervisionLeaseSigner::new_for_profile(
+        dir.clone(),
+        eliot_installation::InstallationProfile::PortableDev,
+        portable_dev_repository,
+        &supervision_authority_config,
+    )
+    .expect("load the fixture's admitted PortableDev supervision signer");
+    let trust_anchor = &authority_receipt.trust_anchor;
+    let now_ms = unix_ms();
+    let lease_id = OperationIdentity::new(incarnation.supervision_lease_id.clone())
+        .expect("current supervision lease identity");
+    let lease_binding = eliot_ors::SupervisionLeaseBinding {
+        scope_ref: OperationIdentity::new(
+            incarnation.derived_scope_ref().expect("derived lease scope ref"),
+        )
+        .expect("supervision scope identity"),
+        observation_scope: eliot_runtime_contracts::canonical_observation_scope(),
+        installation_id: OperationIdentity::new("installation-1").unwrap(),
+        host_epoch: candidate.host_epoch.clone(),
+        activation_id: OperationIdentity::new("activation-1").unwrap(),
+        activation_generation: ResourceGeneration::genesis(),
+        kernel_epoch: test_epoch(1),
+        kernel_front_door_server_sid: "S-1-5-18".to_owned(),
+        kernel_front_door_session_id: 0,
+        kernel_front_door_artifact_sha256: "a".repeat(64),
+        watchdog_epoch: AuthorityEpoch::genesis(),
+        generation_binding: SupervisionGenerationBinding {
+            target_id: "eliotd-artifact".to_owned(),
+            target_generation: ResourceGeneration::genesis(),
+            module_id: "eliotd".to_owned(),
+            module_generation: ResourceGeneration::genesis(),
+            process_id: "pid:42:start:10".to_owned(),
+            process_generation: ResourceGeneration::genesis(),
+        },
+        state_fence: StateFence::new(test_epoch(1), ResourceGeneration::genesis()),
+        issued_at_ms: now_ms,
+        expires_at_ms: now_ms.saturating_add(60_000),
+        renew_before_ms: now_ms.saturating_add(30_000),
+        wake_policy: eliot_runtime_contracts::canonical_wake_policy(),
+        state: LeaseState::Active,
+        terminal_disposition: None,
+        revocation_reason: None,
+        revocation_id: None,
+        revocation_epoch: None,
+    };
+    let stage = kernel
+        .generation_gateway
+        .ors
+        .prepare_supervision_lease(SupervisionLeasePrepareRequest {
+            ticket_id: OperationIdentity::new("c183-supervision-ticket").unwrap(),
+            operation_id: OperationIdentity::new("c183-supervision-operation").unwrap(),
+            lease_id,
+            expected_revision: None,
+            operation: SupervisionLeaseOperation::Commit,
+            binding: lease_binding,
+        })
+        .expect("stage current signed supervision lease");
+    let envelope = stage
+        .ticket
+        .expected_payload()
+        .expect("supervision payload")
+        .sign(&signer)
+        .expect("sign current supervision lease");
+    let verification_context = verification_context_for_supervision_payload(
+        trust_anchor,
+        &envelope.payload,
+        envelope.payload.issued_at_ms,
+    );
+    let verified = trust_anchor
+        .verify(&envelope, &verification_context)
+        .expect("verify current supervision lease");
+    kernel
+        .generation_gateway
+        .ors
+        .commit_supervision_lease(&stage.ticket, &verified)
+        .expect("commit current supervision lease");
+    let current_lease = kernel
+        .supervision_lease_authority()
+        .expect("admitted supervision lease authority")
+        .current_snapshot(&incarnation.supervision_lease_id)
+        .expect("read current supervision lease")
+        .expect("current supervision lease exists before ProbeReady");
+    assert_eq!(current_lease.record.state, LeaseState::Active);
+    current_lease
+        .validate()
+        .expect("current supervision lease is structurally valid");
     let peer = eliot_ipc::PeerIdentity::authenticated_for_test(
         eliot_ipc::ProcessBinding::from_observation(
             candidate.host_process.process_id,
