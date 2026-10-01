@@ -3873,12 +3873,23 @@ impl<P: UserAutomationStorePort + ?Sized> UserAutomationService<'_, P> {
     /// Retires one revision and cancels the exact owner-issued pending wake
     /// targets observed for that revision.
     ///
-    /// This is the production retirement contour of the authenticated
-    /// `Remove` operator route: `KernelStoreGateway::remove_handoff` reads the
-    /// complete fail-closed owner execution view, enumerates the owner-issued
-    /// targets from the wake owner itself, and then calls this method so the
-    /// cancellation and the retirement share one owner view, one admitted
-    /// identity, and one runtime port.
+    /// The cancellation contour of the authenticated `Remove` operator route:
+    /// `KernelStoreGateway::remove_handoff` reads the complete fail-closed
+    /// owner execution view and enumerates the owner-issued targets from the
+    /// wake owner itself, and the cancellation reaches
+    /// `remove_and_cancel_with_targets_observed`, which runs this same body
+    /// through the durable transport-custody observer. The two share one owner
+    /// view, one admitted identity, and one runtime port.
+    ///
+    /// # Live status
+    ///
+    /// No production caller of *this* spelling. The live retirement contour
+    /// named above reaches the `_observed` twin, whose extra custody-observer
+    /// parameter means the gateway cannot call this signature; measured on this
+    /// tree, the only references to this name are its defining line and the two
+    /// prose references to it. Whether the gateway binds this spelling or the
+    /// observer-carrying twin is retired in its favour is an owner decision; no
+    /// caller was added to close the gap.
     ///
     /// The targets are never empty on this path. An empty list is structurally
     /// valid for the request but asks the wake owner to cancel nothing while
@@ -3959,14 +3970,25 @@ impl<P: UserAutomationStorePort + ?Sized> UserAutomationService<'_, P> {
     /// Pauses one revision and cancels the exact owner-issued pending wake
     /// targets observed for that revision (issue #2806 item 6).
     ///
-    /// This is the production pause contour of the authenticated `Pause`
-    /// operator route: the gateway commits the pause, enumerates the affected
-    /// revision's owner `Pending` targets from the wake owner itself, and then
-    /// calls this method so the cancellation and the pause share one owner
-    /// view, one admitted identity, and one runtime port. Already admitted
-    /// jobs, completed occurrences, and unknown effects are never rewritten:
-    /// the cancellation is unadmitted-only and the committed paused revision is
-    /// preserved verbatim.
+    /// The pause contour of the authenticated `Pause` operator route: the gateway
+    /// commits the pause, enumerates the affected revision's owner `Pending`
+    /// targets from the wake owner itself, and the cancellation reaches
+    /// `pause_and_cancel_with_targets_observed`, which runs this same body
+    /// through the durable transport-custody observer, so the cancellation and
+    /// the pause share one owner view, one admitted identity, and one runtime
+    /// port. Already admitted jobs, completed occurrences, and unknown effects
+    /// are never rewritten: the cancellation is unadmitted-only and the
+    /// committed paused revision is preserved verbatim.
+    ///
+    /// # Live status
+    ///
+    /// No production caller of *this* spelling. The live pause contour named
+    /// above reaches the `_observed` twin, whose extra custody-observer
+    /// parameter means the gateway cannot call this signature; measured on this
+    /// tree, the only references to this name are its defining line and the
+    /// prose reference in `store_gateway.rs`. Whether the gateway binds this
+    /// spelling or the observer-carrying twin is retired in its favour is an
+    /// owner decision; no caller was added to close the gap.
     pub async fn pause_and_cancel_with_targets<R: UserAutomationRuntimePort + ?Sized>(
         &self,
         request: UserAutomationServiceRequest,
