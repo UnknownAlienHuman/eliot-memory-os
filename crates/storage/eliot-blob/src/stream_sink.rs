@@ -180,6 +180,7 @@ use eliot_process::{
     ProcessStreamSinkState,
     ProcessStreamSinkTerminal,
     ProcessStreamSinkTerminalCommandIdentity,
+    ProcessStreamSinkTerminalCommandKind,
     ProcessStreamSinkUnknownOutcome,
     ProcessStreamTransformationBinding,
     StreamByteRange,
@@ -630,7 +631,10 @@ struct FinalizeReservation {
     incarnation: u64,
     /// The retained original finalize command, so `reconcile` can drive the
     /// same exact command without minting a second terminal request.
-    request: ProcessStreamSinkFinalizeRequest,
+    /// The full command is available after the caller presents the exact
+    /// original request. The Blob owner persists only its command digest and
+    /// frontier, so restart reconciliation must not synthesize this body.
+    request: Option<ProcessStreamSinkFinalizeRequest>,
     next_sequence: u64,
     next_offset: u64,
     admitted_sha256: String,
@@ -1097,6 +1101,7 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         {
             return Err(ProcessStreamSinkError::SessionMismatch);
         }
+        let terminal_id = session.terminal_id().clone();
         let terminal = snapshot
             .terminal
             .as_ref()
@@ -1120,6 +1125,28 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             {
                 return Err(ProcessStreamSinkError::EvidenceInvariant {
                     reason: "durable terminal differs from the exact append frontier".to_owned(),
+                });
+            }
+            if terminal.state() == ProcessStreamSinkState::CompleteSource {
+                let intent = snapshot
+                    .finalize_intent
+                    .as_ref()
+                    .ok_or(ProcessStreamSinkError::ProviderUnavailable)?;
+                if intent.terminal_command_sha256
+                    != terminal.command_identity().request_sha256()
+                    || intent.final_sequence != terminal.final_sequence()
+                    || intent.final_offset != terminal.final_offset()
+                    || intent.admitted_sha256 != terminal.admitted_sha256()
+                {
+                    return Err(ProcessStreamSinkError::EvidenceInvariant {
+                        reason: "durable CompleteSource terminal differs from the owner's original Finalize intent"
+                            .to_owned(),
+                    });
+                }
+            } else if snapshot.finalize_intent.is_some() {
+                return Err(ProcessStreamSinkError::EvidenceInvariant {
+                    reason: "non-publishing terminal conflicts with the owner's durable Finalize intent"
+                        .to_owned(),
                 });
             }
         }
@@ -1157,6 +1184,17 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             }
             (Some(terminal), None, Some(_))
                 if terminal.state() != ProcessStreamSinkState::CompleteSource => {}
+            (None, Some(ready), None) if snapshot.finalize_intent.is_some() => {
+                ready.validate().map_err(|error| map_blob_error(&error))?;
+                if ready.plaintext_sha256() != snapshot.sha256
+                    || ready.plaintext_length() != snapshot.next_offset
+                {
+                    return Err(ProcessStreamSinkError::EvidenceInvariant {
+                        reason: "recovered Ready receipt differs from the durable Finalize intent"
+                            .to_owned(),
+                    });
+                }
+            }
             (None, None, None) => {}
             _ => {
                 return Err(ProcessStreamSinkError::EvidenceInvariant {
@@ -1184,6 +1222,60 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         state.persistence_queue.queued_chunks = 0;
         state.persistence_queue.queued_bytes = 0;
         state.pending_append = None;
+        if let Some(intent) = snapshot.finalize_intent.as_ref() {
+            if terminal.is_none() {
+                let ready = ready_receipt
+                    .as_ref()
+                    .ok_or(ProcessStreamSinkError::ProviderUnavailable)?;
+                let identity = ProcessStreamSinkTerminalCommandIdentity::new(
+                    terminal_id.clone(),
+                    ProcessStreamSinkTerminalCommandKind::Finalize,
+                    intent.terminal_command_sha256.clone(),
+                )?;
+                let stage_context = &snapshot.session.stage_context;
+                let operation_id = stage_context.operation.operation_id.as_str().to_owned();
+                let idempotency_key = stage_context.operation.idempotency_key.clone();
+                if let Some(reservation) = state.finalization.as_mut() {
+                    if reservation.identity != identity
+                        || reservation.next_sequence != snapshot.next_sequence
+                        || reservation.next_offset != snapshot.next_offset
+                        || reservation.admitted_sha256 != snapshot.sha256
+                        || reservation.stage_operation_id != operation_id
+                        || reservation.stage_idempotency_key != idempotency_key
+                    {
+                        return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+                    }
+                    if let Some(retained) = reservation.ready() {
+                        if retained != ready {
+                            return Err(ProcessStreamSinkError::EvidenceInvariant {
+                                reason: "recovered Ready receipt changed for the retained Finalize intent"
+                                    .to_owned(),
+                            });
+                        }
+                    } else {
+                        reservation.phase = FinalizePhase::ReadyPending {
+                            ready: Box::new(ready.clone()),
+                        };
+                    }
+                } else {
+                    let incarnation = state.finalization_incarnation.saturating_add(1);
+                    state.finalization_incarnation = incarnation;
+                    state.finalization = Some(FinalizeReservation {
+                        identity,
+                        incarnation,
+                        request: None,
+                        next_sequence: snapshot.next_sequence,
+                        next_offset: snapshot.next_offset,
+                        admitted_sha256: snapshot.sha256.clone(),
+                        stage_operation_id: operation_id,
+                        stage_idempotency_key: idempotency_key,
+                        phase: FinalizePhase::ReadyPending {
+                            ready: Box::new(ready.clone()),
+                        },
+                    });
+                }
+            }
+        }
         if let Some(terminal) = terminal {
             let ready = ready_receipt;
             let publication = if let Some(ready) = &ready {
@@ -1217,6 +1309,7 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             state.terminal_command = Some(terminal.command_identity().clone());
             state.publication = Some(publication);
             state.terminal = Some(terminal);
+            state.finalization = None;
         }
         Ok(())
     }
@@ -1921,6 +2014,8 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             }
         }
         let admitted_sha256 = state.admitted_sha256();
+        let current_next_sequence = state.next_sequence;
+        let current_next_offset = state.next_offset;
 
         // An existing reservation for this exact command is resumed, never
         // re-reserved: the same terminal id can never drive a second stage.
@@ -1932,10 +2027,22 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             // clones the whole stream.
             let reservation = state
                 .finalization
-                .as_ref()
+                .as_mut()
                 .ok_or(ProcessStreamSinkError::TerminalIdentityConflict)?;
             if reservation.identity != identity {
                 return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+            }
+            if reservation.next_sequence != current_next_sequence
+                || reservation.next_offset != current_next_offset
+                || reservation.admitted_sha256 != admitted_sha256
+            {
+                return Err(ProcessStreamSinkError::EvidenceInvariant {
+                    reason: "durable finalize intent differs from the restored append frontier"
+                        .to_owned(),
+                });
+            }
+            if reservation.request.is_none() {
+                reservation.request = Some(request.clone());
             }
             let resumed_identity = reservation.identity.clone();
             let resumed_incarnation = reservation.incarnation;
@@ -2042,7 +2149,7 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         state.finalization = Some(FinalizeReservation {
             identity: identity.clone(),
             incarnation,
-            request: request.clone(),
+            request: Some(request.clone()),
             next_sequence: state.next_sequence,
             next_offset: state.next_offset,
             admitted_sha256: admitted_sha256.clone(),
@@ -2273,6 +2380,13 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         };
         // The retained command is re-driven, not replaced: the reservation it
         // owns decides whether only the readback or the exact stage follows.
+        let Some(request) = request else {
+            // The durable owner intent contains the exact command digest and
+            // frontier but deliberately not the process command body. Until
+            // the caller replays that exact command, report the retained
+            // uncertainty without inventing one.
+            return self.unsettled_readback(&session);
+        };
         match self.finalize_async(session.clone(), request).await {
             Ok(terminal) => Ok(ProcessStreamSinkReadback::Terminal { terminal }),
             Err(_) => self.unsettled_readback(&session),
@@ -2570,38 +2684,16 @@ impl<C: BlobStoreClient> ProcessStreamSinkClient for BlobStoreStreamSink<C> {
                 .open_process_stream_stage(store_request)
                 .await
                 .map_err(|error| map_blob_error(&error))?;
-            let ready_receipt = if let Some(record) = &snapshot.terminal {
-                let terminal: ProcessStreamSinkTerminal =
-                    serde_json::from_str(&record.terminal_json).map_err(|error| {
-                        ProcessStreamSinkError::Serialization {
-                            field: "durable_process_terminal",
-                            reason: error.to_string(),
-                        }
-                    })?;
-                if terminal.state() == ProcessStreamSinkState::CompleteSource {
-                    Some(
-                        self.store
-                            .finalize_process_stream_stage(BlobProcessStreamStageFinalizeRequest {
-                                session: BlobProcessStreamStageResumeRequest {
-                                    session_id: session.session_id().as_str().to_owned(),
-                                    source_id: session.source_id().as_str().to_owned(),
-                                    terminal_id: session.terminal_id().as_str().to_owned(),
-                                    open_request_sha256: session.open_request_sha256().to_owned(),
-                                },
-                                terminal_command_sha256: terminal
-                                    .command_identity()
-                                    .request_sha256()
-                                    .to_owned(),
-                                final_sequence: snapshot.next_sequence,
-                                final_offset: snapshot.next_offset,
-                                admitted_sha256: snapshot.sha256.clone(),
-                            })
-                            .await
-                            .map_err(|error| map_blob_error(&error))?,
-                    )
-                } else {
-                    None
-                }
+            // The owner snapshot carries the original accepted Finalize
+            // identity. Reconcile that exact durable intent before admitting
+            // the session or allowing any competing terminal command.
+            let ready_receipt = if let Some(intent) = snapshot.finalize_intent.clone() {
+                Some(
+                    self.store
+                        .finalize_process_stream_stage(intent)
+                        .await
+                        .map_err(|error| map_blob_error(&error))?,
+                )
             } else {
                 None
             };

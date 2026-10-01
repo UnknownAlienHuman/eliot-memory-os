@@ -22,7 +22,8 @@ use eliot_blob_api::wire::{
     ProcessStreamSourceReadbackResponse,
 };
 use eliot_blob_api::{
-    BlobHash, BlobPolicyBinding, BlobProcessStreamReadbackRequest, BlobProcessStreamSourceBinding,
+    BlobHash, BlobPolicyBinding, BlobProcessStreamReadbackRangeRequest,
+    BlobProcessStreamReadbackRequest, BlobProcessStreamSourceBinding,
     BlobReceiptContext, BlobStoreClient, ObjectResidencyKey,
 };
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
@@ -349,6 +350,16 @@ fn admit_prepared_for_execution(
         .validate_against_catalogue(&entries)
         .map_err(StoreCompositionError::Store)?;
     Ok(())
+}
+
+fn require_blob_process_stream_demand_ready(
+    ready: bool,
+) -> Result<(), ProcessStreamSinkError> {
+    if ready {
+        Ok(())
+    } else {
+        Err(ProcessStreamSinkError::ProviderUnavailable)
+    }
 }
 
 /// Canonical store composition. All provider authority is held by the one
@@ -1613,9 +1624,10 @@ impl StoreComposition {
                 reason: eliot_process::stream_sink::ProcessStreamSinkFenceReason::StaleOrRevoked,
             });
         }
-        self.prepare_blob_process_stream_demand(transport, identity)
+        let demand_ready = self.prepare_blob_process_stream_demand(transport, identity)
             .await
             .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        require_blob_process_stream_demand_ready(demand_ready)?;
         if binding.stage_context().request != identity.request {
             return Err(ProcessStreamSinkError::AdmissionFenced {
                 reason: eliot_process::stream_sink::ProcessStreamSinkFenceReason::StaleOrRevoked,
@@ -1986,8 +1998,12 @@ impl StoreComposition {
             .blob_client_for_lease(fresh_lease.clone())
             .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
         let readback = match client
-            .read_process_stream_source_authorized_context(
-                source_request,
+            .read_process_stream_source_authorized_range_context(
+                BlobProcessStreamReadbackRangeRequest {
+                    source: source_request,
+                    offset: request.offset,
+                    max_chunk_bytes: request.chunk_limit,
+                },
                 current_read_context.clone(),
                 fresh_lease,
             )
@@ -2000,6 +2016,7 @@ impl StoreComposition {
             Err(_) => return Ok(ProcessStreamSourceReadbackResponse::Unknown),
         };
         if readback.validate().is_err()
+            || readback.offset() != request.offset
             || readback.ready_receipt().plaintext_sha256() != request.expected_sha256
             || readback.ready_receipt().plaintext_length() != request.expected_byte_length
             || readback
@@ -2009,21 +2026,15 @@ impl StoreComposition {
                 .receipt_id
                 .as_str()
                 != request.ready_receipt_ref
-            || format!("{:x}", Sha256::digest(readback.bytes())) != request.expected_sha256
-            || u64::try_from(readback.bytes().len()).ok() != Some(request.expected_byte_length)
+            || readback.bytes().len() as u64
+                != request
+                    .expected_byte_length
+                    .saturating_sub(request.offset)
+                    .min(request.chunk_limit)
         {
             return Ok(ProcessStreamSourceReadbackResponse::Unknown);
         }
-        let whole_bytes = readback.bytes();
-        let start = usize::try_from(request.offset)
-            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
-        let chunk_limit = usize::try_from(request.chunk_limit)
-            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
-        let end = start.saturating_add(chunk_limit).min(whole_bytes.len());
-        let bytes = whole_bytes
-            .get(start..end)
-            .ok_or(ProcessStreamSinkError::ProviderUnavailable)?
-            .to_vec();
+        let bytes = readback.bytes().to_vec();
         let observed_sha256 = format!("{:x}", Sha256::digest(&bytes));
         let observed_byte_length =
             u64::try_from(bytes.len()).map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
@@ -2161,9 +2172,10 @@ impl StoreComposition {
         // owner session by its full selector tuple after the fresh Store owner
         // and Policy checks above; the returned stage context is the owner's
         // persisted original identity, never a caller echo or a new operation.
-        self.prepare_blob_process_stream_demand(transport, identity)
+        let demand_ready = self.prepare_blob_process_stream_demand(transport, identity)
             .await
             .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        require_blob_process_stream_demand_ready(demand_ready)?;
         let client = self
             .blob_service
             .lock()
@@ -4078,6 +4090,15 @@ mod tests {
         HealthVector, ModuleContract, ModuleGeneration, ModuleGenerationState,
     };
 
+    #[test]
+    fn blob_process_stream_demand_requires_positive_owner_health() {
+        assert!(require_blob_process_stream_demand_ready(true).is_ok());
+        assert!(matches!(
+            require_blob_process_stream_demand_ready(false),
+            Err(ProcessStreamSinkError::ProviderUnavailable)
+        ));
+    }
+
     struct PendingAppendTestOwner {
         open: eliot_blob_api::BlobProcessStreamStageOpenRequest,
         pending: eliot_blob_api::BlobProcessStreamStageAppendRequest,
@@ -4116,6 +4137,7 @@ mod tests {
                 next_sequence: self.pending.sequence + 1,
                 next_offset: self.pending.bytes.len() as u64,
                 terminal: None,
+                finalize_intent: None,
             })
         }
     }

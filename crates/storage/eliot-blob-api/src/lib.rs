@@ -1482,6 +1482,11 @@ pub struct BlobProcessStreamStageSnapshot {
     pub next_offset: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal: Option<BlobProcessStreamStageTerminal>,
+    /// Original durable publication intent, present from the moment the
+    /// owner accepts Finalize and retained across restart until terminal
+    /// reconciliation completes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalize_intent: Option<BlobProcessStreamStageFinalizeRequest>,
 }
 
 impl BlobProcessStreamStageSnapshot {
@@ -1521,6 +1526,21 @@ impl BlobProcessStreamStageSnapshot {
         if let Some(terminal) = &self.terminal {
             terminal.validate()?;
         }
+        if let Some(intent) = &self.finalize_intent {
+            intent.validate()?;
+            if intent.session != (BlobProcessStreamStageResumeRequest {
+                session_id: self.session.session_id.clone(),
+                source_id: self.session.source_id.clone(),
+                terminal_id: self.session.terminal_id.clone(),
+                open_request_sha256: self.session.open_request_sha256.clone(),
+            })
+                || intent.final_sequence != self.next_sequence
+                || intent.final_offset != self.next_offset
+                || intent.admitted_sha256 != self.sha256
+            {
+                return Err(BlobError::IntegrityMismatch);
+            }
+        }
         Ok(())
     }
 }
@@ -1549,6 +1569,33 @@ pub struct BlobProcessStreamReadbackRequest {
     pub ready_receipt_id: String,
     /// Caller ceiling for this bounded source read.
     pub max_bytes: u64,
+}
+
+/// A bounded projection of one exact durable process source. The embedded
+/// request retains every original source selector and commitment; only the
+/// requested range is new caller input.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobProcessStreamReadbackRangeRequest {
+    pub source: BlobProcessStreamReadbackRequest,
+    pub offset: u64,
+    pub max_chunk_bytes: u64,
+}
+
+impl BlobProcessStreamReadbackRangeRequest {
+    pub fn validate(&self) -> Result<(), BlobError> {
+        self.source.validate()?;
+        if self.offset > self.source.expected_plaintext_length
+            || self.max_chunk_bytes == 0
+            || self.max_chunk_bytes > self.source.max_bytes
+        {
+            return Err(BlobError::InvalidField {
+                field: "readback_range",
+                reason: "offset and chunk ceiling must select a bounded source range",
+            });
+        }
+        Ok(())
+    }
 }
 
 impl BlobProcessStreamReadbackRequest {
@@ -2276,6 +2323,7 @@ pub struct BlobReadChunk {
     offset: u64,
     complete: bool,
     bytes: Vec<u8>,
+    bytes_sha256: String,
     anchor_fingerprint: String,
 }
 
@@ -2299,16 +2347,45 @@ impl BlobReadChunk {
         {
             return Err(BlobError::MetadataPayloadMismatch);
         }
+        let bytes_sha256 = hex_sha256(&bytes);
         let value = Self {
             receipt: verified.receipt().clone(),
             ready_receipt,
             offset: 0,
             complete: true,
             bytes,
+            bytes_sha256,
             anchor_fingerprint: verified.anchor_fingerprint().to_owned(),
         };
         value.validate()?;
         Ok(value)
+    }
+
+    /// Projects an already verified complete read into a bounded range. This
+    /// is used inside the Blob owner so large source bytes do not cross the
+    /// Store boundary as one `Vec`.
+    pub fn bounded_range(mut self, offset: u64, max_bytes: u64) -> Result<Self, BlobError> {
+        self.validate()?;
+        if max_bytes == 0 || offset > self.ready_receipt.plaintext_length {
+            return Err(BlobError::InvalidField {
+                field: "readback_range",
+                reason: "offset must be within the source and chunk ceiling must be positive",
+            });
+        }
+        let start = usize::try_from(offset).map_err(|_| BlobError::IntegrityMismatch)?;
+        let limit = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+        let end = start.saturating_add(limit).min(self.bytes.len());
+        let bytes = self
+            .bytes
+            .get(start..end)
+            .ok_or(BlobError::IntegrityMismatch)?
+            .to_vec();
+        self.offset = offset;
+        self.complete = offset == 0 && bytes.len() as u64 == self.ready_receipt.plaintext_length;
+        self.bytes_sha256 = hex_sha256(&bytes);
+        self.bytes = bytes;
+        self.validate()?;
+        Ok(self)
     }
 
     #[must_use]
@@ -2347,12 +2424,19 @@ impl BlobReadChunk {
             .map_err(|error| BlobError::Receipt(error.to_string()))?;
         self.ready_receipt.validate()?;
         canonical_sha256(&self.anchor_fingerprint, "anchor_fingerprint")?;
-        if self.offset != 0
-            || !self.complete
-            || self.bytes.len() as u64 != self.ready_receipt.plaintext_length
-            || hex_sha256(&self.bytes) != self.ready_receipt.plaintext_sha256
-            || blake3::hash(&self.bytes).to_hex().as_str()
-                != self.ready_receipt.locator.hash.as_str()
+        let end = self
+            .offset
+            .checked_add(self.bytes.len() as u64)
+            .ok_or(BlobError::IntegrityMismatch)?;
+        let complete_range = self.offset == 0
+            && self.bytes.len() as u64 == self.ready_receipt.plaintext_length;
+        if end > self.ready_receipt.plaintext_length
+            || self.complete != complete_range
+            || hex_sha256(&self.bytes) != self.bytes_sha256
+            || (complete_range
+                && (self.bytes_sha256 != self.ready_receipt.plaintext_sha256
+                    || blake3::hash(&self.bytes).to_hex().as_str()
+                        != self.ready_receipt.locator.hash.as_str()))
         {
             return Err(BlobError::IntegrityMismatch);
         }
@@ -4283,6 +4367,22 @@ pub trait BlobStoreClient: Send + Sync {
             ))
         })
     }
+    /// Reads one bounded range of an exact persisted process source using
+    /// fresh current authority. The owner resolves and validates the original
+    /// source identity independently before returning only the requested
+    /// bytes.
+    fn read_process_stream_source_authorized_range_context(
+        &self,
+        _request: BlobProcessStreamReadbackRangeRequest,
+        _current_context: BlobReceiptContext,
+        _current_root_lease: BlobRootLease,
+    ) -> BlobFuture<'_, BlobReadChunk> {
+        Box::pin(async {
+            Err(BlobError::PlanGap(
+                "Blob owner does not expose bounded authorized process-source readback".to_owned(),
+            ))
+        })
+    }
     /// Submits bytes only after the same owner has durably reserved and
     /// reconciled the exact process finalization identity.
     fn stage_with_recovery(
@@ -4391,6 +4491,19 @@ where
         )
     }
 
+    fn read_process_stream_source_authorized_range_context(
+        &self,
+        request: BlobProcessStreamReadbackRangeRequest,
+        current_context: BlobReceiptContext,
+        current_root_lease: BlobRootLease,
+    ) -> BlobFuture<'_, BlobReadChunk> {
+        (**self).read_process_stream_source_authorized_range_context(
+            request,
+            current_context,
+            current_root_lease,
+        )
+    }
+
     fn stage_with_recovery(
         &self,
         request: BlobStageRequest,
@@ -4467,6 +4580,42 @@ pub fn metadata_path(locator: &BlobLocator) -> Result<WorkScopePath, BlobError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_source_range_request_accepts_bounded_and_refuses_out_of_bounds_ranges() {
+        let process_binding_json = "{}".to_owned();
+        let policy_json = "{}".to_owned();
+        let source = BlobProcessStreamReadbackRequest {
+            session_id: "session-range".to_owned(),
+            terminal_id: "terminal-range".to_owned(),
+            open_request_sha256: "b".repeat(64),
+            process_source_binding: BlobProcessStreamSourceBinding {
+                process_binding_sha256: hex_sha256(process_binding_json.as_bytes()),
+                process_binding_json,
+                stream_kind: "STDOUT".to_owned(),
+                policy_sha256: hex_sha256(policy_json.as_bytes()),
+                policy_json,
+            },
+            expected_content_hash: BlobHash::new("a".repeat(64)).expect("content hash"),
+            expected_plaintext_sha256: "c".repeat(64),
+            expected_plaintext_length: 8,
+            ready_receipt_id: "ready-range".to_owned(),
+            max_bytes: 8,
+        };
+        let bounded = BlobProcessStreamReadbackRangeRequest {
+            source: source.clone(),
+            offset: 7,
+            max_chunk_bytes: 1,
+        };
+        assert!(bounded.validate().is_ok());
+
+        let out_of_bounds = BlobProcessStreamReadbackRangeRequest {
+            source,
+            offset: 9,
+            max_chunk_bytes: 1,
+        };
+        assert!(out_of_bounds.validate().is_err());
+    }
 
     #[test]
     fn malformed_hash_and_locator_fail_during_deserialization() {

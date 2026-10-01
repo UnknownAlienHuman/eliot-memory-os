@@ -73,6 +73,7 @@ use eliot_blob_api::{
     BlobGcRequest, BlobHash, BlobHealth, BlobId, BlobIssuerTrustAnchor, BlobKeyOperation,
     BlobKeyRecoveryCeiling, BlobLiveSetProof, BlobLocator, BlobPolicyBinding,
     BlobProcessStreamReadbackRequest, BlobProcessStreamSourceBinding,
+    BlobProcessStreamReadbackRangeRequest,
     BlobProcessStreamStageAppendReceipt, BlobProcessStreamStageAppendRequest,
     BlobProcessStreamStageFinalizeRequest, BlobProcessStreamStageOpenRequest,
     BlobProcessStreamStageResumeRequest,
@@ -3387,6 +3388,42 @@ where
                 Ok(record.terminal)
             })
             .transpose()?;
+        let finalize_intent = self
+            .process_stream_stage_record::<ProcessStreamStageFinalizeRecord>(
+                &Self::process_stream_stage_path(&session_key, "finalize")?,
+            )?
+            .map(|record| {
+                record.request.validate()?;
+                if record.version != 1
+                    || record.session_key_sha256 != session_key
+                    || record.request.session.session_id != session.session_id
+                    || record.request.session.source_id != session.source_id
+                    || record.request.session.terminal_id != session.terminal_id
+                    || record.request.session.open_request_sha256 != session.open_request_sha256
+                    || record.request.final_sequence != append_receipts.len() as u64
+                    || record.request.final_offset != plaintext_length
+                    || record.request.admitted_sha256 != digest
+                {
+                    return Err(BlobError::IdempotencyConflict);
+                }
+                Ok(record.request)
+            })
+            .transpose()?;
+        if let Some(terminal) = &terminal {
+            let parsed: eliot_process::ProcessStreamSinkTerminal =
+                serde_json::from_str(&terminal.terminal_json)
+                    .map_err(|_| BlobError::MetadataPayloadMismatch)?;
+            match (
+                parsed.state() == eliot_process::ProcessStreamSinkState::CompleteSource,
+                finalize_intent.as_ref(),
+            ) {
+                (true, Some(intent))
+                    if intent.terminal_command_sha256
+                        == parsed.command_identity().request_sha256() => {}
+                (false, None) => {}
+                _ => return Err(BlobError::IdempotencyConflict),
+            }
+        }
         let snapshot = BlobProcessStreamStageSnapshot {
             session,
             next_sequence: append_receipts.len() as u64,
@@ -3395,6 +3432,7 @@ where
             append_receipts,
             preview_bytes,
             terminal,
+            finalize_intent,
         };
         snapshot.validate()?;
         Ok((snapshot, plaintext_bytes))
@@ -3580,6 +3618,7 @@ where
         let session = session_record.session;
         session.validate()?;
         self.ensure_recovery_lease(&session.root_lease)?;
+        let session_key = session.session_key_sha256()?;
         let finalize_path = Self::process_stream_stage_path(&session_key, "finalize")?;
         if self.platform_stat(&finalize_path)? != BlobPathState::Missing {
             return Err(BlobError::IdempotencyConflict);
@@ -3591,7 +3630,6 @@ where
                 "process stream append exceeds its admitted sequence or chunk ceiling".to_owned(),
             ));
         }
-        let session_key = session.session_key_sha256()?;
         let request_commitment_sha256 = request.request_commitment_sha256()?;
         let record_path = Self::process_stream_stage_path(
             &session_key,
@@ -4006,6 +4044,16 @@ where
         let parsed: eliot_process::ProcessStreamSinkTerminal =
             serde_json::from_str(&terminal.terminal_json)
                 .map_err(|_| BlobError::MetadataPayloadMismatch)?;
+        let mut terminal_guard = if parsed.state()
+            == eliot_process::ProcessStreamSinkState::CompleteSource
+        {
+            None
+        } else {
+            Some(self.lock_shards(&[operation_shard(
+                &request.session_id,
+                &request.open_request_sha256,
+            )])?)
+        };
         let staged = self.process_stream_stage_snapshot_locked(session.session.clone())?;
         if parsed.final_sequence() != staged.next_sequence
             || parsed.final_offset() != staged.next_offset
@@ -4042,20 +4090,27 @@ where
             if expected_value != actual_value {
                 return Err(BlobError::IntegrityMismatch);
             }
-        } else if terminal.ready_receipt_json.is_some() {
-            return Err(BlobError::MetadataPayloadMismatch);
+        } else {
+            if terminal.ready_receipt_json.is_some() {
+                return Err(BlobError::MetadataPayloadMismatch);
+            }
+            if staged.finalize_intent.is_some() {
+                return Err(BlobError::IdempotencyConflict);
+            }
         }
-        let _guard = self.lock_shards(&[operation_shard(
-            &request.session_id,
-            &request.open_request_sha256,
-        )])?;
+        if terminal_guard.is_none() {
+            terminal_guard = Some(self.lock_shards(&[operation_shard(
+                &request.session_id,
+                &request.open_request_sha256,
+            )])?);
+        }
         let record = ProcessStreamStageTerminalRecord {
             version: 1,
             session_key_sha256: session_key.clone(),
             terminal,
         };
         let path = Self::process_stream_stage_path(&session_key, "terminal")?;
-        match self.process_stream_stage_write_new(&path, &record) {
+        let result = match self.process_stream_stage_write_new(&path, &record) {
             Ok(()) => Ok(()),
             Err(BlobError::IdempotencyConflict) => {
                 let existing = self
@@ -4070,7 +4125,9 @@ where
                 }
             }
             Err(error) => Err(error),
-        }
+        };
+        drop(terminal_guard);
+        result
     }
 
     fn read_bounded_file(
@@ -6179,6 +6236,23 @@ where
         })
     }
 
+    fn read_process_stream_source_authorized_range_context_sync(
+        &self,
+        request: BlobProcessStreamReadbackRangeRequest,
+        current_context: BlobReceiptContext,
+        current_root_lease: BlobRootLease,
+    ) -> Result<BlobReadChunk, BlobError> {
+        request.validate()?;
+        let range_offset = request.offset;
+        let max_chunk_bytes = request.max_chunk_bytes;
+        let complete = self.read_process_stream_source_authorized_context_sync(
+            request.source,
+            current_context,
+            current_root_lease,
+        )?;
+        complete.bounded_range(range_offset, max_chunk_bytes)
+    }
+
     fn stage_with_recovery_sync(
         &self,
         stage: BlobStageRequest,
@@ -7094,6 +7168,22 @@ where
         let core = Arc::clone(&self.core);
         Box::pin(async move {
             core.read_process_stream_source_authorized_context_sync(
+                request,
+                current_context,
+                current_root_lease,
+            )
+        })
+    }
+
+    fn read_process_stream_source_authorized_range_context(
+        &self,
+        request: BlobProcessStreamReadbackRangeRequest,
+        current_context: BlobReceiptContext,
+        current_root_lease: BlobRootLease,
+    ) -> BlobFuture<'_, BlobReadChunk> {
+        let core = Arc::clone(&self.core);
+        Box::pin(async move {
+            core.read_process_stream_source_authorized_range_context_sync(
                 request,
                 current_context,
                 current_root_lease,

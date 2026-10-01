@@ -19,7 +19,8 @@ mod windows_durable_owner {
         BlobCapacityCause, BlobCapacityCleanup, BlobCapacityEffect, BlobCapacityEvidence,
         BlobCapacityFailure, BlobCapacityIdentity, BlobCapacityRecovery, BlobCapacityStage,
         BlobCasCapability, BlobCasProviderResult, BlobCasRequest, BlobError, BlobHash, BlobId,
-        BlobPolicyBinding, BlobProcessStreamSourceBinding,
+        BlobPolicyBinding, BlobProcessStreamReadbackRangeRequest,
+        BlobProcessStreamReadbackRequest, BlobProcessStreamSourceBinding,
         BLOB_PROCESS_STREAM_STAGE_MAX_CHUNKS, BLOB_PROCESS_STREAM_STAGE_MAX_PREVIEW_BYTES,
         BlobProcessStreamStageAppendRequest, BlobProcessStreamStageFinalizeRequest,
         BlobProcessStreamStageOpenRequest,
@@ -624,6 +625,44 @@ mod windows_durable_owner {
             .expect("owner promotes the exact durable source");
         assert_eq!(ready.plaintext_sha256(), sha256(&bytes));
         assert_eq!(ready.plaintext_length(), bytes.len() as u64);
+        let read_context = context("READ", "stream-finalize-range-read", generation);
+        let read_lease = owner
+            .lease_for_request(read_context.request.clone())
+            .expect("current source read lease");
+        let source = BlobProcessStreamReadbackRequest {
+            session_id: session.session_id.clone(),
+            terminal_id: session.terminal_id.clone(),
+            open_request_sha256: session.open_request_sha256.clone(),
+            process_source_binding: session.process_source_binding.clone(),
+            expected_content_hash: ready.locator().hash.clone(),
+            expected_plaintext_sha256: ready.plaintext_sha256().to_owned(),
+            expected_plaintext_length: ready.plaintext_length(),
+            ready_receipt_id: ready.receipt().identity.receipt_id.to_string(),
+            max_bytes: bytes.len() as u64,
+        };
+        let range_request = BlobProcessStreamReadbackRangeRequest {
+            source: source.clone(),
+            offset: 13,
+            max_chunk_bytes: 17,
+        };
+        let range = block_on(store.read_process_stream_source_authorized_range_context(
+            range_request,
+            read_context.clone(),
+            read_lease.clone(),
+        ))
+        .expect("owner returns only the bounded source range");
+        assert_eq!(range.offset(), 13);
+        assert_eq!(range.bytes(), &bytes[13..30]);
+        assert!(block_on(store.read_process_stream_source_authorized_range_context(
+            BlobProcessStreamReadbackRangeRequest {
+                source,
+                offset: bytes.len() as u64 + 1,
+                max_chunk_bytes: 17,
+            },
+            read_context,
+            read_lease,
+        ))
+        .is_err());
         let first_receipt_id = ready.receipt().identity.receipt_id.to_string();
         drop(store);
         drop(owner);
@@ -654,7 +693,17 @@ mod windows_durable_owner {
         assert_eq!(snapshot.preview_bytes, bytes[..4 * 1024]);
         assert_eq!(snapshot.next_sequence, 16);
         assert_eq!(snapshot.sha256, sha256(&bytes));
-        let recovered = block_on(store.finalize_process_stream_stage(finalize_request))
+        assert_eq!(snapshot.finalize_intent.as_ref(), Some(&finalize_request));
+        assert!(matches!(
+            block_on(store.append_process_stream_stage(append(
+                &reopened,
+                16,
+                bytes.len() as u64,
+                b"late"
+            ))),
+            Err(BlobError::IdempotencyConflict)
+        ));
+        let recovered = block_on(store.finalize_process_stream_stage(finalize_request.clone()))
             .expect("same finalization identity resolves after restart");
         assert_eq!(recovered.plaintext_sha256(), sha256(&bytes));
         assert_eq!(recovered.plaintext_length(), bytes.len() as u64);
