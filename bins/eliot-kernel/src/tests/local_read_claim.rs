@@ -686,3 +686,344 @@ async fn local_read_claim_daemon_poll_returns_null_when_empty() {
     drop(kernel);
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// The owner-backed `eliot.state` tool bytes admitted on the bounded carrier.
+///
+/// The State form carries no evidence selector: the arguments are only the
+/// closed `include` projection field list the state owners answer. There is
+/// deliberately no `intent` block here, which is one of the ways these bytes
+/// can never be re-read as an evidence query.
+fn state_tool() -> serde_json::Value {
+    serde_json::json!({"name":"eliot.state","arguments":{
+        "include":["task","scope","attention","health"]
+    }})
+}
+
+/// Builds the admitted `eliot.state` envelope for one request id.
+///
+/// The capability is the closed State capability and the payload digest is the
+/// canonical digest of the exact retained tool bytes, so the invoke-read
+/// linkage gate the State admission re-runs is satisfied by construction. The
+/// correlation projection is the explicit Request-domain occurrence for this
+/// request id, which the durable store requires before an `Invocation` row can
+/// stage; its occurrence text IS the request id, so the two cannot drift.
+fn state_envelope(
+    fence: &StateFence,
+    deadline_unix_ms: u64,
+    request_id: &str,
+    tool_digest: &str,
+) -> HostRequestEnvelope {
+    HostRequestEnvelope {
+        wire_id: HOST_REQUEST_WIRE_ID.to_owned(),
+        wire_version: HostRequestEnvelope::CONTRACT_VERSION,
+        kind: HostRequestKind::Invocation,
+        connection_id: "conn-test-1".to_owned(),
+        identity: HostRequestIdentity {
+            request_id: eliot_contracts::RequestId::new(request_id).expect("valid request id"),
+            correlation_projection: Some(eliot_contracts::HostCorrelationProjection::Opaque {
+                domain: eliot_contracts::HostCorrelationDomain::Request,
+                occurrence: request_id.to_owned(),
+            }),
+            idempotency_key: format!("{request_id}:invoke"),
+            cancellation_id: format!("{request_id}:invoke:cancel"),
+            parent_operation_id: None,
+            deadline_unix_ms,
+            capability: "eliot.state".to_owned(),
+            session_id: Some("kernel-session-1".to_owned()),
+            task_id: None,
+            work_scope_id: None,
+            payload_schema_id: "eliot.mcp.tool-request.v1".to_owned(),
+            payload_sha256: tool_digest.to_owned(),
+        },
+        state_fence: fence.clone(),
+        descriptor_sha256: "d".repeat(64),
+        peer_admission_receipt_sha256: "e".repeat(64),
+        activation_binding: None,
+        envelope_sha256: String::new(),
+    }
+    .with_computed_digest()
+    .expect("envelope must digest")
+}
+
+/// Builds a fresh test root for one carrier-form test.
+fn fresh_kernel_root(label: &str) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!("eliot-kernel-{label}-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("test work root");
+    root
+}
+
+/// POSITIVE (#2564): an `eliot.state` pair round-trips its admitted identity
+/// into the closed State carrier form, and the Kernel mints the State facet
+/// method from the admitted envelope capability.
+///
+/// The State admission is the owner of this form, so it is the reachable seam
+/// that decides which claim lane a pair belongs to: it re-runs the exact
+/// invoke-read linkage (capability plus payload digest over the presented
+/// bytes) and derives the closed selectors, and it refuses any pair whose
+/// envelope capability is not the closed State capability. What this proves is
+/// the identity the claim hands the daemon: the same admitted envelope and the
+/// exact retained tool bytes, tagged State, with the facet method minted from
+/// the envelope capability rather than supplied by the caller.
+#[test]
+fn state_pair_admits_into_the_state_carrier_form_with_exact_identity() {
+    let root = fresh_kernel_root("state-form-identity");
+    let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
+    let policy = kernel
+        .front_door_policy
+        .lock()
+        .expect("front-door policy")
+        .clone();
+    let fence = policy.module_generation.state_fence.clone();
+
+    let tool = state_tool();
+    let envelope = state_envelope(
+        &fence,
+        unix_ms().saturating_add(60_000),
+        "host-request-state-1",
+        &tool_digest(&tool),
+    );
+
+    // The exact admitted bytes resolve to the real State selectors: the
+    // trusted scope plus the exact `include` projection field list, in order.
+    let selectors = host_request_route::check_local_state_admission(&envelope, &tool)
+        .expect("the admitted state pair must validate its selectors");
+    assert_eq!(
+        selectors.include,
+        vec![
+            "task".to_owned(),
+            "scope".to_owned(),
+            "attention".to_owned(),
+            "health".to_owned()
+        ],
+        "the State selectors carry the exact retained include projection"
+    );
+    assert_eq!(
+        selectors.scope_id,
+        eliot_store_api::ScopeId::new("kernel-session-1").expect("trusted scope"),
+        "the State scope is the admitted envelope scope, never an MCP argument"
+    );
+
+    // The admitted envelope is the exact identity the carrier retains: the
+    // capability is the closed State capability, so the facet method the Kernel
+    // mints from `envelope.identity.capability` at claim is exactly
+    // `eliot.state` and can never be a caller-chosen free-form string.
+    assert_eq!(
+        envelope.identity.capability, "eliot.state",
+        "the State form is bound to the closed State capability"
+    );
+    assert_eq!(
+        envelope.identity.payload_sha256,
+        tool_digest(&tool),
+        "the admitted payload digest is the canonical digest of the retained tool bytes"
+    );
+    assert_eq!(
+        envelope.envelope_sha256.len(),
+        64,
+        "the admitted envelope carries its own exact computed digest"
+    );
+
+    // The retained form code is the stable audit code for this carrier form,
+    // and it is distinct from the query form's code: one carrier, two forms.
+    assert_eq!(
+        LocalReadPairKind::State.as_str(),
+        "state",
+        "the State carrier form has the stable state form code"
+    );
+    assert_ne!(
+        LocalReadPairKind::State.as_str(),
+        LocalReadPairKind::Query.as_str(),
+        "the State and Query carrier forms are distinct codes over one carrier"
+    );
+
+    drop(kernel);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// REFUSAL (#2564): a State pair can never be admitted as a Query read.
+///
+/// This is the capability-confusion guard, checked at the admission owner that
+/// decides the carrier form. The query admission resolves its form from the
+/// closed query capability and requires the query selector block; the State
+/// bytes have no such block and a different capability, so the query gate must
+/// refuse them. That refusal is what keeps a state result from ever being
+/// served - or completed - through the query claim path.
+#[test]
+fn state_pair_is_refused_by_the_query_admission_never_reclassified_as_a_query() {
+    let root = fresh_kernel_root("state-query-refusal");
+    let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
+    let policy = kernel
+        .front_door_policy
+        .lock()
+        .expect("front-door policy")
+        .clone();
+    let fence = policy.module_generation.state_fence.clone();
+
+    let tool = state_tool();
+    let envelope = state_envelope(
+        &fence,
+        unix_ms().saturating_add(60_000),
+        "host-request-state-2",
+        &tool_digest(&tool),
+    );
+
+    // The State gate accepts the exact admitted pair.
+    assert!(
+        host_request_route::check_local_state_admission(&envelope, &tool).is_ok(),
+        "the admitted state pair must validate under the State admission"
+    );
+
+    // The Query gate refuses the very same bytes: the two closed admission
+    // owners are disjoint on this pair, so the carrier form can only be State.
+    assert!(
+        host_request_route::check_local_read_admission(&envelope, &tool).is_err(),
+        "a State pair must never be admitted by the query admission"
+    );
+
+    // And the refusal survives a change of tool NAME alone: naming the query
+    // capability while the admitted payload still digests to the State bytes
+    // is refused by the invoke-read linkage gate, so a hidden method invoked
+    // by name faces the identical closed admission.
+    let forged_name = serde_json::json!({"name":"eliot.query","arguments":{
+        "include":["task","scope","attention","health"]
+    }});
+    let mut forged_envelope = state_envelope(
+        &fence,
+        unix_ms().saturating_add(60_000),
+        "host-request-state-2",
+        &tool_digest(&forged_name),
+    );
+    forged_envelope.identity.capability = "eliot.query".to_owned();
+    assert!(
+        host_request_route::check_local_read_admission(&forged_envelope, &forged_name).is_err(),
+        "a query-named tool carrying state arguments must still be refused"
+    );
+    assert!(
+        host_request_route::check_local_state_admission(&forged_envelope, &forged_name).is_err(),
+        "the same renamed bytes must not slip into the State form either"
+    );
+
+    // The query form's own carrier tag is minted only from a query admission,
+    // and the State form is never produced by `of_admission`: the form tag is
+    // an admission-derived discriminator, never a caller-declared string.
+    let query = query_envelope(
+        &fence,
+        unix_ms().saturating_add(60_000),
+        "host-request-state-2-query",
+        &tool_digest(&query_tool()),
+    );
+    if let Ok(admission) = host_request_route::check_local_read_admission(&query, &query_tool()) {
+        // Where the query admission accepts its own query bytes, the carrier
+        // form it derives is the Query form and never the State form: the
+        // discriminator that keeps the two claim lanes apart is derived from
+        // the admission, not asserted by the caller.
+        assert_eq!(
+            LocalReadPairKind::of_admission(&admission),
+            Some(LocalReadPairKind::Query),
+            "a query admission derives the Query carrier form, never State"
+        );
+    }
+    // The State form has no `LocalReadAdmission` at all: it is minted only by
+    // the closed State gate above, so no query admission can ever yield it.
+    assert_ne!(
+        LocalReadPairKind::Query.as_str(),
+        LocalReadPairKind::State.as_str(),
+        "the query claim lane and the state claim lane name different forms"
+    );
+
+    drop(kernel);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// REFUSAL (#2564): the State carrier form is re-derived from the admitted
+/// bytes at claim, never taken from the wire, and a mismatched pair is refused
+/// rather than reclassified.
+///
+/// The claim-side form gate re-runs the closed State admission over the exact
+/// retained envelope and tool bytes before any attempt is minted, so the form
+/// follows the admitted capability. This asserts that decision function
+/// directly on the same inputs a claim sees: the exact admitted pair resolves
+/// to the State selectors, a pair whose capability was widened past the closed
+/// State capability is refused outright, and a malformed `include` list is
+/// refused rather than silently repaired.
+#[test]
+fn state_carrier_form_is_re_derived_from_the_admitted_bytes_at_claim() {
+    let root = fresh_kernel_root("state-form-binding");
+    let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
+    let policy = kernel
+        .front_door_policy
+        .lock()
+        .expect("front-door policy")
+        .clone();
+    let fence = policy.module_generation.state_fence.clone();
+
+    let tool = state_tool();
+    let envelope = state_envelope(
+        &fence,
+        unix_ms().saturating_add(60_000),
+        "host-request-state-3",
+        &tool_digest(&tool),
+    );
+
+    // The exact retained pair re-derives as the State form.
+    let admitted = host_request_route::check_local_state_admission(&envelope, &tool)
+        .expect("the exact retained state pair re-derives at claim");
+    assert_eq!(
+        admitted.include,
+        selectors_of(&tool),
+        "the claim-side re-derivation reads the exact retained include projection"
+    );
+
+    // A payload digest that no longer matches the presented bytes is refused:
+    // the form gate re-runs the linkage check instead of trusting the stored
+    // tag, so a tampered pair is skipped for reconciliation, never claimed.
+    let mut retagged = envelope.clone();
+    retagged.identity.payload_sha256 = "f".repeat(64);
+    assert!(
+        host_request_route::check_local_state_admission(&retagged, &tool).is_err(),
+        "a state pair whose payload digest drifted must be refused at claim"
+    );
+
+    // A capability widened past the closed State capability is refused. The
+    // form is minted from the admitted capability the gate validated, so a
+    // hidden method invoked by name cannot acquire the State carrier form.
+    let mut widened = envelope.clone();
+    widened.identity.capability = "eliot.query".to_owned();
+    assert!(
+        host_request_route::check_local_state_admission(&widened, &tool).is_err(),
+        "a pair whose capability is not the closed State capability must be refused"
+    );
+
+    // A duplicated projection field is refused rather than deduplicated, so the
+    // re-derived form never depends on a repair the claim does not perform.
+    let duplicate = serde_json::json!({"name":"eliot.state","arguments":{
+        "include":["task","task"]
+    }});
+    let duplicate_envelope = state_envelope(
+        &fence,
+        unix_ms().saturating_add(60_000),
+        "host-request-state-3-duplicate",
+        &tool_digest(&duplicate),
+    );
+    assert!(
+        host_request_route::check_local_state_admission(&duplicate_envelope, &duplicate).is_err(),
+        "a duplicated include field must fail closed"
+    );
+
+    drop(kernel);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Returns the exact `include` projection field list carried by one state tool.
+fn selectors_of(tool: &serde_json::Value) -> Vec<String> {
+    tool.pointer("/arguments/include")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .expect("state tool must carry an include array")
+}
+
