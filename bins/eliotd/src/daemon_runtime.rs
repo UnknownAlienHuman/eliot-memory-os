@@ -79,12 +79,13 @@ use eliotd::testd_terminal_completion::{
     query_testd_owner_terminal_evidence,
 };
 use eliotd::{
-    ActivationClaim, ActivationSubmitError, AgentActivationResolver, DaemonComposition,
-    DaemonConfig, DaemonKernelClient, DaemonStatus, FinishSubmitOutcome,
+    ActivationClaim, ActivationSubmitError, AgentActivationResolver, DaemonClosureLinkPort,
+    DaemonComposition, DaemonConfig, DaemonKernelClient, DaemonStatus, FinishSubmitOutcome,
     GovernorAuthorityDriveOutcome, GovernorAuthorityDriver, KernelContextReadClient,
     LocalReadSubmitOutcome, MaintenanceObservation, MaintenanceTriggerOrigin, ObserveDeferOutcome,
-    PROTOCOL_VERSION, SELF_OBSERVED_FAMILY, SERVICE_NAME, TaskControllerSubmitOutcome,
-    forward_admitted_local_read, serve_admitted_observe, terminal_for_invalid_ticket,
+    PROTOCOL_VERSION, RevocationResumeIngress, SELF_OBSERVED_FAMILY, SERVICE_NAME,
+    TaskControllerSubmitOutcome, forward_admitted_local_read, serve_admitted_observe,
+    terminal_for_invalid_ticket,
 };
 use serde::Serialize;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
@@ -4101,6 +4102,7 @@ async fn report_authority_revocation_ingress(
                     resume_blocked = pending.resume_blocked,
                 );
             }
+            drive_admitted_revocation_resumes(kernel, composition, &report).await;
         }
         Err(error) => {
             if failure_guard.should_emit() {
@@ -4110,6 +4112,178 @@ async fn report_authority_revocation_ingress(
                     &error.to_string(),
                 )
                 .emit();
+            }
+        }
+    }
+}
+
+/// Drives every owner-admitted pending second phase through the Governor
+/// second-phase-only resume entry under its original identities (issue #2100,
+/// audit 5924750035 items 2-7).
+///
+/// This is the production driver behind
+/// [`eliotd::authority_revocation_ingress`]: the scan hands every bounded
+/// pending closure to the maintenance-request owner for re-admission, and
+/// this pass consumes each admitted row through
+/// [`eliot_governor::GovernorComposition::resume_pending_second_phase`]
+/// — never through a fresh `revoke_grant`, which the Kernel would refuse
+/// with `NotAdmitted` for an already fenced grant. Owner-refused rows stay
+/// pending/recovery-required and are never presented.
+///
+/// Per row, all of it fail-closed and none of it gating readiness or failing
+/// the daemon:
+///
+/// * the committed closure is re-read fresh over the existing closure-receipt
+///   arm (never reused scan bytes across a transport boundary);
+/// * an already linked re-read is converged state — reported, not resumed;
+/// * the row's identities are bound from admitted ingress for this same
+///   obligation (never mixed across operations);
+/// * the resume runs under the composition lock through the bounded
+///   [`eliotd::DaemonComposition::governor_composition_for_revocation_resume`]
+///   seam, linking the Store-issued receipt through the authenticated
+///   Kernel/ORS owner and proving the read-back by content;
+/// * `Committed + Success` links; unknown, partial, non-commit, transport and
+///   admission refusals leave the obligation pending under their exact
+///   disposition for the next pass.
+///
+/// The pass runs on every owner-feed tick including the first pass after a
+/// restart, over the whole bounded denominator, so an interrupted canonical
+/// write or link resumes before any affected descendant or introduction can
+/// regain effect authority through a completed receipt. An exhausted
+/// denominator stays partial/recovery-required, never complete.
+async fn drive_admitted_revocation_resumes(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: SharedComposition,
+    report: &eliotd::AuthorityRevocationIngressReport,
+) {
+    let admitted = report.admitted_revocations();
+    if admitted.is_empty() {
+        return;
+    }
+    let ingress = match RevocationResumeIngress::admit_from_kernel(kernel) {
+        Ok(ingress) => ingress,
+        Err(error) => {
+            tracing::warn!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.authority_revocation_resume_pending",
+                reason = %error,
+                admitted = admitted.len(),
+            );
+            return;
+        }
+    };
+    let link_port = DaemonClosureLinkPort::new(Arc::clone(kernel), ingress.state_fence().clone());
+    for row in admitted {
+        let target = row.request().grant_id.as_str();
+        let closure = match link_port.read_committed_closure(target).await {
+            Ok(Some(closure)) => closure,
+            Ok(None) => {
+                tracing::warn!(
+                    target: "eliotd::diagnostics",
+                    event = "eliotd.authority_revocation_resume_pending",
+                    grant_id = %eliotd::diagnostics::sanitize_identity(target),
+                    closure_operation_id = %eliotd::diagnostics::sanitize_identity(
+                        row.closure_operation_id()
+                    ),
+                    reason = "committed closure no longer held for this target",
+                );
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "eliotd::diagnostics",
+                    event = "eliotd.authority_revocation_resume_pending",
+                    grant_id = %eliotd::diagnostics::sanitize_identity(target),
+                    closure_operation_id = %eliotd::diagnostics::sanitize_identity(
+                        row.closure_operation_id()
+                    ),
+                    reason = %error,
+                );
+                continue;
+            }
+        };
+        if closure.canonical_receipt.is_some() {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.authority_revocation_second_phase_linked",
+                grant_id = %eliotd::diagnostics::sanitize_identity(target),
+                closure_operation_id = %eliotd::diagnostics::sanitize_identity(
+                    &closure.operation_id
+                ),
+            );
+            continue;
+        }
+        let bound = match row.bind_resume_identities(&closure, &ingress) {
+            Ok(bound) => bound,
+            Err(error) => {
+                tracing::warn!(
+                    target: "eliotd::diagnostics",
+                    event = "eliotd.authority_revocation_resume_pending",
+                    grant_id = %eliotd::diagnostics::sanitize_identity(target),
+                    closure_operation_id = %eliotd::diagnostics::sanitize_identity(
+                        row.closure_operation_id()
+                    ),
+                    reason = %error,
+                );
+                continue;
+            }
+        };
+        let outcome = {
+            let mut guard = composition.lock().await;
+            match guard.governor_composition_for_revocation_resume() {
+                Ok(governor) => {
+                    governor
+                        .resume_pending_second_phase(
+                            bound.request(),
+                            &closure,
+                            bound.canonical_operation_id(),
+                            bound.canonical_request_identity(),
+                            bound.operation(),
+                            &link_port,
+                        )
+                        .await
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "eliotd::diagnostics",
+                        event = "eliotd.authority_revocation_resume_pending",
+                        grant_id = %eliotd::diagnostics::sanitize_identity(target),
+                        closure_operation_id = %eliotd::diagnostics::sanitize_identity(
+                            row.closure_operation_id()
+                        ),
+                        reason = %error,
+                    );
+                    continue;
+                }
+            }
+        };
+        match outcome {
+            Ok(resumed) => {
+                tracing::info!(
+                    target: "eliotd::diagnostics",
+                    event = "eliotd.authority_revocation_second_phase_linked",
+                    grant_id = %eliotd::diagnostics::sanitize_identity(target),
+                    closure_operation_id = %eliotd::diagnostics::sanitize_identity(
+                        &closure.operation_id
+                    ),
+                    canonical_operation_id = %eliotd::diagnostics::sanitize_identity(
+                        resumed.canonical_receipt.operation_id.as_str()
+                    ),
+                    canonical_receipt_id = %eliotd::diagnostics::sanitize_identity(
+                        resumed.closure_projection.canonical_receipt().receipt_id.as_str()
+                    ),
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "eliotd::diagnostics",
+                    event = "eliotd.authority_revocation_resume_pending",
+                    grant_id = %eliotd::diagnostics::sanitize_identity(target),
+                    closure_operation_id = %eliotd::diagnostics::sanitize_identity(
+                        row.closure_operation_id()
+                    ),
+                    reason = %error,
+                );
             }
         }
     }

@@ -226,8 +226,8 @@ pub use cue_activation_route::{
 pub use daemon_config::{DaemonConfig, admit_daemon_module_manifest};
 pub(crate) use daemon_kernel_client::kernel_port_error;
 pub use daemon_kernel_client::{
-    ActivationSubmitError, DaemonKernelClient, LocalReadSubmitOutcome, ObserveDeferOutcome,
-    ObserveSubmitOutcome, OwnerSessionFacts, TaskControllerSubmitOutcome,
+    ActivationSubmitError, DaemonClosureLinkPort, DaemonKernelClient, LocalReadSubmitOutcome,
+    ObserveDeferOutcome, ObserveSubmitOutcome, OwnerSessionFacts, TaskControllerSubmitOutcome,
 };
 #[cfg(test)]
 pub(crate) use daemon_kernel_client::{KernelClientError, WireOutcome, operation_payload};
@@ -313,7 +313,9 @@ pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
 pub use maintenance_dispatch::{MaintenanceDecisionGap, MaintenanceDispatch, decision_gap};
 pub use maintenance_trigger_evaluator::{
-    MaintenanceObservation, MaintenanceTriggerOrigin, SELF_OBSERVED_FAMILY, UNRESOLVED_AUTHORITIES,
+    AdmitMaintenanceRevocationError, AdmittedMaintenanceRevocation, BoundRevocationResume,
+    MaintenanceObservation, MaintenanceTriggerOrigin, RevocationResumeIngress, SELF_OBSERVED_FAMILY,
+    UNRESOLVED_AUTHORITIES,
 };
 pub use negative_memory_action_gate::{
     NegativeMemoryActionError, NegativeMemoryActionOutcome, NegativeMemoryPendingAction,
@@ -4012,6 +4014,27 @@ impl DaemonComposition {
             return Err(DaemonError::Composition(CompositionError::NotReady));
         }
         Ok(&mut self.governor_authority)
+    }
+
+    /// Mutably borrows the Governor composition for the bounded canonical
+    /// second-phase resume only (issue #2100, audit 5924750035 items 2-4, 6-7).
+    ///
+    /// Mirrors [`Self::capability_admission_mut`]: readiness is checked first,
+    /// so a degraded composition issues no resume. The caller must already hold
+    /// the composition lock for the whole resume: the returned borrow is the
+    /// composition's own Governor, not a second Governor, and its one
+    /// production use is
+    /// [`eliot_governor::GovernorComposition::resume_pending_second_phase`],
+    /// which never re-strikes `revoke_grant` — the Kernel/ORS first phase
+    /// already fenced the target, and re-presenting it would be refused with
+    /// `NotAdmitted`. No other Governor mutation is exposed through this seam.
+    pub fn governor_composition_for_revocation_resume(
+        &mut self,
+    ) -> Result<&mut GovernorComposition<dyn KernelGenerationPort>, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        Ok(&mut self.governor)
     }
 
     /// Borrows the daemon-held Governor outcome registry view (#1961, I3.4).

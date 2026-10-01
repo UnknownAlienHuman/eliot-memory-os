@@ -42,9 +42,13 @@ use eliot_agent_coordinator::OwnerLoadedClaimRow;
 use eliot_contracts::{ArtifactId, ContractId};
 use eliot_contracts::{
     ClockReading, OperationId, ProductId, RequestId, RequestMetadata, SessionId, SourceId,
+    StateFence,
 };
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
-use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError};
+use eliot_governor::{
+    GovernorLaunchConfig, GrantClosureCanonicalLinkPort, GrantClosureSecondPhaseLink,
+    KernelGenerationSnapshot, KernelPortError,
+};
 use eliot_kernel_service::PROVIDER_CAPABILITY_WIRE_VERSION;
 use eliot_learning_contracts::LearningStateViewRecipe;
 use eliot_ors::OperationIdentity;
@@ -57,7 +61,7 @@ use eliot_protocol::{
     MessageType, ProtocolPayload, ProtocolVersion, RequestIdentity, TaskControllerAttempt,
     TaskControllerInvocation, TaskControllerResultBody, host_request_operation_id,
 };
-use eliot_receipts::RequestBinding;
+use eliot_receipts::{GrantClosureReceipt, ReceiptIdentity, RequestBinding};
 #[cfg(windows)]
 use eliot_runtime_contracts::{MODULE_MANIFEST_SCHEMA_VERSION, ModuleManifest};
 use eliot_store_api::{NamedReadRequest, NamedReadResponse, WriteReceipt};
@@ -3250,6 +3254,307 @@ that does not describe this result: {error}"
             shutdown_tx: self.shutdown_tx.clone(),
             shutdown_rx: self.shutdown_rx.clone(),
         })
+    }
+}
+
+/// Wire operation mirroring the Kernel's committed-closure receipt read arm
+/// (`bins/eliot-kernel/src/daemon_request_dispatch.rs::GRANT_CLOSURE_RECEIPT_OPERATION`,
+/// front-door reachable per `frame_dispatch::is_daemon_operation`). The daemon
+/// mirrors the exact string; the Kernel remains the route and fence authority.
+const GRANT_CLOSURE_RECEIPT_OPERATION: &str = "grant_closure_receipt";
+/// Typed receipt kind answered by that arm.
+const GRANT_CLOSURE_RECEIPT_KIND: &str = "grant_closure_receipt";
+/// Typed refusal kind answered by that arm. A refusal is never read as "no
+/// committed closure": only the receipt-not-found reason reports absence.
+const GRANT_CLOSURE_RECEIPT_REFUSAL_KIND: &str = "grant_closure_receipt_refused";
+/// Wire operation mirroring the Kernel's canonical second-phase link arm
+/// (`LINK_GRANT_CLOSURE_RECEIPT_OPERATION`, owned by
+/// `eliot_kernel_service::commit_grant_closure_canonical_link`).
+const LINK_GRANT_CLOSURE_RECEIPT_OPERATION: &str = "link_grant_closure_canonical_receipt";
+/// Typed receipt kind answered by that arm.
+const GRANT_CLOSURE_LINK_KIND: &str = "grant_closure_canonical_receipt_link";
+/// Typed refusal kind answered by that arm. A refusal is never a completed
+/// link: uncommitted first phases, immutable conflicts and transient failures
+/// all stay unestablished under their durable reason.
+const GRANT_CLOSURE_LINK_REFUSAL_KIND: &str = "grant_closure_canonical_receipt_link_refused";
+/// Wire reason both arms render for an unestablished outcome
+/// (`StoreError::ReceiptNotFound`). It is the only tolerated refusal.
+const CLOSURE_RECEIPT_NOT_FOUND_REASON: &str = "receipt not found";
+
+/// Thin authenticated transport adapter for the canonical second-phase link
+/// (issue #2100, audit 5924750035 items 4-5).
+///
+/// This is the daemon-side `L` port
+/// ([`GrantClosureCanonicalLinkPort`]) the Governor second-phase-only resume
+/// entry consumes, plus the committed-closure re-read the resume drive hands
+/// that entry. Both legs travel over the EXISTING Kernel arms — the
+/// committed-closure receipt read (owned by
+/// `eliot_kernel_service::serve_grant_closure_receipt`) and the canonical
+/// link write (owned by `commit_grant_closure_canonical_link`) — decoded
+/// under the same typed kinds the ingress scan already trusts. No Store
+/// client, no second graph, no second path: the Kernel owns ORS in its own
+/// process, and this adapter only carries the exact link the owner proves on
+/// read-back instead of taking the owner's word for it.
+pub struct DaemonClosureLinkPort {
+    client: Arc<DaemonKernelClient>,
+    state_fence: StateFence,
+}
+
+impl DaemonClosureLinkPort {
+    /// Binds the already-connected authenticated Kernel client and the exact
+    /// admitted State Fence one resume pass runs under.
+    #[must_use]
+    pub fn new(client: Arc<DaemonKernelClient>, state_fence: StateFence) -> Self {
+        Self {
+            client,
+            state_fence,
+        }
+    }
+
+    /// Returns the exact admitted State Fence this port reads and links under.
+    #[must_use]
+    pub const fn state_fence(&self) -> &StateFence {
+        &self.state_fence
+    }
+
+    /// Re-reads one committed closure receipt verbatim over the existing read
+    /// arm.
+    ///
+    /// `Ok(None)` is exactly `StoreError::ReceiptNotFound`: the owner's own
+    /// index holds no committed closure for this target, so no first phase
+    /// ran. Every other refusal, a transport failure, an unexpected response
+    /// kind, an undecodable payload, a closure that fails its own receipt
+    /// contract, or a closure that does not name the presented target and
+    /// fence is a typed [`KernelPortError`].
+    pub async fn read_committed_closure(
+        &self,
+        target_grant_id: &str,
+    ) -> Result<Option<GrantClosureReceipt>, KernelPortError> {
+        if self.client.kernel_fence() != self.state_fence {
+            return Err(KernelPortError::Contract(
+                "closure link port is bound to a different Kernel generation State Fence".to_owned(),
+            ));
+        }
+        let value = self
+            .client
+            .transact_async(
+                GRANT_CLOSURE_RECEIPT_OPERATION,
+                serde_json::json!({
+                    "state_fence": self.state_fence,
+                    "target_grant_id": target_grant_id,
+                }),
+            )
+            .await
+            .map_err(kernel_port_error)?;
+        let object = value.as_object().ok_or_else(|| {
+            KernelPortError::Contract(
+                "grant closure receipt read is not a typed object".to_owned(),
+            )
+        })?;
+        let payload = match object.get("kind").and_then(serde_json::Value::as_str) {
+            Some(GRANT_CLOSURE_RECEIPT_KIND) => object.get("value").cloned().ok_or_else(|| {
+                KernelPortError::Contract(
+                    "grant closure receipt read is missing its payload".to_owned(),
+                )
+            })?,
+            Some(GRANT_CLOSURE_RECEIPT_REFUSAL_KIND) => {
+                let reason = object
+                    .get("value")
+                    .and_then(|value| value.get("reason"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unspecified durable refusal");
+                if reason == CLOSURE_RECEIPT_NOT_FOUND_REASON {
+                    return Ok(None);
+                }
+                return Err(KernelPortError::Unknown(format!(
+                    "Kernel refused the committed closure read for {target_grant_id}: {reason}"
+                )));
+            }
+            other => {
+                return Err(KernelPortError::Contract(format!(
+                    "grant closure receipt read returned an unexpected kind: {other:?}"
+                )));
+            }
+        };
+        let closure: GrantClosureReceipt =
+            serde_json::from_value(payload).map_err(|error| {
+                KernelPortError::Contract(format!(
+                    "grant closure receipt for {target_grant_id} does not decode: {error}"
+                ))
+            })?;
+        closure.validate().map_err(|error| {
+            KernelPortError::Contract(format!(
+                "committed closure for {target_grant_id} fails its own receipt contract: {error}"
+            ))
+        })?;
+        if closure.declaration.target_grant_id != target_grant_id {
+            return Err(KernelPortError::Contract(format!(
+                "committed closure for {target_grant_id} names a different target"
+            )));
+        }
+        if closure.authority.state_fence != self.state_fence {
+            return Err(KernelPortError::Contract(format!(
+                "committed closure for {target_grant_id} is bound to a different State Fence"
+            )));
+        }
+        Ok(Some(closure))
+    }
+
+    /// Links one Store-issued canonical receipt to one already committed
+    /// closure operation over the existing link arm, and returns the owner's
+    /// proved read-back.
+    ///
+    /// The returned [`GrantClosureSecondPhaseLink`] carries the ORIGINAL
+    /// committed first-phase bytes verbatim plus the exact linked receipt; an
+    /// absent link is a typed refusal, never a value. The caller re-proves the
+    /// read-back by content instead of taking the owner's word for it.
+    pub async fn link_closure_canonical_receipt_async(
+        &self,
+        operation_id: &str,
+        canonical_receipt: &ReceiptIdentity,
+    ) -> Result<GrantClosureSecondPhaseLink, KernelPortError> {
+        if self.client.kernel_fence() != self.state_fence {
+            return Err(KernelPortError::Contract(
+                "closure link port is bound to a different Kernel generation State Fence".to_owned(),
+            ));
+        }
+        let value = self
+            .client
+            .transact_async(
+                LINK_GRANT_CLOSURE_RECEIPT_OPERATION,
+                serde_json::json!({
+                    "state_fence": self.state_fence,
+                    "closure_operation_id": operation_id,
+                    "canonical_receipt": canonical_receipt,
+                }),
+            )
+            .await
+            .map_err(kernel_port_error)?;
+        let object = value.as_object().ok_or_else(|| {
+            KernelPortError::Contract(
+                "canonical closure link read is not a typed object".to_owned(),
+            )
+        })?;
+        let payload = match object.get("kind").and_then(serde_json::Value::as_str) {
+            Some(GRANT_CLOSURE_LINK_KIND) => object.get("value").cloned().ok_or_else(|| {
+                KernelPortError::Contract(
+                    "canonical closure link read is missing its payload".to_owned(),
+                )
+            })?,
+            Some(GRANT_CLOSURE_LINK_REFUSAL_KIND) => {
+                let reason = object
+                    .get("value")
+                    .and_then(|value| value.get("reason"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unspecified durable refusal");
+                return Err(KernelPortError::Unknown(format!(
+                    "Kernel refused the canonical closure link for {operation_id}: {reason}"
+                )));
+            }
+            other => {
+                return Err(KernelPortError::Contract(format!(
+                    "canonical closure link read returned an unexpected kind: {other:?}"
+                )));
+            }
+        };
+        // The arm answers the owner's own `GrantClosureProjection`
+        // (`{commit, phase, operation_order, receipt, second_phase}`); the
+        // daemon carries no ORS type, so it decodes only the two facts the
+        // reconciliation proof reads — the ORIGINAL committed first-phase row
+        // and the durably linked receipt — and re-proves them here, exactly as
+        // the Kernel proves them before answering.
+        let projection = payload.as_object().ok_or_else(|| {
+            KernelPortError::Contract(
+                "canonical closure link projection is not a typed object".to_owned(),
+            )
+        })?;
+        let commit: GrantClosureReceipt = serde_json::from_value(
+            projection.get("commit").cloned().ok_or_else(|| {
+                KernelPortError::Contract(
+                    "canonical closure link projection is missing its committed closure".to_owned(),
+                )
+            })?,
+        )
+        .map_err(|error| {
+            KernelPortError::Contract(format!(
+                "canonical closure link projection does not decode: {error}"
+            ))
+        })?;
+        let second_phase: Option<ReceiptIdentity> = serde_json::from_value(
+            projection.get("second_phase").cloned().ok_or_else(|| {
+                KernelPortError::Contract(
+                    "canonical closure link projection is missing its second phase".to_owned(),
+                )
+            })?,
+        )
+        .map_err(|error| {
+            KernelPortError::Contract(format!(
+                "canonical closure link receipt does not decode: {error}"
+            ))
+        })?;
+        commit.validate().map_err(|error| {
+            KernelPortError::Contract(format!(
+                "linked closure for {operation_id} fails its own receipt contract: {error}"
+            ))
+        })?;
+        if commit.operation_id != operation_id {
+            return Err(KernelPortError::Contract(format!(
+                "canonical closure link for {operation_id} names a different operation"
+            )));
+        }
+        if second_phase.as_ref() != Some(canonical_receipt) {
+            return Err(KernelPortError::Contract(format!(
+                "canonical closure link for {operation_id} does not bind the presented receipt"
+            )));
+        }
+        Ok(GrantClosureSecondPhaseLink::new(
+            commit,
+            canonical_receipt.clone(),
+        ))
+    }
+}
+
+impl GrantClosureCanonicalLinkPort for DaemonClosureLinkPort {
+    fn link_grant_closure_canonical_receipt(
+        &self,
+        operation_id: &str,
+        canonical_receipt: &ReceiptIdentity,
+    ) -> Result<GrantClosureSecondPhaseLink, KernelPortError> {
+        // The Governor resume entry is async and runs on the daemon's
+        // current-thread runtime, so driving the async pipe transport inline
+        // would nest a `block_on` inside that runtime and panic. `block_in_place`
+        // is unavailable on a current-thread runtime for the same reason.
+        // Bridge the sync port onto a fresh OS thread — which carries no
+        // ambient runtime — where the same async transport runs under its own
+        // current-thread runtime. One bounded thread per link; the transport,
+        // the arm and the proof are unchanged.
+        let client = Arc::clone(&self.client);
+        let state_fence = self.state_fence.clone();
+        let operation_id = operation_id.to_owned();
+        let canonical_receipt = canonical_receipt.clone();
+        std::thread::Builder::new()
+            .name("eliotd-closure-link".to_owned())
+            .spawn(move || {
+                let port = DaemonClosureLinkPort::new(client, state_fence);
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| KernelPortError::NotAdmitted(error.to_string()))?;
+                runtime.block_on(
+                    port.link_closure_canonical_receipt_async(&operation_id, &canonical_receipt),
+                )
+            })
+            .map_err(|error| {
+                KernelPortError::Unknown(format!(
+                    "canonical closure link transport thread failed to spawn: {error}"
+                ))
+            })?
+            .join()
+            .map_err(|_| {
+                KernelPortError::Unknown(
+                    "canonical closure link transport thread failed".to_owned(),
+                )
+            })?
     }
 }
 

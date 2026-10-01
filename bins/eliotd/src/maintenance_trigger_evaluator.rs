@@ -35,9 +35,16 @@
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use eliot_authority::{AuthorityError, GrantId, GrantRevocationRequest, SnapshotId};
-use eliot_contracts::{OperationId, StateFence, canonical_json_bytes, sha256_hex};
-use eliot_governor::{CompositionError, KernelPortError, KernelTransitionPort};
+use eliot_authority::{
+    AuthorityError, GrantId, GrantRevocationRequest, RevocationOperationIdentity, SnapshotId,
+};
+use eliot_contracts::{
+    ClockReading, OperationId, ProductId, ReceiptId, RequestId, SourceId, StateFence, TaskId,
+    TransactionSequence, canonical_json_bytes, sha256_hex,
+};
+use eliot_governor::{
+    CompositionError, KernelGenerationSnapshotProvider, KernelPortError, KernelTransitionPort,
+};
 use eliot_maintenance::{
     AutomationTriggerDecision, CONTRACT_NAME, CONTRACT_VERSION, MaintenanceBrokerEvidence,
     MaintenanceBudgetEvidence, MaintenanceError, MaintenanceFamily, MaintenancePolicyEvidence,
@@ -48,9 +55,9 @@ use eliot_maintenance::{
 use eliot_protocol::{
     MAINTENANCE_TRIGGER_DECISION_RECEIPT_WIRE_ID,
     MAINTENANCE_TRIGGER_DECISION_RECEIPT_WIRE_VERSION, MaintenanceTriggerClaim,
-    MaintenanceTriggerDecisionReceipt, MaintenanceTriggerRecord, ProtocolError,
+    MaintenanceTriggerDecisionReceipt, MaintenanceTriggerRecord, ProtocolError, RequestIdentity,
 };
-use eliot_receipts::{GrantClosureReceipt, GrantClosureState};
+use eliot_receipts::{GrantClosureReceipt, GrantClosureState, ReceiptIdentity, RequestBinding};
 use eliot_store_api::{StoreError, WriteReceiptStatus};
 use thiserror::Error;
 
@@ -1189,6 +1196,13 @@ pub enum AdmitMaintenanceRevocationError {
         "maintenance revocation admission refused: committed closure is not bound to the live composition State Fence"
     )]
     StaleFence,
+    /// No Kernel-validated session binding backs this connection: the resume
+    /// has no admitted principal to run under, so every obligation stays
+    /// pending instead of resuming under an invented one.
+    #[error(
+        "maintenance revocation admission refused: no Kernel-validated session binding for this connection"
+    )]
+    NoAdmittedSession,
 }
 
 impl AdmitMaintenanceRevocationError {
@@ -1204,6 +1218,9 @@ impl AdmitMaintenanceRevocationError {
             Self::SecondPhaseComplete => "canonical second phase is already linked",
             Self::StaleFence => {
                 "committed closure is not bound to the live composition State Fence"
+            }
+            Self::NoAdmittedSession => {
+                "no Kernel-validated session binding for this connection"
             }
         }
     }
@@ -1278,5 +1295,255 @@ impl AdmittedMaintenanceRevocation {
     #[must_use]
     pub const fn graph_revision(&self) -> u64 {
         self.graph_revision
+    }
+
+    /// Binds the exact re-admitted operation to the indivisible canonical
+    /// identities its second phase reconciles under (issue #2100, audit
+    /// 5924750035 items 2, 4, 6).
+    ///
+    /// `closure` must be the owner's freshly re-read committed bytes for this
+    /// same obligation; `ingress` must be the admitted ingress facts of this
+    /// pass. The binding proves both before composing anything:
+    ///
+    /// * same obligation, never mixed — the presented closure's recorded
+    ///   operation identity must equal the one this admission was built from,
+    ///   otherwise one operation's request would resume under another
+    ///   operation's identity (the mixture `CanonicalRevocationCommit`
+    ///   forbids);
+    /// * same generation — the closure fence must equal the ingress fence,
+    ///   otherwise the operation belongs to a superseded generation;
+    /// * still pending — an already linked closure is converged state, not a
+    ///   resumable obligation, and a non-revoked closure never authorizes a
+    ///   revocation resume.
+    ///
+    /// The composed identities are deterministic per (generation, obligation):
+    /// the canonical operation id retains the ORIGINAL committed operation
+    /// identity (the pure resume predicate requires that equality); the
+    /// canonical request identity is the daemon's own admitted resume-ingress
+    /// identity at the live fence with an idempotency key bound to that same
+    /// operation, so every pass rebuilds byte-identical envelope bytes and a
+    /// retry reconciles onto the first commit instead of conflicting; the
+    /// revocation operation identity carries the admitted principal, task,
+    /// scope, observation and causal clock. No coordinate is derived from the
+    /// restored graph or a diagnostic row, and no fresh identity is minted per
+    /// pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdmitMaintenanceRevocationError`] when the presented closure
+    /// is not this admission's own pending revoked obligation, names a
+    /// different fence, or carries an identity the contract owners refuse.
+    pub fn bind_resume_identities(
+        &self,
+        closure: &GrantClosureReceipt,
+        ingress: &RevocationResumeIngress,
+    ) -> Result<BoundRevocationResume<'_>, AdmitMaintenanceRevocationError> {
+        if closure.operation_id.as_str() != self.closure_operation_id() {
+            return Err(AdmitMaintenanceRevocationError::Identity(
+                AuthorityError::IdentityConflict,
+            ));
+        }
+        if closure.authority.state_fence != ingress.state_fence {
+            return Err(AdmitMaintenanceRevocationError::StaleFence);
+        }
+        if closure.canonical_receipt.is_some() {
+            return Err(AdmitMaintenanceRevocationError::SecondPhaseComplete);
+        }
+        if closure.state != GrantClosureState::Revoked {
+            return Err(AdmitMaintenanceRevocationError::NotRevokedClosure);
+        }
+        let invalid = |field: &'static str| {
+            AdmitMaintenanceRevocationError::Identity(AuthorityError::InvalidField(field))
+        };
+        // The ORIGINAL first-phase operation identity, retained — never
+        // re-derived and never freshly minted. The resume predicate reconciles
+        // the canonical write under exactly this identity.
+        let canonical_operation_id = OperationId::new(closure.operation_id.clone())
+            .map_err(|_| invalid("maintenance_resume.closure_operation_id"))?;
+        // Deterministic operation text: the daemon's own resume-ingress name
+        // anchored to the retained operation, so every pass rebuilds the same
+        // request id and idempotency key for one obligation.
+        let operation_text = format!(
+            "{}:authority-revocation-resume:{}",
+            crate::SERVICE_NAME,
+            closure.operation_id
+        );
+        // Deterministic causal clock: the admitted generation's own sequence.
+        // A13.9 orders work by cause; a host wall-clock reading can never
+        // become that order, and a per-pass wall time would rebuild different
+        // envelope bytes on retry and conflict instead of reconciling.
+        let sequence = TransactionSequence::new(ingress.transaction_sequence)
+            .map_err(|_| invalid("maintenance_resume.transaction_sequence"))?;
+        let clock = ClockReading {
+            valid_time_ms: None,
+            known_time_ms: None,
+            transaction_sequence: Some(sequence),
+            monotonic_ns: None,
+        };
+        let metadata = eliot_contracts::RequestMetadata {
+            request_id: RequestId::new(operation_text.clone())
+                .map_err(|_| invalid("maintenance_resume.request_id"))?,
+            session_id: None,
+            task_id: None,
+            product_id: ProductId::new(crate::SERVICE_NAME)
+                .map_err(|_| invalid("maintenance_resume.product_id"))?,
+            source_id: SourceId::new(crate::SERVICE_NAME)
+                .map_err(|_| invalid("maintenance_resume.source_id"))?,
+            state_fence: ingress.state_fence.clone(),
+            clock,
+        };
+        metadata
+            .validate()
+            .map_err(|_| invalid("maintenance_resume.request_metadata"))?;
+        let canonical_request_identity = RequestIdentity {
+            request: RequestBinding {
+                metadata,
+                state_fence: ingress.state_fence.clone(),
+            },
+            idempotency_key: operation_text.clone(),
+            deadline_unix_ms: crate::unix_ms()
+                .saturating_add(MAINTENANCE_RESULT_PUBLISH_DEADLINE_MS),
+            cancellation_id: format!("{operation_text}:cancel"),
+        };
+        canonical_request_identity
+            .validate()
+            .map_err(|_| invalid("maintenance_resume.canonical_request_identity"))?;
+        // The observation this resume acts on: the pass's own read of THIS
+        // pending obligation, digest-labelled exactly like the owner-feed's
+        // closure-link read observation. The label names which obligation was
+        // observed; the authority coordinates below all come from admitted
+        // ingress.
+        let observation_preimage = canonical_json_bytes(&(
+            "authority-revocation-resume-observation.v1",
+            ingress.state_fence.authority_epoch.lineage_id.as_str(),
+            ingress.state_fence.authority_epoch.sequence.get(),
+            closure.operation_id.clone(),
+        ))
+        .map_err(|_| invalid("maintenance_resume.observation"))?;
+        let operation = RevocationOperationIdentity::admit(
+            ingress.principal.clone(),
+            TaskId::new(ingress.task_text.clone())
+                .map_err(|_| invalid("maintenance_resume.admitted_task"))?,
+            closure.declaration.authority_root_ref.clone(),
+            ReceiptId::new(sha256_hex(&observation_preimage))
+                .map_err(|_| invalid("maintenance_resume.observing_receipt"))?,
+            clock,
+        )
+        .map_err(AdmitMaintenanceRevocationError::Identity)?;
+        Ok(BoundRevocationResume {
+            request: &self.request,
+            canonical_operation_id,
+            canonical_request_identity,
+            operation,
+        })
+    }
+}
+
+/// Admitted ingress facts one revocation-resume admission is composed under
+/// (issue #2100, audit 5924750035 items 1-4).
+///
+/// Every coordinate is owner-proved for this exact pass, never synthesized
+/// from the graph under audit: the principal is the Kernel-authenticated
+/// session binding the transport retained, the fence is the live admitted
+/// State Fence, the task names the admitted Kernel generation, and the clock
+/// position is the owner-assigned generation sequence. The scope and the
+/// observed obligation travel with the committed closure the bundle is bound
+/// to, not here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevocationResumeIngress {
+    principal: String,
+    state_fence: StateFence,
+    task_text: String,
+    transaction_sequence: u64,
+}
+
+impl RevocationResumeIngress {
+    /// Admits the resume ingress from the Kernel-authenticated connection.
+    ///
+    /// Reads only owned admitted sources: the transport-retained session
+    /// binding, the live generation snapshot fence and epoch, and the
+    /// owner-assigned generation sequence. A connection with no validated
+    /// binding admits nothing — every obligation stays pending instead of
+    /// resuming under an invented principal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdmitMaintenanceRevocationError::NoAdmittedSession`] when the
+    /// Kernel admitted no session binding for this connection.
+    pub fn admit_from_kernel(
+        kernel: &DaemonKernelClient,
+    ) -> Result<Self, AdmitMaintenanceRevocationError> {
+        let principal = kernel
+            .validated_session_binding()
+            .ok_or(AdmitMaintenanceRevocationError::NoAdmittedSession)?;
+        let snapshot = kernel.snapshot();
+        let state_fence = snapshot.state_fence();
+        let epoch = &snapshot.authority_epoch;
+        Ok(Self {
+            principal,
+            state_fence: state_fence.clone(),
+            task_text: format!(
+                "kernel-generation:{}:{}",
+                epoch.lineage_id.as_str(),
+                epoch.sequence.get()
+            ),
+            transaction_sequence: state_fence.resource_generation.value(),
+        })
+    }
+
+    /// Returns the exact admitted State Fence the resume runs under.
+    #[must_use]
+    pub const fn state_fence(&self) -> &StateFence {
+        &self.state_fence
+    }
+}
+
+/// One owner-bound resume handoff: the exact re-admitted revocation request
+/// together with the indivisible canonical identities its second phase
+/// reconciles under (issue #2100, audit 5924750035 items 2, 4, 6).
+///
+/// Per `CanonicalRevocationCommit`, the operation identity, the canonical
+/// operation id and the canonical request identity are one indivisible
+/// admission composed together from admitted ingress — never derived from
+/// the durable closure — so the prepare step cannot be handed a mixture of
+/// two different operations. The bundle borrows the admitted request and
+/// owns the three identities; the drive presents all of them to
+/// [`eliot_governor::GovernorComposition::resume_pending_second_phase`] in
+/// one call. A refused bundle stays pending/recovery-required, never
+/// complete.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundRevocationResume<'a> {
+    request: &'a GrantRevocationRequest,
+    canonical_operation_id: OperationId,
+    canonical_request_identity: RequestIdentity,
+    operation: RevocationOperationIdentity,
+}
+
+impl BoundRevocationResume<'_> {
+    /// Returns the exact re-admitted revocation request the resume executes.
+    #[must_use]
+    pub const fn request(&self) -> &GrantRevocationRequest {
+        self.request
+    }
+
+    /// Returns the ORIGINAL first-phase operation identity the canonical
+    /// write reconciles under.
+    #[must_use]
+    pub const fn canonical_operation_id(&self) -> &OperationId {
+        &self.canonical_operation_id
+    }
+
+    /// Returns the admitted canonical request identity the envelope commits
+    /// under.
+    #[must_use]
+    pub const fn canonical_request_identity(&self) -> &RequestIdentity {
+        &self.canonical_request_identity
+    }
+
+    /// Returns the admitted revocation operation identity the bounded closure
+    /// and the prepared transition are computed under.
+    #[must_use]
+    pub const fn operation(&self) -> &RevocationOperationIdentity {
+        &self.operation
     }
 }
