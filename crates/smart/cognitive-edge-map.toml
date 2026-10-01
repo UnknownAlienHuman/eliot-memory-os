@@ -72,6 +72,33 @@ contract = "eliot-dreamer-contracts::TypedCurationHandlerResult"
 consumer = "eliot-dreamer-curation"
 compile_link = "contract_only"
 
+# The three edges below are added by #261 r11 for the families that were frozen at
+# TYPE level only until that revision. Each names a consumer that was located with
+# git grep on the r11 base commit, not one chosen for plausibility.
+#
+# There is deliberately NO fourth edge for the memory-selection family.
+# selection.rs::select has zero callers outside its own crate, so there is no
+# producer-to-consumer pair to record, and naming one would be an invented edge.
+# That absence is carried in the freeze at [[disagreement]] DIS-SEL-NO-CALLER and
+# in [[coverage_accounting]] for that family, where owner_is_complete is false.
+[[edge]]
+producer = "eliot-observation (Governor journal owner, cited by handle)"
+contract = "eliot-observation-contracts::FailureObservation"
+consumer = "eliot-dreamer-memory-revision"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "eliot-observation (Governor journal owner, cited by handle)"
+contract = "eliot-observation-contracts::MemoryRevisionEvidence"
+consumer = "eliot-dreamer-memory-revision"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "eliot-epistemic"
+contract = "eliot-epistemic-contracts::ProviderContribution"
+consumer = "eliot-epistemic-context-provider, eliot-understanding-assessment"
+compile_link = "contract_only"
+
 [[forbidden_compile_edge]]
 from = "eliot-cue-index"
 to = "eliot-cue-normalizer"

@@ -1,8 +1,8 @@
 schema_version = 1
-freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r10"
-revision = 10
-supersedes_freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r9"
-supersedes_freeze_digest = "sha256:6656e090f7b380567bf126dbfff3762b59e4f7bb027742685f5a9a377bad628b"
+freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r11"
+revision = 11
+supersedes_freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r10"
+supersedes_freeze_digest = "sha256:a29ca6e7dee0ab36c917b7040e1c1a602b8ca17e365e4376be0600d8fa2b2124"
 status = "FROZEN_STATIC_SCHEMA"
 base_commit = "12eae28aa4154fd4f8deed21cde8b3c9c0e5094a"
 normative_pair_key = "sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea"
@@ -100,6 +100,151 @@ reason = "The curation family was frozen at type level only, and the deliverable
 unchanged = "every [[frozen_type]] row, every enum list, every [[cell_binding]] order, every [[bound]] row, the r8 and r9 field contracts, proof_ceiling, implementation_support and evidence_execution_status"
 retired_parallel_candidate = "A candidate also numbered r9 was drafted on a branch whose merge base predated the published r8. It is superseded by this r10 and is not published under a duplicate revision identity."
 issue = "#261"
+
+# ---------------------------------------------------------------------------
+# r11 is the W1 reconciliation and W2 field-contract completion of the three
+# families the #196 C1 card names as existing but which were frozen at TYPE
+# level only, plus the W1 disposition of the three the card names as still
+# NOT_FROZEN. It adds no new Rust owner, invents no type, and edits no Rust
+# except the single REQUIRED_FREEZE_DIGEST repin that the [readback] rule
+# requires for any byte change.
+#
+# Why the three existing families needed field contracts at all: memory
+# selection, failure observation and provider contribution were each closed as
+# a challenge with a [[frozen_type]] row naming a list of field NAMES. A
+# downstream implementation agent handed that row receives six field names and
+# no requiredness, no bound, no None meaning, no validator anchor and no error
+# variant, which is the "function-name-only schema presented as frozen" shape
+# the acceptance criteria forbid. r11 states all of those per field.
+#
+# Why the three NOT_FROZEN families got a disposition rather than a type: each
+# was measured and none has an owner. The [[family_disposition]] rows above
+# give each exactly one disposition, name the measured fact, name the owning
+# task, and contribute ZERO to every coverage count. A NOT_FROZEN row that has
+# been measured and assigned an owner is still NOT_FROZEN; what changed is that
+# it is no longer an unexplained omission.
+# ---------------------------------------------------------------------------
+[revision_note_r11]
+revision = 11
+supersedes = "cognitive-rev12-contract-schema-freeze-2026-09-22-r10"
+changed = "adds the [[family_disposition]] table for all seven C1 families, the field contract for three previously type-level-only families (11 [[field_contract]] type rows: 6 selection, 4 failure-observation, 1 provider-contribution, together with 70 [[field_contract_field]] field rows), 3 [[denominator]] rows, 8 [[completeness_rule]] rows, 3 [[version_rule]] rows, 3 [[assignment_binding]] rows, and the r11_disposition block on all three [[not_frozen]] rows"
+reason = "W1 requires every required type to carry exactly one disposition against current source and unresolved rows to stay visible; W2 requires every load-bearing field to carry an exact owner, wire spelling, requiredness, bound, binding, validator, typed error and compatibility rule. Three families satisfied W1 at type level only, and three rows had no owner and no decision at all."
+unchanged = "every pre-existing [[frozen_type]] row and its field list, every [[bound]] row, every [[cell_binding]] order, the r9 cue field contract and the r10 curation field contract verbatim, the r8 and r9 and r10 revision notes, proof_ceiling, implementation_support and evidence_execution_status"
+rust_change = "crates/smart/eliot-dreamer-memory-revision/src/lib.rs only, and only the REQUIRED_FREEZE_DIGEST constant, because that is the single constant pair that enforces this freeze byte-for-byte at runtime through verify_freeze_binding called from propose. No other Rust file is touched, and no contract shape is described here that the owner crates do not already declare."
+issue = "#261"
+
+# ---------------------------------------------------------------------------
+# r11 coverage accounting. Every Complete claim in this file has to carry a
+# recheckable member denominator, and unknown or incomplete evidence must not
+# become complete by default. This table is the single place where the
+# per-family member counts are declared, so a reader can recheck coverage
+# without counting rows by hand.
+#
+# The denominator of each row is stated as a MEASURED COUNT over the owner
+# crate's own declarations, and the recheck procedure names the command that
+# reproduces it. A count alone is deliberately not treated as proof of coverage:
+# each row also states the omission axis and the unknown behaviour, because a
+# member count that ignores omissions is not coverage.
+#
+# Rows whose owner_is_complete is false are NOT counted toward any coverage
+# claim anywhere in this file. That is the mechanism by which unknown or
+# incomplete evidence cannot become complete by default: the three
+# [[not_frozen]] rows and the [[cell_binding]] order-80 blocked_inputs string
+# each name the rows they prevent, and each of those rows contributes zero.
+# ---------------------------------------------------------------------------
+[[coverage_accounting]]
+family = "eliot-cue-contracts"
+owner_crate = "crates/smart/eliot-cue-contracts"
+admitted_in_revision = 9
+declared_member_denominator = 19
+measured_member_denominator = 19
+members = ["ObservedCue", "NormalizedCue", "CanonicalCueIdentity", "ComparisonKey", "CueBindingCandidate", "AdmittedCueBindingProjection", "CueSnapshot", "CueSnapshotClosure", "RebuildIdentity", "SnapshotMember", "RelationEdge", "DirectActivation", "DerivedActivation", "ActivationResult", "CueSnapshotBuildCandidate", "CueKind", "SourceHandle", "CueContext", "NormalizationProfile"]
+disposition_split = "12 FROZEN_EXACT, 7 REFERENCED_NOT_FROZEN. The seven REFERENCED_NOT_FROZEN members are FC-CUE-SOURCE-HANDLE, FC-CUE-CONTEXT, FC-CUE-PROFILE, FC-CUE-ADMITTED-BINDING, FC-CUE-REBUILD-IDENTITY, FC-CUE-SNAPSHOT-MEMBER and FC-CUE-RELATION-EDGE: each is reachable as a nested owner field of a frozen row but is not itself a top-level frozen output, so a downstream agent may reference it and may not treat it as a standalone contract."
+field_rows = 103
+owner_is_complete = true
+omission_axis = "CueProjectionOmission per omitted row and per omitted edge, drawn from the closed CueProjectionOmissionReason set, bounded by CueSnapshotFanout. A truncation with no stated bound is not closure."
+unknown_behaviour = "No unknown state reads as Complete: Complete paired with a nonempty frontier is CompleteWithFrontier, an absent closure is SnapshotNotRebuildable, an unclassifiable normalization is Unsupported with no canonical identity, an unreadable source is SourceUnavailable, and no seed hitting is NoDirectMatch."
+recheck_procedure = "python -c \"import tomllib; d=tomllib.load(open('crates/smart/cognitive-rev12-contract-schema-freeze.toml','rb')); print(len([f for f in d['field_contract'] if f['crate']=='eliot-cue-contracts']))\" returns 19; and count the 'pub struct' plus 'pub enum' declarations reachable from crates/smart/eliot-cue-contracts/src that the [[frozen_type]] rows name."
+not_frozen_rows_in_family = "none; SnapshotInvalidation, RetrievalLineage and RedactedDiagnostic are named in the DIS-CUE-OUTPUT-SET disagreement as the same REFERENCED_NOT_FROZEN disposition and are not counted in the 19"
+
+[[coverage_accounting]]
+family = "eliot-memory-curation-contracts"
+owner_crate = "crates/smart/eliot-memory-curation-contracts"
+admitted_in_revision = 10
+declared_member_denominator = 13
+measured_member_denominator = 13
+members = ["CurationScreenRequest", "SourceIdentity", "FiniteDenominator", "ScreenCoverage", "CurationFinding", "ProtectionAssessment", "Eligibility", "MemberSets", "CurationScreenResult", "CurationDimension", "SourceSnapshot", "MemberEvidenceRefs", "LegacyMigrationDescriptor"]
+disposition_split = "10 FROZEN_EXACT, 3 REFERENCED_NOT_FROZEN (SourceSnapshot, MemberEvidenceRefs and LegacyMigrationDescriptor)"
+field_rows = 76
+owner_is_complete = true
+omission_axis = "ScreenCoverage frontier plus the per-member MemberDisposition, with result ResultState Blocked, Partial or Unknown when the frontier, the coverage order or the resume cursor does not reconcile."
+unknown_behaviour = "Nine named uncertain values, none of which has a default reading as the affirmative: SourceAvailability UNKNOWN and UNAVAILABLE, ProtectionEvidenceState STALE, MISSING, MALFORMED, UNAVAILABLE and UNKNOWN, ProtectionDecision UNKNOWN, EligibilityStatus UNKNOWN_BLOCKED and INCOMPLETE_TRUNCATED, FindingProof UNKNOWN, MemberDisposition UNPROCESSED, ResultState BLOCKED and UNKNOWN."
+recheck_procedure = "python -c \"import tomllib; d=tomllib.load(open('crates/smart/cognitive-rev12-contract-schema-freeze.toml','rb')); print(len([f for f in d['field_contract'] if f['crate']=='eliot-memory-curation-contracts']))\" returns 13; and count the public declarations reachable from crates/smart/eliot-memory-curation-contracts/src."
+not_frozen_rows_in_family = "none"
+
+[[coverage_accounting]]
+family = "eliot-memory-projection-contracts-selection"
+owner_crate = "crates/foundation/eliot-memory-projection-contracts"
+admitted_in_revision = 11
+declared_member_denominator = 6
+measured_member_denominator = 6
+members = ["MemoryQueryIntent", "MemorySelectionPolicy", "MemorySelectionTrace", "SelectionEntry", "SelectionCoverage", "SelectionDisposition"]
+disposition_split = "6 FROZEN_EXACT, 0 REFERENCED_NOT_FROZEN"
+field_rows = 21
+owner_is_complete = false
+incomplete_reason = "The CONTRACT is complete at r11: all 6 of 6 members carry a field contract row with a resolving validator anchor. What is NOT complete is adoption: measured by git grep, no crate outside eliot-memory-projection-contracts references MemoryQueryIntent, MemorySelectionPolicy, MemorySelectionTrace, SelectionCoverage or SelectionDisposition at all, and the crate's own tests/projection_contracts.rs exercises none of them. selection.rs::select has zero callers. This row therefore contributes to CONTRACT coverage and contributes ZERO to any adoption, caller or runtime claim, and AB-MEM-SELECTION records the absence rather than naming a consumer that does not exist."
+omission_axis = "NONE BY CONSTRUCTION and deliberately so: SelectionCoverage counts the records PRESENTED to selection, and a presented record outside the allowlist is recorded as NotSelected rather than dropped. Incompleteness in the SOURCE belongs to the batch's own ProjectionCoverage denominator, frontier and omissions, which this family neither re-states nor blurs."
+unknown_behaviour = "There is no unknown state in this denominator and none is needed, because the denominator is a count of records actually presented rather than a claim about records that might exist. An unreadable batch is a MemoryProjectionError and produces NO trace at all, which is structurally different from a trace with a small considered count. An UNKNOWN batch denominator does not block selection, because select() reads batch.coverage.denominator and never echoes it."
+recheck_procedure = "python -c \"import tomllib; d=tomllib.load(open('crates/smart/cognitive-rev12-contract-schema-freeze.toml','rb')); print(len([f for f in d['field_contract'] if f['type_id'].startswith('FC-SEL-')]))\" returns 6; and `git grep -rln MemorySelectionTrace -- '*.rs'` returns exactly two files, both inside the owning crate."
+not_frozen_rows_in_family = "MemoryContextProjectionRequest, dispositioned MISSING_CONTRACT_DECISION in [[family_disposition]] and in [[not_frozen]]. It is a SEPARATE planning name with no Rust owner and is not one of the 6 members; it contributes zero to this denominator."
+
+[[coverage_accounting]]
+family = "eliot-observation-contracts-failure"
+owner_crate = "crates/foundation/eliot-observation-contracts"
+admitted_in_revision = 11
+declared_member_denominator = 4
+measured_member_denominator = 4
+members = ["FailureObservation", "MemoryRevisionEvidence", "FailureOmission", "FailureOmissionClass"]
+disposition_split = "4 FROZEN_EXACT, 0 REFERENCED_NOT_FROZEN"
+field_rows = 36
+owner_is_complete = true
+omission_axis = "FailureOmission per omission, class drawn from the closed five-member FailureOmissionClass set with no Unknown or Other member, bounded at MAX_OBSERVATION_OMISSIONS 64, plus the owner-declared blind_intervals list on CoverageEvidence which is the frontier equivalent for this family. Both axes are typed and both are covered by each record's frozen digest."
+unknown_behaviour = "Unknown is a NAMED VALUE everywhere: CoverageDisposition carries UNKNOWN, UNAVAILABLE, BLIND, INCOMPLETE_COVERAGE and PARTIAL as five distinct members and none reads as Complete. An empty omissions list means the owner declared no omission and is never a claim that nothing was missed. An unreadable source is Unavailable plus a named omission, and an unadmitted source is the UNADMITTED_SOURCE class."
+recheck_procedure = "python -c \"import tomllib; d=tomllib.load(open('crates/smart/cognitive-rev12-contract-schema-freeze.toml','rb')); print(len([f for f in d['field_contract'] if f['type_id'].startswith('FC-OBS-')]))\" returns 4; and `git grep -n -- 'pub struct FailureObservation' -- crates/foundation/eliot-observation-contracts/src`, repeated for MemoryRevisionEvidence and FailureOmission and 'pub enum FailureOmissionClass', returns exactly those four declarations in src/failure_observation.rs."
+not_frozen_rows_in_family = "none"
+
+[[coverage_accounting]]
+family = "eliot-epistemic-contracts-contribution"
+owner_crate = "crates/smart/eliot-epistemic-contracts"
+admitted_in_revision = 11
+declared_member_denominator = 1
+measured_member_denominator = 1
+members = ["ProviderContribution"]
+disposition_split = "1 FROZEN_EXACT, 0 REFERENCED_NOT_FROZEN. The nested owners CurrentEpistemicPosition, AdmittedKind and Currentness are dispositioned by their own pre-existing [[frozen_type]] rows and are referenced rather than duplicated, which is why the denominator here is 1 and not 4."
+field_rows = 13
+owner_is_complete = true
+omission_axis = "NONE, and its absence is the strongest completeness statement in this file: there is no coverage denominator, no omission list, no partial-contribution variant and no completion flag. contribute() returns Result<Self, ContractError> and runs the position's closed validation first, so a contribution covers exactly its named receipt envelope or does not exist. A caller therefore cannot ship a partial handoff and later mistake it for a whole one."
+unknown_behaviour = "Currentness carries SUPERSEDED as its second member and contribute() REFUSES it, so a superseded position is a typed error rather than a contribution with a weakened marker. The epistemic distinctions this envelope does not carry, such as assumed, conflicted, stale or under investigation, stay visible on the CurrentEpistemicPosition and are not flattened by the handoff. coverage_digest being present is a digest of the OWNER's evidence and is never itself a Complete verdict."
+recheck_procedure = "python -c \"import tomllib; d=tomllib.load(open('crates/smart/cognitive-rev12-contract-schema-freeze.toml','rb')); print(len([f for f in d['field_contract'] if f['type_id'].startswith('FC-EPI-')]))\" returns 1; and `git grep -rln ProviderContribution -- '*.rs'` returns six files, of which the two real external consumers are crates/smart/eliot-epistemic-context-provider/src/context_projection.rs and crates/smart/eliot-understanding-assessment/src/lib.rs."
+not_frozen_rows_in_family = "The rev12 closed seven-class provider enum is dispositioned MISSING_CONTRACT_DECISION. It belongs to the eliot-context-contracts vocabulary, is NOT a member of this family, has no Rust owner, and contributes zero to this denominator. It is NOT closed by the presence of ProviderContribution, which is a provider-neutral ENVELOPE over an admitted position and not a provider-class enum."
+
+[[coverage_accounting]]
+family = "SEVEN-FAMILY-TOTAL"
+owner_crate = "not applicable; this row aggregates the six owner rows above plus the three NOT_FROZEN families"
+admitted_in_revision = 11
+declared_member_denominator = 43
+measured_member_denominator = 43
+denominator_definition = "The whole-file member denominator is the count of [[field_contract]] type rows, one row per named type. It is NOT a count of Rust types in the tree, because most Rust types in these families are correctly unrepresented here as second owners or as nested vocabulary. Measured: 19 cue + 13 curation + 6 selection + 4 failure + 1 contribution = 43."
+disposition_split = "across the whole file: 43 [[field_contract]] type rows, of which 10 carry disposition REFERENCED_NOT_FROZEN and 33 carry FROZEN_EXACT; and 7 [[family_disposition]] rows, of which 4 are REUSED_EXACT and 3 are MISSING_CONTRACT_DECISION. The 10 REFERENCED_NOT_FROZEN rows break down as 7 in eliot-cue-contracts and 3 in eliot-memory-curation-contracts."
+field_rows = 249
+owner_is_complete = false
+incomplete_reason = "THREE of the seven C1 families are NOT complete and cannot be made complete by this work unit, because each lacks a Rust owner: MemoryContextProjectionRequest, the rev12 closed seven-class provider enum, and the typed skill/tool/job evidence projections. Each is dispositioned, measured and assigned an exact owning task in [[family_disposition]] and [[not_frozen]], each contributes ZERO to every count in this table, and [[cell_binding]] order 80 is blocked by the third of them. A sixth family, memory selection, has a complete CONTRACT at 6 of 6 members but zero adoption and zero callers, which is why its owner_is_complete is false even though every member is frozen. The three Complete owner rows are cue at 19 of 19, curation at 13 of 13, failure observation at 4 of 4 and provider contribution at 1 of 1, each with its recheck_procedure stated above."
+omission_axis = "Per-family, as stated on each owner row. No single cross-family omission axis is declared here, because these families share no denominator and a combined one would be a count that proves nothing."
+unknown_behaviour = "A NOT_FROZEN row that has been measured and assigned an owner is STILL not frozen. Measuring it changes it from an unexplained omission into a visible blocked row; it does not move it into any Complete count, and this file states no Complete claim of its own."
+recheck_procedure = "python -c \"import tomllib; d=tomllib.load(open('crates/smart/cognitive-rev12-contract-schema-freeze.toml','rb')); print(len(d['family_disposition']), len(d['field_contract']), len(d['field_contract_field']), len(d['coverage_accounting']), len(d['not_frozen']))\" returns 7 43 249 6 3. This table itself has six rows: five owner rows plus this aggregate."
+not_frozen_rows_in_family = "3, all dispositioned MISSING_CONTRACT_DECISION, all contributing zero."
+recheck_note = "This aggregate row is the only place in the file that states a whole-file total. It states a COUNT and explicitly refuses to treat that count as coverage: five of the seven families are frozen at type level and field level, one is frozen at field level with zero adoption, and three carry no owner at all."
+
 
 # Historical cell numbers 69, 70, 72, 73, 75 (original #223 record) have no
 # referent in the current topology: cognitive-crate-decisions.toml assigns
@@ -783,14 +928,19 @@ denominator_note = "The five curation dimensions are separate verdicts on separa
 # ---------------------------------------------------------------------------
 [field_contract_rule]
 admitted_in_revision = 9
-applies_to = ["eliot-cue-contracts"]
+first_admitted_in = "eliot-cue-contracts at r9. Extended at r10 to eliot-memory-curation-contracts and at r11 to eliot-memory-projection-contracts (selection), eliot-observation-contracts (failure family) and eliot-epistemic-contracts (contribution). The r11 families join under the SAME row shape and the SAME rules; r11 adds no new column."
+applies_to = ["eliot-cue-contracts", "eliot-memory-curation-contracts", "eliot-memory-projection-contracts", "eliot-observation-contracts", "eliot-epistemic-contracts"]
 row_shape = ["field_id", "type_rust_path", "wire_name", "owner_rust_type", "requiredness", "none_meaning", "bound_or_variants", "identity_binding", "validator", "validation_error"]
 type_level_shape = ["type_id", "crate", "type_rust_path", "wire_naming", "validator", "error_family", "provenance_privacy", "invalidation_rule", "disposition"]
 validator_column = "A `path.rs::symbol` anchor naming the real validating function in the defining crate. A row without a resolving validator anchor is a gap and is not counted as frozen."
 validation_error_column = "A variant of the named `error_family`, never a formatted string. A typed failure is never collapsed into a code or a message between layers."
 requiredness_vocabulary = ["REQUIRED", "OPTIONAL_NONE_<meaning>", "EMPTY_SET_ALLOWED", "NOT_APPLICABLE"]
+requiredness_vocabulary_note = "EMPTY_SET_ALLOWED is not the same as REQUIRED and not the same as optional. A field carrying this requiredness is always present and may be an empty list, and the none_meaning column states in words whether an empty list is a real absence, an honest zero, or a claim the owner forbids. Two r11 cases make the distinction load-bearing: FailureOmission.handle is OPTIONAL_NONE with a stated meaning, while MemoryRevisionEvidence.prior_attempts is a plain Rust bool where ZERO is an honest zero and an ABSENT key is a different thing entirely, so that field is REQUIRED with no None case rather than EMPTY_SET_ALLOWED."
 independent_set_rule = "Every expected set named by bound_or_variants, identity_binding or a completeness claim is declared by the OWNER CRATE, never re-derived here. A completeness check compares an independently declared expected set, never a second copy of the caller's own list."
 no_derived_completeness_rule = "This file states no Complete claim. A Complete claim is reachable only through the validator anchor named on the row, over the denominator named by `denominator_ref`."
+disposition_column = "FROZEN_EXACT means the type is a top-level frozen output of its family and the current source matches the row. REFERENCED_NOT_FROZEN means the type is reachable as a nested owner field or as vocabulary of a frozen row but is not itself a top-level frozen output, so a consumer may reference it and may not treat it as a standalone contract. Exactly one of the two applies to every [[field_contract]] row; there is no third value and no blank."
+coverage_claim_rule = "A Complete claim anywhere in this file must carry a recheckable member denominator, an omission axis and an unknown behaviour. The per-family denominators are declared in [[coverage_accounting]] and each carries a recheck_procedure. A row that cannot state all three contributes zero to every count rather than being counted on the strength of its field list alone."
+vocabulary_bundle_rule = "A [[field_contract]] type row whose type_id ends in -VOCABULARIES is a BUNDLE: its type_rust_path names one representative member of a closed enum family, and its [[field_contract_field]] rows name the OTHER members of that family individually, each with its own wire spelling, closed member set and owner path. Those field rows therefore carry a type_rust_path that is not itself a [[field_contract]] type_rust_path, and that is the intended shape rather than a dangling reference. Nineteen rows are in this position at r11: six under FC-CUE-VOCABULARIES (BindingDisposition, BindingRole, ComparisonForm, Completeness, MatchMode, NormalizationOutcome) and thirteen under FC-CUR-VOCABULARIES (DenominatorCoverage, DimensionOutcome, DisclosureCeiling, EligibilityStatus, FindingClass, FindingProof, MemberDisposition, ProtectionClass, ProtectionEvidenceState, ProtectionOutcome, ResultState, SourceAvailability, SourceMemberKind). Every one of the nineteen was machine-checked to be a real type declared in its owner crate's own source. A reader checking parent/child linkage must exempt rows whose field_id prefix belongs to a bundle row."
 
 # --- eliot_cue_contracts::ObservedCue -------------------------------------
 [[field_contract]]
@@ -971,7 +1121,7 @@ wire_name = "state_fence"
 owner_rust_type = "StateFence"
 requiredness = "REQUIRED"
 none_meaning = "no None variant exists; an unfenced cue is not admissible"
-bound_or_variants = "closed by the foundation fence owner; validated through crates/smart/eliot-contracts (StateFence::validate), never re-implemented here"
+bound_or_variants = "closed by the foundation fence owner; validated through crates/foundation/eliot-contracts (StateFence::validate), never re-implemented here"
 identity_binding = "the state fence the observation was captured at; cross-record acceptance goes through VR-FENCE-GATE and nothing else"
 validator = "crates/smart/eliot-cue-contracts/src/context.rs::CueContext::validate"
 validation_error = "CueContractError::Foundation"
@@ -3911,14 +4061,35 @@ note = "Read-aid view echoing owner coverage without establishing it. Builds ind
 name = "MemoryContextProjectionRequest"
 challenge = "CC-MEMORY-PROJECTION-SCHEMA"
 reason = "No field-complete owner-neutral definition exists. The Governor ProjectionRequest is the provider intake port, not this consumer request shape."
+r11_disposition = "MISSING_CONTRACT_DECISION"
+r11_measured = "The name occurs in exactly four places in the tree and in NO Rust source. Measured by git grep over this base commit: crates/smart/cognitive-contract-challenges.toml (the CC-MEMORY-PROJECTION-SCHEMA missing_contract sentence), crates/smart/cognitive-rev12-contract-schema-freeze.toml (this row and the challenge_closure note), crates/smart/eliot-understanding-assessment/module.toml (a disposition string), and crates/smart/eliot-understanding-assessment/src/lib.rs line 65 (a module comment). git log --all -S MemoryContextProjectionRequest returns only planning and comment history, never a definition."
+r11_successor = "eliot_memory_projection_contracts::MemoryQueryIntent plus eliot_memory_projection_contracts::MemorySelectionPolicy consumed by crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::select over a whole eliot_memory_projection_contracts::MemoryProjectionBatch, which already binds scope, fence, deterministic provider order and its own ProjectionCoverage denominator."
+r11_why_not_created = "The CC-MEMORY-PROJECTION-SCHEMA sentence names this alongside MemoryQueryIntent, MemorySelectionPolicy and MemorySelectionTrace, and the owner crate implemented exactly those three under their own names. Reading the fourth planning name as superseded by the delivered batch-taking select() route is the honest reading; creating it now would give a duplicate owner for a shape select() already carries as its three arguments."
+r11_owning_task = "the cognitive-wave integrator named as integration_owner at crates/smart/eliot-memory-curation-contracts/module.toml, over the crate whose module.toml names agent_order = 19, together with the CC-MEMORY-PROJECTION-SCHEMA row in crates/smart/cognitive-contract-challenges.toml"
+r11_blocks_completion_of = "nothing in this file. This row contributes ZERO to every coverage count and no [[assignment_binding]] row waits on it."
+r11_contributes_to_coverage = false
+
 [[not_frozen]]
 name = "rev12 closed seven-class provider enum"
 challenge = "CC-PROVIDER-CONTRIBUTION-SCHEMA"
 reason = "Current ProviderRole is a provider/semantic-role slot struct; the exact rev12 closed seven-class set is not closed in source."
+r11_disposition = "MISSING_CONTRACT_DECISION"
+r11_measured = "crates/smart/eliot-context-contracts/src/identity.rs:58 declares SemanticRole as a SCREAMING_SNAKE_CASE enum with THIRTEEN members: Authority, Goal, Scope, Acceptance, Source, Verifier, MaterialUnknown, Negative, Security, Evidence, Instruction, Optional, Conflict, Constraint. ProviderRole at identity.rs:78 is a two-field struct {provider: ProviderId, role: SemanticRole}, not an enum. There is no seven-member provider enum anywhere: git grep over crates/smart/eliot-context-contracts/src for an enum declaration returns none of that shape, and git log --all -S seven returns no commit defining one."
+r11_why_not_created = "Thirteen is not seven, and SemanticRole is a SEMANTIC role axis while ProviderRole is a PROVIDER slot. Choosing seven of the thirteen because a planning sentence said seven would silently redefine the vocabulary that eliot-context-admission, eliot-context-assembly and crates/meta/eliot-improvement already consume. The #196 C1 card forbids exactly this: 'No old names added to ProviderRole for matching words.'"
+r11_owning_task = "the cognitive-wave integrator named as integration_owner at crates/smart/eliot-cue-contracts/module.toml, over the crate whose module.toml names agent_order = 15 for eliot-context-contracts"
+r11_blocks_completion_of = "nothing in this file. This row contributes ZERO to every coverage count."
+r11_contributes_to_coverage = false
+
 [[not_frozen]]
 name = "Skill-execution / tool-definition / durable-job typed evidence projections for cognitive-quality assessment"
 challenge = "CC-W9-COGNITIVE-QUALITY"
 reason = "Governor SkillExecutionEvidence/SkillLifecycleView and protocol DurableJob* structures exist but carry no versioned owner-neutral projection status with per-sub-assessment denominators; no tool-definition version type exists in source. Consumed by handle only."
+r11_disposition = "MISSING_CONTRACT_DECISION"
+r11_measured = "Three separate gaps, measured individually rather than as one. (1) SKILL: crates/governor/eliot-skill/src/lib.rs:367 declares SkillExecutionEvidence with execution_ref, exact_step_refs, artifact_refs, verifier_refs, outcome, causal_credit and three Option stamps (observed_skill_id, observed_attempt_ref, observed_fence). It carries no scope, no coverage, no denominator and no omission list, so it is a Governor owner record and not an owner-neutral cognitive-quality projection. Any of its three observed_* fields being None marks a PRE-BINDING row that can never support a usefulness claim. (2) TOOL: git grep -rn ToolSurfaceAssessment -- '*.rs' returns NOTHING. The type named in CC-W9-COGNITIVE-QUALITY exists only as cognitive-wave-09.toml field-contract prose, and no tool-definition version type exists in any source. (3) JOB: crates/foundation/eliot-protocol/src/dreamer_job.rs declares DurableJobRequest at 1360, DurableJobRecord at 1407 and DurableJobResponse at 1563, none carrying a per-sub-assessment denominator or a versioned owner-neutral projection status."
+r11_why_not_created = "Freezing the Governor SkillExecutionEvidence as an owner-neutral projection would import a Governor-owned record across an owner boundary and make a pre-binding row readable as evidence. Inventing a tool-definition version type would create a mechanism that does not exist, and W4 forbids a guessed owner."
+r11_owning_task = "the cognitive-wave integrator named as integration_owner at crates/smart/eliot-cognitive-quality/module.toml, over the crate whose module.toml names agent_order = 80, together with the Governor skill lifecycle owner for the skill leg and the eliot-protocol durable-job owner for the job leg"
+r11_blocks_completion_of = "[[cell_binding]] order 80, which already carries this exact string in blocked_inputs. That cell cannot be marked complete while this row is open."
+r11_contributes_to_coverage = false
 
 [[rejected]]
 name = "eliot-mcp FailureObservation DTO"
@@ -3949,3 +4120,1382 @@ rule = "No automatic GitHub Actions trigger is introduced. Workflows stay workfl
 [[fence]]
 id = "F-PACKAGE-PROOF-BEFORE-EDGE"
 rule = "Each target package builds independently against this freeze and exposes only its declared projection/provider contract. Package proof records PACKAGE_PROOF_ONLY before any edge promotion. Package proof alone never reports product support."
+
+
+# ---------------------------------------------------------------------------
+# r11 W1 disposition table: the seven families of the #196 C1 batch card, each
+# required type given EXACTLY ONE disposition against the CURRENT defining Rust.
+#
+# Disposition vocabulary is closed and is used here with these exact meanings:
+#   REUSED_EXACT                  the type is frozen and the current source matches the frozen row
+#   CORRECTED_STATIC_DESCRIPTION  the type is frozen and r11 corrects the prose/row to match current source
+#   REFERENCED_NOT_FROZEN         the type is reachable as a nested owner field but is not itself a frozen row
+#   MISSING_CONTRACT_DECISION     no owner exists; the exact blocker and owning task are named
+#   RETIRED_SUPERSEDED            the historical #223 name has a named successor
+#
+# Every row is measured against this freeze's base commit. A row is never
+# counted as frozen unless a [[field_contract]] row names it too.
+# ---------------------------------------------------------------------------
+
+# The seven families, exactly as the #196 C1 batch card names them.
+[[family_disposition]]
+family = "F1-r8-freeze-field-contract"
+card_text = "\"r8 freeze ... exist\""
+scoped_owners = ["crates/smart/eliot-cue-contracts/src/lib.rs", "crates/smart/eliot-memory-curation-contracts/src/lib.rs"]
+disposition = "REUSED_EXACT"
+reason = "The two families the card names as already existing carry field contracts at r9 (cue) and r10 (curation). r11 re-measures every row against the base commit and changes none of them, so both are reused exactly rather than restated."
+rows_recheckable = "38 [[field_contract]] rows (19 cue + 13 curation), 179 [[field_contract_field]] rows, 11 [[completeness_rule]] rows"
+owner_task = "none; this family is closed by r9 and r10 and needs no new decision"
+
+[[family_disposition]]
+family = "F2-memory-selection"
+card_text = "\"memory selection ... exist\""
+scoped_owners = ["crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs"]
+disposition = "REUSED_EXACT"
+members = ["MemoryQueryIntent", "MemorySelectionPolicy", "MemorySelectionTrace", "SelectionEntry", "SelectionCoverage", "SelectionDisposition"]
+member_count = "6"
+reason = "All six selection types were already present as [[frozen_type]] rows and were closed as CC-MEMORY-PROJECTION-SCHEMA by the owner crate, but at TYPE level only: an implementation agent received six field-name lists with no requiredness, no bound, no validator anchor and no error. r11 adds the [[field_contract]] and [[field_contract_field]] rows FC-SEL-* below, which is an addition of field detail over already-frozen types, not a new owner."
+measured_denominator = "6 of 6 members carry a FC-SEL-* row at r11; the selection module declares exactly these six public types and no others (git grep over selection.rs for 'pub struct' and 'pub enum' returns exactly this set)"
+first_consumer = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::select"
+
+[[family_disposition]]
+family = "F3-failure-observation"
+card_text = "\"failure observation ... exist\""
+scoped_owners = ["crates/foundation/eliot-observation-contracts/src/failure_observation.rs"]
+disposition = "REUSED_EXACT"
+members = ["FailureObservation", "MemoryRevisionEvidence", "FailureOmission", "FailureOmissionClass"]
+member_count = "4"
+reason = "All four were already present as [[frozen_type]] rows and were closed as CC-FAILURE-OBSERVATION-SCHEMA and CC-W9-MEMORY-REVISION at type level only. r11 adds the FC-OBS-* [[field_contract]] and [[field_contract_field]] rows below over those same types. No owner is created and no field is invented."
+measured_denominator = "4 of 4 members carry a FC-OBS-* row at r11; failure_observation.rs declares exactly FailureOmissionClass, FailureOmission, FailureObservation and MemoryRevisionEvidence plus the three MAX_OBSERVATION_* bounds and the five private helpers"
+first_consumer = "crates/smart/eliot-dreamer-memory-revision/src/lib.rs::propose"
+
+[[family_disposition]]
+family = "F4-provider-contribution"
+card_text = "\"provider contribution ... exist\""
+scoped_owners = ["crates/smart/eliot-epistemic-contracts/src/contribution.rs"]
+disposition = "REUSED_EXACT"
+members = ["ProviderContribution", "CurrentEpistemicPosition", "AdmittedKind", "Currentness"]
+member_count = "4"
+reason = "ProviderContribution was already a [[frozen_type]] row closed as CC-PROVIDER-CONTRIBUTION-SCHEMA, at type level only. r11 adds the FC-EPI-* rows below. CurrentEpistemicPosition, AdmittedKind and Currentness are the nested owners the envelope echoes, and are dispositioned REFERENCED_NOT_FROZEN by their own row rather than duplicated here."
+measured_denominator = "1 of 1 top-level member carries a FC-EPI-* row at r11 (ProviderContribution); the 3 nested owners carry [[field_contract]] rows of their own disposition"
+first_consumer = "crates/smart/eliot-epistemic-context-provider/src/context_projection.rs::EpistemicContextContribution::from_contribution"
+
+[[family_disposition]]
+family = "F5-MemoryContextProjectionRequest"
+card_text = "\"Still not_frozen (...): MemoryContextProjectionRequest\""
+scoped_owners = ["crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs"]
+disposition = "MISSING_CONTRACT_DECISION"
+measured_fact = "The name occurs in exactly four places in the tree and in NO Rust source: crates/smart/cognitive-contract-challenges.toml CC-MEMORY-PROJECTION-SCHEMA.missing_contract, crates/smart/cognitive-rev12-contract-schema-freeze.toml not_frozen and challenge_closure, crates/smart/eliot-understanding-assessment/module.toml disposition, and crates/smart/eliot-understanding-assessment/src/lib.rs line 65 in a module comment. `git log --all -S MemoryContextProjectionRequest` finds only planning and comment history, never a definition. So there is no owner to reconcile: the type has never existed."
+why_not_invented = "The CC-MEMORY-PROJECTION-SCHEMA missing_contract sentence names it in a list with MemoryQueryIntent, MemorySelectionPolicy and MemorySelectionTrace, and the owner crate implemented exactly those three under their own names. The honest reading is that the fourth name in the 2026 planning sentence was superseded by the batch-taking select() route that was actually delivered, not that a fourth type is still owed. Inventing it now would create a duplicate owner for a shape select() already carries as its three arguments."
+successor = "eliot_memory_projection_contracts::MemoryQueryIntent plus eliot_memory_projection_contracts::MemorySelectionPolicy consumed by selection.rs::select over a whole eliot_memory_projection_contracts::MemoryProjectionBatch, which already binds scope, fence, provider order and its own coverage denominator"
+blocker = "The decision owner must either retire the planning name explicitly with the successor above, or issue a request shape with a real first caller. Until then the row stays visible and NOT_FROZEN; it is not counted as coverage and no downstream assignment may wait on it."
+owning_task = "the cognitive-wave integrator named as integration_owner at crates/smart/eliot-memory-curation-contracts/module.toml, over the crate whose module.toml names agent_order = 19, together with the CC-MEMORY-PROJECTION-SCHEMA row in crates/smart/cognitive-contract-challenges.toml"
+rust_change_needed = false
+
+[[family_disposition]]
+family = "F6-rev12-closed-seven-class-provider-enum"
+card_text = "\"the closed seven-class provider enum\""
+scoped_owners = ["crates/smart/eliot-context-contracts/src/identity.rs"]
+disposition = "MISSING_CONTRACT_DECISION"
+measured_fact = "crates/smart/eliot-context-contracts/src/identity.rs declares SemanticRole as a SCREAMING_SNAKE_CASE enum with THIRTEEN members: Authority, Goal, Scope, Acceptance, Source, Verifier, MaterialUnknown, Negative, Security, Evidence, Instruction, Optional, Conflict, Constraint. ProviderRole is a two-field struct {provider: ProviderId, role: SemanticRole}, not an enum. There is no seven-member provider enum anywhere in the tree: `git grep -n 'enum' crates/smart/eliot-context-contracts/src` returns no provider-class enum, and `git log --all -S 'seven'` returns no commit defining one."
+why_not_invented = "Thirteen is not seven, and SemanticRole is a SEMANTIC role axis while ProviderRole is a PROVIDER slot. Picking seven of the thirteen because a planning sentence said seven would silently redefine the vocabulary the delivered admission, assembly and improvement crates already consume, and the C1 card forbids exactly that: 'No old names added to ProviderRole for matching words.'"
+blocker = "The closed seven-class set has no referent in current source. It must be either reissued by the eliot-context-contracts owner as a real enum with its own members, or retired explicitly. This row is NOT_FROZEN and contributes zero to any coverage count."
+owning_task = "the cognitive-wave integrator named as integration_owner at crates/smart/eliot-cue-contracts/module.toml, over the crate whose module.toml names agent_order = 15 for eliot-context-contracts"
+rust_change_needed = false
+
+[[family_disposition]]
+family = "F7-typed-skill-tool-job-evidence-projections"
+card_text = "\"typed skill/tool/job evidence projections\""
+scoped_owners = ["crates/governor/eliot-skill/src/lib.rs", "crates/foundation/eliot-protocol/src/dreamer_job.rs", "crates/smart/eliot-cognitive-quality/src/lib.rs"]
+disposition = "MISSING_CONTRACT_DECISION"
+measured_fact = "Three separate gaps, not one. (1) Skill: crates/governor/eliot-skill/src/lib.rs:367 declares SkillExecutionEvidence with execution_ref, exact_step_refs, artifact_refs, verifier_refs, outcome, causal_credit and three Option stamps (observed_skill_id, observed_attempt_ref, observed_fence). It carries no scope, no fence binding beyond the Option stamp, no coverage, no denominator and no omission list, so it is an owner record and not an owner-neutral cognitive-quality projection. (2) Tool: `git grep -rn ToolSurfaceAssessment -- '*.rs'` returns NOTHING; the type named in CC-W9-COGNITIVE-QUALITY exists only in field_contract prose in crates/smart/cognitive-wave-09.toml, and no tool-definition version type exists in any source. (3) Job: crates/foundation/eliot-protocol/src/dreamer_job.rs declares DurableJobRequest, DurableJobRecord and DurableJobResponse with no per-sub-assessment denominator and no owner-neutral projection status."
+why_not_invented = "Freezing the Governor SkillExecutionEvidence as an owner-neutral projection would import a Governor-owned record across an owner boundary and make a pre-binding row (any of the three observed_* fields None) readable as evidence. Inventing a tool-definition version type would create a mechanism that does not exist; W4 forbids a guessed owner."
+blocker = "Each of the three legs needs its own owner decision: the skill leg needs an owner-neutral projection WITH a per-sub-assessment denominator over the existing Governor record; the tool leg has no type at all and needs the tool-definition version type issued by its owner; the job leg needs a per-sub-assessment denominator on the existing protocol record. All three stay NOT_FROZEN, are already recorded in [[cell_binding]] order 80 blocked_inputs, and contribute zero to any coverage count."
+owning_task = "the cognitive-wave integrator named as integration_owner at crates/smart/eliot-cognitive-quality/module.toml, over the crate whose module.toml names agent_order = 80, together with the Governor skill lifecycle owner for the skill leg and the eliot-protocol durable-job owner for the job leg"
+rust_change_needed = false
+
+
+# ---------------------------------------------------------------------------
+# r11 field contract for the eliot-memory-projection-contracts selection family
+# (contracts/selection.rs). These six types were already [[frozen_type]] rows closed as
+# CC-MEMORY-PROJECTION-SCHEMA, but at TYPE level only. r11 states the field contract
+# over the SAME types and creates no new owner.
+#
+# Wire naming here: every struct in selection.rs is `#[serde(deny_unknown_fields)]` with
+# no rename_all, so every wire_name equals the Rust field name. SelectionDisposition is
+# `#[serde(tag = "disposition", deny_unknown_fields)]`, so it is INTERNALLY TAGGED on
+# the wire with the literal tag "disposition"; NOT_SELECTED additionally carries a
+# `reason` payload key. ExclusionReason is a plain unit-variant enum, so its wire
+# spelling is the Rust member name with no case change.
+#
+# CONTRACT_VERSION for this crate is 0.2.0 (crates/foundation/eliot-memory-projection-
+# contracts/src/contracts.rs:75), NOT 1.0.0. VR-EXACT-CONTRACT-VERSION is equality on
+# that triple, so a 1.0.0 record written against another family is a VersionMismatch.
+# ---------------------------------------------------------------------------
+
+[[field_contract]]
+type_id = "FC-SEL-QUERY-INTENT"
+crate = "eliot-memory-projection-contracts"
+type_rust_path = "eliot_memory_projection_contracts::MemoryQueryIntent"
+disposition = "FROZEN_EXACT"
+wire_naming = "selection.rs declares the struct #[serde(deny_unknown_fields)] with no rename_all, so every wire_name below equals the Rust field name. contract_version is the eliot_contracts ContractVersion triple {major, minor, patch}, not a string."
+validator = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::MemoryQueryIntent::validate"
+error_family = "crates/foundation/eliot-memory-projection-contracts/src/contracts/error.rs::MemoryProjectionError"
+provenance_privacy = "Declares no disclosure class of its own and carries no memory body: it names a scope, a kind allowlist and a limit. The privacy posture of anything it points at is carried by the nested MemoryScopeBinding owner and by the batch, not widened here."
+invalidation_rule = "The intent pins one exact binding and one exact allowlist. The trace echoes the allowlist and recomputes intent_digest over the canonical intent bytes, so an intent changed after the trace was produced is caught as a digest mismatch rather than reinterpreted. Version compatibility is VR-EXACT-CONTRACT-VERSION on ContractVersion 0.2.0, equality only."
+
+[[field_contract_field]]
+field_id = "FC-SEL-QUERY-INTENT.contract_version"
+type_rust_path = "eliot_memory_projection_contracts::MemoryQueryIntent"
+wire_name = "contract_version"
+owner_rust_type = "eliot_contracts::ContractVersion"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a record with no version cannot be matched against this crate's own CONTRACT_VERSION and is not representable"
+bound_or_variants = "exact equality with CONTRACT_VERSION 0.2.0 declared at crates/foundation/eliot-memory-projection-contracts/src/contracts.rs::CONTRACT_VERSION; no range, no negotiation"
+identity_binding = "the contract revision this intent was written against"
+validator = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::MemoryQueryIntent::validate"
+validation_error = "MemoryProjectionError::VersionMismatch"
+
+[[field_contract_field]]
+field_id = "FC-SEL-QUERY-INTENT.binding"
+type_rust_path = "eliot_memory_projection_contracts::MemoryQueryIntent"
+wire_name = "binding"
+owner_rust_type = "MemoryScopeBinding"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an intent with no binding names no scope and could select from any batch, so it is not representable"
+bound_or_variants = "closed by the nested owner: task_id, scope_id, session_id (Option) and state_fence, all validated in full by MemoryScopeBinding::validate with MAX_SCOPE_CHARS 256 on scope_id"
+identity_binding = "the exact task, scope, optional session and fence the selected batch must carry exactly; select() rejects a batch whose binding differs as BindingMismatch"
+validator = "crates/foundation/eliot-memory-projection-contracts/src/contracts/record.rs::MemoryScopeBinding::validate"
+validation_error = "MemoryProjectionError::Bounds"
+
+[[field_contract_field]]
+field_id = "FC-SEL-QUERY-INTENT.kinds"
+type_rust_path = "eliot_memory_projection_contracts::MemoryQueryIntent"
+wire_name = "kinds"
+owner_rust_type = "Vec<MemoryKind>"
+requiredness = "EMPTY_SET_ALLOWED_NO_EMPTY_IS_REJECTED"
+none_meaning = "there is no None and an EMPTY LIST IS REJECTED: narrowing must be explicit, so an empty allowlist is SelectionError::EmptyKinds rather than a silent select-everything"
+bound_or_variants = "closed set of the six MemoryKind members {Episode, Observation, Procedure, Concept, NegativeMemory, Counterexample}; duplicates rejected; length is bounded only by the batch bound MEMORY_PROJECTION_MAX_RECORDS 256"
+identity_binding = "the explicit kind allowlist. It is a caller NORMALIZATION request, not evidence: a kind present in the allowlist is not thereby present in the batch, and select() emits a Selected entry only for a record actually carried"
+validator = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::MemoryQueryIntent::validate"
+validation_error = "SelectionError::DuplicateKind"
+
+[[field_contract_field]]
+field_id = "FC-SEL-QUERY-INTENT.limit"
+type_rust_path = "eliot_memory_projection_contracts::MemoryQueryIntent"
+wire_name = "limit"
+owner_rust_type = "usize"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a zero limit is explicitly rejected rather than read as unlimited"
+bound_or_variants = "strictly positive and at most MEMORY_PROJECTION_MAX_RECORDS 256; a zero or over-bound value is SelectionError::BoundViolated carrying both the offending value and the frozen bound"
+identity_binding = "the maximum number of records one selection may emit, counted in DETERMINISTIC PROVIDER ORDER. More records passing the allowlist than the limit admits is SelectionError::LimitExceeded, so selection never cuts silently"
+validator = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::MemoryQueryIntent::validate"
+validation_error = "SelectionError::BoundViolated"
+
+[[field_contract]]
+type_id = "FC-SEL-POLICY"
+crate = "eliot-memory-projection-contracts"
+type_rust_path = "eliot_memory_projection_contracts::MemorySelectionPolicy"
+disposition = "FROZEN_EXACT"
+wire_naming = "selection.rs declares the struct #[serde(deny_unknown_fields)] with no rename_all. The ceiling travels as a JSON number, so it is a count of records and not a score."
+validator = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::MemorySelectionPolicy::validate"
+error_family = "crates/foundation/eliot-memory-projection-contracts/src/contracts/error.rs::MemoryProjectionError"
+provenance_privacy = "Carries no record, no identity and no disclosure class: a policy is a number that bounds the caller and nothing else."
+invalidation_rule = "The policy ceiling is echoed into the trace as policy_ceiling, so an auditor rechecks selected <= policy_ceiling without holding the policy. A ceiling above the frozen batch bound is rejected, so the policy can never be looser than the batch it bounds. Version compatibility is VR-EXACT-CONTRACT-VERSION on 0.2.0."
+
+[[field_contract_field]]
+field_id = "FC-SEL-POLICY.contract_version"
+type_rust_path = "eliot_memory_projection_contracts::MemorySelectionPolicy"
+wire_name = "contract_version"
+owner_rust_type = "eliot_contracts::ContractVersion"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unversioned policy cannot be matched against CONTRACT_VERSION"
+bound_or_variants = "exact equality with CONTRACT_VERSION 0.2.0; equality only"
+identity_binding = "the contract revision this policy was written against"
+validator = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::MemorySelectionPolicy::validate"
+validation_error = "MemoryProjectionError::VersionMismatch"
+
+[[field_contract_field]]
+field_id = "FC-SEL-POLICY.max_selected"
+type_rust_path = "eliot_memory_projection_contracts::MemorySelectionPolicy"
+wire_name = "max_selected"
+owner_rust_type = "usize"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a policy that bounds nothing is not a policy and is rejected as zero"
+bound_or_variants = "strictly positive and at most MEMORY_PROJECTION_MAX_RECORDS 256; over-bound is SelectionError::BoundViolated"
+identity_binding = "the enforceable ceiling on records ONE selection may emit. It carries no allowlist and no request state: it bounds the caller, it does not decide anything"
+validator = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::MemorySelectionPolicy::validate"
+validation_error = "SelectionError::BoundViolated"
+
+[[field_contract]]
+type_id = "FC-SEL-TRACE"
+crate = "eliot-memory-projection-contracts"
+type_rust_path = "eliot_memory_projection_contracts::MemorySelectionTrace"
+disposition = "FROZEN_EXACT"
+wire_naming = "selection.rs declares the struct #[serde(deny_unknown_fields)] with no rename_all. intent_digest is a bare 64-character lowercase hex STRING, not a prefixed digest and not an object."
+validator = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::MemorySelectionTrace::validate_against"
+error_family = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::SelectionError"
+provenance_privacy = "The trace is an owner-neutral static selection record and carries no record BODY: it names each considered record by its canonical handle and kind and nothing more. It therefore discloses no memory content, which is why it can cross into a consumer without widening the record's own privacy posture."
+invalidation_rule = "Three governors bind the trace. The intent binds through intent_digest recomputed over canonical intent bytes; the policy binds through the echoed policy_ceiling; the batch binds STRUCTURALLY, by requiring one entry per batch record in provider order under a checked binding equality, because MemoryProjectionBatch carries no digest field to echo. Any of the three drifting is a typed error, never a quiet re-read. Version compatibility is VR-EXACT-CONTRACT-VERSION on 0.2.0."
+
+[[field_contract_field]]
+field_id = "FC-SEL-TRACE.contract_version"
+type_rust_path = "eliot_memory_projection_contracts::MemorySelectionTrace"
+wire_name = "contract_version"
+owner_rust_type = "eliot_contracts::ContractVersion"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unversioned trace cannot be matched against CONTRACT_VERSION"
+bound_or_variants = "exact equality with CONTRACT_VERSION 0.2.0"
+identity_binding = "the contract revision this trace was written against"
+validator = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::MemorySelectionTrace::validate"
+validation_error = "MemoryProjectionError::VersionMismatch"
+
+[[field_contract_field]]
+field_id = "FC-SEL-TRACE.binding"
+type_rust_path = "eliot_memory_projection_contracts::MemorySelectionTrace"
+wire_name = "binding"
+owner_rust_type = "MemoryScopeBinding"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a trace with no binding names no scope and cannot be gated at a consumer edge"
+bound_or_variants = "closed by the nested owner, MAX_SCOPE_CHARS 256 on scope_id"
+identity_binding = "the binding echoed from the intent. validate_against requires it to equal BOTH the intent binding and the batch binding; a mismatch is SelectionError::BindingMismatch. Cross-record acceptance additionally requires VR-FENCE-GATE against the consumer's governing fence"
+validator = "crates/foundation/eliot-memory-projection-contracts/src/contracts/record.rs::MemoryScopeBinding::validate"
+validation_error = "SelectionError::BindingMismatch"
+
+[[field_contract_field]]
+field_id = "FC-SEL-TRACE.allowlist"
+type_rust_path = "eliot_memory_projection_contracts::MemorySelectionTrace"
+wire_name = "allowlist"
+owner_rust_type = "Vec<MemoryKind>"
+requiredness = "EMPTY_SET_ALLOWED_NO_EMPTY_IS_REJECTED"
+none_meaning = "there is no None and an EMPTY LIST IS REJECTED as SelectionError::EmptyKinds"
+bound_or_variants = "closed set of the six MemoryKind members; the echoed list must equal the intent kinds exactly under validate_against"
+identity_binding = "the allowlist echoed from the intent so the narrowing stays recheckable without holding the intent. It is a request echo, not evidence that any record of those kinds exists"
+validator = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::MemorySelectionTrace::validate_against"
+validation_error = "MemoryProjectionError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-SEL-TRACE.intent_digest"
+type_rust_path = "eliot_memory_projection_contracts::MemorySelectionTrace"
+wire_name = "intent_digest"
+owner_rust_type = "String"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unbound trace has no provable provenance and is rejected"
+bound_or_variants = "exactly 64 characters, every one a LOWERCASE hexadecimal digit; an uppercase hex digit or a wrong length is MemoryProjectionError::InvalidField naming trace.intent_digest"
+identity_binding = "sha256 over the canonical JSON bytes of the MemoryQueryIntent that produced this trace. Under validate_against it is RECOMPUTED from the intent, so a trace replayed against another intent sharing the binding fails rather than passing shape validation"
+validator = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::MemorySelectionTrace::validate_against"
+validation_error = "MemoryProjectionError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-SEL-TRACE.policy_ceiling"
+type_rust_path = "eliot_memory_projection_contracts::MemorySelectionTrace"
+wire_name = "policy_ceiling"
+owner_rust_type = "usize"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a trace echoing no ceiling could not be rechecked against the policy that bounded it"
+bound_or_variants = "strictly positive and at most MEMORY_PROJECTION_MAX_RECORDS 256; must equal MemorySelectionPolicy.max_selected under validate_against"
+identity_binding = "the ceiling echoed from the policy, so an auditor rechecks selected <= policy_ceiling without holding the policy. The trace's selected count is separately rechecked against the intent limit"
+validator = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::MemorySelectionTrace::validate"
+validation_error = "MemoryProjectionError::BoundViolated"
+
+[[field_contract_field]]
+field_id = "FC-SEL-TRACE.entries"
+type_rust_path = "eliot_memory_projection_contracts::MemorySelectionTrace"
+wire_name = "entries"
+owner_rust_type = "Vec<SelectionEntry>"
+requiredness = "EMPTY_SET_ALLOWED_NO_EMPTY_IS_REJECTED"
+none_meaning = "there is no None and an EMPTY LIST IS REJECTED under validate_against, because entries must equal batch.records in length; selecting from an empty batch is not a shape this trace admits"
+bound_or_variants = "length equals the presented batch record count, bounded by MEMORY_PROJECTION_MAX_RECORDS 256. Entries are in DETERMINISTIC PROVIDER ORDER and are never reordered"
+identity_binding = "one entry per batch record, naming each by canonical handle and kind. Each entry is a SELECTION OUTCOME and never an applicability verdict: selection entries never enter ApplicableMemorySet, and the untouched batch still flows whole to evaluate_applicability"
+validator = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::MemorySelectionTrace::validate_against"
+validation_error = "MemoryProjectionError::CoverageMismatch"
+
+[[field_contract_field]]
+field_id = "FC-SEL-TRACE.coverage"
+type_rust_path = "eliot_memory_projection_contracts::MemorySelectionTrace"
+wire_name = "coverage"
+owner_rust_type = "SelectionCoverage"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a trace with no denominator has no accounting at all and is rejected"
+bound_or_variants = "closed by the nested owner; considered equals entries.len(), selected plus not_selected equals considered, and selected must not exceed policy_ceiling"
+identity_binding = "the selection denominator over EXACTLY the presented records. It is a different type from the batch denominator with different field names on purpose, so the batch total can never be echoed under a filtered set and intentional kind selection can never be mistaken for unaccounted loss"
+validator = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::MemorySelectionTrace::validate"
+validation_error = "MemoryProjectionError::CoverageMismatch"
+
+[[field_contract]]
+type_id = "FC-SEL-ENTRY"
+crate = "eliot-memory-projection-contracts"
+type_rust_path = "eliot_memory_projection_contracts::SelectionEntry"
+disposition = "FROZEN_EXACT"
+wire_naming = "selection.rs declares the struct #[serde(deny_unknown_fields)] with no rename_all, so handle, kind and disposition keep their Rust names. handle is an eliot_contracts ArtifactId and travels as its canonical text."
+validator = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::MemorySelectionTrace::validate"
+error_family = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::SelectionError"
+provenance_privacy = "Names a record by handle and kind only. Carries no record body, so it discloses nothing about the record's content."
+invalidation_rule = "An entry is only meaningful inside the trace that carries it: it is not a standalone contract and has no digest of its own. Its binding is the parent trace's intent_digest and the parent batch's binding, both rechecked under validate_against."
+
+[[field_contract_field]]
+field_id = "FC-SEL-ENTRY.handle"
+type_rust_path = "eliot_memory_projection_contracts::SelectionEntry"
+wire_name = "handle"
+owner_rust_type = "eliot_contracts::ArtifactId"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an entry naming no record has no referent and is rejected"
+bound_or_variants = "the canonical ArtifactId of the considered record; under validate_against it must equal the paired batch record handle exactly"
+identity_binding = "the exact canonical handle of the considered record. validate_against zips entries against batch.records positionally, so an invented, duplicated or reordered handle is a CoverageMismatch rather than a silently accepted trace"
+validator = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::MemorySelectionTrace::validate_against"
+validation_error = "MemoryProjectionError::CoverageMismatch"
+
+[[field_contract_field]]
+field_id = "FC-SEL-ENTRY.kind"
+type_rust_path = "eliot_memory_projection_contracts::SelectionEntry"
+wire_name = "kind"
+owner_rust_type = "MemoryKind"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an entry with no kind cannot be checked against the allowlist"
+bound_or_variants = "closed set of the six MemoryKind members {Episode, Observation, Procedure, Concept, NegativeMemory, Counterexample}"
+identity_binding = "the canonical kind of the considered record, replayed against the paired batch record under validate_against. A Selected entry whose kind is outside the echoed allowlist is rejected"
+validator = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::MemorySelectionTrace::validate"
+validation_error = "MemoryProjectionError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-SEL-ENTRY.disposition"
+type_rust_path = "eliot_memory_projection_contracts::SelectionEntry"
+wire_name = "disposition"
+owner_rust_type = "SelectionDisposition"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an entry with no outcome cannot be counted in either half of the denominator"
+bound_or_variants = "closed two-member set. The enum is #[serde(tag = \"disposition\", deny_unknown_fields)], so it is INTERNALLY TAGGED: SELECTED carries no payload key and NOT_SELECTED carries exactly one, `reason`, which must be ExclusionReason::Rejected"
+identity_binding = "the selection outcome for this one record. NOT_SELECTED always carries ExclusionReason::Rejected with a narrow TRACE-LOCAL meaning: rejected by the explicit caller allowlist recorded in this trace. It is NOT a governed applicability verdict and the two cannot merge on the wire because selection entries never enter ApplicableMemorySet"
+validator = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::MemorySelectionTrace::validate"
+validation_error = "MemoryProjectionError::InvalidField"
+
+[[field_contract]]
+type_id = "FC-SEL-COVERAGE"
+crate = "eliot-memory-projection-contracts"
+type_rust_path = "eliot_memory_projection_contracts::SelectionCoverage"
+disposition = "FROZEN_EXACT"
+wire_naming = "selection.rs declares the struct #[serde(deny_unknown_fields)] with no rename_all; all three members are JSON numbers."
+validator = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::MemorySelectionTrace::validate"
+error_family = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::SelectionError"
+provenance_privacy = "Three counts and nothing else: no handle, no identity, no disclosure. It cannot leak what was selected."
+invalidation_rule = "This is the family denominator. It is recheckable against an INDEPENDENTLY declared expected set, namely the batch's own records array length as observed at the consumer, never against the trace's own entries list recomputed from itself. A mismatch on any of the three is MemoryProjectionError::CoverageMismatch."
+
+[[field_contract_field]]
+field_id = "FC-SEL-COVERAGE.considered"
+type_rust_path = "eliot_memory_projection_contracts::SelectionCoverage"
+wire_name = "considered"
+owner_rust_type = "usize"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an uncounted trace has no denominator"
+bound_or_variants = "must equal entries.len() exactly under validate; bounded in practice by MEMORY_PROJECTION_MAX_RECORDS 256 through the batch"
+identity_binding = "the count of batch records PRESENTED to selection. This is the denominator over what was offered, not over what was wanted: the intent's kinds and limit are a separate narrowing and are not folded into this number"
+validator = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::MemorySelectionTrace::validate"
+validation_error = "MemoryProjectionError::CoverageMismatch"
+
+[[field_contract_field]]
+field_id = "FC-SEL-COVERAGE.selected"
+type_rust_path = "eliot_memory_projection_contracts::SelectionCoverage"
+wire_name = "selected"
+owner_rust_type = "usize"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists"
+bound_or_variants = "must equal the number of Selected entries exactly, and must not exceed policy_ceiling"
+identity_binding = "the count of entries whose disposition is Selected. It is rechecked twice: against the echoed policy_ceiling by validate(), and against the intent limit by validate_against(), so a trace cannot pass both while agreeing with neither"
+validator = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::MemorySelectionTrace::validate_against"
+validation_error = "SelectionError::LimitExceeded"
+
+[[field_contract_field]]
+field_id = "FC-SEL-COVERAGE.not_selected"
+type_rust_path = "eliot_memory_projection_contracts::SelectionCoverage"
+wire_name = "not_selected"
+owner_rust_type = "usize"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists"
+bound_or_variants = "must equal the number of NotSelected entries exactly; selected plus not_selected must equal considered"
+identity_binding = "the count of entries whose disposition is NotSelected. Together with selected it partitions considered exactly, so no record can be dropped from the accounting and none can be counted twice"
+validator = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::MemorySelectionTrace::validate"
+validation_error = "MemoryProjectionError::CoverageMismatch"
+
+[[field_contract]]
+type_id = "FC-SEL-DISPOSITION"
+crate = "eliot-memory-projection-contracts"
+type_rust_path = "eliot_memory_projection_contracts::SelectionDisposition"
+disposition = "FROZEN_EXACT"
+wire_naming = "Internally tagged on the literal wire tag \"disposition\" with deny_unknown_fields. SELECTED is a unit variant and carries no payload; NOT_SELECTED carries exactly one key, `reason`. ExclusionReason is a unit-variant enum, so Rejected travels as the bare string \"Rejected\" with no case change, which is deliberately distinct from the SCREAMING_SNAKE_CASE spelling other enums in this catalogue use."
+validator = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::MemorySelectionTrace::validate"
+error_family = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::SelectionError"
+provenance_privacy = "No body and no identity. It states an outcome about a record the parent trace already names."
+invalidation_rule = "Closed at two members and validated in context of the parent trace only. A caller-supplied disposition on a proposal elsewhere never becomes a member: admission is carried only by the projection owner's own record, never by a selection outcome."
+
+[[field_contract_field]]
+field_id = "FC-SEL-DISPOSITION.SELECTED"
+type_rust_path = "eliot_memory_projection_contracts::SelectionDisposition"
+wire_name = "disposition = \"SELECTED\""
+owner_rust_type = "unit variant"
+requiredness = "REQUIRED"
+none_meaning = "no None variant; the absence of the variant tag itself is what makes an entry not selected"
+bound_or_variants = "closed: exactly one member spelling \"SELECTED\" under the internal tag. validate() additionally requires the entry's kind to be inside the trace's echoed allowlist"
+identity_binding = "the record passed the explicit caller allowlist and is selected. Selection NARROWS and never VERDICTS: a Selected entry is not an applicable memory and does not enter ApplicableMemorySet"
+validator = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::MemorySelectionTrace::validate"
+validation_error = "MemoryProjectionError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-SEL-DISPOSITION.NOT_SELECTED"
+type_rust_path = "eliot_memory_projection_contracts::SelectionDisposition"
+wire_name = "disposition = \"NOT_SELECTED\""
+owner_rust_type = "struct variant carrying ExclusionReason"
+requiredness = "REQUIRED"
+none_meaning = "there is no None; the payload key `reason` is REQUIRED on this variant and its absence fails the closed-wire check at the boundary"
+bound_or_variants = "closed at one member spelling \"NOT_SELECTED\", with `reason` required to be ExclusionReason::Rejected and nothing else; any other ExclusionReason member is MemoryProjectionError::InvalidField naming trace.entries"
+identity_binding = "the record fell outside the explicit caller allowlist recorded in this trace. This is a NARROW TRACE-LOCAL exclusion, distinct from ExclusionReason::Rejected as used on an applicability exclusion, and the two cannot be confused because the entry type never enters ApplicableMemorySet"
+validator = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::MemorySelectionTrace::validate"
+validation_error = "MemoryProjectionError::InvalidField"
+
+
+# ---------------------------------------------------------------------------
+# r11 field contract for the eliot-observation-contracts failure family
+# (failure_observation.rs). These four types were already [[frozen_type]] rows closed as
+# CC-FAILURE-OBSERVATION-SCHEMA and CC-W9-MEMORY-REVISION, but at TYPE level only. r11
+# states the field contract over the SAME types and creates no new owner.
+#
+# Wire naming here: every struct is `#[serde(deny_unknown_fields)]` with no rename_all, so
+# every wire_name equals the Rust field name. FailureOmissionClass is
+# `#[serde(rename_all = "SCREAMING_SNAKE_CASE")]` with NO deny_unknown_fields, so its
+# member wire spellings are JOURNAL_BLIND, SUPERSEDED_REVISION, PRIVACY_WITHHELD,
+# EXPIRED_CURSOR and UNADMITTED_SOURCE, which are NOT the Rust member names. Because that
+# enum has no deny_unknown_fields, an unknown enum tag is not rejected by serde on the enum
+# side; the closedness of the set is enforced by the owner validator, not by the decoder.
+#
+# CONTRACT_VERSION for this crate is 1.0.0 (crates/foundation/eliot-observation-contracts/
+# src/lib.rs:33). The three bounds are owner constants in failure_observation.rs itself:
+# MAX_OBSERVATION_REFS 256, MAX_OBSERVATION_OMISSIONS 64 and MAX_OBSERVATION_TEXT 1024
+# characters. Both record types carry a FROZEN DIGEST recomputed from their own fields on
+# every validate(), and the digest field is itself EXCLUDED from the digest computation.
+# ---------------------------------------------------------------------------
+
+[[field_contract]]
+type_id = "FC-OBS-FAILURE-OBSERVATION"
+crate = "eliot-observation-contracts"
+type_rust_path = "eliot_observation_contracts::FailureObservation"
+disposition = "FROZEN_EXACT"
+wire_naming = "failure_observation.rs declares the struct #[serde(deny_unknown_fields)] with no rename_all, so every wire_name below equals the Rust field name. digest is a bare 64-character lowercase hex STRING. journal_refs is a JSON array of ArtifactId canonical text."
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::FailureObservation::validate"
+error_family = "crates/foundation/eliot-observation-contracts/src/lib.rs::ObservationError"
+provenance_privacy = "Cites Governor journal records BY HANDLE ONLY: journal_refs carries ArtifactId text and never a journal body, so a failure memory can be projected across an owner boundary without carrying the Governor's own record content. The privacy class of each cited record stays with the Governor journal owner. PrivacyWithheld is available as a CLOSED omission class precisely so a withheld record is a named value rather than a silent gap."
+invalidation_rule = "The digest is recomputed from the fields on every validate(), so any edit to a field without recomputing the digest is a typed rejection. Completeness is NOT claimed by this type: coverage_complete() requires CoverageDisposition::Complete with an EMPTY blind_intervals list, and anything else is an explicit partial read. A downstream Complete verdict is reachable only through that method plus the consumer's own edge gate under VR-FENCE-GATE. Version compatibility is VR-EXACT-CONTRACT-VERSION-EXT on ContractVersion 1.0.0, equality only."
+
+[[field_contract_field]]
+field_id = "FC-OBS-FAILURE-OBSERVATION.contract_version"
+type_rust_path = "eliot_observation_contracts::FailureObservation"
+wire_name = "contract_version"
+owner_rust_type = "eliot_contracts::ContractVersion"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unversioned observation cannot be read by this crate"
+bound_or_variants = "exact equality with CONTRACT_VERSION 1.0.0; any other triple is ObservationError::InvalidField naming observation.contract_version"
+identity_binding = "the contract revision this observation was written against"
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::FailureObservation::validate"
+validation_error = "ObservationError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-OBS-FAILURE-OBSERVATION.observation_id"
+type_rust_path = "eliot_observation_contracts::FailureObservation"
+wire_name = "observation_id"
+owner_rust_type = "eliot_contracts::ArtifactId"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unnamed failure memory has no stable identity and cannot be cited by MemoryRevisionEvidence"
+bound_or_variants = "non-blank, free of control characters, at most MAX_OBSERVATION_TEXT 1024 characters"
+identity_binding = "the stable observation identity. It is the referent MemoryRevisionEvidence.observation_ref points at, so it is what makes a revision-evidence set bear on exactly one observation"
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::FailureObservation::validate"
+validation_error = "ObservationError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-OBS-FAILURE-OBSERVATION.fingerprint"
+type_rust_path = "eliot_observation_contracts::FailureObservation"
+wire_name = "fingerprint"
+owner_rust_type = "String"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a failure memory with no fingerprint cannot be matched against another occurrence of the same failure"
+bound_or_variants = "non-blank, no control characters, at most MAX_OBSERVATION_TEXT 1024 characters. It is bounded TEXT, not a computed digest: the owner stamps the failure fingerprint identity and this crate does not recompute it"
+identity_binding = "the exact failure fingerprint identity as admitted by the owner, over trigger, action and outcome. Distinct from the frozen digest below, which is computed by this crate"
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::FailureObservation::validate"
+validation_error = "ObservationError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-OBS-FAILURE-OBSERVATION.trigger"
+type_rust_path = "eliot_observation_contracts::FailureObservation"
+wire_name = "trigger"
+owner_rust_type = "String"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a failure memory with no trigger is not an episode"
+bound_or_variants = "non-blank, no control characters, at most MAX_OBSERVATION_TEXT 1024 characters"
+identity_binding = "the deterministic trigger identity, one of the four A14.3 episode legs"
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::FailureObservation::validate"
+validation_error = "ObservationError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-OBS-FAILURE-OBSERVATION.failed_action"
+type_rust_path = "eliot_observation_contracts::FailureObservation"
+wire_name = "failed_action"
+owner_rust_type = "String"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists"
+bound_or_variants = "non-blank, no control characters, at most MAX_OBSERVATION_TEXT 1024 characters"
+identity_binding = "the failed action identity, the second A14.3 leg. It is an identity reference, not the action's own output or a transcript"
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::FailureObservation::validate"
+validation_error = "ObservationError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-OBS-FAILURE-OBSERVATION.outcome"
+type_rust_path = "eliot_observation_contracts::FailureObservation"
+wire_name = "outcome"
+owner_rust_type = "String"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists"
+bound_or_variants = "non-blank, no control characters, at most MAX_OBSERVATION_TEXT 1024 characters"
+identity_binding = "the observed outcome identity, the third A14.3 leg. It records what was OBSERVED, never a repair, a retry or a promotion"
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::FailureObservation::validate"
+validation_error = "ObservationError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-OBS-FAILURE-OBSERVATION.violated_invariant"
+type_rust_path = "eliot_observation_contracts::FailureObservation"
+wire_name = "violated_invariant"
+owner_rust_type = "String"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a failure with no violated invariant names no rule and is not admissible evidence"
+bound_or_variants = "non-blank, no control characters, at most MAX_OBSERVATION_TEXT 1024 characters"
+identity_binding = "the violated invariant identity, the fourth A14.3 leg. It is an identity reference to the rule, and it grants no authority over that rule"
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::FailureObservation::validate"
+validation_error = "ObservationError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-OBS-FAILURE-OBSERVATION.scope"
+type_rust_path = "eliot_observation_contracts::FailureObservation"
+wire_name = "scope"
+owner_rust_type = "ObservationScope"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unscoped failure memory could be applied to any work scope"
+bound_or_variants = "closed by the nested owner: work_scope (WorkScopeId) required, and task_ref, attempt_ref and module_or_route_ref each OPTIONAL but non-blank and control-free when present"
+identity_binding = "the work scope the failure was observed in. This is the scope axis and stays distinct from the fence axis below"
+validator = "crates/foundation/eliot-observation-contracts/src/lib.rs::ObservationScope::validate"
+validation_error = "ObservationError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-OBS-FAILURE-OBSERVATION.state_fence"
+type_rust_path = "eliot_observation_contracts::FailureObservation"
+wire_name = "state_fence"
+owner_rust_type = "eliot_contracts::StateFence"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unfenced failure memory cannot be gated at any consumer edge"
+bound_or_variants = "the fence interval must validate; an invalid interval is ObservationError::InvalidField naming observation.state_fence with reason 'fence interval is invalid'"
+identity_binding = "the fence the observation was READ under. It is CARRIED, not gated: record-level fence recovery stays a live-owner capability, and compatibility is decided by the consumer under VR-FENCE-GATE"
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::FailureObservation::validate"
+validation_error = "ObservationError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-OBS-FAILURE-OBSERVATION.journal_refs"
+type_rust_path = "eliot_observation_contracts::FailureObservation"
+wire_name = "journal_refs"
+owner_rust_type = "Vec<ArtifactId>"
+requiredness = "EMPTY_SET_ALLOWED"
+none_meaning = "there is no None; an EMPTY LIST IS REPRESENTABLE and means the owner projected this observation from no journal record. It is not a completeness claim: coverage_complete() reads the coverage evidence, not this list, so an empty list with Complete coverage and no blind intervals is possible and is bounded by MAX_OBSERVATION_REFS on the other side."
+bound_or_variants = "at most MAX_OBSERVATION_REFS 256 entries, each non-blank and at most MAX_OBSERVATION_TEXT 1024 characters; DUPLICATES ARE REJECTED as ObservationError::Duplicate rather than deduplicated"
+identity_binding = "the Governor journal record handles this observation projects, in DETERMINISTIC SUPPLY ORDER. These are opaque refs: no journal body travels, which is what lets an owner-neutral projection sit beside the Governor journal without duplicating it"
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::FailureObservation::validate"
+validation_error = "ObservationError::Duplicate"
+
+[[field_contract_field]]
+field_id = "FC-OBS-FAILURE-OBSERVATION.journal_revision"
+type_rust_path = "eliot_observation_contracts::FailureObservation"
+wire_name = "journal_revision"
+owner_rust_type = "SourceRevisionHandle"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a projection read at no revision cannot be invalidated when the source moves"
+bound_or_variants = "closed by the nested owner: source_id and revision each at most 256 characters, content_sha256 exactly 64 lowercase hex characters. byte_length is carried and is NOT validated against opened bytes, because this shape validates without opening the source"
+identity_binding = "the revision CURSOR the observation was read at. This is the revision-binding axis and is distinct from the fence axis: a cursor names where the read happened, a fence names what the consumer may accept"
+validator = "crates/foundation/eliot-observation-contracts/src/source_handles.rs::SourceRevisionHandle::validate"
+validation_error = "ObservationError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-OBS-FAILURE-OBSERVATION.coverage"
+type_rust_path = "eliot_observation_contracts::FailureObservation"
+wire_name = "coverage"
+owner_rust_type = "CoverageEvidence"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; observed volume arrives as OWNER coverage evidence and never as caller arithmetic, so a missing coverage block is not representable"
+bound_or_variants = "closed by the nested owner. disposition is the closed seven-member CoverageDisposition set {Complete, Partial, IncompleteCoverage, Unavailable, Unknown, Blind, JournalReplayed} in SCREAMING_SNAKE_CASE. interval is OPTIONAL_NONE_not-read-over-a-single-closed-interval; blind_intervals is a list of explicitly named blind spots; observed_count is the OWNER-OBSERVED volume and is never computed by this crate"
+identity_binding = "the owner coverage POSTURE, and the independent expected set every downstream completeness claim is compared against. The count here reconciles against carried members but never establishes completeness by itself: coverage_complete() additionally requires disposition Complete AND an empty blind_intervals list"
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::FailureObservation::validate"
+validation_error = "ObservationError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-OBS-FAILURE-OBSERVATION.reopen_condition"
+type_rust_path = "eliot_observation_contracts::FailureObservation"
+wire_name = "reopen_condition"
+owner_rust_type = "String"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a failure memory with no reopen condition is permanent by accident rather than by decision"
+bound_or_variants = "non-blank, no control characters, at most MAX_OBSERVATION_TEXT 1024 characters"
+identity_binding = "the reopen condition identity, per A14.3. It is an identity reference and is NOT evaluated by this crate: whether a condition fired is an owner verdict"
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::FailureObservation::validate"
+validation_error = "ObservationError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-OBS-FAILURE-OBSERVATION.extinction_condition"
+type_rust_path = "eliot_observation_contracts::FailureObservation"
+wire_name = "extinction_condition"
+owner_rust_type = "String"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a failure memory with no extinction condition can never legitimately be retired"
+bound_or_variants = "non-blank, no control characters, at most MAX_OBSERVATION_TEXT 1024 characters"
+identity_binding = "the extinction condition identity, per A14.3. A condition being satisfied does NOT retire the memory: this crate applies no lifecycle change, and retirement stays with the Governor and Task owners"
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::FailureObservation::validate"
+validation_error = "ObservationError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-OBS-FAILURE-OBSERVATION.omissions"
+type_rust_path = "eliot_observation_contracts::FailureObservation"
+wire_name = "omissions"
+owner_rust_type = "Vec<FailureOmission>"
+requiredness = "EMPTY_SET_ALLOWED"
+none_meaning = "there is no None; an EMPTY LIST means the owner declared no omission. It is not a claim that nothing was missed: that claim is coverage_complete(), which reads the coverage evidence instead"
+bound_or_variants = "at most MAX_OBSERVATION_OMISSIONS 64 entries; each class is drawn from the closed five-member FailureOmissionClass set and each note is at most MAX_OBSERVATION_TEXT 1024 characters"
+identity_binding = "the EXPLICIT omissions in this read. A blind journal interval, a superseded revision cursor, a privacy withholding, an expired cursor and an unadmitted source each stay a NAMED VALUE, so silent loss is not representable and a free-form reason string cannot cross this boundary"
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::FailureObservation::validate"
+validation_error = "ObservationError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-OBS-FAILURE-OBSERVATION.digest"
+type_rust_path = "eliot_observation_contracts::FailureObservation"
+wire_name = "digest"
+owner_rust_type = "String"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unfrozen observation has no tamper evidence"
+bound_or_variants = "exactly 64 lowercase hexadecimal characters, then RECOMPUTED from every other field on validate(). The digest field is itself EXCLUDED from that computation, so it is a fixed point rather than a contradiction"
+identity_binding = "the frozen digest over the whole observation shape except this field. Any field edit without a digest recompute is a typed rejection, and any recompute over different fields is equally a rejection"
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::FailureObservation::validate"
+validation_error = "ObservationError::InvalidField"
+
+[[field_contract]]
+type_id = "FC-OBS-MEMORY-REVISION-EVIDENCE"
+crate = "eliot-observation-contracts"
+type_rust_path = "eliot_observation_contracts::MemoryRevisionEvidence"
+disposition = "FROZEN_EXACT"
+wire_naming = "failure_observation.rs declares the struct #[serde(deny_unknown_fields)] with no rename_all. evidence_refs is a JSON array of ArtifactId text. prior_attempts is a JSON number and same_hypothesis_recurrence is a JSON boolean, NOT an enum, so an absent key is not the same as false at the boundary."
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::MemoryRevisionEvidence::validate"
+error_family = "crates/foundation/eliot-observation-contracts/src/lib.rs::ObservationError"
+provenance_privacy = "Cites post-dating journal or verifier records BY HANDLE ONLY, exactly as the observation does: no evidence body travels. Same privacy posture as FC-OBS-FAILURE-OBSERVATION, and the same closed PrivacyWithheld omission class is available."
+invalidation_rule = "Same frozen-digest rule and same Complete-posture rule as the observation: digest recomputed from fields on every validate(), and coverage_complete() requires Complete with empty blind intervals. The post-dating property is structural, not asserted: evidence_revision is a separate cursor from the observation's journal_revision. Same-hypothesis recurrence ROUTES to Mechanism Review rather than authorizing another equivalent retry, which is a routing decision and not an effect this type performs. Version compatibility is VR-EXACT-CONTRACT-VERSION-EXT on 1.0.0."
+
+[[field_contract_field]]
+field_id = "FC-OBS-MEMORY-REVISION-EVIDENCE.contract_version"
+type_rust_path = "eliot_observation_contracts::MemoryRevisionEvidence"
+wire_name = "contract_version"
+owner_rust_type = "eliot_contracts::ContractVersion"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unversioned evidence record cannot be read by this crate"
+bound_or_variants = "exact equality with CONTRACT_VERSION 1.0.0"
+identity_binding = "the contract revision this evidence was written against"
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::MemoryRevisionEvidence::validate"
+validation_error = "ObservationError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-OBS-MEMORY-REVISION-EVIDENCE.evidence_id"
+type_rust_path = "eliot_observation_contracts::MemoryRevisionEvidence"
+wire_name = "evidence_id"
+owner_rust_type = "eliot_contracts::ArtifactId"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unnamed evidence set has no stable identity across pages"
+bound_or_variants = "non-blank, no control characters, at most MAX_OBSERVATION_TEXT 1024 characters"
+identity_binding = "the stable evidence identity. Distinct from observation_ref: this names the evidence set, not the observation it bears on"
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::MemoryRevisionEvidence::validate"
+validation_error = "ObservationError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-OBS-MEMORY-REVISION-EVIDENCE.observation_ref"
+type_rust_path = "eliot_observation_contracts::MemoryRevisionEvidence"
+wire_name = "observation_ref"
+owner_rust_type = "eliot_contracts::ArtifactId"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; evidence bearing on nothing is not evidence"
+bound_or_variants = "non-blank, no control characters, at most MAX_OBSERVATION_TEXT 1024 characters"
+identity_binding = "the ONE observation this evidence bears on. It is a single reference and not a list, which is what makes the set scope to exactly one failure memory rather than a class of them"
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::MemoryRevisionEvidence::validate"
+validation_error = "ObservationError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-OBS-MEMORY-REVISION-EVIDENCE.evidence_refs"
+type_rust_path = "eliot_observation_contracts::MemoryRevisionEvidence"
+wire_name = "evidence_refs"
+owner_rust_type = "Vec<ArtifactId>"
+requiredness = "EMPTY_SET_ALLOWED"
+none_meaning = "there is no None; an EMPTY LIST is representable and means the owner supplied no post-dating record. It is not a claim that none exists: that is what the coverage evidence and the omission list are for"
+bound_or_variants = "at most MAX_OBSERVATION_REFS 256 entries, each non-blank and control-free; DUPLICATES REJECTED as ObservationError::Duplicate rather than deduplicated"
+identity_binding = "the POST-DATING journal or verifier record handles, in deterministic supply order. Post-dating is enforced by the separate evidence_revision cursor below, not by anything in this list"
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::MemoryRevisionEvidence::validate"
+validation_error = "ObservationError::Duplicate"
+
+[[field_contract_field]]
+field_id = "FC-OBS-MEMORY-REVISION-EVIDENCE.evidence_revision"
+type_rust_path = "eliot_observation_contracts::MemoryRevisionEvidence"
+wire_name = "evidence_revision"
+owner_rust_type = "SourceRevisionHandle"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; evidence read at no cursor cannot be shown to post-date the observation"
+bound_or_variants = "closed by the nested owner: source_id and revision each at most 256 characters, content_sha256 exactly 64 lowercase hex characters"
+identity_binding = "the revision CURSOR the evidence was read at, SEPARATE from the observation's journal_revision. Comparing the two cursors is how post-dating is established, and it stays an owner comparison rather than one this crate performs"
+validator = "crates/foundation/eliot-observation-contracts/src/source_handles.rs::SourceRevisionHandle::validate"
+validation_error = "ObservationError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-OBS-MEMORY-REVISION-EVIDENCE.scope"
+type_rust_path = "eliot_observation_contracts::MemoryRevisionEvidence"
+wire_name = "scope"
+owner_rust_type = "ObservationScope"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; unscoped evidence could be applied to any work scope"
+bound_or_variants = "closed by the nested owner: work_scope required, task_ref, attempt_ref and module_or_route_ref each OPTIONAL but non-blank and control-free when present"
+identity_binding = "the work scope the evidence was observed in, validated independently of the observation's own scope rather than assumed to match it"
+validator = "crates/foundation/eliot-observation-contracts/src/lib.rs::ObservationScope::validate"
+validation_error = "ObservationError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-OBS-MEMORY-REVISION-EVIDENCE.state_fence"
+type_rust_path = "eliot_observation_contracts::MemoryRevisionEvidence"
+wire_name = "state_fence"
+owner_rust_type = "eliot_contracts::StateFence"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; unfenced evidence cannot be gated at any consumer edge"
+bound_or_variants = "the fence interval must validate or the record is ObservationError::InvalidField naming evidence.state_fence"
+identity_binding = "the fence the evidence was READ under, carried for the consumer's edge gate and not gated here. An evidence set and its observation read under different fences are both valid records; reconciling them is the consumer's decision under VR-FENCE-GATE"
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::MemoryRevisionEvidence::validate"
+validation_error = "ObservationError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-OBS-MEMORY-REVISION-EVIDENCE.coverage"
+type_rust_path = "eliot_observation_contracts::MemoryRevisionEvidence"
+wire_name = "coverage"
+owner_rust_type = "CoverageEvidence"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; coverage arrives from the owner and never as caller arithmetic"
+bound_or_variants = "closed by the nested owner; disposition is the seven-member CoverageDisposition set, interval is OPTIONAL_NONE_not-read-over-a-single-closed-interval, blind_intervals is the explicit blind-spot list, observed_count is the owner-observed volume"
+identity_binding = "the owner coverage POSTURE for this evidence read, and the independent expected set a completeness claim is compared against. Same rule as the observation: coverage_complete() requires Complete with an empty blind_intervals list, and no other disposition reads as complete"
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::MemoryRevisionEvidence::validate"
+validation_error = "ObservationError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-OBS-MEMORY-REVISION-EVIDENCE.same_hypothesis_recurrence"
+type_rust_path = "eliot_observation_contracts::MemoryRevisionEvidence"
+wire_name = "same_hypothesis_recurrence"
+owner_rust_type = "bool"
+requiredness = "REQUIRED"
+none_meaning = "there is no None and NO default: the field is a plain Rust bool and therefore carries no absence case. Absent on the wire is a missing required key under deny_unknown_fields-plus-struct-shape, not a silent false. Recorded here because a JSON boolean and a Rust bool do not have the same absence semantics, and pretending otherwise would make an absent flag readable as an affirmed no-recurrence."
+bound_or_variants = "boolean, no third state. It is evidence ABOUT the causal hypothesis and is not itself a hypothesis or a verdict"
+identity_binding = "true when the failure recurs with the same causal hypothesis. TRUE ROUTES the case to Mechanism Review rather than to another equivalent retry. It does not authorise the retry, close the case or promote anything"
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::MemoryRevisionEvidence::validate"
+validation_error = "ObservationError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-OBS-MEMORY-REVISION-EVIDENCE.prior_attempts"
+type_rust_path = "eliot_observation_contracts::MemoryRevisionEvidence"
+wire_name = "prior_attempts"
+owner_rust_type = "u32"
+requiredness = "REQUIRED"
+none_meaning = "there is no None; a zero is an HONEST ZERO meaning no prior extinction attempt, and is distinguishable from an absent field because the field is required"
+bound_or_variants = "unsigned 32-bit count of prior extinction attempts over this observation; this crate sets no upper bound beyond the type, so a caller relying on one must bound it at its own edge"
+identity_binding = "the count of prior attempts. It is a COUNT and deliberately not a score, rank or probability, consistent with VR-NO-AGGREGATE-SCORE"
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::MemoryRevisionEvidence::validate"
+validation_error = "ObservationError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-OBS-MEMORY-REVISION-EVIDENCE.omissions"
+type_rust_path = "eliot_observation_contracts::MemoryRevisionEvidence"
+wire_name = "omissions"
+owner_rust_type = "Vec<FailureOmission>"
+requiredness = "EMPTY_SET_ALLOWED"
+none_meaning = "there is no None; an EMPTY LIST means the owner declared no omission and is not a completeness claim"
+bound_or_variants = "at most MAX_OBSERVATION_OMISSIONS 64 entries, each class from the closed five-member set and each note at most MAX_OBSERVATION_TEXT 1024 characters"
+identity_binding = "the EXPLICIT omissions in this evidence read, in the same closed classes as the observation's omissions, so a withheld or unreadable post-dating record is a named value"
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::MemoryRevisionEvidence::validate"
+validation_error = "ObservationError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-OBS-MEMORY-REVISION-EVIDENCE.digest"
+type_rust_path = "eliot_observation_contracts::MemoryRevisionEvidence"
+wire_name = "digest"
+owner_rust_type = "String"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; unfrozen evidence has no tamper evidence"
+bound_or_variants = "exactly 64 lowercase hexadecimal characters, then RECOMPUTED from every other field on validate(), with this field itself excluded from the computation"
+identity_binding = "the frozen digest over the whole evidence shape except this field. It covers same_hypothesis_recurrence and prior_attempts as well as the identities, so neither the recurrence flag nor the attempt count can be edited after the fact"
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::MemoryRevisionEvidence::validate"
+validation_error = "ObservationError::InvalidField"
+
+[[field_contract]]
+type_id = "FC-OBS-OMISSION"
+crate = "eliot-observation-contracts"
+type_rust_path = "eliot_observation_contracts::FailureOmission"
+disposition = "FROZEN_EXACT"
+wire_naming = "failure_observation.rs declares the struct #[serde(deny_unknown_fields)] with no rename_all. handle is an ArtifactId and is SERIALIZED AS NULL when absent, because the owner type is Option<ArtifactId> with no skip_serializing_if."
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::FailureOmission::validate"
+error_family = "crates/foundation/eliot-observation-contracts/src/lib.rs::ObservationError"
+provenance_privacy = "This is the omission LEG. The handle names what is missing and the note is bounded free text; the reason itself travels as a closed class, so a free-form reason string cannot stand in for a typed omission and cannot smuggle content past the closed set."
+invalidation_rule = "An omission is a VALUE, not an absence: it is validated with the same bounds as the record it appears in and it is covered by that record's frozen digest, so an omission cannot be added or dropped without invalidating the parent digest."
+
+[[field_contract_field]]
+field_id = "FC-OBS-OMISSION.handle"
+type_rust_path = "eliot_observation_contracts::FailureOmission"
+wire_name = "handle"
+owner_rust_type = "Option<ArtifactId>"
+requiredness = "OPTIONAL_NONE_the-omission-is-not-record-specific"
+none_meaning = "None means the omission is NOT attributable to one named record: a whole journal interval that was blind, or a source that was unadmitted. It does NOT mean the record was absent, and it is not a stand-in for an unknown handle; a named-record omission must carry the handle"
+bound_or_variants = "when Some, non-blank, control-free and at most MAX_OBSERVATION_TEXT 1024 characters"
+identity_binding = "the affected record handle, when the omission names exactly one. A None here is a weaker claim about scope, not a weaker claim about the omission itself: the class and note still have to hold"
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::FailureOmission::validate"
+validation_error = "ObservationError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-OBS-OMISSION.class"
+type_rust_path = "eliot_observation_contracts::FailureOmission"
+wire_name = "class"
+owner_rust_type = "FailureOmissionClass"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unclassified omission is exactly the silent loss this type exists to prevent"
+bound_or_variants = "closed at five members, serialized SCREAMING_SNAKE_CASE: JOURNAL_BLIND, SUPERSEDED_REVISION, PRIVACY_WITHHELD, EXPIRED_CURSOR, UNADMITTED_SOURCE. The enum carries NO deny_unknown_fields, so an unknown tag is not a serde error; closedness is enforced by this crate's own bound and text validation, not by the decoder"
+identity_binding = "WHY something is missing, as a closed class rather than prose. The five members are the five ways this read can be incomplete, and none of them has a default that reads as the affirmative"
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::FailureOmission::validate"
+validation_error = "ObservationError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-OBS-OMISSION.note"
+type_rust_path = "eliot_observation_contracts::FailureOmission"
+wire_name = "note"
+owner_rust_type = "String"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an omission with no note is a class with no content, which is still better than nothing but is not what the owner contract requires"
+bound_or_variants = "non-blank, no control characters, at most MAX_OBSERVATION_TEXT 1024 characters"
+identity_binding = "bounded operational context naming WHAT is missing. It never replaces the class: the class is the reason and the note is the instance, so operational detail cannot widen the closed reason set"
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::FailureOmission::validate"
+validation_error = "ObservationError::InvalidField"
+
+[[field_contract]]
+type_id = "FC-OBS-OMISSION-CLASS"
+crate = "eliot-observation-contracts"
+type_rust_path = "eliot_observation_contracts::FailureOmissionClass"
+disposition = "FROZEN_EXACT"
+wire_naming = "Pure unit-variant enum with #[serde(rename_all = \"SCREAMING_SNAKE_CASE\")] and NO deny_unknown_fields. Wire spellings are JOURNAL_BLIND, SUPERSEDED_REVISION, PRIVACY_WITHHELD, EXPIRED_CURSOR and UNADMITTED_SOURCE, which differ from the Rust member names JournalBlind and so on. There is no payload on any member."
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::FailureOmission::validate"
+error_family = "crates/foundation/eliot-observation-contracts/src/lib.rs::ObservationError"
+provenance_privacy = "Carries no content of any kind. A member names a reason and nothing else, so no disclosure can ride on it."
+invalidation_rule = "Closed at five members with no default. It has no Unknown or Other member, so an omission reason this catalogue does not name is NOT representable and must be refused at the boundary rather than folded into a nearest member. Because there is no deny_unknown_fields on the enum, that refusal is the owner's job and is recorded as such rather than claimed as a decoder guarantee."
+
+[[field_contract_field]]
+field_id = "FC-OBS-OMISSION-CLASS.JournalBlind"
+type_rust_path = "eliot_observation_contracts::FailureOmissionClass"
+wire_name = "JOURNAL_BLIND"
+owner_rust_type = "unit variant"
+requiredness = "REQUIRED"
+none_meaning = "no None variant and no payload; the absence of the tag is itself a decode failure rather than a default"
+bound_or_variants = "closed: exactly the five SCREAMING_SNAKE_CASE members, with no Unknown, Other or default member"
+identity_binding = "the omission reason the cited Governor journal interval was not observable to this read. It is a blind spot, never an empty result. It is a REASON and grants nothing: an omission never authorises reading the withheld material and never becomes a silent pass"
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::FailureOmission::validate"
+validation_error = "ObservationError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-OBS-OMISSION-CLASS.SupersededRevision"
+type_rust_path = "eliot_observation_contracts::FailureOmissionClass"
+wire_name = "SUPERSEDED_REVISION"
+owner_rust_type = "unit variant"
+requiredness = "REQUIRED"
+none_meaning = "no None variant and no payload; the absence of the tag is itself a decode failure rather than a default"
+bound_or_variants = "closed: exactly the five SCREAMING_SNAKE_CASE members, with no Unknown, Other or default member"
+identity_binding = "the omission reason the revision cursor moved before the read completed, so the projection is against a superseded revision rather than a current one. It is a REASON and grants nothing: an omission never authorises reading the withheld material and never becomes a silent pass"
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::FailureOmission::validate"
+validation_error = "ObservationError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-OBS-OMISSION-CLASS.PrivacyWithheld"
+type_rust_path = "eliot_observation_contracts::FailureOmissionClass"
+wire_name = "PRIVACY_WITHHELD"
+owner_rust_type = "unit variant"
+requiredness = "REQUIRED"
+none_meaning = "no None variant and no payload; the absence of the tag is itself a decode failure rather than a default"
+bound_or_variants = "closed: exactly the five SCREAMING_SNAKE_CASE members, with no Unknown, Other or default member"
+identity_binding = "the omission reason the record exists and was deliberately not disclosed at this boundary. This is the member that keeps a privacy decision a NAMED value instead of an unexplained gap. It is a REASON and grants nothing: an omission never authorises reading the withheld material and never becomes a silent pass"
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::FailureOmission::validate"
+validation_error = "ObservationError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-OBS-OMISSION-CLASS.ExpiredCursor"
+type_rust_path = "eliot_observation_contracts::FailureOmissionClass"
+wire_name = "EXPIRED_CURSOR"
+owner_rust_type = "unit variant"
+requiredness = "REQUIRED"
+none_meaning = "no None variant and no payload; the absence of the tag is itself a decode failure rather than a default"
+bound_or_variants = "closed: exactly the five SCREAMING_SNAKE_CASE members, with no Unknown, Other or default member"
+identity_binding = "the omission reason the revision cursor the read needed has expired and can no longer be served. It is a REASON and grants nothing: an omission never authorises reading the withheld material and never becomes a silent pass"
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::FailureOmission::validate"
+validation_error = "ObservationError::InvalidField"
+
+[[field_contract_field]]
+field_id = "FC-OBS-OMISSION-CLASS.UnadmittedSource"
+type_rust_path = "eliot_observation_contracts::FailureOmissionClass"
+wire_name = "UNADMITTED_SOURCE"
+owner_rust_type = "unit variant"
+requiredness = "REQUIRED"
+none_meaning = "no None variant and no payload; the absence of the tag is itself a decode failure rather than a default"
+bound_or_variants = "closed: exactly the five SCREAMING_SNAKE_CASE members, with no Unknown, Other or default member"
+identity_binding = "the omission reason the source is not admitted by the governing manifest, so nothing may be read from it at all. It is a REASON and grants nothing: an omission never authorises reading the withheld material and never becomes a silent pass"
+validator = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::FailureOmission::validate"
+validation_error = "ObservationError::InvalidField"
+
+
+# ---------------------------------------------------------------------------
+# r11 field contract for the eliot-epistemic-contracts provider-contribution family
+# (contribution.rs). ProviderContribution was already a [[frozen_type]] row closed as
+# CC-PROVIDER-CONTRIBUTION-SCHEMA, but at TYPE level only. r11 states the field contract
+# over the SAME type and creates no new owner.
+#
+# Wire naming here: the struct is #[serde(deny_unknown_fields)] with no rename_all, so every
+# wire_name below equals the Rust field name. AdmittedKind and Currentness are unit-variant
+# enums with #[serde(rename_all = "SCREAMING_SNAKE_CASE")] and NO deny_unknown_fields, so
+# their wire spellings are CURRENT_EPISTEMIC_POSITION, CURRENT and SUPERSEDED, which are NOT
+# the Rust member names. ClaimId, PositionId and SourceId are newtype wrappers over String and
+# travel as their inner text.
+#
+# CONTRACT_VERSION for this crate is 1.2.0 (crates/smart/eliot-epistemic-contracts/src/lib.rs:
+# 119), which is a DIFFERENT triple from the projection and observation families. That is why
+# VR-EXACT-CONTRACT-VERSION exists as equality and not as a range.
+# ---------------------------------------------------------------------------
+
+[[field_contract]]
+type_id = "FC-EPI-PROVIDER-CONTRIBUTION"
+crate = "eliot-epistemic-contracts"
+type_rust_path = "eliot_epistemic_contracts::ProviderContribution"
+disposition = "FROZEN_EXACT"
+wire_naming = "contribution.rs declares the struct #[serde(deny_unknown_fields)] with no rename_all, so every wire_name below equals the Rust field name. position_digest, coverage_digest and receipt_digest are bare 64-character lowercase hex strings. view_kind is the internally-tagged marker CURRENT_EPISTEMIC_POSITION and currentness is the SCREAMING_SNAKE_CASE unit member CURRENT."
+validator = "crates/smart/eliot-epistemic-contracts/src/contribution.rs::ProviderContribution::validate"
+error_family = "crates/smart/eliot-epistemic-contracts/src/error.rs::ContractError"
+provenance_privacy = "Owner-neutral and provider-neutral BY CONSTRUCTION: the contributing provider is the admitted position owner itself, so this envelope carries no per-provider identity, no request state and no consumer framing. It names a position by digest and identity and carries no claim body, so it can cross into a Smart provider without widening the position's own privacy posture."
+invalidation_rule = "WHOLE ENVELOPE OR ERROR. There are no partial contributions and no omission entries: contribute() runs the position's closed validation first, so a contribution covers exactly its named receipt envelope or it fails. Every envelope field is echoed from the validated admission envelope and the constructor takes only the admitted position, so no field can be supplied independently and there is no synthetic construction path. That is also why there is no omission axis here: missing or invalid governing material is an error, never a gap. Currentness is the OWNER verdict at contribution time; consumers re-gate liveness at their own edge. Version compatibility is VR-EXACT-CONTRACT-VERSION on ContractVersion 1.2.0."
+
+[[field_contract_field]]
+field_id = "FC-EPI-PROVIDER-CONTRIBUTION.contract_version"
+type_rust_path = "eliot_epistemic_contracts::ProviderContribution"
+wire_name = "contract_version"
+owner_rust_type = "eliot_contracts::ContractVersion"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unversioned contribution cannot be matched against this crate's own CONTRACT_VERSION"
+bound_or_variants = "exact equality with CONTRACT_VERSION 1.2.0; any other triple is ContractError::ImpossibleCombination naming contribution.contract_version. Equality only, because the same triple constant is 0.2.0 in the projection family and 1.0.0 in the observation family"
+identity_binding = "the contract revision this contribution was written against"
+validator = "crates/smart/eliot-epistemic-contracts/src/contribution.rs::ProviderContribution::validate"
+validation_error = "ContractError::ImpossibleCombination"
+
+[[field_contract_field]]
+field_id = "FC-EPI-PROVIDER-CONTRIBUTION.view_kind"
+type_rust_path = "eliot_epistemic_contracts::ProviderContribution"
+wire_name = "view_kind"
+owner_rust_type = "AdmittedKind"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unmarked envelope could be decoded as a different admitted view"
+bound_or_variants = "closed at the single member CURRENT_EPISTEMIC_POSITION in SCREAMING_SNAKE_CASE. The marker is a DISCRIMINATOR, not a payload: it exists so a decoder cannot mistake this envelope for another admitted-view document"
+identity_binding = "the marker binding this document to the admitted-view decoding. contribute() sets it to AdmittedKind::CurrentEpistemicPosition unconditionally and validate() refuses any other member"
+validator = "crates/smart/eliot-epistemic-contracts/src/contribution.rs::ProviderContribution::validate"
+validation_error = "ContractError::ImpossibleCombination"
+
+[[field_contract_field]]
+field_id = "FC-EPI-PROVIDER-CONTRIBUTION.position_digest"
+type_rust_path = "eliot_epistemic_contracts::ProviderContribution"
+wire_name = "position_digest"
+owner_rust_type = "String"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an envelope naming no position digest cannot be matched back to the position it claims to contribute"
+bound_or_variants = "exactly 64 lowercase hexadecimal characters; any other shape is ContractError::InvalidDigest naming contribution.position_digest"
+identity_binding = "the frozen digest of the admitted position, echoed EXACTLY from position.digest. This is the single field a consumer uses to re-attribute the envelope to its position, and the understanding-assessment consumer copies it into its cite digest"
+validator = "crates/smart/eliot-epistemic-contracts/src/contribution.rs::ProviderContribution::validate"
+validation_error = "ContractError::InvalidDigest"
+
+[[field_contract_field]]
+field_id = "FC-EPI-PROVIDER-CONTRIBUTION.claim"
+type_rust_path = "eliot_epistemic_contracts::ProviderContribution"
+wire_name = "claim"
+owner_rust_type = "ClaimId"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; a contribution with no claim identity cannot be cited"
+bound_or_variants = "ClaimId is a validated newtype over String; validate_bounded_text applies the crate MAX_SHORT_TEXT 256 ceiling"
+identity_binding = "the GOVERNED claim identity of the admitted position, echoed exactly. It is an identity reference and carries no claim statement text, so existence of a claim is not asserted by carrying its identity"
+validator = "crates/smart/eliot-epistemic-contracts/src/contribution.rs::ProviderContribution::validate"
+validation_error = "ContractError::TooLong"
+
+[[field_contract_field]]
+field_id = "FC-EPI-PROVIDER-CONTRIBUTION.owner"
+type_rust_path = "eliot_epistemic_contracts::ProviderContribution"
+wire_name = "owner"
+owner_rust_type = "eliot_contracts::SourceId"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an envelope with no owner has no attribution and no accountable producer"
+bound_or_variants = "SourceId is a foundation newtype; its own validation runs at the foundation boundary and eliot-contracts::ContractError surfaces through the crate's Foundation path"
+identity_binding = "the SOURCE OWNING the admitted position, echoed exactly from position.admission.owner. This is the provider-neutral attribution: the owner IS the contributing provider, which is why there is no separate provider field"
+validator = "crates/smart/eliot-epistemic-contracts/src/contribution.rs::ProviderContribution::validate"
+validation_error = "ContractError::ImpossibleCombination"
+
+[[field_contract_field]]
+field_id = "FC-EPI-PROVIDER-CONTRIBUTION.currentness"
+type_rust_path = "eliot_epistemic_contracts::ProviderContribution"
+wire_name = "currentness"
+owner_rust_type = "Currentness"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; there is no absent-currentness case, because a superseded position is refused rather than contributed with a weakened marker"
+bound_or_variants = "closed at the two-member set {Current, Superseded} in SCREAMING_SNAKE_CASE, but ONLY Current is admissible here: contribute() rejects a non-Current position before validating it, and validate() refuses any other member as ContractError::ImpossibleCombination naming contribution.currentness"
+identity_binding = "currentness as OBSERVED at contribution time. It is the owner's verdict, not this crate's: the constructor sets Current because it only accepts a current position, and a consumer re-gates liveness at its own edge because a contribution can go stale after it is written"
+validator = "crates/smart/eliot-epistemic-contracts/src/contribution.rs::ProviderContribution::contribute"
+validation_error = "ContractError::ImpossibleCombination"
+
+[[field_contract_field]]
+field_id = "FC-EPI-PROVIDER-CONTRIBUTION.position"
+type_rust_path = "eliot_epistemic_contracts::ProviderContribution"
+wire_name = "position"
+owner_rust_type = "PositionId"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an envelope naming no position cannot be re-attributed"
+bound_or_variants = "PositionId is a validated newtype over String under the crate MAX_SHORT_TEXT 256 ceiling"
+identity_binding = "the EXACT position identity admitted, echoed exactly from position.admission.position"
+validator = "crates/smart/eliot-epistemic-contracts/src/contribution.rs::ProviderContribution::validate"
+validation_error = "ContractError::TooLong"
+
+[[field_contract_field]]
+field_id = "FC-EPI-PROVIDER-CONTRIBUTION.position_revision"
+type_rust_path = "eliot_epistemic_contracts::ProviderContribution"
+wire_name = "position_revision"
+owner_rust_type = "PositionRevision"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an envelope with no revision cannot be invalidated when the position is revised"
+bound_or_variants = "PositionRevision is the owner's revision type; it is echoed exactly and carries the revision of the ADMITTED position, which is not the same axis as the source revision below"
+identity_binding = "the exact position revision admitted. This is the REVISION-BINDING axis for the position itself and is revalidated separately from source_revision, so a consumer gets per-field attribution rather than one aggregate claim"
+validator = "crates/smart/eliot-epistemic-contracts/src/contribution.rs::ProviderContribution::validate"
+validation_error = "ContractError::ImpossibleCombination"
+
+[[field_contract_field]]
+field_id = "FC-EPI-PROVIDER-CONTRIBUTION.scope"
+type_rust_path = "eliot_epistemic_contracts::ProviderContribution"
+wire_name = "scope"
+owner_rust_type = "String"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unscoped contribution could be applied to any scope"
+bound_or_variants = "non-blank, control-free, at most MAX_SHORT_TEXT 256 characters; over-bound is ContractError::TooLong naming contribution.scope"
+identity_binding = "the SCOPE echoed from the admission envelope. This is the scope axis and stays distinct from the fence axis below: a scope says where the claim applies and a fence says what the consumer may accept"
+validator = "crates/smart/eliot-epistemic-contracts/src/contribution.rs::ProviderContribution::validate"
+validation_error = "ContractError::TooLong"
+
+[[field_contract_field]]
+field_id = "FC-EPI-PROVIDER-CONTRIBUTION.fence"
+type_rust_path = "eliot_epistemic_contracts::ProviderContribution"
+wire_name = "fence"
+owner_rust_type = "eliot_contracts::StateFence"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an unfenced envelope cannot be gated at any consumer edge"
+bound_or_variants = "the fence interval must validate through StateFence::validate; a failure is ContractError::FenceMismatch naming contribution.fence"
+identity_binding = "the FENCE echoed from the admission envelope. It is CARRIED for the consumer's edge gate under VR-FENCE-GATE, not gated here: this crate records which fence the position was admitted under and the consumer decides compatibility"
+validator = "crates/smart/eliot-epistemic-contracts/src/contribution.rs::ProviderContribution::validate"
+validation_error = "ContractError::FenceMismatch"
+
+[[field_contract_field]]
+field_id = "FC-EPI-PROVIDER-CONTRIBUTION.source_revision"
+type_rust_path = "eliot_epistemic_contracts::ProviderContribution"
+wire_name = "source_revision"
+owner_rust_type = "String"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an envelope with no source revision cannot be shown to be current against its source"
+bound_or_variants = "non-blank, control-free, at most MAX_SHORT_TEXT 256 characters; over-bound is ContractError::TooLong naming contribution.source_revision"
+identity_binding = "the source revision echoed from the admission envelope, and it is the SOURCE revision axis, distinct from position_revision above. The understanding-assessment consumer copies it into its cite revision, so a drift here is visible downstream rather than silent"
+validator = "crates/smart/eliot-epistemic-contracts/src/contribution.rs::ProviderContribution::validate"
+validation_error = "ContractError::TooLong"
+
+[[field_contract_field]]
+field_id = "FC-EPI-PROVIDER-CONTRIBUTION.coverage_digest"
+type_rust_path = "eliot_epistemic_contracts::ProviderContribution"
+wire_name = "coverage_digest"
+owner_rust_type = "String"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an envelope with no coverage digest asserts completeness it cannot back"
+bound_or_variants = "exactly 64 lowercase hexadecimal characters; any other shape is ContractError::InvalidDigest naming contribution.coverage_digest"
+identity_binding = "the coverage DENOMINATOR digest echoed from the admission envelope. It is a digest of the owner's coverage evidence, not a coverage claim made here: this file states no Complete claim and the digest alone never establishes one"
+validator = "crates/smart/eliot-epistemic-contracts/src/contribution.rs::ProviderContribution::validate"
+validation_error = "ContractError::InvalidDigest"
+
+[[field_contract_field]]
+field_id = "FC-EPI-PROVIDER-CONTRIBUTION.receipt_digest"
+type_rust_path = "eliot_epistemic_contracts::ProviderContribution"
+wire_name = "receipt_digest"
+owner_rust_type = "String"
+requiredness = "REQUIRED"
+none_meaning = "no None variant exists; an envelope with no receipt digest has no admission proof"
+bound_or_variants = "exactly 64 lowercase hexadecimal characters; any other shape is ContractError::InvalidDigest naming contribution.receipt_digest"
+identity_binding = "the ADMISSION RECEIPT digest, computed by the owner as position.receipt_identity(). It is the field that ties the contribution to a specific admission event, which is what makes the whole-envelope-or-error construction checkable after the fact"
+validator = "crates/smart/eliot-epistemic-contracts/src/contribution.rs::ProviderContribution::validate"
+validation_error = "ContractError::InvalidDigest"
+
+
+# r11 denominators for the three families the C1 card names as existing but
+# previously frozen at type level only. Each names an INDEPENDENTLY declared
+# expected set, because a completeness check that compares a list against a
+# copy of itself proves nothing.
+
+[[denominator]]
+id = "DEN-MEMORY-SELECTION"
+definition = "SelectionCoverage{considered, selected, not_selected} over EXACTLY the records presented to one selection. The denominator is the PRESENTED SET, declared independently by the consumer as the records array length of the batch it holds, and never by the trace's own entries list recomputed from itself. selected plus not_selected must EQUAL considered exactly, and considered must EQUAL entries.len(). This is deliberately a different type with different field names from the batch denominator DenominatorState, so the batch total can never be echoed under a filtered set and an intentional kind selection can never be mistaken for unaccounted loss. Two further recheckable bounds apply outside the denominator itself: selected must not exceed the echoed policy_ceiling and must not exceed the intent limit, and every entry handle and kind must replay against the paired batch record in deterministic provider order. Counts alone never establish completeness here, because a caller arithmetic that merely balances proves only that the caller balanced its own numbers."
+owner = "eliot-memory-projection-contracts"
+independent_expected_set = "the consumer's own held MemoryProjectionBatch.records array length; the trace's entries list is the thing under test and is never used as its own reference"
+recheck_procedure = "1. read batch.records.len() from the consumer's own batch; 2. read trace.coverage.considered and assert equality; 3. assert selected + not_selected == considered; 4. assert selected <= policy_ceiling; 5. assert selected <= intent.limit; 6. zip entries against batch.records and assert handle and kind equality and that each disposition follows the intent allowlist. Any failure is MemoryProjectionError::CoverageMismatch, SelectionError::LimitExceeded or SelectionError::BindingMismatch."
+unknown_behaviour = "There is no unknown state in this denominator and none is needed: the denominator is a count of records actually presented, not a claim about records that might exist elsewhere. An unreadable batch is a MemoryProjectionError from batch.validate() and no trace is produced at all, which is structurally different from a trace with a small considered count. An UNKNOWN batch denominator does not block selection, because selection deliberately claims no completeness: select() reads batch.coverage.denominator and never echoes it."
+omission_axis = "NONE BY CONSTRUCTION, and that is a deliberate design fact rather than a gap. Selection narrows a set the producer already presented; it does not read, so it cannot omit. Incompleteness in the SOURCE is carried by the batch's own ProjectionCoverage denominator, frontier and omissions, which this denominator deliberately does not re-state and cannot blur."
+
+[[denominator]]
+id = "DEN-FAILURE-OBSERVATION"
+definition = "CoverageEvidence{disposition, denominator_source_ref, interval, blind_intervals, observed_count} carried on BOTH FailureObservation and MemoryRevisionEvidence, plus the typed omission list and the counted ref list. Observed volume arrives as OWNER coverage evidence and never as caller arithmetic. The owner-declared expected set is the SourceRevisionHandle plus the observed_count at the named denominator_source_ref; a completeness claim is compared against THAT, never against the refs this crate happens to carry. A Complete claim additionally requires the FULL POSTURE, not just the disposition word: disposition == CoverageDisposition::Complete AND blind_intervals EMPTY. Reachable only through FailureObservation::coverage_complete and MemoryRevisionEvidence::coverage_complete, which is what makes 'counts reconcile' and 'complete' two different statements."
+owner = "eliot-observation-contracts"
+independent_expected_set = "the owner's CoverageEvidence observed_count together with the SourceRevisionHandle and denominator_source_ref that evidence itself declares, compared against the carried journal_refs or evidence_refs. The carried ref list is the thing under test and is never its own reference."
+recheck_procedure = "1. read coverage.disposition; 2. read coverage.blind_intervals and assert it is EMPTY for any Complete claim; 3. reconcile the counted ref list length against coverage.observed_count, naming any difference as an explicit FailureOmission rather than absorbing it; 4. assert journal_refs or evidence_refs holds no duplicate, which the owner validator enforces as ObservationError::Duplicate; 5. recompute digest over every field except digest itself and assert equality. Steps 1 and 2 together are the Complete-posture test; failing either yields an explicit partial read, not a quiet pass."
+unknown_behaviour = "Uncertainty is a NAMED VALUE, never an absence. CoverageDisposition carries UNKNOWN, UNAVAILABLE, BLIND, INCOMPLETE_COVERAGE and PARTIAL as five distinct members, and none of them has a default that reads as Complete. An unreadable source is CoverageDisposition::Unavailable plus a FailureOmission, not an empty ref list. An unadmitted source is the UNADMITTED_SOURCE omission class, not a silent zero. A false sense of completeness cannot arise from an omitted key, because the disposition field is required and there is no serde default."
+omission_axis = "Every omission is a FailureOmission carrying one of the five closed FailureOmissionClass members and a bounded note, bounded at MAX_OBSERVATION_OMISSIONS 64. The frontier equivalent for this family is the blind_intervals list on the coverage evidence, which is owner-declared rather than computed here. Both axes are typed and both are covered by the record's frozen digest."
+
+[[denominator]]
+id = "DEN-PROVIDER-CONTRIBUTION"
+definition = "There is NO coverage denominator on ProviderContribution, and that is the design rather than an omission. The envelope is WHOLE-ENVELOPE-OR-ERROR: contribute() takes only an admitted CurrentEpistemicPosition, refuses a non-current position, and runs the position's closed validation (shape plus frozen-digest recompute) before constructing anything. So a contribution covers EXACTLY its named receipt envelope or it fails to exist. There are no partial contributions and no omission entries by construction, and coverage_digest is a DIGEST OF THE OWNER'S EVIDENCE rather than a completeness claim made here."
+owner = "eliot-epistemic-contracts"
+independent_expected_set = "the admission envelope named by the combination of receipt_digest, position_digest, position and position_revision, which is declared by the owner through position.receipt_identity() and the admission record. The echoed fields are the thing under test and are never their own reference."
+recheck_procedure = "1. assert contract_version equals 1.2.0; 2. assert view_kind is CURRENT_EPISTEMIC_POSITION and currentness is CURRENT; 3. assert all three digests are 64 lowercase hex; 4. assert scope and source_revision are within MAX_SHORT_TEXT 256; 5. assert fence.validate succeeds; 6. re-derive the envelope from the named admission record and assert every echoed field equals it. Step 6 is the whole-envelope check and is available only to a consumer that holds the admission record; without it, validate() establishes shape and echoes internal consistency but NOT provenance."
+unknown_behaviour = "Currentness carries SUPERSEDED as its second member and contribute() refuses it, so a superseded position is an ERROR rather than a contribution with a weakened marker. Epistemic status distinctions that this envelope does not carry, such as assumed, conflicted, stale or under investigation, live on the CurrentEpistemicPosition itself and are not flattened by the handoff. A position whose governing material is missing or invalid yields ContractError from the position validation and NO envelope, which is structurally different from an envelope with an unknown field set to None."
+omission_axis = "NONE, and a missing omission axis is the strongest completeness statement in this file: there is no way to express a partial contribution, so a consumer never has to decide whether a gap is tolerable. The cost is that a caller cannot ship a partial handoff at all, which is the intended trade."
+
+# r11 completeness rules for the same three families. Same no-derived-completeness
+# discipline: each names the OWNER validator that enforces it and the independent
+# expected set the validator compares against.
+
+[[completeness_rule]]
+id = "CR-SEL-DENOMINATOR-EXACT"
+family = "eliot-memory-projection-contracts"
+applies_to = ["FC-SEL-COVERAGE.considered", "FC-SEL-COVERAGE.selected", "FC-SEL-COVERAGE.not_selected", "FC-SEL-TRACE.coverage"]
+rule = "SelectionCoverage must account for every entry exactly: considered equals entries.len(), selected plus not_selected equals considered, and selected must not exceed the echoed policy_ceiling. The three counts must balance; they need not be equal to the batch total, and deliberately so, because this denominator counts the PRESENTED set rather than the source. A trace whose counts balance but whose entries do not replay against the batch is still rejected, so balancing arithmetic alone never establishes a valid selection."
+enforced_by = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::MemorySelectionTrace::validate"
+independent_expected_set = "the consumer's own held MemoryProjectionBatch.records array, compared entry by entry under validate_against; the trace's entries list is the thing under test and is never its own expected set"
+evidence_required = "NOT_EXECUTED; static field contract only"
+
+[[completeness_rule]]
+id = "CR-SEL-NO-SILENT-CUT"
+family = "eliot-memory-projection-contracts"
+applies_to = ["FC-SEL-QUERY-INTENT.limit", "FC-SEL-POLICY.max_selected", "FC-SEL-TRACE.policy_ceiling", "FC-SEL-ENTRY.disposition"]
+rule = "Selection never cuts silently and never reorders. More records passing the allowlist than the limit admits is SelectionError::LimitExceeded carrying both counts, and a requested limit above the policy ceiling is SelectionError::LimitOverPolicy. Neither is resolved by dropping records: the caller narrows kinds or raises the limit. Records outside the allowlist are not dropped either, they are recorded as NotSelected with ExclusionReason::Rejected, so the presented set is always fully accounted for. Provider order is never re-sorted, so the deterministic order a consumer replays is the order the producer emitted."
+enforced_by = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::select"
+independent_expected_set = "the intent limit and the policy ceiling, both declared by their own owner types and compared against the count of Selected entries; neither is derived from the entries list"
+evidence_required = "NOT_EXECUTED; static field contract only"
+
+[[completeness_rule]]
+id = "CR-SEL-NO-VERDICT"
+family = "eliot-memory-projection-contracts"
+applies_to = ["FC-SEL-ENTRY.disposition", "FC-SEL-DISPOSITION.NOT_SELECTED", "FC-SEL-DISPOSITION.SELECTED"]
+rule = "Selection NARROWS and never VERDICTS. A Selected entry is not an applicable memory and never enters ApplicableMemorySet. A NotSelected entry carries ExclusionReason::Rejected with a narrow TRACE-LOCAL meaning, rejected by the explicit caller allowlist recorded in that trace, which is deliberately NOT the same claim as an applicability exclusion even though both use the ExclusionReason::Rejected spelling. The distinction is structural rather than documentary: selection entries are a different type from applicability exclusions, so the two cannot merge on the wire, and the untouched batch still flows whole to evaluate_applicability, which remains the sole verdict authority and still verdicts every record independently. Selection therefore creates no authority, no canonical truth, no scheduling, no external effect and no task finish."
+enforced_by = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::MemorySelectionTrace::validate_against"
+independent_expected_set = "not applicable; this rule is a default prohibition, not a count. The ApplicableMemorySet verdict is produced by the separate set.rs evaluator over the whole batch, never by this trace."
+evidence_required = "NOT_EXECUTED; static field contract only"
+
+[[completeness_rule]]
+id = "CR-OBS-COMPLETE-POSTURE"
+family = "eliot-observation-contracts"
+applies_to = ["FC-OBS-FAILURE-OBSERVATION.coverage", "FC-OBS-MEMORY-REVISION-EVIDENCE.coverage", "FC-OBS-FAILURE-OBSERVATION.journal_refs", "FC-OBS-MEMORY-REVISION-EVIDENCE.evidence_refs"]
+rule = "A Complete verdict on either failure-family record requires the FULL POSTURE and not merely the disposition word: coverage.disposition must equal CoverageDisposition::Complete AND coverage.blind_intervals must be EMPTY. Anything else is an explicit partial read reached through coverage_complete returning false. The disposition word alone is therefore insufficient on purpose, and a carried-member count that reconciles against observed_count establishes nothing about completeness on its own: it is necessary and not sufficient. Duplicates in the ref list are rejected rather than deduplicated, so the counted set and the declared set are the same set."
+enforced_by = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::FailureObservation::coverage_complete"
+independent_expected_set = "the owner CoverageEvidence observed_count together with the SourceRevisionHandle and denominator_source_ref that evidence itself declares, compared against the carried ref list. The carried refs are the thing under test and are never their own expected set."
+evidence_required = "NOT_EXECUTED; static field contract only"
+
+[[completeness_rule]]
+id = "CR-OBS-UNKNOWN-NOT-COMPLETE"
+family = "eliot-observation-contracts"
+applies_to = ["FC-OBS-FAILURE-OBSERVATION.coverage", "FC-OBS-OMISSION.CLASS", "FC-OBS-MEMORY-REVISION-EVIDENCE.same_hypothesis_recurrence", "FC-OBS-MEMORY-REVISION-EVIDENCE.prior_attempts"]
+rule = "Unknown and incomplete evidence cannot become Complete by default anywhere in this family, and each uncertainty is a NAMED VALUE rather than an absence. CoverageDisposition carries UNKNOWN, UNAVAILABLE, BLIND, INCOMPLETE_COVERAGE and PARTIAL as five distinct members and none of them reads as Complete. FailureOmissionClass carries JOURNAL_BLIND, SUPERSEDED_REVISION, PRIVACY_WITHHELD, EXPIRED_CURSOR and UNADMITTED_SOURCE and has NO Unknown or Other member, so an unnamed reason is not representable. An empty omissions list means the owner declared no omission and is never a claim that nothing was missed. On MemoryRevisionEvidence the same_hypothesis_recurrence flag is a plain Rust bool with no absent case, and prior_attempts zero is an HONEST ZERO distinct from an absent field; neither may be read as evidence that recurrence was ruled out, because ruling recurrence out is a reviewer decision and not something this record asserts."
+enforced_by = "crates/foundation/eliot-observation-contracts/src/lib.rs::ObservationError"
+independent_expected_set = "not applicable; this rule is a default prohibition, not a count"
+evidence_required = "NOT_EXECUTED; static field contract only"
+
+[[completeness_rule]]
+id = "CR-OBS-NO-APPLIED-AUTHORITY"
+family = "eliot-observation-contracts"
+applies_to = ["FC-OBS-FAILURE-OBSERVATION.extinction_condition", "FC-OBS-FAILURE-OBSERVATION.reopen_condition", "FC-OBS-MEMORY-REVISION-EVIDENCE.same_hypothesis_recurrence"]
+rule = "Nothing in this family applies a lifecycle change, creates canonical truth, grants authority, schedules work, produces an external effect, finishes a task or promotes itself. A satisfied extinction_condition does NOT retire the memory: the conditions are identity references and this crate evaluates neither. A satisfied reopen_condition does not reopen anything. A true same_hypothesis_recurrence flag ROUTES the case to Mechanism Review rather than to another equivalent retry, which is a routing decision and not an effect this record performs. The original episode stays with the Governor owner; this shape narrows nothing and deletes nothing. Journal and verifier records are cited by handle and never opened, so no admission, retrieval, ranking or promotion happens on this path."
+enforced_by = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs::FailureObservation::validate"
+independent_expected_set = "not applicable; this rule is a default prohibition, not a count. Lifecycle change, Mechanism Review routing and re-open decisions all stay with the Governor and Task owners named in crates/smart/eliot-dreamer-memory-revision/src/lib.rs::propose."
+evidence_required = "NOT_EXECUTED; static field contract only"
+
+[[completeness_rule]]
+id = "CR-EPI-CURRENT-NOT-STALE"
+family = "eliot-epistemic-contracts"
+applies_to = ["FC-EPI-PROVIDER-CONTRIBUTION.currentness", "FC-EPI-PROVIDER-CONTRIBUTION.position_revision", "FC-EPI-PROVIDER-CONTRIBUTION.source_revision"]
+rule = "A contribution exists only for a CURRENT position. contribute() refuses a non-current position before it validates anything, and validate() refuses any currentness other than Current, so a superseded position is a typed error and never a contribution carrying a weakened marker. That is a construction-time statement, not a continuing one: a contribution already written can go stale, which is why the position revision and the source revision are separate echoed axes and why every consumer re-gates liveness at its OWN edge under VR-FENCE-GATE. Neither revision axis is collapsed into the other, so a consumer can tell a revised position from a revised source."
+enforced_by = "crates/smart/eliot-epistemic-contracts/src/contribution.rs::ProviderContribution::contribute"
+independent_expected_set = "the admission record named by receipt_digest, held by the consumer; the envelope's echoed fields are the thing under test and are never their own reference. Without that record, validate() establishes shape and internal echo consistency only, never provenance or liveness."
+evidence_required = "NOT_EXECUTED; static field contract only"
+
+[[completeness_rule]]
+id = "CR-EPI-WHOLE-ENVELOPE"
+family = "eliot-epistemic-contracts"
+applies_to = ["FC-EPI-PROVIDER-CONTRIBUTION.coverage_digest", "FC-EPI-PROVIDER-CONTRIBUTION.receipt_digest", "FC-EPI-PROVIDER-CONTRIBUTION.position_digest"]
+rule = "Completeness in this family is DERIVED and never CLAIMED, and there is no path by which it becomes complete by default. There is no coverage denominator, no omission list, no partial-contribution variant and no completion flag on the envelope. contribute() runs the position's closed validation, shape plus frozen-digest recompute, and fails closed if any of it fails, so a contribution covers exactly its named receipt envelope or does not exist. A consumer that wants a completeness claim must hold the admission record and re-derive the envelope from it; coverage_digest being present is a digest of the OWNER's evidence and never itself a Complete verdict. An unknown or absent field has no representation, so no partial handoff can be shipped and later mistaken for a whole one."
+enforced_by = "crates/smart/eliot-epistemic-contracts/src/contribution.rs::ProviderContribution::contribute"
+independent_expected_set = "the admission envelope named by receipt_digest and the position named by position_digest, both held by the consumer; the envelope's own echoed fields are the thing under test and are never their own expected set"
+evidence_required = "NOT_EXECUTED; static field contract only"
+
+[[version_rule]]
+id = "VR-SELECTION-CONTRACT-VERSION"
+rule = "Every selection record validates its contract_version by exact string-shaped triple equality against CONTRACT_VERSION 0.2.0 declared at crates/foundation/eliot-memory-projection-contracts/src/contracts.rs. Equality only; no range and no negotiation. This triple is DIFFERENT from the epistemic family's 1.2.0 and the observation family's 1.0.0, which is precisely why the rule is equality: a record written against a sibling family is a VersionMismatch and is rejected at decode rather than reinterpreted. Admitted in r11."
+applies_to = ["eliot-memory-projection-contracts"]
+
+[[version_rule]]
+id = "VR-FAILURE-OBSERVATION-VERSION"
+rule = "Every failure-family record validates its contract_version by exact triple equality against CONTRACT_VERSION 1.0.0 declared at crates/foundation/eliot-observation-contracts/src/lib.rs, and additionally re-derives its own frozen digest on every validate(). A record whose stored digest does not match the recomputed value is ObservationError::InvalidField, so a byte edit to any field without a digest recompute is rejected. Admitted in r11."
+applies_to = ["eliot-observation-contracts"]
+
+[[version_rule]]
+id = "VR-CONTRIBUTION-CONTRACT-VERSION"
+rule = "Every provider contribution validates its contract_version by exact triple equality against CONTRACT_VERSION 1.2.0 declared at crates/smart/eliot-epistemic-contracts/src/lib.rs, together with the view_kind discriminator and a currentness of Current. The three checks are conjunctive: passing the version while failing the discriminator, or passing both while carrying a superseded marker, is still a rejection. Admitted in r11."
+applies_to = ["eliot-epistemic-contracts"]
+
+
+# ---------------------------------------------------------------------------
+# r11 downstream assignment bindings. Same shape and same obligations as the r9
+# cue bindings and the r10 curation binding above.
+#
+# Every first_consumer in these rows is a function that exists on this freeze's base
+# commit and was located with git grep, not chosen. Where the honest answer is that no
+# caller exists yet, the row says so and names the owning task instead of naming a
+# function that does not.
+# ---------------------------------------------------------------------------
+
+[[assignment_binding]]
+id = "AB-MEM-SELECTION"
+order = 44
+crate = "eliot-memory-projection-contracts"
+consumer_crate = "a future selection consumer; NO in-tree caller exists today"
+functional_cell = "foundation.memory.projection-contracts"
+input_rust_path = "eliot_memory_projection_contracts::MemoryProjectionBatch plus eliot_memory_projection_contracts::MemoryQueryIntent plus eliot_memory_projection_contracts::MemorySelectionPolicy"
+output_rust_path = "eliot_memory_projection_contracts::MemorySelectionTrace"
+definition_revision = "eliot_contracts::ContractVersion 0.2.0, exact triple equality against CONTRACT_VERSION declared at crates/foundation/eliot-memory-projection-contracts/src/contracts.rs, under VR-SELECTION-CONTRACT-VERSION. Equality only. Note this is a different triple from the epistemic family's 1.2.0 and the observation family's 1.0.0."
+first_consumer = "NONE. Measured: `git grep -rln MemorySelectionTrace -- '*.rs'` on this base commit returns exactly two files, both inside the owning crate itself (crates/foundation/eliot-memory-projection-contracts/src/contracts.rs, which re-exports the type, and src/contracts/selection.rs, which defines it). No crate outside eliot-memory-projection-contracts constructs, reads or forwards a selection trace. The producing entry point is selection.rs::select, and it currently has no external caller. This is recorded rather than papered over with a guessed consumer."
+owned_files = ["crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs", "crates/foundation/eliot-memory-projection-contracts/src/contracts/error.rs", "crates/foundation/eliot-memory-projection-contracts/src/contracts.rs"]
+prerequisite_contract = "FC-SEL-QUERY-INTENT, FC-SEL-POLICY, FC-SEL-TRACE, FC-SEL-ENTRY, FC-SEL-COVERAGE and FC-SEL-DISPOSITION in this file, plus DEN-MEMORY-SELECTION, CR-SEL-DENOMINATOR-EXACT, CR-SEL-NO-SILENT-CUT, CR-SEL-NO-VERDICT and VR-SELECTION-CONTRACT-VERSION. The batch input is already frozen as MemoryProjectionBatch, ProjectionCoverage and DenominatorState in the pre-existing rows."
+error_behavior = "Every rejection is a typed variant and never a formatted string that is later collapsed into a code. SelectionError::Upstream wraps a MemoryProjectionError; BindingMismatch is raised when the intent binding differs from the batch binding OR when validate_against finds the trace binding differing from either; LimitOverPolicy when the requested limit exceeds the enforced ceiling; LimitExceeded when more records pass the allowlist than the limit admits, carrying both counts so the caller can narrow rather than guess; EmptyKinds when the allowlist is empty, because narrowing must be explicit; DuplicateKind when the allowlist repeats a kind; BoundViolated when a limit or ceiling is zero or exceeds MEMORY_PROJECTION_MAX_RECORDS 256. Inside the wrapped MemoryProjectionError: VersionMismatch for a wrong triple, InvalidField for a malformed digest or a ceiling that does not match the policy, CoverageMismatch for accounting that contradicts the carried members, Bounds and Duplicate for the bound and uniqueness checks, FenceMismatch and ScopeMismatch for cross-record gating. There is no partial trace and no error carrying a partial trace, so a caller can never be handed a half-built selection."
+implementation_steps = "1. Obtain a validated MemoryProjectionBatch from the projection provider; do not construct one here. 2. Build a MemoryQueryIntent through MemoryQueryIntent::new, which sets CONTRACT_VERSION and validates; an empty or duplicated allowlist and an out-of-bound limit fail here rather than at selection time. 3. Build a MemorySelectionPolicy through MemorySelectionPolicy::new with a ceiling at or below MEMORY_PROJECTION_MAX_RECORDS 256. 4. Confirm intent.limit does not exceed policy.max_selected. 5. Call select(&intent, &policy, &batch); the batch is consumed whole, records are emitted in deterministic provider order, and the returned trace is already validated. 6. Before the trace crosses a boundary, call MemorySelectionTrace::validate_against(&intent, &policy, &batch) to re-run binding equality, allowlist and ceiling echoes, intent digest recomputation and the positional entry replay. 7. Reconcile SelectionCoverage against the consumer's own batch.records length. 8. Stop. Forward the UNTOUCHED batch to evaluate_applicability for the verdict: this trace narrows and never decides, and selection entries never enter ApplicableMemorySet."
+acceptance_positive = "A selection over a batch whose records are all inside the allowlist and whose passing count is at or below the intent limit yields a trace whose coverage.considered equals the consumer's own batch.records length, whose selected plus not_selected equals considered, whose selected satisfies both selected <= policy_ceiling and selected <= intent.limit, and which survives validate_against against the exact intent, policy and batch it was computed from. An intent digest recomputed by a third party over the canonical intent bytes equals trace.intent_digest."
+acceptance_negative = "A trace whose selected exceeds either the echoed policy ceiling or the intent limit is rejected, as LimitOverPolicy or LimitExceeded rather than by silent truncation. A trace whose coverage counts balance but whose entries do not replay against the batch is rejected as CoverageMismatch. An intent digest that does not match the intent is rejected. A ceiling that does not match the policy is rejected. An allowlist that does not match the intent is rejected. A selected entry whose kind is outside the echoed allowlist is rejected. An empty or duplicated allowlist is rejected. A limit of zero, or a ceiling above MEMORY_PROJECTION_MAX_RECORDS 256, is rejected as BoundViolated. A trace built under one binding and validated against a batch sharing the task but differing in scope is rejected as BindingMismatch."
+proof_status = "STATIC_FIELD_CONTRACT_ONLY; the acceptance above is NOT_EXECUTED and no test is claimed by this row"
+known_gap = "No in-tree caller exists. Wiring the first one is a separate implementation action belonging to whichever consumer crate actually needs narrowing; this row does not choose that consumer, because choosing one would be guessing an owner."
+
+[[assignment_binding]]
+id = "AB-FAILURE-OBSERVATION"
+order = 79
+crate = "eliot-observation-contracts"
+consumer_crate = "eliot-dreamer-memory-revision"
+functional_cell = "smart.dreamer.memory_revision"
+input_rust_path = "eliot_observation_contracts::FailureObservation plus eliot_observation_contracts::MemoryRevisionEvidence"
+output_rust_path = "smart.dreamer.memory_revision::NegativeMemoryExtinctionCandidate (the consumer's own output, NOT a frozen input to this family)"
+definition_revision = "eliot_contracts::ContractVersion 1.0.0, exact triple equality against CONTRACT_VERSION declared at crates/foundation/eliot-observation-contracts/src/lib.rs, under VR-FAILURE-OBSERVATION-VERSION. In addition, each record carries its own frozen digest which the owner recomputes from every other field on each validate(), so the revision axis for the CONTENT of a record is its digest and the revision axis for WHERE it was read is its SourceRevisionHandle. Those are two distinct axes and neither substitutes for the other."
+first_consumer = "crates/smart/eliot-dreamer-memory-revision/src/lib.rs::propose, reached through RevisionIntake which carries observation: &'a FailureObservation and evidence: &'a [MemoryRevisionEvidence]. This consumer is real and is the reason this family exists: propose calls verify_freeze_binding() first, then validate_intake, then classify. Measured present on this base commit."
+owned_files = ["crates/foundation/eliot-observation-contracts/src/failure_observation.rs", "crates/foundation/eliot-observation-contracts/src/lib.rs", "crates/foundation/eliot-observation-contracts/src/source_handles.rs"]
+prerequisite_contract = "FC-OBS-FAILURE-OBSERVATION, FC-OBS-MEMORY-REVISION-EVIDENCE, FC-OBS-OMISSION and FC-OBS-OMISSION-CLASS in this file, plus DEN-FAILURE-OBSERVATION, CR-OBS-COMPLETE-POSTURE, CR-OBS-UNKNOWN-NOT-COMPLETE, CR-OBS-NO-APPLIED-AUTHORITY and VR-FAILURE-OBSERVATION-VERSION. The nested owners CoverageEvidence, ObservationScope and SourceRevisionHandle are already frozen as pre-existing [[frozen_type]] rows in this same file and are referenced rather than duplicated."
+error_behavior = "Every rejection is an ObservationError variant and never a formatted string collapsed into a code across layers. InvalidField carries a static field name and a static reason and is what a blank value, a control character, an over-length value, a wrong contract version, an over-bound ref or omission list, an invalid fence interval or a digest mismatch produces. InvalidInterval is a reversed interval. Duplicate names the offending field and value, and is raised for a repeated journal_ref or evidence_ref handle rather than deduplicating it. CoverageIncomplete is the coverage-accounting failure. Foundation, Receipt and Runtime wrap the shared primitive, receipt and runtime contract errors. Unknown evidence is a VALUE and never an error path: an unreadable source is CoverageDisposition::Unavailable plus a named FailureOmission, an unadmitted source is the UNADMITTED_SOURCE omission class, and neither is silently reported as an empty list. A false same_hypothesis_recurrence or prior_attempts is not detectable by this crate by design, because ruling recurrence out is a reviewer decision; the honest failure is a reviewer reading it wrong, which the frozen digest at least makes visible as an edit."
+implementation_steps = "1. Receive the FailureObservation from the Governor journal owner and validate it; do not construct one here, and do not open any cited journal record. 2. Confirm contract_version is 1.0.0 and that the stored digest equals the recomputed digest over every other field. 3. Confirm every journal_ref is non-blank, at most MAX_OBSERVATION_TEXT 1024 characters, within MAX_OBSERVATION_REFS 256 entries and free of duplicates. 4. Confirm journal_revision validates as a SourceRevisionHandle, which checks source_id and revision within 256 characters and content_sha256 as 64 lowercase hex, WITHOUT opening the source bytes. 5. Read coverage_complete(); treat false as an explicit partial read and carry it as such into any downstream decision rather than treating the record as complete. 6. For each MemoryRevisionEvidence, repeat steps 2 to 5 and confirm evidence_revision is the axis that establishes post-dating relative to journal_revision; comparing the two cursors is an owner comparison, not one this crate performs. 7. Carry every FailureOmission forward as a named value rather than collapsing the omissions list. 8. Hand the validated observation and evidence to the consumer. 9. Stop. This crate applies no lifecycle change, retires nothing, reopens nothing, and schedules nothing; a satisfied extinction_condition retires nothing and a true same_hypothesis_recurrence routes to Mechanism Review rather than to another equivalent retry."
+acceptance_positive = "An observation carrying a valid digest, a validated SourceRevisionHandle, refs within their bounds with no duplicates, and coverage with disposition Complete and an empty blind_intervals list satisfies coverage_complete() and is accepted as a complete read. An observation paired with evidence whose evidence_revision post-dates the journal_revision, whose same_hypothesis_recurrence is true and whose prior_attempts is non-zero, is accepted and the consumer routes it to Mechanism Review rather than to a retry."
+acceptance_negative = "An observation whose stored digest does not match the recomputed digest is rejected as InvalidField. A repeated journal_ref or evidence_ref handle is rejected as Duplicate rather than deduplicated. A 257th ref or a 65th omission is rejected. An observation whose coverage disposition is Complete but whose blind_intervals list is NON-EMPTY does NOT satisfy coverage_complete and is carried as a partial read; that pairing is the specific negative this rule exists for. An over-length condition string, a control character and a malformed content_sha256 are each rejected. An inadmissible omission class cannot be expressed, and an omission whose note is blank is rejected as InvalidField. A record under a contract version other than 1.0.0 is rejected. An observation with no omission recorded for a source the owner reported as unadmitted is a REVIEW finding, not a machine rejection, and is stated here so it is not mistaken for one."
+proof_status = "STATIC_FIELD_CONTRACT_ONLY; the acceptance above is NOT_EXECUTED and no test is claimed by this row"
+known_gap = "none for this family; the owner crate, the frozen digests, the closed omission classes and a real first consumer all exist. What remains unproven is runtime behaviour: no acceptance above has been executed."
+
+[[assignment_binding]]
+id = "AB-PROVIDER-CONTRIBUTION"
+order = 6
+crate = "eliot-epistemic-contracts"
+consumer_crate = "eliot-epistemic-context-provider, and independently eliot-understanding-assessment"
+functional_cell = "smart.epistemic.contracts"
+input_rust_path = "eliot_epistemic_contracts::CurrentEpistemicPosition (already validated and admitted by its owner)"
+output_rust_path = "eliot_epistemic_contracts::ProviderContribution"
+definition_revision = "eliot_contracts::ContractVersion 1.2.0, exact triple equality against CONTRACT_VERSION declared at crates/smart/eliot-epistemic-contracts/src/lib.rs, under VR-CONTRIBUTION-CONTRACT-VERSION, CONJUNCTIVE with the view_kind discriminator being AdmittedKind::CurrentEpistemicPosition and currentness being Currentness::Current. Passing the version while failing either of the other two is still a rejection. Note this is a different triple from the projection family's 0.2.0 and the observation family's 1.0.0."
+first_consumer = "crates/smart/eliot-epistemic-context-provider/src/context_projection.rs::EpistemicContextContribution::from_contribution, which consumes an owner contribution and adapts it. Measured present on this base commit, and the module declares from_position, from_contribution and validate. A SECOND independent consumer exists and is recorded rather than collapsed: crates/smart/eliot-understanding-assessment/src/lib.rs::EvidenceCite::contribution, which validates a contribution and copies position_digest into the cite digest and source_revision into the cite revision."
+owned_files = ["crates/smart/eliot-epistemic-contracts/src/contribution.rs", "crates/smart/eliot-epistemic-contracts/src/admitted.rs", "crates/smart/eliot-epistemic-contracts/src/error.rs", "crates/smart/eliot-epistemic-contracts/src/lib.rs"]
+prerequisite_contract = "FC-EPI-PROVIDER-CONTRIBUTION in this file, plus DEN-PROVIDER-CONTRIBUTION, CR-EPI-CURRENT-NOT-STALE, CR-EPI-WHOLE-ENVELOPE and VR-CONTRIBUTION-CONTRACT-VERSION. The nested owners CurrentEpistemicPosition, AdmittedKind and Currentness are already frozen as pre-existing [[frozen_type]] rows in this same file and are referenced rather than duplicated."
+error_behavior = "Every rejection is a ContractError variant and never a formatted string collapsed into a code. ImpossibleCombination is what a wrong contract_version, a wrong view_kind, a non-Current currentness or a field combination this contract forbids produces, and it names the field. InvalidDigest is a digest that is not exactly 64 lowercase hex characters. TooLong is a value over MAX_SHORT_TEXT 256 characters, and Blank or ControlCharacter is an empty or control-bearing value. FenceMismatch is a fence whose interval does not validate. The whole envelope is the unit of failure: contribute() returns Result<Self, ContractError> and there is no partial contribution and no error carrying one, so a caller can never be handed a partly-populated handoff. Uncertainty is a value rather than an absence: a superseded position is refused outright by contribute() rather than contributed with a weakened marker, and the epistemic distinctions this envelope does not carry, such as assumed, conflicted, stale or under investigation, remain visible on the CurrentEpistemicPosition and are not flattened by the handoff."
+implementation_steps = "1. Receive a CurrentEpistemicPosition that its own owner has already admitted and validated. 2. Confirm currentness is Currentness::Current; a superseded position is refused here and is NOT downgraded to a weaker contribution. 3. Call ProviderContribution::contribute(&position). It runs the position's closed validation, shape plus frozen-digest recompute, then constructs the envelope by ECHOING position_digest, claim, admission.owner, admission.position, admission.position_revision, admission.scope, admission.fence, admission.revision, admission.coverage_digest and position.receipt_identity(). 4. Do not construct a ProviderContribution literal by hand at any point: the fields are echoes and there is no synthetic construction path, so a hand-built envelope is by definition one whose fields were supplied independently of the admission. 5. Call ProviderContribution::validate, which contribution already does; a second call is the consumer's own check. 6. Carry the envelope. Do NOT attach a per-provider identity, request state or consumer framing: this envelope is provider-neutral by construction and the contributing provider IS the admitted position owner, so adding a provider field would create a second attribution that can disagree with owner. 7. At the consumer edge, re-gate liveness and fence compatibility against the governing StateFence under VR-FENCE-GATE; a contribution written while current can be stale by the time it is read. 8. Stop. The envelope is a handoff record: it resolves nothing, acquires nothing, ranks nothing, stores nothing and applies nothing."
+acceptance_positive = "ProviderContribution::contribute over a validated Current position with Currentness::Current yields an envelope whose view_kind is CURRENT_EPISTEMIC_POSITION, whose currentness is CURRENT, whose three digest fields are 64 lowercase hex, and whose owner, position, position_revision, scope, fence, source_revision, coverage_digest and receipt_digest each EQUAL the corresponding field of the admission envelope, so a consumer holding the admission record can re-derive the envelope field by field and reach the same bytes. The understanding-assessment consumer accepts that envelope as a citation and reads position_digest as the cite digest."
+acceptance_negative = "contribute over a position whose currentness is Superseded is refused with ImpossibleCombination and NO envelope is produced, rather than producing an envelope that declares staleness. A hand-built envelope whose echoes disagree with the admission envelope is rejected by validate on the field that disagrees, for example ImpossibleCombination naming contribution.view_kind for a wrong marker. A position whose own frozen digest does not recompute is refused by contribute() BEFORE any envelope exists, so an envelope over an unvalidated position is not reachable. A digest of the wrong shape, an over-length scope or source_revision, and an invalid fence interval are each rejected with their own variant. A record under a contract version other than 1.2.0 is rejected. Passing the version check while carrying a wrong view_kind is still rejected, which is the specific negative the conjunction exists for."
+proof_status = "STATIC_FIELD_CONTRACT_ONLY; the acceptance above is NOT_EXECUTED and no test is claimed by this row"
+known_gap = "none for this family; the owner crate, the closed validation and TWO real independent consumers all exist. What remains unproven is runtime behaviour."
+
+
+# ---------------------------------------------------------------------------
+# r11 disagreement rows. Same obligation as r10: record the exact field, both
+# references, the measured fact, the proposed repair and the existing owning
+# task. Do NOT silently ratify incorrect code by changing the freeze to match it,
+# and do NOT add a type to a crate so that a manifest stops being wrong.
+#
+# All four rows below are REPORTED_NOT_INVENTED and rust_change_needed is false on
+# every one, because in each case the Rust is correct and a PROJECTION of it is
+# wrong. Adding Rust to satisfy a wrong projection would create a duplicate owner,
+# which I5.15 forbids.
+# ---------------------------------------------------------------------------
+
+[[disagreement]]
+id = "DIS-SEL-NO-CALLER"
+family = "eliot-memory-projection-contracts-selection"
+disposition = "REPORTED_NOT_INVENTED"
+field = "first_consumer for the AB-MEM-SELECTION assignment binding"
+code_reference = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs::select is the only producer, and it has zero callers"
+measured_fact = "Measured by git grep over this base commit: `git grep -rln MemorySelectionTrace -- '*.rs'` returns exactly two files, both inside the owning crate (src/contracts.rs, which re-exports it, and src/contracts/selection.rs, which defines it). `git grep -rln 'MemoryQueryIntent|MemorySelectionPolicy|SelectionCoverage' -- '*.rs'` returns the same two files. The crate's own tests/projection_contracts.rs references none of the six selection types. So the selection contract is fully declared, fully frozen at field level at r11, and entirely unconsumed. This is a real adoption gap, not a contract gap."
+document_reference = "docs/architecture/I12-06-cue-binding.md and the #196 C1 card require a contract to be bound to a real caller before it counts as delivered. The card text names memory selection as something that 'exists', which is true of the contract and false of its adoption, and the two must not be conflated."
+freeze_reference = "crates/smart/cognitive-rev12-contract-schema-freeze.toml::[[coverage_accounting]] family = 'eliot-memory-projection-contracts-selection' carries owner_is_complete = false for exactly this reason, and [[assignment_binding]] AB-MEM-SELECTING names NO in-tree caller rather than naming a consumer that does not exist."
+proposed_repair = "Do not invent a consumer. The decision owner either (a) names the consumer crate that genuinely needs kind narrowing from a whole batch, and that crate's lane wires it, or (b) records that selection is delivered-but-unconsumed and carries it as a known adoption gap. Option (b) is the honest default when no consumer has been identified. What must NOT happen is a binding row naming a plausible-sounding crate with no call site, which is the failure mode this row exists to prevent."
+owning_task = "the cognitive-wave integrator named as integration_owner at crates/foundation/eliot-memory-projection-contracts/module.toml"
+rust_change_needed = false
+why_no_rust_change = "The contract is complete and correct at 6 of 6 members with resolving validator anchors. What is missing is a caller, and a caller is an integration decision, not a Rust fix."
+status = "OPEN_OWNED"
+
+[[disagreement]]
+id = "DIS-SEL-DENOMINATOR-NAMING"
+family = "eliot-memory-projection-contracts-selection"
+disposition = "REPORTED_NOT_INVENTED"
+field = "crates/smart/cognitive-rev12-contract-schema-freeze.toml::[[denominator]] id = 'DEN-MEMORY-SELECTION' versus the crate's own type name"
+code_reference = "crates/foundation/eliot-memory-projection-contracts/src/contracts/selection.rs:222 doc comment on SelectionCoverage reads 'Selection denominator: exactly the records presented to selection.'"
+measured_fact = "The crate names the type SelectionCoverage and calls it a denominator in prose; this file names the row DEN-MEMORY-SELECTION and adds a [[denominator]] row for it. Both are true and they do not conflict, but the two vocabularies are not obviously the same word and a future reader could reasonably read DEN-MEMORY-SELECTION as the batch denominator that already exists separately as the ProjectionCoverage/DenominatorState pair. The selection crate is explicit that SelectionCoverage is DELIBERATELY a different type from the batch denominator, with different field names, precisely so the batch total can never be echoed under a filtered set."
+document_reference = "docs/architecture/I5.22-schema-and-migration-rules.md requires an exact referent for a binding identifier rather than a nearest match. A denominator row whose name reads like a sibling denominator is exactly the case where a reader matches on the nearest name."
+freeze_reference = "crates/smart/cognitive-rev12-contract-schema-freeze.toml::[[denominator]] id = 'DEN-MEMORY-SELECTION', whose definition column states the independence rule and the deliberate type difference in full."
+proposed_repair = "No repair is required to the DEN-MEMORY-SELECTION row, which already states the distinction in its definition column. The bounded improvement belongs to a reader-facing index: when the catalogue is next touched by the integration owner, the [[denominator]] set should carry one line naming which row is the batch denominator and which is the selection denominator, so the two are never confused by name. Recorded here so the near-match is visible rather than left for a reader to trip over."
+owning_task = "the cognitive-wave integrator that owns crates/smart/cognitive-rev12-contract-schema-freeze.toml, named as integration_owner at crates/smart/cognitive-rev12-contract-schema-freeze.toml::integration_owner"
+rust_change_needed = false
+why_no_rust_change = "Both sides describe the same Rust correctly; only the naming could mislead, and the row that could mislead already carries an explicit statement of the distinction."
+status = "OPEN_OWNED"
+
+[[disagreement]]
+id = "DIS-VR-DENY-UNKNOWN-SCOPE"
+family = "cross-family, affects eliot-observation-contracts, eliot-epistemic-contracts and eliot-memory-curation-contracts"
+disposition = "REPORTED_NOT_INVENTED"
+field = "the literal scope of VR-DENY-UNKNOWN-FIELDS as against the serde attributes the owner crates actually declare"
+code_reference = "crates/foundation/eliot-observation-contracts/src/failure_observation.rs:108 declares FailureOmissionClass with #[serde(rename_all = \"SCREAMING_SNAKE_CASE\")] and NO deny_unknown_fields. Measured across crates/smart/eliot-memory-curation-contracts/src: all sixteen declared enums are unit-only and every one of them carries rename_all with NO deny_unknown_fields. The same holds for AdmittedKind and Currentness in crates/smart/eliot-epistemic-contracts/src and for CoverageDisposition in crates/foundation/eliot-observation-contracts/src."
+measured_fact = "VR-DENY-UNKNOWN-FIELDS in this file states 'Every frozen wire shape carries deny_unknown_fields (or a checked wire TryFrom route).' Measured against the source, that sentence is TRUE of every STRUCT in these families and FALSE of every ENUM: no enum in any of the three crates carries deny_unknown_fields, and no crate routes enum decode through a checked TryFrom. So the rule as literally written does not hold over the full set of frozen wire shapes it claims to cover. This is a defect in the RULE'S WORDING, not a demonstrated defect in the wire behaviour: the serde container attribute documentation describes deny_unknown_fields in terms of unknown FIELDS, and these sixteen enums are all unit-only with no payload fields for such an attribute to govern. What this row deliberately does NOT claim is that an unknown enum MEMBER decodes successfully; this work unit ran no cargo, so no decode was executed and no such claim is made here."
+document_reference = "docs/architecture/I05-16-common-durable-fields.md and I5.22-schema-and-migration-rules.md require a closed wire shape at a durable boundary. I5.22 in particular requires an exact referent for a rule identifier rather than a nearest match, which is why a rule that over-generalizes is recorded rather than quietly narrowed."
+freeze_reference = "crates/smart/cognitive-rev12-contract-schema-freeze.toml::[[version_rule]] id = \"VR-DENY-UNKNOWN-FIELDS\". The r9 and r10 field-contract wire_naming columns already describe the struct-side and enum-side behaviour SEPARATELY and do not claim deny-unknown-fields on the enum side, so no [[field_contract]] row is contradicted by this."
+proposed_repair = "Narrow the rule's wording at its owner, do not widen the code on the strength of it. The honest replacement states the rule over structs and states separately, for enums, that closedness is a property of the OWNER-DECLARED member set validated by the owner validator named on each row, and that whether an unknown member is rejected at decode is a per-crate serde question that was NOT EXECUTED here. The alternative repair, adding deny_unknown_fields to sixteen enums, is a behavioural change to durable wire contracts across three crates and is the crate owners' decision, not this issue's. Editing the freeze to keep the broad sentence while the source does not support it would be ratifying an incorrect claim, which is precisely what this row prevents."
+owning_task = "the cognitive-wave integrator that owns crates/smart/cognitive-rev12-contract-schema-freeze.toml, named as integration_owner at crates/smart/cognitive-rev12-contract-schema-freeze.toml::integration_owner, for the rule wording; and the crates/foundation/eliot-observation-contracts, crates/smart/eliot-epistemic-contracts and crates/smart/eliot-memory-curation-contracts owner lanes respectively, for any serde-level change"
+rust_change_needed = false
+why_no_rust_change = "The observed fact is about which container attributes the owner crates declare, not about behaviour this work unit is entitled to change or could verify without running cargo. The rule wording is a documentation correction inside this file's own owner scope; the serde attributes are three other crates' durable wire contracts."
+status = "OPEN_OWNED"
+
+[[disagreement]]
+id = "DIS-REMOVED-PATH-STILL-NAMED"
+family = "cross-wave"
+disposition = "REPORTED_NOT_INVENTED"
+field = "crates/smart/cognitive-rev12-contract-schema-freeze.toml::[[removed_package]].paths and ::[[rejected]].location, both naming paths that do not exist on this base commit"
+code_reference = "crates/smart/cognitive-rev12-contract-schema-freeze.toml::[[removed_package]] names paths = [\"crates/smart/eliot-memory-projection/**\"] with removed_in = \"work/223-rev12-freeze commit 1e69357a\", and ::[[rejected]] names location = \"crates/smart/eliot-system-experience (retired duplicate)\""
+measured_fact = "Neither path exists on this base commit. A mechanical sweep of every crates/... path token in this file against the working tree returns exactly these two as absent-and-intentional plus one genuine typo that r11 corrected. Both absent paths are CORRECT as written: [[removed_package]] exists precisely to record that the package was removed, and [[rejected]] exists precisely to record that the retired duplicate was rejected. An absent path is the intended meaning in both rows."
+document_reference = "docs/architecture/I5.22-schema-and-migration-rules.md requires an exact referent for a binding identifier. A reader checking these two paths by filesystem existence would wrongly conclude the freeze has dangling references, so the distinction has to be legible without running a sweep."
+freeze_reference = "crates/smart/cognitive-rev12-contract-schema-freeze.toml::[[removed_package]] and ::[[rejected]] as written at r9 and r10, both unchanged by r11."
+proposed_repair = "No content repair. The bounded improvement is that any future reader-facing index over this file should mark these two rows as intentionally-absent paths, so that the presence of a non-existent path reads as a recorded removal rather than a broken reference. r11 corrected the one genuine typo it found in the same sweep, the crates/smart/eliot-contracts path on FC-CUE-SNAPSHOT-CLOSURE, which should read crates/foundation/eliot-contracts; that correction is in r11 rather than deferred because it named a live crate by a path that does not exist."
+owning_task = "the cognitive-wave integrator that owns this freeze file, named as integration_owner at crates/smart/cognitive-rev12-contract-schema-freeze.toml::integration_owner"
+rust_change_needed = false
+why_no_rust_change = "Two of the three are intentional records of absent paths and the third was a documentation path typo in this file, corrected here."
+status = "CLOSED_R11_TYPO_FIXED_TWO_ROWS_INTENTIONALLY_ABSENT"
