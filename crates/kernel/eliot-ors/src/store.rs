@@ -9,8 +9,8 @@ use eliot_contracts::{
     AuthorityEpoch, BRIDGE_RECOVERY_SELECTOR_VERSION, BridgeRecoveryPageCommitment,
     BridgeRecoverySelector, BridgeRecoveryUnresolvedFrontier, BridgeRecoveryWindowDisposition,
     EpochId, EpochRelation, EpochTransition, HostCorrelationProjection, HostJsonRpcCorrelationId,
-    HostRequestLogicalKind, ResourceGeneration, canonical_json_bytes, host_request_legacy_presence_key,
-    host_request_logical_key,
+    HostRequestLogicalKind, ResourceGeneration, canonical_json_bytes,
+    host_request_legacy_presence_key, host_request_logical_key,
 };
 use eliot_platform::PlatformHandle;
 use eliot_process::ProcessStreamKind;
