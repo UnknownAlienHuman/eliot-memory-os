@@ -56,7 +56,8 @@ pub(crate) fn unavailable_context() -> CrashRuntimeContext {
 pub(crate) fn attach_reporter(
     host: &mut HostComposition,
     reporter: &CrashReporterHandle,
-) {
+) -> Result<(), CrashReportError> {
+    let mut incomplete = false;
     let active_launch = host
         .registry()
         .active()
@@ -67,15 +68,36 @@ pub(crate) fn attach_reporter(
             eliot_installation::InstallationProfile::UserMode => "user_mode",
             eliot_installation::InstallationProfile::PortableDev => "portable_dev",
         };
-        let _ = reporter.update_runtime_profile(runtime_profile);
-        if let Ok(Some(artifact)) = host_symbol_artifact(
-            launch.admitted_symbol_binding(SymbolExecutableRole::Host),
-        ) {
-            let _ = reporter.update_symbol_artifact(artifact);
+        if reporter.update_runtime_profile(runtime_profile).is_err() {
+            incomplete = true;
+        }
+        match host_symbol_artifact(launch.admitted_symbol_binding(SymbolExecutableRole::Host)) {
+            Ok(Some(artifact)) => {
+                if reporter.update_symbol_artifact(artifact).is_err() {
+                    incomplete = true;
+                }
+            }
+            Ok(None) => {}
+            Err(_) => incomplete = true,
         }
     }
-    let _ = reporter.update_retention_policy(incident_retention_policy(
-        host.crash_report_directory(),
-    ));
-    let _ = host.attach_crash_reporter(reporter.clone());
+    if reporter
+        .update_retention_policy(incident_retention_policy(host.crash_report_directory()))
+        .is_err()
+    {
+        incomplete = true;
+    }
+    if incomplete {
+        reporter.invalidate_runtime_context();
+        Err(CrashReportError::InvalidMetadata(
+            "crash_reporter.host_attachment_incomplete",
+        ))
+    } else if host.attach_crash_reporter(reporter.clone()).is_err() {
+        reporter.invalidate_runtime_context();
+        Err(CrashReportError::InvalidMetadata(
+            "crash_reporter.host_attachment_incomplete",
+        ))
+    } else {
+        Ok(())
+    }
 }

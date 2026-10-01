@@ -9165,13 +9165,18 @@ impl HostComposition {
         handle: CrashReporterHandle,
     ) -> Result<(), CrashReportError> {
         if self.crash_reporter.is_some() {
+            handle.invalidate_runtime_context();
             return Err(CrashReportError::InvalidMetadata(
                 "crash_reporter.already_attached",
             ));
         }
-        handle.update_context(self.crash_runtime_context(true))?;
+        if let Err(error) = handle.update_context(self.crash_runtime_context(true)) {
+            handle.invalidate_runtime_context();
+            return Err(error);
+        }
         let journal_reporter = handle.clone();
-        self.journal
+        if self
+            .journal
             .set_append_observer(Arc::new(move |head| {
                 let journal_head = head.map(|(sequence, digest)| CrashOwnerHead {
                     kind: CrashOwnerHeadKind::HostStateJournal,
@@ -9181,7 +9186,13 @@ impl HostComposition {
                 });
                 let _ = journal_reporter.update_journal_head(journal_head);
             }))
-            .map_err(|_| CrashReportError::InvalidMetadata("crash_reporter.journal_observer"))?;
+            .is_err()
+        {
+            handle.invalidate_runtime_context();
+            return Err(CrashReportError::InvalidMetadata(
+                "crash_reporter.journal_observer",
+            ));
+        }
         self.crash_reporter = Some(handle);
         Ok(())
     }
@@ -9195,6 +9206,7 @@ impl HostComposition {
 
     fn crash_runtime_context(&self, journal_head_current: bool) -> CrashRuntimeContext {
         let state = self.journal.snapshot().ok();
+        let journal_head_gap = !journal_head_current || state.is_none();
         let active = if self.registry.pending_activation().is_none() {
             self.registry.active()
         } else {
@@ -9229,7 +9241,7 @@ impl HostComposition {
         } else {
             None
         };
-        CrashRuntimeContext::from_observations(
+        let mut context = CrashRuntimeContext::from_observations(
             module_generation_ref,
             process_generation_ref,
             state_fence,
@@ -9238,12 +9250,23 @@ impl HostComposition {
             None,
             Vec::new(),
             journal_head,
-        )
+        );
+        context.journal_head_gap = journal_head_gap;
+        context
     }
 
     fn publish_crash_context(&self, journal_head_current: bool) {
         if let Some(handle) = self.crash_reporter.as_ref() {
-            let _ = handle.update_context(self.crash_runtime_context(journal_head_current));
+            if handle
+                .update_context(self.crash_runtime_context(journal_head_current))
+                .is_err()
+            {
+                tracing::warn!(
+                    target: "eliot::crash_reporter",
+                    event = "host_context_update_failed",
+                    "Host crash context is unavailable; a later panic will emit an explicit gap"
+                );
+            }
         }
     }
 

@@ -631,6 +631,7 @@ struct CrashReporterState {
     symbol_artifact: RwLock<Option<SymbolArtifact>>,
     report_sink: RwLock<Option<CrashReportSink>>,
     context: RwLock<CrashRuntimeContext>,
+    context_gap: AtomicBool,
     journal_head_gap: AtomicBool,
     sender: SyncSender<CrashCapture>,
     overflow_gap: AtomicBool,
@@ -667,6 +668,13 @@ pub struct CrashReporterHandle {
 }
 
 impl CrashReporterHandle {
+    /// Marks the live runtime snapshot unavailable after a producer-side
+    /// attachment or publication failure. A later capture records a typed gap
+    /// until a complete context update succeeds.
+    pub fn invalidate_runtime_context(&self) {
+        self.state.context_gap.store(true, Ordering::Release);
+    }
+
     /// Replaces the context snapshot from the owning composition boundary.
     ///
     /// This is called on the normal startup/update path. The panic hook uses
@@ -675,6 +683,7 @@ impl CrashReporterHandle {
         &self,
         context: CrashRuntimeContext,
     ) -> Result<(), CrashReportError> {
+        self.state.context_gap.store(true, Ordering::Release);
         context.validate()?;
         let mut current = self
             .state
@@ -682,6 +691,7 @@ impl CrashReporterHandle {
             .write()
             .map_err(|_| CrashReportError::InvalidMetadata("runtime_context.poisoned"))?;
         *current = context;
+        self.state.context_gap.store(false, Ordering::Release);
         self.state.journal_head_gap.store(false, Ordering::Release);
         Ok(())
     }
@@ -691,17 +701,22 @@ impl CrashReporterHandle {
     /// clears the old head and marks an explicit context gap.
     pub fn update_journal_head(&self, journal_head: Option<CrashOwnerHead>) {
         self.state.journal_head_gap.store(true, Ordering::Release);
-        let valid = journal_head.as_ref().map_or(true, |head| {
-            head.kind == CrashOwnerHeadKind::HostStateJournal
-                && head.algorithm == CrashDigestAlgorithm::Sha256
-                && head.sequence > 0
-                && validate_digest(&head.digest, "runtime_context.journal_head").is_ok()
-        });
+        let Some(journal_head) = journal_head else {
+            if let Ok(mut context) = self.state.context.try_write() {
+                context.journal_head = None;
+                context.journal_head_gap = true;
+            }
+            return;
+        };
+        let valid = journal_head.kind == CrashOwnerHeadKind::HostStateJournal
+            && journal_head.algorithm == CrashDigestAlgorithm::Sha256
+            && journal_head.sequence > 0
+            && validate_digest(&journal_head.digest, "runtime_context.journal_head").is_ok();
         if !valid {
             return;
         }
         if let Ok(mut context) = self.state.context.try_write() {
-            context.journal_head = journal_head;
+            context.journal_head = Some(journal_head);
             context.journal_head_gap = false;
             self.state.journal_head_gap.store(false, Ordering::Release);
         }
@@ -875,6 +890,7 @@ pub fn install_crash_reporter(
         symbol_artifact: RwLock::new(config.symbol_artifact),
         report_sink: RwLock::new(report_sink),
         context: RwLock::new(config.initial_context),
+        context_gap: AtomicBool::new(false),
         journal_head_gap: AtomicBool::new(false),
         sender,
         overflow_gap: AtomicBool::new(false),
@@ -945,6 +961,10 @@ impl CrashReporterState {
             self.enqueue_gap(report_id, CrashTelemetryGapReason::RuntimeProfileUnavailable);
             return;
         };
+        if self.context_gap.load(Ordering::Acquire) {
+            self.enqueue_gap(report_id, CrashTelemetryGapReason::RuntimeContextUnavailable);
+            return;
+        }
         let context = match self.context.try_read() {
             Ok(context) => context.clone(),
             Err(_) => {
@@ -952,6 +972,10 @@ impl CrashReporterState {
                 return;
             }
         };
+        if self.context_gap.load(Ordering::Acquire) {
+            self.enqueue_gap(report_id, CrashTelemetryGapReason::RuntimeContextUnavailable);
+            return;
+        }
         let mut context = context;
         if self.journal_head_gap.load(Ordering::Acquire) {
             context.journal_head = None;
@@ -1109,6 +1133,16 @@ impl CrashReporterState {
         } else {
             self.append_record(&text)
         };
+        if write_result.is_err() {
+            tracing::error!(
+                target: "eliot::crash_reporter",
+                event = "crash_gap_unpersisted",
+                process,
+                report_id,
+                reason = ?reason,
+                "Crash telemetry gap could not be persisted"
+            );
+        }
         self.outcome.store(
             if write_result.is_ok() {
                 CrashTelemetryOutcome::GapWritten.as_u8()
