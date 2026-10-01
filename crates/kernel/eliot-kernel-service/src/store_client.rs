@@ -16,6 +16,7 @@ use eliot_contracts::{ArtifactId, ContractId, ContractVersion, StateFence};
 use eliot_ipc::{DeliveryOutcome, TransportError, TransportLimits};
 use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse};
 use eliot_protocol::{ClientHello, Frame, ProtocolRange, ProtocolVersion, ServerHello};
+use eliot_receipts::{AuthorityBinding, CausalBinding};
 use eliot_runtime_contracts::{ModuleContract, ModuleGeneration, ModuleGenerationState};
 use eliot_store_api::{
     BackupOperationReconciliation, CAPABILITIES, CanonicalRequestView, CanonicalRestoreBatch,
@@ -473,7 +474,92 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
                 return Err(StoreError::IdentityConflict);
             }
         }
+        Self::validate_preserved_receipt_bindings(
+            &request.transition.security.authority_binding,
+            &request.transition.security.causal_binding,
+            receipt,
+        )?;
         Ok(())
+    }
+
+    /// Confirms that Store echoed an owner-supplied authority/causal pair in
+    /// its canonical receipt. A bad or absent echo after the single write is
+    /// an unknown outcome: the caller must retain the original operation and
+    /// reconcile it, never retry a rebuilt transition.
+    pub(crate) fn validate_preserved_receipt_bindings(
+        authority: &Option<AuthorityBinding>,
+        causal: &Option<CausalBinding>,
+        receipt: &WriteReceipt,
+    ) -> Result<(), StoreError> {
+        match (authority, causal) {
+            (None, None) => Ok(()),
+            (Some(authority), Some(causal)) => {
+                receipt
+                    .validate()
+                    .map_err(|_| StoreError::MissingReceiptEnvelope)?;
+                let envelope = receipt
+                    .envelope
+                    .as_ref()
+                    .ok_or(StoreError::MissingReceiptEnvelope)?;
+                if envelope.core.authority != *authority || envelope.core.causal != *causal {
+                    return Err(StoreError::MissingReceiptEnvelope);
+                }
+                Ok(())
+            }
+            _ => Err(StoreError::MissingReceiptEnvelope),
+        }
+    }
+
+    /// Checks that a normal write receipt is the exact recorded operation and
+    /// preserves its original authority/causal pair. Since this runs after the
+    /// send, any mismatch means unknown outcome and requires exact recovery.
+    pub(crate) fn validate_prepared_write_receipt(
+        identity: &OperationIdentity,
+        transition_class: eliot_store_api::TransitionClass,
+        state_fence: &StateFence,
+        authority: &Option<AuthorityBinding>,
+        causal: &Option<CausalBinding>,
+        receipt: &WriteReceipt,
+    ) -> Result<(), StoreError> {
+        receipt
+            .validate()
+            .map_err(|_| StoreError::MissingReceiptEnvelope)?;
+        if receipt.operation_id != identity.operation_id
+            || receipt.idempotency_key != identity.idempotency_key
+            || receipt.canonical_request_hash != identity.canonical_request_hash
+            || receipt.transition_class != transition_class
+            || receipt.state_fence != *state_fence
+        {
+            return Err(StoreError::MissingReceiptEnvelope);
+        }
+        Self::validate_preserved_receipt_bindings(authority, causal, receipt)
+            .map_err(|_| StoreError::MissingReceiptEnvelope)
+    }
+
+    async fn reconcile_prepared_write_receipt(
+        &self,
+        identity: &OperationIdentity,
+        transition_class: eliot_store_api::TransitionClass,
+        state_fence: &StateFence,
+        authority: &Option<AuthorityBinding>,
+        causal: &Option<CausalBinding>,
+    ) -> Result<WriteReceipt, StoreError> {
+        let receipt = self
+            .receipt_exact(
+                identity.operation_id.clone(),
+                identity.canonical_request_hash.as_str(),
+            )
+            .await
+            .map_err(|_| StoreError::MissingReceiptEnvelope)?;
+        Self::validate_prepared_write_receipt(
+            identity,
+            transition_class,
+            state_fence,
+            authority,
+            causal,
+            &receipt,
+        )?;
+        Ok(receipt)
     }
 
     async fn reconcile_genesis(
@@ -668,8 +754,11 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
             return Err(StoreError::MissingReceiptEnvelope);
         }
         let operation_id = transition.identity.operation_id.clone();
-        let idempotency_key = transition.identity.idempotency_key.clone();
-        let canonical_request_hash = transition.identity.canonical_request_hash.clone();
+        let expected_identity = transition.identity.clone();
+        let expected_class = transition.transition_class;
+        let expected_fence = transition.state_fence.clone();
+        let expected_authority = transition.security.authority_binding.clone();
+        let expected_causal = transition.security.causal_binding.clone();
         let result = self
             .execute_raw(
                 StoreRequest::Apply {
@@ -679,7 +768,7 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
                     expected_ordering_heads,
                 },
                 Some(ctx),
-                &idempotency_key,
+                &expected_identity.idempotency_key,
             )
             .await;
         match result {
@@ -692,15 +781,40 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
                 if fault == StoreClientFault::PostCommitResponseLoss {
                     return Err(StoreError::MissingReceiptEnvelope);
                 }
-                Ok(receipt)
+                match Self::validate_prepared_write_receipt(
+                    &expected_identity,
+                    expected_class,
+                    &expected_fence,
+                    &expected_authority,
+                    &expected_causal,
+                    &receipt,
+                ) {
+                    Ok(()) => Ok(receipt),
+                    Err(_) => {
+                        self.reconcile_prepared_write_receipt(
+                            &expected_identity,
+                            expected_class,
+                            &expected_fence,
+                            &expected_authority,
+                            &expected_causal,
+                        )
+                        .await
+                    }
+                }
             }
             // Once Apply has crossed the transport boundary, a valid response
             // with the wrong operation identity or response kind is itself an
             // uncertain observation. Reconcile only the operation that this
             // Kernel call admitted; never adopt an identity from the peer.
             Ok(_) => {
-                self.receipt_exact(operation_id, &canonical_request_hash)
-                    .await
+                self.reconcile_prepared_write_receipt(
+                    &expected_identity,
+                    expected_class,
+                    &expected_fence,
+                    &expected_authority,
+                    &expected_causal,
+                )
+                .await
             }
             Err(RequestFailure::Unknown {
                 operation_id: observed,
@@ -709,14 +823,26 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
                 // The peer's identity is evidence of a mismatch only; the
                 // receipt lookup remains bound to our admitted operation.
                 let _ = observed;
-                self.receipt_exact(operation_id, &canonical_request_hash)
-                    .await
+                self.reconcile_prepared_write_receipt(
+                    &expected_identity,
+                    expected_class,
+                    &expected_fence,
+                    &expected_authority,
+                    &expected_causal,
+                )
+                .await
             }
             // A typed unknown-outcome failure was already bound to the
             // admitted operation in `execute_raw`; reconcile exactly it.
             Err(error) if error.is_unknown_outcome_failure() => {
-                self.receipt_exact(operation_id, &canonical_request_hash)
-                    .await
+                self.reconcile_prepared_write_receipt(
+                    &expected_identity,
+                    expected_class,
+                    &expected_fence,
+                    &expected_authority,
+                    &expected_causal,
+                )
+                .await
             }
             Err(error) => Err(error.into_store_error()),
         }
@@ -735,11 +861,10 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
     /// request. Committed, deterministic not-applied/conflict, unsupported,
     /// and possible-commit/reconciliation outcomes are preserved with no
     /// catch-all success, no automatic retry, no second ledger, and no
-    /// fallback to ordinary `Apply`. A misbound or malformed receipt observed
-    /// after the single send returns its typed receipt-validation error, a
-    /// wrong-kind response returns the typed contract error, and an unknown
-    /// outcome returns the typed unknown-outcome error — never success and
-    /// never a second wire operation after `execute_raw`.
+    /// fallback to ordinary `Apply`. A misbound, malformed, or wrong-kind
+    /// response after the single send returns `MissingReceiptEnvelope`, which
+    /// keeps the outcome unknown for exact reconciliation instead of releasing
+    /// the staged original plan as if no effect occurred.
     async fn apply_reserved_write(
         &self,
         request: ReservedWriteRequest,
@@ -785,15 +910,14 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
                 // send is a typed receipt-validation failure for the caller
                 // to reconcile — never success, never an adopted peer
                 // identity, and never a second wire operation.
-                self.validate_reserved_write_receipt(&request, &receipt)?;
+                self.validate_reserved_write_receipt(&request, &receipt)
+                    .map_err(|_| StoreError::MissingReceiptEnvelope)?;
                 Ok(receipt)
             }
             // Once the reserved write has crossed the transport boundary, a
-            // valid response of the wrong kind is itself a typed contract
-            // defect. It is preserved as an error with no second send, no
-            // retry under a new identity, and no fallback to ordinary
-            // `Apply`.
-            Ok(_) => Err(StoreError::InvalidReceipt),
+            // wrong response kind cannot prove that the effect did not happen.
+            // Preserve the exact staged identity as unknown for reconciliation.
+            Ok(_) => Err(StoreError::MissingReceiptEnvelope),
             // Unknown outcomes (transport loss, a peer `Unknown`, or a typed
             // unknown-outcome failure already bound to the admitted operation
             // by the `ReservedWrite` exchange arm) project to the typed
