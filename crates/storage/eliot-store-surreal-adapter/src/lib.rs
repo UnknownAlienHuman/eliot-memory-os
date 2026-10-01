@@ -165,6 +165,36 @@ impl SurrealStoreAdapter {
         config: SurrealAdapterConfig,
         provider_process_lease: RetainedProcessPathLease,
     ) -> Result<Self, AdapterError> {
+        Self::new_with_limits(
+            config,
+            provider_process_lease,
+            ClientSetLimits::compatibility(),
+        )
+    }
+
+    /// Builds the canonical adapter with the exact bounded RPC session profile
+    /// its composition owner already resolved for this bridge.
+    ///
+    /// [`Self::new`] keeps the compatibility profile, so every existing
+    /// caller and struct literal is unchanged. A composition that already owns
+    /// one bounded read/write/health session profile (I5.7, issue #1933) binds
+    /// that same profile here, so the adapter's provider session pool and the
+    /// bridge's connection-manager bounds describe one capacity instead of two
+    /// unrelated ones. That shared bound is what
+    /// [`Self::install_concurrent_execution`] validates the execution lanes
+    /// against, so an adapter left on the compatibility profile can never
+    /// admit a generation wider than its single write session no matter what
+    /// the composition configured.
+    ///
+    /// The bound is never widened here: the supplied profile is the validated
+    /// per-role capacity itself, so an execution generation installed later is
+    /// checked against exactly the sessions this pool can actually open rather
+    /// than against an unrelated constant.
+    pub fn new_with_limits(
+        config: SurrealAdapterConfig,
+        provider_process_lease: RetainedProcessPathLease,
+        client_limits: ClientSetLimits,
+    ) -> Result<Self, AdapterError> {
         config
             .validate()
             .map_err(|error| AdapterError::Config(error.to_string()))?;
@@ -194,7 +224,7 @@ impl SurrealStoreAdapter {
             tx_rendezvous: std::sync::Mutex::new(None),
             execution: std::sync::Mutex::new(None),
             operation_manifest,
-            client_limits: ClientSetLimits::compatibility(),
+            client_limits,
         })
     }
 
