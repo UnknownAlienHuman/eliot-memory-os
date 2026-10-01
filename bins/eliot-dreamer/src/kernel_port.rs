@@ -182,6 +182,11 @@ pub(crate) struct DreamerDispatchedEnvelope {
     /// `UserAutomation` content as a Dreamer orientation payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) semantic_input_bytes: Option<Vec<u8>>,
+    /// Opaque, content-addressed owner record the Kernel published for this
+    /// job. The child records its presence, the owner's recorded digest and
+    /// the owner's recorded byte length, and never interprets its content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) owner_record: Option<OpaqueContentRef>,
     /// Scope the ledger bound to this job (never caller bytes).
     pub(crate) scope_id: String,
     /// Fence the ledger bound to this job (never caller bytes).
@@ -213,6 +218,8 @@ pub(crate) struct ValidatedDreamerMaterial {
     pub(crate) semantic_input: Option<OpaqueContentRef>,
     /// Exact original inline bytes, when supplied by the Store owner.
     pub(crate) semantic_input_bytes: Option<Vec<u8>>,
+    /// Opaque, content-addressed owner record the Kernel published.
+    pub(crate) owner_record: Option<OpaqueContentRef>,
     /// Scope the ledger bound to this job.
     pub(crate) scope_id: String,
     /// Fence the ledger bound to this job.
@@ -285,6 +292,12 @@ pub(crate) enum KernelPortError {
     /// its exact inline bytes.
     #[error("dreamer Kernel reply semantic input reference or bytes are stale: {0}")]
     SemanticInputStale(String),
+    /// A Kernel reply carries an owner record whose recorded digest, byte
+    /// length or artifact handle does not hold. The record is opaque, so this
+    /// proves only that the owner's ORIGINAL recorded value is what travels —
+    /// it never interprets the record and never recomputes its digest here.
+    #[error("dreamer Kernel reply owner record is not the owner's recorded value: {0}")]
+    OwnerRecordStale(String),
     /// A claim/status reply changed the claimed job identity or fence.
     #[error("dreamer Kernel reply job, attempt, scope, or fence changed")]
     StaleClaimBinding,
@@ -453,6 +466,14 @@ fn validate_envelope(
             .validate_semantic_input_bytes(bytes)
             .map_err(|error| KernelPortError::SemanticInputStale(error.to_string()))?;
     }
+    // The owner record is opaque: the child re-proves the owner's ORIGINAL
+    // recorded digest, byte length and artifact handle through the existing
+    // `validate`, and never recomputes the digest or interprets the content.
+    if let Some(owner_record) = &envelope.owner_record {
+        owner_record
+            .validate("owner_record.sha256")
+            .map_err(|error| KernelPortError::OwnerRecordStale(error.to_string()))?;
+    }
     envelope
         .fence
         .validate()
@@ -482,6 +503,7 @@ fn validate_envelope(
         revision: envelope.revision,
         semantic_input: envelope.semantic_input.clone(),
         semantic_input_bytes: envelope.semantic_input_bytes.clone(),
+        owner_record: envelope.owner_record.clone(),
         scope_id: envelope.scope_id.clone(),
         fence: envelope.fence.clone(),
         epoch: envelope.epoch.clone(),
@@ -1263,6 +1285,15 @@ fn checked_response(
 /// semantic input and the exact claimed job/attempt/scope/fence. Lifecycle
 /// revisions may advance after `Start`, so operation-specific revision
 /// binding remains the responsibility of `validate_for` above.
+///
+/// The opaque owner record is bound here against the ORIGINAL value staged for
+/// this job: the Kernel reply must carry exactly the reference the dispatch
+/// material carries, and both sides' digest, byte length and artifact handle are
+/// re-proved through the existing `OpaqueContentRef::validate` rather than
+/// recomputed on this side. A record absent on both sides stays the typed
+/// absence `None`; a record present on one side only is a stale owner record,
+/// not an empty one. Nothing here decodes the record, so it can never stand in
+/// for a typed `OrientationSupply` member.
 fn validate_owner_response_binding(
     material: &ValidatedDreamerMaterial,
     response: &DurableJobResponse,
@@ -1286,6 +1317,33 @@ fn validate_owner_response_binding(
     if response.semantic_input_bytes != material.semantic_input_bytes {
         return Err(KernelPortError::SemanticInputStale(
             "Kernel owner reply changed the original semantic input bytes".to_owned(),
+        ));
+    }
+    // The owner record is opaque. What is bound here is its presence, the
+    // owner's recorded digest and the owner's recorded byte length against the
+    // ORIGINAL value staged for this job — re-proved through the existing
+    // `validate` on both sides, never recomputed here, and never decoded. An
+    // absent record stays absent on both sides: a Kernel that published one and
+    // a staged material that carries one must agree exactly.
+    if let Some(owner_record) = &response.owner_record {
+        owner_record
+            .validate("owner_record.sha256")
+            .map_err(|error| KernelPortError::OwnerRecordStale(error.to_string()))?;
+        let staged = material
+            .owner_record
+            .as_ref()
+            .ok_or(KernelPortError::OwnerRecordStale(
+                "Kernel owner reply carries an owner record this claim was not staged with"
+                    .to_owned(),
+            ))?;
+        if owner_record != staged {
+            return Err(KernelPortError::OwnerRecordStale(
+                "Kernel owner reply changed the original owner record".to_owned(),
+            ));
+        }
+    } else if material.owner_record.is_some() {
+        return Err(KernelPortError::OwnerRecordStale(
+            "Kernel owner reply dropped the staged owner record".to_owned(),
         ));
     }
     if response.job_id.as_str() != material.job_id

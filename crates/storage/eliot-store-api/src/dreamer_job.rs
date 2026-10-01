@@ -41,8 +41,9 @@ pub const MAX_DREAMER_JOB_TEXT_BYTES: usize = 16 * 1024;
 /// Deterministically maps a K0 validation failure to the store boundary.
 ///
 /// The mapping preserves typed identity, CAS, lease, checkpoint, receipt,
-/// coverage, cancellation, unknown-commit, semantic-input availability, and
-/// internal error classes without echoing supplied payloads.
+/// coverage, cancellation, unknown-commit, semantic-input availability,
+/// owner-record identity, and internal error classes without echoing supplied
+/// payloads.
 #[must_use]
 pub fn map_durable_error(error: DurableJobError) -> StoreError {
     match error {
@@ -54,9 +55,24 @@ pub fn map_durable_error(error: DurableJobError) -> StoreError {
         DurableJobError::LimitExceeded(_) => StoreError::PayloadTooLarge,
         DurableJobError::Serialization(reason) => StoreError::Serialization(reason),
         DurableJobError::FenceMismatch => StoreError::FenceMismatch,
-        DurableJobError::OperationMismatch | DurableJobError::SemanticInputMismatch => {
-            StoreError::IdentityConflict
-        }
+        // `SemanticInputMismatch` and `OwnerRecordMismatch` are the same class
+        // of bind, raised from the same arm of `DurableJobResponse::validate_for`:
+        // the store's answer echoes an owner-issued reference that is not the one
+        // the request carried. Both therefore take the identical disposition —
+        // `IdentityConflict`, which `store_failure` renders as a `Conflict` with
+        // mutation disposition `NotAttempted`, so the refusal is raised BEFORE
+        // any write and the stored owner record is preserved exactly as it was.
+        // The caller sees `IDENTITY_CONFLICT` with retry
+        // `NewIdentityAfterCondition`: the owner must reissue under a new
+        // identity rather than have the store accept, drop, or overwrite the
+        // record that is already there.
+        //
+        // This is deliberately NOT `SemanticInputUnavailable`'s `Empty`: absence
+        // of a reference is a different fact from disagreement about one, and
+        // collapsing them would report a missing owner record as an empty field.
+        DurableJobError::OperationMismatch
+        | DurableJobError::SemanticInputMismatch
+        | DurableJobError::OwnerRecordMismatch => StoreError::IdentityConflict,
         DurableJobError::SemanticInputUnavailable => StoreError::Empty {
             field: "semantic_input",
         },

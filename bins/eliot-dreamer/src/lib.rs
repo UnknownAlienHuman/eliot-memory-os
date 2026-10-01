@@ -26,6 +26,7 @@ mod error;
 mod grounding_stage;
 pub(crate) mod kernel_port;
 mod model_stage;
+mod orientation_supply_source;
 mod production_orientation;
 mod pulse;
 mod result_stage;
@@ -178,13 +179,27 @@ pub trait CurationCarrierSource {
 /// before any `&mut` use of the port holding the source; `submit` complies by
 /// running the admitted pipeline to an owned [`DreamResult`] before observing the
 /// live view.
+///
+/// Resolution distinguishes two conditions the carrier must not collapse.
+/// `Ok(Some(supply))` means the owner published the whole mandatory member set
+/// and the carrier composes from it. `Ok(None)` means the owner published
+/// nothing for this job, which is honest absence rather than a failure: the
+/// carrier then publishes the typed blocked disposition it already carries
+/// (`OrientationDisposition::Blocked`, no packet, `CC004_MISSING`, and
+/// `missing_owners` naming the absent owners) instead of a fabricated member or
+/// a whole-job error. `Err` is reserved for a genuine refusal — a presented
+/// record that is not this claim's, or a channel reached under the wrong class —
+/// so a missing owner never masquerades as a malformed one or the reverse.
 pub trait OrientationSupplySource {
     /// Resolves the owner-supplied record set for one admitted Orientation job.
+    ///
+    /// Returns `Ok(None)` when the owner channel published no record for this
+    /// job, which leaves the mandatory carrier honestly absent.
     fn resolve_supply<'s>(
         &'s self,
         admission: &KernelJobAdmission,
         job: &DreamJobInput,
-    ) -> Result<OrientationSupply<'s>, DreamerError>;
+    ) -> Result<Option<OrientationSupply<'s>>, DreamerError>;
 }
 
 /// Authenticated production adapter over the installation-owned Kernel client.
@@ -212,10 +227,14 @@ pub struct AuthenticatedKernelJobPort<'a> {
     /// refuses at the carrier check); `Some` where the Governor wired one via
     /// [`AuthenticatedKernelJobPort::with_curation_source`].
     curation_source: Option<&'a dyn CurationCarrierSource>,
-    /// Optional Governor-injected Orientation supply source. `None` in
-    /// production when no source is wired, so the production carrier stays
-    /// refused rather than synthesizing canonical state; `Some` where the
-    /// Governor wired one via [`AuthenticatedKernelJobPort::with_orientation_source`].
+    /// Owner channel for the mandatory Orientation carrier. `Some` in
+    /// production: `connect` wires
+    /// [`KernelStagedOwnerRecordSource`](crate::orientation_supply_source::KernelStagedOwnerRecordSource),
+    /// which reads the Kernel-staged owner record and reports the members that
+    /// record does not publish. The carrier stays refused on that measured
+    /// absence rather than synthesizing canonical state; the channel itself is
+    /// replaceable through
+    /// [`AuthenticatedKernelJobPort::with_orientation_source`].
     orientation_source: Option<&'a dyn OrientationSupplySource>,
 }
 
@@ -264,7 +283,15 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
             handshake,
             transport: Box::new(transport),
             curation_source: None,
-            orientation_source: None,
+            // The production owner channel is wired here, at the one place the
+            // service is constructed, so `submit` never runs the Orientation
+            // composition with an unconsulted channel. It reports the owner
+            // record it can actually read; the carrier's mandatory members it
+            // cannot read stay absent and the typed blocked disposition
+            // publishes, which is the same disposition the unwired channel
+            // produced but now reached through a real read rather than through
+            // a hardcoded absence.
+            orientation_source: Some(&orientation_supply_source::KERNEL_STAGED_OWNER_RECORD_SOURCE),
         })
     }
 
@@ -281,13 +308,15 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
         }
     }
 
-    /// Wires a Governor-injected Orientation supply source into the port.
+    /// Replaces the Orientation owner channel with another implementor.
     ///
-    /// The Governor calls this after `connect()`; `submit` resolves the CC-004
+    /// `connect` wires the production channel; this swaps in a different owner of
+    /// the same contract without a second code path. `submit` resolves the CC-004
     /// projection set, the Current Epistemic Position handles, and the
     /// owner record set of every mandatory stage this binary does not produce
     /// itself through this source for admitted Orientation jobs only. Other
-    /// classes never consult it.
+    /// classes never consult it, and a source that measures no published record
+    /// leaves the carrier absent rather than filled.
     #[must_use]
     pub fn with_orientation_source(self, source: &'a dyn OrientationSupplySource) -> Self {
         Self {
@@ -430,13 +459,18 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
         }
     }
 
-    /// Resolves the Governor-supplied Orientation records for one admitted job.
+    /// Resolves the owner-supplied Orientation records for one admitted job.
     ///
-    /// `None` when no source was wired: the production carrier then stays
-    /// refused, because the canonical projection set and the mandatory
-    /// stage-owner records are Governor-published values this binary must not
-    /// synthesize. The caller must consume the supply before any `&mut` use of
-    /// the port, exactly as with the Curation carrier.
+    /// `None` — whether because no source was wired or because the wired source
+    /// measured that the owner published no record for this job — leaves the
+    /// production carrier refused, because the canonical projection set and the
+    /// mandatory stage-owner records are owner-published values this binary must
+    /// not synthesize. The two cases are the same disposition for the carrier
+    /// and are deliberately not distinguished downstream: an absent owner is
+    /// absent, and inventing a second blocked shape to tell "no channel" from
+    /// "no record" would add a disposition the carrier does not own. The caller
+    /// must consume the supply before any `&mut` use of the port, exactly as
+    /// with the Curation carrier.
     fn resolve_orientation_supply(
         &self,
         admission: &KernelJobAdmission,
@@ -445,7 +479,7 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
         let source = self.orientation_source;
         match source {
             None => Ok(None),
-            Some(source) => source.resolve_supply(admission, job).map(Some),
+            Some(source) => source.resolve_supply(admission, job),
         }
     }
 
