@@ -40,6 +40,10 @@
 //!   [`launch_admitted_native_worker_attempt`] reuses the same seam shape
 //!   for `eliot-native-worker`, writing
 //!   `eliot-native-worker.admitted-claim.json` plus the same grant object.
+//!   [`launch_admitted_dreamer_attempt`] reuses it once more for
+//!   `eliot-dreamer`, writing `eliot-dreamer.admitted-job.json` from the
+//!   Kernel-loaded admitted `QUEUED` response plus the composition-pinned
+//!   [`DreamerChildBinding`].
 //! * [`trigger_admitted_doctor_launch`] is the T6-D2 front-door trigger:
 //!   pre-admit through the composed gate, derive the launch material from
 //!   the composed registry (admitted manifest revision plus installed
@@ -51,7 +55,9 @@
 //!   [`reconcile_launched_testd_attempt`] /
 //!   [`reconcile_launched_native_worker_attempt`]: the durable admission
 //!   digest is compared, never recomputed under a new id, and no second
-//!   child is spawned for an outstanding launch.
+//!   child is spawned for an outstanding launch. The Dreamer arm is the same
+//!   shape: [`reconcile_launched_dreamer_attempt`] names the retained job
+//!   identity, and terminality stays with the durable Store Dreamer ledger.
 //!
 //! Delivery contract (I7.5/I15.2): each launched child receives a launch
 //! nonce plus a launch grant delivered over the protected dispatch file
@@ -143,10 +149,19 @@ use serde::{Deserialize, Serialize};
 #[path = "dreamer_dispatch_launch.rs"]
 pub(crate) mod dreamer_dispatch_launch;
 
-use dreamer_dispatch_launch::{
-    DreamerChildBinding, DreamerDispatchedEnvelope, DreamerLaunchKeys, DreamerLaunchPhase,
-    DreamerLaunchRecord, DreamerLeaseExpectation, DreamerMaterialError, DreamerReconcileOutcome,
-    DreamerReserveOutcome,
+use dreamer_dispatch_launch::{DreamerDispatchedEnvelope, DreamerReserveOutcome};
+
+/// Dreamer launch material types republished for the composed front door.
+///
+/// The `lib.rs` `dispatch_launch` re-export is the only place this crate's
+/// contour items become reachable outside the crate, so every type the
+/// `DispatchedWorkerKind::Dreamer` seam names in a public signature has to be
+/// reachable from here as well: the Doctor/testd/native-worker triples carry
+/// their material types the same way. Nothing here is minted or defaulted -
+/// these are the existing launch-lineage types, re-published unchanged.
+pub use dreamer_dispatch_launch::{
+    DreamerChildBinding, DreamerLaunchKeys, DreamerLaunchPhase, DreamerLaunchRecord,
+    DreamerLeaseExpectation, DreamerMaterialError, DreamerReconcileOutcome,
 };
 
 use super::doctor_recovery_ledger::KernelDoctorRecoveryLedger;
@@ -5498,10 +5513,6 @@ pub fn reconcile_launched_native_worker_attempt(
 /// [`DispatchedWorkerKind::material_file_name`]). No executable bytes are
 /// taken from caller input: the child binding (path/digest/workdir) stays
 /// composition-pinned.
-#[allow(
-    dead_code,
-    reason = "reachable only from the dreamer_job_dispatch test module: the lib.rs dispatch_launch re-export carries the Doctor/testd/native-worker triples and no Dreamer item, and no front door is composed for DispatchedWorkerKind::Dreamer"
-)]
 pub struct DreamerLaunchMaterial<'a> {
     /// Job/attempt lookup keys; must be answered by `queued`.
     pub keys: DreamerLaunchKeys<'a>,
@@ -5515,10 +5526,6 @@ pub struct DreamerLaunchMaterial<'a> {
 }
 
 /// Why a prepared Dreamer launch produced no child.
-#[allow(
-    dead_code,
-    reason = "reachable only from the dreamer_job_dispatch test module: the lib.rs dispatch_launch re-export carries the Doctor/testd/native-worker triples and no Dreamer item, and no front door is composed for DispatchedWorkerKind::Dreamer"
-)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DreamerLaunchSkip {
     /// The admitted response is not `QUEUED` (already leased, running, or
@@ -5528,10 +5535,6 @@ pub enum DreamerLaunchSkip {
 
 /// A prepared Dreamer launch: admitted, lineage-bound, and (unless skipped)
 /// written to the protected dispatch file, ready to spawn.
-#[allow(
-    dead_code,
-    reason = "reachable only from the dreamer_job_dispatch test module: the lib.rs dispatch_launch re-export carries the Doctor/testd/native-worker triples and no Dreamer item, and no front door is composed for DispatchedWorkerKind::Dreamer"
-)]
 #[allow(
     clippy::large_enum_variant,
     reason = "Ready carries the full spawn binding like PreparedDoctorLaunch::Ready; boxing it would diverge from the sibling seam shape"
@@ -5560,10 +5563,6 @@ pub enum PreparedDreamerLaunch {
 
 /// A Dreamer launch ready to spawn: every authority check passed and the
 /// dispatch file carries exactly what the child reader validates.
-#[allow(
-    dead_code,
-    reason = "reachable only from the dreamer_job_dispatch test module: the lib.rs dispatch_launch re-export carries the Doctor/testd/native-worker triples and no Dreamer item, and no front door is composed for DispatchedWorkerKind::Dreamer"
-)]
 pub struct ReadyDreamerLaunch {
     /// Exact queued job identity (lineage key for spawn settle).
     pub job_id: String,
@@ -5588,10 +5587,6 @@ pub struct ReadyDreamerLaunch {
 }
 
 /// Outcome of one Dreamer admit-then-launch call.
-#[allow(
-    dead_code,
-    reason = "reachable only from the dreamer_job_dispatch test module: the lib.rs dispatch_launch re-export carries the Doctor/testd/native-worker triples and no Dreamer item, and no front door is composed for DispatchedWorkerKind::Dreamer"
-)]
 pub enum DreamerLaunchOutcome {
     /// The child was spawned through the admitted executor.
     Launched {
@@ -5631,10 +5626,6 @@ pub enum DreamerLaunchOutcome {
 
 /// Maps a contour error into the Dreamer launch error: caller-material
 /// defects stay `InvalidMaterial`, everything else fails closed as `Gate`.
-#[allow(
-    dead_code,
-    reason = "reachable only from the dreamer_job_dispatch test module: the lib.rs dispatch_launch re-export carries the Doctor/testd/native-worker triples and no Dreamer item, and no front door is composed for DispatchedWorkerKind::Dreamer"
-)]
 fn dreamer_launch_error(error: DispatchLaunchError) -> DreamerMaterialError {
     match error {
         DispatchLaunchError::InvalidMaterial(detail) => {
@@ -5659,10 +5650,6 @@ fn dreamer_launch_error(error: DispatchLaunchError) -> DreamerMaterialError {
 /// [`write_material_file`]. Nothing is spawned here:
 /// [`launch_admitted_dreamer_attempt`] spawns the returned
 /// [`ReadyDreamerLaunch`] through the admitted executor.
-#[allow(
-    dead_code,
-    reason = "reachable only from the dreamer_job_dispatch test module: the lib.rs dispatch_launch re-export carries the Doctor/testd/native-worker triples and no Dreamer item, and no front door is composed for DispatchedWorkerKind::Dreamer"
-)]
 #[allow(
     clippy::too_many_lines,
     reason = "admit, reserve, nonce, grant, closed-loop proof, and material-write stay in one ordered authority path so no launch step can run before its gate"
@@ -5860,10 +5847,6 @@ pub fn prepare_dreamer_launch(
 /// process owner. The admitted-job material travels only over the protected
 /// dispatch file the child reads; a spawn failure reaps the file
 /// best-effort so a stale presentation never lingers.
-#[allow(
-    dead_code,
-    reason = "reachable only from the dreamer_job_dispatch test module: the lib.rs dispatch_launch re-export carries the Doctor/testd/native-worker triples and no Dreamer item, and no front door is composed for DispatchedWorkerKind::Dreamer"
-)]
 pub async fn start_ready_dreamer_launch(
     kernel: &KernelComposition,
     ready: &ReadyDreamerLaunch,
@@ -5909,10 +5892,6 @@ pub async fn start_ready_dreamer_launch(
 /// the file and releases the reservation; an unknown spawn outcome retains
 /// the launch as unreconciled for
 /// [`reconcile_launched_dreamer_attempt`].
-#[allow(
-    dead_code,
-    reason = "reachable only from the dreamer_job_dispatch test module: the lib.rs dispatch_launch re-export carries the Doctor/testd/native-worker triples and no Dreamer item, and no front door is composed for DispatchedWorkerKind::Dreamer"
-)]
 pub async fn launch_admitted_dreamer_attempt(
     kernel: &KernelComposition,
     material: &DreamerLaunchMaterial<'_>,
@@ -5981,10 +5960,6 @@ pub async fn launch_admitted_dreamer_attempt(
 /// [`dreamer_dispatch_launch::release_dreamer_launch`] (or a process
 /// restart) is the only slot release besides this reconcile — the same
 /// shape as the testd arm.
-#[allow(
-    dead_code,
-    reason = "reachable only from the dreamer_job_dispatch test module: the lib.rs dispatch_launch re-export carries the Doctor/testd/native-worker triples and no Dreamer item, and no front door is composed for DispatchedWorkerKind::Dreamer"
-)]
 pub fn reconcile_launched_dreamer_attempt(
     kernel: &KernelComposition,
     expected: &DreamerLeaseExpectation,

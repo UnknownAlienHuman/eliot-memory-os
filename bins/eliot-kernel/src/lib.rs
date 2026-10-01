@@ -385,29 +385,43 @@ use std::time::{Duration, Instant};
 ///
 /// The composed dispatch owner plus admit-then-launch through the admitted
 /// process executor, parameterized once for the Doctor, testd, and
-/// native-worker one-shot workers. The front-door dispatch arm admits
-/// through this contour; the production caller composes and launches
-/// through it.
+/// native-worker one-shot workers, plus the Dreamer one-shot job worker
+/// (T12-09) whose arm reuses the same seam shape for an admitted durable
+/// `QUEUED` job. The front-door dispatch arm admits through this contour; the
+/// production caller composes and launches through it.
+///
+/// The Dreamer members are the `DispatchedWorkerKind::Dreamer` triple. They
+/// are the same seam the Doctor/testd/native-worker triples expose, and they
+/// carry the same composition contract: the composition root supplies the
+/// `DreamerChildBinding` (installed `eliot-dreamer` path, its approved image
+/// digest, and the working directory) and the Kernel-loaded admitted `QUEUED`
+/// `DurableJobResponse`, and the seam never mints either one. `lib.rs` is the
+/// only place the contour's items become reachable outside this crate, so the
+/// Dreamer triple is published here exactly as the other three are.
 pub use dispatch_launch::{
     ChildStartOutcome, DispatchGrant, DispatchLaunchError, DispatchedWorkerKind,
     DoctorChildBinding, DoctorLaunchMaterial, DoctorLaunchOutcome, DoctorLaunchSkip,
-    NATIVE_WORKER_DISPATCH_AUTHORITY_PREFIX, NATIVE_WORKER_DISPATCH_DERIVATION_DOMAIN,
-    NATIVE_WORKER_DISPATCH_LAUNCH_GRANT_HEAD, NativeWorkerDispatchDerivation,
-    NativeWorkerLaunchMaterial, NativeWorkerLaunchOutcome, NativeWorkerLaunchSkip,
-    PreparedDoctorLaunch, PreparedNativeWorkerLaunch, PreparedTestdLaunch, ReadyDoctorLaunch,
+    DreamerChildBinding, DreamerLaunchKeys, DreamerLaunchMaterial, DreamerLaunchOutcome,
+    DreamerLaunchPhase, DreamerLaunchRecord, DreamerLaunchSkip, DreamerLeaseExpectation,
+    DreamerMaterialError, DreamerReconcileOutcome, NATIVE_WORKER_DISPATCH_AUTHORITY_PREFIX,
+    NATIVE_WORKER_DISPATCH_DERIVATION_DOMAIN, NATIVE_WORKER_DISPATCH_LAUNCH_GRANT_HEAD,
+    NativeWorkerDispatchDerivation, NativeWorkerLaunchMaterial, NativeWorkerLaunchOutcome,
+    NativeWorkerLaunchSkip, PreparedDoctorLaunch, PreparedDreamerLaunch,
+    PreparedNativeWorkerLaunch, PreparedTestdLaunch, ReadyDoctorLaunch, ReadyDreamerLaunch,
     ReadyNativeWorkerLaunch, ReadyTestdLaunch, ReconcileLaunchedOutcome, SpawnedChild,
     TestdLaunchMaterial, TestdLaunchOutcome, TestdLaunchSkip, UncertainSpawn,
     compose_dispatch_contour, compose_doctor_front_door, compose_production_doctor_front_door,
     compose_production_native_worker_front_door, compose_production_testd_front_door,
     dispatch_contour, doctor_repair_advertised, launch_admitted_doctor_attempt,
-    launch_admitted_native_worker_attempt, launch_admitted_testd_attempt,
-    native_worker_dispatch_derivation, native_worker_dispatch_derivation_from_epoch_json,
-    native_worker_material_bytes, native_worker_production_composed, prepare_doctor_launch,
+    launch_admitted_dreamer_attempt, launch_admitted_native_worker_attempt,
+    launch_admitted_testd_attempt, native_worker_dispatch_derivation,
+    native_worker_dispatch_derivation_from_epoch_json, native_worker_material_bytes,
+    native_worker_production_composed, prepare_doctor_launch, prepare_dreamer_launch,
     prepare_native_worker_launch, prepare_testd_launch, reconcile_launched_doctor_attempt,
-    reconcile_launched_native_worker_attempt, reconcile_launched_testd_attempt,
-    release_launched_attempt, start_ready_doctor_launch, start_ready_native_worker_launch,
-    start_ready_testd_launch, testd_admission_advertised, testd_production_composed,
-    trigger_admitted_doctor_launch,
+    reconcile_launched_dreamer_attempt, reconcile_launched_native_worker_attempt,
+    reconcile_launched_testd_attempt, release_launched_attempt, start_ready_doctor_launch,
+    start_ready_dreamer_launch, start_ready_native_worker_launch, start_ready_testd_launch,
+    testd_admission_advertised, testd_production_composed, trigger_admitted_doctor_launch,
 };
 /// Kernel-owned durable Doctor recovery ledger (DISPATCH-WIRE part D).
 ///
