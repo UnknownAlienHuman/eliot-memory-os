@@ -4782,6 +4782,7 @@ fn derive_closure_fence(
         )?;
     }
     let affected = closure_affected_set(enumeration);
+    let affected_set = affected.iter().map(String::as_str).collect::<BTreeSet<_>>();
     validate_complete_owner_closure(boundary, &request.grant_id, enumeration)?;
     // Preserved-survivor membership (`#2100` C73-F1): every declared
     // survivor must prove covering authority at the current revision and
