@@ -13,9 +13,13 @@
 //!   [`ContextBinding`] — the binding the delivery actually renders under — and
 //!   are compared against the immutable view's own recorded binding;
 //! - the load-bearing Context recipe revision is compared against
-//!   `context_recipe_body_digest`, which the Context owner re-derived from the
-//!   exact recipe body its own publication validator accepted — not against the
-//!   view's own record of itself.
+//!   `context_recipe_record_digest`, the content digest of the Context owner
+//!   row the Context owner re-derived through its own publication from the
+//!   exact recipe body its publication validator accepted. That is the same
+//!   object the view records: an immutable owner-record content digest. The
+//!   bare recipe-body digest is a different object under a different name,
+//!   and comparing the two would make this refusal unsatisfiable rather than
+//!   load-bearing — a compatible attempt could never be compiled.
 //!
 //! A stale, missing, blocked or invalidated view therefore fails here, before a
 //! single atom is rendered.
@@ -59,8 +63,9 @@ use crate::AssemblyError;
 /// - an absent or non-current Context recipe row, or a resolved Context row
 ///   with no reference, is `MissingField("campaign_view.context_recipe")` /
 ///   `MissingField("campaign_view.context_reference")`;
-/// - a Context recipe row whose recorded content digest is not the digest the
-///   Context owner re-derived is
+/// - a Context recipe row whose recorded immutable owner-record content
+///   digest is not the owner-row digest the Context owner re-derived from
+///   the exact recipe body is
 ///   `InvalidDigest("campaign_view.context_recipe")`.
 ///
 /// The `Partial` completeness state is not refused here: the learning-state
@@ -70,7 +75,7 @@ use crate::AssemblyError;
 pub fn check_campaign_view_for_assembly(
     admitted: &AdmittedContextSet,
     view: &CampaignLearningStateView,
-    context_recipe_body_digest: &str,
+    context_recipe_record_digest: &str,
 ) -> Result<(), AssemblyError> {
     let binding = &admitted.binding;
     binding.validate().map_err(AssemblyError::Contract)?;
@@ -125,7 +130,7 @@ pub fn check_campaign_view_for_assembly(
     let context_recipe_digest = context_recipe_digest.ok_or(AssemblyError::Contract(
         ContextError::MissingField("campaign_view.context_recipe"),
     ))?;
-    if context_recipe_digest != context_recipe_body_digest {
+    if context_recipe_digest != context_recipe_record_digest {
         return Err(AssemblyError::Contract(ContextError::InvalidDigest(
             "campaign_view.context_recipe",
         )));
