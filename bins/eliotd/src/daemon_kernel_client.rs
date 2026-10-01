@@ -561,18 +561,17 @@ pub fn parse_task_controller_claimed_pair(
         .map(str::to_owned)
         .ok_or_else(|| "Kernel Task Controller claim has no authenticated principal".to_owned())?;
     let tool = decode("tool")?;
-    let request_identity: Option<RequestIdentity> = if invocation.action
-        == eliot_protocol::TaskControllerAction::BindScope
-    {
-        None
-    } else {
-        Some(match pair.get("identity") {
-            Some(value) => serde_json::from_value(value.clone()).map_err(|error| {
-                format!("Kernel Task Controller identity does not decode: {error}")
-            })?,
-            None => derive_task_controller_request_identity(&invocation, &envelope)?,
-        })
-    };
+    let request_identity: Option<RequestIdentity> =
+        if invocation.action == eliot_protocol::TaskControllerAction::BindScope {
+            None
+        } else {
+            Some(match pair.get("identity") {
+                Some(value) => serde_json::from_value(value.clone()).map_err(|error| {
+                    format!("Kernel Task Controller identity does not decode: {error}")
+                })?,
+                None => derive_task_controller_request_identity(&invocation, &envelope)?,
+            })
+        };
     if let Some(identity) = request_identity.as_ref() {
         identity
             .validate()

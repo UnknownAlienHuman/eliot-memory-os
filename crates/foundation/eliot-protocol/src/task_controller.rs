@@ -183,7 +183,8 @@ impl TaskControllerInvocation {
                 self.wire_version == TASK_CONTROLLER_INVOCATION_WIRE_VERSION
             }
             TaskControllerAction::Propose | TaskControllerAction::Apply => {
-                self.wire_version == 2 || self.wire_version == TASK_CONTROLLER_INVOCATION_WIRE_VERSION
+                self.wire_version == 2
+                    || self.wire_version == TASK_CONTROLLER_INVOCATION_WIRE_VERSION
             }
         };
         if self.wire_id != TASK_CONTROLLER_INVOCATION_WIRE_ID || !supported_version {
