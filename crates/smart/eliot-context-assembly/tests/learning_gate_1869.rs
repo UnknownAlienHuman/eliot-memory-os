@@ -23,8 +23,8 @@ use eliot_context_assembly::{
 };
 use eliot_context_contracts::*;
 use eliot_contracts::{
-    ArtifactId, DecisionId, EpochId, EpochLineageId, ResourceGeneration, StateFence, TaskId,
-    TaskRevision, sha256_hex,
+    ArtifactId, ContractVersion, DecisionId, EpochId, EpochLineageId, PolicyRevision,
+    ResourceGeneration, StateFence, TaskId, TaskRevision, sha256_hex,
 };
 use eliot_evidence::{Assertability, EpistemicStatus};
 use eliot_governor::{
@@ -33,7 +33,7 @@ use eliot_governor::{
 };
 use eliot_improvement::candidate_bounds::{BoundedBacklog, GovernedOverlay, OverlayState};
 use eliot_improvement::{PresentedLearning, datetime_from_unix};
-use eliot_receipts::{ProofCeiling, WorkScopeId};
+use eliot_receipts::{ProofCeiling, ProtectedReserves, WorkScopeId};
 
 const LINEAGE_1869: &str = "550e8400-e29b-41d4-a716-446655440000";
 const CAMPAIGN_1869: &str = "campaign-1869-a";
@@ -372,7 +372,7 @@ fn recipe(context: &ContextBinding) -> ContextRecipe {
         decision: DecisionRevision {
             decision_id: context.decision_id.clone(),
             recipe_revision: TaskRevision::new(1).expect("recipe revision"),
-            policy_sha256: digest(),
+            policy_sha256: approved_policy_sha256(),
         },
         recipe_sha256: digest(),
         denominator: ProviderRoleDenominator {
@@ -475,11 +475,144 @@ fn assemble_marked(
     assemble_active_view_with_learning(
         value,
         &recipe(&context),
+        &approved(),
         quality(&context),
         &policy_for(&context, 100_000),
         |bytes| Ok(measurement(&context, bytes)),
         presented_1869(governor, verified, overlay, backlog, now),
     )
+}
+
+/// The approved revision this fixture's compilation is pinned to (#1724 W4).
+///
+/// `assemble_active_view` reads the executed layout order from the APPROVED
+/// revision, so the fixture has to carry one. Nothing here is invented content:
+/// every figure is the one this execution path actually applies, and both
+/// digests are derived by the owners' own `canonical_*_digest` functions rather
+/// than written as a placeholder.
+///
+/// The declared positions are `Goal` at 0 and `Source` at 1, which is the order
+/// the `SemanticRole` ordinal already gives these two roles, so the rendered
+/// payload is byte-identical to the projection these fixtures already assert.
+/// `section_budgets` carries only `Goal`, whose omission policy is the
+/// `NonDroppable` loss rule the fixture's own `recipe` already declares for it.
+fn approved_policy() -> ContextRecipePolicy {
+    let mut policy = ContextRecipePolicy {
+        policy_schema_version: CONTEXT_RECIPE_POLICY_SCHEMA_VERSION,
+        policy_id: id("fixture-policy"),
+        policy_revision: PolicyRevision::new(1).expect("fixture policy revision"),
+        policy_sha256: digest(),
+        applicability: RecipeApplicability {
+            task_profiles: vec!["fixture-task".to_owned()],
+            route_profiles: vec!["fixture-route".to_owned()],
+            impact_profiles: vec!["fixture-impact".to_owned()],
+            governance_profiles: vec!["fixture-governance".to_owned()],
+        },
+        stages: vec![RecipeStage {
+            stage_id: id(EXECUTED_CONTEXT_STAGE),
+            semantic_role: SemanticRole::Goal,
+            predecessors: Vec::new(),
+        }],
+        candidate_features: vec![SemanticRole::Goal, SemanticRole::Source],
+        admission: RecipeAdmissionPolicy {
+            admission_rule: id("fixture-admission-rule"),
+            safety_floor: id("fixture-safety-floor"),
+            suppressible_roles: Vec::new(),
+        },
+        section_budgets: vec![ContextSectionBudget {
+            semantic_role: SemanticRole::Goal,
+            unit_boundary_kind: BoundaryUnitKind::Unit,
+            minimum_required_whole_units: 1,
+            protected_floor_refs: vec![id("fixture-protected-floor")],
+            planning_maximum_whole_units: 1,
+            omission_or_handle_policy: LossPolicy::NonDroppable,
+            degradation_behavior: EXECUTED_SECTION_DEGRADATION,
+            disable_feature_when_floor_cannot_be_preserved: false,
+        }],
+        protected_reserve: ProtectedReservePolicy {
+            reserves: ProtectedReserves {
+                reasoning_reserve: 2,
+                review_reserve: 4,
+                evidence_reserve: 2,
+                owner_ref: "fixture-reserve-owner".to_owned(),
+            },
+            margin_reserve: 1,
+        },
+        layout: RecipeLayoutPolicy {
+            role_positions: vec![
+                RecipeRolePosition {
+                    semantic_role: SemanticRole::Goal,
+                    position: 0,
+                },
+                RecipeRolePosition {
+                    semantic_role: SemanticRole::Source,
+                    position: 1,
+                },
+            ],
+            repetition: EXECUTED_REPETITION_POLICY,
+        },
+        omission: RecipeOmissionPolicy {
+            permitted_reasons: vec![OmissionReason::Capacity],
+            non_recoverable_reasons: Vec::new(),
+        },
+        blocking_dimensions: vec![QUALITY_DIMENSIONS[0]],
+        execution: RecipeExecutionContour {
+            contour: id("fixture-contour"),
+            generation: 1,
+            transform: BoundaryTransformerRevision {
+                transformer_id: "fixture-transformer".to_owned(),
+                revision: ContractVersion::new(1, 0, 0),
+                configuration_sha256: digest(),
+            },
+        },
+        qualification: RecipeQualification {
+            qualification: id("fixture-qualification"),
+            state: RecipeQualificationState::Unqualified,
+            counter_metrics: Vec::new(),
+        },
+        supersession: RecipeSupersession {
+            activation: id("fixture-activation"),
+        },
+    };
+    policy.policy_sha256 = policy
+        .canonical_policy_digest()
+        .expect("fixture approved policy digest");
+    policy
+}
+
+/// The owner-resolved pin for one approved policy revision.
+///
+/// The approval identity is the policy's own `supersession.activation` and the
+/// execution contour is the policy's own, so `ResolvedContextRecipe::validate`
+/// re-derives every recorded member instead of being handed a spare value.
+fn approved() -> ResolvedContextRecipe {
+    let policy = approved_policy();
+    let mut resolution = ResolvedContextRecipe {
+        identity: RecipePolicyIdentity {
+            policy_id: policy.policy_id.clone(),
+            policy_revision: policy.policy_revision,
+            policy_sha256: policy.policy_sha256.clone(),
+        },
+        approval: policy.supersession.activation.clone(),
+        applicability: policy.applicability.clone(),
+        execution: policy.execution.clone(),
+        policy,
+        resolution_sha256: digest(),
+    };
+    resolution.resolution_sha256 = resolution
+        .canonical_resolution_digest()
+        .expect("fixture approved resolution digest");
+    resolution
+}
+
+/// The digest the compilation-bound instance records as the revision it was
+/// issued under.
+///
+/// `binds_recipe` compares this against the approved revision's own
+/// `policy_sha256`, so the fixture derives it from the same policy it passes to
+/// the assembly rather than asserting a placeholder that could not bind.
+fn approved_policy_sha256() -> String {
+    approved_policy().policy_sha256
 }
 
 #[test]
@@ -516,6 +649,7 @@ fn drifted_fence_refuses_before_render() {
     let result = assemble_active_view_with_learning(
         &value,
         &recipe(&context),
+        &approved(),
         quality(&context),
         &policy_for(&context, 100_000),
         |bytes| {
@@ -582,6 +716,7 @@ fn expired_mark_refuses_delivery_and_plain_projection_survives() {
     let result = assemble_active_view_with_learning(
         &value,
         &recipe(&context),
+        &approved(),
         quality(&context),
         &policy_for(&context, 100_000),
         |bytes| Ok(measurement(&context, bytes)),
@@ -613,6 +748,7 @@ fn expired_mark_refuses_delivery_and_plain_projection_survives() {
     let view = assemble_active_view(
         &plain,
         &recipe(&context),
+        &approved(),
         quality(&context),
         &policy_for(&context, 100_000),
         |bytes| Ok(measurement(&context, bytes)),
