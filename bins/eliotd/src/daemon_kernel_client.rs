@@ -472,6 +472,7 @@ pub struct SelectedSourceCaptureActivation {
 fn parse_selected_source_capture_activation(
     value: &serde_json::Value,
     staged: &SelectedSourceCaptureStagedAdmission,
+    causal_receipt: &eliot_store_api::CausalWriteReceipt,
 ) -> Result<SelectedSourceCaptureActivation, String> {
     let string = |field: &str| -> Result<String, String> {
         value
@@ -505,6 +506,39 @@ fn parse_selected_source_capture_activation(
             format!("canonical admission receipt is not the original typed reference: {error}")
         })?,
     };
+    let original_receipt = &causal_receipt.receipt;
+    let original_commit_id = original_receipt
+        .commit_id
+        .as_ref()
+        .map(|commit_id| commit_id.as_str())
+        .ok_or_else(|| "original canonical receipt omits its commit id".to_owned())?;
+    let original_admission_receipt = original_receipt
+        .require_reconciliation_envelope()
+        .map_err(|error| format!("original canonical receipt has no reconciliation envelope: {error}"))?
+        .identity
+        .clone();
+    if original_receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+        || original_receipt.operation_id.as_str()
+            != staged.staged_record.stage_operation_id.as_str()
+        || original_receipt.state_fence != staged.record.state_fence
+        || result.commit_id != original_commit_id
+        || result.canonical_admission_receipt != original_admission_receipt
+        || !original_receipt
+            .outbox_refs
+            .iter()
+            .any(|outbox| outbox.as_str() == result.launch_outbox_id)
+    {
+        return Err(
+            "admission_reservation.admit readback differs from the original canonical receipt, commit, or launch outbox"
+                .to_owned(),
+        );
+    }
+    eliot_ors::AdmissionReservationActivationEvidence {
+        canonical_admission_receipt: result.canonical_admission_receipt.clone(),
+        activation_receipt: result.activation_receipt.clone(),
+    }
+    .validate()
+    .map_err(|error| format!("admission_reservation.admit returned invalid typed activation evidence: {error}"))?;
     if result.reservation_id != staged.record.reservation_id
         || result.canonical_operation_id != staged.staged_record.stage_operation_id.as_str()
         || value.get("disposition").and_then(serde_json::Value::as_str) != Some("ACTIVATED")
@@ -3148,6 +3182,7 @@ impl DaemonKernelClient {
         &self,
         identity: &RequestIdentity,
         staged: &SelectedSourceCaptureStagedAdmission,
+        causal_receipt: &eliot_store_api::CausalWriteReceipt,
     ) -> Result<SelectedSourceCaptureActivation, super::DaemonError> {
         let canonical_operation_id = staged.staged_record.stage_operation_id.as_str();
         if canonical_operation_id != staged.record.reservation_stage_receipt_id
@@ -3172,7 +3207,7 @@ impl DaemonKernelClient {
             )
             .await
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-        parse_selected_source_capture_activation(&value, staged)
+        parse_selected_source_capture_activation(&value, staged, causal_receipt)
             .map_err(super::DaemonError::Kernel)
     }
 
