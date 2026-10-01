@@ -121,12 +121,13 @@ use eliot_process::{OperationId, ProcessRequest};
 use eliot_protocol::dreamer_job::{DurableJobResponse, JobState};
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use eliot_testd_core::{
-    BUILD_ROOT_DIRECTORY, BuildClass, BuildFingerprint, BuildMode, GovernedWorkEnvelope, JobClass,
+    BUILD_ROOT_DIRECTORY, BuildClass, BuildFingerprint, BuildMode, GovernedWorkEnvelope,
+    InstrumentStageRequest, JobClass,
     JobState as TestdJobState, JobSubmissionMetadata, KernelProcessAdmissionEvidence,
     KernelProcessAdmissionProvider, KernelProcessAdmissionRequest, LaneIdentity, ProcessAdmission,
     ResourceWeight, RetryPolicy, TARGET_LAYOUT_REVISION, TESTD_OWNER_SUBMIT_OPERATION,
     TESTD_OWNER_SUBMIT_WIRE_VERSION, TESTD_PRODUCTIVE_PROFILE, TargetLayoutBinding, TargetRoots,
-    TestResourceProfile, TestdOwnerSubmitDirective, TestdOwnerSubmitRequest,
+    StageExecutionKind, TestResourceProfile, TestdOwnerSubmitDirective, TestdOwnerSubmitRequest,
     TestdOwnerSubmitResponse, TestdStore, TestdVerifierDispatchBinding, TestdVerifierJobSubmission,
     issue_process_admission, testd_profile_binding, verification_receipt_sha256,
     verify_envelope_layout_binding,
@@ -386,8 +387,9 @@ impl DispatchGrant {
 ///
 /// Inputs are all Kernel-side live authority plus the durable admission
 /// identity: `identity_digest` is the admission-bound digest
-/// (`attempt_digest` for Doctor, `request_digest` for testd,
-/// `binding_digest` for native — all lowercase SHA-256 by contract),
+/// (`attempt_digest` for Doctor, the stage-bearing TestD admission digest
+/// for TestD, and `binding_digest` for native — all lowercase SHA-256 by
+/// contract),
 /// `authority_epoch`/`generation` are the live values bound at admission,
 /// and `admitted_at_unix_nanos` is the durable admission time (for native,
 /// `admitted_at_unix_ms * 1_000_000`). Derivations are replay-stable, so an
@@ -754,6 +756,9 @@ struct TestdLaunchOwnerBinding {
     process: ProcessAdmission,
     invocation_sha256: String,
     verifier_dispatch: Option<TestdVerifierDispatchBinding>,
+    /// Exact stage identity retained in the durable owner row and copied to
+    /// the protected dispatch material.
+    stage_request: Option<InstrumentStageRequest>,
 }
 
 /// Retained launch records. The durable attempt/effect ledger stays the
@@ -1320,6 +1325,22 @@ pub(crate) async fn submit_testd_owner_job(
             "TestD owner submission does not match the authenticated request identity".to_owned(),
         ));
     }
+    let stage_request = request.submission.stage_request.as_ref().ok_or_else(|| {
+        DispatchLaunchError::Gate(
+            "productive TestD owner submission requires the runner-admitted stage identity"
+                .to_owned(),
+        )
+    })?;
+    if stage_request.invocation != request.submission.invocation
+        || stage_request.execution != StageExecutionKind::Process
+        || stage_request.kind != request.submission.invocation.kind
+        || stage_request.adapter != "eliot.instrument.nextest"
+    {
+        return Err(DispatchLaunchError::Gate(
+            "productive TestD owner currently admits only the selected Nextest process stage"
+                .to_owned(),
+        ));
+    }
     let task_id_present = identity.request.metadata.task_id.is_some();
     let task_revision = identity.request.state_fence.task_revision.as_ref();
     if task_id_present != task_revision.is_some()
@@ -1668,6 +1689,7 @@ pub(crate) async fn submit_testd_owner_job(
         job_id,
         project_id: request.submission.project_id.clone(),
         invocation: request.submission.invocation.clone(),
+        stage_request: Some(stage_request.clone()),
         target_roots,
         target_layout: Some(target_layout),
         // Issue #1897 (AUD1): the lane is now allocated from the admitted
@@ -1941,7 +1963,24 @@ fn capture_testd_launch_owner_binding(
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let invocation_sha256 = sha256_hex(&invocation_bytes);
     let verifier_dispatch = job.verifier_dispatch.clone();
+    let stage_request = job.stage_request.clone();
     if admission.profile == TESTD_PRODUCTIVE_PROFILE {
+        let stage = stage_request.as_ref().ok_or_else(|| {
+            DispatchLaunchError::Gate(
+                "productive TestD owner row is missing its admitted stage identity".to_owned(),
+            )
+        })?;
+        if stage.invocation != job.invocation
+            || stage.invocation.request.request_id.as_str() != admission.operation_id
+            || stage.execution != StageExecutionKind::Process
+            || stage.kind != job.invocation.kind
+            || stage.adapter != "eliot.instrument.nextest"
+        {
+            return Err(DispatchLaunchError::Gate(
+                "durable TestD stage identity does not bind the admitted process invocation"
+                    .to_owned(),
+            ));
+        }
         let binding = verifier_dispatch.as_ref().ok_or_else(|| {
             DispatchLaunchError::Gate(
                 "productive TestD launch has no persisted verifier-plan binding".to_owned(),
@@ -1950,9 +1989,10 @@ fn capture_testd_launch_owner_binding(
         binding
             .validate_for_job(&job)
             .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
-    } else if verifier_dispatch.is_some() {
+    } else if verifier_dispatch.is_some() || stage_request.is_some() {
         return Err(DispatchLaunchError::Gate(
-            "non-productive TestD launch carries a verifier-plan binding".to_owned(),
+            "non-productive TestD launch carries productive stage or verifier bindings"
+                .to_owned(),
         ));
     }
     Ok(TestdLaunchOwnerBinding {
@@ -1961,6 +2001,7 @@ fn capture_testd_launch_owner_binding(
         process: job.process,
         invocation_sha256,
         verifier_dispatch,
+        stage_request,
     })
 }
 
@@ -2066,6 +2107,7 @@ pub(crate) fn read_testd_terminal_completion(
     if job.invocation.profile != TESTD_PRODUCTIVE_PROFILE
         || binding.operation_id != job.process.operation_id.as_str()
         || owner_binding.verifier_dispatch.as_ref() != Some(binding)
+        || owner_binding.stage_request.as_ref() != job.stage_request.as_ref()
         || job.process != owner_binding.process
         || invocation_digest != owner_binding.invocation_sha256
         || job.job_id != admission.job_id
@@ -4537,13 +4579,13 @@ pub fn prepare_testd_launch(
             "live activation generation is unavailable".to_owned(),
         ));
     }
-    let admission = match response {
-        TestdAdmissionResponse::Admitted(admission) => admission,
+    let mut admission = match response {
+        TestdAdmissionResponse::Admitted(admission) => *admission,
         refused => return Ok(PreparedTestdLaunch::Refused(refused)),
     };
     if admission.cancelled {
         return Ok(PreparedTestdLaunch::Skipped {
-            admission,
+            admission: Box::new(admission),
             skip: TestdLaunchSkip::CancelledAdmission,
         });
     }
@@ -4558,6 +4600,24 @@ pub fn prepare_testd_launch(
         &authority_epoch,
         generation,
     )?;
+    if admission.profile == TESTD_PRODUCTIVE_PROFILE {
+        let stored_stage = owner_binding.stage_request.as_ref().ok_or_else(|| {
+            DispatchLaunchError::Gate(
+                "productive TestD owner row is missing its admitted stage identity".to_owned(),
+            )
+        })?;
+        admission.stage_request = Some(stored_stage.clone());
+        admission = admission
+            .with_computed_digest()
+            .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    } else if owner_binding.stage_request.is_some() {
+        return Err(DispatchLaunchError::Gate(
+            "non-productive TestD row carries a productive stage identity".to_owned(),
+        ));
+    }
+    admission
+        .validate()
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let nonce = mint_dispatch_nonce(
         DispatchedWorkerKind::Testd,
         &admission.request_digest,
@@ -4589,6 +4649,12 @@ pub fn prepare_testd_launch(
                 )));
             }
             if let Some(retained) = existing.testd_admission.clone() {
+                if retained.admission_digest != admission.admission_digest {
+                    return Err(DispatchLaunchError::ChangedTerms(format!(
+                        "job {} presents a different persisted stage identity under one request",
+                        admission.job_id
+                    )));
+                }
                 return Ok(PreparedTestdLaunch::ReplayOriginal {
                     admission: Box::new(retained),
                 });
@@ -4607,7 +4673,7 @@ pub fn prepare_testd_launch(
                 nonce: nonce.clone(),
                 operation_id: operation_id_string(&operation_id),
                 phase: LaunchPhase::Reserved,
-                testd_admission: Some((*admission).clone()),
+                testd_admission: Some(admission.clone()),
                 native_receipt: None,
                 native_request: None,
             },
@@ -4632,7 +4698,7 @@ pub fn prepare_testd_launch(
         })?;
     let grant = dispatch_grant_for(
         DispatchedWorkerKind::Testd,
-        &admission.request_digest,
+        &admission.admission_digest,
         &authority_epoch,
         generation,
         admission.admitted_at_unix_nanos,
@@ -4667,7 +4733,7 @@ pub fn prepare_testd_launch(
         record.material_path = Some(material_path.clone());
     }
     Ok(PreparedTestdLaunch::Ready(Box::new(ReadyTestdLaunch {
-        admission,
+        admission: Box::new(admission),
         nonce,
         operation_id,
         executable: material.executable.to_path_buf(),
@@ -4863,13 +4929,35 @@ pub fn reconcile_launched_testd_attempt(
                 "testd closed request envelope is not JSON".to_owned(),
             )
         })?;
+    let owner_binding = retained.testd_owner_binding.as_ref().ok_or_else(|| {
+        DispatchLaunchError::Gate("retained TestD owner binding is absent".to_owned())
+    })?;
+    let store = TestdStore::open(&owner_binding.owner_store_path, RetryPolicy::default())
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let durable_stage_matches = store
+        .get(job_id)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?
+        .is_some_and(|job| {
+            job.stage_request.as_ref() == owner_binding.stage_request.as_ref()
+                && admission.stage_request.as_ref() == owner_binding.stage_request.as_ref()
+        });
+    // Re-prove the original front-door terms separately from the durable
+    // stage binding. The stage was copied from the Kernel-owned TestD row,
+    // so stripping it here reconstructs only the original request admission;
+    // exact stage identity is checked against the same row above.
+    let mut frontdoor_admission = admission.clone();
+    frontdoor_admission.stage_request = None;
+    frontdoor_admission = frontdoor_admission
+        .with_computed_digest()
+        .map_err(gate_error)?;
     let live_epoch = kernel
         .service
         .lock()
         .map_err(|_| DispatchLaunchError::Gate("kernel service lock poisoned".to_owned()))?
         .authority_epoch();
-    let binds = reconcile_testd_admission(&admission, request, &envelope, &live_epoch)
-        .map_err(gate_error)?;
+    let binds = durable_stage_matches
+        && reconcile_testd_admission(&frontdoor_admission, request, &envelope, &live_epoch)
+            .map_err(gate_error)?;
     if binds {
         if let Some(path) = retained.material_path.as_deref() {
             reap_material_file(path);
