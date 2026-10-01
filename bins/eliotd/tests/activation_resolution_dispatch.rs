@@ -234,6 +234,7 @@ fn all_dispositions() -> TestResult<Vec<AgentActivationResolutionDisposition>> {
                 task_revision: "7".to_owned(),
                 plan_id: "plan:test".to_owned(),
                 plan_revision: "plan-revision:test".to_owned(),
+                stop_admission_binding: None,
             }),
         },
         AgentActivationResolutionDisposition::TaskSelectionRequired {

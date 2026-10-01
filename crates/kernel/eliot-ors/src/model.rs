@@ -7796,6 +7796,22 @@ pub struct HostRequestRecord {
     pub session_ref: Option<OpaqueLabel>,
     pub task_ref: Option<OpaqueLabel>,
     pub scope_ref: Option<OpaqueLabel>,
+    /// Governor-issued semantic admission/task-attempt association retained
+    /// verbatim from the activated application session. It is absent on
+    /// legacy/unassociated host requests and never inferred from `task_ref`.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_admission_binding: Option<eliot_contracts::StopBoundaryAdmissionBinding>,
+    /// Full protocol stop-boundary JSON retained atomically with the Unknown
+    /// close. ORS treats the body as opaque, verifies its digest and exact
+    /// admission association, and never interprets it as Finish proof.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_boundary_payload: Option<Value>,
+    /// Digest of the canonical `stop_boundary_payload` bytes.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_boundary_digest: Option<String>,
     pub capability_ref: OpaqueLabel,
     pub fence_digest: String,
     /// Lineage-aware authority epoch (Implements #64).
@@ -7916,6 +7932,7 @@ impl HostRequestRecord {
             && self.session_ref == other.session_ref
             && self.task_ref == other.task_ref
             && self.scope_ref == other.scope_ref
+            && self.stop_admission_binding == other.stop_admission_binding
             && self.capability_ref == other.capability_ref
             && self.fence_digest == other.fence_digest
             && self.authority_epoch == other.authority_epoch
@@ -7951,6 +7968,69 @@ impl HostRequestRecord {
         }
         validate_text(self.capability_ref.as_str(), "host_request_capability_ref")?;
         validate_digest(&self.fence_digest, "host_request_fence_digest")?;
+        if let Some(binding) = &self.stop_admission_binding {
+            binding
+                .validate()
+                .map_err(|_| OrsError::InvalidField {
+                    field: "host_request_stop_admission_binding",
+                    reason: "Governor admission association failed shape validation",
+                })?;
+            let fence_bytes = canonical_json_bytes(&binding.state_fence)
+                .map_err(|_| OrsError::InvalidField {
+                    field: "host_request_stop_admission_binding",
+                    reason: "State Fence could not be canonicalized",
+                })?;
+            if sha256_hex(&fence_bytes) != self.fence_digest
+                || binding.state_fence.authority_epoch != self.authority_epoch
+                || binding.state_fence.resource_generation.value() != self.generation
+                || self
+                    .task_ref
+                    .as_ref()
+                    .is_some_and(|task| task.as_str() != binding.task_id.as_str())
+            {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_stop_admission_binding",
+                    reason: "association differs from the admitted task or full State Fence",
+                });
+            }
+        }
+        match (&self.stop_boundary_payload, &self.stop_boundary_digest) {
+            (Some(payload), Some(digest)) => {
+                validate_digest(digest, "host_request_stop_boundary_digest")?;
+                let bytes = canonical_json_bytes(payload).map_err(|_| OrsError::InvalidField {
+                    field: "host_request_stop_boundary_payload",
+                    reason: "boundary payload could not be canonicalized",
+                })?;
+                if sha256_hex(&bytes) != *digest || self.state != HostRequestState::Unknown {
+                    return Err(OrsError::InvalidField {
+                        field: "host_request_stop_boundary_payload",
+                        reason: "digest mismatch or boundary payload is not retained under Unknown",
+                    });
+                }
+                let observed_binding = payload
+                    .get("admission_binding")
+                    .cloned()
+                    .and_then(|value| {
+                        serde_json::from_value::<eliot_contracts::StopBoundaryAdmissionBinding>(
+                            value,
+                        )
+                        .ok()
+                    });
+                if observed_binding.as_ref() != self.stop_admission_binding.as_ref() {
+                    return Err(OrsError::InvalidField {
+                        field: "host_request_stop_boundary_payload.admission_binding",
+                        reason: "boundary must retain this row's exact Governor admission association",
+                    });
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_stop_boundary_payload",
+                    reason: "payload and digest must be retained together",
+                });
+            }
+        }
         // `EpochId` is always validated; only generation retains a scalar check.
         if self.generation == 0 {
             return Err(OrsError::InvalidField {

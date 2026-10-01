@@ -609,6 +609,7 @@ fn semantic_admission_emits_admitted_or_rejected_with_digest() {
             task_revision: "7".to_owned(),
             plan_id: "plan-1".to_owned(),
             plan_revision: "plan-revision-1".to_owned(),
+            stop_admission_binding: None,
         }),
     };
     assert_eq!(

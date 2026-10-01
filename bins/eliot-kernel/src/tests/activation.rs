@@ -233,6 +233,7 @@ fn activation_denial_codes_map_each_non_resolved_disposition_distinctly() {
             task_revision: "task-revision-test".to_owned(),
             plan_id: "plan-test".to_owned(),
             plan_revision: "plan-revision-test".to_owned(),
+            stop_admission_binding: None,
         }),
     };
     assert_eq!(
@@ -317,6 +318,7 @@ fn activation_v2_resolved(
                 task_revision: "task-revision-test".to_owned(),
                 plan_id: "plan-test".to_owned(),
                 plan_revision: "plan-revision-test".to_owned(),
+                stop_admission_binding: None,
             }),
         },
     )

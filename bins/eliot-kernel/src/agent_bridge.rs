@@ -1811,6 +1811,7 @@ impl KernelComposition {
             peer_admission_receipt_sha256: pending.ticket.peer_admission_receipt_sha256.clone(),
             resolution_result_sha256: result.result_sha256.clone(),
             resolved_binding: binding.clone(),
+            stop_admission_binding: binding.stop_admission_binding.clone(),
             kernel_owner_revision: kernel_owner.revision,
             kernel_owner_bundle_sha256: kernel_owner.bundle_sha256.clone(),
         })

@@ -72,6 +72,11 @@ pub struct AgentActivationResolvedBinding {
     pub task_revision: String,
     pub plan_id: String,
     pub plan_revision: String,
+    /// Owner-issued semantic admission and attempt association. Older
+    /// activation owners that do not carry this authority remain explicitly
+    /// unbound; Kernel must not reconstruct it from task/plan labels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_admission_binding: Option<crate::StopBoundaryAdmissionBinding>,
 }
 
 impl AgentActivationResolvedBinding {
@@ -111,6 +116,20 @@ impl AgentActivationResolvedBinding {
             ),
         ] {
             bounded_text(value, field)?;
+        }
+        if let Some(admission) = &self.stop_admission_binding {
+            admission.validate().map_err(|_| ProtocolError::InvalidField {
+                field: "agent_activation_resolution_result.stop_admission_binding",
+                reason: "owner-issued admission association failed shape validation",
+            })?;
+            if admission.task_id.as_str() != self.task_id
+                || admission.task_revision != self.task_revision
+            {
+                return Err(ProtocolError::InvalidField {
+                    field: "agent_activation_resolution_result.stop_admission_binding",
+                    reason: "must bind the exact resolved task identity and revision",
+                });
+            }
         }
         Ok(())
     }
@@ -212,6 +231,14 @@ impl AgentActivationOwnerEvidence {
             .validate()
             .map_err(ProtocolError::Foundation)?;
         self.binding.validate()?;
+        if let Some(admission) = &self.binding.stop_admission_binding
+            && admission.state_fence != self.state_fence
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_owner_evidence.binding.stop_admission_binding",
+                reason: "must carry the exact owner-observed activation State Fence",
+            });
+        }
         lowercase_sha256(
             &self.binding_sha256,
             "agent_activation_owner_evidence.binding_sha256",

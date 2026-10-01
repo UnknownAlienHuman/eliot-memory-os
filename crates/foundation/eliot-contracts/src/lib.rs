@@ -26,6 +26,7 @@ mod facet_manifest;
 mod module_catalog;
 mod module_test_capsule;
 mod peer_blackboard;
+mod stop_boundary;
 
 pub use bridge_contract::*;
 pub use bridge_event_capacity::*;
@@ -38,6 +39,7 @@ pub use facet_manifest::*;
 pub use module_catalog::*;
 pub use module_test_capsule::*;
 pub use peer_blackboard::*;
+pub use stop_boundary::*;
 
 /// The current wire revision of this foundation surface.
 pub const CONTRACT_NAME: &str = "eliot.foundation.contracts";

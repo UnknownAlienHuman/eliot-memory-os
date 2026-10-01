@@ -82,6 +82,13 @@ use eliot_protocol::{
     WatchdogSpoolExportBatchPayload, WatchdogSpoolExportOutcomeSubmission,
     WatchdogSpoolExportResultPayload, WatchdogSpoolExportSubmission,
     WatchdogSpoolIntentBatchPayload, WatchdogSpoolIntentSubmission, host_request_operation_id,
+    StopBoundaryRecord, StopBoundarySourceBinding, StopBoundaryGeneration,
+    StopBoundaryCursorState, StopBoundaryCursorUnknownReason, StopBoundaryCoverage,
+    StopBoundaryEnumeration, StopBoundaryCoverageGap, StopBoundaryEventPositions,
+    StopBoundaryPositionState, StopBoundaryPositionUnknownReason, StopBoundaryActionPlan,
+    StopBoundaryActionCoverage, StopBoundaryRequiredAction, StopBoundarySourceContent,
+    StopBoundarySourceContentUnknownReason, STOP_BOUNDARY_RECORD_WIRE_ID,
+    STOP_BOUNDARY_RECORD_WIRE_VERSION,
 };
 use eliot_runtime_contracts::RecoveryDirective;
 use eliot_store_api::{
@@ -713,7 +720,7 @@ impl KernelComposition {
             } else {
                 None
             };
-        let requested = requested_host_request_record(envelope)?;
+        let requested = self.requested_host_request_record_for_session(envelope)?;
         let operation_id = OperationIdentity::new(host_request_operation_id(envelope))
             .map_err(|_| TransportError::SessionFenced)?;
         let existing = self
@@ -1833,7 +1840,7 @@ impl KernelComposition {
                 return Err(TransportError::SessionFenced);
             }
         }
-        let expected = requested_host_request_record(envelope)?;
+        let expected = self.requested_host_request_record_for_session(envelope)?;
         let operation_id = OperationIdentity::new(host_request_operation_id(envelope))
             .map_err(|_| TransportError::SessionFenced)?;
         let stored = self
@@ -2529,6 +2536,59 @@ impl KernelComposition {
             }
         }
         Ok(())
+    }
+
+    /// Copies the exact activation-owner association into the durable ORS row.
+    /// The connection binding was authenticated by the preceding application
+    /// gate; this method checks the full fence and task binding again before
+    /// staging so an absent/foreign session value cannot be filled from
+    /// envelope labels.
+    fn retained_stop_admission_binding_for_envelope(
+        &self,
+        envelope: &HostRequestEnvelope,
+    ) -> Result<Option<eliot_contracts::StopBoundaryAdmissionBinding>, TransportError> {
+        if envelope.kind == HostRequestKind::Activation {
+            return Ok(None);
+        }
+        let connections = self
+            .agent_bridge_connections
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let state = connections
+            .get(&envelope.connection_id)
+            .ok_or(TransportError::SessionFenced)?;
+        let retained = state
+            .activated_binding
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        let Some(binding) = retained.stop_admission_binding.clone() else {
+            return Ok(None);
+        };
+        binding
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let task = envelope.identity.task_id.as_deref();
+        if binding.task_id.as_str() != retained.task_id
+            || binding.task_revision != retained.task_revision.get().to_string()
+            || binding.state_fence != envelope.state_fence
+            || task.is_some_and(|task| task != binding.task_id.as_str())
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        Ok(Some(binding))
+    }
+
+    fn requested_host_request_record_for_session(
+        &self,
+        envelope: &HostRequestEnvelope,
+    ) -> Result<HostRequestRecord, TransportError> {
+        let mut requested = requested_host_request_record(envelope)?;
+        requested.stop_admission_binding =
+            self.retained_stop_admission_binding_for_envelope(envelope)?;
+        requested
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(requested)
     }
 
     fn validate_host_request_application_session(
@@ -5228,7 +5288,7 @@ impl KernelComposition {
                 let Some(stored) = stored else {
                     return Err(TransportError::UnknownRequest);
                 };
-                let expected = requested_host_request_record(envelope)?;
+                let expected = self.requested_host_request_record_for_session(envelope)?;
                 if stored.operation_id != operation_id
                     || stored.request_digest != request_digest
                     || !stored.same_binding(&expected)
@@ -6177,6 +6237,9 @@ pub(crate) fn requested_host_request_record(
         session_ref: optional_label(envelope.identity.session_id.as_ref())?,
         task_ref: optional_label(envelope.identity.task_id.as_ref())?,
         scope_ref: optional_label(envelope.identity.work_scope_id.as_ref())?,
+        stop_admission_binding: None,
+        stop_boundary_payload: None,
+        stop_boundary_digest: None,
         capability_ref: label(&envelope.identity.capability)?,
         fence_digest: sha256_json(&envelope.state_fence)
             .map_err(|_| TransportError::SessionFenced)?,
@@ -6251,15 +6314,88 @@ fn fence_one_host_request(
     let Some(record) = current else {
         return;
     };
+    if record.stop_boundary_payload.is_some() {
+        return;
+    }
     if record.state.is_terminal() {
         return;
     }
-    let _ = composition.generation_gateway.ors.advance_host_request(
-        &operation_id,
-        &operation_ref.request_digest,
-        HostRequestState::Unknown,
-        None,
-    );
+    if let Some(binding) = record.stop_admission_binding.as_ref() {
+        let Some(session_id) = record.session_ref.as_ref().map(|session| session.as_str()) else {
+            return;
+        };
+        let now = unix_ms();
+        let Ok(observed_at) = i64::try_from(now) else { return; };
+        let stop = StopBoundaryRecord {
+            wire_id: STOP_BOUNDARY_RECORD_WIRE_ID.to_owned(),
+            wire_version: STOP_BOUNDARY_RECORD_WIRE_VERSION,
+            stop_id: format!("{}:disconnect", operation_ref.operation_id),
+            observed_at: eliot_contracts::ClockReading {
+                valid_time_ms: Some(observed_at),
+                known_time_ms: Some(observed_at),
+                transaction_sequence: None,
+                monotonic_ns: None,
+            },
+            clock_domain: "kernel-host-wall-clock".to_owned(),
+            source: StopBoundarySourceBinding {
+                channel_id: record.connection_ref.as_str().to_owned(),
+                producer_id: "eliot-kernel.host-request-disconnect".to_owned(),
+                session_id: session_id.to_owned(),
+                generation: StopBoundaryGeneration::Observed { generation: record.generation },
+            },
+            task_id: binding.task_id.clone(),
+            attempt_id: binding.attempt_id.clone(),
+            expected_admission_revision: binding.admission_owner_revision.to_string(),
+            state_fence: binding.state_fence.clone(),
+            admission_binding: binding.clone(),
+            source_cursor: StopBoundaryCursorState::Unknown {
+                reason: StopBoundaryCursorUnknownReason::OwnerDidNotReport,
+            },
+            operations: StopBoundaryCoverage {
+                items: Vec::new(),
+                pages: Vec::new(),
+                enumeration: StopBoundaryEnumeration::Incomplete {
+                    gap: StopBoundaryCoverageGap::OwnerEnumerationIncomplete,
+                },
+            },
+            descendants: StopBoundaryCoverage {
+                items: Vec::new(),
+                pages: Vec::new(),
+                enumeration: StopBoundaryEnumeration::Incomplete {
+                    gap: StopBoundaryCoverageGap::UnknownDescendants,
+                },
+            },
+            event_positions: StopBoundaryEventPositions {
+                last_durable: StopBoundaryPositionState::Unknown { reason: StopBoundaryPositionUnknownReason::OwnerDidNotReport },
+                last_normalized: StopBoundaryPositionState::Unknown { reason: StopBoundaryPositionUnknownReason::OwnerDidNotReport },
+                last_applied: StopBoundaryPositionState::Unknown { reason: StopBoundaryPositionUnknownReason::OwnerDidNotReport },
+            },
+            action_plan: StopBoundaryActionPlan {
+                required_actions: vec![StopBoundaryRequiredAction::Reconcile],
+                coverage: StopBoundaryActionCoverage::Unknown,
+            },
+            source_content: StopBoundarySourceContent::Unknown {
+                reason: StopBoundarySourceContentUnknownReason::SourceUnavailable,
+            },
+        };
+        if stop.validate_shape().is_err() { return; }
+        let Ok(payload) = serde_json::to_value(&stop) else { return; };
+        let Ok(bytes) = eliot_contracts::canonical_json_bytes(&payload) else { return; };
+        let digest = eliot_contracts::sha256_hex(&bytes);
+        let _ = composition.generation_gateway.ors.retain_host_request_stop_boundary(
+            &operation_id,
+            &operation_ref.request_digest,
+            &payload,
+            &digest,
+        );
+    } else {
+        let _ = composition.generation_gateway.ors.advance_host_request(
+            &operation_id,
+            &operation_ref.request_digest,
+            HostRequestState::Unknown,
+            None,
+        );
+    }
 }
 
 /// Requires a parent record to belong to the current descriptor generation
@@ -8394,6 +8530,9 @@ fn watchdog_export_projection_record(
         session_ref: None,
         task_ref: None,
         scope_ref: None,
+        stop_admission_binding: None,
+        stop_boundary_payload: None,
+        stop_boundary_digest: None,
         capability_ref: label(WATCHDOG_EXPORT_CAPABILITY)?,
         fence_digest: sha256_json(&submitted_fence).map_err(|_| TransportError::SessionFenced)?,
         authority_epoch: submitted_fence.authority_epoch.clone(),
@@ -8639,6 +8778,9 @@ fn watchdog_intent_projection_record(
         session_ref: None,
         task_ref: None,
         scope_ref: None,
+        stop_admission_binding: None,
+        stop_boundary_payload: None,
+        stop_boundary_digest: None,
         capability_ref: label(WATCHDOG_INTENT_CAPABILITY)?,
         fence_digest: sha256_json(&submitted_fence).map_err(|_| TransportError::SessionFenced)?,
         authority_epoch: submitted_fence.authority_epoch.clone(),

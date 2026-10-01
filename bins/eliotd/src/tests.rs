@@ -73,6 +73,7 @@ fn semantic_resolution_mapping_is_immutable_and_ticket_bound()
         task_revision: 7,
         plan_id: "plan-1".to_owned(),
         plan_revision: "plan-revision-1".to_owned(),
+        stop_admission_binding: None,
     };
     let result = super::activation_projection::map_governor_outcome_to_protocol(
         &ticket,

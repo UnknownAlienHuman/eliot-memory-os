@@ -2070,6 +2070,7 @@ impl DaemonComposition {
             task_revision: snapshot.task_revision.to_string(),
             plan_id: snapshot.plan_id,
             plan_revision: snapshot.plan_revision,
+            stop_admission_binding: snapshot.stop_admission_binding,
         };
         let evidence = AgentActivationOwnerEvidence::for_binding(
             &binding,

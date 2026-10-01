@@ -3341,6 +3341,11 @@ pub struct CanonicalAdmissionSnapshot {
     /// current canonical owner image and must carry the same fence as it.
     #[serde(default)]
     pub finish_evidence: Option<CanonicalFinishEvidence>,
+    /// Current owner-readback of the admitted task attempt, when the semantic
+    /// admission owner has committed one. Absence is an explicit legacy or
+    /// not-admitted state; activation never derives this from task labels.
+    #[serde(default)]
+    pub stop_admission_binding: Option<eliot_protocol::StopBoundaryAdmissionBinding>,
 }
 
 /// The acceptance set the finish coverage was computed over, retained with the
@@ -3594,6 +3599,7 @@ impl CanonicalAdmissionSnapshot {
             current_plan,
             verifier_execution_fact: None,
             finish_evidence: None,
+            stop_admission_binding: None,
         };
         snapshot.validate()?;
         Ok(snapshot)
@@ -3611,6 +3617,21 @@ impl CanonicalAdmissionSnapshot {
         }
         if let Some(current_plan) = &self.current_plan {
             current_plan.validate()?;
+        }
+        if let Some(binding) = &self.stop_admission_binding {
+            binding
+                .validate_shape()
+                .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+            let plan = self.current_plan.as_ref().ok_or_else(|| {
+                CompositionError::Recovery(
+                    "stop admission binding has no current canonical plan".to_owned(),
+                )
+            })?;
+            if binding.task_id != plan.task_id || binding.state_fence != self.state_fence {
+                return Err(CompositionError::Recovery(
+                    "stop admission binding differs from current task or State Fence".to_owned(),
+                ));
+            }
         }
         if let Some(fact) = &self.verifier_execution_fact {
             fact.validate(&self.state_fence)?;
@@ -3653,6 +3674,8 @@ struct CanonicalAdmissionSnapshotWire {
     verifier_execution_fact: Option<CanonicalVerifierExecutionFact>,
     #[serde(default)]
     finish_evidence: Option<CanonicalFinishEvidence>,
+    #[serde(default)]
+    stop_admission_binding: Option<eliot_protocol::StopBoundaryAdmissionBinding>,
 }
 
 impl<'de> Deserialize<'de> for CanonicalAdmissionSnapshot {
@@ -3667,6 +3690,7 @@ impl<'de> Deserialize<'de> for CanonicalAdmissionSnapshot {
             current_plan: wire.current_plan,
             verifier_execution_fact: wire.verifier_execution_fact,
             finish_evidence: wire.finish_evidence,
+            stop_admission_binding: wire.stop_admission_binding,
         };
         snapshot
             .validate()
@@ -3698,6 +3722,10 @@ pub struct GovernorActivationSnapshot {
     pub task_revision: u64,
     pub plan_id: String,
     pub plan_revision: String,
+    /// Exact task attempt association carried from the canonical owner image.
+    /// `None` cannot be upgraded by the activation projection.
+    #[serde(default)]
+    pub stop_admission_binding: Option<eliot_protocol::StopBoundaryAdmissionBinding>,
 }
 
 impl CanonicalAdmissionOwner {
@@ -3891,6 +3919,7 @@ impl CanonicalAdmissionOwner {
             current_plan: self.snapshot.current_plan.clone(),
             verifier_execution_fact: Some(fact),
             finish_evidence: self.snapshot.finish_evidence.clone(),
+            stop_admission_binding: self.snapshot.stop_admission_binding.clone(),
         };
         snapshot.validate()?;
         Ok(snapshot)
@@ -3974,12 +4003,19 @@ impl CanonicalAdmissionOwner {
         let owner_revision = self.snapshot.owner_revision.checked_add(1).ok_or_else(|| {
             CompositionError::Recovery("canonical owner revision overflow".to_owned())
         })?;
+        let stop_admission_binding = self
+            .snapshot
+            .stop_admission_binding
+            .as_ref()
+            .filter(|binding| plan.task_id == binding.task_id)
+            .cloned();
         let snapshot = CanonicalAdmissionSnapshot {
             state_fence: self.state_fence.clone(),
             owner_revision,
             current_plan: Some(plan),
             verifier_execution_fact: self.snapshot.verifier_execution_fact.clone(),
             finish_evidence: self.snapshot.finish_evidence.clone(),
+            stop_admission_binding,
         };
         snapshot.validate()?;
         Ok(snapshot)
@@ -4009,6 +4045,7 @@ impl CanonicalAdmissionOwner {
             current_plan: self.snapshot.current_plan.clone(),
             verifier_execution_fact: self.snapshot.verifier_execution_fact.clone(),
             finish_evidence: Some(evidence),
+            stop_admission_binding: self.snapshot.stop_admission_binding.clone(),
         };
         snapshot.validate()?;
         Ok(snapshot)
@@ -10595,6 +10632,19 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let task_id = self.admit_activation_lifecycle_session(now, &state_fence, &work)?;
         let task = self.admit_activation_task(&task_id, &state_fence)?;
         let (work_scope_id, plan) = self.admit_activation_plan(&task_id, &state_fence)?;
+        let stop_admission_binding = self
+            .owners
+            .canonical
+            .snapshot
+            .stop_admission_binding
+            .clone();
+        if let Some(binding) = &stop_admission_binding
+            && (binding.task_id != task_id
+                || binding.task_revision != task.revision.to_string()
+                || binding.state_fence != state_fence)
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
         Ok(GovernorActivationSnapshot {
             state_fence,
             owner_revision: self.owners.canonical.owner_revision(),
@@ -10606,6 +10656,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             task_revision: task.revision,
             plan_id: plan.plan_id,
             plan_revision: plan.plan_revision,
+            stop_admission_binding,
         })
     }
 
@@ -11611,6 +11662,7 @@ mod tests {
                 current_plan: None,
                 verifier_execution_fact: None,
                 finish_evidence: None,
+                stop_admission_binding: None,
             }),
             RecoveryOwner::Task => serde_json::to_value(TaskLifecycleSnapshot {
                 next_sequence: 1,
@@ -11727,6 +11779,7 @@ mod tests {
             }),
             verifier_execution_fact: None,
             finish_evidence: None,
+            stop_admission_binding: None,
         }
     }
 
@@ -12625,6 +12678,7 @@ mod tests {
             }),
             verifier_execution_fact: None,
             finish_evidence: None,
+            stop_admission_binding: None,
         };
         mismatched_plan.validate().expect("plan shape");
         let mut mismatch = activation_fake(&observed);

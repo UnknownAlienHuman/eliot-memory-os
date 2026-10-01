@@ -387,6 +387,7 @@ fn map_governor_outcome_to_protocol_inner(
                 task_revision: snapshot.task_revision.to_string(),
                 plan_id: snapshot.plan_id,
                 plan_revision: snapshot.plan_revision,
+                stop_admission_binding: snapshot.stop_admission_binding,
             };
             AgentActivationResolutionDisposition::Resolved {
                 binding: Box::new(binding),
@@ -639,6 +640,7 @@ mod projection_tests {
             task_revision: 7,
             plan_id: "plan-1".to_owned(),
             plan_revision: "plan-revision-1".to_owned(),
+            stop_admission_binding: None,
         }
     }
 

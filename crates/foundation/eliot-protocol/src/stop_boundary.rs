@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{MAX_FRAME_BYTES, OpaqueContentRef, ProtocolError};
 
+pub use eliot_contracts::StopBoundaryAdmissionBinding;
+
 /// Stable identity for one stop-boundary wire record.
 pub const STOP_BOUNDARY_RECORD_WIRE_ID: &str = "eliot.protocol.stop-boundary-record";
 /// Current stop-boundary record wire version.
@@ -66,65 +68,6 @@ pub struct StopBoundarySourceBinding {
     pub session_id: String,
     /// Session generation supplied by its owner, or its explicit unknown state.
     pub generation: StopBoundaryGeneration,
-}
-
-/// Owner-issued association between one Task Controller definition, its
-/// Governor admission receipt, and one concrete admitted execution attempt.
-///
-/// The Kernel and ORS preserve this value verbatim. They do not derive or
-/// refresh any of its semantic identities. A Governor/AgentFabric owner must
-/// compare every member with the current durable admission before publishing
-/// a stop boundary.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct StopBoundaryAdmissionBinding {
-    /// Governor-issued semantic admission identity.
-    pub admission_id: String,
-    /// Store-owned revision of the exact Governor admission record.
-    pub admission_owner_revision: u64,
-    /// Exact opaque Governor receipt bound by the admitted semantic record.
-    pub admission_receipt: String,
-    /// Task Controller definition identity admitted by Governor.
-    pub definition_id: String,
-    /// Digest of the exact frozen definition bytes.
-    pub definition_digest: String,
-    /// Task identity from the exact frozen definition.
-    pub task_id: TaskId,
-    /// Task revision from the exact frozen definition.
-    pub task_revision: String,
-    /// Concrete attempt identity registered by the canonical admission.
-    pub attempt_id: String,
-    /// Full fence carried by the exact admission and activation receipts.
-    pub state_fence: StateFence,
-}
-
-impl StopBoundaryAdmissionBinding {
-    fn validate_shape(&self) -> Result<(), ProtocolError> {
-        for (value, field) in [
-            (self.admission_id.as_str(), "stop_boundary.admission.admission_id"),
-            (self.admission_receipt.as_str(), "stop_boundary.admission.admission_receipt"),
-            (self.definition_id.as_str(), "stop_boundary.admission.definition_id"),
-            (self.definition_digest.as_str(), "stop_boundary.admission.definition_digest"),
-            (self.task_revision.as_str(), "stop_boundary.admission.task_revision"),
-            (self.attempt_id.as_str(), "stop_boundary.admission.attempt_id"),
-        ] {
-            text(value, field)?;
-        }
-        if self.admission_owner_revision == 0 {
-            return Err(ProtocolError::InvalidField {
-                field: "stop_boundary.admission.admission_owner_revision",
-                reason: "must be a positive Store-owned revision",
-            });
-        }
-        if self.task_revision.parse::<u64>().ok().filter(|revision| revision.to_string() == self.task_revision).filter(|revision| *revision > 0).is_none() {
-            return Err(ProtocolError::InvalidField {
-                field: "stop_boundary.admission.task_revision",
-                reason: "must be a positive canonical decimal task revision",
-            });
-        }
-        self.state_fence.validate()?;
-        Ok(())
-    }
 }
 
 impl StopBoundarySourceBinding {
@@ -575,7 +518,12 @@ impl StopBoundaryRecord {
             "stop_boundary.expected_admission_revision",
         )?;
         self.state_fence.validate()?;
-        self.admission_binding.validate_shape()?;
+        self.admission_binding
+            .validate()
+            .map_err(|_| ProtocolError::InvalidField {
+                field: "stop_boundary.admission_binding",
+                reason: "owner-issued admission association failed shape validation",
+            })?;
         if self.admission_binding.task_id != self.task_id
             || self.admission_binding.attempt_id != self.attempt_id
             || self.admission_binding.state_fence != self.state_fence

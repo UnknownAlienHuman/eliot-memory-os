@@ -240,6 +240,7 @@ mod tests {
             task_revision: 7,
             plan_id: "plan-1".to_owned(),
             plan_revision: "plan-revision-1".to_owned(),
+            stop_admission_binding: None,
         }
     }
 

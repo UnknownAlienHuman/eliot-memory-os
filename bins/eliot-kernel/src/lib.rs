@@ -1081,6 +1081,10 @@ struct ActivatedApplicationBinding {
     resolution_result_sha256: String,
     /// Full owner-resolved identity from the exact typed result.
     resolved_binding: eliot_protocol::AgentActivationResolvedBinding,
+    /// Exact owner-issued admitted attempt association carried by the
+    /// Governor activation result, when present. Kernel preserves it without
+    /// deriving semantic identity from request labels.
+    stop_admission_binding: Option<eliot_protocol::StopBoundaryAdmissionBinding>,
     /// Current P-07 owner projection under which the result was accepted.
     kernel_owner_revision: u64,
     kernel_owner_bundle_sha256: String,

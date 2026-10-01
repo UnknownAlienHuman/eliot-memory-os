@@ -56,6 +56,7 @@ fn binding() -> AgentActivationResolvedBinding {
         task_revision: "task-revision-1".to_owned(),
         plan_id: "plan-1".to_owned(),
         plan_revision: "plan-revision-1".to_owned(),
+        stop_admission_binding: None,
     }
 }
 
