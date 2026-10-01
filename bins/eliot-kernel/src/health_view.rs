@@ -165,6 +165,62 @@ impl KernelComposition {
         Ok(snapshot)
     }
 
+    /// Replays one explicitly requested persisted trace through the
+    /// authenticated daemon snapshot route. The caller's current State Fence
+    /// must match the trace's recorded fence; no latest-record fallback is
+    /// allowed because that could disclose another operation's evidence.
+    pub(crate) fn daemon_trace_replay_projection(
+        &self,
+        session: &Session,
+        request_identity: Option<&RequestIdentity>,
+        operation_id: &str,
+    ) -> serde_json::Value {
+        let Some(request_identity) = request_identity else {
+            return serde_json::json!({"status": "unknown"});
+        };
+        if request_identity.validate().is_err()
+            || request_identity.request.state_fence != session.module_generation.state_fence
+        {
+            return serde_json::json!({"status": "unknown"});
+        }
+        let Some(digest) = operation_id.strip_prefix("hostreq:") else {
+            return serde_json::json!({"status": "unknown"});
+        };
+        if !is_lower_sha256(digest) {
+            return serde_json::json!({"status": "unknown"});
+        }
+        let Ok(records) = self.audit_chain_records() else {
+            return serde_json::json!({"status": "unknown"});
+        };
+        let Some(manifest) = TraceManifest::find_sealed(&records, operation_id) else {
+            return serde_json::json!({"status": "unknown"});
+        };
+        if manifest.operation_id != operation_id
+            || manifest.state_fence.as_ref() != Some(&session.module_generation.state_fence)
+            || manifest.session_id.as_deref()
+                != request_identity
+                    .request
+                    .metadata
+                    .session_id
+                    .as_ref()
+                    .map(|value| value.as_str())
+            || manifest.task_id.as_deref()
+                != request_identity
+                    .request
+                    .metadata
+                    .task_id
+                    .as_ref()
+                    .map(|value| value.as_str())
+        {
+            return serde_json::json!({"status": "unknown"});
+        }
+        observe_health("kernel.health.trace_replay_projected", "success");
+        serde_json::json!({
+            "status": "known",
+            "value": manifest,
+        })
+    }
+
     #[cfg(windows)]
     pub(super) async fn daemon_health(
         &self,
