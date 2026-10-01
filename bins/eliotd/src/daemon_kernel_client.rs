@@ -426,7 +426,7 @@ pub struct TaskControllerClaimedInvocation {
     pub envelope: HostRequestEnvelope,
     pub tool: serde_json::Value,
     pub request_identity: RequestIdentity,
-    /// Original Kernel-authenticated transport peer persisted with the Host
+    /// Original Kernel-authenticated transport peer persisted with the `Host`
     /// request. This is distinct from caller payload identity and remains
     /// available after Kernel restart/claim rehydration.
     pub authenticated_peer: eliot_ors::HostRequestKernelAuthenticatedPeer,
