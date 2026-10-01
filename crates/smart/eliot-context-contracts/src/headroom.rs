@@ -27,9 +27,11 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroU64;
 
-use eliot_contracts::ArtifactId;
+use eliot_contracts::{ArtifactId, OperationId, StateFence, TaskId};
+use eliot_receipts::WorkScopeBinding;
 use eliot_runtime_contracts::{
-    CapacityBottleneck, CapacityPermitBinding, CapacityRequest, CapacityUnit,
+    CapacityBottleneck, CapacityLimit, CapacityPermitBinding, CapacityRequest, CapacityUnit,
+    RequestedOperationClass,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -41,6 +43,288 @@ use crate::{
 
 /// Exact wire revision of the downstream headroom reservation contract.
 pub const DOWNSTREAM_HEADROOM_SCHEMA_VERSION: u32 = 1;
+
+/// Version of the admitted Orientation demand profile stored with its approved
+/// Context recipe. Every row is a recipe-owned resource formula result in one
+/// owner unit; request identity and authority fields are filled from the
+/// original admitted job when the Governor compiles the request.
+pub const ORIENTATION_HEADROOM_PROFILE_VERSION: u32 = 1;
+/// Version of the admitted Orientation headroom supplier carrier.
+pub const ADMITTED_ORIENTATION_HEADROOM_SCHEMA_VERSION: u32 = 1;
+
+/// One approved, independent downstream capacity demand for Orientation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OrientationHeadroomDemandProfile {
+    /// The independent owner dimension this recipe protects.
+    pub dimension: HeadroomDimension,
+    /// The measured or formula-derived positive demand in that owner's unit.
+    pub quantity: HeadroomQuantity,
+    /// Work class permitted for this downstream request by the approved recipe.
+    pub operation: RequestedOperationClass,
+    /// Existing capacity owner's requester identity.
+    pub requesting_owner_ref: String,
+    /// Source artifact for the measured peak or approved formula input.
+    pub source_fact: ArtifactId,
+}
+
+impl OrientationHeadroomDemandProfile {
+    fn validate(&self, profile_id: &str, profile_revision: &str) -> Result<(), ContextError> {
+        let Some(value) = self.quantity.known() else {
+            return Err(ContextError::InvalidField(
+                "orientation_headroom.demand.quantity",
+            ));
+        };
+        if value.get() == 0 || self.quantity.unit() != Some(self.dimension.owner_unit()) {
+            return Err(ContextError::InvalidField(
+                "orientation_headroom.demand.quantity",
+            ));
+        }
+        if self.dimension.owner_bottleneck().is_none() {
+            return Err(ContextError::InvalidField(
+                "orientation_headroom.demand.dimension",
+            ));
+        }
+        validate_text(&self.requesting_owner_ref, "orientation_headroom.requesting_owner")?;
+        validate_text(self.source_fact.as_str(), "orientation_headroom.source_fact")?;
+        validate_text(profile_id, "orientation_headroom.profile_id")?;
+        validate_text(profile_revision, "orientation_headroom.profile_revision")
+    }
+}
+
+/// Approved recipe-owned Orientation downstream demand profile.
+///
+/// This profile stores the source-backed demand facts, not live capacity or a
+/// permit. The Governor binds these facts to the original job, operation,
+/// generation and deadline to form a `DownstreamHeadroomRequest`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OrientationHeadroomProfileV1 {
+    /// Exact profile schema version.
+    pub schema_version: u32,
+    /// Capacity owner's approved profile identity.
+    pub profile_id: String,
+    /// Capacity owner's approved profile revision.
+    pub profile_revision: String,
+    /// Exact admitted consumer protected by each demand.
+    pub consumer: HeadroomConsumer,
+    /// Exact stage at which the owner acquires the demand.
+    pub stage_id: ArtifactId,
+    /// Nonempty, duplicate-free set of measured/formula-derived demands.
+    pub demands: Vec<OrientationHeadroomDemandProfile>,
+    /// Approved cancellation release policy; completion identity and expiry
+    /// come from the original admitted job when this profile is compiled.
+    pub release_on_cancel: bool,
+}
+
+impl OrientationHeadroomProfileV1 {
+    /// Validate the approved recipe profile without consulting live capacity.
+    pub fn validate(&self) -> Result<(), ContextError> {
+        if self.schema_version != ORIENTATION_HEADROOM_PROFILE_VERSION {
+            return Err(ContextError::InvalidField(
+                "orientation_headroom.schema_version",
+            ));
+        }
+        validate_text(&self.profile_id, "orientation_headroom.profile_id")?;
+        validate_text(&self.profile_revision, "orientation_headroom.profile_revision")?;
+        validate_text(self.stage_id.as_str(), "orientation_headroom.stage_id")?;
+        if self.demands.is_empty() || self.demands.len() > HeadroomDimension::DENOMINATOR.len() {
+            return Err(ContextError::Bounds {
+                field: "orientation_headroom.demands",
+            });
+        }
+        let mut seen = BTreeSet::new();
+        for demand in &self.demands {
+            demand.validate(&self.profile_id, &self.profile_revision)?;
+            if !seen.insert(demand.dimension) {
+                return Err(ContextError::Duplicate(
+                    "orientation_headroom.demands.dimension",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Compile profile facts into exact owner requests under the original
+    /// operation and State Fence. The demand values and their source facts are
+    /// copied from the approved profile without deriving from owner capacity.
+    pub fn compile_request(
+        &self,
+        pipeline_id: ArtifactId,
+        attempt_id: ArtifactId,
+        binding: ContextBinding,
+        route_id: String,
+        serializer_id: String,
+        recipe_digest: String,
+        operation_id: &OperationId,
+        state_fence: &StateFence,
+        deadline_ms: u64,
+        completion_artifact_id: ArtifactId,
+    ) -> Result<DownstreamHeadroomRequest, ContextError> {
+        self.validate()?;
+        binding.validate()?;
+        validate_text(completion_artifact_id.as_str(), "headroom.release.completion_receipt")?;
+        if deadline_ms == 0
+            || binding.state_fence != *state_fence
+            || binding.operation_id.as_ref() != Some(operation_id)
+        {
+            return Err(ContextError::IdentityConflict);
+        }
+        let mut demands = Vec::with_capacity(self.demands.len());
+        for demand in &self.demands {
+            let Some(bottleneck) = demand.dimension.owner_bottleneck() else {
+                return Err(ContextError::InvalidField(
+                    "orientation_headroom.demand.dimension",
+                ));
+            };
+            let Some(quantity) = demand.quantity.known() else {
+                return Err(ContextError::InvalidField(
+                    "orientation_headroom.demand.quantity",
+                ));
+            };
+            let owner_request = CapacityRequest {
+                operation: demand.operation,
+                operation_id: operation_id.to_string(),
+                requested_bottleneck: bottleneck,
+                requested_limit: CapacityLimit {
+                    unit: demand.dimension.owner_unit(),
+                    quantity,
+                },
+                requesting_owner_ref: demand.requesting_owner_ref.clone(),
+                requesting_generation_ref: state_fence.resource_generation,
+                authority_epoch_ref: state_fence.authority_epoch.clone(),
+                profile_id: self.profile_id.clone(),
+                profile_revision: self.profile_revision.clone(),
+                deadline_ms,
+            };
+            owner_request
+                .validate()
+                .map_err(|_| ContextError::InvalidField("orientation_headroom.capacity_request"))?;
+            demands.push(HeadroomDemand {
+                dimension: demand.dimension,
+                quantity: demand.quantity.clone(),
+                request: owner_request,
+            });
+        }
+        let request = DownstreamHeadroomRequest {
+            schema_version: DOWNSTREAM_HEADROOM_SCHEMA_VERSION,
+            pipeline_id,
+            attempt_id,
+            stage_id: self.stage_id.clone(),
+            consumer: self.consumer,
+            binding,
+            route_id,
+            serializer_id,
+            recipe_digest,
+            demands,
+            release: HeadroomReleaseCondition {
+                completion_receipt: completion_artifact_id,
+                release_on_cancel: self.release_on_cancel,
+                expires_at_ms: deadline_ms,
+            },
+        };
+        request.validate()?;
+        Ok(request)
+    }
+}
+
+/// Original admitted Orientation demand request plus its exact job and
+/// candidate closure. This is the neutral handoff consumed by the runtime
+/// owner; it grants no permit and is not a second reservation ledger.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AdmittedOrientationHeadroomSupplyV1 {
+    /// Exact carrier schema version.
+    pub schema_version: u32,
+    /// Original request containing every actual per-dimension owner request.
+    pub request: DownstreamHeadroomRequest,
+    /// Canonical digest retained from the original request producer.
+    pub request_digest: String,
+    /// Exact Orientation candidate this demand protects.
+    pub candidate_digest: String,
+    /// Original pipeline identity duplicated for closure comparison.
+    pub pipeline_id: ArtifactId,
+    /// Original durable job and Governor task identities.
+    pub job_id: TaskId,
+    pub task_id: TaskId,
+    /// Original attempt and full work-scope closure.
+    pub attempt_id: ArtifactId,
+    pub work_scope: WorkScopeBinding,
+    /// Full original context binding and State Fence.
+    pub context_binding: ContextBinding,
+    pub state_fence: StateFence,
+    /// Exact admitted operation identity.
+    pub operation_id: OperationId,
+    /// Original source revision used by the recipe/context supplier.
+    pub source_revision: String,
+    /// Original operation deadline.
+    pub deadline_ms: u64,
+    /// Exact completion artifact and its release policy.
+    pub completion_artifact_id: ArtifactId,
+    pub release: HeadroomReleaseCondition,
+}
+
+impl AdmittedOrientationHeadroomSupplyV1 {
+    /// Reject any split between the original request and job/candidate closure.
+    pub fn validate(&self) -> Result<(), ContextError> {
+        if self.schema_version != ADMITTED_ORIENTATION_HEADROOM_SCHEMA_VERSION {
+            return Err(ContextError::InvalidField(
+                "admitted_orientation_headroom.schema_version",
+            ));
+        }
+        self.request.validate()?;
+        self.context_binding.validate()?;
+        self.state_fence
+            .validate()
+            .map_err(|_| ContextError::InvalidFence)?;
+        self.work_scope
+            .state_fence
+            .validate()
+            .map_err(|_| ContextError::InvalidFence)?;
+        validate_digest(&self.request_digest, "admitted_orientation_headroom.request_digest")?;
+        validate_digest(
+            &self.candidate_digest,
+            "admitted_orientation_headroom.candidate_digest",
+        )?;
+        validate_text(
+            &self.source_revision,
+            "admitted_orientation_headroom.source_revision",
+        )?;
+        validate_text(self.job_id.as_str(), "admitted_orientation_headroom.job_id")?;
+        validate_text(self.task_id.as_str(), "admitted_orientation_headroom.task_id")?;
+        validate_text(
+            self.operation_id.as_str(),
+            "admitted_orientation_headroom.operation_id",
+        )?;
+        if self.request.canonical_digest()? != self.request_digest
+            || self.request.pipeline_id != self.pipeline_id
+            || self.request.attempt_id != self.attempt_id
+            || self.request.binding != self.context_binding
+            || self.request.binding.task_id != self.task_id
+            || self.request.binding.operation_id.as_ref() != Some(&self.operation_id)
+            || self.request.binding.state_fence != self.state_fence
+            || self.work_scope.scope_id != self.context_binding.scope_id
+            || self.work_scope.state_fence != self.state_fence
+            || self.work_scope.resource_generation != self.state_fence.resource_generation
+            || self.request.release != self.release
+            || self.request.release.completion_receipt != self.completion_artifact_id
+            || self.release.expires_at_ms != self.deadline_ms
+            || self.request.demands.iter().any(|demand| {
+                demand.request.operation_id != self.operation_id.as_str()
+                    || demand.request.deadline_ms != self.deadline_ms
+                    || demand.request.requesting_generation_ref
+                        != self.state_fence.resource_generation
+                    || !demand
+                        .request
+                        .authority_epoch_ref
+                        .is_same_authority(&self.state_fence.authority_epoch)
+            })
+        {
+            return Err(ContextError::IdentityConflict);
+        }
+        Ok(())
+    }
+}
 
 /// One independent downstream capacity dimension.
 ///
