@@ -21,6 +21,21 @@ const ALLOWED_HTTP_HOSTS = new Set(["127.0.0.1", "::1", "[::1]"])
 // path requires the versioned owner-proved response (see verifyGatePermit).
 const ALLOWED_GATE_DECISIONS = new Set(["recorded", "allow", "allowed", "pass"])
 
+// Broker-pinned bridge server identity (issue #332 AUD4; minted as
+// `OpenCodeBridgeIntroduction.server_identity`, lowercase SHA-256 hex).
+// Loopback location is not server identity: when the User Broker has
+// projected the pinned identity into this child process,
+// `httpBridgeConfiguration` validates it before any Bearer disclosure and
+// `verifyGatePermit` binds a server-echoed identity to it. A manually
+// configured environment without the broker projection is not an admitted
+// installation path (see `credential_materialization` in
+// plugin-bridge-contract.json); the server-side introduction join still
+// refuses it. Required provisioning plus the no-credential challenge probe
+// remain issue #2898 (protected bootstrap transport and broker launch
+// projection).
+const BRIDGE_SERVER_IDENTITY_ENV = "ELIOT_OPENCODE_BRIDGE_SERVER_IDENTITY"
+const LOWER_SHA256_HEX = /^[0-9a-f]{64}$/
+
 const BRIDGE_ENV_KEYS = [
   "APPDATA",
   "COMSPEC",
@@ -52,6 +67,40 @@ const MAX_EFFECT_DESCRIPTOR_BYTES = 64 * 1024
 const EFFECT_SCHEMA_VERSION = "eliot.opencode.effect.v1"
 const ARGUMENT_NORMALIZATION_VERSION = "eliot.opencode.arguments.v1"
 const MEDIA_TYPE_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/
+
+// Single source for the gate/host-event payload shape (issue #332 AUD5),
+// pinned to integrations/opencode/plugin-bridge-contract.json
+// `payload.allowlisted_fields` (same members, same order). `compactEvent`
+// projects every payload through the applicable allowlist and
+// `assertPayloadAllowlist` throws fail-closed on any drift, so payload
+// minimization is a production guarantee enforced on every event — not only
+// the static/Node allowlist comparison in the test suite. The effect pair is
+// present exactly when an effect binding was computed; passive observations
+// without one carry the 12-field base shape.
+const PAYLOAD_ALLOWLIST_BASE = Object.freeze([
+  "event_id",
+  "sequence",
+  "emitted_at",
+  "event_kind",
+  "vendor_event_kind",
+  "host_session_id",
+  "task_id",
+  "work_item_id",
+  "tool",
+  "changed_path",
+  "argument_keys",
+  "attached_task",
+])
+const PAYLOAD_ALLOWLIST_EFFECT = Object.freeze([...PAYLOAD_ALLOWLIST_BASE, "effect_descriptor", "effect_digest"])
+
+function assertPayloadAllowlist(payload, hasEffect) {
+  const expected = hasEffect ? PAYLOAD_ALLOWLIST_EFFECT : PAYLOAD_ALLOWLIST_BASE
+  const keys = Object.keys(payload).sort()
+  const wanted = [...expected].sort()
+  if (keys.length !== wanted.length || keys.some((key, index) => key !== wanted[index])) {
+    throw new Error("ELIOT host-event payload drifted from its allowlisted contract")
+  }
+}
 
 function boundedInteger(name, fallback, minimum, maximum) {
   const parsed = Number.parseInt(process.env[name] ?? "", 10)
@@ -408,7 +457,8 @@ async function compactEvent(kind, input = {}, output = {}, effectBinding = null)
           ? `opencode:sha256:${identityDigest}`
           : `opencode:${hostSessionId ?? "unknown"}:${vendorEventKind}:${sequence}`
 
-  const payload = {
+  const hasEffect = effectBinding !== null
+  const fields = {
     event_id: eventId,
     sequence,
     emitted_at: emittedAt,
@@ -421,11 +471,22 @@ async function compactEvent(kind, input = {}, output = {}, effectBinding = null)
     changed_path: changedPath,
     argument_keys: argumentKeys,
     attached_task: attachedTask(),
+    ...(hasEffect
+      ? {
+          effect_descriptor: effectBinding.descriptor,
+          effect_digest: effectBinding.effectDigest,
+        }
+      : {}),
   }
-  if (effectBinding !== null) {
-    payload.effect_descriptor = effectBinding.descriptor
-    payload.effect_digest = effectBinding.effectDigest
-  }
+  // Allowlist-driven construction: only allowlisted members can reach the
+  // wire, and any drift throws fail-closed below. Production caller chain:
+  // `compactEvent` <- `invokeBridge` (every HTTP attempt, gate and passive)
+  // <- `requireMutationGate` / `enqueuePassive` <- `tool.execute.before`,
+  // `tool.execute.after`, `event`.
+  const allowlist = hasEffect ? PAYLOAD_ALLOWLIST_EFFECT : PAYLOAD_ALLOWLIST_BASE
+  const payload = {}
+  for (const key of allowlist) payload[key] = fields[key]
+  assertPayloadAllowlist(payload, hasEffect)
   return payload
 }
 
@@ -471,9 +532,18 @@ function httpBridgeConfiguration() {
   if (!token) {
     throw new HttpBridgeError("ELIOT OpenCode bridge token is unavailable")
   }
+  // The pinned server identity is validated before the Bearer is ever
+  // disclosed: a malformed provisioned identity fails closed here, and a
+  // missing one records the non-admitted manual path (`serverIdentity: null`)
+  // the server-side introduction join still refuses.
+  const serverIdentity = process.env[BRIDGE_SERVER_IDENTITY_ENV] ?? null
+  if (serverIdentity !== null && !LOWER_SHA256_HEX.test(serverIdentity)) {
+    throw new HttpBridgeError("ELIOT OpenCode bridge server identity is malformed")
+  }
   return {
     endpoint: new URL("/v1/host-events", base).toString(),
     token,
+    serverIdentity,
   }
 }
 
@@ -799,7 +869,7 @@ function responseCommitmentMessage(result) {
   ])
 }
 
-async function verifyGatePermit(result, { payload, token, tool }) {
+async function verifyGatePermit(result, { payload, token, serverIdentity, tool }) {
   const unverified = (detail) =>
     new Error(
       `ELIOT ActionGate returned a legacy/unverified response: ${detail} (cannot authorize a mutating tool)`,
@@ -824,6 +894,13 @@ async function verifyGatePermit(result, { payload, token, tool }) {
   const stateFence = process.env.ELIOT_STATE_FENCE
   if (stateFence && result.state_fence !== stateFence) {
     throw unverified("response binds a different state fence")
+  }
+  if (
+    serverIdentity !== null &&
+    typeof result.server_identity === "string" &&
+    result.server_identity !== serverIdentity
+  ) {
+    throw unverified("response binds a different bridge incarnation")
   }
   if (typeof result.response_commitment !== "string" || !result.response_commitment) {
     throw unverified("response carries no owner proof")
@@ -876,7 +953,12 @@ async function invokeBridge(
     try {
       const result = await invokeHttpBridge(httpConfig, payload)
       if (verifiedGate) {
-        await verifyGatePermit(result, { payload, token: httpConfig.token, tool: verifiedGate.tool })
+        await verifyGatePermit(result, {
+          payload,
+          token: httpConfig.token,
+          serverIdentity: httpConfig.serverIdentity,
+          tool: verifiedGate.tool,
+        })
       }
       return result
     } catch (error) {
