@@ -1120,17 +1120,7 @@ impl StartupCoordinator {
                 && current.observed_at_ms == observed_at_ms
                 && current.valid_for_ms == valid_for_ms
             {
-                let Some(current_deadline) = self.current_supervision_deadline else {
-                    return Err(
-                        "the retained Kernel-local Watchdog observation deadline is unavailable"
-                            .to_owned(),
-                    );
-                };
-                if Instant::now() >= current_deadline {
-                    return Err(
-                        "the retained original Watchdog heartbeat window has expired".to_owned(),
-                    );
-                }
+                self.require_current_supervision_deadline()?;
                 return Ok(false);
             }
             if current.candidate_digest != candidate_digest
@@ -1183,6 +1173,18 @@ impl StartupCoordinator {
         });
         self.current_supervision_deadline = Some(local_deadline);
         Ok(true)
+    }
+
+    fn require_current_supervision_deadline(&self) -> Result<(), String> {
+        let Some(current_deadline) = self.current_supervision_deadline else {
+            return Err(
+                "the retained Kernel-local Watchdog observation deadline is unavailable".to_owned(),
+            );
+        };
+        if Instant::now() >= current_deadline {
+            return Err("the retained original Watchdog heartbeat window has expired".to_owned());
+        }
+        Ok(())
     }
 
     fn validate_supervision_observation_window(
