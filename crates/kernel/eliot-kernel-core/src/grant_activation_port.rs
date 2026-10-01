@@ -7306,7 +7306,9 @@ pub(crate) mod tests {
         use eliot_authority::P07PortError;
         assert!(matches!(
             map_thin_error(&KernelError::FenceMismatch),
-            P07PortError::NotAdmitted
+            P07PortError::Refused {
+                cause: eliot_authority::P07RefusalCause::StaleStateFence
+            }
         ));
         assert!(matches!(
             map_thin_error(&KernelError::Expired { expires_at_ms: 1 }),
@@ -7377,7 +7379,9 @@ pub(crate) mod tests {
         };
         assert!(matches!(
             P07AuthorityPort::activate_grant(&port, &split_request),
-            Err(P07PortError::NotAdmitted)
+            Err(P07PortError::Refused {
+                cause: eliot_authority::P07RefusalCause::AuthorityEpochDisagreesWithFence
+            })
         ));
 
         // Blank owner: caller-material failure, never Unavailable.
@@ -7425,7 +7429,10 @@ pub(crate) mod tests {
             authority_epoch: epoch.clone(),
             state_fence: fence,
             allowed_effect: EffectClass::ExternalEffect,
-            proof_ceiling: ProofCeiling::ObservedExternalEffect,
+            // Keep the authority fixture ceiling equal to the scoped
+            // verification ceiling declared by the grant-intent fixtures.
+            // The compiled I6.10 mechanical subset binds that exact ceiling.
+            proof_ceiling: ProofCeiling::ScopedVerification,
         })
     }
 
@@ -7647,6 +7654,19 @@ pub(crate) mod tests {
                 preserved: Vec::new(),
             })
         }
+
+        fn hydrate_grant_member(&self, grant_id: &str) -> Result<GrantClosureMember, KernelError> {
+            if grant_id != self.value.intent.grant_id {
+                return Err(KernelError::RecoveryUnavailable(
+                    "fixture owner admits no hydration for the requested grant".to_owned(),
+                ));
+            }
+            Ok(GrantClosureMember {
+                intent: self.value.intent.clone(),
+                durable_record: self.value.durable_record.clone(),
+                observed_at_ms: self.value.observed_at_ms,
+            })
+        }
     }
 
     fn durable_root_fixture(
@@ -7798,6 +7818,27 @@ pub(crate) mod tests {
                         observed_at_ms: value.observed_at_ms,
                     }],
                     preserved: Vec::new(),
+                })
+            }
+
+            fn hydrate_grant_member(
+                &self,
+                grant_id: &str,
+            ) -> Result<GrantClosureMember, KernelError> {
+                let value = self
+                    .value
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                if grant_id != value.intent.grant_id {
+                    return Err(KernelError::RecoveryUnavailable(
+                        "fixture owner admits no hydration for the requested grant".to_owned(),
+                    ));
+                }
+                Ok(GrantClosureMember {
+                    intent: value.intent,
+                    durable_record: value.durable_record,
+                    observed_at_ms: value.observed_at_ms,
                 })
             }
         }
@@ -8009,12 +8050,15 @@ pub(crate) mod tests {
                 "intent.holder_principal",
                 "intent.session_id",
                 "intent.scope_id",
+                "intent.token_id",
                 "intent.binding",
                 "intent.allowed_effect",
                 "intent.proof_ceiling",
                 "intent.issued_at_ms",
                 "intent.expires_at_ms",
                 "intent.receipt_obligations",
+                "intent.mechanical_subset",
+                "intent.mechanical_subset_commitment",
                 "durable_record",
                 "observed_at_ms",
             ]
@@ -8385,12 +8429,15 @@ pub(crate) mod tests {
                 "members[].intent.holder_principal",
                 "members[].intent.session_id",
                 "members[].intent.scope_id",
+                "members[].intent.token_id",
                 "members[].intent.binding",
                 "members[].intent.allowed_effect",
                 "members[].intent.proof_ceiling",
                 "members[].intent.issued_at_ms",
                 "members[].intent.expires_at_ms",
                 "members[].intent.receipt_obligations",
+                "members[].intent.mechanical_subset",
+                "members[].intent.mechanical_subset_commitment",
                 "members[].durable_record",
                 "members[].observed_at_ms",
                 "preserved[].grant_id",
