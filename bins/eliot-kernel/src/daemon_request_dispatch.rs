@@ -681,6 +681,8 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "watchdog_export_claim" => "watchdog_export_claim",
         "watchdog_export_result" => "watchdog_export_result",
         "campaign_packet_claim" => "campaign_packet_claim",
+        "source_capture.claim" => "source_capture.claim",
+        "source_capture.stage" => "source_capture.stage",
         "campaign_packet_result" => "campaign_packet_result",
         "task_controller_claim" => "task_controller_claim",
         "task_controller_result" => "task_controller_result",
@@ -3379,8 +3381,13 @@ impl KernelComposition {
                     .await
             }
             "apply_prepared" => {
-                Box::pin(self.store_apply_operation(session, request_id.clone(), payload.clone()))
-                    .await
+                Box::pin(self.store_apply_operation(
+                    session,
+                    request_id.clone(),
+                    payload.clone(),
+                    request_identity,
+                ))
+                .await
             }
             NOTIFICATION_STATE_MUTATION_OPERATION => {
                 Box::pin(self.notification_state_operation(
@@ -4002,6 +4009,88 @@ impl KernelComposition {
                                 "recovery": null,
                             }),
                         })
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "source_capture.claim" => {
+                #[cfg(windows)]
+                {
+                    if payload.as_object().is_none_or(|object| !object.is_empty()) {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    self.claim_selected_source_capture_pair(session)
+                        .map(|pair| match pair {
+                            Some((envelope, invocation, request_identity)) => serde_json::json!({
+                                "status": "known",
+                                "value": { "pair": {
+                                    "envelope": envelope,
+                                    "invocation": invocation,
+                                    "request_identity": request_identity,
+                                }},
+                                "recovery": null,
+                            }),
+                            None => serde_json::json!({
+                                "status": "known",
+                                "value": { "pair": null },
+                                "recovery": null,
+                            }),
+                        })
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "source_capture.stage" => {
+                #[cfg(windows)]
+                {
+                    let object = payload.as_object().ok_or(TransportError::SessionFenced)?;
+                    if object.len() != 3 {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    let operation_id = object
+                        .get("operation_id")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or(TransportError::SessionFenced)?;
+                    let request_digest = object
+                        .get("request_digest")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or(TransportError::SessionFenced)?;
+                    let intent: eliot_kernel_service::source_capture_mutation::SelectedSourceCaptureStageIntent =
+                        serde_json::from_value(
+                            object
+                                .get("intent")
+                                .cloned()
+                                .ok_or(TransportError::SessionFenced)?,
+                        )
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    let original_identity = request_identity.ok_or(TransportError::SessionFenced)?;
+                    let staged = self.stage_selected_source_capture_host_request(
+                        session,
+                        operation_id,
+                        request_digest,
+                        original_identity,
+                        &intent,
+                    )?;
+                    let staged_record = serde_json::to_value(staged.staged.snapshot.record())
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    let stage_receipt = serde_json::to_value(staged.staged.snapshot.receipt())
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    Ok(serde_json::json!({
+                        "status": "known",
+                        "value": { "stage": {
+                            "record": staged.record,
+                            "stage_receipt_id": staged.stage_receipt_id,
+                            "staged_record": staged_record,
+                            "stage_receipt": stage_receipt,
+                        }},
+                        "recovery": null,
+                    }))
                 }
                 #[cfg(not(windows))]
                 {
@@ -9180,6 +9269,7 @@ impl KernelComposition {
         session: &Session,
         request_id: RequestId,
         payload: serde_json::Value,
+        request_identity: Option<&RequestIdentity>,
     ) -> Result<serde_json::Value, TransportError> {
         let operation: StoreApplyOperation =
             serde_json::from_value(without_daemon_routing_key(payload)?)
@@ -9188,6 +9278,27 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         validate_store_session_fence(session, &operation.context.state_fence)?;
+        let proposed_attempt_commands = operation
+            .transition
+            .named_operations
+            .iter()
+            .filter(|command| {
+                command.operation == eliot_store_api::NamedMutationOperation::AdmitProposedAttempt
+            })
+            .collect::<Vec<_>>();
+        if proposed_attempt_commands.len() > 1 {
+            return Err(TransportError::IdentityConflict);
+        }
+        let proposed_attempt = proposed_attempt_commands
+            .first()
+            .map(|command| {
+                eliot_store_api::decode_proposed_attempt_record(
+                    eliot_store_api::NamedMutationOperation::AdmitProposedAttempt,
+                    &command.parameters,
+                )
+                .map_err(|_| TransportError::IdentityConflict)
+            })
+            .transpose()?;
         // Issue #1796 (I6.8): the pre-stage admission boundary emits one typed
         // rejection carrying every detected defect with `stage_state: none`,
         // `ordering_sequence_assigned: false`, `write_mutation_status:
@@ -9267,6 +9378,20 @@ impl KernelComposition {
             .await?
         {
             return Ok(replayed);
+        }
+        if let Some(record) = proposed_attempt.as_ref() {
+            if self
+                .validate_source_capture_transition_for_commit(
+                    session,
+                    &operation.context,
+                    &operation.transition,
+                    request_identity,
+                    record,
+                )
+                .is_err()
+            {
+                return Err(TransportError::IdentityConflict);
+            }
         }
         if let Some(rejection) =
             self.material_write_admission_response(&operation.context.state_fence)
@@ -9401,6 +9526,7 @@ impl KernelComposition {
         // enumerates, revalidates by the envelope's recorded hash, and reconciles
         // by operation identity into either the canonical receipt or a durable
         // Recovery Problem whenever ORS does hold one.
+        let expected_identity = operation.transition.identity.clone();
         match gateway
             .apply_with_causal(
                 &operation.context,
@@ -9411,6 +9537,19 @@ impl KernelComposition {
             .await
         {
             Ok(pair) => {
+                if let Some(record) = proposed_attempt {
+                    if let Err(error) =
+                        eliot_kernel_service::source_capture_mutation::verify_proposed_attempt_readback(
+                            &gateway,
+                            record,
+                            expected_identity,
+                            pair.clone(),
+                        )
+                        .await
+                    {
+                        return Ok(Self::store_error_response_text("write_receipt", &error));
+                    }
+                }
                 let receipt = &pair.receipt;
                 if !campaign_source_publications.is_empty() {
                     if receipt.status == WriteReceiptStatus::Committed {
@@ -9492,6 +9631,32 @@ impl KernelComposition {
             .map_err(|_| TransportError::IdentityConflict)?;
         pair.validate()
             .map_err(|_| TransportError::IdentityConflict)?;
+        let proposed_attempt_commands = operation
+            .transition
+            .named_operations
+            .iter()
+            .filter(|command| {
+                command.operation == eliot_store_api::NamedMutationOperation::AdmitProposedAttempt
+            })
+            .collect::<Vec<_>>();
+        if proposed_attempt_commands.len() > 1 {
+            return Err(TransportError::IdentityConflict);
+        }
+        if let Some(command) = proposed_attempt_commands.first() {
+            let record = eliot_store_api::decode_proposed_attempt_record(
+                eliot_store_api::NamedMutationOperation::AdmitProposedAttempt,
+                &command.parameters,
+            )
+            .map_err(|_| TransportError::IdentityConflict)?;
+            eliot_kernel_service::source_capture_mutation::verify_proposed_attempt_readback(
+                gateway,
+                record,
+                operation.transition.identity.clone(),
+                pair.clone(),
+            )
+            .await
+            .map_err(|_| TransportError::IdentityConflict)?;
+        }
         Ok(Some(store_apply_response(
             &pair,
             verified_correction,
@@ -9505,6 +9670,7 @@ impl KernelComposition {
         _session: &Session,
         _request_id: RequestId,
         payload: serde_json::Value,
+        _request_identity: Option<&RequestIdentity>,
     ) -> Result<serde_json::Value, TransportError> {
         let _ = payload;
         Err(TransportError::SessionFenced)

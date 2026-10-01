@@ -618,7 +618,9 @@ impl<'a, P: KernelGovernorPort + ?Sized> KernelHostRequestBinder<'a, P> {
     ) -> Result<StagedAdmission, PortFailure> {
         if matches!(
             envelope.kind,
-            HostRequestKind::Invocation | HostRequestKind::Cancellation
+            HostRequestKind::Invocation
+                | HostRequestKind::SelectedSourceCapture
+                | HostRequestKind::Cancellation
         ) && (envelope.identity.correlation_projection.is_none()
             || envelope.identity.session_id.is_none())
         {
@@ -636,7 +638,9 @@ impl<'a, P: KernelGovernorPort + ?Sized> KernelHostRequestBinder<'a, P> {
         let staged = requested_host_request_record(envelope)?;
         let stored = if matches!(
             staged.kind,
-            OrsHostRequestKind::Invocation | OrsHostRequestKind::Cancellation
+            OrsHostRequestKind::Invocation
+                | OrsHostRequestKind::SelectedSourceCapture
+                | OrsHostRequestKind::Cancellation
         ) {
             self.store.resolve_or_stage_host_request(&staged)
         } else {
@@ -1120,6 +1124,7 @@ fn requested_host_request_record(
         kind: match envelope.kind {
             HostRequestKind::Activation => OrsHostRequestKind::Activation,
             HostRequestKind::Invocation => OrsHostRequestKind::Invocation,
+            HostRequestKind::SelectedSourceCapture => OrsHostRequestKind::SelectedSourceCapture,
             HostRequestKind::Cancellation => OrsHostRequestKind::Cancellation,
             HostRequestKind::Status => OrsHostRequestKind::Status,
             HostRequestKind::Reconciliation => OrsHostRequestKind::Reconciliation,
