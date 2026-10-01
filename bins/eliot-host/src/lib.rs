@@ -1709,7 +1709,10 @@ mod host_lifecycle_boundary_table_tests {
         // Every emitting event resolves through the production binding, and
         // the resolved row is exactly the table row: unknown IDs cannot
         // silently become new production vocabulary.
-        for row in table.iter().filter(|row| !row.event.starts_with("propagated:")) {
+        for row in table
+            .iter()
+            .filter(|row| !row.event.starts_with("propagated:"))
+        {
             let resolved = super::boundary_by_event(row.event);
             assert_eq!(
                 resolved.name, row.name,
