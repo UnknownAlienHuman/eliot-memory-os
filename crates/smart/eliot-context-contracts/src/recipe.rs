@@ -1165,16 +1165,12 @@ impl RecipeImprovementCandidate {
     /// only for an improvement candidate it is still not part of the certified
     /// digest — see [`EXCLUDED_FROM_POLICY_DIGEST_DOMAIN`].
     fn covers_declared_counter_metrics(&self, policy: &ContextRecipePolicy) -> bool {
-        policy
-            .qualification
-            .counter_metrics
-            .iter()
-            .all(|declared| {
-                self.counter_metrics.iter().any(|measured| {
-                    measured.metric_id == declared.metric_id
-                        && measured.forbidden_movement == declared.forbidden_movement
-                })
+        policy.qualification.counter_metrics.iter().all(|declared| {
+            self.counter_metrics.iter().any(|measured| {
+                measured.metric_id == declared.metric_id
+                    && measured.forbidden_movement == declared.forbidden_movement
             })
+        })
     }
 }
 
@@ -1461,7 +1457,7 @@ struct RecipePolicyDigestContent<'a> {
     supersession: &'a RecipeSupersession,
 }
 
-impl<'a> RecipePolicyDigestContent<'a> {
+impl RecipePolicyDigestContent<'_> {
     /// The single place where every member of a policy is classified.
     ///
     /// #1724 A2. This function destructures [`ContextRecipePolicy`] — and every
@@ -1548,7 +1544,7 @@ impl<'a> RecipePolicyDigestContent<'a> {
                 RecipeCounterMetricDigestContent { metric_id }
             })
             .collect();
-        certified_metrics.sort_by(|left, right| left.metric_id.cmp(&right.metric_id));
+        certified_metrics.sort_by(|left, right| left.metric_id.cmp(right.metric_id));
 
         let canonical_applicability = RecipeApplicability {
             task_profiles: canonical_set(applicability.task_profiles.clone()),
@@ -1556,15 +1552,15 @@ impl<'a> RecipePolicyDigestContent<'a> {
             impact_profiles: canonical_set(applicability.impact_profiles.clone()),
             governance_profiles: canonical_set(applicability.governance_profiles.clone()),
         };
-        let candidate_features = canonical_set(candidate_features.to_vec());
-        let suppressible_roles = canonical_set(suppressible_roles.to_vec());
-        let section_budgets = canonical_budgets(section_budgets.to_vec());
-        let role_positions = canonical_role_positions(role_positions.to_vec());
+        let candidate_features = canonical_set(candidate_features.clone());
+        let suppressible_roles = canonical_set(suppressible_roles.clone());
+        let section_budgets = canonical_budgets(section_budgets.clone());
+        let role_positions = canonical_role_positions(role_positions.clone());
         let canonical_omission = RecipeOmissionPolicy {
             permitted_reasons: canonical_set(omission.permitted_reasons.clone()),
             non_recoverable_reasons: canonical_set(omission.non_recoverable_reasons.clone()),
         };
-        let blocking_dimensions = canonical_set(blocking_dimensions.to_vec());
+        let blocking_dimensions = canonical_set(blocking_dimensions.clone());
 
         let content = RecipePolicyDigestContent {
             policy_schema_version: *policy_schema_version,
