@@ -1875,8 +1875,7 @@ impl KernelComposition {
             max_frame: u32::try_from(eliot_protocol::MAX_FRAME_BYTES)
                 .map_err(|_| KernelBuildError::Core("maximum frame exceeds u32".to_owned()))?,
         };
-        let runtime = Runtime::new(
-            RuntimeConfig {
+        let runtime_config = RuntimeConfig {
                 mailbox_capacity: 128,
                 control_reserve: 4,
                 concurrency: 4,
@@ -1886,7 +1885,22 @@ impl KernelComposition {
                 restart_window: Duration::from_mins(1),
                 restart_backoff: Duration::from_millis(100),
                 shutdown_grace: Duration::from_secs(5),
-            },
+            };
+        let runtime_owner_generation_ref = format!(
+            "kernel-runtime-generation-{}",
+            generation.value()
+        );
+        let runtime_authority_epoch_ref = serde_json::to_string(&canonical_epoch)
+            .map_err(|error| KernelBuildError::Core(error.to_string()))?;
+        let runtime_capacity_reserve = RuntimeReserve::from_config(
+            &runtime_config,
+            &runtime_owner_generation_ref,
+            &runtime_authority_epoch_ref,
+        )
+        .map_err(|error| KernelBuildError::Core(error.to_string()))?;
+        let runtime = Runtime::new_with_capacity_reserve(
+            runtime_config,
+            runtime_capacity_reserve,
             None,
         )
         .map_err(KernelBuildError::Runtime)?;
@@ -2141,6 +2155,7 @@ impl KernelComposition {
             ors_object_path,
             work_root,
             runtime,
+            runtime_owner_generation: generation,
             platform,
             ipc,
             generation_gateway,

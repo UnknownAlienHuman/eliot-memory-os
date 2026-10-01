@@ -548,7 +548,7 @@ use eliot_protocol::{
     AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt, AgentBridgePeerChallenge,
     EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, RequestIdentity,
 };
-use eliot_runtime::{Runtime, RuntimeConfig, ShutdownOutcome};
+use eliot_runtime::{Runtime, RuntimeConfig, RuntimeReserve, ShutdownOutcome};
 #[cfg(test)]
 pub use eliot_runtime_contracts::SupervisionLeasePredecessorIdentity;
 #[cfg(windows)]
@@ -684,6 +684,9 @@ pub struct KernelComposition {
     ors_object_path: PathBuf,
     work_root: PathBuf,
     runtime: Runtime,
+    /// Resource generation that owns the shared RuntimeReserve instance used
+    /// by both ordinary task admission and authenticated headroom IPC.
+    runtime_owner_generation: ResourceGeneration,
     platform: Arc<WindowsPlatform>,
     ipc: IpcImplementation,
     generation_gateway: OrsGenerationCoordinator,

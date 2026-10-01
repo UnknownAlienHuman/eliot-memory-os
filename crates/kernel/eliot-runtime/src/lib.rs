@@ -11,7 +11,9 @@ mod control_reserve;
 
 use eliot_observation_contracts::ObservationKind;
 use eliot_platform::{PortError, PortOutcome, ProviderError, ProviderErrorCode};
-use eliot_runtime_contracts::ServiceProcessState;
+use eliot_runtime_contracts::{
+    ControlOperationClass, NormalWorkClass, ServiceProcessState,
+};
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
@@ -94,8 +96,15 @@ pub enum RuntimeFailure {
 /// A bounded, typed mailbox with an independent control reserve.
 #[derive(Clone)]
 pub struct Mailbox<T> {
-    data: mpsc::Sender<T>,
-    control: mpsc::Sender<ControlSignal>,
+    data: mpsc::Sender<ReservedMessage<T>>,
+    control: mpsc::Sender<ReservedMessage<ControlSignal>>,
+    capacity_reserve: Option<RuntimeReserve>,
+    operation_sequence: Arc<AtomicU64>,
+}
+
+struct ReservedMessage<T> {
+    value: T,
+    _permit: Option<RuntimePermit>,
 }
 
 /// The sending half of a typed mailbox.
@@ -109,8 +118,8 @@ enum Lane {
 
 /// The receiving half of a typed mailbox.
 pub struct MailboxReceiver<T> {
-    data: mpsc::Receiver<T>,
-    control: mpsc::Receiver<ControlSignal>,
+    data: mpsc::Receiver<ReservedMessage<T>>,
+    control: mpsc::Receiver<ReservedMessage<ControlSignal>>,
     preferred: Lane,
     last: Option<Lane>,
     streak: usize,
@@ -129,13 +138,32 @@ impl<T> Mailbox<T> {
         control_reserve: usize,
         fairness_quantum: usize,
     ) -> Result<(Self, MailboxReceiver<T>), ConfigError> {
+        Self::bounded_with_capacity_reserve(
+            data_capacity,
+            control_reserve,
+            fairness_quantum,
+            None,
+        )
+    }
+
+    fn bounded_with_capacity_reserve(
+        data_capacity: usize,
+        control_reserve: usize,
+        fairness_quantum: usize,
+        capacity_reserve: Option<RuntimeReserve>,
+    ) -> Result<(Self, MailboxReceiver<T>), ConfigError> {
         if data_capacity == 0 || control_reserve == 0 || fairness_quantum == 0 {
             return Err(ConfigError::ZeroCapacity);
         }
         let (data, data_rx) = mpsc::channel(data_capacity);
         let (control, control_rx) = mpsc::channel(control_reserve);
         Ok((
-            Self { data, control },
+            Self {
+                data,
+                control,
+                capacity_reserve,
+                operation_sequence: Arc::new(AtomicU64::new(1)),
+            },
             MailboxReceiver {
                 data: data_rx,
                 control: control_rx,
@@ -151,7 +179,14 @@ impl<T> Mailbox<T> {
 
     /// Attempts to send data without consuming control capacity.
     pub fn try_send(&self, item: T) -> SendResult {
-        match self.data.try_send(item) {
+        let permit = match self.acquire_runnable(false) {
+            Ok(permit) => permit,
+            Err(()) => return SendResult::Saturated,
+        };
+        match self.data.try_send(ReservedMessage {
+            value: item,
+            _permit: permit,
+        }) {
             Ok(()) => SendResult::Accepted,
             Err(mpsc::error::TrySendError::Full(_)) => SendResult::Saturated,
             Err(mpsc::error::TrySendError::Closed(_)) => SendResult::Closed,
@@ -160,7 +195,14 @@ impl<T> Mailbox<T> {
 
     /// Attempts to send a protected control signal.
     pub fn try_send_control(&self, signal: ControlSignal) -> SendResult {
-        match self.control.try_send(signal) {
+        let permit = match self.acquire_runnable(true) {
+            Ok(permit) => permit,
+            Err(()) => return SendResult::Saturated,
+        };
+        match self.control.try_send(ReservedMessage {
+            value: signal,
+            _permit: permit,
+        }) {
             Ok(()) => SendResult::Accepted,
             Err(mpsc::error::TrySendError::Full(_)) => SendResult::Saturated,
             Err(mpsc::error::TrySendError::Closed(_)) => SendResult::Closed,
@@ -169,7 +211,14 @@ impl<T> Mailbox<T> {
 
     /// Sends data, waiting only for data capacity.
     pub async fn send(&self, item: T) -> SendResult {
-        match self.data.send(item).await {
+        let permit = match self.acquire_runnable(false) {
+            Ok(permit) => permit,
+            Err(()) => return SendResult::Saturated,
+        };
+        match self.data.send(ReservedMessage {
+            value: item,
+            _permit: permit,
+        }).await {
             Ok(()) => SendResult::Accepted,
             Err(_) => SendResult::Closed,
         }
@@ -177,10 +226,41 @@ impl<T> Mailbox<T> {
 
     /// Sends control, waiting only for protected control capacity.
     pub async fn send_control(&self, signal: ControlSignal) -> SendResult {
-        match self.control.send(signal).await {
+        let permit = match self.acquire_runnable(true) {
+            Ok(permit) => permit,
+            Err(()) => return SendResult::Saturated,
+        };
+        match self.control.send(ReservedMessage {
+            value: signal,
+            _permit: permit,
+        }).await {
             Ok(()) => SendResult::Accepted,
             Err(_) => SendResult::Closed,
         }
+    }
+
+    fn acquire_runnable(&self, protected: bool) -> Result<Option<RuntimePermit>, ()> {
+        let Some(reserve) = &self.capacity_reserve else {
+            return Ok(None);
+        };
+        let operation_id = format!(
+            "runtime-mailbox-{}",
+            self.operation_sequence.fetch_add(1, Ordering::AcqRel)
+        );
+        let permit = if protected {
+            reserve.try_acquire_protected_runnable_slot(
+                ControlOperationClass::Recovery,
+                "kernel-runtime",
+                &operation_id,
+            )
+        } else {
+            reserve.try_acquire_normal_runnable_slot(
+                NormalWorkClass::NormalBackground,
+                "kernel-runtime",
+                &operation_id,
+            )
+        };
+        permit.map(Some).map_err(|_| ())
     }
 }
 
@@ -202,20 +282,23 @@ impl<T> MailboxReceiver<T> {
         }
     }
 
-    fn data_item(&mut self, item: Option<T>) -> Option<MailboxItem<T>> {
+    fn data_item(&mut self, item: Option<ReservedMessage<T>>) -> Option<MailboxItem<T>> {
         if let Some(item) = item {
             self.record(Lane::Data);
-            Some(MailboxItem::Data(item))
+            Some(MailboxItem::Data(item.value))
         } else {
             self.data_closed = true;
             None
         }
     }
 
-    fn control_item(&mut self, item: Option<ControlSignal>) -> Option<MailboxItem<T>> {
+    fn control_item(
+        &mut self,
+        item: Option<ReservedMessage<ControlSignal>>,
+    ) -> Option<MailboxItem<T>> {
         if let Some(item) = item {
             self.record(Lane::Control);
-            Some(MailboxItem::Control(item))
+            Some(MailboxItem::Control(item.value))
         } else {
             self.control_closed = true;
             None
@@ -847,6 +930,8 @@ pub struct Runtime {
     config: RuntimeConfig,
     data_permits: Arc<Semaphore>,
     control_permits: Arc<Semaphore>,
+    capacity_reserve: Option<RuntimeReserve>,
+    capacity_operation_sequence: AtomicU64,
     shared: Arc<RuntimeShared>,
     sink: Option<Arc<dyn ObservationSink>>,
 }
@@ -861,6 +946,8 @@ impl Runtime {
         Ok(Self {
             data_permits: Arc::new(Semaphore::new(config.concurrency)),
             control_permits: Arc::new(Semaphore::new(config.control_concurrency_reserve)),
+            capacity_reserve: None,
+            capacity_operation_sequence: AtomicU64::new(1),
             shared: Arc::new(RuntimeShared {
                 lifecycle: AtomicU8::new(RUNNING),
                 admission: Mutex::new(()),
@@ -872,12 +959,46 @@ impl Runtime {
         })
     }
 
+    /// Creates a runtime whose active task admission shares the supplied
+    /// native capacity reserve with other Kernel owners. The reserve is the
+    /// same counter set ordinary task admission consults; a headroom reader
+    /// can therefore never observe capacity already consumed by running work.
+    pub fn new_with_capacity_reserve(
+        config: RuntimeConfig,
+        capacity_reserve: RuntimeReserve,
+        sink: Option<Arc<dyn ObservationSink>>,
+    ) -> Result<Self, ConfigError> {
+        config.validate()?;
+        Ok(Self {
+            data_permits: Arc::new(Semaphore::new(config.concurrency)),
+            control_permits: Arc::new(Semaphore::new(config.control_concurrency_reserve)),
+            capacity_reserve: Some(capacity_reserve),
+            capacity_operation_sequence: AtomicU64::new(1),
+            shared: Arc::new(RuntimeShared {
+                lifecycle: AtomicU8::new(RUNNING),
+                admission: Mutex::new(()),
+                cancellation: CancellationToken::root(),
+                registry: Arc::new(TaskRegistry::new()),
+            }),
+            config,
+            sink,
+        })
+    }
+
+    /// Returns the exact reserve instance used by ordinary task admission,
+    /// when the Kernel constructed this runtime with a shared owner reserve.
+    #[must_use]
+    pub fn capacity_reserve(&self) -> Option<RuntimeReserve> {
+        self.capacity_reserve.clone()
+    }
+
     /// Creates a mailbox using this runtime's bounded fairness policy.
     pub fn mailbox<T>(&self) -> Result<(Mailbox<T>, MailboxReceiver<T>), ConfigError> {
-        Mailbox::bounded(
+        Mailbox::bounded_with_capacity_reserve(
             self.config.mailbox_capacity,
             self.config.control_reserve,
             self.config.fairness_quantum,
+            self.capacity_reserve.clone(),
         )
     }
 
@@ -931,6 +1052,11 @@ impl Runtime {
         let token = self.shared.cancellation.child();
         let work_token = token.clone();
         let sink = self.sink.clone();
+        let capacity_reserve = self.capacity_reserve.clone();
+        let capacity_operation_id = format!(
+            "runtime-task-{}",
+            self.capacity_operation_sequence.fetch_add(1, Ordering::AcqRel)
+        );
         let join = self.shared.registry.spawn(async move {
             let permit = tokio::select! {
                 () = work_token.cancelled() => return Err(TaskFailure::Cancelled),
@@ -938,6 +1064,27 @@ impl Runtime {
                     Ok(permit) => permit,
                     Err(_) => return Err(TaskFailure::Cancelled),
                 },
+            };
+            let capacity_permit = match (capacity_reserve, class) {
+                (Some(reserve), ExecutionClass::Data) => Some(
+                    reserve
+                        .try_acquire_normal_cpu_task(
+                            NormalWorkClass::NormalBackground,
+                            "kernel-runtime",
+                            &capacity_operation_id,
+                        )
+                        .map_err(|error| TaskFailure::Failed(error.to_string()))?,
+                ),
+                (Some(reserve), ExecutionClass::ProtectedControl) => Some(
+                    reserve
+                        .try_acquire_protected_cpu_task(
+                            ControlOperationClass::Recovery,
+                            "kernel-runtime",
+                            &capacity_operation_id,
+                        )
+                        .map_err(|error| TaskFailure::Failed(error.to_string()))?,
+                ),
+                (None, _) => None,
             };
             work_token.checkpoint()?;
             let Ok(future) = catch_unwind(AssertUnwindSafe(|| factory(work_token.clone()))) else {
@@ -947,6 +1094,7 @@ impl Runtime {
                 Ok(result) => result,
                 Err(()) => Err(TaskFailure::Panicked),
             };
+            drop(capacity_permit);
             drop(permit);
             if let Err(error) = &result {
                 observe_safely(
