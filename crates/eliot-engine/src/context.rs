@@ -3316,8 +3316,7 @@ fn mandatory_floor(
     let mut floor = supplement_tokens;
     loop {
         finalize_budget_report(&mut packet, floor, truncated, &sections_truncated)?;
-        let (quality_packet, packet_tokens) =
-            finalize_packet_quality_measurement(&packet, frame)?;
+        let (quality_packet, packet_tokens) = finalize_packet_quality_measurement(&packet, frame)?;
         let next = total_surface_estimate(packet_tokens, supplement_tokens, 0)?;
         if next == floor {
             return Ok((quality_packet, next));
@@ -3342,8 +3341,7 @@ fn fit_packet_to_limit(
         packet.truncation.truncated |= truncated;
         packet.truncation.returned = packet.exact_handles.len();
         finalize_budget_report(&mut packet, limit, truncated, &sections_truncated)?;
-        let (quality_packet, packet_tokens) =
-            finalize_packet_quality_measurement(&packet, frame)?;
+        let (quality_packet, packet_tokens) = finalize_packet_quality_measurement(&packet, frame)?;
         if total_surface_estimate(packet_tokens, supplement_tokens, 0)? <= limit {
             return Ok(Some(quality_packet));
         }

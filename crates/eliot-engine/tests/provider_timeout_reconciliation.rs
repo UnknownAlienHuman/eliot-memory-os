@@ -139,7 +139,11 @@ fn legacy_attempt_without_route_policy_remains_loadable() -> TestResult {
     let root = temp_root("legacy-load");
     let nullable_id = "legacy-load-null-policy";
     let nullable_path = root.join(format!("runtime/provider-invocations/{nullable_id}.json"));
-    fs::create_dir_all(nullable_path.parent().ok_or("legacy attempt parent missing")?)?;
+    fs::create_dir_all(
+        nullable_path
+            .parent()
+            .ok_or("legacy attempt parent missing")?,
+    )?;
     let mut nullable_value = serde_json::to_value(attempt(nullable_id))?;
     nullable_value["provider_route_policy"] = serde_json::Value::Null;
     fs::write(&nullable_path, serde_json::to_vec_pretty(&nullable_value)?)?;

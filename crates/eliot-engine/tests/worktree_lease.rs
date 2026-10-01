@@ -736,12 +736,8 @@ async fn completion_requires_candidate_patch_verifiers() -> TestResult {
     let original_id = substituted_runs[substituted_index].verifier_run_id;
     substituted_runs[substituted_index].verifier_run_id = eliot_types::VerifierRunId::new_v7();
     let foreign_id = substituted_runs[substituted_index].verifier_run_id;
-    let substituted_proof = completion_proof(
-        &patch_run,
-        &substituted_runs,
-        &candidate_diff,
-        &review,
-    );
+    let substituted_proof =
+        completion_proof(&patch_run, &substituted_runs, &candidate_diff, &review);
     let unbound = CompletionGate::decide_with_candidate_context(
         &substituted_proof,
         CandidateCompletionContext {
@@ -758,19 +754,28 @@ async fn completion_requires_candidate_patch_verifiers() -> TestResult {
         rollback_failed_missing_candidate.final_status,
         CompletionStatus::UnsafeToFinish
     );
-    assert!(rollback_failed_base.reasons.iter().all(|reason| {
-        rollback_failed_missing_candidate.reasons.contains(reason)
-    }));
-    assert!(rollback_failed_missing_candidate
-        .reasons
-        .contains(&"missing_candidate_diff".to_owned()));
+    assert!(
+        rollback_failed_base
+            .reasons
+            .iter()
+            .all(|reason| { rollback_failed_missing_candidate.reasons.contains(reason) })
+    );
+    assert!(
+        rollback_failed_missing_candidate
+            .reasons
+            .contains(&"missing_candidate_diff".to_owned())
+    );
     assert_eq!(unbound.final_status, CompletionStatus::PartialProgress);
-    assert!(unbound.reasons.contains(&format!(
-        "patch_run_verifier_ref_missing:{original_id}"
-    )));
-    assert!(unbound
-        .reasons
-        .contains(&format!("verifier_run_not_in_patch_run:{foreign_id}")));
+    assert!(
+        unbound
+            .reasons
+            .contains(&format!("patch_run_verifier_ref_missing:{original_id}"))
+    );
+    assert!(
+        unbound
+            .reasons
+            .contains(&format!("verifier_run_not_in_patch_run:{foreign_id}"))
+    );
     Ok(())
 }
 

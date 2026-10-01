@@ -30,9 +30,7 @@ impl EvalVerdictService {
                     || result.measurements.iter().any(|measurement| {
                         !measurement.passed
                             || measurement.observed.trim().is_empty()
-                            || measurement
-                                .observed
-                                .starts_with("not yet implemented:")
+                            || measurement.observed.starts_with("not yet implemented:")
                             || measurement.evidence_refs.is_empty()
                             || measurement
                                 .evidence_refs

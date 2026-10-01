@@ -422,7 +422,10 @@ async fn adapter_supervisor_does_not_redispatch_before_provider_dispatch() -> Te
     assert_eq!(window.circuit_state, AdapterCircuitState::Closed);
     assert!(window.last_failure_at.is_some());
     assert!(window.last_success_at.is_none());
-    assert_eq!(window.last_failure_class.as_deref(), Some("adapter_failure"));
+    assert_eq!(
+        window.last_failure_class.as_deref(),
+        Some("adapter_failure")
+    );
     assert_eq!(
         window.last_failure_at.as_deref(),
         Some(window.updated_at.as_str())

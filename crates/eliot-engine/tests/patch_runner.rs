@@ -10,9 +10,8 @@ use eliot_types::{
     LeaseDecision, LeaseStatus, PatchRequest, PatchRequestId, PatchRun, PatchRunStatus, ProjectId,
     ReceiptId, SymbolEvidence, TaskId, UnifiedDiff, VerifierCommandKind, VerifierEvidence,
     VerifierPlan, VerifierRequirement, VerifierRun, VerifierRunId, VerifierStatus, WorkItemId,
-    WorkLease,
-    WorkLeaseDecision, WorkLeaseDecisionKind, WorkLeaseDecisionReason, WorkLeaseId, WorkLeaseState,
-    WriteId, WriteReceiptRef,
+    WorkLease, WorkLeaseDecision, WorkLeaseDecisionKind, WorkLeaseDecisionReason, WorkLeaseId,
+    WorkLeaseState, WriteId, WriteReceiptRef,
 };
 use std::fs::{self, OpenOptions};
 use std::io::ErrorKind;
@@ -218,19 +217,20 @@ async fn completion_service_reads_only_canonical_patch_execution() -> TestResult
     substituted_runs[substituted_index].verifier_run_id = VerifierRunId::new_v7();
     let foreign_id = substituted_runs[substituted_index].verifier_run_id;
     let proof = completion_proof(&patch_run, &substituted_runs);
-    let decision = CompletionGate::decide_with_patch_context(
-        &proof,
-        Some(&patch_run),
-        &substituted_runs,
-    );
+    let decision =
+        CompletionGate::decide_with_patch_context(&proof, Some(&patch_run), &substituted_runs);
 
     assert_ne!(decision.final_status, CompletionStatus::DoneVerified);
-    assert!(decision.reasons.contains(&format!(
-        "patch_run_verifier_ref_missing:{original_id}"
-    )));
-    assert!(decision
-        .reasons
-        .contains(&format!("verifier_run_not_in_patch_run:{foreign_id}")));
+    assert!(
+        decision
+            .reasons
+            .contains(&format!("patch_run_verifier_ref_missing:{original_id}"))
+    );
+    assert!(
+        decision
+            .reasons
+            .contains(&format!("verifier_run_not_in_patch_run:{foreign_id}"))
+    );
     Ok(())
 }
 

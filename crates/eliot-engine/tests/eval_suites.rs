@@ -238,9 +238,7 @@ fn family_is_inconclusive_without_runtime_evidence(family: EvalFamily) {
         .expect("core-smoke suite includes each runnable family");
     assert_eq!(result.status, EvalCaseStatus::NotYetImplemented);
     assert!(result.measurements.iter().any(|measurement| {
-        measurement
-            .observed
-            .starts_with("not yet implemented:")
+        measurement.observed.starts_with("not yet implemented:")
             && measurement.evidence_refs.is_empty()
     }));
 }
@@ -268,7 +266,11 @@ fn structural_block_observation_does_not_promote_a_declaration_only_case() {
         .find(|measurement| measurement.measurement_id == structural_spec.measurement_id)
         .expect("runner records its structural block observation");
     assert!(observation.passed);
-    assert!(observation.observed.starts_with("structural self-check: runner gate blocked"));
+    assert!(
+        observation
+            .observed
+            .starts_with("structural self-check: runner gate blocked")
+    );
     assert!(observation.evidence_refs.is_empty());
     assert_eq!(result.status, EvalCaseStatus::NotYetImplemented);
     assert_eq!(verdict.status, EvalVerdictStatus::Inconclusive);
@@ -288,7 +290,10 @@ fn eval_runner_rejects_missing_suite_case_output() {
     });
     assert_eq!(run.status, EvalRunStatus::BlockedInvalidDataset);
     assert!(run.case_results.is_empty());
-    assert_eq!(EvalVerdictService::verdict(&run).status, EvalVerdictStatus::Blocked);
+    assert_eq!(
+        EvalVerdictService::verdict(&run).status,
+        EvalVerdictStatus::Blocked
+    );
 }
 
 #[test]
@@ -329,7 +334,12 @@ fn eval_verdict_rejects_empty_result_output() {
     run.case_results.clear();
     let verdict = EvalVerdictService::verdict(&run);
     assert_eq!(verdict.status, EvalVerdictStatus::Inconclusive);
-    assert!(verdict.reasons.iter().any(|reason| reason.contains("empty output")));
+    assert!(
+        verdict
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("empty output"))
+    );
 }
 
 #[test]
@@ -340,9 +350,12 @@ fn eval_verdict_rejects_pass_claim_without_observed_evidence() {
     }
     let verdict = EvalVerdictService::verdict(&run);
     assert_eq!(verdict.status, EvalVerdictStatus::Inconclusive);
-    assert!(verdict.reasons.iter().any(|reason| {
-        reason.contains("lacks complete observed measurement evidence")
-    }));
+    assert!(
+        verdict
+            .reasons
+            .iter()
+            .any(|reason| { reason.contains("lacks complete observed measurement evidence") })
+    );
 }
 
 fn case_for(family: EvalFamily) -> TestResult<EvalCase> {

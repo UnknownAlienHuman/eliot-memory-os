@@ -748,10 +748,9 @@ impl EvalDatasetManifestService {
             && !suite.cases.is_empty()
             && manifest.case_count == suite.cases.len()
             && manifest.fixture_checksums.len() == suite.cases.len()
-            && manifest
-                .fixture_checksums
-                .iter()
-                .all(|fixture| !fixture.fixture_ref.trim().is_empty() && !fixture.checksum.is_empty())
+            && manifest.fixture_checksums.iter().all(|fixture| {
+                !fixture.fixture_ref.trim().is_empty() && !fixture.checksum.is_empty()
+            })
             && manifest.holdout_preserved == suite.holdout;
         BenchmarkIntegrityReceipt {
             benchmark_integrity_receipt_id: BenchmarkIntegrityReceiptId::new_v7(),
@@ -1727,10 +1726,8 @@ impl EvalComparisonService {
                 let family_deltas = families
                     .into_iter()
                     .map(|family| {
-                        let baseline_score =
-                            baseline_scores.get(&family).copied().unwrap_or(0.0);
-                        let candidate_score =
-                            candidate_scores.get(&family).copied().unwrap_or(0.0);
+                        let baseline_score = baseline_scores.get(&family).copied().unwrap_or(0.0);
+                        let candidate_score = candidate_scores.get(&family).copied().unwrap_or(0.0);
                         let delta = candidate_score - baseline_score;
                         EvalFamilyDelta {
                             family,
@@ -1746,11 +1743,7 @@ impl EvalComparisonService {
                     .iter()
                     .filter(|result| {
                         result.status == EvalCaseStatus::Failed
-                            && baseline_scores
-                                .get(&result.family)
-                                .copied()
-                                .unwrap_or(0.0)
-                                >= 100.0
+                            && baseline_scores.get(&result.family).copied().unwrap_or(0.0) >= 100.0
                     })
                     .map(|result| result.eval_case_id.to_string())
                     .collect::<Vec<_>>();
@@ -1759,11 +1752,7 @@ impl EvalComparisonService {
                     .iter()
                     .filter(|result| {
                         result.status == EvalCaseStatus::Passed
-                            && baseline_scores
-                                .get(&result.family)
-                                .copied()
-                                .unwrap_or(0.0)
-                                < 100.0
+                            && baseline_scores.get(&result.family).copied().unwrap_or(0.0) < 100.0
                     })
                     .map(|result| result.eval_case_id.to_string())
                     .collect::<Vec<_>>();
@@ -1957,7 +1946,9 @@ impl EvalRegressionGateService {
                 Some(comparison.comparison_id.clone()),
                 comparison.candidate_run_id.clone(),
                 EvalGateDecisionKind::Block,
-                vec!["eval comparison is inconclusive and cannot carry a regression gate".to_owned()],
+                vec![
+                    "eval comparison is inconclusive and cannot carry a regression gate".to_owned(),
+                ],
                 warnings,
                 vec!["obtain complete measured case outputs before gating".to_owned()],
             );
@@ -1970,7 +1961,10 @@ impl EvalRegressionGateService {
                 EvalGateDecisionKind::Block,
                 vec!["eval comparison is stale and cannot carry a regression gate".to_owned()],
                 warnings,
-                vec!["re-execute both baseline and candidate under current evaluator identity".to_owned()],
+                vec![
+                    "re-execute both baseline and candidate under current evaluator identity"
+                        .to_owned(),
+                ],
             );
         }
         let families = comparison
@@ -2225,17 +2219,19 @@ impl EvalFixtureStabilityService {
             .collect::<Vec<_>>();
         let mut by_case: BTreeMap<String, Vec<EvalCaseStatus>> = BTreeMap::new();
         for run in runs {
-            let run_is_measured = eval_run_covers_suite(suite, run)
-                && eval_run_has_fresh_measured_results(run);
+            let run_is_measured =
+                eval_run_covers_suite(suite, run) && eval_run_has_fresh_measured_results(run);
             for result in &run.case_results {
                 by_case
                     .entry(result.eval_case_id.to_string())
                     .or_default()
-                    .push(if run_is_measured && case_result_has_measurement_evidence(result) {
-                        result.status
-                    } else {
-                        EvalCaseStatus::NotYetImplemented
-                    });
+                    .push(
+                        if run_is_measured && case_result_has_measurement_evidence(result) {
+                            result.status
+                        } else {
+                            EvalCaseStatus::NotYetImplemented
+                        },
+                    );
             }
         }
         let mut stable_cases = Vec::new();
@@ -2909,7 +2905,10 @@ fn run_score_map(run: &EvalRun) -> BTreeMap<EvalFamily, f64> {
     by_family
         .into_iter()
         .filter_map(|(family, results)| {
-            if results.iter().any(|result| !case_result_has_measurement_evidence(result)) {
+            if results
+                .iter()
+                .any(|result| !case_result_has_measurement_evidence(result))
+            {
                 return None;
             }
             let total = u32::try_from(results.len()).unwrap_or(u32::MAX);
@@ -2947,8 +2946,14 @@ fn eval_run_covers_suite(suite: &EvalSuite, run: &EvalRun) -> bool {
 
 fn case_result_has_measurement_evidence(result: &EvalCaseResult) -> bool {
     let outcome_matches_measurements = match result.status {
-        EvalCaseStatus::Passed => result.measurements.iter().all(|measurement| measurement.passed),
-        EvalCaseStatus::Failed => result.measurements.iter().any(|measurement| !measurement.passed),
+        EvalCaseStatus::Passed => result
+            .measurements
+            .iter()
+            .all(|measurement| measurement.passed),
+        EvalCaseStatus::Failed => result
+            .measurements
+            .iter()
+            .any(|measurement| !measurement.passed),
         _ => false,
     };
     outcome_matches_measurements

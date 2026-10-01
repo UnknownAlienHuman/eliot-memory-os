@@ -673,9 +673,11 @@ impl CompletionGate {
             .collect::<Vec<_>>();
         if required_verifier_runs.is_empty() {
             reasons.push("missing_required_verifier_run".to_owned());
-        } else if required_verifier_runs.iter().copied().any(|run| {
-            run.status != VerifierStatus::Passed || is_quarantined_legacy_run(run)
-        }) {
+        } else if required_verifier_runs
+            .iter()
+            .copied()
+            .any(|run| run.status != VerifierStatus::Passed || is_quarantined_legacy_run(run))
+        {
             reasons.push("required_verifier_failed".to_owned());
             return completion_decision(proof, CompletionStatus::FailedVerifier, reasons);
         }

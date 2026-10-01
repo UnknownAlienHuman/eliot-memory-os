@@ -6,9 +6,9 @@ use eliot_types::{
     ActionLease, AgentId, AgentSessionId, CandidateDiff, CandidateDiffId, CandidateDiffStatus,
     CandidateReview, CandidateReviewDecision, CommandContext, CompletionGateDecision,
     CompletionProof, CompletionStatus, LifecycleStatus, PatchRequest, SemanticCommand, TaintClass,
-    ToolObservationRecordCommand, UnifiedDiff, VerifierRun, Visibility, WorkLease,
-    WorkScope, WorktreeLease, WorktreeLeaseId, WorktreeLeaseKind, WorktreeLeaseRequest,
-    WorktreeLeaseState, WriteId, WriteReceiptRef,
+    ToolObservationRecordCommand, UnifiedDiff, VerifierRun, Visibility, WorkLease, WorkScope,
+    WorktreeLease, WorktreeLeaseId, WorktreeLeaseKind, WorktreeLeaseRequest, WorktreeLeaseState,
+    WriteId, WriteReceiptRef,
 };
 #[cfg(windows)]
 use std::fs;

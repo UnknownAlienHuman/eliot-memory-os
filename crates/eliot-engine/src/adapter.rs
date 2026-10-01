@@ -696,9 +696,7 @@ impl AdapterSupervisor {
             }
             CircuitEvent::TransportFailure
             | CircuitEvent::IntegrityFailure
-            | CircuitEvent::AdapterFailure => {
-                AdapterCircuitState::Closed
-            }
+            | CircuitEvent::AdapterFailure => AdapterCircuitState::Closed,
         };
         window.updated_at = now_epoch.to_string();
         self.runtime_store.put_restart_window(window).await

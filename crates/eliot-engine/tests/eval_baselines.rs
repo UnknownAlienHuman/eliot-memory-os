@@ -305,12 +305,8 @@ fn stale_candidate_evidence_is_refused_by_comparison_and_gate() {
         .expect("current runner retains evaluator fingerprints");
     fingerprints.oracle_version.push_str("-stale");
 
-    let comparison = EvalComparisonService::compare(
-        &artifacts.suite,
-        &baseline,
-        &stale_candidate,
-        "test-git",
-    );
+    let comparison =
+        EvalComparisonService::compare(&artifacts.suite, &baseline, &stale_candidate, "test-git");
     assert_eq!(comparison.verdict, EvalComparisonVerdict::Stale);
     assert!(comparison.family_deltas.is_empty());
 
