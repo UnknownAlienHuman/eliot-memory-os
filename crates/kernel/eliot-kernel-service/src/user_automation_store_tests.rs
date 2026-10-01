@@ -183,8 +183,16 @@ fn unbound_normalization_receipt_envelope() -> Box<eliot_receipts::ReceiptEnvelo
             occurrence_count: 1,
         }),
     };
-    let (_, envelope) =
-        super::normalize_user_automation_operation(&request).expect("Kernel normalization fixture");
+    // `normalize_user_automation_operation` is defined `pub(crate)` in the
+    // sibling `user_automation_store` module and is deliberately NOT re-exported
+    // at the crate root, so `super::` (the crate root, this module's parent)
+    // cannot resolve it. This is the same qualified path the production caller
+    // in `store_gateway` uses, and the same shape every other sibling test
+    // module in this crate already uses. The fixture's intent is unchanged: it
+    // still obtains the route-issued envelope from the real production
+    // operation rather than fabricating one.
+    let (_, envelope) = super::user_automation_store::normalize_user_automation_operation(&request)
+        .expect("Kernel normalization fixture");
     Box::new(envelope)
 }
 
