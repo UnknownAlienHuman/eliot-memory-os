@@ -982,11 +982,20 @@ const FACADE_MAIN: &str = include_str!("main.rs");
 /// A frozen reference, not a live claim: the guard reads the real dependency
 /// list out of [`FACADE_MANIFEST`] and fails on any difference in either
 /// direction, so gaining a dependency cannot pass unnoticed.
+///
+/// `eliot-context-measurement` is recorded here as the audited measurement
+/// envelope validator the refused `mcp` arm compiles against
+/// (`src/mcp_stdio.rs`: `MAX_MEASUREMENT_BYTES`, `stu_for_bytes`,
+/// `validate_envelope`; added under #783). It owns no canonical state, opens
+/// no write path and carries no [`FORBIDDEN_OWNER_SYMBOLS`] word, so admitting
+/// it to this baseline is not new facade ownership under W10; the baseline
+/// still refuses every other difference in either direction.
 const FROZEN_FACADE_DEPENDENCIES: &[&str] = &[
     "anyhow",
     "blake3",
     "clap",
     "eliot-agent-bridge-core",
+    "eliot-context-measurement",
     "eliot-engine",
     "eliot-runtime-contracts",
     "eliot-store",
@@ -1113,7 +1122,7 @@ pub fn current_consumer_inventory() -> &'static [ConsumerEntry] {
             proof: "plugin/eliot-governor/.codex-plugin/plugin.json",
             live_reference: "\"name\": \"eliot-governor\"",
             disposition: Disposition::TemporaryFixture,
-            expiry: "remove with the Codex Governor plugin subtree after accepted #18 consumer and retirement evidence under #1719",
+            expiry: "remove by 2026-12-31, when the Codex Governor plugin subtree is removed together with the accepted #18 consumer and retirement evidence under #1719",
         },
         ConsumerEntry {
             consumer: "OpenCode host integration",
@@ -1218,21 +1227,21 @@ pub fn current_consumer_inventory() -> &'static [ConsumerEntry] {
             proof: "scripts/eliot-mcp-reference-client.ps1",
             live_reference: "'codex_controller'",
             disposition: Disposition::TemporaryFixture,
-            expiry: "remove when the UL runner and codex_controller profile use the admitted current MCP owner under #18 and its owner track",
+            expiry: "remove by 2026-12-31, when the UL runner and codex_controller profile use the admitted current MCP owner under #18 and its owner track",
         },
         ConsumerEntry {
             consumer: "OpenCode legacy executable fallback fixture",
             proof: "integrations/opencode/tests/eliot-plugin.test.mjs",
             live_reference: "process.env.ELIOT_GOVERNOR_EXE",
             disposition: Disposition::TemporaryFixture,
-            expiry: "remove when the OpenCode integration no longer accepts the legacy executable fallback under #18",
+            expiry: "remove by 2026-12-31, when the OpenCode integration no longer accepts the legacy executable fallback under #18",
         },
         ConsumerEntry {
             consumer: "Windows x64 live signing retained-Governor fixture",
             proof: "tests/release-security/trusted-cli-live-signing-tests.ps1",
             live_reference: "eliot-governor.exe",
             disposition: Disposition::TemporaryFixture,
-            expiry: "update after #18 admits retirement so the signing fixture matches the selected bundle denominator",
+            expiry: "remove by 2026-12-31, when the retained-Governor signing fixture is updated after #18 admits retirement so it matches the selected bundle denominator and no longer names eliot-governor.exe",
         },
         ConsumerEntry {
             consumer: "Operator compatibility query contract",
@@ -1267,7 +1276,7 @@ pub fn current_consumer_inventory() -> &'static [ConsumerEntry] {
             proof: "tests/Eliot.Operator.Tests/Program.cs",
             live_reference: "crates/eliot-app/src/mcp_stdio/operator.rs",
             disposition: Disposition::TemporaryFixture,
-            expiry: "remove after the Operator adapter test asserts the current owner contract and no longer references facade output under #18",
+            expiry: "remove by 2026-12-31, when the Operator adapter test asserts the current owner contract and no longer references facade output under #18",
         },
     ]
 }
