@@ -666,7 +666,26 @@ impl KernelComposition {
         self.admit_host_request_envelope_under_transition(envelope)
     }
 
-    fn validate_host_request_admission(
+fn is_completed_finish_replay(
+    expired: bool,
+    envelope: &HostRequestEnvelope,
+    existing: Option<&HostRequestRecord>,
+    requested: &HostRequestRecord,
+) -> bool {
+    expired
+        && envelope.kind == HostRequestKind::Invocation
+        && envelope.identity.capability == "eliot.finish"
+        && existing.is_some_and(|record| {
+            matches!(
+                record.state,
+                HostRequestState::ResultReceived | HostRequestState::Terminal
+            ) && record.result_digest.is_some()
+                && record.result_response.is_some()
+                && record.same_binding(requested)
+        })
+}
+
+fn validate_host_request_admission(
         envelope: &HostRequestEnvelope,
     ) -> Result<(), TransportError> {
         envelope
@@ -741,17 +760,8 @@ impl KernelComposition {
         // digest-bound terminal row qualifies, and the route below still
         // refuses to serve its body without a current owner tuple and actual
         // committed Store receipt.
-        let completed_finish_replay = expired
-            && envelope.kind == HostRequestKind::Invocation
-            && envelope.identity.capability == "eliot.finish"
-            && existing.as_ref().is_some_and(|record| {
-                matches!(
-                    record.state,
-                    HostRequestState::ResultReceived | HostRequestState::Terminal
-                ) && record.result_digest.is_some()
-                    && record.result_response.is_some()
-                    && record.same_binding(&requested)
-            });
+        let completed_finish_replay =
+            is_completed_finish_replay(expired, envelope, existing.as_ref(), &requested);
         // Exact replay of an admitted or terminal operation remains an
         // observation path. A fresh or still-Requested Invocation can still
         // grant authority, so reject it before service admission and before
@@ -1611,6 +1621,17 @@ impl KernelComposition {
                 .map_err(|_| TransportError::SessionFenced)?
                 .ok_or(TransportError::SessionFenced)?;
         }
+        self.route_admitted_invoke_read_pair(envelope, tool, &receipt, &mut record)?;
+        Ok((receipt, record))
+    }
+
+    fn route_admitted_invoke_read_pair(
+        &self,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+        receipt: &HostRequestAdmissionReceipt,
+        record: &mut HostRequestRecord,
+    ) -> Result<(), TransportError> {
         // Queue each admitted shape in its Kernel-owned lane. Query and Skill
         // lifecycle pairs use the authenticated local-read poller; a packet is
         // never handed to that queue or selector derivation.
@@ -1715,7 +1736,7 @@ impl KernelComposition {
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
         }
-        Ok((receipt, record))
+        Ok(())
     }
 
     /// Runs the Kernel-owned bind/dispatch leg for one admitted invoke-read
@@ -1875,7 +1896,9 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?
             .ok_or(TransportError::UnknownRequest)?;
         let mut expected = requested_host_request_record(envelope)?;
-        expected.finish_replay_binding = stored.finish_replay_binding.clone();
+        expected
+            .finish_replay_binding
+            .clone_from(&stored.finish_replay_binding);
         if !stored.same_binding(&expected) {
             return Err(TransportError::IdentityConflict);
         }
@@ -5356,7 +5379,9 @@ impl KernelComposition {
                     return Err(TransportError::UnknownRequest);
                 };
                 let mut expected = requested_host_request_record(envelope)?;
-                expected.finish_replay_binding = stored.finish_replay_binding.clone();
+                expected
+                    .finish_replay_binding
+                    .clone_from(&stored.finish_replay_binding);
                 if stored.operation_id != operation_id
                     || stored.request_digest != request_digest
                     || !stored.same_binding(&expected)
@@ -6532,64 +6557,13 @@ impl KernelComposition {
         if operation == AGENT_HOST_REQUEST_INVOKE_READ_OPERATION
             && envelope.identity.capability == "eliot.finish"
         {
-            let tool = match host_request_tool_from_payload(payload) {
-                Ok(tool) => tool,
-                Err(error) => {
-                    let value = self.host_request_failure_value(
-                        operation,
-                        envelope,
-                        protocol_version,
-                        error,
-                    )?;
-                    return Self::host_request_correlated_reply(
-                        session,
-                        request_id,
-                        protocol_version,
-                        value,
-                    );
-                }
-            };
-            let (admission_receipt, record) = match self.invoke_read_host_request(envelope, &tool) {
-                Ok(pair) => pair,
-                Err(error) => {
-                    let value = self.host_request_failure_value(
-                        operation,
-                        envelope,
-                        protocol_version,
-                        error,
-                    )?;
-                    return Self::host_request_correlated_reply(
-                        session,
-                        request_id,
-                        protocol_version,
-                        value,
-                    );
-                }
-            };
-            if matches!(
-                record.state,
-                HostRequestState::ResultReceived | HostRequestState::Terminal
-            ) {
-                if record.result_digest.is_none() || record.result_response.is_none() {
-                    return Err(TransportError::SessionFenced);
-                }
-                return Ok(KernelFrameAction::FinishReplay {
-                    request_id,
-                    protocol_version,
-                    envelope: envelope.clone(),
-                    tool,
-                    admission_receipt,
-                    record,
-                    reconnect_envelope: None,
-                    logical_key: None,
-                });
-            }
-            let value = host_request_admitted_response(&admission_receipt, &record);
-            return Self::host_request_correlated_reply(
+            return self.dispatch_finish_invoke_read(
                 session,
                 request_id,
+                operation,
+                envelope,
+                payload,
                 protocol_version,
-                value,
             );
         }
         #[cfg(windows)]
@@ -6599,7 +6573,7 @@ impl KernelComposition {
                 .cloned()
                 .ok_or(TransportError::SessionFenced)?;
             let resolved = self.resolve_host_request_by_logical_key(envelope, &query)?;
-            if let Some(action) = self.finish_replay_action_from_resolve(
+            if let Some(action) = Self::finish_replay_action_from_resolve(
                 request_id.clone(),
                 protocol_version,
                 envelope,
@@ -6664,9 +6638,85 @@ impl KernelComposition {
         Self::host_request_correlated_reply(session, request_id, protocol_version, value)
     }
 
+    fn dispatch_finish_invoke_read(
+        &self,
+        session: &Session,
+        request_id: RequestId,
+        operation: &str,
+        envelope: &HostRequestEnvelope,
+        payload: &serde_json::Value,
+        protocol_version: eliot_protocol::ProtocolVersion,
+    ) -> Result<KernelFrameAction, TransportError> {
+        if operation == AGENT_HOST_REQUEST_INVOKE_READ_OPERATION
+            && envelope.identity.capability == "eliot.finish"
+        {
+            let tool = match host_request_tool_from_payload(payload) {
+                Ok(tool) => tool,
+                Err(error) => {
+                    let value = self.host_request_failure_value(
+                        operation,
+                        envelope,
+                        protocol_version,
+                        error,
+                    )?;
+                    return Self::host_request_correlated_reply(
+                        session,
+                        request_id,
+                        protocol_version,
+                        value,
+                    );
+                }
+            };
+            let (admission_receipt, record) = match self.invoke_read_host_request(envelope, &tool) {
+                Ok(pair) => pair,
+                Err(error) => {
+                    let value = self.host_request_failure_value(
+                        operation,
+                        envelope,
+                        protocol_version,
+                        error,
+                    )?;
+                    return Self::host_request_correlated_reply(
+                        session,
+                        request_id,
+                        protocol_version,
+                        value,
+                    );
+                }
+            };
+            if matches!(
+                record.state,
+                HostRequestState::ResultReceived | HostRequestState::Terminal
+            ) {
+                if record.result_digest.is_none() || record.result_response.is_none() {
+                    return Err(TransportError::SessionFenced);
+                }
+                return Ok(KernelFrameAction::FinishReplay(Box::new(
+                    crate::FinishReplayAction {
+                    request_id,
+                    protocol_version,
+                    envelope: envelope.clone(),
+                    tool,
+                    admission_receipt,
+                    record,
+                    reconnect_envelope: None,
+                    logical_key: None,
+                    },
+                )));
+            }
+            let value = host_request_admitted_response(&admission_receipt, &record);
+            return Self::host_request_correlated_reply(
+                session,
+                request_id,
+                protocol_version,
+                value,
+            );
+        }
+        Err(TransportError::SessionFenced)
+    }
+
     #[cfg(windows)]
     fn finish_replay_action_from_resolve(
-        &self,
         request_id: RequestId,
         protocol_version: eliot_protocol::ProtocolVersion,
         reconnect_envelope: &HostRequestEnvelope,
@@ -6723,7 +6773,8 @@ impl KernelComposition {
         };
         let admission_receipt = HostRequestAdmissionReceipt::issue(&retained.envelope)
             .map_err(|_| TransportError::SessionFenced)?;
-        Ok(Some(KernelFrameAction::FinishReplay {
+        Ok(Some(KernelFrameAction::FinishReplay(Box::new(
+            crate::FinishReplayAction {
             request_id,
             protocol_version,
             envelope: retained.envelope,
@@ -6732,7 +6783,8 @@ impl KernelComposition {
             record,
             reconnect_envelope: Some(reconnect_envelope.clone()),
             logical_key,
-        }))
+            },
+        ))))
     }
 
     fn host_request_correlated_reply(

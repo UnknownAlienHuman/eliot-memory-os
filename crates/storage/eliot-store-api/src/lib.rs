@@ -406,6 +406,9 @@ pub const MAX_RECOVERY_RECORD_BYTES: usize = 512 * 1024;
 pub const MAX_RECOVERY_PACKET_BYTES: usize = 3 * 1024 * 1024;
 /// Maximum number of replayable receipts in one recovery snapshot.
 pub const MAX_RECOVERY_RECEIPTS: usize = 256;
+/// Maximum number of exact historical operations whose parameter authority
+/// may be requested in one recovery read.
+pub const MAX_RECOVERY_RECEIPT_AUTHORITY_OPERATIONS: usize = 8;
 /// Maximum number of durable jobs in one recovery snapshot.
 pub const MAX_RECOVERY_JOBS: usize = 256;
 /// Fixed neutral receipt scope placeholder for genesis envelopes. This is
@@ -520,6 +523,11 @@ pub struct StoreRecoveryRequest {
     pub records: Vec<RecoveryRecordKey>,
     pub include_receipts: bool,
     pub include_jobs: bool,
+    /// Exact committed operations whose original named-operation parameter
+    /// bytes are needed for receipt reconciliation. Empty keeps the legacy
+    /// recovery wire shape unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub receipt_authority_operation_ids: Vec<OperationId>,
 }
 
 impl StoreRecoveryRequest {
@@ -536,8 +544,46 @@ impl StoreRecoveryRequest {
             record.validate()?;
         }
         unique(self.records.iter().cloned(), "recovery.records")?;
+        if self.receipt_authority_operation_ids.len() > MAX_RECOVERY_RECEIPT_AUTHORITY_OPERATIONS {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        for operation_id in &self.receipt_authority_operation_ids {
+            validate_text(operation_id.as_str(), "recovery.receipt_authority.operation_id")?;
+        }
+        unique(
+            self.receipt_authority_operation_ids.iter().cloned(),
+            "recovery.receipt_authority.operation_ids",
+        )?;
+        if !self.receipt_authority_operation_ids.is_empty() && !self.include_receipts {
+            return Err(StoreError::InvalidField {
+                field: "recovery.receipt_authority_operation_ids",
+                reason: "receipt authority requires canonical receipts",
+            });
+        }
         validate_recovery_packet_size(self)
     }
+}
+
+/// One exact payload-authority parameter from an original committed Store
+/// operation, linked by operation identity and the receipt table's global
+/// commit ordering. Store adapters return this only after validating the
+/// persisted bytes, digest, count, index, and closed named-operation shape.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryReceiptAuthority {
+    pub operation_id: OperationId,
+    pub state_fence: StateFence,
+    pub commit_sequence: u64,
+    pub named_operation_count: usize,
+    pub records: Vec<RecoveryReceiptAuthorityRecord>,
+}
+
+/// One indexed exact named-operation parameter byte string.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryReceiptAuthorityRecord {
+    pub operation_index: usize,
+    pub parameters: ExactJsonBytes,
 }
 
 /// Same-fence store recovery result containing opaque owner/job records and
@@ -552,6 +598,10 @@ pub struct StoreRecoverySnapshot {
     pub owner_records: Vec<RecoveryRecord>,
     pub job_records: Vec<RecoveryRecord>,
     pub receipts: Vec<WriteReceipt>,
+    /// Original parameter authorities requested by exact operation identity.
+    /// Empty is omitted to preserve the existing canonical wire encoding.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub receipt_authorities: Vec<RecoveryReceiptAuthority>,
 }
 
 impl StoreRecoverySnapshot {
@@ -578,6 +628,9 @@ impl StoreRecoverySnapshot {
         if self.receipts.len() > MAX_RECOVERY_RECEIPTS {
             return Err(StoreError::PayloadTooLarge);
         }
+        if self.receipt_authorities.len() > MAX_RECOVERY_RECEIPT_AUTHORITY_OPERATIONS {
+            return Err(StoreError::PayloadTooLarge);
+        }
 
         let mut record_keys = BTreeSet::new();
         for record in self.owner_records.iter().chain(self.job_records.iter()) {
@@ -596,6 +649,47 @@ impl StoreRecoverySnapshot {
                 return Err(StoreError::Duplicate {
                     field: "recovery.receipts",
                 });
+            }
+        }
+        let receipts_by_operation = self
+            .receipts
+            .iter()
+            .map(|receipt| (receipt.operation_id.clone(), receipt))
+            .collect::<BTreeMap<_, _>>();
+        let mut authority_operations = BTreeSet::new();
+        for authority in &self.receipt_authorities {
+            validate_text(
+                authority.operation_id.as_str(),
+                "recovery.receipt_authority.operation_id",
+            )?;
+            ensure_same_fence(&self.state_fence, &authority.state_fence)?;
+            let receipt = receipts_by_operation
+                .get(&authority.operation_id)
+                .ok_or(StoreError::InvalidReceipt)?;
+            if receipt.status != WriteReceiptStatus::Committed
+                || authority.commit_sequence == 0
+                || receipt.committed_at.as_deref()
+                    != Some(format!("commit-sequence-{:016}", authority.commit_sequence).as_str())
+                || authority.named_operation_count == 0
+                || authority.records.is_empty()
+                || !authority_operations.insert(authority.operation_id.clone())
+            {
+                return Err(StoreError::InvalidReceipt);
+            }
+            if authority.records.len() != authority.named_operation_count {
+                return Err(StoreError::InvalidReceipt);
+            }
+            let mut operation_indices = BTreeSet::new();
+            for record in &authority.records {
+                if record.operation_index >= authority.named_operation_count
+                    || !operation_indices.insert(record.operation_index)
+                {
+                    return Err(StoreError::InvalidReceipt);
+                }
+                if record.parameters.source != PayloadSource::NamedOperationParameter {
+                    return Err(StoreError::InvalidReceipt);
+                }
+                record.parameters.validate()?;
             }
         }
         validate_recovery_packet_size(self)
@@ -7005,6 +7099,7 @@ mod tests {
             owner_records: records,
             job_records: Vec::new(),
             receipts: Vec::new(),
+            receipt_authorities: Vec::new(),
         }
     }
 
@@ -7082,6 +7177,7 @@ mod tests {
                 records: vec![RecoveryRecordKey::new("owner", "one").expect("key")],
                 include_receipts: true,
                 include_jobs: true,
+                receipt_authority_operation_ids: Vec::new(),
             },
         };
         let encoded = serde_json::to_value(&request).expect("encode request");

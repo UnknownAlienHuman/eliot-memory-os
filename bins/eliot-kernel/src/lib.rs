@@ -1657,22 +1657,33 @@ pub enum KernelFrameAction {
     /// driver must re-read the canonical Store receipt before serving the
     /// retained result body.
     #[cfg(windows)]
-    FinishReplay {
-        request_id: RequestId,
-        protocol_version: eliot_protocol::ProtocolVersion,
-        envelope: eliot_protocol::HostRequestEnvelope,
-        tool: serde_json::Value,
-        admission_receipt: eliot_protocol::HostRequestAdmissionReceipt,
-        record: eliot_ors::HostRequestRecord,
-        /// Present only for a reconnect `Status` resolution. The operation's
-        /// original envelope remains in `envelope`; this is the newly
-        /// authenticated transport request used solely for current read
-        /// authorization and correlated response delivery.
-        reconnect_envelope: Option<eliot_protocol::HostRequestEnvelope>,
-        logical_key: Option<String>,
-    },
+    FinishReplay(Box<FinishReplayAction>),
     /// Return a typed rejection, then fence the connection.
     Fence(Frame),
+}
+
+/// Deferred asynchronous readback material for one completed Finish row.
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct FinishReplayAction {
+    /// Public request correlation identity.
+    pub request_id: RequestId,
+    /// Protocol version negotiated by the authenticated connection.
+    pub protocol_version: eliot_protocol::ProtocolVersion,
+    /// Exact original admitted Finish envelope.
+    pub envelope: eliot_protocol::HostRequestEnvelope,
+    /// Exact original admitted Finish tool payload.
+    pub tool: serde_json::Value,
+    /// Admission receipt issued for the original Finish envelope.
+    pub admission_receipt: eliot_protocol::HostRequestAdmissionReceipt,
+    /// Durable ORS result row selected by the original operation identity.
+    pub record: eliot_ors::HostRequestRecord,
+    /// Present only for reconnect `Status`; this is the newly authenticated
+    /// transport request used for current read authorization and delivery.
+    /// New authenticated transport envelope when resolving a reconnect.
+    pub reconnect_envelope: Option<eliot_protocol::HostRequestEnvelope>,
+    /// Logical key to bind into a reconnect resolution, if one was supplied.
+    pub logical_key: Option<String>,
 }
 
 /// Milliseconds since the Unix epoch, saturating at the `u64` boundary.

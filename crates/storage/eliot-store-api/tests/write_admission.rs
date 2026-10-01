@@ -700,6 +700,7 @@ fn recovery_wire_request() -> StoreRequest {
             records: Vec::new(),
             include_receipts: false,
             include_jobs: false,
+            receipt_authority_operation_ids: Vec::new(),
         },
     }
 }
