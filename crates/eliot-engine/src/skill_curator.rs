@@ -661,10 +661,16 @@ fn measured_skill_context_cost(skill: &SkillCardV2) -> Option<u64> {
 }
 
 fn low_utility_high_cost(skill: &SkillCardV2) -> bool {
-    // Unchanged threshold. Unknown canonical evidence does not prove a high
-    // cost, so it does not open an archive proposal on cost grounds.
+    // The lifecycle decision is driven by OBSERVED utility only: under I7.25
+    // curation "examines actual usage, failure, transfer and distractor
+    // evidence", and low observed utility is the observed-failure signal this
+    // predicate already carries. The canonical envelope measurement is always
+    // unvalidated STU (`MeasurementStatus::ConservativeStu`, `actual_tokens:
+    // None`) and, per I2.16, planning fallbacks "never prove ... by
+    // themselves"; it therefore never opens the archive on its own. The STU is
+    // still measured and published as the proposal's reported cost evidence
+    // (see `expected_context_delta`), never as the trigger.
     skill.failure_count > skill.success_count
-        && measured_skill_context_cost(skill).is_some_and(|cost| cost >= 180)
 }
 
 fn negative_transfer(skill: &SkillCardV2) -> bool {

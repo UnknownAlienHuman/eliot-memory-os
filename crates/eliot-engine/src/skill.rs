@@ -545,19 +545,26 @@ impl SkillNeedEstimator {
         } else {
             0.0
         };
-        // The canonical unvalidated STU of the exact serialized Skill envelope.
-        // Unknown measurement evidence is never zero, cheap or preferred: an
-        // unavailable canonical measurement takes the maximum risk penalty and
-        // cannot lower `distractor_risk` below what an unknown cost may allow.
-        let cost_penalty = match measure_skill_context_envelope(skill) {
-            Ok(measurement) => {
-                let context_cost = f64::from(
-                    u32::try_from(measurement.estimated_context_cost()).unwrap_or(u32::MAX),
-                );
-                (context_cost / 2000.0).min(0.25)
-            }
-            Err(_) => 0.25,
+        // Canonical context measurement is EVIDENCE, not a decision input.
+        //
+        // The canonical envelope measurement of a Skill is always unvalidated
+        // STU (`MeasurementStatus::ConservativeStu`, `actual_tokens: None`), and
+        // no bound route/model/tokenizer observation can qualify it. Under
+        // I2.16 an `UNVALIDATED` value guides planning only, so it may not
+        // block a Material action, and under I7.25 curation observes actual
+        // usage/failure/transfer/distractor evidence - not an envelope estimate.
+        // A measurement failure is therefore NOT substituted by any numeric
+        // value: it is represented exactly as this file already represents
+        // "no measured value", namely the absence of a canonical record, and
+        // the estimate simply carries no cost evidence. The value is never
+        // added to `distractor_risk` and can never move a Skill across the
+        // inclusion boundary; it is published only as an evidence reference.
+        let measurement_evidence = match measure_skill_context_envelope(skill) {
+            Ok(measurement) => Some(measurement.measurement_evidence_ref()),
+            Err(_) => None,
         };
+        let mut evidence_refs = context.evidence_refs.clone();
+        evidence_refs.extend(measurement_evidence);
         let verifier_bonus = if missing_verifier(skill, context) {
             -0.20
         } else {
@@ -566,8 +573,9 @@ impl SkillNeedEstimator {
         let necessity = (0.20 + (0.55 * scope_match) + verifier_bonus).clamp(0.0, 1.0);
         let utility =
             (0.30 + (0.35 * scope_match) + recent_success + verifier_bonus).clamp(0.0, 1.0);
+        // Pre-existing activation and lifecycle owner only: a non-allowed
+        // activation decision and observed recent failure. No measurement term.
         let distractor_risk = (0.20
-            + cost_penalty
             + recent_failure
             + f64::from(activation.decision != SkillActivationDecision::Allow) * 0.30)
             .clamp(0.0, 1.0);
@@ -592,7 +600,7 @@ impl SkillNeedEstimator {
             distractor_risk,
             verdict,
             reasons: activation.reasons,
-            evidence_refs: context.evidence_refs.clone(),
+            evidence_refs,
             created_at: OffsetDateTime::now_utc(),
         }
     }
