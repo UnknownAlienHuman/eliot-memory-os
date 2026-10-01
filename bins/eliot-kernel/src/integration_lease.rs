@@ -81,7 +81,7 @@ pub enum IntegrationLeaseError {
         reason: &'static str,
     },
     /// The W1 candidate read failed. No lease was granted.
-    Candidate(IntegrationCandidateError),
+    Candidate(Box<IntegrationCandidateError>),
     /// The candidate targets a different scope than the requested lease.
     /// No lease was granted.
     TargetMismatch {
@@ -112,7 +112,7 @@ pub enum IntegrationLeaseError {
     /// persist; it must never be applied.
     StaleMarked {
         /// Candidate record transitioned to `Stale` with its history entry.
-        stale: IntegrationCandidate,
+        stale: Box<IntegrationCandidate>,
     },
     /// The carried State Fence failed its own owner validation.
     Foundation(ContractError),
@@ -284,7 +284,7 @@ pub fn acquire_integration_lease(
         });
     }
     let candidate = read_integration_candidate(candidates, &request.candidate_id)
-        .map_err(IntegrationLeaseError::Candidate)?;
+        .map_err(|error| IntegrationLeaseError::Candidate(Box::new(error)))?;
     if candidate.target_scope != request.target_scope {
         return Err(IntegrationLeaseError::TargetMismatch {
             target_scope: request.target_scope.clone(),
@@ -306,10 +306,9 @@ pub fn acquire_integration_lease(
             holder_candidate_id: holder.candidate_id.clone(),
         });
     }
-    if candidate.base_commit != request.current_base_commit && request.candidate_depends_on_base
-    {
+    if candidate.base_commit != request.current_base_commit && request.candidate_depends_on_base {
         return Err(IntegrationLeaseError::StaleMarked {
-            stale: mark_stale(candidate, request.observed_at_unix_ms),
+            stale: Box::new(mark_stale(candidate, request.observed_at_unix_ms)),
         });
     }
     candidate
@@ -365,10 +364,7 @@ fn is_leaseable_status(status: IntegrationCandidateStatus) -> bool {
 /// Transitions a base-moved record to `Stale` with its history entry. The
 /// bridge persists the returned record; the stale candidate is never
 /// applied.
-fn mark_stale(
-    candidate: &IntegrationCandidate,
-    observed_at_unix_ms: u64,
-) -> IntegrationCandidate {
+fn mark_stale(candidate: &IntegrationCandidate, observed_at_unix_ms: u64) -> IntegrationCandidate {
     let mut stale = candidate.clone();
     stale.status = IntegrationCandidateStatus::Stale;
     stale.history.push(IntegrationCandidateRevision {
