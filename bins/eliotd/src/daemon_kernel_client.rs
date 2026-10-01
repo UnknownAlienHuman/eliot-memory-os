@@ -2772,6 +2772,30 @@ impl DaemonKernelClient {
         parse_local_read_submit_outcome(&value).map_err(super::DaemonError::Kernel)
     }
 
+    /// Submits one daemon-produced `eliot.state` result body for its waiting
+    /// host request (issue #2564).
+    ///
+    /// Deliberately a SEPARATE operation name from
+    /// [`Self::submit_local_read_result_async`]. Both travel the same transport
+    /// and the same persistence owner, but the Kernel binds each to the exact
+    /// carrier form the pair was retained under, so a state result can never
+    /// complete a query claim and a query result can never complete a state
+    /// claim. Routing a state result through the query operation would defeat
+    /// the form binding the carrier exists to enforce.
+    #[cfg(windows)]
+    pub async fn submit_local_state_result_async(
+        &self,
+        body: &HostRequestResultBody,
+    ) -> Result<LocalReadSubmitOutcome, super::DaemonError> {
+        body.validate()
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let value = self
+            .transact_async("local_state_result", serde_json::json!({ "result": body }))
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        parse_local_read_submit_outcome(&value).map_err(super::DaemonError::Kernel)
+    }
+
     /// Claims one queued admitted `eliot.observe` pair for the outbound-only
     /// observe poller (issue #2565).
     ///

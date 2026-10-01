@@ -673,6 +673,14 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         AGENT_ACTIVATION_V1_IMPORT_OPERATION => AGENT_ACTIVATION_V1_IMPORT_OPERATION,
         "local_read_claim" => "local_read_claim",
         "local_read_result" => "local_read_result",
+        // Issue #2564: the owner-backed `eliot.state` result travels under its
+        // OWN operation so the Kernel can bind it to the State carrier form.
+        // Reusing `local_read_result` here would let a state result complete a
+        // query claim, which is the capability confusion the form binding on
+        // the carrier exists to prevent. The claim needs its own name for the
+        // same reason: a state claim must not be metered as a query claim.
+        "local_state_claim" => "local_state_claim",
+        "local_state_result" => "local_state_result",
         "semantic_observe_claim" => "semantic_observe_claim",
         "semantic_observe_result" => "semantic_observe_result",
         "semantic_observe_deferred" => "semantic_observe_deferred",
@@ -3795,15 +3803,64 @@ impl KernelComposition {
                 // claimed pair carries the Kernel-minted fenced attempt
                 // capability the daemon must present back on the read leg and
                 // the submit leg; no time lease is involved.
+                //
+                // #2564: the answer also carries the retained carrier FORM.
+                // This arm admits only the `query` form, so `form` is `query`
+                // here by construction; a State pair is claimed on
+                // `local_state_claim` and never appears in this answer.
                 #[cfg(windows)]
                 {
                     if payload.as_object().is_none_or(|object| object.len() != 1) {
                         return Err(TransportError::SessionFenced);
                     }
                     self.claim_local_read_pair(session).map(|pair| match pair {
-                        Some((envelope, tool, attempt)) => serde_json::json!({
+                        Some(read) => serde_json::json!({
                             "status": "known",
-                            "value": { "pair": { "envelope": envelope, "tool": tool, "attempt": attempt } },
+                            "value": { "pair": {
+                                "form": read.form.as_str(),
+                                "envelope": read.envelope,
+                                "tool": read.tool,
+                                "attempt": read.attempt,
+                            } },
+                            "recovery": null,
+                        }),
+                        None => serde_json::json!({
+                            "status": "known",
+                            "value": { "pair": null },
+                            "recovery": null,
+                        }),
+                    })
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "local_state_claim" => {
+                // #2564: the closed State poller entry for retained
+                // `eliot.state` pairs. Same session/auth/ready/fence gates, same
+                // single-`operation`-key payload shape and same null poll as
+                // `local_read_claim`, but a SEPARATE claim over the State form
+                // of the same bounded carrier: a query or Skill pair is not
+                // claimable here and a State pair is not claimable on the query
+                // claim. The answer carries the same four fields — `form` (here
+                // always `state`), the exact admitted envelope, the exact
+                // retained tool bytes, and the Kernel-minted fenced attempt.
+                #[cfg(windows)]
+                {
+                    if payload.as_object().is_none_or(|object| object.len() != 1) {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    self.claim_local_state_pair(session).map(|pair| match pair {
+                        Some(read) => serde_json::json!({
+                            "status": "known",
+                            "value": { "pair": {
+                                "form": read.form.as_str(),
+                                "envelope": read.envelope,
+                                "tool": read.tool,
+                                "attempt": read.attempt,
+                            } },
                             "recovery": null,
                         }),
                         None => serde_json::json!({
@@ -3852,6 +3909,41 @@ impl KernelComposition {
                             // possible work stays `unknown` in the diagnostic
                             // stream alongside the folded expired response.
                             // Observation only.
+                            observe_daemon_request("kernel.daemon_response_unknown", "unknown");
+                            Ok(Self::expired_activation_daemon_response())
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            // Issue #2564: the owner-backed `eliot.state` result. Deliberately a
+            // separate arm from `local_read_result` so the submitted result is bound
+            // to the STATE carrier form. A state result arriving on the query arm (or
+            // a query result on this one) is refused by the carrier form check inside
+            // `submit_local_state_result`, which is what keeps the two lanes from
+            // completing each other's claims.
+            "local_state_result" => {
+                #[cfg(windows)]
+                {
+                    let result_value = payload
+                        .get("result")
+                        .cloned()
+                        .ok_or(TransportError::SessionFenced)?;
+                    let body: HostRequestResultBody = serde_json::from_value(result_value)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    match self.submit_local_state_result(session, &body) {
+                        Ok(host_request_route::LocalReadSubmitDisposition::Persisted(_)) => {
+                            Ok(Self::accepted_daemon_response())
+                        }
+                        Ok(host_request_route::LocalReadSubmitDisposition::StaleAttempt(
+                            observation,
+                        )) => Ok(Self::stale_attempt_daemon_response(&observation)),
+                        Err(TransportError::Timeout) => {
                             observe_daemon_request("kernel.daemon_response_unknown", "unknown");
                             Ok(Self::expired_activation_daemon_response())
                         }
@@ -10182,7 +10274,17 @@ impl KernelComposition {
         // capability equality proves every echoed field is exactly what the
         // Kernel minted for this envelope; a substituted echo fails closed.
         let operation_id = host_request_operation_id(&envelope);
-        let live = self.live_local_read_attempt(&operation_id, &envelope.envelope_sha256)?;
+        // This leg is the query-only Gateway path: the admission match above
+        // already refused every non-query form, so the carrier form here is
+        // `Query` by construction rather than by a caller-supplied label. The
+        // claim gate therefore looks up the QUERY slot specifically — a State
+        // pair retained on the same carrier is not claimable here, which is
+        // what keeps the two lanes from completing each other's attempts.
+        let live = self.live_local_read_attempt(
+            &operation_id,
+            &envelope.envelope_sha256,
+            host_request_route::LocalReadPairKind::Query,
+        )?;
         let current = match live {
             Some(state)
                 if state.attempt_id == attempt.attempt_id
