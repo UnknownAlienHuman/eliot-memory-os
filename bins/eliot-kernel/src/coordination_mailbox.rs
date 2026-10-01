@@ -16,7 +16,12 @@
 //! ([`record_mailbox_delivery`], stable name
 //! [`COORDINATION_MAILBOX_DELIVER_NAME`]), the required control-message
 //! acknowledgement handling ([`acknowledge_mailbox_message`], stable name
-//! [`COORDINATION_MAILBOX_ACKNOWLEDGE_NAME`]), the derived delivery-order
+//! [`COORDINATION_MAILBOX_ACKNOWLEDGE_NAME`]), the route-qualified delivery
+//! resolution ([`resolve_mailbox_route`], stable name
+//! [`COORDINATION_MAILBOX_ROUTE_NAME`]) with its durable degraded state, the
+//! session-loss expiry/reassignment rows ([`expire_mailbox_message`] under
+//! [`COORDINATION_MAILBOX_EXPIRE_NAME`], [`reassign_mailbox_message`] under
+//! [`COORDINATION_MAILBOX_REASSIGN_NAME`]), the derived delivery-order
 //! projection ([`project_mailbox_queue`]), and the rebuildable coordination
 //! map ([`rebuild_coordination_map_view`], stable name
 //! [`COORDINATION_MAP_VIEW_NAME`]). Durability stays with the canonical
@@ -40,16 +45,28 @@
 //! recipient through [`CoordinationMapView::resolve_recipient`], and delivers
 //! through that entry's queue. Every entry queue is the
 //! [`project_mailbox_queue`] projection of the already-known records; the
-//! view carries no rows of its own. The stable `*_NAME` and `*_SCHEMA_V1`
+//! view carries no rows of its own. The route slice calls
+//! [`resolve_mailbox_route`] with the caller-attested route capability and
+//! recipient liveness: a deliverable route records the
+//! [`record_mailbox_delivery`] receipt, while an unavailable route or a lapsed
+//! recipient retains the item as a durable [`MailboxDegradedReceipt`] that
+//! names the capability gap without claiming passive awareness. The
+//! session-loss slice calls [`expire_mailbox_message`] and
+//! [`reassign_mailbox_message`] with the caller-observed time and session
+//! liveness; both rows carry the retained delivery count so delivery history
+//! survives the transition. The stable `*_NAME` and `*_SCHEMA_V1`
 //! constants are the exact keys those slices register on the Store bridge;
 //! they are declared here so the names cannot drift between the Kernel surface
 //! and the bridge registration.
 //!
 //! # What this deliberately does not do
 //!
-//! No large-payload handles, no route capabilities, and no expiry/reassignment:
-//! those are later slices. A message admitted here starts undelivered; every
-//! later delivery step is owned by the slice that performs it.
+//! No scheduler, task graph, subscription engine, or routing authority: route
+//! resolution names the capability gap but never reroutes by itself, and a
+//! reassignment row names the new recipient without moving delivery history.
+//! Session liveness arrives as a caller-attested boolean; this module keeps no
+//! session table and owns no lease. A message admitted here starts undelivered;
+//! every later delivery step is owned by the slice that performs it.
 //!
 //! # Relation to the coordination record
 //!
@@ -122,6 +139,12 @@ pub enum CoordinationMailboxError {
         /// Exact identity that was presented.
         message_id: String,
     },
+    /// The message is neither past its horizon nor past a lost session. No
+    /// expiry row was recorded.
+    ExpiryNotDue {
+        /// Exact identity that was presented.
+        message_id: String,
+    },
     /// The carried State Fence failed its own owner validation.
     Foundation(ContractError),
 }
@@ -143,6 +166,9 @@ impl std::fmt::Display for CoordinationMailboxError {
                     f,
                     "mailbox message requires no acknowledgement: {message_id}"
                 )
+            }
+            Self::ExpiryNotDue { message_id } => {
+                write!(f, "mailbox message expiry not due: {message_id}")
             }
             Self::Foundation(error) => {
                 write!(f, "mailbox message foundation contract: {error}")
@@ -571,8 +597,9 @@ fn require_timestamp(value: u64, field: &'static str) -> Result<(), Coordination
 // the queue admission order already defines. Typed failures stay typed:
 // every rejection is a [`CoordinationMailboxError`].
 //
-// Out of scope here: large-payload handles, route capabilities, and
-// expiry/reassignment (later slices).
+// Out of scope here: large-payload handles (payload-handles slice below).
+// Route capabilities and session-loss expiry/reassignment live in their own
+// slices below.
 // ============================================================================
 
 /// Schema identifier for a rebuilt coordination map. The route/delivery slice
@@ -774,8 +801,8 @@ pub fn rebuild_coordination_map_view(
 // STITCH. Typed failures stay typed: every rejection is a
 // [`CoordinationMailboxError`].
 //
-// Out of scope here: map view, route capabilities, and expiry/reassignment
-// (other slices).
+// Out of scope here: map view (map-view slice above), route capabilities
+// (route slice below), and expiry/reassignment (session-loss slice below).
 // ============================================================================
 
 /// Large-payload handle for one message whose content exceeds the inline
@@ -923,4 +950,448 @@ fn require_payload_digest(value: &str) -> Result<(), CoordinationMailboxError> {
         });
     }
     Ok(())
+}
+
+// ============================================================================
+// Route-qualified delivery with durable degraded state (issue #1820, route
+// slice W5).
+//
+// I10.18 requires route-qualified delivery capability and visible degradation:
+// when the route is unavailable the item remains durable, the result names the
+// delivery capability gap, and no passive recipient awareness is claimed. The
+// closed capability vocabulary below spells the four I10.18 delivery profiles
+// 1:1 with an independent closed decode: the Governor `DeliveryPolicy` in
+// `eliot-coordination` is Governor semantics and is not interpreted here, and
+// this composition root takes no new dependency to name it twice.
+//
+// Production chain: the route/delivery slice calls [`resolve_mailbox_route`]
+// under [`COORDINATION_MAILBOX_ROUTE_NAME`] with the caller-attested route
+// capability and recipient liveness (session state lives with the session
+// owner, never here). A deliverable route records the
+// [`record_mailbox_delivery`] receipt through the same resolution path, so
+// delivery and degradation share one named operation; an unavailable route or
+// a lapsed recipient retains the item as a durable [`MailboxDegradedReceipt`]
+// row keyed by the message identity. A reused identity with the identical
+// route and cause replays the existing degraded row with no second effect; a
+// reused identity with a different route or cause is an identity conflict,
+// never a silent overwrite. Typed failures stay typed: every rejection is a
+// [`CoordinationMailboxError`].
+//
+// Out of scope here: map view (map-view slice above), large-payload handles
+// (payload-handles slice above), and expiry/reassignment (session-loss slice
+// below).
+// ============================================================================
+
+/// Stable named route resolution. The route/delivery slice calls
+/// [`resolve_mailbox_route`] under this exact name before delivering.
+pub const COORDINATION_MAILBOX_ROUTE_NAME: &str = "ResolveMailboxRoute";
+
+/// Closed route-capability vocabulary (I10.18 delivery profiles). Unknown
+/// spellings are rejected by [`MailboxRouteProfile::decode`], never coerced.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub enum MailboxRouteProfile {
+    EventIntegrated,
+    ToolOnly,
+    OfflineWorker,
+    Unavailable,
+}
+
+impl MailboxRouteProfile {
+    /// Canonical wire spelling of one profile.
+    #[must_use]
+    pub const fn as_wire(&self) -> &'static str {
+        match self {
+            Self::EventIntegrated => "event_integrated",
+            Self::ToolOnly => "tool_only",
+            Self::OfflineWorker => "offline_worker",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    /// Closed decode: unknown spellings are rejected, never coerced.
+    pub fn decode(text: &str) -> Result<Self, CoordinationMailboxError> {
+        match text {
+            "event_integrated" => Ok(Self::EventIntegrated),
+            "tool_only" => Ok(Self::ToolOnly),
+            "offline_worker" => Ok(Self::OfflineWorker),
+            "unavailable" => Ok(Self::Unavailable),
+            _ => Err(CoordinationMailboxError::InvalidField {
+                field: "route_profile",
+                reason: "unknown route profile",
+            }),
+        }
+    }
+
+    /// Exact closed denominator of the route vocabulary.
+    #[must_use]
+    pub const fn all() -> [&'static str; 4] {
+        [
+            "event_integrated",
+            "tool_only",
+            "offline_worker",
+            "unavailable",
+        ]
+    }
+}
+
+/// Closed cause of one durable degraded record: either the route capability
+/// itself is unavailable, or the recipient session has lapsed. Both retain
+/// the item; neither claims passive recipient awareness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub enum MailboxDegradedCause {
+    RouteUnavailable,
+    RecipientNotLive,
+}
+
+impl MailboxDegradedCause {
+    /// Canonical wire spelling of one cause.
+    #[must_use]
+    pub const fn as_wire(&self) -> &'static str {
+        match self {
+            Self::RouteUnavailable => "route_unavailable",
+            Self::RecipientNotLive => "recipient_not_live",
+        }
+    }
+}
+
+/// Durable degraded record for one admitted message whose route cannot
+/// deliver now. The item stays durable under its identity; the row names the
+/// exact capability gap (`route` plus `cause`) and carries no delivery claim.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MailboxDegradedReceipt {
+    /// Identity of the retained message.
+    pub message_id: String,
+    /// Ordering key of the retained record.
+    pub sequence: u64,
+    /// Route capability observed at resolution time.
+    pub route: MailboxRouteProfile,
+    /// Why delivery cannot proceed on this route now.
+    pub cause: MailboxDegradedCause,
+    /// Producer-observed resolution time, Unix milliseconds.
+    pub observed_at_unix_ms: u64,
+    /// True when the identical degraded row was already recorded.
+    pub replayed: bool,
+}
+
+/// Route-resolution outcome (`ResolveMailboxRoute`): either the delivery
+/// receipt or the durable degraded record.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum MailboxDeliveryOutcome {
+    Delivered(MailboxDeliveryReceipt),
+    Degraded(MailboxDegradedReceipt),
+}
+
+/// Resolves one admitted record against the caller-attested route
+/// (`ResolveMailboxRoute`).
+///
+/// When the route is unavailable, or the recipient session has lapsed, the
+/// item is retained as a durable [`MailboxDegradedReceipt`] naming the exact
+/// capability gap; no delivery is claimed and no passive awareness is
+/// reported. Otherwise the call records delivery through
+/// [`record_mailbox_delivery`] against the already-known receipts. A message
+/// already delivered replays its delivery receipt however the route reads now:
+/// history is never revised. `existing_deliveries` and `existing_degraded`
+/// are the caller-read-back row views (the Store bridge readback in
+/// production); this function stores nothing itself.
+pub fn resolve_mailbox_route(
+    record: &CoordinationMailboxRecord,
+    existing_deliveries: &[MailboxDeliveryReceipt],
+    existing_degraded: &[MailboxDegradedReceipt],
+    route: MailboxRouteProfile,
+    recipient_live: bool,
+    observed_at_unix_ms: u64,
+) -> Result<MailboxDeliveryOutcome, CoordinationMailboxError> {
+    require_timestamp(observed_at_unix_ms, "observed_at_unix_ms")?;
+    if let Some(known) = existing_deliveries
+        .iter()
+        .find(|receipt| receipt.message_id == record.message_id)
+    {
+        return Ok(MailboxDeliveryOutcome::Delivered(MailboxDeliveryReceipt {
+            replayed: true,
+            ..known.clone()
+        }));
+    }
+    let cause = if route == MailboxRouteProfile::Unavailable {
+        Some(MailboxDegradedCause::RouteUnavailable)
+    } else if !recipient_live {
+        Some(MailboxDegradedCause::RecipientNotLive)
+    } else {
+        None
+    };
+    let Some(cause) = cause else {
+        return Ok(MailboxDeliveryOutcome::Delivered(record_mailbox_delivery(
+            record,
+            existing_deliveries,
+            observed_at_unix_ms,
+        )?));
+    };
+    if let Some(known) = existing_degraded
+        .iter()
+        .find(|receipt| receipt.message_id == record.message_id)
+    {
+        if known.route != route || known.cause != cause {
+            return Err(CoordinationMailboxError::IdentityConflict {
+                message_id: record.message_id.clone(),
+            });
+        }
+        return Ok(MailboxDeliveryOutcome::Degraded(MailboxDegradedReceipt {
+            replayed: true,
+            ..known.clone()
+        }));
+    }
+    Ok(MailboxDeliveryOutcome::Degraded(MailboxDegradedReceipt {
+        message_id: record.message_id.clone(),
+        sequence: record.sequence,
+        route,
+        cause,
+        observed_at_unix_ms,
+        replayed: false,
+    }))
+}
+
+// ============================================================================
+// Session-loss expiry and reassignment (issue #1820, session-loss slice W6).
+//
+// I10.18 requires expiry/reassignment after Session loss while retaining
+// delivery history. The record stays immutable after admission, so expiry and
+// reassignment are separate durable rows keyed by the message identity, the
+// same way payload attachments are: the original record and every delivery
+// receipt keep their identity, and each new row binds the retained delivery
+// count the caller read back, so a transition that drops history cannot
+// produce the same row.
+//
+// Session liveness arrives as a caller-attested boolean: the session table
+// lives with the session owner, and this module keeps no rows and owns no
+// lease. The expiry horizon is supplied per call by the owning slice for the
+// same reason: no ambient clock and no config surface here. Expiry is
+// terminal: an expired identity is never reassigned. Reassignment names the
+// replacement recipient for a lost session without moving delivery history;
+// the consumer routes through the rebuilt coordination map afterwards. Typed
+// failures stay typed: every rejection is a [`CoordinationMailboxError`].
+//
+// Production chain: the session-loss slice calls [`expire_mailbox_message`]
+// under [`COORDINATION_MAILBOX_EXPIRE_NAME`] when the recipient session lapses
+// or the horizon passes, and [`reassign_mailbox_message`] under
+// [`COORDINATION_MAILBOX_REASSIGN_NAME`] to name the replacement recipient.
+// Both callers persist the returned rows through the Store bridge (STITCH).
+//
+// Out of scope here: map view (map-view slice above), large-payload handles
+// (payload-handles slice above), and route capabilities (route slice above).
+// ============================================================================
+
+/// Stable named expiry. The session-loss slice calls
+/// [`expire_mailbox_message`] under this exact name.
+pub const COORDINATION_MAILBOX_EXPIRE_NAME: &str = "ExpireMailboxMessage";
+/// Stable named reassignment. The session-loss slice calls
+/// [`reassign_mailbox_message`] under this exact name.
+pub const COORDINATION_MAILBOX_REASSIGN_NAME: &str = "ReassignMailboxMessage";
+
+/// Closed cause of one session-loss transition: the configured horizon
+/// passed, or the recipient session was lost.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub enum MailboxExpiryCause {
+    HorizonReached,
+    SessionLoss,
+}
+
+impl MailboxExpiryCause {
+    /// Canonical wire spelling of one cause.
+    #[must_use]
+    pub const fn as_wire(&self) -> &'static str {
+        match self {
+            Self::HorizonReached => "horizon_reached",
+            Self::SessionLoss => "session_loss",
+        }
+    }
+}
+
+/// Durable expiry row for one admitted message (`ExpireMailboxMessage`).
+/// Terminal: an expired identity is never reassigned and admits no further
+/// delivery step.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MailboxExpiryReceipt {
+    /// Identity of the expired message.
+    pub message_id: String,
+    /// Ordering key of the expired record.
+    pub sequence: u64,
+    /// Why the message expired.
+    pub cause: MailboxExpiryCause,
+    /// Producer-observed expiry time, Unix milliseconds.
+    pub expired_at_unix_ms: u64,
+    /// Delivery receipts the caller read back for this identity: the history
+    /// retained through the transition, bound into the row.
+    pub retained_deliveries: u64,
+    /// True when this identity was already expired.
+    pub replayed: bool,
+}
+
+/// Expires one admitted message after Session loss or horizon expiry
+/// (`ExpireMailboxMessage`).
+///
+/// A lost session expires the message with [`MailboxExpiryCause::SessionLoss`];
+/// a live session expires it with [`MailboxExpiryCause::HorizonReached`] only
+/// once the caller-observed time reaches the owning slice's horizon. A message
+/// that is neither past its horizon nor past a lost session is rejected with
+/// [`CoordinationMailboxError::ExpiryNotDue`]. `existing` is the
+/// caller-read-back expiry view and `deliveries` the caller-read-back delivery
+/// view (the Store bridge readback in production); this function stores
+/// nothing itself.
+pub fn expire_mailbox_message(
+    record: &CoordinationMailboxRecord,
+    existing: &[MailboxExpiryReceipt],
+    deliveries: &[MailboxDeliveryReceipt],
+    observed_at_unix_ms: u64,
+    session_live: bool,
+    expiry_horizon_unix_ms: Option<u64>,
+) -> Result<MailboxExpiryReceipt, CoordinationMailboxError> {
+    require_timestamp(observed_at_unix_ms, "observed_at_unix_ms")?;
+    if let Some(horizon) = expiry_horizon_unix_ms {
+        require_timestamp(horizon, "expiry_horizon_unix_ms")?;
+    }
+    if let Some(known) = existing
+        .iter()
+        .find(|receipt| receipt.message_id == record.message_id)
+    {
+        return Ok(MailboxExpiryReceipt {
+            replayed: true,
+            ..known.clone()
+        });
+    }
+    let cause = if !session_live {
+        Some(MailboxExpiryCause::SessionLoss)
+    } else if expiry_horizon_unix_ms.is_some_and(|horizon| observed_at_unix_ms >= horizon) {
+        Some(MailboxExpiryCause::HorizonReached)
+    } else {
+        None
+    };
+    let Some(cause) = cause else {
+        return Err(CoordinationMailboxError::ExpiryNotDue {
+            message_id: record.message_id.clone(),
+        });
+    };
+    Ok(MailboxExpiryReceipt {
+        message_id: record.message_id.clone(),
+        sequence: record.sequence,
+        cause,
+        expired_at_unix_ms: observed_at_unix_ms,
+        retained_deliveries: retained_delivery_count(deliveries, &record.message_id),
+        replayed: false,
+    })
+}
+
+/// Durable reassignment row for one admitted message
+/// (`ReassignMailboxMessage`): the replacement recipient after the recorded
+/// recipient's session was lost. The original record is untouched and every
+/// delivery receipt stays keyed by the message identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MailboxReassignment {
+    /// Identity of the reassigned message.
+    pub message_id: String,
+    /// Ordering key of the reassigned record.
+    pub sequence: u64,
+    /// Recipient named on the admitted record.
+    pub from_recipient_id: String,
+    /// Replacement recipient named by the session-loss slice.
+    pub to_recipient_id: String,
+    /// Task that owns the coordination context.
+    pub task_id: TaskId,
+    /// Producer-observed reassignment time, Unix milliseconds.
+    pub reassigned_at_unix_ms: u64,
+    /// Delivery receipts the caller read back for this identity: the history
+    /// retained through the transition, bound into the row.
+    pub retained_deliveries: u64,
+    /// True when this identity was already reassigned to this recipient.
+    pub replayed: bool,
+}
+
+/// Reassigns one admitted message after its recipient session was lost
+/// (`ReassignMailboxMessage`).
+///
+/// Reassignment requires a lost session: a live session is a typed rejection,
+/// never a silent no-op. The replacement must name a different recipient, and
+/// an expired identity is never reassigned. A reused identity with the same
+/// replacement replays the existing row with no second effect; a reused
+/// identity with a different replacement is an identity conflict, never a
+/// silent overwrite. `existing` is the caller-read-back reassignment view,
+/// `deliveries` the caller-read-back delivery view, and `expiries` the
+/// caller-read-back expiry view (the Store bridge readback in production);
+/// this function stores nothing itself.
+pub fn reassign_mailbox_message(
+    record: &CoordinationMailboxRecord,
+    existing: &[MailboxReassignment],
+    deliveries: &[MailboxDeliveryReceipt],
+    expiries: &[MailboxExpiryReceipt],
+    new_recipient_id: &str,
+    observed_at_unix_ms: u64,
+    session_live: bool,
+) -> Result<MailboxReassignment, CoordinationMailboxError> {
+    require_timestamp(observed_at_unix_ms, "observed_at_unix_ms")?;
+    if session_live {
+        return Err(CoordinationMailboxError::InvalidField {
+            field: "session_live",
+            reason: "reassignment requires a lost session",
+        });
+    }
+    require_text(new_recipient_id, "new_recipient_id", MAX_IDENTITY_LEN)?;
+    if new_recipient_id == record.recipient_id {
+        return Err(CoordinationMailboxError::InvalidField {
+            field: "new_recipient_id",
+            reason: "must name a different recipient",
+        });
+    }
+    if expiries
+        .iter()
+        .any(|receipt| receipt.message_id == record.message_id)
+    {
+        return Err(CoordinationMailboxError::InvalidField {
+            field: "message_id",
+            reason: "message already expired",
+        });
+    }
+    if let Some(known) = existing
+        .iter()
+        .find(|row| row.message_id == record.message_id)
+    {
+        if known.to_recipient_id != new_recipient_id {
+            return Err(CoordinationMailboxError::IdentityConflict {
+                message_id: record.message_id.clone(),
+            });
+        }
+        return Ok(MailboxReassignment {
+            replayed: true,
+            ..known.clone()
+        });
+    }
+    Ok(MailboxReassignment {
+        message_id: record.message_id.clone(),
+        sequence: record.sequence,
+        from_recipient_id: record.recipient_id.clone(),
+        to_recipient_id: new_recipient_id.to_owned(),
+        task_id: record.task_id.clone(),
+        reassigned_at_unix_ms: observed_at_unix_ms,
+        retained_deliveries: retained_delivery_count(deliveries, &record.message_id),
+        replayed: false,
+    })
+}
+
+/// Counts the delivery receipts the caller read back for one identity, so a
+/// session-loss row binds the history it retains.
+fn retained_delivery_count(deliveries: &[MailboxDeliveryReceipt], message_id: &str) -> u64 {
+    let mut retained: u64 = 0;
+    for receipt in deliveries {
+        if receipt.message_id == message_id {
+            retained = retained.saturating_add(1);
+        }
+    }
+    retained
 }
