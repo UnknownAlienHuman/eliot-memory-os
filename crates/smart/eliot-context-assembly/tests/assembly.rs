@@ -886,11 +886,17 @@ fn rendered_fields_and_quality_binding_are_retained() {
     mismatched_recipe.recipe_sha256 = mismatched_recipe
         .canonical_policy_digest()
         .expect("mismatched recipe digest");
+    // Re-stamp the admitted set under this instance. `economy.recipe_digest`
+    // still names the original, so assemble.rs:541 would refuse with
+    // `IdentityConflict` before `validate_recipe_membership` at :549 — the
+    // denominator check this assertion exists to prove.
+    let mut mismatched_admitted = admitted();
+    refinalize(&mut mismatched_admitted, &mismatched_recipe.recipe_sha256.clone());
     let result = assemble_active_view(
-        &value,
+        &mismatched_admitted,
         &mismatched_recipe,
         &approved_for(&mismatched_recipe),
-        quality_for(&value, &mismatched_recipe),
+        quality_for(&mismatched_admitted, &mismatched_recipe),
         &policy(100_000),
         |_bytes| panic!("mandatory-role mismatch must preflight before measurement"),
     );
@@ -1259,7 +1265,13 @@ fn denominator_mismatch_is_rejected() {
         &broken,
         &recipe(&broken_context),
         &approved_for(&recipe(&broken_context)),
-        quality_for(&broken, &recipe(&broken_context)),
+        // The placeholder card, not `quality_for`: clearing `economy.admitted`
+        // leaves it short of the admitted identities, refused as
+        // `EconomyMismatch` by `AdmittedContextSet::validate` at
+        // admission.rs:453-455 via `admitted.validate()` at assemble.rs:540.
+        // That set has no canonical payload digest, so no card can name it, and
+        // the grade at :594 is never read.
+        quality(&broken_context),
         &policy(100_000),
         |bytes| Ok(measurement(&broken_context, bytes)),
     );
@@ -1460,8 +1472,7 @@ fn changed_role_required_protected_state_fails() {
         Err(AssemblyError::Contract(ContextError::IdentityConflict))
     );
 
-    let value = admitted();
-    let context = value.binding.clone();
+    let context = admitted().binding.clone();
     let mut widened = recipe(&context);
     widened.mandatory_roles.push(SemanticRole::Source);
     widened.role_policies.push(RoleLossRule {
@@ -1473,11 +1484,16 @@ fn changed_role_required_protected_state_fails() {
     widened.recipe_sha256 = widened
         .canonical_policy_digest()
         .expect("widened recipe digest");
+    // Re-stamp the admitted set under this instance, for the same reason as
+    // `mismatched_recipe` above: without it assemble.rs:541 refuses with
+    // `IdentityConflict` and `validate_recipe_membership` at :549 never runs.
+    let mut widened_admitted = admitted();
+    refinalize(&mut widened_admitted, &widened.recipe_sha256.clone());
     let result = assemble_active_view(
-        &value,
+        &widened_admitted,
         &widened,
         &approved_for(&widened),
-        quality_for(&value, &widened),
+        quality_for(&widened_admitted, &widened),
         &policy(100_000),
         |_bytes| panic!("widened mandatory roles must fail denominator"),
     );
@@ -2308,9 +2324,17 @@ fn missing_omission_coverage_evidence_is_rejected() {
     // Built from `quality_for`, so this card names the exact output this
     // compilation produces and the only thing wrong with it is the missing
     // twelfth axis. A card carrying placeholder output identities would be
-    // refused by `require_graded_output` instead, which returns the same
-    // `QualityIncomplete` variant and would let this test pass without the
-    // completeness refusal ever happening.
+    // refused earlier still, by `require_graded_output`, and would not reach
+    // the completeness check at all.
+    //
+    // The refusal is `Contract`, not `QualityIncomplete`: a card missing an axis
+    // is not structurally valid, and `QualityScorecard::validate` refuses it at
+    // quality.rs:750-755 because the declared vectors differ from
+    // `QUALITY_DIMENSIONS`. `suitability` therefore reports `InvalidScorecard`,
+    // which assemble.rs:572-573 converts to a contract rejection. The precedence
+    // is the documented one, quoted at assemble.rs:569-570: "A card that is not
+    // even structurally valid is still a contract rejection unless the owner
+    // reported it as quality incompleteness."
     let mut thin_quality = quality_for(&value, &recipe(&context));
     thin_quality.results.pop();
     let result = assemble_active_view(
@@ -2323,7 +2347,7 @@ fn missing_omission_coverage_evidence_is_rejected() {
     );
     assert!(matches!(
         result,
-        Err(AssemblyError::QualityIncomplete(_, _))
+        Err(AssemblyError::Contract(ContextError::QualityIncomplete))
     ));
 }
 
