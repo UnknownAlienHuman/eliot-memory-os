@@ -803,7 +803,7 @@ impl KernelComposition {
         let retained_fence_digest = super::sha256_json(&retained_parent.request.state_fence)
             .map_err(|_| TransportError::SessionFenced)?;
         if parent_record.kind != eliot_ors::HostRequestKind::SelectedSourceCapture
-            || parent_record.state != eliot_ors::HostRequestState::Routed
+            || parent_record.state != eliot_ors::HostRequestState::Admitted
             || parent_record.request_digest != request.parent_request_digest
             || parent_record.deadline_unix_ms <= super::unix_ms()
             || parent_record.request_id.as_str()
@@ -978,7 +978,7 @@ impl KernelComposition {
         let retained_fence_digest = super::sha256_json(&retained_parent.request.state_fence)
             .map_err(|_| TransportError::SessionFenced)?;
         if parent_record.kind != eliot_ors::HostRequestKind::SelectedSourceCapture
-            || parent_record.state != eliot_ors::HostRequestState::Routed
+            || parent_record.state != eliot_ors::HostRequestState::Admitted
             || parent_record.request_digest != request.parent_request_digest
             || parent_record.deadline_unix_ms <= super::unix_ms()
             || parent_record.request_id.as_str()
