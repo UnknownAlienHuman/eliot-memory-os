@@ -18,7 +18,8 @@ use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
 use eliot_ors::{
     ExpectedOrderingHead, OpaqueLabel, OperationalRecoveryStore, OrsError, RecoveryAccessClass,
     RecoveryCursor, RecoveryEnvelopeContext, RecoveryPayloadEnvelope, RedbRecoveryStore,
-    ReservationRequest, ReservationState, ScopeReservationRequest, StateFenceSnapshot,
+    RecoveryWriteBinding, ReservationRequest, ReservationState, ScopeReservationRequest,
+    StateFenceSnapshot,
     test_support::{KernelRouteStoreFixture, kernel_fixture_dir, kernel_route_writer_epoch},
 };
 use eliot_platform::SecretReference;
@@ -37,40 +38,76 @@ fn reservation_request(tag: &str) -> ReservationRequest {
     let writer_epoch =
         kernel_route_writer_epoch(LINEAGE_2031, 1).expect("2031 writer epoch builds");
     let snapshot = StateFenceSnapshot::capture(&fence(), 1).expect("2031 fence snapshot captures");
+    let operation_id = OpaqueLabel::new(format!("op-2031-{tag}"))
+        .expect("2031 operation label");
+    let reservation_id = OpaqueLabel::new(format!("reservation-2031-{tag}"))
+        .expect("2031 reservation label");
+    let visibility = OpaqueLabel::new("owner-only").expect("2031 visibility label");
+    let access_class = RecoveryAccessClass {
+        privacy: PrivacyClass::Private,
+        visibility,
+        instruction_taint: InstructionTaint::DataOnly,
+    };
+    let key = SecretReference::new("kernel-reservation-key", "store-write-reservation-v1")
+        .expect("2031 key reference");
     let envelope = RecoveryPayloadEnvelope::encrypted(
         RecoveryEnvelopeContext {
-            operation_or_checkpoint_id: OpaqueLabel::new(format!("op-2031-{tag}"))
-                .expect("2031 operation label"),
-            privacy_and_visibility_class: RecoveryAccessClass {
-                privacy: PrivacyClass::Private,
-                visibility: OpaqueLabel::new("owner-only").expect("2031 visibility label"),
-                instruction_taint: InstructionTaint::DataOnly,
-            },
+            operation_or_checkpoint_id: operation_id.clone(),
+            privacy_and_visibility_class: access_class.clone(),
             authority_epoch: writer_epoch.clone(),
-            state_fence: snapshot,
+            state_fence: snapshot.clone(),
             created_at_ms: 1_700_000_000_000,
             known_at_ms: 1_700_000_000_000,
             expires_at_ms: Some(1_700_000_100_000),
         },
-        SecretReference::new("kernel-reservation-key", "store-write-reservation-v1")
-            .expect("2031 key reference"),
+        key.clone(),
         format!("kernel-fixture-payload-{tag}").into_bytes(),
     )
     .expect("2031 envelope binds");
+    let scope = OpaqueLabel::new("scope-2031-a").expect("2031 scope label");
+    let prepared_transition_sha256 = "a".repeat(64);
+    let envelope_contract_version = envelope.contract_version;
+    let payload_sha256 = envelope.payload_sha256.clone();
+    let payload_length = envelope.payload_length;
+    let envelope = envelope
+        .with_write_binding(RecoveryWriteBinding {
+            write_envelope_protocol_version: 1,
+            recovery_envelope_contract_version: envelope_contract_version,
+            recovery_access_class: access_class,
+            payload_created_at_ms: 1_700_000_000_000,
+            payload_known_at_ms: 1_700_000_000_000,
+            payload_expires_at_ms: Some(1_700_000_100_000),
+            operation_id,
+            write_intent_id: OpaqueLabel::new(format!("intent-2031-{tag}"))
+                .expect("2031 write intent label"),
+            idempotency_key: OpaqueLabel::new(format!("idempotency-2031-{tag}"))
+                .expect("2031 idempotency label"),
+            canonical_request_sha256: "b".repeat(64),
+            prepared_transition_sha256: prepared_transition_sha256.clone(),
+            ordering_scopes: vec![scope.clone()],
+            admission_contract_set_digest: "c".repeat(64),
+            operation_manifest_digest: OpaqueLabel::new("manifest-2031")
+                .expect("2031 manifest label"),
+            authority_epoch: writer_epoch.clone(),
+            state_fence: snapshot,
+            protected_payload_sha256: payload_sha256,
+            protected_payload_length: payload_length,
+            payload_key_reference: key,
+        })
+        .expect("2031 write binding validates");
     ReservationRequest {
-        reservation_id: OpaqueLabel::new(format!("reservation-2031-{tag}"))
-            .expect("2031 reservation label"),
+        reservation_id,
         envelope,
         writer_epoch,
         scopes: vec![ScopeReservationRequest {
-            scope: OpaqueLabel::new("scope-2031-a").expect("2031 scope label"),
+            scope,
             expected_head: ExpectedOrderingHead {
                 sequence: 6,
                 head_sha256: "c".repeat(64),
                 revision_head: None,
             },
         }],
-        prepared_transition_sha256: "a".repeat(64),
+        prepared_transition_sha256,
         expires_at_ms: 1_700_000_100_000,
         recovery_owner: OpaqueLabel::new("owner-2031").expect("2031 owner label"),
     }
