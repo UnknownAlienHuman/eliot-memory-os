@@ -1,12 +1,20 @@
 //! Read-only validation of the canonical Host SCM launch registration.
 
+use std::path::{Path, PathBuf};
+
+use eliot_installation::InstallationProfile;
 use eliot_platform::ServiceState;
 use eliot_platform_windows::{
     ELIOT_HOST_SERVICE_DISPLAY_NAME, ELIOT_HOST_SERVICE_NAME, ServiceAccount,
     ServiceBootstrapArguments, ServiceInspectionUnknownDetail, ServiceRegistrationRequest,
     ServiceRegistrationRuntimeInspection, ServiceStartMode, WindowsPlatform,
 };
+use serde::{Deserialize, Serialize};
+#[cfg(windows)]
+use uuid::Uuid;
 
+#[cfg(windows)]
+use super::host_durable_persistence::{sync_dir, write_durable_file};
 use super::{HostError, HostLaunchOptions};
 
 // F-LOG-HOST-3 (#978) SCM launch observation helpers.
@@ -491,6 +499,429 @@ pub fn validate_host_scm_bootstrap(
         bootstrap,
         registration,
         inspection,
+    })
+}
+
+/// Wire version of the per-component supervision record (#1801 W1).
+pub const SUPERVISION_RECORD_WIRE: &str = "eliot.host.supervision-record.v1";
+
+/// Retained file name of the supervision record below the Host state root.
+pub const SUPERVISION_RECORD_FILE_NAME: &str = "supervision-record.json";
+
+/// Bounded size of the retained supervision record (five rows of approved
+/// digests, paths, identities, and restart-policy references).
+const MAX_SUPERVISION_RECORD_BYTES: u64 = 16 * 1024;
+
+/// Canonical supervision-table components in row order (#1801 Work item 1).
+pub const SUPERVISION_RECORD_COMPONENTS: [&str; 5] =
+    ["host", "watchdog", "kernel", "surreal", "doctor"];
+
+/// One per-component record of the supervision table (#1801 W1): artifact,
+/// registration or launch descriptor, admitted profile, OS/service identity
+/// where applicable, supervising owner, Job membership, journal/root,
+/// current generation, and restart-policy reference.
+///
+/// Every cell carries either an owner-observed value or an explicit
+/// not-owned marker naming the owning reader (for example the Kernel-managed
+/// Doctor budget, which Host never observes directly). Intended
+/// (manifest-approved) and observed (live readback or pre-admission) facts
+/// stay in distinct cells so a later readback can compare desired manifests
+/// to actual registration/process state instead of asserting them equal.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisionComponentRecord {
+    /// One of [`SUPERVISION_RECORD_COMPONENTS`].
+    pub component: String,
+    /// Approved artifact digest plus the live image digest where observed.
+    pub artifact: String,
+    /// Registration or launch descriptor binding the artifact.
+    pub descriptor: String,
+    /// Admitted installation profile (`system_service`, `user_mode`, or
+    /// `portable_dev`).
+    pub profile: String,
+    /// OS/service identity (SCM name, Job-qualified process lineage, or the
+    /// explicit marker where Host holds no handle).
+    pub identity: String,
+    /// Supervising owner of the component lifetime.
+    pub owner: String,
+    /// Job membership of the component.
+    pub job: String,
+    /// Journal or state root proving the component contour.
+    pub journal_or_root: String,
+    /// Approved generation plus the live observed generation where known.
+    pub generation: String,
+    /// Restart-policy reference: the owning budget and its durable evidence.
+    pub restart_policy: String,
+}
+
+/// Diagnostic projection of the full supervision table: one row per
+/// component of the #1801 topology, bound to the installation and Host
+/// epoch that published it. This is the inspectable artifact Work item 1
+/// requires: Host publishes it at open beside the journal, and the
+/// installed-candidate RUN under #11 reads it back next to live SCM and Job
+/// observations.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisionRecordTable {
+    /// Must equal [`SUPERVISION_RECORD_WIRE`].
+    pub wire: String,
+    /// Installation identity that published the table.
+    pub installation: String,
+    /// Host epoch sequence that published the table.
+    pub host_epoch_sequence: u64,
+    /// Host epoch lineage that published the table.
+    pub host_lineage: String,
+    /// Exactly one row per [`SUPERVISION_RECORD_COMPONENTS`], in order.
+    pub rows: Vec<SupervisionComponentRecord>,
+}
+
+impl SupervisionRecordTable {
+    /// Validates the table shape with the existing typed failures: a wrong
+    /// wire, an unbound installation/lineage, a missing or reordered row, or
+    /// an empty cell fails closed instead of publishing a partial record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError::RecoveryRequired`] when the table is not the
+    /// complete five-row supervision record it claims to be.
+    pub fn validate(&self) -> Result<(), HostError> {
+        if self.wire != SUPERVISION_RECORD_WIRE {
+            return Err(HostError::RecoveryRequired(
+                "supervision record wire is not the canonical record version".to_owned(),
+            ));
+        }
+        for bound in [
+            &self.installation,
+            &self.host_lineage,
+        ] {
+            if bound.trim().is_empty() || bound.chars().any(char::is_control) {
+                return Err(HostError::RecoveryRequired(
+                    "supervision record publisher binding is malformed".to_owned(),
+                ));
+            }
+        }
+        if self.rows.len() != SUPERVISION_RECORD_COMPONENTS.len() {
+            return Err(HostError::RecoveryRequired(
+                "supervision record does not carry every topology component".to_owned(),
+            ));
+        }
+        for (row, expected) in self.rows.iter().zip(SUPERVISION_RECORD_COMPONENTS) {
+            if row.component != expected {
+                return Err(HostError::RecoveryRequired(
+                    "supervision record rows are not the canonical topology order".to_owned(),
+                ));
+            }
+            for cell in [
+                &row.artifact,
+                &row.descriptor,
+                &row.profile,
+                &row.identity,
+                &row.owner,
+                &row.job,
+                &row.journal_or_root,
+                &row.generation,
+                &row.restart_policy,
+            ] {
+                if cell.trim().is_empty() {
+                    return Err(HostError::RecoveryRequired(format!(
+                        "supervision record row '{}' has an empty cell",
+                        row.component
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Retained path of the supervision record below a Host state root.
+#[must_use]
+pub fn supervision_record_path(host_state_root: &Path) -> PathBuf {
+    host_state_root.join(SUPERVISION_RECORD_FILE_NAME)
+}
+
+/// Publishes the supervision record durably beside the Host journal: the
+/// staged bytes are synced, atomically moved over the retained record on the
+/// same volume, committed with a directory sync, and proven back by an exact
+/// validated reload. Called from `HostComposition::open` (the production
+/// write path); read back with [`read_supervision_record_table`].
+///
+/// # Errors
+///
+/// Returns [`HostError::Platform`] when the table is not publishable or the
+/// atomic publication fails, and [`HostError::RecoveryRequired`] when the
+/// readback differs from the published table or its cleanup fails.
+#[cfg(windows)]
+pub fn publish_supervision_record_table(
+    host_state_root: &Path,
+    table: &SupervisionRecordTable,
+) -> Result<(), HostError> {
+    scm_launch_observe("host.scm-launch supervision record publish requested");
+    table.validate().map_err(|error| {
+        HostError::Platform(format!("supervision record is not publishable: {error}"))
+    })?;
+    let bytes =
+        serde_json::to_vec(table).map_err(|error| HostError::Platform(error.to_string()))?;
+    if bytes.len() as u64 > MAX_SUPERVISION_RECORD_BYTES {
+        return Err(HostError::Platform(
+            "supervision record exceeds its bounded size".to_owned(),
+        ));
+    }
+    let path = supervision_record_path(host_state_root);
+    let tmp = host_state_root.join(format!(
+        ".supervision-record.{}.tmp",
+        Uuid::new_v4().simple()
+    ));
+    let publication = (|| {
+        write_durable_file(&tmp, &bytes)?;
+        eliot_windows_ipc::atomic_replace_file(&tmp, &path).map_err(|error| {
+            HostError::Platform(format!("supervision record atomic replace failed: {error}"))
+        })?;
+        sync_dir(host_state_root)?;
+        Ok(())
+    })();
+    // The atomic move consumes the staging file on success; on failure the
+    // staging file is removed. Publication failure stays primary across
+    // cleanup and its commit.
+    let cleanup = std::fs::remove_file(&tmp);
+    let sync_after_cleanup = sync_dir(host_state_root);
+    match publication {
+        Err(publication_error) => {
+            scm_launch_observe("host.scm-launch supervision record publication failed");
+            Err(publication_error)
+        }
+        Ok(()) => {
+            match cleanup {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(HostError::RecoveryRequired(format!(
+                        "supervision record temporary cleanup failed: {error}"
+                    )));
+                }
+            }
+            sync_after_cleanup?;
+            let reloaded = read_supervision_record_table(host_state_root)?;
+            if reloaded != *table {
+                return Err(HostError::RecoveryRequired(
+                    "supervision record readback differs from the published table".to_owned(),
+                ));
+            }
+            scm_launch_observe("host.scm-launch supervision record published");
+            Ok(())
+        }
+    }
+}
+
+/// Reads back the retained supervision record: the production read path for
+/// the #1801 record table, used by the verified-reload step of publication
+/// and by the installed-candidate RUN under #11 next to live SCM and Job
+/// observations.
+///
+/// # Errors
+///
+/// Returns [`HostError::RecoveryRequired`] when the record is absent,
+/// oversized, malformed, or invalid. The original record is validated with
+/// the existing [`SupervisionRecordTable::validate`]; validation failures
+/// stay typed.
+pub fn read_supervision_record_table(
+    host_state_root: &Path,
+) -> Result<SupervisionRecordTable, HostError> {
+    const LABEL: &str = "supervision record";
+    let path = supervision_record_path(host_state_root);
+    let metadata = std::fs::metadata(&path).map_err(|error| {
+        HostError::RecoveryRequired(format!("{LABEL} cannot be inspected: {error}"))
+    })?;
+    if !metadata.is_file() || metadata.len() > MAX_SUPERVISION_RECORD_BYTES {
+        return Err(HostError::RecoveryRequired(format!(
+            "{LABEL} is malformed or too large"
+        )));
+    }
+    let bytes = std::fs::read(&path)
+        .map_err(|error| HostError::RecoveryRequired(format!("{LABEL} cannot be read: {error}")))?;
+    if bytes.len() as u64 > MAX_SUPERVISION_RECORD_BYTES {
+        return Err(HostError::RecoveryRequired(format!(
+            "{LABEL} is malformed or too large"
+        )));
+    }
+    let table = serde_json::from_slice::<SupervisionRecordTable>(&bytes)
+        .map_err(|error| HostError::RecoveryRequired(format!("{LABEL} is malformed: {error}")))?;
+    table.validate()?;
+    Ok(table)
+}
+
+/// Caller-supplied identity of one disposable first-install candidate
+/// contour (#1801 A1).
+///
+/// Only the canonical `EliotHost` service identity can be inspected: the
+/// platform admits no other service name, so a disposable candidate is
+/// isolated by its disposable root and installation — never by a guessed
+/// service name. Every path below names the candidate's own files; the
+/// candidate image must already exist on disk (the registration constructor
+/// proves that, it is never assumed here).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstalledCandidateSpec {
+    /// Candidate Host image path (must exist; proven by the constructor).
+    pub image_path: PathBuf,
+    /// Candidate bootstrap config descriptor path.
+    pub config_descriptor_path: PathBuf,
+    /// Candidate bootstrap config descriptor digest (lowercase SHA-256).
+    pub config_descriptor_digest: String,
+    /// Candidate installation identity.
+    pub installation_id: String,
+    /// Candidate immutable transaction-plan generation (non-zero).
+    pub transaction_plan_generation: u64,
+    /// Candidate Host state root carrying the candidate registry.
+    pub host_state_root: PathBuf,
+    /// Filesystem root the platform adapter observes from.
+    pub platform_root: PathBuf,
+    /// Installation profile the candidate registry is opened under.
+    pub profile: InstallationProfile,
+}
+
+/// Approved-manifest summary read back from a candidate registry: the
+/// desired side of the installed-candidate readback, sourced from the
+/// existing installation registry owner (never synthesized).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstalledCandidateManifestSummary {
+    /// Approved candidate generation.
+    pub generation: String,
+    /// Admitted installation profile.
+    pub profile: String,
+    /// Approved Kernel image digest.
+    pub kernel_artifact: String,
+    /// Approved Store bridge image digest.
+    pub store_bridge_artifact: String,
+    /// Approved canonical Store engine image digest.
+    pub canonical_store_artifact: String,
+    /// Approved Host image digest.
+    pub host_artifact: String,
+    /// Approved Doctor image digest.
+    pub doctor_artifact: String,
+    /// Approved generation configuration digest.
+    pub config_digest: String,
+}
+
+/// Exact registration plus manifest readback taken on a disposable
+/// first-install candidate (#1801 A1).
+///
+/// `inspection` is the live platform readback for the canonical Host
+/// registration (matching/absent/mismatched/unknown, with the observed
+/// process identity where SCM reports one); `manifest` is the desired side
+/// read from the candidate's own installation registry (`None` when the
+/// candidate installed no registry yet). Branch Job/process rows for the
+/// candidate's live branches are produced inside the running candidate by
+/// `HostComposition::supervision_record_table` and published beside its
+/// journal; the installed RUN under #11 joins both halves.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstalledCandidateReadback {
+    /// Canonical service name that was inspected (`EliotHost`).
+    pub service_name: String,
+    /// Expected SCM configuration digest the inspection compared against.
+    pub configuration_digest: String,
+    /// Live platform registration readback (data, not an error: the #11
+    /// harness asserts the expected outcome from this value).
+    pub inspection: ServiceRegistrationRuntimeInspection,
+    /// Desired side from the candidate registry, when one is installed.
+    pub manifest: Option<InstalledCandidateManifestSummary>,
+}
+
+/// Performs exact registration plus manifest readback on a disposable
+/// first-install candidate contour.
+///
+/// TEST-PHASE (#11): this is the product code path for the
+/// first-install candidate contour; the installed-candidate RUN itself
+/// (install a disposable SystemService candidate, start it, assert exact
+/// registration and process/Job readback demonstrate the supervision table)
+/// follows product assembly under #11 per the issue body sequencing. This
+/// function is therefore not invoked by `service_main` or `open`, and it
+/// must never be pointed at the live service: it performs read-only
+/// inspection only (one SCM registration readback plus one short-lived
+/// registry load) and owns no register/start/stop/remove capability — the
+/// only platform calls below are `inspect_service_registration_runtime`
+/// and the registry read; no SCM mutation exists on this path by
+/// construction.
+///
+/// # Errors
+///
+/// Returns [`HostError::Platform`] when the candidate identity is not
+/// canonical or the platform cannot be observed, [`HostError::Installation`]
+/// when the candidate registry cannot be loaded, and
+/// [`HostError::RecoveryRequired`] when a live observation cannot be read.
+pub fn read_installed_candidate_contour(
+    spec: &InstalledCandidateSpec,
+) -> Result<InstalledCandidateReadback, HostError> {
+    scm_launch_observe("host.scm-launch installed candidate readback requested");
+    let bootstrap = ServiceBootstrapArguments::new(
+        spec.config_descriptor_path.clone(),
+        spec.config_descriptor_digest.clone(),
+        spec.installation_id.clone(),
+        spec.transaction_plan_generation,
+        std::iter::empty::<String>(),
+    )
+    .map_err(|error| HostError::Platform(error.to_string()))?
+    .with_host_state_root(spec.host_state_root.clone())
+    .map_err(|error| HostError::Platform(error.to_string()))?;
+    // The candidate carries the canonical Host identity: the platform
+    // admits no other service name, and `with_bootstrap` proves the
+    // canonical name/display/mode/account plus the on-disk image instead
+    // of trusting the spec.
+    let request = ServiceRegistrationRequest::with_bootstrap(
+        ELIOT_HOST_SERVICE_NAME,
+        ELIOT_HOST_SERVICE_DISPLAY_NAME,
+        spec.image_path.clone(),
+        ServiceStartMode::Automatic,
+        ServiceAccount::LocalService,
+        bootstrap,
+    )
+    .map_err(|error| HostError::Platform(error.to_string()))?;
+    let platform = WindowsPlatform::new(spec.platform_root.clone())
+        .map_err(|error| HostError::Platform(error.to_string()))?;
+    let inspection = platform.inspect_service_registration_runtime(&request);
+    let configuration_digest = request.expected_configuration_digest();
+    let service_name = request.service_name().to_owned();
+    let store =
+        super::open_installation_registry_with_transient_retry_for_profile(
+            &spec.host_state_root,
+            spec.profile,
+        )?;
+    let manifest = match store.as_ref() {
+        None => None,
+        Some(store) => {
+            let registry = store.load().map_err(HostError::Installation)?;
+            registry
+                .active()
+                .map(|active| &active.manifest)
+                .or_else(|| {
+                    registry
+                        .pending_activation()
+                        .map(|pending| &pending.manifest)
+                })
+                .map(|manifest| InstalledCandidateManifestSummary {
+                    generation: manifest.generation.as_str().to_owned(),
+                    profile: format!("{:?}", manifest.runtime_launch.profile),
+                    kernel_artifact: manifest.kernel_artifact_digest.as_str().to_owned(),
+                    store_bridge_artifact: manifest
+                        .store_bridge_artifact_digest
+                        .as_str()
+                        .to_owned(),
+                    canonical_store_artifact: manifest
+                        .canonical_store_artifact_digest
+                        .as_str()
+                        .to_owned(),
+                    host_artifact: manifest.host_artifact_digest.as_str().to_owned(),
+                    doctor_artifact: manifest.doctor_artifact_digest.as_str().to_owned(),
+                    config_digest: manifest.config_digest.as_str().to_owned(),
+                })
+        }
+    };
+    scm_launch_observe("host.scm-launch installed candidate readback observed");
+    Ok(InstalledCandidateReadback {
+        service_name,
+        configuration_digest,
+        inspection,
+        manifest,
     })
 }
 
