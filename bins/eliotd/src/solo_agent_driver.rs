@@ -1993,18 +1993,44 @@ fn projection_settled(projection: &SoloPersistedAttempt) -> bool {
     let terminal_cancel = projection
         .snapshot
         .cancellations
-        .values()
-        .any(|state| *state == crate::agent_fabric::CancellationLifecycle::Terminal);
+        .get(&projection.attempt_id)
+        .is_some_and(|state| *state == crate::agent_fabric::CancellationLifecycle::Terminal);
     if terminal_cancel {
         return true;
     }
-    projection.snapshot.attempt_states.values().any(|state| {
-        matches!(
-            state,
-            crate::agent_fabric::AttemptLifecycle::ResultSubmitted
-                | crate::agent_fabric::AttemptLifecycle::UnknownOutcome
-        )
-    })
+    // An unknown outcome is explicitly unresolved external-effect state. It
+    // must keep the original operation in the single live slot until a
+    // result or terminal cancellation is observed; treating it as settled
+    // would permit a second operation while the first may still be running.
+    projection
+        .snapshot
+        .attempt_states
+        .get(&projection.attempt_id)
+        .is_some_and(attempt_lifecycle_is_settled)
+}
+
+fn attempt_lifecycle_is_settled(state: &crate::agent_fabric::AttemptLifecycle) -> bool {
+    *state == crate::agent_fabric::AttemptLifecycle::ResultSubmitted
+}
+
+#[cfg(test)]
+mod projection_settlement_tests {
+    use super::attempt_lifecycle_is_settled;
+    use crate::agent_fabric::AttemptLifecycle;
+
+    #[test]
+    fn unknown_outcome_keeps_the_original_operation_live() {
+        assert!(!attempt_lifecycle_is_settled(
+            &AttemptLifecycle::UnknownOutcome
+        ));
+    }
+
+    #[test]
+    fn submitted_result_releases_the_original_operation_slot() {
+        assert!(attempt_lifecycle_is_settled(
+            &AttemptLifecycle::ResultSubmitted
+        ));
+    }
 }
 
 /// Rebuilds the solo ports plus a restored fabric from a persisted projection.
