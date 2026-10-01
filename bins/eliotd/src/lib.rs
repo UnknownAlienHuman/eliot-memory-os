@@ -103,6 +103,13 @@ pub struct SelectedSourceCaptureCanonicalAdmission {
     pub record: eliot_store_api::ProposedAttemptRecord,
     pub causal_receipt: eliot_store_api::CausalWriteReceipt,
     pub activation: crate::daemon_kernel_client::SelectedSourceCaptureActivation,
+    /// Current original WorkScope snapshot and matched receipt from the live
+    /// Governor selection that authorized the staged source candidate.
+    pub(crate) work_scope: eliot_workscope::WorkScopeBindingSnapshot,
+    /// Fresh physical root, exact candidate bytes, and byte digest observed
+    /// under that same WorkScope immediately before canonical admission.
+    pub(crate) source_workspace:
+        crate::task_binding_admission::BoundSelectedSourceObservation,
 }
 
 /// Typed failures from the live captured-LSP source read and semantic adoption.
@@ -2411,6 +2418,16 @@ impl DaemonComposition {
             ));
         }
         let record = &staged.record;
+        let source_workspace = crate::task_binding_admission::observe_bound_selected_source(
+            current.work_scope(),
+            &claimed.host_request_envelope.state_fence,
+            &claimed.invocation.selected_relative_path,
+        )?;
+        if record.source_digest != source_workspace.source_sha256 {
+            return Err(CapturedLspAdoptionError::SelectedSourceCaptureRequest(
+                "staged source digest differs from bytes read under the current WorkScope root",
+            ));
+        }
         let expected_operation = match claimed.invocation.operation {
             eliot_protocol::SelectedSourceCaptureOperation::Diagnostics => "Diagnostics",
             eliot_protocol::SelectedSourceCaptureOperation::ProbeVersion => "ProbeVersion",
@@ -2572,6 +2589,8 @@ impl DaemonComposition {
             record: staged.record,
             causal_receipt,
             activation,
+            work_scope: current.work_scope().clone(),
+            source_workspace,
         })
     }
 
