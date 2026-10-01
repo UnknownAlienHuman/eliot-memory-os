@@ -11095,6 +11095,49 @@ impl RedbRecoveryStore {
             } else {
                 current.owner_readback = Some(evidence.clone());
             }
+            // Issue #2970 A10: settling with exact owner-readback evidence
+            // persists the `ResponseReceived` custody boundary carrying the
+            // retained result commitment when no such observation exists, so
+            // the terminal `ResultReceived` phase is never committed without
+            // its response boundary and the retained answer stays decodable
+            // from the observation history. Earlier observations are never
+            // rewritten and an existing `ResponseReceived` observation is
+            // never duplicated.
+            let response_already_observed = current.transport_observations.last().is_some_and(
+                |observation| {
+                    observation.boundary
+                        == crate::HostRequestTransportBoundary::ResponseReceived
+                },
+            );
+            if !response_already_observed {
+                if current.transport_observations.len() >= 3 {
+                    return Err(OrsError::ProjectionLimitExceeded);
+                }
+                let Some(first) = current.transport_observations.first() else {
+                    return Err(OrsError::InvalidTransition);
+                };
+                let channel_binding_sha256 = first.channel_binding_sha256.clone();
+                let transport_request_sha256 = first.transport_request_sha256.clone();
+                let observation = crate::HostRequestTransportObservation {
+                    operation_id: record.operation_id.clone(),
+                    request_digest: record.request_digest.clone(),
+                    attempt_id: current.attempt_id.clone(),
+                    attempt_generation: current.generation,
+                    boundary: crate::HostRequestTransportBoundary::ResponseReceived,
+                    channel_binding_sha256,
+                    transport_request_sha256,
+                    request_commitment_sha256: record.request_digest.clone(),
+                    payload_commitment_sha256: record.payload_digest.clone(),
+                    delivery_receipt: None,
+                    response_commitment_sha256: Some(evidence.result_commitment_sha256.clone()),
+                    response_source: Some(
+                        crate::HostRequestResponseSource::AuthenticatedTransport,
+                    ),
+                    no_send_proof: None,
+                };
+                observation.validate_for(&record, &current)?;
+                current.transport_observations.push(observation);
+            }
             current.phase = crate::HostRequestAttemptPhase::ResponseReceived;
         }
         if current.phase != crate::HostRequestAttemptPhase::ResponseReceived {
