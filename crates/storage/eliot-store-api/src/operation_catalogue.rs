@@ -498,7 +498,7 @@ struct ActivatedMutationDescriptor {
 /// activated mutation rows address no store scope, mirroring the scope-free read
 /// descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 23] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 24] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
@@ -548,6 +548,15 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 23] = [
         // Owner snapshots are bounded at 512 KiB. The existing 2 MiB bulk
         // parameter bound covers canonical JSON string escaping and the
         // remaining fixed parameters without broadening the payload bound.
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::CommitBudgetConsumption,
+        transition_classes: &[TransitionClass::RecoverySchema],
+        maximum_effect: EffectClass::ReversibleMutation,
+        // One exact measured-usage receipt and the next existing Budget owner
+        // image are bounded by the recovery-record contract, with JSON string
+        // escaping headroom in the enclosing named mutation.
         max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
     },
     ActivatedMutationDescriptor {
@@ -668,6 +677,15 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 23] = [
         // JSON inside the parameters object, so the bulk bound covers escaping
         // and the enclosing structure without loosening the record's own
         // closed validator.
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::AdmitWork,
+        transition_classes: &[TransitionClass::TaskControl],
+        maximum_effect: EffectClass::ReversibleMutation,
+        // Work definitions and their five original claim references are
+        // bounded owner records; the exact typed validator remains narrower
+        // than this canonical-JSON transport bound.
         max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
     },
 ];
@@ -1011,6 +1029,14 @@ pub fn validate_transition_against_catalogue(
             NamedMutationOperation::RecordTaskContractAcceptanceSet => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
                 validate_task_contract_acceptance_transition(transition, &command.parameters)?;
+            }
+            NamedMutationOperation::AdmitWork => {
+                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+                crate::validate_work_admission_transition(transition)?;
+            }
+            NamedMutationOperation::CommitBudgetConsumption => {
+                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+                crate::validate_budget_consumption_transition(transition)?;
             }
             NamedMutationOperation::RecordAuthorityRevocation => {
                 return Err(StoreError::UnknownOperation);

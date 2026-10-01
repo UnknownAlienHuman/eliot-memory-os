@@ -286,6 +286,7 @@ fn genesis_payload(
         RecoveryOwner::Canonical => serde_json::to_value(CanonicalAdmissionSnapshot {
             state_fence: state_fence.clone(),
             owner_revision: revision,
+            work_admission_revision: None,
             current_plan: None,
             verifier_execution_fact: None,
             finish_evidence: None,

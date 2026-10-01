@@ -43,6 +43,7 @@ use thiserror::Error;
 mod architecture_self_model;
 mod backup_io;
 mod blackboard;
+pub mod budget_consumption;
 pub mod canonical_event;
 mod dreamer_job;
 pub mod epistemic_revision;
@@ -60,6 +61,7 @@ mod store_failure;
 mod swarm_owner_revisions;
 mod task_contract_acceptance;
 mod user_automation_state;
+pub mod work_admission;
 mod wire;
 pub mod write_admission;
 
@@ -92,6 +94,13 @@ pub use blackboard::{
     BLACKBOARD_ITEM_MUTATION_NAME, BLACKBOARD_ITEM_READ_NAME, BLACKBOARD_ITEM_SCHEMA_V1,
     BlackboardItemRecord, BlackboardItemRevision, blackboard_item_read_request,
     blackboard_item_request, decode_blackboard_item,
+};
+
+pub use budget_consumption::{
+    BUDGET_CONSUMPTION_RECORD_NAMESPACE, BUDGET_CONSUMPTION_SCHEMA_V1,
+    BudgetConsumptionRecord, BudgetConsumptionSubmission,
+    ExpectedBudgetConsumptionCommitment, commit_budget_consumption_operation,
+    decode_budget_consumption_record, validate_budget_consumption_transition,
 };
 
 pub use mailbox::{
@@ -249,6 +258,19 @@ pub use task_contract_acceptance::{
     TaskContractAcceptanceRecord, decode_task_contract_acceptance_record,
     task_contract_acceptance_record_key, task_contract_acceptance_record_request,
     validate_acceptance_record_identity,
+};
+pub use work_admission::{
+    CANONICAL_ADMISSION_OWNER_KEY, ExpectedWorkAdmissionCommitment, WORK_ADMISSION_SCHEMA_V1,
+    WORK_ADMISSION_RECORD_NAMESPACE, WorkAdmissionBudget, WorkAdmissionBudgetAttribution,
+    WorkAdmissionBudgetDimension, WorkAdmissionClaimRef, WorkAdmissionClaims,
+    WorkAdmissionDependency, WorkAdmissionOwnerAttribution, WorkAdmissionOwnerReadback,
+    WorkAdmissionOwnerReference, WorkAdmissionOwnerRole, WorkAdmissionRecord,
+    WorkAdmissionModelCatalogEvidence, WorkAdmissionModelCatalogueImage,
+    WorkAdmissionProviderAccountObservation, WorkAdmissionProviderAccountUnavailableReason,
+    WorkAdmissionSemanticRevision, WorkAdmissionState, WorkAdmissionSubmission,
+    WorkAdmissionSwarmBudgetAttribution, admit_work_operation, decode_work_admission_record,
+    validate_admit_work_command, validate_work_admission_owner_cas,
+    validate_work_admission_transition, work_admission_value_digest,
 };
 
 pub use wire::{
@@ -4039,6 +4061,10 @@ pub enum NamedMutationOperation {
     CaptureObservation,
     ApplyEpistemicRevision,
     UpdateTaskState,
+    /// Persists the Governor-owned semantic ADMITTED decision and its exact
+    /// reservation/claim/fence/epoch join in the same canonical transaction
+    /// as the operation's launch-outbox row (#1678, I14.6/I10.15).
+    AdmitWork,
     /// Unactivated contract for immutable swarm owner revisions; requires a
     /// verified semantic-owner authorization gate before catalogue admission.
     ApplySwarmOwnerRevisions,
@@ -4057,6 +4083,9 @@ pub enum NamedMutationOperation {
     /// opaque bytes and only arbitrates the fixed `owner/module_registry`
     /// revision. Admission currentness remains a Governor readback decision.
     RecordModuleCatalogSnapshot,
+    /// Commits exact provider/tool-measured usage into the existing Budget
+    /// owner snapshot and records its work/admission attribution atomically.
+    CommitBudgetConsumption,
     AppendAuditEvent,
     /// Durable authority-revocation record (issue #686). Known-but-
     /// unsupported until a store-owned slice activates its catalogue row
@@ -4206,12 +4235,14 @@ impl NamedMutationOperation {
             Self::ApplyEpistemicRevision => TransitionClass::Epistemic,
             Self::UpdateTaskState
             | Self::ApplySwarmOwnerRevisions
-            | Self::RecordTaskContractAcceptanceSet => TransitionClass::TaskControl,
+            | Self::RecordTaskContractAcceptanceSet
+            | Self::AdmitWork => TransitionClass::TaskControl,
             Self::ApplyLifecyclePolicy => TransitionClass::LifecyclePolicy,
             Self::ReconcileRecovery
             | Self::RecordFinishDecision
             | Self::RecordFinishEvidence
             | Self::RecordModuleCatalogSnapshot
+            | Self::CommitBudgetConsumption
             | Self::RecordAuthorityRevocation
             | Self::ApplyProblemOwnerState => TransitionClass::RecoverySchema,
             Self::ApplyErasure => TransitionClass::Erasure,
@@ -5034,6 +5065,13 @@ impl PreparedTransition {
             operation.operation == NamedMutationOperation::ApplySwarmOwnerRevisions
         }) {
             validate_swarm_owner_revision_transition(self)?;
+        }
+        if self
+            .named_operations
+            .iter()
+            .any(|operation| operation.operation == NamedMutationOperation::AdmitWork)
+        {
+            validate_work_admission_transition(self)?;
         }
         // Issue #18: the bound decision/plan digests are recomputed from the
         // carried content and compared; any divergence (including a
