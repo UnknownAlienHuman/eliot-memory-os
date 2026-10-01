@@ -282,6 +282,79 @@ def _prerequisite_evidence(
             return ()
     return tuple(evidence)
 
+
+# ---------------------------------------------------------------------------
+# Cohort snapshot-currency wiring (#852 AUD1).
+#
+# The frozen cohort module verifies open only what its caller supplies:
+#   expected_base_commit / expected_repository
+#                        caller-supplied currency expectations for the
+#                        committed lock (observed checkout HEAD / unanimous
+#                        descriptor repository; omitted when unobservable);
+#   assignment_receipts  live or explicitly admitted offline receipts rebound
+#                        per row before catalogue integrity is declared.
+# Until supplied, those paths stay lock-internal inside cohort; this layer
+# supplies them from the inputs it already holds, and supplies nothing it
+# has not observed (unobservable stays omitted, never fabricated, never a
+# fallback). Catalogue-only acquires no assignment, so its receipt map is
+# the honest projection of memo_assignment -- empty on that path -- which
+# reaches verify_assignment_binding without fabricating a receipt.
+# ---------------------------------------------------------------------------
+
+def _observed_base_commit(root: Path) -> str | None:
+    """Observe the current checkout revision for lock-currency expectations.
+
+    Fixed read-only `git rev-parse HEAD` projection bounded to `root`; only a
+    well-formed 40-hex observation becomes an expectation, so a stale lock
+    base is invalidation rather than a valid self-consistent catalogue. Temp
+    fixture roots (no `.git`) and any unobservable/malformed output yield no
+    expectation, keeping lock-internal verification exactly as before.
+    """
+    if not cohort.is_real_repository_root(root):
+        return None
+    observed = _git_observed(root, ["rev-parse", "HEAD"])
+    if observed is None or re.fullmatch(r"[0-9a-f]{40}", observed) is None:
+        return None
+    return observed
+
+
+def _expected_repository(descriptors: object) -> c.RepositoryIdentity | None:
+    """Unanimous repository expectation across typed descriptors, if any.
+
+    A single distinct repository becomes the moved-source expectation for the
+    committed lock. Zero descriptors or mixed repositories yield no
+    expectation (structural checks still apply); nothing is guessed.
+    """
+    assert isinstance(descriptors, (list, tuple, set, dict))
+    values = descriptors.values() if isinstance(descriptors, dict) else descriptors
+    repos = set()
+    for desc in values:
+        if type(desc) is not c.WorkUnitDescriptor:
+            raise cohort.CohortError(cohort.CohortProblem.INTERNAL_ERROR,
+                                     "currency descriptor mistyped")
+        repos.add(desc.issue.repository)
+    if len(repos) != 1:
+        return None
+    return next(iter(repos))
+
+
+def _assignment_receipts(memo_assignment: dict) -> dict:
+    """Project acquired assignment documents onto their typed source receipts.
+
+    Only issues whose assignment was actually acquired through the frozen #849
+    source (live or explicitly admitted offline) contribute a receipt, so
+    rows stay bound to live evidence and no receipt is fabricated for
+    unacquired rows. Callers pass the result only where it covers the rows
+    being verified; otherwise they pass none and keep lock-internal binding.
+    """
+    receipts = {}
+    for number, doc in memo_assignment.items():
+        if type(doc) is not assignment_source.AssignmentDocument:
+            raise cohort.CohortError(cohort.CohortProblem.INTERNAL_ERROR,
+                                     "assignment document mistyped")
+        receipts[number] = doc.receipt
+    return receipts
+
 # Frozen CLI contract (#837 D-WU-FINAL, integrator-frozen; byte-for-byte).
 # Proof kinds: catalogue-only | selected | full-project (validated before
 # effects). Selector: --issue NUMBER (repeatable, distinct values) xor --crate
@@ -904,12 +977,22 @@ def main(argv: list[str] | None = None) -> int:
                 seen_issues.append(typed.issue)
             # Committed aggregate lock (#852): re-discover the numeric class,
             # rebuild every row and compare the recomputed digest against the
-            # lock's [aggregate] sha256. Fails closed on any mismatch.
+            # lock's [aggregate] sha256. The retained snapshot identity is
+            # verified against caller-supplied currency (observed checkout
+            # HEAD, unanimous descriptor repository) and every covered row is
+            # rebound to its live or explicitly admitted offline receipt
+            # before catalogue integrity is declared; a stale base or moved
+            # source fails closed. Catalogue-only acquires no assignment, so
+            # the receipt map is empty here and binding stays lock-internal
+            # without fabricating a receipt. Fails closed on any mismatch.
             if use_lock:
                 try:
                     typed_by_issue = {t.issue.number: t for t in typed_descs}
                     catalogue = cohort.verify_cohort_lock(
-                        lock_path, root / ".github" / "work-units", typed_by_issue)
+                        lock_path, root / ".github" / "work-units", typed_by_issue,
+                        expected_base_commit=_observed_base_commit(root),
+                        expected_repository=_expected_repository(typed_descs),
+                        assignment_receipts=_assignment_receipts(memo_assignment))
                 except cohort.CohortError as exc:
                     return finish(fail_result(f"catalogue aggregate lock invalid: {_redact(exc.problem.value if hasattr(exc, 'problem') else type(exc).__name__)}", 1,
                                               ceiling="catalogue-integrity-only", scope="selected",
