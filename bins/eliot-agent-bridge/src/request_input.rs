@@ -284,61 +284,83 @@ pub(crate) enum ReadOutcome {
 /// record that is not valid UTF-8 yields `InvalidUtf8`. An overlong record
 /// stops buffering immediately and is resynchronized according to the
 /// profile's oversize disposition without buffering during discard.
+///
+/// # The ceiling is on content bytes, on every chunking path
+///
+/// A chunk that ends on a lone CR is the one arrival the LF-only scan cannot
+/// classify, because the byte that ends the chunk and the newline that proves
+/// the CR is framing both live in different fills. That fill is held out of the
+/// running total entirely — and out of `record` — so the ceiling that is
+/// finally compared is always the length of the content with both terminator
+/// bytes excluded, and the collected prefix never exceeds the ceiling even
+/// transiently. Without that, the ceiling would depend on the caller's read
+/// size: a record delivered in one fill, or in fills that land on a content
+/// byte, would be ACCEPTED at exactly `max_record_bytes` content bytes, while
+/// the identical byte stream whose CR arrives on a fill of its own would be
+/// REFUSED.
+///
+/// Nothing else is deferred, so a held CR is the only possibility at that
+/// point, and the next fill resolves it: an LF proves it terminator framing and
+/// it is discarded, while EOF, a second CR, or any other byte proves it record
+/// content and it is charged against the ceiling in that same iteration,
+/// before anything is buffered. A CR is never both charged and then dropped, so
+/// a record can neither exceed the ceiling nor be silently shortened.
 pub(crate) fn read_bounded_record<R: std::io::BufRead>(
     reader: &mut R,
     profile: RequestInputProfile,
 ) -> std::io::Result<ReadOutcome> {
     let mut record: Vec<u8> = Vec::new();
+    // Content bytes already charged to the ceiling. A held carriage return is
+    // deliberately absent from both this counter and `record`: it is content
+    // only once a later fill proves no newline follows it.
+    let mut record_content_len: usize = 0;
+    let mut carriage_return_held = false;
     loop {
-        let (content_len, consume_len, terminated) = {
+        let (chunk_len, consume_len, terminated, eof_final, lone_carriage_return) = {
             let available = reader.fill_buf()?;
             if available.is_empty() {
-                if record.is_empty() {
-                    return Ok(ReadOutcome::Eof);
-                }
-                if std::str::from_utf8(&record).is_err() {
-                    return Ok(ReadOutcome::InvalidUtf8);
-                }
-                return Ok(ReadOutcome::Record(record));
-            }
-            match available.iter().position(|byte| *byte == b'\n') {
-                Some(newline) => {
-                    let mut content_len = newline;
-                    if content_len > 0 && available[content_len - 1] == b'\r' {
-                        content_len -= 1;
+                (0, 0, true, true, false)
+            } else {
+                match available.iter().position(|byte| *byte == b'\n') {
+                    Some(newline) => {
+                        let mut content_len = newline;
+                        if content_len > 0 && available[content_len - 1] == b'\r' {
+                            content_len -= 1;
+                        }
+                        (content_len, newline.saturating_add(1), true, false, false)
                     }
-                    (content_len, newline.saturating_add(1), true)
+                    None if available == [b'\r'] => (0, 1, false, false, true),
+                    None => (available.len(), available.len(), false, false, false),
                 }
-                None => (available.len(), available.len(), false),
             }
         };
-        if terminated {
-            let Some(combined_len) = record.len().checked_add(content_len) else {
-                return discard_oversize_record(reader, profile);
-            };
-            if combined_len > profile.max_record_bytes {
-                return discard_oversize_record(reader, profile);
+        if lone_carriage_return {
+            if carriage_return_held {
+                // Two lone carriage returns in a row: the first one is content
+                // after all, because no newline can follow it here. Charge it
+                // against the ceiling before buffering it.
+                let Some(total) = record_content_len.checked_add(1) else {
+                    return discard_oversize_record(reader, profile);
+                };
+                if total > profile.max_record_bytes {
+                    return discard_oversize_record(reader, profile);
+                }
+                record.push(b'\r');
+                record_content_len = total;
             }
-            {
-                let available = reader.fill_buf()?;
-                record.extend_from_slice(&available[..content_len]);
-            }
-            reader.consume(consume_len);
-            if content_len == 0 && record.last() == Some(&b'\r') {
-                // A CRLF terminator split across buffer fills: the carriage
-                // return was buffered as content by an earlier chunk because
-                // the newline had not been observed yet. Removing it keeps
-                // split and unsplit CRLF identical; both terminator bytes stay
-                // excluded from the ceiling since removal only shrinks the
-                // already-bounded record.
-                record.pop();
-            }
-            if std::str::from_utf8(&record).is_err() {
-                return Ok(ReadOutcome::InvalidUtf8);
-            }
-            return Ok(ReadOutcome::Record(record));
+            carriage_return_held = true;
+            reader.consume(1);
+            continue;
         }
-        let Some(combined_len) = record.len().checked_add(content_len) else {
+        // The held CR is terminator framing exactly when this fill is the LF
+        // that follows it (a `consume_len` of one byte with no content); at EOF
+        // or after any other byte it is content the ceiling must charge.
+        let carriage_return_was_content = carriage_return_held && (eof_final || consume_len != 1);
+        let owed = usize::from(carriage_return_was_content);
+        let Some(combined_len) = record_content_len
+            .checked_add(owed)
+            .and_then(|total| total.checked_add(chunk_len))
+        else {
             return discard_oversize_record(reader, profile);
         };
         if combined_len > profile.max_record_bytes {
@@ -346,9 +368,40 @@ pub(crate) fn read_bounded_record<R: std::io::BufRead>(
         }
         {
             let available = reader.fill_buf()?;
-            record.extend_from_slice(&available[..content_len]);
+            if carriage_return_was_content {
+                record.push(b'\r');
+            }
+            record.extend_from_slice(&available[..chunk_len]);
         }
         reader.consume(consume_len);
+        record_content_len = combined_len;
+        carriage_return_held = false;
+        if terminated {
+            if eof_final {
+                // End of input with no content is the owner's Eof; end of
+                // input with content is the EOF-final record. A held CR is
+                // already charged and already in `record` by this point, and it
+                // is content because no newline ever followed it.
+                if record_content_len == 0 {
+                    return Ok(ReadOutcome::Eof);
+                }
+            } else if chunk_len == 0
+                && !carriage_return_was_content
+                && record.last() == Some(&b'\r')
+            {
+                // A CRLF terminator whose carriage return reached `record` as
+                // content because the newline that proves it framing only
+                // arrived in this fill. Removing it keeps split and unsplit
+                // CRLF identical; the byte is already absent from the ceiling
+                // total, and removal only shrinks an already-bounded record.
+                // It cannot be a held CR: a held CR is never in `record`.
+                record.pop();
+            }
+            if std::str::from_utf8(&record).is_err() {
+                return Ok(ReadOutcome::InvalidUtf8);
+            }
+            return Ok(ReadOutcome::Record(record));
+        }
     }
 }
 
@@ -1583,6 +1636,87 @@ mod tests {
         assert!(matches!(
             read_bounded_record(&mut crlf_blank, SMALL),
             Ok(ReadOutcome::Record(record)) if record.is_empty()
+        ));
+    }
+
+    // WORK_UNIT_CASE: 977/3
+    #[test]
+    fn a_carriage_return_is_never_charged_to_the_ceiling_or_lost() {
+        // The owner's ceiling is on content bytes, so a record exactly at
+        // `max_record_bytes` is accepted however the bytes arrive. A fill of
+        // exactly one CR is the arrival the LF-only scan cannot classify, and
+        // it is where the ceiling used to depend on the caller's read size:
+        // the held CR is excluded from the total while the next fill decides
+        // whether it frames the newline.
+        let body = "{\"a\":1,\"b\":2}";
+        let exact = format!("{body}{}", " ".repeat(SMALL.max_record_bytes - body.len()));
+        assert_eq!(exact.len(), SMALL.max_record_bytes);
+
+        // CR on a fill of its own: accepted, and the CR is framing, so the
+        // accepted record is byte-identical to the one the unsplit arrival
+        // returns.
+        let mut crlf = format!("{exact}\r\n");
+        let mut crlf_split = ChunkReader::new(crlf.as_bytes(), 1);
+        let split_outcome = read_bounded_record(&mut crlf_split, SMALL);
+        assert!(
+            matches!(&split_outcome, Ok(ReadOutcome::Record(record)) if record.len() == SMALL.max_record_bytes && record == exact.as_bytes()),
+            "a record at the ceiling is accepted with the CR framing excluded, saw {split_outcome:?}"
+        );
+
+        // One byte over the ceiling is refused identically on that same
+        // arrival, so the two dispositions cannot disagree between chunkings.
+        let over = format!("{exact} ");
+        assert_eq!(over.len(), SMALL.max_record_bytes + 1);
+        let mut crlf_over = format!("{over}\r\n");
+        let mut crlf_split_over = ChunkReader::new(crlf_over.as_bytes(), 1);
+        assert!(matches!(
+            read_bounded_record(&mut crlf_split_over, SMALL),
+            Ok(ReadOutcome::Oversize { .. })
+        ));
+
+        // A CR is content, not framing, when no newline follows it: an
+        // EOF-final record that ends on a CR keeps the byte, still within the
+        // ceiling, and framing the next record after it still works.
+        let mut cr_at_eof = ChunkReader::new(b"{\"a\":1}\r{\"b\":2}\n", 7);
+        assert!(matches!(
+            read_bounded_record(&mut cr_at_eof, SMALL),
+            Ok(ReadOutcome::Record(record)) if record == b"{\"a\":1}\r"
+        ));
+        assert!(matches!(
+            read_bounded_record(&mut cr_at_eof, SMALL),
+            Ok(ReadOutcome::Record(record)) if record == b"{\"b\":2}"
+        ));
+
+        // The same holds when the second CR is also alone on its fill: a fill
+        // that cannot be framing proves the held CR was content, and both
+        // bytes are charged before either is buffered.
+        let mut cr_then_cr = ChunkReader::new(b"{\"a\":1}\r\r\n", 1);
+        assert!(matches!(
+            read_bounded_record(&mut cr_then_cr, SMALL),
+            Ok(ReadOutcome::Record(record)) if record == b"{\"a\":1}\r"
+        ));
+
+        // A record that is nothing but a CR is content too, never an empty
+        // record: one byte in, one byte out.
+        let mut only_cr = ChunkReader::new(b"\r", 1);
+        assert!(matches!(
+            read_bounded_record(&mut only_cr, SMALL),
+            Ok(ReadOutcome::Record(record)) if record == b"\r"
+        ));
+        assert!(matches!(
+            read_bounded_record(&mut only_cr, SMALL),
+            Ok(ReadOutcome::Eof)
+        ));
+
+        // A ceiling-length record whose last content byte is a CR is still
+        // content at the boundary, and is accepted only because the byte is
+        // inside the ceiling, not because it was dropped.
+        let cr_content = format!("{} \r", "x".repeat(SMALL.max_record_bytes - 2));
+        assert_eq!(cr_content.len(), SMALL.max_record_bytes);
+        let mut cr_content_reader = ChunkReader::new(cr_content.as_bytes(), 1);
+        assert!(matches!(
+            read_bounded_record(&mut cr_content_reader, SMALL),
+            Ok(ReadOutcome::Record(record)) if record == cr_content.as_bytes()
         ));
     }
 

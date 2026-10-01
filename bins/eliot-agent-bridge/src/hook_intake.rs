@@ -33,11 +33,32 @@
 //! bounded input is not authenticated event admission, and this intake mints no
 //! task or session authority.
 //!
-//! Every disposition named above is exercised in this module's `tests` against
-//! finite readers at the published `HOOK_INPUT_PROFILE` ceiling: accepted empty
-//! input, a multi-chunk EOF-final record with no trailing newline, both
-//! invalid-UTF-8 arms, invalid JSON, a huge newline-free stream, the exact
-//! ceiling accepted, and one byte over it refused.
+//! # What this module's `tests` exercise, and what they do not
+//!
+//! These tests run against finite readers at the published
+//! `HOOK_INPUT_PROFILE` ceiling, and they cover:
+//!
+//! - accepted empty input, and the retired empty-input decode to `{}`;
+//! - a multi-chunk EOF-final record with no trailing newline;
+//! - both invalid-UTF-8 arms (terminator-framed and EOF-final), and invalid
+//!   JSON, each refused before any service construction;
+//! - a huge newline-free stream, refused fail-closed with
+//!   `found_terminator: false` and without draining past the owner's discard
+//!   bound;
+//! - the exact ceiling ACCEPTED and one byte over it REFUSED, in a single fill,
+//!   in fills that split the record, and in fills that leave the CRLF
+//!   terminator's carriage return on a fill of its own — the same byte stream,
+//!   one disposition;
+//! - the public hook branch itself, end to end through argv, bounded
+//!   acquisition, decode, the real [`EliotHookService`], and the host decision
+//!   write: one accepted payload and one refused over-limit payload, where the
+//!   refused run is observed to have written no spool record.
+//!
+//! They do not run [`run_hook_intake`], which takes no reader and can only be
+//! served with the process's own standard input; it is exercised through
+//! [`run_hook_intake_with`], which is that function's entire body. Nothing
+//! here is proved about the decision document the process writes to its own
+//! stdout, because tests cannot capture the process stdout port.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -225,22 +246,37 @@ fn hook_runtime_root() -> Result<PathBuf, HookIntakeError> {
 ///
 /// The comparison is the owner's, not this function's:
 /// [`crate::request_input::read_bounded_record`] accumulates each buffered
-/// chunk with `checked_add` and refuses the moment the running content total is
+/// chunk with `checked_add` and refuses the moment the running CONTENT total is
 /// GREATER THAN [`HOOK_INPUT_PROFILE`]::`max_record_bytes`. That test is strict,
 /// so the boundary falls exactly as follows:
 ///
 /// - content length == `max_record_bytes` is ACCEPTED;
 /// - content length == `max_record_bytes + 1` is REFUSED as
 ///   [`HookIntakeError::StdinOversize`];
-/// - the framing byte is excluded from the total (and a single trailing
-///   carriage return is removed as part of CRLF), so an accepted terminated
+/// - the framing bytes are excluded from the total, and a single trailing
+///   carriage return is removed as part of CRLF, so an accepted terminated
 ///   record may be `max_record_bytes` content bytes plus its terminator.
 ///
-/// Because the check runs per chunk, the same boundary holds whether the record
-/// arrives in one read or many. [`ReadOutcome::Record`] is reachable only when
-/// the ceiling held for every chunk of it, so an accepted payload is never a
-/// truncation of a longer record, and no `String` or `serde_json::Value` is
-/// constructed before the bound has been observed against THIS input.
+/// The content total is the length of the record with BOTH terminator bytes
+/// removed, and it is that total the owner compares — on every chunking path.
+/// The one arrival the owner's LF-only scan cannot classify is a fill that ends
+/// on a lone CR, because the CR and the newline that would prove it framing
+/// land in different fills; the owner holds that byte back out of the running
+/// total until the next fill classifies it. A record that therefore arrives as
+/// `max_record_bytes` content bytes, `\r`, `\n` is ACCEPTED in one fill, in
+/// 64 KiB fills that divide the content evenly, and in fills that leave the
+/// `\r` on a fill of its own, and the byte stream is refused identically once
+/// it carries one byte more of content. (Before that arm existed, the third of
+/// those arrivals was refused at exactly `max_record_bytes` content bytes, so
+/// the disposition depended on the caller's buffer size rather than on the
+/// bytes.) A carriage return that no newline follows is content, not framing:
+/// it is charged against the ceiling and kept in the record, so an EOF-final
+/// record that ends on a CR is not silently shortened.
+///
+/// [`ReadOutcome::Record`] is reachable only when the ceiling held for every
+/// chunk of it, so an accepted payload is never a truncation of a longer
+/// record, and no `String` or `serde_json::Value` is constructed before the
+/// bound has been observed against THIS input.
 ///
 /// # Framing: exactly one record is the contract
 ///
@@ -315,20 +351,43 @@ fn decode_hook_payload(record: &[u8]) -> Result<serde_json::Value, HookIntakeErr
 
 /// Serves one `hook <event>` invocation: stdin in, host decision on stdout.
 ///
+/// This is the argv entry point the binary's `main` calls with the process's
+/// real standard input. It adds nothing to [`run_hook_intake_with`] beyond
+/// supplying that reader.
+pub fn run_hook_intake(argv: &[String]) -> Result<(), HookIntakeError> {
+    let stdin = std::io::stdin();
+    let stdin = stdin.lock();
+    run_hook_intake_with(argv, &mut std::io::BufReader::new(stdin))
+}
+
+/// Serves one `hook <event>` invocation against an injected host stdin.
+///
 /// The stdin/attach/decision contract is the retired `run_hook` contract:
 /// empty input parses as `{}`, a set non-empty `ELIOT_TASK_ID` attaches the
 /// session to a task, and only `result.decision.stdout` is written. Host stdin
 /// is first acquired under the published finite ceiling by
 /// [`acquire_hook_payload`], then decoded by [`decode_hook_payload`]; only an
 /// accepted and decodable payload is dispatched to [`EliotHookService`].
-pub fn run_hook_intake(argv: &[String]) -> Result<(), HookIntakeError> {
+///
+/// This is the whole public hook branch behind [`run_hook_intake`], and it
+/// takes host stdin as an ordinary `BufRead` parameter rather than reaching
+/// for the process handle. The seam exists so the branch is testable with a
+/// finite reader: there is no fake service, no substituted decision, and no
+/// no-op stand-in below this signature, so what a test observes is what the
+/// shipped process does. The event name still comes from argv alone, the
+/// `ELIOT_TASK_ID` attach signal and the runtime home are still read from the
+/// process environment exactly as before, and stdout is still the process
+/// stdout.
+pub fn run_hook_intake_with<R: std::io::BufRead>(
+    argv: &[String],
+    stdin: &mut R,
+) -> Result<(), HookIntakeError> {
     if argv.len() != 1 {
         return Err(HookIntakeError::MissingEvent(argv.len()));
     }
     let kind =
         parse_hook_event(&argv[0]).ok_or_else(|| HookIntakeError::UnknownEvent(argv[0].clone()))?;
-    let mut stdin = std::io::stdin().lock();
-    let record = acquire_hook_payload(&mut stdin)?;
+    let record = acquire_hook_payload(stdin)?;
     let payload = decode_hook_payload(&record)?;
     let task_attached = std::env::var("ELIOT_TASK_ID")
         .ok()
@@ -425,6 +484,12 @@ mod tests {
     /// Fill size used by every test that needs a large-chunk reader, and the
     /// buffer slack the D5 stop-path bound allows for.
     const CHUNK: usize = 64 * 1024;
+
+    /// Fill size that leaves the CRLF terminator's carriage return on a fill
+    /// of its own at the published 1 MiB ceiling: one byte more than the
+    /// ceiling, so the content fills divide evenly and only the terminator
+    /// straddles the boundary.
+    const CR_SPLIT_FILL_CHUNK: usize = 1_048_576 + 1;
 
     /// Convenience: acquire through the production `acquire_hook_payload` and
     /// decode through the production `decode_hook_payload`, i.e. exactly the
@@ -556,7 +621,10 @@ mod tests {
                 discarded_bytes,
                 found_terminator,
             } => {
-                assert_eq!(limit_bytes, HOOK_INPUT_PROFILE.max_record_bytes);
+                // The published ceiling, as a literal: the same 1_048_576 the
+                // D6 test asserts, so this pins the emitted number against the
+                // profile instead of against the constant it was copied from.
+                assert_eq!(limit_bytes, 1_048_576);
                 assert!(!found_terminator, "no terminator was ever observed");
                 assert_eq!(
                     discarded_bytes, HOOK_INPUT_PROFILE.max_oversize_discard_bytes,
@@ -581,31 +649,82 @@ mod tests {
         );
     }
 
-    /// D6: content of exactly `max_record_bytes` is ACCEPTED.
+    /// D6: content of exactly `max_record_bytes` is ACCEPTED, and the
+    /// disposition does not depend on how the bytes arrive.
     ///
     /// The owner's comparison is a strict `>`, so equality must not trip it.
     /// The fixture is built at the real published ceiling (1 MiB), padded with
     /// JSON whitespace so it is also a well-formed document, and the accepted
     /// record must be exactly the ceiling long.
+    ///
+    /// The arrival is the point. The byte stream is CRLF-terminated and is
+    /// driven through four readers: one fill holding everything, `CHUNK` fills
+    /// that divide the ceiling evenly, `CR_SPLIT_FILL_CHUNK` (one byte more
+    /// than the ceiling) fills that leave the terminator's carriage return on a
+    /// fill of its own, and a one-byte fill that leaves it alone. That
+    /// `CR_SPLIT_FILL_CHUNK` arrival is the contested one — it is the only
+    /// shape whose carriage return cannot be classified by the owner's LF-only
+    /// scan in the fill that carries it — so a ceiling charged for a
+    /// not-yet-proven terminator byte would refuse there while accepting the
+    /// others.
     #[test]
-    fn exact_record_limit_is_accepted_at_the_published_ceiling() {
+    fn exact_record_limit_is_accepted_at_the_published_ceiling_for_every_chunking() {
         let body = r#"{"a":1}"#;
         let ceiling = HOOK_INPUT_PROFILE.max_record_bytes;
         assert_eq!(ceiling, REQUEST_INPUT_PROFILE.max_record_bytes);
         assert_eq!(ceiling, 1_048_576);
-        let mut exact = String::with_capacity(ceiling + 1);
+        let mut exact = String::with_capacity(ceiling + 2);
         exact.push_str(body);
         exact.extend(std::iter::repeat_n(' ', ceiling - body.len()));
         assert_eq!(exact.len(), ceiling);
-        // Framed with a terminator; the terminator is excluded from the bound.
+        // Framed with a CRLF terminator; neither terminator byte is bound.
         let mut framed = exact.clone();
+        framed.push('\r');
         framed.push('\n');
-        let mut reader = ChunkReader::new(framed.as_bytes(), CHUNK);
-        let record = acquire_hook_payload(&mut reader).expect("exact ceiling must be accepted");
-        assert_eq!(record.len(), ceiling);
-        // And it decodes: the accepted prefix is a whole valid document, not a
-        // truncated one.
-        decode_hook_payload(&record).expect("exact ceiling record parses");
+        let framed = framed.as_bytes();
+
+        for (arrival, chunk) in [
+            ("one fill", framed.len()),
+            ("fills dividing the ceiling", CHUNK),
+            (
+                "fills splitting the carriage return onto its own fill",
+                CR_SPLIT_FILL_CHUNK,
+            ),
+            ("the carriage return on a one-byte fill", 1),
+        ] {
+            assert_ne!(
+                chunk, 0,
+                "arrival {arrival} would not produce multiple fills"
+            );
+            let mut reader = ChunkReader::new(framed, chunk);
+            let record = acquire_hook_payload(&mut reader).unwrap_or_else(|error| {
+                panic!("exact ceiling must be accepted: {arrival}: {error:?}")
+            });
+            assert_eq!(
+                record,
+                exact.as_bytes(),
+                "accepted record differs: {arrival}"
+            );
+            assert_eq!(record.len(), ceiling, "accepted length differs: {arrival}");
+            // And it decodes: the accepted prefix is a whole valid document,
+            // not a truncated one.
+            decode_hook_payload(&record).unwrap_or_else(|error| {
+                panic!("exact ceiling record parses: {arrival}: {error:?}")
+            });
+        }
+
+        // The same read size that splits the carriage return onto its own fill
+        // refuses the byte-identical stream one byte of content longer, so the
+        // two dispositions cannot disagree about the same arrival.
+        let mut over = exact.clone();
+        over.push(' ');
+        over.push('\r');
+        over.push('\n');
+        assert_eq!(over.len(), ceiling + 3);
+        let mut reader = ChunkReader::new(over.as_bytes(), CR_SPLIT_FILL_CHUNK);
+        let error = acquire_hook_payload(&mut reader)
+            .expect_err("one over the ceiling must be refused on the split-CR arrival");
+        assert!(matches!(error, HookIntakeError::StdinOversize { .. }));
     }
 
     /// D7: content of `max_record_bytes + 1` is REFUSED as oversize.
@@ -633,28 +752,37 @@ mod tests {
                 found_terminator,
                 ..
             } => {
-                assert_eq!(limit_bytes, ceiling);
+                // The published ceiling as a literal, not as the local alias
+                // this test derived it from: an invented ceiling would satisfy
+                // the alias comparison for any value.
+                assert_eq!(limit_bytes, 1_048_576);
                 assert!(found_terminator, "resynchronization found the terminator");
             }
             other => panic!("expected StdinOversize, got {other:?}"),
         }
     }
 
-    /// A2: over-limit and malformed acquisition never reach dispatch or spool.
+    /// A2: over-limit and malformed acquisition fail closed, and the
+    /// acquisition/decode ordering precedes the one service construction.
     ///
-    /// Executed half: every refusal disposition is produced by the production
-    /// functions BEFORE any service could be constructed, and each carries the
-    /// invalid-argument exit code, so the process fails closed without calling
-    /// `EliotHookService` (whose only spool write lives behind that call).
+    /// What this test proves, precisely: every refusal disposition is produced
+    /// by the production functions with the invalid-argument exit code, and in
+    /// the production region of this file both `?` come before the single
+    /// `EliotHookService::for_session` construction, whose `process` call owns
+    /// the branch's only spool write.
     ///
-    /// Structural half (source ordering): this test pins the ordering in the
-    /// real file so the `?` on acquisition/decode provably precedes the
-    /// `EliotHookService::for_session` construction. A fake service is not used
-    /// (forbidden), so "no spool record is written" is argued from this
-    /// ordering plus the fact that `EliotHookService::process` is the only
-    /// writer and is only reached after both `?`.
+    /// What it does NOT prove, and no reader should take from it: that no
+    /// service was ever BUILT. `exit_code()` is a pure match that returns the
+    /// argument exit for every intake refusal whether or not a service exists,
+    /// so the executed half cannot observe construction. The observed
+    /// no-spool-record half of the same property is proved where a real run can
+    /// be watched, in
+    /// `public_hook_branch_serves_an_accepted_payload_and_refuses_an_oversize_one_without_spooling`.
+    ///
+    /// A fake service is not used (forbidden), so the ordering is what carries
+    /// the rest: the source scan below pins it in the real file.
     #[test]
-    fn refusals_never_reach_dispatch_or_spool_and_ordering_precedes_service() {
+    fn over_limit_and_malformed_dispositions_fail_closed_and_ordering_precedes_service() {
         // Executed: the over-limit and malformed dispositions, and their
         // invalid-argument exit codes, all produced by production code.
         let mut framed = Vec::new();
@@ -696,7 +824,7 @@ mod tests {
             .split_once("#[cfg(test)]")
             .map_or(source, |(head, _)| head);
         let acquire_at = production
-            .find("let record = acquire_hook_payload(&mut stdin)?;")
+            .find("let record = acquire_hook_payload(stdin)?;")
             .expect("acquire call");
         let decode_at = production
             .find("let payload = decode_hook_payload(&record)?;")
@@ -712,6 +840,151 @@ mod tests {
             production.matches("EliotHookService::for_session(").count(),
             1,
             "one service construction on this branch, and it is last"
+        );
+    }
+
+    /// Records that a test is holding `ELIOT_GOVERNOR_CONFIG` right now, so
+    /// no other test in this binary moves the same process environment
+    /// variable underneath it.
+    static GOVERNOR_CONFIG_SET: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// Points `ELIOT_GOVERNOR_CONFIG` at a `governor.toml` under `root`, so the
+    /// branch resolves its runtime home to `root` — the grandparent of the
+    /// config file — instead of the developer's `LOCALAPPDATA`. The value is
+    /// restored on drop, including on panic, so the branch's process
+    /// environment is not changed for anything that follows.
+    struct HookRuntimeHome {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl HookRuntimeHome {
+        fn scoped(root: &std::path::Path) -> Self {
+            // A relative path would be joined onto whatever working directory the
+            // harness happens to use, so the temp root is made absolute first:
+            // `hook_runtime_root` takes the grandparent of this config file as the
+            // runtime home, and that must be this test's own directory.
+            let absolute = std::fs::canonicalize(root).expect("temp root must resolve");
+            let previous = std::env::var_os("ELIOT_GOVERNOR_CONFIG");
+            std::env::set_var("ELIOT_GOVERNOR_CONFIG", absolute.join("governor"));
+            assert!(
+                !GOVERNOR_CONFIG_SET.swap(true, Ordering::SeqCst),
+                "two tests must not hold ELIOT_GOVERNOR_CONFIG at once"
+            );
+            Self { previous }
+        }
+    }
+
+    impl Drop for HookRuntimeHome {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(previous) => std::env::set_var("ELIOT_GOVERNOR_CONFIG", previous),
+                None => std::env::remove_var("ELIOT_GOVERNOR_CONFIG"),
+            }
+            GOVERNOR_CONFIG_SET.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// A private directory under the OS temp root that removes itself, so this
+    /// test's spool observations are its own and leave nothing behind.
+    struct PrivateTempDir(std::path::PathBuf);
+
+    impl PrivateTempDir {
+        fn new(tag: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+                ^ u64::from(std::process::id());
+            let path = std::env::temp_dir().join(format!("eliot-hook-4601-{tag}-{unique}"));
+            std::fs::create_dir_all(&path).expect("temp dir must be creatable");
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+
+        /// Number of JSON records the branch's only spool writer left behind.
+        fn spool_records(&self) -> usize {
+            std::fs::read_dir(self.0.join("hook-spool").join("pending"))
+                .map(|entries| entries.filter_map(Result::ok).count())
+                .unwrap_or(0)
+        }
+    }
+
+    impl Drop for PrivateTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// D2: the public hook branch is driven end to end with finite readers.
+    ///
+    /// This runs the same code the process runs for `hook session-start`,
+    /// through argv, bounded acquisition, decode, the real
+    /// [`EliotHookService`], and the host decision write — with host stdin
+    /// injected instead of taken from the process. Nothing below is
+    /// substituted: there is no fake service and no stand-in decision, so the
+    /// spool directory the run touches is the owner's own.
+    ///
+    /// It asserts, from the filesystem:
+    ///
+    /// - an accepted payload runs the whole branch and spools exactly one
+    ///   record — the accepted payload is dispatched, not silently dropped;
+    /// - an over-limit payload is refused as `StdinOversize` with the published
+    ///   limit and the argument exit code, and the run leaves no spool record
+    ///   at all, so over-limit input provably never reached the service or
+    ///   wrote spool state.
+    ///
+    /// The host decision document itself is written to the process's stdout
+    /// port, which a unit test cannot capture, so the decision CONTENT is not
+    /// asserted here and is not claimed to be.
+    #[test]
+    fn public_hook_branch_serves_an_accepted_payload_and_refuses_an_oversize_one_without_spooling()
+    {
+        let temp = PrivateTempDir::new("public-branch");
+        let _home = HookRuntimeHome::scoped(temp.path());
+        let event = vec!["session-start".to_owned()];
+
+        // Accepted: the retired empty-input contract, so the payload is `{}`
+        // and no host field is required.
+        let mut empty_stdin = ChunkReader::new(b"", 4);
+        run_hook_intake_with(&event, &mut empty_stdin)
+            .expect("the public branch must serve an accepted empty payload");
+        assert_eq!(
+            temp.spool_records(),
+            1,
+            "an accepted payload reaches the service and spools one record"
+        );
+
+        // Refused: the same branch, one byte over the published ceiling, run
+        // through the arrival that splits the terminator's carriage return onto
+        // a fill of its own so the contested path is the one being refused.
+        let mut over = Vec::new();
+        over.extend(std::iter::repeat_n(
+            b'a',
+            HOOK_INPUT_PROFILE.max_record_bytes + 1,
+        ));
+        over.push(b'\r');
+        over.push(b'\n');
+        let mut over_stdin = ChunkReader::new(&over, CR_SPLIT_FILL_CHUNK);
+        let error = run_hook_intake_with(&event, &mut over_stdin)
+            .expect_err("an over-limit payload must be refused by the public branch");
+        assert_eq!(error.code(), "HOOK_STDIN_OVERSIZE");
+        assert_eq!(error.exit_code(), crate::INVALID_ARGUMENT_EXIT);
+        assert!(matches!(
+            error,
+            HookIntakeError::StdinOversize {
+                limit_bytes: 1_048_576,
+                found_terminator: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            temp.spool_records(),
+            1,
+            "an over-limit payload must not spool a record; the count is still \
+             the one the accepted run wrote"
         );
     }
 }
