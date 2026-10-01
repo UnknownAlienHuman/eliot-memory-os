@@ -1967,6 +1967,31 @@ impl TestdVerifierDispatchBinding {
         }
         Ok(())
     }
+
+    /// Returns the exact non-empty required test IDs from the validated
+    /// canonical verifier plan retained with this job.
+    ///
+    /// Runner replay must evaluate only the identities selected by the
+    /// original plan; it must never infer required IDs from process output.
+    pub fn required_test_ids_for_job(&self, job: &TestJob) -> Result<Vec<String>, TestdError> {
+        self.validate_for_job(job)?;
+        let plan_value: serde_json::Value = serde_json::from_str(&self.canonical_plan_json)
+            .map_err(|_| TestdError::InvalidBinding)?;
+        let ids = plan_value
+            .get("verifier")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|verifier| verifier.get("required_test_ids"))
+            .and_then(serde_json::Value::as_array)
+            .filter(|ids| !ids.is_empty())
+            .ok_or(TestdError::InvalidBinding)?;
+        ids.iter()
+            .map(|id| {
+                id.as_str()
+                    .map(str::to_owned)
+                    .ok_or(TestdError::InvalidBinding)
+            })
+            .collect()
+    }
 }
 
 /// Authenticated terminal notification for the daemon completion poller.
