@@ -9,8 +9,12 @@
 //! ([`ModuleDependency::invalidation_triggers`]) and the versioned restart policy
 //! ([`ModuleManifest::restart_policy`]). [`ModuleCatalog::select_invalidation_dependents`]
 //! answers "which modules does replacing this one actually invalidate?" from
-//! those declared edges, and the answer is recorded on
-//! [`PreparedCatalogTransition::invalidated_dependents`] so the owner that
+//! those declared edges, under finite node/work bounds that REFUSE rather than
+//! truncate, and returns the answer as an [`AffectedGraphSelection`] carrying
+//! the rule that produced the set and the capabilities an optional/advisory
+//! absence degraded. The selection is recorded on
+//! [`PreparedCatalogTransition::invalidated_dependents`] with its reason on
+//! [`PreparedCatalogTransition::invalidation_reason`], so the owner that
 //! performs the restart cannot substitute a different set. Selecting by startup
 //! order, by iteration order, or by "everything currently running" is the defect
 //! this module exists to prevent.
@@ -98,6 +102,14 @@ pub enum ModuleError {
     /// The declared required dependency edges contain a cycle.
     #[error("module catalog required dependency cycle: {path}")]
     RequiredDependencyCycle { path: String },
+    /// The affected-graph walk charged more work than the catalog's own declared
+    /// node and edge counts can justify. The selection is REFUSED, never
+    /// truncated: a partial affected set restarts the WRONG modules.
+    #[error("module catalog affected-graph walk exceeded its declared work bound {bound}")]
+    AffectedGraphWorkBoundExceeded { bound: usize },
+    /// The affected-graph walk selected more nodes than the catalog declares.
+    #[error("module catalog affected-graph walk exceeded its declared node bound {bound}")]
+    AffectedGraphNodeBoundExceeded { bound: usize },
     #[error("module catalog serialization failed: {0}")]
     Serialization(String),
     #[error("module catalog contract failed: {0}")]
@@ -1063,6 +1075,18 @@ pub struct PreparedCatalogTransition {
     /// when no selection was made, so an empty set can never be read as "the
     /// graph was consulted and found nothing" unless the trigger says so.
     pub invalidation_trigger: Option<RestartInvalidationTrigger>,
+    /// Which declared rule produced `invalidated_dependents`.
+    ///
+    /// W2 requires the selection AND ITS REASON to be recorded: a set alone
+    /// cannot distinguish "an independent child failed and nothing else was
+    /// joined" from "a declared closure selected exactly one dependent". It is
+    /// derived by the bounded walk, never supplied by a caller, and it is
+    /// re-derived and compared on every `apply`.
+    pub invalidation_reason: AffectedGraphSelectionReason,
+    /// Capabilities an OPTIONAL/ADVISORY dependency absence degraded, recorded
+    /// so the degradation is observable rather than silently dropped or turned
+    /// into a live dependency edge.
+    pub degraded_dependencies: Vec<DegradedDependency>,
     pub approval_refs: Vec<String>,
 }
 
@@ -1096,7 +1120,58 @@ impl PreparedCatalogTransition {
                 reason: "the selected dependent set and its trigger must agree",
             });
         }
+        // The reason and the degradations belong to the same derivation as the
+        // set, so they are validated together and kept internally consistent:
+        // a transition claiming a closure it did not derive, or an
+        // independent-child claim carrying degradations, is refused.
+        AffectedGraphSelection {
+            dependents: self.invalidated_dependents.clone(),
+            reason: self.invalidation_reason,
+            degraded: self.degraded_dependencies.clone(),
+        }
+        .validate()?;
         unique(self.approval_refs.iter().cloned(), "approval_refs")?;
+        Ok(())
+    }
+
+    /// Checks the recorded selection reason and degradations against an
+    /// expected selection derived independently from the declared edges.
+    ///
+    /// `expected` must be the bounded walk's own answer, never a copy of this
+    /// transition's recorded values, so this compares two separate derivations
+    /// rather than a value with itself. The dependent SET itself is proved by
+    /// [`Self::verify_invalidation_dependents`]; this check proves the two
+    /// facts the set alone cannot carry — WHICH declared rule produced it, and
+    /// WHICH capabilities an optional/advisory absence degraded. A recorded
+    /// reason that does not match the rule that actually ran is refused rather
+    /// than believed. An absent trigger means nothing was selected, so the
+    /// reason must be the independent-child default and no capability can have
+    /// degraded.
+    pub fn verify_invalidation_selection(
+        &self,
+        expected: &AffectedGraphSelection,
+    ) -> Result<(), ModuleError> {
+        let recorded = AffectedGraphSelection {
+            dependents: self.invalidated_dependents.clone(),
+            reason: self.invalidation_reason,
+            degraded: self.degraded_dependencies.clone(),
+        };
+        recorded.validate()?;
+        if self.invalidation_trigger.is_none()
+            && (recorded.reason != AffectedGraphSelectionReason::IndependentChild
+                || !recorded.degraded.is_empty())
+        {
+            return Err(ModuleError::InvalidField {
+                field: "invalidation_reason",
+                reason: "a transition that selected nothing carries no closure reason or degradation",
+            });
+        }
+        if recorded.reason != expected.reason || recorded.degraded != expected.degraded {
+            return Err(ModuleError::InvalidField {
+                field: "invalidation_reason",
+                reason: "the recorded selection reason and degradations do not match the declared graph",
+            });
+        }
         Ok(())
     }
 
@@ -1206,6 +1281,83 @@ impl ModuleCatalogSnapshot {
     }
 }
 
+/// Why the affected set was selected, recorded so the owner performing the
+/// restart knows WHICH rule produced the set it is about to restart.
+///
+/// The reason is derived by the walk itself, never supplied by a caller: a
+/// caller-chosen reason would describe the caller's intent, not the rule that
+/// actually ran.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AffectedGraphSelectionReason {
+    /// `one_for_one` is the DEFAULT independent-child strategy: the declared
+    /// dependent edges were not consulted, because an independent sibling is
+    /// never joined by a peer failure (I14.10).
+    IndependentChild,
+    /// `rest_for_one` selected the transitive closure of declared REQUIRED
+    /// invalidation edges carrying this exact trigger.
+    DeclaredInvalidationClosure,
+}
+
+/// One declared OPTIONAL/ADVISORY dependency whose provider became invalid, so
+/// this dependent's own capability degrades.
+///
+/// The absence is recorded rather than promoted into a liveness edge and rather
+/// than silently dropped: the dependent stays out of the recovery set, and the
+/// capability it lost is named.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DegradedDependency {
+    /// The dependent whose capability is degraded.
+    pub dependent: ModuleId,
+    /// The provider whose invalidation degraded it.
+    pub provider: ModuleId,
+    /// The declared edge kind that makes the absence a degradation.
+    pub kind: RestartDependencyKind,
+}
+
+/// The bounded, reason-carrying answer to "which modules does replacing this
+/// one actually invalidate?".
+///
+/// W2 requires both halves: the selection is derived from the declared
+/// invalidation edges under finite bounds, and the reason for that selection is
+/// recorded instead of being implied by the set's contents.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AffectedGraphSelection {
+    /// The affected set, subject included, in stable `ModuleId` order.
+    pub dependents: Vec<ModuleId>,
+    /// The rule that produced this set.
+    pub reason: AffectedGraphSelectionReason,
+    /// Capabilities an optional/advisory absence degraded, recorded so the
+    /// degradation is observable instead of being lost.
+    pub degraded: Vec<DegradedDependency>,
+}
+
+impl AffectedGraphSelection {
+    /// Validates the recorded selection against its own rule.
+    pub fn validate(&self) -> Result<(), ModuleError> {
+        unique(self.dependents.iter().cloned(), "affected_graph.dependents")?;
+        unique(
+            self.degraded
+                .iter()
+                .map(|degraded| (degraded.dependent.clone(), degraded.provider.clone())),
+            "affected_graph.degraded",
+        )?;
+        // The independent-child strategy walks no declared edge, so it cannot
+        // have degraded anything. A degradation recorded under it is a claim
+        // the walk never made.
+        if self.reason == AffectedGraphSelectionReason::IndependentChild && !self.degraded.is_empty()
+        {
+            return Err(ModuleError::InvalidField {
+                field: "affected_graph.degraded",
+                reason: "the independent-child strategy follows no declared edge and degrades nothing",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Deterministic in-process catalog state machine used by the canonical writer.
 /// Persistence and event/outbox delivery remain responsibilities of the store.
 #[derive(Clone, Debug)]
@@ -1226,16 +1378,21 @@ struct AppliedCatalogMutation {
     entry: ModuleCatalogEntry,
     invalidated_dependents: Vec<ModuleId>,
     invalidation_trigger: Option<RestartInvalidationTrigger>,
+    invalidation_reason: AffectedGraphSelectionReason,
+    degraded_dependencies: Vec<DegradedDependency>,
 }
 
 impl AppliedCatalogMutation {
-    /// A mutation that invalidates nothing: no trigger, and the empty selection
-    /// that an absent trigger is verified against.
+    /// A mutation that invalidates nothing: no trigger, the empty selection
+    /// that an absent trigger is verified against, the independent-child
+    /// default reason, and no degraded capability.
     fn without_invalidation(entry: ModuleCatalogEntry) -> Self {
         Self {
             entry,
             invalidated_dependents: Vec::new(),
             invalidation_trigger: None,
+            invalidation_reason: AffectedGraphSelectionReason::IndependentChild,
+            degraded_dependencies: Vec::new(),
         }
     }
 }
@@ -1327,6 +1484,8 @@ impl ModuleCatalog {
             admission_contract_digest: digest_value(&request.mutation)?,
             invalidated_dependents: applied.invalidated_dependents,
             invalidation_trigger: applied.invalidation_trigger,
+            invalidation_reason: applied.invalidation_reason,
+            degraded_dependencies: applied.degraded_dependencies,
             approval_refs: request.approval_refs.clone(),
         };
         prepared.validate()?;
@@ -1339,12 +1498,25 @@ impl ModuleCatalog {
         // independently derived empty set, not skipped. The set below is
         // derived, never read back off the transition, so the comparison is
         // between two derivations and not the selection with itself.
-        let mut expected_dependents = Vec::new();
+        //
+        // W2 also requires the selection REASON to be recorded. The reason
+        // travels in the same transition as the set and is produced by the same
+        // bounded walk, so the owner performing the restart reads which rule
+        // (independent child vs declared closure) produced the set it is
+        // applying, and which optional/advisory capabilities the invalidation
+        // degraded. The reason and the degradations are verified here against
+        // that same independent re-derivation, so a recorded reason that does
+        // not match the rule that actually ran is refused rather than believed.
+        let mut expected = AffectedGraphSelection {
+            dependents: Vec::new(),
+            reason: AffectedGraphSelectionReason::IndependentChild,
+            degraded: Vec::new(),
+        };
         if let Some(trigger) = prepared.invalidation_trigger {
-            expected_dependents =
-                self.select_invalidation_dependents(&request.module_id, trigger)?;
+            expected = self.select_invalidation_dependents(&request.module_id, trigger)?;
         }
-        prepared.verify_invalidation_dependents(&expected_dependents)?;
+        prepared.verify_invalidation_dependents(&expected.dependents)?;
+        prepared.verify_invalidation_selection(&expected)?;
         Ok(prepared)
     }
 
@@ -1358,22 +1530,28 @@ impl ModuleCatalog {
     /// selected, so a later-started unrelated child stays running while an
     /// independent earlier sibling does too.
     ///
-    /// The walk is transitive and bounded by the catalog's declared edge count,
-    /// so a cyclic declaration cannot make it loop or silently truncate the
-    /// closure. Optional and advisory edges are followed for the closure (a
-    /// declared invalidation is a declared invalidation) but never create a
-    /// liveness edge: their absence degrades a capability instead.
+    /// The walk is transitive and bounded by the catalog's OWN declared node
+    /// and edge counts, and REFUSES when a bound is exceeded rather than
+    /// truncating into a partial closure.
     ///
     /// `one_for_one` returns only the subject. `rest_for_one` adds the declared
     /// invalidated closure. `one_for_all` is rejected here: a group restart
     /// needs a finite named inseparable group plus accepted rationale, and
     /// refusing it before any effect is the only safe default for a request that
     /// arrived without them.
+    ///
+    /// Optional and advisory edges are NOT followed for the closure: their
+    /// absence degrades that dependency's own capability, recorded in
+    /// [`AffectedGraphSelection::degraded`], and never becomes a liveness edge
+    /// that drags a healthy child into another child's recovery. This is the
+    /// same rule the restart-policy contract already applies to a recorded
+    /// selected dependent set, where only a declared `Required` edge may join a
+    /// recovery.
     pub fn select_invalidation_dependents(
         &self,
         subject: &ModuleId,
         trigger: RestartInvalidationTrigger,
-    ) -> Result<Vec<ModuleId>, ModuleError> {
+    ) -> Result<AffectedGraphSelection, ModuleError> {
         let root = self.entries.get(subject).ok_or(ModuleError::NotFound)?;
         // The policy's own `subject_id` must name this module. A policy that
         // claims a different subject would supply another module's restart
@@ -1398,46 +1576,90 @@ impl ModuleCatalog {
             });
         }
         if strategy == RestartGroupStrategy::OneForOne {
-            return Ok(vec![subject.clone()]);
+            return Ok(AffectedGraphSelection {
+                dependents: vec![subject.clone()],
+                reason: AffectedGraphSelectionReason::IndependentChild,
+                degraded: Vec::new(),
+            });
         }
         // `startup_order` is deliberately unread here. It orders startup, not
         // invalidation, and reading it is exactly the defect this replaces.
         let mut selected: BTreeSet<ModuleId> = BTreeSet::from([subject.clone()]);
         let mut frontier: Vec<ModuleId> = vec![subject.clone()];
-        // The work bound is the total declared edge count of the catalog plus
-        // the subject. Every selected module except the subject was reached
-        // through at least one declared edge, so the closure cannot exceed it.
-        // It is checked rather than assumed, so a malformed graph that selected
-        // more than its own declarations justify is refused instead of being
-        // returned as a complete affected set.
+        // FINITE BOUNDS, derived from the catalog's OWN declarations rather
+        // than from any caller or an invented global constant. A transitive
+        // closure over an unbounded graph is a denial-of-service vector, so the
+        // walk runs under explicit finite node and work bounds and REFUSES when
+        // one is exceeded. It never truncates and returns a partial selection:
+        // a partial affected set restarts the WRONG modules, which is worse
+        // than refusing.
+        //
+        // `node_budget` is the catalog's own declared module count: the closure
+        // can only ever select a module the catalog contains, so a selection
+        // larger than this is a malformed graph and is refused.
+        let node_budget = self.entries.len();
+        // `edge_budget` is the catalog's total declared dependency-edge count.
         let edge_budget = self
             .entries
             .values()
             .map(|entry| entry.manifest.dependencies.len())
-            .sum::<usize>()
-            + 1;
-        let mut work = 0usize;
+            .sum::<usize>();
+        // The honest cost of this walk is quadratic: every frontier node
+        // re-examines every declared edge in the catalog, and at most
+        // `node_budget` nodes can ever enter the frontier. `work_budget`
+        // states that ceiling exactly, so the walk's work is finite and
+        // provably bounded instead of unbounded on a hostile declaration.
+        let work_budget = node_budget.saturating_mul(edge_budget);
+        let mut scanned_edges = 0usize;
+        let mut degraded: BTreeSet<DegradedDependency> = BTreeSet::new();
         while let Some(current) = frontier.pop() {
             for entry in self.entries.values() {
+                // Every declared edge of every entry is examined once per
+                // frontier node. The bound is on the WORK the graph causes, not
+                // on the answer's size, so a wide graph is charged for each
+                // examination whether or not it selects anything.
+                scanned_edges = scanned_edges.saturating_add(entry.manifest.dependencies.len());
+                if scanned_edges > work_budget {
+                    return Err(ModuleError::AffectedGraphWorkBoundExceeded { bound: work_budget });
+                }
                 // A dependent joins only because it declared this exact edge on
                 // `current` carrying this exact trigger. No edge, no selection.
-                let declares_invalidation = entry.manifest.dependencies.iter().any(|dependency| {
+                let Some(declared) = entry.manifest.dependencies.iter().find(|dependency| {
                     dependency.module_id == current && dependency.invalidated_by(trigger)
-                });
-                if !declares_invalidation || !selected.insert(entry.module_id.clone()) {
+                }) else {
+                    continue;
+                };
+                // I14.10 / I6.4: an OPTIONAL or ADVISORY edge whose provider
+                // became invalid DEGRADES that dependency's own capability. It
+                // is recorded as a degradation and it does NOT become a
+                // liveness edge: it never drags a healthy dependent into
+                // another child's recovery, and it is not silently dropped
+                // either. Only a REQUIRED edge can select, which is exactly
+                // what `validate_selected_dependents` in the restart-policy
+                // contract already requires of a recorded selected dependent
+                // set.
+                if declared.kind != RestartDependencyKind::Required {
+                    degraded.insert(DegradedDependency {
+                        dependent: entry.module_id.clone(),
+                        provider: current.clone(),
+                        kind: declared.kind,
+                    });
                     continue;
                 }
-                work = work.saturating_add(1);
-                if work > edge_budget {
-                    return Err(ModuleError::InvalidField {
-                        field: "dependencies",
-                        reason: "the selected set exceeds the declared edge bound",
-                    });
+                if selected.len() >= node_budget && !selected.contains(&entry.module_id) {
+                    return Err(ModuleError::AffectedGraphNodeBoundExceeded { bound: node_budget });
+                }
+                if !selected.insert(entry.module_id.clone()) {
+                    continue;
                 }
                 frontier.push(entry.module_id.clone());
             }
         }
-        Ok(selected.into_iter().collect())
+        Ok(AffectedGraphSelection {
+            dependents: selected.into_iter().collect(),
+            reason: AffectedGraphSelectionReason::DeclaredInvalidationClosure,
+            degraded: degraded.into_iter().collect(),
+        })
     }
 
     /// Applies one catalog mutation to the entry it replaces, under the
