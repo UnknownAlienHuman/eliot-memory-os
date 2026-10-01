@@ -60,7 +60,8 @@ use super::{
     TransportError, activation_deadline_expired, sha256_json, status_frame, unix_ms,
 };
 use eliot_contracts::{
-    BridgeRecoverySelector, ClockReading, ProductId, RequestId, RequestMetadata, SessionId, SourceId,
+    BridgeRecoverySelector, ClockReading, ProductId, RequestId, RequestMetadata, SessionId,
+    SourceId,
 };
 use eliot_ipc::PeerIdentity;
 use eliot_kernel_service::{
@@ -80,13 +81,13 @@ use eliot_protocol::{
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HOST_REQUEST_PAYLOAD_SCHEMA_ID,
     HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestAdmissionReceipt, HostRequestEnvelope,
     HostRequestInvokeReadPayload, HostRequestKind, HostRequestResultBody, LocalReadAttempt,
-    WatchdogIntentKind, WatchdogSpoolEntryKind, WatchdogSpoolEntryOutcome,
+    RequestIdentity, WatchdogIntentKind, WatchdogSpoolEntryKind, WatchdogSpoolEntryOutcome,
     WatchdogSpoolExportBatchPayload, WatchdogSpoolExportOutcomeSubmission,
-    RequestIdentity, WatchdogSpoolExportResultPayload, WatchdogSpoolExportSubmission,
+    WatchdogSpoolExportResultPayload, WatchdogSpoolExportSubmission,
     WatchdogSpoolIntentBatchPayload, WatchdogSpoolIntentSubmission, host_request_operation_id,
 };
-use eliot_runtime_contracts::RecoveryDirective;
 use eliot_receipts::RequestBinding;
+use eliot_runtime_contracts::RecoveryDirective;
 use eliot_store_api::{
     CampaignLearningStateViewPublication, EVIDENCE_PACK_MAX_RECORDS, RevisionHead, RevisionKey,
     ScopeId,

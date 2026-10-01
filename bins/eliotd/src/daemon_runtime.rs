@@ -7201,14 +7201,8 @@ async fn trigger_accepted_cold_start(
             );
             return;
         }
-        let trigger_result = trigger_cold_start_controller(
-            kernel,
-            &composition,
-            ticket,
-            discovery,
-            contour,
-        )
-        .await;
+        let trigger_result =
+            trigger_cold_start_controller(kernel, &composition, ticket, discovery, contour).await;
         match trigger_result {
             Err(refusal) => {
                 tracing::warn!(
@@ -7350,12 +7344,13 @@ async fn retain_discovery_lease_revision(
     let snapshot = owner
         .read_current(&ticket.state_fence)
         .map_err(ColdStartIngressError::WorkScope)?;
-    let expected_owner_revision = snapshot
-        .owner_revision
-        .checked_sub(1)
-        .ok_or(ColdStartIngressError::WorkScope(
-            eliot_workscope::WorkScopeError::BindingReceiptMismatch,
-        ))?;
+    let expected_owner_revision =
+        snapshot
+            .owner_revision
+            .checked_sub(1)
+            .ok_or(ColdStartIngressError::WorkScope(
+                eliot_workscope::WorkScopeError::BindingReceiptMismatch,
+            ))?;
     let persist = || {
         eliotd::task_binding_admission::retain_scan_discovery_lease_owner_revision(
             kernel,
@@ -7393,12 +7388,13 @@ async fn retain_scan_evidence_revision(
     let snapshot = owner
         .read_current(&ticket.state_fence)
         .map_err(ColdStartIngressError::WorkScope)?;
-    let expected_owner_revision = snapshot
-        .owner_revision
-        .checked_sub(1)
-        .ok_or(ColdStartIngressError::WorkScope(
-            eliot_workscope::WorkScopeError::BindingReceiptMismatch,
-        ))?;
+    let expected_owner_revision =
+        snapshot
+            .owner_revision
+            .checked_sub(1)
+            .ok_or(ColdStartIngressError::WorkScope(
+                eliot_workscope::WorkScopeError::BindingReceiptMismatch,
+            ))?;
     let persist = || {
         eliotd::task_binding_admission::retain_scan_evidence_owner_revision(
             kernel,
@@ -7413,9 +7409,7 @@ async fn retain_scan_evidence_revision(
         )
     };
     if persist().await.is_err() {
-        persist().await.map_err(|second| {
-            scan_owner_error(second)
-        })?;
+        persist().await.map_err(|second| scan_owner_error(second))?;
     }
     install_readback_work_scope_revision(kernel, composition, &ticket.state_fence, snapshot)
         .await
@@ -7503,9 +7497,7 @@ async fn trigger_cold_start_controller(
             &discovery.discovery,
         )
         .map_err(ColdStartIngressError::WorkScope)?;
-        return Ok(eliotd::task_binding_admission::ColdStartTriggerResult::Question(
-            outcome,
-        ));
+        return Ok(eliotd::task_binding_admission::ColdStartTriggerResult::Question(outcome));
     }
 
     // Retain the exact accepted discovery lease as a WorkScope owner revision
@@ -7520,14 +7512,8 @@ async fn trigger_cold_start_controller(
             owner: "Governor discovery-lease admission",
             detail: error.to_string(),
         })?;
-    retain_discovery_lease_revision(
-        kernel,
-        composition,
-        ticket,
-        &discovery.lease,
-        lease_owner,
-    )
-    .await?;
+    retain_discovery_lease_revision(kernel, composition, ticket, &discovery.lease, lease_owner)
+        .await?;
 
     let route_kernel = Arc::clone(kernel);
     let connection_id = ticket.connection_id.clone();
@@ -7573,21 +7559,14 @@ async fn trigger_cold_start_controller(
     let outcome = composition
         .lock()
         .await
-        .run_cold_start_trigger_scan(
-            trigger,
-            &mut discovery,
-            &binding,
-            now,
-        )
+        .run_cold_start_trigger_scan(trigger, &mut discovery, &binding, now)
         .map_err(|error| ColdStartIngressError::Owner {
             owner: "Governor trigger scan",
             detail: error.to_string(),
         })?;
     match outcome {
         eliot_workscope::BootstrapScanOutcome::PrivacyBoundaryRequired { .. } => {
-            Ok(eliotd::task_binding_admission::ColdStartTriggerResult::Question(
-                outcome,
-            ))
+            Ok(eliotd::task_binding_admission::ColdStartTriggerResult::Question(outcome))
         }
         eliot_workscope::BootstrapScanOutcome::Completed {
             receipt: expected_receipt,
@@ -7631,18 +7610,20 @@ async fn trigger_cold_start_controller(
                 evidence_owner,
             )
             .await?;
-            Ok(eliotd::task_binding_admission::ColdStartTriggerResult::Persisted {
-                scan: eliotd::task_binding_admission::ColdStartScanOwnerReceipt {
-                    trigger,
-                    discovery,
-                    contour,
-                    binding,
-                    scan_evidence,
-                    disclosure_receipt,
-                    receipt_handle,
-                    store,
+            Ok(
+                eliotd::task_binding_admission::ColdStartTriggerResult::Persisted {
+                    scan: eliotd::task_binding_admission::ColdStartScanOwnerReceipt {
+                        trigger,
+                        discovery,
+                        contour,
+                        binding,
+                        scan_evidence,
+                        disclosure_receipt,
+                        receipt_handle,
+                        store,
+                    },
                 },
-            })
+            )
         }
     }
 }

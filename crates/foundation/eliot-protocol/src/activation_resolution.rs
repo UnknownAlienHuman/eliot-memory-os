@@ -350,7 +350,10 @@ impl AgentActivationBindScopeEvidence {
                 reason: "must name the authenticated semantic owner at a non-zero revision",
             });
         }
-        bounded_text(&self.ticket_id, "agent_activation_bind_scope_evidence.ticket_id")?;
+        bounded_text(
+            &self.ticket_id,
+            "agent_activation_bind_scope_evidence.ticket_id",
+        )?;
         lowercase_sha256(
             &self.ticket_sha256,
             "agent_activation_bind_scope_evidence.ticket_sha256",

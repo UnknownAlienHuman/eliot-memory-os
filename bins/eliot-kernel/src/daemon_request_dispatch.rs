@@ -70,8 +70,8 @@ use eliot_store_api::{
     OrderingHeadExpectation, PreparedTransition, ReadConsistency, RecoveryRecord,
     RecoveryRecordKey, RequestMeta, RevisionHeadExpectation, StoreError, StoreFailure,
     StoreFailureIdentityContext, StoreGenesisRequest, StoreRecoveryRequest, StoreRecoverySnapshot,
-    StoreWorkScopeOwnerRequest, WriteReceipt, WriteReceiptStatus,
-    verify_canonical_request_hash, verify_ordering_scope_binding,
+    StoreWorkScopeOwnerRequest, WriteReceipt, WriteReceiptStatus, verify_canonical_request_hash,
+    verify_ordering_scope_binding,
 };
 use serde::Deserialize;
 
@@ -1591,9 +1591,13 @@ fn validate_work_scope_record_against_retained_input(
         || cold_start_inputs.get("discovery_lease") != field("discovery_lease").ok()
         || cold_start_inputs.get("bootstrap_discovery_inputs") != Some(bootstrap)
         || cold_start_inputs.get("privacy_boundary") != bootstrap.get("privacy_boundary")
-        || cold_start_inputs.get("principal_ref").and_then(serde_json::Value::as_str)
+        || cold_start_inputs
+            .get("principal_ref")
+            .and_then(serde_json::Value::as_str)
             != Some(authenticated_principal)
-        || cold_start_inputs.get("session_ref").and_then(serde_json::Value::as_str)
+        || cold_start_inputs
+            .get("session_ref")
+            .and_then(serde_json::Value::as_str)
             != Some(authenticated_session)
         || owner_binding
             .get("scope")
@@ -4155,23 +4159,30 @@ impl KernelComposition {
                     }
                     self.claim_task_controller_pair(session)
                         .map(|pair| match pair {
-                            Some((envelope, tool, invocation, attempt, authenticated_principal, identity)) => {
+                            Some((
+                                envelope,
+                                tool,
+                                invocation,
+                                attempt,
+                                authenticated_principal,
+                                identity,
+                            )) => {
                                 serde_json::json!({
-                                "status": "known",
-                                "value": {
-                                    "pair": {
-                                        "invocation": invocation,
-                                        "authenticated_principal": authenticated_principal,
-                                        "identity": identity,
-                                        "envelope": envelope,
-                                        "tool": tool,
-                                        "operation_id": attempt.operation_id,
-                                        "attempt": attempt,
-                                    }
-                                },
-                                "recovery": null,
-                            })
-                            },
+                                    "status": "known",
+                                    "value": {
+                                        "pair": {
+                                            "invocation": invocation,
+                                            "authenticated_principal": authenticated_principal,
+                                            "identity": identity,
+                                            "envelope": envelope,
+                                            "tool": tool,
+                                            "operation_id": attempt.operation_id,
+                                            "attempt": attempt,
+                                        }
+                                    },
+                                    "recovery": null,
+                                })
+                            }
                             None => serde_json::json!({
                                 "status": "known",
                                 "value": { "pair": null },
@@ -9257,7 +9268,10 @@ impl KernelComposition {
                 .as_ref()
                 .map(eliot_contracts::SessionId::as_str)
                 != Some(operation.attempt.session_id.as_str())
-            || context.task_id.as_ref().is_none_or(|task| task.as_str() != operation.attempt.task_id.as_str())
+            || context
+                .task_id
+                .as_ref()
+                .is_none_or(|task| task.as_str() != operation.attempt.task_id.as_str())
             || identity.request.state_fence != operation.attempt.state_fence
             || identity.deadline_unix_ms != operation.attempt.expires_at_unix_ms
         {
