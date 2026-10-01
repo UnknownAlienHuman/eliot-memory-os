@@ -668,6 +668,10 @@ pub(crate) struct ContinuationReadRequest<'a> {
 /// child creation, and parent-to-child linking in one Surreal transaction.
 /// Replaying a parent with an existing child returns that child's same opaque
 /// identifier after checking it against the just-produced page tail.
+///
+/// Issue #2860 A6: exact replay therefore preserves the same page and cursor
+/// identity — the already-linked successor is reused, and a changed tail or
+/// binding fails closed instead of minting a fresh identity.
 pub(crate) async fn issue_automation_continuation(
     db: &RpcTransport,
     config: &SurrealAdapterConfig,

@@ -2383,6 +2383,11 @@ struct AutomationPageSlice<T> {
 /// `last_row_id` is the identity of the last row actually returned, so a
 /// continuation is never minted from the probe row or from a row that
 /// truncation removed.
+///
+/// Issue #2860 W3: this post-truncation tail is the only row identity the
+/// owner may retain as a continuation boundary. Both payloads hand
+/// `page.last_row_id` to `automation_page_with_continuation`, never the
+/// discarded probe.
 fn automation_page_slice<T>(
     eligible: Vec<T>,
     limit: usize,
@@ -2787,6 +2792,10 @@ struct AutomationPageContinuation<'a> {
 /// Mints and attaches the retained owner continuation for one already-sliced
 /// truncated page. Any write/capacity failure aborts this payload so no
 /// unresumable page can be published as `TRUNCATED`.
+///
+/// The boundary retained here is always the post-slice returned tail supplied
+/// by the caller. A truncated page with no tail is a typed refusal, never a
+/// probe-derived cursor (issue #2860 W3).
 async fn automation_page_with_continuation(
     db: &client::RpcTransport,
     config: &SurrealAdapterConfig,
