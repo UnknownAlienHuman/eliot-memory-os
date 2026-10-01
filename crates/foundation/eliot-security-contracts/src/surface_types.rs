@@ -732,6 +732,65 @@ impl SourceSecurityAssessment {
         Ok(surviving)
     }
 
+    /// Prepares the source quarantine a deterministic rule supports, for one
+    /// retained indicator record and one exact dependency closure.
+    ///
+    /// This is the Governor's preparation step. It routes the retained record
+    /// through the finite indicator-to-source map and admits the quarantine only
+    /// if that map produced a restriction, which it does only for an
+    /// independent observation carrying a rule binding. A model-proposed record,
+    /// a record with an incomplete comparison, and every content-shaped class
+    /// each yield [`crate::IndicatorResolution::CandidateOnly`], which carries
+    /// no restriction — so they return `Ok(None)` and quarantine nothing. That
+    /// is the A3 property: a model-only judgement reaches zero quarantine,
+    /// Incident and authority mutations because there is no value it can carry
+    /// into an admission, not because a confidence score was compared.
+    ///
+    /// The closure is the exact affected scope, and `state_fence` is the fence
+    /// the caller is preparing under. The closure must be under that same
+    /// fence, so an admission cannot be prepared against a closure that belongs
+    /// to a different epoch. This method refuses a closure that does not cover
+    /// this assessment's source rather than widening it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the assessment or retained record is malformed,
+    /// when the indicator map refuses the combination, or when the supplied
+    /// closure, revision, owner or fence cannot be bound to this assessment.
+    pub fn prepare_indicator_quarantine(
+        &self,
+        record: &crate::RecordedIndicatorObservation,
+        dependency_closure: &InfluenceDependencyClosure,
+        expected_state_revision: u64,
+        owner: &str,
+        state_fence: &StateFence,
+    ) -> Result<Option<crate::AdmittedSourceQuarantine>, crate::SecurityContractError> {
+        self.validate()?;
+        record.validate()?;
+        // The assessment's own assurance is resolved against the fence in force
+        // first, so a source or profile that moved after this assessment was
+        // taken is refused here rather than admitted against a stale fence.
+        self.resolve_source_use(&self.source_assurance, state_fence)?;
+        let resolution = crate::IndicatorSourceMap::resolve(
+            record.indicator,
+            &record.evidence,
+            &record.observation,
+            &self.source,
+            state_fence,
+            record.release_condition.as_deref(),
+        )?;
+        let Some(restriction) = resolution.restriction() else {
+            return Ok(None);
+        };
+        crate::AdmittedSourceQuarantine::admit_from_rule(
+            restriction,
+            dependency_closure,
+            expected_state_revision,
+            owner,
+        )
+        .map(Some)
+    }
+
     /// Resolves what one action may take from this assessed source right now.
     ///
     /// The current source owner supplies the assurance and the fence for the
