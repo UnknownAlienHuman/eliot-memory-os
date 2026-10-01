@@ -8,9 +8,10 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{ArtifactId, StateFence};
+use eliot_epistemic_contracts::MAX_HANDLES;
 use eliot_evidence::{Assertability, EvidenceEnvelope};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -36,6 +37,8 @@ pub enum EpistemicError {
         handle: ArtifactId,
         predecessor: ArtifactId,
     },
+    #[error("supersession lineage is cyclic: {}", handles.iter().map(ArtifactId::as_str).collect::<Vec<_>>().join(", "))]
+    SupersessionCycle { handles: Vec<ArtifactId> },
     #[error("record {handle} has a scope different from the requested scope")]
     ScopeMismatch { handle: ArtifactId },
     #[error("record {handle} is not compatible with the requested state fence")]
@@ -142,6 +145,16 @@ pub struct PositionRequest {
 }
 
 impl PositionRequest {
+    /// Validates the admitted read set before any resolution work begins.
+    ///
+    /// A supersession graph that contains a cycle has no current record: every
+    /// member of the cycle is named as a predecessor by another member, so the
+    /// supersession union removes all of them at once. Left unchecked that
+    /// collapse is indistinguishable from an unobserved source, which is why it
+    /// is refused here as [`EpistemicError::SupersessionCycle`] instead of
+    /// reaching [`crate::resolve`] as ordinary absence. The refusal happens at
+    /// this boundary, so no evidence is destroyed: [`crate::resolve`] derives
+    /// no position and drops no provenance for a request it never admits.
     pub fn validate(&self) -> Result<(), EpistemicError> {
         text(self.question.as_str(), "question")?;
         text(self.scope.as_str(), "scope")?;
@@ -151,25 +164,116 @@ impl PositionRequest {
         if self.records.is_empty() {
             return Err(EpistemicError::EmptyInput);
         }
-        let mut handles = BTreeSet::new();
+        // Unique handles are established first, because the lineage walk below
+        // needs exactly one record per handle to be well defined.
+        let mut by_handle: BTreeMap<&ArtifactId, &EpistemicRecord> = BTreeMap::new();
         for record in &self.records {
-            if !handles.insert(record.handle.clone()) {
+            if by_handle.insert(&record.handle, record).is_some() {
                 return Err(EpistemicError::DuplicateHandle(record.handle.clone()));
             }
             record.validate(self.scope.as_str(), &self.state_fence)?;
         }
+        // Every predecessor must name an admitted record in the same read set.
+        // The index supplies the edges in handle order, not presentation order.
+        let mut edges: BTreeMap<&ArtifactId, Vec<&ArtifactId>> = BTreeMap::new();
         for record in &self.records {
+            let mut predecessors = Vec::with_capacity(record.supersedes.len());
             for predecessor in &record.supersedes {
-                if !handles.contains(predecessor) {
+                if !by_handle.contains_key(predecessor) {
                     return Err(EpistemicError::MissingPredecessor {
                         handle: record.handle.clone(),
                         predecessor: predecessor.clone(),
                     });
                 }
+                predecessors.push(predecessor);
             }
+            // Visiting order is handle order, not presentation order, so the
+            // walk cannot be steered by how the caller sorted the list.
+            predecessors.sort();
+            edges.insert(&record.handle, predecessors);
         }
+        reject_supersession_cycle(&edges)?;
         Ok(())
     }
+}
+
+/// Walks the admitted supersession graph and refuses a cycle.
+///
+/// The walk is a loop over explicit stacks rather than a recursion, so caller
+/// depth is bounded by the admitted read set and never by the call stack.
+///
+/// Nodes are visited in handle order and each node's predecessors in handle
+/// order, so the walk depends only on the admitted set: a cycle is reported
+/// identically for every permutation of the same records. No input order,
+/// lexical handle or recency picks a winner either, because a cycle is refused
+/// whole instead of having one member chosen to survive. The reported handles
+/// are the cycle itself, sorted and bounded by the admitted handle ceiling so
+/// the diagnostic cannot be steered into an unbounded string.
+fn reject_supersession_cycle(
+    edges: &BTreeMap<&ArtifactId, Vec<&ArtifactId>>,
+) -> Result<(), EpistemicError> {
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum Colour {
+        /// Not yet reached.
+        White,
+        /// On the current chain; reaching one again closes a cycle.
+        Grey,
+        /// Fully explored; reaching one again cannot close a cycle.
+        Black,
+    }
+    let mut colour: BTreeMap<&ArtifactId, Colour> = edges
+        .keys()
+        .map(|handle| (*handle, Colour::White))
+        .collect();
+    for start in edges.keys().copied() {
+        if colour.get(start) != Some(&Colour::White) {
+            continue;
+        }
+        // `path` is the current chain and `cursors[depth]` the next predecessor
+        // index to try within `path[depth]`. The walk ends when the last node
+        // is popped, which leaves `path` empty and `last()` returning `None`.
+        let mut path: Vec<&ArtifactId> = vec![start];
+        let mut cursors: Vec<usize> = vec![0];
+        colour.insert(start, Colour::Grey);
+        while let Some(&current) = path.last() {
+            let depth = path.len() - 1;
+            let successors: &[&ArtifactId] = edges.get(current).map_or(&[][..], Vec::as_slice);
+            let Some(&next) = successors.get(cursors[depth]) else {
+                colour.insert(current, Colour::Black);
+                path.pop();
+                cursors.pop();
+                continue;
+            };
+            cursors[depth] += 1;
+            // An absent entry is an unvisited one: every admitted handle is
+            // seeded `White`, and every predecessor was resolved against the
+            // same index before this walk, so no edge leaves the node set.
+            match colour.get(next).copied().unwrap_or(Colour::White) {
+                Colour::Grey => {
+                    // `next` is already on this chain, so the chain from its
+                    // position onward is the cycle. `next` is Grey only while it
+                    // is on `path`, so the skip always stops and the reported
+                    // handles are the cycle itself, never a prefix of it.
+                    let mut involved: Vec<ArtifactId> = path
+                        .iter()
+                        .copied()
+                        .skip_while(|handle| *handle != next)
+                        .cloned()
+                        .collect();
+                    involved.sort();
+                    involved.truncate(MAX_HANDLES);
+                    return Err(EpistemicError::SupersessionCycle { handles: involved });
+                }
+                Colour::Black => {}
+                Colour::White => {
+                    colour.insert(next, Colour::Grey);
+                    path.push(next);
+                    cursors.push(0);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Exact provenance closure for the returned position.
