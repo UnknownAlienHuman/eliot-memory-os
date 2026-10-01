@@ -3585,10 +3585,6 @@ fn invoke_request_frame(
 }
 
 impl KernelHostRequestPort for KernelHostRequestClient {
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the eight canonical entries must dispatch serially on the same carrier (issue #1739 W5); splitting the match would scatter the single dispatch order"
-    )]
     fn invoke(
         &mut self,
         request: &HostInvocationRequest,
