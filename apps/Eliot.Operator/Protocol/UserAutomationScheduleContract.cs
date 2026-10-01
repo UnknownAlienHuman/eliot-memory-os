@@ -208,6 +208,29 @@ public static class UserAutomationScheduleMirror
     }
 
     /// <summary>
+    /// Returns whether one occurrence uses a retired shape-only, V2, or V3
+    /// encoding. This is used only to preserve a legacy predecessor for an
+    /// explicit owner migration; these encodings are never accepted for a
+    /// current revision.
+    /// </summary>
+    public static bool IsLegacyOccurrenceEncoding(string occurrenceKey)
+    {
+        ArgumentNullException.ThrowIfNull(occurrenceKey);
+        var encoding = occurrenceKey.Split(OperatorScheduleContract.NORMALIZED_OCCURRENCE_FIELD_SEPARATOR)[0];
+        return IsLegacyOccurrenceKey(occurrenceKey) || IsPredecessorOccurrenceEncoding(encoding);
+    }
+
+    /// <summary>Applies the generated bound shared by normalization requests.</summary>
+    public static void RequireNormalizationOccurrenceCount(ushort occurrenceCount)
+    {
+        if (occurrenceCount == 0 || occurrenceCount > OperatorScheduleContract.MAX_REFERENCES)
+        {
+            throw new InvalidOperationException(
+                "schedule.normalization.occurrence_count must be between 1 and the owner limit.");
+        }
+    }
+
+    /// <summary>
     /// V2 and V3 are retired versioned occurrence contracts. They cannot be
     /// reinterpreted as V4 because neither carries both local clocks.
     /// </summary>
@@ -599,6 +622,10 @@ public static class UserAutomationScheduleMirror
         IReadOnlyList<string> nextOccurrences)
     {
         ArgumentNullException.ThrowIfNull(nextOccurrences);
+        if (nextOccurrences.Count > OperatorScheduleContract.MAX_REFERENCES)
+        {
+            throw Invalid("schedule.next_occurrences");
+        }
         RequireCanonicalTimezone(timezone);
         var start = ParseCivilInstantSeconds(startAt, "schedule.start_at");
         var end = endAt is null ? (long?)null : ParseCivilInstantSeconds(endAt, "schedule.end_at");
@@ -733,7 +760,7 @@ public static class UserAutomationScheduleMirror
         ArgumentNullException.ThrowIfNull(previous);
         ArgumentNullException.ThrowIfNull(next);
         var previousProjection = previous.ReadLocalProjection();
-        var nextProjection = next.ReadLocalProjection(allowReceiptFreeDraft: true);
+        var nextProjection = next.ReadLocalProjection();
         var sameDigestInputs = string.Equals(previous.Kind, next.Kind, StringComparison.Ordinal)
             && string.Equals(previous.Expression, next.Expression, StringComparison.Ordinal)
             && string.Equals(previous.Calendar, next.Calendar, StringComparison.Ordinal)
@@ -906,16 +933,19 @@ public enum UserAutomationOutcomeClass
 
     /// <summary>
     /// The owner reports a current versioned transition bound to the submitted
-    /// operation. The Operator has no independent current-fence comparand, and
-    /// the schedule fields remain inspection data without normalization proof.
+    /// operation and the exact expected State Fence. The schedule fields remain
+    /// inspection data without owner-issued normalization proof.
     /// </summary>
     OwnerBoundTransitionScheduleUnverified,
 
-    /// <summary>The owner reports non-retention, but no independent current-fence comparison is available.</summary>
-    OwnerReportedNotRetainedFenceUnverified,
+    /// <summary>The Kernel returned its exact schedule normalization result for this request.</summary>
+    OwnerScheduleNormalized,
 
-    /// <summary>The owner reports a commit with a ledger read owed, but the current fence is not independently compared.</summary>
-    OwnerReportedCommitFenceUnverifiedLedgerReadOwed,
+    /// <summary>The owner reports non-retention under the expected State Fence.</summary>
+    OwnerReportedNotRetained,
+
+    /// <summary>The owner reports a commit under the expected State Fence with a ledger read owed.</summary>
+    OwnerReportedCommitLedgerReadOwed,
 
     /// <summary>
     /// The answer does not prove schedule normalization provenance. A decodable
@@ -948,7 +978,25 @@ public sealed record UserAutomationOutcome(
     string Detail,
     string? RefusalKind,
     string? RefusalText,
-    UserAutomationScheduleProjection? ScheduleProjection);
+    UserAutomationScheduleProjection? ScheduleProjection,
+    UserAutomationScheduleNormalizationResult? ScheduleNormalizationResult = null);
+
+/// <summary>The closed owner result from an explicit normalization action.</summary>
+public enum UserAutomationScheduleNormalizationOutcome
+{
+    ScheduleNormalized,
+    LegacyScheduleMigrated
+}
+
+/// <summary>
+/// Validated typed revision plus the original owner receipt envelope. The
+/// envelope remains a cloned <see cref="JsonElement"/> so Create/Edit carries
+/// its complete nested receipt rather than a C# projection of that contract.
+/// </summary>
+public sealed record UserAutomationScheduleNormalizationResult(
+    UserAutomationScheduleNormalizationOutcome Outcome,
+    UserAutomationRevision Revision,
+    JsonElement NormalizationReceiptEnvelope);
 
 /// <summary>
 /// Identity retained by the Operator for the exact request whose response is
@@ -959,26 +1007,32 @@ public sealed record UserAutomationOutcome(
 public sealed record UserAutomationResultValidationContext
 {
     // A reviewed decoder change must explicitly acknowledge the Rust result schema.
-    // Widened 785065c0 -> c71ee403 by #2806: one new closed execution-phase
-    // value, "rejected", carrying the refusing owner's own reason string. No
-    // existing member, shape, or kind changed, and no fallback spelling exists;
-    // the value was taken from the generator's own refusal message, not from a
-    // second hand-maintained digest. Reverting it makes every answer an
+    // Widened c71ee403 -> f6447bee by #2865: the result union adds closed
+    // authenticated context and owner-normalized schedule values carrying the
+    // exact receipt envelope. No caller projection or fallback spelling is
+    // accepted; the value comes from the owner's source-derived generator, not
+    // a second hand-maintained digest. Reverting it makes every answer an
     // UnverifiedOwnerAnswer.
-    private const string SupportedUserAutomationResultSchemaSha256 = "c71ee40384dba3eaebac57d4c92c9e7406a342d6901e532ee362c163e8f7cf1c";
+    private const string SupportedUserAutomationResultSchemaSha256 = "f6447beefa281b252674c6ca18adc39d9f5fe12c1cbd122969776e33ab6375fe";
 
     private UserAutomationResultValidationContext(
         string expectedOperationId,
         string expectedIdempotencyKey,
         string expectedResultWireId,
         int supportedResultWireVersion,
-        string? transportCorrelationId)
+        string? transportCorrelationId,
+        JsonElement? expectedStateFence,
+        string expectedOperationKind,
+        JsonElement expectedOperation)
     {
         ExpectedOperationId = expectedOperationId;
         ExpectedIdempotencyKey = expectedIdempotencyKey;
         ExpectedResultWireId = expectedResultWireId;
         SupportedResultWireVersion = supportedResultWireVersion;
         TransportCorrelationId = transportCorrelationId;
+        ExpectedStateFence = expectedStateFence?.Clone();
+        ExpectedOperationKind = expectedOperationKind;
+        ExpectedOperation = expectedOperation.Clone();
     }
 
     public string ExpectedOperationId { get; }
@@ -996,6 +1050,18 @@ public sealed record UserAutomationResultValidationContext
     /// is never substituted for the semantic operation identity.
     /// </summary>
     public string? TransportCorrelationId { get; }
+
+    /// <summary>
+    /// The independently acquired fence embedded in the exact request being
+    /// classified. It is absent only for the read-only get_context handshake.
+    /// </summary>
+    public JsonElement? ExpectedStateFence { get; }
+
+    /// <summary>The closed operation discriminator from the exact submitted request.</summary>
+    public string ExpectedOperationKind { get; }
+
+    /// <summary>Immutable JSON snapshot of the submitted typed operation.</summary>
+    internal JsonElement ExpectedOperation { get; }
 
     /// <summary>
     /// Creates validation context from the same request value that is sent or
@@ -1023,7 +1089,10 @@ public sealed record UserAutomationResultValidationContext
             request.IdempotencyKey,
             OperatorScheduleContract.USER_AUTOMATION_RESULT_WIRE_ID,
             OperatorScheduleContract.USER_AUTOMATION_RESULT_WIRE_VERSION,
-            transportCorrelationId);
+            transportCorrelationId,
+            request.ExpectedStateFence,
+            OperationKind(request.Operation),
+            JsonSerializer.SerializeToElement(request.Operation, OperatorJson.Writer));
     }
 
     /// <summary>Rejects a context that does not name the current closed wire contract.</summary>
@@ -1037,10 +1106,76 @@ public sealed record UserAutomationResultValidationContext
             OperatorScheduleContract.USER_AUTOMATION_RESULT_WIRE_ID,
             StringComparison.Ordinal)
         && SupportedResultWireVersion == OperatorScheduleContract.USER_AUTOMATION_RESULT_WIRE_VERSION
+        && ExpectedOperationJsonMatchesKind()
+        && (ExpectedOperationKind == "get_context"
+            ? ExpectedStateFence is null
+            : ExpectedStateFence is { } expectedFence
+                && UserAutomationOutcomeClassifier.IsClosedStateFence(expectedFence))
         && string.Equals(
             OperatorScheduleContract.USER_AUTOMATION_RESULT_SCHEMA_SHA256,
             SupportedUserAutomationResultSchemaSha256,
             StringComparison.Ordinal);
+
+    private bool ExpectedOperationJsonMatchesKind()
+    {
+        if (ExpectedOperation.ValueKind != JsonValueKind.Object
+            || !ExpectedOperation.TryGetProperty(
+                OperatorScheduleContract.USER_AUTOMATION_OPERATION_DISCRIMINATOR,
+                out var kind)
+            || kind.ValueKind != JsonValueKind.String
+            || !string.Equals(kind.GetString(), ExpectedOperationKind, StringComparison.Ordinal)
+            || !OperatorScheduleContract.USER_AUTOMATION_OPERATION_KINDS.Contains(
+                ExpectedOperationKind,
+                StringComparer.Ordinal))
+        {
+            return false;
+        }
+
+        var operationMembers = ExpectedOperationKind switch
+        {
+            "get_context" => OperatorScheduleContract.USER_AUTOMATION_GET_CONTEXT_OPERATION_MEMBERS,
+            "normalize_schedule" => OperatorScheduleContract.USER_AUTOMATION_NORMALIZE_SCHEDULE_OPERATION_MEMBERS,
+            "migrate_legacy_schedule" => OperatorScheduleContract.USER_AUTOMATION_MIGRATE_LEGACY_SCHEDULE_OPERATION_MEMBERS,
+            "create" => OperatorScheduleContract.USER_AUTOMATION_CREATE_OPERATION_MEMBERS,
+            "edit" => OperatorScheduleContract.USER_AUTOMATION_EDIT_OPERATION_MEMBERS,
+            _ => null
+        };
+        if (operationMembers is null)
+        {
+            // Other operations remain closed typed contracts too; their
+            // serializer shape is already pinned by the full owner source hash.
+            return OperatorScheduleContract.USER_AUTOMATION_OPERATION_KINDS.Contains(
+                ExpectedOperationKind,
+                StringComparer.Ordinal);
+        }
+
+        var expectedMembers = new HashSet<string>(operationMembers, StringComparer.Ordinal);
+        if (!expectedMembers.Add(OperatorScheduleContract.USER_AUTOMATION_OPERATION_DISCRIMINATOR)) return false;
+        var actualMembers = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var property in ExpectedOperation.EnumerateObject())
+        {
+            if (!actualMembers.Add(property.Name)) return false;
+        }
+        return actualMembers.SetEquals(expectedMembers);
+    }
+
+    private static string OperationKind(UserAutomationOperation operation) => operation switch
+    {
+        UserAutomationGetContextOperation => "get_context",
+        UserAutomationNormalizeScheduleOperation => "normalize_schedule",
+        UserAutomationMigrateLegacyScheduleOperation => "migrate_legacy_schedule",
+        UserAutomationCreateOperation => "create",
+        UserAutomationListOperation => "list",
+        UserAutomationStatusOperation => "status",
+        UserAutomationHistoryOperation => "history",
+        UserAutomationPauseOperation => "pause",
+        UserAutomationResumeOperation => "resume",
+        UserAutomationEditOperation => "edit",
+        UserAutomationRunNowOperation => "run_now",
+        UserAutomationRemoveOperation => "remove",
+        UserAutomationInspectLastFailureOperation => "inspect_last_failure",
+        _ => string.Empty
+    };
 }
 
 /// <summary>
@@ -1078,6 +1213,61 @@ public static class UserAutomationOutcomeClassifier
     private const int MaxRecoveryReasonChars = 1_024;
     // Bound summary text; the retained response remains available separately.
     private const int MaxDescribedOccurrences = 8;
+
+    /// <summary>
+    /// Reads the StateFence from the authenticated, versioned get_context
+    /// answer. The returned top-level fence is admitted only when the nested
+    /// context projection is identical and the operation correlation matches
+    /// this exact one-call handshake request.
+    /// </summary>
+    public static JsonElement ReadContextStateFence(
+        JsonElement answer,
+        UserAutomationOperatorRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        request.Validate();
+        if (request.Operation is not UserAutomationGetContextOperation)
+        {
+            throw new InvalidOperationException("a State Fence can only be read from a get_context request");
+        }
+
+        var context = UserAutomationResultValidationContext.FromRequest(request);
+        if (!context.IsValid()
+            || context.ExpectedStateFence is not null
+            || answer.ValueKind != JsonValueKind.Object
+            || !HasExactProperties(answer, OperatorScheduleContract.USER_AUTOMATION_RESULT_ENVELOPE_MEMBERS)
+            || !TryReadBoundedText(answer, "wire_id", 128, out var wireId)
+            || !string.Equals(wireId, context.ExpectedResultWireId, StringComparison.Ordinal)
+            || !answer.TryGetProperty("wire_version", out var wireVersion)
+            || wireVersion.ValueKind != JsonValueKind.Number
+            || !wireVersion.TryGetInt32(out var version)
+            || version != context.SupportedResultWireVersion
+            || !TryReadBoundedText(answer, "status", 32, out var status)
+            || !string.Equals(status, "known", StringComparison.Ordinal)
+            || !TryGetObject(answer, "correlation", out var correlation)
+            || !HasExactProperties(correlation, OperatorScheduleContract.USER_AUTOMATION_RESULT_CORRELATION_MEMBERS)
+            || !MatchesResultCorrelation(correlation, context)
+            || !answer.TryGetProperty("recovery", out var recovery)
+            || recovery.ValueKind != JsonValueKind.Null
+            || !TryGetObject(answer, "state_fence", out var envelopeFence)
+            || !IsClosedStateFence(envelopeFence)
+            || !TryGetObject(answer, "value", out var value)
+            || !HasExactProperties(value, OperatorScheduleContract.USER_AUTOMATION_CONTEXT_VALUE_MEMBERS)
+            || !TryReadBoundedText(value, "outcome", 32, out var outcome)
+            || !OperatorScheduleContract.USER_AUTOMATION_RESULT_VALUE_OUTCOMES.Contains(
+                outcome,
+                StringComparer.Ordinal)
+            || !string.Equals(outcome, "context", StringComparison.Ordinal)
+            || !TryGetObject(value, "state_fence", out var valueFence)
+            || !SameStateFence(envelopeFence, valueFence))
+        {
+            throw new InvalidOperationException(
+                "the authenticated get_context answer is missing the current wire version, request identity, or matching closed State Fence");
+        }
+
+        return envelopeFence.Clone();
+    }
+
     /// <summary>Decodes one owner answer for one typed operation identity.</summary>
     public static UserAutomationOutcome Read(
         string action,
@@ -1089,6 +1279,13 @@ public static class UserAutomationOutcomeClassifier
         if (!context.IsValid())
         {
             return UnverifiedOwnerAnswer(action, "the submitted result-validation context is unsupported");
+        }
+        if (context.ExpectedStateFence is not { } expectedStateFence
+            || !IsClosedStateFence(expectedStateFence))
+        {
+            return UnverifiedOwnerAnswer(
+                action,
+                "the request has no independently acquired closed State Fence witness");
         }
         if (answer.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null)
         {
@@ -1182,6 +1379,22 @@ public static class UserAutomationOutcomeClassifier
             return UnverifiedOwnerAnswer(action, "the known owner transition is not a closed, settled typed shape");
         }
 
+        if (recovery.ValueKind == JsonValueKind.Null
+            && TryDecodeScheduleNormalizationResult(value, context, out var normalizationResult)
+            && normalizationResult is not null)
+        {
+            var scheduleProjection = normalizationResult.Revision.Schedule.ReadLocalProjection();
+            return new UserAutomationOutcome(
+                UserAutomationOutcomeClass.OwnerScheduleNormalized,
+                $"UserAutomation {action}: Kernel owner returned {normalizationResult.Outcome}",
+                DescribeScheduleProjection(scheduleProjection, ownerIssued: true)
+                    + " The exact original owner receipt envelope is retained for the immutable revision.",
+                RefusalKind: null,
+                RefusalText: null,
+                ScheduleProjection: scheduleProjection,
+                ScheduleNormalizationResult: normalizationResult);
+        }
+
         if (HasExactProperties(value, "accepted", "outcome", "reason")
             && value.TryGetProperty("accepted", out var notRetainedAccepted)
             && notRetainedAccepted.ValueKind == JsonValueKind.False
@@ -1191,9 +1404,9 @@ public static class UserAutomationOutcomeClassifier
             && recovery.ValueKind == JsonValueKind.Null)
         {
             return new UserAutomationOutcome(
-                UserAutomationOutcomeClass.OwnerReportedNotRetainedFenceUnverified,
-                $"UserAutomation {action}: owner reports not retained; current fence unverified",
-                $"The owner reports that this operation was not retained: {notRetainedReason}. The Operator has no independent submitted/current State Fence comparand for this result, so this remains an owner-reported value and does not authorize a new submission.",
+                UserAutomationOutcomeClass.OwnerReportedNotRetained,
+                $"UserAutomation {action}: owner reports not retained under the expected State Fence",
+                $"The owner reports that this operation was not retained under the submitted State Fence: {notRetainedReason}. The result is bound to this operation identity and the expected State Fence, but remains owner-reported and does not authorize a new submission.",
                 RefusalKind: null,
                 RefusalText: null,
                 ScheduleProjection: null);
@@ -1211,9 +1424,9 @@ public static class UserAutomationOutcomeClassifier
             && TryReadBoundedText(recovery, "reason", MaxRecoveryReasonChars, out var ledgerReadReason))
         {
             return new UserAutomationOutcome(
-                UserAutomationOutcomeClass.OwnerReportedCommitFenceUnverifiedLedgerReadOwed,
-                $"UserAutomation {action}: owner reports commit; current fence unverified and ledger read owed",
-                $"The owner reports a canonical commit ({settledReason}) and a separate ledger read remains owed ({ledgerReadReason}). The Operator has no independent submitted/current State Fence comparand for this result, so keep it under the same identity and reconcile before another submission.",
+                UserAutomationOutcomeClass.OwnerReportedCommitLedgerReadOwed,
+                $"UserAutomation {action}: owner reports commit under the expected State Fence; ledger read owed",
+                $"The owner reports a canonical commit under the submitted State Fence ({settledReason}) and a separate ledger read remains owed ({ledgerReadReason}). Keep it under the same identity and reconcile before another submission.",
                 RefusalKind: null,
                 RefusalText: null,
                 ScheduleProjection: null);
@@ -1280,8 +1493,7 @@ public static class UserAutomationOutcomeClassifier
             return new UserAutomationOutcome(
                 UserAutomationOutcomeClass.OwnerBoundTransitionScheduleUnverified,
                 $"UserAutomation {action} answered — schedule normalization unverified",
-                "The owner reports a known transition under its reported State Fence. "
-                + "The Operator has no independent submitted/current-fence comparand. "
+                "The owner returned a transition bound to this operation identity and the expected State Fence. "
                 + DescribeUnverifiedScheduleProjection(projection),
                 RefusalKind: null,
                 RefusalText: null,
@@ -1291,13 +1503,138 @@ public static class UserAutomationOutcomeClassifier
         return new UserAutomationOutcome(
             UserAutomationOutcomeClass.OwnerBoundTransitionScheduleUnverified,
             $"UserAutomation {action} answered — schedule not verified",
-            "The owner reports a known transition under its reported State Fence, but the Operator has no independent submitted/current-fence comparand. "
+            "The owner returned a transition bound to this operation identity and the expected State Fence, but the schedule is not verified. "
             + "This answer carries no decodable "
             + $"{OperatorScheduleContract.NORMALIZED_OCCURRENCE_ENCODING} occurrence projection, "
             + "so the Operator does not report the schedule as normalized",
             RefusalKind: null,
             RefusalText: null,
             ScheduleProjection: null);
+    }
+
+    private static bool TryDecodeScheduleNormalizationResult(
+        JsonElement value,
+        UserAutomationResultValidationContext context,
+        out UserAutomationScheduleNormalizationResult? result)
+    {
+        result = null;
+        var expectedOutcome = context.ExpectedOperationKind switch
+        {
+            "normalize_schedule" => "schedule_normalized",
+            "migrate_legacy_schedule" => "legacy_schedule_migrated",
+            _ => null
+        };
+        if (expectedOutcome is null
+            || !OperatorScheduleContract.USER_AUTOMATION_RESULT_VALUE_OUTCOMES.Contains(
+                expectedOutcome,
+                StringComparer.Ordinal)
+            || !HasExactProperties(value, OperatorScheduleContract.USER_AUTOMATION_NORMALIZED_SCHEDULE_VALUE_MEMBERS)
+            || !TryReadBoundedText(value, "outcome", 64, out var outcome)
+            || !string.Equals(outcome, expectedOutcome, StringComparison.Ordinal)
+            || !TryGetObject(value, "revision", out var revisionElement)
+            || !HasUniqueObjectPropertiesRecursively(revisionElement)
+            || !value.TryGetProperty("normalization_receipt_envelope", out var receiptEnvelope))
+        {
+            return false;
+        }
+
+        try
+        {
+            var revision = revisionElement.Deserialize<UserAutomationRevision>(OperatorJson.Reader);
+            if (revision is null) return false;
+            revision.Validate();
+            if (!context.ExpectedOperation.TryGetProperty("occurrence_count", out var requestedCount)
+                || requestedCount.ValueKind != JsonValueKind.Number
+                || !requestedCount.TryGetInt32(out var expectedOccurrenceCount)
+                || expectedOccurrenceCount < 1
+                || expectedOccurrenceCount > OperatorScheduleContract.MAX_REFERENCES
+                || revision.Schedule.NextOccurrences.Count != expectedOccurrenceCount)
+            {
+                return false;
+            }
+            var expectedReceiptOperationKind = context.ExpectedOperationKind == "normalize_schedule"
+                ? UserAutomationNormalizationReceiptEnvelope.NormalizationOperationKind
+                : UserAutomationNormalizationReceiptEnvelope.LegacyMigrationOperationKind;
+            UserAutomationNormalizationReceiptEnvelope.Validate(
+                receiptEnvelope,
+                revision,
+                expectedReceiptOperationKind);
+            if (!context.ExpectedOperation.TryGetProperty("revision", out var submittedRevision)
+                || !MatchesSubmittedNormalizationSource(submittedRevision, revisionElement))
+            {
+                return false;
+            }
+
+            result = new UserAutomationScheduleNormalizationResult(
+                context.ExpectedOperationKind == "normalize_schedule"
+                    ? UserAutomationScheduleNormalizationOutcome.ScheduleNormalized
+                    : UserAutomationScheduleNormalizationOutcome.LegacyScheduleMigrated,
+                revision,
+                receiptEnvelope.Clone());
+            return true;
+        }
+        catch (Exception error) when (error is JsonException or InvalidOperationException or NotSupportedException)
+        {
+            return false;
+        }
+    }
+
+    private static bool MatchesSubmittedNormalizationSource(
+        JsonElement submittedRevision,
+        JsonElement ownerRevision)
+    {
+        if (submittedRevision.ValueKind != JsonValueKind.Object
+            || ownerRevision.ValueKind != JsonValueKind.Object
+            || !TryGetObject(submittedRevision, "schedule", out var submittedSchedule)
+            || !TryGetObject(ownerRevision, "schedule", out var ownerSchedule)
+            || !SameObjectMembersExcept(submittedRevision, ownerRevision, "schedule"))
+        {
+            return false;
+        }
+
+        string[] sourceFields =
+        ["kind", "expression", "calendar", "timezone", "dst_fold", "dst_gap", "start_at", "end_at"];
+        return sourceFields.All(name =>
+            submittedSchedule.TryGetProperty(name, out var submittedValue)
+            && ownerSchedule.TryGetProperty(name, out var ownerValue)
+            && JsonElement.DeepEquals(submittedValue, ownerValue));
+    }
+
+    private static bool SameObjectMembersExcept(
+        JsonElement left,
+        JsonElement right,
+        string ignoredMember)
+    {
+        if (left.ValueKind != JsonValueKind.Object || right.ValueKind != JsonValueKind.Object) return false;
+        var leftMembers = left.EnumerateObject()
+            .Where(property => !string.Equals(property.Name, ignoredMember, StringComparison.Ordinal))
+            .ToDictionary(property => property.Name, property => property.Value, StringComparer.Ordinal);
+        var rightMembers = right.EnumerateObject()
+            .Where(property => !string.Equals(property.Name, ignoredMember, StringComparison.Ordinal))
+            .ToDictionary(property => property.Name, property => property.Value, StringComparer.Ordinal);
+        return leftMembers.Count == rightMembers.Count
+            && leftMembers.All(pair => rightMembers.TryGetValue(pair.Key, out var value)
+                && JsonElement.DeepEquals(pair.Value, value));
+    }
+
+    private static bool HasUniqueObjectPropertiesRecursively(JsonElement value)
+    {
+        if (value.ValueKind == JsonValueKind.Object)
+        {
+            var names = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var property in value.EnumerateObject())
+            {
+                if (!names.Add(property.Name) || !HasUniqueObjectPropertiesRecursively(property.Value)) return false;
+            }
+        }
+        else if (value.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in value.EnumerateArray())
+            {
+                if (!HasUniqueObjectPropertiesRecursively(item)) return false;
+            }
+        }
+        return true;
     }
 
     private static UserAutomationOutcome ReadUnknownEnvelope(
@@ -1406,7 +1743,9 @@ public static class UserAutomationOutcomeClassifier
         && TryGetObject(transition, "state_fence", out var stateFence)
         && IsClosedStateFence(stateFence)
         && TryGetObject(answer, "state_fence", out var envelopeFence)
-        && SameSerializedFence(stateFence, envelopeFence);
+        && context.ExpectedStateFence is { } expectedStateFence
+        && SameStateFence(stateFence, expectedStateFence)
+        && SameStateFence(stateFence, envelopeFence);
 
     private static bool HasCurrentResultEnvelope(
         JsonElement answer,
@@ -1423,7 +1762,10 @@ public static class UserAutomationOutcomeClassifier
             || !HasExactProperties(correlation, OperatorScheduleContract.USER_AUTOMATION_RESULT_CORRELATION_MEMBERS)
             || !MatchesResultCorrelation(correlation, context)
             || !TryGetObject(answer, "state_fence", out var stateFence)
-            || !IsClosedStateFence(stateFence))
+            || !IsClosedStateFence(stateFence)
+            || context.ExpectedStateFence is not { } expectedStateFence
+            || (!SameStateFence(stateFence, expectedStateFence)
+                && !IsStateFenceMismatchRefusalEnvelope(answer, context, stateFence)))
         {
             return false;
         }
@@ -1438,6 +1780,61 @@ public static class UserAutomationOutcomeClassifier
         && string.Equals(operationId, context.ExpectedOperationId, StringComparison.Ordinal)
         && TryReadBoundedText(correlation, "idempotency_key", MaxIdentityChars, out var idempotencyKey)
         && string.Equals(idempotencyKey, context.ExpectedIdempotencyKey, StringComparison.Ordinal);
+
+    /// <summary>
+    /// A stale-fence refusal reports the live request fence, which must differ
+    /// from the caller's expected fence. Admit that one mismatch only when the
+    /// unknown answer proves the exact pre-Store refusal contract; all other
+    /// known and unknown answers must echo the submitted fence.
+    /// </summary>
+    private static bool IsStateFenceMismatchRefusalEnvelope(
+        JsonElement answer,
+        UserAutomationResultValidationContext context,
+        JsonElement liveFence)
+    {
+        if (context.ExpectedStateFence is not { } expectedStateFence
+            || !IsClosedStateFence(liveFence)
+            || SameStateFence(liveFence, expectedStateFence)
+            || !TryReadBoundedText(answer, "status", 32, out var status)
+            || !string.Equals(status, "unknown", StringComparison.Ordinal)
+            || !TryGetObject(answer, "value", out var value)
+            || !HasExactProperties(
+                value,
+                "kind",
+                "schema_version",
+                "operation",
+                "state_fence",
+                "attempt_state",
+                "refusal")
+            || !TryReadBoundedText(value, "kind", 64, out var kind)
+            || !string.Equals(kind, "user_automation_refusal", StringComparison.Ordinal)
+            || !value.TryGetProperty("schema_version", out var schemaVersion)
+            || schemaVersion.ValueKind != JsonValueKind.Number
+            || !schemaVersion.TryGetInt32(out var version)
+            || version != 1
+            || !TryGetObject(value, "operation", out var operation)
+            || !MatchesOperationIdentity(operation, context, RequestIdMember)
+            || !TryGetObject(value, "state_fence", out var nestedFence)
+            || !SameStateFence(nestedFence, liveFence)
+            || !TryReadBoundedText(value, "attempt_state", 64, out var attemptState)
+            || !string.Equals(attemptState, "store_not_called", StringComparison.Ordinal)
+            || !TryGetObject(value, "refusal", out var refusal)
+            || !HasExactProperties(refusal, "code")
+            || !TryReadBoundedText(refusal, "code", 64, out var refusalCode)
+            || !string.Equals(refusalCode, "state_fence_mismatch", StringComparison.Ordinal)
+            || !TryGetObject(answer, "recovery", out var recovery)
+            || !HasExactProperties(recovery, "kind", "reason")
+            || !TryReadBoundedText(recovery, "kind", 64, out var recoveryKind)
+            || !string.Equals(recoveryKind, "unknown_outcome", StringComparison.Ordinal)
+            || !TryReadBoundedText(recovery, "reason", MaxRecoveryReasonChars, out var recoveryReason)
+            || !string.Equals(recoveryReason, "state_fence_mismatch_store_not_called", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        return TryGetObject(answer, "state_fence", out var envelopeFence)
+            && SameStateFence(envelopeFence, liveFence);
+    }
 
     private static bool HasCurrentTransitionShape(JsonElement transition) =>
         HasAllowedAndRequiredProperties(
@@ -2256,8 +2653,10 @@ public static class UserAutomationOutcomeClassifier
         return requiredNames.All(names.Contains);
     }
 
-    private static bool SameSerializedFence(JsonElement left, JsonElement right) =>
-        string.Equals(left.GetRawText(), right.GetRawText(), StringComparison.Ordinal);
+    private static bool SameStateFence(JsonElement left, JsonElement right) =>
+        IsClosedStateFence(left)
+        && IsClosedStateFence(right)
+        && JsonElement.DeepEquals(left, right);
 
     private static UserAutomationOutcome ReadAttemptRefusal(
         string action,
@@ -2284,8 +2683,11 @@ public static class UserAutomationOutcomeClassifier
             || !MatchesOperationIdentity(operation, context, RequestIdMember)
             || !TryGetObject(value, "state_fence", out var stateFence)
             || !IsClosedStateFence(stateFence)
+            || context.ExpectedStateFence is not { } expectedStateFence
             || !TryGetObject(answer, "state_fence", out var envelopeFence)
-            || !SameSerializedFence(stateFence, envelopeFence)
+            || !SameStateFence(stateFence, envelopeFence)
+            || (!SameStateFence(stateFence, expectedStateFence)
+                && !IsStateFenceMismatchRefusalEnvelope(answer, context, stateFence))
             || !TryReadBoundedText(value, "attempt_state", 64, out var attemptState)
             || !string.Equals(attemptState, "store_not_called", StringComparison.Ordinal)
             || !HasExactProperties(recovery, "kind", "reason")
@@ -2306,7 +2708,26 @@ public static class UserAutomationOutcomeClassifier
         }
 
         if (!TryReadBoundedText(refusal, "code", 64, out var code)
-            || !TryExplainRefusal(code, out var explanation))
+            || code.Length == 0)
+        {
+            return UnverifiedOwnerAnswer(action, "the typed refusal code is malformed; the operation outcome remains unknown");
+        }
+
+        if (string.Equals(code, "state_fence_mismatch", StringComparison.Ordinal))
+        {
+            if (!IsStateFenceMismatchRefusalEnvelope(answer, context, stateFence))
+            {
+                return UnverifiedOwnerAnswer(
+                    action,
+                    "the state_fence_mismatch refusal does not prove the exact stale-fence pre-Store contract");
+            }
+
+            return UnverifiedOwnerAnswer(
+                action,
+                "the owner rejected this attempt before Store because the submitted State Fence was stale; preserve this request and reconcile its same operation identity before any new submission");
+        }
+
+        if (!TryExplainRefusal(code, out var explanation))
         {
             return UnverifiedOwnerAnswer(action, "the typed refusal code is unsupported; the operation outcome remains unknown");
         }
@@ -2376,7 +2797,7 @@ public static class UserAutomationOutcomeClassifier
                 StringComparison.Ordinal);
     }
 
-    private static bool IsClosedStateFence(JsonElement stateFence)
+    internal static bool IsClosedStateFence(JsonElement stateFence)
     {
         if (!HasExactProperties(
                 stateFence,
@@ -2523,12 +2944,16 @@ public static class UserAutomationOutcomeClassifier
     /// Summarizes the parsed projection's contract identity and occurrence
     /// details without asserting who normalized the underlying bytes.
     /// </summary>
-    private static string DescribeScheduleProjection(UserAutomationScheduleProjection projection)
+    private static string DescribeScheduleProjection(
+        UserAutomationScheduleProjection projection,
+        bool ownerIssued = false)
     {
         var builder = new StringBuilder(projection.ContractIdentity());
         if (projection.NormalizationReceipt is { } normalizationReceipt)
         {
-            builder.Append("\ncaller-supplied normalization_receipt (identity and provenance unverified): ")
+            builder.Append(ownerIssued
+                    ? "\nowner-issued normalization_receipt (exact receipt envelope retained): "
+                    : "\ncaller-supplied normalization_receipt (identity and provenance unverified): ")
                 .Append("receipt_id ").Append(normalizationReceipt.ReceiptId)
                 .Append("; authority ").Append(normalizationReceipt.NormalizerAuthority)
                 .Append("; source_digest ").Append(normalizationReceipt.SourceDigest)
