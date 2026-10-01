@@ -788,10 +788,13 @@ impl KernelComposition {
             // could admit a contour whose branch had never been observed. The
             // replacement requires an independent Watchdog observation bound to
             // THIS contour and to the exact consumer State Fence and still
-            // inside its own finite validity interval (only `HostStartupEvidence`
-            // can record one, and only after Host revalidated the PID/start pair
-            // against the live OS and the live image bytes against the approved
-            // Watchdog artifact), plus the whole supervised-branch conjunction.
+            // inside its own finite validity interval. Only the
+            // `ReportHostStartupEvidence` command with its original admitted
+            // heartbeat proof can record that observation, after the same
+            // authenticated control session's immediately preceding exact-fence
+            // revocation anchored Kernel-local time. The process-only startup
+            // carrier and its SCM identity fields cannot establish step 11.
+            // The whole supervised-branch conjunction must also succeed.
             //
             // What this gate establishes, precisely: it refuses every case the
             // dropped lease-derived equality refused, and it additionally
