@@ -35,7 +35,7 @@ pub const TASK_CONTROLLER_RESULT_BODY_WIRE_VERSION: u16 = 1;
 pub const TASK_CONTROLLER_COORDINATE_INTENT_WIRE_ID: &str =
     "eliot.protocol.task-controller-coordinate-intent";
 /// Current Coordinate requester-intent wire version.
-pub const TASK_CONTROLLER_COORDINATE_INTENT_WIRE_VERSION: u16 = 1;
+pub const TASK_CONTROLLER_COORDINATE_INTENT_WIRE_VERSION: u16 = 2;
 
 const MAX_TASK_CONTROLLER_TEXT_BYTES: usize = 512;
 const MAX_TASK_CONTROLLER_VALUE_BYTES: usize = MAX_FRAME_BYTES;
@@ -106,6 +106,31 @@ pub enum TaskControllerAction {
     Coordinate,
 }
 
+/// Explicit requester intent about whether this Coordinate is solo or swarm
+/// work. It is never a budget-owner receipt: Governor must confirm the chosen
+/// scope against current Task/plan/work-scope owners before attribution.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CoordinateExecutionScopeV1 {
+    /// The requester asks for one solo work attempt.
+    Solo,
+    /// The requester asks for a named swarm work scope.
+    Swarm {
+        /// Selector for independent current swarm and budget owner reads.
+        swarm_id: String,
+    },
+}
+
+impl CoordinateExecutionScopeV1 {
+    /// Validates the requested scope selector without granting authority.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if let Self::Swarm { swarm_id } = self {
+            bounded_text(swarm_id, "task_controller_coordinate_intent.swarm_id")?;
+        }
+        Ok(())
+    }
+}
+
 /// Requester-authored Coordinate intent attached to an authenticated Task
 /// Controller claim. The exact requester JSON is retained byte-for-byte;
 /// staffing intent, constraints, and owner locators are semantic input only,
@@ -126,6 +151,8 @@ pub struct TaskControllerCoordinateIntentV1 {
     pub canonical_request_sha256: String,
     /// Explicit human staffing intent, decoded by the daemon's native owner.
     pub human_staffing_intent: Value,
+    /// Explicit solo/swarm scope request, not owner-side attribution.
+    pub requested_execution_scope: CoordinateExecutionScopeV1,
     /// Requested constraints; these are intent, not current owner evidence.
     pub requested_constraints: Value,
     /// Bounded owner locators that select rows for independent reads only.
@@ -179,6 +206,7 @@ impl TaskControllerCoordinateIntentV1 {
             &self.human_staffing_intent,
             "task_controller_coordinate_intent.human_staffing_intent",
         )?;
+        self.requested_execution_scope.validate()?;
         structured_object(
             &self.requested_constraints,
             "task_controller_coordinate_intent.requested_constraints",
@@ -570,6 +598,7 @@ mod coordinate_intent_tests {
             canonical_request_json: String::from_utf8(canonical.clone()).expect("UTF-8"),
             canonical_request_sha256: eliot_contracts::sha256_hex(&canonical),
             human_staffing_intent: serde_json::json!({"mode":"solo"}),
+            requested_execution_scope: CoordinateExecutionScopeV1::Solo,
             requested_constraints: serde_json::json!({"max_workers":1}),
             owner_locators: vec![serde_json::json!({"task":"task:1"})],
         }

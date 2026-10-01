@@ -22910,6 +22910,192 @@ impl RedbRecoveryStore {
         Ok(Some(durable))
     }
 
+    /// Atomically retains the original reservation/admission identity on the
+    /// same claim row after the typed service owner has admitted it. This is
+    /// the durable join used by subsequent material reads to re-check the
+    /// exact active admission; it creates no reservation state or second
+    /// registry.
+    pub fn bind_native_worker_claim_admission_reservation(
+        &self,
+        claim_id: &crate::OperationIdentity,
+        reservation_id: &crate::OperationIdentity,
+        work_item_id: &crate::OperationIdentity,
+        semantic_admission_revision: &eliot_store_api::WorkAdmissionSemanticRevision,
+        semantic_admission_predecessor_revision: u64,
+    ) -> Result<Option<crate::NativeWorkerClaimRecord>, OrsError> {
+        semantic_admission_revision
+            .validate_owner_canonical(semantic_admission_predecessor_revision)
+            .map_err(|_| OrsError::ReconciliationMismatch)?;
+        let mut candidate: crate::NativeWorkerClaimRecord = {
+            let read = self.database.begin_read().map_err(storage)?;
+            let table = read.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?;
+            let Some(encoded) = table.get(claim_id.as_str()).map_err(storage)? else {
+                return Ok(None);
+            };
+            decode(encoded.value())?
+        };
+        candidate.admission_reservation_id = Some(reservation_id.clone());
+        candidate.admission_work_item_id = Some(work_item_id.clone());
+        candidate.semantic_admission_revision = Some(semantic_admission_revision.clone());
+        candidate.semantic_admission_predecessor_revision =
+            Some(semantic_admission_predecessor_revision);
+        candidate.validate()?;
+        if candidate.claim_id != *claim_id
+            || candidate.executable_binding_record_json.is_none()
+            || candidate.executable_binding_digest.is_empty()
+            || candidate.state != crate::NativeWorkerClaimState::Admitted
+        {
+            return Err(OrsError::NativeWorkerClaimIdentityConflict {
+                claim_id: claim_id.as_str().to_owned(),
+            });
+        }
+
+        let write = self.database.begin_write().map_err(storage)?;
+        let durable = {
+            let mut table = write.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?;
+            let Some(encoded) = table.get(claim_id.as_str()).map_err(storage)? else {
+                return Ok(None);
+            };
+            let mut current: crate::NativeWorkerClaimRecord = decode(encoded.value())?;
+            current.validate()?;
+            if current.claim_id != *claim_id || !current.same_binding(&candidate) {
+                return Err(OrsError::NativeWorkerClaimIdentityConflict {
+                    claim_id: claim_id.as_str().to_owned(),
+                });
+            }
+            match (
+                &current.admission_reservation_id,
+                &current.admission_work_item_id,
+                &current.semantic_admission_revision,
+                current.semantic_admission_predecessor_revision,
+            ) {
+                (Some(stored_reservation), Some(stored_work), Some(stored_revision), Some(stored_predecessor))
+                    if stored_reservation == reservation_id
+                        && stored_work == work_item_id
+                        && stored_revision == semantic_admission_revision
+                        && stored_predecessor == semantic_admission_predecessor_revision =>
+                {
+                    current
+                }
+                (None, None, None, None) if current.state == crate::NativeWorkerClaimState::Admitted => {
+                    current.admission_reservation_id = Some(reservation_id.clone());
+                    current.admission_work_item_id = Some(work_item_id.clone());
+                    current.semantic_admission_revision =
+                        Some(semantic_admission_revision.clone());
+                    current.semantic_admission_predecessor_revision =
+                        Some(semantic_admission_predecessor_revision);
+                    current.validate()?;
+                    let payload = encode(&current)?;
+                    table
+                        .insert(claim_id.as_str(), payload.as_str())
+                        .map_err(storage)?;
+                    current
+                }
+                _ => {
+                    return Err(OrsError::NativeWorkerClaimIdentityConflict {
+                        claim_id: claim_id.as_str().to_owned(),
+                    });
+                }
+            }
+        };
+        write.commit().map_err(storage)?;
+        Ok(Some(durable))
+    }
+
+    /// Atomically retains the exact provider material and distinct provider
+    /// process readbacks on the existing claim row. Both values are immutable
+    /// owner records: an exact replay adopts them, a partial or changed pair
+    /// conflicts, and no second material/claim registry is introduced.
+    pub fn bind_native_worker_claim_provider_readbacks(
+        &self,
+        claim_id: &crate::OperationIdentity,
+        material_readback_json: &str,
+        provider_process_readback_json: &str,
+    ) -> Result<Option<crate::NativeWorkerClaimRecord>, OrsError> {
+        let mut candidate: crate::NativeWorkerClaimRecord = {
+            let read = self.database.begin_read().map_err(storage)?;
+            let table = read.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?;
+            let Some(encoded) = table.get(claim_id.as_str()).map_err(storage)? else {
+                return Ok(None);
+            };
+            decode(encoded.value())?
+        };
+        candidate.retained_provider_material_readback_json =
+            Some(material_readback_json.to_owned());
+        candidate.retained_provider_process_readback_json =
+            Some(provider_process_readback_json.to_owned());
+        candidate.validate()?;
+        if candidate.claim_id != *claim_id
+            || candidate.executable_binding_record_json.is_none()
+            || candidate.executable_binding_digest.is_empty()
+            || !matches!(
+                candidate.state,
+                crate::NativeWorkerClaimState::Admitted
+                    | crate::NativeWorkerClaimState::Ready
+                    | crate::NativeWorkerClaimState::Active
+            )
+        {
+            return Err(OrsError::NativeWorkerClaimIdentityConflict {
+                claim_id: claim_id.as_str().to_owned(),
+            });
+        }
+
+        let write = self.database.begin_write().map_err(storage)?;
+        let durable = {
+            let mut table = write.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?;
+            let Some(encoded) = table.get(claim_id.as_str()).map_err(storage)? else {
+                return Ok(None);
+            };
+            let mut current: crate::NativeWorkerClaimRecord = decode(encoded.value())?;
+            current.validate()?;
+            if current.claim_id != *claim_id || !current.same_binding(&candidate) {
+                return Err(OrsError::NativeWorkerClaimIdentityConflict {
+                    claim_id: claim_id.as_str().to_owned(),
+                });
+            }
+            match (
+                current.retained_provider_material_readback_json.as_deref(),
+                current.retained_provider_process_readback_json.as_deref(),
+            ) {
+                (Some(material), Some(process))
+                    if material == material_readback_json
+                        && process == provider_process_readback_json =>
+                {
+                    current
+                }
+                (None, None) => {
+                    if !matches!(
+                        current.state,
+                        crate::NativeWorkerClaimState::Admitted
+                            | crate::NativeWorkerClaimState::Ready
+                            | crate::NativeWorkerClaimState::Active
+                    ) {
+                        return Err(OrsError::NativeWorkerClaimIdentityConflict {
+                            claim_id: claim_id.as_str().to_owned(),
+                        });
+                    }
+                    current.retained_provider_material_readback_json =
+                        Some(material_readback_json.to_owned());
+                    current.retained_provider_process_readback_json =
+                        Some(provider_process_readback_json.to_owned());
+                    current.validate()?;
+                    let payload = encode(&current)?;
+                    table
+                        .insert(claim_id.as_str(), payload.as_str())
+                        .map_err(storage)?;
+                    current
+                }
+                _ => {
+                    return Err(OrsError::NativeWorkerClaimIdentityConflict {
+                        claim_id: claim_id.as_str().to_owned(),
+                    });
+                }
+            }
+        };
+        write.commit().map_err(storage)?;
+        Ok(Some(durable))
+    }
+
     /// Loads one native-worker claim by exact claim identity.
     pub fn load_native_worker_claim(
         &self,

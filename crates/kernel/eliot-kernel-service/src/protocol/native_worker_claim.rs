@@ -391,7 +391,10 @@ impl NativeWorkerExecutableBinding {
 pub struct NativeWorkerExecutableBindingPublication {
     pub claim_id: String,
     pub registration_id: String,
+    pub parent_job_id: String,
     pub task_id: String,
+    pub decision_id: String,
+    pub attempt_id: String,
     pub work_unit_id: String,
     pub work_scope_id: String,
     pub attempt: u32,
@@ -451,7 +454,7 @@ impl NativeWorkerExecutableBindingPublication {
     /// Governor-owned wire identity for the original full binding record.
     pub const WIRE_ID: &'static str = "eliot.governor.native-worker-executable-binding";
     /// Current Governor-owned binding record version.
-    pub const WIRE_VERSION: u16 = 2;
+    pub const WIRE_VERSION: u16 = 3;
 
     /// Validates the complete record and its original Governor digest.
     pub fn validate_original_binding(&self) -> Result<(), KernelServiceError> {
@@ -464,7 +467,10 @@ impl NativeWorkerExecutableBindingPublication {
         for (value, field) in [
             (&self.claim_id, "claim_id"),
             (&self.registration_id, "registration_id"),
+            (&self.parent_job_id, "parent_job_id"),
             (&self.task_id, "task_id"),
+            (&self.decision_id, "decision_id"),
+            (&self.attempt_id, "attempt_id"),
             (&self.work_unit_id, "work_unit_id"),
             (&self.work_scope_id, "work_scope_id"),
             (&self.lease_id, "lease_id"),

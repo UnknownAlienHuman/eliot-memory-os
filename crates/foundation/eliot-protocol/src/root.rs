@@ -101,11 +101,13 @@ pub use task_controller::{
     TASK_CONTROLLER_INVOCATION_WIRE_ID, TASK_CONTROLLER_INVOCATION_WIRE_VERSION,
     TASK_CONTROLLER_RESULT_BODY_WIRE_ID, TASK_CONTROLLER_RESULT_BODY_WIRE_VERSION,
     TaskControllerAction, TaskControllerAttempt, TaskControllerCampaignOwnerMaterials,
-    TaskControllerCoordinateIntentV1, TaskControllerInvocation, TaskControllerResultBody,
+    CoordinateExecutionScopeV1, TaskControllerCoordinateIntentV1, TaskControllerInvocation,
+    TaskControllerResultBody,
 };
 
 mod native_worker_material;
 pub use native_worker_material::{
+    NATIVE_WORKER_RETAINED_PROVIDER_MATERIAL_PUBLISH_OPERATION,
     NATIVE_WORKER_PROVIDER_PROCESS_READ_OPERATION,
     NATIVE_WORKER_RETAINED_PROVIDER_MATERIAL_READ_OPERATION,
     NATIVE_WORKER_RETAINED_PROVIDER_MATERIAL_RESOLVE_OPERATION,
@@ -116,6 +118,8 @@ pub use native_worker_material::{
     NativeWorkerProviderProcessReadRequestV1,
     NativeWorkerProviderProcessReadResponseV1,
     NativeWorkerProviderProcessReadbackV1,
+    NativeWorkerRetainedProviderMaterialPublishRequestV1,
+    NativeWorkerRetainedProviderMaterialPublishResponseV1,
     NativeWorkerRetainedProviderMaterialReadRequestV1,
     NativeWorkerRetainedProviderMaterialReadbackV1,
     NativeWorkerRetainedProviderMaterialReadResponseV1,

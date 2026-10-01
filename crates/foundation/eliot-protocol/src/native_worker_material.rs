@@ -27,6 +27,10 @@ pub const NATIVE_WORKER_RETAINED_PROVIDER_MATERIAL_RESOLVE_OPERATION: &str =
 /// Authenticated Kernel operation that reads the original canonical material.
 pub const NATIVE_WORKER_RETAINED_PROVIDER_MATERIAL_READ_OPERATION: &str =
     "native_worker.retained_material.read";
+/// Authenticated Kernel operation that immutably publishes provider material
+/// and its separately sealed process owner readback onto the same ORS claim.
+pub const NATIVE_WORKER_RETAINED_PROVIDER_MATERIAL_PUBLISH_OPERATION: &str =
+    "native_worker.retained_material.publish";
 /// Authenticated Kernel operation that reads the separately sealed provider
 /// process admission and grant.
 pub const NATIVE_WORKER_PROVIDER_PROCESS_READ_OPERATION: &str =
@@ -351,6 +355,77 @@ pub struct NativeWorkerProviderProcessReadRequestV1 {
     pub provider_process: NativeWorkerProviderProcessIdentityV1,
 }
 
+/// Daemon-to-Kernel owner publication. The daemon obtains Governor
+/// currentness for the complete binding first; Kernel independently validates
+/// the active claim, process admission, and original owner binding before a
+/// single ORS-row compare-and-set.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeWorkerRetainedProviderMaterialPublishRequestV1 {
+    /// Exact native-worker claim tuple and fence.
+    pub binding: NativeWorkerRetainedProviderMaterialResolveRequestV1,
+    /// Complete immutable original material owner readback.
+    pub material_readback: NativeWorkerRetainedProviderMaterialReadbackV1,
+    /// Separate Kernel-issued provider-process admission and grant.
+    pub provider_process_readback: NativeWorkerProviderProcessReadbackV1,
+}
+
+impl NativeWorkerRetainedProviderMaterialPublishRequestV1 {
+    /// Validates the owner readback joins before Kernel checks its own live
+    /// claim, fence, executable, process, and owner state.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        self.binding.validate()?;
+        self.material_readback.validate_for(
+            &self.material_readback.reference,
+            &self.material_readback.provider_process,
+        )?;
+        self.provider_process_readback
+            .validate_for(&self.material_readback.provider_process)?;
+        if self.material_readback.reference.claim_id != self.binding.claim_id
+            || self.material_readback.reference.dispatch_operation_id
+                != self.binding.dispatch_operation_id
+            || self.material_readback.reference.attempt_id != self.binding.attempt_id
+            || self.material_readback.reference.binding_digest != self.binding.binding_digest
+            || self.material_readback.provider_process.provider_operation_id
+                == self.binding.dispatch_operation_id
+            || self.provider_process_readback.grant.authority_epoch
+                != self.binding.authority_epoch
+            || self.provider_process_readback.grant.fence_generation
+                != self.binding.worker_generation
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "native_worker_material_publish.binding",
+                reason: "owner readbacks must match the original claim and distinct provider process",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Result of a provider-material owner publication. A `Bound` response is an
+/// immutable idempotent row result; pending/unknown carry no launch authority.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum NativeWorkerRetainedProviderMaterialPublishResponseV1 {
+    /// Exact original readbacks are retained on the matching claim row.
+    Bound {
+        /// Original claim-scoped material reference.
+        reference: NativeWorkerRetainedProviderMaterialRefV1,
+        /// Distinct original provider-process identity.
+        provider_process: NativeWorkerProviderProcessIdentityV1,
+    },
+    /// The same claim has not reached an admissible publication stage.
+    Pending {
+        /// Bounded diagnostic reason.
+        reason: String,
+    },
+    /// Currentness or owner identity could not be established.
+    Unknown {
+        /// Bounded diagnostic reason.
+        reason: String,
+    },
+}
+
 impl NativeWorkerProviderProcessReadRequestV1 {
     /// Requires both retained owner rows to join to the exact active dispatch
     /// claim before Kernel reads either one.
@@ -496,6 +571,7 @@ impl NativeWorkerProviderProcessReadbackV1 {
             .map_err(|error| ProtocolError::Json(error.to_string()))?;
         if operation_id != Some(expected.provider_operation_id.as_str())
             || executable_digest != Some(expected.provider_executable_digest.as_str())
+            || expected.launch_nonce != self.grant.fence_nonce
             || process_generation != Some(self.grant.fence_generation)
             || fence_generation != Some(self.grant.fence_generation)
             || fence_nonce != Some(self.grant.fence_nonce.as_str())
@@ -568,6 +644,9 @@ pub struct NativeWorkerProviderProcessIdentityV1 {
     pub provider_process_invocation_digest: String,
     /// Exact executable digest in that provider process intent.
     pub provider_executable_digest: String,
+    /// Original one-shot child launch nonce retained by the Kernel owner and
+    /// passed to the existing dispatch derivation on both sides.
+    pub launch_nonce: String,
     /// Opaque reference to the in-process retained sealed request owner row.
     /// It is never interpreted as a filesystem path or request encoding.
     pub process_ref: String,
@@ -580,6 +659,10 @@ impl NativeWorkerProviderProcessIdentityV1 {
             (
                 &self.provider_operation_id,
                 "native_worker_provider_process.provider_operation_id",
+            ),
+            (
+                &self.launch_nonce,
+                "native_worker_provider_process.launch_nonce",
             ),
             (
                 &self.process_ref,
@@ -599,6 +682,12 @@ impl NativeWorkerProviderProcessIdentityV1 {
             ),
         ] {
             validate_sha256(value, field)?;
+        }
+        if !(16..=256).contains(&self.launch_nonce.len()) {
+            return Err(ProtocolError::InvalidField {
+                field: "native_worker_provider_process.launch_nonce",
+                reason: "must be 16..=256 characters",
+            });
         }
         Ok(())
     }
@@ -693,26 +782,80 @@ impl NativeWorkerRetainedProviderMaterialReadbackV1 {
                 reason: "readback bytes do not match the original owner digest",
             });
         }
-        let provider_operation_id = value
+        let retained_process_matches = value
             .get("provider_operation_id")
-            .and_then(serde_json::Value::as_str);
-        let provider_process_invocation_digest = value
-            .get("provider_process_invocation_digest")
-            .and_then(serde_json::Value::as_str);
-        let provider_executable_digest = value
-            .get("provider_executable_digest")
-            .and_then(serde_json::Value::as_str);
-        let process_ref = value.get("process_ref").and_then(serde_json::Value::as_str);
-        if provider_operation_id != Some(expected_process.provider_operation_id.as_str())
-            || provider_process_invocation_digest
-                != Some(expected_process.provider_process_invocation_digest.as_str())
-            || provider_executable_digest
-                != Some(expected_process.provider_executable_digest.as_str())
-            || process_ref != Some(expected_process.process_ref.as_str())
-        {
+            .and_then(serde_json::Value::as_str)
+            == Some(expected_process.provider_operation_id.as_str())
+            && value
+                .get("provider_process_invocation_digest")
+                .and_then(serde_json::Value::as_str)
+                == Some(expected_process.provider_process_invocation_digest.as_str())
+            && value
+                .get("provider_executable_digest")
+                .and_then(serde_json::Value::as_str)
+                == Some(expected_process.provider_executable_digest.as_str())
+            && value
+                .get("launch_nonce")
+                .and_then(serde_json::Value::as_str)
+                == Some(expected_process.launch_nonce.as_str())
+            && value
+                .get("process_ref")
+                .and_then(serde_json::Value::as_str)
+                == Some(expected_process.process_ref.as_str());
+        if !retained_process_matches {
             return Err(ProtocolError::InvalidField {
                 field: "native_worker_material.provider_process",
                 reason: "canonical material does not match the owner-retained process identity",
+            });
+        }
+        let prompt: NativeWorkerPromptRetentionReceiptV1 = value
+            .get("prompt_retention_receipt")
+            .cloned()
+            .and_then(|receipt| serde_json::from_value(receipt).ok())
+            .ok_or(ProtocolError::InvalidField {
+                field: "native_worker_material.prompt_retention_receipt",
+                reason: "canonical material requires the original Governor receipt",
+            })?;
+        prompt.validate_shape()?;
+        let source_host_request_id = value
+            .get("source_host_request_id")
+            .and_then(serde_json::Value::as_str);
+        let source_request_ref = value
+            .get("source_request_ref")
+            .and_then(serde_json::Value::as_str);
+        let source_request_sha256 = value
+            .get("source_request_sha256")
+            .and_then(serde_json::Value::as_str);
+        let request_json = value
+            .get("request_json")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(ProtocolError::InvalidField {
+                field: "native_worker_material.request_json",
+                reason: "canonical provider request bytes are required",
+            })?;
+        let request_bytes = request_json.as_bytes();
+        let request_value: serde_json::Value = serde_json::from_slice(request_bytes).map_err(|_| {
+            ProtocolError::InvalidField {
+                field: "native_worker_material.request_json",
+                reason: "provider request must be canonical JSON",
+            }
+        })?;
+        let canonical_request = canonical_json_bytes(&request_value)
+            .map_err(|error| ProtocolError::Json(error.to_string()))?;
+        let request_sha256 = value
+            .get("request_sha256")
+            .and_then(serde_json::Value::as_str);
+        if canonical_request.as_slice() != request_bytes
+            || request_sha256 != Some(sha256_hex(request_bytes).as_str())
+            || prompt.derived_prompt_sha256 != sha256_hex(request_bytes)
+            || source_host_request_id != Some(prompt.source_host_request_id.as_str())
+            || source_request_ref != Some(prompt.source_request_ref.as_str())
+            || source_request_sha256 != Some(prompt.source_request_sha256.as_str())
+            || prompt.attempt_id != expected.attempt_id
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "native_worker_material.prompt_retention_receipt",
+                reason: "receipt must bind the exact original source and compact provider request bytes",
             });
         }
         Ok(())
@@ -782,6 +925,7 @@ mod tests {
             provider_operation_id: "provider-child:1".to_owned(),
             provider_process_invocation_digest: "b".repeat(64),
             provider_executable_digest: "c".repeat(64),
+            launch_nonce: "provider-launch-nonce-0001".to_owned(),
             process_ref: "provider-process-request:1".to_owned(),
         }
     }
@@ -849,11 +993,22 @@ mod tests {
 
     #[test]
     fn retained_provider_material_readback_accepts_exact_original_bytes() {
+        let provider_process = provider_process();
+        let request_json = r#"{"messages":[]}"#;
+        let mut prompt = prompt_retention_receipt();
+        prompt.derived_prompt_sha256 = sha256_hex(request_json.as_bytes());
         let value = serde_json::json!({
-            "provider_operation_id": "provider-child:1",
-            "provider_process_invocation_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            "provider_executable_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-            "process_ref": "provider-process-request:1",
+            "provider_operation_id": provider_process.provider_operation_id,
+            "provider_process_invocation_digest": provider_process.provider_process_invocation_digest,
+            "provider_executable_digest": provider_process.provider_executable_digest,
+            "launch_nonce": provider_process.launch_nonce,
+            "process_ref": provider_process.process_ref,
+            "prompt_retention_receipt": prompt.clone(),
+            "source_host_request_id": prompt.source_host_request_id,
+            "source_request_ref": prompt.source_request_ref,
+            "source_request_sha256": prompt.source_request_sha256,
+            "request_json": request_json,
+            "request_sha256": sha256_hex(request_json.as_bytes()),
             "schema": "claude-attempt-material.v1",
         });
         let bytes = canonical_json_bytes(&value).expect("canonical JSON");
@@ -861,23 +1016,23 @@ mod tests {
         let reference = reference(&bytes);
         let readback = NativeWorkerRetainedProviderMaterialReadbackV1 {
             reference: reference.clone(),
-            provider_process: provider_process(),
+            provider_process: provider_process.clone(),
             canonical_material_json: text,
         };
         readback
-            .validate_for(&reference, &provider_process())
+            .validate_for(&reference, &provider_process)
             .expect("exact owner readback");
     }
 
     #[test]
     fn retained_provider_material_readback_refuses_changed_bytes() {
-        let original = br#"{"provider_executable_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","provider_operation_id":"provider-child:1","provider_process_invocation_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","process_ref":"provider-process-request:1","schema":"claude-attempt-material.v1"}"#;
+        let original = br#"{"launch_nonce":"provider-launch-nonce-0001","process_ref":"provider-process-request:1","provider_executable_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","provider_operation_id":"provider-child:1","provider_process_invocation_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","schema":"claude-attempt-material.v1"}"#;
         let reference = reference(original);
         let readback = NativeWorkerRetainedProviderMaterialReadbackV1 {
             reference: reference.clone(),
             provider_process: provider_process(),
             canonical_material_json:
-                r#"{"provider_executable_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","provider_operation_id":"provider-child:2","provider_process_invocation_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","process_ref":"provider-process-request:1","schema":"claude-attempt-material.v1"}"#
+                r#"{"launch_nonce":"provider-launch-nonce-0001","process_ref":"provider-process-request:1","provider_executable_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","provider_operation_id":"provider-child:2","provider_process_invocation_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","schema":"claude-attempt-material.v1"}"#
                     .to_owned(),
         };
         assert!(readback

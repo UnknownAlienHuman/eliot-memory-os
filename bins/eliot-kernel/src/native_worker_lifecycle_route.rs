@@ -69,10 +69,30 @@ use eliot_ors::{
     admission_reservation_identity, epoch_lineage_for, stage_admission_reservation_inactive,
     stage_operation_identity,
 };
-use eliot_process::OperationId;
-use eliot_protocol::{Frame, FrameKind, MessageType, ProtocolPayload};
-use eliot_security_contracts::PrivacyClass;
+use eliot_process::{
+    ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, KernelDispatchKey, OperationId,
+    PermitIssuance, ProcessExecutionAdmissionRequest, ProcessRequest,
+};
+use eliot_protocol::{
+    Frame, FrameKind, MessageType, NativeWorkerProviderProcessIdentityV1,
+    NativeWorkerProviderProcessReadRequestV1, NativeWorkerProviderProcessReadResponseV1,
+    NativeWorkerProviderProcessReadbackV1, NativeWorkerRetainedProviderMaterialPublishRequestV1,
+    NativeWorkerRetainedProviderMaterialPublishResponseV1,
+    NativeWorkerRetainedProviderMaterialReadRequestV1,
+    NativeWorkerRetainedProviderMaterialReadResponseV1,
+    NativeWorkerRetainedProviderMaterialReadbackV1,
+    NativeWorkerRetainedProviderMaterialResolveRequestV1,
+    NativeWorkerRetainedProviderMaterialResolveResponseV1,
+    NATIVE_WORKER_PROVIDER_PROCESS_READ_OPERATION,
+    NATIVE_WORKER_RETAINED_PROVIDER_MATERIAL_PUBLISH_OPERATION,
+    NATIVE_WORKER_RETAINED_PROVIDER_MATERIAL_READ_OPERATION,
+    NATIVE_WORKER_RETAINED_PROVIDER_MATERIAL_RESOLVE_OPERATION,
+    MAX_NATIVE_WORKER_PROVIDER_PROCESS_ADMISSION_BYTES,
+    MAX_NATIVE_WORKER_RETAINED_PROVIDER_MATERIAL_BYTES,
+    NativeWorkerPromptRetentionReceiptV1,
+};
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 // ---------------------------------------------------------------------------
 // Wire operations and Wave-A identity mirrors.
@@ -99,8 +119,8 @@ pub(crate) const NATIVE_WORKER_EXECUTABLE_BINDING_PUBLISH_OPERATION: &str =
 pub(crate) const NATIVE_WORKER_EXECUTABLE_BINDING_READ_OPERATION: &str =
     "native_worker.executable_binding.read";
 
-/// Returns true for the eight native-worker operations (seven lifecycle
-/// operations owned here plus reconciliation owned by the sibling
+/// Returns true for all native-worker lifecycle, owner-publication, and
+/// owner-read operations (plus reconciliation owned by the sibling
 /// `native_worker_reconcile_route` module).
 ///
 /// Paired with the worker-side operation constants in
@@ -118,6 +138,10 @@ pub(crate) fn is_native_worker_operation(operation: &str) -> bool {
             | NATIVE_WORKER_CANCEL_OBSERVE_OPERATION
             | NATIVE_WORKER_EXECUTABLE_BINDING_PUBLISH_OPERATION
             | NATIVE_WORKER_EXECUTABLE_BINDING_READ_OPERATION
+            | NATIVE_WORKER_RETAINED_PROVIDER_MATERIAL_PUBLISH_OPERATION
+            | NATIVE_WORKER_RETAINED_PROVIDER_MATERIAL_RESOLVE_OPERATION
+            | NATIVE_WORKER_RETAINED_PROVIDER_MATERIAL_READ_OPERATION
+            | NATIVE_WORKER_PROVIDER_PROCESS_READ_OPERATION
             | NATIVE_WORKER_RECONCILE_OPERATION
     )
 }
@@ -554,6 +578,11 @@ fn native_worker_presented_currentness(
                 .ok_or(NativeWorkerRouteError::Shape { field: "claim" })?;
             (claim, Some(require_op_id(claim, "claim_id")?), None)
         }
+        NATIVE_WORKER_RETAINED_PROVIDER_MATERIAL_RESOLVE_OPERATION => (
+            payload,
+            Some(require_op_id(payload, "claim_id")?),
+            None,
+        ),
         _ => {
             let binding = payload
                 .get("binding")
@@ -1019,6 +1048,10 @@ fn native_worker_operation_requires_watchdog(operation: &str) -> bool {
             | NATIVE_WORKER_CLAIM_OPERATION
             | NATIVE_WORKER_READY_OPERATION
             | NATIVE_WORKER_CHECKPOINT_OPERATION
+            | NATIVE_WORKER_RETAINED_PROVIDER_MATERIAL_PUBLISH_OPERATION
+            | NATIVE_WORKER_RETAINED_PROVIDER_MATERIAL_RESOLVE_OPERATION
+            | NATIVE_WORKER_RETAINED_PROVIDER_MATERIAL_READ_OPERATION
+            | NATIVE_WORKER_PROVIDER_PROCESS_READ_OPERATION
     )
 }
 
@@ -1134,6 +1167,27 @@ impl KernelComposition {
             frame.validate().map_err(|_| TransportError::SessionFenced)?;
             return Ok(KernelFrameAction::Reply(frame));
         }
+        if context.operation == NATIVE_WORKER_RETAINED_PROVIDER_MATERIAL_PUBLISH_OPERATION {
+            self.require_material_owner_session(
+                session,
+                &context.identity_value,
+                &context.presented_fence,
+                &context.payload,
+            )
+            .map_err(NativeWorkerRouteError::into_transport)?;
+            let receipt = self
+                .handle_retained_provider_material_publish(
+                    &context.identity_value,
+                    &context.presented_fence,
+                    &context.payload,
+                )
+                .map_err(NativeWorkerRouteError::into_transport)?;
+            let mut frame =
+                status_frame(session, FrameKind::Response, MessageType::Result, receipt)?;
+            frame.request_id = Some(context.request_id);
+            frame.validate().map_err(|_| TransportError::SessionFenced)?;
+            return Ok(KernelFrameAction::Reply(frame));
+        }
         let current_proof = self
             .native_worker_cell_current_proof(
                 session,
@@ -1143,6 +1197,21 @@ impl KernelComposition {
                 &context.presented_fence,
             )
             .map_err(NativeWorkerRouteError::into_transport)?;
+        if matches!(
+            context.operation.as_str(),
+            NATIVE_WORKER_RETAINED_PROVIDER_MATERIAL_RESOLVE_OPERATION
+                | NATIVE_WORKER_RETAINED_PROVIDER_MATERIAL_READ_OPERATION
+                | NATIVE_WORKER_PROVIDER_PROCESS_READ_OPERATION
+        ) {
+            let receipt = self
+                .dispatch_retained_provider_material_worker_read(&context)
+                .map_err(NativeWorkerRouteError::into_transport)?;
+            let mut frame =
+                status_frame(session, FrameKind::Response, MessageType::Result, receipt)?;
+            frame.request_id = Some(context.request_id);
+            frame.validate().map_err(|_| TransportError::SessionFenced)?;
+            return Ok(KernelFrameAction::Reply(frame));
+        }
         if context.operation == NATIVE_WORKER_RECONCILE_OPERATION {
             let action = self.dispatch_native_worker_reconcile(session, frame)?;
             return Self::attach_native_worker_proof_to_action(action, current_proof);
@@ -1506,10 +1575,13 @@ impl KernelComposition {
     ) -> Result<(), NativeWorkerRouteError> {
         if binding.claim_id != record.claim_id.as_str()
             || binding.registration_id != record.registration_id.as_str()
+            || binding.parent_job_id != record.parent_job_id.as_str()
             || binding.task_id != record.task_id.as_str()
+            || binding.decision_id != record.decision_id.as_str()
             || binding.work_scope_id != record.work_scope_id.as_str()
             || binding.operation_id != record.operation_id.as_str()
             || record.attempt_id.as_str() != attempt_id
+            || binding.attempt_id != record.attempt_id.as_str()
             || binding.worker_generation != record.worker_generation
             || binding.authority_epoch.sequence.get() != record.authority_epoch
             || binding.state_fence.resource_generation.value() != record.worker_generation
@@ -2980,6 +3052,36 @@ impl KernelComposition {
             .map_err(|_| NativeWorkerRouteError::Fence {
                 field: "service_state",
             })?;
+        if matches!(decision, NativeWorkerClaimResponse::Admitted(_)) {
+            let work_item_id = OperationIdentity::new(request.claim_id.as_str())
+                .map_err(|_| NativeWorkerRouteError::Shape { field: "claim_id" })?;
+            let semantic_revision = request
+                .semantic_admission_revision
+                .as_ref()
+                .ok_or(NativeWorkerRouteError::Shape {
+                    field: "semantic_admission_revision",
+                })?;
+            let predecessor = request
+                .semantic_admission_predecessor_revision
+                .ok_or(NativeWorkerRouteError::Shape {
+                    field: "semantic_admission_predecessor_revision",
+                })?;
+            self.generation_gateway
+                .ors
+                .bind_native_worker_claim_admission_reservation(
+                    &claim_identity,
+                    &reservation_id,
+                    &work_item_id,
+                    semantic_revision,
+                    predecessor,
+                )
+                .map_err(|_| NativeWorkerRouteError::Fence {
+                    field: "ors_bind_admission_reservation",
+                })?
+                .ok_or_else(|| NativeWorkerRouteError::Unknown {
+                    identity: claim_id.clone(),
+                })?;
+        }
         // T9-02 executable enforcement (Implements #22): an `Admitted`
         // decision carries no launch authority until the presented v2 join
         // agrees with the current owner record built from the live
@@ -3973,7 +4075,10 @@ mod single_shape_proof {
         NativeWorkerExecutableBindingPublication {
             claim_id: request.claim_id.clone(),
             registration_id: request.registration_id.clone(),
+            parent_job_id: request.parent_job_id.clone(),
             task_id: request.task_id.clone(),
+            decision_id: request.decision_id.clone(),
+            attempt_id: request.attempt_id.clone(),
             work_unit_id: "work-unit-r1-gate".to_owned(),
             work_scope_id: request.work_scope_id.clone(),
             attempt: 1,
@@ -4066,6 +4171,12 @@ mod single_shape_proof {
             request_digest: request.request_digest.clone(),
             executable_binding_digest: owner_binding.binding_digest.clone(),
             executable_binding_record_json: Some(owner_json),
+            admission_reservation_id: None,
+            admission_work_item_id: None,
+            semantic_admission_revision: None,
+            semantic_admission_predecessor_revision: None,
+            retained_provider_material_readback_json: None,
+            retained_provider_process_readback_json: None,
             execution_unit_schema_version: request.execution_unit_schema_version,
             predecessor_revision: OpaqueLabel::new(request.predecessor_revision.as_str())
                 .expect("predecessor"),

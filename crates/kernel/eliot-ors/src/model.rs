@@ -19,6 +19,7 @@ use eliot_runtime_contracts::{
     SupervisionObservationScope, SupervisionOrsMirrorBinding, VerifiedSupervisionLease,
     VerifiedSupervisionLeaseTerminalTransition,
 };
+use eliot_store_api::WorkAdmissionSemanticRevision;
 use eliot_security_contracts::{
     InfluenceState, InstructionTaint, NativeResourceSelection, PolicyFence, PrivacyClass,
     TransformationLineage,
@@ -44,6 +45,13 @@ pub const MAX_HOST_REQUEST_SEND_ATTEMPTS: usize = 2;
 /// Maximum encoded size of the full Governor-issued executable binding on
 /// the existing native-worker claim row.
 pub const MAX_NATIVE_WORKER_EXECUTABLE_BINDING_RECORD_BYTES: usize = 128 * 1024;
+/// Maximum canonical JSON material readback retained on a native-worker
+/// claim row. This is the provider-specific immutable body, not a second
+/// claim or material registry.
+pub const MAX_NATIVE_WORKER_RETAINED_PROVIDER_MATERIAL_BYTES: usize = 512 * 1024;
+/// Maximum canonical JSON provider-process admission retained on a
+/// native-worker claim row.
+pub const MAX_NATIVE_WORKER_PROVIDER_PROCESS_READBACK_BYTES: usize = 160 * 1024;
 
 /// Maximum active claim lifetime for one authenticated `UserAutomation` send.
 /// This follows the Host Control Endpoint's existing 30-second queue-response
@@ -8883,6 +8891,31 @@ pub struct NativeWorkerClaimRecord {
     /// same claim row before admission or readback. No second registry exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable_binding_record_json: Option<String>,
+    /// Exact reservation/work/semantic revision link produced when Kernel
+    /// stages the admission saga. It lives on this claim row so later
+    /// provider reads can re-check the same active reservation rather than
+    /// trusting a caller-provided reservation ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_reservation_id: Option<OperationIdentity>,
+    /// Exact work item identity paired with `admission_reservation_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_work_item_id: Option<OperationIdentity>,
+    /// Original Governor-issued canonical semantic admission revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_admission_revision: Option<WorkAdmissionSemanticRevision>,
+    /// Original owner-observed predecessor for the canonical owner CAS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_admission_predecessor_revision: Option<u64>,
+    /// Canonical owner readback containing the exact immutable provider
+    /// material reference/body and its distinct provider-process identity.
+    /// Attached to this same claim row only after the original binding exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_provider_material_readback_json: Option<String>,
+    /// Canonical Kernel process-owner readback for the distinct provider
+    /// child operation. It is separate from the native-worker supervisor
+    /// `ProcessRequest` and shares this claim row's immutable material join.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_provider_process_readback_json: Option<String>,
     /// Supported execution-unit schema version.
     pub execution_unit_schema_version: u16,
     /// Predecessor revision this claim continues from; opaque to ORS.
@@ -8942,6 +8975,16 @@ impl NativeWorkerClaimRecord {
             && self.request_digest == other.request_digest
             && self.executable_binding_digest == other.executable_binding_digest
             && self.executable_binding_record_json == other.executable_binding_record_json
+            // Admission-link metadata and provider readbacks are monotonic
+            // owner-side enrichment of the same admitted claim, like the
+            // executable binding above. Exact request replay must not erase
+            // those later immutable owner publications.
+            // The two retained provider readbacks are monotonic owner-side
+            // enrichment of the same claim row, like the executable binding
+            // attached by its dedicated compare-and-set method. They are
+            // intentionally excluded from the request replay projection so
+            // replaying the original claim cannot erase or conflict with
+            // later owner publications.
             && self.execution_unit_schema_version == other.execution_unit_schema_version
             && self.predecessor_revision == other.predecessor_revision
             && self.resource_envelope_digest == other.resource_envelope_digest
@@ -9018,6 +9061,169 @@ impl NativeWorkerClaimRecord {
                 return Err(OrsError::InvalidField {
                     field: "native_worker_claim_executable_binding_record",
                     reason: "owner binding record is not canonical JSON",
+                });
+            }
+        }
+        match (
+            &self.admission_reservation_id,
+            &self.admission_work_item_id,
+            &self.semantic_admission_revision,
+            self.semantic_admission_predecessor_revision,
+        ) {
+            (None, None, None, None) => {}
+            (Some(reservation), Some(work_item), Some(revision), Some(predecessor)) => {
+                validate_text(reservation.as_str(), "native_worker_claim_reservation_id")?;
+                validate_text(work_item.as_str(), "native_worker_claim_work_item_id")?;
+                revision
+                    .validate_owner_canonical(predecessor)
+                    .map_err(|_| OrsError::ReconciliationMismatch)?;
+                if reservation.as_str().trim().is_empty()
+                    || work_item.as_str().trim().is_empty()
+                    || matches!(self.state, NativeWorkerClaimState::Requested)
+                {
+                    return Err(OrsError::InvalidField {
+                        field: "native_worker_claim_admission_reservation",
+                        reason: "the original reservation link requires an admitted claim",
+                    });
+                }
+            }
+            _ => {
+                return Err(OrsError::InvalidField {
+                    field: "native_worker_claim_admission_reservation",
+                    reason: "reservation, work item, semantic revision, and predecessor must be retained together",
+                });
+            }
+        }
+        match (
+            &self.retained_provider_material_readback_json,
+            &self.retained_provider_process_readback_json,
+        ) {
+            (None, None) => {}
+            (Some(material_json), Some(process_json)) => {
+                validate_canonical_native_worker_owner_record(
+                    material_json,
+                    MAX_NATIVE_WORKER_RETAINED_PROVIDER_MATERIAL_BYTES,
+                    "native_worker_claim_retained_provider_material",
+                )?;
+                validate_canonical_native_worker_owner_record(
+                    process_json,
+                    MAX_NATIVE_WORKER_PROVIDER_PROCESS_READBACK_BYTES,
+                    "native_worker_claim_retained_provider_process",
+                )?;
+                let material: Value = serde_json::from_str(material_json).map_err(|_| {
+                    OrsError::InvalidField {
+                        field: "native_worker_claim_retained_provider_material",
+                        reason: "owner material readback must be JSON",
+                    }
+                })?;
+                let reference = material.get("reference").and_then(Value::as_object);
+                let provider_process = material
+                    .get("provider_process")
+                    .and_then(Value::as_object);
+                let process: Value = serde_json::from_str(process_json).map_err(|_| {
+                    OrsError::InvalidField {
+                        field: "native_worker_claim_retained_provider_process",
+                        reason: "owner process readback must be JSON",
+                    }
+                })?;
+                let process_identity = process
+                    .get("provider_process")
+                    .and_then(Value::as_object);
+                let matches = |object: Option<&Map<String, Value>>, field: &str, expected: &str| {
+                    object.and_then(|value| value.get(field)).and_then(Value::as_str)
+                        == Some(expected)
+                };
+                let material_body = material
+                    .get("canonical_material_json")
+                    .and_then(Value::as_str);
+                let material_body_value = material_body
+                    .and_then(|body| serde_json::from_str::<Value>(body).ok());
+                let provider_operation_id = material_body_value
+                    .as_ref()
+                    .and_then(|value| value.get("provider_operation_id"))
+                    .and_then(Value::as_str);
+                let process_operation_id = process_identity
+                    .and_then(|value| value.get("provider_operation_id"))
+                    .and_then(Value::as_str);
+                let material_sha = reference
+                    .and_then(|value| value.get("material_sha256"))
+                    .and_then(Value::as_str);
+                if !matches(reference, "claim_id", self.claim_id.as_str())
+                    || !matches(
+                        reference,
+                        "dispatch_operation_id",
+                        self.operation_id.as_str(),
+                    )
+                    || !matches(reference, "attempt_id", self.attempt_id.as_str())
+                    || !matches(reference, "binding_digest", &self.binding_digest)
+                    || provider_operation_id.is_none()
+                    || process_operation_id != provider_operation_id
+                    || provider_operation_id == Some(self.operation_id.as_str())
+                    || process_identity != provider_process
+                    || material_body_value.as_ref().is_none_or(|body| {
+                        !matches(
+                            body.as_object(),
+                            "provider_process_invocation_digest",
+                            provider_process
+                                .and_then(|value| value.get("provider_process_invocation_digest"))
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                        ) || !matches(
+                            body.as_object(),
+                            "provider_executable_digest",
+                            provider_process
+                                .and_then(|value| value.get("provider_executable_digest"))
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                        ) || !matches(
+                            body.as_object(),
+                            "launch_nonce",
+                            provider_process
+                                .and_then(|value| value.get("launch_nonce"))
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                        ) || !matches(
+                            body.as_object(),
+                            "process_ref",
+                            provider_process
+                                .and_then(|value| value.get("process_ref"))
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                        )
+                    })
+                    || material_body.is_none_or(|body| {
+                        body.len() > MAX_NATIVE_WORKER_RETAINED_PROVIDER_MATERIAL_BYTES
+                            || !serde_json::from_str::<Value>(body).is_ok_and(|parsed| {
+                                parsed.is_object()
+                                    && canonical_json_bytes(&parsed)
+                                        .is_ok_and(|canonical| canonical.as_slice() == body.as_bytes())
+                            })
+                    })
+                    || material_sha.is_none_or(|digest| {
+                        validate_digest(digest, "native_worker_claim_retained_provider_material_digest").is_err()
+                            || material_body.is_none_or(|body| sha256_hex(body.as_bytes()) != digest)
+                    })
+                {
+                    return Err(OrsError::InvalidField {
+                        field: "native_worker_claim_retained_provider_material",
+                        reason: "owner readbacks must join the original claim and exact provider body",
+                    });
+                }
+                if process_identity
+                    .and_then(|value| value.get("provider_operation_id"))
+                    .and_then(Value::as_str)
+                    == Some(self.operation_id.as_str())
+                {
+                    return Err(OrsError::InvalidField {
+                        field: "native_worker_claim_retained_provider_process",
+                        reason: "provider child operation must be distinct from dispatch operation",
+                    });
+                }
+            }
+            _ => {
+                return Err(OrsError::InvalidField {
+                    field: "native_worker_claim_retained_provider_material",
+                    reason: "material and provider process readbacks must be retained together",
                 });
             }
         }
@@ -9125,6 +9331,34 @@ impl NativeWorkerClaimRecord {
         }
         Ok(&self.executable_binding_digest)
     }
+}
+
+fn validate_canonical_native_worker_owner_record(
+    record_json: &str,
+    maximum_bytes: usize,
+    field: &'static str,
+) -> Result<(), OrsError> {
+    if record_json.len() > maximum_bytes {
+        return Err(OrsError::InvalidField {
+            field,
+            reason: "owner readback exceeds its byte bound",
+        });
+    }
+    let value: Value = serde_json::from_str(record_json).map_err(|_| OrsError::InvalidField {
+        field,
+        reason: "owner readback must be JSON",
+    })?;
+    let canonical = canonical_json_bytes(&value).map_err(|_| OrsError::InvalidField {
+        field,
+        reason: "owner readback cannot be canonicalized",
+    })?;
+    if !value.is_object() || canonical.as_slice() != record_json.as_bytes() {
+        return Err(OrsError::InvalidField {
+            field,
+            reason: "owner readback must be a canonical JSON object",
+        });
+    }
+    Ok(())
 }
 
 /// Admission evidence bound when a requested claim becomes admitted.
