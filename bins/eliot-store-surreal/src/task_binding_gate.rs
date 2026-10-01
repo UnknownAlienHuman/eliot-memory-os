@@ -470,13 +470,129 @@ fn validate_retained_selection(
     Ok(())
 }
 
+fn validate_cold_capture(
+    context: &RequestMeta,
+    transition: &PreparedTransition,
+) -> Result<(), TaskBindingRejection> {
+    if context.state_fence != transition.state_fence {
+        return Err(TaskBindingRejection::scope_incompatible(
+            "cold capture fence differs from the admitted request",
+        ));
+    }
+    if transition.transition_class != TransitionClass::CaptureCandidate
+        || transition.requested_effect_ceiling != EffectClass::Candidate
+        || transition.named_operations.iter().any(|operation| {
+            !matches!(
+                operation.operation,
+                NamedMutationOperation::CaptureObservation
+                    | NamedMutationOperation::AppendAuditEvent
+            )
+        })
+    {
+        return Err(TaskBindingRejection::selection_required(
+            "cold unbound capture may carry only CaptureObservation and AppendAuditEvent under the Candidate effect ceiling",
+        ));
+    }
+    for operation in &transition.named_operations {
+        if operation.operation != NamedMutationOperation::CaptureObservation {
+            continue;
+        }
+        if operation
+            .parameters
+            .keys()
+            .any(|key| key.starts_with("task_selection_") || key == "task_id")
+        {
+            return Err(TaskBindingRejection::selection_required(
+                "cold capture cannot discard supplied task binding evidence",
+            ));
+        }
+        // Existing raw captures need no MCP submission. A contextual task may
+        // remain in authenticated RequestMeta only when the original retained
+        // submission proves that the semantic capture has no task selection.
+        if operation
+            .parameters
+            .contains_key("observation_submission_json")
+        {
+            validate_cold_capture_submission(operation, transition)?;
+        } else if context.task_id.is_some() {
+            return Err(TaskBindingRejection::selection_required(
+                "contextual cold capture requires its original unbound observation submission",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_cold_capture_submission(
+    operation: &eliot_store_api::NamedMutationRequest,
+    transition: &PreparedTransition,
+) -> Result<(), TaskBindingRejection> {
+    let encoded = operation_json_text(operation, "observation_submission_json")?;
+    let submission: serde_json::Value = serde_json::from_str(encoded).map_err(|_| {
+        TaskBindingRejection::selection_required("cold capture submission is not valid JSON")
+    })?;
+    let fence: eliot_store_api::StateFence = submission
+        .get("state_fence")
+        .cloned()
+        .ok_or_else(|| {
+            TaskBindingRejection::selection_required("cold capture has no retained fence")
+        })
+        .and_then(|value| {
+            serde_json::from_value(value).map_err(|_| {
+                TaskBindingRejection::selection_required(
+                    "cold capture has an invalid retained fence",
+                )
+            })
+        })?;
+    if fence != transition.state_fence {
+        return Err(TaskBindingRejection::scope_incompatible(
+            "cold capture submission fence differs from the prepared operation",
+        ));
+    }
+    if !submission
+        .get("task_selection")
+        .is_some_and(serde_json::Value::is_null)
+    {
+        return Err(TaskBindingRejection::selection_required(
+            "cold capture must retain an absent task selection",
+        ));
+    }
+    let affected_scope = submission
+        .get("record")
+        .and_then(|record| record.get("event"))
+        .and_then(|event| event.get("affected_scope"))
+        .ok_or_else(|| {
+            TaskBindingRejection::selection_required("cold capture has no retained affected scope")
+        })?;
+    if affected_scope
+        .get("task_ref")
+        .is_some_and(|task| !task.is_null())
+    {
+        return Err(TaskBindingRejection::selection_required(
+            "cold capture cannot carry a task-relative affected scope",
+        ));
+    }
+    if affected_scope
+        .get("work_scope")
+        .and_then(serde_json::Value::as_str)
+        != Some(transition.scope_id.as_str())
+    {
+        return Err(TaskBindingRejection::scope_incompatible(
+            "cold capture submission WorkScope differs from the prepared operation",
+        ));
+    }
+    Ok(())
+}
+
 /// Gates one prepared transition before any provider I/O.
 ///
 /// Rules:
 /// - A cold unbound capture may contain only `CaptureObservation` and
 ///   `AppendAuditEvent`, both in the `CaptureCandidate` family under the
 ///   `Candidate` ceiling. Other candidate-family operations may retain task
-///   memory or authority evidence and are rejected before provider I/O.
+///   memory or authority evidence and are rejected before provider I/O. A task
+///   hint in authenticated request metadata stays contextual only when the
+///   original retained submission has no semantic task selection or task scope.
 /// - `CaptureObservation` naming a task, and every `UpdateTaskState`, require
 ///   exact binding: context/transition task identities present and equal,
 ///   fences equal, retained original evidence agrees with the operation's
@@ -519,20 +635,8 @@ pub fn gate_apply(
         let transition_task = transition.task_id.as_deref();
         let context_task = context.task_id.as_ref().map(TaskId::as_str);
         match (transition_task, context_task) {
-            (None, None) => {
-                if operations.iter().any(|operation| {
-                    !matches!(
-                        operation,
-                        NamedMutationOperation::CaptureObservation
-                            | NamedMutationOperation::AppendAuditEvent
-                    )
-                }) || transition.transition_class != TransitionClass::CaptureCandidate
-                    || transition.requested_effect_ceiling != EffectClass::Candidate
-                {
-                    return Err(TaskBindingRejection::selection_required(
-                        "cold unbound capture may carry only CaptureObservation and AppendAuditEvent under the Candidate effect ceiling",
-                    ));
-                }
+            (None, _) => {
+                validate_cold_capture(context, transition)?;
                 return Ok(GateDisposition::ColdUnbound);
             }
             (Some(task), Some(ctx)) if task == ctx => {
