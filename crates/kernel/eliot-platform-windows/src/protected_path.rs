@@ -223,6 +223,11 @@ pub struct ProtectedRootLease {
     pub(crate) directories: Vec<std::fs::File>,
 }
 
+/// Upper bound on the number of loose scan-disclosure captures migrated from
+/// the installation's canonical protected state directory in one pass.
+const MAX_LOOSE_SCAN_DISCLOSURE_CAPTURES: usize = 256;
+const MAX_LOOSE_SCAN_DISCLOSURE_BYTES: u64 = 64 * 1024;
+
 impl std::fmt::Debug for ProtectedRootLease {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -304,6 +309,64 @@ impl ProtectedRootLease {
                 return Err(ProtectedPathError::IdentityMismatch);
             }
             Ok(())
+        }
+        #[cfg(not(windows))]
+        {
+            Err(ProtectedPathError::UnsupportedPlatform)
+        }
+    }
+
+    /// Reads bounded loose scan-disclosure captures from the canonical
+    /// installation-protected state contour. Filenames are selectors only;
+    /// callers must send every returned byte vector to quarantine and must
+    /// never promote a file into an owned receipt based on its name/content.
+    ///
+    /// The directory handle pins the admitted contour for the whole pass and
+    /// every candidate is reopened through [`ProtectedPathLease`], which
+    /// rejects reparse points and checks its protected file identity before
+    /// bounded reads. No legacy caller directory is consulted.
+    pub fn read_loose_scan_disclosure_captures(
+        &self,
+    ) -> Result<Vec<(String, Vec<u8>)>, ProtectedPathError> {
+        #[cfg(windows)]
+        {
+            const PREFIX: &str = "scan-disclosure-";
+            const SUFFIX: &str = ".json";
+
+            self.verify_stable_identity()?;
+            let directory = self.canonical_path()?;
+            let expected = protected_program_data_root()?.join(r"Eliot\governor\state");
+            if !crate::windows_paths_equal(&directory, &expected) {
+                return Err(ProtectedPathError::InvalidPath);
+            }
+            let mut captures = Vec::new();
+            let entries = std::fs::read_dir(&directory).map_err(|_| ProtectedPathError::Io)?;
+            for entry in entries {
+                let entry = entry.map_err(|_| ProtectedPathError::Io)?;
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                if !name.starts_with(PREFIX) || !name.ends_with(SUFFIX) {
+                    continue;
+                }
+                if captures.len() >= MAX_LOOSE_SCAN_DISCLOSURE_CAPTURES {
+                    return Err(ProtectedPathError::SizeExceeded);
+                }
+                let candidate = directory.join(name);
+                let candidate_lease = ProtectedPathLease::open_existing_absolute(&candidate)?;
+                let opened = candidate_lease
+                    .canonical_path()
+                    .map_err(|_| ProtectedPathError::Io)?;
+                if !crate::windows_paths_equal(&opened, candidate_lease.path()) {
+                    return Err(ProtectedPathError::IdentityMismatch);
+                }
+                let bytes = candidate_lease.read_bounded(MAX_LOOSE_SCAN_DISCLOSURE_BYTES)?;
+                candidate_lease.verify_stable_identity()?;
+                captures.push((name.to_owned(), bytes));
+            }
+            self.verify_stable_identity()?;
+            Ok(captures)
         }
         #[cfg(not(windows))]
         {

@@ -333,15 +333,21 @@ impl InstallationScanDisclosureStore {
         if file_name.contains('/') || file_name.contains('\\') {
             return Err(WorkScopeError::ScanReceiptCorrupt);
         }
-        let stem = file_name
+        let valid_stem = file_name
             .strip_prefix(LOOSE_SCAN_DISCLOSURE_PREFIX)
             .and_then(|rest| rest.strip_suffix(LOOSE_SCAN_DISCLOSURE_SUFFIX))
-            .filter(|stem| stem.len() == 64 && stem.bytes().all(|byte| byte.is_ascii_hexdigit()))
-            .ok_or(WorkScopeError::ScanReceiptCorrupt)?;
+            .filter(|stem| {
+                !stem.is_empty()
+                    && stem.len() <= 200
+                    && stem.chars().all(|character| !character.is_control())
+            })
+            .is_some();
+        if !valid_stem {
+            return Err(WorkScopeError::ScanReceiptCorrupt);
+        }
         if bytes.len() > eliot_ors::MAX_SCAN_DISCLOSURE_QUARANTINE_BYTES {
             return Err(WorkScopeError::ScanReceiptCorrupt);
         }
-        let _filename_matches_content = sha256_hex(bytes) == stem.to_ascii_lowercase();
         let content_sha256 = sha256_hex(bytes);
         let mut record = ScanDisclosureQuarantineRecord {
             contract_version: eliot_ors::CONTRACT_VERSION,
@@ -799,7 +805,8 @@ fn conflict_error(error: &OrsError) -> WorkScopeError {
     match error {
         OrsError::ScanDisclosureReadFailure(failure) => read_failure_error(*failure),
         OrsError::IntegrityProblem { record_type, .. }
-            if *record_type == SCAN_DISCLOSURE_RECORD_TYPE =>
+            if *record_type == SCAN_DISCLOSURE_RECORD_TYPE
+                || *record_type == eliot_ors::SCAN_DISCLOSURE_QUARANTINE_RECORD_TYPE =>
         {
             WorkScopeError::ScanIdentityConflict
         }
@@ -813,7 +820,8 @@ fn read_error(error: &OrsError) -> WorkScopeError {
     match error {
         OrsError::ScanDisclosureReadFailure(failure) => read_failure_error(*failure),
         OrsError::IntegrityProblem { record_type, .. }
-            if *record_type == SCAN_DISCLOSURE_RECORD_TYPE =>
+            if *record_type == SCAN_DISCLOSURE_RECORD_TYPE
+                || *record_type == eliot_ors::SCAN_DISCLOSURE_QUARANTINE_RECORD_TYPE =>
         {
             WorkScopeError::ScanReceiptCorrupt
         }
