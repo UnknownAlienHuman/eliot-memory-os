@@ -777,14 +777,66 @@ def _module_gate(attributes: str) -> tuple[bool, str]:
     cfgs = [" ".join(match.group("body").split()) for match in CFG_ATTRIBUTE_RE.finditer(attributes)]
     if not cfgs:
         return False, ""
-    if all(CFG_TEST_RE.search(f"#[cfg({cfg})]") for cfg in cfgs):
+    # `cfg(all(test, ...))` still requires `test`, so it is a test-only edge.
+    # A negation, or an `any(...)` that offers a non-test alternative, is a
+    # genuine mixed gate and is preserved as explicit uncertainty.
+    if all(_requires_test(cfg) for cfg in cfgs):
         return True, ""
-    if any("test" in cfg for cfg in cfgs):
+    if any(
+        re.search(r"\btest\b", cfg) and not _requires_test(cfg) for cfg in cfgs
+    ):
         return False, (
-            "module edge gate mixes test with a non-test condition and cannot be "
-            f"resolved to test-only or production: {'; '.join(cfgs)}"
+            "module edge gate mentions `test` but can be satisfied without it, "
+            f"so it is neither test-only nor an unconditional production edge: "
+            f"{'; '.join(cfgs)}"
         )
     return False, ""
+
+
+def _requires_test(cfg: str) -> bool:
+    """Whether one `cfg(...)` predicate list cannot hold without `test`.
+
+    `cfg` accepts several comma-separated predicates that must all hold, so
+    `test, windows` requires `test`. Within one predicate, `test` alone and
+    `all(...)` whose every conjunct requires `test` require it; `any(...)` with
+    a non-test alternative and `not(...)` do not. A feature name that merely
+    contains the word `test`, such as `test-support`, does not require `test`.
+    """
+    return any(_predicate_requires_test(part) for part in _split_cfg(cfg.strip()))
+
+
+def _predicate_requires_test(predicate: str) -> bool:
+    body = predicate.strip()
+    if body.startswith("all(") and body.endswith(")"):
+        inner = body[len("all(") : -1]
+        # `all(...)` holds only when every conjunct holds, so one conjunct that
+        # requires `test` is enough to make the whole predicate require it.
+        return bool(inner) and any(
+            _predicate_requires_test(part) for part in _split_cfg(inner)
+        )
+    if body.startswith(("any(", "not(")):
+        return False
+    return body == "test"
+
+
+def _split_cfg(body: str) -> list[str]:
+    """Split one `cfg(...)` argument list on its top-level commas."""
+    parts: list[str] = []
+    depth = 0
+    current = ""
+    for character in body:
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+        if character == "," and depth == 0:
+            parts.append(current)
+            current = ""
+            continue
+        current += character
+    if current.strip():
+        parts.append(current)
+    return [part.strip() for part in parts if part.strip()]
 
 
 def _module_declarations(text: str, module_path: str) -> list[tuple[str, bool, str]]:
