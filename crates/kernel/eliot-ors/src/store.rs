@@ -71,12 +71,14 @@ use crate::{
     AuthorityActivationReceipt, AuthorityHandoffBegin, AuthorityHandoffRecord,
     AuthorityHandoffState, AuthorityRevocation, AuthorityRevocationReceipt,
     AuthoritySnapshotReceipt, BACKUP_VERIFICATION_RESULT_RECORD_TYPE,
-    BackupVerificationDisposition, BackupVerificationResultRecord, CanonicalDisposition,
-    CanonicalReconciliation, CapabilityGrantActivation, CapabilityGrantProjection,
-    CapabilityGrantRevocation, CapabilityIntroductionActivation, CapabilityIntroductionFence,
-    CapabilityIntroductionProjection, CapabilityIntroductionReceipt, DeliveryAcknowledgement,
-    DeliveryCursorReceipt, DeliveryCursorState, EpochIdentity, EpochLineage,
-    GenerationCutoverReceipt, GenerationCutoverRecord, GenerationCutoverSnapshot,
+    BackupVerificationDisposition, BackupVerificationResultRecord, BlobProcessStreamCallRecord,
+    BlobProcessStreamCallState, BlobProcessStreamGrantRecord, BlobProcessStreamGrantState,
+    BlobProcessStreamOwnerFactsPullRecord, BlobProcessStreamOwnerFactsPullState,
+    CanonicalDisposition, CanonicalReconciliation, CapabilityGrantActivation,
+    CapabilityGrantProjection, CapabilityGrantRevocation, CapabilityIntroductionActivation,
+    CapabilityIntroductionFence, CapabilityIntroductionProjection, CapabilityIntroductionReceipt,
+    DeliveryAcknowledgement, DeliveryCursorReceipt, DeliveryCursorState, EpochIdentity,
+    EpochLineage, GenerationCutoverReceipt, GenerationCutoverRecord, GenerationCutoverSnapshot,
     GenerationTransition, GenerationTransitionReceipt, GrantClosureCommit,
     GrantClosureCommitReceipt, GrantClosureFenceReceipt, GrantClosureFenceRequest,
     GrantClosureProjection, GrantClosureState, HostRequestRecord, HostRequestState, JobCheckpoint,
@@ -89,9 +91,6 @@ use crate::{
     OperationalRecordContext, OperationalRecordInput, OrsError, OrsSnapshotReceipt,
     OrsSnapshotRequest, PendingOperationPage, ProcessEvidenceReadback, ProcessEvidenceRecord,
     ProcessStartReplayAbort, ProcessStartReplayRecord, ProcessStartReplayState,
-    BlobProcessStreamCallRecord, BlobProcessStreamCallState, BlobProcessStreamGrantRecord,
-    BlobProcessStreamGrantState, BlobProcessStreamOwnerFactsPullRecord,
-    BlobProcessStreamOwnerFactsPullState,
     ProcessStreamRecoveryFence, ProcessStreamRecoveryLoadError, ProcessStreamRecoveryProjection,
     ProcessStreamRecoveryRevalidation, ProcessStreamRecoveryStatusProjection,
     ProcessStreamRecoveryWriteOutcome, ProcessStreamRetirementProof, ProcessStreamSourceResolver,
@@ -5723,18 +5722,22 @@ impl RedbRecoveryStore {
         let write = self.database.begin_write().map_err(storage)?;
         let key = grant.capability_ref.as_str();
         let result = {
-            let mut table = write.open_table(BLOB_PROCESS_STREAM_GRANTS).map_err(storage)?;
+            let mut table = write
+                .open_table(BLOB_PROCESS_STREAM_GRANTS)
+                .map_err(storage)?;
             match table.get(key).map_err(storage)? {
                 Some(value) => {
                     let existing: BlobProcessStreamGrantRecord = decode(value.value())?;
                     existing.validate()?;
                     if !existing.same_binding(grant)
-                        || (existing.state != grant.state && existing.state != BlobProcessStreamGrantState::Active)
+                        || (existing.state != grant.state
+                            && existing.state != BlobProcessStreamGrantState::Active)
                         || grant.next_ordinal < existing.next_ordinal
                     {
                         return Err(OrsError::IntegrityProblem {
                             record_type: "blob_process_stream_grant",
-                            reason: "capability binding or monotonic grant state conflicts".to_owned(),
+                            reason: "capability binding or monotonic grant state conflicts"
+                                .to_owned(),
                         });
                     }
                     if &existing != grant {
@@ -5761,7 +5764,9 @@ impl RedbRecoveryStore {
     ) -> Result<Option<BlobProcessStreamGrantRecord>, OrsError> {
         crate::model::validate_text(capability_ref, "blob_process_stream_capability_ref")?;
         let read = self.database.begin_read().map_err(storage)?;
-        let table = read.open_table(BLOB_PROCESS_STREAM_GRANTS).map_err(storage)?;
+        let table = read
+            .open_table(BLOB_PROCESS_STREAM_GRANTS)
+            .map_err(storage)?;
         table
             .get(capability_ref)
             .map_err(storage)?
@@ -5804,7 +5809,8 @@ impl RedbRecoveryStore {
                     if !existing.same_request(pull) {
                         return Err(OrsError::IntegrityProblem {
                             record_type: "blob_process_stream_owner_facts_pull",
-                            reason: "pull reference conflicts with a different exact request".to_owned(),
+                            reason: "pull reference conflicts with a different exact request"
+                                .to_owned(),
                         });
                     }
                     existing
@@ -5944,8 +5950,12 @@ impl RedbRecoveryStore {
         crate::model::validate_text(token_ref, "blob_process_stream_token_ref")?;
         let write = self.database.begin_write().map_err(storage)?;
         let result = {
-            let mut grants = write.open_table(BLOB_PROCESS_STREAM_GRANTS).map_err(storage)?;
-            let mut calls = write.open_table(BLOB_PROCESS_STREAM_CALLS).map_err(storage)?;
+            let mut grants = write
+                .open_table(BLOB_PROCESS_STREAM_GRANTS)
+                .map_err(storage)?;
+            let mut calls = write
+                .open_table(BLOB_PROCESS_STREAM_CALLS)
+                .map_err(storage)?;
             let mut grant: BlobProcessStreamGrantRecord = grants
                 .get(capability_ref)
                 .map_err(storage)?
@@ -5983,9 +5993,13 @@ impl RedbRecoveryStore {
             };
             token.validate()?;
             let token_payload = encode(&token)?;
-            calls.insert(token_ref, token_payload.as_str()).map_err(storage)?;
+            calls
+                .insert(token_ref, token_payload.as_str())
+                .map_err(storage)?;
             let grant_payload = encode(&grant)?;
-            grants.insert(capability_ref, grant_payload.as_str()).map_err(storage)?;
+            grants
+                .insert(capability_ref, grant_payload.as_str())
+                .map_err(storage)?;
             token
         };
         write.commit().map_err(storage)?;
@@ -6002,7 +6016,9 @@ impl RedbRecoveryStore {
         crate::model::validate_text(capability_ref, "blob_process_stream_capability_ref")?;
         crate::model::validate_text(token_ref, "blob_process_stream_token_ref")?;
         let read = self.database.begin_read().map_err(storage)?;
-        let table = read.open_table(BLOB_PROCESS_STREAM_CALLS).map_err(storage)?;
+        let table = read
+            .open_table(BLOB_PROCESS_STREAM_CALLS)
+            .map_err(storage)?;
         table
             .get(token_ref)
             .map_err(storage)?
@@ -6015,7 +6031,8 @@ impl RedbRecoveryStore {
                 {
                     return Err(OrsError::IntegrityProblem {
                         record_type: "blob_process_stream_call",
-                        reason: "call token does not match its retained capability/ordinal".to_owned(),
+                        reason: "call token does not match its retained capability/ordinal"
+                            .to_owned(),
                     });
                 }
                 Ok(record)
@@ -6082,7 +6099,9 @@ impl RedbRecoveryStore {
     ) -> Result<BlobProcessStreamCallRecord, OrsError> {
         let write = self.database.begin_write().map_err(storage)?;
         let result = {
-            let mut table = write.open_table(BLOB_PROCESS_STREAM_CALLS).map_err(storage)?;
+            let mut table = write
+                .open_table(BLOB_PROCESS_STREAM_CALLS)
+                .map_err(storage)?;
             let existing = table
                 .get(desired.token_ref.as_str())
                 .map_err(storage)?
@@ -6127,13 +6146,28 @@ impl RedbRecoveryStore {
             } else if existing.same_binding(desired)
                 && matches!(
                     (existing.state, desired.state),
-                    (BlobProcessStreamCallState::Reserved, BlobProcessStreamCallState::Dispatched)
-                        | (BlobProcessStreamCallState::Dispatched, BlobProcessStreamCallState::Completed)
-                        | (BlobProcessStreamCallState::Dispatched, BlobProcessStreamCallState::Unknown)
-                        | (BlobProcessStreamCallState::Unknown, BlobProcessStreamCallState::Completed)
-                        | (BlobProcessStreamCallState::Unknown, BlobProcessStreamCallState::NotStarted)
-                        | (BlobProcessStreamCallState::Reserved, BlobProcessStreamCallState::NotStarted)
-                        | (BlobProcessStreamCallState::Reserved, BlobProcessStreamCallState::Unavailable)
+                    (
+                        BlobProcessStreamCallState::Reserved,
+                        BlobProcessStreamCallState::Dispatched
+                    ) | (
+                        BlobProcessStreamCallState::Dispatched,
+                        BlobProcessStreamCallState::Completed
+                    ) | (
+                        BlobProcessStreamCallState::Dispatched,
+                        BlobProcessStreamCallState::Unknown
+                    ) | (
+                        BlobProcessStreamCallState::Unknown,
+                        BlobProcessStreamCallState::Completed
+                    ) | (
+                        BlobProcessStreamCallState::Unknown,
+                        BlobProcessStreamCallState::NotStarted
+                    ) | (
+                        BlobProcessStreamCallState::Reserved,
+                        BlobProcessStreamCallState::NotStarted
+                    ) | (
+                        BlobProcessStreamCallState::Reserved,
+                        BlobProcessStreamCallState::Unavailable
+                    )
                 )
             {
                 desired.clone()
@@ -6145,7 +6179,9 @@ impl RedbRecoveryStore {
             };
             if existing != next {
                 let payload = encode(&next)?;
-                table.insert(desired.token_ref.as_str(), payload.as_str()).map_err(storage)?;
+                table
+                    .insert(desired.token_ref.as_str(), payload.as_str())
+                    .map_err(storage)?;
             }
             next
         };

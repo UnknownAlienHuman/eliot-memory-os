@@ -2,31 +2,35 @@
 
 use std::collections::BTreeSet;
 
+use eliot_bootstrap::{
+    NormativePair,
+    normative::{NormativePairReceiptIdentity, parse_normative_pair_receipt_identity},
+};
 use eliot_contracts::{ArtifactId, ClockReading, StateFence, sha256_hex};
 use eliot_instrument_api::{EvidenceCoverage, RawEvidence, RawEvidenceSource, VerificationOutcome};
-use eliot_process::{EnvironmentProjection, ExitDisposition, ExitStatus};
+use eliot_instrument_cargo::{CONTRACT_NAME as CARGO_INSTRUMENT, parse_jsonl as parse_cargo_jsonl};
 use eliot_instrument_nextest::{
     NEXTEST_INSTRUMENT, NEXTEST_STDOUT_CONTENT_TYPE, parse_jsonl, parse_list_json,
 };
-use eliot_instrument_cargo::{CONTRACT_NAME as CARGO_INSTRUMENT, parse_jsonl as parse_cargo_jsonl};
 use eliot_instrument_rustc::{RUSTC_INSTRUMENT, parse_clippy_jsonl};
 use eliot_instrument_rustfmt::{RUSTFMT_INSTRUMENT, parse_output as parse_rustfmt_output};
+use eliot_process::{EnvironmentProjection, ExitDisposition, ExitStatus};
 use eliot_testd_core::{
     EphemeralSourceBytes, InstrumentStageRequest, StageExecutionKind, TestdEvaluationObservation,
     TestdEvaluationStatus, TestdParsingObservation, TestdParsingStatus,
     TestdProviderCatalogLifecycle, TestdSourceObservationRange, TestdStreamDisposition,
     TestdStreamEvidenceBinding, TestdToolObservation,
 };
-use eliot_bootstrap::{
-    NormativePair,
-    normative::{NormativePairReceiptIdentity, parse_normative_pair_receipt_identity},
+use eliot_workscope::{
+    GoverningSource, GoverningSourceRole, SourceStatus, WorkScopeBindingSnapshot,
 };
-use eliot_workscope::{GoverningSource, GoverningSourceRole, SourceStatus, WorkScopeBindingSnapshot};
 use thiserror::Error;
 
 use crate::{
     profile::{InstrumentRegistry, ProfileCompiler},
-    registry::{InvalidationSet, ProviderRegistry, RegistryEntry, RegistryError, RegistryFreshness},
+    registry::{
+        InvalidationSet, ProviderRegistry, RegistryEntry, RegistryError, RegistryFreshness,
+    },
 };
 
 /// Exact independent observations available at the governed process finish
@@ -118,7 +122,8 @@ impl VerifiedTestdReplayContext {
             .validate()
             .map_err(|error| ProfileReplayError::CurrentnessObservation(error.to_string()))?;
         if !observations.source.unchanged()
-            || observations.source.before.repository_root != observations.source.after.repository_root
+            || observations.source.before.repository_root
+                != observations.source.after.repository_root
             || !valid_sha256_text(&observations.cargo_lock_sha256)
             || !valid_sha256_text(&observations.lane_fingerprint_digest)
         {
@@ -235,11 +240,8 @@ pub fn current_testd_provider_registry(
         return Err(ProfileReplayError::NormativePairMismatch);
     }
     let fingerprints = observed_invalidation_set(profile_registry, observations)?;
-    let registry = ProviderRegistry::ready_for_catalog_generation(
-        lifecycle,
-        receipt.pair_key,
-        &fingerprints,
-    )?;
+    let registry =
+        ProviderRegistry::ready_for_catalog_generation(lifecycle, receipt.pair_key, &fingerprints)?;
     Ok((registry, fingerprints))
 }
 
@@ -362,7 +364,8 @@ fn required_registry_denominator(
                     instrument: stage.spec.as_str().to_owned(),
                 });
             }
-            required_providers.insert((entry.instrument.as_str().to_owned(), entry.adapter.clone()));
+            required_providers
+                .insert((entry.instrument.as_str().to_owned(), entry.adapter.clone()));
         }
     }
     if required_profiles.is_empty() {
@@ -577,7 +580,8 @@ fn replay_profile_stream_inner(
         .map_err(|error| ProfileReplayError::InvalidStage {
             detail: error.to_string(),
         })?;
-    let (entry, parser_revision) = current_selection(profile_registry, provider_registry, freshness, stage)?;
+    let (entry, parser_revision) =
+        current_selection(profile_registry, provider_registry, freshness, stage)?;
     if required_profile_ids.is_some_and(|required| !required.contains(&stage.profile_name)) {
         return Err(ProfileReplayError::UnrequiredProfile);
     }
@@ -604,12 +608,42 @@ fn replay_profile_stream_inner(
         return list_receipt(source, verified, bytes, entry, parser_revision, finished_at);
     }
     match entry.instrument.as_str() {
-        CARGO_INSTRUMENT if stage.stage_id == "cargo-metadata" => {
-            cargo_metadata_receipt(source, verified, bytes, entry, parser_revision, terminal, finished_at)
-        }
-        CARGO_INSTRUMENT => cargo_receipt(source, verified, bytes, entry, parser_revision, terminal, finished_at),
-        RUSTC_INSTRUMENT => rustc_receipt(source, verified, bytes, entry, parser_revision, terminal, finished_at),
-        RUSTFMT_INSTRUMENT => rustfmt_receipt(source, verified, bytes, entry, parser_revision, terminal, finished_at),
+        CARGO_INSTRUMENT if stage.stage_id == "cargo-metadata" => cargo_metadata_receipt(
+            source,
+            verified,
+            bytes,
+            entry,
+            parser_revision,
+            terminal,
+            finished_at,
+        ),
+        CARGO_INSTRUMENT => cargo_receipt(
+            source,
+            verified,
+            bytes,
+            entry,
+            parser_revision,
+            terminal,
+            finished_at,
+        ),
+        RUSTC_INSTRUMENT => rustc_receipt(
+            source,
+            verified,
+            bytes,
+            entry,
+            parser_revision,
+            terminal,
+            finished_at,
+        ),
+        RUSTFMT_INSTRUMENT => rustfmt_receipt(
+            source,
+            verified,
+            bytes,
+            entry,
+            parser_revision,
+            terminal,
+            finished_at,
+        ),
         NEXTEST_INSTRUMENT => run_receipt(
             source,
             verified,
@@ -622,7 +656,9 @@ fn replay_profile_stream_inner(
             started_at,
             finished_at,
         ),
-        _ => Err(ProfileReplayError::UnsupportedProfile { profile: stage.profile_name.clone() }),
+        _ => Err(ProfileReplayError::UnsupportedProfile {
+            profile: stage.profile_name.clone(),
+        }),
     }
 }
 
@@ -695,15 +731,20 @@ fn current_selection<'a>(
             return Err(ProfileReplayError::StageMismatch { field });
         }
     }
-    let retained_command = stage
-        .stage_command
-        .as_ref()
-        .ok_or(ProfileReplayError::StageMismatch { field: "stage_command" })?;
+    let retained_command =
+        stage
+            .stage_command
+            .as_ref()
+            .ok_or(ProfileReplayError::StageMismatch {
+                field: "stage_command",
+            })?;
     if retained_command.executable != selected.command.executable
         || retained_command.argv != selected.command.argv
         || retained_command.spec_digest != selected.spec_digest
     {
-        return Err(ProfileReplayError::StageMismatch { field: "stage_command" });
+        return Err(ProfileReplayError::StageMismatch {
+            field: "stage_command",
+        });
     }
     let entry = provider_registry.resolve_current(&stage.invocation, freshness)?;
     let retained_freshness = stage
@@ -742,7 +783,11 @@ fn current_selection<'a>(
         }
     }
     let supported_process = match entry.instrument.as_str() {
-        CARGO_INSTRUMENT => matches!(stage.kind, eliot_instrument_api::InstrumentKind::Build | eliot_instrument_api::InstrumentKind::Test),
+        CARGO_INSTRUMENT => matches!(
+            stage.kind,
+            eliot_instrument_api::InstrumentKind::Build
+                | eliot_instrument_api::InstrumentKind::Test
+        ),
         RUSTC_INSTRUMENT => stage.kind == eliot_instrument_api::InstrumentKind::Build,
         RUSTFMT_INSTRUMENT => stage.kind == eliot_instrument_api::InstrumentKind::Format,
         NEXTEST_INSTRUMENT => stage.kind == eliot_instrument_api::InstrumentKind::Test,
@@ -883,7 +928,16 @@ fn cargo_receipt(
 ) -> Result<ProfileReplayReceipt, ProfileReplayError> {
     let report = match parse_cargo_jsonl(bytes.bytes()) {
         Ok(report) => report,
-        Err(error) => return parse_failed_receipt(source, verified, entry, parser_revision, error.to_string(), finished_at),
+        Err(error) => {
+            return parse_failed_receipt(
+                source,
+                verified,
+                entry,
+                parser_revision,
+                error.to_string(),
+                finished_at,
+            );
+        }
     };
     // Cargo's build-finished record and error diagnostics are its evaluator
     // contract. Missing build-finished remains Unknown.
@@ -909,7 +963,14 @@ fn cargo_metadata_receipt(
     finished_at: ClockReading,
 ) -> Result<ProfileReplayReceipt, ProfileReplayError> {
     if let Err(error) = eliot_instrument_cargo::parse_metadata_json(bytes.bytes()) {
-        return parse_failed_receipt(source, verified, entry, parser_revision, error.to_string(), finished_at);
+        return parse_failed_receipt(
+            source,
+            verified,
+            entry,
+            parser_revision,
+            error.to_string(),
+            finished_at,
+        );
     }
     evaluated_report_receipt(
         source,
@@ -933,7 +994,16 @@ fn rustc_receipt(
 ) -> Result<ProfileReplayReceipt, ProfileReplayError> {
     let report = match parse_clippy_jsonl(bytes.bytes()) {
         Ok(report) => report,
-        Err(error) => return parse_failed_receipt(source, verified, entry, parser_revision, error.to_string(), finished_at),
+        Err(error) => {
+            return parse_failed_receipt(
+                source,
+                verified,
+                entry,
+                parser_revision,
+                error.to_string(),
+                finished_at,
+            );
+        }
     };
     // Clippy's JSON has no terminal-success record. Diagnostics can prove a
     // compiler error; absence of errors alone cannot prove a successful exit.
@@ -970,7 +1040,14 @@ fn rustfmt_receipt(
             "rustfmt-output-and-terminal-outcome",
             finished_at,
         ),
-        Err(error) => parse_failed_receipt(source, verified, entry, parser_revision, error.to_string(), finished_at),
+        Err(error) => parse_failed_receipt(
+            source,
+            verified,
+            entry,
+            parser_revision,
+            error.to_string(),
+            finished_at,
+        ),
     }
 }
 
@@ -984,12 +1061,17 @@ fn terminal_cancelled(terminal: Option<&ExitStatus>) -> bool {
     terminal.is_some_and(|status| status.disposition() == ExitDisposition::Cancelled)
 }
 
-fn terminal_outcome(parsed: VerificationOutcome, terminal: Option<&ExitStatus>) -> VerificationOutcome {
+fn terminal_outcome(
+    parsed: VerificationOutcome,
+    terminal: Option<&ExitStatus>,
+) -> VerificationOutcome {
     match terminal.map(ExitStatus::disposition) {
         Some(ExitDisposition::Completed) if terminal_code(terminal) == Some(0) => parsed,
         Some(ExitDisposition::Completed) => VerificationOutcome::Fail,
         Some(ExitDisposition::Cancelled) => VerificationOutcome::Cancelled,
-        Some(ExitDisposition::Signalled | ExitDisposition::ResourceLimit | ExitDisposition::Unknown)
+        Some(
+            ExitDisposition::Signalled | ExitDisposition::ResourceLimit | ExitDisposition::Unknown,
+        )
         | None => match parsed {
             VerificationOutcome::Fail => VerificationOutcome::Fail,
             _ => VerificationOutcome::Unknown,
@@ -1013,7 +1095,15 @@ fn parse_failed_receipt(
         TestdParsingStatus::ParseFailed,
         finished_at,
     )?;
-    Ok(receipt_base(source, verified, Some(parsing), None, None, None, Some(detail)))
+    Ok(receipt_base(
+        source,
+        verified,
+        Some(parsing),
+        None,
+        None,
+        None,
+        Some(detail),
+    ))
 }
 
 fn evaluated_report_receipt(
@@ -1054,7 +1144,9 @@ fn evaluated_report_receipt(
         verified.fence.clone(),
         finished_at,
     )
-    .map_err(|error| ProfileReplayError::Evaluator { detail: error.to_string() })?;
+    .map_err(|error| ProfileReplayError::Evaluator {
+        detail: error.to_string(),
+    })?;
     Ok(receipt_base(
         source,
         verified,

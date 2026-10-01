@@ -206,7 +206,11 @@ pub struct BlobProcessStreamKernelRequest {
 /// intentionally has no dependency on `eliot-process`; a JSON body cannot
 /// reach Store unless that typed decode and validation succeeds.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "operation", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[serde(
+    tag = "operation",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    deny_unknown_fields
+)]
 pub enum BlobProcessStreamKernelOperationRequest {
     /// Open one stream using an admitted process binding.
     SinkOpen {
@@ -270,24 +274,42 @@ impl BlobProcessStreamKernelOperationRequest {
     /// operation-specific `eliot-process` deserialization and validation.
     pub fn validate(&self) -> Result<(), WireValidationError> {
         match self {
-            Self::SinkOpen { body, deadline_ms }
-            => {
+            Self::SinkOpen { body, deadline_ms } => {
                 validate_body(body)?;
                 if *deadline_ms == 0 {
                     return Err(WireValidationError::InvalidField("deadline_ms"));
                 }
             }
-            Self::SinkAppend { binding, body, deadline_ms }
-            | Self::SinkFinalize { binding, body, deadline_ms }
-            | Self::SinkAbort { binding, body, deadline_ms }
-            | Self::SinkReconcile { binding, body, deadline_ms } => {
+            Self::SinkAppend {
+                binding,
+                body,
+                deadline_ms,
+            }
+            | Self::SinkFinalize {
+                binding,
+                body,
+                deadline_ms,
+            }
+            | Self::SinkAbort {
+                binding,
+                body,
+                deadline_ms,
+            }
+            | Self::SinkReconcile {
+                binding,
+                body,
+                deadline_ms,
+            } => {
                 binding.validate()?;
                 validate_body(body)?;
                 if *deadline_ms == 0 {
                     return Err(WireValidationError::InvalidField("deadline_ms"));
                 }
             }
-            Self::SinkReadback { binding, deadline_ms } => {
+            Self::SinkReadback {
+                binding,
+                deadline_ms,
+            } => {
                 binding.validate()?;
                 if *deadline_ms == 0 {
                     return Err(WireValidationError::InvalidField("deadline_ms"));
@@ -421,7 +443,8 @@ impl BlobProcessStreamKernelSourceReadbackRequest {
 }
 
 fn validate_body(body: &serde_json::Value) -> Result<(), WireValidationError> {
-    let encoded = serde_json::to_vec(body).map_err(|_| WireValidationError::InvalidField("body"))?;
+    let encoded =
+        serde_json::to_vec(body).map_err(|_| WireValidationError::InvalidField("body"))?;
     if !body.is_object() || encoded.len() > PROCESS_STREAM_SINK_MAX_BODY_BYTES {
         return Err(WireValidationError::InvalidField("body"));
     }
@@ -538,7 +561,10 @@ impl BlobProcessStreamOwnerFactsPullRequest {
             &self.kernel_causal_binding_sha256,
         )?;
         validate_digest("outer_request_sha256", &self.outer_request_sha256)?;
-        validate_digest("source_root_identity_sha256", &self.source_root_identity_sha256)?;
+        validate_digest(
+            "source_root_identity_sha256",
+            &self.source_root_identity_sha256,
+        )?;
         if self.process_binding_json.len() > 16 * 1024
             || !json_object(&self.process_binding_json)
             || sha256_hex(self.process_binding_json.as_bytes()) != self.process_binding_sha256
@@ -549,8 +575,8 @@ impl BlobProcessStreamOwnerFactsPullRequest {
         self.state_fence
             .validate()
             .map_err(|_| WireValidationError::InvalidField("state_fence"))?;
-        let encoded = serde_json::to_vec(self)
-            .map_err(|_| WireValidationError::InvalidField("frame"))?;
+        let encoded =
+            serde_json::to_vec(self).map_err(|_| WireValidationError::InvalidField("frame"))?;
         if encoded.len() > BLOB_PROCESS_STREAM_KERNEL_MAX_FRAME_BYTES {
             return Err(WireValidationError::InvalidField("frame"));
         }
@@ -661,7 +687,11 @@ impl BlobProcessStreamVerifiedOwnerFacts {
 
 /// Closed owner-facts pull disposition.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "outcome", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[serde(
+    tag = "outcome",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    deny_unknown_fields
+)]
 pub enum BlobProcessStreamOwnerFactsPullOutcome {
     /// All independent verified owner facts needed by the Store resolver are
     /// current and refer to the exact WorkScope/source/process binding.
@@ -788,13 +818,19 @@ impl BlobProcessStreamOwnerFactsPullResponse {
                 ("owner_facts_sha256", owner_facts_sha256),
                 ("work_scope_snapshot_sha256", work_scope_snapshot_sha256),
                 ("matched_guard_receipt_sha256", matched_guard_receipt_sha256),
-                ("canonical_source_receipt_sha256", canonical_source_receipt_sha256),
+                (
+                    "canonical_source_receipt_sha256",
+                    canonical_source_receipt_sha256,
+                ),
                 ("policy_sha256", policy_sha256),
                 ("residency_sha256", residency_sha256),
                 ("causal_receipt_sha256", causal_receipt_sha256),
                 ("authority_sha256", authority_sha256),
                 ("currentness_sha256", currentness_sha256),
-                ("module_catalog_owner_readback_sha256", module_catalog_owner_readback_sha256),
+                (
+                    "module_catalog_owner_readback_sha256",
+                    module_catalog_owner_readback_sha256,
+                ),
                 ("generation_admission_sha256", generation_admission_sha256),
             ] {
                 validate_digest(field, value)?;
@@ -809,10 +845,9 @@ impl BlobProcessStreamOwnerFactsPullResponse {
                 generation_admission_json,
                 generation_admission_sha256,
             )?;
-            let owner_facts: BlobProcessStreamVerifiedOwnerFacts = serde_json::from_str(
-                owner_facts_json,
-            )
-            .map_err(|_| WireValidationError::InvalidField("owner_facts_json"))?;
+            let owner_facts: BlobProcessStreamVerifiedOwnerFacts =
+                serde_json::from_str(owner_facts_json)
+                    .map_err(|_| WireValidationError::InvalidField("owner_facts_json"))?;
             owner_facts.validate()?;
             if serde_json::to_string(&owner_facts).ok().as_deref()
                 != Some(owner_facts_json.as_str())
@@ -833,8 +868,8 @@ impl BlobProcessStreamOwnerFactsPullResponse {
                 return Err(WireValidationError::InvalidField("owner_facts_commitment"));
             }
         }
-        let encoded = serde_json::to_vec(self)
-            .map_err(|_| WireValidationError::InvalidField("frame"))?;
+        let encoded =
+            serde_json::to_vec(self).map_err(|_| WireValidationError::InvalidField("frame"))?;
         if encoded.len() > BLOB_PROCESS_STREAM_KERNEL_MAX_FRAME_BYTES {
             return Err(WireValidationError::InvalidField("frame"));
         }
@@ -869,8 +904,7 @@ impl BlobProcessStreamOwnerFactsPullResponse {
         if matches!(
             &self.outcome,
             BlobProcessStreamOwnerFactsPullOutcome::Available { .. }
-        ) && (request.expected_module_id.is_none()
-            || request.expected_generation_id.is_none())
+        ) && (request.expected_module_id.is_none() || request.expected_generation_id.is_none())
         {
             return Err(WireValidationError::InvalidField(
                 "provider_catalog_expectation",
@@ -1025,8 +1059,7 @@ impl BlobProcessStreamKernelResponse {
             if !matches!(
                 &self.outcome,
                 BlobProcessStreamKernelOutcome::Completed { .. }
-            )
-                || next_call_token.ordinal <= self.call_token.ordinal
+            ) || next_call_token.ordinal <= self.call_token.ordinal
                 || next_call_token.reference == self.call_token.reference
             {
                 return Err(WireValidationError::InvalidField("next_call_token"));
@@ -1041,7 +1074,10 @@ impl BlobProcessStreamKernelResponse {
             } => {
                 validate_digest("operation_sha256", operation_sha256)?;
                 response.validate()?;
-                match (original_terminal_request, original_terminal_operation_sha256) {
+                match (
+                    original_terminal_request,
+                    original_terminal_operation_sha256,
+                ) {
                     (Some(request), Some(original_sha256)) => {
                         request.validate()?;
                         validate_digest("original_terminal_operation_sha256", original_sha256)?;
@@ -1049,12 +1085,9 @@ impl BlobProcessStreamKernelResponse {
                             request.as_ref(),
                             BlobProcessStreamKernelOperationRequest::SinkFinalize { .. }
                                 | BlobProcessStreamKernelOperationRequest::SinkAbort { .. }
-                        ) || sha256_hex(
-                            &serde_json::to_vec(request)
-                                .map_err(|_| WireValidationError::InvalidField(
-                                    "original_terminal_request",
-                                ))?,
-                        ) != *original_sha256
+                        ) || sha256_hex(&serde_json::to_vec(request).map_err(|_| {
+                            WireValidationError::InvalidField("original_terminal_request")
+                        })?) != *original_sha256
                         {
                             return Err(WireValidationError::InvalidField(
                                 "original_terminal_request",
@@ -1632,8 +1665,8 @@ fn validate_canonical_owner_json(
     digest: &str,
 ) -> Result<(), WireValidationError> {
     validate_digest(field, digest)?;
-    let value: serde_json::Value = serde_json::from_str(json)
-        .map_err(|_| WireValidationError::InvalidField(field))?;
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|_| WireValidationError::InvalidField(field))?;
     if !matches!(&value, serde_json::Value::Object(_))
         || serde_json::to_string(&value).as_bytes() != json.as_bytes()
         || sha256_hex(json.as_bytes()) != digest

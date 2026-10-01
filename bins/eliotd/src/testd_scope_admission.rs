@@ -126,7 +126,9 @@ pub fn read_current_module_catalog_generation(
         || admission.state_fence != *state_fence
         || admission.catalog_revision > readback.snapshot.catalog_revision
     {
-        return Err("fresh Module Registry generation differs from retained selectors or fence".to_owned());
+        return Err(
+            "fresh Module Registry generation differs from retained selectors or fence".to_owned(),
+        );
     }
     admission
         .validate()
@@ -195,7 +197,9 @@ pub fn resolve_blob_owner_facts(
                     // its scope governs this product/source/task identity.
                     None => BlobProcessStreamOwnerFactsUnavailableReason::ScopeGuardUnavailable,
                     Some(_) => match snapshot.source_admission.as_ref() {
-                        None => BlobProcessStreamOwnerFactsUnavailableReason::SourceReceiptUnavailable,
+                        None => {
+                            BlobProcessStreamOwnerFactsUnavailableReason::SourceReceiptUnavailable
+                        }
                         Some(source)
                             if source.sources.scope_ref != snapshot.binding.scope.scope_ref
                                 || source.sources.generation

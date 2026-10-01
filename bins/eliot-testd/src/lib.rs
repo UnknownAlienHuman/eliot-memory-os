@@ -23,8 +23,8 @@ use eliot_process::{
     EnvironmentInheritance, EnvironmentProjection, ExitDisposition, FencingToken, Generation,
     ImageId, JobId, KernelDispatchKey, OperationId, PermitIssuance, ProcessEvidenceSink,
     ProcessExecutionError, ProcessExecutor, ProcessIntent, ProcessRequest, ProcessStartReceipt,
-    ProcessStreamSinkClient, ProcessTreeId, ResourceLimits, SessionId,
-    SuspendedProcessIdentity, ValidatedDispatch,
+    ProcessStreamSinkClient, ProcessTreeId, ResourceLimits, SessionId, SuspendedProcessIdentity,
+    ValidatedDispatch,
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_testd_core::{
@@ -1320,46 +1320,45 @@ pub fn derive_testd_intent(params: &TestdDerivedIntentParams) -> Result<ProcessI
             reason: "testd admits only the closed cargo-test tool-probe profile",
         });
     }
-    let (artifact_sha256, argv, limits) = if eliot_testd_core::is_testd_executor_profile(
-        &params.profile,
-    ) {
-        let command = params.stage_command.as_ref().ok_or(TestdError::Invalid {
-            field: "stage_request.stage_command",
-            reason: "productive runner execution requires its sealed command projection",
-        })?;
-        if !matches!(command.executable.as_str(), "cargo" | "cargo-nextest")
-            || command.argv.is_empty()
-            || command.argv.len() > 64
-            || command.argv.iter().any(|argument| {
-                argument.is_empty()
-                    || argument.len() > 4_096
-                    || argument.chars().any(char::is_control)
-            })
-            || command.spec_digest.len() != 64
-            || !command
-                .spec_digest
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        {
-            return Err(TestdError::InvalidBinding);
-        }
-        (
-            params.executable_sha256.clone(),
-            command.argv.clone(),
-            eliot_testd_core::testd_productive_stage_resource_limits()?,
-        )
-    } else {
-        let binding = eliot_testd_core::testd_profile_binding_with_slots(
-            &params.profile,
-            &params.executable_sha256,
-            &params.slot_suffix,
-        )?;
-        (
-            binding.package_artifact_digest.clone(),
-            binding.fixed_argv.clone(),
-            testd_profile_resource_limits(&binding)?,
-        )
-    };
+    let (artifact_sha256, argv, limits) =
+        if eliot_testd_core::is_testd_executor_profile(&params.profile) {
+            let command = params.stage_command.as_ref().ok_or(TestdError::Invalid {
+                field: "stage_request.stage_command",
+                reason: "productive runner execution requires its sealed command projection",
+            })?;
+            if !matches!(command.executable.as_str(), "cargo" | "cargo-nextest")
+                || command.argv.is_empty()
+                || command.argv.len() > 64
+                || command.argv.iter().any(|argument| {
+                    argument.is_empty()
+                        || argument.len() > 4_096
+                        || argument.chars().any(char::is_control)
+                })
+                || command.spec_digest.len() != 64
+                || !command
+                    .spec_digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            {
+                return Err(TestdError::InvalidBinding);
+            }
+            (
+                params.executable_sha256.clone(),
+                command.argv.clone(),
+                eliot_testd_core::testd_productive_stage_resource_limits()?,
+            )
+        } else {
+            let binding = eliot_testd_core::testd_profile_binding_with_slots(
+                &params.profile,
+                &params.executable_sha256,
+                &params.slot_suffix,
+            )?;
+            (
+                binding.package_artifact_digest.clone(),
+                binding.fixed_argv.clone(),
+                testd_profile_resource_limits(&binding)?,
+            )
+        };
     let executable = Path::new(&params.executable_absolute);
     if !executable.is_absolute()
         || executable
@@ -2162,8 +2161,7 @@ fn validate_job_process_stage(job: &TestJob) -> Result<(), TestdError> {
     match job.stage_request.as_ref() {
         Some(stage) => {
             stage.validate()?;
-            if stage.execution != StageExecutionKind::Process
-                || stage.invocation != job.invocation
+            if stage.execution != StageExecutionKind::Process || stage.invocation != job.invocation
             {
                 return Err(TestdError::InvalidBinding);
             }
@@ -2378,7 +2376,10 @@ async fn drive_validated_dispatch_material_inner(
     let authority = Arc::new(TestdDispatchAuthority::new()?);
     let mut readback_port = None;
     let executor = if eliot_testd_core::is_productive_testd_profile(&job.invocation.profile) {
-        let stream_material = material.blob_stream.as_ref().ok_or(TestdError::InvalidBinding)?;
+        let stream_material = material
+            .blob_stream
+            .as_ref()
+            .ok_or(TestdError::InvalidBinding)?;
         let (durable_grant, tokens) = match store.resolve_blob_process_stream_grant(
             &job.job_id,
             &stream_material.capability_ref,
@@ -2401,10 +2402,7 @@ async fn drive_validated_dispatch_material_inner(
             return Err(TestdError::InvalidBinding);
         }
         let current_token = store
-            .resolve_blob_process_stream_token_head(
-                &job.job_id,
-                &durable_grant.capability_ref,
-            )?
+            .resolve_blob_process_stream_token_head(&job.job_id, &durable_grant.capability_ref)?
             .ok_or(TestdError::InvalidBinding)?;
         let client = blob_client.ok_or(TestdError::InvalidBinding)?;
         let calls = crate::kernel_client::KernelBlobStreamCallSequence::new(

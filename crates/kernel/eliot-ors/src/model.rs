@@ -1212,19 +1212,31 @@ impl BlobProcessStreamGrantRecord {
             (&self.capability_ref, "blob_process_stream_capability_ref"),
             (&self.job_id, "blob_process_stream_job_id"),
             (&self.invocation_id, "blob_process_stream_invocation_id"),
-            (&self.authority_lineage_id, "blob_process_stream_authority_lineage"),
+            (
+                &self.authority_lineage_id,
+                "blob_process_stream_authority_lineage",
+            ),
         ] {
             validate_text(value, field)?;
         }
         for (value, field) in [
-            (&self.process_binding_sha256, "blob_process_stream_process_binding"),
-            (&self.store_session_binding_sha256, "blob_process_stream_store_session"),
+            (
+                &self.process_binding_sha256,
+                "blob_process_stream_process_binding",
+            ),
+            (
+                &self.store_session_binding_sha256,
+                "blob_process_stream_store_session",
+            ),
             (&self.owner_facts_sha256, "blob_process_stream_owner_facts"),
             (&self.state_fence_sha256, "blob_process_stream_state_fence"),
         ] {
             validate_digest(value, field)?;
         }
-        validate_text(&self.owner_facts_pull_ref, "blob_process_stream_owner_facts_pull_ref")?;
+        validate_text(
+            &self.owner_facts_pull_ref,
+            "blob_process_stream_owner_facts_pull_ref",
+        )?;
         if self.authority_epoch == 0
             || self.generation == 0
             || self.expires_at_unix_ms == 0
@@ -1455,12 +1467,22 @@ impl BlobProcessStreamCallRecord {
         }
         if let Some(json) = &self.operation_projection_json {
             if json.len() > MAX_BLOB_PROCESS_STREAM_PROJECTION_JSON_BYTES
-                || !matches!(serde_json::from_str::<serde_json::Value>(json), Ok(serde_json::Value::Object(_)))
-                || serde_json::to_string(&serde_json::from_str::<serde_json::Value>(json).map_err(|_| OrsError::InvalidField {
-                    field: "blob_process_stream_call_operation_projection",
-                    reason: "must be a bounded canonical JSON object",
-                })?).as_bytes() != json.as_bytes()
-                || self.operation_sha256.as_deref().is_none_or(|digest| sha256_hex(json.as_bytes()) != digest)
+                || !matches!(
+                    serde_json::from_str::<serde_json::Value>(json),
+                    Ok(serde_json::Value::Object(_))
+                )
+                || serde_json::to_string(&serde_json::from_str::<serde_json::Value>(json).map_err(
+                    |_| OrsError::InvalidField {
+                        field: "blob_process_stream_call_operation_projection",
+                        reason: "must be a bounded canonical JSON object",
+                    },
+                )?)
+                .as_bytes()
+                    != json.as_bytes()
+                || self
+                    .operation_sha256
+                    .as_deref()
+                    .is_none_or(|digest| sha256_hex(json.as_bytes()) != digest)
             {
                 return Err(OrsError::InvalidField {
                     field: "blob_process_stream_call_operation_projection",
@@ -1470,12 +1492,22 @@ impl BlobProcessStreamCallRecord {
         }
         if let Some(json) = &self.response_projection_json {
             if json.len() > MAX_BLOB_PROCESS_STREAM_PROJECTION_JSON_BYTES
-                || !matches!(serde_json::from_str::<serde_json::Value>(json), Ok(serde_json::Value::Object(_)))
-                || serde_json::to_string(&serde_json::from_str::<serde_json::Value>(json).map_err(|_| OrsError::InvalidField {
-                    field: "blob_process_stream_call_response_projection",
-                    reason: "must be a bounded canonical JSON object",
-                })?).as_bytes() != json.as_bytes()
-                || self.response_sha256.as_deref().is_none_or(|digest| sha256_hex(json.as_bytes()) != digest)
+                || !matches!(
+                    serde_json::from_str::<serde_json::Value>(json),
+                    Ok(serde_json::Value::Object(_))
+                )
+                || serde_json::to_string(&serde_json::from_str::<serde_json::Value>(json).map_err(
+                    |_| OrsError::InvalidField {
+                        field: "blob_process_stream_call_response_projection",
+                        reason: "must be a bounded canonical JSON object",
+                    },
+                )?)
+                .as_bytes()
+                    != json.as_bytes()
+                || self
+                    .response_sha256
+                    .as_deref()
+                    .is_none_or(|digest| sha256_hex(json.as_bytes()) != digest)
             {
                 return Err(OrsError::InvalidField {
                     field: "blob_process_stream_call_response_projection",
@@ -1491,7 +1523,10 @@ impl BlobProcessStreamCallRecord {
         }
         for (value, field) in [
             (&self.operation_sha256, "blob_process_stream_call_operation"),
-            (&self.request_identity_sha256, "blob_process_stream_call_identity"),
+            (
+                &self.request_identity_sha256,
+                "blob_process_stream_call_identity",
+            ),
             (&self.response_sha256, "blob_process_stream_call_response"),
         ] {
             if let Some(value) = value {
@@ -1500,11 +1535,18 @@ impl BlobProcessStreamCallRecord {
         }
         if let Some(json) = &self.request_identity_json {
             if json.len() > MAX_BLOB_PROCESS_STREAM_IDENTITY_JSON_BYTES
-                || !matches!(serde_json::from_str::<serde_json::Value>(json), Ok(serde_json::Value::Object(_)))
-                || serde_json::to_string(&serde_json::from_str::<serde_json::Value>(json).map_err(|_| OrsError::InvalidField {
-                    field: "blob_process_stream_call_identity_json",
-                    reason: "must be a bounded JSON object",
-                })?).as_bytes() != json.as_bytes()
+                || !matches!(
+                    serde_json::from_str::<serde_json::Value>(json),
+                    Ok(serde_json::Value::Object(_))
+                )
+                || serde_json::to_string(&serde_json::from_str::<serde_json::Value>(json).map_err(
+                    |_| OrsError::InvalidField {
+                        field: "blob_process_stream_call_identity_json",
+                        reason: "must be a bounded JSON object",
+                    },
+                )?)
+                .as_bytes()
+                    != json.as_bytes()
             {
                 return Err(OrsError::InvalidField {
                     field: "blob_process_stream_call_identity_json",
@@ -1526,7 +1568,10 @@ impl BlobProcessStreamCallRecord {
         }
         for (value, field) in [
             (&self.response_ref, "blob_process_stream_call_response_ref"),
-            (&self.owner_receipt_ref, "blob_process_stream_call_owner_receipt"),
+            (
+                &self.owner_receipt_ref,
+                "blob_process_stream_call_owner_receipt",
+            ),
         ] {
             if let Some(value) = value {
                 validate_text(value, field)?;
@@ -1547,28 +1592,40 @@ impl BlobProcessStreamCallRecord {
             && self.request_identity_sha256.is_some();
         let completed = self.response_sha256.is_some();
         match self.state {
-            BlobProcessStreamCallState::Issued if reserved || completed => Err(OrsError::InvalidField {
-                field: "blob_process_stream_call_state",
-                reason: "issued token cannot carry a request or result",
-            }),
-            BlobProcessStreamCallState::Reserved if !reserved || completed => Err(OrsError::InvalidField {
-                field: "blob_process_stream_call_state",
-                reason: "reserved call requires exact request and no result",
-            }),
-            BlobProcessStreamCallState::Dispatched if !reserved || completed => Err(OrsError::InvalidField {
-                field: "blob_process_stream_call_state",
-                reason: "dispatched call requires exact request and no result",
-            }),
-            BlobProcessStreamCallState::Completed if !reserved || !completed => Err(OrsError::InvalidField {
-                field: "blob_process_stream_call_state",
-                reason: "completed call requires exact request and response digest",
-            }),
+            BlobProcessStreamCallState::Issued if reserved || completed => {
+                Err(OrsError::InvalidField {
+                    field: "blob_process_stream_call_state",
+                    reason: "issued token cannot carry a request or result",
+                })
+            }
+            BlobProcessStreamCallState::Reserved if !reserved || completed => {
+                Err(OrsError::InvalidField {
+                    field: "blob_process_stream_call_state",
+                    reason: "reserved call requires exact request and no result",
+                })
+            }
+            BlobProcessStreamCallState::Dispatched if !reserved || completed => {
+                Err(OrsError::InvalidField {
+                    field: "blob_process_stream_call_state",
+                    reason: "dispatched call requires exact request and no result",
+                })
+            }
+            BlobProcessStreamCallState::Completed if !reserved || !completed => {
+                Err(OrsError::InvalidField {
+                    field: "blob_process_stream_call_state",
+                    reason: "completed call requires exact request and response digest",
+                })
+            }
             BlobProcessStreamCallState::NotStarted
             | BlobProcessStreamCallState::Unknown
-            | BlobProcessStreamCallState::Unavailable if !reserved || completed => Err(OrsError::InvalidField {
-                field: "blob_process_stream_call_state",
-                reason: "terminal refusal/unknown state requires request without result",
-            }),
+            | BlobProcessStreamCallState::Unavailable
+                if !reserved || completed =>
+            {
+                Err(OrsError::InvalidField {
+                    field: "blob_process_stream_call_state",
+                    reason: "terminal refusal/unknown state requires request without result",
+                })
+            }
             _ => Ok(()),
         }
     }

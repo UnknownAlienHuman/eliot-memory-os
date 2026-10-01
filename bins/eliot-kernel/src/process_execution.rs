@@ -1780,8 +1780,7 @@ pub(crate) struct ProcessExecutionGateway {
 pub(crate) struct KernelIssuedBlobProcessStreamGrant {
     pub(crate) capability: eliot_blob_api::wire::ProcessStreamSinkCapabilityRef,
     pub(crate) initial_call_token: eliot_blob_api::wire::BlobProcessStreamCallToken,
-    pub(crate) owner_facts_response:
-        eliot_blob_api::wire::BlobProcessStreamOwnerFactsPullResponse,
+    pub(crate) owner_facts_response: eliot_blob_api::wire::BlobProcessStreamOwnerFactsPullResponse,
 }
 
 #[cfg(windows)]
@@ -2926,11 +2925,13 @@ impl ProcessExecutionGateway {
     ) -> Result<eliot_blob_api::wire::BlobProcessStreamOwnerFactsPullResponse, ProcessExecutionError>
     {
         use eliot_blob_api::wire::{
+            BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_ID, BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_REVISION,
             BlobProcessStreamOwnerFactsPullOutcome, BlobProcessStreamOwnerFactsPullRequest,
-            BlobProcessStreamOwnerFactsPullResponse, BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_ID,
-            BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_REVISION,
+            BlobProcessStreamOwnerFactsPullResponse,
         };
-        use eliot_contracts::{ContractId, StateFence, TransactionSequence, canonical_json_bytes, sha256_hex};
+        use eliot_contracts::{
+            ContractId, StateFence, TransactionSequence, canonical_json_bytes, sha256_hex,
+        };
         use eliot_ors::{
             BLOB_PROCESS_STREAM_ORS_VERSION, BlobProcessStreamOwnerFactsPullRecord,
             BlobProcessStreamOwnerFactsPullState,
@@ -3772,12 +3773,9 @@ impl KernelComposition {
         deadline_ms: u64,
     ) -> Result<eliot_blob_api::wire::BlobProcessStreamOwnerFactsPullResponse, ProcessExecutionError>
     {
-        let gateway = self
-            .process_gateway
-            .as_ref()
-            .ok_or_else(|| ProcessExecutionError::Unavailable(
-                "Kernel process issuer is unavailable".to_owned(),
-            ))?;
+        let gateway = self.process_gateway.as_ref().ok_or_else(|| {
+            ProcessExecutionError::Unavailable("Kernel process issuer is unavailable".to_owned())
+        })?;
         gateway
             .pull_testd_blob_process_stream_owner_facts(
                 &self.p07_ors,
@@ -3834,8 +3832,7 @@ impl KernelComposition {
             .await?;
         let owner_facts_sha256 = match &response.outcome {
             BlobProcessStreamOwnerFactsPullOutcome::Available {
-                owner_facts_sha256,
-                ..
+                owner_facts_sha256, ..
             } => owner_facts_sha256.clone(),
             BlobProcessStreamOwnerFactsPullOutcome::Unavailable { .. } => {
                 return Err(ProcessExecutionError::Unavailable(
@@ -3874,8 +3871,18 @@ impl KernelComposition {
         let store_session_binding_json = canonical_json_bytes(&(
             identity.request.metadata.product_id.as_str(),
             identity.request.metadata.source_id.as_str(),
-            identity.request.metadata.session_id.as_ref().map(|value| value.as_str()),
-            identity.request.metadata.task_id.as_ref().map(|value| value.as_str()),
+            identity
+                .request
+                .metadata
+                .session_id
+                .as_ref()
+                .map(|value| value.as_str()),
+            identity
+                .request
+                .metadata
+                .task_id
+                .as_ref()
+                .map(|value| value.as_str()),
             &identity.request.state_fence,
         ))
         .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
@@ -3896,11 +3903,7 @@ impl KernelComposition {
                 .as_str()
                 .to_owned(),
             authority_epoch: identity.request.state_fence.authority_epoch.sequence.get(),
-            generation: identity
-                .request
-                .state_fence
-                .resource_generation
-                .value(),
+            generation: identity.request.state_fence.resource_generation.value(),
             state_fence_sha256: sha256_hex(&state_fence_json),
             expires_at_unix_ms: deadline_ms,
             next_ordinal: 1,

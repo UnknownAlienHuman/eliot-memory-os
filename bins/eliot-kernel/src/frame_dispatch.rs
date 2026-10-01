@@ -40,9 +40,7 @@ use super::{
     TestdAdmissionAttemptRequest, TransportError, caller_binding, probe_ready_state_admitted,
     route_doctor_repair, route_testd_admission, status_frame, unix_ms,
 };
-use eliot_blob_api::wire::{
-    BLOB_PROCESS_STREAM_KERNEL_WIRE_ID, BlobProcessStreamKernelRequest,
-};
+use eliot_blob_api::wire::{BLOB_PROCESS_STREAM_KERNEL_WIRE_ID, BlobProcessStreamKernelRequest};
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_kernel_core::{
     CapabilityReadiness, CompatibilityEnvelope, DurableCompatibilityState, HealthDimensionKind,

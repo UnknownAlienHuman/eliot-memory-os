@@ -5487,11 +5487,12 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                     .to_owned(),
             ));
         }
-        let snapshot: ModuleCatalogSnapshot = serde_json::from_slice(&reply.payload).map_err(|error| {
-            CompositionError::Recovery(format!(
-                "Kernel Module Registry owner payload is invalid: {error}"
-            ))
-        })?;
+        let snapshot: ModuleCatalogSnapshot =
+            serde_json::from_slice(&reply.payload).map_err(|error| {
+                CompositionError::Recovery(format!(
+                    "Kernel Module Registry owner payload is invalid: {error}"
+                ))
+            })?;
         snapshot
             .validate()
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;

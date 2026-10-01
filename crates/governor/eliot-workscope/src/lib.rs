@@ -3232,11 +3232,7 @@ impl WorkScopeBindingSnapshot {
             return Err(WorkScopeError::BindingReceiptMismatch);
         }
         if let Some(source_admission) = &self.source_admission {
-            source_admission.validate_for(
-                &self.state_fence,
-                &self.binding,
-                &self.guard_receipt,
-            )?;
+            source_admission.validate_for(&self.state_fence, &self.binding, &self.guard_receipt)?;
         }
         Ok(())
     }

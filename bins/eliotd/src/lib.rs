@@ -159,8 +159,8 @@ pub mod supervision_progress;
 pub mod swarm_composition;
 pub mod task_binding_admission;
 mod task_lifecycle_adapters;
-pub mod testd_terminal_completion;
 pub mod testd_scope_admission;
+pub mod testd_terminal_completion;
 
 pub use activation_projection::AgentActivationResolver;
 pub use activation_projection::{

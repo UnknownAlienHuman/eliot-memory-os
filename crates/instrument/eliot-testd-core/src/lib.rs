@@ -729,8 +729,7 @@ pub fn is_testd_executor_profile(profile: &str) -> bool {
 /// process stage. The limits are not caller-configurable and are independent
 /// of the exact sealed command carried by the stage request.
 pub fn testd_productive_stage_resource_limits() -> Result<ResourceLimits, TestdError> {
-    let (wall, cpu, memory, stdout, stderr, descendants) =
-        profile_limits(TESTD_PRODUCTIVE_PROFILE);
+    let (wall, cpu, memory, stdout, stderr, descendants) = profile_limits(TESTD_PRODUCTIVE_PROFILE);
     ResourceLimits::new(wall, cpu, memory, stdout, stderr, descendants)
         .map_err(|error| TestdError::Contract(error.to_string()))
 }
@@ -1930,9 +1929,7 @@ impl TestdBlobProcessStreamGrant {
         for (index, token) in self.tokens.iter().enumerate() {
             validate_text(&token.reference, "blob_stream.token.reference")?;
             if token.ordinal == 0
-                || (index > 0
-                    && token.ordinal
-                        != self.tokens[index - 1].ordinal.saturating_add(1))
+                || (index > 0 && token.ordinal != self.tokens[index - 1].ordinal.saturating_add(1))
             {
                 return Err(TestdError::Invalid {
                     field: "blob_stream.tokens",
@@ -2797,9 +2794,7 @@ impl TestdVerifierJobSubmission {
                 reason: "productive submission requires an accepted catalog lifecycle projection",
             });
         }
-        if stage.invocation != self.invocation
-            || stage.execution != StageExecutionKind::Process
-        {
+        if stage.invocation != self.invocation || stage.execution != StageExecutionKind::Process {
             return Err(TestdError::InvalidBinding);
         }
         if let Some(layout) = self.target_layout.as_ref() {
@@ -4038,9 +4033,8 @@ fn blob_process_stream_token_head_key(
     job_id: &str,
     capability_ref: &str,
 ) -> Result<String, TestdError> {
-    let canonical =
-        eliot_contracts::canonical_json_bytes(&("token-head", job_id, capability_ref))
-            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+    let canonical = eliot_contracts::canonical_json_bytes(&("token-head", job_id, capability_ref))
+        .map_err(|error| TestdError::Corrupt(error.to_string()))?;
     Ok(blake3::hash(&canonical).to_hex().to_string())
 }
 
@@ -4182,7 +4176,11 @@ impl TestdStore {
         // stores migrate idempotently without rewriting job payloads.
         let write = db.begin_write().map_err(database)?;
         drop(write.open_table(ADMITTED_IDENTITIES).map_err(database)?);
-        drop(write.open_table(BLOB_PROCESS_STREAM_CALLS).map_err(database)?);
+        drop(
+            write
+                .open_table(BLOB_PROCESS_STREAM_CALLS)
+                .map_err(database)?,
+        );
         drop(
             write
                 .open_table(BLOB_PROCESS_STREAM_TOKEN_HEADS)
@@ -4286,10 +4284,7 @@ impl TestdStore {
                     .open_table(BLOB_PROCESS_STREAM_TOKEN_HEADS)
                     .map_err(database)?;
                 if heads.get(head_key.as_str()).map_err(database)?.is_none() {
-                    let initial = grant
-                        .tokens
-                        .first()
-                        .ok_or(TestdError::InvalidBinding)?;
+                    let initial = grant.tokens.first().ok_or(TestdError::InvalidBinding)?;
                     let encoded = serde_json::to_vec(initial)
                         .map_err(|error| TestdError::Corrupt(error.to_string()))?;
                     heads
@@ -4309,13 +4304,11 @@ impl TestdStore {
             .ok_or(TestdError::InvalidBinding)?;
         let head_key = blob_process_stream_token_head_key(job_id, &grant.capability_ref)?;
         job.blob_process_stream_grant = Some(grant);
-        let encoded = serde_json::to_vec(&job)
-            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        let encoded =
+            serde_json::to_vec(&job).map_err(|error| TestdError::Corrupt(error.to_string()))?;
         {
             let mut table = write.open_table(JOBS).map_err(database)?;
-            table
-                .insert(job_id, encoded.as_slice())
-                .map_err(database)?;
+            table.insert(job_id, encoded.as_slice()).map_err(database)?;
         }
         let head_encoded = serde_json::to_vec(&initial_token)
             .map_err(|error| TestdError::Corrupt(error.to_string()))?;
@@ -4475,10 +4468,10 @@ impl TestdStore {
                 .open_table(BLOB_PROCESS_STREAM_TOKEN_HEADS)
                 .map_err(database)?;
             match heads.get(head_key.as_str()).map_err(database)? {
-                Some(value) => serde_json::from_slice::<TestdBlobProcessStreamTokenRef>(
-                    value.value(),
-                )
-                .map_err(|error| TestdError::Corrupt(error.to_string()))?,
+                Some(value) => {
+                    serde_json::from_slice::<TestdBlobProcessStreamTokenRef>(value.value())
+                        .map_err(|error| TestdError::Corrupt(error.to_string()))?
+                }
                 None => grant
                     .tokens
                     .first()
@@ -4617,8 +4610,10 @@ impl TestdStore {
     ) -> Result<(), TestdError> {
         validate_blob_process_stream_outcome(&outcome)?;
         validate_text(&successor.reference, "blob_stream.token.reference")?;
-        if !matches!(&outcome, TestdBlobProcessStreamCallOutcome::Completed { .. })
-            || ordinal == u32::MAX
+        if !matches!(
+            &outcome,
+            TestdBlobProcessStreamCallOutcome::Completed { .. }
+        ) || ordinal == u32::MAX
             || successor.ordinal != ordinal + 1
         {
             return Err(TestdError::InvalidBinding);
@@ -4740,18 +4735,22 @@ impl TestdStore {
                 record.state = TestdBlobProcessStreamCallState::Completed(outcome);
             }
             (TestdBlobProcessStreamCallState::Completed(existing), Some(outcome))
-                if existing == outcome => {
-                    if successor.is_none() {
-                        return Ok(());
-                    }
+                if existing == outcome =>
+            {
+                if successor.is_none() {
+                    return Ok(());
                 }
+            }
             // A protected reconciliation can resolve an earlier Unknown for
             // this exact logical call. Unknown is explicitly unresolved, so
             // replacing it with the retained owner outcome does not change
             // the request binding or authorize another Store dispatch.
-            (TestdBlobProcessStreamCallState::Completed(
-            TestdBlobProcessStreamCallOutcome::Unknown,
-            ), Some(outcome)) => {
+            (
+                TestdBlobProcessStreamCallState::Completed(
+                    TestdBlobProcessStreamCallOutcome::Unknown,
+                ),
+                Some(outcome),
+            ) => {
                 if successor.is_some() {
                     return Err(TestdError::InvalidBinding);
                 }
@@ -4782,10 +4781,10 @@ impl TestdStore {
                     .open_table(BLOB_PROCESS_STREAM_TOKEN_HEADS)
                     .map_err(database)?;
                 match heads.get(head_key.as_str()).map_err(database)? {
-                    Some(value) => serde_json::from_slice::<TestdBlobProcessStreamTokenRef>(
-                        value.value(),
-                    )
-                    .map_err(|error| TestdError::Corrupt(error.to_string()))?,
+                    Some(value) => {
+                        serde_json::from_slice::<TestdBlobProcessStreamTokenRef>(value.value())
+                            .map_err(|error| TestdError::Corrupt(error.to_string()))?
+                    }
                     None => grant
                         .tokens
                         .first()
@@ -4829,8 +4828,8 @@ impl TestdStore {
                     .map_err(database)?;
             }
         }
-        let encoded = serde_json::to_vec(&record)
-            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        let encoded =
+            serde_json::to_vec(&record).map_err(|error| TestdError::Corrupt(error.to_string()))?;
         write
             .open_table(BLOB_PROCESS_STREAM_CALLS)
             .map_err(database)?

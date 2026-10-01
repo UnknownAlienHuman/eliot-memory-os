@@ -11,27 +11,27 @@ use super::restore_journal::{
     RESTORE_JOURNAL_INTENTS, RESTORE_JOURNAL_META, RESTORE_JOURNAL_RESULTS,
 };
 use super::{
-    ACTIVATION_LIFECYCLES, AUTHORITY_HANDOFFS, BRIDGE_EVENT_CURSORS, BRIDGE_EVENT_GAPS,
-    BRIDGE_EVENT_HANDOFFS, BRIDGE_EVENT_OWNER_MAINTENANCE_CURSORS, BRIDGE_EVENT_PROJECTIONS,
-    BRIDGE_EVENT_RECORDS, CAMPAIGN_SOURCE_PENDING, COLD_START_READINESS_BINDINGS,
-    COLD_START_READINESS_HEADS, COLD_START_READINESS_RECORDS, CUTOVER_OWNERSHIP, DOCTOR_ATTEMPTS,
-    DOCTOR_EFFECTS, BLOB_PROCESS_STREAM_CALLS, BLOB_PROCESS_STREAM_GRANTS,
-    BLOB_PROCESS_STREAM_OWNER_FACTS_PULLS, DurableInboxRecord, DurableOperationalRecord,
-    EFFECT_OPERATION_LEASES,
-    EFFECT_REPLAY_RECONCILIATIONS, HOST_REQUEST_LOGICAL_KEYS, HOST_REQUESTS, META,
-    NATIVE_WORKER_CLAIMS, OPERATIONAL_CURRENT, PROCESS_START_REPLAY, PROCESS_STREAM_RECOVERY,
-    RECOVERY_INBOX, RECOVERY_PROBLEMS, REPLAY_ACKS, REPLAY_EVENTS, RESERVATIONS,
-    RUNTIME_LEASE_CURRENT, RedbRecoveryStore, SCAN_DISCLOSURE_RECORDS, STORE_FAILURE_RETENTION,
-    STORE_REBIND_REPLAY, SUPERVISION_LEASE_CURRENT, SUPERVISION_LEASE_STAGED,
-    UNKNOWN_COMMIT_RECOVERY, decode, decode_named, read_store_object_identity, storage,
+    ACTIVATION_LIFECYCLES, AUTHORITY_HANDOFFS, BLOB_PROCESS_STREAM_CALLS,
+    BLOB_PROCESS_STREAM_GRANTS, BLOB_PROCESS_STREAM_OWNER_FACTS_PULLS, BRIDGE_EVENT_CURSORS,
+    BRIDGE_EVENT_GAPS, BRIDGE_EVENT_HANDOFFS, BRIDGE_EVENT_OWNER_MAINTENANCE_CURSORS,
+    BRIDGE_EVENT_PROJECTIONS, BRIDGE_EVENT_RECORDS, CAMPAIGN_SOURCE_PENDING,
+    COLD_START_READINESS_BINDINGS, COLD_START_READINESS_HEADS, COLD_START_READINESS_RECORDS,
+    CUTOVER_OWNERSHIP, DOCTOR_ATTEMPTS, DOCTOR_EFFECTS, DurableInboxRecord,
+    DurableOperationalRecord, EFFECT_OPERATION_LEASES, EFFECT_REPLAY_RECONCILIATIONS,
+    HOST_REQUEST_LOGICAL_KEYS, HOST_REQUESTS, META, NATIVE_WORKER_CLAIMS, OPERATIONAL_CURRENT,
+    PROCESS_START_REPLAY, PROCESS_STREAM_RECOVERY, RECOVERY_INBOX, RECOVERY_PROBLEMS, REPLAY_ACKS,
+    REPLAY_EVENTS, RESERVATIONS, RUNTIME_LEASE_CURRENT, RedbRecoveryStore, SCAN_DISCLOSURE_RECORDS,
+    STORE_FAILURE_RETENTION, STORE_REBIND_REPLAY, SUPERVISION_LEASE_CURRENT,
+    SUPERVISION_LEASE_STAGED, UNKNOWN_COMMIT_RECOVERY, decode, decode_named,
+    read_store_object_identity, storage,
 };
 use crate::model::{SupervisionLeaseSnapshot, SupervisionLeaseStageReceipt};
 use crate::{
-    AdmissionReservationState, HostRequestRecord, KernelReconciliationItem, OperationalPhase,
-    RecoveryInboxDisposition, RecoveryProblem, ReservationRecord, UnknownCommitRecord,
-    BlobProcessStreamCallRecord, BlobProcessStreamCallState, BlobProcessStreamGrantRecord,
-    BlobProcessStreamGrantState, BlobProcessStreamOwnerFactsPullRecord,
-    BlobProcessStreamOwnerFactsPullState,
+    AdmissionReservationState, BlobProcessStreamCallRecord, BlobProcessStreamCallState,
+    BlobProcessStreamGrantRecord, BlobProcessStreamGrantState,
+    BlobProcessStreamOwnerFactsPullRecord, BlobProcessStreamOwnerFactsPullState, HostRequestRecord,
+    KernelReconciliationItem, OperationalPhase, RecoveryInboxDisposition, RecoveryProblem,
+    ReservationRecord, UnknownCommitRecord,
 };
 use eliot_contracts::StateFence;
 use eliot_runtime_contracts::RuntimeLease;
@@ -940,7 +940,9 @@ fn observe_blob_process_stream(
     read: &redb::ReadTransaction,
     builder: &mut CensusBuilder,
 ) -> Result<(), crate::OrsError> {
-    let grants = read.open_table(BLOB_PROCESS_STREAM_GRANTS).map_err(storage)?;
+    let grants = read
+        .open_table(BLOB_PROCESS_STREAM_GRANTS)
+        .map_err(storage)?;
     for row in grants.iter().map_err(storage)? {
         let (key, value) = row.map_err(storage)?;
         let grant: BlobProcessStreamGrantRecord = decode(value.value())?;
@@ -958,7 +960,9 @@ fn observe_blob_process_stream(
         }
     }
 
-    let calls = read.open_table(BLOB_PROCESS_STREAM_CALLS).map_err(storage)?;
+    let calls = read
+        .open_table(BLOB_PROCESS_STREAM_CALLS)
+        .map_err(storage)?;
     for row in calls.iter().map_err(storage)? {
         let (key, value) = row.map_err(storage)?;
         let call: BlobProcessStreamCallRecord = decode(value.value())?;
@@ -969,7 +973,11 @@ fn observe_blob_process_stream(
                 "token reference does not match its table key",
             ));
         }
-        if grants.get(call.capability_ref.as_str()).map_err(storage)?.is_none() {
+        if grants
+            .get(call.capability_ref.as_str())
+            .map_err(storage)?
+            .is_none()
+        {
             return Err(integrity(
                 "blob_process_stream_call",
                 "call references a missing capability grant",

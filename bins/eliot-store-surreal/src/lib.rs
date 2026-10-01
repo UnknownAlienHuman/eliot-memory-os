@@ -13,15 +13,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use eliot_blob::{
-    BlobRootOwner, BlobStoreService, BlobStoreStreamSink, BlobStreamSinkStoreBinding, DpapiUserAeadPort,
-    DpapiUserKeyPort, RleCompressionPort, WindowsBlobPlatformPort,
-};
-use eliot_blob_api::{
-    BlobHash, BlobProcessStreamReadbackRequest, BlobProcessStreamSourceBinding, BlobStoreClient,
+    BlobRootOwner, BlobStoreService, BlobStoreStreamSink, BlobStreamSinkStoreBinding,
+    DpapiUserAeadPort, DpapiUserKeyPort, RleCompressionPort, WindowsBlobPlatformPort,
 };
 use eliot_blob_api::wire::{
     BlobProcessStreamVerifiedOwnerFacts, ProcessStreamSourceReadbackRequest,
     ProcessStreamSourceReadbackResponse,
+};
+use eliot_blob_api::{
+    BlobHash, BlobProcessStreamReadbackRequest, BlobProcessStreamSourceBinding, BlobStoreClient,
 };
 use eliot_contracts::{StateFence, canonical_json_bytes};
 use eliot_installation::{
@@ -38,6 +38,7 @@ use eliot_kernel_service::{
 };
 use eliot_platform::{ClockObservation, PlatformHandle};
 use eliot_platform_windows::WindowsPlatform;
+use eliot_process::ProcessExecutionBinding;
 use eliot_process::stream_sink::{
     ProcessStreamSinkAbortRequest, ProcessStreamSinkAppend, ProcessStreamSinkAppendDisposition,
     ProcessStreamSinkClient, ProcessStreamSinkError, ProcessStreamSinkFinalizeRequest,
@@ -48,7 +49,6 @@ use eliot_protocol::{
     ClientHello, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolRange,
     ProtocolVersion, RequestIdentity, ServerHello,
 };
-use eliot_process::ProcessExecutionBinding;
 use eliot_store_api::{
     BackupOperationReconciliation, CAPABILITIES, CanonicalRequestView, CanonicalRestoreBatch,
     CanonicalSnapshotPort, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS,
@@ -848,10 +848,9 @@ impl StoreComposition {
         let Some(current) = current else {
             return Ok(ProcessStreamSourceReadbackResponse::Unknown);
         };
-        let process_binding: ProcessExecutionBinding = serde_json::from_str(
-            request.process_binding_json.as_str(),
-        )
-        .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let process_binding: ProcessExecutionBinding =
+            serde_json::from_str(request.process_binding_json.as_str())
+                .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
         if process_binding.job_id().to_string() != request.job_id
             || process_binding.operation_id().to_string() != request.operation_id
             || process_binding.process_tree_id().to_string() != request.process_tree_id
@@ -931,7 +930,12 @@ impl StoreComposition {
         if readback.validate().is_err()
             || readback.ready_receipt().plaintext_sha256() != request.expected_sha256
             || readback.ready_receipt().plaintext_length() != request.expected_byte_length
-            || readback.ready_receipt().receipt().identity.receipt_id.as_str()
+            || readback
+                .ready_receipt()
+                .receipt()
+                .identity
+                .receipt_id
+                .as_str()
                 != request.ready_receipt_ref
             || format!("{:x}", Sha256::digest(readback.bytes())) != request.expected_sha256
             || u64::try_from(readback.bytes().len()).ok() != Some(request.expected_byte_length)
@@ -949,8 +953,8 @@ impl StoreComposition {
             .ok_or(ProcessStreamSinkError::ProviderUnavailable)?
             .to_vec();
         let observed_sha256 = format!("{:x}", Sha256::digest(&bytes));
-        let observed_byte_length = u64::try_from(bytes.len())
-            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let observed_byte_length =
+            u64::try_from(bytes.len()).map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
         Ok(ProcessStreamSourceReadbackResponse::Ready {
             bytes,
             whole_source_sha256: readback.ready_receipt().plaintext_sha256().to_owned(),

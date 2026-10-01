@@ -91,8 +91,7 @@ pub(crate) const DAEMON_STARTUP_EVIDENCE_OPERATION: &str = "daemon_startup_evide
 /// head so the producer converges after renewals on any path.
 pub(crate) const DAEMON_SUPERVISION_PROGRESS_OPERATION: &str = "daemon_supervision_progress";
 /// Authenticated eliotd poll for one pending Kernel-issued Blob owner-facts read.
-pub(crate) const TESTD_BLOB_OWNER_FACTS_PENDING_OPERATION: &str =
-    "testd_blob_owner_facts_pending";
+pub(crate) const TESTD_BLOB_OWNER_FACTS_PENDING_OPERATION: &str = "testd_blob_owner_facts_pending";
 /// Authenticated eliotd completion for one exact Blob owner-facts pull.
 pub(crate) const TESTD_BLOB_OWNER_FACTS_COMPLETE_OPERATION: &str =
     "testd_blob_owner_facts_complete";
@@ -3231,8 +3230,7 @@ impl KernelComposition {
                     .validate_for_request(&pull_request)
                     .map_err(|_| TransportError::SessionFenced)?;
                 if pending.state != eliot_ors::BlobProcessStreamOwnerFactsPullState::Pending
-                    || response.observed_state_fence
-                        != identity.request.state_fence
+                    || response.observed_state_fence != identity.request.state_fence
                 {
                     return Err(TransportError::SessionFenced);
                 }

@@ -47,18 +47,18 @@
 //! composed Kernel advertises the exact testd wire. The Drive path below
 //! already derives its executable binding from the admitted profile registry.
 
-use std::sync::{Arc, Mutex};
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use eliot_cli::kernel_client::{KernelClient, KernelClientError};
 use eliot_blob_api::wire::{
     BlobProcessStreamCallToken, BlobProcessStreamKernelOperationRequest,
-    BlobProcessStreamKernelRequest, BlobProcessStreamKernelResponse,
-    BlobProcessStreamKernelOutcome, BlobProcessStreamOperationResponse,
+    BlobProcessStreamKernelOutcome, BlobProcessStreamKernelRequest,
+    BlobProcessStreamKernelResponse, BlobProcessStreamOperationResponse,
     ProcessStreamSinkBindingRef, ProcessStreamSinkCapabilityRef, ProcessStreamSinkWireResponse,
 };
+use eliot_cli::kernel_client::{KernelClient, KernelClientError};
 use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
 use eliot_instrument_api::{InstrumentInvocation, InstrumentKind};
 use eliot_process::{ProcessEvidenceSink, ProcessExecutionError, ProcessExecutor, ProcessRequest};
@@ -74,8 +74,7 @@ use eliot_testd_core::{
     KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider, KernelProcessAdmissionRequest,
     TestJob, TestdBlobProcessStreamCallOutcome, TestdBlobProcessStreamReserve,
     TestdBlobProcessStreamTokenRef, TestdError, TestdStore, TestdTerminalCompletionNotice,
-    TestdVerifierDispatchBinding,
-    verification_receipt_sha256,
+    TestdVerifierDispatchBinding, verification_receipt_sha256,
 };
 use serde::{Deserialize, Serialize};
 
@@ -968,8 +967,7 @@ impl KernelBlobStreamCallSequence {
         let mut values = VecDeque::with_capacity(tokens.len());
         for (index, token) in tokens.iter().enumerate() {
             if token.ordinal == 0
-                || (index > 0
-                    && token.ordinal != tokens[index - 1].ordinal.saturating_add(1))
+                || (index > 0 && token.ordinal != tokens[index - 1].ordinal.saturating_add(1))
                 || token.reference.trim().is_empty()
                 || token.reference.len() > 128
                 || token.reference.chars().any(char::is_control)
@@ -1041,13 +1039,12 @@ impl KernelBlobStreamCallSequence {
         // Keep one lock across token consumption and the authenticated
         // exchange. Stdout, stderr, and readback share this sequence, so a
         // successor token can never overtake the operation that issued it.
-        let mut tokens = self
-            .tokens
-            .lock()
-            .map_err(|_| TestdIpcError::Transport("Blob token sequence lock poisoned".to_owned()))?;
-        let token = tokens
-            .pop_front()
-            .ok_or_else(|| TestdIpcError::Transport("Blob call token sequence exhausted".to_owned()))?;
+        let mut tokens = self.tokens.lock().map_err(|_| {
+            TestdIpcError::Transport("Blob token sequence lock poisoned".to_owned())
+        })?;
+        let token = tokens.pop_front().ok_or_else(|| {
+            TestdIpcError::Transport("Blob call token sequence exhausted".to_owned())
+        })?;
         let request = BlobProcessStreamKernelRequest::new(
             self.capability.clone(),
             token.clone(),
@@ -1162,13 +1159,13 @@ impl KernelProcessStreamSinkClient {
     ) -> Result<ProcessStreamSinkSession, ProcessStreamSinkError> {
         request.validate()?;
         let body = Box::new(serde_json::to_value(&request).map_err(|_| sink_invalid())?);
-        let deadline_ms = self.calls.deadline_for_budget(5_000).map_err(map_sink_ipc_error)?;
+        let deadline_ms = self
+            .calls
+            .deadline_for_budget(5_000)
+            .map_err(map_sink_ipc_error)?;
         let response = self
             .calls
-            .exchange(BlobProcessStreamKernelOperationRequest::SinkOpen {
-                body,
-                deadline_ms,
-            })
+            .exchange(BlobProcessStreamKernelOperationRequest::SinkOpen { body, deadline_ms })
             .map_err(map_sink_ipc_error)?;
         let owner = completed_sink_response(response)?;
         let ProcessStreamSinkWireResponse::Opened { binding } = owner else {
@@ -1209,9 +1206,8 @@ impl KernelProcessStreamSinkClient {
                 .deadline_for_budget(request.wait_budget_ms())
                 .map_err(map_sink_ipc_error)?,
         };
-        let owner = completed_sink_response(
-            self.calls.exchange(operation).map_err(map_sink_ipc_error)?,
-        )?;
+        let owner =
+            completed_sink_response(self.calls.exchange(operation).map_err(map_sink_ipc_error)?)?;
         let ProcessStreamSinkWireResponse::AppendDisposition { body } = owner else {
             return Err(ProcessStreamSinkError::ProviderUnavailable);
         };
@@ -1298,12 +1294,12 @@ impl KernelProcessStreamSinkClient {
     ) -> Result<ProcessStreamSinkReadback, ProcessStreamSinkError> {
         let operation = BlobProcessStreamKernelOperationRequest::SinkReadback {
             binding: self.binding_for_session(&session)?,
-            deadline_ms: self.calls.deadline_for_budget(2_000).map_err(map_sink_ipc_error)?,
+            deadline_ms: self
+                .calls
+                .deadline_for_budget(2_000)
+                .map_err(map_sink_ipc_error)?,
         };
-        let response = self
-            .calls
-            .exchange(operation)
-            .map_err(map_sink_ipc_error)?;
+        let response = self.calls.exchange(operation).map_err(map_sink_ipc_error)?;
         let (owner, original_terminal) = completed_sink_response_with_terminal(response)?;
         let ProcessStreamSinkWireResponse::Readback { body } = owner else {
             return Err(ProcessStreamSinkError::ProviderUnavailable);
@@ -1320,12 +1316,12 @@ impl KernelProcessStreamSinkClient {
         let operation = BlobProcessStreamKernelOperationRequest::SinkReconcile {
             binding: self.binding_for_session(&session)?,
             body: Box::new(serde_json::to_value(&outcome).map_err(|_| sink_invalid())?),
-            deadline_ms: self.calls.deadline_for_budget(2_000).map_err(map_sink_ipc_error)?,
+            deadline_ms: self
+                .calls
+                .deadline_for_budget(2_000)
+                .map_err(map_sink_ipc_error)?,
         };
-        let response = self
-            .calls
-            .exchange(operation)
-            .map_err(map_sink_ipc_error)?;
+        let response = self.calls.exchange(operation).map_err(map_sink_ipc_error)?;
         let (owner, original_terminal) = completed_sink_response_with_terminal(response)?;
         let ProcessStreamSinkWireResponse::Readback { body } = owner else {
             return Err(ProcessStreamSinkError::ProviderUnavailable);
@@ -1406,10 +1402,7 @@ impl ProcessStreamSinkClient for KernelProcessStreamSinkClient {
     }
 }
 
-fn blocking_sink_future<T, F>(
-    budget_ms: u64,
-    operation: F,
-) -> ProcessStreamSinkFuture<'static, T>
+fn blocking_sink_future<T, F>(budget_ms: u64, operation: F) -> ProcessStreamSinkFuture<'static, T>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T, ProcessStreamSinkError> + Send + 'static,
@@ -1444,9 +1437,15 @@ struct TerminalProjection {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 enum ReadbackProjection {
-    Session { view: ProcessStreamSinkSessionView },
-    Terminal { terminal: serde_json::Value },
-    UnknownOutcome { outcome: ProcessStreamSinkUnknownOutcome },
+    Session {
+        view: ProcessStreamSinkSessionView,
+    },
+    Terminal {
+        terminal: serde_json::Value,
+    },
+    UnknownOutcome {
+        outcome: ProcessStreamSinkUnknownOutcome,
+    },
 }
 
 fn ensure_binding_ref(
