@@ -257,10 +257,7 @@ impl HandoffCausalLink {
     /// it continues; the compatible session and route, the fresh authority
     /// epoch, and the fingerprinted continuation state are then enforced by
     /// the owning admission validator, never by this shape check.
-    pub fn validate_for_continuity(
-        &self,
-        continuity: ContinuityKind,
-    ) -> Result<(), ProtocolError> {
+    pub fn validate_for_continuity(&self, continuity: ContinuityKind) -> Result<(), ProtocolError> {
         self.validate_shape()?;
         if self.source_attempt_id == self.target_attempt_id
             && continuity.creates_new_attempt_identity()
