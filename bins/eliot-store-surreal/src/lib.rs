@@ -2205,7 +2205,10 @@ mod tests {
         InstallationRoots {
             binding_version: INSTALLATION_ROOT_BINDING_VERSION,
             immutable_binaries: r"C:\Program Files\Eliot\eliot\test-version".to_owned(),
-            durable_data: roots.installation_root.as_str().to_owned(),
+            // I3.1 durable-data root: `select_profile_roots` binds it to
+            // `<profile_anchor_root>\Eliot`, the top-level state contour this
+            // profile retains.
+            durable_data: format!(r"{}\Eliot", roots.profile_anchor_root.as_str()),
             user_config: installer_user_root.to_owned(),
             user_cache: installer_user_root.to_owned(),
             runtime_state_roots: roots.clone(),
@@ -2229,7 +2232,13 @@ mod tests {
             // The I3.1 four-root binding is derived from the same
             // `runtime_state_roots` this descriptor already carries, so the
             // compatibility projection and the retained binding are the same
-            // fixture value rather than two independently chosen ones. These are
+            // fixture value rather than two independently chosen ones. Its two
+            // state roots are distinct and nested, not one repeated value:
+            // `durable_data` is the I3.1 durable-data root
+            // `<profile_anchor_root>\Eliot`, and `installation_root` is the
+            // per-installation runtime directory the profile refines it into,
+            // `<profile_anchor_root>\Eliot\installations\<installation_key>`,
+            // which must sit strictly below the durable-data root. These are
             // the owner-derived values the package's integration fixtures
             // already use for this profile; they are not filler.
             profile_component: handle("eliot"),

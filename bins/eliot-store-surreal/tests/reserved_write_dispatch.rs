@@ -124,7 +124,10 @@ fn system_profile_roots(roots: &RuntimeStateRoots) -> InstallationRoots {
     InstallationRoots {
         binding_version: INSTALLATION_ROOT_BINDING_VERSION,
         immutable_binaries: r"C:\Program Files\Eliot\eliot\test-version".to_owned(),
-        durable_data: roots.installation_root.as_str().to_owned(),
+        // I3.1 durable-data root: `select_profile_roots` binds it to
+        // `<profile_anchor_root>\Eliot`, the top-level state contour this
+        // profile retains.
+        durable_data: format!(r"{}\Eliot", roots.profile_anchor_root.as_str()),
         user_config: installer_user_root.to_owned(),
         user_cache: installer_user_root.to_owned(),
         runtime_state_roots: roots.clone(),
