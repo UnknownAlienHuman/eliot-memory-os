@@ -3817,6 +3817,7 @@ impl HostRequestKind {
         match self {
             Self::Activation => "ACTIVATION",
             Self::Invocation => "INVOCATION",
+            Self::SelectedSourceCapture => "SELECTED_SOURCE_CAPTURE",
             Self::Cancellation => "CANCELLATION",
             Self::Status => "STATUS",
             Self::Reconciliation => "RECONCILIATION",
