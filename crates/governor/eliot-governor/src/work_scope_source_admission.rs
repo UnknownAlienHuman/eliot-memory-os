@@ -908,11 +908,12 @@ pub enum WorkScopeSourceAdmissionError {
 /// bases, guard receipts, or source capture. `approval` can only be
 /// constructed from the trust-anchor-verified first-run config snapshot. The
 /// caller must issue `lease` before observing the workspace or reading source
-/// bytes, then pass the resulting Bootstrap parser capture here. This function
-/// joins that exact capture against the signed approval before deriving the
-/// WorkScope source set. `lease_key` must come from the authenticated Kernel
-/// peer projection; this function binds its request, session, host principal,
-/// and root components to the verified `RequestIdentity` and observed root.
+/// bytes. This function then captures the exact observed root through the
+/// Bootstrap parser under that lease, and joins those bytes against the signed
+/// approval before deriving the WorkScope source set. `lease_key` must come
+/// from the authenticated Kernel peer projection; this function binds its
+/// request, session, host principal, and root components to the verified
+/// `RequestIdentity` and observed root.
 /// `operation_id` is the exact admitted Store operation identity retained by
 /// the authenticated Task Controller attempt; this producer never aliases it
 /// to the transport `RequestId`.
@@ -937,8 +938,7 @@ pub fn prepare_initial_work_scope_source_admission(
     owner_readback: &WorkScopeOwnerSnapshotReadback,
     lease_key: &DiscoveryLeaseKey,
     lease: &InitialWorkScopeSourceDiscoveryLease,
-    capture: &NormativePairSourceCapture,
-    now_after_source_reads: u64,
+    owner_clock: impl Fn() -> u64,
 ) -> Result<PreparedWorkScopeSourceAdmission, WorkScopeSourceAdmissionError> {
     identity
         .validate()
@@ -972,13 +972,6 @@ pub fn prepare_initial_work_scope_source_admission(
         approved.scope_privacy_class,
         governing_source_generation,
     )?;
-    if now_after_source_reads < lease.issued_at
-        || now_after_source_reads > identity.deadline_unix_ms
-    {
-        return Err(WorkScopeSourceAdmissionError::SourceAdmission(
-            "source observation clock is outside the active request lease".to_owned(),
-        ));
-    }
     let request_session = identity
         .request
         .metadata
@@ -1000,16 +993,6 @@ pub fn prepare_initial_work_scope_source_admission(
             "discovery lease key differs from the authenticated request or approved root".to_owned(),
         ));
     }
-    approved.validate_live_binding(
-        capture,
-        &binding.scope.root_identity,
-        &identity.request.metadata.product_id,
-        &identity.request.metadata.source_id,
-        &approved.privacy,
-        approved.scope_privacy_class,
-        fence,
-        &lease.authenticated_approver_principal_ref,
-    )?;
     if lease.lease.deadline != identity.deadline_unix_ms
         || lease.lease.candidate_root_ref != binding.scope.root_identity
         || lease.lease.allowed_reads != [DiscoveryRead::GoverningSourceCandidates]
@@ -1025,12 +1008,37 @@ pub fn prepare_initial_work_scope_source_admission(
             "source discovery lease differs from its admitted request or read scope".to_owned(),
         ));
     }
+    // Read the normative pair only after the caller has issued the exact-root
+    // lease and supplied the observed workspace identity. The timestamp is
+    // sampled from the owner clock after all parser I/O completes.
+    let capture = eliot_bootstrap::capture::capture_normative_pair_sources(Path::new(
+        &binding.scope.root_identity,
+    ))
+    .map_err(|error| WorkScopeSourceAdmissionError::SourceCapture(error.to_string()))?;
+    approved.validate_live_binding(
+        &capture,
+        &binding.scope.root_identity,
+        &identity.request.metadata.product_id,
+        &identity.request.metadata.source_id,
+        &approved.privacy,
+        approved.scope_privacy_class,
+        fence,
+        &lease.authenticated_approver_principal_ref,
+    )?;
+    let now_after_source_reads = owner_clock();
+    if now_after_source_reads < lease.issued_at
+        || now_after_source_reads > identity.deadline_unix_ms
+    {
+        return Err(WorkScopeSourceAdmissionError::SourceAdmission(
+            "source observation clock is outside the active request lease".to_owned(),
+        ));
+    }
     lease
         .lease
         .authorize(DiscoveryRead::GoverningSourceCandidates, now_after_source_reads)
         .map_err(|error| WorkScopeSourceAdmissionError::SourceAdmission(error.to_string()))?;
     let sources = approval.derive_work_scope_sources(
-        capture,
+        &capture,
         &lease.lease,
         &binding.scope.root_identity,
         &identity.request.metadata.product_id,
