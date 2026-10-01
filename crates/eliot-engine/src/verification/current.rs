@@ -137,7 +137,7 @@ mod current_tests {
     use eliot_instrument_api::{
         EvidenceCoverage, ExecutionStatus, RawEvidenceSource, VerificationOutcome,
     };
-    use eliot_instrument_nextest::NextestCommand;
+    use eliot_instrument_nextest::{NEXTEST_LIBTEST_JSON_FORMAT_VERSION, NextestCommand};
     use eliot_instrument_runner::registry::{
         InvalidationSet, RegistryFreshness, ResolvedExecutableIdentity,
     };
@@ -366,25 +366,27 @@ fn probe_passes() {
         assert!(registry.resolve_current(&invocation, &stale).is_err());
 
         // The registered command shape really executes: one crate test runs
-        // through the real `cargo nextest` process in an isolated target dir.
+        // through the real `cargo-nextest` executable in an isolated target dir.
         let fixture = dir.join("nextest-fixture");
         scaffold_nextest_fixture(&fixture)?;
         let filter = "probe_passes".to_owned();
         let target = fixture.to_string_lossy().into_owned();
         let command = NextestCommand::run(target, "default", std::slice::from_ref(&filter))?;
-        assert_eq!(command.executable, "cargo");
+        assert_eq!(command.executable, "cargo-nextest");
         assert_eq!(
             command.arguments,
             vec![
-                "nextest".to_owned(),
                 "run".to_owned(),
                 "--profile".to_owned(),
                 "default".to_owned(),
+                "--message-format".to_owned(),
+                "libtest-json-plus".to_owned(),
+                "--message-format-version".to_owned(),
+                NEXTEST_LIBTEST_JSON_FORMAT_VERSION.to_owned(),
                 filter.clone(),
             ]
         );
-        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
-        let nextest_output = std::process::Command::new(cargo)
+        let nextest_output = std::process::Command::new(&command.executable)
             .args(&command.arguments)
             .current_dir(&fixture)
             .env("CARGO_TARGET_DIR", fixture.join("target-isolated"))

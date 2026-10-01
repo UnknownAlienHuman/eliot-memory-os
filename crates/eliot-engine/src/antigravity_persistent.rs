@@ -685,18 +685,22 @@ mod tests {
         };
         assert!(matches!(err, FakeRuntimeError::SchemaDrift(_)));
 
-        // Also payload drift marker
+        // #934 removed magic-key payload rejection: Eliot owns no per-kind
+        // payload schema, so bounded vendor JSON remains opaque inert data.
+        // The outer frame version above remains the actual schema boundary.
         let frame2 = AntigravityPersistentFrame {
             frame_version: ANTIGRAVITY_PERSISTENT_SCHEMA_VERSION.to_owned(),
             seq: 2,
             kind: eliot_types::antigravity_persistent::AntigravityFrameKind::Request,
             payload: serde_json::json!({"schema_drift": true}),
         };
-        let err2 = match runtime.emit_frame(&frame2) {
-            Ok(v) => panic!("expected error but got ok: {v:?}"),
-            Err(e) => e,
-        };
-        assert!(matches!(err2, FakeRuntimeError::SchemaDrift(_)));
+        let echoed_line = runtime
+            .emit_frame(&frame2)
+            .expect("bounded opaque vendor payload must be emitted unchanged");
+        let echoed_frame = runtime
+            .validate_inbound_line(&echoed_line)
+            .expect("emitted opaque vendor payload must remain valid inbound data");
+        assert_eq!(echoed_frame, frame2);
     }
 
     #[test]

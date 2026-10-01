@@ -135,6 +135,16 @@ impl PacketQualityService {
         let (seed_bytes, seed_stu, _) = super::canonical_measurement_for_payload(&seed_serialized)?;
         let seed_bytes = usize::try_from(seed_bytes).map_err(|_| ContextError::Overflow)?;
         let seed_stu = usize::try_from(seed_stu.value).map_err(|_| ContextError::Overflow)?;
+        // Signal density describes the packet content before this quality
+        // report is attached. Measuring it from the final envelope would make
+        // the report's floating-point representation feed back into its own
+        // byte count. Exact final-envelope bytes and STU are retained below
+        // and bound by PacketBudgetDecision.
+        let signal_density = if seed_bytes == 0 {
+            0.0
+        } else {
+            (signal_items as f32 * 128.0 / seed_bytes as f32).min(1.0)
+        };
         let report = PacketQualityReport {
             packet_id: packet.packet_id.clone(),
             task_id: packet.task_id.clone(),
@@ -158,7 +168,7 @@ impl PacketQualityService {
             wrong_scope_items_suppressed,
             tool_schema_bytes_visible: frame.tool_schema_bytes_visible,
             instruction_hotset_size: frame.instruction_hotset_size,
-            signal_density: 0.0,
+            signal_density,
             result,
         };
         packet.packet_quality = Some(report);
@@ -180,15 +190,9 @@ impl PacketQualityService {
                 usize::try_from(structured_bytes).map_err(|_| ContextError::Overflow)?;
             let estimated_tokens =
                 usize::try_from(stu_estimate.value).map_err(|_| ContextError::Overflow)?;
-            let signal_density = if structured_bytes == 0 {
-                0.0
-            } else {
-                (signal_items as f32 * 128.0 / structured_bytes as f32).min(1.0)
-            };
             if let Some(report) = &mut packet.packet_quality {
                 report.structured_bytes = structured_bytes;
                 report.estimated_tokens = estimated_tokens;
-                report.signal_density = signal_density;
             }
             if serde_json::to_vec(&packet)? == serialized {
                 break;

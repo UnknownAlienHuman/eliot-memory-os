@@ -374,8 +374,12 @@ impl ContextCompiler {
             None,
             &ProjectUnderstandingEvidence::default(),
         ));
-        enforce_budget(&mut packet, request.max_tokens, &request.candidate_handles)?;
-        PacketQualityService::finalize(&mut packet, frame)?;
+        enforce_budget_including_quality(
+            &mut packet,
+            request.max_tokens,
+            &request.candidate_handles,
+            frame,
+        )?;
         adjudicate_post_quality_packet_budget(&packet, request.max_tokens, 0, 0)?;
         Ok(packet)
     }
@@ -3060,6 +3064,7 @@ fn finalize_precompiled_packet_with_policy_and_audit_context(
             budget_policy,
             required_handles,
             budget_metadata_tokens,
+            frame,
         )?;
         PacketQualityService::finalize(&mut rendered_packet, frame)?;
         let final_serialized_packet =
@@ -3139,14 +3144,16 @@ fn render_packet_with_budget_policy(
     policy: PacketBudgetPolicy,
     required_handles: &[String],
     budget_metadata_tokens: usize,
+    frame: Option<&MaterialPacketFrame>,
 ) -> Result<(ContextPacketL3, PacketBudgetDecision), PacketCompileError> {
     let required_handles = required_handles.iter().collect::<BTreeSet<_>>();
-    let (_, packet_mandatory_floor_tokens) = mandatory_floor(candidate, &required_handles, 0)?;
+    let (_, packet_mandatory_floor_tokens) =
+        mandatory_floor(candidate, &required_handles, 0, frame)?;
     let total_supplement_tokens = policy
         .supplement_tokens
         .saturating_add(budget_metadata_tokens);
     let (mandatory_floor_packet, mandatory_floor_tokens) =
-        mandatory_floor(candidate, &required_handles, total_supplement_tokens)?;
+        mandatory_floor(candidate, &required_handles, total_supplement_tokens, frame)?;
     if mandatory_floor_tokens > policy.hard_ceiling_tokens {
         return Err(packet_hard_ceiling_error(
             &mandatory_floor_packet,
@@ -3182,6 +3189,7 @@ fn render_packet_with_budget_policy(
         effective_tokens,
         total_supplement_tokens,
         &required_handles,
+        frame,
     )?
     else {
         return Err(packet_hard_ceiling_error(
@@ -3291,6 +3299,7 @@ fn mandatory_floor(
     candidate: &ContextPacketL3,
     required_handles: &BTreeSet<&String>,
     supplement_tokens: usize,
+    frame: Option<&MaterialPacketFrame>,
 ) -> Result<(ContextPacketL3, usize), EngineError> {
     let mut packet = candidate.clone();
     packet.packet_id.clear();
@@ -3301,15 +3310,17 @@ fn mandatory_floor(
     packet.truncation.truncated |= truncated;
     packet.truncation.returned = packet.exact_handles.len();
 
-    // The budget report is itself delivered content. Iterate both its estimate
-    // and its effective limit to obtain a stable, reproducible floor.
+    // Both the budget report and quality report are delivered content. Iterate
+    // the packet's exact post-quality envelope with its effective limit to
+    // obtain a stable, reproducible mandatory floor.
     let mut floor = supplement_tokens;
     loop {
-        let packet_tokens =
-            finalize_budget_report(&mut packet, floor, truncated, &sections_truncated)?;
-        let next = packet_tokens.saturating_add(supplement_tokens);
+        finalize_budget_report(&mut packet, floor, truncated, &sections_truncated)?;
+        let (quality_packet, packet_tokens) =
+            finalize_packet_quality_measurement(&packet, frame)?;
+        let next = total_surface_estimate(packet_tokens, supplement_tokens, 0)?;
         if next == floor {
-            return Ok((packet, next));
+            return Ok((quality_packet, next));
         }
         floor = next;
     }
@@ -3320,6 +3331,7 @@ fn fit_packet_to_limit(
     limit: usize,
     supplement_tokens: usize,
     required_handles: &BTreeSet<&String>,
+    frame: Option<&MaterialPacketFrame>,
 ) -> Result<Option<ContextPacketL3>, EngineError> {
     let mut packet = candidate.clone();
     packet.packet_id.clear();
@@ -3329,9 +3341,11 @@ fn fit_packet_to_limit(
         let truncated = !sections_truncated.is_empty();
         packet.truncation.truncated |= truncated;
         packet.truncation.returned = packet.exact_handles.len();
-        let estimated = finalize_budget_report(&mut packet, limit, truncated, &sections_truncated)?;
-        if estimated.saturating_add(supplement_tokens) <= limit {
-            return Ok(Some(packet));
+        finalize_budget_report(&mut packet, limit, truncated, &sections_truncated)?;
+        let (quality_packet, packet_tokens) =
+            finalize_packet_quality_measurement(&packet, frame)?;
+        if total_surface_estimate(packet_tokens, supplement_tokens, 0)? <= limit {
+            return Ok(Some(quality_packet));
         }
         if !trim_next(&mut packet, required_handles, &mut sections_truncated) {
             return Ok(None);
@@ -3339,6 +3353,7 @@ fn fit_packet_to_limit(
     }
 }
 
+#[cfg(test)]
 fn enforce_budget(
     packet: &mut ContextPacketL3,
     max_tokens: usize,
@@ -3381,6 +3396,41 @@ fn enforce_budget(
     packet.truncation.truncated |= truncated;
     packet.truncation.returned = packet.exact_handles.len();
     Ok(())
+}
+
+fn finalize_packet_quality_measurement(
+    packet: &ContextPacketL3,
+    frame: Option<&MaterialPacketFrame>,
+) -> Result<(ContextPacketL3, usize), EngineError> {
+    let mut rendered_packet = packet.clone();
+    PacketQualityService::finalize(&mut rendered_packet, frame)?;
+    let serialized = serde_json::to_vec(&rendered_packet)?;
+    let (_, stu_estimate, _) = canonical_measurement_for_payload(&serialized)?;
+    let packet_tokens = usize::try_from(stu_estimate.value)
+        .map_err(|_| EngineError::from(ContextError::Overflow))?;
+    Ok((rendered_packet, packet_tokens))
+}
+
+fn enforce_budget_including_quality(
+    packet: &mut ContextPacketL3,
+    max_tokens: usize,
+    required_handles: &[String],
+    frame: Option<&MaterialPacketFrame>,
+) -> Result<(), EngineError> {
+    let required_handles = required_handles.iter().collect::<BTreeSet<_>>();
+    if let Some(rendered_packet) =
+        fit_packet_to_limit(packet, max_tokens, 0, &required_handles, frame)?
+    {
+        *packet = rendered_packet;
+        return Ok(());
+    }
+
+    let (floor_packet, estimated_tokens) = mandatory_floor(packet, &required_handles, 0, frame)?;
+    Err(EngineError::PacketFloorExceedsBudget {
+        max_tokens,
+        estimated_tokens,
+        section_tokens: packet_section_accounting(&floor_packet)?,
+    })
 }
 
 fn finalize_budget_report(
@@ -3547,8 +3597,7 @@ pub fn refinalize_compiled_packet(
     max_tokens: usize,
     required_handles: &[String],
 ) -> Result<(), EngineError> {
-    enforce_budget(packet, max_tokens, required_handles)?;
-    PacketQualityService::finalize(packet, frame)?;
+    enforce_budget_including_quality(packet, max_tokens, required_handles, frame)?;
     adjudicate_post_quality_packet_budget(packet, max_tokens, 0, 0)
 }
 
@@ -4510,6 +4559,8 @@ mod current_git_scope_tests {
             .packet_quality
             .as_ref()
             .ok_or_else(|| EngineError::WriteRejected("packet quality missing".to_owned()))?;
+        assert_eq!(quality.structured_bytes, serde_json::to_vec(&packet)?.len());
+        assert_eq!(quality.estimated_tokens, estimate_tokens(&packet)?);
         assert_eq!(quality.result, PacketQualityResult::Sufficient);
         assert_eq!(quality.causal_bridge_hops, 4);
         assert!(quality.causal_bridge_missing_hops.is_empty());
@@ -4653,23 +4704,25 @@ mod current_git_scope_tests {
         ));
         ProjectContinuityService::restore(&mut prepared, None);
         let required_handles = BTreeSet::from([required_handle]);
-        Ok(mandatory_floor(&prepared, &required_handles, 0)?.1)
+        Ok(mandatory_floor(&prepared, &required_handles, 0, None)?.1)
     }
 
-    fn candidate_with_exact_floor(target: usize) -> Result<(ContextPacketL3, String), EngineError> {
+    fn candidate_with_floor_above(
+        preferred_tokens: usize,
+    ) -> Result<(ContextPacketL3, String, usize), EngineError> {
         let project_id = eliot_types::ProjectId::new_v7();
         let claim = verified_claim(project_id, BRANCH);
         let required_handle = claim_handle(&claim);
-        let mut candidate = packet(project_id, &claim);
-        for _ in 0..20_000 {
-            let floor = final_candidate_floor(&candidate, &required_handle)?;
-            if floor == target {
-                return Ok((candidate, required_handle));
-            }
-            assert!(floor < target, "floor skipped target {target}: {floor}");
-            candidate.decision_locality_suffix.stop_condition.push('x');
-        }
-        panic!("could not construct exact packet floor {target}")
+        let candidate = packet(project_id, &claim);
+        // I2.16 defines planning STU as ceil(UTF-8 bytes / 3). Derive this
+        // fixture's exact mandatory floor from its current serialized content
+        // and quality report instead of pinning the stale pre-migration value 1207.
+        let floor = final_candidate_floor(&candidate, &required_handle)?;
+        assert!(
+            floor > preferred_tokens,
+            "fixture floor {floor} must exceed preferred budget {preferred_tokens}"
+        );
+        Ok((candidate, required_handle, floor))
     }
 
     #[test]
@@ -4869,7 +4922,7 @@ mod current_git_scope_tests {
 
     #[test]
     fn preferred_1200_auto_expands_to_mandatory_floor_1207() -> Result<(), PacketCompileError> {
-        let (candidate, required_handle) = candidate_with_exact_floor(1_207)?;
+        let (candidate, required_handle, packet_floor) = candidate_with_floor_above(1_200)?;
 
         let outcome = finalize_packet_candidate(
             &candidate,
@@ -4881,8 +4934,8 @@ mod current_git_scope_tests {
             std::slice::from_ref(&required_handle),
         )?;
 
-        assert_eq!(outcome.budget.packet_mandatory_floor_tokens, 1_207);
-        assert!(outcome.budget.mandatory_floor_tokens > 1_207);
+        assert_eq!(outcome.budget.packet_mandatory_floor_tokens, packet_floor);
+        assert!(outcome.budget.mandatory_floor_tokens > packet_floor);
         assert_eq!(
             outcome.budget.effective_tokens,
             outcome.budget.mandatory_floor_tokens
@@ -4905,7 +4958,7 @@ mod current_git_scope_tests {
     #[test]
     fn hard_ceiling_failure_is_typed_and_does_not_mutate_candidate()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (candidate, required_handle) = candidate_with_exact_floor(1_207)?;
+        let (candidate, required_handle, packet_floor) = candidate_with_floor_above(1_200)?;
         let before = serde_json::to_vec(&candidate)?;
 
         let error = finalize_packet_candidate_with_policy(
@@ -4916,7 +4969,7 @@ mod current_git_scope_tests {
             None,
             PacketBudgetPolicy {
                 preferred_tokens: 1_200,
-                hard_ceiling_tokens: 1_206,
+                hard_ceiling_tokens: packet_floor - 1,
                 supplement_tokens: 0,
             },
             std::slice::from_ref(&required_handle),
@@ -4927,8 +4980,8 @@ mod current_git_scope_tests {
         let PacketCompileError::HardCeiling(error) = error else {
             panic!("expected typed hard-ceiling error");
         };
-        assert_eq!(error.mandatory_floor_tokens, 1_207);
-        assert_eq!(error.hard_ceiling_tokens, 1_206);
+        assert_eq!(error.mandatory_floor_tokens, packet_floor);
+        assert_eq!(error.hard_ceiling_tokens, packet_floor - 1);
         assert_eq!(error.expansion_handles, vec![required_handle]);
         assert!(error.section_tokens.contains_key("whole_packet_serialized"));
         assert_eq!(serde_json::to_vec(&candidate)?, before);
