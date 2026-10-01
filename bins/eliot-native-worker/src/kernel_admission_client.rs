@@ -2102,6 +2102,11 @@ mod tests {
                 expected_result_schema: "result-schema-live".to_owned(),
                 expected_result_schema_version: 1,
                 predecessor_revision: "rev-live-0".to_owned(),
+                semantic_admission_revision: eliot_protocol::WorkAdmissionSemanticRevision {
+                    key: "owner/canonical".to_owned(),
+                    revision: "1".to_owned(),
+                },
+                semantic_admission_predecessor_revision: 0,
                 authority_epoch: live_epoch.clone(),
                 state_fence: fence.clone(),
                 wire_version: NATIVE_WORKER_CLAIM_WIRE_VERSION,

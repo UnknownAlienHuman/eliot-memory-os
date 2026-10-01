@@ -12,13 +12,13 @@ use eliot_agent_api::{
 };
 use eliot_agent_claude::{
     CancellationEnvelope, ClaudeCandidateDisposition, ClaudeFactoryInput, ClaudeRunningSidecar,
-    ClaudeSidecarError, ClaudeSidecarRequest, ClaudeSidecarResponse,
+    ClaudeSidecarError, ClaudeSidecarLaunchPlan, ClaudeSidecarRequest, ClaudeSidecarResponse,
     ClaudeTerminalCandidate, ClaudeLaunchPort, UnknownOutcomeGate,
     execution::{
         ClaudeFactoryOutcome, restore_running_sidecar_after_reconcile, sidecar_stdin_line,
         translate_candidate_result, ClaudeResultInput, ClaudeSidecarFactory,
     },
-    claude_local_digest_256_hex,
+    claude_local_digest_256_hex, CLAUDE_SIDECAR_PROTOCOL_VERSION,
 };
 use eliot_contracts::sha256_hex;
 use eliot_native_worker_core::{
@@ -52,6 +52,100 @@ pub struct RetainedClaudeResult {
     pub process_evidence: ProcessEvidence,
     /// Bounded body and commitment for the daemon bridge handoff.
     pub outcome: NativeWorkerRetainedOperationOutcome,
+}
+
+/// Exact inert query projection produced from a Governor-admitted task goal
+/// and owner-approved Claude launch plan. The JSON bytes are the exact
+/// provider request committed by `ProviderExecutionBinding`; the NDJSON line
+/// is that same compact JSON followed by the sidecar framing newline.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaudeRequestProjection {
+    /// Closed typed request consumed by the existing Claude factory.
+    pub request: ClaudeSidecarRequest,
+    /// Exact compact JSON bytes committed by the provider binding, without
+    /// the transport framing newline.
+    pub request_json: String,
+    /// SHA-256 over the exact `request_json` bytes.
+    pub request_sha256: String,
+    /// Exact stdin line for the sidecar (`request_json` plus one newline).
+    pub stdin_line: String,
+}
+
+/// Construct one canonical Claude query from an already admitted goal and
+/// an owner-approved launch plan. The request ID and expected digest are read
+/// from the independently issued provider binding. This is a pure adapter
+/// projection: it issues no admission, credential, process permit, privacy
+/// receipt, or provider owner receipt. The caller must validate the
+/// Governor-issued prompt-retention receipt before storing or disclosing the
+/// query bytes.
+pub fn project_admitted_task_query(
+    binding: &ProviderExecutionBinding,
+    prompt: String,
+    launch_plan: ClaudeSidecarLaunchPlan,
+) -> Result<ClaudeRequestProjection, RegistryError> {
+    let request = ClaudeSidecarRequest {
+        protocol_version: CLAUDE_SIDECAR_PROTOCOL_VERSION.to_owned(),
+        request_id: binding.start_request_id.as_str().to_owned(),
+        kind: eliot_agent_claude::ClaudeRequestKind::Query,
+        prompt: Some(prompt),
+        launch_plan: Some(launch_plan),
+        sequence: None,
+    };
+    project_bound_request(binding, request)
+}
+
+fn project_bound_request(
+    binding: &ProviderExecutionBinding,
+    request: ClaudeSidecarRequest,
+) -> Result<ClaudeRequestProjection, RegistryError> {
+    project_request_for_owner(
+        binding.start_request_id.as_str(),
+        binding.start_request_sha256.as_str(),
+        request,
+    )
+}
+
+fn project_request_for_owner(
+    expected_request_id: &str,
+    expected_request_sha256: &str,
+    request: ClaudeSidecarRequest,
+) -> Result<ClaudeRequestProjection, RegistryError> {
+    request.validate().map_err(map_claude_error)?;
+    if request.kind != eliot_agent_claude::ClaudeRequestKind::Query
+        || request.request_id != expected_request_id
+    {
+        return Err(RegistryError::BadInput {
+            field: "claude_start_request_identity",
+            detail: "Claude query request id must equal the original provider binding request id".to_owned(),
+        });
+    }
+    let request_json = serde_json::to_string(&request).map_err(|_| RegistryError::BadInput {
+        field: "claude_request_json",
+        detail: "Claude query request could not be serialized".to_owned(),
+    })?;
+    let request_sha256 = claude_local_digest_256_hex(request_json.as_bytes());
+    if request_sha256 != expected_request_sha256 {
+        return Err(RegistryError::BadInput {
+            field: "claude_start_request_digest",
+            detail: "exact Claude request JSON does not match the original provider binding digest".to_owned(),
+        });
+    }
+    let stdin_line = request.to_ndjson_line().map_err(|_| RegistryError::BadInput {
+        field: "claude_request_line",
+        detail: "Claude query request could not be encoded as NDJSON".to_owned(),
+    })?;
+    if stdin_line.strip_suffix('\n') != Some(request_json.as_str()) {
+        return Err(RegistryError::BadInput {
+            field: "claude_request_line",
+            detail: "sidecar NDJSON line differs from the request bytes committed by the provider binding".to_owned(),
+        });
+    }
+    Ok(ClaudeRequestProjection {
+        request,
+        request_json,
+        request_sha256,
+        stdin_line,
+    })
 }
 
 /// Start may return an exact replay with no new process, a started attempt, or
@@ -477,9 +571,70 @@ fn require_owner_reconcile_gate(
 
 #[cfg(test)]
 mod tests {
-    use eliot_agent_claude::UnknownOutcomeGate;
+    use eliot_agent_claude::{
+        ClaudeAllowedTool, ClaudeArgv, ClaudeEnvAllowlist, ClaudePermissionMode,
+        ClaudeRequestKind, ClaudeSidecarLaunchPlan, ClaudeSidecarRequest, UnknownOutcomeGate,
+        CLAUDE_SIDECAR_PROTOCOL_VERSION,
+    };
+    use eliot_contracts::sha256_hex;
 
-    use super::require_owner_reconcile_gate;
+    use super::{
+        project_request_for_owner, require_owner_reconcile_gate,
+    };
+
+    fn query_request() -> ClaudeSidecarRequest {
+        ClaudeSidecarRequest {
+            protocol_version: CLAUDE_SIDECAR_PROTOCOL_VERSION.to_owned(),
+            request_id: "request-owner-1".to_owned(),
+            kind: ClaudeRequestKind::Query,
+            prompt: Some("exact admitted goal".to_owned()),
+            launch_plan: Some(ClaudeSidecarLaunchPlan {
+                argv: ClaudeArgv {
+                    program: "eliot-claude-sidecar".to_owned(),
+                    argv: vec!["--stdio".to_owned()],
+                },
+                working_directory: "C:\\workspace".to_owned(),
+                env: ClaudeEnvAllowlist { vars: Vec::new() },
+                wall_time_ms: 30_000,
+                max_output_bytes: 4_096,
+                permission_mode: ClaudePermissionMode::Default,
+                allowed_tools: vec![ClaudeAllowedTool::Read],
+            }),
+            sequence: None,
+        }
+    }
+
+    /// #22 Work/Acceptance positive: the exact request bytes and their
+    /// compact sidecar line are accepted under the original binding digest.
+    #[test]
+    fn admitted_query_projection_preserves_original_request_commitment() {
+        let request = query_request();
+        let request_json = serde_json::to_string(&request).expect("serializable query");
+        let expected_digest = sha256_hex(request_json.as_bytes());
+        let projection = project_request_for_owner(
+            "request-owner-1",
+            &expected_digest,
+            request,
+        )
+        .expect("exact owner request commitment");
+
+        assert_eq!(projection.request_json, request_json);
+        assert_eq!(projection.request_sha256, expected_digest);
+        assert_eq!(projection.stdin_line, format!("{request_json}\n"));
+    }
+
+    /// #22 Work/Acceptance refusal: a request that differs from the original
+    /// provider binding digest cannot reach Claude preparation or launch.
+    #[test]
+    fn admitted_query_projection_refuses_foreign_request_digest() {
+        let request = query_request();
+        assert!(project_request_for_owner(
+            "request-owner-1",
+            &"0".repeat(64),
+            request,
+        )
+        .is_err());
+    }
 
     /// #22 Work/Acceptance positive: reconciliation accepts the original
     /// owner gate for the exact retained attempt.
@@ -505,6 +660,7 @@ fn require_owner_binding(
     hello: &WorkerHello,
     input: &ClaudeFactoryInput,
 ) -> Result<(), RegistryError> {
+    let _request_projection = project_bound_request(&input.binding, input.request.clone())?;
     let claim = admission.claim();
     if identity.task_id != validated.task_id()
         || identity.claim_id() != validated.claim_id()

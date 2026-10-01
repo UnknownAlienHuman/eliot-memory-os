@@ -1510,6 +1510,11 @@ mod single_shape_constructors {
             expected_result_schema: "result-schema".to_owned(),
             expected_result_schema_version: 1,
             predecessor_revision: "rev-1".to_owned(),
+            semantic_admission_revision: eliot_protocol::WorkAdmissionSemanticRevision {
+                key: "owner/canonical".to_owned(),
+                revision: "2".to_owned(),
+            },
+            semantic_admission_predecessor_revision: 1,
             authority_epoch: epoch(),
             state_fence: fence(),
             wire_version: NATIVE_WORKER_CLAIM_WIRE_VERSION,

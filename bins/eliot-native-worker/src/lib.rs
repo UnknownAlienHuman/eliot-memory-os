@@ -1512,6 +1512,9 @@ pub mod admitted_material {
 
     use crate::ReconcileSubmission;
     use crate::dispatch_authority::ValidatedDispatchGrant;
+    use eliot_protocol::native_worker_material::{
+        NativeWorkerProviderProcessIdentityV1, NativeWorkerRetainedProviderMaterialRefV1,
+    };
 
     /// Bins-local dispatch file name, read from the executable directory only.
     /// See the module documentation: locator, never authority.
@@ -1605,6 +1608,92 @@ pub mod admitted_material {
         /// (shape only). The governed drive decodes and enforces them
         /// before any lifecycle submit or process start.
         pub action_envelopes: Vec<ActionEnvelopeCarrier>,
+        /// Exact material lookup identity returned by the authenticated
+        /// Kernel owner after this claim was validated. This is never read
+        /// from the dispatch file or an EBP request payload.
+        pub(crate) retained_provider_material: Option<AuthenticatedRetainedProviderMaterial>,
+    }
+
+    /// Authenticated Kernel lookup result bound to this exact admitted claim.
+    /// Fields stay private so ordinary caller data cannot manufacture the
+    /// material reference or child-process identity.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct AuthenticatedRetainedProviderMaterial {
+        reference: NativeWorkerRetainedProviderMaterialRefV1,
+        provider_process: NativeWorkerProviderProcessIdentityV1,
+    }
+
+    impl AuthenticatedRetainedProviderMaterial {
+        /// Exact immutable material reference issued by the Kernel owner.
+        pub(crate) const fn reference(&self) -> &NativeWorkerRetainedProviderMaterialRefV1 {
+            &self.reference
+        }
+
+        /// Exact separately retained provider process identity.
+        pub(crate) const fn provider_process(&self) -> &NativeWorkerProviderProcessIdentityV1 {
+            &self.provider_process
+        }
+    }
+
+    impl ValidatedAdmittedMaterial {
+        /// Attaches an exact authenticated Kernel owner readback to the
+        /// already-validated claim. The claim tuple is compared as issued;
+        /// this method neither derives a reference nor computes a replacement
+        /// binding digest.
+        pub(crate) fn attach_retained_provider_material(
+            &mut self,
+            reference: NativeWorkerRetainedProviderMaterialRefV1,
+            provider_process: NativeWorkerProviderProcessIdentityV1,
+        ) -> Result<(), AdmittedMaterialError> {
+            if self.retained_provider_material.is_some() {
+                return Err(AdmittedMaterialError::Binding(
+                    "retained provider material identity is already attached".to_owned(),
+                ));
+            }
+            let claim = self.admission.claim();
+            validate_retained_provider_identity(&reference, &provider_process, claim)?;
+            self.retained_provider_material = Some(AuthenticatedRetainedProviderMaterial {
+                reference,
+                provider_process,
+            });
+            Ok(())
+        }
+
+        /// Returns the authenticated retained-material lookup identity, when
+        /// the Kernel owner resolved this claim to one.
+        pub(crate) const fn retained_provider_material(
+            &self,
+        ) -> Option<&AuthenticatedRetainedProviderMaterial> {
+            self.retained_provider_material.as_ref()
+        }
+    }
+
+    pub(crate) fn validate_retained_provider_identity(
+        reference: &NativeWorkerRetainedProviderMaterialRefV1,
+        provider_process: &NativeWorkerProviderProcessIdentityV1,
+        claim: &NativeWorkerClaim,
+    ) -> Result<(), AdmittedMaterialError> {
+        reference
+            .validate()
+            .map_err(|_| AdmittedMaterialError::Binding("malformed retained material reference".to_owned()))?;
+        provider_process
+            .validate()
+            .map_err(|_| AdmittedMaterialError::Binding("malformed provider process identity".to_owned()))?;
+        let recomputed_binding = claim.compute_binding_digest().map_err(|_| {
+            AdmittedMaterialError::Binding("claim binding digest is unavailable".to_owned())
+        })?;
+        if reference.claim_id != claim.claim_id.as_str()
+            || reference.dispatch_operation_id != claim.operation_id.as_str()
+            || reference.attempt_id != claim.attempt_id.as_str()
+            || reference.binding_digest != claim.binding_digest
+            || reference.binding_digest != recomputed_binding
+            || provider_process.provider_operation_id == claim.operation_id.as_str()
+        {
+            return Err(AdmittedMaterialError::Binding(
+                "retained provider material does not bind the exact admitted claim and child operation".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Typed failure for the dispatch-file read. Every variant is fail-closed:
@@ -1817,6 +1906,7 @@ pub mod admitted_material {
             kernel_nonce: None,
             worker_artifact_digest,
             action_envelopes: envelope.action_envelopes,
+            retained_provider_material: None,
         })
     }
 
@@ -2368,6 +2458,7 @@ pub mod admitted_material {
             // population (see the 2251 kernel handoff); absent files keep
             // the missing-envelope refusal at the governed drive.
             action_envelopes: file.action_envelopes,
+            retained_provider_material: None,
         })
     }
 
@@ -2609,6 +2700,11 @@ mod tests {
             expected_result_schema: "result-schema-1".to_owned(),
             expected_result_schema_version: 1,
             predecessor_revision: "rev-0".to_owned(),
+            semantic_admission_revision: eliot_protocol::WorkAdmissionSemanticRevision {
+                key: "owner/canonical".to_owned(),
+                revision: "1".to_owned(),
+            },
+            semantic_admission_predecessor_revision: 0,
             authority_epoch: epoch(),
             state_fence: fence(),
             wire_version: NATIVE_WORKER_CLAIM_WIRE_VERSION,
@@ -2927,5 +3023,58 @@ mod tests {
             detail.contains("not a closed envelope"),
             "undecodable bytes are named, got {detail}"
         );
+    }
+
+    fn retained_provider_join(
+        claim: &NativeWorkerClaim,
+    ) -> (
+        eliot_protocol::native_worker_material::NativeWorkerRetainedProviderMaterialRefV1,
+        eliot_protocol::native_worker_material::NativeWorkerProviderProcessIdentityV1,
+    ) {
+        use eliot_protocol::native_worker_material::{
+            NativeWorkerProviderProcessIdentityV1, NativeWorkerRetainedProviderMaterialRefV1,
+        };
+
+        (
+            NativeWorkerRetainedProviderMaterialRefV1 {
+                claim_id: claim.claim_id.as_str().to_owned(),
+                dispatch_operation_id: claim.operation_id.as_str().to_owned(),
+                attempt_id: claim.attempt_id.as_str().to_owned(),
+                binding_digest: claim.binding_digest.clone(),
+                material_ref: "provider-material:claim-1".to_owned(),
+                material_sha256: "a".repeat(64),
+            },
+            NativeWorkerProviderProcessIdentityV1 {
+                provider_operation_id: "provider-child-operation-1".to_owned(),
+                provider_process_invocation_digest: "b".repeat(64),
+                provider_executable_digest: "c".repeat(64),
+                process_ref: "provider-process:claim-1".to_owned(),
+            },
+        )
+    }
+
+    #[test]
+    fn authenticated_retained_provider_reference_joins_exact_claim() {
+        let mut claim = claim_with("claude.local", "eliot-agent-claude", "nonce-claim-1", true);
+        claim.binding_digest = claim
+            .compute_binding_digest()
+            .unwrap_or_else(|error| panic!("claim binding digest computes: {error:?}"));
+        let (reference, process) = retained_provider_join(&claim);
+
+        admitted_material::validate_retained_provider_identity(&reference, &process, &claim)
+            .unwrap_or_else(|error| panic!("owner readback joins exact claim: {error:?}"));
+    }
+
+    #[test]
+    fn authenticated_retained_provider_reference_refuses_foreign_claim_tuple() {
+        let mut claim = claim_with("claude.local", "eliot-agent-claude", "nonce-claim-1", true);
+        claim.binding_digest = claim
+            .compute_binding_digest()
+            .unwrap_or_else(|error| panic!("claim binding digest computes: {error:?}"));
+        let (mut reference, process) = retained_provider_join(&claim);
+        reference.attempt_id = "attempt-foreign".to_owned();
+
+        assert!(admitted_material::validate_retained_provider_identity(&reference, &process, &claim)
+            .is_err());
     }
 }

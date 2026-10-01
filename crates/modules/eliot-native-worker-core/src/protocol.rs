@@ -12,7 +12,7 @@ use eliot_process::{
 use eliot_protocol::{
     AckPhase, EncodingProfile, Frame, NATIVE_WORKER_FRAME_V1_WIRE_VERSION,
     NATIVE_WORKER_PROTOCOL_VERSION, NativeWorkerFramePayloadV1, NativeWorkerOperationV1,
-    ProtocolPayload, ProtocolVersion,
+    ProtocolPayload, ProtocolVersion, WorkAdmissionSemanticRevision,
 };
 use eliot_receipts::ReceiptDisposition;
 use eliot_runtime_contracts::ServiceProcessState;
@@ -1252,6 +1252,13 @@ pub struct NativeWorkerClaim {
     pub expected_result_schema_version: u16,
     /// Predecessor revision this claim continues from.
     pub predecessor_revision: String,
+    /// Exact canonical owner semantic-admission revision proposed for this
+    /// work attempt. This is owner evidence, not derived from request or task
+    /// digests.
+    pub semantic_admission_revision: WorkAdmissionSemanticRevision,
+    /// Exact predecessor used by the canonical owner compare-and-swap that
+    /// issued `semantic_admission_revision`.
+    pub semantic_admission_predecessor_revision: u64,
     /// Current authority epoch; must equal `state_fence.authority_epoch`.
     pub authority_epoch: EpochId,
     /// Exact immutable fence paired with the generation and epoch.
@@ -1293,7 +1300,9 @@ impl NativeWorkerClaim {
     /// `deadline_unix_ms`, `decision_id`, `executable_binding`,
     /// `expected_result_schema`, `expected_result_schema_version`,
     /// `operation_id`, `parent_job_id`, `predecessor_revision`,
-    /// `privacy_class`, `registration_id`, `route_class`, `state_fence`,
+    /// `privacy_class`, `registration_id`, `route_class`,
+    /// `semantic_admission_predecessor_revision`,
+    /// `semantic_admission_revision`, `state_fence`,
     /// `swarm_id`, `task_id`, `visibility`, `work_scope_id`,
     /// `worker_generation`. The nested `executable_binding`
     /// object is JSON `null` for wire-v1 claims (which predate the join) and
@@ -1335,6 +1344,8 @@ impl NativeWorkerClaim {
             "privacy_class": self.privacy_class,
             "registration_id": self.registration_id,
             "route_class": self.route_class,
+            "semantic_admission_predecessor_revision": self.semantic_admission_predecessor_revision,
+            "semantic_admission_revision": self.semantic_admission_revision,
             "state_fence": self.state_fence,
             "swarm_id": self.swarm_id,
             "task_id": self.task_id,
@@ -1396,6 +1407,9 @@ impl NativeWorkerClaim {
         self.budget
             .validate()
             .map_err(|_| WorkerError::InvalidRequest("budget"))?;
+        self.semantic_admission_revision
+            .validate_owner_canonical(self.semantic_admission_predecessor_revision)
+            .map_err(|_| WorkerError::InvalidRequest("semantic_admission_revision"))?;
         // Harness/swarm legs are owner-published: `None` until the owner
         // publishes them, shape-only text when present, never invented
         // here. `privacy_class` is the canonical owner type, so its shape

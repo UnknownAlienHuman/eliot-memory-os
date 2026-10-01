@@ -43,7 +43,7 @@ pub use generated::{
 };
 use thiserror::Error;
 
-pub use eliot_protocol::AckPhase;
+pub use eliot_protocol::{AckPhase, WorkAdmissionSemanticRevision};
 use ports::{AdmissionLiveness, CapabilityGrant, EffectAdmissionGrant, ProcessBindingSnapshot};
 pub use ports::{
     AdmissionLivenessFacts, AdmissionLivenessOutcome, CapabilityAdmissionFacts,

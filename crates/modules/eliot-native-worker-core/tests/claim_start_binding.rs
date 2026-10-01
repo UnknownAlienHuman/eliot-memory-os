@@ -494,6 +494,11 @@ fn claim_with(
         expected_result_schema: "result-schema-1".to_owned(),
         expected_result_schema_version: 1,
         predecessor_revision: "rev-0".to_owned(),
+        semantic_admission_revision: eliot_protocol::WorkAdmissionSemanticRevision {
+            key: "owner/canonical".to_owned(),
+            revision: "1".to_owned(),
+        },
+        semantic_admission_predecessor_revision: 0,
         authority_epoch: epoch(),
         state_fence: fence(),
         wire_version: NATIVE_WORKER_CLAIM_WIRE_VERSION,
@@ -504,6 +509,47 @@ fn claim_with(
         binding_digest: String::new(),
     };
     load(draft.with_computed_digest())
+}
+
+#[test]
+fn semantic_admission_revision_is_preserved_and_digest_bound() {
+    let registration = registration();
+    let hello_value = hello();
+    let process = process_request();
+    let original = claim_with(&registration, &hello_value, &process);
+    assert_eq!(original.semantic_admission_revision.key, "owner/canonical");
+    assert_eq!(original.semantic_admission_revision.revision, "1");
+    assert_eq!(original.semantic_admission_predecessor_revision, 0);
+    assert!(original.validate().is_ok());
+
+    let mut advanced = original.clone();
+    advanced.semantic_admission_revision.revision = "2".to_owned();
+    advanced.semantic_admission_predecessor_revision = 1;
+    let advanced = load(advanced.with_computed_digest());
+    assert!(advanced.validate().is_ok());
+    assert_ne!(advanced.binding_digest, original.binding_digest);
+}
+
+#[test]
+fn semantic_admission_revision_refuses_foreign_owner_or_predecessor() {
+    let registration = registration();
+    let hello_value = hello();
+    let process = process_request();
+    let mut foreign = claim_with(&registration, &hello_value, &process);
+    foreign.semantic_admission_revision.key = "owner/foreign".to_owned();
+    let foreign = load(foreign.with_computed_digest());
+    assert_eq!(
+        foreign.validate(),
+        Err(WorkerError::InvalidRequest("semantic_admission_revision"))
+    );
+
+    let mut skipped = claim_with(&registration, &hello_value, &process);
+    skipped.semantic_admission_revision.revision = "3".to_owned();
+    let skipped = load(skipped.with_computed_digest());
+    assert_eq!(
+        skipped.validate(),
+        Err(WorkerError::InvalidRequest("semantic_admission_revision"))
+    );
 }
 
 fn claim_request(
