@@ -1380,72 +1380,11 @@ impl KernelControlRequest {
             });
         }
         self.candidate.validate()?;
-        if let KernelControlCommand::BootstrapStore(handoff) = &self.command {
-            handoff.validate()?;
-        }
-        if let KernelControlCommand::RebindStore(handoff) = &self.command {
-            handoff.validate()?;
-            handoff.validate_canonical_digest()?;
-            if handoff.candidate_binding_digest != self.candidate.compute_digest()? {
-                return Err(KernelServiceError::HandshakeMismatch {
-                    field: "store_rebind.candidate_binding",
-                });
-            }
-            if handoff.generation != self.generation
-                || handoff.authority_epoch != self.candidate.kernel_epoch
-            {
-                return Err(KernelServiceError::HandshakeMismatch {
-                    field: "store_rebind.generation_or_epoch",
-                });
-            }
-            if self.payload_digest != handoff.request_digest {
-                return Err(KernelServiceError::HandshakeMismatch {
-                    field: "store_rebind.request_digest",
-                });
-            }
-        }
-        if let KernelControlCommand::ReconcileRebindStore(query) = &self.command {
-            query.validate()?;
-        }
-        if let KernelControlCommand::ReadRuntimeLeaseCensus(query) = &self.command {
-            query.validate()?;
-        }
-        if let KernelControlCommand::RevokeRuntimeLease(query) = &self.command {
-            query.validate()?;
-        }
-        if let KernelControlCommand::RevokeHostSupervisionEvidence(query) = &self.command {
-            query.validate()?;
-            if query.candidate_digest != self.candidate.compute_digest()?
-                || query.state_fence.resource_generation != self.generation
-                || query.state_fence.authority_epoch != self.candidate.kernel_epoch
-            {
-                return Err(KernelServiceError::HandshakeMismatch {
-                    field: "supervision_revocation.candidate_or_fence",
-                });
-            }
-        }
-        if let KernelControlCommand::Activate(permit) = &self.command {
-            permit.validate(&self.candidate, self.generation)?;
-        }
-        if let KernelControlCommand::ReportHostStartupEvidence(evidence) = &self.command {
-            evidence.validate(&self.candidate, self.generation)?;
-            if evidence.startup_evidence.candidate_digest != self.candidate.compute_digest()? {
-                return Err(KernelServiceError::HandshakeMismatch {
-                    field: "startup_evidence.candidate_binding",
-                });
-            }
-            if evidence.startup_evidence.state_fence.resource_generation != self.generation
-                || !evidence
-                    .startup_evidence
-                    .state_fence
-                    .authority_epoch
-                    .is_same_authority(&self.candidate.kernel_epoch)
-            {
-                return Err(KernelServiceError::HandshakeMismatch {
-                    field: "startup_evidence.fence",
-                });
-            }
-        }
+        self.command.validate_request_binding(
+            &self.candidate,
+            self.generation,
+            &self.payload_digest,
+        )?;
         if self.payload_digest.len() != 64
             || !self
                 .payload_digest
@@ -3778,6 +3717,87 @@ pub enum KernelControlCommand {
     /// Process-only evidence never completes or renews I1.11 step 11; only the
     /// complete heartbeat-bound record can establish that revocable claim.
     ReportHostStartupEvidence(HostStartupEvidenceReport),
+}
+
+impl KernelControlCommand {
+    fn validate_request_binding(
+        &self,
+        candidate: &HostKernelCandidateBinding,
+        generation: ResourceGeneration,
+        payload_digest: &str,
+    ) -> Result<(), KernelServiceError> {
+        match self {
+            Self::BootstrapStore(handoff) => handoff.validate(),
+            Self::RebindStore(handoff) => {
+                handoff.validate()?;
+                handoff.validate_canonical_digest()?;
+                if handoff.candidate_binding_digest != candidate.compute_digest()? {
+                    return Err(KernelServiceError::HandshakeMismatch {
+                        field: "store_rebind.candidate_binding",
+                    });
+                }
+                if handoff.generation != generation
+                    || handoff.authority_epoch != candidate.kernel_epoch
+                {
+                    return Err(KernelServiceError::HandshakeMismatch {
+                        field: "store_rebind.generation_or_epoch",
+                    });
+                }
+                if payload_digest != handoff.request_digest {
+                    return Err(KernelServiceError::HandshakeMismatch {
+                        field: "store_rebind.request_digest",
+                    });
+                }
+                Ok(())
+            }
+            Self::ReconcileRebindStore(query) => query.validate(),
+            Self::ReadRuntimeLeaseCensus(query) => query.validate(),
+            Self::RevokeRuntimeLease(query) => query.validate(),
+            Self::RevokeHostSupervisionEvidence(query) => {
+                query.validate()?;
+                if query.candidate_digest != candidate.compute_digest()?
+                    || query.state_fence.resource_generation != generation
+                    || query.state_fence.authority_epoch != candidate.kernel_epoch
+                {
+                    return Err(KernelServiceError::HandshakeMismatch {
+                        field: "supervision_revocation.candidate_or_fence",
+                    });
+                }
+                Ok(())
+            }
+            Self::Activate(permit) => permit.validate(candidate, generation),
+            Self::ReportHostStartupEvidence(evidence) => {
+                evidence.validate(candidate, generation)?;
+                if evidence.startup_evidence.candidate_digest != candidate.compute_digest()? {
+                    return Err(KernelServiceError::HandshakeMismatch {
+                        field: "startup_evidence.candidate_binding",
+                    });
+                }
+                if evidence.startup_evidence.state_fence.resource_generation != generation
+                    || !evidence
+                        .startup_evidence
+                        .state_fence
+                        .authority_epoch
+                        .is_same_authority(&candidate.kernel_epoch)
+                {
+                    return Err(KernelServiceError::HandshakeMismatch {
+                        field: "startup_evidence.fence",
+                    });
+                }
+                Ok(())
+            }
+            Self::Reconcile
+            | Self::Shadow
+            | Self::PrepareHandoff
+            | Self::ReconcileActivation(_)
+            | Self::ProbeReady
+            | Self::Degrade(_)
+            | Self::ReadIntroductionRows(_)
+            | Self::Drain
+            | Self::Stop
+            | Self::Fail(_) => Ok(()),
+        }
+    }
 }
 
 impl From<PortError> for KernelServiceError {
