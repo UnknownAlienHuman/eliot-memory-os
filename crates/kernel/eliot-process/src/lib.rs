@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+use crate::ProcessStreamPolicyBinding;
 use blake3::Hash;
 use eliot_contracts::{EpochId, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_instrument_api::{Assertability, EvidenceAxes, EvidenceStatus};
@@ -36,7 +37,7 @@ pub use execution_evidence::{
 };
 
 /// Current provider-neutral process contract revision.
-pub const PROCESS_CONTRACT_SCHEMA_VERSION: &str = "eliot-process-contract-v4";
+pub const PROCESS_CONTRACT_SCHEMA_VERSION: &str = "eliot-process-contract-v5";
 /// The sole admitted Windows semantic implementation identifier.
 pub const PROCESS_IMPLEMENTATION_ID: &str = "eliot.process.windows.v1";
 
@@ -433,6 +434,7 @@ pub struct ProcessIntent {
     working_directory: String,
     environment: EnvironmentProjection,
     resource_limits: ResourceLimits,
+    stream_output_policy: ProcessStreamPolicyBinding,
     effect_digest: String,
 }
 
@@ -466,11 +468,27 @@ impl ProcessIntent {
             working_directory: working_directory.into(),
             environment,
             resource_limits,
+            stream_output_policy: ProcessStreamPolicyBinding::p04_bounded_prefix_only(),
             effect_digest: String::new(),
         };
         intent.validate_without_digest()?;
         intent.effect_digest = intent.compute_effect_digest()?;
         Ok(intent)
+    }
+
+    /// Replaces the generic bounded-prefix policy with the exact policy issued
+    /// by the process owner, then reseals the immutable effect material.
+    ///
+    /// The default constructor remains bounded-prefix-only. A caller cannot
+    /// obtain a wider disclosure policy from strings at the process boundary;
+    /// it must receive a validated owner-issued `ProcessStreamPolicyBinding`.
+    pub fn with_stream_output_policy(
+        mut self,
+        policy: ProcessStreamPolicyBinding,
+    ) -> Result<Self, ContractError> {
+        self.stream_output_policy = policy;
+        self.effect_digest = self.compute_effect_digest()?;
+        Ok(self)
     }
 
     /// Validates exact launch material and its digest.
@@ -525,6 +543,7 @@ impl ProcessIntent {
             working_directory: &'a str,
             environment: &'a EnvironmentProjection,
             resource_limits: ResourceLimits,
+            stream_output_policy: &'a ProcessStreamPolicyBinding,
         }
         hash_serialized(&EffectMaterial {
             operation_id: &self.operation_id,
@@ -539,6 +558,7 @@ impl ProcessIntent {
             working_directory: &self.working_directory,
             environment: &self.environment,
             resource_limits: self.resource_limits,
+            stream_output_policy: &self.stream_output_policy,
         })
     }
 
@@ -600,6 +620,11 @@ impl ProcessIntent {
     /// Returns the resource limits.
     pub const fn resource_limits(&self) -> &ResourceLimits {
         &self.resource_limits
+    }
+
+    /// Exact stream disclosure and retention policy sealed into this intent.
+    pub const fn stream_output_policy(&self) -> &ProcessStreamPolicyBinding {
+        &self.stream_output_policy
     }
 
     /// Returns the exact executable/environment/effect digest.
@@ -1091,6 +1116,11 @@ impl ProcessExecutionAdmissionRequest {
     /// Returns the immutable intent.
     pub const fn intent(&self) -> &ProcessIntent {
         &self.intent
+    }
+
+    /// Exact stream policy sealed into the original owner-issued intent.
+    pub const fn stream_output_policy(&self) -> &ProcessStreamPolicyBinding {
+        self.intent.stream_output_policy()
     }
 
     /// Returns the Kernel-visible lease reference.
@@ -2986,6 +3016,34 @@ mod tests {
             )?,
             ResourceLimits::new(10_000, Some(5_000), Some(1_048_576), 4096, 4096, 4)?,
         )
+    }
+
+    #[test]
+    fn process_stream_policy_is_owner_sealed_and_defaults_to_prefix_only() -> TestResult {
+        let default_intent = intent()?;
+        assert_eq!(
+            default_intent.stream_output_policy().retention_ref(),
+            "p04:retention:bounded-prefix-only"
+        );
+
+        let owner_policy = ProcessStreamPolicyBinding::new(
+            "owner:stream-policy:provider-parser-v1",
+            "owner:privacy:admitted-provider-output",
+            "owner:visibility:provider-attempt-parser",
+            "owner:retention:ephemeral-authorized-parse",
+            "owner:redaction:parser-input-only",
+        )?;
+        let admitted = intent()?.with_stream_output_policy(owner_policy.clone())?;
+        admitted.validate()?;
+        assert_eq!(admitted.stream_output_policy(), &owner_policy);
+        assert_ne!(admitted.effect_digest(), default_intent.effect_digest());
+
+        let mut altered = serde_json::to_value(&admitted)?;
+        altered["stream_output_policy"]["retention_ref"] =
+            serde_json::Value::String("owner:retention:unbounded".to_owned());
+        let altered: ProcessIntent = serde_json::from_value(altered)?;
+        assert!(altered.validate().is_err());
+        Ok(())
     }
 
     fn fence() -> Result<FencingToken, ContractError> {
