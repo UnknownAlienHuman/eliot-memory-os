@@ -383,7 +383,7 @@ fn decode_reserved_apply_outcome(
             }
             Ok(PreparedWriteOutcome::Staged(Box::new(submission)))
         }
-        WireOutcome::Error { code, reason } => Err(kernel_port_error(KernelClientError::Contract(
+        WireOutcome::Error { code, reason, .. } => Err(kernel_port_error(KernelClientError::Contract(
             format!("{code}: {reason}"),
         ))),
         WireOutcome::Partial { reason, .. } | WireOutcome::Unknown { reason } => {

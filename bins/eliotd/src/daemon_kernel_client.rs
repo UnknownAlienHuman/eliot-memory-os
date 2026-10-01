@@ -2307,7 +2307,7 @@ impl DaemonKernelClient {
                 let _ = recovery;
                 Ok(value)
             }
-            WireOutcome::Error { code, reason } => {
+            WireOutcome::Error { code, reason, .. } => {
                 Err(KernelClientError::Contract(format!("{code}: {reason}")))
             }
             WireOutcome::Partial { reason, value } => {
@@ -2896,7 +2896,7 @@ impl DaemonKernelClient {
                     "Kernel staged Observe response unexpectedly carries recovery".to_owned(),
                 ));
             }
-            WireOutcome::Error { code, reason } => {
+            WireOutcome::Error { code, reason, .. } => {
                 return Err(super::DaemonError::Kernel(format!("{code}: {reason}")));
             }
             WireOutcome::Partial { reason, .. } | WireOutcome::Unknown { reason } => {

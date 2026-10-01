@@ -25,6 +25,7 @@ use eliot_store_api::{
     CampaignSourceDocumentSchema, CampaignSourceHead, CampaignSourcePublication,
     CampaignSourcePublisher, CampaignSourceReadStatus, CampaignSourceRevisionLookup,
     CampaignSourceRevisionRead, NamedReadOperation, NamedReadRequest, ReadConsistency, ScopeId,
+    StoreFailureDisposition,
 };
 use eliot_workscope::ObservedScopeResources;
 use serde::Deserialize;
@@ -34,6 +35,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::{
     DaemonComposition, KernelContextReadClient,
     daemon_kernel_client::{DaemonKernelClient, TaskControllerClaimedInvocation},
+    kernel_recovery_client::WorkScopeOwnerWriteFailure,
     task_binding_admission::{InitialWorkScopeBindingRequest, observe_explicit_workspace},
     unix_ms,
 };
@@ -673,32 +675,75 @@ pub async fn complete_initial_work_scope_binding(
             .await
         {
             Ok(record) => record,
-            Err(_) => {
-                let reconciled = kernel
+            Err(WorkScopeOwnerWriteFailure::Store { failure, expected })
+                if failure.disposition == StoreFailureDisposition::UnknownOutcome =>
+            {
+                let reconciled = match kernel
                     .read_work_scope_owner(fence, kernel.protected_snapshot_digest())
                     .await
-                    .map_err(|error| format!("WorkScope owner write readback failed: {error}"))?;
-                if reconciled.payload == expected_payload
-                    && reconciled.value_digest == sha256_hex(&expected_payload)
-                    && reconciled.revision == snapshot.owner_revision
-                    && reconciled.state_fence == *fence
-                    && reconciled.schema == OWNER_SNAPSHOT_SCHEMA
                 {
-                    reconciled
-                } else if reconciled.revision == expected_owner_revision {
-                    return task_controller_rejection(&claimed, "scope_owner_write_rejected");
-                } else {
-                    return Err(
-                        "WorkScope owner write outcome conflicts with retained readback".to_owned(),
+                    Ok(record) => record,
+                    Err(_) => {
+                        return task_controller_result_body(
+                            &claimed,
+                            json!({"status": "rejected", "store_failure": failure}),
+                        );
+                    }
+                };
+                if reconciled.validate_for_fence(fence).is_err() {
+                    return task_controller_result_body(
+                        &claimed,
+                        json!({"status": "rejected", "store_failure": failure}),
                     );
+                }
+                if reconciled == expected {
+                    reconciled
+                } else {
+                    return task_controller_result_body(
+                        &claimed,
+                        json!({"status": "rejected", "store_failure": failure}),
+                    );
+                }
+            }
+            Err(WorkScopeOwnerWriteFailure::Store { failure, .. }) => {
+                return task_controller_result_body(
+                    &claimed,
+                    json!({"status": "rejected", "store_failure": failure}),
+                );
+            }
+            Err(WorkScopeOwnerWriteFailure::Kernel { error, expected }) => {
+                if matches!(&error, KernelPortError::Unknown(_)) {
+                    if let Some(expected) = expected {
+                        let reconciled = match kernel
+                            .read_work_scope_owner(fence, kernel.protected_snapshot_digest())
+                            .await
+                        {
+                            Ok(record) => record,
+                            Err(_) => return Err(error.to_string()),
+                        };
+                        if reconciled.validate_for_fence(fence).is_err() {
+                            return Err(error.to_string());
+                        }
+                        if reconciled == expected {
+                            reconciled
+                        } else {
+                            return Err(error.to_string());
+                        }
+                    } else {
+                        return Err(error.to_string());
+                    }
+                } else {
+                    return Err(error.to_string());
                 }
             }
         }
     } else {
         current
     };
+    readback
+        .validate_for_fence(fence)
+        .map_err(|error| format!("WorkScope owner readback is invalid: {error}"))?;
     if readback.payload != expected_payload
-        || readback.value_digest != sha256_hex(&expected_payload)
         || readback.revision != snapshot.owner_revision
         || readback.state_fence != *fence
         || readback.schema != OWNER_SNAPSHOT_SCHEMA
@@ -718,7 +763,7 @@ pub async fn complete_initial_work_scope_binding(
     if installed != snapshot {
         return task_controller_rejection(&claimed, "scope_owner_readback_mismatch");
     }
-    let snapshot_digest = sha256_hex(&expected_payload);
+    let snapshot_digest = readback.value_digest.clone();
     task_controller_result_body(
         &claimed,
         json!({
@@ -733,13 +778,13 @@ fn work_scope_owner_revision_state(
     record: &eliot_store_api::RecoveryRecord,
     expected_fence: &StateFence,
 ) -> Result<(u64, Option<eliot_governor::WorkScopeBindingSnapshot>), ()> {
+    record.validate_for_fence(expected_fence).map_err(|_| ())?;
     if record.namespace != "owner"
         || record.key != "work_scope"
         || record.state_fence != *expected_fence
         || record.revision == 0
         || record.schema != OWNER_SNAPSHOT_SCHEMA
         || record.payload.is_empty()
-        || record.value_digest != sha256_hex(&record.payload)
     {
         return Err(());
     }

@@ -10,6 +10,7 @@ use eliot_contracts::EpochId;
 #[cfg(windows)]
 use eliot_contracts::{ArtifactId, ContractId, ContractVersion, ResourceGeneration};
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError};
+use eliot_store_api::StoreFailure;
 #[cfg(windows)]
 use eliot_protocol::{
     ClientHello, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolRange, ProtocolVersion,
@@ -63,6 +64,14 @@ pub(crate) enum WireOutcome {
     Error {
         code: String,
         reason: String,
+        /// Operation-specific empty/error payload carried by the existing
+        /// Kernel response envelope. Absent for legacy/non-Store failures.
+        #[serde(default)]
+        value: Option<serde_json::Value>,
+        /// Typed Store refusal when the operation preserves the existing
+        /// StoreFailure contract. Absent for all legacy/non-Store failures.
+        #[serde(default)]
+        failure: Option<StoreFailure>,
     },
 }
 
