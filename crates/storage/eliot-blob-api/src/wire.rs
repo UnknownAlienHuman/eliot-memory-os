@@ -416,6 +416,14 @@ impl BlobProcessStreamKernelSourceReadbackRequest {
         capability: ProcessStreamSinkCapabilityRef,
         binding: ProcessStreamSinkBindingRef,
         owner_facts: BlobProcessStreamVerifiedOwnerFacts,
+        module_catalog_owner_readback_json: String,
+        module_catalog_owner_readback_sha256: String,
+        generation_admission_json: String,
+        generation_admission_sha256: String,
+        process_source_admission_readback_json: String,
+        process_source_admission_readback_sha256: String,
+        source_admission_write_receipt_json: String,
+        source_admission_write_receipt_sha256: String,
     ) -> Result<ProcessStreamSourceReadbackRequest, WireValidationError> {
         self.validate()?;
         capability.validate()?;
@@ -441,6 +449,14 @@ impl BlobProcessStreamKernelSourceReadbackRequest {
             policy_json: self.policy_json.clone(),
             policy_sha256: self.policy_sha256.clone(),
             owner_facts,
+            module_catalog_owner_readback_json,
+            module_catalog_owner_readback_sha256,
+            generation_admission_json,
+            generation_admission_sha256,
+            process_source_admission_readback_json,
+            process_source_admission_readback_sha256,
+            source_admission_write_receipt_json,
+            source_admission_write_receipt_sha256,
             fence,
             max_bytes: self.max_bytes,
             offset: self.offset,
@@ -1056,13 +1072,13 @@ impl BlobProcessStreamVerifiedOwnerFacts {
         validate_digest("currentness_sha256", &self.currentness_sha256)?;
         validate_optional_canonical_owner_json_pair(
             "task_binding",
-            self.task_binding_json.as_deref(),
-            self.task_binding_sha256.as_deref(),
+            &self.task_binding_json,
+            &self.task_binding_sha256,
         )?;
         validate_optional_canonical_owner_json_pair(
             "session_binding",
-            self.session_binding_json.as_deref(),
-            self.session_binding_sha256.as_deref(),
+            &self.session_binding_json,
+            &self.session_binding_sha256,
         )
     }
 }
@@ -1321,13 +1337,13 @@ impl BlobProcessStreamOwnerFactsPullResponse {
                 return Err(WireValidationError::InvalidField("purpose_result"));
             }
             if request.purpose == BlobProcessStreamOwnerFactsPullPurpose::StoreOpen
-                && (process_source_admission_json
+                && (process_source_admission_json.as_ref()
                     != request.source_admission_json.as_ref()
-                    || process_source_admission_sha256
+                    || process_source_admission_sha256.as_ref()
                         != request.source_admission_sha256.as_ref()
-                    || source_admission_write_receipt_json
+                    || source_admission_write_receipt_json.as_ref()
                         != request.source_admission_write_receipt_json.as_ref()
-                    || source_admission_write_receipt_sha256
+                    || source_admission_write_receipt_sha256.as_ref()
                         != request.source_admission_write_receipt_sha256.as_ref())
             {
                 return Err(WireValidationError::InvalidField(
@@ -1335,9 +1351,9 @@ impl BlobProcessStreamOwnerFactsPullResponse {
                 ));
             }
             if request.purpose == BlobProcessStreamOwnerFactsPullPurpose::SourceReadback
-                && (source_admission_write_receipt_json
+                && (source_admission_write_receipt_json.as_ref()
                     != request.source_admission_write_receipt_json.as_ref()
-                    || source_admission_write_receipt_sha256
+                    || source_admission_write_receipt_sha256.as_ref()
                         != request.source_admission_write_receipt_sha256.as_ref())
             {
                 return Err(WireValidationError::InvalidField(
