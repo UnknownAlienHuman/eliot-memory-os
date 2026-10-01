@@ -9380,14 +9380,18 @@ impl KernelComposition {
             &invocation.task_input,
             &invocation.work_scope_id,
         )?;
-        let protected_snapshot_digest = self
-            .front_door_policy
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?
-            .config_snapshot
-            .get("protected_snapshot_digest")
-            .and_then(serde_json::Value::as_str)
-            .ok_or(TransportError::SessionFenced)?;
+        let protected_snapshot_digest = {
+            let policy = self
+                .front_door_policy
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            policy
+                .config_snapshot
+                .get("protected_snapshot_digest")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(TransportError::SessionFenced)?
+                .to_owned()
+        };
         if operation.request.protected_snapshot_digest != protected_snapshot_digest {
             return Err(TransportError::SessionFenced);
         }
