@@ -1014,7 +1014,7 @@ impl ProtectedRuntimePathLease {
             let identity =
                 file_identity_from_handle(&self.file).map_err(|_| ProtectedPathError::Io)?;
             if identity != self.identity {
-                return Err(ProtectedPathError::Io);
+                return Err(ProtectedPathError::IdentityMismatch);
             }
             Ok(())
         }
@@ -1036,7 +1036,7 @@ impl ProtectedRuntimePathLease {
             let file = open_runtime_read_file(&self.path)?;
             let identity = file_identity_from_handle(&file).map_err(|_| ProtectedPathError::Io)?;
             if identity != self.identity {
-                return Err(ProtectedPathError::Io);
+                return Err(ProtectedPathError::IdentityMismatch);
             }
             Ok(())
         }

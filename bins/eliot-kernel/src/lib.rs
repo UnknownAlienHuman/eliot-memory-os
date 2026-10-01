@@ -685,6 +685,12 @@ pub struct KernelComposition {
         allow(dead_code, reason = "the authenticated scan contour is Windows-only")
     )]
     ors_object_path: PathBuf,
+    /// Retained no-follow protected root and exact ORS-file proof used before
+    /// and after installation scan/readiness storage operations.
+    #[cfg(windows)]
+    pub(super) scan_disclosure_storage: Option<ScanDisclosureStorageLease>,
+    #[cfg(windows)]
+    pub(super) scan_disclosure_ors_generation: Option<u64>,
     work_root: PathBuf,
     runtime: Runtime,
     platform: Arc<WindowsPlatform>,
@@ -927,6 +933,32 @@ pub struct KernelComposition {
     /// Process-local only, never canonical state: the brief carries
     /// references, never rolling log content (I16.7).
     pub(crate) diagnostic_brief: Mutex<Option<diagnostic_brief::DiagnosticBrief>>,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) struct ScanDisclosureStorageLease {
+    #[cfg(windows)]
+    root: ProtectedRootLease,
+    #[cfg(windows)]
+    file: ProtectedRuntimePathLease,
+}
+
+#[cfg(windows)]
+impl ScanDisclosureStorageLease {
+    pub(super) fn verify(
+        &self,
+        expected_path: &Path,
+    ) -> Result<(), eliot_platform_windows::ProtectedPathError> {
+        if !windows_paths_equal(self.file.path(), expected_path) {
+            return Err(eliot_platform_windows::ProtectedPathError::IdentityMismatch);
+        }
+        self.root.verify_current_protected_contour()?;
+        self.file.verify_stable_identity()?;
+        self.file.verify_path_identity()?;
+        self.root.verify_current_protected_contour()?;
+        self.file.verify_stable_identity()?;
+        Ok(())
+    }
 }
 
 impl KernelComposition {
@@ -1753,9 +1785,14 @@ fn load_agent_bridge_declaration(
 
 #[cfg(windows)]
 impl KernelComposition {
-    fn ors_path_for_config(config: &KernelConfig) -> Result<PathBuf, KernelBuildError> {
+    fn ors_path_for_config(
+        config: &KernelConfig,
+    ) -> Result<(PathBuf, Option<ProtectedRootLease>), KernelBuildError> {
         let Some(binding) = config.eliotd_receipt_binding.as_ref() else {
-            return Ok(config.work_root.join(".eliot").join("kernel-ors.redb"));
+            return Ok((
+                config.work_root.join(".eliot").join("kernel-ors.redb"),
+                None,
+            ));
         };
         binding.validate().map_err(KernelBuildError::Service)?;
         #[cfg(windows)]
@@ -1766,13 +1803,13 @@ impl KernelComposition {
                 .canonical_path()
                 .map_err(|error| KernelBuildError::Service(error.to_string()))?;
             if !windows_paths_equal(&canonical, binding.kernel_ors_root())
-                || lease.verify_stable_identity().is_err()
+                || lease.verify_current_protected_contour().is_err()
             {
                 return Err(KernelBuildError::Service(
                     "manifest-bound Kernel ORS root identity is unavailable".to_owned(),
                 ));
             }
-            Ok(canonical.join("kernel-ors.redb"))
+            Ok((canonical.join("kernel-ors.redb"), Some(lease)))
         }
         #[cfg(not(windows))]
         {
@@ -1780,6 +1817,48 @@ impl KernelComposition {
                 "manifest-bound Kernel ORS root requires Windows retained-path proof".to_owned(),
             ))
         }
+    }
+
+    #[cfg(windows)]
+    fn open_scan_disclosure_storage(
+        config: &KernelConfig,
+        ors_path: &Path,
+        root: Option<ProtectedRootLease>,
+    ) -> Result<Option<ScanDisclosureStorageLease>, KernelBuildError> {
+        let Some(binding) = config.eliotd_receipt_binding.as_ref() else {
+            if root.is_some() {
+                return Err(KernelBuildError::Service(
+                    "unbound Kernel ORS unexpectedly retained a protected root".to_owned(),
+                ));
+            }
+            return Ok(None);
+        };
+        let root = root.ok_or_else(|| {
+            KernelBuildError::Service("Host installation ORS root proof is unavailable".to_owned())
+        })?;
+        let canonical_root = root
+            .canonical_path()
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        if !windows_paths_equal(&canonical_root, binding.kernel_ors_root())
+            || !windows_paths_equal(
+                ors_path,
+                &binding.kernel_ors_root().join("kernel-ors.redb"),
+            )
+        {
+            return Err(KernelBuildError::Service(
+                "manifest-bound Kernel ORS path changed before its file lease".to_owned(),
+            ));
+        }
+        root.verify_current_protected_contour()
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        let file = ProtectedRuntimePathLease::open_or_create_absolute(ors_path)
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        file.verify_stable_identity()
+            .and_then(|()| file.verify_path_identity())
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        root.verify_current_protected_contour()
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        Ok(Some(ScanDisclosureStorageLease { root, file }))
     }
 
     /// Returns the discriminator bound to the production Kernel composition.

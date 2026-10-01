@@ -374,6 +374,39 @@ impl ProtectedRootLease {
         }
     }
 
+    /// Reopens the current protected contour and proves that every directory
+    /// still resolves to the same no-follow object with the original storage
+    /// DACL. This method is read-only: it never repairs or rewrites ACLs.
+    pub fn verify_current_protected_contour(&self) -> Result<(), ProtectedPathError> {
+        #[cfg(windows)]
+        {
+            self.verify_stable_identity()?;
+            let current = Self::open_existing(&self.path)?;
+            if current.identity != self.identity
+                || current.directories.len() != self.directories.len()
+            {
+                return Err(ProtectedPathError::IdentityMismatch);
+            }
+            for (retained, reopened) in self.directories.iter().zip(&current.directories) {
+                let retained_identity = file_identity_from_handle(retained)
+                    .map_err(|_| ProtectedPathError::Io)?;
+                let reopened_identity = file_identity_from_handle(reopened)
+                    .map_err(|_| ProtectedPathError::Io)?;
+                if retained_identity != reopened_identity {
+                    return Err(ProtectedPathError::IdentityMismatch);
+                }
+                verify_protected_storage_dacl(retained)?;
+                verify_protected_storage_dacl(reopened)?;
+            }
+            current.verify_stable_identity()?;
+            Ok(())
+        }
+        #[cfg(not(windows))]
+        {
+            Err(ProtectedPathError::UnsupportedPlatform)
+        }
+    }
+
     /// Carries this retained ownership proof into a handle-bound removal
     /// operation for the very same object.
     ///
@@ -1180,6 +1213,80 @@ pub(crate) fn protect_opened_handle(
         GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision) != 0
             && control & SE_DACL_PROTECTED != 0
     };
+    unsafe { LocalFree(descriptor.cast()) };
+    if !dacl_matches || !protected {
+        return Err(ProtectedPathError::AclMismatch);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn verify_protected_storage_dacl(file: &std::fs::File) -> Result<(), ProtectedPathError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
+    };
+    let expected = crate::OwnedSecurityDescriptor::for_protected_storage()
+        .map_err(|_| ProtectedPathError::AclMismatch)?;
+    let expected_dacl = expected
+        .dacl()
+        .map_err(|_| ProtectedPathError::AclMismatch)?;
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: GetSecurityInfo reads the DACL through the retained directory
+    // handle; all output pointers are live locals and the descriptor is freed
+    // exactly once below.
+    let status = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle().cast(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &raw mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS || descriptor.is_null() {
+        if !descriptor.is_null() {
+            // SAFETY: This descriptor was allocated by GetSecurityInfo above.
+            unsafe { LocalFree(descriptor.cast()) };
+        }
+        return Err(ProtectedPathError::AclMismatch);
+    }
+    let mut present = 0;
+    let mut actual_dacl = std::ptr::null_mut();
+    let mut defaulted = 0;
+    // SAFETY: The descriptor is valid until the matching LocalFree below.
+    let dacl_matches = unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor,
+            &raw mut present,
+            &raw mut actual_dacl,
+            &raw mut defaulted,
+        ) != 0
+            && present != 0
+            && !actual_dacl.is_null()
+            && (*actual_dacl).AclSize == (*expected_dacl).AclSize
+            && std::slice::from_raw_parts(
+                actual_dacl.cast::<u8>(),
+                usize::from((*actual_dacl).AclSize),
+            ) == std::slice::from_raw_parts(
+                expected_dacl.cast::<u8>(),
+                usize::from((*expected_dacl).AclSize),
+            )
+    };
+    let mut control = 0_u16;
+    let mut revision = 0_u32;
+    // SAFETY: The descriptor remains live and the out-pointers are valid.
+    let protected = unsafe {
+        GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision) != 0
+            && control & SE_DACL_PROTECTED != 0
+    };
+    // SAFETY: `descriptor` is the allocation returned by GetSecurityInfo.
     unsafe { LocalFree(descriptor.cast()) };
     if !dacl_matches || !protected {
         return Err(ProtectedPathError::AclMismatch);
