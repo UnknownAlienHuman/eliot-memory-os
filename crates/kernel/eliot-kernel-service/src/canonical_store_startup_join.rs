@@ -28,9 +28,7 @@ use eliot_host_state::{ImmutableProcessManifest, ManagedDependencyRecord};
 use eliot_platform::PlatformHandle;
 use eliot_store_api::StoreSemanticReadiness;
 
-use crate::store_write_status::{
-    CanonicalStoreWriteStatus, project_canonical_store_write_status,
-};
+use crate::store_write_status::{CanonicalStoreWriteStatus, project_canonical_store_write_status};
 
 /// Evaluates the I1.11 step 5 startup join for one required canonical-store
 /// lineage.

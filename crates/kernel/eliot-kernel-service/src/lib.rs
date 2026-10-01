@@ -254,6 +254,7 @@ pub use store_gateway::{store_read_profile_revision, store_read_unavailable_resp
 // distinguish a proven mutation disposition from a still-open Problem State
 // and from a bare gateway refusal, so both the carrier and the recovered
 // outcome it carries are part of the crate's public contract.
+pub use canonical_store_startup_join::join_canonical_store_startup_readiness;
 #[cfg(windows)]
 pub use store_gateway::DreamerCommitUncertain;
 #[cfg(windows)]
@@ -270,7 +271,6 @@ pub use store_write_reservation::{
     recovery_page, reserve_for_transition, unresolved_reservations, writer_epoch_for_fence,
     writer_epoch_for_fence_from_epoch,
 };
-pub use canonical_store_startup_join::join_canonical_store_startup_readiness;
 // The Host-owned operational halves the canonical-store startup join consumes.
 // Re-exported here so the Kernel startup path names the exact Host record
 // types without a second edge to the Host journal owner.
