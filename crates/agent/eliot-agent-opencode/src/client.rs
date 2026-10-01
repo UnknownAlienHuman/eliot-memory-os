@@ -233,14 +233,67 @@ pub enum OpenCodeRunError {
 /// never appear here as ordinary success with an unexplained absence: the
 /// disposition is computed before candidate sealing, bound into the sealed
 /// candidate digest through the run extra, and finalized before slot
-/// confirmation. The returned run is the exact candidate-seal preimage; its
-/// attempt-bound terminal observation is added before sealing so a consumer
-/// can reproduce the seal without adding post-seal fields to its digest.
+/// confirmation. The terminal observation is appended after sealing and
+/// quotes that exact candidate digest; consumers verify it against the
+/// reconstructed seal preimage.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AdmittedAttemptOutcome {
     pub run: NoAuthorityRunResult,
     pub candidate: AdmittedAttemptCandidate,
     pub route: SealedRouteDisposition,
+}
+
+impl AdmittedAttemptOutcome {
+    /// Verifies the sealed candidate against the post-seal run presentation.
+    ///
+    /// The terminal observation is deliberately appended after sealing: it
+    /// names the candidate digest and therefore cannot be part of its own
+    /// digest preimage. Consumers reconstruct that preimage by extracting
+    /// only this typed sidecar, then verify the sidecar's attempt, kind, and
+    /// exact candidate digest before accepting the candidate.
+    pub fn verify_sealed_candidate(
+        &self,
+        admitted: &AdmittedOpenCodeAttempt,
+    ) -> Result<(), AdmittedAttemptError> {
+        let mut seal_preimage = self.run.clone();
+        let terminal_value = seal_preimage
+            .extra
+            .remove("admitted_terminal_observation")
+            .ok_or(AdmittedAttemptError::SealRejected {
+                reason: "terminal observation is missing from the post-seal run",
+            })?;
+        let terminal: AdmittedObservation = serde_json::from_value(terminal_value)
+            .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))?;
+        if terminal.attempt_id != admitted.attempt().id {
+            return Err(AdmittedAttemptError::AttemptMismatch);
+        }
+        if terminal.kind != AdmittedObservationKind::Terminal {
+            return Err(AdmittedAttemptError::SealRejected {
+                reason: "post-seal observation is not terminal",
+            });
+        }
+        let route_summary = self.route.summary_value(admitted.admission())?;
+        if seal_preimage.extra.get("route_disposition") != Some(&route_summary) {
+            return Err(AdmittedAttemptError::SealRejected {
+                reason: "post-seal run route summary differs from the typed route disposition",
+            });
+        }
+
+        let mut resealed = AdmittedAttemptCandidate::seal(admitted, &seal_preimage)?;
+        resealed.route_disposition = Some(self.route.clone());
+        let digest = resealed.compute_digest()?;
+        if terminal.detail != format!("sealed candidate {}", digest.as_str()) {
+            return Err(AdmittedAttemptError::SealRejected {
+                reason: "terminal observation does not name the reconstructed candidate digest",
+            });
+        }
+        if resealed != self.candidate {
+            return Err(AdmittedAttemptError::SealRejected {
+                reason: "post-seal run does not reproduce the returned candidate",
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Classifies the route disposition carried by one sealed candidate artifact
@@ -1859,20 +1912,6 @@ fn seal_admitted_outcome(
         "route_disposition".to_owned(),
         route.summary_value(admitted.admission())?,
     );
-    // The terminal observation is part of the candidate preimage. It cannot
-    // quote the candidate digest that covers it without making the digest
-    // self-referential. Its exact attempt identity and content are instead
-    // authenticated by the result digest computed below.
-    let terminal = AdmittedObservation::new(
-        admitted,
-        AdmittedObservationKind::Terminal,
-        "terminal candidate outcome observed".to_owned(),
-    );
-    run.extra.insert(
-        "admitted_terminal_observation".to_owned(),
-        serde_json::to_value(&terminal)
-            .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))?,
-    );
     let mut candidate = AdmittedAttemptCandidate::seal(admitted, &run)?;
     // The typed route disposition computed and validated above is bound into
     // the sealed candidate artifact itself (issue #2902 items 8 and 11): the
@@ -1881,6 +1920,25 @@ fn seal_admitted_outcome(
     // explicitly unverified rather than a current receipt.
     candidate.route_disposition = Some(route.clone());
     slot.confirm(admitted, &session_id, message_id)?;
+    // The terminal observation is a post-seal sidecar because it quotes the
+    // exact candidate digest. Its attempt identity, kind, and digest are
+    // independently checked by `AdmittedAttemptOutcome::verify_sealed_candidate`.
+    let terminal = AdmittedObservation::new(
+        admitted,
+        AdmittedObservationKind::Terminal,
+        format!(
+            "sealed candidate {}",
+            candidate
+                .compute_digest()
+                .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))?
+                .as_str()
+        ),
+    );
+    run.extra.insert(
+        "admitted_terminal_observation".to_owned(),
+        serde_json::to_value(&terminal)
+            .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))?,
+    );
     // Canonical route-observation disposition (issue #2902): the typed
     // disposition computed before sealing travels on the outcome. The
     // retained wire receipt stays the downstream normalization evidence, and

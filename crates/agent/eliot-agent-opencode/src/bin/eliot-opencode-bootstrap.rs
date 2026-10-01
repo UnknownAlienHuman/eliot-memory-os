@@ -3,9 +3,9 @@ use eliot_agent_api::{
     RouteFingerprint,
 };
 use eliot_agent_opencode::{
-    AdmittedAttemptCandidate, AdmittedAttemptOutcome, AdmittedOpenCodeAttempt, BasicAuth,
-    LoopbackEndpoint, ModelSelection, NoAuthorityRunResult, OpenCodeClient, OpenCodeRouteAdmission,
-    OpenCodeRouteRole, OpenCodeRunError, OpenCodeRunPolicy, ReadOnlyRunRequest, RunStatus,
+    AdmittedAttemptOutcome, AdmittedOpenCodeAttempt, BasicAuth, LoopbackEndpoint, ModelSelection,
+    NoAuthorityRunResult, OpenCodeClient, OpenCodeRouteAdmission, OpenCodeRouteRole,
+    OpenCodeRunError, OpenCodeRunPolicy, ReadOnlyRunRequest, RunStatus,
     classify_sealed_candidate, opencode_adapter_contract, opencode_pilot_observation,
     opencode_pilot_observation_with_fallback, opencode_pilot_probe_evidence,
     redact_route_diagnostics, select_opencode_route, validate_opencode_adapter_contract,
@@ -577,17 +577,14 @@ async fn run_admitted(args: AdmittedCliArgs) -> Result<(), CliError> {
 /// Emits the sealed candidate artifact for one admitted seal (issue #2902
 /// items 8, 11, and 12).
 ///
-/// The reseal guard proves the published candidate re-derives from the same
-/// admitted attempt and run: re-sealing the observed run must reproduce the
-/// identical seal, and the seal must link the admitted attempt and admission
-/// digest carried by the envelope. The typed route disposition the seal
-/// bound into the candidate rides the comparison too — an identical run
-/// re-derives an identical disposition (the result digest covers the run
-/// extra that carries the disposition summary), so a changed wire route fails
-/// at the digest first. The published artifact carries the disposition, and
-/// the bounded diagnostics line classifies it: a legacy candidate without
-/// the disposition field classifies as explicitly unverified rather than a
-/// current receipt.
+/// The seal guard reconstructs the candidate preimage from the post-seal run
+/// by extracting only the typed terminal observation, then verifies that its
+/// attempt, terminal kind, and quoted digest match the reconstructed
+/// candidate. All other run fields, including the digest-bound route summary,
+/// remain in the preimage. The seal must link the admitted attempt and route
+/// digest carried by the envelope; the bounded diagnostics line classifies
+/// the published artifact, and a legacy candidate without a route disposition
+/// remains explicitly unverified.
 fn emit_sealed_candidate(
     outcome: &AdmittedAttemptOutcome,
     admitted: &AdmittedOpenCodeAttempt,
@@ -596,11 +593,10 @@ fn emit_sealed_candidate(
     password: &str,
 ) -> Result<(), CliError> {
     // The production boundary emits only the sealed candidate artifact.
-    let mut resealed = AdmittedAttemptCandidate::seal(admitted, &outcome.run)
+    outcome
+        .verify_sealed_candidate(admitted)
         .map_err(|error| CliError::Run(sanitize_error(&error.to_string(), password)))?;
-    resealed.route_disposition = Some(outcome.route.clone());
-    if resealed != outcome.candidate
-        || outcome.candidate.attempt_id != *admitted_attempt_id
+    if outcome.candidate.attempt_id != *admitted_attempt_id
         || outcome.candidate.admitted_route_digest != *admitted_route_digest
     {
         return Err(CliError::Run(

@@ -74,17 +74,21 @@ async fn admitted_happy_path_seals_replay_stable_candidate()
     }
 
     let candidate = &outcome.candidate;
+    outcome.verify_sealed_candidate(&parts.edge)?;
     let terminal = serde_json::from_value::<AdmittedObservation>(
         outcome
             .run
             .extra
             .get("admitted_terminal_observation")
             .cloned()
-            .ok_or("seal preimage must retain the terminal observation")?,
+            .ok_or("post-seal run must retain the terminal observation")?,
     )?;
     assert_eq!(terminal.attempt_id, candidate.attempt_id);
     assert_eq!(terminal.kind, AdmittedObservationKind::Terminal);
-    assert_eq!(terminal.detail, "terminal candidate outcome observed");
+    assert_eq!(
+        terminal.detail,
+        format!("sealed candidate {}", candidate.compute_digest()?.as_str())
+    );
     assert_eq!(candidate.attempt_id, AttemptId::new("attempt-487")?);
     assert_eq!(
         candidate.admitted_route_digest,
@@ -99,11 +103,24 @@ async fn admitted_happy_path_seals_replay_stable_candidate()
     // result digest and the candidate artifact. Replaying a seal therefore
     // uses the retained disposition from the same outcome, not the legacy
     // low-level seal's `None` default.
-    let mut resealed = AdmittedAttemptCandidate::seal(&parts.edge, &outcome.run)?;
-    resealed.route_disposition = Some(outcome.route.clone());
-    assert_eq!(resealed.compute_digest()?, candidate.compute_digest()?);
-    assert_eq!(resealed, *candidate);
     assert_eq!(candidate.route_disposition.as_ref(), Some(&outcome.route));
+
+    let mut mismatched_terminal = outcome.clone();
+    let Some(Value::Object(terminal)) = mismatched_terminal
+        .run
+        .extra
+        .get_mut("admitted_terminal_observation")
+    else {
+        return Err("post-seal terminal observation must be an object".into());
+    };
+    terminal.insert(
+        "detail".to_owned(),
+        json!("sealed candidate 0000000000000000000000000000000000000000000000000000000000000000"),
+    );
+    assert!(matches!(
+        mismatched_terminal.verify_sealed_candidate(&parts.edge),
+        Err(AdmittedAttemptError::SealRejected { .. })
+    ));
 
     let wire = serde_json::to_value(candidate)?;
     let keys: BTreeSet<String> = wire
