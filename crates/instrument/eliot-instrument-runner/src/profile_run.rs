@@ -1586,10 +1586,12 @@ pub fn stage_request(
         } else {
             StageExecutionKind::Process
         },
-        stage_command: testd_executor_profile.then(|| eliot_testd_core::InstrumentStageCommand {
-            executable: stage.command.executable.clone(),
-            argv: stage.command.argv.clone(),
-            spec_digest: stage.spec_digest.clone(),
+        stage_command: (testd_executor_profile && !entry.executable.is_decoder_only()).then(|| {
+            eliot_testd_core::InstrumentStageCommand {
+                executable: stage.command.executable.clone(),
+                argv: stage.command.argv.clone(),
+                spec_digest: stage.spec_digest.clone(),
+            }
         }),
     })
 }
