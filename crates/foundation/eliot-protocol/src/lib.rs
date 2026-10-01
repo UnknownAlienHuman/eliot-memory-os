@@ -11,6 +11,7 @@
 use std::{collections::BTreeMap, fmt, io::Read};
 
 use crate::activation_resolution::AgentActivationResolutionDisposition;
+use crate::reason_codes::canonical_denial_projection;
 use eliot_agent_contracts::LivePeerMessage;
 use eliot_contracts::{
     ArtifactId, ContractError, ContractIdentity, ContractVersion, EpochId, RequestId,
@@ -3351,33 +3352,36 @@ impl OpenAgentBridgeActivationDisposition {
             } => {
                 text(reason_code, "agent_bridge_activation_response.reason_code")?;
                 detail.validate()?;
-                let compatible = match detail {
-                    AgentActivationResolutionDisposition::TaskSelectionRequired { .. }
-                    | AgentActivationResolutionDisposition::ScopeSelectionRequired { .. } => {
-                        *disposition == AgentResponseDisposition::InvalidRequest
-                            && *directive_kind
-                                == AgentActivationDirectiveKind::CandidateRecoveryNoAutoSelection
+                // The expected closed disposition and typed directive come
+                // from the generated I7.20 denial projection, keyed by the
+                // owner-issued detail's canonical reason. The open reason
+                // string itself stays verbatim, so unknown future reasons keep
+                // their explicit typed control fields.
+                let projected = match detail {
+                    AgentActivationResolutionDisposition::TaskSelectionRequired { .. } => {
+                        canonical_denial_projection("TASK_SELECTION_REQUIRED")
+                    }
+                    AgentActivationResolutionDisposition::ScopeSelectionRequired { .. } => {
+                        canonical_denial_projection("TASK_SCOPE_INCOMPATIBLE")
                     }
                     AgentActivationResolutionDisposition::ScopeAmbiguous { .. } => {
-                        *disposition == AgentResponseDisposition::StaleOrConflict
-                            && *directive_kind
-                                == AgentActivationDirectiveKind::CandidateRecoveryNoAutoSelection
+                        canonical_denial_projection("AMBIGUOUS_RESULT")
                     }
                     AgentActivationResolutionDisposition::NotReady { .. } => {
-                        *disposition == AgentResponseDisposition::UnavailableOrCapacity
-                            && *directive_kind
-                                == AgentActivationDirectiveKind::RetryRequiresNewTicket
+                        canonical_denial_projection("DEFERRED_CAPACITY")
                     }
                     AgentActivationResolutionDisposition::StaleFence { .. } => {
-                        *disposition == AgentResponseDisposition::StaleOrConflict
-                            && *directive_kind == AgentActivationDirectiveKind::StaleFenceFailClosed
+                        canonical_denial_projection("STALE_STATE_FENCE")
                     }
                     AgentActivationResolutionDisposition::FailedInternal { .. } => {
-                        *disposition == AgentResponseDisposition::Failed
-                            && *directive_kind == AgentActivationDirectiveKind::FailureCapsule
+                        canonical_denial_projection("RUNTIME_FAILED")
                     }
-                    AgentActivationResolutionDisposition::Resolved { .. } => false,
+                    AgentActivationResolutionDisposition::Resolved { .. } => None,
                 };
+                let compatible = projected.is_some_and(|row| {
+                    disposition.as_str() == row.disposition
+                        && directive_kind.as_str() == row.directive
+                });
                 if compatible {
                     Ok(())
                 } else {
