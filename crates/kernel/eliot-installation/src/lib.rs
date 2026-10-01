@@ -200,7 +200,8 @@ pub use managed_change_plan::{
 
 pub use survey::{
     InstallationSurvey, SurveyCandidate, SurveyFamilyReport, SurveyInputObservation,
-    SurveyObservationSource, SurveyProbeAnswer, SurveyStage, SurveyStageOutcome, SurveyStageResult,
+    SurveyObservationSource, SurveyProbeAdmission, SurveyProbeAnswer, SurveyStage,
+    SurveyStageOutcome, SurveyStageResult,
     survey_installation,
 };
 

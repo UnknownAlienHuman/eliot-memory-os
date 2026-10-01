@@ -191,18 +191,23 @@ pub struct SurveyCandidate {
     /// Every input that resolved to this exact identity, ascending.
     pub aliases: Vec<PlatformHandle>,
     /// The probe stage's coverage outcome for this exact identity.
-    ///
-    /// Always [`SurveyStageOutcome::Withheld`]: this coordinator never runs a
-    /// probe, so it never learns whether one succeeded.
     pub probe_outcome: SurveyStageOutcome,
-    /// Answers a caller reported about a probe performed outside this
-    /// coordinator, ascending.
-    ///
-    /// Evidence only. This coordinator neither performed those probes nor
-    /// verified the answers, so a present answer is not evidence that anything
-    /// was installed, launched or permitted to run; it is retained so the
-    /// out-of-band observation is not lost.
+    /// Whether an admitted executor completed this identity's exact probe.
+    /// Metadata-only surveys always set this to `Withheld`.
+    pub probe_admission: SurveyProbeAdmission,
+    /// Bounded, non-secret answer references retained from an admitted probe.
+    /// Metadata-only surveys always leave this empty.
     pub probe_answers: Vec<PlatformHandle>,
+}
+
+/// Provenance state for one observed identity's probe stage.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SurveyProbeAdmission {
+    /// The Kernel admitted and completed the exact bounded invocation.
+    AnsweredByAdmittedExecutor,
+    /// No admitted executor result is attached to this survey.
+    Withheld,
 }
 
 /// One catalogue family's complete ordered survey result.
@@ -223,13 +228,11 @@ pub struct SurveyFamilyReport {
     pub candidates: Vec<SurveyCandidate>,
 }
 
-/// A probe answer a caller reports for a probe performed outside this
-/// coordinator.
+/// A caller-reported probe answer, which is not admitted survey evidence.
 ///
-/// The survey retains the answer and re-derives nothing from it: this
-/// coordinator has no execution port, so it neither ran the probe nor checked
-/// that anything permitted it, and a well-formed answer is not a record that
-/// anything was admitted to run.
+/// This type remains for wire compatibility. The metadata survey refuses all
+/// non-empty answer lists because this value carries no Kernel execution
+/// receipt or source-bound approval.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SurveyProbeAnswer {
@@ -350,12 +353,19 @@ impl InstallationSurvey {
                 }
                 validate_ascending("survey.candidates.aliases", &candidate.aliases)?;
                 validate_ascending("survey.candidates.probe_answers", &candidate.probe_answers)?;
-                // The probe stage is never reached for an identity here, so a
-                // reported non-withheld probe outcome would claim a coverage
-                // this coordinator never obtained.
-                if candidate.probe_outcome != SurveyStageOutcome::Withheld {
+                let probe_result_consistent = match candidate.probe_admission {
+                    SurveyProbeAdmission::Withheld => {
+                        candidate.probe_outcome == SurveyStageOutcome::Withheld
+                            && candidate.probe_answers.is_empty()
+                    }
+                    SurveyProbeAdmission::AnsweredByAdmittedExecutor => {
+                        candidate.probe_outcome == SurveyStageOutcome::Found
+                            && !candidate.probe_answers.is_empty()
+                    }
+                };
+                if !probe_result_consistent {
                     return Err(InstallationError::IncompleteObservation(
-                        "survey candidate reports a probe outcome this coordinator never reached"
+                        "survey candidate probe result and admitted-executor provenance disagree"
                             .to_owned(),
                     ));
                 }
@@ -372,9 +382,10 @@ impl InstallationSurvey {
 /// and the source's per-stage observations are sorted before use: reordering
 /// the catalogue or the observations cannot change the meaning of the result.
 /// Stage order is mandatory and comes from [`SurveyStage::ORDER`], the probe
-/// stage runs nothing, aliases coalesce by exact observed identity only, and
-/// every unavailable input keeps its own coverage state. A probe answer naming
-/// a family the catalogue does not contain is rejected, not dropped.
+/// stage does not execute anything, aliases coalesce by exact observed
+/// identity only, and every unavailable input keeps its own coverage state.
+/// Caller-reported probe answers are rejected because they carry no executor
+/// receipt.
 ///
 /// `catalogue` is validated before traversal and its [`InstallationError`]
 /// surfaces unchanged; no second validation scheme applies here.
@@ -384,7 +395,11 @@ pub fn survey_installation(
     probe_answers: &[SurveyProbeAnswer],
 ) -> Result<InstallationSurvey, InstallationError> {
     catalogue.validate()?;
-    let answers = index_probe_answers(probe_answers)?;
+    if !probe_answers.is_empty() {
+        return Err(InstallationError::IncompleteObservation(
+            "caller-reported probe answers are not admitted execution evidence".to_owned(),
+        ));
+    }
 
     // `validate()` already rejected duplicate family identities; this guard
     // only keeps the ordered map from silently dropping one if that ever
@@ -399,24 +414,9 @@ pub fn survey_installation(
         }
     }
 
-    // Fail closed: an answer bound to a family this catalogue does not contain
-    // is consumed by no traversal step, so it is rejected rather than silently
-    // dropped and degraded into an unprobed family.
-    if let Some(orphan) = answers
-        .keys()
-        .find(|family_id| !ordered.contains_key(*family_id))
-    {
-        return Err(InstallationError::IncompleteObservation(format!(
-            "survey probe answer names catalogue family {} that the catalogue does not contain",
-            orphan.as_str()
-        )));
-    }
-
     let mut families = Vec::with_capacity(ordered.len());
     for (family_id, entry) in ordered {
-        let empty = BTreeMap::new();
-        let family_answers = answers.get(&family_id).unwrap_or(&empty);
-        let report = survey_family(entry, source, family_answers)?;
+        let report = survey_family(entry, source)?;
         if report.family_id != family_id {
             return Err(InstallationError::IdentityConflict);
         }
@@ -435,7 +435,6 @@ pub fn survey_installation(
 fn survey_family(
     entry: &IntegrationDiscoveryCatalogueEntry,
     source: &dyn SurveyObservationSource,
-    family_answers: &BTreeMap<PlatformHandle, PlatformHandle>,
 ) -> Result<SurveyFamilyReport, InstallationError> {
     // Each stage result is built by its own call and filed under its
     // `SurveyStage` key, so the reported order comes from `SurveyStage::ORDER`
@@ -471,21 +470,7 @@ fn survey_family(
         stage_result(identity_stage, &identity_observations, &[])?,
     );
 
-    let candidates = coalesce_candidates(&identity_observations, family_answers);
-
-    // Fail closed: an answer bound to an identity this survey never observed
-    // says nothing about this installation, so it is rejected rather than
-    // attached to a candidate that does not exist.
-    for answered_identity in family_answers.keys() {
-        if !candidates
-            .iter()
-            .any(|candidate| &candidate.observed_identity == answered_identity)
-        {
-            return Err(InstallationError::IncompleteObservation(
-                "survey probe answer names an identity the survey did not observe".to_owned(),
-            ));
-        }
-    }
+    let candidates = coalesce_candidates(&identity_observations);
 
     // Stage 4. Built from the candidates and runs nothing.
     results.insert(
@@ -695,7 +680,6 @@ impl SurveyStageResult {
 /// identities remain distinct installations.
 fn coalesce_candidates(
     identity_observations: &[SurveyInputObservation],
-    family_answers: &BTreeMap<PlatformHandle, PlatformHandle>,
 ) -> Vec<SurveyCandidate> {
     let mut aliases: BTreeMap<PlatformHandle, BTreeSet<PlatformHandle>> = BTreeMap::new();
     for observation in identity_observations {
@@ -710,32 +694,31 @@ fn coalesce_candidates(
 
     let mut candidates = Vec::with_capacity(aliases.len());
     for (observed_identity, inputs) in aliases {
-        // A reported answer is carried as evidence only: it says nothing about
-        // whether the probe stage was reached, so the per-identity probe
-        // outcome stays `Withheld` whatever the caller supplied.
-        let answer = family_answers.get(&observed_identity).cloned();
         candidates.push(SurveyCandidate {
             observed_identity,
             aliases: inputs.into_iter().collect(),
             probe_outcome: SurveyStageOutcome::Withheld,
-            probe_answers: answer.into_iter().collect(),
+            probe_admission: SurveyProbeAdmission::Withheld,
+            probe_answers: Vec::new(),
         });
     }
     candidates
 }
 
-/// Builds the probe stage result without running anything.
-///
-/// The probe stage has no execution port here, so it is never reached: every
-/// observed identity is `Withheld`, with or without a caller-reported answer.
-/// The answers are still retained in the stage's evidence so the out-of-band
-/// observation is not lost, and an empty candidate set is also `Withheld`,
-/// because a stage that was asked about nothing learned nothing.
+/// Builds the probe stage result from each candidate's admitted result.
 fn probe_stage_result(candidates: &[SurveyCandidate]) -> SurveyStageResult {
+    let mut found = BTreeSet::new();
     let mut withheld = BTreeSet::new();
     let mut evidence = BTreeSet::new();
     for candidate in candidates {
-        withheld.insert(candidate.observed_identity.clone());
+        match candidate.probe_admission {
+            SurveyProbeAdmission::AnsweredByAdmittedExecutor => {
+                found.insert(candidate.observed_identity.clone());
+            }
+            SurveyProbeAdmission::Withheld => {
+                withheld.insert(candidate.observed_identity.clone());
+            }
+        }
         evidence.extend(candidate.probe_answers.iter().cloned());
     }
     let mut result = SurveyStageResult {
@@ -745,7 +728,7 @@ fn probe_stage_result(candidates: &[SurveyCandidate]) -> SurveyStageResult {
             .iter()
             .map(|candidate| candidate.observed_identity.clone())
             .collect(),
-        found: Vec::new(),
+        found: found.into_iter().collect(),
         not_found: Vec::new(),
         denied: Vec::new(),
         unreadable: Vec::new(),
@@ -760,10 +743,8 @@ fn probe_stage_result(candidates: &[SurveyCandidate]) -> SurveyStageResult {
 
 /// Requires the family probe stage to describe exactly its candidates.
 ///
-/// The probe stage was never run, so it must withhold every observed identity
-/// and nothing else: an identity the stage never reached, or a withheld
-/// identity no candidate observed, would both be a coverage claim this
-/// coordinator cannot make.
+/// The probe stage accounts for every candidate exactly once as found or
+/// withheld; a metadata-only survey has only withheld candidates.
 fn validate_probe_stage_coverage(family: &SurveyFamilyReport) -> Result<(), InstallationError> {
     let probe = family
         .stages
@@ -779,40 +760,17 @@ fn validate_probe_stage_coverage(family: &SurveyFamilyReport) -> Result<(), Inst
         .iter()
         .map(|candidate| candidate.observed_identity.clone())
         .collect::<BTreeSet<_>>();
+    let found = probe.found.iter().cloned().collect::<BTreeSet<_>>();
     let withheld = probe.withheld.iter().cloned().collect::<BTreeSet<_>>();
     let asked = probe.inputs.iter().cloned().collect::<BTreeSet<_>>();
-    if asked != identities || withheld != identities {
+    let covered = found.union(&withheld).cloned().collect::<BTreeSet<_>>();
+    if asked != identities || covered != identities || found.intersection(&withheld).next().is_some() {
         return Err(InstallationError::IncompleteObservation(
-            "survey probe stage does not withhold exactly its observed candidates".to_owned(),
+            "survey probe stage does not account for every observed candidate exactly once"
+                .to_owned(),
         ));
     }
     Ok(())
-}
-
-fn index_probe_answers(
-    probe_answers: &[SurveyProbeAnswer],
-) -> Result<BTreeMap<PlatformHandle, BTreeMap<PlatformHandle, PlatformHandle>>, InstallationError> {
-    let mut indexed: BTreeMap<PlatformHandle, BTreeMap<PlatformHandle, PlatformHandle>> =
-        BTreeMap::new();
-    for answer in probe_answers {
-        handle(&answer.family_id, "survey.probe_answer.family_id")?;
-        handle(
-            &answer.observed_identity,
-            "survey.probe_answer.observed_identity",
-        )?;
-        handle(&answer.answer, "survey.probe_answer.answer")?;
-        let replaced = indexed
-            .entry(answer.family_id.clone())
-            .or_default()
-            .insert(answer.observed_identity.clone(), answer.answer.clone());
-        if replaced.is_some() {
-            return Err(InstallationError::Duplicate {
-                kind: "survey probe answer".to_owned(),
-                identity: answer.observed_identity.as_str().to_owned(),
-            });
-        }
-    }
-    Ok(indexed)
 }
 
 fn validate_ascending(field: &str, values: &[PlatformHandle]) -> Result<(), InstallationError> {
