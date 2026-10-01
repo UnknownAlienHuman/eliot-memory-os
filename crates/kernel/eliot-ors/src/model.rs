@@ -4335,7 +4335,7 @@ pub struct ActivationLifecycleRecord {
     /// original activation ticket. This is retained in the existing ticket
     /// row before the first scope bind; ORS bounds and preserves it without
     /// interpreting its semantic fields or deriving a replacement digest.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_discovery_lease: Option<String>,
 }
 
