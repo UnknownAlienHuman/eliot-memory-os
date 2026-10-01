@@ -431,9 +431,11 @@ impl UserAutomationOperatorResultEnvelope {
         &self,
         request: &UserAutomationServiceRequest,
     ) -> Result<(), String> {
+        let expected_operation_id = expected_operation_id(request);
         if self.wire_id != USER_AUTOMATION_RESULT_WIRE_ID
             || self.wire_version != USER_AUTOMATION_RESULT_WIRE_VERSION
             || self.correlation != result_correlation(request)
+            || request.identity.operation_id.as_str() != expected_operation_id.as_str()
             || self.state_fence != request.context.state_fence
         {
             return Err(
@@ -656,6 +658,20 @@ fn result_correlation(request: &UserAutomationServiceRequest) -> UserAutomationR
         operation_id: request.identity.operation_id.to_string(),
         idempotency_key: request.identity.idempotency_key.clone(),
     }
+}
+
+/// Exact issued-identity contract of the `UserAutomation` route: the semantic
+/// operation ID is the route's fixed prefix over the submitted idempotency
+/// key, and the Operator mirror expects exactly that derivation. The Operator
+/// retains only the key, so this derivation is the one request-correlation
+/// handle both sides can verify without the submitted State Fence (#2972);
+/// the Kernel-minted attempt `request_id` and the fence itself stay
+/// owner-side until #1777 surfaces them to the UI.
+fn expected_operation_id(request: &UserAutomationServiceRequest) -> String {
+    format!(
+        "user-automation-operation:{}",
+        request.identity.idempotency_key
+    )
 }
 
 fn parse_result_value(
@@ -1308,8 +1324,10 @@ impl UserAutomationOperatorTransition {
             .context
             .validate()
             .map_err(|error| error.to_string())?;
+        let expected_operation_id = expected_operation_id(request);
         if request.intent.state_fence != request.context.state_fence
             || self.identity.operation_id != request.identity.operation_id
+            || request.identity.operation_id.as_str() != expected_operation_id.as_str()
             || self.identity.idempotency_key != request.identity.idempotency_key
             || self.state_fence != request.context.state_fence
         {
