@@ -30,7 +30,7 @@ use eliot_store_api::StoreHealth;
 use eliot_store_api::StoreHealthStatus;
 use eliot_store_api::StoreRecoveryRequest;
 use eliot_store_api::StoreRecoverySnapshot;
-use eliot_store_api::WriteReceipt;
+use eliot_store_api::{CausalBinding, WriteReceipt, committed_receipt_sequence};
 use eliot_store_api::{canonical_json_bytes, sha256_hex};
 
 use crate::CompatibilityVerdict;
@@ -223,15 +223,42 @@ pub(crate) fn failure_context_for_backup(
 /// never a success and never a not-attempted claim. The admitted
 /// `operation_id` in `context` is the sole reconciliation key; no
 /// receipt-carried identity is adopted and no provider prose is attached.
+#[cfg(test)]
 fn response_for_transaction_receipt(
     receipt: WriteReceipt,
     context: StoreFailureIdentityContext,
 ) -> Response {
-    if receipt.validate().is_ok() && receipt.require_reconciliation_envelope().is_ok() {
+    if receipt.validate().is_ok()
+        && receipt.require_reconciliation_envelope().is_ok()
+        && committed_receipt_sequence(&receipt).is_ok_and(|sequence| sequence == 1)
+    {
         return Response::Transaction { receipt };
     }
     let sanitized = sanitized_identity_context(context);
     match StoreFailure::from_store_error(StoreError::MissingReceiptEnvelope, sanitized.clone()) {
+        Ok(failure) => Response::canonical_failure(failure),
+        Err(_) => internal_defect_fallback(&sanitized),
+    }
+}
+
+fn response_for_transaction_receipt_with_causal(
+    receipt: WriteReceipt,
+    causal: CausalBinding,
+    context: StoreFailureIdentityContext,
+) -> Response {
+    let valid = receipt.validate().is_ok()
+        && committed_receipt_sequence(&receipt)
+            .is_ok_and(|sequence| sequence == causal.transaction_sequence.value())
+        && receipt
+            .require_reconciliation_envelope()
+            .is_ok_and(|envelope| {
+                envelope.core.causal == causal && receipt.state_fence == causal.state_fence
+            });
+    if valid {
+        return Response::TransactionWithCausal { receipt, causal };
+    }
+    let sanitized = sanitized_identity_context(context);
+    match StoreFailure::from_store_error(StoreError::InvalidReceipt, sanitized.clone()) {
         Ok(failure) => Response::canonical_failure(failure),
         Err(_) => internal_defect_fallback(&sanitized),
     }
@@ -243,6 +270,7 @@ fn response_for_transaction_receipt(
 /// A missing receipt is a valid empty lookup, not a failure. An invalid or
 /// envelope-less receipt for the admitted operation is an unknown outcome
 /// bound to that exact operation identity, reconciled via receipt query.
+#[cfg(test)]
 fn response_for_receipt_lookup(
     receipt: Option<WriteReceipt>,
     context: StoreFailureIdentityContext,
@@ -250,7 +278,9 @@ fn response_for_receipt_lookup(
     match receipt {
         None => Response::Receipt { receipt: None },
         Some(receipt)
-            if receipt.validate().is_ok() && receipt.require_reconciliation_envelope().is_ok() =>
+            if receipt.validate().is_ok()
+                && receipt.require_reconciliation_envelope().is_ok()
+                && committed_receipt_sequence(&receipt).is_ok_and(|sequence| sequence == 1) =>
         {
             Response::Receipt {
                 receipt: Some(receipt),
@@ -264,6 +294,41 @@ fn response_for_receipt_lookup(
             ) {
                 Ok(failure) => Response::canonical_failure(failure),
                 Err(_) => internal_defect_fallback(&sanitized),
+            }
+        }
+    }
+}
+
+fn response_for_receipt_lookup_with_causal(
+    receipt: Option<(WriteReceipt, CausalBinding)>,
+    context: StoreFailureIdentityContext,
+) -> Response {
+    match receipt {
+        None => Response::ReceiptWithCausal {
+            receipt: None,
+            causal: None,
+        },
+        Some((receipt, causal)) => {
+            let valid = receipt.validate().is_ok()
+                && committed_receipt_sequence(&receipt)
+                    .is_ok_and(|sequence| sequence == causal.transaction_sequence.value())
+                && receipt
+                    .require_reconciliation_envelope()
+                    .is_ok_and(|envelope| {
+                        envelope.core.causal == causal && receipt.state_fence == causal.state_fence
+                    });
+            if valid {
+                Response::ReceiptWithCausal {
+                    receipt: Some(receipt),
+                    causal: Some(causal),
+                }
+            } else {
+                let sanitized = sanitized_identity_context(context);
+                match StoreFailure::from_store_error(StoreError::InvalidReceipt, sanitized.clone())
+                {
+                    Ok(failure) => Response::canonical_failure(failure),
+                    Err(_) => internal_defect_fallback(&sanitized),
+                }
             }
         }
     }
@@ -375,7 +440,15 @@ async fn dispatch_receipt_lookup(
             ReplayVerdict::UseExistingReceipt
             | ReplayVerdict::NewIdentityOnly
             | ReplayVerdict::RequiresGapDisposition,
-        )) => response_for_receipt_lookup(receipt, context),
+        )) => match receipt {
+            Some(receipt) => match store.committed_receipt_with_causal(&receipt).await {
+                Ok((receipt, causal)) => {
+                    response_for_receipt_lookup_with_causal(Some((receipt, causal)), context)
+                }
+                Err(error) => map_store_error(error, context),
+            },
+            None => response_for_receipt_lookup_with_causal(None, context),
+        },
         // Nothing proves this exact operation, so the outcome is still
         // unknown: report the reconciling disposition bound to the queried
         // operation identity instead of an unproven answer.
@@ -592,6 +665,22 @@ pub async fn dispatch_with_log<B: StoreDispatchBackend + ?Sized>(
     response
 }
 
+async fn dispatch_committed_write_result(
+    composition: &StoreComposition,
+    outcome: Result<WriteReceipt, StoreCompositionError>,
+    context: StoreFailureIdentityContext,
+) -> Response {
+    match outcome {
+        Ok(receipt) => match composition.committed_receipt_with_causal(&receipt).await {
+            Ok((receipt, causal)) => {
+                response_for_transaction_receipt_with_causal(receipt, causal, context)
+            }
+            Err(error) => map_store_error(error, context),
+        },
+        Err(error) => map_composition_error(error, context),
+    }
+}
+
 impl StoreDispatchBackend for StoreComposition {
     async fn dispatch_request(&self, request: Request) -> Response {
         // I5.9 compatibility gate (issue #1932). The decision is resolved from
@@ -637,17 +726,14 @@ impl StoreDispatchBackend for StoreComposition {
                     transition.identity.operation_id.clone(),
                     transition.identity.idempotency_key.clone(),
                 );
-                match Box::pin(self.apply(
+                let outcome = Box::pin(self.apply(
                     &context,
                     transition,
                     expected_revision_heads,
                     expected_ordering_heads,
                 ))
-                .await
-                {
-                    Ok(receipt) => response_for_transaction_receipt(receipt, failure_context),
-                    Err(error) => map_composition_error(error, failure_context),
-                }
+                .await;
+                dispatch_committed_write_result(self, outcome, failure_context).await
             }
             Request::Receipt { operation_id } => dispatch_receipt_lookup(self, operation_id).await,
             // Issue #991: one authenticated reserved-write arm. The sealed
@@ -661,10 +747,8 @@ impl StoreDispatchBackend for StoreComposition {
                     request.transition.identity.operation_id.clone(),
                     request.transition.identity.idempotency_key.clone(),
                 );
-                match Box::pin(self.apply_reserved_write(request)).await {
-                    Ok(receipt) => response_for_transaction_receipt(receipt, failure_context),
-                    Err(error) => map_composition_error(error, failure_context),
-                }
+                let outcome = Box::pin(self.apply_reserved_write(request)).await;
+                dispatch_committed_write_result(self, outcome, failure_context).await
             }
             // Issue #975: one authenticated backup arm. The closed envelope
             // carries its fence-bound context beside the operation; the

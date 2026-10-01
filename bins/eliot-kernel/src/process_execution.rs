@@ -27,7 +27,7 @@ use eliot_kernel_core::{
 };
 use eliot_kernel_service::{
     HostKernelCandidateBinding, KernelServiceError, ProcessExecutionRequest,
-    ProcessExecutionResponse,
+    ProcessExecutionResponse, ProcessStreamReadChunk, ProcessStreamReadRequest,
 };
 use eliot_ors::{
     EpochIdentity, EpochLineage, OpaqueLabel, ProcessEvidenceRecord,
@@ -54,6 +54,8 @@ use eliot_store_api::{
     CanonicalValidationSnapshot, RevisionHead, StateFence as StoreStateFence, canonical_json_bytes,
 };
 use serde::{Deserialize, Serialize};
+
+mod lsp_admission;
 
 /// F-LOG-KERNEL-3 (#901): process-execution boundary observations.
 ///
@@ -116,7 +118,11 @@ fn process_operation_context(
 /// Updates one of the optional correlation fields declared by the shared
 /// operation span. Inputs are existing owner references and still pass through
 /// the shared diagnostic policy before being recorded.
-fn record_process_context_field(context: &tracing::Span, field: &str, value: Option<&str>) {
+pub(crate) fn record_process_context_field(
+    context: &tracing::Span,
+    field: &str,
+    value: Option<&str>,
+) {
     if let Some(value) = value {
         let bounded = super::kernel_diagnostics::bound_field(value);
         context.record(field, bounded.text());
@@ -225,6 +231,13 @@ fn record_process_request_context(
         | ProcessExecutionRequest::Cancel { operation_id }
         | ProcessExecutionRequest::Reconcile { operation_id } => {
             record_process_owner_operation_context(context, owner, operation_id);
+        }
+        ProcessExecutionRequest::ReadStream { request } => {
+            record_process_owner_operation_context(
+                context,
+                owner,
+                request.start_receipt().operation_id(),
+            );
         }
     }
 }
@@ -3328,17 +3341,34 @@ impl ProcessExecutionGateway {
         operation_id: eliot_process::OperationId,
         context: &tracing::Span,
     ) -> Result<ProcessEvidence, ProcessExecutionError> {
+        match self.reconcile_inner(owner, operation_id, context).await {
+            Ok(evidence) => Ok(evidence),
+            Err(error) => {
+                super::kernel_diagnostics::observe_terminal_error_in_context(
+                    process_terminal_code(&error),
+                    context,
+                );
+                Err(error)
+            }
+        }
+    }
+
+    /// Reconciles under the caller's safe operation context without assigning
+    /// a terminal. A composed gateway boundary owns the one terminal for the
+    /// larger operation.
+    pub(crate) async fn reconcile_inner(
+        &self,
+        owner: &ProcessOwnerBinding,
+        operation_id: eliot_process::OperationId,
+        context: &tracing::Span,
+    ) -> Result<ProcessEvidence, ProcessExecutionError> {
         // F-LOG-KERNEL-3 (#901): exit/evidence reconciliation boundary. Exit
         // zero and provider success never imply semantic completion; the
-        // reported evidence stays the owner's, and exactly one terminal is
-        // emitted per failed reconcile.
+        // reported evidence stays the owner's. The enclosing gateway owns
+        // the terminal for this call.
         observe_process_in_context(context, "kernel.process.reconcile_requested", "attempt");
         if let Err(error) = self.authorize_operation(owner, &operation_id, context) {
             observe_process_in_context(context, "kernel.process.reconcile_rejected", "fenced");
-            super::kernel_diagnostics::observe_terminal_error_in_context(
-                process_terminal_code(&error),
-                context,
-            );
             return Err(error);
         }
         let effect_operation_id = operation_id.clone();
@@ -3367,6 +3397,38 @@ impl ProcessExecutionGateway {
             }
             Err(error) => {
                 observe_process_in_context(context, "kernel.process.reconcile_unknown", "unknown");
+                Err(error)
+            }
+        }
+    }
+
+    /// Reads one bounded chunk from the exact original, complete Kernel-owned
+    /// capture. The readback module rejects previews, durable-source claims
+    /// this gateway cannot resolve, and any capture that exceeded its
+    /// original retained capacity.
+    pub(crate) async fn read_stream_chunk(
+        &self,
+        owner: &ProcessOwnerBinding,
+        request: ProcessStreamReadRequest,
+    ) -> Result<ProcessStreamReadChunk, ProcessExecutionError> {
+        let context = Self::operation_context_for(owner, request.start_receipt().operation_id());
+        self.read_stream_chunk_in_context(owner, request, &context)
+            .await
+    }
+
+    /// Reads one bounded chunk under its caller's existing safe context. The
+    /// gateway owns the one terminal for every failed readback, including
+    /// failures from its nonterminal inspect and reconcile sub-operations.
+    pub(crate) async fn read_stream_chunk_in_context(
+        &self,
+        owner: &ProcessOwnerBinding,
+        request: ProcessStreamReadRequest,
+        context: &tracing::Span,
+    ) -> Result<ProcessStreamReadChunk, ProcessExecutionError> {
+        match super::process_stream_readback::read_stream_chunk(self, owner, request, context).await
+        {
+            Ok(chunk) => Ok(chunk),
+            Err(error) => {
                 super::kernel_diagnostics::observe_terminal_error_in_context(
                     process_terminal_code(&error),
                     context,
@@ -4094,10 +4156,6 @@ impl KernelComposition {
         }
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the compatibility request entry keeps admission, dispatch, and response projection in one ordered boundary"
-    )]
     pub async fn execute_process_request(
         &self,
         session: &Session,
@@ -4105,43 +4163,69 @@ impl KernelComposition {
         request: ProcessExecutionRequest,
     ) -> ProcessExecutionResponse {
         let context = super::kernel_diagnostics::operation_context(None, None, None, None);
-        // F-LOG-KERNEL-3 (#901): process front-door boundary. Receipt is an
-        // observation of the gateway outcome; rejections below are typed
-        // responses (subordinate infos), while a failed gateway operation
-        // emits exactly one terminal through its own boundary.
         observe_process_in_context(&context, "kernel.process.request_received", "attempt");
-        let Ok((owner, expected_session_binding)) = super::caller_binding(session) else {
+        self.execute_process_request_inner(session, session_binding, request, None, &context)
+            .await
+    }
+
+    /// Revalidates the original optional source binding and resolves this
+    /// transport to the server-admitted process owner before P-03 dispatch.
+    /// The source identity and admitted task are borrowed intact so their
+    /// original operation, task metadata, and fence remain the binding used
+    /// by the existing process gateway. Every observation shares the request's
+    /// already-established safe context.
+    fn admit_process_request_owner(
+        &self,
+        session: &Session,
+        session_binding: &ProcessSessionBinding,
+        request: &ProcessExecutionRequest,
+        source_binding: Option<(&eliot_protocol::RequestIdentity, &eliot_contracts::TaskId)>,
+        context: &tracing::Span,
+    ) -> Result<ProcessOwnerBinding, eliot_kernel_service::ProcessExecutionRejection> {
+        if let Some((identity, admitted_task_id)) = source_binding
+            && let Err(rejection) = lsp_admission::validate_current_source_request(
+                identity,
+                admitted_task_id,
+                request,
+                session,
+            )
+        {
             observe_process_in_context(
-                &context,
+                context,
+                "kernel.process.request_rejected",
+                "source_binding",
+            );
+            return Err(rejection);
+        }
+
+        let (owner, expected_session_binding) = super::caller_binding(session).map_err(|_| {
+            observe_process_in_context(
+                context,
                 "kernel.process.request_rejected",
                 "caller_unavailable",
             );
-            return ProcessExecutionResponse::Rejected(
-                eliot_kernel_service::ProcessExecutionRejection {
-                    code: "AUTHENTICATED_CALLER_REQUIRED".to_owned(),
-                    detail: "the established authenticated session binding is unavailable"
-                        .to_owned(),
-                },
-            );
-        };
+            eliot_kernel_service::ProcessExecutionRejection {
+                code: "AUTHENTICATED_CALLER_REQUIRED".to_owned(),
+                detail: "the established authenticated session binding is unavailable".to_owned(),
+            }
+        })?;
         if eliot_process::validate_process_transport_binding(
-            &session_binding,
+            session_binding,
             &expected_session_binding,
         )
         .is_err()
         {
             observe_process_in_context(
-                &context,
+                context,
                 "kernel.process.request_rejected",
                 "session_mismatch",
             );
-            return ProcessExecutionResponse::Rejected(
-                eliot_kernel_service::ProcessExecutionRejection {
-                    code: "SESSION_BINDING_MISMATCH".to_owned(),
-                    detail: "process operation session binding does not match the established authenticated session".to_owned(),
-                },
-            );
+            return Err(eliot_kernel_service::ProcessExecutionRejection {
+                code: "SESSION_BINDING_MISMATCH".to_owned(),
+                detail: "process operation session binding does not match the established authenticated session".to_owned(),
+            });
         }
+
         // Issue #79: the intent session must validate against the
         // server-derived admitted process-owner/session binding, never
         // against the presenting pipe. Identity validates before authority
@@ -4149,23 +4233,20 @@ impl KernelComposition {
         // stale epoch/fence, and a wrong owner each reject with a distinct
         // typed code, while cancel and reconcile below stay on
         // operation/owner identity.
-        if let ProcessExecutionRequest::Start(admission) = &request {
-            let caller = match self.admitted_process_caller_session(session) {
-                Ok(caller) => caller,
-                Err(error) => {
+        if let ProcessExecutionRequest::Start(admission) = request {
+            let caller = self
+                .admitted_process_caller_session(session)
+                .map_err(|error| {
                     observe_process_in_context(
-                        &context,
+                        context,
                         "kernel.process.request_rejected",
                         "caller_session",
                     );
-                    return ProcessExecutionResponse::Rejected(
-                        eliot_kernel_service::ProcessExecutionRejection {
-                            code: "ADMITTED_CALLER_SESSION_REQUIRED".to_owned(),
-                            detail: error.to_string().chars().take(512).collect(),
-                        },
-                    );
-                }
-            };
+                    eliot_kernel_service::ProcessExecutionRejection {
+                        code: "ADMITTED_CALLER_SESSION_REQUIRED".to_owned(),
+                        detail: error.to_string().chars().take(512).collect(),
+                    }
+                })?;
             if let Err(error) = eliot_process::validate_process_intent_session(
                 admission.intent(),
                 &caller,
@@ -4173,17 +4254,48 @@ impl KernelComposition {
                 admission.state_fence(),
             ) {
                 observe_process_in_context(
-                    &context,
+                    context,
                     "kernel.process.request_rejected",
                     "intent_session",
                 );
-                return ProcessExecutionResponse::Rejected(process_session_rejection(error));
+                return Err(process_session_rejection(error));
             }
         }
-        record_process_request_context(&context, &request, &owner);
+
+        Ok(owner)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the shared request boundary keeps admission, dispatch, and response projection ordered"
+    )]
+    async fn execute_process_request_inner(
+        &self,
+        session: &Session,
+        session_binding: ProcessSessionBinding,
+        request: ProcessExecutionRequest,
+        source_binding: Option<(&eliot_protocol::RequestIdentity, &eliot_contracts::TaskId)>,
+        context: &tracing::Span,
+    ) -> ProcessExecutionResponse {
+        // F-LOG-KERNEL-3 (#901): process front-door boundary. Receipt is an
+        // observation of the gateway outcome; rejections below are typed
+        // responses (subordinate infos), while a failed gateway operation
+        // emits exactly one terminal through its own boundary. This existing
+        // safe span is shared with admission and the contextual gateway call.
+        let owner = match self.admit_process_request_owner(
+            session,
+            &session_binding,
+            &request,
+            source_binding,
+            context,
+        ) {
+            Ok(owner) => owner,
+            Err(rejection) => return ProcessExecutionResponse::Rejected(rejection),
+        };
+        record_process_request_context(context, &request, &owner);
         let Some(gateway) = &self.process_gateway else {
             observe_process_in_context(
-                &context,
+                context,
                 "kernel.process.request_rejected",
                 "authority_unavailable",
             );
@@ -4194,13 +4306,13 @@ impl KernelComposition {
                 },
             );
         };
-        observe_process_in_context(&context, "kernel.process.request_admitted", "success");
+        observe_process_in_context(context, "kernel.process.request_admitted", "success");
         let result = match request {
             ProcessExecutionRequest::Start(admission) => {
                 // Material/Critical process start is fail-closed on the exact
                 // target fence before any external effect owner is entered.
                 let outer_binding = match self
-                    .reject_process_start_without_material_coverage_in_context(&admission, &context)
+                    .reject_process_start_without_material_coverage_in_context(&admission, context)
                 {
                     Ok(outer_binding) => outer_binding,
                     Err(rejection) => return ProcessExecutionResponse::Rejected(rejection),
@@ -4209,7 +4321,7 @@ impl KernelComposition {
                     Ok(proof) => proof,
                     Err(error) => {
                         observe_process_in_context(
-                            &context,
+                            context,
                             "kernel.process.request_rejected",
                             "path_proof",
                         );
@@ -4219,32 +4331,84 @@ impl KernelComposition {
                     }
                 };
                 gateway
-                    .start_in_context(&owner, admission, proof, outer_binding, &context)
+                    .start_in_context(&owner, admission, proof, outer_binding, context)
                     .await
                     .map(ProcessExecutionResponse::Started)
             }
             ProcessExecutionRequest::Inspect { operation_id } => gateway
-                .inspect_in_context(&owner, operation_id, &context)
+                .inspect_in_context(&owner, operation_id, context)
                 .await
                 .map(ProcessExecutionResponse::Status),
             ProcessExecutionRequest::Cancel { operation_id } => gateway
-                .cancel_in_context(&owner, operation_id, &context)
+                .cancel_in_context(&owner, operation_id, context)
                 .await
                 .map(ProcessExecutionResponse::Cancelled),
             ProcessExecutionRequest::Reconcile { operation_id } => gateway
-                .reconcile_in_context(&owner, operation_id, &context)
+                .reconcile_in_context(&owner, operation_id, context)
                 .await
                 .map(ProcessExecutionResponse::Reconciled),
+            ProcessExecutionRequest::ReadStream { request } => gateway
+                .read_stream_chunk_in_context(&owner, request, context)
+                .await
+                .map(ProcessExecutionResponse::StreamChunk),
         };
         result.unwrap_or_else(|error| {
             // F-LOG-KERNEL-3 (#901): subordinate observation only; the
             // gateway boundary above owns the single terminal for the failed
             // operation (case 25 across propagation).
-            observe_process_in_context(&context, "kernel.process.request_failed", "rejected");
+            observe_process_in_context(context, "kernel.process.request_failed", "rejected");
             ProcessExecutionResponse::Rejected(
                 eliot_kernel_service::ProcessExecutionRejection::from_error(&error),
             )
         })
+    }
+
+    /// Routes one authenticated source-process call through the same private
+    /// P-03 gateway after joining it to the exact original request identity.
+    ///
+    /// The source bridge transport carries an inert process request. This
+    /// boundary binds that request to the original EBP identity before the
+    /// process gateway can issue its one-shot permit; it does not treat the
+    /// identity or payload as authority by itself.
+    pub(crate) async fn execute_current_source_process_request(
+        &self,
+        session: &Session,
+        session_binding: ProcessSessionBinding,
+        request: ProcessExecutionRequest,
+        identity: &eliot_protocol::RequestIdentity,
+        admitted_task_id: &eliot_contracts::TaskId,
+    ) -> ProcessExecutionResponse {
+        let context = super::kernel_diagnostics::operation_context(None, None, None, None);
+        observe_process_in_context(&context, "kernel.process.request_received", "attempt");
+        let bound = match lsp_admission::BoundCurrentSourceProcessRequest::bind(
+            identity,
+            admitted_task_id,
+            request,
+            session,
+        ) {
+            Ok(bound) => bound,
+            Err(rejection) => {
+                observe_process_in_context(
+                    &context,
+                    "kernel.process.request_rejected",
+                    "source_binding",
+                );
+                return ProcessExecutionResponse::Rejected(rejection);
+            }
+        };
+        let (request, original_identity, original_task_id) = bound.into_parts();
+        // The exact original identity reaches this Kernel boundary and is
+        // rechecked immediately before P-03 delegation. The gateway then
+        // independently checks the live caller, fence, material coverage,
+        // path lease, replay state, and permit issuance.
+        self.execute_process_request_inner(
+            session,
+            session_binding,
+            request,
+            Some((&original_identity, &original_task_id)),
+            &context,
+        )
+        .await
     }
 
     pub(crate) fn retain_process_path_proof(

@@ -17,7 +17,8 @@ use eliot_store_api::{
     RevisionHeadExpectation, ScopeRevisionView, SecurityContext, TransitionClass, WriteReceipt,
     WriteReceiptStatus,
     epistemic_revision::{EpistemicCommit, EpistemicPositionReadback},
-    generated_operation_manifests, operation_manifest_set_digest, validate_store_receipt_envelope,
+    generated_operation_manifests, operation_manifest_set_digest,
+    validate_store_receipt_envelope_with_causal,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -208,10 +209,18 @@ impl<P: KernelTransitionPort + ?Sized, R: CanonicalReadClient + ?Sized>
         let prepared = capture.prepare()?;
         let receipt = self
             .kernel
-            .receipt(capture.operation_id.clone())
+            .receipt_with_causal(capture.operation_id.clone())
             .await?
             .ok_or_else(|| refused("source capture has no external receipt"))?;
-        validate_store_receipt_envelope(&capture.request, &prepared, &receipt).map_err(refused)?;
+        receipt.validate().map_err(refused)?;
+        validate_store_receipt_envelope_with_causal(
+            &capture.request,
+            &prepared,
+            &receipt.receipt,
+            &receipt.causal,
+        )
+        .map_err(refused)?;
+        let receipt = receipt.receipt;
         if receipt.status != WriteReceiptStatus::Committed
             || capture.scope_id != proposal.source_heads.scope_id
             || capture.request.state_fence != proposal.request.fence
@@ -345,11 +354,11 @@ impl<P: KernelTransitionPort + ?Sized, R: CanonicalReadClient + ?Sized>
         // that the first commit necessarily advanced. Changed bytes fail here.
         if let Some(receipt) = self
             .kernel
-            .receipt(proposal.request.operation_id.clone())
+            .receipt_with_causal(proposal.request.operation_id.clone())
             .await?
         {
-            commit.readback(&receipt).map_err(refused)?;
-            return self.read_committed(proposal, &receipt).await;
+            commit.readback_with_causal(&receipt).map_err(refused)?;
+            return self.read_committed(proposal, &receipt.receipt).await;
         }
         if self.activation.task_revision != proposal.request.revision.value()
             || self.activation.task_id != proposal.request.task_id
@@ -386,19 +395,23 @@ impl<P: KernelTransitionPort + ?Sized, R: CanonicalReadClient + ?Sized>
         let observation = self.acquired_observation(proposal).await?;
         Self::validate_semantics(proposal, before.as_ref(), &observation)?;
         self.check_heads(proposal).await?;
-        let receipt = match self.canonical.commit(self.kernel, identity, envelope).await {
+        let receipt = match self
+            .canonical
+            .commit_with_causal(self.kernel, identity, envelope)
+            .await
+        {
             Ok(receipt) => receipt,
             Err(error) => match self
                 .kernel
-                .receipt(proposal.request.operation_id.clone())
+                .receipt_with_causal(proposal.request.operation_id.clone())
                 .await?
             {
                 Some(receipt) => receipt,
                 None => return Err(error), // Unknown never causes a second execution.
             },
         };
-        commit.readback(&receipt).map_err(refused)?;
-        self.read_committed(proposal, &receipt).await
+        commit.readback_with_causal(&receipt).map_err(refused)?;
+        self.read_committed(proposal, &receipt.receipt).await
     }
 
     fn validate_semantics(

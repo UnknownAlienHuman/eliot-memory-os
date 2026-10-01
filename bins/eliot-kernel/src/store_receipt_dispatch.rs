@@ -21,7 +21,7 @@ use serde::Deserialize;
 #[cfg(windows)]
 use eliot_contracts::{OperationId, StateFence};
 #[cfg(windows)]
-use eliot_store_api::WriteReceipt;
+use eliot_store_api::CausalWriteReceipt;
 
 #[cfg(windows)]
 #[derive(Deserialize)]
@@ -86,7 +86,7 @@ pub(super) async fn dispatch(
         "kernel.store.receipt_submitted",
     );
     match gateway
-        .receipt(&operation.state_fence, operation.operation_id)
+        .receipt_with_causal(&operation.state_fence, operation.operation_id)
         .await
     {
         Ok(receipt) => {
@@ -146,10 +146,10 @@ pub(super) async fn dispatch(
 }
 
 #[cfg(windows)]
-fn store_receipt_response(receipt: Option<&WriteReceipt>) -> serde_json::Value {
+fn store_receipt_response(receipt: Option<&CausalWriteReceipt>) -> serde_json::Value {
     serde_json::json!({
         "status": "known",
-        "value": { "kind": "receipt", "value": receipt },
+        "value": { "kind": "causal_write_receipt", "value": receipt },
         "recovery": null,
     })
 }
