@@ -2075,11 +2075,10 @@ fn deserialize_user_automation_expected_state_fence<'de, D>(
 where
     D: serde::Deserializer<'de>,
 {
-    Option::<StateFence>::deserialize(deserializer)
-        .map(|witness| match witness {
-            Some(witness) => UserAutomationExpectedStateFence::Witness(witness),
-            None => UserAutomationExpectedStateFence::Null,
-        })
+    Option::<StateFence>::deserialize(deserializer).map(|witness| match witness {
+        Some(witness) => UserAutomationExpectedStateFence::Witness(witness),
+        None => UserAutomationExpectedStateFence::Null,
+    })
 }
 
 #[cfg(windows)]
@@ -6250,16 +6249,19 @@ impl KernelComposition {
             state_fence: session.module_generation.state_fence.clone(),
             operation: route.payload.operation,
         };
-        Ok((eliot_kernel_service::UserAutomationServiceRequest {
-            context: identity.request.metadata.clone(),
-            authenticated_principal: principal,
-            identity: OperationIdentity {
-                operation_id,
-                idempotency_key: route.payload.idempotency_key,
-                canonical_request_hash: String::new(),
+        Ok((
+            eliot_kernel_service::UserAutomationServiceRequest {
+                context: identity.request.metadata.clone(),
+                authenticated_principal: principal,
+                identity: OperationIdentity {
+                    operation_id,
+                    idempotency_key: route.payload.idempotency_key,
+                    canonical_request_hash: String::new(),
+                },
+                intent,
             },
-            intent,
-        }, route.expected_state_fence))
+            route.expected_state_fence,
+        ))
     }
 
     #[cfg(windows)]
