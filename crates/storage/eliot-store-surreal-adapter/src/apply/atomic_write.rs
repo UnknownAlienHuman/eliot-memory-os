@@ -16,10 +16,13 @@ use super::surreal_reactive::{ReactiveWrites, reactive_write_statements};
 use crate::client;
 use crate::config::SurrealAdapterConfig;
 use crate::error::AdapterError;
-use crate::plan::{ApplyPlan, EvidenceRecord, PayloadAuthorityRecord};
+use crate::plan::{ApplyPlan, EvidenceRecord, OrderingChainTips, PayloadAuthorityRecord};
 use crate::schema;
 use eliot_store_api::epistemic_revision::EpistemicCommit;
-use eliot_store_api::{OrderingHead, RevisionHead, ScopeId, StateFence, StoreError, WriteReceipt};
+use eliot_store_api::{
+    ORDERING_LINK_GENESIS_HASH, OrderingHead, OrderingHeadExpectation, RevisionHead,
+    RevisionHeadExpectation, ScopeId, StateFence, StoreError, WriteReceipt,
+};
 
 // Read and compare in the same transaction as the fence CAS and receipt.
 // The fence CAS serializes racing writers even when the position is absent.
@@ -420,6 +423,7 @@ pub(super) async fn write_transaction(
     clippy::too_many_lines,
     reason = "the transaction writer preserves the closed named-operation order and atomic SQL assembly"
 )]
+#[cfg(test)]
 pub(super) async fn write_canonical_transaction(
     db: &client::RpcTransport,
     config: &SurrealAdapterConfig,
@@ -431,6 +435,58 @@ pub(super) async fn write_canonical_transaction(
     expected_outbox_sequence: u64,
     current_revisions: &[RevisionHead],
     current_orderings: &[OrderingHead],
+    lane: TxLane,
+    notifications: &[super::surreal_notification::SurrealNotificationWrite],
+    reactive: &ReactiveWrites,
+    automation: &AutomationWrites,
+    experience: &ExperienceWrites,
+    learning: &LearningWrites,
+    erasure: Option<ErasureInTx>,
+) -> Result<(), AdapterError> {
+    write_canonical_transaction_with_expected_heads(
+        db,
+        config,
+        transition,
+        plan,
+        receipt,
+        initial_state,
+        expected_commit_sequence,
+        expected_outbox_sequence,
+        current_revisions,
+        current_orderings,
+        &[],
+        &[],
+        &OrderingChainTips::new(),
+        lane,
+        notifications,
+        reactive,
+        automation,
+        experience,
+        learning,
+        erasure,
+    )
+    .await
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the transaction writer preserves the closed named-operation order and atomic SQL assembly"
+)]
+pub(super) async fn write_canonical_transaction_with_expected_heads(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    transition: &eliot_store_api::PreparedTransition,
+    plan: &ApplyPlan,
+    receipt: &WriteReceipt,
+    initial_state: bool,
+    expected_commit_sequence: u64,
+    expected_outbox_sequence: u64,
+    current_revisions: &[RevisionHead],
+    current_orderings: &[OrderingHead],
+    expected_revision_heads: &[RevisionHeadExpectation],
+    expected_ordering_heads: &[OrderingHeadExpectation],
+    current_chain_tips: &OrderingChainTips,
     lane: TxLane,
     notifications: &[super::surreal_notification::SurrealNotificationWrite],
     reactive: &ReactiveWrites,
@@ -455,6 +511,20 @@ pub(super) async fn write_canonical_transaction(
         experience,
         learning,
     )?;
+    let (head_checks, head_bindings) = expected_head_predicates(
+        expected_revision_heads,
+        expected_ordering_heads,
+        &transition.state_fence,
+        current_chain_tips,
+    )?;
+    sql.insert_str(schema::TX_BEGIN.len(), &head_checks);
+    for (name, value) in head_bindings {
+        if bindings.insert(name, value).is_some() {
+            return Err(AdapterError::Serialization(
+                "expected head binding collided with a canonical binding".to_owned(),
+            ));
+        }
+    }
     if let Some(erasure) = erasure {
         // The erasure bundle joins the canonical atomic unit ahead of the
         // receipt create (intent before destructive scrubs, seal before the
@@ -506,6 +576,78 @@ pub(super) async fn write_canonical_transaction(
         return Err(unknown());
     }
     Ok(())
+}
+
+/// Builds transaction-local predicates for every independently declared
+/// expected head. The ordering chain hash is the exact pre-plan observation
+/// that produced the planned next link; the transaction compares that same
+/// stored sibling field before any canonical mutation.
+fn expected_head_predicates(
+    revisions: &[RevisionHeadExpectation],
+    orderings: &[OrderingHeadExpectation],
+    state_fence: &StateFence,
+    chain_tips: &OrderingChainTips,
+) -> Result<(String, Map<String, Value>), AdapterError> {
+    let mut sql = String::new();
+    let mut bindings = Map::new();
+    for (index, expected) in revisions.iter().enumerate() {
+        expected.validate()?;
+        if expected.state_fence != *state_fence {
+            return Err(AdapterError::Store(StoreError::FenceMismatch));
+        }
+        let suffix = index.to_string();
+        sql.push_str(&schema::indexed(schema::TX_VERIFY_EXPECTED_REVISION, index));
+        bindings.insert(
+            format!("expected_revision_table{suffix}"),
+            json!(schema::table::REVISION_HEAD),
+        );
+        bindings.insert(
+            format!("expected_revision_key{suffix}"),
+            json!(expected.key.to_string()),
+        );
+        bindings.insert(
+            format!("expected_revision_value{suffix}"),
+            json!(expected.expected_revision),
+        );
+        bindings.insert(
+            format!("expected_revision_fence{suffix}"),
+            json!(expected.state_fence),
+        );
+    }
+    for (index, expected) in orderings.iter().enumerate() {
+        expected.validate()?;
+        if expected.state_fence != *state_fence {
+            return Err(AdapterError::Store(StoreError::FenceMismatch));
+        }
+        let suffix = index.to_string();
+        let scope = expected.scope.to_string();
+        let expected_hash = chain_tips
+            .get(&scope)
+            .map_or(ORDERING_LINK_GENESIS_HASH, String::as_str);
+        sql.push_str(&schema::indexed(schema::TX_VERIFY_EXPECTED_ORDERING, index));
+        bindings.insert(
+            format!("expected_ordering_table{suffix}"),
+            json!(schema::table::ORDERING_HEAD),
+        );
+        bindings.insert(format!("expected_ordering_scope{suffix}"), json!(scope));
+        bindings.insert(
+            format!("expected_ordering_sequence{suffix}"),
+            json!(expected.expected_sequence),
+        );
+        bindings.insert(
+            format!("expected_ordering_fence{suffix}"),
+            json!(expected.state_fence),
+        );
+        bindings.insert(
+            format!("expected_ordering_hash{suffix}"),
+            json!(expected_hash),
+        );
+        bindings.insert(
+            format!("ordering_genesis_hash{suffix}"),
+            json!(ORDERING_LINK_GENESIS_HASH),
+        );
+    }
+    Ok((sql, bindings))
 }
 
 /// Sends one assembled canonical transaction on the selected lane.
