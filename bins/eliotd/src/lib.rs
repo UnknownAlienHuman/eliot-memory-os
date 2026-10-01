@@ -2095,6 +2095,74 @@ impl DaemonComposition {
         Ok(Some(readback))
     }
 
+    /// Resolves the exact TaskBinding revision from the retained canonical
+    /// Task owner for one authenticated owner-facts pull. A task selector is
+    /// never enough by itself: the TaskRecord must exist at the same current
+    /// fence and carry a non-zero owner revision.
+    pub fn current_testd_blob_task_binding(
+        &self,
+        task_ref: &str,
+        state_fence: &StateFence,
+    ) -> Result<eliot_receipts::TaskBinding, String> {
+        state_fence
+            .validate()
+            .map_err(|error| format!("invalid TaskBinding fence: {error}"))?;
+        if self.governor.kernel_snapshot().state_fence() != *state_fence {
+            return Err("TaskBinding fence is not the current Governor fence".to_owned());
+        }
+        let task_id = eliot_contracts::TaskId::new(task_ref.to_owned())
+            .map_err(|error| format!("invalid TaskBinding task ID: {error}"))?;
+        let record = self
+            .governor
+            .owners()
+            .task
+            .task(&task_id)
+            .ok_or_else(|| "Task owner has no record for the selected task".to_owned())?;
+        if record.task_id != task_id || record.revision == 0 || record.state_fence != *state_fence {
+            return Err("Task owner record is stale or differs from the exact task/fence".to_owned());
+        }
+        Ok(eliot_receipts::TaskBinding {
+            task_id,
+            task_revision: record.revision,
+            state_fence: state_fence.clone(),
+        })
+    }
+
+    /// Resolves the exact SessionBinding from the retained canonical Session
+    /// owner. A session selector is never accepted as proof by itself.
+    pub fn current_testd_blob_session_binding(
+        &self,
+        session_ref: &str,
+        state_fence: &StateFence,
+    ) -> Result<eliot_receipts::SessionBinding, String> {
+        state_fence
+            .validate()
+            .map_err(|error| format!("invalid SessionBinding fence: {error}"))?;
+        if self.governor.kernel_snapshot().state_fence() != *state_fence {
+            return Err("SessionBinding fence is not the current Governor fence".to_owned());
+        }
+        let session_id = eliot_contracts::SessionId::new(session_ref.to_owned())
+            .map_err(|error| format!("invalid SessionBinding session ID: {error}"))?;
+        let record = self
+            .governor
+            .owners()
+            .session
+            .session(&session_id)
+            .ok_or_else(|| "Session owner has no record for the selected session".to_owned())?;
+        if record.session_id != session_id
+            || record.status.terminal()
+            || record.state_fence != *state_fence
+            || record.authority_epoch != state_fence.authority_epoch
+        {
+            return Err("Session owner record is terminal, stale, or differs from the exact session/fence".to_owned());
+        }
+        Ok(eliot_receipts::SessionBinding {
+            session_id,
+            authority_epoch: record.authority_epoch.clone(),
+            state_fence: state_fence.clone(),
+        })
+    }
+
     /// Freshly resolves the exact process-stream admission row selected by
     /// WorkScope, session, stream source ID, and ProcessExecutionBinding
     /// digest. The Governor joins it to the current named WorkScope owner's
