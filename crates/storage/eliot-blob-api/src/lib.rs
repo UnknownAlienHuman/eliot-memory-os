@@ -1194,10 +1194,15 @@ impl<'de> Deserialize<'de> for BlobStageRequest {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlobProcessStreamSourceBinding {
+    /// Exact serialized validated process execution binding.
     pub process_binding_json: String,
+    /// SHA-256 of `process_binding_json`.
     pub process_binding_sha256: String,
+    /// Stable process stream label (`STDOUT` or `STDERR`).
     pub stream_kind: String,
+    /// Exact serialized five-reference process policy binding.
     pub policy_json: String,
+    /// SHA-256 of `policy_json`.
     pub policy_sha256: String,
 }
 
@@ -1231,11 +1236,17 @@ impl BlobProcessStreamSourceBinding {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlobProcessStreamReadbackRequest {
+    /// Owner-issued process binding and policy used when the source was staged.
     pub process_source_binding: BlobProcessStreamSourceBinding,
+    /// BLAKE3 identity parsed from the exact Blob locator.
     pub expected_content_hash: BlobHash,
+    /// Expected SHA-256 of the plaintext source.
     pub expected_plaintext_sha256: String,
+    /// Expected exact plaintext length.
     pub expected_plaintext_length: u64,
+    /// Identity of the original owner-issued ready receipt.
     pub ready_receipt_id: String,
+    /// Caller ceiling for this bounded source read.
     pub max_bytes: u64,
 }
 
