@@ -598,7 +598,7 @@ def discover_work_units(work_units_dir: Path | str) -> DescriptorDiscovery:
         except OSError:
             return DescriptorDiscovery(DescriptorDiscoveryStatus.UNREADABLE)
         stem = child.stem
-        if stem in ALLOWED_NAMED_INVENTORY:
+        if child.name in ALLOWED_NAMED_INVENTORY:
             continue
         if _RE_NUMERIC_STEM.fullmatch(stem) is None:
             raise CohortError(
