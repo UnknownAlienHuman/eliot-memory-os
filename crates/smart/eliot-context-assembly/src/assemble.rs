@@ -4,8 +4,8 @@ use eliot_context_contracts::{
     ActiveUnderstandingView, AdmittedContextSet, ContextError, ContextExecutionIdentity,
     ContextRecipe, DownstreamHeadroomRequest, DownstreamHeadroomResult, HeadroomAttempt,
     HeadroomDimension, HeadroomRefusal, HeadroomReleaseInstruction, MeasurementStatus,
-    QualityOperation, QualityRefusal, QualityRefusalKind, QualityScorecard,
-    RecipeExecutionSupport, ResolvedContextRecipe, SerializedContextMeasurement,
+    QualityOperation, QualityRefusal, QualityRefusalKind, QualityScorecard, RecipeExecutionSupport,
+    ResolvedContextRecipe, SerializedContextMeasurement,
 };
 use eliot_contracts::ArtifactId;
 use serde::{Deserialize, Serialize};
@@ -383,14 +383,12 @@ fn executed_ordering_revision(approved: &ResolvedContextRecipe) -> String {
 /// here instead would make the comparison vacuously true and the fail-closed
 /// coupling described on that constant pointless.
 fn assembly_execution_support() -> Result<RecipeExecutionSupport, AssemblyError> {
-    let ordering_revision = ArtifactId::new(ASSEMBLY_ORDERING_REVISION)
-        .map_err(|_| {
-            AssemblyError::Contract(ContextError::InvalidField(
-                "recipe_support.ordering_revision",
-            ))
-        })?;
-    RecipeExecutionSupport::for_context_compiler(ordering_revision)
-        .map_err(AssemblyError::Contract)
+    let ordering_revision = ArtifactId::new(ASSEMBLY_ORDERING_REVISION).map_err(|_| {
+        AssemblyError::Contract(ContextError::InvalidField(
+            "recipe_support.ordering_revision",
+        ))
+    })?;
+    RecipeExecutionSupport::for_context_compiler(ordering_revision).map_err(AssemblyError::Contract)
 }
 
 /// Require that the approved revision supplying the executed order is the exact
