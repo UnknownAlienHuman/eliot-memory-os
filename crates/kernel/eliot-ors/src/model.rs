@@ -7985,18 +7985,7 @@ impl HostRequestRecord {
         if let Some(body) = &self.payload_body {
             validate_payload_body(body, &self.payload_digest)?;
         }
-        if let Some(binding) = &self.finish_replay_binding {
-            if !binding.is_object()
-                || serde_json::to_vec(binding).map_or(true, |bytes| {
-                    bytes.len() > MAX_HOST_REQUEST_RESULT_RESPONSE_BYTES
-                })
-            {
-                return Err(OrsError::InvalidField {
-                    field: "host_request_finish_replay_binding",
-                    reason: "must be a bounded JSON object",
-                });
-            }
-        }
+        self.validate_finish_replay_binding()?;
         match (&self.state, &self.result_digest, &self.result_response) {
             (
                 HostRequestState::ResultReceived | HostRequestState::Terminal,
@@ -8055,6 +8044,22 @@ impl HostRequestRecord {
             return Err(OrsError::InvalidField {
                 field: "host_request_commit_order",
                 reason: "non-terminal states must not carry a commit order",
+            });
+        }
+        Ok(())
+    }
+
+    /// Validates the opaque original Finish replay binding without interpreting it.
+    fn validate_finish_replay_binding(&self) -> Result<(), OrsError> {
+        if let Some(binding) = &self.finish_replay_binding
+            && (!binding.is_object()
+                || serde_json::to_vec(binding).map_or(true, |bytes| {
+                    bytes.len() > MAX_HOST_REQUEST_RESULT_RESPONSE_BYTES
+                }))
+        {
+            return Err(OrsError::InvalidField {
+                field: "host_request_finish_replay_binding",
+                reason: "must be a bounded JSON object",
             });
         }
         Ok(())
