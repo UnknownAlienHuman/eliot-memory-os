@@ -135,6 +135,7 @@ fn validate_git_child_lineage(
         || parent.deadline_unix_ms != child.deadline_unix_ms
         || parent_metadata.product_id != child_metadata.product_id
         || parent_metadata.source_id != child_metadata.source_id
+        || parent_metadata.session_id != child_metadata.session_id
         || parent_metadata.task_id.as_ref() != Some(task_id)
         || child_metadata.task_id.as_ref() != Some(task_id)
         || &parent_request.state_fence != session_fence
