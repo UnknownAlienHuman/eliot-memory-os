@@ -6,6 +6,7 @@
 
 use eliot_contracts::StateFence;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// Wire revision for the authenticated Store-to-Blob readback exchange.
 pub const PROCESS_STREAM_READBACK_WIRE_REVISION: u16 = 1;
@@ -14,6 +15,10 @@ pub const PROCESS_STREAM_READBACK_WIRE_REVISION: u16 = 1;
 /// JSON encodes each byte as a decimal integer, so the frame cost can exceed
 /// the source size. This bound stays well below EBP's 4 MiB frame ceiling.
 pub const PROCESS_STREAM_READBACK_MAX_CHUNK_BYTES: u32 = 256 * 1024;
+/// Wire revision for the closed process-stream sink operations.
+pub const PROCESS_STREAM_SINK_WIRE_REVISION: u16 = 1;
+/// Maximum encoded body carried by one sink-operation frame.
+pub const PROCESS_STREAM_SINK_MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// Closed process-stream discriminator.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -69,6 +74,10 @@ pub struct ProcessStreamSourceReadbackRequest {
     pub operation_id: String,
     /// Exact admitted process-tree identity.
     pub process_tree_id: String,
+    /// Exact serialized `ProcessExecutionBinding` admitted for this source.
+    pub process_binding_json: String,
+    /// SHA-256 of the exact serialized process binding bytes.
+    pub process_binding_sha256: String,
     /// Stdout or stderr.
     pub stream: ProcessStreamKind,
     /// Immutable locator class.
@@ -83,6 +92,10 @@ pub struct ProcessStreamSourceReadbackRequest {
     pub expected_byte_length: u64,
     /// Immutable policy/privacy/visibility/retention binding.
     pub policy: ProcessStreamPolicyBinding,
+    /// Exact serialized policy bytes retained with the original staged source.
+    pub policy_json: String,
+    /// SHA-256 of the exact serialized policy bytes.
+    pub policy_sha256: String,
     /// Exact state fence under which readback is admitted.
     pub fence: StateFence,
     /// Maximum source size accepted by the caller.
@@ -112,6 +125,18 @@ impl ProcessStreamSourceReadbackRequest {
             validate_text(field, value)?;
         }
         validate_digest("expected_sha256", &self.expected_sha256)?;
+        validate_digest("process_binding_sha256", &self.process_binding_sha256)?;
+        validate_digest("policy_sha256", &self.policy_sha256)?;
+        if self.process_binding_json.len() > 16 * 1024
+            || self.policy_json.len() > 4 * 1024
+            || !json_object(&self.process_binding_json)
+            || sha256_hex(self.process_binding_json.as_bytes()) != self.process_binding_sha256
+            || serde_json::to_string(&self.policy).ok().as_deref()
+                != Some(self.policy_json.as_str())
+            || sha256_hex(self.policy_json.as_bytes()) != self.policy_sha256
+        {
+            return Err(WireValidationError::InvalidField("process_binding"));
+        }
         if self.max_bytes < self.expected_byte_length {
             return Err(WireValidationError::InvalidField("max_bytes"));
         }
@@ -137,6 +162,258 @@ impl ProcessStreamSourceReadbackRequest {
         }
         Ok(())
     }
+}
+
+/// Closed operation selector for the retained Store-side stream sink.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ProcessStreamSinkOperation {
+    /// Bind one process stream and mint its retained owner context.
+    Open,
+    /// Append one bounded, digest-bound byte chunk.
+    Append,
+    /// Finalize the exact terminal command.
+    Finalize,
+    /// Abort the exact terminal command.
+    Abort,
+    /// Read the owner-retained sink observation.
+    Readback,
+    /// Reconcile the original uncertain terminal command.
+    Reconcile,
+}
+
+/// Opaque reference to the Kernel-issued stream capability.
+///
+/// The reference selects a Kernel-retained admission. It grants no authority
+/// by itself and is accepted only over the authenticated Kernel EBP peer.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessStreamSinkCapabilityRef {
+    /// Opaque Kernel-selected lookup identity.
+    pub reference: String,
+}
+
+impl ProcessStreamSinkCapabilityRef {
+    /// Validates a bounded opaque reference.
+    pub fn validate(&self) -> Result<(), WireValidationError> {
+        if self.reference.trim().is_empty()
+            || self.reference.len() > 128
+            || self.reference.chars().any(char::is_control)
+        {
+            return Err(WireValidationError::InvalidField("capability_ref"));
+        }
+        Ok(())
+    }
+}
+
+/// Exact identity of one retained open stream at the Store owner.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessStreamSinkBindingRef {
+    /// Owner-bound sink session identity.
+    pub session_id: String,
+    /// Owner-bound source identity.
+    pub source_id: String,
+    /// Original terminal identity.
+    pub terminal_id: String,
+    /// Digest of the original validated Open request.
+    pub open_request_sha256: String,
+}
+
+impl ProcessStreamSinkBindingRef {
+    /// Validates exact bounded sink identities.
+    pub fn validate(&self) -> Result<(), WireValidationError> {
+        validate_text("session_id", &self.session_id)?;
+        validate_text("source_id", &self.source_id)?;
+        validate_text("terminal_id", &self.terminal_id)?;
+        validate_digest("open_request_sha256", &self.open_request_sha256)
+    }
+}
+
+/// Closed Store EBP request family for process stream sink operations.
+///
+/// `body` is limited to the operation's already closed `eliot-process`
+/// request wire. Kernel and Store adapters must deserialize it into exactly
+/// the named request type with unknown-field rejection and call its validator
+/// before using any field. No operation accepts arbitrary commands, paths,
+/// Blob contexts, leases, or caller-issued receipts.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum ProcessStreamSinkWireRequest {
+    /// Open a stream from the admitted process binding.
+    Open {
+        /// Kernel-issued admitted process capability reference.
+        capability: ProcessStreamSinkCapabilityRef,
+        /// Exact closed ProcessStreamSinkOpenRequest JSON object.
+        body: serde_json::Value,
+        /// Authenticated request fence.
+        fence: StateFence,
+        /// Absolute Unix-millisecond operation deadline.
+        deadline_ms: u64,
+    },
+    /// Append one exact sequence/offset chunk to its retained session.
+    Append {
+        /// Kernel-issued admitted process capability reference.
+        capability: ProcessStreamSinkCapabilityRef,
+        /// Exact retained stream binding selected by this caller.
+        binding: ProcessStreamSinkBindingRef,
+        /// Exact closed ProcessStreamSinkAppend JSON object.
+        body: serde_json::Value,
+        /// Authenticated request fence.
+        fence: StateFence,
+        /// Absolute Unix-millisecond operation deadline.
+        deadline_ms: u64,
+    },
+    /// Finalize a stream under its exact terminal command identity.
+    Finalize {
+        /// Kernel-issued admitted process capability reference.
+        capability: ProcessStreamSinkCapabilityRef,
+        /// Exact retained stream binding selected by this caller.
+        binding: ProcessStreamSinkBindingRef,
+        /// Exact closed ProcessStreamSinkFinalizeRequest JSON object.
+        body: serde_json::Value,
+        /// Authenticated request fence.
+        fence: StateFence,
+        /// Absolute Unix-millisecond operation deadline.
+        deadline_ms: u64,
+    },
+    /// Abort a stream under its exact terminal command identity.
+    Abort {
+        /// Kernel-issued admitted process capability reference.
+        capability: ProcessStreamSinkCapabilityRef,
+        /// Exact retained stream binding selected by this caller.
+        binding: ProcessStreamSinkBindingRef,
+        /// Exact closed ProcessStreamSinkAbortRequest JSON object.
+        body: serde_json::Value,
+        /// Authenticated request fence.
+        fence: StateFence,
+        /// Absolute Unix-millisecond operation deadline.
+        deadline_ms: u64,
+    },
+    /// Read back the current retained sink observation, with no effect replay.
+    Readback {
+        /// Kernel-issued admitted process capability reference.
+        capability: ProcessStreamSinkCapabilityRef,
+        /// Exact retained stream binding selected by this caller.
+        binding: ProcessStreamSinkBindingRef,
+        /// Authenticated request fence.
+        fence: StateFence,
+        /// Absolute Unix-millisecond operation deadline.
+        deadline_ms: u64,
+    },
+    /// Reconcile an uncertain original terminal command without repeating it.
+    Reconcile {
+        /// Kernel-issued admitted process capability reference.
+        capability: ProcessStreamSinkCapabilityRef,
+        /// Exact retained stream binding selected by this caller.
+        binding: ProcessStreamSinkBindingRef,
+        /// Exact closed ProcessStreamSinkUnknownOutcome JSON object.
+        body: serde_json::Value,
+        /// Authenticated request fence.
+        fence: StateFence,
+        /// Absolute Unix-millisecond operation deadline.
+        deadline_ms: u64,
+    },
+}
+
+impl ProcessStreamSinkWireRequest {
+    /// Rejects invalid capability references, unbounded bodies, fences, and deadlines.
+    pub fn validate(&self) -> Result<(), WireValidationError> {
+        let (capability, binding, body, fence, deadline_ms) = match self {
+            Self::Open {
+                capability,
+                body,
+                fence,
+                deadline_ms,
+            } => (capability, None, Some(body), fence, *deadline_ms),
+            Self::Append {
+                capability,
+                binding,
+                body,
+                fence,
+                deadline_ms,
+            }
+            | Self::Finalize {
+                capability,
+                binding,
+                body,
+                fence,
+                deadline_ms,
+            }
+            | Self::Abort {
+                capability,
+                binding,
+                body,
+                fence,
+                deadline_ms,
+            }
+            | Self::Reconcile {
+                capability,
+                binding,
+                body,
+                fence,
+                deadline_ms,
+            } => (capability, Some(binding), Some(body), fence, *deadline_ms),
+            Self::Readback {
+                capability,
+                binding,
+                fence,
+                deadline_ms,
+            } => (capability, Some(binding), None, fence, *deadline_ms),
+        };
+        capability.validate()?;
+        if let Some(binding) = binding {
+            binding.validate()?;
+        }
+        if let Some(body) = body {
+            let encoded = serde_json::to_vec(body)
+                .map_err(|_| WireValidationError::InvalidField("body"))?;
+            if !body.is_object() || encoded.len() > PROCESS_STREAM_SINK_MAX_BODY_BYTES {
+                return Err(WireValidationError::InvalidField("body"));
+            }
+        }
+        if deadline_ms == 0 {
+            return Err(WireValidationError::InvalidField("deadline_ms"));
+        }
+        fence
+            .validate()
+            .map_err(|_| WireValidationError::InvalidField("fence"))
+    }
+}
+
+/// Closed owner outcomes for process-stream sink operations.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum ProcessStreamSinkWireResponse {
+    /// Open accepted under the exact original binding.
+    Opened {
+        /// Store-retained stream binding.
+        binding: ProcessStreamSinkBindingRef,
+    },
+    /// Append returned its exact typed disposition JSON.
+    AppendDisposition {
+        /// Closed ProcessStreamSinkAppendDisposition JSON.
+        body: serde_json::Value,
+    },
+    /// Finalize returned owner-validated terminal evidence JSON.
+    Finalized {
+        /// Closed terminal projection JSON.
+        body: serde_json::Value,
+    },
+    /// Abort returned owner-validated terminal evidence JSON.
+    Aborted {
+        /// Closed terminal projection JSON.
+        body: serde_json::Value,
+    },
+    /// Readback returned the exact retained owner observation JSON.
+    Readback {
+        /// Closed ProcessStreamSinkReadback JSON.
+        body: serde_json::Value,
+    },
+    /// Owner proved the exact original command never started.
+    NotStarted,
+    /// The exact original command outcome remains unknown.
+    Unknown,
 }
 
 /// Closed outcome of a source readback/reconciliation request.
@@ -199,4 +476,12 @@ fn validate_digest(field: &'static str, value: &str) -> Result<(), WireValidatio
     } else {
         Ok(())
     }
+}
+
+fn json_object(value: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(value).is_ok_and(|value| value.is_object())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
