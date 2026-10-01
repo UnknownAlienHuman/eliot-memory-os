@@ -140,6 +140,50 @@ use crate::{
 /// `commit_id` is the store-issued commit identity that the outbox row shares.
 pub type CanonicalWriteReceipt = eliot_store_api::WriteReceipt;
 
+/// Derives the owner-issued canonical admission receipt for one committed
+/// `ADMITTED` write from the canonical owner's own receipt (#1678 W3, REQ4).
+///
+/// This is the only way a caller obtains the receipt reference the retained
+/// commit carries, and it is never a caller assertion: the reference is the
+/// identity of the store-owned reconciliation envelope the canonical owner
+/// issued inside the transaction that committed this exact operation
+/// ([`eliot_store_api::WriteReceipt::require_reconciliation_envelope`]). A
+/// value no owner issued cannot enter the saga here, so Kernel never fabricates
+/// this receipt and never infers it from a successful transport response.
+///
+/// The receipt must be a committed receipt for `operation_id`, and its
+/// envelope must pass the owner's own `validate()`, which also binds the
+/// envelope to this receipt's operation, idempotency key and State Fence. That
+/// binding is the owner's check, not a second comparison scheme here.
+///
+/// # Errors
+///
+/// Returns [`OrsError::ReconciliationMismatch`] when the receipt is not a
+/// committed receipt for `operation_id`, or when it carries no store-owned
+/// reconciliation envelope to derive the reference from. Returns
+/// [`OrsError::Contract`] when the owner's own `validate()` refuses the receipt
+/// or its envelope.
+pub fn canonical_admission_receipt_from_owner_receipt(
+    receipt: &CanonicalWriteReceipt,
+    operation_id: &OperationIdentity,
+) -> Result<ReceiptIdentity, OrsError> {
+    receipt
+        .validate()
+        .map_err(|error| OrsError::Contract(error.to_string()))?;
+    if receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+        || receipt.operation_id.as_str() != operation_id.as_str()
+    {
+        return Err(OrsError::ReconciliationMismatch);
+    }
+    let envelope = receipt
+        .require_reconciliation_envelope()
+        .map_err(|_| OrsError::ReconciliationMismatch)?;
+    envelope
+        .validate()
+        .map_err(|error| OrsError::Contract(error.to_string()))?;
+    Ok(envelope.identity.clone())
+}
+
 /// Builds the retained canonical-commit record from the owner's own receipt.
 ///
 /// This is the only way a caller obtains an
@@ -147,10 +191,11 @@ pub type CanonicalWriteReceipt = eliot_store_api::WriteReceipt;
 /// owner's `WriteReceipt` for the exact operation — not a copy of some fields,
 /// not a caller assertion. Every retained value is read out of that receipt:
 /// the operation identity, the idempotency key, the admission-decision and
-/// mutation-plan digests, the store-issued `commit_id`, the owner's
-/// `admission_receipt` reference, and the commit time. Nothing is defaulted and
-/// nothing is derived, so what the reservation row retains is exactly what the
-/// canonical owner committed.
+/// mutation-plan digests, the store-issued `commit_id`, the commit time, and —
+/// via [`canonical_admission_receipt_from_owner_receipt`] — the owner-issued
+/// admission receipt reference derived from the receipt's own reconciliation
+/// envelope. Nothing is defaulted and nothing is caller-supplied, so what the
+/// reservation row retains is exactly what the canonical owner committed.
 ///
 /// The commit time is taken from the receipt's own `committed_at` string,
 /// which the store issues as Unix milliseconds. A receipt that is not
@@ -162,12 +207,12 @@ pub type CanonicalWriteReceipt = eliot_store_api::WriteReceipt;
 ///
 /// Returns [`OrsError::ReconciliationMismatch`] when the receipt does not carry
 /// a committed `ADMITTED` decision for a named operation: a non-committed
-/// status, an absent commit id, or an absent/non-numeric commit time. Returns
-/// [`OrsError::Contract`] when the owner's own `validate()` refuses the receipt.
+/// status, an absent commit id, an absent/non-numeric commit time, or a receipt
+/// whose operation is not the named one. Returns [`OrsError::Contract`] when
+/// the owner's own `validate()` refuses the receipt or its envelope.
 pub fn canonical_admission_from_owner_commit(
     receipt: &CanonicalWriteReceipt,
     operation_id: &str,
-    admission_receipt: &ReceiptIdentity,
     launch_outbox_operation_id: &OperationIdentity,
     launch_outbox_id: &str,
 ) -> Result<AdmissionReservationCanonicalAdmission, OrsError> {
@@ -185,18 +230,25 @@ pub fn canonical_admission_from_owner_commit(
     let Some(committed_at_marker) = receipt.committed_at.clone() else {
         return Err(OrsError::ReconciliationMismatch);
     };
-    let retained = AdmissionReservationCanonicalAdmission {
-        operation_id: OperationIdentity::new(operation_id).map_err(|_| OrsError::InvalidField {
+    // The admission receipt is derived from the owner's own receipt, never
+    // accepted from the caller: the operation identity the envelope is derived
+    // for is the same named operation this commit is built for.
+    let operation_identity =
+        OperationIdentity::new(operation_id).map_err(|_| OrsError::InvalidField {
             field: "canonical_admission.operation_id",
             reason: "canonical operation identity must be non-blank",
-        })?,
+        })?;
+    let admission_receipt =
+        canonical_admission_receipt_from_owner_receipt(receipt, &operation_identity)?;
+    let retained = AdmissionReservationCanonicalAdmission {
+        operation_id: operation_identity,
         idempotency_key: receipt.idempotency_key.clone(),
         admission_digest: receipt.admission_digest.clone(),
         mutation_plan_digest: receipt.mutation_plan_digest.clone(),
         commit_id: commit_id.as_str().to_owned(),
         launch_outbox_operation_id: launch_outbox_operation_id.clone(),
         launch_outbox_id: launch_outbox_id.to_owned(),
-        admission_receipt: admission_receipt.clone(),
+        admission_receipt,
         committed_at_marker,
     };
     retained.validate()?;
@@ -330,20 +382,19 @@ pub fn verify_launch_outbox_intent(
 
 /// Everything the admit half needs from the canonical owner for one operation.
 ///
-/// Both halves are read back by the caller through the owner's own receipt and
-/// outbox readback for the ORIGINAL operation identity, and are then compared
-/// BY VALUE against the owner's committed receipt. Neither is a Kernel
-/// assertion: a caller cannot claim an `ADMITTED` decision by spelling one
-/// here.
+/// The owner's own receipt for the ORIGINAL operation identity is the whole of
+/// it, read back by the caller through the owner's receipt readback. The
+/// admission receipt reference the retained commit carries is derived from that
+/// receipt's own reconciliation envelope by
+/// [`canonical_admission_receipt_from_owner_receipt`], never supplied beside
+/// it: a caller cannot claim an `ADMITTED` decision by spelling one here, and
+/// cannot pair the owner's receipt with a different admission reference.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CanonicalAdmissionCommit {
     /// The canonical owner's `WriteReceipt` for the committed `ADMITTED`
     /// write. This is the owner-issued artifact; the retained record is built
     /// from it verbatim.
     pub receipt: CanonicalWriteReceipt,
-    /// The owner-issued canonical admission receipt reference carried by that
-    /// write's reconciliation envelope.
-    pub admission_receipt: ReceiptIdentity,
 }
 
 /// Proves the committed canonical `ADMITTED` decision and its launch outbox
@@ -446,14 +497,14 @@ pub fn prove_canonical_admission_for_reservation<S: OperationalRecoveryStore + ?
     }
 
     // The launch intent is proven for THIS operation from the owner's own
-    // receipt, and the retained commit is built from that same owner-issued
-    // receipt — never from a Kernel assertion and never inferred from a
-    // successful transport call.
+    // receipt, and the retained commit — including the admission receipt
+    // derived from that receipt's own reconciliation envelope — is built from
+    // that same owner-issued receipt: never from a Kernel assertion and never
+    // inferred from a successful transport call.
     let launch = verify_launch_outbox_intent(&commit.receipt, operation_id)?;
     let retained = canonical_admission_from_owner_commit(
         &commit.receipt,
         operation_id.as_str(),
-        &commit.admission_receipt,
         operation_id,
         launch.outbox_id.as_str(),
     )?;

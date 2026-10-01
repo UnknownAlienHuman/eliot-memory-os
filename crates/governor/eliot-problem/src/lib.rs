@@ -1356,23 +1356,34 @@ impl Problem {
             return Err(ProblemError::ImmutableState);
         }
         let route = self.default_owner_route();
-        let obligation = OwnershipObligation {
-            obligation_id: obligation_id(
-                self.problem_id.as_str(),
-                route,
-                unassigned.ownership_epoch,
-            )?,
-            route,
-            lost_lease: unassigned.lost_lease.clone(),
-            ownership_epoch: unassigned.ownership_epoch,
-            raised_at_revision: self.revision,
-        };
-        if obligation != unassigned.obligation {
+        // The obligation is RESTATED here, never re-derived. `raised_at_revision`
+        // is a historical fact — the revision the owner loss produced — but this
+        // entry rebuilt it from the *current* revision, which turned the check
+        // below into a coincidence rather than a comparison: the first
+        // transition after the loss moved the revision, so the rebuilt
+        // obligation could never equal the retained one again and escalation of
+        // an owner-loss obligation became permanently refused for every record
+        // touched since its loss. That is the same one-way door the reassignment
+        // half already had, arriving through the escalation half instead. I13.9
+        // makes ownership unassigned "until reassigned to an eligible successor
+        // OR escalated through Critical Attention", so refusing the escalation
+        // left half of the discharge routes dead on a record the reassignment
+        // half had just opened.
+        //
+        // The guard is not weakened, only made to compare the right thing. The
+        // one member a caller could disagree about is the route, so that is what
+        // is compared, against the route the owner loss actually recorded on the
+        // record. `lost_lease`, `ownership_epoch` and `obligation_id` are all
+        // read out of the record's own retained unassigned state, so restating
+        // them keeps them equal by construction instead of by accident — the
+        // refusal still fires on a route that was never this record's.
+        if route != unassigned.obligation.route {
             return Err(ProblemError::InvalidField {
                 field: "obligation",
                 reason: "an escalation may only restate the obligation the owner loss raised",
             });
         }
+        let obligation = unassigned.obligation.clone();
         let revision = next_revision(self.revision)?;
         let mut candidate = self.clone();
         candidate.observed_evidence = merge_evidence(&candidate.observed_evidence, evidence);
