@@ -1351,7 +1351,9 @@ impl DaemonComposition {
             .map_err(|error| format!("prepare source-admission transition: {error}"))?;
         prepared
             .validate_against_catalogue(&manifests)
-            .map_err(|error| format!("source-admission transition is not currently admitted: {error}"))?;
+            .map_err(|error| {
+                format!("source-admission transition is not currently admitted: {error}")
+            })?;
         self.governor
             .commit_canonical(identity, envelope)
             .await
@@ -2119,7 +2121,9 @@ impl DaemonComposition {
             .task(&task_id)
             .ok_or_else(|| "Task owner has no record for the selected task".to_owned())?;
         if record.task_id != task_id || record.revision == 0 || record.state_fence != *state_fence {
-            return Err("Task owner record is stale or differs from the exact task/fence".to_owned());
+            return Err(
+                "Task owner record is stale or differs from the exact task/fence".to_owned(),
+            );
         }
         Ok(eliot_receipts::TaskBinding {
             task_id,
@@ -2154,7 +2158,10 @@ impl DaemonComposition {
             || record.state_fence != *state_fence
             || record.authority_epoch != state_fence.authority_epoch
         {
-            return Err("Session owner record is terminal, stale, or differs from the exact session/fence".to_owned());
+            return Err(
+                "Session owner record is terminal, stale, or differs from the exact session/fence"
+                    .to_owned(),
+            );
         }
         Ok(eliot_receipts::SessionBinding {
             session_id,

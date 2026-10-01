@@ -494,11 +494,11 @@ pub mod kernel_client {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
-    use eliot_contracts::{EpochId, RequestId};
     use eliot_blob_api::wire::{
         BlobProcessStreamKernelReconcileRequest, BlobProcessStreamKernelRequest,
         BlobProcessStreamKernelResponse,
     };
+    use eliot_contracts::{EpochId, RequestId};
     use eliot_ipc::{
         DeliveryOutcome, NamedPipeTransport, TransportLimits, client_hello_frame,
         decode_server_hello_frame,
@@ -971,7 +971,10 @@ pub mod kernel_client {
                 .validate()
                 .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
             let (mut transport, limits) = self.connect().await?;
-            let token_digest = format!("{:x}", Sha256::digest(request.call_token.reference.as_bytes()));
+            let token_digest = format!(
+                "{:x}",
+                Sha256::digest(request.call_token.reference.as_bytes())
+            );
             let request_id = RequestId::new(format!(
                 "blob-stream-{}-{token_digest}",
                 request.call_token.ordinal
@@ -998,12 +1001,14 @@ pub mod kernel_client {
                 .receive_frame(limits)
                 .await
                 .map_err(|error| KernelClientError::UnknownOutcome(error.to_string()))?;
-            let value = validate_result_response(&self.config.connection_id, &request_id, &response)?;
-            let typed: BlobProcessStreamKernelResponse = serde_json::from_value(value).map_err(|error| {
-                KernelClientError::UnknownOutcome(format!(
-                    "Kernel Blob process-stream reply is not a closed response: {error}"
-                ))
-            })?;
+            let value =
+                validate_result_response(&self.config.connection_id, &request_id, &response)?;
+            let typed: BlobProcessStreamKernelResponse =
+                serde_json::from_value(value).map_err(|error| {
+                    KernelClientError::UnknownOutcome(format!(
+                        "Kernel Blob process-stream reply is not a closed response: {error}"
+                    ))
+                })?;
             typed
                 .validate_for_request(&request)
                 .map_err(|error| KernelClientError::UnknownOutcome(error.to_string()))?;
@@ -1019,7 +1024,10 @@ pub mod kernel_client {
                 .validate()
                 .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
             let (mut transport, limits) = self.connect().await?;
-            let token_digest = format!("{:x}", Sha256::digest(request.call_token.reference.as_bytes()));
+            let token_digest = format!(
+                "{:x}",
+                Sha256::digest(request.call_token.reference.as_bytes())
+            );
             let request_id = RequestId::new(format!(
                 "blob-reconcile-{}-{token_digest}",
                 request.call_token.ordinal
@@ -1046,12 +1054,14 @@ pub mod kernel_client {
                 .receive_frame(limits)
                 .await
                 .map_err(|error| KernelClientError::UnknownOutcome(error.to_string()))?;
-            let value = validate_result_response(&self.config.connection_id, &request_id, &response)?;
-            let typed: BlobProcessStreamKernelResponse = serde_json::from_value(value).map_err(|error| {
-                KernelClientError::UnknownOutcome(format!(
-                    "Kernel Blob reconciliation reply is not a closed response: {error}"
-                ))
-            })?;
+            let value =
+                validate_result_response(&self.config.connection_id, &request_id, &response)?;
+            let typed: BlobProcessStreamKernelResponse =
+                serde_json::from_value(value).map_err(|error| {
+                    KernelClientError::UnknownOutcome(format!(
+                        "Kernel Blob reconciliation reply is not a closed response: {error}"
+                    ))
+                })?;
             typed
                 .validate_for_reconcile(&request)
                 .map_err(|error| KernelClientError::UnknownOutcome(error.to_string()))?;

@@ -82,9 +82,8 @@ pub use profile::{
     ProfileCompiler, ProfileError, ProfileScopeClasses, REGISTRY_SNAPSHOT_SCHEMA,
     REGISTRY_SNAPSHOT_SCHEMA_VERSION, ResolvedProfile, ResolvedStage, ResourceLimits, StageDag,
     StageDecl, StageEnvironment, TEST_PROFILE, TOOLCHAIN_PATH_ENV, TargetLayout,
-    VERIFICATION_REGISTRY_GENERATION, WorkScope,
-    admitted_profile_for_alias, bundle_verification_profile, compiler_profile,
-    package_verification_profile, test_profile,
+    VERIFICATION_REGISTRY_GENERATION, WorkScope, admitted_profile_for_alias,
+    bundle_verification_profile, compiler_profile, package_verification_profile, test_profile,
 };
 pub use profile_replay::{
     ProfileReplayError, ProfileReplayReceipt, ReplayObservedInputs, VerifiedTestdReplayContext,

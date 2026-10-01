@@ -8,27 +8,31 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use crate::kernel_client::{KernelBlobStreamCallSequence, TestdIpcError};
 use eliot_blob_api::wire::{
-    BlobProcessStreamKernelOperationRequest as KernelOperation,
+    BlobProcessStreamKernelOperationRequest as KernelOperation, BlobProcessStreamKernelOutcome,
+    BlobProcessStreamKernelResponse,
     BlobProcessStreamKernelSourceReadbackRequest as KernelSourceRequest,
-    BlobProcessStreamKernelResponse, BlobProcessStreamKernelOutcome,
-    BlobProcessStreamOperationResponse,
-    PROCESS_STREAM_READBACK_MAX_CHUNK_BYTES,
+    BlobProcessStreamOperationResponse, PROCESS_STREAM_READBACK_MAX_CHUNK_BYTES,
     ProcessStreamSourceReadbackResponse as BlobResponse,
 };
 use eliot_contracts::{ClockReading, canonical_json_bytes};
 use eliot_process::{DurableStreamLocatorKind, ProcessStreamKind};
 use eliot_testd_core::{
     AsyncProcessStreamSourceReadbackPort, ProcessStreamSourceReadbackFuture,
-    ProcessStreamSourceReadbackObservation, ProcessStreamSourceReadbackRequest,
-    TestdEvidenceError, TestdReplayOwnerReadback, TestdStreamDisposition, sha256_hex,
+    ProcessStreamSourceReadbackObservation, ProcessStreamSourceReadbackRequest, TestdEvidenceError,
+    TestdReplayOwnerReadback, TestdStreamDisposition, sha256_hex,
 };
-use crate::kernel_client::{KernelBlobStreamCallSequence, TestdIpcError};
 use serde::Serialize;
 
 /// Future returned by the authenticated Kernel source-readback exchange.
-pub type BlobReadbackExchangeFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<BlobProcessStreamKernelResponse, TestdEvidenceError>> + Send + 'a>>;
+pub type BlobReadbackExchangeFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<BlobProcessStreamKernelResponse, TestdEvidenceError>>
+            + Send
+            + 'a,
+    >,
+>;
 
 /// One typed source-readback exchange over the already authenticated Kernel
 /// session. The implementation supplies owner-issued per-operation identity.
@@ -152,7 +156,9 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
                 chunk_limit: PROCESS_STREAM_READBACK_MAX_CHUNK_BYTES,
                 deadline_ms: request.deadline_ms,
             };
-            wire_request.validate().map_err(|_| invalid_stream(stream))?;
+            wire_request
+                .validate()
+                .map_err(|_| invalid_stream(stream))?;
             let kernel_response = self.exchange.read_source_chunk(&wire_request).await?;
             let response = match kernel_response.outcome {
                 BlobProcessStreamKernelOutcome::Completed { response, .. } => {
@@ -256,10 +262,10 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
                     });
                 }
             };
-            let source_admission_write_receipt_json = source_admission_write_receipt_json
-                .ok_or_else(|| integrity_error(stream))?;
-            let source_admission_write_receipt_sha256 = source_admission_write_receipt_sha256
-                .ok_or_else(|| integrity_error(stream))?;
+            let source_admission_write_receipt_json =
+                source_admission_write_receipt_json.ok_or_else(|| integrity_error(stream))?;
+            let source_admission_write_receipt_sha256 =
+                source_admission_write_receipt_sha256.ok_or_else(|| integrity_error(stream))?;
             if chunk_offset != offset
                 || whole_source_sha256 != request.expected_sha256
                 || whole_source_byte_length != request.expected_byte_length
@@ -295,7 +301,9 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
                 generation_admission_json,
                 generation_admission_sha256,
             };
-            current_owner_readback.validate().map_err(|_| integrity_error(stream))?;
+            current_owner_readback
+                .validate()
+                .map_err(|_| integrity_error(stream))?;
             if replay_owner_readback
                 .as_ref()
                 .is_some_and(|existing| existing != &current_owner_readback)
@@ -353,9 +361,7 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
             },
             TestdStreamDisposition::CompleteSource,
         )
-        .with_replay_owner_readback(
-            replay_owner_readback.ok_or_else(|| integrity_error(stream))?,
-        ))
+        .with_replay_owner_readback(replay_owner_readback.ok_or_else(|| integrity_error(stream))?))
     }
 }
 

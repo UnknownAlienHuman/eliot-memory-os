@@ -9,9 +9,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_blob_api::wire::{
     BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_ID, BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_REVISION,
-    BlobProcessStreamOwnerFactsPullOutcome, BlobProcessStreamOwnerFactsPullRequest,
-    BlobProcessStreamOwnerFactsPullResponse, BlobProcessStreamOwnerFactsUnavailableReason,
-    BlobProcessStreamOwnerFactsPullPurpose, BlobProcessStreamVerifiedOwnerFacts,
+    BlobProcessStreamOwnerFactsPullOutcome, BlobProcessStreamOwnerFactsPullPurpose,
+    BlobProcessStreamOwnerFactsPullRequest, BlobProcessStreamOwnerFactsPullResponse,
+    BlobProcessStreamOwnerFactsUnavailableReason, BlobProcessStreamVerifiedOwnerFacts,
 };
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use serde::Serialize;
@@ -249,15 +249,20 @@ fn available_launch_owner_facts(
         || causal.state_fence != request.state_fence
         || (causal.transaction_sequence.value() > 1
             && causal.parent_receipt_id.as_ref().is_none_or(|parent| {
-                !causal.predecessor_receipt_ids.iter().any(|item| item == parent)
+                !causal
+                    .predecessor_receipt_ids
+                    .iter()
+                    .any(|item| item == parent)
             }))
     {
-        return Err("Kernel causal or authority binding differs from the authenticated fence".to_owned());
+        return Err(
+            "Kernel causal or authority binding differs from the authenticated fence".to_owned(),
+        );
     }
     let task_binding = match request.task_id.as_deref() {
-        Some(task_ref) => Some(
-            composition.current_testd_blob_task_binding(task_ref, &request.state_fence)?,
-        ),
+        Some(task_ref) => {
+            Some(composition.current_testd_blob_task_binding(task_ref, &request.state_fence)?)
+        }
         None => None,
     };
     let session_binding = match request.session_id.as_deref() {
@@ -298,7 +303,9 @@ fn available_launch_owner_facts(
             .map(|bytes| String::from_utf8(bytes.clone()))
             .transpose()
             .map_err(|error| format!("TaskBinding is not UTF-8: {error}"))?,
-        session_binding_sha256: session_binding_bytes.as_ref().map(|bytes| sha256_hex(bytes)),
+        session_binding_sha256: session_binding_bytes
+            .as_ref()
+            .map(|bytes| sha256_hex(bytes)),
         session_binding_json: session_binding_bytes
             .as_ref()
             .map(|bytes| String::from_utf8(bytes.clone()))
@@ -360,7 +367,12 @@ fn available_launch_owner_facts(
         .map_err(|error| format!("verified owner facts are not UTF-8: {error}"))?;
     let policy_ref = serde_json::from_str::<serde_json::Value>(&policy.policy_json)
         .ok()
-        .and_then(|value| value.get("policy_ref").and_then(serde_json::Value::as_str).map(str::to_owned))
+        .and_then(|value| {
+            value
+                .get("policy_ref")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
         .ok_or_else(|| "selected policy has no typed policy reference".to_owned())?;
     let response = BlobProcessStreamOwnerFactsPullResponse {
         wire_id: BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_ID.to_owned(),
@@ -465,7 +477,9 @@ pub fn resolve_blob_owner_facts(
                     BlobProcessStreamOwnerFactsUnavailableReason::StaleBinding
                 } else {
                     match snapshot.source_admission.as_ref() {
-                        None => BlobProcessStreamOwnerFactsUnavailableReason::SourceReceiptUnavailable,
+                        None => {
+                            BlobProcessStreamOwnerFactsUnavailableReason::SourceReceiptUnavailable
+                        }
                         Some(source)
                             if source.sources.scope_ref != snapshot.binding.scope.scope_ref
                                 || source.sources.generation
@@ -474,8 +488,14 @@ pub fn resolve_blob_owner_facts(
                             BlobProcessStreamOwnerFactsUnavailableReason::SourceReceiptUnavailable
                         }
                         Some(_) => {
-                            let scope = match canonical_current_work_scope_source_receipt(snapshot) {
-                                Ok(value) if value.work_scope_snapshot_sha256 == readback.value_digest => value,
+                            let scope = match canonical_current_work_scope_source_receipt(snapshot)
+                            {
+                                Ok(value)
+                                    if value.work_scope_snapshot_sha256
+                                        == readback.value_digest =>
+                                {
+                                    value
+                                }
                                 _ => {
                                     return unavailable_blob_owner_facts(
                                         request,

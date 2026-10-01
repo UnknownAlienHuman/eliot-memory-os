@@ -500,7 +500,8 @@ fn validate_source_readback_response(
             || process_source_admission_readback_sha256
                 != &request.process_source_admission_readback_sha256
             || source_admission_write_receipt_json != &request.source_admission_write_receipt_json
-            || source_admission_write_receipt_sha256 != &request.source_admission_write_receipt_sha256
+            || source_admission_write_receipt_sha256
+                != &request.source_admission_write_receipt_sha256
         {
             return Err(
                 "Blob source-readback evidence does not match the exact request".to_owned(),

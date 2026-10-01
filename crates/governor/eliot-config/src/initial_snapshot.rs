@@ -178,12 +178,7 @@ pub fn prepare_initial_snapshot_payload_with_blob_policy(
     first_run: &FirstRunDecision,
     blob_process_policy: &BlobProcessPolicyValue,
 ) -> Result<InitialSnapshotPayload, InitialSnapshotError> {
-    prepare_initial_snapshot_payload_inner(
-        identity,
-        privacy,
-        first_run,
-        Some(blob_process_policy),
-    )
+    prepare_initial_snapshot_payload_inner(identity, privacy, first_run, Some(blob_process_policy))
 }
 
 fn prepare_initial_snapshot_payload_inner(

@@ -635,16 +635,17 @@ impl RegisteredStageCommand {
     /// decoder. It checks shape only and never normalizes the admitted bytes.
     fn validate_shape(&self) -> Result<(), ProfileError> {
         validate_text(&self.executable, "stage_command.executable")?;
-        if self.executable.len() > 4_096
-            || self.argv.is_empty()
-            || self.argv.len() > 64
-        {
-            return Err(ProfileError::InvalidText { field: "stage_command.argv" });
+        if self.executable.len() > 4_096 || self.argv.is_empty() || self.argv.len() > 64 {
+            return Err(ProfileError::InvalidText {
+                field: "stage_command.argv",
+            });
         }
         for argument in &self.argv {
             validate_text(argument, "stage_command.argv")?;
             if argument.len() > 4_096 {
-                return Err(ProfileError::InvalidText { field: "stage_command.argv" });
+                return Err(ProfileError::InvalidText {
+                    field: "stage_command.argv",
+                });
             }
         }
         Ok(())
@@ -1248,7 +1249,11 @@ pub fn test_profile() -> Result<InstrumentProfile, ProfileError> {
             )?
             .with_command(RegisteredStageCommand::new(
                 "cargo-nextest".to_owned(),
-                vec!["list".to_owned(), "--message-format".to_owned(), "json".to_owned()],
+                vec![
+                    "list".to_owned(),
+                    "--message-format".to_owned(),
+                    "json".to_owned(),
+                ],
             )?),
             StageDecl::new(
                 "nextest-run".to_owned(),
@@ -1728,7 +1733,9 @@ impl InstrumentRegistry {
     ///
     /// Production denominators are derived from this admitted registry rather
     /// than from a caller-supplied profile-name list.
-    pub fn iter(&self) -> std::collections::btree_map::Values<'_, (String, u64), InstrumentProfile> {
+    pub fn iter(
+        &self,
+    ) -> std::collections::btree_map::Values<'_, (String, u64), InstrumentProfile> {
         self.profiles.values()
     }
 
@@ -2191,7 +2198,10 @@ impl<'a> InstrumentProfileResolver<'a> {
             .topological_order()
             .into_iter()
             .map(|stage| {
-                let spec = self.registry.spec(stage.spec.as_str()).expect("stage spec checked above");
+                let spec = self
+                    .registry
+                    .spec(stage.spec.as_str())
+                    .expect("stage spec checked above");
                 ResolvedStage {
                     stage_id: stage.stage_id.clone(),
                     spec: stage.spec.clone(),
@@ -2199,10 +2209,13 @@ impl<'a> InstrumentProfileResolver<'a> {
                     required: stage.required,
                     external: stage.external,
                     depends_on: stage.depends_on.clone(),
-                    command: stage.command.clone().unwrap_or_else(|| RegisteredStageCommand {
-                        executable: spec.executable.clone(),
-                        argv: spec.verification_command.clone(),
-                    }),
+                    command: stage
+                        .command
+                        .clone()
+                        .unwrap_or_else(|| RegisteredStageCommand {
+                            executable: spec.executable.clone(),
+                            argv: spec.verification_command.clone(),
+                        }),
                 }
             })
             .collect::<Vec<_>>();
@@ -2862,10 +2875,13 @@ impl<'a> ProfileCompiler<'a> {
                 supply_receipt,
                 argument_template: spec.argument_template.clone(),
                 verification_command: spec.verification_command.clone(),
-                command: stage.command.clone().unwrap_or_else(|| RegisteredStageCommand {
-                    executable: spec.executable.clone(),
-                    argv: spec.verification_command.clone(),
-                }),
+                command: stage
+                    .command
+                    .clone()
+                    .unwrap_or_else(|| RegisteredStageCommand {
+                        executable: spec.executable.clone(),
+                        argv: spec.verification_command.clone(),
+                    }),
                 schema: spec.schema.clone(),
                 environment_class: spec.environment_profile.clone(),
                 credential_policy: spec.credential_policy.clone(),

@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 use anyhow::{Context, Result};
+use eliot_config::BlobProcessPolicyValue;
 use eliot_config::first_run::{
     FirstRunAutomation, FirstRunDecision, FirstRunInput, FirstRunRole, RecommendationBoard,
     RouteSelection, apply_automation_update, apply_update, decide_first_run, describe_defaults,
@@ -21,7 +22,6 @@ use eliot_config::first_run::{
 use eliot_config::initial_snapshot::{
     InitialSnapshotIdentity, PrivacyChoice, prepare_initial_snapshot_payload_with_blob_policy,
 };
-use eliot_config::BlobProcessPolicyValue;
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
@@ -365,8 +365,8 @@ pub fn run_setup_initial_config(args: &SetupInitialConfigArgs) -> Result<i32> {
         &decision,
         &blob_process_policy,
     )
-        .map_err(|error| anyhow::anyhow!(error.to_string()))
-        .context("prepare the first signed configuration payload")?;
+    .map_err(|error| anyhow::anyhow!(error.to_string()))
+    .context("prepare the first signed configuration payload")?;
     println!(
         "{}",
         serde_json::json!({

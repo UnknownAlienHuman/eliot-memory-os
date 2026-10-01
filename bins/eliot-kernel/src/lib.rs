@@ -1029,13 +1029,13 @@ fn blob_store_sink_request(
                 capability: capability.clone(),
                 body: Box::new(open_json),
                 owner_facts: owner_facts.clone(),
-                process_source_admission_readback_json:
-                    process_source_admission_readback_json.to_owned(),
-                process_source_admission_readback_sha256:
-                    process_source_admission_readback_sha256.to_owned(),
+                process_source_admission_readback_json: process_source_admission_readback_json
+                    .to_owned(),
+                process_source_admission_readback_sha256: process_source_admission_readback_sha256
+                    .to_owned(),
                 source_admission_write_receipt_json: source_admission_write_receipt_json.to_owned(),
-                source_admission_write_receipt_sha256:
-                    source_admission_write_receipt_sha256.to_owned(),
+                source_admission_write_receipt_sha256: source_admission_write_receipt_sha256
+                    .to_owned(),
                 fence,
                 deadline_ms: *deadline_ms,
             }
@@ -1578,15 +1578,13 @@ impl KernelComposition {
         deadline_ms: u64,
     ) -> Result<eliot_blob_api::wire::BlobProcessStreamOwnerFactsPullResponse, String> {
         use eliot_blob_api::wire::{
+            BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_ID, BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_REVISION,
             BlobProcessStreamOwnerFactsPullOutcome, BlobProcessStreamOwnerFactsPullPurpose,
             BlobProcessStreamOwnerFactsPullRecord, BlobProcessStreamOwnerFactsPullRequest,
-            BlobProcessStreamOwnerFactsPullResponse, BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_ID,
-            BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_REVISION,
+            BlobProcessStreamOwnerFactsPullResponse,
         };
-        use eliot_contracts::{canonical_json_bytes, sha256_hex, TransactionSequence};
-        use eliot_ors::{
-            BLOB_PROCESS_STREAM_ORS_VERSION, BlobProcessStreamOwnerFactsPullState,
-        };
+        use eliot_contracts::{TransactionSequence, canonical_json_bytes, sha256_hex};
+        use eliot_ors::{BLOB_PROCESS_STREAM_ORS_VERSION, BlobProcessStreamOwnerFactsPullState};
         use eliot_receipts::{AuthorityBinding, CausalBinding};
 
         if deadline_ms <= unix_ms() || deadline_ms > grant.expires_at_unix_ms {
@@ -1611,8 +1609,7 @@ impl KernelComposition {
             return Err("retained launch facts do not bind this capability".to_owned());
         }
         let open_binding_json = String::from_utf8(
-            canonical_json_bytes(open_request.binding())
-                .map_err(|error| error.to_string())?,
+            canonical_json_bytes(open_request.binding()).map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
         if sha256_hex(open_binding_json.as_bytes()) != grant.process_binding_sha256
@@ -1629,10 +1626,7 @@ impl KernelComposition {
             "blob-process-source-admission:{}:{}",
             request.capability.reference, request.call_token.reference
         );
-        let owner_update_token_ref = format!(
-            "{}-source-admission",
-            request.call_token.reference
-        );
+        let owner_update_token_ref = format!("{}-source-admission", request.call_token.reference);
         let owner_update_identity = blob_store_request_identity(
             &pull_request,
             &request.capability.reference,
@@ -1662,10 +1656,9 @@ impl KernelComposition {
             )[..32]
         );
         pull_request.purpose = BlobProcessStreamOwnerFactsPullPurpose::OpenAdmission;
-        pull_request.kernel_causal_binding_json = String::from_utf8(
-            canonical_json_bytes(&causal).map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())?;
+        pull_request.kernel_causal_binding_json =
+            String::from_utf8(canonical_json_bytes(&causal).map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?;
         pull_request.kernel_causal_binding_sha256 =
             sha256_hex(pull_request.kernel_causal_binding_json.as_bytes());
         pull_request.outer_request_sha256 = outer_request_sha256;
@@ -1727,7 +1720,9 @@ impl KernelComposition {
                         ..
                     }
                 ) {
-                    return Err("daemon did not persist the exact Pending source admission".to_owned());
+                    return Err(
+                        "daemon did not persist the exact Pending source admission".to_owned()
+                    );
                 }
                 return self
                     .prepare_blob_store_open_context(
@@ -1757,17 +1752,19 @@ impl KernelComposition {
         deadline_ms: u64,
     ) -> Result<eliot_blob_api::wire::BlobProcessStreamOwnerFactsPullResponse, String> {
         use eliot_blob_api::wire::{
+            BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_ID, BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_REVISION,
             BlobProcessStreamOwnerFactsPullOutcome, BlobProcessStreamOwnerFactsPullPurpose,
             BlobProcessStreamOwnerFactsPullRecord, BlobProcessStreamOwnerFactsPullRequest,
-            BlobProcessStreamOwnerFactsPullResponse, BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_ID,
-            BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_REVISION,
+            BlobProcessStreamOwnerFactsPullResponse,
         };
-        use eliot_contracts::{canonical_json_bytes, sha256_hex, TransactionSequence};
+        use eliot_contracts::{TransactionSequence, canonical_json_bytes, sha256_hex};
         use eliot_ors::{BLOB_PROCESS_STREAM_ORS_VERSION, BlobProcessStreamOwnerFactsPullState};
         use eliot_receipts::CausalBinding;
 
         if deadline_ms <= unix_ms() || deadline_ms > grant.expires_at_unix_ms {
-            return Err("Store Open context deadline is outside the retained capability".to_owned());
+            return Err(
+                "Store Open context deadline is outside the retained capability".to_owned(),
+            );
         }
         let (
             process_source_admission_json,
@@ -1787,7 +1784,12 @@ impl KernelComposition {
                 receipt_json.clone(),
                 receipt_sha256.clone(),
             ),
-            _ => return Err("Pending source admission lacks its exact readback and write receipt".to_owned()),
+            _ => {
+                return Err(
+                    "Pending source admission lacks its exact readback and write receipt"
+                        .to_owned(),
+                );
+            }
         };
         if sha256_hex(process_source_admission_json.as_bytes()) != process_source_admission_sha256
             || sha256_hex(source_admission_write_receipt_json.as_bytes())
@@ -1809,26 +1811,28 @@ impl KernelComposition {
                     .unwrap_or_default()
             || receipt.state_fence != admission_request.state_fence
         {
-            return Err("source-admission WriteReceipt does not bind the exact committed update".to_owned());
+            return Err(
+                "source-admission WriteReceipt does not bind the exact committed update".to_owned(),
+            );
         }
-        let receipt_envelope = receipt
-            .envelope
-            .as_ref()
-            .ok_or_else(|| "committed source-admission WriteReceipt lacks its canonical envelope".to_owned())?;
+        let receipt_envelope = receipt.envelope.as_ref().ok_or_else(|| {
+            "committed source-admission WriteReceipt lacks its canonical envelope".to_owned()
+        })?;
         let owner_update_identity: RequestIdentity = serde_json::from_str(
             admission_request
                 .owner_update_identity_json
                 .as_deref()
-                .ok_or_else(|| "Pending source admission lacks its original RequestIdentity".to_owned())?,
+                .ok_or_else(|| {
+                    "Pending source admission lacks its original RequestIdentity".to_owned()
+                })?,
         )
         .map_err(|error| format!("source-admission RequestIdentity is invalid: {error}"))?;
-        owner_update_identity
-            .validate()
-            .map_err(|error| format!("source-admission RequestIdentity failed validation: {error}"))?;
-        let admitted_causal: CausalBinding = serde_json::from_str(
-            &admission_request.kernel_causal_binding_json,
-        )
-        .map_err(|error| format!("source-admission causal binding is invalid: {error}"))?;
+        owner_update_identity.validate().map_err(|error| {
+            format!("source-admission RequestIdentity failed validation: {error}")
+        })?;
+        let admitted_causal: CausalBinding =
+            serde_json::from_str(&admission_request.kernel_causal_binding_json)
+                .map_err(|error| format!("source-admission causal binding is invalid: {error}"))?;
         let admitted_authority: AuthorityBinding = serde_json::from_str(
             &admission_request.kernel_authority_binding_json,
         )
@@ -1842,7 +1846,8 @@ impl KernelComposition {
             || receipt_envelope.core.causal != admitted_causal
             || receipt_envelope.core.authority != admitted_authority
             || receipt_envelope.core.operation.operation_id.as_str() != source_operation_id
-            || receipt_envelope.core.operation.idempotency_key != owner_update_identity.idempotency_key
+            || receipt_envelope.core.operation.idempotency_key
+                != owner_update_identity.idempotency_key
         {
             return Err("source-admission WriteReceipt differs from the original identity or owner bindings".to_owned());
         }
@@ -1861,10 +1866,9 @@ impl KernelComposition {
             parent_receipt_id: Some(receipt_id.clone()),
             predecessor_receipt_ids: vec![receipt_id],
         };
-        let causal_json = String::from_utf8(
-            canonical_json_bytes(&causal).map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())?;
+        let causal_json =
+            String::from_utf8(canonical_json_bytes(&causal).map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?;
         let store_identity = blob_store_request_identity(
             admission_request,
             &request.capability.reference,
@@ -1905,7 +1909,9 @@ impl KernelComposition {
         store_open_request.source_admission_write_receipt_sha256 =
             Some(source_admission_write_receipt_sha256);
         store_open_request.deadline_ms = deadline_ms;
-        store_open_request.validate().map_err(|error| error.to_string())?;
+        store_open_request
+            .validate()
+            .map_err(|error| error.to_string())?;
         let request_json = String::from_utf8(
             canonical_json_bytes(&store_open_request).map_err(|error| error.to_string())?,
         )
@@ -2063,16 +2069,18 @@ impl KernelComposition {
                 };
             }
         };
-        let identity_json = match canonical_json_bytes(&store_identity)
-            .ok()
-            .and_then(|bytes| String::from_utf8(bytes).ok())
-        {
-            Some(value) => value,
-            None => return BlobProcessStreamKernelOutcome::Unavailable {
-                operation_sha256: request.operation_sha256.clone(),
-                reason: eliot_blob_api::wire::BlobProcessStreamUnavailableReason::GrantUnavailable,
-            },
-        };
+        let identity_json =
+            match canonical_json_bytes(&store_identity)
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+            {
+                Some(value) => value,
+                None => return BlobProcessStreamKernelOutcome::Unavailable {
+                    operation_sha256: request.operation_sha256.clone(),
+                    reason:
+                        eliot_blob_api::wire::BlobProcessStreamUnavailableReason::GrantUnavailable,
+                },
+            };
         let operation_projection_json =
             match &request.operation {
                 eliot_blob_api::wire::BlobProcessStreamKernelOperationRequest::SinkOpen {
@@ -2211,15 +2219,16 @@ impl KernelComposition {
                 };
             }
         };
-        let owner_facts: BlobProcessStreamVerifiedOwnerFacts = match serde_json::from_str(owner_facts_json) {
-            Ok(facts) if facts.validate().is_ok() => facts,
-            _ => {
-                mark_unknown(&dispatched);
-                return BlobProcessStreamKernelOutcome::Unknown {
-                    operation_sha256: request.operation_sha256.clone(),
-                };
-            }
-        };
+        let owner_facts: BlobProcessStreamVerifiedOwnerFacts =
+            match serde_json::from_str(owner_facts_json) {
+                Ok(facts) if facts.validate().is_ok() => facts,
+                _ => {
+                    mark_unknown(&dispatched);
+                    return BlobProcessStreamKernelOutcome::Unknown {
+                        operation_sha256: request.operation_sha256.clone(),
+                    };
+                }
+            };
         let process_source_admission_readback = match &effective_pull_response.outcome {
             BlobProcessStreamOwnerFactsPullOutcome::Available {
                 process_source_admission_json: Some(json),

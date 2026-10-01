@@ -4,6 +4,11 @@ use std::{collections::BTreeSet, path::Path};
 
 use eliot_bootstrap::{
     NormativePair,
+    capture::{NormativePairSourceCapture, NormativePairSourceRole},
+    normative::{NormativePairReceiptIdentity, parse_normative_pair_receipt_identity},
+};
+use eliot_bootstrap::{
+    NormativePair,
     normative::{NormativePairReceiptIdentity, parse_normative_pair_receipt_identity},
 };
 use eliot_contracts::{ArtifactId, ClockReading, StateFence, canonical_json_bytes, sha256_hex};
@@ -14,6 +19,7 @@ use eliot_instrument_nextest::{
 };
 use eliot_instrument_rustc::{RUSTC_INSTRUMENT, parse_clippy_jsonl};
 use eliot_instrument_rustfmt::{RUSTFMT_INSTRUMENT, parse_output as parse_rustfmt_output};
+use eliot_module_registry::ModuleCatalogSnapshot;
 use eliot_process::{EnvironmentProjection, ExitDisposition, ExitStatus};
 use eliot_testd_core::{
     EphemeralSourceBytes, InstrumentStageRequest, StageExecutionKind, TestdEvaluationObservation,
@@ -21,12 +27,8 @@ use eliot_testd_core::{
     TestdProviderCatalogLifecycle, TestdSourceObservationRange, TestdStreamDisposition,
     TestdStreamEvidenceBinding, TestdToolObservation,
 };
-use eliot_module_registry::ModuleCatalogSnapshot;
-use eliot_workscope::{GoverningSource, GoverningSourceRole, SourceStatus, WorkScopeBindingSnapshot};
-use eliot_bootstrap::{
-    NormativePair,
-    capture::{NormativePairSourceCapture, NormativePairSourceRole},
-    normative::{NormativePairReceiptIdentity, parse_normative_pair_receipt_identity},
+use eliot_workscope::{
+    GoverningSource, GoverningSourceRole, SourceStatus, WorkScopeBindingSnapshot,
 };
 use thiserror::Error;
 
@@ -146,11 +148,17 @@ impl VerifiedTestdReplayContext {
             .ok_or(ProfileReplayError::StageMismatch { field: "stage_id" })?;
         for (matches, field) in [
             (selected.spec == stage.spec, "spec"),
-            (selected.spec_revision == stage.spec_revision, "spec_revision"),
+            (
+                selected.spec_revision == stage.spec_revision,
+                "spec_revision",
+            ),
             (selected.spec_digest == stage.spec_digest, "spec_digest"),
             (selected.kind == stage.kind, "kind"),
             (selected.parser == stage.parser, "parser"),
-            (selected.parser_generation == stage.parser_generation, "parser_generation"),
+            (
+                selected.parser_generation == stage.parser_generation,
+                "parser_generation",
+            ),
         ] {
             if !matches {
                 return Err(ProfileReplayError::StageMismatch { field });
@@ -159,19 +167,24 @@ impl VerifiedTestdReplayContext {
         let command = stage
             .stage_command
             .as_ref()
-            .ok_or(ProfileReplayError::StageMismatch { field: "stage_command" })?;
+            .ok_or(ProfileReplayError::StageMismatch {
+                field: "stage_command",
+            })?;
         if command.executable != selected.command.executable
             || command.argv != selected.command.argv
             || command.spec_digest != selected.spec_digest
         {
-            return Err(ProfileReplayError::StageMismatch { field: "stage_command" });
+            return Err(ProfileReplayError::StageMismatch {
+                field: "stage_command",
+            });
         }
-        let lifecycle = stage
-            .provider_catalog_lifecycle
-            .as_ref()
-            .ok_or(ProfileReplayError::StageMismatch {
-                field: "provider_catalog_lifecycle",
-            })?;
+        let lifecycle =
+            stage
+                .provider_catalog_lifecycle
+                .as_ref()
+                .ok_or(ProfileReplayError::StageMismatch {
+                    field: "provider_catalog_lifecycle",
+                })?;
         if !lifecycle_matches(lifecycle, &self.lifecycle)
             || lifecycle.state_fence != stage.invocation.request.state_fence
         {
@@ -229,12 +242,11 @@ impl VerifiedTestdReplayContext {
         work_scope_binding_json: &[u8],
         work_scope_binding_sha256: &str,
     ) -> Result<Self, ProfileReplayError> {
-        let readback_json: ModuleCatalogOwnerReadbackJson =
-            decode_canonical_owner_json(
-                catalog_readback_json,
-                catalog_readback_sha256,
-                "Module Catalog owner readback",
-            )?;
+        let readback_json: ModuleCatalogOwnerReadbackJson = decode_canonical_owner_json(
+            catalog_readback_json,
+            catalog_readback_sha256,
+            "Module Catalog owner readback",
+        )?;
         let readback = eliot_module_registry::ModuleCatalogOwnerReadback {
             owner_revision: readback_json.owner_revision,
             snapshot: readback_json.snapshot,
@@ -516,8 +528,7 @@ fn admitted_work_scope_normative_pair(
         || current_capture.architecture.role != NormativePairSourceRole::Architecture
         || current_capture.architecture.source_ref != receipt.architecture_path
         || current_capture.architecture.entry_ref != receipt.architecture_entry_path
-        || current_capture.architecture.compatibility_ref
-            != receipt.architecture_compatibility_path
+        || current_capture.architecture.compatibility_ref != receipt.architecture_compatibility_path
         || current_capture.architecture.content_sha256 != receipt.pair.architecture_sha256
         || current_capture.implementation.role != NormativePairSourceRole::Implementation
         || current_capture.implementation.source_ref != receipt.implementation_path
@@ -1242,7 +1253,7 @@ fn rustc_receipt(
                 parser_revision,
                 error.to_string(),
                 finished_at,
-            )
+            );
         }
     };
     // Clippy's projection deliberately ignores Cargo lifecycle messages.

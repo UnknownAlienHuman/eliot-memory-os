@@ -122,12 +122,11 @@ use eliot_protocol::dreamer_job::{DurableJobResponse, JobState};
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use eliot_testd_core::{
     BUILD_ROOT_DIRECTORY, BuildClass, BuildFingerprint, BuildMode, GovernedWorkEnvelope,
-    InstrumentStageRequest, JobClass,
-    JobState as TestdJobState, JobSubmissionMetadata, KernelProcessAdmissionEvidence,
-    KernelProcessAdmissionProvider, KernelProcessAdmissionRequest, LaneIdentity, ProcessAdmission,
-    ResourceWeight, RetryPolicy, TARGET_LAYOUT_REVISION, TESTD_OWNER_SUBMIT_OPERATION,
-    TESTD_OWNER_SUBMIT_WIRE_VERSION, TargetLayoutBinding, TargetRoots,
-    StageExecutionKind, TestResourceProfile, TestdBlobProcessStreamGrant,
+    InstrumentStageRequest, JobClass, JobState as TestdJobState, JobSubmissionMetadata,
+    KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider, KernelProcessAdmissionRequest,
+    LaneIdentity, ProcessAdmission, ResourceWeight, RetryPolicy, StageExecutionKind,
+    TARGET_LAYOUT_REVISION, TESTD_OWNER_SUBMIT_OPERATION, TESTD_OWNER_SUBMIT_WIRE_VERSION,
+    TargetLayoutBinding, TargetRoots, TestResourceProfile, TestdBlobProcessStreamGrant,
     TestdBlobProcessStreamTokenRef, TestdOwnerSubmitDirective, TestdOwnerSubmitRequest,
     TestdOwnerSubmitResponse, TestdStore, TestdVerifierDispatchBinding, TestdVerifierJobSubmission,
     issue_process_admission, testd_productive_stage_resource_limits, verification_receipt_sha256,
@@ -1619,7 +1618,9 @@ pub(crate) async fn submit_testd_owner_job(
         .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
 
     let stage_command = stage_request.stage_command.as_ref().ok_or_else(|| {
-        DispatchLaunchError::Gate("productive TestD stage has no sealed registered command".to_owned())
+        DispatchLaunchError::Gate(
+            "productive TestD stage has no sealed registered command".to_owned(),
+        )
     })?;
     let (executable_path, executable_sha256) = match stage_command.executable.as_str() {
         "cargo" => (
@@ -1726,30 +1727,30 @@ pub(crate) async fn submit_testd_owner_job(
         ));
     }
     let profile_registry = eliot_instrument_runner::testd_builtin_profile_registry()
-    .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
-    let replay_context = eliot_instrument_runner::VerifiedTestdReplayContext::from_canonical_owner_readback_json(
-        profile_registry,
-        &stream_grant.owner_facts_response.observed_state_fence,
-        owner_projection
-            .module_catalog_owner_readback_json
-            .as_bytes(),
-        &owner_projection.module_catalog_owner_readback_sha256,
-        owner_projection.generation_admission_json.as_bytes(),
-        &owner_projection.generation_admission_sha256,
-        owner_facts.work_scope_binding_json.as_bytes(),
-        &owner_facts.work_scope_binding_sha256,
-    )
-    .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let replay_context =
+        eliot_instrument_runner::VerifiedTestdReplayContext::from_canonical_owner_readback_json(
+            profile_registry,
+            &stream_grant.owner_facts_response.observed_state_fence,
+            owner_projection
+                .module_catalog_owner_readback_json
+                .as_bytes(),
+            &owner_projection.module_catalog_owner_readback_sha256,
+            owner_projection.generation_admission_json.as_bytes(),
+            &owner_projection.generation_admission_sha256,
+            owner_facts.work_scope_binding_json.as_bytes(),
+            &owner_facts.work_scope_binding_sha256,
+        )
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     replay_context
         .validate_registered_stage(stage_request)
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let verified_catalog = replay_context.accepted_catalog_lifecycle();
-    let provider_freshness = stage_request
-        .provider_freshness
-        .as_ref()
-        .ok_or_else(|| DispatchLaunchError::Gate(
+    let provider_freshness = stage_request.provider_freshness.as_ref().ok_or_else(|| {
+        DispatchLaunchError::Gate(
             "productive TestD stage has no provider freshness tuple".to_owned(),
-        ))?;
+        )
+    })?;
     let job_currentness_bytes = canonical_json_bytes(&(
         provider_freshness,
         &verified_catalog,

@@ -58,8 +58,8 @@
 //! external reactor. The production dispatch launch seam owns the runtime
 //! decision when the admitted drive goes live.
 
-use std::future::Future;
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -67,15 +67,15 @@ use std::time::Duration;
 use eliot_contracts::ClockReading;
 use eliot_instrument_api::{ExecutionStatus, KernelProcessAdmissionRequest};
 use eliot_process::{
-    ExitDisposition, ExitStatus, OperationId, ProcessEvidence, ProcessEvidenceSink, ProcessExecutionView,
-    ProcessExecutor, ProcessLifecycle, ProcessRequest, ProcessStreamSinkOpenRequest,
+    ExitDisposition, ExitStatus, OperationId, ProcessEvidence, ProcessEvidenceSink,
+    ProcessExecutionView, ProcessExecutor, ProcessLifecycle, ProcessRequest,
+    ProcessStreamSinkOpenRequest,
 };
 use eliot_testd_core::{
-    EvidenceCollector, JobState, KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider,
-    AsyncProcessStreamSourceReadbackPort, EphemeralSourceBytes, Lease, SourceObservationGitPort,
-    TestJob, TestdError, TestdReadbackContext, TestdSourceObservationRange,
-    TestdStreamEvidenceBinding, TestdToolObservation,
-    TestdSourceObservation, TestdSourceObservationRange, TestdStore, TestdToolObservation,
+    AsyncProcessStreamSourceReadbackPort, EphemeralSourceBytes, EvidenceCollector, JobState,
+    KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider, Lease,
+    SourceObservationGitPort, TestJob, TestdError, TestdReadbackContext, TestdSourceObservation,
+    TestdSourceObservationRange, TestdStore, TestdStreamEvidenceBinding, TestdToolObservation,
     evaluate_testd_verification, issue_process_admission,
 };
 
@@ -161,9 +161,9 @@ impl VerifiedStreamReplayPort for KernelReadbackVerifiedReplay {
         finished_at: ClockReading,
     ) -> Result<eliot_instrument_runner::ProfileReplayReceipt, String> {
         let owner = bytes.replay_owner_readback();
-        owner
-            .validate()
-            .map_err(|error| format!("fresh owner readback failed canonical validation: {error}"))?;
+        owner.validate().map_err(|error| {
+            format!("fresh owner readback failed canonical validation: {error}")
+        })?;
         let owner_facts: eliot_blob_api::wire::BlobProcessStreamVerifiedOwnerFacts =
             serde_json::from_str(&owner.owner_facts_json)
                 .map_err(|error| format!("fresh Kernel owner facts are not typed JSON: {error}"))?;
@@ -205,7 +205,7 @@ impl VerifiedStreamReplayPort for KernelReadbackVerifiedReplay {
         }
         let expected_fence = source.binding.state_fence();
         let profile_registry = eliot_instrument_runner::testd_builtin_profile_registry()
-        .map_err(|error| format!("current closed TestD profile registry refused: {error}"))?;
+            .map_err(|error| format!("current closed TestD profile registry refused: {error}"))?;
         let replay = eliot_instrument_runner::VerifiedTestdReplayContext::from_canonical_owner_readback_json(
             profile_registry,
             expected_fence,
@@ -311,53 +311,54 @@ fn validate_ready_process_source_admission(
         .ready
         .as_ref()
         .ok_or_else(|| "process source admission has no Ready commitment".to_owned())?;
-    let ready_write_receipt: eliot_store_api::WriteReceipt = serde_json::from_str(
-        &owner.source_admission_write_receipt_json,
-    )
-    .map_err(|error| format!("Ready CAS receipt is not a typed Store WriteReceipt: {error}"))?;
+    let ready_write_receipt: eliot_store_api::WriteReceipt =
+        serde_json::from_str(&owner.source_admission_write_receipt_json).map_err(|error| {
+            format!("Ready CAS receipt is not a typed Store WriteReceipt: {error}")
+        })?;
     ready_write_receipt
         .validate()
         .map_err(|error| format!("Ready CAS WriteReceipt failed owner validation: {error}"))?;
     let ready_write_receipt_envelope = ready_write_receipt
         .require_reconciliation_envelope()
-        .map_err(|error| format!("Ready CAS WriteReceipt lacks its committed receipt envelope: {error}"))?;
-    let ready_request_identity: eliot_protocol::RequestIdentity = serde_json::from_str(
-        &ready.ready_request_identity_json,
-    )
-    .map_err(|error| format!("Ready CAS request identity is not typed: {error}"))?;
+        .map_err(|error| {
+            format!("Ready CAS WriteReceipt lacks its committed receipt envelope: {error}")
+        })?;
+    let ready_request_identity: eliot_protocol::RequestIdentity =
+        serde_json::from_str(&ready.ready_request_identity_json)
+            .map_err(|error| format!("Ready CAS request identity is not typed: {error}"))?;
     ready_request_identity
         .validate()
         .map_err(|error| format!("Ready CAS request identity is invalid: {error}"))?;
-    let ready_request_identity_bytes = eliot_contracts::canonical_json_bytes(
-        &ready_request_identity,
-    )
-    .map_err(|error| format!("Ready CAS request identity is not canonical: {error}"))?;
+    let ready_request_identity_bytes =
+        eliot_contracts::canonical_json_bytes(&ready_request_identity)
+            .map_err(|error| format!("Ready CAS request identity is not canonical: {error}"))?;
     if ready_request_identity_bytes != ready.ready_request_identity_json.as_bytes()
         || eliot_testd_core::sha256_hex(&ready_request_identity_bytes)
             != ready.ready_request_identity_sha256
     {
-        return Err("Ready CAS request identity differs from its retained canonical commitment".to_owned());
+        return Err(
+            "Ready CAS request identity differs from its retained canonical commitment".to_owned(),
+        );
     }
     let ready_request_binding = serde_json::to_value(&ready_request_identity.request)
         .map_err(|error| format!("Ready CAS request binding is invalid: {error}"))?;
     let receipt_request_binding = serde_json::to_value(&ready_write_receipt_envelope.core.request)
-    .map_err(|error| format!("Ready CAS receipt request binding is invalid: {error}"))?;
-    let receipt_operation_id = serde_json::to_value(
-        &ready_write_receipt_envelope.core.operation.operation_id,
-    )
-    .map_err(|error| format!("Ready CAS receipt operation identity is invalid: {error}"))?;
-    let receipt_operation_request_id = serde_json::to_value(
-        &ready_write_receipt_envelope.core.operation.request_id,
-    )
-    .map_err(|error| format!("Ready CAS receipt request identity is invalid: {error}"))?;
-    let expected_request_id = serde_json::to_value(
-        &ready_request_identity.request.metadata.request_id,
-    )
-    .map_err(|error| format!("Ready CAS request identity is invalid: {error}"))?;
+        .map_err(|error| format!("Ready CAS receipt request binding is invalid: {error}"))?;
+    let receipt_operation_id =
+        serde_json::to_value(&ready_write_receipt_envelope.core.operation.operation_id)
+            .map_err(|error| format!("Ready CAS receipt operation identity is invalid: {error}"))?;
+    let receipt_operation_request_id =
+        serde_json::to_value(&ready_write_receipt_envelope.core.operation.request_id)
+            .map_err(|error| format!("Ready CAS receipt request identity is invalid: {error}"))?;
+    let expected_request_id =
+        serde_json::to_value(&ready_request_identity.request.metadata.request_id)
+            .map_err(|error| format!("Ready CAS request identity is invalid: {error}"))?;
     let receipt_idempotency_key = &ready_write_receipt_envelope.core.operation.idempotency_key;
     let expected_ready_operation_id = serde_json::Value::String(ready.ready_operation_id.clone());
     let write_receipt_operation_id = serde_json::to_value(&ready_write_receipt.operation_id)
-        .map_err(|error| format!("Ready CAS WriteReceipt operation identity is invalid: {error}"))?;
+        .map_err(|error| {
+            format!("Ready CAS WriteReceipt operation identity is invalid: {error}")
+        })?;
     let ready_receipt: serde_json::Value = serde_json::from_str(&ready.blob_ready_receipt_json)
         .map_err(|error| format!("retained Blob Ready receipt is not JSON: {error}"))?;
     let receipt_id = ready_receipt
@@ -696,7 +697,8 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
     let collector = Arc::new(EvidenceCollector::for_operation(operation_id.clone()));
     let mut process_environment = None;
     if eliot_testd_core::is_productive_testd_profile(&job.invocation.profile) {
-        let (observation, launch_environment) = match observe_tool_identity(&job, permit.request()) {
+        let (observation, launch_environment) = match observe_tool_identity(&job, permit.request())
+        {
             Ok(observation) => observation,
             Err(error) => {
                 finish_unknown(
@@ -820,7 +822,10 @@ fn observe_tool_identity(
             crate::TESTD_ENV_RUSTC_SHA256,
             observation.rustc_sha256.as_str(),
         ),
-        (crate::TESTD_ENV_TOOLCHAIN, observation.selected_toolchain.as_str()),
+        (
+            crate::TESTD_ENV_TOOLCHAIN,
+            observation.selected_toolchain.as_str(),
+        ),
     ] {
         if required(key)? != expected {
             return Err(TestdError::InvalidBinding);
@@ -1163,7 +1168,8 @@ fn build_replay_observed_inputs(
         "CARGO_TARGET_DIR".to_owned(),
         job.target_roots.target_root.clone(),
     );
-    expected_process_environment.insert("CARGO_HOME".to_owned(), job.target_roots.cache_root.clone());
+    expected_process_environment
+        .insert("CARGO_HOME".to_owned(), job.target_roots.cache_root.clone());
     let expected_process_environment = eliot_process::EnvironmentProjection::new(
         expected_process_environment,
         submitted_environment.secret_refs().to_vec(),
@@ -1184,13 +1190,12 @@ fn build_replay_observed_inputs(
             reason: "the admitted Cargo.lock is empty at replay time",
         });
     }
-    let normative_pair_receipt = std::fs::read(
-        Path::new(&job.target_roots.source_root).join("docs/normative-pair.toml"),
-    )
-    .map_err(|_| TestdError::Invalid {
-        field: "provider_currentness.normative_pair",
-        reason: "the exact normative-pair receipt cannot be reread before replay",
-    })?;
+    let normative_pair_receipt =
+        std::fs::read(Path::new(&job.target_roots.source_root).join("docs/normative-pair.toml"))
+            .map_err(|_| TestdError::Invalid {
+                field: "provider_currentness.normative_pair",
+                reason: "the exact normative-pair receipt cannot be reread before replay",
+            })?;
     if normative_pair_receipt.is_empty()
         || normative_pair_receipt.len()
             > eliot_bootstrap::normative::MAX_NORMATIVE_PAIR_RECEIPT_BYTES
@@ -1325,7 +1330,8 @@ fn finish_observed_attempt<E: ProcessExecutor + 'static>(
                             resolved_streams += 1;
                             let Some(replay_context) = replay_context else {
                                 replay_fault.get_or_insert_with(|| {
-                                    "no authenticated current replay context was supplied".to_owned()
+                                    "no authenticated current replay context was supplied"
+                                        .to_owned()
                                 });
                                 continue;
                             };
@@ -1386,7 +1392,8 @@ fn finish_observed_attempt<E: ProcessExecutor + 'static>(
                     reason = error;
                 } else if resolved_streams == 0 {
                     execution = ExecutionStatus::Unknown;
-                    reason = "productive process emitted no readback-bound stream evidence".to_owned();
+                    reason =
+                        "productive process emitted no readback-bound stream evidence".to_owned();
                 }
             }
         }

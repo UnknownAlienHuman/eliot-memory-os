@@ -49,23 +49,23 @@ use eliot_protocol::{
     ClientHello, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolRange,
     ProtocolVersion, RequestIdentity, ServerHello,
 };
-use eliot_store_api::{
-    BackupOperationReconciliation, CAPABILITIES, CanonicalRequestView, CanonicalRestoreBatch,
-    CanonicalSnapshotPort, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS,
-    ExactJsonBytes, IsolatedDestination, IsolatedDestinationReceipt, IsolatedRestorePort,
-    NamedReadRequest, NamedReadResponse, OperationId, OperationIdentity, OrderingHead,
-    OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta,
-    ReservedWriteRequest, RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation,
-    RevisionKey, SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle,
-    SnapshotPage, StoreBackupStatus, StoreBackupStatusOutcome, StoreError, StoreHealth,
-    StoreRecoveryRequest, RecoveryRecordKey, WriteReceipt, WriteReceiptStatus,
-    decode_request_frame_with_authority, generated_operation_manifests,
-    genesis_manifest, verify_canonical_request_hash, OWNER_SNAPSHOT_SCHEMA,
-};
 use eliot_store_api::blob_process_source_admission::{
     BlobProcessSourceAdmissionIdentity, BlobProcessSourceAdmissionPhase,
     BlobProcessSourceAdmissionReadback, blob_process_source_admission_read_request,
     decode_blob_process_source_admission_readback,
+};
+use eliot_store_api::{
+    BackupOperationReconciliation, CAPABILITIES, CanonicalRequestView, CanonicalRestoreBatch,
+    CanonicalSnapshotPort, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS,
+    ExactJsonBytes, IsolatedDestination, IsolatedDestinationReceipt, IsolatedRestorePort,
+    NamedReadRequest, NamedReadResponse, OWNER_SNAPSHOT_SCHEMA, OperationId, OperationIdentity,
+    OrderingHead, OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RecoveryRecordKey,
+    RequestMeta, ReservedWriteRequest, RestoreValidationReceipt, RevisionHead,
+    RevisionHeadExpectation, RevisionKey, SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt,
+    SnapshotHandle, SnapshotPage, StoreBackupStatus, StoreBackupStatusOutcome, StoreError,
+    StoreHealth, StoreRecoveryRequest, WriteReceipt, WriteReceiptStatus,
+    decode_request_frame_with_authority, generated_operation_manifests, genesis_manifest,
+    verify_canonical_request_hash,
 };
 pub use eliot_store_api::{
     ReadinessReceipt, ReadinessStatus, StoreRequest as Request, StoreResponse as Response,
@@ -679,13 +679,13 @@ impl StoreComposition {
             return Err("source-admission readback bytes or digest are not canonical".to_owned());
         }
         let admission = &readback.admission;
-        let retained_facts: BlobProcessStreamVerifiedOwnerFacts = serde_json::from_str(
-            &admission.owner_facts_json,
-        )
-        .map_err(|error| format!("invalid retained source-admission owner facts: {error}"))?;
-        retained_facts
-            .validate()
-            .map_err(|error| format!("retained source-admission owner facts are invalid: {error}"))?;
+        let retained_facts: BlobProcessStreamVerifiedOwnerFacts =
+            serde_json::from_str(&admission.owner_facts_json).map_err(|error| {
+                format!("invalid retained source-admission owner facts: {error}")
+            })?;
+        retained_facts.validate().map_err(|error| {
+            format!("retained source-admission owner facts are invalid: {error}")
+        })?;
         owner_facts
             .validate()
             .map_err(|error| format!("current open owner facts are invalid: {error}"))?;
@@ -704,7 +704,9 @@ impl StoreComposition {
             .map_err(|error| format!("invalid source-admission identity: {error}"))?;
         readback
             .validate_for(&identity_axes, &identity.request.state_fence)
-            .map_err(|error| format!("source-admission fence/identity validation failed: {error}"))?;
+            .map_err(|error| {
+                format!("source-admission fence/identity validation failed: {error}")
+            })?;
         if admission.phase != BlobProcessSourceAdmissionPhase::Pending
             || admission.owner_revision != 1
             || admission.identity != identity_axes
@@ -720,7 +722,8 @@ impl StoreComposition {
             || retained_facts.work_scope_binding_json != owner_facts.work_scope_binding_json
             || retained_facts.work_scope_binding_sha256 != owner_facts.work_scope_binding_sha256
             || retained_facts.matched_guard_receipt_json != owner_facts.matched_guard_receipt_json
-            || retained_facts.matched_guard_receipt_sha256 != owner_facts.matched_guard_receipt_sha256
+            || retained_facts.matched_guard_receipt_sha256
+                != owner_facts.matched_guard_receipt_sha256
             || retained_facts.canonical_source_receipt_json
                 != owner_facts.canonical_source_receipt_json
             || retained_facts.canonical_source_receipt_sha256
@@ -744,18 +747,20 @@ impl StoreComposition {
         supplied_receipt
             .validate()
             .map_err(|error| format!("invalid source-admission WriteReceipt: {error}"))?;
-        let retained_update_identity: RequestIdentity = serde_json::from_str(
-            &admission.pending_request_identity_json,
-        )
-        .map_err(|error| format!("invalid retained owner-update identity: {error}"))?;
+        let retained_update_identity: RequestIdentity =
+            serde_json::from_str(&admission.pending_request_identity_json)
+                .map_err(|error| format!("invalid retained owner-update identity: {error}"))?;
         retained_update_identity
             .validate()
             .map_err(|error| format!("invalid retained owner-update identity: {error}"))?;
         let canonical_receipt = canonical_json_bytes(&supplied_receipt)
             .map_err(|error| format!("canonical source-admission receipt failed: {error}"))?;
-        let receipt_envelope = supplied_receipt
-            .require_reconciliation_envelope()
-            .map_err(|error| format!("source-admission receipt has no reconciliation envelope: {error}"))?;
+        let receipt_envelope =
+            supplied_receipt
+                .require_reconciliation_envelope()
+                .map_err(|error| {
+                    format!("source-admission receipt has no reconciliation envelope: {error}")
+                })?;
         if String::from_utf8(canonical_receipt)
             .map_err(|error| format!("source-admission receipt is not UTF-8: {error}"))?
             != receipt_json
@@ -768,7 +773,9 @@ impl StoreComposition {
             || receipt_envelope.core.operation.idempotency_key
                 != retained_update_identity.idempotency_key
         {
-            return Err("WriteReceipt does not prove the exact committed Pending transition".to_owned());
+            return Err(
+                "WriteReceipt does not prove the exact committed Pending transition".to_owned(),
+            );
         }
 
         // Re-read both durable authorities through this Store composition. The
@@ -790,7 +797,9 @@ impl StoreComposition {
         )
         .map_err(|error| format!("invalid fresh source-admission owner read: {error}"))?;
         if current != readback {
-            return Err("supplied source admission differs from the current Store owner".to_owned());
+            return Err(
+                "supplied source admission differs from the current Store owner".to_owned(),
+            );
         }
 
         let work_scope_key = RecoveryRecordKey::new("owner", "work_scope")
@@ -817,12 +826,15 @@ impl StoreComposition {
         let owner_facts_scope_bytes = owner_facts.work_scope_binding_json.as_bytes();
         let scope_value: serde_json::Value = serde_json::from_slice(&scope_record.payload)
             .map_err(|error| format!("fresh WorkScope row is not valid JSON: {error}"))?;
-        let facts_scope: serde_json::Value = serde_json::from_str(&owner_facts.work_scope_binding_json)
-            .map_err(|error| format!("owner facts WorkScope JSON is invalid: {error}"))?;
-        let facts_source: serde_json::Value = serde_json::from_str(&owner_facts.canonical_source_receipt_json)
-            .map_err(|error| format!("owner facts source receipt JSON is invalid: {error}"))?;
-        let facts_guard: serde_json::Value = serde_json::from_str(&owner_facts.matched_guard_receipt_json)
-            .map_err(|error| format!("owner facts guard receipt JSON is invalid: {error}"))?;
+        let facts_scope: serde_json::Value =
+            serde_json::from_str(&owner_facts.work_scope_binding_json)
+                .map_err(|error| format!("owner facts WorkScope JSON is invalid: {error}"))?;
+        let facts_source: serde_json::Value =
+            serde_json::from_str(&owner_facts.canonical_source_receipt_json)
+                .map_err(|error| format!("owner facts source receipt JSON is invalid: {error}"))?;
+        let facts_guard: serde_json::Value =
+            serde_json::from_str(&owner_facts.matched_guard_receipt_json)
+                .map_err(|error| format!("owner facts guard receipt JSON is invalid: {error}"))?;
         if scope_record.schema != OWNER_SNAPSHOT_SCHEMA
             || scope_record.revision != admission.work_scope_owner_revision
             || scope_record.value_digest != admission.work_scope_owner_digest
@@ -832,7 +844,9 @@ impl StoreComposition {
             || scope_value.get("guard_receipt") != Some(&facts_guard)
             || scope_value.get("source_admission") != Some(&facts_source)
         {
-            return Err("current WorkScope row differs from the admitted owner-facts projection".to_owned());
+            return Err(
+                "current WorkScope row differs from the admitted owner-facts projection".to_owned(),
+            );
         }
         Ok((readback, supplied_receipt))
     }
@@ -999,7 +1013,8 @@ impl StoreComposition {
         capability_ref: &str,
         binding_ref: &str,
         request: ProcessStreamSinkFinalizeRequest,
-    ) -> Result<(ProcessStreamSinkTerminal, Option<String>, Option<String>), ProcessStreamSinkError> {
+    ) -> Result<(ProcessStreamSinkTerminal, Option<String>, Option<String>), ProcessStreamSinkError>
+    {
         let (sink, session) = self
             .blob_sink_handle(transport, identity, capability_ref, binding_ref)
             .await?;
@@ -1010,8 +1025,8 @@ impl StoreComposition {
         let ready = sink.finalized_ready_receipt(&session, &terminal)?;
         let bytes = canonical_json_bytes(&ready)
             .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
-        let json = String::from_utf8(bytes)
-            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let json =
+            String::from_utf8(bytes).map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
         let digest = sha256_hex(json.as_bytes());
         Ok((terminal, Some(json), Some(digest)))
     }

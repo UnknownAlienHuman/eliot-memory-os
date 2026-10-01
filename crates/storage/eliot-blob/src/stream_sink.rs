@@ -509,7 +509,8 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             || source.locator() != format!("{BLOB_SOURCE_LOCATOR_SCHEME}:{}", ready.locator().hash)
         {
             return Err(ProcessStreamSinkError::EvidenceInvariant {
-                reason: "retained Blob ready receipt differs from the exact terminal source".to_owned(),
+                reason: "retained Blob ready receipt differs from the exact terminal source"
+                    .to_owned(),
             });
         }
         Ok(ready.clone())

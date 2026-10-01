@@ -1461,9 +1461,11 @@ pub fn stage_request(
     let route = planned.route.stage();
     let testd_executor_profile = eliot_testd_core::is_testd_executor_profile(&plan.profile);
     if testd_executor_profile {
-        let current_registry = crate::profile_replay::testd_builtin_profile_registry()
-            .map_err(|_| TestdPortError::StageBinding {
-                detail: "current Testd builtin profile registry could not be assembled",
+        let current_registry =
+            crate::profile_replay::testd_builtin_profile_registry().map_err(|_| {
+                TestdPortError::StageBinding {
+                    detail: "current Testd builtin profile registry could not be assembled",
+                }
             })?;
         if plan.registry_generation != current_registry.generation()
             || plan.registry_digest != current_registry.digest()
@@ -1557,12 +1559,10 @@ pub fn stage_request(
         } else {
             StageExecutionKind::Process
         },
-        stage_command: testd_executor_profile.then(|| {
-            eliot_testd_core::InstrumentStageCommand {
-                executable: stage.command.executable.clone(),
-                argv: stage.command.argv.clone(),
-                spec_digest: stage.spec_digest.clone(),
-            }
+        stage_command: testd_executor_profile.then(|| eliot_testd_core::InstrumentStageCommand {
+            executable: stage.command.executable.clone(),
+            argv: stage.command.argv.clone(),
+            spec_digest: stage.spec_digest.clone(),
         }),
     })
 }

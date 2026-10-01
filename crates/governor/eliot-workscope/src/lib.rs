@@ -3336,15 +3336,17 @@ impl WorkScopeSourceAdmission {
     }
 }
 
-fn validate_normative_pair_capture(json: &str, expected_sha256: &str) -> Result<(), WorkScopeError> {
+fn validate_normative_pair_capture(
+    json: &str,
+    expected_sha256: &str,
+) -> Result<(), WorkScopeError> {
     if json.is_empty() {
         return Err(WorkScopeError::InvalidSourceEvidence);
     }
     digest(expected_sha256, "normative_pair_source_capture_sha256")?;
-    let value: serde_json::Value = serde_json::from_str(json)
-        .map_err(|_| WorkScopeError::InvalidSourceEvidence)?;
-    let bytes = canonical_json_bytes(&value)
-        .map_err(|_| WorkScopeError::InvalidSourceEvidence)?;
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|_| WorkScopeError::InvalidSourceEvidence)?;
+    let bytes = canonical_json_bytes(&value).map_err(|_| WorkScopeError::InvalidSourceEvidence)?;
     if !value.is_object() || bytes != json.as_bytes() || sha256_hex(&bytes) != expected_sha256 {
         return Err(WorkScopeError::InvalidSourceEvidence);
     }
@@ -3355,8 +3357,8 @@ fn validate_normative_pair_sources(
     capture_json: &str,
     sources: &GoverningSourceSet,
 ) -> Result<(), WorkScopeError> {
-    let capture: serde_json::Value = serde_json::from_str(capture_json)
-        .map_err(|_| WorkScopeError::InvalidSourceEvidence)?;
+    let capture: serde_json::Value =
+        serde_json::from_str(capture_json).map_err(|_| WorkScopeError::InvalidSourceEvidence)?;
     let receipt_pair = capture
         .get("receipt")
         .and_then(|receipt| receipt.get("pair"))

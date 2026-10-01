@@ -1195,13 +1195,10 @@ impl KernelBlobStreamCallSequence {
 
     /// Reconciles the exact call attached to the durable current token head.
     /// No semantic operation is constructed or dispatched on this path.
-    pub fn reconcile_current_call(
-        &self,
-    ) -> Result<BlobProcessStreamKernelResponse, TestdIpcError> {
-        let _tokens = self
-            .tokens
-            .lock()
-            .map_err(|_| TestdIpcError::Transport("Blob token sequence lock poisoned".to_owned()))?;
+    pub fn reconcile_current_call(&self) -> Result<BlobProcessStreamKernelResponse, TestdIpcError> {
+        let _tokens = self.tokens.lock().map_err(|_| {
+            TestdIpcError::Transport("Blob token sequence lock poisoned".to_owned())
+        })?;
         let record = self
             .store
             .resolve_blob_process_stream_call_at_token_head(
@@ -1229,13 +1226,9 @@ impl KernelBlobStreamCallSequence {
         token: BlobProcessStreamCallToken,
         operation_sha256: &str,
     ) -> Result<BlobProcessStreamKernelResponse, TestdIpcError> {
-        let response = self
-            .client
-            .reconcile(
-                self.capability.clone(),
-                token.clone(),
-                operation_sha256,
-            )?;
+        let response =
+            self.client
+                .reconcile(self.capability.clone(), token.clone(), operation_sha256)?;
         let compact_outcome = match &response.outcome {
             BlobProcessStreamKernelOutcome::Completed { response_ref, .. } => {
                 let response_bytes = canonical_json_bytes(&response)
@@ -1270,10 +1263,9 @@ impl KernelBlobStreamCallSequence {
                     },
                 )
                 .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
-            let mut tokens = self
-                .tokens
-                .lock()
-                .map_err(|_| TestdIpcError::Transport("Blob token sequence lock poisoned".to_owned()))?;
+            let mut tokens = self.tokens.lock().map_err(|_| {
+                TestdIpcError::Transport("Blob token sequence lock poisoned".to_owned())
+            })?;
             tokens.clear();
             tokens.push_back(next_token.clone());
         } else {
@@ -1422,11 +1414,8 @@ impl KernelProcessStreamSinkClient {
         else {
             return Err(ProcessStreamSinkError::ProviderUnavailable);
         };
-        let terminal = terminal_from_projection(
-            &session,
-            TerminalCommand::Finalize(request),
-            *body,
-        )?;
+        let terminal =
+            terminal_from_projection(&session, TerminalCommand::Finalize(request), *body)?;
         validate_finalized_blob_ready_receipt(
             &terminal,
             blob_ready_receipt_json.as_deref(),
@@ -1488,7 +1477,9 @@ impl KernelProcessStreamSinkClient {
         outcome: ProcessStreamSinkUnknownOutcome,
     ) -> Result<ProcessStreamSinkReadback, ProcessStreamSinkError> {
         outcome.validate_against_session(&session)?;
-        let response = self.calls.reconcile_current_call()
+        let response = self
+            .calls
+            .reconcile_current_call()
             .map_err(map_sink_ipc_error)?;
         match response.outcome {
             BlobProcessStreamKernelOutcome::Unknown { .. }
@@ -1501,8 +1492,7 @@ impl KernelProcessStreamSinkClient {
                 original_terminal_request,
                 ..
             } => {
-                let original_terminal =
-                    original_terminal_request.map(|request| *request);
+                let original_terminal = original_terminal_request.map(|request| *request);
                 let owner = match response.operation {
                     BlobProcessStreamOperationResponse::SourceReadback { .. } => {
                         return Err(ProcessStreamSinkError::BindingMismatch);
@@ -1524,11 +1514,8 @@ impl KernelProcessStreamSinkClient {
                         ) {
                             return Err(ProcessStreamSinkError::TerminalIdentityConflict);
                         }
-                        let terminal = terminal_from_retained_operation(
-                            &session,
-                            operation,
-                            *body,
-                        )?;
+                        let terminal =
+                            terminal_from_retained_operation(&session, operation, *body)?;
                         validate_finalized_blob_ready_receipt(
                             &terminal,
                             blob_ready_receipt_json.as_deref(),
@@ -1546,19 +1533,12 @@ impl KernelProcessStreamSinkClient {
                         ) {
                             return Err(ProcessStreamSinkError::TerminalIdentityConflict);
                         }
-                        let terminal = terminal_from_retained_operation(
-                            &session,
-                            operation,
-                            *body,
-                        )?;
+                        let terminal =
+                            terminal_from_retained_operation(&session, operation, *body)?;
                         Ok(ProcessStreamSinkReadback::Terminal { terminal })
                     }
                     ProcessStreamSinkWireResponse::Readback { body } => {
-                        readback_from_projection(
-                            &session,
-                            original_terminal.as_ref(),
-                            *body,
-                        )
+                        readback_from_projection(&session, original_terminal.as_ref(), *body)
                     }
                     ProcessStreamSinkWireResponse::AppendDisposition { body } => {
                         // The exact completed append response is retained by
@@ -1865,8 +1845,8 @@ fn validate_finalized_blob_ready_receipt(
         (true, Some(receipt_json), Some(receipt_sha256)) => {
             let value: serde_json::Value =
                 serde_json::from_str(receipt_json).map_err(|_| sink_invalid())?;
-            let canonical = eliot_contracts::canonical_json_bytes(&value)
-                .map_err(|_| sink_invalid())?;
+            let canonical =
+                eliot_contracts::canonical_json_bytes(&value).map_err(|_| sink_invalid())?;
             if String::from_utf8(canonical.clone()).ok().as_deref() != Some(receipt_json)
                 || sha256_hex(&canonical) != receipt_sha256
             {

@@ -5,9 +5,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod blob_process_policy;
 pub mod initial_snapshot;
 pub mod legacy_capability_import;
-pub mod blob_process_policy;
 
 pub use blob_process_policy::{
     BLOB_PROCESS_POLICY_LITERAL_PREFIX, BLOB_PROCESS_POLICY_SCHEMA,

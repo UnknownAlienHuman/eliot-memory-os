@@ -153,7 +153,9 @@ impl BlobProcessStreamFrameResponse {
         }
         match &self.operation {
             BlobProcessStreamOperationResponse::Sink { response } => response.validate()?,
-            BlobProcessStreamOperationResponse::SourceReadback { response } => response.validate()?,
+            BlobProcessStreamOperationResponse::SourceReadback { response } => {
+                response.validate()?
+            }
         }
         Ok(())
     }
@@ -766,8 +768,12 @@ impl BlobProcessStreamOwnerFactsPullRequest {
                 )?;
                 validate_canonical_owner_json(
                     "owner_update_identity_json",
-                    self.owner_update_identity_json.as_deref().unwrap_or_default(),
-                    self.owner_update_identity_sha256.as_deref().unwrap_or_default(),
+                    self.owner_update_identity_json
+                        .as_deref()
+                        .unwrap_or_default(),
+                    self.owner_update_identity_sha256
+                        .as_deref()
+                        .unwrap_or_default(),
                 )?;
                 validate_canonical_owner_json(
                     "source_admission_write_receipt",
@@ -847,7 +853,9 @@ impl BlobProcessStreamOwnerFactsPullRequest {
             {
                 validate_text(
                     "source_admission_operation_id",
-                    self.source_admission_operation_id.as_deref().unwrap_or_default(),
+                    self.source_admission_operation_id
+                        .as_deref()
+                        .unwrap_or_default(),
                 )?;
                 validate_canonical_owner_json(
                     "open_request_json",
@@ -895,7 +903,9 @@ impl BlobProcessStreamOwnerFactsPullRequest {
             {
                 validate_text(
                     "source_admission_operation_id",
-                    self.source_admission_operation_id.as_deref().unwrap_or_default(),
+                    self.source_admission_operation_id
+                        .as_deref()
+                        .unwrap_or_default(),
                 )?;
                 validate_text(
                     "ready_operation_id",
@@ -917,13 +927,19 @@ impl BlobProcessStreamOwnerFactsPullRequest {
                 )?;
                 validate_canonical_owner_json(
                     "owner_update_identity_json",
-                    self.owner_update_identity_json.as_deref().unwrap_or_default(),
-                    self.owner_update_identity_sha256.as_deref().unwrap_or_default(),
+                    self.owner_update_identity_json
+                        .as_deref()
+                        .unwrap_or_default(),
+                    self.owner_update_identity_sha256
+                        .as_deref()
+                        .unwrap_or_default(),
                 )?;
                 validate_canonical_owner_json(
                     "blob_ready_receipt",
                     self.blob_ready_receipt_json.as_deref().unwrap_or_default(),
-                    self.blob_ready_receipt_sha256.as_deref().unwrap_or_default(),
+                    self.blob_ready_receipt_sha256
+                        .as_deref()
+                        .unwrap_or_default(),
                 )?;
                 validate_digest(
                     "whole_source_sha256",
@@ -1372,10 +1388,8 @@ impl BlobProcessStreamOwnerFactsPullResponse {
                 return Err(WireValidationError::InvalidField("purpose_result"));
             }
             if request.purpose == BlobProcessStreamOwnerFactsPullPurpose::StoreOpen
-                && (process_source_admission_json
-                    != request.source_admission_json.as_ref()
-                    || process_source_admission_sha256
-                        != request.source_admission_sha256.as_ref()
+                && (process_source_admission_json != request.source_admission_json.as_ref()
+                    || process_source_admission_sha256 != request.source_admission_sha256.as_ref()
                     || source_admission_write_receipt_json
                         != request.source_admission_write_receipt_json.as_ref()
                     || source_admission_write_receipt_sha256
@@ -1421,8 +1435,9 @@ impl BlobProcessStreamOwnerFactsPullResponse {
             }
             match (&request.task_id, &owner_facts.task_binding_json) {
                 (Some(task_id), Some(binding_json)) => {
-                    let binding: eliot_receipts::TaskBinding = serde_json::from_str(binding_json)
-                        .map_err(|_| WireValidationError::InvalidField("task_binding"))?;
+                    let binding: eliot_receipts::TaskBinding =
+                        serde_json::from_str(binding_json)
+                            .map_err(|_| WireValidationError::InvalidField("task_binding"))?;
                     if binding.task_id.as_str() != task_id
                         || binding.state_fence != request.state_fence
                     {
@@ -2358,11 +2373,12 @@ impl ProcessStreamSourceReadbackResponse {
             module_catalog_owner_readback_sha256,
             generation_admission_json,
             generation_admission_sha256,
-        process_source_admission_readback_json,
-        process_source_admission_readback_sha256,
-        source_admission_write_receipt_json,
-        source_admission_write_receipt_sha256,
-    } = self else {
+            process_source_admission_readback_json,
+            process_source_admission_readback_sha256,
+            source_admission_write_receipt_json,
+            source_admission_write_receipt_sha256,
+        } = self
+        else {
             return Ok(());
         };
         validate_digest("whole_source_sha256", whole_source_sha256)?;
