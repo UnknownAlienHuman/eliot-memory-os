@@ -152,19 +152,19 @@ pub fn submit_admission_snapshot(
         "snapshot_json".to_owned(),
         Value::String(snapshot_json.clone()),
     )]);
-    let admitted_bytes = decode_instrument_registry_mutation(&parameters)
-        .map_err(|error| ProfileError::Snapshot {
+    let admitted_bytes = decode_instrument_registry_mutation(&parameters).map_err(|error| {
+        ProfileError::Snapshot {
             detail: error.to_string(),
-        })?;
+        }
+    })?;
     let recovered = InstrumentRegistry::recover(&admitted_bytes)?;
-    let recovered_spec =
-        recovered
-            .spec(kind)
-            .ok_or_else(|| ProfileError::UnknownSpec {
-                profile: stage.profile.clone(),
-                stage: stage.stage_id.clone(),
-                spec: kind.to_owned(),
-            })?;
+    let recovered_spec = recovered
+        .spec(kind)
+        .ok_or_else(|| ProfileError::UnknownSpec {
+            profile: stage.profile.clone(),
+            stage: stage.stage_id.clone(),
+            spec: kind.to_owned(),
+        })?;
     if recovered_spec.digest() != stage.spec_digest
         || recovered
             .supply_chain(kind)

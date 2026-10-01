@@ -1230,8 +1230,7 @@ impl StageOrchestrator {
             return InstrumentRun::missing(route, reason);
         }
         if let Some(registry) = live
-            && let Err(error) =
-                submit_admission_snapshot(registry, &planned.stage, &identity)
+            && let Err(error) = submit_admission_snapshot(registry, &planned.stage, &identity)
         {
             return InstrumentRun::missing(route, format!("stage admission refused: {error}"));
         }
