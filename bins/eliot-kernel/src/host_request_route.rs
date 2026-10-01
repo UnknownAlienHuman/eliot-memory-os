@@ -300,6 +300,74 @@ pub(crate) fn is_host_request_operation(operation: &str) -> bool {
     )
 }
 
+impl KernelComposition {
+    /// Returns the exact full EBP identity retained with one admitted
+    /// selected-source HostRequest. ORS intentionally omits Product, Source
+    /// and Clock dimensions, so D1 cannot reconstruct this identity from its
+    /// durable row; after the queue owner loses it, the stage remains
+    /// unavailable until the original complete owner record can resolve it.
+    pub(crate) fn retained_selected_source_parent_identity(
+        &self,
+        operation_id: &str,
+        request_digest: &str,
+    ) -> Result<RequestIdentity, TransportError> {
+        let _transition = self.agent_bridge_transition_read()?;
+        let index = self
+            .host_request_connection_index
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let mut matching = index.values().flatten().filter(|row| {
+            row.operation_id == operation_id
+                && row.request_digest == request_digest
+                && row.source_capture_envelope.is_some()
+        });
+        let row = matching.next().ok_or(TransportError::UnknownRequest)?;
+        if matching.next().is_some() {
+            return Err(TransportError::IdentityConflict);
+        }
+        let envelope = row
+            .source_capture_envelope
+            .as_ref()
+            .ok_or(TransportError::UnknownRequest)?;
+        let invocation = row
+            .source_capture_invocation
+            .as_ref()
+            .ok_or(TransportError::UnknownRequest)?;
+        let identity = row
+            .source_capture_request_identity
+            .as_ref()
+            .ok_or(TransportError::UnknownRequest)?;
+        invocation
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let payload_bytes = eliot_contracts::canonical_json_bytes(invocation)
+            .map_err(|_| TransportError::SessionFenced)?;
+        if envelope.kind != HostRequestKind::SelectedSourceCapture
+            || envelope.envelope_sha256 != request_digest
+            || host_request_operation_id(envelope) != operation_id
+            || envelope.identity.capability != eliot_protocol::SELECTED_SOURCE_CAPTURE_CAPABILITY
+            || envelope.identity.payload_schema_id
+                != eliot_protocol::SELECTED_SOURCE_CAPTURE_PAYLOAD_SCHEMA_ID
+            || eliot_contracts::sha256_hex(&payload_bytes) != envelope.identity.payload_sha256
+            || identity.request.metadata.request_id != envelope.identity.request_id
+            || identity.request.state_fence != envelope.state_fence
+            || identity.idempotency_key != envelope.identity.idempotency_key
+            || identity.cancellation_id != envelope.identity.cancellation_id
+            || identity.deadline_unix_ms != envelope.identity.deadline_unix_ms
+            || identity.request.metadata.session_id.as_ref().map(|value| value.as_str())
+                != envelope.identity.session_id.as_deref()
+            || identity.request.metadata.task_id.as_ref().map(|value| value.as_str())
+                != envelope.identity.task_id.as_deref()
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        Ok(identity.clone())
+    }
+}
+
 /// Returns whether the operation string selects the closed agent-bridge
 /// event-delivery entries (the #2561 subset of [`is_host_request_operation`]).
 pub(crate) fn is_bridge_event_operation(operation: &str) -> bool {
