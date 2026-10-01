@@ -66,12 +66,13 @@ use std::time::Duration;
 use eliot_contracts::ClockReading;
 use eliot_instrument_api::{ExecutionStatus, KernelProcessAdmissionRequest};
 use eliot_process::{
-    ExitDisposition, OperationId, ProcessEvidence, ProcessEvidenceSink, ProcessExecutionView,
+    ExitDisposition, ExitStatus, OperationId, ProcessEvidence, ProcessEvidenceSink, ProcessExecutionView,
     ProcessExecutor, ProcessLifecycle, ProcessRequest,
 };
 use eliot_testd_core::{
     EvidenceCollector, JobState, KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider,
-    Lease, SourceObservationGitPort, TestJob, TestdError,
+    AsyncProcessStreamSourceReadbackPort, EphemeralSourceBytes, Lease, SourceObservationGitPort,
+    TestJob, TestdError, TestdReadbackContext, TestdStreamEvidenceBinding,
     TestdSourceObservation, TestdSourceObservationRange, TestdStore, TestdToolObservation,
     evaluate_testd_verification, issue_process_admission,
 };
@@ -117,12 +118,69 @@ pub struct GovernedContour<'a, E: ?Sized> {
     executor: &'a E,
     /// The same executor, presented as the physical Git port.
     git: Option<&'a dyn SourceObservationGitPort>,
+    /// Stored-source readback port used before immutable terminal evidence is
+    /// written. The port returns only verified ephemeral bytes.
+    readback: Option<&'a dyn AsyncProcessStreamSourceReadbackPort>,
+    /// Independently verified current-registry replay context.
+    replay: Option<&'a dyn VerifiedStreamReplayPort>,
+}
+
+/// Authenticated currentness owner for replaying stored process bytes.
+/// Implementations must source their registries from an accepted live catalog
+/// owner readback, never from the retained stage alone.
+pub(crate) trait VerifiedStreamReplayPort: Send + Sync {
+    /// Replays one exact stored stream under its retained runner stage.
+    fn replay_stream(
+        &self,
+        stage: &eliot_testd_core::InstrumentStageRequest,
+        source: &TestdStreamEvidenceBinding,
+        bytes: &EphemeralSourceBytes,
+        terminal: Option<&ExitStatus>,
+        started_at: ClockReading,
+        finished_at: ClockReading,
+    ) -> Result<eliot_instrument_runner::ProfileReplayReceipt, String>;
 }
 
 impl<'a, E: ?Sized> GovernedContour<'a, E> {
     /// Binds one executor as both the launch contour and the Git port.
     pub const fn new(executor: &'a E, git: Option<&'a dyn SourceObservationGitPort>) -> Self {
-        Self { executor, git }
+        Self {
+            executor,
+            git,
+            readback: None,
+            replay: None,
+        }
+    }
+
+    /// Adds the Kernel-authenticated stored-source reader for productive
+    /// capture. It is awaited outside the collector lock and before finish.
+    pub const fn with_readback_port(
+        executor: &'a E,
+        git: Option<&'a dyn SourceObservationGitPort>,
+        readback: &'a dyn AsyncProcessStreamSourceReadbackPort,
+    ) -> Self {
+        Self {
+            executor,
+            git,
+            readback: Some(readback),
+            replay: None,
+        }
+    }
+
+    /// Binds stored-source readback and independently verified replay into
+    /// one finish path.
+    pub(crate) const fn with_readback_and_replay(
+        executor: &'a E,
+        git: Option<&'a dyn SourceObservationGitPort>,
+        readback: &'a dyn AsyncProcessStreamSourceReadbackPort,
+        replay: &'a dyn VerifiedStreamReplayPort,
+    ) -> Self {
+        Self {
+            executor,
+            git,
+            readback: Some(readback),
+            replay: Some(replay),
+        }
     }
 
     /// The admitted executor that owns the Job Object contour.
@@ -133,6 +191,17 @@ impl<'a, E: ?Sized> GovernedContour<'a, E> {
     /// The same executor presented as the physical Git port.
     pub const fn git(&self) -> Option<&'a dyn SourceObservationGitPort> {
         self.git
+    }
+
+    /// The authenticated immutable-source readback port, when productive
+    /// capture is composed for this attempt.
+    pub const fn readback(&self) -> Option<&'a dyn AsyncProcessStreamSourceReadbackPort> {
+        self.readback
+    }
+
+    /// The authenticated live replay context, when the Kernel supplied one.
+    pub const fn replay(&self) -> Option<&'a dyn VerifiedStreamReplayPort> {
+        self.replay
     }
 }
 
@@ -321,7 +390,7 @@ fn receipt_or_corrupt(
     // records carrying the presented operation; start refuses other sinks.
     let collector = Arc::new(EvidenceCollector::for_operation(operation_id.clone()));
     if eliot_testd_core::is_productive_testd_profile(&job.invocation.profile) {
-        let observation = match observe_tool_identity(permit.request()) {
+        let observation = match observe_tool_identity(&job, permit.request()) {
             Ok(observation) => observation,
             Err(error) => {
                 finish_unknown(
@@ -379,7 +448,39 @@ fn receipt_or_corrupt(
 /// ProcessRequest immediately before the consuming start. The resolver has
 /// already selected cargo/rustc through rustup; this readback binds the
 /// resulting files and nextest executable into the durable receipt.
-fn observe_tool_identity(request: &ProcessRequest) -> Result<TestdToolObservation, TestdError> {
+fn observe_tool_identity(
+    job: &TestJob,
+    request: &ProcessRequest,
+) -> Result<TestdToolObservation, TestdError> {
+    let observation = job
+        .provider_tool_observation
+        .clone()
+        .ok_or(TestdError::Invalid {
+            field: "tool_environment",
+            reason: "productive job has no durable owner-observed tool identities",
+        })?;
+    observation.validate()?;
+    let stage_command = job
+        .stage_request
+        .as_ref()
+        .and_then(|stage| stage.stage_command.as_ref())
+        .ok_or(TestdError::Invalid {
+            field: "stage_request.stage_command",
+            reason: "productive job has no sealed registered command",
+        })?;
+    let (selected_path, selected_sha256) = match stage_command.executable.as_str() {
+        "cargo" => (&observation.cargo_path, &observation.cargo_sha256),
+        "cargo-nextest" => (&observation.nextest_path, &observation.nextest_sha256),
+        _ => {
+            return Err(TestdError::Invalid {
+                field: "stage_request.stage_command.executable",
+                reason: "productive command selector is not admitted",
+            });
+        }
+    };
+    if request.executable() != selected_path || request.executable_sha256() != selected_sha256 {
+        return Err(TestdError::InvalidBinding);
+    }
     let environment = request.environment().non_secret();
     let required = |key: &'static str| {
         environment.get(key).cloned().ok_or(TestdError::Invalid {
@@ -387,23 +488,28 @@ fn observe_tool_identity(request: &ProcessRequest) -> Result<TestdToolObservatio
             reason: "productive process request is missing owner-observed tool identity",
         })
     };
-    let nextest_path = request.executable().to_owned();
-    let nextest_sha256 = request.executable_sha256().to_owned();
-    let cargo_path = required(crate::TESTD_ENV_CARGO)?;
-    let cargo_sha256 = required(crate::TESTD_ENV_CARGO_SHA256)?;
-    let rustc_path = required(crate::TESTD_ENV_RUSTC)?;
-    let rustc_sha256 = required(crate::TESTD_ENV_RUSTC_SHA256)?;
-    let selected_toolchain = required(crate::TESTD_ENV_TOOLCHAIN)?;
-    let observation = TestdToolObservation {
-        nextest_path,
-        nextest_sha256,
-        cargo_path,
-        cargo_sha256,
-        rustc_path,
-        rustc_sha256,
-        selected_toolchain,
-    };
-    observation.validate()?;
+    for (key, expected) in [
+        (crate::TESTD_ENV_NEXTEST, observation.nextest_path.as_str()),
+        (
+            crate::TESTD_ENV_NEXTEST_SHA256,
+            observation.nextest_sha256.as_str(),
+        ),
+        (crate::TESTD_ENV_CARGO, observation.cargo_path.as_str()),
+        (
+            crate::TESTD_ENV_CARGO_SHA256,
+            observation.cargo_sha256.as_str(),
+        ),
+        (crate::TESTD_ENV_RUSTC, observation.rustc_path.as_str()),
+        (
+            crate::TESTD_ENV_RUSTC_SHA256,
+            observation.rustc_sha256.as_str(),
+        ),
+        (crate::TESTD_ENV_TOOLCHAIN, observation.selected_toolchain.as_str()),
+    ] {
+        if required(key)? != expected {
+            return Err(TestdError::InvalidBinding);
+        }
+    }
     for (path, expected) in [
         (
             observation.nextest_path.as_str(),
@@ -529,6 +635,9 @@ impl SupervisionInput {
 
 struct SupervisionOutcome {
     execution: ExecutionStatus,
+    /// Exact physical terminal observation from the admitted executor. This
+    /// never substitutes for parser/evaluator evidence.
+    exit_status: Option<ExitStatus>,
     reason: String,
     reconcile_note: Option<String>,
     durable_cancelled: bool,
@@ -552,6 +661,7 @@ fn supervise_operation<E: ProcessExecutor + 'static>(
         lease_ms,
     } = input;
     let mut execution = ExecutionStatus::Unknown;
+    let mut exit_status = None;
     let mut reason =
         "terminal observation did not prove an outcome; reconcile by exact identity".to_owned();
     let mut reconcile_note = None;
@@ -589,6 +699,7 @@ fn supervise_operation<E: ProcessExecutor + 'static>(
         match block_on_one_shot(executor.inspect(operation_id.clone())) {
             Ok(view) if view.lifecycle().is_terminal() => {
                 execution = classify_observation(&view);
+                exit_status = view.exit().cloned();
                 reason = observation_reason(&view).to_owned();
                 // A terminal inspect is only a lifecycle observation. The
                 // executor's reconcile owner joins the real stdout/stderr
@@ -633,6 +744,7 @@ fn supervise_operation<E: ProcessExecutor + 'static>(
 
     Ok(SupervisionOutcome {
         execution,
+        exit_status,
         reason,
         reconcile_note,
         durable_cancelled,
@@ -729,6 +841,7 @@ fn finish_observed_attempt<E: ProcessExecutor + 'static>(
     let FinishInputs { claimed, observed } = *inputs;
     let SupervisionOutcome {
         mut execution,
+        exit_status,
         mut reason,
         reconcile_note,
         ..
@@ -738,6 +851,94 @@ fn finish_observed_attempt<E: ProcessExecutor + 'static>(
         observe_terminal_source(observed, contour, &mut execution);
     if let Some(message) = observation_fault {
         reason = message;
+    }
+    if let Some(port) = contour.readback() {
+        let context = TestdReadbackContext {
+            job_id: claimed.job_id.clone(),
+            invocation_id: claimed.invocation.request.request_id.clone(),
+            expected_operation_id: claimed.process.operation_id.clone(),
+            expected_process_tree_id: claimed.process.process_tree_id.clone(),
+            expected_process_generation: claimed.process.generation,
+            expected_authority_epoch: claimed.process.authority_epoch.clone(),
+            max_bytes: eliot_blob_api::BLOB_MAX_PLAINTEXT_BYTES as u64,
+            deadline_ms: current_clock_ms().saturating_add(30_000),
+        };
+        match block_on_one_shot(collector.resolve_typed_sources_async(port, &context)) {
+            Err(error) => {
+                execution = ExecutionStatus::Unknown;
+                reason = format!("stored-source readback did not complete safely: {error}");
+            }
+            Ok(groups) => {
+                let mut resolved_streams = 0usize;
+                let mut replay_fault = None;
+                let replay_context = contour.replay();
+                let stage = claimed.stage_request.as_ref();
+                for resolution in groups.into_iter().flatten() {
+                    match resolution {
+                        eliot_testd_core::TestdStreamResolution::Resolved {
+                            source, bytes, ..
+                        } => {
+                            resolved_streams += 1;
+                            let Some(replay_context) = replay_context else {
+                                replay_fault.get_or_insert_with(|| {
+                                    "no authenticated current replay context was supplied".to_owned()
+                                });
+                                continue;
+                            };
+                            let Some(stage) = stage else {
+                                replay_fault.get_or_insert_with(|| {
+                                    "the productive job has no retained runner stage".to_owned()
+                                });
+                                continue;
+                            };
+                            let replayed = match replay_context.replay_stream(
+                                stage,
+                                &source,
+                                &bytes,
+                                exit_status.as_ref(),
+                                started_at,
+                                finished_at,
+                            ) {
+                                Ok(replayed) => replayed,
+                                Err(error) => {
+                                    replay_fault.get_or_insert_with(|| {
+                                        format!("current parser/evaluator replay refused: {error}")
+                                    });
+                                    continue;
+                                }
+                            };
+                            let Some(parsing) = replayed.parsing.as_ref() else {
+                                replay_fault.get_or_insert_with(|| {
+                                    "replay returned no executed parser observation".to_owned()
+                                });
+                                continue;
+                            };
+                            if let Err(error) = collector.apply_stream_replay(
+                                &source,
+                                parsing,
+                                replayed.evaluation.as_ref(),
+                            ) {
+                                replay_fault.get_or_insert_with(|| {
+                                    format!("replay evidence no longer matches its stream: {error}")
+                                });
+                            }
+                        }
+                        eliot_testd_core::TestdStreamResolution::Refused { error, .. } => {
+                            replay_fault.get_or_insert_with(|| {
+                                format!("stored-source readback refused a stream: {error}")
+                            });
+                        }
+                    }
+                }
+                if let Some(error) = replay_fault {
+                    execution = ExecutionStatus::Unknown;
+                    reason = error;
+                } else if resolved_streams == 0 {
+                    execution = ExecutionStatus::Unknown;
+                    reason = "productive process emitted no readback-bound stream evidence".to_owned();
+                }
+            }
+        }
     }
     let mut receipt =
         collector.verification_receipt_at(claimed, execution, started_at, finished_at);
@@ -1039,4 +1240,3 @@ pub(crate) fn block_on_one_shot<F: Future>(future: F) -> F::Output {
         }
     }
 }
-

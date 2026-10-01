@@ -47,23 +47,33 @@
 //! composed Kernel advertises the exact testd wire. The Drive path below
 //! already derives its executable binding from the admitted profile registry.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_cli::kernel_client::{KernelClient, KernelClientError};
 use eliot_blob_api::wire::{
-    BlobProcessStreamCallToken, BlobProcessStreamFrameRequest,
+    BlobProcessStreamCallToken, BlobProcessStreamKernelOperationRequest,
     BlobProcessStreamKernelRequest, BlobProcessStreamKernelResponse,
-    ProcessStreamSinkCapabilityRef,
+    BlobProcessStreamKernelOutcome, BlobProcessStreamOperationResponse,
+    ProcessStreamSinkBindingRef, ProcessStreamSinkCapabilityRef, ProcessStreamSinkWireResponse,
 };
 use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
 use eliot_instrument_api::{InstrumentInvocation, InstrumentKind};
 use eliot_process::{ProcessEvidenceSink, ProcessExecutionError, ProcessExecutor, ProcessRequest};
+use eliot_process::{
+    ProcessStreamEvidence, ProcessStreamSinkAbortRequest, ProcessStreamSinkAppend,
+    ProcessStreamSinkAppendDisposition, ProcessStreamSinkClient, ProcessStreamSinkError,
+    ProcessStreamSinkFinalizeRequest, ProcessStreamSinkFuture, ProcessStreamSinkOpenRequest,
+    ProcessStreamSinkReadback, ProcessStreamSinkSession, ProcessStreamSinkSessionView,
+    ProcessStreamSinkState, ProcessStreamSinkTerminal, ProcessStreamSinkUnknownOutcome,
+};
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use eliot_testd_core::{
     KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider, KernelProcessAdmissionRequest,
-    TestJob, TestdError, TestdTerminalCompletionNotice, TestdVerifierDispatchBinding,
+    TestJob, TestdBlobProcessStreamTokenRef, TestdError, TestdTerminalCompletionNotice,
+    TestdVerifierDispatchBinding,
     verification_receipt_sha256,
 };
 use serde::{Deserialize, Serialize};
@@ -615,7 +625,7 @@ struct RetainedTestdAdmission {
 /// idempotent intent check against the retained admission. It mints no
 /// permit, builds no [`ProcessRequest`], and executes nothing.
 pub struct KernelTestdIpcClient {
-    client: KernelClient,
+    client: Arc<Mutex<KernelClient>>,
     #[allow(
         dead_code,
         reason = "dispatch contour retains the live epoch for the lineage-aware binding once the delivery seam lands"
@@ -643,7 +653,7 @@ impl KernelTestdIpcClient {
         require_health_open(&health)?;
         let live_epoch = parse_live_epoch(&health)?;
         Ok(Self {
-            client,
+            client: Arc::new(Mutex::new(client)),
             live_epoch: Some(live_epoch),
             retained: None,
         })
@@ -664,29 +674,19 @@ impl KernelTestdIpcClient {
         &mut self,
         capability: ProcessStreamSinkCapabilityRef,
         call_token: BlobProcessStreamCallToken,
-        operation: BlobProcessStreamFrameRequest,
+        operation: BlobProcessStreamKernelOperationRequest,
         job_id: &str,
     ) -> Result<BlobProcessStreamKernelResponse, TestdIpcError> {
-        let request = BlobProcessStreamKernelRequest::new(capability, call_token, operation)
-            .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
-        let op_digest = request.operation_sha256.clone();
-        let response = self
-            .client
-            .blob_process_stream_exchange(request.clone())
-            .map_err(|error| match error {
-                KernelClientError::UnknownOutcome(_) => TestdIpcError::UnknownOutcome {
-                    job_id: job_id.to_owned(),
-                    request_digest: op_digest.clone(),
-                },
-                other => TestdIpcError::Transport(other.to_string()),
-            })?;
-        response
-            .validate_for_request(&request)
-            .map_err(|_| TestdIpcError::UnknownOutcome {
-                job_id: job_id.to_owned(),
-                request_digest: op_digest,
-            })?;
-        Ok(response)
+        self.blob_stream_client()
+            .exchange(capability, call_token, operation, job_id)
+    }
+
+    /// Returns a cloneable handle to this already-authenticated Kernel session
+    /// for the concurrent stdout/stderr sink and readback adapters.
+    pub fn blob_stream_client(&self) -> KernelTestdBlobStreamClient {
+        KernelTestdBlobStreamClient {
+            client: self.client.clone(),
+        }
     }
 
     /// Sends the immutable terminal receipt reference through the existing
@@ -727,18 +727,22 @@ impl KernelTestdIpcClient {
                     request_digest: request.request_digest.clone(),
                 });
             }
-            self.client.set_request_identity(identity.clone());
             let payload = serde_json::json!({"request": &request});
-            let value = self
-                .client
-                .transact_json(TESTD_TERMINAL_COMPLETION_OPERATION, payload)
-                .map_err(|error| match error {
-                    KernelClientError::UnknownOutcome(_) => TestdIpcError::UnknownOutcome {
-                        job_id: notice.job_id.clone(),
-                        request_digest: request.request_digest.clone(),
-                    },
-                    other => TestdIpcError::Transport(other.to_string()),
+            let value = {
+                let mut client = self.client.lock().map_err(|_| {
+                    TestdIpcError::Transport("Kernel client lock poisoned".to_owned())
                 })?;
+                client.set_request_identity(identity.clone());
+                client
+                    .transact_json(TESTD_TERMINAL_COMPLETION_OPERATION, payload)
+                    .map_err(|error| match error {
+                        KernelClientError::UnknownOutcome(_) => TestdIpcError::UnknownOutcome {
+                            job_id: notice.job_id.clone(),
+                            request_digest: request.request_digest.clone(),
+                        },
+                        other => TestdIpcError::Transport(other.to_string()),
+                    })?
+            };
             let response: TestdTerminalCompletionResponse = serde_json::from_value(value)
                 .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
             match response {
@@ -880,6 +884,629 @@ impl KernelTestdIpcClient {
             invocation_id: invocation_id.to_owned(),
             invocation_digest: admission.invocation_digest.clone(),
         });
+    }
+}
+
+/// Cloneable handle for the single authenticated Kernel session shared by
+/// concurrent process-stream persistence pumps.
+#[derive(Clone)]
+pub struct KernelTestdBlobStreamClient {
+    client: Arc<Mutex<KernelClient>>,
+}
+
+impl KernelTestdBlobStreamClient {
+    /// Exchanges one exact closed capability operation, consuming the
+    /// supplied one-use token and preserving unknown outcomes without retry.
+    pub fn exchange(
+        &self,
+        capability: ProcessStreamSinkCapabilityRef,
+        call_token: BlobProcessStreamCallToken,
+        operation: BlobProcessStreamKernelOperationRequest,
+        job_id: &str,
+    ) -> Result<BlobProcessStreamKernelResponse, TestdIpcError> {
+        let request = BlobProcessStreamKernelRequest::new(capability, call_token, operation)
+            .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+        let op_digest = request.operation_sha256.clone();
+        let response = self
+            .client
+            .lock()
+            .map_err(|_| TestdIpcError::Transport("Kernel client lock poisoned".to_owned()))?
+            .blob_process_stream_exchange(request.clone())
+            .map_err(|error| match error {
+                KernelClientError::UnknownOutcome(_) => TestdIpcError::UnknownOutcome {
+                    job_id: job_id.to_owned(),
+                    request_digest: op_digest.clone(),
+                },
+                other => TestdIpcError::Transport(other.to_string()),
+            })?;
+        response
+            .validate_for_request(&request)
+            .map_err(|_| TestdIpcError::UnknownOutcome {
+                job_id: job_id.to_owned(),
+                request_digest: op_digest,
+            })?;
+        Ok(response)
+    }
+}
+
+/// A bounded one-use token sequence shared by the sink and source-readback
+/// adapters for one job. Tokens are consumed before a call and never put back,
+/// including when transport outcome is unknown.
+#[derive(Clone)]
+pub struct KernelBlobStreamCallSequence {
+    client: KernelTestdBlobStreamClient,
+    capability: ProcessStreamSinkCapabilityRef,
+    tokens: Arc<Mutex<VecDeque<BlobProcessStreamCallToken>>>,
+    job_id: String,
+    grant_deadline_ms: u64,
+}
+
+impl KernelBlobStreamCallSequence {
+    /// Binds the authenticated session to the exact material projection after
+    /// the caller has compared it with the durable TestdStore grant.
+    pub fn new(
+        client: KernelTestdBlobStreamClient,
+        capability_ref: &str,
+        tokens: &[TestdBlobProcessStreamTokenRef],
+        job_id: &str,
+        grant_deadline_ms: u64,
+    ) -> Result<Self, TestdIpcError> {
+        let capability = ProcessStreamSinkCapabilityRef {
+            reference: capability_ref.to_owned(),
+        };
+        capability
+            .validate()
+            .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+        if tokens.is_empty() || tokens.len() > 8_336 || grant_deadline_ms == 0 {
+            return Err(TestdIpcError::Contract(
+                "Blob process-stream grant has no bounded token sequence".to_owned(),
+            ));
+        }
+        let mut values = VecDeque::with_capacity(tokens.len());
+        for (index, token) in tokens.iter().enumerate() {
+            if token.ordinal as usize != index + 1
+                || token.reference.trim().is_empty()
+                || token.reference.len() > 128
+                || token.reference.chars().any(char::is_control)
+                || tokens[..index]
+                    .iter()
+                    .any(|previous| previous.reference == token.reference)
+            {
+                return Err(TestdIpcError::Contract(
+                    "Blob call tokens are malformed or out of sequence".to_owned(),
+                ));
+            }
+            values.push_back(BlobProcessStreamCallToken {
+                reference: token.reference.clone(),
+                ordinal: token.ordinal,
+            });
+        }
+        Ok(Self {
+            client,
+            capability,
+            tokens: Arc::new(Mutex::new(values)),
+            job_id: job_id.to_owned(),
+            grant_deadline_ms,
+        })
+    }
+
+    /// Derives a short operation deadline no later than the Kernel-issued
+    /// launch-grant expiry.
+    pub fn deadline_for_budget(&self, budget_ms: u64) -> Result<u64, TestdIpcError> {
+        let now = unix_ms();
+        let deadline = now
+            .saturating_add(budget_ms.max(1))
+            .min(self.grant_deadline_ms);
+        if deadline <= now {
+            return Err(TestdIpcError::Transport(
+                "Kernel-issued Blob capability has expired".to_owned(),
+            ));
+        }
+        Ok(deadline)
+    }
+
+    /// Sends one validated semantic operation with its next distinct owner
+    /// token. No transport, Unknown, or Unavailable result is retried.
+    pub fn exchange(
+        &self,
+        operation: BlobProcessStreamKernelOperationRequest,
+    ) -> Result<BlobProcessStreamKernelResponse, TestdIpcError> {
+        operation
+            .validate()
+            .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+        let deadline_ms = match &operation {
+            BlobProcessStreamKernelOperationRequest::SinkOpen { deadline_ms, .. }
+            | BlobProcessStreamKernelOperationRequest::SinkAppend { deadline_ms, .. }
+            | BlobProcessStreamKernelOperationRequest::SinkFinalize { deadline_ms, .. }
+            | BlobProcessStreamKernelOperationRequest::SinkAbort { deadline_ms, .. }
+            | BlobProcessStreamKernelOperationRequest::SinkReadback { deadline_ms, .. }
+            | BlobProcessStreamKernelOperationRequest::SinkReconcile { deadline_ms, .. } => {
+                *deadline_ms
+            }
+            BlobProcessStreamKernelOperationRequest::SourceReadback { request } => {
+                request.deadline_ms
+            }
+        };
+        if deadline_ms > self.grant_deadline_ms || unix_ms() >= deadline_ms {
+            return Err(TestdIpcError::Transport(
+                "Blob operation deadline exceeds its Kernel-issued grant".to_owned(),
+            ));
+        }
+        let token = self
+            .tokens
+            .lock()
+            .map_err(|_| TestdIpcError::Transport("Blob token sequence lock poisoned".to_owned()))?
+            .pop_front()
+            .ok_or_else(|| TestdIpcError::Transport("Blob call token sequence exhausted".to_owned()))?;
+        self.client.exchange(
+            self.capability.clone(),
+            token,
+            operation,
+            &self.job_id,
+        )
+    }
+}
+
+/// Authenticated provider-neutral process-stream sink backed by the Kernel's
+/// opaque capability and one-use call-token sequence.
+pub struct KernelProcessStreamSinkClient {
+    calls: KernelBlobStreamCallSequence,
+    /// Exact Store-issued binding references returned by Open, retained only
+    /// as a bounded live-session optimization. Restart recovery resolves the
+    /// original persisted intent through the Kernel owner path.
+    bindings: Mutex<BTreeMap<String, ProcessStreamSinkBindingRef>>,
+}
+
+impl KernelProcessStreamSinkClient {
+    /// Uses the same authenticated session and retained one-use token sequence
+    /// as source readback.
+    pub fn new(calls: KernelBlobStreamCallSequence) -> Self {
+        Self {
+            calls,
+            bindings: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn open_sync(
+        &self,
+        request: ProcessStreamSinkOpenRequest,
+    ) -> Result<ProcessStreamSinkSession, ProcessStreamSinkError> {
+        request.validate()?;
+        let body = Box::new(serde_json::to_value(&request).map_err(|_| sink_invalid())?);
+        let deadline_ms = self.calls.deadline_for_budget(5_000).map_err(map_sink_ipc_error)?;
+        let response = self
+            .calls
+            .exchange(BlobProcessStreamKernelOperationRequest::SinkOpen {
+                body,
+                deadline_ms,
+            })
+            .map_err(map_sink_ipc_error)?;
+        let owner = completed_sink_response(response)?;
+        let ProcessStreamSinkWireResponse::Opened { binding } = owner else {
+            return Err(ProcessStreamSinkError::ProviderUnavailable);
+        };
+        let session = ProcessStreamSinkSession::from_open_request(request)?;
+        ensure_binding_ref(&binding, &session)?;
+        let mut bindings = self
+            .bindings
+            .lock()
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        if bindings.len() >= 2 && !bindings.contains_key(session.session_id().as_str()) {
+            return Err(ProcessStreamSinkError::ProviderUnavailable);
+        }
+        bindings.insert(session.session_id().as_str().to_owned(), binding);
+        Ok(session)
+    }
+
+    fn append_sync(
+        &self,
+        session: ProcessStreamSinkSession,
+        request: ProcessStreamSinkAppend,
+    ) -> Result<ProcessStreamSinkAppendDisposition, ProcessStreamSinkError> {
+        session.validate_append(&request)?;
+        let expected_sequence = request
+            .sequence()
+            .checked_add(1)
+            .ok_or(ProcessStreamSinkError::InvalidBinding)?;
+        let expected_offset = request
+            .offset()
+            .checked_add(request.byte_length())
+            .ok_or(ProcessStreamSinkError::InvalidBinding)?;
+        let operation = BlobProcessStreamKernelOperationRequest::SinkAppend {
+            binding: self.binding_for_session(&session)?,
+            body: Box::new(serde_json::to_value(&request).map_err(|_| sink_invalid())?),
+            deadline_ms: self
+                .calls
+                .deadline_for_budget(request.wait_budget_ms())
+                .map_err(map_sink_ipc_error)?,
+        };
+        let owner = completed_sink_response(
+            self.calls.exchange(operation).map_err(map_sink_ipc_error)?,
+        )?;
+        let ProcessStreamSinkWireResponse::AppendDisposition { body } = owner else {
+            return Err(ProcessStreamSinkError::ProviderUnavailable);
+        };
+        let disposition: ProcessStreamSinkAppendDisposition =
+            serde_json::from_value(*body).map_err(|_| sink_invalid())?;
+        match &disposition {
+            ProcessStreamSinkAppendDisposition::Accepted {
+                next_sequence,
+                next_offset,
+            }
+            | ProcessStreamSinkAppendDisposition::Replayed {
+                next_sequence,
+                next_offset,
+            } if *next_sequence == expected_sequence && *next_offset == expected_offset => {
+                Ok(disposition)
+            }
+            ProcessStreamSinkAppendDisposition::Accepted { .. }
+            | ProcessStreamSinkAppendDisposition::Replayed { .. } => {
+                Err(ProcessStreamSinkError::InvalidBinding)
+            }
+            other => Ok(other),
+        }
+    }
+
+    fn finalize_sync(
+        &self,
+        session: ProcessStreamSinkSession,
+        request: ProcessStreamSinkFinalizeRequest,
+    ) -> Result<ProcessStreamSinkTerminal, ProcessStreamSinkError> {
+        session.validate_finalize(&request)?;
+        let operation = BlobProcessStreamKernelOperationRequest::SinkFinalize {
+            binding: self.binding_for_session(&session)?,
+            body: Box::new(serde_json::to_value(&request).map_err(|_| sink_invalid())?),
+            deadline_ms: self
+                .calls
+                .deadline_for_budget(request.wait_budget_ms())
+                .map_err(map_sink_ipc_error)?,
+        };
+        let response = self
+            .calls
+            .exchange(operation.clone())
+            .map_err(map_sink_ipc_error)?;
+        let (owner, original_terminal) = completed_sink_response_with_terminal(response)?;
+        if original_terminal.as_ref() != Some(&operation) {
+            return Err(ProcessStreamSinkError::ProviderUnavailable);
+        }
+        let ProcessStreamSinkWireResponse::Finalized { body } = owner else {
+            return Err(ProcessStreamSinkError::ProviderUnavailable);
+        };
+        terminal_from_projection(&session, TerminalCommand::Finalize(request), *body)
+    }
+
+    fn abort_sync(
+        &self,
+        session: ProcessStreamSinkSession,
+        request: ProcessStreamSinkAbortRequest,
+    ) -> Result<ProcessStreamSinkTerminal, ProcessStreamSinkError> {
+        session.validate_abort(&request)?;
+        let operation = BlobProcessStreamKernelOperationRequest::SinkAbort {
+            binding: self.binding_for_session(&session)?,
+            body: Box::new(serde_json::to_value(&request).map_err(|_| sink_invalid())?),
+            deadline_ms: self
+                .calls
+                .deadline_for_budget(request.wait_budget_ms())
+                .map_err(map_sink_ipc_error)?,
+        };
+        let response = self
+            .calls
+            .exchange(operation.clone())
+            .map_err(map_sink_ipc_error)?;
+        let (owner, original_terminal) = completed_sink_response_with_terminal(response)?;
+        if original_terminal.as_ref() != Some(&operation) {
+            return Err(ProcessStreamSinkError::ProviderUnavailable);
+        }
+        let ProcessStreamSinkWireResponse::Aborted { body } = owner else {
+            return Err(ProcessStreamSinkError::ProviderUnavailable);
+        };
+        terminal_from_projection(&session, TerminalCommand::Abort(request), *body)
+    }
+
+    fn readback_sync(
+        &self,
+        session: ProcessStreamSinkSession,
+    ) -> Result<ProcessStreamSinkReadback, ProcessStreamSinkError> {
+        let operation = BlobProcessStreamKernelOperationRequest::SinkReadback {
+            binding: self.binding_for_session(&session)?,
+            deadline_ms: self.calls.deadline_for_budget(2_000).map_err(map_sink_ipc_error)?,
+        };
+        let response = self
+            .calls
+            .exchange(operation)
+            .map_err(map_sink_ipc_error)?;
+        let (owner, original_terminal) = completed_sink_response_with_terminal(response)?;
+        let ProcessStreamSinkWireResponse::Readback { body } = owner else {
+            return Err(ProcessStreamSinkError::ProviderUnavailable);
+        };
+        readback_from_projection(&session, original_terminal.as_ref(), *body)
+    }
+
+    fn reconcile_sync(
+        &self,
+        session: ProcessStreamSinkSession,
+        outcome: ProcessStreamSinkUnknownOutcome,
+    ) -> Result<ProcessStreamSinkReadback, ProcessStreamSinkError> {
+        outcome.validate_against_session(&session)?;
+        let operation = BlobProcessStreamKernelOperationRequest::SinkReconcile {
+            binding: self.binding_for_session(&session)?,
+            body: Box::new(serde_json::to_value(&outcome).map_err(|_| sink_invalid())?),
+            deadline_ms: self.calls.deadline_for_budget(2_000).map_err(map_sink_ipc_error)?,
+        };
+        let response = self
+            .calls
+            .exchange(operation)
+            .map_err(map_sink_ipc_error)?;
+        let (owner, original_terminal) = completed_sink_response_with_terminal(response)?;
+        let ProcessStreamSinkWireResponse::Readback { body } = owner else {
+            return Err(ProcessStreamSinkError::ProviderUnavailable);
+        };
+        readback_from_projection(&session, original_terminal.as_ref(), *body)
+    }
+
+    fn binding_for_session(
+        &self,
+        session: &ProcessStreamSinkSession,
+    ) -> Result<ProcessStreamSinkBindingRef, ProcessStreamSinkError> {
+        let binding = self
+            .bindings
+            .lock()
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?
+            .get(session.session_id().as_str())
+            .cloned()
+            .ok_or(ProcessStreamSinkError::BindingMismatch)?;
+        ensure_binding_ref(&binding, session)?;
+        Ok(binding)
+    }
+}
+
+impl ProcessStreamSinkClient for KernelProcessStreamSinkClient {
+    fn open(
+        &self,
+        request: ProcessStreamSinkOpenRequest,
+    ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkSession> {
+        Box::pin(std::future::ready(self.open_sync(request)))
+    }
+
+    fn append(
+        &self,
+        session: ProcessStreamSinkSession,
+        request: ProcessStreamSinkAppend,
+    ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkAppendDisposition> {
+        Box::pin(std::future::ready(self.append_sync(session, request)))
+    }
+
+    fn finalize(
+        &self,
+        session: ProcessStreamSinkSession,
+        request: ProcessStreamSinkFinalizeRequest,
+    ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkTerminal> {
+        Box::pin(std::future::ready(self.finalize_sync(session, request)))
+    }
+
+    fn abort(
+        &self,
+        session: ProcessStreamSinkSession,
+        request: ProcessStreamSinkAbortRequest,
+    ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkTerminal> {
+        Box::pin(std::future::ready(self.abort_sync(session, request)))
+    }
+
+    fn readback(
+        &self,
+        session: ProcessStreamSinkSession,
+    ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkReadback> {
+        Box::pin(std::future::ready(self.readback_sync(session)))
+    }
+
+    fn reconcile(
+        &self,
+        session: ProcessStreamSinkSession,
+        outcome: ProcessStreamSinkUnknownOutcome,
+    ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkReadback> {
+        Box::pin(std::future::ready(self.reconcile_sync(session, outcome)))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TerminalProjection {
+    session_id: serde_json::Value,
+    source_id: serde_json::Value,
+    terminal_id: serde_json::Value,
+    open_request_sha256: String,
+    state: ProcessStreamSinkState,
+    final_sequence: u64,
+    final_offset: u64,
+    admitted_chunks: u64,
+    admitted_bytes: u64,
+    admitted_sha256: String,
+    command_identity: serde_json::Value,
+    evidence: ProcessStreamEvidence,
+    terminal_sha256: String,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+enum ReadbackProjection {
+    Session { view: ProcessStreamSinkSessionView },
+    Terminal { terminal: serde_json::Value },
+    UnknownOutcome { outcome: ProcessStreamSinkUnknownOutcome },
+}
+
+fn ensure_binding_ref(
+    binding: &ProcessStreamSinkBindingRef,
+    session: &ProcessStreamSinkSession,
+) -> Result<(), ProcessStreamSinkError> {
+    binding
+        .validate()
+        .map_err(|_| ProcessStreamSinkError::InvalidBinding)?;
+    if binding.session_id != session.session_id().as_str()
+        || binding.source_id != session.source_id().as_str()
+        || binding.terminal_id != session.terminal_id().as_str()
+        || binding.open_request_sha256 != session.open_request_sha256()
+        || binding.binding_ref.trim().is_empty()
+    {
+        return Err(ProcessStreamSinkError::BindingMismatch);
+    }
+    Ok(())
+}
+
+fn completed_sink_response(
+    response: BlobProcessStreamKernelResponse,
+) -> Result<ProcessStreamSinkWireResponse, ProcessStreamSinkError> {
+    let BlobProcessStreamKernelOutcome::Completed { response, .. } = response.outcome else {
+        return Err(ProcessStreamSinkError::ProviderUnavailable);
+    };
+    let BlobProcessStreamOperationResponse::Sink { response } = response.operation else {
+        return Err(ProcessStreamSinkError::ProviderUnavailable);
+    };
+    Ok(response)
+}
+
+fn completed_sink_response_with_terminal(
+    response: BlobProcessStreamKernelResponse,
+) -> Result<
+    (
+        ProcessStreamSinkWireResponse,
+        Option<BlobProcessStreamKernelOperationRequest>,
+    ),
+    ProcessStreamSinkError,
+> {
+    let BlobProcessStreamKernelOutcome::Completed {
+        response,
+        original_terminal_request,
+        ..
+    } = response.outcome
+    else {
+        return Err(ProcessStreamSinkError::ProviderUnavailable);
+    };
+    let BlobProcessStreamOperationResponse::Sink { response } = response.operation else {
+        return Err(ProcessStreamSinkError::ProviderUnavailable);
+    };
+    Ok((response, original_terminal_request.map(|request| *request)))
+}
+
+enum TerminalCommand {
+    Finalize(ProcessStreamSinkFinalizeRequest),
+    Abort(ProcessStreamSinkAbortRequest),
+}
+
+fn terminal_from_projection(
+    session: &ProcessStreamSinkSession,
+    command: TerminalCommand,
+    body: serde_json::Value,
+) -> Result<ProcessStreamSinkTerminal, ProcessStreamSinkError> {
+    let projection: TerminalProjection =
+        serde_json::from_value(*body).map_err(|_| sink_invalid())?;
+    if projection.session_id
+        != serde_json::to_value(session.session_id()).map_err(|_| sink_invalid())?
+        || projection.source_id
+            != serde_json::to_value(session.source_id()).map_err(|_| sink_invalid())?
+        || projection.terminal_id
+            != serde_json::to_value(session.terminal_id()).map_err(|_| sink_invalid())?
+        || projection.open_request_sha256 != session.open_request_sha256()
+        || projection.admitted_chunks != projection.final_sequence
+        || projection.admitted_bytes != projection.final_offset
+    {
+        return Err(ProcessStreamSinkError::BindingMismatch);
+    }
+    let terminal = match command {
+        TerminalCommand::Finalize(request) => ProcessStreamSinkTerminal::from_finalize(
+            session.clone(),
+            request,
+            projection.state,
+            projection.final_sequence,
+            projection.final_offset,
+            projection.admitted_sha256,
+            projection.evidence,
+        )?,
+        TerminalCommand::Abort(request) => ProcessStreamSinkTerminal::from_abort(
+            session.clone(),
+            request,
+            projection.state,
+            projection.final_sequence,
+            projection.final_offset,
+            projection.admitted_sha256,
+            projection.evidence,
+        )?,
+    };
+    terminal.validate()?;
+    if terminal.identity_sha256() != projection.terminal_sha256
+        || serde_json::to_value(terminal.command_identity()).map_err(|_| sink_invalid())?
+            != projection.command_identity
+        || serde_json::to_value(&terminal).map_err(|_| sink_invalid())? != body
+    {
+        return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+    }
+    Ok(terminal)
+}
+
+fn terminal_from_retained_operation(
+    session: &ProcessStreamSinkSession,
+    operation: &BlobProcessStreamKernelOperationRequest,
+    body: serde_json::Value,
+) -> Result<ProcessStreamSinkTerminal, ProcessStreamSinkError> {
+    match operation {
+        BlobProcessStreamKernelOperationRequest::SinkFinalize {
+            binding,
+            body: request_body,
+            ..
+        } => {
+            ensure_binding_ref(binding, session)?;
+            let request: ProcessStreamSinkFinalizeRequest =
+                serde_json::from_value((**request_body).clone()).map_err(|_| sink_invalid())?;
+            terminal_from_projection(session, TerminalCommand::Finalize(request), body)
+        }
+        BlobProcessStreamKernelOperationRequest::SinkAbort {
+            binding,
+            body: request_body,
+            ..
+        } => {
+            ensure_binding_ref(binding, session)?;
+            let request: ProcessStreamSinkAbortRequest =
+                serde_json::from_value((**request_body).clone()).map_err(|_| sink_invalid())?;
+            terminal_from_projection(session, TerminalCommand::Abort(request), body)
+        }
+        _ => Err(ProcessStreamSinkError::ProviderUnavailable),
+    }
+}
+
+fn readback_from_projection(
+    session: &ProcessStreamSinkSession,
+    original_terminal: Option<&BlobProcessStreamKernelOperationRequest>,
+    body: serde_json::Value,
+) -> Result<ProcessStreamSinkReadback, ProcessStreamSinkError> {
+    match serde_json::from_value::<ReadbackProjection>(body.clone()).map_err(|_| sink_invalid())? {
+        ReadbackProjection::Session { view } => {
+            if view.session_id() != session.session_id()
+                || view.source_id() != session.source_id()
+                || view.terminal_id() != session.terminal_id()
+                || view.open_request_sha256() != session.open_request_sha256()
+            {
+                return Err(ProcessStreamSinkError::BindingMismatch);
+            }
+            Ok(ProcessStreamSinkReadback::Session { view })
+        }
+        ReadbackProjection::Terminal { terminal } => {
+            let operation = original_terminal.ok_or(ProcessStreamSinkError::ProviderUnavailable)?;
+            let terminal = terminal_from_retained_operation(session, operation, terminal)?;
+            Ok(ProcessStreamSinkReadback::Terminal { terminal })
+        }
+        ReadbackProjection::UnknownOutcome { outcome } => {
+            outcome.validate_against_session(session)?;
+            Ok(ProcessStreamSinkReadback::UnknownOutcome { outcome })
+        }
+    }
+}
+
+fn map_sink_ipc_error(_: TestdIpcError) -> ProcessStreamSinkError {
+    ProcessStreamSinkError::ProviderUnavailable
+}
+
+fn sink_invalid() -> ProcessStreamSinkError {
+    ProcessStreamSinkError::InvalidRequest {
+        reason: "Kernel sink response did not match its closed projection",
     }
 }
 
@@ -1408,7 +2035,7 @@ mod tests {
         KernelClient::load()
             .ok()
             .map(|client| KernelTestdIpcClient {
-                client,
+                client: Arc::new(Mutex::new(client)),
                 live_epoch,
                 retained: None,
             })

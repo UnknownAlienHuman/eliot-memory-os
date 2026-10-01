@@ -23,7 +23,7 @@
 //!   evaluation remain separate closed axes: admitting a stream sets no
 //!   parser/evaluator status, and parser success sets no evaluator status.
 
-use eliot_contracts::{ClockReading, StateFence};
+use eliot_contracts::{ClockReading, EpochId, StateFence};
 use eliot_process::{
     DurableStreamLocatorKind, DurableStreamRepresentation, ProcessEvidence,
     ProcessExecutionBinding, ProcessStreamEvidence, ProcessStreamKind, ProcessStreamPolicyBinding,
@@ -510,16 +510,23 @@ impl TestdEvaluatorSlot {
 
 /// Attempt context the composition supplies for one readback resolution.
 ///
-/// The job/attempt/invocation identities and the current [`StateFence`] come
-/// from the durable attempt owner, never from the evidence bytes.
+/// The job/attempt/invocation and exact process binding come from the durable
+/// admitted attempt, never from evidence bytes. Store StateFence selection is
+/// Kernel-owned and is deliberately absent from this Testd context.
 #[derive(Clone, Debug)]
 pub struct TestdReadbackContext {
     /// Durable job identity the resolution serves.
     pub job_id: String,
     /// Instrument invocation identity the resolution serves.
     pub invocation_id: String,
-    /// Current State Fence the readback must satisfy.
-    pub fence: StateFence,
+    /// Exact operation identity from the durable process admission.
+    pub expected_operation_id: String,
+    /// Exact process-tree identity from the durable process admission.
+    pub expected_process_tree_id: String,
+    /// Exact process generation from the durable process admission.
+    pub expected_process_generation: u64,
+    /// Exact authority epoch from the durable process admission.
+    pub expected_authority_epoch: EpochId,
     /// Maximum source bytes the caller accepts. Must cover the admitted
     /// source length; anything larger fails closed.
     pub max_bytes: u64,
@@ -554,8 +561,6 @@ pub struct ProcessStreamSourceReadbackRequest {
     pub expected_byte_length: u64,
     /// Policy/privacy/visibility/retention binding fixed before persistence.
     pub policy: ProcessStreamPolicyBinding,
-    /// State Fence the readback must satisfy.
-    pub fence: StateFence,
     /// Maximum source bytes the caller accepts.
     pub max_bytes: u64,
     /// Unix-millisecond deadline the provider must meet.
@@ -607,12 +612,6 @@ impl ProcessStreamSourceReadbackRequest {
                 reason: "the provider deadline must be non-zero",
             });
         }
-        self.fence
-            .validate()
-            .map_err(|_| TestdEvidenceError::ReadbackRequestInvalid {
-                field: "fence",
-                reason: "the readback fence must carry a non-zero resource generation",
-            })?;
         Ok(())
     }
 }
@@ -795,12 +794,12 @@ impl ProcessStreamSourceReadbackObservation {
                 reason: "the readback names a different locator or ready receipt",
             });
         }
-        if !self.observed_fence.is_compatible_with(&request.fence) {
-            return Err(TestdEvidenceError::SourceStale {
+        self.observed_fence
+            .validate()
+            .map_err(|_| TestdEvidenceError::SourceStale {
                 stream,
-                reason: "the readback fence is incompatible with the attempt fence",
-            });
-        }
+                reason: "the owner-returned readback fence is invalid",
+            })?;
         validate_reference(
             "readback_receipt_id",
             Some(self.readback_receipt_id.as_str()),
@@ -1469,7 +1468,7 @@ impl TestdStreamEvidenceBinding {
             self.disposition = disposition_for_readback_error(&error);
             return Err(error);
         }
-        self.fence = Some(context.fence.clone());
+        self.fence = Some(observation.observed_fence.clone());
         self.readback_receipt_id = Some(observation.readback_receipt_id.clone());
         self.readback_observed_at = Some(observation.observed_at);
         self.disposition = if self.transport == StreamTransportStatus::Complete
@@ -1489,6 +1488,20 @@ impl TestdStreamEvidenceBinding {
         context: &TestdReadbackContext,
     ) -> Result<ProcessStreamSourceReadbackRequest, TestdEvidenceError> {
         let stream = self.stream;
+        if self.binding.job_id().as_str() != context.job_id
+            || self.binding.operation_id().as_str() != context.expected_operation_id
+            || self.binding.process_tree_id().as_str() != context.expected_process_tree_id
+            || self.binding.state_fence().generation().get()
+                != context.expected_process_generation
+            || !self
+                .binding
+                .authority_epoch()
+                .is_same_authority(&context.expected_authority_epoch)
+        {
+            return Err(TestdEvidenceError::BindingMismatch {
+                reason: "the source binding disagrees with the admitted process context",
+            });
+        }
         let (
             Some(locator_kind),
             Some(locator),
@@ -1519,7 +1532,6 @@ impl TestdStreamEvidenceBinding {
             expected_sha256,
             expected_byte_length,
             policy: self.policy.clone(),
-            fence: context.fence.clone(),
             max_bytes: context.max_bytes,
             deadline_ms: context.deadline_ms,
         })
@@ -2018,6 +2030,8 @@ pub enum TestdStreamResolution {
     Resolved {
         /// Resolved physical stream.
         stream: ProcessStreamKind,
+        /// Exact admitted and readback-bound source evidence.
+        source: TestdStreamEvidenceBinding,
         /// Ephemeral source bytes.
         bytes: EphemeralSourceBytes,
     },
@@ -2060,6 +2074,7 @@ fn resolve_slot(
                 slot.disposition = binding.disposition;
                 TestdStreamResolution::Resolved {
                     stream: slot.stream,
+                    source: binding.clone(),
                     bytes,
                 }
             }
@@ -2150,6 +2165,7 @@ async fn resolve_slot_async(
                 slot.disposition = binding.disposition;
                 TestdStreamResolution::Resolved {
                     stream: slot.stream,
+                    source: binding.clone(),
                     bytes,
                 }
             }
