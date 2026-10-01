@@ -4297,14 +4297,13 @@ mod tests {
     use eliot_agent_bridge::{GovernanceEvidence, ReadinessDisposition, ScopeLevel};
     use eliot_agent_bridge_core::{
         ActivationPortOutcome, ActivationPortResult, ClockReading, EventCursor, EventId,
-        HOST_EVENT_CONTRACT_VERSION,
-        HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition, HostEventNormalizationReceipt,
-        HostActivationPort, HostEventPrivacyClass, LowercaseSha256, NativeSession, NativeSessionLocator,
-        NormalizationCoverage, NormalizedHostEventEnvelope, NormalizedHostEventPayload,
-        PrincipalId, ProviderFailure, ProviderObservationLineage, ProviderReadiness,
-        QualifiedSourceDigest, RawSourceRecord,
-        RestrictedRawSourceHandle, SessionLifecycleObservation, SessionLifecycleTransition,
-        SessionId, SessionObservation, TaskId, UnsupportedDisposition, WorkUnitId,
+        HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM, HostActivationPort,
+        HostEventDeliveryDisposition, HostEventNormalizationReceipt, HostEventPrivacyClass,
+        LowercaseSha256, NativeSession, NativeSessionLocator, NormalizationCoverage,
+        NormalizedHostEventEnvelope, NormalizedHostEventPayload, PrincipalId, ProviderFailure,
+        ProviderObservationLineage, ProviderReadiness, QualifiedSourceDigest, RawSourceRecord,
+        RestrictedRawSourceHandle, SessionId, SessionLifecycleObservation,
+        SessionLifecycleTransition, SessionObservation, TaskId, UnsupportedDisposition, WorkUnitId,
     };
     use eliot_integration_coverage::{
         ALL_EVENTS, DispatchOrdering, EventCompleteness, EventCoverage, EventDisposition,
@@ -5395,10 +5394,8 @@ mod tests {
         let generation = Generation::new(7).expect("non-zero fixture generation");
         let fence = FencingToken::new(
             EpochId::new(
-                eliot_contracts::EpochLineageId::new(
-                    "550e8400-e29b-41d4-a716-446655440000",
-                )
-                .expect("valid fixture lineage"),
+                eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                    .expect("valid fixture lineage"),
                 std::num::NonZeroU64::new(3).expect("non-zero fixture epoch"),
             )
             .expect("valid fixture epoch"),

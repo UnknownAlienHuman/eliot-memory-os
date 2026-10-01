@@ -4191,8 +4191,7 @@ mod tests {
         let (base, facts, _) = test_envelope();
         let mut value = serde_json::to_value(&base).expect("base request must serialize");
         value["correlation_id"] = serde_json::json!("host-user-automation-1");
-        value["correlation_projection"]["occurrence"] =
-            serde_json::json!("host-user-automation-1");
+        value["correlation_projection"]["occurrence"] = serde_json::json!("host-user-automation-1");
         value["tool"] = serde_json::json!({
             "name": "eliot_user_automation",
             "arguments": {
