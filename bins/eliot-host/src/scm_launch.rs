@@ -61,7 +61,10 @@ fn scm_launch_note_event_log_unavailable() {
 
 fn scm_launch_observe_bound(
     detail: &str,
-    fields: &[(&'static str, super::host_job_launch::LaunchIdentityField<'_>)],
+    fields: &[(
+        &'static str,
+        super::host_job_launch::LaunchIdentityField<'_>,
+    )],
 ) {
     scm_launch_note_event_log_unavailable();
     super::host_diagnostics::observe_entrypoint_with_detail(
@@ -308,6 +311,11 @@ pub fn classify_host_scm_inspection(
     // The identity this classifier's owner already holds: the canonical
     // service name the request asked about and the expected configuration
     // digest it compared against. Both are non-secret approved request values.
+    // The accessor returns an owned digest, so it is bound to a named local
+    // here and the identity slots below borrow that binding for the whole
+    // classification rather than a temporary that dies at the end of the
+    // array expression.
+    let expected_configuration_digest = request.expected_configuration_digest();
     let requested = [
         (
             "service",
@@ -316,7 +324,7 @@ pub fn classify_host_scm_inspection(
         (
             "expected_config_digest",
             super::host_job_launch::LaunchIdentityField::Text(
-                request.expected_configuration_digest().as_str(),
+                expected_configuration_digest.as_str(),
             ),
         ),
     ];
@@ -348,9 +356,9 @@ pub fn classify_host_scm_inspection(
             ));
             fields.push((
                 "checkpoint",
-                super::host_job_launch::LaunchIdentityField::Number(
-                    u64::from(observation.checkpoint()),
-                ),
+                super::host_job_launch::LaunchIdentityField::Number(u64::from(
+                    observation.checkpoint(),
+                )),
             ));
             let process = observation.process().map(scm_render_process_start_identity);
             fields.push((
@@ -441,7 +449,9 @@ pub fn classify_host_scm_inspection(
             let mut fields = requested.to_vec();
             fields.push((
                 "win32_error",
-                super::host_job_launch::LaunchIdentityField::Number(u64::from(detail.win32_error())),
+                super::host_job_launch::LaunchIdentityField::Number(u64::from(
+                    detail.win32_error(),
+                )),
             ));
             fields.push((
                 "stage",
@@ -459,20 +469,24 @@ pub fn classify_host_scm_inspection(
             fields.push((
                 "pid",
                 match detail.process_id() {
-                    Some(pid) => super::host_job_launch::LaunchIdentityField::Number(u64::from(pid)),
+                    Some(pid) => {
+                        super::host_job_launch::LaunchIdentityField::Number(u64::from(pid))
+                    }
                     None => super::host_job_launch::LaunchIdentityField::Unavailable,
                 },
             ));
             fields.push((
                 "transient_pending",
-                super::host_job_launch::LaunchIdentityField::Text(if detail
-                    .current_state()
-                    .is_some_and(|state| state == HOST_SCM_START_PENDING_STATE)
-                {
-                    "pending"
-                } else {
-                    "not_pending"
-                }),
+                super::host_job_launch::LaunchIdentityField::Text(
+                    if detail
+                        .current_state()
+                        .is_some_and(|state| state == HOST_SCM_START_PENDING_STATE)
+                    {
+                        "pending"
+                    } else {
+                        "not_pending"
+                    },
+                ),
             ));
             // WORK_UNIT_CASE: 978/5 — ephemeral PID observation; never
             // promoted into start-identity.
@@ -568,9 +582,7 @@ fn resolve_host_scm_inspection_with_probe<P: HostScmBootstrapProbe>(
         ),
         (
             "retry_sleep_ms",
-            super::host_job_launch::LaunchIdentityField::Number(
-                HOST_SCM_TRANSIENT_RETRY_SLEEP_MS,
-            ),
+            super::host_job_launch::LaunchIdentityField::Number(HOST_SCM_TRANSIENT_RETRY_SLEEP_MS),
         ),
     ];
     // WORK_UNIT_CASE: 978/13 — deterministic probe schedule requested; the
@@ -604,6 +616,12 @@ fn resolve_host_scm_inspection_with_probe<P: HostScmBootstrapProbe>(
         "inspections_issued",
         super::host_job_launch::LaunchIdentityField::Number(issued),
     ));
+    // The settled inspection's process start identity is rendered once, into a
+    // named local that outlives the branch below, so the identity slot can
+    // borrow it for the whole record instead of a temporary scoped to the
+    // `Matching` arm. It reads the settled readback already in hand and never
+    // queries a process.
+    let settled_process = scm_inspection_process(&current).map(scm_render_process_start_identity);
     if let ServiceRegistrationRuntimeInspection::Matching { observation } = &current {
         fields.push((
             "observed_config_digest",
@@ -613,10 +631,9 @@ fn resolve_host_scm_inspection_with_probe<P: HostScmBootstrapProbe>(
             "scm_state",
             super::host_job_launch::LaunchIdentityField::Text(scm_state_name(observation.state())),
         ));
-        let process = observation.process().map(scm_render_process_start_identity);
         fields.push((
             "process",
-            match process.as_deref() {
+            match settled_process.as_deref() {
                 Some(process) => super::host_job_launch::LaunchIdentityField::Text(process),
                 None => super::host_job_launch::LaunchIdentityField::Unavailable,
             },
@@ -720,7 +737,9 @@ pub fn validate_host_scm_bootstrap(
     let identity = [
         (
             "installation",
-            super::host_job_launch::LaunchIdentityField::Text(launch_options.installation().as_str()),
+            super::host_job_launch::LaunchIdentityField::Text(
+                launch_options.installation().as_str(),
+            ),
         ),
         (
             "plan_generation",
@@ -809,17 +828,22 @@ pub fn validate_host_scm_bootstrap(
         "observed_config_digest",
         match &inspection {
             ServiceRegistrationRuntimeInspection::Matching { observation } => {
-                super::host_job_launch::LaunchIdentityField::Text(observation.configuration_digest())
+                super::host_job_launch::LaunchIdentityField::Text(
+                    observation.configuration_digest(),
+                )
             }
             _ => super::host_job_launch::LaunchIdentityField::Unavailable,
         },
     ));
+    // The admitted inspection's exact process start identity is rendered into a
+    // named local that outlives the record below, so the identity slot borrows
+    // the binding rather than a temporary that would be dropped at the end of
+    // the push expression.
+    let admitted_process =
+        scm_inspection_process(&inspection).map(scm_render_process_start_identity);
     fields.push((
         "process",
-        match scm_inspection_process(&inspection)
-            .map(scm_render_process_start_identity)
-            .as_deref()
-        {
+        match admitted_process.as_deref() {
             Some(process) => super::host_job_launch::LaunchIdentityField::Text(process),
             None => super::host_job_launch::LaunchIdentityField::Unavailable,
         },
@@ -1008,7 +1032,10 @@ pub fn publish_supervision_record_table(
             super::host_job_launch::LaunchIdentityField::Number(table.rows.len() as u64),
         ),
     ];
-    scm_launch_observe_bound("host.scm-launch supervision record publish requested", &published);
+    scm_launch_observe_bound(
+        "host.scm-launch supervision record publish requested",
+        &published,
+    );
     table.validate().map_err(|error| {
         HostError::Platform(format!("supervision record is not publishable: {error}"))
     })?;
@@ -1313,12 +1340,14 @@ pub fn read_installed_candidate_contour(
         "inspection",
         super::host_job_launch::LaunchIdentityField::Text(scm_inspection_class(&inspection)),
     ));
+    // The observed process start identity is rendered into a named local that
+    // outlives the record below, so the identity slot borrows the binding rather
+    // than a temporary that would be dropped at the end of the push expression.
+    let observed_process =
+        scm_inspection_process(&inspection).map(scm_render_process_start_identity);
     fields.push((
         "process",
-        match scm_inspection_process(&inspection)
-            .map(scm_render_process_start_identity)
-            .as_deref()
-        {
+        match observed_process.as_deref() {
             Some(process) => super::host_job_launch::LaunchIdentityField::Text(process),
             None => super::host_job_launch::LaunchIdentityField::Unavailable,
         },

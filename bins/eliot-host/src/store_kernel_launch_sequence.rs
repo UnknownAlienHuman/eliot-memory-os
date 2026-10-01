@@ -21,7 +21,7 @@
 //! layers.
 
 #[cfg(windows)]
-use std::cell::Cell;
+use std::cell::RefCell;
 
 use thiserror::Error;
 
@@ -81,6 +81,20 @@ fn store_kernel_observe_bound(detail: &str, identity: &StoreKernelLaunchIdentity
     identity.emit(detail);
 }
 
+/// Phase-only projection for a caller that holds no launch identity to bind.
+///
+/// The label is the whole record: the enclosing identity-bound contour carries
+/// the installation, generation, digests, and process start identity that
+/// correlate these ordering phases.
+#[cfg(all(test, windows))]
+fn store_kernel_observe_phase_only(detail: &str) {
+    store_kernel_note_event_log_unavailable();
+    crate::host_diagnostics::observe_entrypoint_with_detail(
+        crate::host_diagnostics::EntrypointStage::Startup,
+        detail,
+    );
+}
+
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum StoreLivenessEvidence {
     #[error("dead")]
@@ -98,10 +112,12 @@ pub enum StoreLivenessEvidence {
 /// artifact digests. `store_process` holds the Store child's already-observed
 /// process start identity as `pid/creation-time` — the pair that distinguishes
 /// one process incarnation from a later process reusing the same PID. It is a
-/// [`Cell`] because the caller's liveness closure reads it from the retained
-/// child evidence between this leaf's records; nothing here opens, queries, or
-/// re-observes a process, and the slot stays explicitly unavailable until the
-/// owner has actually observed one.
+/// [`RefCell`] rather than a plain owned field because the caller's liveness
+/// closure fills it in through a shared `&self` handle between this leaf's
+/// records, and every record reads it by borrowing the value in hand for the
+/// duration of that one render; nothing here opens, queries, or re-observes a
+/// process, and the slot stays explicitly unavailable until the owner has
+/// actually observed one.
 #[cfg(windows)]
 pub(super) struct StoreKernelLaunchIdentity<'a> {
     installation: &'a str,
@@ -110,7 +126,7 @@ pub(super) struct StoreKernelLaunchIdentity<'a> {
     config_digest: &'a str,
     store_artifact_digest: &'a str,
     kernel_artifact_digest: &'a str,
-    store_process: Cell<Option<String>>,
+    store_process: RefCell<Option<String>>,
 }
 
 #[cfg(windows)]
@@ -132,7 +148,7 @@ impl<'a> StoreKernelLaunchIdentity<'a> {
             config_digest,
             store_artifact_digest,
             kernel_artifact_digest,
-            store_process: Cell::new(None),
+            store_process: RefCell::new(None),
         }
     }
 
@@ -142,7 +158,7 @@ impl<'a> StoreKernelLaunchIdentity<'a> {
     /// retained child evidence during its own liveness proof. This setter
     /// stores that value; it never derives, guesses, or probes one.
     pub(super) fn set_store_process(&self, process_start: String) {
-        self.store_process.set(Some(process_start));
+        self.store_process.replace(Some(process_start));
     }
 
     /// Emits one phase record bound to this identity through the #889 facade.
@@ -150,7 +166,9 @@ impl<'a> StoreKernelLaunchIdentity<'a> {
     /// The stored Store process identity is borrowed for the duration of this
     /// render only, so it cannot outlive the record, and a phase emitted before
     /// the caller's liveness proof still reports it as explicitly unavailable
-    /// rather than as an empty or invented value.
+    /// rather than as an empty or invented value. The borrow guard is a local
+    /// of this render, so the identity string it exposes stays borrowed from
+    /// the caller's own retained evidence and never escapes this call.
     fn emit(&self, detail: &str) {
         store_kernel_note_event_log_unavailable();
         let store_process = self.store_process.borrow();
@@ -206,9 +224,17 @@ pub(super) enum StoreKernelLaunchError<S> {
     Kernel { error: HostError },
 }
 
+/// Runs the Store-before-Kernel sequence, projecting each phase through `emit`.
+///
+/// `emit` is the caller's own observation seam: the production contour hands in
+/// a closure bound to the [`StoreKernelLaunchIdentity`] it already holds, and a
+/// caller that holds no identity hands in the phase-only projection. Keeping
+/// the sequence itself generic over that seam is what lets one ordering
+/// implementation serve both, rather than duplicating the fail-closed ordering
+/// per projection.
 #[cfg(windows)]
-pub(super) fn launch_store_then_kernel<S, K, LF, OF, KF, CF>(
-    identity: &StoreKernelLaunchIdentity<'_>,
+fn run_store_then_kernel<S, K, LF, OF, KF, CF, EM>(
+    emit: EM,
     launch_store: LF,
     observe_store: OF,
     launch_kernel: KF,
@@ -219,15 +245,16 @@ where
     OF: FnOnce(&S) -> Result<(), StoreLivenessEvidence>,
     KF: FnOnce() -> Result<K, HostError>,
     CF: FnOnce(S) -> Result<(), Box<(S, String)>>,
+    EM: Fn(&str),
 {
     // WORK_UNIT_CASE: 978/6 — Store launch requested before any Kernel work;
     // Store-before-Kernel ordering is observed, never reordered.
-    store_kernel_observe_bound("host.store-launch requested", identity);
+    emit("host.store-launch requested");
     // WORK_UNIT_CASE: 978/6 — Store launch failure is a subordinate phase
     // observation only; the failure disposition propagates unchanged to the
     // single designated terminal owner. No terminal is emitted here.
     let store = launch_store().map_err(|error| {
-        store_kernel_observe_bound("host.store-launch launch-failed observed", identity);
+        emit("host.store-launch launch-failed observed");
         StoreKernelLaunchError::Launch(error)
     })?;
     if let Err(evidence) = observe_store(&store) {
@@ -238,10 +265,10 @@ where
         // enters a record (I15.4, I07.20).
         match &evidence {
             StoreLivenessEvidence::Dead => {
-                store_kernel_observe_bound("host.store-launch store-dead observed", identity);
+                emit("host.store-launch store-dead observed");
             }
             StoreLivenessEvidence::Unknown(_) => {
-                store_kernel_observe_bound("host.store-launch store-unknown observed", identity);
+                emit("host.store-launch store-unknown observed");
             }
         }
         return match cleanup_store(store) {
@@ -257,16 +284,16 @@ where
     // invoked only after this barrier. The Store process start identity the
     // caller's liveness closure already observed is bound, so this record names
     // the exact process incarnation that passed the barrier.
-    store_kernel_observe_bound("host.store-launch store-live observed", identity);
+    emit("host.store-launch store-live observed");
     // WORK_UNIT_CASE: 978/6 — Kernel launch requested only after Store-live.
-    store_kernel_observe_bound("host.kernel-launch requested", identity);
+    emit("host.kernel-launch requested");
     let kernel = match launch_kernel() {
         Ok(kernel) => kernel,
         Err(error) => {
             // WORK_UNIT_CASE: 978/6 — Kernel launch failure is a subordinate
             // phase observation only; the failure disposition propagates
             // unchanged to the single designated terminal owner.
-            store_kernel_observe_bound("host.kernel-launch launch-failed observed", identity);
+            emit("host.kernel-launch launch-failed observed");
             return match cleanup_store(store) {
                 Ok(()) => Err(StoreKernelLaunchError::Kernel { error }),
                 Err(boxed) => {
@@ -286,9 +313,70 @@ where
     // (permit, activation receipt, ready receipt) is not held here, so the
     // record states that it is unavailable; Kernel readiness is emitted solely
     // on owner evidence in `kernel_activation_driver::active`.
-    store_kernel_observe_bound(
-        "host.kernel-launch kernel-launched observed; activation evidence unavailable",
-        identity,
-    );
+    emit("host.kernel-launch kernel-launched observed; activation evidence unavailable");
     Ok((store, kernel))
+}
+
+/// Runs the Store-before-Kernel sequence with each phase bound to the launch
+/// identity `identity` already holds.
+///
+/// This is the production entry point: the calling contour constructs the
+/// [`StoreKernelLaunchIdentity`] from its own approved launch bindings, so
+/// every record in the sequence names the exact installation, generation,
+/// digests, and (once the liveness closure has observed it) the exact Store
+/// process incarnation that passed the barrier.
+#[cfg(windows)]
+pub(super) fn launch_store_then_kernel_identified<S, K, LF, OF, KF, CF>(
+    identity: &StoreKernelLaunchIdentity<'_>,
+    launch_store: LF,
+    observe_store: OF,
+    launch_kernel: KF,
+    cleanup_store: CF,
+) -> Result<(S, K), StoreKernelLaunchError<S>>
+where
+    LF: FnOnce() -> Result<S, HostError>,
+    OF: FnOnce(&S) -> Result<(), StoreLivenessEvidence>,
+    KF: FnOnce() -> Result<K, HostError>,
+    CF: FnOnce(S) -> Result<(), Box<(S, String)>>,
+{
+    run_store_then_kernel(
+        |detail| store_kernel_observe_bound(detail, identity),
+        launch_store,
+        observe_store,
+        launch_kernel,
+        cleanup_store,
+    )
+}
+
+/// Runs the Store-before-Kernel sequence with phase-only records.
+///
+/// Used only where the caller holds no launch identity of its own to bind, so
+/// the ordering is still observed and correlated by phase while the enclosing
+/// identity-bound contour supplies the distinguishing detail. The ordering and
+/// fail-closed dispositions are exactly those of the identified entry point;
+/// only the projection differs.
+///
+/// Gated to the test build because the production contour always holds a launch
+/// identity and therefore uses the identified entry point; this exists so the
+/// ordering contract is testable against a caller that holds none.
+#[cfg(all(test, windows))]
+pub(super) fn launch_store_then_kernel<S, K, LF, OF, KF, CF>(
+    launch_store: LF,
+    observe_store: OF,
+    launch_kernel: KF,
+    cleanup_store: CF,
+) -> Result<(S, K), StoreKernelLaunchError<S>>
+where
+    LF: FnOnce() -> Result<S, HostError>,
+    OF: FnOnce(&S) -> Result<(), StoreLivenessEvidence>,
+    KF: FnOnce() -> Result<K, HostError>,
+    CF: FnOnce(S) -> Result<(), Box<(S, String)>>,
+{
+    run_store_then_kernel(
+        store_kernel_observe_phase_only,
+        launch_store,
+        observe_store,
+        launch_kernel,
+        cleanup_store,
+    )
 }

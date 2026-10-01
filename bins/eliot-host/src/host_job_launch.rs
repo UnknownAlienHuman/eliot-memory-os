@@ -48,7 +48,7 @@ use crate::launch_artifact::{
 #[cfg(windows)]
 use crate::store_kernel_launch_sequence::{
     StoreKernelLaunchError, StoreKernelLaunchIdentity, StoreLivenessEvidence,
-    launch_store_then_kernel,
+    launch_store_then_kernel_identified,
 };
 
 // F-LOG-HOST-3 (#978) launch observation helpers.
@@ -196,7 +196,10 @@ impl<'a> LaunchContourIdentity<'a> {
                 LaunchIdentityField::Number(self.authority_epoch),
             ),
             ("generation", LaunchIdentityField::Text(self.generation)),
-            ("config_digest", LaunchIdentityField::Text(self.config_digest)),
+            (
+                "config_digest",
+                LaunchIdentityField::Text(self.config_digest),
+            ),
             (
                 "artifact_digest",
                 LaunchIdentityField::Text(self.artifact_digest),
@@ -255,7 +258,10 @@ impl<'a> LaunchStartIdentity<'a> {
                 LaunchIdentityField::Number(self.authority_epoch),
             ),
             ("generation", LaunchIdentityField::Text(self.generation)),
-            ("config_digest", LaunchIdentityField::Text(self.config_digest)),
+            (
+                "config_digest",
+                LaunchIdentityField::Text(self.config_digest),
+            ),
             (
                 "kernel_artifact",
                 LaunchIdentityField::Text(self.kernel_artifact_digest),
@@ -329,10 +335,7 @@ fn host_launch_observe(detail: &str) {
 
 /// Phase record bound to the identities the calling owner already holds.
 #[cfg(windows)]
-fn host_launch_observe_bound(
-    detail: &str,
-    fields: &[(&'static str, LaunchIdentityField<'_>)],
-) {
+fn host_launch_observe_bound(detail: &str, fields: &[(&'static str, LaunchIdentityField<'_>)]) {
     host_launch_note_event_log_unavailable();
     crate::host_diagnostics::observe_entrypoint_with_detail(
         crate::host_diagnostics::EntrypointStage::Startup,
@@ -626,12 +629,13 @@ pub(super) fn ensure_store_endpoint_available_or_owned(
             "installation",
             LaunchIdentityField::Text(binding.installation.as_str()),
         ),
-        ("generation", LaunchIdentityField::Text(binding.generation.as_str())),
+        (
+            "generation",
+            LaunchIdentityField::Text(binding.generation.as_str()),
+        ),
         (
             "authority_epoch",
-            LaunchIdentityField::Number(
-                binding.state_fence.authority_epoch.sequence.get(),
-            ),
+            LaunchIdentityField::Number(binding.state_fence.authority_epoch.sequence.get()),
         ),
         (
             "resource_generation",
@@ -692,10 +696,7 @@ pub(super) fn ensure_store_endpoint_available_or_owned(
         StoreEndpointObservation::Occupied {
             owner_process_id: 0,
         } => {
-            host_launch_observe_bound(
-                "host.launch store endpoint owner unobservable",
-                &planned,
-            );
+            host_launch_observe_bound("host.launch store endpoint owner unobservable", &planned);
             Err(HostError::StoreEndpointOwnerUnreadable(format!(
                 "planned Store endpoint {endpoint} owner observation is not a real process; a corrupt read is not absence, so the start/reconnect defers until exact installation ownership is observable"
             )))
@@ -753,10 +754,7 @@ pub(super) fn ensure_store_endpoint_available_or_owned(
             // the launch DEFERS rather than proceeding on a clean-absence
             // reading that was never established. The provider's own reason
             // text stays with the typed error and never enters a record.
-            host_launch_observe_bound(
-                "host.launch store endpoint owner unreadable",
-                &planned,
-            );
+            host_launch_observe_bound("host.launch store endpoint owner unreadable", &planned);
             Err(HostError::StoreEndpointOwnerUnreadable(format!(
                 "planned Store endpoint {endpoint} owner could not be read ({reason}); a failed read is not absence, so the start/reconnect defers until exact installation ownership is observable"
             )))
@@ -1345,7 +1343,9 @@ impl HostJobBranches {
             ),
             (
                 "authority_epoch",
-                LaunchIdentityField::Number(launch.authority_state_fence.authority_epoch.sequence.get()),
+                LaunchIdentityField::Number(
+                    launch.authority_state_fence.authority_epoch.sequence.get(),
+                ),
             ),
         ];
         // WORK_UNIT_CASE: 978/1 — working directories requested.
@@ -1458,9 +1458,7 @@ impl HostJobBranches {
                 &[
                     (
                         "installation",
-                        LaunchIdentityField::Text(
-                            launch.installation_epoch.installation.as_str(),
-                        ),
+                        LaunchIdentityField::Text(launch.installation_epoch.installation.as_str()),
                     ),
                     (
                         "installation_epoch",
@@ -1717,7 +1715,7 @@ impl HostJobBranches {
             store_artifact.as_str(),
             kernel_artifact.as_str(),
         );
-        let launch_result = launch_store_then_kernel(
+        let launch_result = launch_store_then_kernel_identified(
             &sequence_identity,
             || {
                 Self::launch(
