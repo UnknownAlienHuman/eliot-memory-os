@@ -83,11 +83,11 @@ use eliotd::{
     DaemonConfig, DaemonKernelClient, DaemonStatus, FinishSubmitOutcome,
     GovernorAuthorityDriveOutcome, GovernorAuthorityDriver, KernelContextReadClient,
     LocalReadSubmitOutcome, MaintenanceObservation, MaintenanceTriggerOrigin, ObserveDeferOutcome,
-    ObserveServeOutcome, ObserveSubmitOutcome, ObserveSuboperation, PROTOCOL_VERSION,
+    ObserveServeOutcome, ObserveSubmitOutcome, ObserveSuboperation, OutcomeLayer, PROTOCOL_VERSION,
     SELF_OBSERVED_FAMILY, SERVICE_NAME, TaskControllerSubmitOutcome, decode_observation_capture,
-    forward_admitted_local_read, observation_base_operation, observation_request_identity,
-    observation_result_body, observe_serve_outcome, serve_admitted_observe,
-    terminal_for_invalid_ticket,
+    forward_admitted_local_read, observation_base_operation, observation_pending_handle,
+    observation_request_identity, observation_result_body, observation_unavailable_outcome,
+    observe_serve_outcome, serve_admitted_observe, terminal_for_invalid_ticket,
 };
 use serde::Serialize;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
@@ -4825,6 +4825,14 @@ enum ObservePollOutcome {
     IdleBackoff,
     Committed,
     Refused,
+    /// The owner holds the admitted operation and issued no terminal receipt:
+    /// a live pending handle with a real read/wait/cancel path. Not a
+    /// completion, and never reported as one.
+    Pending,
+    /// The owner's effect is real but the host result was not retained
+    /// (issue #2565 W5). Distinct from `Committed`, which is only true when the
+    /// exact correlated response actually reached the host record.
+    EffectNotRetained,
     Deferred,
     Settled,
     Expired,
@@ -4949,6 +4957,8 @@ fn observe_outcome_name(outcome: &ObservePollOutcome) -> &'static str {
         ObservePollOutcome::IdleBackoff => "idle_backoff",
         ObservePollOutcome::Committed => "committed",
         ObservePollOutcome::Refused => "refused",
+        ObservePollOutcome::Pending => "pending",
+        ObservePollOutcome::EffectNotRetained => "effect_not_retained",
         ObservePollOutcome::Deferred => "deferred",
         ObservePollOutcome::Settled => "settled",
         ObservePollOutcome::Expired => "expired",
@@ -5002,6 +5012,19 @@ async fn run_observe_poll(
         // semantic owner is not connected, so the pair retires through the
         // defer leg with its named residual owner. No effect is produced and
         // none is claimed.
+        //
+        // W5: the classification is taken from the typed
+        // [`OutcomeLayer::Unavailable`] outcome rather than asserted in prose,
+        // so the reported layer is derived from the same owner map the serve
+        // used. An unavailable arm is never given a pending handle: there is no
+        // owner operation to poll or cancel, and a handle nothing can service
+        // is exactly the failure A5 forbids.
+        let unavailable = observation_unavailable_outcome(&deferral);
+        debug_assert_eq!(
+            unavailable.outcome_layer(),
+            OutcomeLayer::Unavailable,
+            "an arm with no connected owner must classify as unavailable"
+        );
         let outcome =
             match defer_observe_pair_idempotent(kernel, &operation_id, &request_digest, &attempt)
                 .await?
@@ -5031,9 +5054,16 @@ async fn run_observe_poll(
 /// `PossiblyEffected/Unknown` against the original owner operation so the pair
 /// is never handed back as a clean failure.
 ///
-/// The composition lock is taken only around the owner borrow and released
-/// before the result submit, so no Kernel/daemon composition lock is held
-/// across the owner RPC or the Store wait.
+/// W5: the result is classified at the layer that actually produced it. The
+/// owner's commit is a [`OutcomeLayer::CanonicalCommit`], an operation the
+/// owner admitted without a terminal receipt is a non-terminal
+/// [`OutcomeLayer::Pending`] against a live handle, an unresolvable outcome is
+/// [`OutcomeLayer::PossiblyEffected`] against the owner operation, and a
+/// persistence failure after a real commit is reported as
+/// `EffectOccurrenceUnretained` — never as `Committed`. The composition lock
+/// is taken only around the owner borrow and released before the result submit,
+/// so no Kernel/daemon composition lock is held across the owner RPC or the
+/// Store wait.
 async fn execute_observation_capture(
     kernel: &DaemonKernelClient,
     composition: &SharedComposition,
@@ -5046,6 +5076,15 @@ async fn execute_observation_capture(
     let identity = observation_request_identity(envelope, &capture, crate::unix_ms_i64())
         .map_err(|error| format!("daemon observe identity: {error}"))?;
     let base_operation = observation_base_operation(envelope)?;
+    // The exact owner operation the commit would carry. It is derived here, not
+    // guessed: it is the same identity the owner's own admission mints for this
+    // capture, so a pending handle or an unresolved outcome points at exactly
+    // the operation a later read or reconciliation resolves.
+    let owner_operation_id = format!(
+        "{}/observe-{}",
+        base_operation.as_str(),
+        capture.observation_identity()
+    );
     let receipt = {
         let guard = composition.lock().await;
         let owner = guard
@@ -5055,15 +5094,18 @@ async fn execute_observation_capture(
             .admit_captured_observation(&identity, &base_operation, &capture)
             .await
         {
-            Ok(receipt) => receipt,
+            Ok(_receipt) => (),
             // The commit may have executed without returning a receipt. The
             // owner already reconciles an unknown outcome against the neutral
             // port; anything left here is genuinely unresolved, so the pair
-            // advances to the unknown disposition against its own owner
-            // operation instead of being retired as a clean failure.
+            // advances to the unresolved disposition against its own owner
+            // operation instead of being retired as a clean failure. This is
+            // NOT a pending handle: the owner may never have started anything,
+            // so there is nothing anyone could poll or cancel — only a
+            // reconciliation reference.
             Err(error) => {
                 let unresolved = ObserveServeOutcome::OutcomeUnknown {
-                    operation_id: format!("{}/observe-unresolved", base_operation.as_str()),
+                    operation_id: owner_operation_id.clone(),
                 };
                 return submit_observe_result_idempotent(kernel, envelope, attempt, &unresolved)
                     .await
@@ -5075,8 +5117,116 @@ async fn execute_observation_capture(
             }
         }
     };
-    let outcome = observe_serve_outcome(&receipt)?;
-    submit_observe_result_idempotent(kernel, envelope, attempt, &outcome).await
+    // The owner's returned receipt is deliberately NOT the retained result
+    // here: the flight re-reads the exact owner operation through the
+    // handle's read/wait verb below, so the completion it claims is the one
+    // the owner's own receipt route still holds rather than the value the
+    // admission call happened to return.
+    // W5: before claiming a retained completion, resolve the owner's own
+    // operation through the pending handle's read/wait verb. A committed owner
+    // operation is submitted as the completion; an owner that admitted the
+    // operation but holds no terminal receipt yet is a REAL pending handle,
+    // not a completion and not a deferral. This is the one place the flight
+    // decides between them, and it decides from the owner's own receipt route
+    // rather than from the shape of the call.
+    let handle = observation_pending_handle(envelope, &owner_operation_id)
+        .map_err(|error| format!("daemon observe pending handle: {error}"))?;
+    // The cancel verb is resolved here so a handle never travels without its
+    // cancellation identity being provable: an admitted envelope without one
+    // yields `None`, which is the honest answer and is reported rather than
+    // substituted with an invented right to stop the operation.
+    let cancellation_id = handle.cancel().unwrap_or("none").to_owned();
+    let read_back = {
+        let guard = composition.lock().await;
+        let owner = guard
+            .observation_reconciliation()
+            .map_err(|error| format!("daemon observe owner borrow: {error}"))?;
+        handle.wait(&owner, &base_operation, &capture).await
+    };
+    let outcome = match read_back? {
+        // The owner holds a terminal receipt for this exact operation: submit
+        // that real disposition as the retained completion.
+        terminal
+        @ (ObserveServeOutcome::Committed { .. } | ObserveServeOutcome::Refused { .. }) => terminal,
+        // The owner admitted the operation and holds no terminal receipt. The
+        // honest result is the live pending handle itself, which carries the
+        // read/wait/cancel path. It is explicitly NOT a completion.
+        ObserveServeOutcome::OutcomeUnknown { .. } => ObserveServeOutcome::Pending { handle },
+        // A read-back cannot itself be pending, unavailable or unretained;
+        // anything else is the step error it is rather than an invented
+        // disposition.
+        other => {
+            return Err(format!(
+                "daemon observe owner readback produced an unexpected layer: {}",
+                other.outcome_layer().as_str()
+            ));
+        }
+    };
+    tracing::debug!(
+        target: "eliotd::diagnostics",
+        event = "eliotd.observe_owner_readback",
+        layer = outcome.outcome_layer().as_str(),
+        terminal = outcome.is_terminal(),
+        cancellation_id = cancellation_id,
+    );
+    let retained = submit_observe_result_idempotent(kernel, envelope, attempt, &outcome).await;
+    match retained {
+        Ok(retained) => Ok(retained),
+        // W5: the owner committed and issued its exact receipt, but that
+        // response never reached the host record. The effect happened and the
+        // completion was not retained, so the honest answer is a distinct
+        // state carrying the committed operation and receipt hash as the
+        // reconciliation reference — not success, and not a retry of the
+        // effect, which is already durable and idempotent under its own
+        // identity.
+        Err(persist_error) => {
+            let outcome = match &outcome {
+                ObserveServeOutcome::Committed {
+                    operation_id,
+                    canonical_request_hash,
+                } => ObserveServeOutcome::EffectOccurrenceUnretained {
+                    operation_id: operation_id.clone(),
+                    canonical_request_hash: canonical_request_hash.clone(),
+                    reason: persist_error.clone(),
+                },
+                // Anything else that fails to persist never claimed a commit,
+                // so it keeps its own disposition and the persistence failure
+                // stays the step error rather than being relabelled as an
+                // effected effect.
+                other => {
+                    return Err(format!(
+                        "daemon observe host result not retained: {persist_error}; outcome: {}",
+                        other.outcome_layer().as_str()
+                    ));
+                }
+            };
+            tracing::warn!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.observe_effect_occurred_result_not_retained",
+                owner_operation_id = outcome_owner_operation(&outcome).unwrap_or("none"),
+                reason = persist_error,
+            );
+            Ok(ObservePollOutcome::EffectNotRetained)
+        }
+    }
+}
+
+/// The exact owner operation one classified outcome reconciles against.
+///
+/// Returns `None` for arms that admit no owner operation — a refusal-free
+/// unavailable disposition has nothing to reconcile — so a caller never reads a
+/// missing owner operation as an empty one.
+fn outcome_owner_operation(outcome: &ObserveServeOutcome) -> Option<&str> {
+    match outcome {
+        ObserveServeOutcome::Committed { operation_id, .. }
+        | ObserveServeOutcome::Refused { operation_id, .. }
+        | ObserveServeOutcome::OutcomeUnknown { operation_id }
+        | ObserveServeOutcome::EffectOccurrenceUnretained { operation_id, .. } => {
+            Some(operation_id.as_str())
+        }
+        ObserveServeOutcome::Pending { handle } => Some(handle.operation_id.as_str()),
+        ObserveServeOutcome::Unavailable { .. } => None,
+    }
 }
 
 /// Submits one real owner outcome for the exact admitted attempt, retrying once
@@ -5086,7 +5236,8 @@ async fn execute_observation_capture(
 /// `(operation_id, canonical_request_hash)`: an identical body under the same
 /// live attempt replays the retained result rather than binding a second
 /// completion, and the receipt-comparison gate keeps a foreign or receiptless
-/// presentation from serving as this retained outcome.
+/// presentation from serving as this retained outcome. It retries the
+/// *submission of an already-decided body*, never the owner's effect.
 async fn submit_observe_result_idempotent(
     kernel: &DaemonKernelClient,
     envelope: &eliot_protocol::HostRequestEnvelope,
@@ -5101,7 +5252,18 @@ async fn submit_observe_result_idempotent(
     let retained = match outcome {
         ObserveServeOutcome::Committed { .. } => ObservePollOutcome::Committed,
         ObserveServeOutcome::Refused { .. } => ObservePollOutcome::Refused,
+        // A pending handle is NOT a deferred pair: the owner admitted the
+        // operation, so the queue pair retires with a live handle whose
+        // read/wait/cancel path is the owner's own receipt route. Reporting it
+        // as `Deferred` would claim the owner never started anything.
+        ObserveServeOutcome::Pending { .. } => ObservePollOutcome::Pending,
         ObserveServeOutcome::OutcomeUnknown { .. } => ObservePollOutcome::Deferred,
+        // An arm with no connected owner is retired through the defer leg, not
+        // the result leg: there is no disposition to persist.
+        ObserveServeOutcome::Unavailable { .. } => ObservePollOutcome::Deferred,
+        ObserveServeOutcome::EffectOccurrenceUnretained { .. } => {
+            ObservePollOutcome::EffectNotRetained
+        }
     };
     let observe_outcome = |submitted: ObserveSubmitOutcome| match submitted {
         ObserveSubmitOutcome::Accepted => Ok(retained),

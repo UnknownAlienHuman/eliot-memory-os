@@ -2442,6 +2442,45 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
         .await
     }
 
+    /// Reads the exact committed receipt for one admitted `eliot.observe`
+    /// capture operation (issue #2565 W5).
+    ///
+    /// This is the read/wait verb of a pending capture handle. It adds no
+    /// admission, no commit and no state: it resolves the exact operation
+    /// identity the owner's own [`Self::admit_captured_observation`] mints for
+    /// this capture — `{base_operation_id}/observe-{capture.observation_identity()}`
+    /// — and asks the existing
+    /// [`KernelTransitionPort::receipt`] route for whatever the owner actually
+    /// holds. It performs no `check_receipt` binding pass, because it is a
+    /// status read rather than an admission: the caller already proved the
+    /// capture's identities before it ever held a handle, and the receipt it
+    /// returns is passed through exactly as issued.
+    ///
+    /// `Some(receipt)` means the owner committed and issued its terminal
+    /// receipt. `None` means the owner holds no terminal receipt for this
+    /// operation — the honest "still pending" answer. A port failure is a
+    /// typed [`CompositionError`], never a disposition: an unreachable owner is
+    /// not an owner verdict, and this must never be collapsed into `None` or
+    /// into a refusal.
+    ///
+    /// This is a pure read of the owner's own canonical receipt route; it adds
+    /// no second store client, no queue, and no effect.
+    pub async fn read_captured_observation_receipt(
+        &self,
+        base_operation_id: &OperationId,
+        capture: &CapturedObservation,
+    ) -> Result<Option<WriteReceipt>, CompositionError> {
+        let observation_operation = OperationId::new(format!(
+            "{base_operation_id}/observe-{}",
+            capture.observation_identity()
+        ))
+        .map_err(|error| owner_refused(error.to_string()))?;
+        self.kernel
+            .receipt(observation_operation)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Commits one named Problem owner transition (issue #1759 I2).
     ///
     /// This is the production entry for the nine named transitions. It adds no

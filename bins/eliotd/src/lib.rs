@@ -296,10 +296,11 @@ pub use governor_local_read::{
     serve_admitted_local_read,
 };
 pub use governor_observe_serve::{
-    ObserveDeferral, ObserveOwnerRoute, ObserveServeOutcome, ObserveSuboperation,
-    decode_observation_capture, decode_observe_suboperation, observation_base_operation,
-    observation_request_identity, observation_result_body, observe_serve_outcome,
-    observe_suboperation_owner, serve_admitted_observe,
+    OBSERVE_PENDING_RECEIPT_OWNER, ObserveDeferral, ObserveOwnerRoute, ObserveServeOutcome,
+    ObserveSuboperation, OutcomeLayer, PendingObserveHandle, decode_observation_capture,
+    decode_observe_suboperation, observation_base_operation, observation_pending_handle,
+    observation_request_identity, observation_result_body, observation_unavailable_outcome,
+    observe_serve_outcome, observe_suboperation_owner, serve_admitted_observe,
 };
 pub use improvement_candidate_dispatch::{
     ImprovementRouteDispatch, ImprovementRouteOutcome, commit_unknown_effect_obligation,
