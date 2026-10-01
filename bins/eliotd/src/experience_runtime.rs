@@ -222,6 +222,14 @@ pub fn propose_memory_extinction_candidate(
 /// scope revision head is read first and its revision becomes the declared
 /// minimum, so a head that moves between the two reads fails closed as
 /// [`ReadError::StaleRevision`] rather than being served as current.
+///
+/// #223 C2: the requested subject and scope are retained across the await and
+/// joined to the decoded readback by `select_applicable_current_position`,
+/// which refuses a substituted subject/scope/fence and refuses an ambiguous set
+/// of applicable currents instead of taking the first one. The requested
+/// subject is the only thing that distinguishes this request from any other
+/// `GetCurrentEpistemicPosition` read, so comparing it is what makes the
+/// returned position this request's answer rather than merely *a* position.
 pub async fn read_current_position(
     composition: &DaemonComposition,
     kernel: &Arc<DaemonKernelClient>,
@@ -253,6 +261,13 @@ pub async fn read_current_position(
     )?;
     let mut dependency_revisions = BTreeMap::new();
     dependency_revisions.insert(scope_key, minimum.revision);
+    // #223 C2: the requested subject and scope ARE the identity this read is
+    // answered against. Both are moved into the selector map below, so they are
+    // retained here first: without these copies nothing after the await could
+    // join the decoded readback back to the request, and any position the store
+    // returned would be accepted as this request's answer.
+    let requested_subject = position_subject.clone();
+    let requested_scope = scope.clone();
     let parameters = NamedParameters::from_map(BTreeMap::from([(
         "position".to_owned(),
         serde_json::Value::String(position_subject),
@@ -290,23 +305,91 @@ pub async fn read_current_position(
             field: "response.payload",
             reason: "position readback is not the versioned shape",
         })?;
-    for position in &readback.positions {
+    select_applicable_current_position(
+        &readback.positions,
+        &requested_subject,
+        &requested_scope,
+        &ctx.state_fence,
+    )
+}
+
+/// Joins one decoded position readback to the request that asked for it, then
+/// resolves the single applicable current position.
+///
+/// [`ReadService::bound_state`] proves the read *envelope*, not the *payload*:
+/// the owner already refuses a scope divergence
+/// (`owner_inventory::compare_operation_with_store_read_model` +
+/// `refuse_scope_divergence`), validates the declared ordering binding against
+/// the fence (`ReadOrderingBinding::validate_against`), and refuses a changed
+/// operation or fence (`response.operation != operation ||
+/// response.state_fence != ctx.state_fence`), together with the revision-head
+/// closure, churn and stale-revision checks. None of that can see a position,
+/// because the owner never decodes the payload. So before this function the
+/// decoded readback was joined to nothing: the terminal `.find(..)` resolved
+/// several `Current` positions by input order and accepted a readback holding
+/// positions for a different subject as this request's answer.
+///
+/// This is that missing join, and it is a binding of two owner-produced values,
+/// not a second semantic scheme: the owner still decides what a position is and
+/// what admits it, and this only refuses an answer that is not this request's
+/// answer. The three outcomes stay three, and none may be read as another:
+///
+/// * a position whose own admission does not name the requested subject, the
+///   requested scope and the invocation fence is a substitution and is refused
+///   as `positions.admission`, whatever its currentness;
+/// * several *applicable* positions are a conflict, refused as
+///   `positions.applicable` — never resolved first-wins. Applicable means
+///   `Current` under a distinct [`CurrentEpistemicPosition::position_identity`]:
+///   the owner projects one admitted position once per claim, so per-claim views
+///   of one admission revision are the owner's own shape and stay accepted,
+///   while two admitted revisions both claiming `Current` for this subject is
+///   the ambiguity (I12.12 `conflicted`) that input order would have hidden;
+/// * no applicable position is the pre-existing explicit absence, unchanged:
+///   `positions` / "no current admitted position in the readback", which is
+///   known-empty — never a mismatch and never a conflict.
+fn select_applicable_current_position(
+    positions: &[CurrentEpistemicPosition],
+    requested_subject: &str,
+    requested_scope: &ScopeId,
+    invocation_fence: &StateFence,
+) -> Result<CurrentEpistemicPosition, ExperienceDriverError> {
+    let mut selected: Option<&CurrentEpistemicPosition> = None;
+    for position in positions {
         position
             .validate()
             .map_err(|_| ExperienceDriverError::Position {
                 field: "positions",
                 reason: "admitted position is invalid",
             })?;
+        let identity = position.position_identity();
+        if identity.0.as_str() != requested_subject
+            || position.admission.scope.as_str() != requested_scope.as_str()
+            || position.admission.fence != *invocation_fence
+        {
+            return Err(ExperienceDriverError::Position {
+                field: "positions.admission",
+                reason: "admitted position does not answer the requested subject, scope and fence",
+            });
+        }
+        if position.currentness != Currentness::Current {
+            continue;
+        }
+        match selected {
+            None => selected = Some(position),
+            // One admission revision read through several claims is one position.
+            Some(chosen) if chosen.position_identity() == identity => {}
+            Some(_) => {
+                return Err(ExperienceDriverError::Position {
+                    field: "positions.applicable",
+                    reason: "several applicable current positions answer this request",
+                });
+            }
+        }
     }
-    readback
-        .positions
-        .iter()
-        .find(|position| position.currentness == Currentness::Current)
-        .cloned()
-        .ok_or(ExperienceDriverError::Position {
-            field: "positions",
-            reason: "no current admitted position in the readback",
-        })
+    selected.cloned().ok_or(ExperienceDriverError::Position {
+        field: "positions",
+        reason: "no current admitted position in the readback",
+    })
 }
 
 /// Journal-leg driver inputs: projection context plus live binding.
@@ -1009,4 +1092,297 @@ pub async fn commit_experience_event_records(
         feedback_receipts,
         view_stale,
     })
+}
+
+#[cfg(test)]
+mod position_binding_tests {
+    #![allow(clippy::expect_used)] // test-only panic-acceptable (#838).
+    use super::*;
+    use eliot_contracts::{EpochId, EpochLineageId, ReceiptId, ResourceGeneration, SourceId};
+    use eliot_epistemic_contracts::{
+        AdmittedReceipt, AdmittedReceiptParams, ClaimId, PositionId, PositionRevision,
+    };
+    use std::num::NonZeroU64;
+
+    type ProofResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const REQUESTED_SUBJECT: &str = "position-223";
+    const REQUESTED_SCOPE: &str = "scope-223";
+    const FOREIGN_SUBJECT: &str = "position-foreign";
+    const FOREIGN_SCOPE: &str = "scope-foreign";
+
+    fn test_fence(sequence: u64) -> StateFence {
+        StateFence::new(
+            EpochId::new(
+                EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+                NonZeroU64::new(sequence).expect("nonzero test sequence"),
+            )
+            .expect("valid test epoch"),
+            ResourceGeneration::new(1).expect("nonzero resource generation"),
+        )
+    }
+
+    fn requested_scope_id() -> ScopeId {
+        ScopeId::new(REQUESTED_SCOPE).expect("valid scope id")
+    }
+
+    /// One admitted position view, exactly as the owner projects it: the
+    /// admission envelope names the subject, scope, fence and position
+    /// revision, and `currentness` says whether the owner holds it as current.
+    fn admitted_view(
+        subject: &str,
+        scope: &str,
+        fence: &StateFence,
+        position_revision: u64,
+        claim: &str,
+        currentness: Currentness,
+    ) -> CurrentEpistemicPosition {
+        // A superseded view must name what superseded it; a current one must
+        // name nothing. That pairing is the owner's own shape rule, so the
+        // fixture honours it instead of relaxing it.
+        let supersession = match currentness {
+            Currentness::Current => BTreeSet::new(),
+            Currentness::Superseded => BTreeSet::from([
+                ArtifactId::new(format!("supersedes-{claim}")).expect("valid artifact id"),
+            ]),
+        };
+        CurrentEpistemicPosition::new(
+            AdmittedReceipt::new(AdmittedReceiptParams {
+                receipt_id: ReceiptId::new(format!("receipt-{claim}")).expect("valid receipt id"),
+                payload_digest: "a".repeat(64),
+                owner: SourceId::new("store-223").expect("valid source id"),
+                revision: "1".to_owned(),
+                scope: scope.to_owned(),
+                fence: fence.clone(),
+                evidence_digest: "b".repeat(64),
+                coverage_digest: "c".repeat(64),
+                conflict_digest: "d".repeat(64),
+                proof_digest: "e".repeat(64),
+                position: PositionId::new(subject).expect("valid position id"),
+                position_revision: PositionRevision::new(position_revision)
+                    .expect("nonzero position revision"),
+            })
+            .expect("valid admitted receipt"),
+            currentness,
+            supersession,
+            ClaimId::new(claim).expect("valid claim id"),
+        )
+        .expect("valid admitted position view")
+    }
+
+    fn current_for_request(
+        fence: &StateFence,
+        position_revision: u64,
+        claim: &str,
+    ) -> CurrentEpistemicPosition {
+        admitted_view(
+            REQUESTED_SUBJECT,
+            REQUESTED_SCOPE,
+            fence,
+            position_revision,
+            claim,
+            Currentness::Current,
+        )
+    }
+
+    fn select(
+        positions: &[CurrentEpistemicPosition],
+        fence: &StateFence,
+    ) -> Result<CurrentEpistemicPosition, ExperienceDriverError> {
+        let scope = requested_scope_id();
+        select_applicable_current_position(positions, REQUESTED_SUBJECT, &scope, fence)
+    }
+
+    #[test]
+    fn matching_single_current_position_is_returned() -> ProofResult {
+        let fence = test_fence(1);
+        let position = current_for_request(&fence, 1, "claim-1");
+
+        let selected = select(std::slice::from_ref(&position), &fence)?;
+
+        assert_eq!(selected, position);
+        assert_eq!(selected.claim.as_str(), "claim-1");
+        Ok(())
+    }
+
+    /// The owner projects one admitted position once per claim, so several
+    /// `Current` views of the SAME admission revision are one position and stay
+    /// accepted. Refusing these would make every multi-claim position unreadable.
+    #[test]
+    fn per_claim_views_of_one_admission_revision_stay_one_position() -> ProofResult {
+        let fence = test_fence(1);
+        let positions = [
+            current_for_request(&fence, 7, "claim-1"),
+            current_for_request(&fence, 7, "claim-2"),
+            current_for_request(&fence, 7, "claim-3"),
+        ];
+
+        let selected = select(&positions, &fence)?;
+
+        assert_eq!(selected.position_identity().1, PositionRevision::new(7)?);
+        Ok(())
+    }
+
+    #[test]
+    fn foreign_subject_is_refused_as_substitution() {
+        let fence = test_fence(1);
+        let positions = [admitted_view(
+            FOREIGN_SUBJECT,
+            REQUESTED_SCOPE,
+            &fence,
+            1,
+            "claim-1",
+            Currentness::Current,
+        )];
+
+        let error = select(&positions, &fence).expect_err("a foreign subject must not answer");
+
+        assert!(matches!(
+            error,
+            ExperienceDriverError::Position {
+                field: "positions.admission",
+                reason: "admitted position does not answer the requested subject, scope and fence",
+            }
+        ));
+    }
+
+    #[test]
+    fn foreign_scope_is_refused_as_substitution() {
+        let fence = test_fence(1);
+        let positions = [admitted_view(
+            REQUESTED_SUBJECT,
+            FOREIGN_SCOPE,
+            &fence,
+            1,
+            "claim-1",
+            Currentness::Current,
+        )];
+
+        let error = select(&positions, &fence).expect_err("a foreign scope must not answer");
+
+        assert!(matches!(
+            error,
+            ExperienceDriverError::Position {
+                field: "positions.admission",
+                reason: "admitted position does not answer the requested subject, scope and fence",
+            }
+        ));
+    }
+
+    #[test]
+    fn foreign_fence_is_refused_as_substitution() {
+        let fence = test_fence(1);
+        let positions = [current_for_request(&test_fence(2), 1, "claim-1")];
+
+        let error = select(&positions, &fence).expect_err("a foreign fence must not answer");
+
+        assert!(matches!(
+            error,
+            ExperienceDriverError::Position {
+                field: "positions.admission",
+                reason: "admitted position does not answer the requested subject, scope and fence",
+            }
+        ));
+    }
+
+    /// Two admitted revisions both claiming `Current` for one subject is the
+    /// ambiguity. First-wins resolved it by input order; it is now a refusal.
+    #[test]
+    fn several_applicable_currents_are_refused_as_conflict() {
+        let fence = test_fence(1);
+        let positions = [
+            current_for_request(&fence, 1, "claim-1"),
+            current_for_request(&fence, 2, "claim-2"),
+        ];
+
+        let error = select(&positions, &fence).expect_err("several currents must be a conflict");
+
+        assert!(matches!(
+            error,
+            ExperienceDriverError::Position {
+                field: "positions.applicable",
+                reason: "several applicable current positions answer this request",
+            }
+        ));
+    }
+
+    #[test]
+    fn no_current_position_stays_the_explicit_absence() {
+        let fence = test_fence(1);
+        let positions = [admitted_view(
+            REQUESTED_SUBJECT,
+            REQUESTED_SCOPE,
+            &fence,
+            1,
+            "claim-1",
+            Currentness::Superseded,
+        )];
+
+        let error = select(&positions, &fence).expect_err("a superseded position is not current");
+
+        assert!(matches!(
+            error,
+            ExperienceDriverError::Position {
+                field: "positions",
+                reason: "no current admitted position in the readback",
+            }
+        ));
+    }
+
+    /// The three refusals are three outcomes: a consumer can tell a substituted
+    /// answer from an ambiguous one and from known-empty. None collapses into
+    /// another, and none is reachable as success.
+    #[test]
+    fn the_three_refusals_stay_distinguishable() {
+        let fence = test_fence(1);
+        let outcomes = [
+            select(
+                &[admitted_view(
+                    FOREIGN_SUBJECT,
+                    REQUESTED_SCOPE,
+                    &fence,
+                    1,
+                    "claim-1",
+                    Currentness::Current,
+                )],
+                &fence,
+            ),
+            select(
+                &[
+                    current_for_request(&fence, 1, "claim-1"),
+                    current_for_request(&fence, 2, "claim-2"),
+                ],
+                &fence,
+            ),
+            select(
+                &[admitted_view(
+                    REQUESTED_SUBJECT,
+                    REQUESTED_SCOPE,
+                    &fence,
+                    1,
+                    "claim-1",
+                    Currentness::Superseded,
+                )],
+                &fence,
+            ),
+        ];
+
+        let mut described = BTreeSet::new();
+        for outcome in &outcomes {
+            match outcome {
+                Ok(position) => panic!("a refusal collapsed into success: {position:?}"),
+                Err(ExperienceDriverError::Position { field, reason }) => {
+                    let refusal = (*field, *reason);
+                    assert!(
+                        described.insert(refusal),
+                        "duplicate refusal: {}",
+                        refusal.0
+                    );
+                }
+                Err(other) => panic!("unexpected refusal variant: {other:?}"),
+            }
+        }
+        assert_eq!(described.len(), 3, "the three refusals must stay distinct");
+    }
 }
