@@ -92,9 +92,7 @@ use std::sync::Mutex;
 use eliot_agent_api::{AttemptId, RouteFingerprint};
 use eliot_agent_bridge_core::ToolResultReceipt;
 #[cfg(not(test))]
-use eliot_agent_coordinator::{
-    AdmittedProviderCapability, OwnerCurrentness, PresentedClaimMaterial,
-};
+use eliot_agent_coordinator::CoordinatorError;
 use eliot_agent_coordinator::{
     CandidateId, RUNTIME_PROFILE_FILE_NAME, SchedulingProfile, StaffingPlanRequest,
     load_runtime_scheduling_profile,
@@ -111,8 +109,6 @@ use crate::agent_fabric::{
 #[cfg(test)]
 use crate::agent_fabric::{FabricPorts, ModelRegistryPort};
 use crate::daemon_kernel_client::DaemonKernelClient;
-#[cfg(not(test))]
-use crate::semantic_revision_store::SemanticRevisionStore;
 use crate::staffing_policy::{
     StaffedLane, StaffingPlanReceipt, plan_coordinator_staffing, verify_receipt_digest,
 };
@@ -2089,99 +2085,35 @@ fn restore_solo_fabric(
     Ok(fabric)
 }
 
-/// Builds the restore-time admitted provider capability from the durable
-/// projection's claimed halves plus freshly resolved session halves.
-///
-/// Production mirror of the session-bound resolution the test seam performs
-/// through the composition's verified-material resolution plus the
-/// material-to-capability builder: the claimed halves ride from the
-/// digest-bound persisted projection (never invented here), while the live
-/// fence and the validated session binding are the daemon's current
-/// authenticated-session observations passed in by the caller. The Governor
-/// expectation travels from the projection and is judged for currency
-/// against the live fence by the same authority rule, so a projection
-/// restored under a moved epoch refuses instead of resuming effect
-/// authority. Revocation is observed per proof, never at construction, so a
-/// revoked projection still builds and the coordinator's event replay
-/// refuses it without mutation.
-///
-/// Residual (issue #1108 A4/A5): this synchronous builder still constructs
-/// through `AdmittedProviderCapability::new` directly from presented halves,
-/// so the factory agreement gate never observes sync-restore material. The
-/// row source (`DaemonKernelClient::load_provider_claim_row_async`) is async
-/// and this builder's callers (`restore_solo_fabric` via `solo_request_cancel`,
-/// `solo_reconcile_cancel`, `solo_ingest_result`, `solo_ingest_tool_result`,
-/// `solo_restore`) are synchronous by contract, so the row cannot be resolved
-/// here without a sync-to-async conversion. The async restore path
-/// (`restore_solo_fabric_async` via `agent_fabric_restore_verified_async`)
-/// is factory-wired through `build_production_provider_capability`.
-///
-/// # Errors
-///
-/// Returns the session-currency rejection or the coordinator owner rejection
-/// unchanged.
-#[cfg(not(test))]
-fn build_solo_restore_capability(
-    material: VerifiedProviderMaterial,
-    live_fence: eliot_contracts::StateFence,
-) -> Result<AdmittedProviderCapability, FabricError> {
-    if !material
-        .expectation
-        .live_authority_epoch
-        .is_same_authority(&live_fence.authority_epoch)
-    {
-        return Err(FabricError::StaleEpoch(
-            "provider expectation epoch is not current under the live Kernel session".to_owned(),
-        ));
-    }
-    let presented = PresentedClaimMaterial::new(
-        material.claim_id,
-        material.attempt_id,
-        material.operation_id,
-        material.binding_digest,
-        material.executable_digest,
-        material.route_revision,
-        material.capacity_revision,
-        material.worker_generation,
-        material.presented_fence,
-    )?;
-    let currentness = OwnerCurrentness::new(material.expectation, live_fence)?;
-    Ok(AdmittedProviderCapability::new(
-        material.identity,
-        presented,
-        currentness,
-        material.health,
-        material.minimum_event_sequence,
-    )?)
-}
-
 /// Rebuilds the solo ports plus a restored fabric from a persisted projection.
 ///
-/// Production restore (issue #1108 A12): the digest-bound projection supplies
-/// the claimed halves, the daemon supplies the live session halves (a fresh
-/// fence plus the validated session binding, by the same rule as the
-/// session-bound resolution), the closed production ports bind no test fake,
-/// and the coordinator replays every snapshot event through the fresh owner
-/// verifier, so stale, revoked, foreign, or conflicting evidence fails
-/// closed instead of resuming effect authority. The restored fabric carries
-/// the recorded dispatch intent, which is the independent expected set the
-/// tool-result ingest leg binds its receipt against before anything is
-/// observed.
-///
-/// Every solo leg reaches `AgentFabric::observe_tool_result` through this
-/// restore in a non-test build; without a validated session, a current
-/// fence, or a coherent capability it returns the typed refusal unchanged.
-#[cfg(not(test))]
-/// Synchronous production restore stays fail-closed (issue #1108 A8).
+/// Synchronous production restore stays fail-closed (issue #1108 A4/A5, A8).
 ///
 /// Every restore caller in this module except `solo_fair_pull_recovery` is
 /// synchronous (`solo_request_cancel`, `solo_reconcile_cancel`,
-/// `solo_ingest_result`, `solo_restore`); awaiting the async restore seam
-/// from any of them would convert sync to async, so the synchronous
-/// production path refuses typed here instead of half-wiring the seam, and
-/// no production build resumes effecting operations from a snapshot over
-/// this path. The async restore path is `restore_solo_fabric_async`,
-/// reached from the async fair-pull recovery poll.
+/// `solo_ingest_result`, `solo_ingest_tool_result`, `solo_restore`), while
+/// the durable owner row that witnesses a capability resolves only through
+/// the async claim-row read
+/// (`DaemonKernelClient::load_provider_claim_row_async`). Awaiting it here
+/// would convert sync to async with no composition mutex held across the
+/// await and no sync-to-async conversion, so this path refuses typed with
+/// `StaleProviderBinding` instead of constructing a rowless capability for
+/// `AgentFabric::restore_with_admitted_provider`: without the retained row
+/// the witnessed-binding gate cannot tell a live binding from
+/// caller-supplied halves. The witnessed restore path is
+/// `restore_solo_fabric_async`, reached from the async fair-pull recovery
+/// poll; no production build resumes effecting operations from a snapshot
+/// over this path.
+///
+/// The projection liveness guards below still run first, so a missing
+/// definition binding, a fence-moved definition, or a missing validated
+/// session keeps its exact typed refusal.
+///
+/// # Errors
+///
+/// Returns the readiness, definition-binding, fence, or session rejection
+/// unchanged; otherwise the typed `StaleProviderBinding` refusal.
+#[cfg(not(test))]
 fn restore_solo_fabric(
     composition: &DaemonComposition,
     kernel: &Arc<DaemonKernelClient>,
@@ -2212,33 +2144,9 @@ fn restore_solo_fabric(
                 .to_owned(),
         ));
     }
-    let capability = build_solo_restore_capability(projection.claimed.material(), live_fence)
-        .map_err(DaemonError::ProviderAdmission)?;
-    let config = daemon_coordinator_config()?;
-    let ports = composition.production_fabric_ports()?;
-    let store = SemanticRevisionStore::new(composition.state_root());
-    let mut fabric = AgentFabric::restore_with_admitted_provider(
-        projection.snapshot.clone(),
-        config,
-        ports,
-        Some(&store),
-        capability,
-    )
-    .map_err(DaemonError::ProviderAdmission)?;
-    // Same durable carrier as the drive path, so a revision published after
-    // restore is committed before it is reported current exactly as before.
-    fabric.attach_semantic_revision_store(composition.state_root());
-    // Reconcile the unknown: an emitted dispatch with no ingested result
-    // cannot relaunch and cannot release; its outcome stays unknown until
-    // the worker observation arrives through the ingest leg.
-    if projection.emitted && projection.result_digest.is_none() {
-        let attempt = AttemptId::new(projection.attempt_id.clone())
-            .map_err(|error| DaemonError::ProviderAdmission(contract(error)))?;
-        if fabric.attempt_of(&attempt) == Some(crate::agent_fabric::AttemptLifecycle::Dispatched) {
-            fabric.mark_unknown_outcome(&attempt)?;
-        }
-    }
-    Ok(fabric)
+    Err(DaemonError::ProviderAdmission(FabricError::Coordinator(
+        CoordinatorError::StaleProviderBinding,
+    )))
 }
 
 /// Restores the solo fabric through the verified async seam (issue #1108
