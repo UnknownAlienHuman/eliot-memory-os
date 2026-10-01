@@ -110,7 +110,7 @@ pub enum UserAutomationOperatorResultValue {
     /// Read-only authenticated context used to obtain a request-side fence witness.
     Context(UserAutomationOperatorContextValue),
     /// Owner-generated normalized immutable revision and its exact receipt bytes.
-    NormalizedSchedule(UserAutomationNormalizedScheduleValue),
+    NormalizedSchedule(Box<UserAutomationNormalizedScheduleValue>),
     /// Typed refusal before the canonical Store was called.
     AttemptRefusal(Box<UserAutomationAttemptRefusalValue>),
     /// Proven absence in an owner readback.
@@ -168,6 +168,7 @@ impl<'de> Deserialize<'de> for UserAutomationOperatorResultValue {
                 .map(Self::Context)
                 .map_err(D::Error::custom),
             "schedule_normalized" | "legacy_schedule_migrated" => serde_json::from_value(value)
+                .map(Box::new)
                 .map(Self::NormalizedSchedule)
                 .map_err(D::Error::custom),
             "transition" => serde_json::from_value(value)
@@ -406,7 +407,7 @@ impl UserAutomationOperatorResultEnvelope {
     }
 
     /// Builds the read-only fence handshake response from the authenticated
-    /// request already admitted by the UserAutomation route.
+    /// request already admitted by the `UserAutomation` route.
     pub fn from_context(request: &UserAutomationServiceRequest) -> Result<Self, String> {
         if !matches!(
             &request.intent.operation,
@@ -445,13 +446,13 @@ impl UserAutomationOperatorResultEnvelope {
             status: UserAutomationOperatorResultStatus::Known,
             correlation: result_correlation(request),
             state_fence: request.context.state_fence.clone(),
-            value: UserAutomationOperatorResultValue::NormalizedSchedule(
+            value: UserAutomationOperatorResultValue::NormalizedSchedule(Box::new(
                 UserAutomationNormalizedScheduleValue {
                     outcome: outcome.to_owned(),
                     revision,
                     normalization_receipt_envelope,
                 },
-            ),
+            )),
             recovery: None,
         };
         envelope.validate_for_request(request)?;
@@ -832,8 +833,7 @@ fn validate_normalization_result(
 
     let mut source_projection = revision.clone();
     source_projection.schedule.next_occurrences.clear();
-    source_projection.schedule.normalization_receipt =
-        Box::new(ScheduleNormalizationReceipt::default());
+    *source_projection.schedule.normalization_receipt = ScheduleNormalizationReceipt::default();
     if &source_projection != draft {
         return Err("normalization result changed non-owner revision fields".to_owned());
     }
@@ -885,6 +885,7 @@ fn parse_result_value(
             .map(UserAutomationOperatorResultValue::Context)
             .map_err(|_| "UserAutomation context result is not closed".to_owned()),
         "schedule_normalized" | "legacy_schedule_migrated" => serde_json::from_value(value)
+            .map(Box::new)
             .map(UserAutomationOperatorResultValue::NormalizedSchedule)
             .map_err(|_| "UserAutomation normalization result is not closed".to_owned()),
         "not_retained" => serde_json::from_value(value)
