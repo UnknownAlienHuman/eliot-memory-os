@@ -4604,6 +4604,7 @@ where
         {
             return Err(BlobError::IdempotencyConflict);
         }
+        self.ensure_lease(&recovery.root_lease)?;
         let operation_id = recovery.stage_context.operation.operation_id.as_str();
         let idempotency_key = recovery.stage_context.operation.idempotency_key.as_str();
         let content_idx = content_shard(&request.expected_content_hash);
