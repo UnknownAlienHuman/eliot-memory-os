@@ -2000,7 +2000,7 @@ fn require_restore_receipt_claim(
         // under another operation's identity cannot reach this point with an
         // agreeing receipt. Named explicitly so the relation is a comparison
         // against THIS operation rather than a property of the stream key.
-        || transaction.operation_id() != operation_id
+        || transaction.operation_id().ok().as_deref() != Some(operation_id)
     {
         return Err(BackupError::RestoreJournalMismatch);
     }
