@@ -36,16 +36,20 @@
 //!   what has to exist rather than that "admitted capture is not implemented":
 //!   `KernelBackupCapture::capture` consumes a caller-issued
 //!   `CaptureCallerAuth`, a `PublicationPort` that publishes exactly once, and
-//!   an already-accepted `CaptureRequest` evidence bundle. The port DOES have a
-//!   production implementation now - #959's
-//!   `eliot_blob::BlobArchivePublicationOwner` - but nothing can BIND it,
-//!   because it takes an `eliot_blob::BlobStoreService` that no production code
-//!   constructs; and the bundle still has no producer at all
+//!   an already-accepted `CaptureRequest` evidence bundle. The caller admission
+//!   IS supplied here ([`admit_backup_caller`]). The port DOES have a production
+//!   implementation now - #959's `eliot_blob::BlobArchivePublicationOwner` - but
+//!   nothing can BIND it, because it takes an `eliot_blob::BlobStoreService` that
+//!   no production code constructs; the bundle has no producer at all
 //!   (`request_from_ports` and `EbpCanonicalStoreClient::backup_begin`/
-//!   `backup_page`/`backup_end` have no production caller). Admitting capture
-//!   here would invent authority, so the item's "any missing capture-owner
-//!   behavior remains with #959" holds and this route refuses a typed
-//!   owner-absence instead of a receipt for having read its own arguments.
+//!   `backup_page`/`backup_end` have no production caller); and the frozen plan's
+//!   approved manifest digests have no owner-ISSUED issuer, because
+//!   `gate_approved_manifest_digests` binds each to a carried artifact's OWN
+//!   recorded `sha256` and so cannot be satisfied by a value minted here.
+//!   Admitting capture here would invent authority, so the item's "any missing
+//!   capture-owner behavior remains with #959" holds and this route refuses a
+//!   typed owner-absence instead of a receipt for having read its own
+//!   arguments.
 //! - `backup.verify` admits the bounded inline bundle bytes, then decodes and
 //!   validates them through the real capture owner
 //!   ([`KernelBackupCapture::verify_only`], bound on the composition by #959
@@ -841,6 +845,13 @@ fn cancellation_reply(idempotency_key: &str, owner_reason: &str) -> Value {
 ///    carried artifact's OWN recorded digest, so a digest read off the artifacts
 ///    it gates compares one caller list with itself and binds nothing.
 ///
+/// The refusal below enumerates these THREE in this order. It used to name only
+/// the first two, which read as "the publication port is the whole of what is
+/// missing" and pointed an operator at #959 for a plan-digest issuer that is
+/// not #959's to fix. Naming the third costs nothing operationally and is the
+/// only part of this item that was within reach: the missing owners themselves
+/// stay with the issues that own them.
+///
 /// So the create arm does what the item says to do with an absent owner: it
 /// returns a TYPED FAILURE NAMING THE ABSENT OWNER BEHAVIOUR. It emits no
 /// archive id, no manifest digest and no receipt, and it never occupies the
@@ -944,10 +955,16 @@ fn handle_backup_create(
         idempotency_key,
         "plan_gap",
         BACKUP_CREATE_MISSING_OWNER,
+        // Names all THREE absent owner behaviours, which is what an operator
+        // needs in order to act: naming only two read as "wire the third" and
+        // pointed #959 at a plan-digest issuer that is not #959's to fix.
+        // Enumerated in the SAME ORDER as the handler doc above, so the prose an
+        // operator reads in the source and the prose it reads on the wire cannot
+        // drift, and bounded by the same `BACKUP_TEXT_MAX` the surface prints
+        // under (176 of 256 bytes, so this is not silently truncated).
         "capture owner entry KernelBackupCapture::capture is unreachable: \
-         #959's BlobArchivePublicationOwner cannot be bound because no \
-         production BlobStoreService exists, and no producer supplies the \
-         accepted CaptureRequest evidence",
+         no accepted CaptureRequest producer, no bindable PublicationPort, \
+         and no owner-issued FrozenCapturePlan digests",
     ))
 }
 
