@@ -1,15 +1,25 @@
 //! Behavioral cognition validation, memory influence accounting, and comparison experiments.
+//!
+//! Causal candidates (issue #1910) travel the same seams: the runtime outcome
+//! writer records explicitly assessed intervention outcomes through the
+//! owner's own transition, and the uncertainty/inspector projections expose
+//! unresolved causal uncertainty and the full A6.5 field set without ever
+//! collapsing rivals into one explanation.
 
 use crate::{EngineError, WriteAdmissionService, WriterHandle};
+use eliot_types::cognition::{
+    CAUSAL_DISCRIMINATIVE_CHECK_WORK_CLASS, CausalCandidate, CausalCheckAssignment,
+    CausalEdgeStatus, CausalInterventionOutcomeRecord,
+};
 use eliot_types::{
     AgentId, AgentSessionId, CommandContext, ContextCargoReceipt, LifecycleStatus,
     MemoryAdmissionDecision, MemoryDecisionReceipt, MemoryInfluenceClass, MemoryInfluenceTrace,
     MemoryValueComparison, MemoryValueExperiment, OBSERVABILITY_SCHEMA_VERSION, ObservabilityKind,
     ObservabilityWriteEnvelope, ObservabilityWriteReceipt, PlanningDecisionRecord, ProjectId,
     SemanticCommand, SessionId, TaintClass, TaskId, ToolObservationRecordCommand,
-    UnderstandingOutcomeRecord, Visibility, WriteId, WriteReceiptRef,
+    UnderstandingOutcomeRecord, Visibility, WorkItemId, WriteId, WriteReceiptRef,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::str::FromStr;
 use time::OffsetDateTime;
@@ -220,6 +230,87 @@ impl CognitiveMemoryWriter {
         Ok(receipt)
     }
 
+    /// Records one explicitly assessed intervention outcome against its causal
+    /// candidate and commits the updated candidate beside the appended history
+    /// entry.
+    ///
+    /// Issue #1910 W5/A2: the reachable runtime outcome writer. The state
+    /// change is this file's restatement of nothing: it is the owner's own
+    /// [`CausalCandidate::record_intervention_outcome`], so the outcome must
+    /// name this candidate, its before state must match the candidate's
+    /// current edge status, rival set, calibration and transfer boundary, and
+    /// its assessment must be complete — otherwise the typed owner refusal
+    /// below carries the whole call and nothing is written. On success the
+    /// caller's candidate carries the outcome's after state with the outcome
+    /// appended to its append-only history, so the before/after linkage
+    /// outlives the pass that observed it and the caller retains exactly what
+    /// was committed.
+    ///
+    /// # Update, not overwrite, and what the record does NOT do
+    ///
+    /// The document is the updated candidate beside the history entry this
+    /// call appended, read back out of the updated value rather than
+    /// re-stated, so the durable bytes are one record rather than two that
+    /// could drift apart. It carries no permit, no authority and no
+    /// activation: a status of `observed-under-intervention` records that an
+    /// intervention was observed, it does not promote the mechanism, and a
+    /// successful outcome still supports an effect without confirming the
+    /// claimed mechanism. The three edge statuses stay three distinct values
+    /// chosen only by explicit assessment — recording an outcome never
+    /// promotes a status by itself — and an outcome never erases a rival on
+    /// its own: dropping a documented rival without `rival_update_evidence`
+    /// is an owner refusal, not a silent edit.
+    ///
+    /// # Seam and caller
+    ///
+    /// The write travels the same production seam as every other cognitive
+    /// write in this file (`write_cognitive_observation` in
+    /// `crates/eliot-engine/src/cognition.rs`, scope `cognitive-memory-l8`),
+    /// which is live in production through
+    /// `crates/eliot-app/src/mcp_stdio/task_handlers.rs::dispatch_understanding_outcome_record`.
+    /// The production caller of THIS writer is STITCH, stated not papered
+    /// over: no production path hands it an explicitly assessed causal
+    /// outcome yet, so it is reachable API with no caller rather than a
+    /// caller that fabricates an assessment.
+    pub async fn write_causal_intervention_outcome(
+        handle: &WriterHandle,
+        admission: &WriteAdmissionService,
+        project_id: ProjectId,
+        task_id: TaskId,
+        session_id: AgentSessionId,
+        candidate: &mut CausalCandidate,
+        outcome: CausalInterventionOutcomeRecord,
+    ) -> Result<WriteReceiptRef, EngineError> {
+        let candidate_id = outcome.candidate_id.clone();
+        candidate
+            .record_intervention_outcome(outcome)
+            .map_err(|error| {
+                EngineError::WriteRejected(format!(
+                    "causal intervention outcome on candidate {candidate_id} refused: {error}"
+                ))
+            })?;
+        let Some(appended) = candidate.intervention_outcomes.last().cloned() else {
+            return Err(EngineError::WriteRejected(format!(
+                "causal intervention outcome on candidate {candidate_id} applied but left no history entry"
+            )));
+        };
+        let record = serde_json::json!({
+            "causal_candidate": candidate,
+            "intervention_outcome": appended,
+        });
+        write_cognitive_observation(
+            handle,
+            admission,
+            project_id,
+            task_id,
+            session_id,
+            "causal_intervention_outcome",
+            "cognitive-memory-l8",
+            &record,
+        )
+        .await
+    }
+
     pub async fn write_memory_influence_trace(
         handle: &WriterHandle,
         project_id: ProjectId,
@@ -346,6 +437,203 @@ impl CognitiveMemoryWriter {
             record,
         )
         .await
+    }
+}
+
+/// One admitted causal candidate as the Active View exposes it: its identity,
+/// its current edge status, and the rivals or no-rival rationale that keep
+/// its mechanism uncertain.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CausalUncertaintyEntry {
+    /// Candidate this entry projects; never a second construction.
+    pub candidate_id: String,
+    /// Current edge status: hypothetical, supported, or
+    /// observed-under-intervention. The three values stay distinct here.
+    pub edge_status: CausalEdgeStatus,
+    /// Rival explanations still standing against the claimed mechanism.
+    pub rival_explanations: Vec<String>,
+    /// Explicit rationale when no plausible rival exists.
+    pub no_plausible_rival_rationale: Option<String>,
+    /// True while the mechanism is unresolved: the edge was never observed
+    /// under intervention, or rivals still stand. An entry with false here
+    /// records that an intervention was observed and no rival stands; it does
+    /// not promote the mechanism — only explicit assessment does, and only
+    /// the owner's transition changes status.
+    pub unresolved_uncertainty: bool,
+}
+
+/// The Active View's causal section: every admitted candidate, none collapsed
+/// into one explanation.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CausalUncertaintyView {
+    /// One entry per admitted candidate, in admission order. The view ranks
+    /// nothing, selects no winner, and carries no single-explanation field.
+    pub entries: Vec<CausalUncertaintyEntry>,
+    /// Entries with `unresolved_uncertainty` set.
+    pub unresolved_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CausalUncertaintyViewService;
+
+impl CausalUncertaintyViewService {
+    /// Admits owner-validated causal candidates and projects the Active View's
+    /// causal section over them.
+    ///
+    /// Issue #1910 W6: unresolved causal uncertainty is exposed, never
+    /// collapsed into one explanation. Admission is the owner's own
+    /// [`CausalCandidate::validate_material`] — the full A6.5 field set plus
+    /// rival-or-rationale plus a valid intervention history — and the whole
+    /// projection is refused when any candidate is not material, so an
+    /// unvalidated causal claim is never projected. The projection itself is
+    /// total over the admitted set: one entry per candidate with its status
+    /// and its rivals intact.
+    ///
+    /// Active View wiring is STITCH, stated not papered over:
+    /// `crates/smart/eliot-context-assembly/src/assemble.rs::assemble_active_view`
+    /// takes no causal candidates yet, so no production reader pages this
+    /// projection. This service is the admitted-set surface that reader
+    /// embeds when it arrives, not a second Active View scheme.
+    pub fn project(candidates: &[CausalCandidate]) -> Result<CausalUncertaintyView, EngineError> {
+        let mut entries = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            candidate.validate_material().map_err(|error| {
+                EngineError::WriteRejected(format!(
+                    "causal candidate {} is not material: {error}",
+                    candidate.candidate_id
+                ))
+            })?;
+            entries.push(CausalUncertaintyEntry {
+                candidate_id: candidate.candidate_id.clone(),
+                edge_status: candidate.edge_status,
+                rival_explanations: candidate.rival_explanations.clone(),
+                no_plausible_rival_rationale: candidate.no_plausible_rival_rationale.clone(),
+                unresolved_uncertainty: candidate.edge_status
+                    != CausalEdgeStatus::ObservedUnderIntervention
+                    || !candidate.rival_explanations.is_empty(),
+            });
+        }
+        let unresolved_count = entries
+            .iter()
+            .filter(|entry| entry.unresolved_uncertainty)
+            .count();
+        Ok(CausalUncertaintyView {
+            entries,
+            unresolved_count,
+        })
+    }
+}
+
+/// Everything a production inspector reads for one material causal
+/// recommendation: the full A6.5 field set, the current edge status and
+/// calibration, and the linked verification work unit.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CausalCandidateInspectorView {
+    /// Candidate under inspection.
+    pub candidate_id: String,
+    /// Claimed causal mechanism.
+    pub mechanism: String,
+    /// Intervention the mechanism is claimed under.
+    pub intervention: String,
+    /// Preregistered predicted observable.
+    pub predicted_observable: String,
+    /// Counterfactual: what would be observed if the mechanism did not hold.
+    pub counterfactual: String,
+    /// Possible confounders of the claimed effect.
+    pub possible_confounders: Vec<String>,
+    /// Causes interacting with the claimed mechanism.
+    pub interacting_causes: Vec<String>,
+    /// Temporal lag between intervention and observable effect.
+    pub temporal_lag: String,
+    /// Abstraction level of the claim.
+    pub abstraction_level: String,
+    /// Rival explanations still standing.
+    pub rival_explanations: Vec<String>,
+    /// Explicit rationale when no plausible rival exists.
+    pub no_plausible_rival_rationale: Option<String>,
+    /// Boundary the claim does not transfer beyond without new evidence.
+    pub transfer_boundary: String,
+    /// Current edge status: hypothetical, supported, or
+    /// observed-under-intervention.
+    pub edge_status: CausalEdgeStatus,
+    /// Current calibration of the claim.
+    pub calibration: String,
+    /// Assigned discriminative check, when one is assigned: the verifier
+    /// work item or bounded inquiry a Critical action depends on.
+    pub assigned_check: Option<CausalCheckAssignment>,
+    /// Linked verification work unit, when the assigned check is one.
+    pub verifier_work_item: Option<WorkItemId>,
+    /// Bounded inquiry text, when the assigned check is one.
+    pub bounded_inquiry: Option<String>,
+    /// Recorded explicitly assessed intervention outcomes against this
+    /// candidate.
+    pub recorded_outcome_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CausalCandidateInspectorService;
+
+impl CausalCandidateInspectorService {
+    /// The I14.1 work class every causal discriminative check is submitted
+    /// through: whichever check form is assigned, the check that makes a
+    /// causal claim load-bearing stays a verification-class work unit.
+    pub fn discriminative_check_work_class() -> &'static str {
+        CAUSAL_DISCRIMINATIVE_CHECK_WORK_CLASS
+    }
+
+    /// Projects the inspector view of one material causal candidate.
+    ///
+    /// Issue #1910 A1: for a material causal recommendation, an inspector
+    /// sees the mechanism, the predicted observable, the counterfactual, the
+    /// confounder and rival fields, the transfer boundary, and the linked
+    /// verification work unit. Admission is the owner's own
+    /// [`CausalCandidate::validate_material`], so an unvalidated candidate is
+    /// refused rather than rendered. The view is a pure read: it assigns no
+    /// check, admits no claim for a Critical action, and promotes nothing —
+    /// the Critical-action gate stays the owner's
+    /// [`CausalCandidate::validate_for_critical_action`].
+    ///
+    /// The production inspector path is STITCH, stated not papered over: no
+    /// production inspector reads this view yet. The view is the typed
+    /// inspector surface that path renders when it arrives.
+    pub fn inspect(
+        candidate: &CausalCandidate,
+    ) -> Result<CausalCandidateInspectorView, EngineError> {
+        candidate.validate_material().map_err(|error| {
+            EngineError::WriteRejected(format!(
+                "causal candidate {} is not material: {error}",
+                candidate.candidate_id
+            ))
+        })?;
+        let (verifier_work_item, bounded_inquiry) = match &candidate.assigned_check {
+            Some(CausalCheckAssignment::VerifierWorkItem(work_item_id)) => {
+                (Some(*work_item_id), None)
+            }
+            Some(CausalCheckAssignment::BoundedInquiry(description)) => {
+                (None, Some(description.clone()))
+            }
+            None => (None, None),
+        };
+        Ok(CausalCandidateInspectorView {
+            candidate_id: candidate.candidate_id.clone(),
+            mechanism: candidate.mechanism.clone(),
+            intervention: candidate.intervention.clone(),
+            predicted_observable: candidate.predicted_observable.clone(),
+            counterfactual: candidate.counterfactual.clone(),
+            possible_confounders: candidate.possible_confounders.clone(),
+            interacting_causes: candidate.interacting_causes.clone(),
+            temporal_lag: candidate.temporal_lag.clone(),
+            abstraction_level: candidate.abstraction_level.clone(),
+            rival_explanations: candidate.rival_explanations.clone(),
+            no_plausible_rival_rationale: candidate.no_plausible_rival_rationale.clone(),
+            transfer_boundary: candidate.transfer_boundary.clone(),
+            edge_status: candidate.edge_status,
+            calibration: candidate.calibration.clone(),
+            assigned_check: candidate.assigned_check.clone(),
+            verifier_work_item,
+            bounded_inquiry,
+            recorded_outcome_count: candidate.intervention_outcomes.len(),
+        })
     }
 }
 
