@@ -1821,6 +1821,12 @@ fn ors_refusal(error: &OrsError) -> KernelServiceError {
         OrsError::DuplicateConflict => invalid_field("durable_state_duplicate"),
         OrsError::AlreadyTerminalWrite(_) => invalid_field("reservation_already_terminal"),
         OrsError::ReservationNotFound => invalid_field("reservation_missing"),
+        // An absent I1.9 Generation Registry row is a missing durable record,
+        // not a presented-record mismatch: the ORS states it holds no record
+        // for the key, and grants nothing to compare an epoch or fence against.
+        OrsError::GenerationRegistryRecordNotFound => {
+            invalid_field("generation_registry_record_missing")
+        }
         OrsError::InvalidTransition => invalid_field("reservation_lifecycle"),
         OrsError::PredecessorPending => invalid_field("ordering_scope_predecessor"),
         OrsError::ScopeRecoveryRequired => invalid_field("ordering_scope_reconciliation"),

@@ -16,6 +16,7 @@ mod cutover_ownership;
 mod doctor;
 mod effect_operation_lease;
 mod execution_manifest;
+mod generation_registry;
 mod maintenance_trigger_staging;
 mod model;
 mod process_stream_recovery;
@@ -96,6 +97,14 @@ pub use execution_manifest::{
     KernelRestartEvidence, KernelServiceAdmission, ManifestDependencyEntry, ManifestEffectCeiling,
     ManifestResourceLimits, ManifestRestartBudget, RestartAuthorizationClass,
     RevocationAcknowledgement, verify_kernel_execution_restart,
+};
+/// I1.9 Generation Registry: the Kernel/ORS-owned operational generation
+/// record set. This is the only owner of installed/running/candidate
+/// operational state, process handles, Authority Epoch, route state and
+/// drain/checkpoint/restart state.
+pub use generation_registry::{
+    GenerationDrainState, GenerationOperationalState, GenerationProcessHandles, GenerationRegistry,
+    GenerationRegistryRecord, GenerationRouteState,
 };
 pub use maintenance_trigger_staging::{
     MaintenanceTriggerStagingPayload, MaintenanceTriggerStagingPosition,
