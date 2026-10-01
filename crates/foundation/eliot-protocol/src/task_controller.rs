@@ -101,7 +101,7 @@ pub enum TaskControllerAction {
     Propose,
     /// Apply an exact command to an existing task.
     Apply,
-    /// Bind the exact admitted task to a caller-declared WorkScope.
+    /// Bind the exact admitted task to a caller-declared `WorkScope`.
     BindScope,
 }
 
@@ -240,6 +240,11 @@ impl TaskControllerInvocation {
                 "task_controller_invocation.prior_delivery_selector",
             )?;
         }
+        self.validate_campaign_owner_materials()?;
+        Ok(())
+    }
+
+    fn validate_campaign_owner_materials(&self) -> Result<(), ProtocolError> {
         if let Some(materials) = &self.campaign_owner_materials {
             structured_object(
                 &materials.prior_delivery,

@@ -345,7 +345,10 @@ impl OriginalWriteSubmissionInput {
                 reason: "must contain no control characters",
             });
         }
-        if !matches!(self.response_mode.as_str(), "wait_for_commit" | "accept_after_stage") {
+        if !matches!(
+            self.response_mode.as_str(),
+            "wait_for_commit" | "accept_after_stage"
+        ) {
             return Err(ContractViolation::InvalidField {
                 field: "observe.write_submission.response_mode",
                 reason: "must be wait_for_commit or accept_after_stage",

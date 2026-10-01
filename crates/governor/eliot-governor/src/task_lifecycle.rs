@@ -45,7 +45,7 @@ use std::collections::BTreeMap;
 use eliot_canonical::CanonicalWriteEnvelope;
 use eliot_contracts::{
     OperationId, RequestMetadata, SessionId, StateFence, TaskId, TaskRevision,
-    canonical_json_bytes, sha256_hex,
+    canonical_json_bytes,
 };
 use eliot_learning_contracts::{
     CampaignSourceBinding, CampaignSourceRole, LearningStateViewRecipe,
@@ -667,10 +667,6 @@ fn task_envelope(
                 "current Governor ordering head is unavailable at the Task fence".to_owned(),
             ))
         })?;
-    let admission_digest = sha256_hex(
-        &canonical_json_bytes(event)
-            .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?,
-    );
     let mut parameters = BTreeMap::new();
     parameters.insert(
         "task_id".to_owned(),

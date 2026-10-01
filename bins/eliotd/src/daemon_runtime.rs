@@ -4954,8 +4954,7 @@ struct PendingObserveCapture {
     resume: &'static str,
 }
 
-const OBSERVE_CAPTURE_RECEIPT_RESUME: &str =
-    "poll this retained staged capture for its exact committed receipt; do not replay the original submission";
+const OBSERVE_CAPTURE_RECEIPT_RESUME: &str = "poll this retained staged capture for its exact committed receipt; do not replay the original submission";
 
 enum PreparedObserveCapture {
     Terminal(HostRequestResultBody),
@@ -5221,11 +5220,13 @@ async fn run_observe_poll(
     let body = match prepared_capture {
         PreparedObserveCapture::Terminal(body) => body,
         PreparedObserveCapture::Staged { body, prepared } => {
-            let staged_submission: eliot_store_api::WriteSubmission =
-                serde_json::from_value(body.response.get("submission").cloned().ok_or_else(
-                    || "staged Observe response omits its submission".to_owned(),
-                )?)
-                .map_err(|error| format!("staged Observe submission cannot decode: {error}"))?;
+            let staged_submission: eliot_store_api::WriteSubmission = serde_json::from_value(
+                body.response
+                    .get("submission")
+                    .cloned()
+                    .ok_or_else(|| "staged Observe response omits its submission".to_owned())?,
+            )
+            .map_err(|error| format!("staged Observe submission cannot decode: {error}"))?;
             let pending = PendingObserveCapture {
                 claimed,
                 prepared,

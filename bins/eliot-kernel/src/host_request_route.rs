@@ -86,11 +86,10 @@ use eliot_protocol::{
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HOST_REQUEST_PAYLOAD_SCHEMA_ID,
     HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestAdmissionReceipt, HostRequestEnvelope,
     HostRequestInvokeReadPayload, HostRequestKind, HostRequestResultBody, LocalReadAttempt,
-    WatchdogIntentKind, WatchdogSpoolEntryKind, WatchdogSpoolEntryOutcome,
+    RequestIdentity, WatchdogIntentKind, WatchdogSpoolEntryKind, WatchdogSpoolEntryOutcome,
     WatchdogSpoolExportBatchPayload, WatchdogSpoolExportOutcomeSubmission,
     WatchdogSpoolExportResultPayload, WatchdogSpoolExportSubmission,
     WatchdogSpoolIntentBatchPayload, WatchdogSpoolIntentSubmission, host_request_operation_id,
-    RequestIdentity,
 };
 use eliot_runtime_contracts::RecoveryDirective;
 use eliot_store_api::{
@@ -11079,6 +11078,7 @@ fn watchdog_export_projection_record(
         // the durable record rather than from a queue copy.
         payload_schema_id: Some(label(eliot_protocol::WATCHDOG_SPOOL_EXPORT_BATCH_WIRE_ID)?),
         payload_body: Some(body),
+        executable_input: None,
         connection_ref: label(&payload.sink_id)?,
         session_ref: None,
         task_ref: None,

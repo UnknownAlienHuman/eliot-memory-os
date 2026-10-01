@@ -303,7 +303,7 @@ impl AgentActivationKernelOwnerReadback {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentActivationObservationAccessBinding {
-    /// Privacy class from the current WorkScope owner binding.
+    /// Privacy class from the current `WorkScope` owner binding.
     pub privacy: eliot_security_contracts::PrivacyClass,
     /// Exact visibility class selected by the current observation policy.
     pub visibility: String,
@@ -687,6 +687,11 @@ impl AgentActivationObservationPolicyReadback {
         ] {
             lowercase_sha256(digest, field)?;
         }
+        self.validate_policy_snapshot_and_taint()?;
+        Ok(())
+    }
+
+    fn validate_policy_snapshot_and_taint(&self) -> Result<(), ProtocolError> {
         if !self.config_policy_snapshot.is_object()
             || !self.policy.is_string()
             || !self.work_scope_binding.is_object()
@@ -731,7 +736,7 @@ pub struct AgentActivationOwnerReadback {
     /// source-compatible without weakening the production Kernel gate.
     #[serde(default)]
     pub kernel_owner: Option<AgentActivationKernelOwnerReadback>,
-    /// Exact current PolicyOwner and WorkScope owner readbacks used only by
+    /// Exact current `PolicyOwner` and `WorkScope` owner readbacks used only by
     /// the Observation capture producer. Older readbacks remain valid, while
     /// Observation admission fails closed when this owner projection is absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -109,7 +109,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         clippy::too_many_lines,
         reason = "the event driver carries the trigger, scanner, lease, candidate, source, fence, privacy, task, and receipt inputs of the three sequenced legs in one fail-closed entry"
     )]
-    pub fn drive_cold_start_for_event(
+    pub async fn drive_cold_start_for_event(
         &mut self,
         trigger: ColdStartTrigger,
         discovery_lease: &mut DiscoveryReadLease,
@@ -231,7 +231,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             binding,
             Some(scan_receipt),
             now,
-        )?;
+        )
+        .await?;
         Ok(ColdStartTriggerCompilation {
             claim,
             join: compiled,

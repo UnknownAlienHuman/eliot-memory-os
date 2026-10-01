@@ -3966,13 +3966,8 @@ impl KernelHostRequestPort for KernelHostRequestClient {
             Ok(reply) => reply,
             Err(error @ PortFailure::AgentResponse { .. }) => return Err(error),
             Err(_) => {
-                let outcome = self.probe_settles_invocation(
-                    request,
-                    &facts,
-                    &session,
-                    &envelope,
-                    now_ms,
-                );
+                let outcome =
+                    self.probe_settles_invocation(request, &facts, &session, &envelope, now_ms);
                 return self.record_settled(correlation.as_str(), outcome);
             }
         };

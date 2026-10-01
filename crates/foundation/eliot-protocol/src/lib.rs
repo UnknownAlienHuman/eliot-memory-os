@@ -2817,6 +2817,11 @@ impl AgentActivationResolutionTicket {
                 });
             }
         }
+        self.validate_ticket_digest()?;
+        Ok(())
+    }
+
+    fn validate_ticket_digest(&self) -> Result<(), ProtocolError> {
         lowercase_sha256(
             &self.ticket_sha256,
             "agent_activation_resolution_ticket.ticket_sha256",
