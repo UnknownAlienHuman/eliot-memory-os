@@ -1613,6 +1613,17 @@ impl AcpResultEnvelope {
         format!("{truncated}{suffix}")
     }
 
+    /// Appends the typed wire code captured before the outcome moved to
+    /// sanitized text after sanitization, so default-deny redaction keeps
+    /// distinct codes distinct instead of merging them into one generic
+    /// result. `None` leaves the text untouched.
+    fn append_wire_code(sanitized: String, error_code: Option<i64>) -> String {
+        match error_code {
+            Some(code) => Self::acp_failure_display_with_code(&sanitized, code),
+            None => sanitized,
+        }
+    }
+
     pub fn into_agent_result(
         self,
         route: RouteFingerprint,
@@ -1660,10 +1671,7 @@ impl AcpResultEnvelope {
                 });
                 sanitize_adapter_error(trusted_diagnostic.unwrap_or(""))
             };
-            match error_code {
-                Some(code) => Self::acp_failure_display_with_code(&sanitized, code),
-                None => sanitized,
-            }
+            Self::append_wire_code(sanitized, error_code)
         });
         let usage = UsageReceipt {
             input_tokens: None,
