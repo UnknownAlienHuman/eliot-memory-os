@@ -268,7 +268,7 @@ pub(crate) const USER_AUTOMATION_PREFLIGHT_SELECTOR: &str =
 /// Reaching the arm is not the same as a cutover being available. The arm admits
 /// the exact session fence and generation and then drives the coordinator, which
 /// re-derives the route scope and cutover state from the committed ORS
-/// cutover-ownership record rather than the payload — and the durable
+/// cutover-ownership record rather than the payload â€” and the durable
 /// `StorageReplacementCutoverReceiptRecord` is **not yet** in `eliot-ors`, so
 /// after a crash the operator must still hold the receipt. The operation is
 /// honestly *reachable and admitted*,
@@ -282,7 +282,7 @@ pub(crate) const STORAGE_REPLACEMENT_OPERATION: &str = "daemon_storage_replaceme
 /// This is the path a retry of a committed cutover reaches, and the only one:
 /// [`STORAGE_REPLACEMENT_OPERATION`] itself refuses a candidate generation that
 /// already owns the pinned route through a committed cutover. It carries the same
-/// availability caveat as that operation — it is recognized here and unreachable
+/// availability caveat as that operation â€” it is recognized here and unreachable
 /// from the front door until `frame_dispatch::is_daemon_operation` lists it.
 pub(crate) const STORAGE_REPLACEMENT_RESUME_OPERATION: &str = "daemon_storage_replacement_resume";
 
@@ -308,7 +308,7 @@ pub(crate) const STORAGE_REPLACEMENT_ROLLBACK_OPERATION: &str =
 /// through the ORS owner; exact identity/hash replay returns the same
 /// staging obligation, changed content conflicts, and any capacity, key,
 /// integrity, or durable-write failure is answered with the exact bounded
-/// failure — never an acknowledgement — so the producer keeps its retry
+/// failure â€” never an acknowledgement â€” so the producer keeps its retry
 /// identity and its cursor must not advance. No new owner, database, or
 /// poller; no Governor types in ORS.
 ///
@@ -666,6 +666,12 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         AGENT_ACTIVATION_V1_IMPORT_OPERATION => AGENT_ACTIVATION_V1_IMPORT_OPERATION,
         "local_read_claim" => "local_read_claim",
         "local_read_result" => "local_read_result",
+        // Issue #2564: the owner-backed `eliot.state` result travels under its
+        // OWN operation so the Kernel can bind it to the State carrier form.
+        // Reusing `local_read_result` here would let a state result complete a
+        // query claim, which is the capability confusion the form binding on
+        // the carrier exists to prevent.
+        "local_state_result" => "local_state_result",
         "semantic_observe_claim" => "semantic_observe_claim",
         "semantic_observe_result" => "semantic_observe_result",
         "semantic_observe_deferred" => "semantic_observe_deferred",
@@ -713,7 +719,7 @@ struct StoreNamedOperation {
 /// and the frame loop routes on exactly that key. A carrier that decodes the
 /// **whole** body with `#[serde(deny_unknown_fields)]` therefore sees a key it
 /// never declared, refuses the body, and the daemon frame loop propagates the
-/// resulting `SessionFenced` with `?` — fencing the Kernel connection, not just
+/// resulting `SessionFenced` with `?` â€” fencing the Kernel connection, not just
 /// the one request. Removing the key before the closed decode is the shape the
 /// dispatcher already establishes for its own nested carriers
 /// (`daemon_supervision_progress_operation` removes its wrapper key before
@@ -744,7 +750,7 @@ pub(crate) fn without_daemon_routing_key(
 /// Closed local-read envelope for one admitted `eliot.query` (Implements #18).
 ///
 /// Carries the exact admitted envelope plus the exact canonical tool bytes it
-/// admits — the same linkage-checked pair as the invoke-read frame payload —
+/// admits â€” the same linkage-checked pair as the invoke-read frame payload â€”
 /// so the read leg re-proves capability + payload-digest binding before any
 /// Gateway IO. The Kernel-issued attempt capability is required: the sync leg
 /// never mints authority and never bypasses the claim record. `eliot.packet`
@@ -772,7 +778,7 @@ struct StoreRecoveryOperation {
     /// `(operation_id, stream)`. Reading one through the other would be a
     /// category error, so the two never share a selector.
     ///
-    /// `None` — the shape every existing caller sends — answers explicit `null`
+    /// `None` â€” the shape every existing caller sends â€” answers explicit `null`
     /// and reads no ORS row, so this addition changes no existing answer and
     /// costs the retained daemon no extra read. The selector is bounded by the
     /// Store's own recovery-record denominator so the extra view can never grow
@@ -859,7 +865,7 @@ struct GrantRevocationOperation {
 /// Closed P-07 root-transition activation operation (`#2962`).
 ///
 /// This is a DISTINCT front-door operation, not an `activate_grant` overload:
-/// it carries the complete typed root-transition operation — operation
+/// it carries the complete typed root-transition operation â€” operation
 /// identity, idempotency key, both grant identities AND their immutable
 /// commitments, both authority roots, the graph snapshot and its
 /// predecessor/expected-next revisions, policy revision, deadline, effect
@@ -935,7 +941,7 @@ const WASM_HOST_MODULE_ID: &str = "eliot-wasm-host";
 /// Closed owner-side WASM dispatch publication (`#1780` D4a, `#1955`).
 ///
 /// Carries the installation-observed host binding (path + digest, re-hashed
-/// against real file bytes before publication — never trusted from config)
+/// against real file bytes before publication â€” never trusted from config)
 /// plus every admitted owner record and the exact guest bytes to stage. The
 /// install directory derives as the host path's parent, never from a caller
 /// string. Unknown fields fail closed.
@@ -1190,9 +1196,9 @@ fn p07_cause_classification(
         ),
         // Issue #1679 A9-4 P07 (caller STITCH): same whole-or-null seam as
         // the capacity arm above. Guarantee loss and recovery failure carry
-        // no owner-measured observation at this pure-cause call site — no
+        // no owner-measured observation at this pure-cause call site â€” no
         // last-resort path reading, no recording operation identity, no
-        // profile revision, no state fence — so the versioned directive is
+        // profile revision, no state fence â€” so the versioned directive is
         // honestly null here rather than a fabricated guarantee-loss
         // record. Placement is the same `p07_refusal_response` `"recovery"`
         // slot, fed later by the reserve owner's `guarantee_lost_response`
@@ -1560,7 +1566,7 @@ struct NotificationStateReadOperation {
 /// closed `GetNotificationState` selector set together with the fence the
 /// page must be served and proved under. The fence is a named field rather
 /// than a sibling argument because that is the whole hazard this value
-/// removes — a selector set and the fence it is served under are one fact
+/// removes â€” a selector set and the fence it is served under are one fact
 /// about one read, and a caller can no longer hand `read_notification_page` a
 /// query built for one fence and check the echoed fence against another.
 ///
@@ -1605,7 +1611,7 @@ impl NotificationPageQuery {
     /// The addressed-record page: exactly the record one lifecycle leg names,
     /// resolved at the fence that leg was admitted under.
     ///
-    /// The single named constructor for the two read-backs that must agree —
+    /// The single named constructor for the two read-backs that must agree â€”
     /// the committed transition's post-commit read-back and the Notify launch
     /// grant's durable-record join. Both ask "does this exact record persist
     /// at this exact fence", so both build the same value here instead of
@@ -2069,8 +2075,8 @@ struct UserAutomationOperatorIntent {
 /// the admitted frame selector the front door routed on, `request_identity` is
 /// the front-door-authenticated identity the frame router copied verbatim, and
 /// `payload` is the caller's closed read request. The inner payload repeats
-/// the exact fields the notify client sends — including the `trigger` and
-/// `mode` it read from its own invocation — so the owner can compare each one
+/// the exact fields the notify client sends â€” including the `trigger` and
+/// `mode` it read from its own invocation â€” so the owner can compare each one
 /// with its live state instead of merely receiving an automation identity.
 #[cfg(windows)]
 #[derive(Deserialize)]
@@ -2182,7 +2188,7 @@ struct StorageReplacementDriveRequest {
 ///
 /// `stages` is what makes this the path that finishes a replacement rather than
 /// only reconstructing it. The reconstruction resumes at I5.11 stage 9, so the
-/// canary, the read-only rollback window and the retirement are recorded here —
+/// canary, the read-only rollback window and the retirement are recorded here â€”
 /// and stage 11 is still refused by the coordinator until the receipt exists,
 /// which the same reconstruction guarantees. Pre-cutover stages are *not*
 /// accepted here: the reconstructed coordinator is positioned after the
@@ -2356,7 +2362,7 @@ fn storage_replacement_response(outcome: &StorageReplacementOutcome) -> serde_js
 /// Every position field is empty on purpose: a request that never reached the
 /// coordinator's state machine has recorded no stage, holds no irreversible
 /// effect, owns no receipt and answers no rollback question. Reporting the
-/// refusal code alone is the honest shape — a refused request is not a
+/// refusal code alone is the honest shape â€” a refused request is not a
 /// replacement that made no progress, and it must not read as one.
 fn storage_replacement_refusal_outcome(terminal_code: &'static str) -> StorageReplacementOutcome {
     StorageReplacementOutcome {
@@ -2553,7 +2559,7 @@ impl KernelComposition {
     /// ownership row the receipt names, so a durable `forward_repair_required`
     /// migration refuses the request even when the in-process ledger is silent.
     /// A refused rollback is answered as a refusal carrying the coordinator's
-    /// disposition and the cutover state it leaves behind — never as a
+    /// disposition and the cutover state it leaves behind â€” never as a
     /// switched-back route and never as an effect-free success.
     fn storage_replacement_rollback_operation(
         &self,
@@ -2627,7 +2633,7 @@ impl KernelComposition {
     /// arm applies (`generation_control::KernelComposition::apply_authenticated_generation_cutover`):
     /// the request's own State Fence must be well formed, the version must be
     /// the one this arm speaks, and the presented fence must be the **exact**
-    /// admitted session fence — a compatible-but-different fence is still stale
+    /// admitted session fence â€” a compatible-but-different fence is still stale
     /// for this observation. A request failing any of them is fenced at the
     /// transport, before the coordinator is touched, so an unfenced or
     /// stale-fenced request never reaches a stage machine or a cutover.
@@ -2735,7 +2741,7 @@ impl From<MaintenanceTriggerDeliveryError> for MaintenanceTriggerIntakeFailure {
     /// `MaintenanceTriggerDeliveryError::LedgerAuthority` plus its
     /// `from_ledger_admission_error` mapper in
     /// `crates/kernel/eliot-kernel-service/src/store_gateway.rs`, this match
-    /// intentionally breaks until that variant is classified here — no
+    /// intentionally breaks until that variant is classified here â€” no
     /// wildcard arm may absorb it.
     fn from(error: MaintenanceTriggerDeliveryError) -> Self {
         match error {
@@ -2821,7 +2827,7 @@ fn maintenance_trigger_intake_response(
 ///
 /// Every position field is empty on purpose: an intake that never reached
 /// admission staged nothing new, holds no obligation, and owns no receipt.
-/// Reporting the refusal code alone is the honest shape — a refused intake
+/// Reporting the refusal code alone is the honest shape â€” a refused intake
 /// is not an admitted trigger that made no progress, and the producer keeps
 /// its retry identity.
 #[cfg(windows)]
@@ -3300,7 +3306,7 @@ impl KernelComposition {
             // Issue #1872: the I5.11 `canonical_store` storage-replacement
             // ingress. The three markers are the same admitted daemon channel
             // `GENERATION_CUTOVER_OPERATION` above already uses, and the arms
-            // reach the Kernel-owned `StorageReplacement` coordinator — they do
+            // reach the Kernel-owned `StorageReplacement` coordinator â€” they do
             // not implement a stage machine here. Each arm proves the daemon
             // module binding, the admitted session State Fence and the exact
             // request fence, and every route scope, cutover state, migration
@@ -3657,22 +3663,71 @@ impl KernelComposition {
             }
             "local_read_claim" => {
                 // Outbound-only eliotd poller for admitted `eliot.query` pairs
-                // (Implements #18): mirrors `agent_activation_claim` —
+                // (Implements #18): mirrors `agent_activation_claim` â€”
                 // same session/auth/ready/fence gates via the dispatcher head
                 // and `frame_dispatch` allowlist, same single-`operation`-key
                 // payload shape, same null poll (not error) when empty. The
                 // claimed pair carries the Kernel-minted fenced attempt
                 // capability the daemon must present back on the read leg and
                 // the submit leg; no time lease is involved.
+                //
+                // #2564: the answer also carries the retained carrier FORM.
+                // This arm admits only the `query` form, so `form` is `query`
+                // here by construction; a State pair is claimed on
+                // `local_state_claim` and never appears in this answer.
                 #[cfg(windows)]
                 {
                     if payload.as_object().is_none_or(|object| object.len() != 1) {
                         return Err(TransportError::SessionFenced);
                     }
                     self.claim_local_read_pair(session).map(|pair| match pair {
-                        Some((envelope, tool, attempt)) => serde_json::json!({
+                        Some(read) => serde_json::json!({
                             "status": "known",
-                            "value": { "pair": { "envelope": envelope, "tool": tool, "attempt": attempt } },
+                            "value": { "pair": {
+                                "form": read.form.as_str(),
+                                "envelope": read.envelope,
+                                "tool": read.tool,
+                                "attempt": read.attempt,
+                            } },
+                            "recovery": null,
+                        }),
+                        None => serde_json::json!({
+                            "status": "known",
+                            "value": { "pair": null },
+                            "recovery": null,
+                        }),
+                    })
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "local_state_claim" => {
+                // #2564: the closed State poller entry for retained
+                // `eliot.state` pairs. Same session/auth/ready/fence gates, same
+                // single-`operation`-key payload shape and same null poll as
+                // `local_read_claim`, but a SEPARATE claim over the State form
+                // of the same bounded carrier: a query or Skill pair is not
+                // claimable here and a State pair is not claimable on the query
+                // claim. The answer carries the same four fields â€” `form` (here
+                // always `state`), the exact admitted envelope, the exact
+                // retained tool bytes, and the Kernel-minted fenced attempt.
+                #[cfg(windows)]
+                {
+                    if payload.as_object().is_none_or(|object| object.len() != 1) {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    self.claim_local_state_pair(session).map(|pair| match pair {
+                        Some(read) => serde_json::json!({
+                            "status": "known",
+                            "value": { "pair": {
+                                "form": read.form.as_str(),
+                                "envelope": read.envelope,
+                                "tool": read.tool,
+                                "attempt": read.attempt,
+                            } },
                             "recovery": null,
                         }),
                         None => serde_json::json!({
@@ -3733,10 +3788,45 @@ impl KernelComposition {
                     Err(TransportError::SessionFenced)
                 }
             }
+            // Issue #2564: the owner-backed `eliot.state` result. Deliberately a
+            // separate arm from `local_read_result` so the submitted result is bound
+            // to the STATE carrier form. A state result arriving on the query arm (or
+            // a query result on this one) is refused by the carrier form check inside
+            // `submit_local_state_result`, which is what keeps the two lanes from
+            // completing each other's claims.
+            "local_state_result" => {
+                #[cfg(windows)]
+                {
+                    let result_value = payload
+                        .get("result")
+                        .cloned()
+                        .ok_or(TransportError::SessionFenced)?;
+                    let body: HostRequestResultBody = serde_json::from_value(result_value)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    match self.submit_local_state_result(session, &body) {
+                        Ok(host_request_route::LocalReadSubmitDisposition::Persisted(_)) => {
+                            Ok(Self::accepted_daemon_response())
+                        }
+                        Ok(host_request_route::LocalReadSubmitDisposition::StaleAttempt(
+                            observation,
+                        )) => Ok(Self::stale_attempt_daemon_response(&observation)),
+                        Err(TransportError::Timeout) => {
+                            observe_daemon_request("kernel.daemon_response_unknown", "unknown");
+                            Ok(Self::expired_activation_daemon_response())
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
             "semantic_observe_claim" => {
                 // Outbound-only eliotd observe poller for admitted
                 // `eliot.observe` pairs (issue #2565): mirrors
-                // `local_read_claim` — same session/auth/ready/fence gates
+                // `local_read_claim` â€” same session/auth/ready/fence gates
                 // via the dispatcher head and `frame_dispatch` allowlist,
                 // same single-`operation`-key payload shape, same null poll
                 // (not error) when empty. The claimed pair carries the
@@ -5451,8 +5541,8 @@ impl KernelComposition {
     /// `status: "unknown"`; only an answer that acknowledged the whole requested
     /// set settles the route.
     ///
-    /// The answer is borrowed rather than taken by value: it is read twice — once
-    /// to validate it against the request and once to project it — and
+    /// The answer is borrowed rather than taken by value: it is read twice â€” once
+    /// to validate it against the request and once to project it â€” and
     /// `serde_json::json!` borrows every interpolated expression, so a by-value
     /// parameter would be copied in and never consumed.
     #[cfg(windows)]
@@ -5691,7 +5781,7 @@ impl KernelComposition {
     /// Tool Definition revisions the revision declares, and delivery
     /// capability from the named platform observation. The observed provider
     /// fingerprint stays absent because this boundary issues no provider call
-    /// before preflight — which is exactly what deterministic mode requires —
+    /// before preflight â€” which is exactly what deterministic mode requires â€”
     /// and `UserAutomationPreflightProjection::assemble` refuses every other
     /// gap instead of letting it through. A member no reachable owner attests
     /// is a typed refusal naming that owner, never a default.
@@ -5825,7 +5915,7 @@ impl KernelComposition {
         };
         // The normalization envelope is the retained bytes the revision row
         // carries, selected by the content-derived identity the immutable
-        // revision names — the same selection the run-now assembler makes —
+        // revision names â€” the same selection the run-now assembler makes â€”
         // and assembly re-checks that those bytes name the compiled occurrence
         // digest. A row that retained none leaves the occurrence unadmitted by
         // name instead of receiving a substituted receipt.
@@ -5836,7 +5926,7 @@ impl KernelComposition {
         )?;
         // Live evidence below the Kernel decoding boundary. This read issues
         // no provider call before preflight, so the only honest provider
-        // observation is none — which is exactly what deterministic mode
+        // observation is none â€” which is exactly what deterministic mode
         // requires and what assembly enforces for every other mode through the
         // revision's own provider policy. The Tool Definition set is the exact
         // closure the canonical owner revision declares, repeated here so
@@ -6022,7 +6112,7 @@ impl KernelComposition {
                 ))
             })?;
         // The envelope must be THIS provenance's receipt, proven against the
-        // envelope's own request binding and work scope — the same joint the
+        // envelope's own request binding and work scope â€” the same joint the
         // run-now join makes. An envelope that merely exists for some other
         // operation, or one whose request body differs from the committed
         // provenance, is not this occurrence's source evidence.
@@ -6073,7 +6163,7 @@ impl KernelComposition {
     /// user session, so a declared toast target with no session behind it
     /// reports the capability it actually observed instead of defaulting to
     /// capable. The rule lives in one sentence here rather than behind a
-    /// second helper because the owner it observes — the platform session —
+    /// second helper because the owner it observes â€” the platform session â€”
     /// is the same one.
     #[cfg(windows)]
     fn user_automation_preflight_delivery_capability(
@@ -6128,7 +6218,7 @@ impl KernelComposition {
         // refused is only this route's claim to own a decision it cannot
         // durably record. The improvement owner is the single writer of that
         // record, and it must take the deciding principal from an
-        // authenticated Session of its own — A12.02:3's "Identity is not a
+        // authenticated Session of its own â€” A12.02:3's "Identity is not a
         // model's self-declared string" is why the decision cannot be
         // forwarded over a payload and re-attributed there, and why an ingress
         // that could not bind the session principal has no honest way to
@@ -7022,8 +7112,8 @@ impl KernelComposition {
     /// Every refusal happens before the effect owner is contacted, and a refusal
     /// returns the closed cause and the existing operation rather than prose.
     ///
-    /// After the Durable Job owner issues an owner-acknowledged disposition —
-    /// an admission, or a refusal it answered before any owner effect — the
+    /// After the Durable Job owner issues an owner-acknowledged disposition â€”
+    /// an admission, or a refusal it answered before any owner effect â€” the
     /// next bounded recurring horizon slice is requested through the same
     /// schedule owner (item 6). The advance recompiles the denominator from the
     /// immutable revision the wake resolved against, so it never mutates that
@@ -7112,9 +7202,9 @@ impl KernelComposition {
         // owner, and resolves the complete owner-issued
         // `UserAutomationDurableJobMaterial` through
         // `UserAutomationDurableJobMaterial::from_admitted_occurrence`. The
-        // transport it submits over is `UserAutomationOperatorRuntime` — the
+        // transport it submits over is `UserAutomationOperatorRuntime` â€” the
         // production `UserAutomationRuntimePort` over this already-authenticated
-        // Host channel — and the owner's answer is validated there. Calling
+        // Host channel â€” and the owner's answer is validated there. Calling
         // `UserAutomationDurableJobPort::admit_occurrence` on the bare client,
         // as this contour did, reached the Durable Job owner without ever running
         // the deterministic preflight, which is the blind rerun I11.12:59 and
@@ -8145,7 +8235,7 @@ impl KernelComposition {
     /// A horizon publication belongs to the read/observation family, not the
     /// occurrence family: it names an immutable revision and a State Fence but
     /// no occurrence. `revalidate_user_automation_enumeration` is therefore its
-    /// exact analogue — the same `UserAutomationOwnerLookup`, the same canonical
+    /// exact analogue â€” the same `UserAutomationOwnerLookup`, the same canonical
     /// owner readback, the same owner-recompiled occurrence denominator, and the
     /// same parent Store receipt proof. `revalidate_user_automation_wake_read` is
     /// not usable here because it keys on a `UserAutomationWakeReadRequest` and
@@ -8155,7 +8245,7 @@ impl KernelComposition {
     /// automation identity, the revision, the owner principal and the complete
     /// occurrence denominator are all recompiled from the canonical current
     /// revision, and the carried `revision_digest` must equal that revision's
-    /// own `digest()` — a digest a caller could compute for itself would
+    /// own `digest()` â€” a digest a caller could compute for itself would
     /// otherwise name another revision's cursor. This is issue #2806 item 2's
     /// "revalidate principal, revision, State Fence and owner denominator
     /// before each owner call", applied to the publish leg and the read-back leg
@@ -8270,7 +8360,7 @@ impl KernelComposition {
             // and for a proven absence, but would be a false statement here:
             // something provably DID happen, and a client keying on
             // `accepted == false` would read a proven commit as a refusal. The
-            // operation was accepted — its commit is proven — so the accepted
+            // operation was accepted â€” its commit is proven â€” so the accepted
             // flag stays true and the remaining ledger read is reported as the
             // structured `recovery` obligation it is, not as English prose.
             UserAutomationRuntimeError::OutcomeSettled(reason) => serde_json::json!({
@@ -8398,7 +8488,7 @@ impl KernelComposition {
         // Graceful WASM ladder (`#2896` W1/A1): when the decided
         // operation is a supervised WASM-host parent, the owner first
         // offers the ordered Reconcile/Cancel/Shutdown ladder through
-        // its replayable control spool — the exact A4 ordered pairs —
+        // its replayable control spool â€” the exact A4 ordered pairs â€”
         // so the host loop can reconcile the uncertain outcome,
         // contain guest work, and close admission before the gateway
         // kill lands. A foreign image skips this half with the response
@@ -8479,7 +8569,7 @@ impl KernelComposition {
     /// caller against the retained operation record, cross-checks the
     /// envelope operation and the live installation against the journaled
     /// original, and then either replays the preserved original kill
-    /// receipt or answers reconciliation-required — never re-executing and
+    /// receipt or answers reconciliation-required â€” never re-executing and
     /// never minting a fresh nonce. A proven (`Effected`) effect projects
     /// the preserved receipt; an unproven (`Unknown`) effect projects a
     /// structured `reconciliation_required` recovery obligation, not prose;
@@ -9004,7 +9094,7 @@ impl KernelComposition {
     /// (codec-version mismatch versus interrupted read) instead of being
     /// flattened into a transport error, so a caller can tell a stale codec from
     /// an interrupted read, and an empty stream list means ORS retains no row
-    /// for that operation — never that the operation had no streams.
+    /// for that operation â€” never that the operation had no streams.
     #[cfg(windows)]
     fn process_stream_recovery_status_view(
         &self,
@@ -9569,7 +9659,7 @@ impl KernelComposition {
     /// transition/context fence agreement, every expected head's own
     /// validation and fence agreement, the ordering-scope binding, and finally
     /// the canonical request hash recomputed from the exact values about to be
-    /// executed — a plan edited after admission fails here instead of entering
+    /// executed â€” a plan edited after admission fails here instead of entering
     /// the store bridge.
     #[cfg(windows)]
     fn validate_notification_state_apply(
@@ -9727,7 +9817,7 @@ impl KernelComposition {
     /// instead of being collapsed into a fence (issue #1681 W3, I14.11). An
     /// unreachable Store produces no page, and this read carries no admitted
     /// Kernel-issued operation handle of its own, so the caller cannot be told
-    /// a current answer — only the closed `DB_UNAVAILABLE` disposition with the
+    /// a current answer â€” only the closed `DB_UNAVAILABLE` disposition with the
     /// shared directive, which names the cause and the fence it was observed
     /// against. Reporting the outage as a fencing refusal instead would name
     /// neither, and would let an owner outage be read as proof the generation
@@ -9935,12 +10025,12 @@ impl KernelComposition {
     ///
     /// The `local_read` kind is the authenticated dispatch sibling of
     /// `store_named` on the same authenticated daemon session: no new
-    /// transport, pipe, or listener. Rejection happens before reading —
+    /// transport, pipe, or listener. Rejection happens before reading â€”
     /// linkage plus closed selectors are proven (pure, no IO), then the full
     /// admission gate runs, then an exact replay of a resulted operation
-    /// serves its stored bounded body without re-dispatch — rejoined first to
+    /// serves its stored bounded body without re-dispatch â€” rejoined first to
     /// the current source revisions its own lineage records, which is one
-    /// bounded head read and never a re-execution — then the presented
+    /// bounded head read and never a re-execution â€” then the presented
     /// attempt capability is proven current against the live claim record
     /// before any Gateway IO. Only a fresh admitted
     /// query with a current attempt reaches the evidence Gateway, over the admitted
@@ -10021,7 +10111,7 @@ impl KernelComposition {
             }
             // The bytes are about to leave this process, so the CURRENT
             // disclosure permission is re-evaluated now, at the moment of
-            // redelivery, against the durable row and the live owner reads —
+            // redelivery, against the durable row and the live owner reads â€”
             // never against the value captured when the result was first
             // produced and never against anything the presenting caller
             // supplies. A changed permission withholds the bytes; it does not
@@ -10038,7 +10128,17 @@ impl KernelComposition {
         // capability equality proves every echoed field is exactly what the
         // Kernel minted for this envelope; a substituted echo fails closed.
         let operation_id = host_request_operation_id(&envelope);
-        let live = self.live_local_read_attempt(&operation_id, &envelope.envelope_sha256)?;
+        // This leg is the query-only Gateway path: the admission match above
+        // already refused every non-query form, so the carrier form here is
+        // `Query` by construction rather than by a caller-supplied label. The
+        // claim gate therefore looks up the QUERY slot specifically â€” a State
+        // pair retained on the same carrier is not claimable here, which is
+        // what keeps the two lanes from completing each other's attempts.
+        let live = self.live_local_read_attempt(
+            &operation_id,
+            &envelope.envelope_sha256,
+            host_request_route::LocalReadPairKind::Query,
+        )?;
         let current = match live {
             Some(state)
                 if state.attempt_id == attempt.attempt_id
@@ -10202,8 +10302,8 @@ impl KernelComposition {
     /// A retained read is a dependent retrieval branch: the answer, its
     /// ranking and its counts all descend from the source revisions the
     /// result's own retained lineage names. I15.7 makes final-result filtering
-    /// defense in depth, not the boundary — "If such content participated in a
-    /// retrieval/scoring branch, the whole contaminated branch … is discarded
+    /// defense in depth, not the boundary â€” "If such content participated in a
+    /// retrieval/scoring branch, the whole contaminated branch â€¦ is discarded
     /// and replanned under the latest grant/policy". So the branch is rejoined
     /// to the source revision, not filtered down to a permitted row.
     ///
@@ -10291,7 +10391,7 @@ impl KernelComposition {
     ///   row was produced under. The session is established by the
     ///   authenticated transport, so the presented envelope contributes
     ///   nothing to this half.
-    /// * [`Self::admit_material_authority_for_governor_issued_fence`] — the
+    /// * [`Self::admit_material_authority_for_governor_issued_fence`] â€” the
     ///   SAME live owner read the fresh leg clears at
     ///   [`Self::local_read_operation`]. It resolves the currently recorded
     ///   Governor-issued coverage revision and active fingerprint, runs the
@@ -10338,7 +10438,7 @@ impl KernelComposition {
     /// the presented digest. (`eliot-installation` is not a dependency of
     /// this composition root, so the validated
     /// `wasm_host_artifact_binding()` accessor cannot be called here; the
-    /// path pin plus byte re-hash is the fail-closed equivalent — the same
+    /// path pin plus byte re-hash is the fail-closed equivalent â€” the same
     /// proof the P03 executor repeats at launch.) The install directory is
     /// the host path's parent, never a caller string. Publication requires
     /// a fence-bound session on a Ready, unfenced Kernel; the claim and its
@@ -10347,7 +10447,7 @@ impl KernelComposition {
     /// admitted process gateway with argv from the validated material, so a
     /// real ordinary request reaches the host request loop; a refused start
     /// fails the operation closed (the staged set stays for the delivery
-    /// owner — cleanup is `#2786` territory, never an invented delete
+    /// owner â€” cleanup is `#2786` territory, never an invented delete
     /// here). The computed one-shot join gate is projected into the receipt,
     /// and the composition-retained join table holds the one-shot
     /// consumption across calls, so an exact same-delivery replay answers
@@ -10457,7 +10557,7 @@ impl KernelComposition {
         // Publisher concurrency (#2786 step 4): sessions run as `JoinSet`
         // tasks on the multi-threaded `#[tokio::main]` runtime, so two
         // `publish_wasm_dispatch_bundle` calls can interleave on different
-        // threads — no single-publisher ownership is claimed. The
+        // threads â€” no single-publisher ownership is claimed. The
         // publisher serializes replacements only through the live-envelope
         // gate (claim-by-rename plus per-step re-verification), not a
         // lock; the residual per-file window is stated at the reclaim.
@@ -10477,7 +10577,7 @@ impl KernelComposition {
             Err(eliot_kernel_service::WasmDispatchError::Backpressure(live)) => {
                 // Issue #1679 (caller STITCH): the versioned I14 directive
                 // rides alongside the typed backpressure kind/value, never
-                // replacing them. The observation is whole-or-null — `null`
+                // replacing them. The observation is whole-or-null â€” `null`
                 // while the publishing owner supplies no complete directive.
                 let directive = wasm_dispatch_backpressure_directive(claim.operation_id.as_str());
                 return Ok(serde_json::json!({
@@ -10505,9 +10605,9 @@ impl KernelComposition {
         // one-shot admission and any exact replay observes the spent
         // record. Expiry is re-verified at launch instant (closing the
         // validation-to-start window), so this is a real expiry gate
-        // (`Stale` can fire here). A failed launch stays consumed — an
+        // (`Stale` can fire here). A failed launch stays consumed â€” an
         // unknown outcome reconciles, it is never blindly retried under
-        // the same delivery — and recovery resubmits under fresh claim
+        // the same delivery â€” and recovery resubmits under fresh claim
         // authority (#2786 A7). Anything else fails closed before the
         // child starts.
         let admission = {
@@ -10585,7 +10685,7 @@ impl KernelComposition {
     ///
     /// The P-03 intent carries the re-hashed host image, the install
     /// directory as its working directory, and argv assembled from the
-    /// validated material only (`--profile <profile>` — the closed
+    /// validated material only (`--profile <profile>` â€” the closed
     /// publisher-checked spelling the host CLI requires before it reaches
     /// `run_ordinary_request_loop`; no nonce, handle, or path travels on
     /// the command line). The intent operation is the admitted claim
@@ -10596,8 +10696,8 @@ impl KernelComposition {
     /// Environment is secret-free, limits are the same bounded contour, and
     /// supervision stays with the gateway owner (replay begin for exact
     /// resubmits, path-lease re-proof at launch, inspect/cancel by
-    /// operation). Every refusal — no gateway, stale snapshot, an image
-    /// outside the retained root, or an unknown spawn outcome — fails
+    /// operation). Every refusal â€” no gateway, stale snapshot, an image
+    /// outside the retained root, or an unknown spawn outcome â€” fails
     /// closed; the staged set is left for the delivery owner (`#2786`), and
     /// no launch table or reconciler is kept here.
     #[cfg(windows)]
@@ -10720,8 +10820,8 @@ impl KernelComposition {
     /// generation, grant, work scope), the live session (epoch, fence,
     /// principal, connection), and the origin grant funding the decision
     /// (challenge, operation class, decision time). The running image
-    /// bytes re-hash to the staged grant digest — the same fail-closed
-    /// contour as launch — and the child-sealed request digest is never
+    /// bytes re-hash to the staged grant digest â€” the same fail-closed
+    /// contour as launch â€” and the child-sealed request digest is never
     /// minted here; the child cross-checks the operation/invocation/grant
     /// triple against its own sealed binding.
     ///
@@ -10829,7 +10929,7 @@ impl KernelComposition {
 
     /// Publishes the ordered graceful owner-control ladder for a
     /// decided WASM-host operation (`#2896` W1/A1): Reconcile, then
-    /// Cancel, then Shutdown — the exact A4 ordered pairs — through
+    /// Cancel, then Shutdown â€” the exact A4 ordered pairs â€” through
     /// the existing owner spool before the gateway kill lands.
     ///
     /// The origin-control Kill decision is the sole production trigger
@@ -10916,13 +11016,13 @@ impl KernelComposition {
     /// binder checks shape, this dispatch proves bytes). The grant never
     /// binds to a merely presented reference: the durable canonical record
     /// is read back from the retained store by `notification_id` first under
-    /// the live session fence — the minter-to-durable-state join. A missing
+    /// the live session fence â€” the minter-to-durable-state join. A missing
     /// record, a fence disagreement, or an unavailable store fails closed
     /// before binding. The presented `notification_digest` stays opaque here
     /// (shape-checked by the binder; no digest derivation is specified in
     /// `notify_grant.rs`, so this dispatch never invents one). Session evidence
-    /// is threaded from the live authenticated session — connection, exact
-    /// epoch, exact fence — never from the payload. Ready state, unfenced
+    /// is threaded from the live authenticated session â€” connection, exact
+    /// epoch, exact fence â€” never from the payload. Ready state, unfenced
     /// generation, and exact epoch/fence currency are enforced inside the
     /// binder; any denial fails closed here.
     #[allow(
@@ -10959,7 +11059,7 @@ impl KernelComposition {
         }
         // Minter-to-durable-state join: the grant binds only to a persisted
         // canonical record read back under the session fence. This is a
-        // read-only existence/digest proof — canonical writes stay on the
+        // read-only existence/digest proof â€” canonical writes stay on the
         // `eliotd` admission path, never in this composition root.
         self.require_durable_notification_record(
             session,
@@ -10971,7 +11071,7 @@ impl KernelComposition {
         // `SessionBinding` lives in `eliot-receipts` (no direct dependency
         // edge from this composition root under single-file ownership); its
         // `Deserialize` impl plus struct-field inference carries the exact
-        // evidence type — connection, epoch, fence — without a new
+        // evidence type â€” connection, epoch, fence â€” without a new
         // dependency or a caller-asserted session.
         let session_evidence = serde_json::json!({
             "session_id": &session.connection_id,
@@ -11323,9 +11423,9 @@ impl KernelComposition {
     }
 
     /// Renders one typed I6.8 pre-stage rejection (issue #1796) as the
-    /// `write_receipt` error response. The full typed record — stage state,
+    /// `write_receipt` error response. The full typed record â€” stage state,
     /// ordering flag, decision, defect codes, mutation status, and retry rule
-    /// — travels in `recovery` so the client can distinguish schema-invalid,
+    /// â€” travels in `recovery` so the client can distinguish schema-invalid,
     /// identity-conflict, and staged outcomes without parsing prose.
     #[cfg(windows)]
     fn pre_stage_rejection_response(rejection: &PreStageRejection) -> serde_json::Value {
@@ -11341,9 +11441,9 @@ impl KernelComposition {
     /// Renders one refused Store `apply` as the operation's error response.
     ///
     /// A typed I5.19 admission decision is the one refusal that carries
-    /// evidence rather than prose, so the full typed `WriteSubmission` —
+    /// evidence rather than prose, so the full typed `WriteSubmission` â€”
     /// submission id, state, reason codes, retry-identity rule, and next
-    /// allowed action — travels in `recovery` exactly as the I6.8
+    /// allowed action â€” travels in `recovery` exactly as the I6.8
     /// [`Self::pre_stage_rejection_response`] record does. That is what lets a
     /// client tell a `not_accepted` submission from any other failure without
     /// parsing the operator line, and it is I5.19 line 21: a syntax/shape
@@ -11490,8 +11590,8 @@ fn store_read_unavailable_directive(
 /// genuinely unavailable at this call site, so this helper emits `None`
 /// rather than a partial directive. `reserve_campaign_source_publications`
 /// fails with a prose `OrsError` that carries no owner-measured ORS durable
-/// queue reading — neither the requested staging bytes nor the available
-/// bytes the `STORAGE_BACKPRESSURE` contract requires — and that failure may
+/// queue reading â€” neither the requested staging bytes nor the available
+/// bytes the `STORAGE_BACKPRESSURE` contract requires â€” and that failure may
 /// be a CAS identity conflict, contract rejection, or storage fault
 /// rather than measured byte exhaustion, so minting an exhausted-bytes
 /// observation here would fabricate capacity evidence. There is likewise no
@@ -11522,8 +11622,8 @@ fn store_staging_backpressure_directive(operation_id: &str) -> Option<serde_json
 /// unavailable at this call site, so this helper emits `None` rather than a
 /// partial directive. The typed [`WasmDeliveryBackpressure`] the
 /// `WasmDispatchError::Backpressure` arm carries names the live delivery
-/// holding the fixed names plus a prose retry condition — identities only,
-/// never an owner-measured exhausted bottleneck dimension — and this edge
+/// holding the fixed names plus a prose retry condition â€” identities only,
+/// never an owner-measured exhausted bottleneck dimension â€” and this edge
 /// owns no capacity-profile revision artifact or state fence to bind. A BUSY
 /// directive validates only with a claimed, observed exhausted dimension plus
 /// the owner-produced compiled profile revision, so naming one here would
@@ -12069,7 +12169,7 @@ fn validate_origin_inspection(
 /// Requires one closed canonical notification plan before any store IO
 /// (issue #1780).
 ///
-/// The store contract — not this route — owns the leg discriminator and its
+/// The store contract â€” not this route â€” owns the leg discriminator and its
 /// complete parameter set, so this only proves the plan *is* a canonical
 /// notification transition: the fixed `NotificationState` class, the fixed
 /// notification scope and ordering scope, exactly one named operation, and a
@@ -12162,7 +12262,7 @@ pub(crate) fn validate_store_session_fence(
 /// `Serialize` impls, so the Kernel neither re-derives nor reshapes it. `None`
 /// stays an explicit `null` rather than an omitted key (I5.16), and the
 /// `reports_complete_evidence` flag is ORS's own conjunction over the typed axes
-/// that are projected beside it — it is a mechanical restatement, never an
+/// that are projected beside it â€” it is a mechanical restatement, never an
 /// independent judgement about the stream.
 #[cfg(windows)]
 fn process_stream_recovery_stream_view(
@@ -12216,8 +12316,8 @@ fn process_stream_recovery_load_disposition(
 /// and the ORS staged write recovery view.
 ///
 /// Both extra members are SIBLINGS of `kind`/`value` inside the typed
-/// application object, so the retained daemon client's `kind_value` reader —
-/// which resolves `kind` then `value` by name — keeps decoding the identical
+/// application object, so the retained daemon client's `kind_value` reader â€”
+/// which resolves `kind` then `value` by name â€” keeps decoding the identical
 /// `StoreRecoverySnapshot` it always did. `process_stream_recovery` is explicit
 /// `null` when the request selected no operation (I5.16: a field that does not
 /// apply stays explicit `None`), never omitted, so the answer shape is stable.
@@ -12972,8 +13072,8 @@ mod local_read_dispatch_tests {
             "the closed evidence-pack read must pass the gate"
         );
 
-        // Any other catalogue operation — including the packet
-        // projection-inputs read — stays unavailable on this leg.
+        // Any other catalogue operation â€” including the packet
+        // projection-inputs read â€” stays unavailable on this leg.
         for operation in [
             NamedReadOperation::GetCurrentEpistemicPosition,
             NamedReadOperation::GetRevisionHeads,
