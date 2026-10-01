@@ -29,9 +29,7 @@ use std::sync::Arc;
 
 use eliot_governor::CompositionError;
 pub use eliot_integration_coverage::GovernorAuthorityObservation;
-use eliot_integration_coverage::{
-    AdapterAdmissionIdentity, EvidenceAvailability, SourceReadback,
-};
+use eliot_integration_coverage::{AdapterAdmissionIdentity, EvidenceAvailability, SourceReadback};
 
 use super::daemon_kernel_client::DaemonKernelClient;
 use super::{DaemonComposition, DaemonError, kind_value};
@@ -41,8 +39,7 @@ use super::{DaemonComposition, DaemonError, kind_value};
 /// into the payload object, so it is not duplicated there.
 const PUBLISH_GOVERNOR_AUTHORITY_OPERATION: &str = "publish_governor_authority";
 /// Authenticated Kernel readback operation for original admitted bridge rows.
-const READ_GOVERNOR_AUTHORITY_OBSERVATION_OPERATION: &str =
-    "read_governor_authority_observation";
+const READ_GOVERNOR_AUTHORITY_OBSERVATION_OPERATION: &str = "read_governor_authority_observation";
 /// Typed receipt kind answered by the publish arm.
 const GOVERNOR_AUTHORITY_RECEIPT_KIND: &str = "governor_authority_receipt";
 /// Typed observation kind answered by the authenticated owner read.
@@ -102,14 +99,11 @@ pub async fn maintain_governor_authority_observation(
     kernel: &Arc<DaemonKernelClient>,
     observation: &GovernorAuthorityObservation,
 ) -> Result<Option<u64>, CompositionError> {
-    Ok(maintain_governor_authority_observation_inner(
-        composition,
-        kernel,
-        observation,
-        None,
+    Ok(
+        maintain_governor_authority_observation_inner(composition, kernel, observation, None)
+            .await?
+            .map(|(revision, _, _)| revision),
     )
-    .await?
-    .map(|(revision, _, _)| revision))
 }
 
 async fn maintain_governor_authority_observation_inner(
@@ -164,18 +158,19 @@ async fn read_governor_authority_observation(
         after_event_sequence,
         page_limit: GOVERNOR_AUTHORITY_OBSERVATION_PAGE_LIMIT,
     };
-    let unavailable = |adapter: Option<AdapterAdmissionIdentity>, reason: &str| GovernorAuthorityObservation {
-        adapter,
-        source: SourceReadback::Unavailable {
-            reason: reason.to_owned(),
-        },
-        watchdog: EvidenceAvailability::Unavailable {
-            reason: reason.to_owned(),
-        },
-        trace: EvidenceAvailability::Unavailable {
-            reason: reason.to_owned(),
-        },
-    };
+    let unavailable =
+        |adapter: Option<AdapterAdmissionIdentity>, reason: &str| GovernorAuthorityObservation {
+            adapter,
+            source: SourceReadback::Unavailable {
+                reason: reason.to_owned(),
+            },
+            watchdog: EvidenceAvailability::Unavailable {
+                reason: reason.to_owned(),
+            },
+            trace: EvidenceAvailability::Unavailable {
+                reason: reason.to_owned(),
+            },
+        };
     let response = match kernel
         .transact_async(
             READ_GOVERNOR_AUTHORITY_OBSERVATION_OPERATION,
@@ -343,11 +338,9 @@ impl GovernorAuthorityDriver {
             self.last_adapter_descriptor = Some(descriptor);
         }
         let (next_owner_sequence, next_event_sequence) = match &observation.source {
-            SourceReadback::Available { next, .. } => {
-                next.as_ref().map_or((0, 0), |next| {
-                    (next.after_owner_sequence, next.after_event_sequence)
-                })
-            }
+            SourceReadback::Available { next, .. } => next.as_ref().map_or((0, 0), |next| {
+                (next.after_owner_sequence, next.after_event_sequence)
+            }),
             SourceReadback::Unavailable { .. } => (0, 0),
         };
         let result = maintain_governor_authority_observation_inner(
@@ -357,14 +350,14 @@ impl GovernorAuthorityDriver {
             self.last_acknowledged.as_ref(),
         )
         .await;
-        let Some((revision, published, fingerprint)) = match result {
+        let Some((revision, published, fingerprint)) = (match result {
             Ok(result) => result,
             Err(error) => {
                 self.after_owner_sequence = 0;
                 self.after_event_sequence = 0;
                 return Err(error);
             }
-        } else {
+        }) else {
             self.after_owner_sequence = 0;
             self.after_event_sequence = 0;
             return Ok(GovernorAuthorityDriveOutcome::SkippedNoObservation);
