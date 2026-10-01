@@ -2250,10 +2250,7 @@ fn classify_payload_coverage(
 /// this BEFORE reading any coverage member of the page, because the ordering is
 /// the guarantee: a truncation flag on a page projected under another fence
 /// describes that other fence's rows.
-pub fn prove_page_state_fence(
-    payload: &Value,
-    bound_fence: &StateFence,
-) -> Result<(), ReadError> {
+pub fn prove_page_state_fence(payload: &Value, bound_fence: &StateFence) -> Result<(), ReadError> {
     // The page's own fence member, read through the Store's exported key
     // constant rather than a spelling restated here. It is read before any
     // other member so that a page which states no readable fence keeps that
