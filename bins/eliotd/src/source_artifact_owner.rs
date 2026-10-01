@@ -105,6 +105,7 @@ pub(crate) struct SourceArtifactStagingTarget {
     resource_ref: String,
     source_id: eliot_contracts::SourceId,
     archive_sha256: String,
+    blob_root_id: String,
     policy_snapshot_id: String,
     policy_snapshot_digest: String,
     state_fence: eliot_contracts::StateFence,
@@ -117,6 +118,10 @@ impl SourceArtifactStagingTarget {
 
     pub(crate) fn resource_ref(&self) -> &str {
         &self.resource_ref
+    }
+
+    pub(crate) fn blob_root_id(&self) -> &str {
+        &self.blob_root_id
     }
 }
 
@@ -183,6 +188,7 @@ impl SourceArtifactOwner {
             resource_ref,
             source_id: source_id.clone(),
             archive_sha256: eliot_contracts::sha256_hex(exact_archive_bytes),
+            blob_root_id: self.root_owner.root_id().to_owned(),
             policy_snapshot_id: policy_profile.policy_snapshot_id().to_owned(),
             policy_snapshot_digest: policy_profile.policy_snapshot_digest().to_owned(),
             state_fence,
