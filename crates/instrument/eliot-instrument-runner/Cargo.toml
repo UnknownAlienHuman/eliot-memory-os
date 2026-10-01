@@ -8,6 +8,7 @@ description = "Bounded provider-neutral instrument runner for ELIOT"
 
 [dependencies]
 eliot-build-test-graph = { path = "../eliot-build-test-graph", version = "0.1.0" }
+eliot-bootstrap.workspace = true
 eliot-contracts.workspace = true
 eliot-instrument-api.workspace = true
 eliot-instrument-cargo = { path = "../eliot-instrument-cargo", version = "0.1.0" }
