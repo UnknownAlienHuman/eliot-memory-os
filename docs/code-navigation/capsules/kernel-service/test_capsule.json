@@ -453,8 +453,8 @@
       },
       {
         "path": "crates/kernel/eliot-kernel-service/tests/sconc994_kernel_route.rs",
-        "bytes": 42960,
-        "sha256": "f41b36aa9abe24fd968ec89cd22745c832ab155352d783f35315f654f81eea23",
+        "bytes": 43952,
+        "sha256": "4f084570facea64a08da5f181e9dfd9ee2f4f64617b3d43582c42330a22a45a4",
         "test_attributes": 2,
         "inline_cfg_test": false,
         "test_only_module": false,
@@ -577,7 +577,7 @@
   "expected_nonzero_test_count": {
     "method": "count of #[test]/#[tokio::test] attributes in the selected test slice",
     "test_attribute_count": 279,
-    "test_stu": 239681,
+    "test_stu": 240012,
     "nonzero": true
   },
   "bound_contract_digest": "5ea02eabb3332172",
@@ -608,20 +608,20 @@
       },
       "physical_source_inventory": {
         "path_count": 60,
-        "sha256": "0b0f29576c040592433f1f73229eee7ff6eb1f41a0a4205be602f5d86beecc83"
+        "sha256": "469b6fe48274ba93d69d8420f5f643e3462e151b9e631619cca0e70ddda42cf3"
       },
       "selected_workset": {
         "allocation_scope": "PER_CELL",
         "allocation_state": "ACCEPTED_ALLOCATION",
         "path_count": 18,
-        "sha256": "1b457d8c1f6fb659d27e2deede7c13d24c7c7937911efd9fd4d024b79d04f4d9"
+        "sha256": "4e7ac857fb443e14c65de93da3ea131ac6cf3438d75e4989a7df867513cdd06a"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0",
     "note": "A change under exact_provenance moves artifact_digest only. It is not a public API or semantic-contract change and is not an instruction to re-read or re-test every cell."
   },
-  "artifact_digest": "25955db3e9c89b42481cb29df5b5f05f9ab4aabacb41d7f10bf7e6819cc88e2f",
+  "artifact_digest": "6b920ce4951a889949626e9bcfc209733356b5f6cf615a9a85159e55d2ad0265",
   "contract_revision": {
     "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
     "value": "01d9f1c2f17c8fc4"
