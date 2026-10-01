@@ -91,8 +91,8 @@ use crate::{
     CompositionReservation, ObservedHead, RESERVATION_KEY_NAME, RESERVATION_KEY_PROVIDER,
     RESERVATION_VISIBILITY, ReservationSeed, ReservationWriteError, ReservedSubmission,
     ResolvedSendOutcome, SealedReservation, begin_execute_after_send, cancel_before_send,
-    ensure_eligible, mark_unknown_outcome, project_reserved_write,
-    reconcile_receipt, reserve_for_transition,
+    ensure_eligible, mark_unknown_outcome, project_reserved_write, reconcile_receipt,
+    reserve_for_transition,
 };
 use eliot_contracts::{
     ClockReading, EpochId, EpochLineageId, OperationId, ProductId, RequestId, ResourceGeneration,
@@ -1947,9 +1947,11 @@ fn ordinary_committed_lifecycle_refuses_to_finalize_without_head_evidence() {
     let mut transition_b = transition_for("23b", &[successor_fixture.scope_a.as_str()]);
     let (revision_b, ordering_b) = heads_for("23b", &[successor_fixture.scope_a.as_str()]);
     seal(&context_b, &mut transition_b, &revision_b, &ordering_b);
-    let seed_b = seed_for("23b", transition_b.identity.operation_id.as_str(), &[
-        successor_fixture.scope_a.as_str(),
-    ]);
+    let seed_b = seed_for(
+        "23b",
+        transition_b.identity.operation_id.as_str(),
+        &[successor_fixture.scope_a.as_str()],
+    );
     let next = reserve_for_transition(
         &owner,
         &seed_b,
@@ -2510,7 +2512,11 @@ fn mutated_fixture_prefix_controls_generated_reservation_identity() {
         "992/29",
     );
     let pending = unresolved(&owner);
-    assert_eq!(pending.len(), 1, "992/29 the mutated reservation is retained");
+    assert_eq!(
+        pending.len(),
+        1,
+        "992/29 the mutated reservation is retained"
+    );
     assert_eq!(
         pending[0].token.reservation_id.as_str(),
         format!("{mutated_prefix}{tag}"),
