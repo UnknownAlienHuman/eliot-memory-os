@@ -1600,9 +1600,14 @@ mod tests {
             let mut behavior = candidate.behavior.clone();
             behavior.action = "apply a different change".to_owned();
             let material = material_for(&behavior);
-            let package = package_for(&candidate, &material);
-            // The package still validates against its own inputs; the binding
-            // to the accepted candidate is what refuses it.
+            let mut package = package_for(&candidate, &material);
+            // A package is self-consistent only against its OWN material: the
+            // presented behavior is the one the material was built from, so it
+            // validates alone. The binding to the accepted candidate is what
+            // refuses it.
+            package.behavior = behavior;
+            package.digests =
+                eliot_skills::PackageDigests::derive(&material).expect("re-derived digests");
             package
                 .validate(&material)
                 .expect("diverged package validates alone");
@@ -1752,14 +1757,17 @@ mod tests {
         fn lifecycle_gate_allows_uncovered_current_and_provisional() {
             let (candidate, package, material) = standing_package();
             let fence = standing_fence();
+            // The covered cases must name the Skill the registry actually
+            // holds; `standing_view` keys by the package's registration id.
+            let skill_id = package.registration.skill_id.clone();
             let empty = crate::SkillRegistry::default();
-            crate::check_lifecycle_standing(&empty, "skill.demo", &package, &fence)
+            crate::check_lifecycle_standing(&empty, &skill_id, &package, &fence)
                 .expect("uncovered skill installs provisional");
             for status in [crate::SkillStatus::Current, crate::SkillStatus::Provisional] {
                 let registry =
                     crate::SkillRegistry::from_snapshot([standing_view(&fence, &package, status)])
                         .expect("recovered registry");
-                crate::check_lifecycle_standing(&registry, "skill.demo", &package, &fence)
+                crate::check_lifecycle_standing(&registry, &skill_id, &package, &fence)
                     .expect("standing skill installs");
             }
             let _ = (candidate, material);
@@ -1769,6 +1777,12 @@ mod tests {
         fn lifecycle_gate_refuses_drift_revocation_and_stale_fence() {
             let (_, package, _) = standing_package();
             let fence = standing_fence();
+            // The gate is consulted for the Skill the registry actually
+            // covers. `standing_view` keys the view by the package's own
+            // registration id, so the lookup below must name that same id:
+            // any other id is an uncovered Skill, which the open-world gate
+            // admits provisionally and never checks.
+            let skill_id = package.registration.skill_id.clone();
             // A refreshed Governor fences old standing: currency fails first.
             let drifted_fence = {
                 let epoch = eliot_contracts::EpochId::new(
@@ -1789,21 +1803,21 @@ mod tests {
             )])
             .expect("recovered registry");
             assert!(matches!(
-                crate::check_lifecycle_standing(&current, "skill.demo", &package, &drifted_fence),
+                crate::check_lifecycle_standing(&current, &skill_id, &package, &drifted_fence),
                 Err(SkillError::FenceMismatch)
             ));
             // A package revision the lifecycle never promoted is superseded.
             let mut revised = package.clone();
             revised.registration.revision = "2.0.0".to_owned();
             assert!(matches!(
-                crate::check_lifecycle_standing(&current, "skill.demo", &revised, &fence),
+                crate::check_lifecycle_standing(&current, &skill_id, &revised, &fence),
                 Err(SkillError::InvalidField { field, .. }) if field == "lifecycle.revision"
             ));
             // Material the lifecycle never bound is a different package.
             let mut rebound = package.clone();
             rebound.digests.source_digest = "0".repeat(64);
             assert!(matches!(
-                crate::check_lifecycle_standing(&current, "skill.demo", &rebound, &fence),
+                crate::check_lifecycle_standing(&current, &skill_id, &rebound, &fence),
                 Err(SkillError::IdentityMismatch)
             ));
             // Revocation and supersession recorded by the lifecycle owner
@@ -1814,11 +1828,14 @@ mod tests {
                 crate::SkillStatus::Archived,
                 crate::SkillStatus::Quarantined,
             ] {
+                let mut revoked = standing_view(&fence, &package, status);
+                // A revoked or quarantined Skill must carry the reason its
+                // lifecycle owner recorded; absence is a malformed view.
+                revoked.stale_or_quarantine_reason = Some("lifecycle recorded refusal".to_owned());
                 let held =
-                    crate::SkillRegistry::from_snapshot([standing_view(&fence, &package, status)])
-                        .expect("recovered registry");
+                    crate::SkillRegistry::from_snapshot([revoked]).expect("recovered registry");
                 assert!(matches!(
-                    crate::check_lifecycle_standing(&held, "skill.demo", &package, &fence),
+                    crate::check_lifecycle_standing(&held, &skill_id, &package, &fence),
                     Err(SkillError::InvalidField { field, .. }) if field == "lifecycle.status"
                 ));
             }

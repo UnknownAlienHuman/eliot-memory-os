@@ -3398,18 +3398,22 @@ mod tests {
 
     #[test]
     fn owner_reassignment_fences_old_owner() -> Result<(), ProblemError> {
-        let old_fence = state_fence();
-        let new_fence =
-            StateFence::new(test_epoch(TEST_LINEAGE_A, 2), ResourceGeneration::genesis());
-        let old_lease = lease_for("owner-1", &old_fence, 1)?;
-        let new_lease = lease_for("owner-2", &new_fence, 2)?;
+        // I13.8: "Lost owner triggers reassignment/escalation with new
+        // Authority Epoch." The "new Authority Epoch" is the lease's ownership
+        // epoch, not a new State Fence: the successor lease is bound to the
+        // record's live fence, so the reassignment happens under the same
+        // fence and it is the strictly greater ownership epoch that fences the
+        // old owner out.
+        let fence = state_fence();
+        let old_lease = lease_for("owner-1", &fence, 1)?;
+        let new_lease = lease_for("owner-2", &fence, 2)?;
         let mut value = problem()?;
-        value.assign_owner(&old_fence, &new_lease, 1_500)?;
+        value.assign_owner(&fence, &new_lease, 1_500)?;
         assert!(matches!(
-            value.acknowledge(&old_fence, &old_lease),
-            Err(ProblemError::FenceMismatch)
+            value.acknowledge(&fence, &old_lease),
+            Err(ProblemError::OwnerLeaseMismatch)
         ));
-        value.acknowledge(&new_fence, &new_lease)?;
+        value.acknowledge(&fence, &new_lease)?;
         Ok(())
     }
 

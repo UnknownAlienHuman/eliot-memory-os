@@ -1130,9 +1130,11 @@ mod tests {
         }
     }
 
-    // `None` is the canonical "no retained prior record" input, so the fixtures
-    // below still describe a candidate that never reached a prior record. The
-    // replay test below supplies real records.
+    // `None` is the canonical "no retained prior record" input, so the reject
+    // fixtures below still describe a candidate that never reached a prior
+    // record. Those branches are decided before the replay assessment, so
+    // they are unaffected by it. A fixture that must reach admission supplies
+    // its own retained record, as each such test does.
     fn decide(
         candidate: &ImprovementCandidateView,
         evidence: &ImprovementEvidenceView,
@@ -1157,7 +1159,24 @@ mod tests {
 
     #[test]
     fn admits_complete_candidate_for_bounded_experiment_only() {
-        let decision = decide(&candidate(), &evidence(), &policy());
+        // Admission only proceeds for an ordinary new candidate, which under
+        // the current contract requires a retained prior record that
+        // establishes a new causal discriminator: an absent retained record is
+        // no progress, never novelty, and never releases the transition. The
+        // retained record below is a different logical operation with its own
+        // discriminator and evidence reference, so this candidate's evidence
+        // is new relative to it. See
+        // crates/governor/eliot-maintenance/src/improvement_pipeline.rs
+        // `compare_improvement_commitments` ("Without a retained record
+        // nothing is established at all").
+        let mut ev = evidence();
+        ev.retained_prior_proposal = Some(RetainedImprovementProposal {
+            commitment: prior_commitment("commitment-1144-a", "op-1144-a"),
+            discriminator: projection("hypothesis-1144-a", "evidence-1144-a"),
+            material_equality: material("exp-1144-a", "evidence-1144-a"),
+            experiment_plan: plan("exp-1144-a", "scope-1144-a"),
+        });
+        let decision = decide(&candidate(), &ev, &policy());
         match decision {
             ImprovementAdmissionDecision::AdmitForExperiment {
                 candidate_id,

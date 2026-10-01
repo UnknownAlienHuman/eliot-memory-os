@@ -10,18 +10,22 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
 use std::num::NonZeroU64;
 
+use eliot_agent_contracts::{
+    CoordinationEntry, CoordinationMapView, LivePeerDeliveryPolicy, LivePeerMessageKind,
+    LivePeerMessagePayload, MessageUrgency, RecipientRef, RequestedReaction,
+};
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
 use eliot_coordination::{
     AdmitArtifactRevision, AnchorResolution, AnchoredReview, ArgumentAcceptability, AssertedEffect,
     BoardCompactionPolicy, ConflictCandidateDraft, CoordinationError, CoordinationOwner,
     EmbeddedMarkerDraft, EmbeddedMarkerKind, EnqueuePeerMessage, ExternalResolutionReceipt,
-    LiveDeltaKind, PeerBoardKind, PeerClockPort, PeerConflictDimension, PeerConflictState,
-    PeerConflictType, PeerDeliveryAttempt, PeerDeliveryPort, PeerDeliveryTarget, PeerDurability,
-    PeerDurabilityAttestation, PeerDurabilityPort, PeerMessageKind, PeerMessageState,
-    PeerReviewAdvance, PeerReviewStanding, PeerStreamId, PostBoardEntry, PrivacyClass, RawField,
-    RecordPeerConflict, RegisterSession, ReviewCompleteness, ReviewKind, ReviewRecommendation,
-    ReviewTargetKind, ReviseBoardEntry, SubmitPeerReview, WorkItem, WorkState,
-    decode_peer_envelope,
+    LiveDeltaKind, LivePeerDeliveryProfile, PeerBoardKind, PeerClockPort, PeerConflictDimension,
+    PeerConflictState, PeerConflictType, PeerDeliveryAttempt, PeerDeliveryPort, PeerDeliveryTarget,
+    PeerDurability, PeerDurabilityAttestation, PeerDurabilityPort, PeerMessageKind,
+    PeerMessageState, PeerReviewAdvance, PeerReviewStanding, PeerStreamId, PostBoardEntry,
+    PrivacyClass, RawField, RecordPeerConflict, RegisterSession, ReviewCompleteness, ReviewKind,
+    ReviewRecommendation, ReviewTargetKind, ReviseBoardEntry, SubmitPeerReview, WorkItem,
+    WorkState, decode_peer_envelope,
 };
 
 const LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -519,6 +523,49 @@ fn admit_revisions(setup: &mut PeerSetup, artifact: &str, head: u64, digest_pref
     }
 }
 
+/// Frozen coordination map the typed live-peer payload is validated against.
+fn live_peer_map() -> CoordinationMapView {
+    let entry = |work: &str, attempt: &str| CoordinationEntry {
+        work_item_id: eliot_agent_contracts::WorkItemId::new(work).expect("map work item"),
+        responsibility: "fixture responsibility".to_owned(),
+        dependency_ids: Vec::new(),
+        overlap_ids: Vec::new(),
+        assigned_attempt_id: Some(
+            eliot_agent_contracts::AgentAttemptId::new(attempt).expect("map attempt"),
+        ),
+        assigned_role: Some("implementer".to_owned()),
+        mailbox_route_handle: Some(format!("route-{work}")),
+    };
+    CoordinationMapView {
+        plan_revision: eliot_agent_contracts::RevisionId::new("plan-r1").expect("plan revision"),
+        wave_revision: eliot_agent_contracts::RevisionId::new("wave-r1").expect("wave revision"),
+        entries: vec![entry("work-w1", "attempt-a"), entry("work-w2", "attempt-b")],
+    }
+}
+
+/// Typed content-only live-peer payload addressed to a different work item.
+fn live_peer_payload() -> LivePeerMessagePayload {
+    LivePeerMessagePayload {
+        sender_attempt_id: eliot_agent_contracts::AgentAttemptId::new("attempt-a")
+            .expect("sender attempt"),
+        sender_work_item_id: eliot_agent_contracts::WorkItemId::new("work-w1")
+            .expect("sender work item"),
+        recipients: vec![RecipientRef::attempt(
+            eliot_agent_contracts::AgentAttemptId::new("attempt-b").expect("recipient attempt"),
+        )],
+        plan_revision: eliot_agent_contracts::RevisionId::new("plan-r1").expect("plan revision"),
+        wave_revision: eliot_agent_contracts::RevisionId::new("wave-r1").expect("wave revision"),
+        kind: LivePeerMessageKind::AssumptionInvalidated,
+        concise_delta: "assumption no longer holds".to_owned(),
+        evidence_refs: Vec::new(),
+        requested_reaction: RequestedReaction::Revalidate,
+        urgency: MessageUrgency::Normal,
+        dedup_key: "dedup-live-1".to_owned(),
+        expires_at: None,
+        delivery_policy: LivePeerDeliveryPolicy::NextAdmissibleBoundary,
+    }
+}
+
 // WORK_UNIT_CASE: 696/1
 #[test]
 fn peer_mailbox_covers_all_normative_kinds() {
@@ -573,13 +620,63 @@ fn peer_mailbox_covers_all_normative_kinds() {
         assert_eq!(receipt.message.state, PeerMessageState::Staged);
         assert!(!receipt.replayed);
     }
+    // `live_peer_delta` is the one mailbox kind that is NOT admitted through
+    // the plain envelope path.  Since #1821 (docs/architecture/
+    // I10-18-mailbox-blackboard-live-peer-delivery-and-anchored-review.md,
+    // "Live peer message") it carries a typed `LivePeerMessagePayload`
+    // admitted through `enqueue_live_peer_delta`; the untyped path must stay
+    // closed rather than admitting a bare delta.
     let mut delta = base_draft(&setup.fence.clone(), "msg-kind-delta", "req-kind-delta");
     delta.kind = PeerMessageKind::LivePeerDelta;
     delta.delta_kind = Some(LiveDeltaKind::AssumptionInvalidated);
-    let receipt = enqueue(&mut setup, &delta);
+    assert_eq!(
+        setup
+            .owner
+            .enqueue_peer_message(&delta, &setup.clock, &setup.durability,),
+        Err(CoordinationError::MissingPeerField(
+            "typed_live_peer_payload".to_owned(),
+        ))
+    );
+
+    let payload = live_peer_payload();
+    // The envelope must bind the typed payload exactly: the concise delta and
+    // the digest/length are taken from the canonical payload bytes, never
+    // invented on the envelope.
+    let payload_bytes =
+        eliot_contracts::canonical_json_bytes(&payload).expect("canonical live peer payload bytes");
+    let mut bound = delta.clone();
+    // The payload is sent by attempt-a on work-w1 to attempt-b, whose map
+    // entry is work-w2; the envelope stream is the recipient's work item.
+    bound.work_item_id = "work-w2".to_owned();
+    bound.inline_text = Some(payload.concise_delta.clone());
+    bound.payload_bytes = payload_bytes.len() as u64;
+    bound.payload_digest = eliot_contracts::sha256_hex(&payload_bytes);
+    let receipt = setup
+        .owner
+        .enqueue_live_peer_delta(
+            &bound,
+            &payload,
+            LivePeerDeliveryProfile::EventIntegrated,
+            &live_peer_map(),
+            &setup.clock,
+            &setup.durability,
+        )
+        .expect("typed live peer delta admits");
+    assert_eq!(receipt.message.kind, PeerMessageKind::LivePeerDelta);
     assert_eq!(
         receipt.message.delta_kind,
         Some(LiveDeltaKind::AssumptionInvalidated)
+    );
+    assert_eq!(receipt.message.state, PeerMessageState::Staged);
+    assert!(!receipt.replayed);
+    assert_eq!(
+        receipt
+            .message
+            .live_peer_payload
+            .as_ref()
+            .expect("typed payload retained")
+            .kind,
+        LivePeerMessageKind::AssumptionInvalidated
     );
 }
 
