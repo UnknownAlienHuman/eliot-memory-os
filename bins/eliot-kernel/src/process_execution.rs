@@ -118,7 +118,11 @@ fn process_operation_context(
 /// Updates one of the optional correlation fields declared by the shared
 /// operation span. Inputs are existing owner references and still pass through
 /// the shared diagnostic policy before being recorded.
-fn record_process_context_field(context: &tracing::Span, field: &str, value: Option<&str>) {
+pub(crate) fn record_process_context_field(
+    context: &tracing::Span,
+    field: &str,
+    value: Option<&str>,
+) {
     if let Some(value) = value {
         let bounded = super::kernel_diagnostics::bound_field(value);
         context.record(field, bounded.text());
@@ -3400,17 +3404,34 @@ impl ProcessExecutionGateway {
         operation_id: eliot_process::OperationId,
         context: &tracing::Span,
     ) -> Result<ProcessEvidence, ProcessExecutionError> {
+        match self.reconcile_inner(owner, operation_id, context).await {
+            Ok(evidence) => Ok(evidence),
+            Err(error) => {
+                super::kernel_diagnostics::observe_terminal_error_in_context(
+                    process_terminal_code(&error),
+                    context,
+                );
+                Err(error)
+            }
+        }
+    }
+
+    /// Reconciles under the caller's safe operation context without assigning
+    /// a terminal. A composed gateway boundary owns the one terminal for the
+    /// larger operation.
+    pub(crate) async fn reconcile_inner(
+        &self,
+        owner: &ProcessOwnerBinding,
+        operation_id: eliot_process::OperationId,
+        context: &tracing::Span,
+    ) -> Result<ProcessEvidence, ProcessExecutionError> {
         // F-LOG-KERNEL-3 (#901): exit/evidence reconciliation boundary. Exit
         // zero and provider success never imply semantic completion; the
-        // reported evidence stays the owner's, and exactly one terminal is
-        // emitted per failed reconcile.
+        // reported evidence stays the owner's. The enclosing gateway owns
+        // the terminal for this call.
         observe_process_in_context(context, "kernel.process.reconcile_requested", "attempt");
         if let Err(error) = self.authorize_operation(owner, &operation_id, context) {
             observe_process_in_context(context, "kernel.process.reconcile_rejected", "fenced");
-            super::kernel_diagnostics::observe_terminal_error_in_context(
-                process_terminal_code(&error),
-                context,
-            );
             return Err(error);
         }
         let effect_operation_id = operation_id.clone();
@@ -3439,10 +3460,6 @@ impl ProcessExecutionGateway {
             }
             Err(error) => {
                 observe_process_in_context(context, "kernel.process.reconcile_unknown", "unknown");
-                super::kernel_diagnostics::observe_terminal_error_in_context(
-                    process_terminal_code(&error),
-                    context,
-                );
                 Err(error)
             }
         }
@@ -3457,7 +3474,31 @@ impl ProcessExecutionGateway {
         owner: &ProcessOwnerBinding,
         request: ProcessStreamReadRequest,
     ) -> Result<ProcessStreamReadChunk, ProcessExecutionError> {
-        super::process_stream_readback::read_stream_chunk(self, owner, request).await
+        let context = Self::operation_context_for(owner, request.start_receipt().operation_id());
+        self.read_stream_chunk_in_context(owner, request, &context)
+            .await
+    }
+
+    /// Reads one bounded chunk under its caller's existing safe context. The
+    /// gateway owns the one terminal for every failed readback, including
+    /// failures from its nonterminal inspect and reconcile sub-operations.
+    pub(crate) async fn read_stream_chunk_in_context(
+        &self,
+        owner: &ProcessOwnerBinding,
+        request: ProcessStreamReadRequest,
+        context: &tracing::Span,
+    ) -> Result<ProcessStreamReadChunk, ProcessExecutionError> {
+        match super::process_stream_readback::read_stream_chunk(self, owner, request, context).await
+        {
+            Ok(chunk) => Ok(chunk),
+            Err(error) => {
+                super::kernel_diagnostics::observe_terminal_error_in_context(
+                    process_terminal_code(&error),
+                    context,
+                );
+                Err(error)
+            }
+        }
     }
 
     fn authorize_operation(
@@ -4370,7 +4411,7 @@ impl KernelComposition {
                 .await
                 .map(ProcessExecutionResponse::Reconciled),
             ProcessExecutionRequest::ReadStream { request } => gateway
-                .read_stream_chunk(&owner, request)
+                .read_stream_chunk_in_context(&owner, request, context)
                 .await
                 .map(ProcessExecutionResponse::StreamChunk),
         };
