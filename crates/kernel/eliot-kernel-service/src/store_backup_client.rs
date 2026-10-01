@@ -238,6 +238,29 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         Ok(handle.clone())
     }
 
+    /// Refuses a caller-supplied begin request whose capture scope is fenced
+    /// outside this client's Host-approved requirement (issue #975, W10).
+    ///
+    /// #950's `SnapshotBeginRequest` carries its own `ScopeRevisionView`, and
+    /// `SnapshotBeginRequest::validate` proves only that the scope's heads
+    /// agree with the scope's own fence. The Host-approved generation and
+    /// authority epoch live in [`Self::requirement`], reached through
+    /// [`Self::validate_requirement_fence`]. Binding the two here keeps the
+    /// fence a separate identity beside the payload instead of a field inside
+    /// it, so a caller cannot drive a continuation, an end, or a
+    /// begin-to-page binding from a capture fenced at a generation this Host
+    /// never approved. `StoreBackupRequest::validate` applies the same rule
+    /// for the `Begin` send itself, where the begin request does cross the
+    /// wire; this check covers the `Page`/`End` sends, whose envelope carries
+    /// only the handle and cursor.
+    fn validate_begin_scope_fence(
+        &self,
+        begin: &SnapshotBeginRequest,
+    ) -> Result<(), StoreError> {
+        self.validate_requirement_fence(&begin.scope.state_fence)?;
+        Ok(())
+    }
+
     /// Reads one bounded page of an open capture under its owner-issued
     /// consistency point (issue #975).
     ///
@@ -257,6 +280,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         cursor.validate()?;
         ctx.validate().map_err(StoreError::Foundation)?;
         self.validate_requirement_fence(&ctx.state_fence)?;
+        self.validate_begin_scope_fence(begin)?;
         if handle.snapshot_digest != begin.compute_digest()?
             || handle.operation_id != begin.operation.operation_id
             || handle.idempotency_key != begin.operation.idempotency_key
@@ -327,6 +351,11 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             return Err(StoreError::IdentityConflict);
         }
         page.validate_for_begin(begin)?;
+        // The returned members are the owner-observed denominator for this
+        // capture; they are checked against the admitted begin request by
+        // `validate_for_begin`, so a page that substitutes another member or
+        // another coverage denominator is refused above. Nothing here is
+        // compared against the page's own echoed members (issue #975, A6).
         Ok(page.clone())
     }
 
@@ -346,6 +375,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         handle.validate()?;
         ctx.validate().map_err(StoreError::Foundation)?;
         self.validate_requirement_fence(&ctx.state_fence)?;
+        self.validate_begin_scope_fence(begin)?;
         if handle.snapshot_digest != begin.compute_digest()?
             || handle.operation_id != begin.operation.operation_id
             || handle.idempotency_key != begin.operation.idempotency_key
