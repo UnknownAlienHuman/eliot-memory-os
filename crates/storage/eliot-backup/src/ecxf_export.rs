@@ -88,7 +88,7 @@
 //! `A00-07` defines an **Ordering Scope** as "The smallest domain in which
 //! conflicting transitions must be ordered", and I5.7 selects one by "the state
 //! whose preconditions may mutually invalidate". An `OrderingScopeId` is
-//! therefore an *order* domain, not a WorkScope: nothing in `eliot-store-api`
+//! therefore an *order* domain, not a `WorkScope`: nothing in `eliot-store-api`
 //! relates one to a `ScopeId`, the store's own `WriteReceipt` records
 //! `ordering_sequences` and no scope identity at all, and several unrelated
 //! heads legitimately sit under one caller-visible scope label. A `scope_id`
@@ -155,8 +155,8 @@ use std::path::{Path, PathBuf};
 use eliot_blob_api::BlobReadyReceipt;
 use eliot_security_contracts::PurgeLedgerEntry;
 use eliot_store_api::{
-    CanonicalEvent, OrderingHead, OrderingLink, OrderingScopeId, RevisionHead, RevisionKey, ScopeId,
-    ScopeRevisionView, SnapshotCompleteness, WriteReceipt,
+    CanonicalEvent, OrderingHead, OrderingLink, OrderingScopeId, RevisionHead, RevisionKey,
+    ScopeId, ScopeRevisionView, SnapshotCompleteness, WriteReceipt,
 };
 pub use eliot_store_api::{EcxfExportReport, EcxfExportRequest};
 use serde::{Deserialize, Serialize};
@@ -800,7 +800,7 @@ impl ObservedOrderingFrontier {
 /// scope-closure check. `A00-07` defines an Ordering Scope as "The smallest
 /// domain in which conflicting transitions must be ordered" and I5.7 selects one
 /// by "the state whose preconditions may mutually invalidate": an
-/// `OrderingScopeId` is an order domain, not a WorkScope. The store's own
+/// `OrderingScopeId` is an order domain, not a `WorkScope`. The store's own
 /// `WriteReceipt` records `ordering_sequences` and no scope identity, so a
 /// `scope_id` on an ordering head could only be a fact about whichever writer
 /// advanced that head last. The fence's ordering-head member is therefore
@@ -873,14 +873,16 @@ fn prove_fence_revision_heads_against_store(
         }
     }
     for head in &snapshot.revision_heads {
-        let mut committed = advances.get(&head.key).cloned().ok_or_else(|| {
-            BackupError::FenceMismatch {
-                subject: format!(
-                    "revision head {} has no committed advance in the exported receipts",
-                    head.key
-                ),
-            }
-        })?;
+        let mut committed =
+            advances
+                .get(&head.key)
+                .cloned()
+                .ok_or_else(|| BackupError::FenceMismatch {
+                    subject: format!(
+                        "revision head {} has no committed advance in the exported receipts",
+                        head.key
+                    ),
+                })?;
         committed.sort_unstable();
         for handover in committed.windows(2) {
             if handover[0].1 != handover[1].0 {
