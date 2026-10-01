@@ -19,7 +19,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_agent_contracts::{
     CoordinationMapView, DeliveryPolicy, LivePeerMessageKind, LivePeerMessagePayload,
-    MAX_LIVE_PEER_PAYLOAD_BYTES, MAX_LIVE_PEER_REFERENCES, MessageUrgency, RequestedReaction,
+    MAX_LIVE_PEER_PAYLOAD_BYTES, MAX_LIVE_PEER_REFERENCES, MessageUrgency, PublicReference,
+    RequestedReaction,
 };
 use eliot_contracts::{
     BoardEntryState, ClockReading, EpochId, EpochRelation, PeerBoardKind, StateFence,
@@ -3788,12 +3789,30 @@ pub struct AnchoredReview {
     pub operation: String,
     pub target_kind: ReviewTargetKind,
     pub kind: ReviewKind,
+    /// Review body exactly as submitted. Empty for records admitted before
+    /// content binding; new submissions must carry nonblank bounded content.
+    #[serde(default)]
+    pub content: String,
     pub criteria: Vec<String>,
     pub proof_refs: Vec<String>,
     pub anchor_field: String,
     pub anchor_resolution: AnchorResolution,
     pub findings: Vec<String>,
     pub evidence_refs: Vec<String>,
+    /// Response references bound at submit (I10.18
+    /// `response_change_and_verifier_refs`). Typed public handles only; they
+    /// grant no write, effect, goal, or acceptance authority.
+    #[serde(default)]
+    pub response_refs: Vec<PublicReference>,
+    /// Requested-change references bound at submit. A referenced change is a
+    /// candidate only: it takes effect solely through the normal owner,
+    /// effect, and verifier paths, never through this record.
+    #[serde(default)]
+    pub change_refs: Vec<PublicReference>,
+    /// Verifier-result references bound at submit. They are evidence handles,
+    /// never verifier authority.
+    #[serde(default)]
+    pub verifier_refs: Vec<PublicReference>,
     pub dissent: Option<String>,
     pub uncertainty: Option<String>,
     pub recommendation: ReviewRecommendation,
@@ -3829,12 +3848,24 @@ pub struct SubmitPeerReview {
     pub operation: String,
     pub target_kind: ReviewTargetKind,
     pub kind: ReviewKind,
+    /// Review body supplied by the author. Validated as a submit-time
+    /// original: nonblank, bounded, and immutable once admitted.
+    pub content: String,
     pub criteria: Vec<String>,
     pub proof_refs: Vec<String>,
     pub anchor_field: String,
     pub anchor_resolution: AnchorResolution,
     pub findings: Vec<String>,
     pub evidence_refs: Vec<String>,
+    /// Response references supplied by the author. Each entry is validated as
+    /// a submit-time original; entries grant no authority.
+    pub response_refs: Vec<PublicReference>,
+    /// Requested-change references supplied by the author. Each entry is
+    /// validated as a submit-time original and retained as a candidate only.
+    pub change_refs: Vec<PublicReference>,
+    /// Verifier-result references supplied by the author. Each entry is
+    /// validated as a submit-time original and retained as evidence only.
+    pub verifier_refs: Vec<PublicReference>,
     pub dissent: Option<String>,
     pub uncertainty: Option<String>,
     pub recommendation: ReviewRecommendation,
@@ -3929,6 +3960,8 @@ pub struct PeerReviewObligation {
     pub operation: String,
     pub target_kind: ReviewTargetKind,
     pub kind: ReviewKind,
+    /// Review body copied from the retained record.
+    pub content: String,
     /// Historical anchor selector exactly as submitted.
     pub anchor_field: String,
     /// Anchor resolution claimed at submit; the owner records the claim and
@@ -3958,6 +3991,16 @@ pub struct PeerReviewObligation {
     pub conflict_id: Option<String>,
     pub evidence_refs: Vec<String>,
     pub proof_refs: Vec<String>,
+    /// Response references copied from the retained record. They grant no
+    /// write, effect, goal, or acceptance authority.
+    pub response_refs: Vec<PublicReference>,
+    /// Requested-change references copied from the retained record. They are
+    /// candidates only; a referenced change takes effect solely through the
+    /// normal owner, effect, and verifier paths.
+    pub change_refs: Vec<PublicReference>,
+    /// Verifier-result references copied from the retained record. They are
+    /// evidence handles, never verifier authority.
+    pub verifier_refs: Vec<PublicReference>,
     pub created_at: u64,
     /// Record fence the retained obligation was admitted under.
     pub state_fence: StateFence,
@@ -3995,6 +4038,7 @@ impl From<&AnchoredReview> for PeerReviewObligation {
             operation: review.operation.clone(),
             target_kind: review.target_kind,
             kind: review.kind,
+            content: review.content.clone(),
             anchor_field: review.anchor_field.clone(),
             anchor_resolution: review.anchor_resolution,
             current_resolution: None,
@@ -4005,6 +4049,9 @@ impl From<&AnchoredReview> for PeerReviewObligation {
             conflict_id: review.conflict_id.clone(),
             evidence_refs: review.evidence_refs.clone(),
             proof_refs: review.proof_refs.clone(),
+            response_refs: review.response_refs.clone(),
+            change_refs: review.change_refs.clone(),
+            verifier_refs: review.verifier_refs.clone(),
             created_at: review.created_at,
             state_fence: review.state_fence.clone(),
             submission_sequence: review.submission_sequence,
@@ -4221,6 +4268,34 @@ impl CoordinationOwner {
         for finding in draft.findings.iter().chain(draft.evidence_refs.iter()) {
             peer_text(finding, "review_finding")?;
         }
+        peer_text(&draft.content, "review_content")?;
+        if draft.content.len() as u64 > MAX_PEER_MESSAGE_BYTES {
+            return Err(CoordinationError::InvalidField("review_content"));
+        }
+        if draft.response_refs.len() > MAX_PEER_REFERENCES {
+            return Err(CoordinationError::InvalidField("response_refs"));
+        }
+        if draft.change_refs.len() > MAX_PEER_REFERENCES {
+            return Err(CoordinationError::InvalidField("change_refs"));
+        }
+        if draft.verifier_refs.len() > MAX_PEER_REFERENCES {
+            return Err(CoordinationError::InvalidField("verifier_refs"));
+        }
+        for reference in &draft.response_refs {
+            reference
+                .validate()
+                .map_err(|_| CoordinationError::InvalidField("response_refs"))?;
+        }
+        for reference in &draft.change_refs {
+            reference
+                .validate()
+                .map_err(|_| CoordinationError::InvalidField("change_refs"))?;
+        }
+        for reference in &draft.verifier_refs {
+            reference
+                .validate()
+                .map_err(|_| CoordinationError::InvalidField("verifier_refs"))?;
+        }
         if let Some(indexed) = self.peer_review_requests.get(&draft.request_id) {
             if indexed != &draft.review_id {
                 return Err(CoordinationError::PeerSemanticConflict(
@@ -4300,12 +4375,16 @@ impl CoordinationOwner {
             operation: draft.operation.clone(),
             target_kind: draft.target_kind,
             kind: draft.kind,
+            content: draft.content.clone(),
             criteria: draft.criteria.clone(),
             proof_refs: draft.proof_refs.clone(),
             anchor_field: draft.anchor_field.clone(),
             anchor_resolution: draft.anchor_resolution,
             findings: draft.findings.clone(),
             evidence_refs: draft.evidence_refs.clone(),
+            response_refs: draft.response_refs.clone(),
+            change_refs: draft.change_refs.clone(),
+            verifier_refs: draft.verifier_refs.clone(),
             dissent: draft.dissent.clone(),
             uncertainty: draft.uncertainty.clone(),
             recommendation: draft.recommendation,
@@ -4406,6 +4485,31 @@ impl CoordinationOwner {
             durability: recorded,
             replayed: false,
         })
+    }
+
+    /// Submits a batch of revision-anchored reviews as one derived envelope.
+    ///
+    /// The batch carries no lifecycle of its own: every draft is admitted
+    /// through [`Self::submit_peer_review`] under its own request identity,
+    /// so each item keeps an independent lifecycle and disposition and
+    /// answering one never resolves or hides another. A batch that fails on
+    /// one draft returns that draft's typed error; drafts admitted before the
+    /// failure stay admitted under their own idempotency keys, and a retry
+    /// replays them instead of duplicating them.
+    pub fn submit_peer_review_batch(
+        &mut self,
+        drafts: &[SubmitPeerReview],
+        clock: &dyn PeerClockPort,
+        durability: &dyn PeerDurabilityPort,
+    ) -> Result<Vec<PeerReviewReceipt>, CoordinationError> {
+        if drafts.is_empty() {
+            return Err(CoordinationError::InvalidField("review_batch"));
+        }
+        let mut receipts = Vec::with_capacity(drafts.len());
+        for draft in drafts {
+            receipts.push(self.submit_peer_review(draft, clock, durability)?);
+        }
+        Ok(receipts)
     }
 
     /// Advances one review along its lifecycle. Illegal transitions are
