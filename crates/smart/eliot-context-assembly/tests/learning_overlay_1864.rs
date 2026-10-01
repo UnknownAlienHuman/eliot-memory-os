@@ -546,8 +546,7 @@ fn approved_policy() -> ContextRecipePolicy {
             governance_profiles: vec!["default".to_owned()],
         },
         stages: vec![RecipeStage {
-            stage_id: ArtifactId::new(EXECUTED_CONTEXT_STAGE)
-                .expect("executed stage"),
+            stage_id: ArtifactId::new(EXECUTED_CONTEXT_STAGE).expect("executed stage"),
             semantic_role: SemanticRole::Goal,
             predecessors: Vec::new(),
         }],
@@ -628,8 +627,7 @@ fn approved_policy() -> ContextRecipePolicy {
 fn approved_for(recipe: &ContextRecipe) -> ResolvedContextRecipe {
     let policy = approved_policy();
     assert_eq!(
-        recipe.decision.policy_sha256,
-        policy.policy_sha256,
+        recipe.decision.policy_sha256, policy.policy_sha256,
         "the instance must name the approved revision the resolution carries"
     );
     let mut resolution = ResolvedContextRecipe {
