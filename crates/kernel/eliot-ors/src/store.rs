@@ -18769,17 +18769,13 @@ impl RedbRecoveryStore {
                 owner.incarnation,
                 BridgeStreamRight::Append,
             )?;
+            // The active handoff charge covers only a genuinely new row:
+            // an idempotent duplicate needs no normal slot, so the
+            // table-global bound is enforced at insert time below,
+            // beside the retained-window (retired) answer — never
+            // before identity resolution (issue #2731, item 4).
             let existing: Option<BridgeEventHandoffRow> = {
                 let handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
-                if handoffs.len().map_err(storage)? >= MAX_BRIDGE_EVENT_HANDOFFS as u64
-                    && handoffs.get(key.as_str()).map_err(storage)?.is_none()
-                {
-                    return Err(OrsError::BridgeEventCapacityExceeded(
-                        eliot_contracts::BridgeEventCapacityPressure::pending_handoffs(
-                            eliot_contracts::BridgeEventLocalPhase::Durable,
-                        ),
-                    ));
-                }
                 handoffs
                     .get(key.as_str())
                     .map_err(storage)?
@@ -18809,6 +18805,47 @@ impl RedbRecoveryStore {
                     || row.sequence != sequence
                 {
                     return Err(OrsError::DuplicateConflict);
+                }
+                // Quiet-stream retire-first at saturation (issue #2731,
+                // item 4; audit 5847810833 defect 1): terminal
+                // receipt-complete rows hold retained replay/history
+                // evidence, not active charge. One bounded retirement
+                // page for this stream advances its compacted boundary
+                // without requiring future events on it; the retirement
+                // eligibility gate keeps every pending/unknown row
+                // non-evictable, and retirement itself allocates no
+                // handoff slot, so recovery/terminalization capacity is
+                // preserved. Only a still-full table after that page
+                // returns typed pending-handoff backpressure.
+                {
+                    let full = write
+                        .open_table(BRIDGE_EVENT_HANDOFFS)
+                        .map_err(storage)?
+                        .len()
+                        .map_err(storage)?
+                        >= MAX_BRIDGE_EVENT_HANDOFFS as u64;
+                    if full {
+                        Self::retire_bridge_handoffs_in(
+                            &write,
+                            &access.namespace,
+                            owner.revision,
+                            owner.incarnation,
+                            MAX_BRIDGE_HANDOFF_RETIRE_PER_RECOVERY,
+                        )?;
+                        let still_full = write
+                            .open_table(BRIDGE_EVENT_HANDOFFS)
+                            .map_err(storage)?
+                            .len()
+                            .map_err(storage)?
+                            >= MAX_BRIDGE_EVENT_HANDOFFS as u64;
+                        if still_full {
+                            return Err(OrsError::BridgeEventCapacityExceeded(
+                                eliot_contracts::BridgeEventCapacityPressure::pending_handoffs(
+                                    eliot_contracts::BridgeEventLocalPhase::Durable,
+                                ),
+                            ));
+                        }
+                    }
                 }
                 let row = BridgeEventHandoffRow {
                     contract_version: crate::CONTRACT_VERSION,
