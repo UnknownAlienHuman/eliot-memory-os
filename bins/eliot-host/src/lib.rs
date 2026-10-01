@@ -2281,6 +2281,7 @@ struct HostSupervisionControlContext {
 }
 
 #[cfg(windows)]
+#[derive(Clone, Copy)]
 struct KernelReadinessApproval<'a> {
     generation: &'a PlatformHandle,
     kernel_artifact: &'a PlatformHandle,
@@ -3274,7 +3275,7 @@ impl HostJobBranches {
             }
         };
         self.finish_fresh_supervision_control_context(
-            expected_selector,
+            &expected_selector,
             runtime,
             transport,
             disposition,
@@ -3286,7 +3287,7 @@ impl HostJobBranches {
     #[cfg(windows)]
     fn finish_fresh_supervision_control_context(
         &mut self,
-        expected_selector: Option<PlatformHandle>,
+        expected_selector: &Option<PlatformHandle>,
         runtime: tokio::runtime::Runtime,
         transport: NamedPipeTransport,
         disposition: HostSupervisionRevocationDisposition,
@@ -3296,14 +3297,14 @@ impl HostJobBranches {
         match disposition {
             HostSupervisionRevocationDisposition::Revoked
             | HostSupervisionRevocationDisposition::AlreadyAbsent => {
-                if self.current_supervision_observation_digest == expected_selector {
+                if self.current_supervision_observation_digest == *expected_selector {
                     self.current_supervision_observation_digest = None;
                 }
             }
             HostSupervisionRevocationDisposition::Superseded {
                 current_observation_digest,
             } => {
-                if self.current_supervision_observation_digest == expected_selector {
+                if self.current_supervision_observation_digest == *expected_selector {
                     self.current_supervision_observation_digest = Some(current_observation_digest);
                 }
                 return Err(HostError::KernelSupervisionRevocationSuperseded(
