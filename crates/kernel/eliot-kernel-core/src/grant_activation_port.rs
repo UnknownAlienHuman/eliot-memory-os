@@ -3448,6 +3448,11 @@ impl GrantActivationPort {
             owner_enumeration,
             active_epoch,
         )?;
+        let enumeration = owner_enumeration.ok_or_else(|| {
+            KernelError::RecoveryUnavailable(
+                "grant-closure owner declaration is not bound".to_owned(),
+            )
+        })?;
         let digest = closure_revocation_digest(request, &derived)?;
         match ledger.resolve(&request.operation_id, &digest) {
             IntentResolve::Conflict => return Err(KernelError::IdempotencyConflict),
@@ -3466,8 +3471,8 @@ impl GrantActivationPort {
         }
         check_revision(
             &ledger,
-            &request.authority_root_ref,
-            request.grant_graph_revision,
+            &enumeration.authority_root_ref,
+            enumeration.grant_graph_revision,
         )?;
         if derived.unknown_target {
             ledger.intents.insert(
@@ -3491,11 +3496,6 @@ impl GrantActivationPort {
             });
         }
 
-        let enumeration = owner_enumeration.ok_or_else(|| {
-            KernelError::RecoveryUnavailable(
-                "grant-closure owner declaration is not bound".to_owned(),
-            )
-        })?;
         let declaration = closure_declaration_from_enumeration(enumeration)?;
         let authority_receipt = AuthorityRevocationReceipt {
             revocation_id: format!("revocation-{}", request.operation_id),
@@ -3559,8 +3559,8 @@ impl GrantActivationPort {
         // valid later owner revision is rejected as if the graph were stale.
         check_closure_watermark(
             boundary,
-            &request.authority_root_ref,
-            request.grant_graph_revision,
+            &enumeration.authority_root_ref,
+            enumeration.grant_graph_revision,
         )?;
         let durable = boundary
             .store
@@ -3621,7 +3621,10 @@ impl GrantActivationPort {
             }
         }
         let receipt = authority_receipt;
-        ledger.note_revision(&request.authority_root_ref, request.grant_graph_revision);
+        ledger.note_revision(
+            &enumeration.authority_root_ref,
+            enumeration.grant_graph_revision,
+        );
         // The Kernel-first fence watermark, one entry per fenced identity. From
         // the moment this commits, those projections are denied at the effect
         // gate and a delayed activation replay presenting that same revision
@@ -3629,7 +3632,7 @@ impl GrantActivationPort {
         // own watermark, and a replacement grant compiled at a newer revision is
         // a different identity this revocation never touched.
         for grant_id in &derived.affected {
-            ledger.note_revocation_revision(grant_id, request.grant_graph_revision);
+            ledger.note_revocation_revision(grant_id, enumeration.grant_graph_revision);
         }
         ledger.intents.insert(
             request.operation_id.clone(),
@@ -8816,6 +8819,192 @@ pub(crate) mod tests {
 
         drop(after_restart);
         drop(after_restart_store);
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the owner-revision proof keeps producer, refusals, durable commit, and live install in one sequence"
+    )]
+    fn closure_revocation_requires_current_owner_revision_before_fencing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::Arc;
+
+        let epoch = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 7)?;
+        let binding = restart_test_binding(&epoch)?;
+        let initial = chain_enumeration(&epoch, &binding, 5, Vec::new())?;
+        let path = std::env::temp_dir().join(format!(
+            "eliot-kernel-grant-closure-owner-revision-{}-{}.redb",
+            std::process::id(),
+            epoch.sequence
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(eliot_ors::RedbRecoveryStore::open(&path)?);
+        let hydration_source = Arc::new(TestClosureHydration::new(initial.clone()));
+        let port =
+            GrantActivationPort::with_durable_root_grant(hydration_source.clone(), store.clone());
+        let root = OpaqueLabel::new("root-chain")?;
+
+        let activated = port.activate_grant_closure(
+            &GrantClosureActivationIntent {
+                operation_id: "op-owner-revision-activate".to_owned(),
+                enumeration: initial.clone(),
+            },
+            &epoch,
+        )?;
+        assert_eq!(activated.len(), initial.members.len());
+        assert_eq!(store.load_grant_graph_revision(&root)?, Some(5));
+
+        // Foreign owner roots and empty owner closures have no valid grant
+        // identity to fence; neither can manufacture an ORS closure row.
+        let mut foreign = initial.clone();
+        foreign.authority_root_ref = "root-foreign".to_owned();
+        hydration_source.replace(foreign);
+        let foreign_root = chain_revocation_intent(&binding, "op-owner-revision-foreign", 5);
+        assert!(matches!(
+            port.revoke_grant_closure(&foreign_root, &epoch),
+            Err(KernelError::FenceMismatch)
+        ));
+
+        let mut empty = initial.clone();
+        empty.members.clear();
+        hydration_source.replace(empty);
+        let empty_owner = chain_revocation_intent(&binding, "op-owner-revision-empty", 5);
+        assert!(matches!(
+            port.revoke_grant_closure(&empty_owner, &epoch),
+            Err(KernelError::InvalidField {
+                field: "enumeration.members",
+                ..
+            })
+        ));
+
+        hydration_source.replace(initial.clone());
+        let mut wrong_target =
+            chain_revocation_intent(&binding, "op-owner-revision-target", 5);
+        wrong_target.grant_id = "grant-chain-mid".to_owned();
+        assert!(matches!(
+            port.revoke_grant_closure(&wrong_target, &epoch),
+            Err(KernelError::InvalidField {
+                field: "grant_id",
+                ..
+            })
+        ));
+
+        // Owner observation time is part of its member evidence: an expired
+        // row at that observation refuses before the graph or live ledger
+        // advances.
+        let mut expired_observation = initial.clone();
+        expired_observation.members[0].observed_at_ms = 10_000;
+        hydration_source.replace(expired_observation);
+        let expired = chain_revocation_intent(&binding, "op-owner-revision-expired", 5);
+        assert!(matches!(
+            port.revoke_grant_closure(&expired, &epoch),
+            Err(KernelError::Expired {
+                expires_at_ms: 10_000
+            })
+        ));
+        hydration_source.replace(initial.clone());
+
+        // A caller cannot substitute a future revision for the current owner
+        // enumeration, even when the durable watermark would otherwise allow
+        // that higher value.
+        let future = chain_revocation_intent(&binding, "op-owner-revision-future", 6);
+        assert!(matches!(
+            port.revoke_grant_closure(&future, &epoch),
+            Err(KernelError::InvalidField {
+                field: "grant_graph_revision",
+                ..
+            })
+        ));
+        assert_eq!(port.grant_graph_revision("root-chain"), Some(5));
+        assert_eq!(store.load_grant_graph_revision(&root)?, Some(5));
+        assert!(port.disposition(&future.operation_id).is_none());
+        assert!(port.closure_receipt(&future.operation_id).is_none());
+        for operation_id in [
+            &foreign_root.operation_id,
+            &empty_owner.operation_id,
+            &wrong_target.operation_id,
+            &expired.operation_id,
+            &future.operation_id,
+        ] {
+            assert!(port.disposition(operation_id).is_none());
+            assert!(port.closure_receipt(operation_id).is_none());
+            assert!(store
+                .load_grant_closure(&OperationIdentity::new(operation_id)?)?
+                .is_none());
+        }
+        for member in &initial.members {
+            assert!(!port.grant_revoked(&member.intent.grant_id));
+            let subject = OperationIdentity::new(&member.intent.grant_id)?;
+            assert_eq!(
+                store
+                    .load_capability_grant(&subject)?
+                    .ok_or("owner member activation projection missing")?
+                    .phase(),
+                OperationalPhase::Active
+            );
+        }
+
+        // A newer durable owner watermark makes an otherwise exact but stale
+        // enumeration refuse before any live fence or closure receipt lands.
+        assert_eq!(store.note_grant_graph_revision(&root, 6)?, 6);
+        let stale_owner = chain_revocation_intent(&binding, "op-owner-revision-stale", 5);
+        assert!(matches!(
+            port.revoke_grant_closure(&stale_owner, &epoch),
+            Err(KernelError::InvalidField {
+                field: "grant_graph_revision",
+                ..
+            })
+        ));
+        assert_eq!(port.grant_graph_revision("root-chain"), Some(5));
+        assert_eq!(store.load_grant_graph_revision(&root)?, Some(6));
+        assert!(port.disposition(&stale_owner.operation_id).is_none());
+        assert!(port.closure_receipt(&stale_owner.operation_id).is_none());
+        assert!(store
+            .load_grant_closure(&OperationIdentity::new(&stale_owner.operation_id)?)?
+            .is_none());
+        for member in &initial.members {
+            assert!(!port.grant_revoked(&member.intent.grant_id));
+            let subject = OperationIdentity::new(&member.intent.grant_id)?;
+            assert_eq!(
+                store
+                    .load_capability_grant(&subject)?
+                    .ok_or("stale-owner activation projection missing")?
+                    .phase(),
+                OperationalPhase::Active
+            );
+        }
+
+        // Re-enumeration at the current owner revision is the positive path:
+        // the ORS closure row, exact member fences and live ledger agree.
+        let current = chain_enumeration(&epoch, &binding, 6, Vec::new())?;
+        hydration_source.replace(current);
+        let current_owner = chain_revocation_intent(&binding, "op-owner-revision-current", 6);
+        let receipt = port.revoke_grant_closure(&current_owner, &epoch)?;
+        assert_eq!(receipt.operation_id, current_owner.operation_id);
+        assert_eq!(receipt.declaration.grant_graph_revision, 6);
+        assert!(matches!(receipt.state, GrantClosureState::Revoked));
+        assert_eq!(store.load_grant_graph_revision(&root)?, Some(6));
+        let stored = store
+            .load_grant_closure(&OperationIdentity::new(&current_owner.operation_id)?)?
+            .ok_or("current-owner closure projection missing")?;
+        assert_eq!(stored.commit(), &receipt);
+        for member in &initial.members {
+            assert!(port.grant_revoked(&member.intent.grant_id));
+            let subject = OperationIdentity::new(&member.intent.grant_id)?;
+            assert_eq!(
+                store
+                    .load_capability_grant(&subject)?
+                    .ok_or("current-owner fenced projection missing")?
+                    .phase(),
+                OperationalPhase::Fenced
+            );
+        }
+
+        drop(port);
+        drop(store);
         let _ = std::fs::remove_file(&path);
         Ok(())
     }
