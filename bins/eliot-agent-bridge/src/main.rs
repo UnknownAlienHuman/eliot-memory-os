@@ -4297,18 +4297,17 @@ mod tests {
     use eliot_agent_bridge::{GovernanceEvidence, ReadinessDisposition, ScopeLevel};
     use eliot_agent_bridge_core::{
         ClockReading, EventCursor, EventId, HOST_EVENT_CONTRACT_VERSION,
-        HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition,
-        HostEventNormalizationReceipt, HostEventPrivacyClass, LowercaseSha256,
-        NativeSession, NativeSessionLocator, NormalizationCoverage,
-        NormalizedHostEventEnvelope, NormalizedHostEventPayload,
+        HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition, HostEventNormalizationReceipt,
+        HostEventPrivacyClass, LowercaseSha256, NativeSession, NativeSessionLocator,
+        NormalizationCoverage, NormalizedHostEventEnvelope, NormalizedHostEventPayload,
         ProviderObservationLineage, QualifiedSourceDigest, RawSourceRecord,
-        RestrictedRawSourceHandle, SessionLifecycleObservation,
-        SessionLifecycleTransition, SessionObservation, UnsupportedDisposition,
+        RestrictedRawSourceHandle, SessionLifecycleObservation, SessionLifecycleTransition,
+        SessionObservation, UnsupportedDisposition,
     };
     use eliot_integration_coverage::{
-        ALL_EVENTS, DispatchOrdering, EventCompleteness, EventCoverage,
-        EventDisposition, GovernorCoverageDerivation, IntegrationCoverageProfile,
-        LogicalEvent, TraceFreshness, WatchdogEvidence,
+        ALL_EVENTS, DispatchOrdering, EventCompleteness, EventCoverage, EventDisposition,
+        GovernorCoverageDerivation, IntegrationCoverageProfile, LogicalEvent, TraceFreshness,
+        WatchdogEvidence,
     };
     use serde_json::Value;
     use std::fmt::Write as _;
@@ -4435,12 +4434,10 @@ mod tests {
             adapter_contract_version: "bridge-fixture/v1".to_owned(),
             sequence: 1,
             causal_predecessors: Vec::new(),
-            payload: NormalizedHostEventPayload::SessionLifecycle(
-                SessionLifecycleObservation {
-                    transition: SessionLifecycleTransition::Started,
-                    detail_ref: None,
-                },
-            ),
+            payload: NormalizedHostEventPayload::SessionLifecycle(SessionLifecycleObservation {
+                transition: SessionLifecycleTransition::Started,
+                detail_ref: None,
+            }),
             admitted_route_digest: None,
             raw_source: raw_source.clone(),
             normalization: HostEventNormalizationReceipt {
@@ -4496,8 +4493,8 @@ mod tests {
             "parent_event_id": null,
             "observed_at": "2026-09-21T00:00:00Z"
         });
-        event["normalized"] = serde_json::to_value(fixture_normalized_hook())
-            .expect("normalized fixture serializes");
+        event["normalized"] =
+            serde_json::to_value(fixture_normalized_hook()).expect("normalized fixture serializes");
         serde_json::json!({"op": "forward_hook", "event": event}).to_string()
     }
 
@@ -5381,8 +5378,8 @@ mod tests {
 
     #[test]
     fn loopback_http_idle_peer_times_out_without_a_request() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")
-            .expect("test listener binds loopback");
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("test listener binds loopback");
         let client = std::net::TcpStream::connect(
             listener.local_addr().expect("listener has a local address"),
         )
@@ -5413,8 +5410,8 @@ mod tests {
             "status op must decode to its own request"
         );
         let bootstrap_op = generated_bootstrap_op();
-        let bootstrap_decoded = decode_bounded_request(&bootstrap_op)
-            .expect("valid bootstrap op must decode");
+        let bootstrap_decoded =
+            decode_bounded_request(&bootstrap_op).expect("valid bootstrap op must decode");
         assert!(
             matches!(bootstrap_decoded, Request::Bootstrap { .. }),
             "explicit bootstrap retrieval must survive the envelope gate"
