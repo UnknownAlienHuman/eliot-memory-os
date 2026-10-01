@@ -109,6 +109,20 @@ fn validate_git_child_lineage(
     task_id: &TaskId,
     session: &Session,
 ) -> Result<(), ProcessExecutionRejection> {
+    validate_git_child_identity_lineage(
+        parent,
+        child,
+        task_id,
+        &session.module_generation.state_fence,
+    )
+}
+
+fn validate_git_child_identity_lineage(
+    parent: &RequestIdentity,
+    child: &RequestIdentity,
+    task_id: &TaskId,
+    session_fence: &eliot_contracts::StateFence,
+) -> Result<(), ProcessExecutionRejection> {
     let reject = |code: &str, detail: &str| ProcessExecutionRejection {
         code: code.to_owned(),
         detail: detail.to_owned(),
@@ -130,7 +144,6 @@ fn validate_git_child_lineage(
     let child_request = &child.request;
     let parent_metadata = &parent_request.metadata;
     let child_metadata = &child_request.metadata;
-    let session_fence = &session.module_generation.state_fence;
     if parent_metadata.request_id == child_metadata.request_id
         || parent.deadline_unix_ms != child.deadline_unix_ms
         || parent_metadata.product_id != child_metadata.product_id
@@ -154,14 +167,54 @@ fn validate_git_child_lineage(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eliot_contracts::{EpochId, EpochLineageId};
+    use eliot_contracts::{
+        ClockReading, EpochId, EpochLineageId, ProductId, RequestId, RequestMetadata,
+        ResourceGeneration, SessionId, SourceId, StateFence,
+    };
     use eliot_kernel_service::ProcessExecutionRequest;
     use eliot_process::{
         EnvironmentInheritance, EnvironmentProjection, Generation, ImageId, JobId, OperationId,
-        ProcessTreeId, ResourceLimits, SessionId,
+        ProcessTreeId, ResourceLimits, SessionId as ProcessSessionId,
     };
     use std::collections::BTreeMap;
     use std::num::NonZeroU64;
+
+    fn lineage_fence(sequence: u64, generation: u64) -> StateFence {
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("valid lineage");
+        StateFence::new(
+            EpochId::new(lineage, NonZeroU64::new(sequence).expect("nonzero sequence")),
+            ResourceGeneration::new(generation).expect("nonzero generation"),
+        )
+    }
+
+    fn identity(request_id: &str, session_id: &str, task_id: &str, fence: StateFence) -> RequestIdentity {
+        let clock = ClockReading {
+            valid_time_ms: Some(1),
+            known_time_ms: Some(1),
+            transaction_sequence: None,
+            monotonic_ns: Some(1),
+        };
+        let idempotency_key = format!("{request_id}-idempotency");
+        let cancellation_id = format!("{request_id}-cancel");
+        RequestIdentity {
+            request: eliot_receipts::RequestBinding {
+                metadata: RequestMetadata {
+                    request_id: RequestId::new(request_id).expect("request id"),
+                    session_id: Some(SessionId::new(session_id).expect("session id")),
+                    task_id: Some(TaskId::new(task_id).expect("task id")),
+                    product_id: ProductId::new("eliotd").expect("product id"),
+                    source_id: SourceId::new("selected-source").expect("source id"),
+                    state_fence: fence.clone(),
+                    clock,
+                },
+                state_fence: fence,
+            },
+            idempotency_key,
+            deadline_unix_ms: 4_000_000_000_000,
+            cancellation_id,
+        }
+    }
 
     fn process_intent() -> ProcessIntent {
         let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
@@ -172,7 +225,7 @@ mod tests {
             ProcessTreeId::new("git-process-tree").expect("tree"),
             JobId::new("git-process-job").expect("job"),
             ImageId::new("git-process-image").expect("image"),
-            SessionId::new("git-session").expect("session"),
+            ProcessSessionId::new("git-session").expect("session"),
             Generation::new(1).expect("generation"),
             r"C:\Program Files\Git\cmd\git.exe",
             "a".repeat(64),
@@ -242,6 +295,90 @@ mod tests {
                 code,
                 ..
             }) if code == "SOURCE_GIT_PROCESS_ADMISSION_INVALID"
+        ));
+    }
+
+    #[test]
+    fn child_lineage_accepts_original_session_task_fence_and_distinct_operation() {
+        let fence = lineage_fence(1, 1);
+        let task = TaskId::new("task-live-source").expect("task");
+        let parent = identity("selected-source-parent", "session-current", "task-live-source", fence.clone());
+        let child = identity("git-process-op", "session-current", "task-live-source", fence.clone());
+        let request = build_current_source_git_start_request(
+            process_intent(),
+            ActionLeaseRef::new("governor-git-lease").expect("owner lease"),
+            FencingToken::new(
+                EpochId::new(
+                    EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                        .expect("valid lineage"),
+                    NonZeroU64::new(1).expect("nonzero sequence"),
+                ),
+                Generation::new(1).expect("generation"),
+                "git-fence",
+            )
+            .expect("fence"),
+            "eliot-kernel".to_owned(),
+            parent.deadline_unix_ms,
+        )
+        .expect("owner process request");
+        let ProcessExecutionRequest::Start(admission) = request else {
+            unreachable!("Git operation producer always returns a P-03 Start")
+        };
+
+        assert!(validate_git_child_identity_lineage(&parent, &child, &task, &fence).is_ok());
+        assert_ne!(
+            parent.request.metadata.request_id,
+            child.request.metadata.request_id
+        );
+        assert_eq!(
+            child.request.metadata.request_id.as_str(),
+            admission.intent().operation_id().as_str()
+        );
+    }
+
+    #[test]
+    fn child_lineage_refuses_session_task_fence_deadline_and_operation_drift() {
+        let fence = lineage_fence(1, 1);
+        let task = TaskId::new("task-live-source").expect("task");
+        let parent = identity("selected-source-parent", "session-current", "task-live-source", fence.clone());
+        let child = identity("git-process-op", "session-current", "task-live-source", fence.clone());
+        assert!(validate_git_child_identity_lineage(&parent, &child, &task, &fence).is_ok());
+
+        let foreign_session = identity("git-process-op", "session-foreign", "task-live-source", fence.clone());
+        assert!(matches!(
+            validate_git_child_identity_lineage(&parent, &foreign_session, &task, &fence),
+            Err(ProcessExecutionRejection { code, .. }) if code == "SOURCE_CHILD_LINEAGE_MISMATCH"
+        ));
+
+        let foreign_task = identity("git-process-op", "session-current", "task-foreign", fence.clone());
+        assert!(matches!(
+            validate_git_child_identity_lineage(&parent, &foreign_task, &task, &fence),
+            Err(ProcessExecutionRejection { code, .. }) if code == "SOURCE_CHILD_LINEAGE_MISMATCH"
+        ));
+
+        let foreign_fence = lineage_fence(2, 2);
+        let foreign_fence_child = identity("git-process-op", "session-current", "task-live-source", foreign_fence);
+        assert!(matches!(
+            validate_git_child_identity_lineage(&parent, &foreign_fence_child, &task, &fence),
+            Err(ProcessExecutionRejection { code, .. }) if code == "SOURCE_CHILD_LINEAGE_MISMATCH"
+        ));
+
+        let mut foreign_deadline = child.clone();
+        foreign_deadline.deadline_unix_ms += 1;
+        assert!(matches!(
+            validate_git_child_identity_lineage(&parent, &foreign_deadline, &task, &fence),
+            Err(ProcessExecutionRejection { code, .. }) if code == "SOURCE_CHILD_LINEAGE_MISMATCH"
+        ));
+
+        let aliased_operation = identity(
+            parent.request.metadata.request_id.as_str(),
+            "session-current",
+            "task-live-source",
+            fence.clone(),
+        );
+        assert!(matches!(
+            validate_git_child_identity_lineage(&parent, &aliased_operation, &task, &fence),
+            Err(ProcessExecutionRejection { code, .. }) if code == "SOURCE_CHILD_LINEAGE_MISMATCH"
         ));
     }
 }

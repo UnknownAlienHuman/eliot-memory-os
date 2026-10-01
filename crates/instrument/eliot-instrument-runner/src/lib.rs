@@ -45,7 +45,8 @@ pub use build_projection::{
 };
 pub use git_source_snapshot_profile::{
     GitSourceSnapshotCommand, GitSourceSnapshotProcessProfile,
-    GitSourceSnapshotProfileError, prepare_current_git_source_snapshot_profile,
+    GitSourceSnapshotProfileError, GitSourceSnapshotResourceTargets,
+    prepare_current_git_source_snapshot_profile,
     validate_git_source_snapshot_admission,
 };
 pub use cache_lane::{CacheLane, CacheLaneAttestations, CacheLaneError, LaneOutcome};
