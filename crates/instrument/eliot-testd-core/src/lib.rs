@@ -1960,6 +1960,110 @@ pub struct TestdBlobProcessStreamTokenRef {
     pub ordinal: u32,
 }
 
+/// Bounded owner receipt projection retained only for the exact completed
+/// Finalize call that produced a durable CompleteSource. Large Blob bytes and
+/// the rest of the Kernel response are never stored in Testd.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdBlobProcessStreamReadyReceipt {
+    pub process_binding_sha256: String,
+    pub binding_ref: String,
+    pub session_id: String,
+    pub source_id: String,
+    pub terminal_id: String,
+    pub ready_receipt_ref: String,
+    pub source_sha256: String,
+    pub source_byte_length: u64,
+    pub receipt_json: String,
+    pub receipt_sha256: String,
+}
+
+impl TestdBlobProcessStreamReadyReceipt {
+    pub fn validate(&self) -> Result<(), TestdError> {
+        for (field, value) in [
+            ("blob_stream.binding_ref", self.binding_ref.as_str()),
+            ("blob_stream.session_id", self.session_id.as_str()),
+            ("blob_stream.source_id", self.source_id.as_str()),
+            ("blob_stream.terminal_id", self.terminal_id.as_str()),
+            ("blob_stream.ready_receipt_ref", self.ready_receipt_ref.as_str()),
+        ] {
+            validate_text(value, field)?;
+        }
+        for (field, value) in [
+            (
+                "blob_stream.process_binding_sha256",
+                self.process_binding_sha256.as_str(),
+            ),
+            ("blob_stream.source_sha256", self.source_sha256.as_str()),
+            ("blob_stream.receipt_sha256", self.receipt_sha256.as_str()),
+        ] {
+            if !is_binding_digest(value) {
+                return Err(TestdError::Invalid {
+                    field,
+                    reason: "must be a lowercase SHA-256 digest",
+                });
+            }
+        }
+        let receipt: serde_json::Value = serde_json::from_str(&self.receipt_json)
+            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        if self.receipt_json.len()
+            > eliot_blob_api::wire::BLOB_PROCESS_STREAM_KERNEL_MAX_FRAME_BYTES
+        {
+            return Err(TestdError::Invalid {
+                field: "blob_stream.receipt_json",
+                reason: "must fit the existing Kernel process-stream frame bound",
+            });
+        }
+        let bytes = eliot_contracts::canonical_json_bytes(&receipt)
+            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        if bytes != self.receipt_json.as_bytes()
+            || eliot_contracts::sha256_hex(&bytes) != self.receipt_sha256
+            || receipt
+                .pointer("/receipt/identity/receipt_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(self.ready_receipt_ref.as_str())
+            || receipt
+                .get("plaintext_sha256")
+                .and_then(serde_json::Value::as_str)
+                != Some(self.source_sha256.as_str())
+            || receipt
+                .get("plaintext_length")
+                .and_then(serde_json::Value::as_u64)
+                != Some(self.source_byte_length)
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        Ok(())
+    }
+}
+
+/// Original Testd call-row identity plus the exact retained small receipt
+/// projection. Kernel ORS reconciliation uses this exact token and digest to
+/// re-read the original response without repeating the Store effect.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdBlobProcessStreamReadyReceiptProof {
+    pub token: TestdBlobProcessStreamTokenRef,
+    pub operation_sha256: String,
+    pub response_sha256: String,
+    pub response_ref: String,
+    pub ready_receipt: TestdBlobProcessStreamReadyReceipt,
+}
+
+impl TestdBlobProcessStreamReadyReceiptProof {
+    pub fn validate(&self) -> Result<(), TestdError> {
+        if self.token.ordinal == 0
+            || !is_binding_digest(&self.operation_sha256)
+            || !is_binding_digest(&self.response_sha256)
+            || self.response_ref != self.token.reference
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        validate_text(&self.token.reference, "blob_stream.token.reference")?;
+        self.ready_receipt.validate()
+    }
+}
+
 /// Compact Kernel-return projection retained by TestD. It intentionally has
 /// no field for stream chunk bytes or RequestIdentity.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1968,6 +2072,10 @@ pub enum TestdBlobProcessStreamCallOutcome {
     Completed {
         response_sha256: String,
         response_ref: Option<String>,
+        /// Exact small BlobReadyReceipt pair from a validated CompleteSource
+        /// Finalize response, bound by this original call row.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ready_receipt: Option<TestdBlobProcessStreamReadyReceipt>,
     },
     NotStarted,
     Unknown,
@@ -3983,6 +4091,7 @@ fn validate_blob_process_stream_outcome(
     if let TestdBlobProcessStreamCallOutcome::Completed {
         response_sha256,
         response_ref,
+        ready_receipt,
     } = outcome
     {
         if !is_binding_digest(response_sha256) {
@@ -3998,6 +4107,9 @@ fn validate_blob_process_stream_outcome(
             });
         };
         validate_text(response_ref, "blob_stream.response_ref")?;
+        if let Some(receipt) = ready_receipt {
+            receipt.validate()?;
+        }
     }
     Ok(())
 }
@@ -4420,6 +4532,105 @@ impl TestdStore {
             &record.operation_sha256,
         )?;
         Ok(Some(record))
+    }
+
+    /// Resolves the unique retained CompleteSource Finalize receipt for the
+    /// exact grant/process/session/source/terminal identity. It does not pick
+    /// a latest call and refuses conflicting or ambiguous retained receipts.
+    pub fn resolve_blob_process_stream_ready_receipt(
+        &self,
+        job_id: &str,
+        capability_ref: &str,
+        process_binding_sha256: &str,
+        session_id: &str,
+        source_id: &str,
+        terminal_id: &str,
+        ready_receipt_ref: &str,
+    ) -> Result<Option<TestdBlobProcessStreamReadyReceiptProof>, TestdError> {
+        validate_text(job_id, "blob_stream.job_id")?;
+        validate_text(capability_ref, "blob_stream.capability_ref")?;
+        for (field, value) in [
+            ("blob_stream.session_id", session_id),
+            ("blob_stream.source_id", source_id),
+            ("blob_stream.terminal_id", terminal_id),
+            ("blob_stream.ready_receipt_ref", ready_receipt_ref),
+        ] {
+            validate_text(value, field)?;
+        }
+        if !is_binding_digest(process_binding_sha256) {
+            return Err(TestdError::Invalid {
+                field: "blob_stream.process_binding_sha256",
+                reason: "must be a lowercase SHA-256 digest",
+            });
+        }
+        let grant = match self.resolve_blob_process_stream_grant(job_id, capability_ref)? {
+            TestdBlobProcessStreamGrantResolution::Active(grant) => grant,
+            TestdBlobProcessStreamGrantResolution::NotFound
+            | TestdBlobProcessStreamGrantResolution::Revoked => return Ok(None),
+        };
+        if grant.process_binding_sha256 != process_binding_sha256 {
+            return Err(TestdError::InvalidBinding);
+        }
+
+        let read = self.database.begin_read().map_err(database)?;
+        let calls = read
+            .open_table(BLOB_PROCESS_STREAM_CALLS)
+            .map_err(database)?;
+        let mut found = None;
+        for item in calls.iter().map_err(database)? {
+            let (_, value) = item.map_err(database)?;
+            let record: TestdBlobProcessStreamCallRecord = serde_json::from_slice(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+            if record.job_id != job_id || record.capability_ref != capability_ref {
+                continue;
+            }
+            validate_blob_process_stream_call_record(
+                &record,
+                job_id,
+                capability_ref,
+                &record.token_ref,
+                record.ordinal,
+                &record.operation_sha256,
+            )?;
+            let TestdBlobProcessStreamCallState::Completed(
+                TestdBlobProcessStreamCallOutcome::Completed {
+                    response_sha256,
+                    response_ref,
+                    ready_receipt: Some(receipt),
+                },
+            ) = &record.state
+            else {
+                continue;
+            };
+            if receipt.process_binding_sha256 != process_binding_sha256
+                || receipt.session_id != session_id
+                || receipt.source_id != source_id
+                || receipt.terminal_id != terminal_id
+            {
+                continue;
+            }
+            let Some(response_ref) = response_ref.as_deref() else {
+                return Err(TestdError::InvalidBinding);
+            };
+            if response_ref != record.token_ref || receipt.ready_receipt_ref != ready_receipt_ref {
+                return Err(TestdError::InvalidBinding);
+            }
+            let proof = TestdBlobProcessStreamReadyReceiptProof {
+                token: TestdBlobProcessStreamTokenRef {
+                    reference: record.token_ref.clone(),
+                    ordinal: record.ordinal,
+                },
+                operation_sha256: record.operation_sha256.clone(),
+                response_sha256: response_sha256.clone(),
+                response_ref: response_ref.to_owned(),
+                ready_receipt: receipt.clone(),
+            };
+            proof.validate()?;
+            if found.replace(proof).is_some() {
+                return Err(TestdError::InvalidBinding);
+            }
+        }
+        Ok(found)
     }
 
     /// Permanently revokes the exact retained capability. Repeated revocation

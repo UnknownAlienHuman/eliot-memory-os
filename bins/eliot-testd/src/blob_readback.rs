@@ -21,7 +21,8 @@ use eliot_process::{DurableStreamLocatorKind, ProcessStreamKind};
 use eliot_testd_core::{
     AsyncProcessStreamSourceReadbackPort, ProcessStreamSourceReadbackFuture,
     ProcessStreamSourceReadbackObservation, ProcessStreamSourceReadbackRequest,
-    TestdEvidenceError, TestdReplayOwnerReadback, TestdStreamDisposition, sha256_hex,
+    TestdBlobProcessStreamReadyReceipt, TestdEvidenceError, TestdReplayOwnerReadback,
+    TestdStreamDisposition, sha256_hex,
 };
 use crate::kernel_client::{KernelBlobStreamCallSequence, TestdIpcError};
 use serde::Serialize;
@@ -38,6 +39,17 @@ pub trait BlobReadbackExchange: Send + Sync {
         &'a self,
         request: &'a KernelSourceRequest,
     ) -> BlobReadbackExchangeFuture<'a>;
+
+    /// Resolves the exact retained Finalize receipt under its durable call
+    /// row; the selector must include the admitted process and stream IDs.
+    fn retained_ready_finalize_receipt(
+        &self,
+        process_binding_sha256: &str,
+        session_id: &str,
+        source_id: &str,
+        terminal_id: &str,
+        ready_receipt_ref: &str,
+    ) -> Result<Option<TestdBlobProcessStreamReadyReceipt>, TestdEvidenceError>;
 }
 
 impl BlobReadbackExchange for KernelBlobStreamCallSequence {
@@ -61,6 +73,26 @@ impl BlobReadbackExchange for KernelBlobStreamCallSequence {
                     reason: "the authenticated Kernel readback task ended without a proven result",
                 }),
             }
+        })
+    }
+
+    fn retained_ready_finalize_receipt(
+        &self,
+        process_binding_sha256: &str,
+        session_id: &str,
+        source_id: &str,
+        terminal_id: &str,
+        ready_receipt_ref: &str,
+    ) -> Result<Option<TestdBlobProcessStreamReadyReceipt>, TestdEvidenceError> {
+        self.lookup_retained_ready_finalize_receipt(
+            process_binding_sha256,
+            session_id,
+            source_id,
+            terminal_id,
+            ready_receipt_ref,
+        )
+        .map_err(|_| TestdEvidenceError::BindingMismatch {
+            reason: "the exact Finalize Ready receipt is absent or conflicted in the durable call ledger",
         })
     }
 }
@@ -291,6 +323,8 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
                 process_source_admission_readback_sha256,
                 source_admission_write_receipt_json,
                 source_admission_write_receipt_sha256,
+                finalized_blob_ready_receipt_json: None,
+                finalized_blob_ready_receipt_sha256: None,
                 owner_facts_json,
                 owner_facts_sha256,
                 module_catalog_owner_readback_json,
@@ -335,6 +369,13 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
         {
             return Err(integrity_error(stream));
         }
+        let process_binding_sha256 = sha256_hex(process_binding_json.as_bytes());
+        let source_fence = observed_fence
+            .as_ref()
+            .ok_or_else(|| integrity_error(stream))?;
+        let mut replay_owner = replay_owner_readback.ok_or_else(|| integrity_error(stream))?;
+        self.bind_finalize_receipt(request, &process_binding_sha256, source_fence, &mut replay_owner)?;
+        replay_owner.validate().map_err(|_| integrity_error(stream))?;
         let observed_at_unix_ms = observed_at.ok_or_else(|| integrity_error(stream))?;
         let observed_at_unix_ms = i64::try_from(observed_at_unix_ms)
             .map_err(|_| integrity_error(stream))?;
@@ -356,9 +397,113 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
             },
             TestdStreamDisposition::CompleteSource,
         )
-        .with_replay_owner_readback(
-            replay_owner_readback.ok_or_else(|| integrity_error(stream))?,
-        ))
+        .with_replay_owner_readback(replay_owner))
+    }
+
+    fn bind_finalize_receipt(
+        &self,
+        request: &ProcessStreamSourceReadbackRequest,
+        process_binding_sha256: &str,
+        source_fence: &eliot_contracts::StateFence,
+        owner: &mut TestdReplayOwnerReadback,
+    ) -> Result<(), TestdEvidenceError> {
+        use eliot_store_api::blob_process_source_admission::{
+            BlobProcessSourceAdmissionIdentity, BlobProcessSourceAdmissionPhase,
+            BlobProcessSourceAdmissionReadback,
+        };
+
+        let facts: eliot_blob_api::wire::BlobProcessStreamVerifiedOwnerFacts =
+            serde_json::from_str(&owner.owner_facts_json).map_err(|_| integrity_error(request.stream))?;
+        facts.validate().map_err(|_| integrity_error(request.stream))?;
+        let scope: serde_json::Value = serde_json::from_str(&facts.work_scope_binding_json)
+            .map_err(|_| integrity_error(request.stream))?;
+        let work_scope_ref = scope
+            .pointer("/binding/scope/scope_ref")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| integrity_error(request.stream))?;
+        let work_scope_owner_revision = scope
+            .get("owner_revision")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| integrity_error(request.stream))?;
+        let work_scope_fence: eliot_contracts::StateFence = serde_json::from_value(
+            scope
+                .get("state_fence")
+                .cloned()
+                .ok_or_else(|| integrity_error(request.stream))?,
+        )
+        .map_err(|_| integrity_error(request.stream))?;
+        let process_readback: BlobProcessSourceAdmissionReadback = serde_json::from_str(
+            &owner.process_source_admission_readback_json,
+        )
+        .map_err(|_| integrity_error(request.stream))?;
+        let admission = &process_readback.admission;
+        let open: eliot_process::ProcessStreamSinkOpenRequest = serde_json::from_str(
+            &admission.open_request_json,
+        )
+        .map_err(|_| integrity_error(request.stream))?;
+        open.validate().map_err(|_| integrity_error(request.stream))?;
+        let identity = BlobProcessSourceAdmissionIdentity {
+            work_scope_ref: work_scope_ref.to_owned(),
+            session_id: open.session_id().as_str().to_owned(),
+            source_id: open.source_id().as_str().to_owned(),
+            process_binding_sha256: process_binding_sha256.to_owned(),
+        };
+        process_readback
+            .validate_for(&identity, request.binding.state_fence())
+            .map_err(|_| integrity_error(request.stream))?;
+        let ready = admission
+            .ready
+            .as_ref()
+            .ok_or_else(|| integrity_error(request.stream))?;
+        if admission.phase != BlobProcessSourceAdmissionPhase::Ready
+            || process_readback.owner_revision != 2
+            || admission.owner_revision != 2
+            || admission.work_scope_owner_revision != work_scope_owner_revision
+            || admission.work_scope_owner_digest
+                != sha256_hex(facts.work_scope_binding_json.as_bytes())
+            || admission.state_fence != *request.binding.state_fence()
+            || work_scope_fence != *request.binding.state_fence()
+            || process_readback.state_fence != *source_fence
+            || admission.owner_facts_json != owner.owner_facts_json
+            || admission.owner_facts_sha256 != owner.owner_facts_sha256
+            || admission.process_binding_json != canonical_json(&request.binding)?
+            || admission.process_binding_sha256 != process_binding_sha256
+            || admission.open_request_sha256 != open.open_request_sha256()
+            || open.binding() != &request.binding
+            || open.stream() != request.stream
+            || open.policy() != &request.policy
+            || ready.whole_source_sha256 != request.expected_sha256
+            || ready.whole_source_byte_length != request.expected_byte_length
+        {
+            return Err(integrity_error(request.stream));
+        }
+        let receipt = self
+            .exchange
+            .retained_ready_finalize_receipt(
+                process_binding_sha256,
+                &identity.session_id,
+                &identity.source_id,
+                open.terminal_id().as_str(),
+                &request.ready_receipt_ref,
+            )?
+            .ok_or_else(|| integrity_error(request.stream))?;
+        receipt.validate().map_err(|_| integrity_error(request.stream))?;
+        if receipt.process_binding_sha256 != process_binding_sha256
+            || receipt.binding_ref.is_empty()
+            || receipt.session_id != identity.session_id
+            || receipt.source_id != identity.source_id
+            || receipt.terminal_id != open.terminal_id().as_str()
+            || receipt.ready_receipt_ref != request.ready_receipt_ref
+            || receipt.source_sha256 != request.expected_sha256
+            || receipt.source_byte_length != request.expected_byte_length
+            || receipt.receipt_json != ready.blob_ready_receipt_json
+            || receipt.receipt_sha256 != ready.blob_ready_receipt_sha256
+        {
+            return Err(integrity_error(request.stream));
+        }
+        owner.finalized_blob_ready_receipt_json = Some(receipt.receipt_json);
+        owner.finalized_blob_ready_receipt_sha256 = Some(receipt.receipt_sha256);
+        Ok(())
     }
 }
 
