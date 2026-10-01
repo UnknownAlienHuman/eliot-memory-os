@@ -753,8 +753,7 @@ pub async fn drive_pending_second_phases(
             // naming them.
             continue;
         };
-        let outcome =
-            drive_admitted_pending_second_phase(kernel, &live_fence, admitted).await?;
+        let outcome = drive_admitted_pending_second_phase(kernel, &live_fence, admitted).await?;
         driven.push(DrivenSecondPhase {
             grant_id: pending.grant_id.clone(),
             closure_operation_id: pending.closure_operation_id.clone(),
@@ -833,8 +832,7 @@ async fn drive_admitted_pending_second_phase(
             reason: AUTHORITY_REVOCATION_RESUME_BLOCKED,
         });
     };
-    let link =
-        link_closure_second_phase(kernel, live_fence, &closure, &canonical_receipt).await?;
+    let link = link_closure_second_phase(kernel, live_fence, &closure, &canonical_receipt).await?;
     Ok(SecondPhaseDriveOutcome::Linked(Box::new(link)))
 }
 
