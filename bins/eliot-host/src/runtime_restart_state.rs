@@ -109,14 +109,6 @@ pub(super) fn read_bounded_runtime_restart_file(
     Ok(bytes)
 }
 
-/// Reports whether a restart-store entry is the Host-managed episode budget
-/// file (issue #1801 W5): read by its own owner (`load_restart_budget`), it
-/// is never a restart receipt and therefore never adopted here.
-#[cfg(windows)]
-fn is_restart_budget_entry(file_name: &str) -> bool {
-    file_name == RESTART_BUDGET_FILE_NAME
-}
-
 #[cfg(windows)]
 pub(super) fn load_durable_runtime_restarts(
     host_state_root: &Path,
@@ -168,7 +160,8 @@ pub(super) fn load_durable_runtime_restarts(
                     "runtime restart store contains a non-text filename".to_owned(),
                 )
             })?;
-        if is_restart_budget_entry(file_name) {
+        // Budget file is owned by load_restart_budget; never adopted here.
+        if file_name == RESTART_BUDGET_FILE_NAME {
             host_restart_observe("host.restart budget not adopted observed"); continue;
         }
         let pending_digest = file_name
