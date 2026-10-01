@@ -91,13 +91,25 @@ public sealed record OperatorRoleBinding(
     public bool GrantsCommands => Grants(OperatorCapabilityNames.OperatorCommand);
 }
 
-/// The broker-issued Human principal this client retained when the User Broker
+/// The Human principal this client retained when the User Broker
 /// redeemed the Operator handoff, on the very pipe that proved the OS-observed
-/// peer identity (I11.8). Every value is the broker's OWN `redeemed` response,
-/// read back after the redemption checks already proved it equal to this
-/// process's identity, session, token, role and exact capability set. Nothing
-/// here is composed, defaulted, derived, read from an environment value or a
-/// configuration file, or carried across processes.
+/// peer identity (I11.8). Every value is read out of the broker's OWN
+/// `redeemed` response, after the redemption checks, rather than composed
+/// here. That is an account of where the retained bytes come from, not a claim
+/// that all four are the broker's independent decision - the per-field
+/// provenance is at `main.rs:651-658` and at the retained construction in
+/// `BrokerPipeClient.RedeemOperatorHandoffAsync`:
+/// `Principal` and `InteractiveSessionId` are OS-observed peer facts,
+/// `KernelSessionToken` is broker-minted and then echoed back from this client's
+/// own presentation of it, and `Grant`'s `Role` and `Capabilities` are this
+/// client's own request echoed back verbatim, so the redemption comparisons for
+/// those two are tautological and prove no agreement this client did not
+/// manufacture. `Grant` is still the correct value to gate on, and still a real
+/// refusal rather than a constant; it is simply not independent broker
+/// authority, and the client-side capability arm in
+/// `GovernorPipeClient.RequireRetainedHumanPrincipal` must stay because of
+/// that. Nothing here is composed, defaulted, derived, read from an environment
+/// value or a configuration file, or carried across processes.
 ///
 /// It carries five of the six fields of the broker's `HumanStateAuthority`, and
 /// the sixth is deliberately ABSENT. `approval_hash` would be a claim with

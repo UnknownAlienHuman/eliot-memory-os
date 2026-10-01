@@ -61,12 +61,17 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
     private const int LifecycleClosing = 1;
     private const int LifecycleDisposed = 2;
 
-    /// The broker-granted role and exact capability set the live connection
-    /// was redeemed for, read off the handoff that authenticated it. A
-    /// dropped, aborted or half-open transport grants nothing: only a live
-    /// connection reports its grant, and an unreadable transport reports
-    /// null rather than a stale grant. Null never authorizes; callers treat
-    /// it as "let the transport authenticate", never as a capability.
+    /// The REQUESTED role and exact capability set of the live connection's
+    /// handoff, read off the handoff that authenticated it - this client's own
+    /// authority material, not a broker-issued answer. It is equal to the
+    /// broker's redeemed grant because redemption refused any other set (see
+    /// `BrokerPipeClient.RedeemOperatorHandoffAsync`), and it is not equal by
+    /// construction here; see `MainViewModel.RefreshRoleBinding` for why that
+    /// distinction is recorded rather than smoothed over. A dropped, aborted or
+    /// half-open transport grants nothing: only a live connection reports this
+    /// binding, and an unreadable transport reports null rather than a stale
+    /// one. Null never authorizes; callers treat it as "let the transport
+    /// authenticate", never as a capability.
     public OperatorRoleBinding? GrantedBinding
     {
         get
@@ -153,13 +158,13 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         || string.Equals(tool, UserAutomationContract.Route, StringComparison.Ordinal);
 
     /// Admits a state-changing route only against the explicit authenticated
-    /// Human principal the User Broker issued and this client retained at
-    /// redemption (I11.8), and only when that broker-issued grant covers the
+    /// Human principal the User Broker acknowledged and this client retained at
+    /// redemption (I11.8), and only when that retained grant covers the
     /// capability the route acts on.
     ///
     /// Two refusals share one disposition, because this process can hold no
     /// other one: a state-changing route with no retained principal has nothing
-    /// to present, and a route whose broker-issued grant does not cover
+    /// to present, and a route whose retained grant does not cover
     /// `operator.command` is a capability-expanded request. In both cases the
     /// retained binding authorizes nothing on this route, and the handoff is
     /// single-use, so a fresh broker-issued handoff - and therefore a fresh UI
@@ -173,24 +178,50 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
     /// publishes the retained broker session strictly BEFORE it publishes the
     /// Governor connection this check runs against, so on the establishing path
     /// the principal is necessarily present and the no-principal arm cannot
-    /// fire there. That arm is reached on the path where the retained session has
-    /// genuinely ended under a request that was already past admission: the
-    /// disposal race in which `DisposeAsync` releases the binding, after which
-    /// `RetainedPrincipal` reports null because `ReleaseOperatorBinding` nulled
-    /// the field under the binding gate. That single condition is the whole
-    /// mechanism; there is no pipe-liveness arm to reach, because the broker
+    /// fire there. That arm is DEFENSIVE rather than demonstrated: it covers
+    /// the teardown race in which `DisposeAsync` reaches
+    /// `ReleaseOperatorBinding` - which nulls the field under the binding gate -
+    /// while a request already past admission is still between publication and
+    /// this check. No ordinary request reaches it, and the reason it is not
+    /// demonstrable is structural rather than incidental: a request holds
+    /// `_requestGate` from admission to release, so `DisposeAsync` can only get
+    /// to the release by letting its finite teardown gate wait TIME OUT, and
+    /// the path from a returned `EnsureConnectedAsync` to this check contains
+    /// no yield point. It is kept because `null` is a refusal and a guard that
+    /// stays correct under teardown is cheaper than one that assumes the race
+    /// away. There is no pipe-liveness arm to reach either, because the broker
     /// drops its pipe end after writing `redeemed`, this client never writes to
     /// the retained handle again, and `IsConnected` therefore cannot observe
-    /// that closure. The
-    /// capability arm is the ordinary one - `ValidateEndpoint` admits any
-    /// non-empty subset of the closed two-capability vocabulary, so a
-    /// read-only broker-issued binding is a real admitted shape and reaches
-    /// here without `operator.command`.
+    /// that closure.
+    ///
+    /// The capability arm is defensive for a different reason: it guards a
+    /// LOCAL shape, not an ordinary production path. `ValidateEndpoint` is a
+    /// fail-early shape check only - it admits any non-empty subset of the
+    /// closed two-capability vocabulary - but the broker admits NO narrower
+    /// binding. `exact_operator_capabilities`
+    /// (`crates/surfaces/eliot-user-broker-core/src/lib.rs:110-116`) requires
+    /// the full ordered two-element set, so a one-element request is
+    /// `BrokerError::Denied` in `issue` (same file, :239-244), and the endpoint
+    /// `issue` then builds takes its `capabilities` from `OPERATOR_CAPABILITIES`
+    /// itself (:256-259, over the `OPERATOR_CAPABILITIES: [&str; 2]` at :43)
+    /// whatever was asked for. `RuntimeDiscoveryService.ValidateEndpoint`
+    /// records the same division of labour: fail early on shape locally, defer
+    /// the authority to the owner. So a read-only broker-issued binding is not
+    /// a shape this owner can produce, and this arm protects against an
+    /// endpoint that reached this client by some other route - not against the
+    /// owner's own output.
     ///
     /// The check reads the retained binding, never a constant and never the
-    /// endpoint's requested authority: the broker's granted answer is the only
-    /// one that counts. A capability outside that grant is refused here as well
-    /// as by the broker, because a client that would send it is already wrong.
+    /// endpoint's requested authority object: the retained `redeemed` value is
+    /// the one that counts, because it is the one the broker acknowledged at
+    /// redemption. Note what that does and does not make it - for `role` and
+    /// `capabilities` the broker echoed this client's own request
+    /// (`main.rs:651-658`), so this is not an independent broker decision and
+    /// the client-side arm is load-bearing rather than redundant. A capability
+    /// outside that grant is refused here as well as by the broker, because a
+    /// client that would send it is already wrong, and because a reader who
+    /// believed the broker re-decided the set would be tempted to drop this
+    /// check as redundant.
     private void RequireRetainedHumanPrincipal(string tool)
     {
         if (!IsStateChangingRoute(tool)) return;
@@ -435,8 +466,8 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
 
             // I11.8: a state-changing request carries an explicit
             // authenticated Human principal. The only principal this client can
-            // present is the one the User Broker issued and this client retained
-            // at redemption, so the check runs HERE - after the connection is
+            // present is the one the User Broker acknowledged and this client
+            // retained at redemption, so the check runs HERE - after the connection is
             // established, which is what proves that redemption happened at all,
             // because `EnsureConnectedAsync` publishes the retained broker
             // session strictly before it publishes this connection - and before

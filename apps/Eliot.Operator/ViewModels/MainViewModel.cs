@@ -2246,9 +2246,32 @@ public sealed class MainViewModel : INotifyPropertyChanged
         }
     }
 
-    /// Pulls the broker-granted role binding off the live transport. The
-    /// grant is the exact set the broker redeemed this binding for
-    /// (I11.8); views and mutations gate on it, never on a constant.
+    /// Pulls the role binding off the live transport for VIEW gating. The
+    /// value is the REQUESTED authority, not an independent broker-issued
+    /// grant: `GovernorPipeClient.GrantedBinding` returns
+    /// `Handoff.Endpoint.Role` and `Handoff.Endpoint.Capabilities`, the
+    /// `OperatorEndpoint` deserialized from `ELIOT_OPERATOR_ENDPOINT`, which
+    /// is this client's own authority material (it is re-sent as
+    /// `requested_capabilities` in the handshake).
+    ///
+    /// It EQUALS the broker's redeemed grant, and that equality is not a
+    /// property of this read - it is established elsewhere and once. In
+    /// `BrokerPipeClient.RedeemOperatorHandoffAsync`, `CapabilitiesMatch`
+    /// compares the broker's `redeemed` capabilities against
+    /// `endpoint.Capabilities` and the redemption is refused if they differ,
+    /// so a broker that granted anything other than the requested set never
+    /// produces a retained session. `main.rs:651-658` is why the retained
+    /// grant and this requested set are the same value rather than two
+    /// independent ones: the broker echoes `role` and `capabilities` back from
+    /// the endpoint. Nothing re-establishes that equality if those redemption
+    /// checks change, so it is cross-referenced here rather than implied.
+    ///
+    /// So MUTATION gating and VIEW gating read DIFFERENT objects that are
+    /// currently equal: mutations gate on `BrokerPipeClient.RetainedPrincipal`
+    /// (the broker's `redeemed` object), while views gate on this requested
+    /// set. Both are real refusals rather than constants, and a narrower binding
+    /// withholds views and mutations alike - but a reader must not believe both
+    /// read the broker's own answer, because only the mutation side does.
     private void RefreshRoleBinding()
     {
         var binding = _client.GrantedBinding;

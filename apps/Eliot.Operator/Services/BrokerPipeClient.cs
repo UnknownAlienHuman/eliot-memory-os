@@ -14,13 +14,23 @@ namespace Eliot.Operator.Services;
 /// The authenticated binding's LIFETIME is the session, not this method. The
 /// bound pipe is the one that proved the OS-observed peer identity and that
 /// carried the Kernel-backed binding, so it is RETAINED after redemption
-/// rather than disposed with the call, and the broker's own answer for that
-/// binding is retained with it (see <see cref="OperatorHumanPrincipal"/>).
+/// rather than disposed with the call, and the broker's own `redeemed`
+/// response for that binding is retained with it (see
+/// <see cref="OperatorHumanPrincipal"/>).
 /// No second pipe is opened, the challenge/redeem exchange is not repeated, no
 /// token is re-minted and no authority is copied into a cache: the retained
-/// state is the OS handle, the object the broker already bound, and the exact
-/// values the broker issued for that handle, which are the broker's own
-/// `redeemed` response rather than anything this client composed or remembered.
+/// state is the OS handle, the object the broker already bound, and the values
+/// as this client reads them out of the broker's own `redeemed` response rather
+/// than out of anything it composed or remembered. Read "out of the `redeemed`
+/// response" as an account of WHERE the retained bytes come from, not as a
+/// uniform claim of broker authorship: three of the five fields are
+/// OS-observed peer facts the broker could not have taken from this request,
+/// two are the client's own request echoed back, and one is broker-minted
+/// before it was echoed. The retained construction below and
+/// <see cref="OperatorHumanPrincipal"/> name which is which, because the
+/// `Grant` inside it is the exact value that gates every mutation and a reader
+/// who believes it is broker-issued would conclude the broker re-checks it and
+/// weaken this client's own capability arm.
 ///
 /// What the retained handle is NOT is a channel. No later request leg is
 /// written to it: this client reads the retained principal out of process
@@ -46,10 +56,16 @@ internal static class BrokerPipeClient
     private static readonly object BindingGate = new();
 
     /// The one bound pipe this process holds, or null when none is retained.
-    /// Cleared and disposed by <see cref="ReleaseOperatorBinding"/>, which
-    /// `GovernorPipeClient.DisposeAsync` calls as the deterministic end of the
-    /// session and which a later successful redemption also reaches by
-    /// superseding this session.
+    /// Cleared and disposed by <see cref="ReleaseOperatorBinding"/>, whose SOLE
+    /// caller is `GovernorPipeClient.DisposeAsync` - the deterministic end of
+    /// the session, and the single call site the release invariant rests on.
+    /// Supersession is a different path that never reaches that release:
+    /// <see cref="PublishSession"/> nulls and replaces this field under
+    /// <see cref="BindingGate"/> and then disposes the previous session itself,
+    /// so a later successful redemption disposes the session it supersedes
+    /// without ever calling the release. Anyone adding a second release call
+    /// site should read this as the single-call-site invariant it states, not
+    /// as an existing second end of the hold.
     private static BrokerPipeSession? _session;
 
     private static readonly string[] ChallengeProperties =
@@ -76,9 +92,9 @@ internal static class BrokerPipeClient
     private static readonly string[] ErrorProperties = ["status", "code", "detail"];
 
     /// Performs the one challenge/redeem exchange and RETAINS the bound pipe
-    /// for the session, returning the authenticated binding the broker minted
-    /// for this exact process, endpoint and peer. A refusal or fault throws and
-    /// retains nothing, exactly as before.
+    /// for the session, returning the authenticated binding the broker
+    /// acknowledged for this exact process, endpoint and peer. A refusal or
+    /// fault throws and retains nothing, exactly as before.
     ///
     /// The accessibility is `internal`, matching the enclosing type's own
     /// effective accessibility: the returned session type is no wider than this
@@ -242,11 +258,42 @@ internal static class BrokerPipeClient
             // Every field of the retained principal is read back out of the
             // broker's OWN `redeemed` object here, AFTER the checks above
             // proved it, rather than from the endpoint and local process
-            // identity it was compared against: the retained value is the
-            // broker's answer, not this client's copy of what it asked for.
-            // Reading it after the checks also keeps the refusal precedence
-            // above unchanged - a malformed field in a response that was
-            // already refused is never read at all.
+            // identity it was compared against. Reading it after the checks
+            // also keeps the refusal precedence above unchanged - a malformed
+            // field in a response that was already refused is never read at all.
+            //
+            // "Read out of the broker's own `redeemed` object" says where the
+            // retained bytes come from. It is NOT a claim that all five are the
+            // broker's own decision, and the difference is load-bearing because
+            // `Grant` is what gates every mutation. The message is built at
+            // `bins/eliot-user-broker/src/main.rs:651-658`, and the provenance
+            // differs per field:
+            //   - OS-OBSERVED and independent of this request:
+            //     `principal` (peer.sid()), `interactive_session_id`
+            //     (peer.session_id()) and `client_process_id`
+            //     (peer.process().process_id). The broker could not have taken
+            //     these from the request, and the comparisons above are real
+            //     checks against this process's own observation.
+            //   - BROKER-MINTED, THEN ECHOED: `kernel_session_token`. The
+            //     Kernel issues it at challenge and the client presents it back,
+            //     so the value is the broker's own token as the client read it
+            //     back, not a fresh answer.
+            //   - THIS CLIENT'S OWN REQUEST, ECHOED BACK: `role` and
+            //     `capabilities` are `endpoint.role` / `endpoint.capabilities`
+            //     verbatim. The two comparisons at the end of the block above
+            //     are therefore TAUTOLOGICAL for these fields - the broker's
+            //     echo is compared against the very value that was echoed - and
+            //     they prove no agreement this client did not manufacture. The
+            //     retained grant is still the right value to gate on, because it
+            //     is the one this client sent and the broker accepted unchanged,
+            //     but it is not independent broker authority and a reader must
+            //     not remove the client-side capability arm in
+            //     `GovernorPipeClient.RequireRetainedHumanPrincipal` on the
+            //     belief that the broker re-decided the set. That the echo can be
+            //     trusted as the client's own set is also what makes
+            //     `CapabilitiesMatch` above worth running: it is a shape and
+            //     order check on the response, and a broker that answered with a
+            //     different set would be refused here rather than retained.
             var redeemedRole = RequiredString(redeemed.RootElement, "role", "broker_redeem");
             var principal = new OperatorHumanPrincipal(
                 RequiredString(redeemed.RootElement, "principal", "broker_redeem"),
@@ -275,8 +322,13 @@ internal static class BrokerPipeClient
         }
     }
 
-    /// The broker-issued Human principal this process retained at redemption,
-    /// or null when no redeemed session is retained.
+    /// The Human principal this process retained at redemption, taken from the
+    /// broker's own `redeemed` response, or null when no redeemed session is
+    /// retained. Per-field provenance is documented on
+    /// <see cref="OperatorHumanPrincipal"/>; the short version is that the
+    /// identity fields are OS-observed and the `Grant` is this client's own
+    /// request echoed back, so this is the acknowledged value rather than an
+    /// independently broker-decided one.
     ///
     /// Null is a refusal, never an authorization. It is returned whenever there
     /// is nothing to report, and there is exactly ONE such condition: no
@@ -586,10 +638,14 @@ internal static class BrokerPipeClient
         string shapeName) =>
         RequiredCapabilities(parent, shapeName).SequenceEqual(expected, StringComparer.Ordinal);
 
-    /// The broker's own capability array, in the order it sent it. Reading it
-    /// is separated from comparing it so the exact granted SET can be retained
-    /// from the same bytes the comparison proved, instead of being rebuilt from
-    /// the requested list afterwards.
+    /// The capability array as the broker SENT it, in the order it sent it.
+    /// Reading it is separated from comparing it so the exact SET can be
+    /// retained from the same bytes the comparison read, instead of being
+    /// rebuilt from the requested list afterwards. Note that the array is an
+    /// echo of this client's request (`main.rs:651-658`), so reading it here is
+    /// about provenance of the BYTES, not about the broker having chosen the
+    /// set; the comparison against the request is what refuses a differing
+    /// answer.
     private static IReadOnlyList<string> RequiredCapabilities(JsonElement parent, string shapeName)
     {
         if (!parent.TryGetProperty("capabilities", out var value)
@@ -659,10 +715,10 @@ internal sealed class BrokerPipeSession : IDisposable
     private readonly StreamWriter _writer;
     private int _disposed;
 
-    /// The broker-issued Human principal redemption proved for THIS session,
-    /// or null for the handle a failed exchange disposes. It is set once, at
-    /// construction, and never recomputed or refreshed, so it always describes
-    /// the exchange that published this handle rather than a later one.
+    /// The Human principal redemption retained for THIS session, or null for the
+    /// handle a failed exchange disposes. It is set once, at construction, and
+    /// never recomputed or refreshed, so it always describes the exchange that
+    /// published this handle rather than a later one.
     internal OperatorHumanPrincipal? Principal { get; }
 
     internal BrokerPipeSession(
