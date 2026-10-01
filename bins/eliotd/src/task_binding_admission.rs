@@ -143,6 +143,18 @@
 //!   finish legs.
 //! - [`observe_and_admit_task`] has **zero call sites**, so
 //!   [`admit_task_bound_with_observed_scope`] is transitively dead with it.
+//! - [`admit_bootstrap_context`] has **zero call sites** as well. Both of its
+//!   designated callers are themselves uncalled —
+//!   `DaemonComposition::read_cold_start_surface_for_attach` (`caller: STITCH`)
+//!   and [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition)
+//!   (zero production call sites, above) — so no live path carries an admitted
+//!   bootstrap toward the #1742 Material gate.
+//! - [`revalidate_dispatched_binding`] has **zero call sites** — stronger than
+//!   the "no live caller passes that retained/observed pair" recorded under
+//!   [`revalidate_task_bound_for_effect`] below, which describes why no caller
+//!   can supply the pair. Its designated caller is the same uncalled
+//!   `commit_canonical_and_refresh`, so its private `material_effect_guard_detail`
+//!   helper is dead with it too.
 //! - [`revalidate_task_bound_for_effect`] **is** live: its one production call
 //!   site is the pre-commit effect gate in
 //!   [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition),
@@ -1563,6 +1575,16 @@ pub fn refuse_ready_string_without_evidence(
 /// binding.
 ///
 /// Called by [`admit_task_bound_with_observed_scope`].
+///
+/// # Not yet reached (issue #1929)
+///
+/// That is the whole caller set, so this entry is dead transitively: its only
+/// caller has one caller of its own, [`observe_and_admit_task`], which has zero
+/// call sites (see this module's "Measured reachability" section). The next
+/// live `check_at_trigger` owner leg is
+/// `GovernorComposition::check_canonical_write_work_scope`, joined in
+/// `DaemonComposition::commit_canonical_and_refresh`; this composition-level
+/// disposition mapper is the unwired observation-derived duplicate of it.
 pub fn scope_guard_disposition(
     expected: &ScopeBinding,
     observed: &ObservedScopeResources,
@@ -2007,6 +2029,24 @@ pub struct MaterialBootstrap {
 /// freshness instead of re-deriving it, so an expired receipt or lease fails
 /// closed here before any owner field is compared. This entry
 /// mints no profile, receipt, or lease of its own.
+///
+/// # Not yet reached (issue #1929)
+///
+/// Measured on this tree, this entry has **zero call sites**: no code in any
+/// crate names it other than its defining line; every other mention in the tree
+/// is a [`admit_bootstrap_context`] prose back-link. Both designated callers
+/// above are themselves uncalled —
+/// `DaemonComposition::read_cold_start_surface_for_attach` has zero call sites
+/// (`caller: STITCH`), and
+/// [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition)
+/// has zero production call sites (see this module's "Measured reachability"
+/// section) — so the #1742 Material gate has no live bootstrap to carry even
+/// once that composition entry is wired. Nothing reads
+/// [`BootstrapAdmission::Material`] from here, and the retention route this
+/// admission feeds is already held behind the same blocking symbol (the
+/// compiled readiness receipt). A production caller therefore needs the
+/// receipt owner named in that section to exist first; none was invented to
+/// close the gap.
 #[allow(
     clippy::too_many_arguments,
     reason = "bootstrap joins the receipt, surface, both profiles, the live fence, and the freshness clock in one edge"
@@ -2799,6 +2839,26 @@ fn material_effect_guard_detail(report: &eliot_workscope::TriggerReport) -> Stri
 /// receipt revision, governance profile reference, projection generation (the
 /// live receipt's own `projection_generation`, alongside its revision), and
 /// kernel-snapshot fence.
+///
+/// # Not yet reached (issue #1929)
+///
+/// Measured on this tree, this entry has **zero call sites**: no code in any
+/// crate names it other than its defining line; every other mention in the tree
+/// is a [`revalidate_dispatched_binding`] prose back-link. The designated
+/// caller above is itself uncalled (zero production call sites — see this
+/// module's "Measured reachability" section).
+/// The daemon holds no retained `ScopeBinding` — that requires the uncalled,
+/// circular `DaemonComposition::admit_scope_attach` — so no live gate can pass
+/// this entry's `retained`/`observed` pair even if it were called. One
+/// second-order consequence is named here because a name-level scan cannot see
+/// it: the private [`material_effect_guard_detail`] is called only from this
+/// entry and is therefore dead with it. This entry is also *not* the route by
+/// which the
+/// fence leg [`revalidate_task_bound_for_effect`] runs: that function's only
+/// other caller is `DaemonComposition::commit_canonical_and_refresh`, which
+/// itself has zero production call sites (see this module's "Measured
+/// reachability" section), so nothing here substitutes for it. No caller was
+/// invented to close the gap.
 #[allow(
     clippy::too_many_arguments,
     reason = "revalidation joins the sealed identity against every live owner value that can invalidate it in one fail-closed edge"
