@@ -434,6 +434,19 @@ pub struct TaskControllerClaimedInvocation {
     pub authenticated_peer_sha256: String,
     pub operation_id: OperationId,
     pub attempt: TaskControllerAttempt,
+    /// Kernel-selected, ORS-validated first-setup predecessor for a genuine
+    /// task-free BindScope action. Ordinary task actions carry no value.
+    pub initial_setup_authority: Option<InitialWorkScopeClaimAuthority>,
+}
+
+/// Exact Kernel-retained Policy lineage and its deterministic WorkScope
+/// successor causal binding. The record is evidence only; callers still
+/// verify the signed setup envelope through the independent Installation
+/// trust anchor before using its source approval.
+#[derive(Clone, Debug)]
+pub struct InitialWorkScopeClaimAuthority {
+    pub record: eliot_ors::InitialSetupAuthorityRecord,
+    pub work_scope_causal: eliot_receipts::CausalBinding,
 }
 
 /// Typed outcome of one `task_controller_result` submit.
@@ -573,6 +586,14 @@ pub fn parse_task_controller_claimed_pair(
     attempt
         .validate()
         .map_err(|error| format!("Kernel Task Controller attempt is invalid: {error}"))?;
+    let initial_setup_authority = serde_json::from_value::<
+        Option<(eliot_ors::InitialSetupAuthorityRecord, eliot_receipts::CausalBinding)>,
+    >(decode("initial_setup_authority")?)
+    .map_err(|error| format!("Kernel initial setup authority does not decode: {error}"))?
+    .map(|(record, work_scope_causal)| InitialWorkScopeClaimAuthority {
+        record,
+        work_scope_causal,
+    });
 
     let tool_name = tool.get("name").and_then(serde_json::Value::as_str);
     let tool_invocation = tool
@@ -624,8 +645,53 @@ pub fn parse_task_controller_claimed_pair(
         || attempt.state_fence != envelope.state_fence
         || attempt.authority_epoch != envelope.state_fence.authority_epoch
         || attempt.expires_at_unix_ms != envelope.identity.deadline_unix_ms
+        || task_free_bind != initial_setup_authority.is_some()
     {
         return Err("Kernel Task Controller pair does not bind its admitted envelope".to_owned());
+    }
+    if let Some(bundle) = &initial_setup_authority {
+        bundle
+            .record
+            .validate()
+            .map_err(|error| format!("Kernel initial setup authority is invalid: {error}"))?;
+        let record = &bundle.record;
+        let policy_receipt = record
+            .policy_write_receipt
+            .as_ref()
+            .ok_or_else(|| "Kernel initial setup authority lacks committed Policy receipt".to_owned())?;
+        let policy_envelope = policy_receipt
+            .envelope
+            .as_ref()
+            .ok_or_else(|| "Kernel Policy receipt lacks its canonical envelope".to_owned())?;
+        let expected_sequence = policy_envelope
+            .core
+            .causal
+            .transaction_sequence
+            .value()
+            .checked_add(1)
+            .ok_or_else(|| "Kernel Policy causal sequence is exhausted".to_owned())?;
+        let receipt_id = &policy_envelope.identity.receipt_id;
+        let policy_identity: RequestIdentity = serde_json::from_str(&record.policy_request_identity_json)
+            .map_err(|_| "Kernel setup Policy RequestIdentity is invalid".to_owned())?;
+        policy_identity
+            .validate()
+            .map_err(|_| "Kernel setup Policy RequestIdentity failed validation".to_owned())?;
+        if record.phase != eliot_ors::InitialSetupAuthorityPhase::PolicyCommitted
+            || record.state_fence != envelope.state_fence
+            || policy_receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+            || policy_receipt.state_fence != envelope.state_fence
+            || policy_identity.request.state_fence != envelope.state_fence
+            || policy_identity.request.metadata.state_fence != envelope.state_fence
+            || policy_identity.request.metadata.product_id != request_identity.request.metadata.product_id
+            || policy_identity.request.metadata.source_id != request_identity.request.metadata.source_id
+            || policy_identity.request.metadata.session_id != request_identity.request.metadata.session_id
+            || bundle.work_scope_causal.state_fence != envelope.state_fence
+            || bundle.work_scope_causal.transaction_sequence.value() != expected_sequence
+            || bundle.work_scope_causal.parent_receipt_id.as_ref() != Some(receipt_id)
+            || bundle.work_scope_causal.predecessor_receipt_ids.as_slice() != [receipt_id]
+        {
+            return Err("Kernel initial setup authority does not match the claimed BindScope".to_owned());
+        }
     }
     Ok(Some(TaskControllerClaimedInvocation {
         invocation,
@@ -636,6 +702,7 @@ pub fn parse_task_controller_claimed_pair(
         authenticated_peer_sha256,
         operation_id,
         attempt,
+        initial_setup_authority,
     }))
 }
 
