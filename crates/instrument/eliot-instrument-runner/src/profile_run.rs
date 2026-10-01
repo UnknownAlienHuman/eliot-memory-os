@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use eliot_contracts::{ClockReading, ModuleRuntimeClass, StateFence, sha256_hex};
+use eliot_contracts::{ClockReading, ModuleRuntimeClass, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_instrument_api::{
     BuildClass, ExecutionStatus, InstrumentAdmissionGrant, InstrumentAdmissionRequest,
     InstrumentInvocation, InstrumentKind, TARGET_LAYOUT_REVISION, VerificationOutcome,
@@ -34,8 +34,11 @@ use eliot_instrument_api::{
 use eliot_process::{
     DurableProcessStreamSource, DurableStreamRepresentation, ExitDisposition, ProcessEvidence,
     ProcessEvidenceSink, ProcessExecutionBinding, ProcessExecutor, ProcessLifecycle,
-    ProcessRequest, ProcessStreamEvidence, ProcessStreamKind, StreamPersistenceStatus,
-    StreamTransportStatus,
+    ProcessRequest, ProcessStartReceipt, ProcessStreamEvidence, ProcessStreamKind,
+    ProcessStreamPolicyBinding, StreamPersistenceStatus, StreamTransportStatus,
+};
+use eliot_blob_api::verification_wire::{
+    VerificationStageBinding, VerificationStageGrantProjection, VerificationStageSourceOwnerProof,
 };
 use eliot_process_executor::ExecutableObservation;
 use serde::{Deserialize, Serialize};
@@ -455,14 +458,40 @@ pub struct RetainedProcessStreamIdentity {
     binding: ProcessExecutionBinding,
     /// Original immutable source admitted by the process evidence.
     source: DurableProcessStreamSource,
+    /// Exact policy identity the process owner bound to this stream.
+    policy: ProcessStreamPolicyBinding,
     /// Canonical identity digest of the original raw process stream evidence.
     evidence_digest: String,
+    /// SHA-256 of the original canonical ProcessExecutionBinding.
+    process_binding_sha256: String,
+    /// Per-chunk offsets, hashes, and independently retained owner readback proofs.
+    chunks: Vec<RetainedStreamReadbackChunkProof>,
     /// Owner-issued receipt for this exact readback.
     readback_receipt_id: String,
     /// Current owner-authorized fence the readback satisfied.
     readback_fence: StateFence,
     /// Clock observed by the readback owner.
     readback_observed_at: ClockReading,
+}
+
+/// Persisted metadata for one verified immutable-source readback chunk.
+///
+/// Parser bytes remain ephemeral. The run retains each exact range/hash and
+/// the Store proof returned for that range so later receipt validation can
+/// verify complete coverage without persisting tool output.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedStreamReadbackChunkProof {
+    /// First byte offset in the immutable source.
+    pub offset: u64,
+    /// Exact number of bytes returned for this chunk.
+    pub byte_length: u64,
+    /// SHA-256 of the exact ephemeral bytes consumed by the parser.
+    pub chunk_sha256: String,
+    /// Exact current Store-owner proof returned with the chunk.
+    pub owner_proof: Box<VerificationStageSourceOwnerProof>,
+    /// Canonical digest of `owner_proof`.
+    pub owner_proof_sha256: String,
 }
 
 impl RetainedProcessStreamIdentity {
@@ -486,6 +515,21 @@ impl RetainedProcessStreamIdentity {
         &self.evidence_digest
     }
 
+    /// Returns the canonical digest of the original process binding.
+    pub fn process_binding_sha256(&self) -> &str {
+        &self.process_binding_sha256
+    }
+
+    /// Returns the exact process-stream policy binding.
+    pub const fn policy(&self) -> &ProcessStreamPolicyBinding {
+        &self.policy
+    }
+
+    /// Returns every per-chunk owner proof, in byte order.
+    pub fn chunks(&self) -> &[RetainedStreamReadbackChunkProof] {
+        &self.chunks
+    }
+
     /// Returns the owner-issued readback receipt identity.
     pub fn readback_receipt_id(&self) -> &str {
         &self.readback_receipt_id
@@ -507,31 +551,139 @@ impl RetainedProcessStreamIdentity {
     pub fn is_complete_owner_readback(&self) -> bool {
         self.source.representation() == DurableStreamRepresentation::ExactTransportBytes
             && validate_digest(&self.evidence_digest, "evidence_digest").is_ok()
+            && validate_digest(&self.process_binding_sha256, "process_binding_sha256").is_ok()
             && validate_text(&self.readback_receipt_id, "readback_receipt_id").is_ok()
             && self.readback_fence.validate().is_ok()
             && self.readback_observed_at.validate().is_ok()
+            && self.chunks_cover_source()
+    }
+
+    /// Builds an identity only from a complete ordered set of owner proofs.
+    pub fn from_verified_chunks(
+        stream: ProcessStreamKind,
+        binding: ProcessExecutionBinding,
+        source: DurableProcessStreamSource,
+        policy: ProcessStreamPolicyBinding,
+        evidence_digest: String,
+        process_binding_sha256: String,
+        chunks: Vec<RetainedStreamReadbackChunkProof>,
+    ) -> Result<Self, ProfileRunError> {
+        validate_digest(&evidence_digest, "evidence_digest")?;
+        validate_digest(&process_binding_sha256, "process_binding_sha256")?;
+        if source.representation() != DurableStreamRepresentation::ExactTransportBytes
+            || chunks.is_empty()
+        {
+            return Err(ProfileRunError::IncompleteStreamSource { stream: "source" });
+        }
+        let last = chunks.last().ok_or(ProfileRunError::IncompleteStreamSource {
+            stream: "source",
+        })?;
+        let observed_at_i64 = i64::try_from(last.owner_proof.observed_at_unix_ms).map_err(|_| {
+            ProfileRunError::InvalidReadbackIdentity {
+                field: "readback_observed_at",
+            }
+        })?;
+        let readback_observed_at = ClockReading {
+            valid_time_ms: Some(observed_at_i64),
+            known_time_ms: Some(observed_at_i64),
+            transaction_sequence: None,
+            monotonic_ns: None,
+        };
+        let value = Self {
+            stream,
+            binding,
+            source,
+            policy,
+            evidence_digest,
+            process_binding_sha256,
+            readback_receipt_id: last.owner_proof.readback_receipt_id.clone(),
+            readback_fence: last.owner_proof.observed_fence.clone(),
+            readback_observed_at,
+            chunks,
+        };
+        if !value.is_complete_owner_readback() {
+            return Err(ProfileRunError::InvalidReadbackIdentity {
+                field: "complete_owner_readback",
+            });
+        }
+        Ok(value)
+    }
+
+    fn chunks_cover_source(&self) -> bool {
+        let Some((last_index, _)) = self.chunks.iter().enumerate().last() else {
+            return false;
+        };
+        let first = &self.chunks[0].owner_proof;
+        let mut next_offset = 0_u64;
+        let mut last_observed_at = 0_u64;
+        let mut receipts = BTreeSet::new();
+        for (index, chunk) in self.chunks.iter().enumerate() {
+            let proof = &chunk.owner_proof;
+            if chunk.offset != next_offset
+                || validate_digest(&chunk.chunk_sha256, "chunk_sha256").is_err()
+                || validate_digest(&chunk.owner_proof_sha256, "owner_proof_sha256").is_err()
+                || proof.validate().is_err()
+                || proof
+                    .digest()
+                    .map_or(true, |digest| digest != chunk.owner_proof_sha256)
+                || proof.source_owner_generation != first.source_owner_generation
+                || proof.source_key != first.source_key
+                || proof.stage_grant_sha256 != first.stage_grant_sha256
+                || proof.process_binding_sha256 != first.process_binding_sha256
+                || proof.ready_receipt_sha256 != first.ready_receipt_sha256
+                || proof.scope_binding_sha256 != first.scope_binding_sha256
+                || proof.policy_binding_sha256 != first.policy_binding_sha256
+                || proof.scope_binding_json != first.scope_binding_json
+                || proof.policy_binding_json != first.policy_binding_json
+                || proof.observed_at_unix_ms < last_observed_at
+                || !receipts.insert(proof.readback_receipt_id.as_str())
+                || (chunk.byte_length == 0
+                    && !(self.source.byte_length() == 0 && self.chunks.len() == 1))
+            {
+                return false;
+            }
+            last_observed_at = proof.observed_at_unix_ms;
+            next_offset = next_offset.saturating_add(chunk.byte_length);
+            if index < last_index && next_offset >= self.source.byte_length() {
+                return false;
+            }
+        }
+        next_offset == self.source.byte_length()
+            && self.readback_receipt_id == self.chunks[last_index].owner_proof.readback_receipt_id
+            && self.readback_fence == self.chunks[last_index].owner_proof.observed_fence
+            && self
+                .readback_observed_at
+                .valid_time_ms
+                .is_some_and(|time| u64::try_from(time).ok() == Some(last_observed_at))
     }
 
     /// Canonical digest over this exact source and its owner readback proof.
     #[must_use]
     pub fn digest(&self) -> String {
-        sha256_hex(
-            format!(
-                "{:?}\0{:?}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{:?}\0{:?}",
-                self.stream,
-                serde_json::to_string(&self.binding).unwrap_or_default(),
-                self.source.kind(),
-                self.source.locator(),
-                self.source.ready_receipt_ref(),
-                self.source.sha256(),
-                self.source.byte_length(),
-                self.readback_receipt_id,
-                self.evidence_digest,
-                self.readback_fence,
-                self.readback_observed_at,
-            )
-            .as_bytes(),
-        )
+        let mut material = format!(
+            "{:?}\0{:?}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{:?}\0{:?}",
+            self.stream,
+            serde_json::to_string(&self.binding).unwrap_or_default(),
+            self.source.kind(),
+            self.source.locator(),
+            self.source.ready_receipt_ref(),
+            self.source.sha256(),
+            self.source.byte_length(),
+            serde_json::to_string(&self.policy).unwrap_or_default(),
+            self.process_binding_sha256,
+            self.readback_receipt_id,
+            self.evidence_digest,
+            self.readback_fence,
+            self.readback_observed_at,
+        );
+        for chunk in &self.chunks {
+            let _ = write!(
+                material,
+                "\0{}\0{}\0{}\0{}",
+                chunk.offset, chunk.byte_length, chunk.chunk_sha256, chunk.owner_proof_sha256
+            );
+        }
+        sha256_hex(material.as_bytes())
     }
 
 }
@@ -579,9 +731,11 @@ impl StageTerminalEvaluation {
         let mut seen = BTreeSet::new();
         for stream in &streams {
             validate_digest(&stream.evidence_digest, "evidence_digest")?;
+            validate_digest(&stream.process_binding_sha256, "process_binding_sha256")?;
             validate_text(&stream.readback_receipt_id, "readback_receipt_id")?;
             if stream.readback_fence.validate().is_err()
                 || stream.readback_observed_at.validate().is_err()
+                || !stream.is_complete_owner_readback()
             {
                 return Err(ProfileRunError::InvalidReadbackIdentity {
                     field: "readback_observation",
@@ -788,7 +942,8 @@ impl RetainedToolIdentity {
 /// directory and output roots sealed from the launch request). Workspace
 /// and checkout identities are recorded only when issued to this boundary;
 /// they are never inferred from branch names, paths, or caller strings.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StageTargetLayout {
     /// Layout derivation revision in force at launch.
     pub layout_revision: u32,
@@ -805,6 +960,73 @@ pub struct StageTargetLayout {
     pub target_root_observed: Option<String>,
     /// `CARGO_HOME` sealed from the launch request, when carried.
     pub cache_root_observed: Option<String>,
+}
+
+/// Kernel-owned stage grant and its server-computed commitment.
+///
+/// This is separate from [`InstrumentRun::profile_admission_grant_digest`], which records only
+/// local profile/spec admission. The Kernel projection carries the retained
+/// process operation, original binding, current scope/policy/fence and grant
+/// lifetime issued by the authenticated ProfileResolver owner.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KernelStageGrantEvidence {
+    /// Read-only grant projection returned from retained Kernel admission.
+    pub projection: VerificationStageGrantProjection,
+    /// Kernel-computed canonical commitment to `projection`.
+    pub grant_sha256: String,
+}
+
+impl KernelStageGrantEvidence {
+    /// Validates and retains one exact Kernel stage grant projection.
+    pub fn new(
+        projection: VerificationStageGrantProjection,
+        grant_sha256: String,
+    ) -> Result<Self, ProfileRunError> {
+        projection
+            .validate()
+            .map_err(|_| ProfileRunError::InvalidReadbackIdentity {
+                field: "kernel_stage_grant",
+            })?;
+        validate_digest(&grant_sha256, "kernel_stage_grant_sha256")?;
+        if projection
+            .digest()
+            .map_or(true, |digest| digest != grant_sha256)
+        {
+            return Err(ProfileRunError::InvalidReadbackIdentity {
+                field: "kernel_stage_grant_sha256",
+            });
+        }
+        Ok(Self {
+            projection,
+            grant_sha256,
+        })
+    }
+
+    /// Validates the grant against the exact wire alias, planned stage, and process binding.
+    pub fn validates_for(
+        &self,
+        planned: &PlannedStage,
+        process: &ProcessEvidence,
+        process_binding_sha256: &str,
+        kernel_profile_id: &str,
+        expected_binding: &VerificationStageBinding,
+    ) -> bool {
+        let projection = &self.projection;
+        projection.validate().is_ok()
+            && projection.digest().is_ok_and(|digest| digest == self.grant_sha256)
+            && &projection.binding == expected_binding
+            && projection.binding.profile_id == kernel_profile_id
+            && projection.binding.profile_revision == planned.route.stage().profile_revision
+            && projection.binding.stage_id == planned.route.stage().stage_id
+            && projection.process_operation_id == process.operation_id().as_str()
+            && projection.process_binding_sha256 == process_binding_sha256
+            && projection.execution_ref.trim().len() > 0
+            && process.binding().state_fence().authority_epoch()
+                == &projection.state_fence.authority_epoch
+            && process.binding().state_fence().generation().get()
+                == projection.state_fence.resource_generation.value()
+    }
 }
 
 impl StageTargetLayout {
@@ -848,13 +1070,32 @@ pub struct InstrumentRun {
     pub verification: Option<VerificationOutcome>,
     /// Machine-derived executable identity digest, when observed.
     pub executable_digest: Option<String>,
-    /// Process grant digest sealed by pre-launch admission, when admitted.
+    /// Local profile-admission grant digest, distinct from the Kernel process grant.
     ///
     /// The digest binds the matched spec revision, profile revision, and
     /// parser generation (I10.8.3): a run that never passed admission
     /// carries no grant. It travels into the aggregate digest so a changed
     /// executable/argument combination can never reuse an earlier receipt.
-    pub grant_digest: Option<String>,
+    pub profile_admission_grant_digest: Option<String>,
+    /// Authenticated Kernel-owned ProfileResolver stage grant, distinct from
+    /// the local profile admission grant above.
+    pub kernel_stage_grant: Option<KernelStageGrantEvidence>,
+    /// Exact closed route alias bound by the Kernel grant.
+    pub kernel_profile_id: Option<String>,
+    /// Exact original ProcessStartReceipt returned by Kernel after resume.
+    pub kernel_process_start_receipt: Option<ProcessStartReceipt>,
+    /// Exact Kernel-retained binding for this profile-stage process.
+    ///
+    /// It remains available when launch or lifecycle is unresolved, unlike
+    /// reconciled `ProcessEvidence`, and is always separate from the local
+    /// profile-admission grant.
+    pub kernel_process_binding: Option<ProcessExecutionBinding>,
+    /// SHA-256 of the exact canonical Kernel ProcessExecutionBinding bytes.
+    pub kernel_process_binding_sha256: Option<String>,
+    /// SHA-256 of the canonical original ProcessStartReceipt bytes.
+    pub kernel_process_start_receipt_sha256: Option<String>,
+    /// Kernel observation time for the exact accepted start receipt.
+    pub kernel_start_observed_at_unix_ms: Option<u64>,
     /// Exact process evidence returned by reconciliation after terminal
     /// supervision. This retains the launch binding, terminal process view,
     /// and original raw stdout/stderr evidence alongside the grant digest.
@@ -863,6 +1104,14 @@ pub struct InstrumentRun {
     /// Most recent exact executor observation retained when supervision did
     /// not reach reconciliation, or the reconciled terminal view otherwise.
     pub last_process_observation: Option<eliot_process::ProcessExecutionView>,
+    /// Kernel observation time for the latest exact view retained above.
+    pub last_process_observation_at_unix_ms: Option<u64>,
+    /// SHA-256 of the exact canonical latest Kernel process view.
+    pub last_process_observation_sha256: Option<String>,
+    /// Kernel observation time for terminal reconciliation.
+    pub terminal_reconciled_at_unix_ms: Option<u64>,
+    /// SHA-256 of the exact canonical Kernel-reconciled ProcessEvidence.
+    pub kernel_terminal_process_evidence_sha256: Option<String>,
     /// Candidate/configuration identity inherited from the stage plan, when
     /// this run belongs to a candidate-bound plan.
     pub candidate_identity: Option<String>,
@@ -920,7 +1169,7 @@ impl InstrumentRun {
     /// The digest is still VALIDATED rather than trusted for its spelling, and a
     /// malformed observation fails closed into an explicit missing proof instead
     /// of a launched run claiming an identity no producer observed. The grant
-    /// remains recorded as `grant_digest`; a grant whose `content_digest`
+    /// remains recorded as `profile_admission_grant_digest`; a grant whose `content_digest`
     /// disagrees with the observation is refused rather than preferred, because
     /// the observation is the later, measured fact.
     fn launched_observed(
@@ -955,9 +1204,20 @@ impl InstrumentRun {
             },
             verification: None,
             executable_digest: Some(observed_executable_digest.to_owned()),
-            grant_digest: Some(grant.grant_digest.clone()),
+            profile_admission_grant_digest: Some(grant.grant_digest.clone()),
+            kernel_stage_grant: None,
+            kernel_profile_id: None,
+            kernel_process_start_receipt: None,
+            kernel_process_binding: None,
+            kernel_process_binding_sha256: None,
+            kernel_process_start_receipt_sha256: None,
+            kernel_start_observed_at_unix_ms: None,
             terminal_process_evidence: None,
             last_process_observation: None,
+            last_process_observation_at_unix_ms: None,
+            last_process_observation_sha256: None,
+            terminal_reconciled_at_unix_ms: None,
+            kernel_terminal_process_evidence_sha256: None,
             candidate_identity: None,
             target_layout,
         })
@@ -1015,9 +1275,20 @@ impl InstrumentRun {
             },
             verification: None,
             executable_digest: None,
-            grant_digest: None,
+            profile_admission_grant_digest: None,
+            kernel_stage_grant: None,
+            kernel_profile_id: None,
+            kernel_process_start_receipt: None,
+            kernel_process_binding: None,
+            kernel_process_binding_sha256: None,
+            kernel_process_start_receipt_sha256: None,
+            kernel_start_observed_at_unix_ms: None,
             terminal_process_evidence: None,
             last_process_observation: None,
+            last_process_observation_at_unix_ms: None,
+            last_process_observation_sha256: None,
+            terminal_reconciled_at_unix_ms: None,
+            kernel_terminal_process_evidence_sha256: None,
             candidate_identity: None,
             target_layout: None,
         }
@@ -1063,9 +1334,20 @@ impl InstrumentRun {
             },
             verification: None,
             executable_digest: Some(executable_digest),
-            grant_digest: Some(grant.grant_digest.clone()),
+            profile_admission_grant_digest: Some(grant.grant_digest.clone()),
+            kernel_stage_grant: None,
+            kernel_profile_id: None,
+            kernel_process_start_receipt: None,
+            kernel_process_binding: None,
+            kernel_process_binding_sha256: None,
+            kernel_process_start_receipt_sha256: None,
+            kernel_start_observed_at_unix_ms: None,
             terminal_process_evidence: None,
             last_process_observation: None,
+            last_process_observation_at_unix_ms: None,
+            last_process_observation_sha256: None,
+            terminal_reconciled_at_unix_ms: None,
+            kernel_terminal_process_evidence_sha256: None,
             candidate_identity: None,
             target_layout,
         })
@@ -1109,7 +1391,7 @@ impl InstrumentRun {
             && self.is_success()
     }
 
-    fn adopt_terminal_evaluation(
+    pub(crate) fn adopt_terminal_evaluation(
         &mut self,
         execution: ExecutionStatus,
         process: &ProcessEvidence,
@@ -1171,9 +1453,10 @@ impl InstrumentRun {
             return false;
         };
         if self
-            .grant_digest
+            .profile_admission_grant_digest
             .as_deref()
-            .is_none_or(|digest| validate_digest(digest, "grant_digest").is_err())
+            .is_none_or(|digest| validate_digest(digest, "profile_admission_grant_digest").is_err())
+            || !self.kernel_start_and_grant_match(process, tool)
             || process.validate().is_err()
             || process.operation_id().as_str() != operation_id
             || process.view().lifecycle() != ProcessLifecycle::Exited
@@ -1190,7 +1473,119 @@ impl InstrumentRun {
             && tool.exit.code == Some(0)
             && stream_identity_matches(stdout, process.stdout())
             && stream_identity_matches(stderr, process.stderr())
+            && self.kernel_stage_grant.as_ref().is_some_and(|grant| {
+                owner_readbacks_match_grant(
+                    grant,
+                    stdout,
+                    stderr,
+                    self.terminal_reconciled_at_unix_ms,
+                )
+            })
     }
+
+    fn kernel_start_and_grant_match(
+        &self,
+        process: &ProcessEvidence,
+        tool: &RetainedToolIdentity,
+    ) -> bool {
+        let (
+            Some(grant),
+            Some(start),
+            Some(start_digest),
+            Some(start_observed),
+            Some(terminal_at),
+        ) = (
+            self.kernel_stage_grant.as_ref(),
+            self.kernel_process_start_receipt.as_ref(),
+            self.kernel_process_start_receipt_sha256.as_deref(),
+            self.kernel_start_observed_at_unix_ms,
+            self.terminal_reconciled_at_unix_ms,
+        )
+        else {
+            return false;
+        };
+        let start_hash = canonical_json_bytes(start)
+            .ok()
+            .map(|bytes| sha256_hex(&bytes));
+        let process_binding_hash = canonical_json_bytes(process.binding())
+            .ok()
+            .map(|bytes| sha256_hex(&bytes));
+        let observation_hash = self
+            .last_process_observation
+            .as_ref()
+            .and_then(|view| canonical_json_bytes(view).ok())
+            .map(|bytes| sha256_hex(&bytes));
+        let terminal_evidence_hash = canonical_json_bytes(process)
+            .ok()
+            .map(|bytes| sha256_hex(&bytes));
+        let argv_hash = canonical_json_bytes(&tool.arguments)
+            .ok()
+            .map(|bytes| sha256_hex(&bytes));
+        let source_root_hash = self
+            .target_layout
+            .as_ref()
+            .map(|layout| sha256_hex(layout.working_directory_observed.as_bytes()));
+        start.validate().is_ok()
+            && self.kernel_process_binding.as_ref() == Some(process.binding())
+            && self.kernel_process_binding_sha256.as_deref()
+                == process_binding_hash.as_deref()
+            && start.binding() == process.binding()
+            && start.operation_id().as_str() == process.operation_id().as_str()
+            && start_hash.as_deref() == Some(start_digest)
+            && process_binding_hash.as_deref()
+                == Some(grant.projection.process_binding_sha256.as_str())
+            && grant.projection.process_operation_id == process.operation_id().as_str()
+            && self.kernel_profile_id.as_deref()
+                == Some(grant.projection.binding.profile_id.as_str())
+            && grant.projection.binding.profile_revision == self.stage.profile_revision
+            && grant.projection.binding.stage_id == self.stage.stage_id
+            && grant.projection.binding.tool_sha256
+                == self.executable_digest.as_deref().unwrap_or_default()
+            && grant.projection.binding.argv_sha256.as_str() == argv_hash.as_deref().unwrap_or_default()
+            && grant.projection.binding.environment_sha256 == tool.environment_digest
+            && Some(grant.projection.binding.source_root_identity_sha256.as_str())
+                == source_root_hash.as_deref().map(String::as_str)
+            && process.binding().state_fence().authority_epoch()
+                == &grant.projection.state_fence.authority_epoch
+            && process.binding().state_fence().generation().get()
+                == grant.projection.state_fence.resource_generation.value()
+            && start_observed >= grant.projection.issued_at_unix_ms
+            && start_observed <= grant.projection.expires_at_unix_ms
+            && terminal_at >= start_observed
+            && terminal_at <= grant.projection.expires_at_unix_ms
+            && self.last_process_observation_at_unix_ms == Some(terminal_at)
+            && self.last_process_observation_sha256.as_deref()
+                == observation_hash.as_deref()
+            && self.kernel_terminal_process_evidence_sha256.as_deref()
+                == terminal_evidence_hash.as_deref()
+    }
+}
+
+fn owner_readbacks_match_grant(
+    grant: &KernelStageGrantEvidence,
+    stdout: &RetainedProcessStreamIdentity,
+    stderr: &RetainedProcessStreamIdentity,
+    terminal_at: Option<u64>,
+) -> bool {
+    let projection = &grant.projection;
+    let Some(terminal_at) = terminal_at else {
+        return false;
+    };
+    [stdout, stderr].into_iter().all(|stream| {
+        !stream.chunks.is_empty()
+            && stream.chunks.iter().all(|chunk| {
+                let proof = &chunk.owner_proof;
+                proof.scope_binding_json == projection.scope_binding_json
+                    && proof.scope_binding_sha256 == projection.scope_binding_sha256
+                    && proof.policy_binding_json == projection.policy_binding_json
+                    && proof.policy_binding_sha256 == projection.policy_binding_sha256
+                    && proof.observed_fence == projection.state_fence
+                    && proof.stage_grant_sha256 == grant.grant_sha256
+                    && proof.process_binding_sha256 == stream.process_binding_sha256
+                    && proof.observed_at_unix_ms >= terminal_at
+                    && proof.observed_at_unix_ms <= projection.expires_at_unix_ms
+            })
+    })
 }
 
 /// Confirms that one owner readback identity preserves its exact raw stream.
@@ -1206,6 +1601,7 @@ fn stream_identity_matches(
     };
     evidence.stream() == identity.stream
         && evidence.binding() == identity.binding()
+        && evidence.policy() == identity.policy()
         && identity.is_complete_owner_readback()
         && source == &identity.source
         && evidence.transport() == StreamTransportStatus::Complete
@@ -1386,7 +1782,70 @@ impl ProfileAggregate {
             material.push('\0');
             material.push_str(run.executable_digest.as_deref().unwrap_or(""));
             material.push('\0');
-            material.push_str(run.grant_digest.as_deref().unwrap_or(""));
+            material.push_str(
+                run.profile_admission_grant_digest
+                    .as_deref()
+                    .unwrap_or(""),
+            );
+            material.push('\0');
+            material.push_str(run.kernel_profile_id.as_deref().unwrap_or(""));
+            material.push('\0');
+            if let Some(grant) = &run.kernel_stage_grant {
+                material.push_str(&grant.grant_sha256);
+                material.push('\0');
+            }
+            material.push_str(
+                run.kernel_process_binding_sha256
+                    .as_deref()
+                    .unwrap_or_default(),
+            );
+            material.push('\0');
+            if let Some(binding) = &run.kernel_process_binding {
+                if let Ok(bytes) = canonical_json_bytes(binding) {
+                    material.push_str(&sha256_hex(&bytes));
+                }
+            }
+            if let Some(start) = &run.kernel_process_start_receipt {
+                if let Ok(bytes) = canonical_json_bytes(start) {
+                    material.push_str(&sha256_hex(&bytes));
+                }
+            }
+            material.push_str(
+                &run
+                    .kernel_process_start_receipt_sha256
+                    .as_deref()
+                    .unwrap_or_default(),
+            );
+            material.push('\0');
+            material.push_str(
+                &run
+                    .kernel_start_observed_at_unix_ms
+                    .map_or_else(String::new, |value| value.to_string()),
+            );
+            material.push('\0');
+            material.push_str(
+                &run
+                    .last_process_observation_at_unix_ms
+                    .map_or_else(String::new, |value| value.to_string()),
+            );
+            material.push('\0');
+            material.push_str(
+                run.last_process_observation_sha256
+                    .as_deref()
+                    .unwrap_or_default(),
+            );
+            material.push('\0');
+            material.push_str(
+                &run
+                    .terminal_reconciled_at_unix_ms
+                    .map_or_else(String::new, |value| value.to_string()),
+            );
+            material.push('\0');
+            material.push_str(
+                run.kernel_terminal_process_evidence_sha256
+                    .as_deref()
+                    .unwrap_or_default(),
+            );
             material.push('\0');
             if let Some(process) = &run.terminal_process_evidence {
                 // `ProcessEvidence` is a validated, serializable owner DTO.
