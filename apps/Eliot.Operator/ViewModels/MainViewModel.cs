@@ -529,7 +529,13 @@ public sealed class MainViewModel : INotifyPropertyChanged
 
         try
         {
-            retained.Request.Validate();
+            // Current-shape only: the superseded shape returned above. The
+            // derived key, the retained key and the journal OperationId must
+            // all name the same operation — the retained-key equality was
+            // checked above, and this checks the derived key against the
+            // retained bytes — so a replacement operation kept under an old
+            // identity is refused before transport.
+            retained.Request.ValidateCurrentIdentity();
         }
         catch (InvalidOperationException error)
         {
@@ -718,7 +724,9 @@ public sealed class MainViewModel : INotifyPropertyChanged
         // so the retained identity and the wire identity cannot diverge and
         // the key is minted exactly once.
         var request = UserAutomationOperatorRequest.Create(operation);
-        request.Validate();
+        // Fresh output of `Create` carries the digest of its own bytes; the
+        // current-identity check pins that binding at mint time.
+        request.ValidateCurrentIdentity();
         var pending = new OperatorPendingOperation(
             request.IdempotencyKey,
             OperatorMutationRoute.UserAutomation,

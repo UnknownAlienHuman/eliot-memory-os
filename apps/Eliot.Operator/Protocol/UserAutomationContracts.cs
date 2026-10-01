@@ -234,6 +234,28 @@ public sealed record UserAutomationOperatorRequest(
         Operation.Validate();
         OperatorIntentContract.RequireOperationId(IdempotencyKey);
     }
+
+    /// Validates the CURRENT-shape identity binding: the operation decodes
+    /// through today's closed contract, the key is syntactically valid, and
+    /// the key is exactly the digest today's serializer derives from those
+    /// same canonical operation bytes.
+    ///
+    /// This is the sendable-identity invariant. It is required of fresh
+    /// `Create` output, at the live transport boundary and for current-shape
+    /// recovery, so a corrupted or edited journal entry cannot travel under
+    /// an identity that names a different operation. It must never be
+    /// applied to a superseded-shape retained record: that key was derived
+    /// from bytes that included the old local classifier, so recomputing it
+    /// under today's serializer names a different request commitment, and
+    /// the record stays withheld under its exact retained key.
+    public void ValidateCurrentIdentity()
+    {
+        Validate();
+        if (!string.Equals(IdempotencyKey, DeriveIdempotencyKey(Operation), StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("idempotency_key does not name the retained typed operation.");
+        }
+    }
 }
 
 /// One typed UserAutomation request read from a retained user-local envelope,
@@ -366,6 +388,19 @@ public sealed record UserAutomationRetainedRequest(
         using var canonical = JsonDocument.Parse(
             JsonSerializer.Serialize(superseded.Operation, OperatorJson.Writer));
         RequireSameMembersAndValues(operation, canonical.RootElement, classifier);
+        // The retained classifier must equal the locally derived classifier
+        // for the same typed operation: the superseded serializer wrote the
+        // live value of `IsEffect()`, so a disagreeing Boolean is not output
+        // of that serializer and is refused here rather than classified as
+        // the known legacy shape. The value stays non-authoritative recovery
+        // metadata — routing re-derives `IsEffect()` from the typed
+        // operation — and the record remains unsendable either way.
+        if (superseded.Operation is null
+            || classifier.GetBoolean() != superseded.Operation.IsEffect())
+        {
+            throw new InvalidOperationException(
+                "retained UserAutomation operation carries a local classifier the superseded serializer could not have produced");
+        }
         return new UserAutomationRetainedRequest(
             superseded,
             CarriesSupersededLocalClassifier: true);
