@@ -33,11 +33,15 @@
 use std::num::NonZeroU64;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
+use eliot_contracts::{
+    ArtifactId, ContractId, ContractIdentity, ContractVersion, EpochId, EpochLineageId,
+    ResourceGeneration, StateFence, sha256_hex,
+};
 use eliot_dreamer_claim_grounding::GroundingRequest;
 use eliot_dreamer_contracts::ScreenBinding;
 use eliot_dreamer_contracts::grounding::{GroundedDreamDraft, StructuredModelDraft};
 use eliot_dreamer_curation::{NativeCurationPort, NativeCurationPortSet};
+use eliot_dreamer_orientation::OrientationDisposition;
 
 use crate::admitted_material::{admission_of, validation_input_for};
 use crate::controller::verify_admitted_binding;
@@ -54,6 +58,7 @@ use crate::kernel_port::{
     ClaimTransport, DREAMER_JOB_WIRE_ID, DispatchGrant, KernelPortError, ValidatedDreamerMaterial,
 };
 use crate::model_stage::{resolve_model_inputs, run_admitted_model};
+use crate::production_orientation::CC004_MISSING;
 use crate::result_stage::{project_result_view, render_jsonl};
 use crate::validation_stage::{resolve_validation_inputs, validate_admitted_draft};
 use crate::{
@@ -64,7 +69,7 @@ use crate::{
 use eliot_dreamer_contracts::validation::structured::{
     GroundingValidationInput, ValidatedGroundingCandidate,
 };
-use eliot_protocol::dreamer_job::{DurableJobRequest, JobOperation, JobRole};
+use eliot_protocol::dreamer_job::{DurableJobRequest, JobOperation, JobRole, OpaqueContentRef};
 
 const TEST_LINEAGE_E2E: &str = "550e8400-e29b-41d4-a716-446655440000";
 const SCOPE_E2E: &str = "scope-e2e";
@@ -164,9 +169,17 @@ fn validate_through_model(
     (request, validated)
 }
 
-/// Orientation passes the full owned pipeline: genuine owner calls at every
-/// stage, a native packet out of dispatch, and a single-line JSONL receipt
-/// that round-trips to the identical view.
+/// Orientation threads the admitted stages and lands on the typed production
+/// pulse result. The Governor supply channel is absent in this binary, so the
+/// documented terminal state is the `Blocked` disposition carrying no packet —
+/// `production_orientation`'s module contract (issue #2901) keeps
+/// `supply_missing_blocked` as the result "whenever it is reached at all".
+/// The result edge is still proved: the blocked pulse renders through the
+/// Slice-8 edge to one JSONL line that round-trips to the identical view.
+///
+/// The case NAME predates #4407/#4470, which deleted the packet-only
+/// compatibility seam and made CC-002/CC-004 mandatory; production Orientation
+/// can no longer return `DreamResult::Packet`.
 #[test]
 fn orientation_pipeline_threads_screen_to_packet_receipt() {
     let admission = admitted_admission("job-e2e-orientation");
@@ -192,25 +205,34 @@ fn orientation_pipeline_threads_screen_to_packet_receipt() {
         Some(&validated),
         Some(PipelineOrientationRecords::new(&grounding, &validated)),
     );
-    let Ok(DreamResult::Packet(packet)) = result else {
-        panic!("orientation dispatch must project, got {result:?}");
+    let Ok(DreamResult::Orientation(pulse)) = result else {
+        panic!("orientation dispatch must return the typed pulse result, got {result:?}");
     };
-    assert_eq!(packet.packet_id.len(), 64);
-    let canonical = admission_of(&admission, &job)
-        .expect("e2e admission must derive")
-        .canonical_id();
-    assert_eq!(packet.job_id, canonical);
-    assert_eq!(packet.question, job.exact_question);
-    assert_eq!(packet.scope_id, SCOPE_E2E);
-    assert_eq!(packet.source_coverage.evidence, job.evidence_handles);
-    assert_eq!(packet.synthesized_interpretations.len(), 1);
-    // G4: exactly the two owner residue markers travel as rival entries.
-    assert_eq!(packet.rival_models_and_dissent.len(), 2);
-    let job_id = packet.job_id.clone();
+    assert_eq!(
+        pulse.disposition,
+        OrientationDisposition::Blocked,
+        "with no Governor supply channel the pulse must block"
+    );
+    assert!(
+        pulse.packet.is_none(),
+        "the blocked pulse must carry no packet, got {:?}",
+        pulse.packet
+    );
+    assert_eq!(
+        pulse.projections.reason.as_deref(),
+        Some(CC004_MISSING),
+        "the absent canonical projection set must be named"
+    );
+    assert!(pulse.model_outcome.present);
+    // The refused pulse still carries the admitted identity verbatim.
+    assert_eq!(pulse.job_id, admission.job_id);
+    assert_eq!(pulse.scope_id, SCOPE_E2E);
+    assert_eq!(pulse.state_fence, job.state_fence);
+    let job_id = pulse.job_id.clone();
     let view = project_result_view(
         &job_id,
         JobState::Completed,
-        Some(DreamResult::Packet(packet)),
+        Some(DreamResult::Orientation(pulse)),
     );
     let line = render_jsonl(&view).expect("receipt must render");
     assert!(!line.contains('\n'), "receipt must be exactly one line");
@@ -303,25 +325,33 @@ fn curation_pipeline_routes_a31_without_class_refusal() {
 
 /// The exact admitted chain `submit` executes past the bundle plan-factor for
 /// Orientation: one call proves screen, model, grounding, validation, and
-/// native dispatch run in canonical order to a packet result. (`submit`
-/// itself additionally needs the Slice-2 controller/bundle gates and a live
-/// Kernel transport, so the chain — the same function `submit` calls — is
-/// the provable unit in-process.)
+/// native dispatch run in canonical order to the typed pulse result, which the
+/// absent Governor supply channel leaves `Blocked` and packet-free
+/// (`production_orientation`'s module contract, issue #2901). The Slice-8 edge
+/// still projects the view and proves the single-line JSONL round-trip.
+///
+/// The case NAME predates #4407/#4470, which deleted the packet-only
+/// compatibility seam and made CC-002/CC-004 mandatory.
 #[test]
 fn submit_chain_returns_orientation_packet_with_jsonl() {
     let admission = admitted_admission("job-e2e-chain-orientation");
     let job = job_with_handles("job-e2e-chain-orientation", JobClass::Orientation);
     let result = run_admitted_pipeline(&admission, &job, None, None);
-    let Ok(DreamResult::Packet(packet)) = result else {
-        panic!("submit chain must project orientation, got {result:?}");
+    let Ok(DreamResult::Orientation(pulse)) = result else {
+        panic!("submit chain must return the typed orientation pulse, got {result:?}");
     };
-    assert_eq!(packet.scope_id, SCOPE_E2E);
-    assert_eq!(packet.source_coverage.evidence, job.evidence_handles);
-    let job_id = packet.job_id.clone();
+    assert_eq!(pulse.disposition, OrientationDisposition::Blocked);
+    assert!(pulse.packet.is_none());
+    assert_eq!(
+        pulse.projections.reason.as_deref(),
+        Some(CC004_MISSING)
+    );
+    assert_eq!(pulse.scope_id, SCOPE_E2E);
+    let job_id = pulse.job_id.clone();
     let view = project_result_view(
         &job_id,
         JobState::Completed,
-        Some(DreamResult::Packet(packet)),
+        Some(DreamResult::Orientation(pulse)),
     );
     let line = render_jsonl(&view).expect("chain receipt must render");
     assert!(!line.contains('\n'), "chain receipt must be one JSONL line");
@@ -653,6 +683,38 @@ fn submit_material(job_id: &str) -> ValidatedDreamerMaterial {
     }
 }
 
+/// Claim material that also stages the semantic-input reference and its
+/// original inline bytes.
+///
+/// `submit_material` deliberately stages neither, and every caller that only
+/// needs to reach a refusal is correct to leave them absent: `status_once` and
+/// `claim_once` both fail closed on `SemanticInputUnavailable`, which is the
+/// point of those proofs. A test that must observe the live success tail has to
+/// stage them instead, because `kernel_port::validate_owner_response_binding`
+/// requires the staged reference AND the Kernel reply to agree exactly —
+/// "a record present on one side only is a stale owner record, not an empty
+/// one". The digest and byte length here are the owner's own recorded values
+/// for these exact bytes, not invented constants.
+fn staged_material(job_id: &str) -> ValidatedDreamerMaterial {
+    let bytes = format!("e2e staged semantic input for {job_id}").into_bytes();
+    let mut material = submit_material(job_id);
+    material.semantic_input = Some(OpaqueContentRef {
+        contract: ContractIdentity {
+            name: ContractId::new("eliot.dreamer.e2e-input").expect("canonical test contract"),
+            version: ContractVersion::new(1, 0, 0),
+            shape_sha256: "1".repeat(64),
+        },
+        source_revision: format!("{job_id}-source-1"),
+        byte_length: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        sha256: sha256_hex(&bytes),
+        artifact_id: Some(
+            ArtifactId::new(format!("{job_id}-semantic-input")).expect("canonical test artifact"),
+        ),
+    });
+    material.semantic_input_bytes = Some(bytes);
+    material
+}
+
 /// Kernel admission mirroring the claim material exactly — job, scope, fence,
 /// and idempotency key match, and the deadline stays live — so only stage
 /// gates (never identity) can refuse the submit path.
@@ -881,25 +943,29 @@ fn submit_orientation_stops_at_controller_gate() {
 /// then answers the live-tail `STATUS` observation by echoing the submitted
 /// request — never hardcoded job ids.
 ///
-/// Mirrors the `kernel_port.rs` fake's `STATUS` answer shape (`RUNNING` state,
-/// null disposition, null receipt) but derives every binding from the decoded
-/// request: job/attempt/revision echo the `Status` operation, the fence echoes
-/// the operation fence, and the lease pins the echoed attempt under the echoed
-/// generation with a fresh wall-clock pin. The scope id rides from the test
-/// material (the `Status` operation carries no scope field, so there is
-/// nothing to echo); every other binding is request-derived. Any non-`STATUS`
-/// kind fails closed: `submit`'s live tail only ever sends `STATUS`.
+/// The staged semantic-input reference and its inline bytes are the one thing
+/// the `STATUS` operation itself does not carry, so they are echoed from the
+/// same claim material the port was built from rather than from the operation.
+/// `kernel_port::validate_owner_response_binding` re-proves both sides against
+/// that one recorded reference, so the transport must return exactly what was
+/// staged: a reply that carried a different reference, or none, is a stale
+/// owner record and the port must fail closed.
 struct SuccessClaimTransport {
     scope_id: String,
+    semantic_input: Option<OpaqueContentRef>,
+    semantic_input_bytes: Option<Vec<u8>>,
 }
 
 impl SuccessClaimTransport {
-    /// Binds the scope the echoed `STATUS` reply projects: the `Status`
-    /// operation carries job/attempt/revision/fence but no scope, so the
-    /// material scope travels here instead of being invented per reply.
-    fn for_scope(scope_id: &str) -> Self {
+    /// Binds the scope the echoed `STATUS` reply projects and the semantic-input
+    /// reference the claim staged. The `Status` operation carries job/attempt/
+    /// revision/fence but no scope and no semantic input, so both ride from the
+    /// staged material instead of being invented per reply.
+    fn for_material(material: &ValidatedDreamerMaterial) -> Self {
         Self {
-            scope_id: scope_id.to_owned(),
+            scope_id: material.scope_id.clone(),
+            semantic_input: material.semantic_input.clone(),
+            semantic_input_bytes: material.semantic_input_bytes.clone(),
         }
     }
 
@@ -999,6 +1065,8 @@ impl SuccessClaimTransport {
             "request_identity": identity_json,
             "job_id": job_id.as_str(),
             "attempt_id": attempt_id.as_str(),
+            "semantic_input": self.semantic_input,
+            "semantic_input_bytes": self.semantic_input_bytes,
             "scope": {
                 "scope_id": self.scope_id.as_str(),
                 "product_id": product_id,
@@ -1050,17 +1118,23 @@ impl ClaimTransport for SuccessClaimTransport {
 /// Curation result attached. The closed-transport twin proves the fail-closed
 /// tail; this test proves the success tail on the same code production
 /// executes.
+///
+/// The claim must stage the semantic-input reference (`staged_material`), and
+/// the echo transport must return it, because `status_once` refuses a claim
+/// that staged none and `validate_owner_response_binding` treats a one-sided
+/// reference as stale. `submit_material` stages neither on purpose, which is
+/// why the fail-closed twins keep using it.
 #[test]
 fn submit_curation_with_source_succeeds_with_curation_result_view() {
     let job_id = "job-e2e-submit-curation-live";
-    let material = submit_material(job_id);
+    let material = staged_material(job_id);
     let admission = submit_admission(&material);
     let job = single_target_job(job_id);
     let source = TestCarrierSource::new();
     let mut port = AuthenticatedKernelJobPort::for_test(
         material.clone(),
         admission.clone(),
-        Box::new(SuccessClaimTransport::for_scope(&material.scope_id)),
+        Box::new(SuccessClaimTransport::for_material(&material)),
         Some(&source),
         None,
     )

@@ -71,8 +71,8 @@ use eliot_dreamer_curation::{
     ValidatedCurationBatch, route_validated_curation,
 };
 use eliot_dreamer_orientation::{
-    AdmittedOrientationJob, LocalOrientationFrame, OrientationError, OrientationPolicy,
-    projection::OrientationPacketCandidate,
+    AdmittedOrientationJob, LocalOrientationFrame, OrientationDisposition, OrientationError,
+    OrientationPolicy, projection::OrientationPacketCandidate,
 };
 
 use crate::admitted_material::{
@@ -1965,11 +1965,27 @@ mod slice_7_native_owner_tests {
         }
     }
 
-    /// Orientation genuinely projects from the admitted pair: the structured
-    /// A-05 receipt is proved at the dispatch gate, then the v1 hypothesis
-    /// pair validates through the real v1 A-05 entry, the owner
-    /// `build_projection` succeeds, packet identity bindings travel verbatim,
-    /// and the G4 residues are preserved in `rival_models_and_dissent`.
+    /// Orientation dispatch returns the typed production pulse result, and with
+    /// the Governor supply channel absent it is `Blocked` with no packet.
+    ///
+    /// The case NAME is historical. It was written when production Orientation
+    /// still returned `DreamResult::Packet`; #4407 deleted the packet-only
+    /// compatibility seam and #4470 made the CC-002/CC-004 boundaries
+    /// mandatory, so `DreamResult::Packet` is no longer reachable from the
+    /// production Orientation arm. The governing contract is
+    /// `production_orientation`'s module doc (issue #2901): the carrier keeps
+    /// returning `supply_missing_blocked` "carrying no packet, `CC004_MISSING`
+    /// on the CC-004 boundary record, and `missing_owners` naming the canonical
+    /// projection owner plus every stage owner", and "no stage runs from a
+    /// caller-built lookalike". This case therefore asserts THAT contract: the
+    /// blocked disposition, the absent packet, the wired-and-committed CC-002
+    /// boundary beside the absent CC-004 one, and the named owner set.
+    ///
+    /// COVERAGE NOTE: the G4 marker-preservation assertions this case used to
+    /// make cannot survive the change, because `map_orientation_packet` is only
+    /// reached from a complete pulse and no complete pulse is constructible
+    /// without the owner channel. They are not restated here rather than
+    /// restated against a lookalike.
     #[test]
     fn orientation_projects_packet_with_g4_preserved() {
         let admission = admission();
@@ -1983,55 +1999,43 @@ mod slice_7_native_owner_tests {
             Some(&validated),
             Some(PipelineOrientationRecords::new(&grounding, &validated)),
         );
-        let Ok(DreamResult::Packet(packet)) = result else {
-            panic!("orientation must project, got {result:?}");
+        let Ok(DreamResult::Orientation(pulse)) = result else {
+            panic!("orientation must return the typed pulse result, got {result:?}");
         };
-        assert_eq!(packet.packet_id.len(), 64);
-        assert_eq!(packet.question, QUESTION);
-        assert_eq!(packet.scope_id, SCOPE);
-        assert_eq!(packet.state_fence, job.state_fence);
-        assert_eq!(packet.source_coverage.evidence, job.evidence_handles);
-        assert_eq!(packet.source_coverage.memory, job.memory_handles);
-        assert_eq!(
-            packet.source_coverage.architecture,
-            job.architecture_handles
-        );
-        assert_eq!(
-            packet.source_coverage.implementation,
-            job.implementation_handles
-        );
-        assert_eq!(packet.source_coverage.conformance, job.conformance_handles);
-        assert_eq!(packet.synthesized_interpretations.len(), 1);
-        let interpretation = &packet.synthesized_interpretations[0];
-        assert_eq!(interpretation.statement, QUESTION);
-        assert_eq!(interpretation.support_handles, job.evidence_handles);
-        assert_eq!(interpretation.epistemic_status, "candidate_only");
-        // ABSOLUTE G4 RULE: the admitted model carries no counterevidence
-        // text, so the rival list is exactly the two owner residue texts —
-        // neither marker dropped nor thinned.
-        assert_eq!(
-            packet.rival_models_and_dissent.len(),
-            2,
-            "rival list must carry exactly both residue markers, got {:?}",
-            packet.rival_models_and_dissent
-        );
-        // The four screening-side families are accounted as omissions and
-        // surface as unknowns, never silently dropped.
-        assert_eq!(
-            packet.unknowns_and_gaps.len(),
-            4,
-            "unknowns must account the four omitted families, got {:?}",
-            packet.unknowns_and_gaps
-        );
-        assert_eq!(
-            packet.recommended_probes_or_next_actions,
-            Vec::<String>::new()
-        );
-        assert_eq!(packet.invalidation_conditions, vec![CONFLICT.to_owned()]);
+        assert_eq!(pulse.disposition, OrientationDisposition::Blocked);
+        assert_eq!(pulse.proof_ceiling, crate::pulse::CEILING_BLOCKED);
         assert!(
-            packet.provenance.contains(&OPERATION.to_owned()),
-            "provenance must carry the projection-input proof, got {:?}",
-            packet.provenance
+            pulse.packet.is_none(),
+            "an absent owner channel must never project a packet, got {:?}",
+            pulse.packet
+        );
+        // CC-002 is wired in-binary: dispatch measured the admitted route, so
+        // the boundary is present, committed, and carries no missing reason.
+        assert_eq!(pulse.model_outcome.boundary, "cc002_model_route");
+        assert!(pulse.model_outcome.present);
+        assert!(pulse.model_outcome.commitment.is_some());
+        assert!(pulse.model_outcome.reason.is_none());
+        // CC-004 is the absent boundary, and it says so with the static code.
+        assert_eq!(pulse.projections.boundary, "cc004_canonical_projections");
+        assert!(!pulse.projections.present);
+        assert_eq!(
+            pulse.projections.reason.as_deref(),
+            Some(crate::production_orientation::CC004_MISSING)
+        );
+        // The admitted identity travels on the refusal verbatim.
+        assert_eq!(pulse.job_id, admission.job_id);
+        assert_eq!(pulse.scope_id, SCOPE);
+        assert_eq!(pulse.state_fence, job.state_fence);
+        // The absent owner set is named, never synthesized.
+        assert!(
+            !pulse.missing_owners.is_empty(),
+            "the blocked result must name the owners it could not read"
+        );
+        assert!(
+            pulse
+                .omissions
+                .contains(&crate::production_orientation::CC004_MISSING.to_owned()),
+            "the absent canonical projection set must be recorded as an omission"
         );
     }
 
@@ -2266,20 +2270,31 @@ mod slice_7_native_owner_tests {
 
     /// Curation with a valid batch but an empty port set reaches the genuine
     /// A-31 port boundary: descriptors resolve from the real closed registry,
-    /// registry/policy/screen validate for real, and the terminal refusal
-    /// names the missing Governor-injected live ports with the precise
+    /// registry/policy/screen/protection validate for real, and the terminal
+    /// refusal names the missing Governor-injected live ports with the precise
     /// reason — never `UnsupportedJobClass`.
+    ///
+    /// The owner protection assessment is derived from the same screened binding
+    /// the carrier was built against (`protection_for_admitted` is exactly what
+    /// `run_admitted_pipeline` hands `dispatch_curation` in production). Passing
+    /// `None` here would refuse earlier, at `CURATION_PROTECTION_REFUSAL`, and
+    /// this case's subject — the live-port boundary behind the carrier — would
+    /// never be reached.
     #[test]
     fn curation_empty_ports_carrier_reaches_port_boundary() {
         let harness = harness_for_fixture();
+        let admission = admission();
+        let job = semantic_job(JobClass::Curation);
+        let screen = valid_screen();
+        let protection = crate::curation_screen_stage::protection_for_admitted(&job, &screen);
         let carrier = CurationExecutionCarrier {
             batch: harness.batch().clone(),
             ports: NativeCurationPortSet { ports: Vec::new() },
         };
         let refused = dispatch_admitted(
-            &admission(),
-            &semantic_job(JobClass::Curation),
-            carriers(Some(carrier), Some(valid_screen()), None),
+            &admission,
+            &job,
+            carriers(Some(carrier), Some(screen), Some(protection)),
             JobClass::Curation,
             None,
             // Unconstructible for Curation, not merely omitted: the A-05 gate
@@ -2314,16 +2329,25 @@ mod slice_7_native_owner_tests {
     /// handler and result digest, the candidate-only ceiling, and denominator
     /// provenance; the result then renders through the Slice-8 edge to one
     /// JSONL line that round-trips to the identical view.
+    ///
+    /// The owner protection assessment is derived from the same screened binding
+    /// the harness batch was built against — exactly what `run_admitted_pipeline`
+    /// hands `dispatch_curation` in production — so this case reaches the route
+    /// instead of refusing at `CURATION_PROTECTION_REFUSAL`.
     #[test]
     fn curation_success_routes_accepted_candidate_with_provenance() {
         use crate::result_stage::{project_result_view, render_jsonl};
         use crate::{JobState, JobView};
 
         let harness = harness_for_fixture();
+        let admission = admission();
+        let job = semantic_job(JobClass::Curation);
+        let screen = valid_screen();
+        let protection = crate::curation_screen_stage::protection_for_admitted(&job, &screen);
         let result = dispatch_admitted(
-            &admission(),
-            &semantic_job(JobClass::Curation),
-            carriers(Some(harness.carrier()), Some(valid_screen()), None),
+            &admission,
+            &job,
+            carriers(Some(harness.carrier()), Some(screen), Some(protection)),
             JobClass::Curation,
             None,
             // Unconstructible for Curation, not merely omitted: the A-05 gate
