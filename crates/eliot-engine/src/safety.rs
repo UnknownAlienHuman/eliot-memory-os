@@ -736,6 +736,39 @@ impl RestoreService {
                 "restore evidence does not authorize rollback of this target",
             ));
         }
+        // A success-shaped status is an effect claim, so it cannot stand without the
+        // exact action binding that was approved for the restore itself.
+        if restore_report
+            .receipt
+            .exact_action_hash
+            .as_deref()
+            .is_none_or(str::is_empty)
+        {
+            return Err(service_error(
+                "restore_rollback",
+                "restore evidence claims a performed restore without an exact action binding",
+            ));
+        }
+        // A dry-run receipt describes verification, never an executed restore.
+        if restore_report.receipt.dry_run {
+            return Err(service_error(
+                "restore_rollback",
+                "dry-run restore evidence cannot stand for an executed restore",
+            ));
+        }
+        // Deserialization is not owner issuance. The receipt is admitted only when it is
+        // bound to the owner-issued planned action hash, never against a copy of its own
+        // field.
+        let planned_action_hash = restore_report.plan.exact_action_hash.as_deref();
+        if restore_report.receipt.restore_plan_id != restore_report.plan.restore_plan_id
+            || planned_action_hash.is_none_or(str::is_empty)
+            || restore_report.receipt.exact_action_hash.as_deref() != planned_action_hash
+        {
+            return Err(service_error(
+                "restore_rollback",
+                "restore evidence action binding is not the owner-issued planned restore action hash",
+            ));
+        }
         let evidence_checksum = checksum_file(&evidence)?;
         let exact_action_hash = rollback_action_hash(target, &evidence_checksum.digest_hex)?;
         let quarantine = rollback_quarantine_path(target, &exact_action_hash)?;
