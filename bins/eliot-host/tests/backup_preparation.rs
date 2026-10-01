@@ -27,6 +27,8 @@ use eliot_host::backup_preparation::{
     cleanup_preparations, derive_destination_epoch, derive_destination_id,
     prepare_isolated_destination, reconcile_preparation,
 };
+#[cfg(windows)]
+use eliot_platform_windows::test_support::override_protected_root;
 use serde_json::Value;
 
 const LINEAGE_958: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -377,6 +379,10 @@ fn valid_admitted_destination_prepares() {
     let (source_root, sentinel) = source_tree("05");
     let before = sentinel_bytes(&sentinel);
     let parent = isolated_root("05", "staging");
+    // Bounded-test contour: the owner containment-checks the staging parent,
+    // so select the documented disposable-root override (test_support).
+    #[cfg(windows)]
+    let _contour = override_protected_root(&std::env::temp_dir());
     let admission =
         admission_from_fixture("destination-admission-valid.json", &source_root, &parent);
     assert_eq!(admission.operation_id, "op-958-dest-05");
@@ -411,6 +417,10 @@ fn source_active_and_foreign_destinations_rejected() {
     }
     let (source_root, _) = source_tree("06");
     let parent = isolated_root("06", "staging");
+    // Bounded-test contour: the owner containment-checks the staging parent,
+    // so select the documented disposable-root override (test_support).
+    #[cfg(windows)]
+    let _contour = override_protected_root(&std::env::temp_dir());
     let mut journal = MemJournal::default();
     // Staging parent IS the source root: active installation refused.
     let active = admission("op-958-active", &source_root, &source_root);
@@ -552,6 +562,10 @@ fn alias_substitution_refused_and_identity_pinned() {
     }
     let (source_root, _) = source_tree("08");
     let parent = isolated_root("08", "staging");
+    // Bounded-test contour: the owner containment-checks the staging parent,
+    // so select the documented disposable-root override (test_support).
+    #[cfg(windows)]
+    let _contour = override_protected_root(&std::env::temp_dir());
     let mut journal = MemJournal::default();
     // A symlinked staging parent is an alias substitution, refused before
     // any destination effect. Symlink creation needs privilege: when the
@@ -716,6 +730,10 @@ fn no_implicit_source_shutdown_or_replacement() {
     let before = sentinel_bytes(&sentinel);
     let before_meta = std::fs::metadata(&sentinel).expect("meta");
     let parent = isolated_root("11", "staging");
+    // Bounded-test contour: the owner containment-checks the staging parent,
+    // so select the documented disposable-root override (test_support).
+    #[cfg(windows)]
+    let _contour = override_protected_root(&std::env::temp_dir());
     let mut journal = MemJournal::default();
     prepare_isolated_destination(
         &mut journal,
@@ -749,6 +767,10 @@ fn exact_repeat_returns_same_destination() {
     }
     let (source_root, _) = source_tree("12");
     let parent = isolated_root("12", "staging");
+    // Bounded-test contour: the owner containment-checks the staging parent,
+    // so select the documented disposable-root override (test_support).
+    #[cfg(windows)]
+    let _contour = override_protected_root(&std::env::temp_dir());
     let mut journal = MemJournal::default();
     let first = prepare_isolated_destination(
         &mut journal,
@@ -786,6 +808,10 @@ fn changed_same_operation_input_conflicts_by_field() {
     }
     let (source_root, _) = source_tree("13");
     let parent = isolated_root("13", "staging");
+    // Bounded-test contour: the owner containment-checks the staging parent,
+    // so select the documented disposable-root override (test_support).
+    #[cfg(windows)]
+    let _contour = override_protected_root(&std::env::temp_dir());
     let mut journal = MemJournal::default();
     prepare_isolated_destination(
         &mut journal,
@@ -822,6 +848,10 @@ fn lost_response_reconciles_before_retry() {
     }
     let (source_root, _) = source_tree("14");
     let parent = isolated_root("14", "staging");
+    // Bounded-test contour: the owner containment-checks the staging parent,
+    // so select the documented disposable-root override (test_support).
+    #[cfg(windows)]
+    let _contour = override_protected_root(&std::env::temp_dir());
     // Fresh operation with no record reconciles Absent: retry may proceed.
     let mut journal = MemJournal::default();
     assert_eq!(
@@ -888,6 +918,10 @@ fn cancellation_cleanup_preserves_source_and_unknown() {
     let (source_root, sentinel) = source_tree("15");
     let before = sentinel_bytes(&sentinel);
     let parent = isolated_root("15", "staging");
+    // Bounded-test contour: the owner containment-checks the staging parent,
+    // so select the documented disposable-root override (test_support).
+    #[cfg(windows)]
+    let _contour = override_protected_root(&std::env::temp_dir());
     let mut journal = MemJournal::default();
     let prepared = prepare_isolated_destination(
         &mut journal,
@@ -998,6 +1032,10 @@ fn real_windows_isolated_root_preparation_and_cleanup() {
         ),
         "non-protected root yields no owner evidence"
     );
+    // Bounded-test contour from here on: the owner containment-checks the
+    // staging parent, so select the documented disposable-root override.
+    #[cfg(windows)]
+    let _contour = override_protected_root(&std::env::temp_dir());
     let mut journal = MemJournal::default();
     let prepared = prepare_isolated_destination(
         &mut journal,
@@ -1072,6 +1110,10 @@ fn preparation_guard_excludes_registry_restore_and_cutover() {
     // Recursive listing before and after: preparation adds exactly one
     // destination directory under the staging parent, nothing in source.
     let parent = isolated_root("18", "staging");
+    // Bounded-test contour: the owner containment-checks the staging parent,
+    // so select the documented disposable-root override (test_support).
+    #[cfg(windows)]
+    let _contour = override_protected_root(&std::env::temp_dir());
     let source_before = listing(&source_root);
     let mut journal = MemJournal::default();
     prepare_isolated_destination(

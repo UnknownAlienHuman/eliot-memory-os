@@ -47,6 +47,7 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage
 [dev-dependencies]
 eliot-host-state = { workspace = true, features = ["test-support"] }
 eliot-installation = { workspace = true, features = ["test-support"] }
+eliot-platform-windows = { workspace = true, features = ["test-support"] }
 
 [lints.rust]
 # SAFETY-OWNERSHIP: SCM-entry exception, see docs/ADR/0014-unsafe-ownership-and-exceptions.md#row-eliot-host (canonical owner eliot-platform-windows).
