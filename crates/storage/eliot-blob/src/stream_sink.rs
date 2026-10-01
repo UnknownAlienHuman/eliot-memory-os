@@ -19,7 +19,17 @@
 //!   returns the same session; a different digest is `OpenDigestMismatch`.
 //! * `append` admits exact sequence/offset chunks into a staging buffer
 //!   bounded by the session ceilings, with exact-replay acknowledgement and
-//!   an explicit backpressure contract. Appends never touch storage.
+//!   an explicit backpressure contract. Appends never touch storage, never
+//!   wait and never retry.
+//! * Backpressure isolation (issue #267 W5): the RETAINED bytes this session
+//!   will keep and the QUEUED / IN-FLIGHT bytes it is holding right now are
+//!   two separate accountings against two separate declared ceilings, and both
+//!   are enforced. See [`PersistenceQueueBound`].
+//! * The declared overflow disposition is `Backpressured`: a full persistence
+//!   queue REFUSES the append, stages nothing and charges nothing, and the
+//!   caller applies backpressure at its own end. This adapter holds no wait
+//!   on the append path, so persistence pressure can never stall the pipe
+//!   drain.
 //! * `finalize` publishes only a gap-free, transport-complete source through
 //!   one durable stage call, verifies the ready receipt, reads the object
 //!   back, and only then mints the `COMPLETE_SOURCE` terminal. Anything else
@@ -74,6 +84,16 @@
 //! recoverable. The append-only temporary object that removes this window
 //! entirely is the #297 path named below.
 //!
+//! Shed bytes are never coverage (issue #267 W5). An append refused by the
+//! persistence-queue ceiling is refused BEFORE anything is charged: it does
+//! not reach `staged`, does not feed the transport digest or the preview, and
+//! advances neither `next_sequence` nor `next_offset`. So a shed byte cannot
+//! appear in the admitted digest, the admitted count, the published object or
+//! any measure, and a session that shed is only ever publishable if its own
+//! caller declared the matching gap. Bytes that are dropped are recorded by
+//! the caller as `StreamEvidenceGap::PersistenceBackpressure`; this adapter
+//! never mints a terminal that calls them covered.
+//!
 //! Publication coverage (audit `5881613195`): a terminal is always the one
 //! [`BlobStreamPublication`] the session actually proved. A gapped,
 //! policy-prohibited or failed-redaction finalize never calls the owner at
@@ -81,6 +101,32 @@
 //! failed-redaction terminal is additionally forbidden from carrying any
 //! inline preview by the shared terminal-evidence invariant, so a raw
 //! pre-policy preview can never reach the durable record.
+//!
+//! Transformation binding (issue #267 W7): this adapter applies NO byte-level
+//! transformation. It normalizes nothing, decodes nothing, re-encodes nothing,
+//! inserts no header or length prefix and joins no chunk boundary by rewriting
+//! bytes — admitted chunks are staged verbatim and their SHA-256 is the
+//! transport digest. The only byte-touching derivations are the two digests the
+//! owner needs: BLAKE3 over the staged bytes for the store's content identity
+//! ([`BlobStoreStreamSink::stage_request`]) and SHA-256 over them for the
+//! ready-receipt and readback commitment.
+//!
+//! Because it holds no transformed bytes it can never OBSERVE a transformation's
+//! output, so it refuses every terminal command that declares one
+//! ([`refuse_transformation`]) instead of recording an unverified output digest.
+//! A raw pre-policy preview therefore cannot reach the durable record through
+//! this adapter in either direction: transformed output is refused outright, and
+//! a policy-prohibited or failed-redaction terminal cannot carry an inline
+//! preview at all.
+//!
+//! Owner boundary still open elsewhere: the transformer producer contract — the
+//! owner that would stage transformed bytes together with their exact
+//! input/output receipt — does not exist. `ProcessStreamTransformationBinding`
+//! already carries the receipt, policy and redaction references the process
+//! contract needs; what is missing is a caller that produces transformed bytes
+//! and an append-shaped way to stage them under the one bound blob operation
+//! identity (issue #297). No policy identifier or transformation enum was
+//! invented here to fill that gap.
 //!
 //! Owner boundary still open elsewhere: the append-only *temporary* object
 //! required by I10.8.5 needs an `append`-shaped operation on the one blob
@@ -265,6 +311,15 @@ pub enum BlobStreamUnavailableReason {
 /// contract; the ready receipt reference resolves and verifies the object.
 const BLOB_SOURCE_LOCATOR_SCHEME: &str = "blob";
 
+/// Serialized size of one `u64` field in a queue record.
+///
+/// A canonical serialization carries the value's decimal text, but the byte
+/// width of the slot is used here as the FIXED per-record overhead, so the
+/// charge is a floor: it can only understate a real digest string, and a real
+/// digest string is added on top of it exactly. This is not a new limit — it
+/// is the width of a field the record already has.
+const U64_SERIALIZED_BYTES: u64 = 8;
+
 /// Store-side identities bound once for one sink session.
 ///
 /// The composition owner supplies the one root lease, one stage context
@@ -355,11 +410,12 @@ struct SinkState {
     /// running digest. It stops filling at the session preview ceiling, so the
     /// preview cost is bounded independently of the staged plaintext.
     preview: BoundedPreviewDigest,
-    /// Declared admissible-source identity. `None` until a terminal command
-    /// declares a transformation; the exact-transport default then describes
-    /// the admitted stream itself.
-    admissible_source: Option<BlobStreamAdmissibleSourceMeasure>,
     admitted_chunks: Vec<AdmittedChunk>,
+    /// The QUEUED / IN-FLIGHT half of the accounting, independent of the
+    /// RETAINED half (`next_offset` against `max_total_admitted_bytes`).
+    /// See [`PersistenceQueueBound`] for what each side bounds and why the
+    /// overflow disposition is a refusal rather than a block.
+    persistence_queue: PersistenceQueueBound,
     next_sequence: u64,
     next_offset: u64,
     terminal: Option<ProcessStreamSinkTerminal>,
@@ -402,15 +458,15 @@ struct BoundedPreviewDigest {
     truncated_at_ceiling: bool,
 }
 
-/// Admissible-source byte count/digest after the declared policy transformation.
+/// Admissible-source byte count/digest — the exact bytes this adapter stages.
 ///
-/// It is a different quantity from the transport measure: only bytes the policy
-/// admits count. When no transformation is declared the admissible source is the
-/// admitted transport stream itself and the two measures are one measure over
-/// one byte set; when a transformation is declared its output identity is the
-/// caller's exact input/output receipt, never a digest derived by transforming
-/// the transport digest. Bytes the policy rejected are never fed to it and never
-/// staged.
+/// This adapter stages the admitted transport stream verbatim and refuses any
+/// command declaring a policy transformation (see [`refuse_transformation`]), so
+/// the admissible source is always `ExactTransportBytes`: one measure over the
+/// admitted byte set, identical in value to the transport measure and never a
+/// digest derived by transforming it. The `representation` field stays because
+/// the process contract's preview coordinates are expressed against it, but
+/// `PolicyTransformed` is not a value this adapter can produce.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlobStreamAdmissibleSourceMeasure {
     /// Relationship between this source and the physical transport bytes.
@@ -423,11 +479,80 @@ pub struct BlobStreamAdmissibleSourceMeasure {
     pub sha256: String,
 }
 
+/// One admitted chunk's queue metadata — no plaintext.
+///
+/// A record is what the persistence queue holds *beside* the plaintext: a
+/// sequence, an offset, the exact byte length and the caller's per-chunk
+/// digest string. It is why `max_in_flight_chunks` bounds records rather than
+/// a claim, and it is why the in-flight byte charge is a serialization size
+/// and not a `Vec::len()`: `Vec::len()` counts one chunk's payload only, and
+/// is blind to this record and to the same bytes already copied into
+/// [`SinkState::staged`].
 struct AdmittedChunk {
     sequence: u64,
     offset: u64,
     length: u64,
     sha256: String,
+}
+
+/// The two INDEPENDENT accountings this adapter now keeps for one session.
+///
+/// They are deliberately separate quantities and neither is derived from the
+/// other, because "bytes the sink will KEEP" and "bytes the sink is HOLDING
+/// right now on behalf of persistence" have different ceilings and different
+/// failure modes:
+///
+/// * **RETAINED** is the caller-supplied `max_total_admitted_bytes`. It is
+///   what the terminal's coverage claim rests on, and it is charged against
+///   `next_offset` — a monotone cursor that never runs back down, so a
+///   released byte is never re-spendable and the total over a session's life
+///   is bounded by the session, not by instantaneous occupancy.
+/// * **QUEUED / IN-FLIGHT** is the declared `max_in_flight_chunks` and
+///   `max_in_flight_bytes`. It is charged when an append is admitted and
+///   released when the session's terminal is recorded. Until then the charge
+///   is real memory this adapter is holding, so a full queue refuses the
+///   *next* append immediately instead of waiting for room to appear.
+///
+/// The overflow disposition is `ProcessStreamSinkAppendDisposition::
+/// Backpressured`: the append is REFUSED, nothing is staged, and the caller
+/// applies backpressure at its own end and records the shed byte range as a
+/// `StreamEvidenceGap`. This adapter never blocks, never sleeps, never retries
+/// and never queues behind a provider call, so a full persistence queue
+/// cannot stall the pipe drain.
+///
+/// Every dimension here is a ceiling this crate already READS from the
+/// session (`ProcessStreamSinkLimits::max_in_flight_chunks` and
+/// `::max_in_flight_bytes`), both of which the #296 constructor already
+/// rejects at zero. No numeric limit is invented by this adapter.
+struct PersistenceQueueBound {
+    /// Queued/in-flight chunk records currently charged.
+    queued_chunks: u32,
+    /// Queued/in-flight bytes currently charged, measured as a serialization
+    /// size (see [`PersistenceQueueBound::record_bytes`]).
+    queued_bytes: u64,
+    /// Latched once a queued/in-flight ceiling refused an append. It is never
+    /// cleared, so once the persistence queue has overflowed every later
+    /// append sheds too and the pipe keeps draining at full speed. Latching
+    /// is what makes "cannot stall indefinitely" structural rather than a
+    /// property of the caller noticing to stop retrying.
+    overflowed: bool,
+}
+
+impl PersistenceQueueBound {
+    /// Serialization size of one chunk's queue metadata plus its payload.
+    ///
+    /// The four `u64` slots are charged at their byte width (see
+    /// [`U64_SERIALIZED_BYTES`]) and the digest at its exact hex length, so
+    /// the fixed part is a floor rather than an over-count. A longer digest
+    /// only ever RAISES the charge, so this can never under-count what the
+    /// record really costs.
+    fn record_bytes(length: u64, sha256_hex_len: usize) -> u64 {
+        // The fixed fields are the sequence, the offset, the length and the
+        // retained digest's own length — four `u64` slots.
+        let fixed = 4 * U64_SERIALIZED_BYTES;
+        let digest = u64::try_from(sha256_hex_len).unwrap_or(u64::MAX);
+        fixed.saturating_add(digest).saturating_add(length)
+    }
 }
 
 /// Bounded phase record for the one terminal command of one session.
@@ -632,8 +757,12 @@ impl SinkState {
             publication: None,
             transport: TransportDigest::new(),
             preview: BoundedPreviewDigest::new(),
-            admissible_source: None,
             admitted_chunks: Vec::new(),
+            persistence_queue: PersistenceQueueBound {
+                queued_chunks: 0,
+                queued_bytes: 0,
+                overflowed: false,
+            },
             next_sequence: 0,
             next_offset: 0,
             terminal: None,
@@ -650,20 +779,19 @@ impl SinkState {
     /// revisions, so re-binding is idempotent; a differing open digest is refused
     /// before this point, so a measure can never be stamped with a revision other
     /// than the one its session committed to.
-    fn bind_measure_revisions(
-        &mut self,
-        session: &ProcessStreamSinkSession,
-    ) -> Result<(), ProcessStreamSinkError> {
-        if let Some(existing) = &self.admissible_source
-            && existing.digest_algorithm != session.source_digest_algorithm()
-        {
-            return Err(ProcessStreamSinkError::EvidenceInvariant {
-                reason: "declared source digest revision does not match the session".to_owned(),
-            });
-        }
+    fn bind_measure_revisions(&mut self, session: &ProcessStreamSinkSession) {
+        // W7: this used to be guarded by a `self.admissible_source` field that
+        // was initialised to `None` and NEVER assigned anywhere, so the guard
+        // could not fire and the field's own documentation ("`None` until a
+        // terminal command declares a transformation") described behaviour that
+        // did not exist. A declared-but-never-written revision check is the same
+        // unaccounted-quantity shape as an unused ceiling: it reads as a live
+        // invariant and proves nothing. The admissible source is derived per
+        // terminal command by `admissible_source_measure`, so there is no stored
+        // revision to disagree with, and the real binding — the transport
+        // revision this session's measures are stamped with — is below.
         self.transport = TransportDigest::new_with(session.transport_digest_algorithm());
         self.preview = BoundedPreviewDigest::new_with(session.transport_digest_algorithm());
-        Ok(())
     }
 
     /// Feeds one admitted chunk into every measure that covers it.
@@ -690,33 +818,24 @@ impl SinkState {
         self.transport.digest()
     }
 
-    /// The exact admissible-source measure for a terminal command.
+    /// The exact admissible-source measure for one terminal command.
     ///
-    /// With no declared transformation the admissible source IS the admitted
-    /// transport stream, so this returns the transport measure's own values and
-    /// names them `ExactTransportBytes`: one measure over one byte set, never a
-    /// digest derived from another. With a declared transformation the output
-    /// identity comes from the caller's exact input/output receipt alone, so this
-    /// adapter neither transforms the transport digest nor claims an output it
-    /// never observed.
-    fn admissible_source_measure(
-        &self,
-        session: &ProcessStreamSinkSession,
-        request_transformation: Option<&ProcessStreamTransformationBinding>,
-    ) -> BlobStreamAdmissibleSourceMeasure {
-        let Some(transformation) = request_transformation else {
-            return BlobStreamAdmissibleSourceMeasure {
-                representation: DurableStreamRepresentation::ExactTransportBytes,
-                digest_algorithm: self.transport.algorithm,
-                byte_count: self.transport.byte_count,
-                sha256: self.admitted_sha256(),
-            };
-        };
+    /// No transformation reaches this function: every terminal command is
+    /// refused by [`refuse_transformation`] before `measures_for` builds any
+    /// measure, so the admissible source is ALWAYS the admitted transport stream
+    /// itself and is named `ExactTransportBytes` — one measure over one byte
+    /// set, never a digest derived from another and never an unobserved
+    /// transformed output.
+    ///
+    /// A `DurableSourceBytes` preview still measures against this measure's
+    /// `byte_count`, which is exactly the admitted length, so a durable-source
+    /// preview cannot claim coordinates this adapter never covered.
+    fn admissible_source_measure(&self) -> BlobStreamAdmissibleSourceMeasure {
         BlobStreamAdmissibleSourceMeasure {
-            representation: DurableStreamRepresentation::PolicyTransformed,
-            digest_algorithm: session.source_digest_algorithm(),
-            byte_count: transformation.output_byte_length(),
-            sha256: transformation.output_sha256().to_owned(),
+            representation: DurableStreamRepresentation::ExactTransportBytes,
+            digest_algorithm: self.transport.algorithm,
+            byte_count: self.transport.byte_count,
+            sha256: self.admitted_sha256(),
         }
     }
 
@@ -778,13 +897,16 @@ impl SinkState {
 
     /// All three measures for one terminal command, bound to the exact
     /// admissible source this command declares.
+    ///
+    /// The admissible source is proven transform-free first, so no measure can
+    /// ever be derived from a transformation output this adapter does not hold.
     fn measures_for(
         &self,
-        session: &ProcessStreamSinkSession,
         request_preview: &ProcessStreamPrefixPreview,
         request_transformation: Option<&ProcessStreamTransformationBinding>,
     ) -> Result<BlobStreamEvidenceMeasures, ProcessStreamSinkError> {
-        let admissible_source = self.admissible_source_measure(session, request_transformation);
+        refuse_transformation(request_transformation)?;
+        let admissible_source = self.admissible_source_measure();
         let bounded_preview = self.bounded_preview_measure(request_preview, &admissible_source)?;
         Ok(BlobStreamEvidenceMeasures {
             transport: self.transport_measure(),
@@ -987,6 +1109,19 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         Ok(ProcessStreamSinkReadback::Session { view })
     }
 
+    /// Exact bytes one arriving append charges the persistence queue.
+    ///
+    /// The charge is a SERIALIZATION size and not `request.byte_length()`: this
+    /// adapter produces two live copies of every arriving byte — the caller's
+    /// `ProcessStreamSinkAppend` and the copy this adapter extends into
+    /// [`SinkState::staged`] — plus one queue record per chunk. Accounting only
+    /// the payload would leave every record and the staged copy invisible to
+    /// the byte ceiling, which is the finding the audit names: "not only
+    /// `Vec::len()`".
+    fn queue_charge_bytes(request: &ProcessStreamSinkAppend) -> u64 {
+        PersistenceQueueBound::record_bytes(request.byte_length(), request.sha256().len())
+    }
+
     fn append_locked(
         state: &mut SinkState,
         session: &ProcessStreamSinkSession,
@@ -1045,11 +1180,49 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         {
             return Err(ProcessStreamSinkError::TotalLimitExceeded);
         }
-        // This synchronous adapter has no append queue: each request is
-        // admitted as one bounded chunk. The total byte and chunk ceilings
-        // bound staged memory and reject overflow explicitly above. Since
-        // each admitted sequence adds one record, max_chunks also bounds
-        // this metadata without retaining another plaintext copy.
+        // PERSISTENCE QUEUE BOUND (issue #267 W5). This is the half of the
+        // accounting the RETAINED ceiling above cannot express. `next_offset`
+        // answers "how much will this session keep"; the ledger below answers
+        // "how much is this adapter holding right now for persistence", and
+        // the two have separate ceilings because a caller can be refused long
+        // before its retained total is reached.
+        //
+        // The check is BEFORE any charge and before `staged` is extended, so a
+        // refused append stages nothing, digests nothing and advances no
+        // cursor: a shed byte can never reach the staged plaintext, the
+        // transport digest or the admitted count, and therefore can never be
+        // counted as covered.
+        //
+        // `retry_after_ms` is a hint, never a promise. This adapter holds no
+        // wait on the append path — it never sleeps, never retries, never
+        // queues behind a provider call — so `0` states the truth that room
+        // only appears as a terminal or abort releases it. A caller that
+        // retries immediately still gets an immediate, identical refusal
+        // instead of a block, and the drain therefore cannot stall here.
+        let charged_bytes = Self::queue_charge_bytes(request);
+        if state.persistence_queue.overflowed
+            || u64::from(state.persistence_queue.queued_chunks).saturating_add(1)
+                > u64::from(limits.max_in_flight_chunks())
+            || state
+                .persistence_queue
+                .queued_bytes
+                .saturating_add(charged_bytes)
+                > limits.max_in_flight_bytes()
+        {
+            // Latched, never cleared: once persistence has overflowed, every
+            // later append sheds too. That is what makes the drain immune to
+            // a stalled provider — a caller cannot grind through a full queue
+            // by retrying, and a caller's failure to stop retrying costs it a
+            // refusal per chunk, never the pipe.
+            state.persistence_queue.overflowed = true;
+            return Ok(ProcessStreamSinkAppendDisposition::Backpressured { retry_after_ms: 0 });
+        }
+        state.persistence_queue.queued_chunks =
+            state.persistence_queue.queued_chunks.saturating_add(1);
+        state.persistence_queue.queued_bytes = state
+            .persistence_queue
+            .queued_bytes
+            .saturating_add(charged_bytes);
         state.admitted_chunks.push(AdmittedChunk {
             sequence: request.sequence(),
             offset: request.offset(),
@@ -1111,6 +1284,10 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             request.expected_final_offset(),
         )?;
         Self::check_observed(state, request.observed_sha256(), request.observed_bytes())?;
+        // An abort never publishes, so it has no durable source and nowhere to
+        // bind a transformation receipt: the same refusal as `plan_finalize`,
+        // with the same truthful cause (W7).
+        refuse_transformation(request.transformation())?;
         // Abort never publishes: no stage call for any reason, so a
         // policy-prohibited or failed-redaction session cannot stage raw
         // bytes. The staged plaintext is dropped with the terminal.
@@ -1406,19 +1583,20 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         Self::check_observed(&state, request.observed_sha256(), request.observed_bytes())?;
         let publishes =
             request.gaps().is_empty() && request.transport() == StreamTransportStatus::Complete;
+        // This adapter stages EXACT admitted transport bytes and never transformed
+        // output, so a finalize that declares a transformation is refused for
+        // BOTH outcomes — not only the publishing one — and it is refused BEFORE
+        // any measure is built. See [`refuse_transformation`] for the two W7
+        // defects this closes; `measures_for` below is the single place that
+        // enforcement happens, for finalize and abort alike.
+        //
         // The three measures of THIS terminal, computed once here from the
         // digests accumulated while its bytes arrived and from this exact
-        // command's preview/transformation. Every ticket below carries this
-        // one value; no site re-derives it, so a resumed publish records the
-        // same measures its first planning pass computed.
-        let measures =
-            state.measures_for(&existing, request.preview(), request.transformation())?;
+        // command's preview. Every ticket below carries this one value; no site
+        // re-derives it, so a resumed publish records the same measures its
+        // first planning pass computed.
+        let measures = state.measures_for(request.preview(), request.transformation())?;
         if publishes {
-            if request.transformation().is_some() {
-                return Err(ProcessStreamSinkError::EvidenceInvariant {
-                    reason: "adapter stages exact transport bytes only".to_owned(),
-                });
-            }
             // A reservation already holds the exact admitted byte commitment
             // it was created from, and a resumed publish has moved the staged
             // plaintext out of the session. Re-deriving the transport prefix
@@ -1623,6 +1801,14 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         }
         state.terminal_command = Some(identity);
         state.finalization = None;
+        // The whole persistence-queue charge is released with the terminal,
+        // because this is the last moment anything is retained: the staged
+        // plaintext, the queue records and the queued byte count all go at
+        // once. Releasing it here is also what bounds the charge's LIFETIME —
+        // an adapter whose session never terminates keeps its charge, and that
+        // is precisely the pressure the ceiling above is there to refuse.
+        state.persistence_queue.queued_chunks = 0;
+        state.persistence_queue.queued_bytes = 0;
         state.staged = Vec::new();
         state.publication = Some(publication);
         state.terminal = Some(terminal.clone());
@@ -1825,6 +2011,49 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// Refuses a terminal command that declares a policy transformation (W7).
+///
+/// This adapter stages EXACT admitted transport bytes and holds no transformed
+/// bytes, so it can never observe a transformation's output and can never bind
+/// one to a durable object. Two defects are closed by this one refusal, applied
+/// by BOTH terminal commands before any measure is built:
+///
+/// * **Unverified output, unverified input.** The declared transformation's
+///   `input_sha256`/`input_byte_length` were previously read NOWHERE in this
+///   file, so a caller could present a receipt claiming an arbitrary input
+///   while the adapter copied only that receipt's unverified OUTPUT digest into
+///   the admissible-source measure. Two different transformations that happen to
+///   emit the same output for the same input produced the SAME recorded
+///   `PolicyTransformed` measure, so a consumer could not tell which one ran.
+/// * **Untruthful failure.** A gapped finalize or an abort carrying a
+///   transformation fell through to terminal construction and failed with
+///   `TerminalIdentityConflict`, naming an identity collision for what is
+///   actually an unsupported transformation.
+///
+/// Refusing BEFORE any measure is derived also fixes the ordering the owner's
+/// audit keeps finding: a result must never be counted before the
+/// transformation that produced it is known, and here no admissible-source
+/// identity is ever derived from a transformation at all.
+///
+/// Nothing is invented: no enum variant, no policy identifier, no
+/// transformation type. `ProcessStreamTransformationBinding` already carries the
+/// input/output receipt, policy reference and redaction reference; this adapter
+/// simply cannot honour one and says so instead of half-recording it. Closing
+/// the remaining half of W7 — actually STAGING transformed bytes with their
+/// exact receipt — needs the transformer producer contract that no caller
+/// supplies; that is the owner reported in the accompanying report, not a field
+/// invented here.
+fn refuse_transformation(
+    request_transformation: Option<&ProcessStreamTransformationBinding>,
+) -> Result<(), ProcessStreamSinkError> {
+    if request_transformation.is_some() {
+        return Err(ProcessStreamSinkError::EvidenceInvariant {
+            reason: "adapter stages exact transport bytes only".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// The exact provider-side reason a durable source is unavailable.
 ///
 /// The declared gaps are the only input, so this can never invent a cause the
@@ -1908,13 +2137,12 @@ impl<C: BlobStoreClient> ProcessStreamSinkClient for BlobStoreStreamSink<C> {
                 Ok(existing.clone())
             }
             Some(_) => Err(ProcessStreamSinkError::OpenDigestMismatch),
-            None => ProcessStreamSinkSession::from_open_request(request)
-                .inspect(|session| state.session = Some(session.clone()))
-                .and_then(|session| {
-                    // The measures this session will be stamped with are bound
-                    // to the revisions its own open request declared.
-                    state.bind_measure_revisions(&session).map(|()| session)
-                }),
+            None => ProcessStreamSinkSession::from_open_request(request).inspect(|session| {
+                // The measures this session will be stamped with are bound
+                // to the revisions its own open request declared.
+                state.session = Some(session.clone());
+                state.bind_measure_revisions(session);
+            }),
         };
         Self::ready(result)
     }

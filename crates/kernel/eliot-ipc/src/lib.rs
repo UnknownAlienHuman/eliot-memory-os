@@ -547,6 +547,27 @@ pub fn dispatch_lifecycle_cancel(
     Ok(registry.cancel_stable(&identity.cancellation_id))
 }
 
+/// Applies one lifecycle control frame as an explicit transition on the
+/// module-lifecycle owner (W4: I7.4 `Quiesce`/`Checkpoint`/`RestoreCheckpoint`/
+/// `DrainStatus`/`Shutdown`/`Fatal` as explicit I7.2 control flows).
+///
+/// The frame is routed through [`eliot_protocol::ModuleLifecycle::apply`]:
+/// validation, phase gating, checkpoint retention and drain reporting all
+/// live in that owner, and non-control messages are rejected with the typed
+/// protocol failure. This dispatcher never infers phase from process state
+/// and never touches any other owner.
+///
+/// # Errors
+///
+/// Returns the owner's typed protocol failure for invalid frames,
+/// non-control messages, illegal phase moves and missing checkpoints.
+pub fn dispatch_lifecycle_control(
+    frame: &Frame,
+    lifecycle: &mut eliot_protocol::ModuleLifecycle,
+) -> Result<eliot_protocol::ModuleControlEffect, TransportError> {
+    lifecycle.apply(frame).map_err(TransportError::Protocol)
+}
+
 /// Transport failures are deliberately distinct from application outcomes.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TransportError {

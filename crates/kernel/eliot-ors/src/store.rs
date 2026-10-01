@@ -3083,6 +3083,8 @@ struct BridgeEventPrivacyAuthorization {
     scope_ref: String,
     source_class: Option<String>,
     recipient_grant: Vec<String>,
+    provider_restriction: eliot_workscope::BridgeIngestPolicyLeg,
+    retention_terms: eliot_workscope::BridgeIngestPolicyLeg,
 }
 
 /// Resolved I7.23 disclosure staging for canonical envelope bytes.
@@ -11571,9 +11573,15 @@ impl RedbRecoveryStore {
     /// source bytes, the scope, and the policy revision
     /// (`privacy_authorization`: `verdict`, `source_sha256`, `scope`,
     /// `policy_revision`, plus the decided evidence `scope_ref`,
-    /// `source_class`, and `recipient_grant`). A presented verdict is
-    /// accepted only when it equals the owner rule's verdict for the staged
-    /// evidence and names the owner's current policy revision; anything else
+    /// `source_class`, `recipient_grant`, and the Governor-owned
+    /// `provider_restriction` and `retention_terms` legs). The legs enter the
+    /// owner rule as deny-only gates — undecided provider restriction or
+    /// undecided retention terms withhold raw persistence before any grant
+    /// membership can admit — and the stage entry re-resolves the rule with
+    /// those same staged legs, so a verdict that misstates them fails closed.
+    /// A presented verdict is accepted only when it equals the owner rule's
+    /// verdict for the staged evidence and names the owner's current policy
+    /// revision; anything else
     /// — including a caller that cannot present an owner verdict for these
     /// exact bytes — gets a rejected disposition, never an inferred
     /// `allowed`. The conservative deny scan still runs inside the stage entry
@@ -12012,9 +12020,10 @@ impl RedbRecoveryStore {
     /// is an `Err`: a verdict reached about other bytes cannot authorize
     /// these. A verdict decided under another policy revision is an `Err` as
     /// well: only the owner's current rule revision authorizes persistence.
-    /// The decided evidence (`scope_ref`, `source_class`, `recipient_grant`)
-    /// is required so the stage entry can re-resolve the owner verdict for
-    /// the staged bytes instead of trusting the presented disposition.
+    /// The decided evidence (`scope_ref`, `source_class`, `recipient_grant`,
+    /// plus the Governor-owned `provider_restriction` and `retention_terms`
+    /// legs) is required so the stage entry can re-resolve the owner verdict
+    /// for the staged bytes instead of trusting the presented disposition.
     fn presented_privacy_authorization(
         authorization: Option<&serde_json::Value>,
         transport_hash: &str,
@@ -12094,6 +12103,8 @@ impl RedbRecoveryStore {
             crate::model::validate_text(class, "privacy_authorization.recipient_grant")?;
             grant.push(class.to_owned());
         }
+        let provider_restriction = Self::bridge_privacy_policy_leg(value, "provider_restriction")?;
+        let retention_terms = Self::bridge_privacy_policy_leg(value, "retention_terms")?;
         Ok(Some(BridgeEventPrivacyAuthorization {
             verdict,
             scope,
@@ -12102,7 +12113,32 @@ impl RedbRecoveryStore {
             scope_ref,
             source_class,
             recipient_grant: grant,
+            provider_restriction,
+            retention_terms,
         }))
+    }
+
+    /// Reads one Governor-owned policy leg out of a presented privacy
+    /// authorization (issue #1934, I7.23).
+    ///
+    /// The spelling is validated as text through the existing validator and
+    /// must equal the owner vocabulary
+    /// ([`eliot_workscope::BridgeIngestPolicyLeg::as_str`]): mere presence of
+    /// the field proves nothing, so any other spelling is a typed rejection
+    /// before any durable write.
+    fn bridge_privacy_policy_leg(
+        value: &serde_json::Value,
+        field: &'static str,
+    ) -> Result<eliot_workscope::BridgeIngestPolicyLeg, OrsError> {
+        let spelling = bridge_text(value, field)?;
+        if spelling == eliot_workscope::BridgeIngestPolicyLeg::Unavailable.as_str() {
+            Ok(eliot_workscope::BridgeIngestPolicyLeg::Unavailable)
+        } else {
+            Err(OrsError::InvalidField {
+                field,
+                reason: "privacy owner policy leg must name owner-decided evidence availability",
+            })
+        }
     }
 
     /// Re-resolves the `WorkScope` privacy owner's verdict for the staged
@@ -12110,7 +12146,8 @@ impl RedbRecoveryStore {
     ///
     /// This is the re-verification that keeps a self-asserted disposition out
     /// of durable state: the owner rule runs again over the staged scope
-    /// reference, source class, and recipient grant, and the presented
+    /// reference, source class, recipient grant, and the Governor-owned
+    /// provider-restriction and retention-terms legs, and the presented
     /// `verdict` and `declared_class` must match what the owner decides for
     /// that evidence. A mismatch fails closed before any durable write; the
     /// conservative deny scan still applies separately and can only deny.
@@ -12121,6 +12158,8 @@ impl RedbRecoveryStore {
             &grant.scope_ref,
             grant.source_class.as_deref(),
             &grant.recipient_grant,
+            grant.provider_restriction,
+            grant.retention_terms,
         )
         .map_err(|_| OrsError::InvalidField {
             field: "privacy_authorization",

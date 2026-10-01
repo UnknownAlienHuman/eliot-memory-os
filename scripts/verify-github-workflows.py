@@ -3,10 +3,15 @@
 
 Enforces that:
 1. Triggers follow a closed per-workflow policy (accepted issue #3004): every
-   workflow is workflow_dispatch-only except ci.yml, the sole automatic
-   compile-only merge check (workflow_dispatch, main-scoped pull_request and
-   push). pull_request_target, schedules, releases, merge queue and every
-   other automatic trigger are rejected on every workflow.
+   workflow is workflow_dispatch-only except the one automatic compile-only
+   merge check (workflow_dispatch, main-scoped pull_request and push). That
+   exception is a property of the workflow's own `on:` block and compile-only
+   profile invocation, not of its filename, and exactly one workflow may claim
+   it, so a copy of the accepted workflow under any other name, an extra
+   automatic event, a wrong branch, a missing PR transition, or an automatic
+   workflow that no longer runs the compile-only profile are all rejected.
+   pull_request_target, schedules, releases, merge queue and every other
+   automatic trigger are rejected on every workflow.
 2. Every third-party Action is verified by immutable identity (issue #1225 step
    2): the reference must be a reviewed full 40-character commit SHA owned by an
    approved action owner, the human-readable release stays comment-only metadata,
@@ -123,13 +128,21 @@ OIDC_TOKEN_RE = re.compile(r"id-token\s*:")
 APPROVED_ACTION_OWNERS = ("actions",)
 
 # Closed per-workflow trigger policy (accepted issue #3004). Default: every
-# repository workflow is manual-only. ci.yml is the sole exception: the
-# automatic compile-only merge check.
+# repository workflow is manual-only.
 DEFAULT_ALLOWED_EVENTS = {"workflow_dispatch"}
-WORKFLOW_EVENT_EXCEPTIONS = {
-    "ci.yml": {"workflow_dispatch", "pull_request", "push"},
-}
-# ci.yml exception scoping: automatic events are main-only, and PR activity
+# The one accepted automatic scope, and how a workflow's own content is judged
+# against it. The exception is a PROPERTY of the workflow's `on:` block and
+# profile invocation, never of its filename: a name-keyed grant is computed from
+# the same set it is meant to judge, so the rule that rejects unauthorized
+# triggers cannot fail for the one file that carries them, and any other file
+# copying that content under any name is judged differently from the accepted
+# exception for no reason but its name. The constants below are read from the
+# workflow itself, so an automatic trigger is permitted only in the single
+# automatic compile-only merge check, and only with exactly the scope #3004
+# accepted.
+CI_AUTOMATIC_EVENTS = {"pull_request", "push"}
+CI_ALLOWED_EVENTS = DEFAULT_ALLOWED_EVENTS | CI_AUTOMATIC_EVENTS
+# Automatic-exception scoping: automatic events are main-only, and PR activity
 # must cover every open/update/reopen/ready transition (an absent types key
 # keeps the GitHub default, which covers them).
 CI_MAIN_BRANCHES = ["main"]
@@ -720,6 +733,33 @@ def event_scalar_list(content: str, event: str, key: str) -> list[str] | None:
     return values
 
 
+def is_accepted_automatic_workflow(content: str, events: set[str]) -> bool:
+    """True when the workflow's own content is the accepted #3004 exception.
+
+    The grant is derived from the file, never from its filename. A workflow is
+    the accepted automatic compile-only merge check only when its declared event
+    set is exactly the accepted one, its automatic events target only
+    `CI_MAIN_BRANCHES`, its pull_request activity covers every
+    `CI_REQUIRED_PR_TYPES` transition, and it actually invokes the compile-only
+    profile. Anything broader or narrower is refused: an extra automatic event,
+    a wrong branch, a missing PR transition, and a workflow that keeps the
+    automatic triggers while no longer running the compile-only merge check all
+    fail here, so the exception cannot be inherited by editing the filename or
+    by copying the accepted content anywhere.
+    """
+    if events != CI_ALLOWED_EVENTS:
+        return False
+    if COMPILE_ONLY_PROFILE_MARKER not in content:
+        return False
+    for automatic_event in CI_AUTOMATIC_EVENTS:
+        if event_scalar_list(content, automatic_event, "branches") != CI_MAIN_BRANCHES:
+            return False
+    pr_types = event_scalar_list(content, "pull_request", "types")
+    # An absent types key keeps the GitHub default, which covers every required
+    # transition; a present but narrower list does not.
+    return pr_types is None or CI_REQUIRED_PR_TYPES <= set(pr_types)
+
+
 def iter_action_references_in_text(content: str) -> list[tuple[int, str]]:
     """(line number, reference) for every third-party `uses:` in one workflow.
 
@@ -792,6 +832,22 @@ def check_workflows(root: Path) -> list[Finding]:
         findings.append(Finding("GWF-000", ".github/workflows", 0, "no workflow files found"))
         return findings
 
+    # Read every workflow's own trigger section first: the automatic exception
+    # is a repository-level property, so a workflow may only claim it after every
+    # other claimant is known. Reading here also keeps an unreadable file
+    # reported once, as GWF-000 below, instead of silently as "no triggers".
+    events_by_path: dict[Path, set[str]] = {}
+    for wf_path in workflow_files:
+        try:
+            events_by_path[wf_path] = parse_workflow_events(wf_path.read_text(encoding="utf-8"))
+        except OSError:
+            events_by_path[wf_path] = set()
+    automatic_claims = [
+        wf_path
+        for wf_path in workflow_files
+        if events_by_path[wf_path] - DEFAULT_ALLOWED_EVENTS
+    ]
+
     for wf_path in workflow_files:
         rel_path = str(wf_path.relative_to(root)).replace("\\", "/")
         try:
@@ -803,47 +859,33 @@ def check_workflows(root: Path) -> list[Finding]:
         lines = content.splitlines()
 
         # 1. Event trigger check: closed per-workflow policy (issue #3004).
-        # Default is workflow_dispatch-only; ci.yml is the sole automatic
-        # exception with main-scoped pull_request/push.
-        events = parse_workflow_events(content)
-        allowed_events = WORKFLOW_EVENT_EXCEPTIONS.get(wf_path.name, DEFAULT_ALLOWED_EVENTS)
+        # Default is workflow_dispatch-only. The automatic exception is a
+        # property of the workflow's own content (is_accepted_automatic_workflow),
+        # and #3004 accepts exactly one automatic workflow, so a second claimant
+        # is unauthorized whatever it is called. A byte-identical copy of the
+        # accepted workflow under a different name therefore fails here, and so
+        # does an accepted workflow whose automatic scope drifted wider.
+        events = events_by_path[wf_path]
+        automatic_events = sorted(events - DEFAULT_ALLOWED_EVENTS)
         if not events:
             findings.append(Finding("GWF-001", rel_path, 1, "missing 'on:' event trigger section"))
-        elif events != allowed_events:
-            invalid = sorted(events - allowed_events)
+        elif automatic_events and not (
+            len(automatic_claims) == 1
+            and automatic_claims[0] == wf_path
+            and is_accepted_automatic_workflow(content, events)
+        ):
             findings.append(
                 Finding(
                     "GWF-001",
                     rel_path,
                     1,
-                    f"unauthorized workflow triggers {invalid} for {wf_path.name}; only {sorted(allowed_events)} allowed",
+                    f"unauthorized workflow triggers {automatic_events} for {wf_path.name}; "
+                    f"only {sorted(DEFAULT_ALLOWED_EVENTS)} allowed, except for the sole "
+                    f"automatic compile-only merge check, which must declare exactly "
+                    f"{sorted(CI_ALLOWED_EVENTS)} with branches {CI_MAIN_BRANCHES} and pull_request "
+                    f"types covering {sorted(CI_REQUIRED_PR_TYPES)}",
                 )
             )
-        if wf_path.name in WORKFLOW_EVENT_EXCEPTIONS:
-            for scoped_event in ("pull_request", "push"):
-                if scoped_event in events:
-                    branches = event_scalar_list(content, scoped_event, "branches")
-                    if branches != CI_MAIN_BRANCHES:
-                        findings.append(
-                            Finding(
-                                "GWF-001",
-                                rel_path,
-                                1,
-                                f"{wf_path.name} {scoped_event} must target branches {CI_MAIN_BRANCHES}",
-                            )
-                        )
-            pr_types = event_scalar_list(content, "pull_request", "types")
-            if pr_types is not None and pr_types:
-                missing_types = sorted(CI_REQUIRED_PR_TYPES - set(pr_types))
-                if missing_types:
-                    findings.append(
-                        Finding(
-                            "GWF-001",
-                            rel_path,
-                            1,
-                            f"{wf_path.name} pull_request types miss required activity {missing_types}",
-                        )
-                    )
 
         # 2. Action identity check (issue #1225 step 2): every third-party `uses:`
         # is a reviewed full 40-character commit SHA owned by an approved action
@@ -2130,6 +2172,11 @@ def run_self_tests() -> int:
         ("ci_pr_target_rejected", "ci.yml", "name: Automatic PR Merge Compile Gate\non:\n  workflow_dispatch:\n  pull_request_target:\n    branches: [main]\n  push:\n    branches: [main]\npermissions:\n  contents: read\njobs:\n  check:\n    runs-on: windows-latest\n    steps:\n      - run: echo never\n", "GWF-001"),
         ("ci_unscoped_push_rejected", "ci.yml", "name: Automatic PR Merge Compile Gate\non:\n  workflow_dispatch:\n  pull_request:\n    branches: [main]\n  push:\npermissions:\n  contents: read\njobs:\n  check:\n    runs-on: windows-latest\n    steps:\n      - run: echo never\n", "GWF-001"),
         ("other_workflow_push_rejected", "policy.yml", "name: Manual Policy Gate\non:\n  workflow_dispatch:\n  push:\n    branches: [main]\npermissions:\n  contents: read\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo never\n", "GWF-001"),
+        # The exception name carrying the accepted trigger scope is not by itself
+        # the accepted exception: a ci.yml whose automatic triggers survive after
+        # the compile-only merge check is gone is no longer the workflow #3004
+        # accepted, so the trigger grant must fail on the content, not the name.
+        ("ci_automatic_scope_without_compile_only_profile_rejected", "ci.yml", "name: Automatic PR Merge Compile Gate\non:\n  workflow_dispatch:\n  pull_request:\n    branches: [main]\n    types: [opened, synchronize, reopened, ready_for_review]\n  push:\n    branches: [main]\npermissions:\n  contents: read\njobs:\n  check:\n    runs-on: windows-latest\n    steps:\n      - run: pwsh -NoProfile -File scripts/build.ps1\n", "GWF-001"),
         ("mergecompile_dotnet_run_rejected", "ci.yml", ci_prefix + "jobs:\n  check:\n    runs-on: windows-latest\n    steps:\n      - run: pwsh -NoProfile -File scripts/verify.ps1 -Profile MergeCompile\n      - run: dotnet test tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj\n", "GWF-006"),
         ("mergecompile_claim_rejected", "ci.yml", ci_prefix + "jobs:\n  check:\n    runs-on: windows-latest\n    steps:\n      # invokes -Profile MergeCompile through the shared profile owner\n      - run: echo \"Operator tests: executed Eliot.Operator.Tests\"\n", "GWF-006"),
         ("mergecompile_clean_accepted", "ci.yml", ci_prefix + "jobs:\n  check:\n    runs-on: windows-latest\n    steps:\n      # invokes -Profile MergeCompile through the shared profile owner\n      - run: echo merge-compile-check\n", None, {"scripts/verify.ps1": "# stub profile owner\ndotnet restore apps/Eliot.Operator/Eliot.Operator.csproj --locked-mode\ndotnet restore tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj --locked-mode\ndotnet build apps/Eliot.Operator/Eliot.Operator.csproj\ndotnet build tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj\n"}),

@@ -357,9 +357,14 @@ impl AuthorityPort for KernelAuthorityPort {
         receipt: &RegistrationReceipt,
         request: &LaunchRequest,
     ) -> Result<LaunchGrant, PortError> {
+        // The WorkScope claim is never trusted here: the Kernel route
+        // re-derives the expected `interactive_user:<sid>` scope from the
+        // live registration it admitted and refuses anything else, so a
+        // caller-supplied scope can only match, never widen.
         let payload = serde_json::json!({
             "registration": receipt,
             "request": request,
+            "work_scope": format!("interactive_user:{}", receipt.windows_sid),
         });
         let now = now_unix_ms()?;
         let identity = {

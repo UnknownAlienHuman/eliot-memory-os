@@ -1560,6 +1560,14 @@ impl KernelComposition {
         // never handed to that queue or selector derivation.
         if record.result_digest.is_none() {
             let mut mismatch_reason: Option<&'static str> = None;
+            // #2564 I4/AUD-C2/AUD-C5: a lane whose carrier could not retain
+            // its pair must not be answered with a successful acknowledgement.
+            // The carrier's OWN typed reason is carried out of the routing
+            // match and re-raised once the audit evidence for the refusal has
+            // been recorded, so a refusal is never downgraded into a recorded
+            // mismatch beside a successful reply, and a gate failure is never
+            // flattened into a generic fence. `None` until a lane sets it.
+            let mut refused_carrier_error: Option<TransportError> = None;
             let routed_lane = match check_local_read_admission(envelope, tool) {
                 Ok(LocalReadAdmission::Query(_)) => {
                     // Queue admission is part of the same authenticated
@@ -1601,16 +1609,24 @@ impl KernelComposition {
                         self.enqueue_finish_pair_under_transition(envelope, tool)?;
                         Some("finish")
                     } else if check_local_state_admission(envelope, tool).is_ok() {
-                        // #2564 I4 state-carrier seam: validated `eliot.state`
-                        // pairs attempt the shared local-read carrier for the
-                        // outbound-only eliotd poller. The carrier enqueue
-                        // gate and the claim gate are query-only today, so the
-                        // attempt is refused without side effects (the gate is
-                        // the first statement of the enqueue fn, before any
-                        // mutation); the serve leg that admits state pairs is
-                        // #2565's dispatch lane.
-                        let _ = self.enqueue_local_read_pair_under_transition(envelope, tool);
+                        // #2564 I4/AUD-C2/AUD-C5: a validated `eliot.state` pair
+                        // enters the shared local-read carrier, and the carrier's
+                        // disposition IS this lane's admission result — never a
+                        // remark. The disposition used to be discarded with
+                        // `let _ =` while the request was still acknowledged as
+                        // accepted, so an admitted read produced a recorded
+                        // refusal and nothing else. The typed refusal reason is
+                        // recorded first (so it keeps its durable evidence) and
+                        // the carrier's own error is then propagated, so a state
+                        // read is never acknowledged when its pair could not be
+                        // retained and the real gate failure is never flattened
+                        // into a generic fence.
                         mismatch_reason = Some("state_carrier_refused");
+                        if let Err(error) =
+                            self.enqueue_local_read_pair_under_transition(envelope, tool)
+                        {
+                            refused_carrier_error = Some(error);
+                        }
                         None
                     } else {
                         mismatch_reason = Some("no_lane");
@@ -1638,6 +1654,13 @@ impl KernelComposition {
                 // route. The requested capability matched no serving lane,
                 // so the work was refused before queueing.
                 self.audit_observe(AuditEventDraft::route_mismatch_routing(envelope, reason));
+            }
+            // #2564 AUD-C2/AUD-C5: retention is part of admission. The refusal
+            // above has already been recorded durably, so the carrier's own
+            // typed gate failure is raised here instead of being answered with
+            // a successful admission record.
+            if let Some(error) = refused_carrier_error {
+                return Err(error);
             }
         }
         // Coherence gate before serving: a resulted record must carry a
@@ -6929,6 +6952,13 @@ impl KernelComposition {
     ///   privacy class, source/recipient class, or provider-retention field,
     ///   so no disclosure class is proven for these exact bytes and no grant
     ///   membership can hold for them. No grant is invented to fill the gap.
+    /// - the Governor-owned provider-restriction and retention-terms legs:
+    ///   undecided — no caller on this route presents either leg (the
+    ///   envelope carries no provider-retention field and the retained
+    ///   `Session` negotiates no provider terms), so the owner withholds on
+    ///   the provider leg before any grant membership can admit. The legs
+    ///   enter the owner query as deny-only gates and travel in the recorded
+    ///   verdict, never as an invented admission.
     ///
     /// Absent evidence is UNRESOLVED, never permission: the owner withholds
     /// raw persistence and names the side the evaluated evidence determined,
@@ -6963,15 +6993,18 @@ impl KernelComposition {
         )
         .map_err(|_| TransportError::SessionFenced)?;
         // The verdict is the owner's evaluation over the evidence for THIS
-        // event: the retained session's recipient grant and the (unproven)
-        // source class of these exact bytes inside the Governor-resolved
-        // scope. The policy revision recorded alongside it is the owner's own
-        // rule revision — never the fencing generation, which measures
-        // liveness rather than policy.
+        // event: the retained session's recipient grant, the (unproven)
+        // source class of these exact bytes, and the (undecided)
+        // provider-restriction and retention-terms legs, inside the
+        // Governor-resolved scope. The policy revision recorded alongside it
+        // is the owner's own rule revision — never the fencing generation,
+        // which measures liveness rather than policy.
         let disclosure = eliot_workscope::resolve_bridge_ingest_disclosure(
             work_scope_id,
             None,
             &session.privacy_classes,
+            eliot_workscope::BridgeIngestPolicyLeg::Unavailable,
+            eliot_workscope::BridgeIngestPolicyLeg::Unavailable,
         )
         .map_err(|_| TransportError::SessionFenced)?;
         Ok(serde_json::json!({
@@ -6983,6 +7016,8 @@ impl KernelComposition {
             "scope_ref": work_scope_id,
             "source_class": serde_json::Value::Null,
             "recipient_grant": &session.privacy_classes,
+            "provider_restriction": eliot_workscope::BridgeIngestPolicyLeg::Unavailable.as_str(),
+            "retention_terms": eliot_workscope::BridgeIngestPolicyLeg::Unavailable.as_str(),
         }))
     }
 
