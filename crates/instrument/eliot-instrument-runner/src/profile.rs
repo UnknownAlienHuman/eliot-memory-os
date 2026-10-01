@@ -1025,8 +1025,9 @@ impl InstrumentProfile {
 /// - cargo: `cargo build --message-format=json ...`, the Cargo
 ///   `--message-format=json` stream the admitted parser projects;
 /// - rustc: `cargo clippy --message-format=json ...`, the Clippy stream
-///   [`eliot_instrument_rustc::parse_clippy_jsonl`] is the admitted parser
-///   for, matching the Clippy-performs-the-compilation rule `dev-fast` states;
+///   [`eliot_instrument_rustc::parse_clippy_jsonl`] projects lint diagnostics
+///   and the Cargo parser retains its required successful `build-finished`
+///   record, matching the Clippy-performs-the-compilation rule `dev-fast` states;
 /// - nextest: `cargo nextest run --message-format libtest-json-plus ...`,
 ///   the exact argument spine [`eliot_instrument_nextest::NextestCommand`]
 ///   renders;
