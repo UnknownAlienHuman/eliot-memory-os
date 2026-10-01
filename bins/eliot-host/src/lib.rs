@@ -2915,7 +2915,7 @@ impl HostJobBranches {
         authority_generation: ResourceGeneration,
         host_state_root: &Path,
         store_data_root: &Path,
-        supervision_heartbeat: Option<AdmittedWatchdogHeartbeatProof>,
+        supervision_heartbeat: Option<&watchdog_heartbeat::AdmittedHostHeartbeat>,
         sequence: u64,
     ) -> Result<(), HostError> {
         let evidence = host_startup_evidence::build_host_startup_evidence(
@@ -2960,9 +2960,22 @@ impl HostJobBranches {
         module_build_provenance: Option<Vec<ModuleBuildProvenanceRecord>>,
         candidate: &HostKernelCandidateBinding,
         generation_handle: &PlatformHandle,
-        supervision_heartbeat: Option<AdmittedWatchdogHeartbeatProof>,
+        supervision_heartbeat: Option<&watchdog_heartbeat::AdmittedHostHeartbeat>,
         sequence: u64,
     ) -> Result<(), HostError> {
+        let supervision_heartbeat = supervision_heartbeat
+            .map(|admitted| {
+                if admitted.observation.host_receive_monotonic.elapsed()
+                    > admitted.observation.freshness_window
+                {
+                    return Err(HostError::WatchdogCoverageUnavailable(
+                        "admitted Watchdog heartbeat expired before authenticated report send"
+                            .to_owned(),
+                    ));
+                }
+                kernel_heartbeat_proof(admitted)
+            })
+            .transpose()?;
         let request = kernel_control_request(
             candidate,
             evidence.state_fence.resource_generation,
@@ -3863,10 +3876,6 @@ impl HostJobBranches {
                 .as_ref()
                 .map(kernel_heartbeat_observation_digest)
                 .transpose()?;
-            let heartbeat_proof = admitted_heartbeat
-                .as_ref()
-                .map(kernel_heartbeat_proof)
-                .transpose()?;
             // I1.11 steps 1, 2, 4 and 11: the combined report follows the
             // real SCM-bound continuous heartbeat, then ProbeReady consumes
             // the Kernel owner's admitted observation on the next sequence.
@@ -3884,7 +3893,7 @@ impl HostJobBranches {
                 launch.authority_generation,
                 Path::new(launch.runtime_state_roots.host_state_root.as_str()),
                 Path::new(launch.runtime_state_roots.store_data_root.as_str()),
-                heartbeat_proof,
+                admitted_heartbeat.as_ref(),
                 probe_sequence + 1,
             )
             .await
@@ -4765,11 +4774,11 @@ impl HostJobBranches {
         approved_store_artifact: &PlatformHandle,
         approved_config: &PlatformHandle,
         supervision_evidence: &HostStartupEvidence,
-        supervision_heartbeat: Option<AdmittedWatchdogHeartbeatProof>,
+        supervision_heartbeat: Option<&watchdog_heartbeat::AdmittedHostHeartbeat>,
     ) -> Result<AuthenticatedKernelReadiness, HostError> {
         let reported_observation_digest = supervision_heartbeat
-            .as_ref()
-            .map(|proof| proof.observation_digest.clone());
+            .map(kernel_heartbeat_observation_digest)
+            .transpose()?;
         let launch = self.launch.as_ref().ok_or_else(|| {
             HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
         })?;
@@ -12719,10 +12728,7 @@ impl HostComposition {
             store_artifact,
             &materialized_config_digest,
             &supervision_evidence,
-            admitted_heartbeat
-                .as_ref()
-                .map(kernel_heartbeat_proof)
-                .transpose()?,
+                admitted_heartbeat.as_ref(),
         )?;
         let post_probe = (|| -> Result<ReadinessContourIdentity, HostError> {
             // ProbeReady may renew the same owner lease. Publish that actual
