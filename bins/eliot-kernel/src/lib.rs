@@ -951,10 +951,13 @@ impl KernelComposition {
     /// (`request_dispatch.rs`, `handle_backup_verify`), so the object is
     /// reached on the production front door today. What is still absent is the
     /// *capture* side of it — `capture` and `request_from_ports` have no
-    /// production caller. The [`PublicationPort`] provider that does exist
+    /// production caller. Reaching it needs three inputs, and each one is absent
+    /// for a different reason: the [`PublicationPort`] provider that does exist
     /// (`eliot_blob::BlobArchivePublicationOwner`, #959) needs an
     /// `eliot_blob::BlobStoreService`, and no production code constructs one, so
-    /// nothing can bind it. That is the owner-blocked half this issue's
+    /// nothing can bind it; no producer supplies the accepted `CaptureRequest`
+    /// evidence bundle; and no owner issues the `FrozenCapturePlan`'s approved
+    /// manifest digests. That is the owner-blocked half this issue's
     /// `backup.create` leg refuses with `plan_gap` naming #959.
     #[must_use]
     pub fn backup_capture(&self) -> &KernelBackupCapture {
