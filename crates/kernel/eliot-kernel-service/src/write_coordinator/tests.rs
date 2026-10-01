@@ -35,13 +35,14 @@ use eliot_ors::{
     CanonicalDisposition, CanonicalEvidenceProvider, CanonicalReconciliation,
     CanonicalScopeObservation, EpochIdentity, EpochLineage, ExpectedOrderingHead, OpaqueLabel,
     OrsError, RecoveryAccessClass, RecoveryEnvelopeContext, RecoveryInboxItem,
-    RecoveryPayloadEnvelope, RedbRecoveryStore, ReservationRequest, ReservationState,
-    ScopeReservationRequest, StateFenceSnapshot, WriterReservationToken,
+    RecoveryPayloadEnvelope, RecoveryWriteBinding, RedbRecoveryStore, ReservationRequest,
+    ReservationState, ScopeReservationRequest, StateFenceSnapshot, WriterReservationToken,
 };
 use eliot_platform::SecretReference;
 use eliot_receipts::{ReceiptCore, ReceiptEnvelope};
 use eliot_security_contracts::{InstructionTaint, PrivacyClass};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use super::{CoordinatorError, WriteCoordinator, WriteCoordinatorConfig, default_executor_lanes};
 
@@ -118,6 +119,17 @@ fn genesis_head() -> ExpectedOrderingHead {
     }
 }
 
+fn fixture_sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn fixture_digest(value: &Value) -> TestResult<String> {
+    Ok(fixture_sha256(&serde_json::to_vec(value)?))
+}
+
 fn request(
     reservation_id: &str,
     operation_id: &str,
@@ -126,31 +138,98 @@ fn request(
     heads: Option<Vec<ExpectedOrderingHead>>,
 ) -> TestResult<ReservationRequest> {
     let state_fence = fence(&writer_epoch)?;
+    let reservation_identity = label(reservation_id)?;
+    let operation_identity = label(operation_id)?;
+    let write_intent_id = label(&format!("write-intent-{operation_id}"))?;
+    let idempotency_key = label(&format!("idempotency-{reservation_id}"))?;
+    let recovery_access_class = RecoveryAccessClass {
+        privacy: PrivacyClass::Private,
+        visibility: label("owner-only")?,
+        instruction_taint: InstructionTaint::DataOnly,
+    };
+    let payload_key_reference = SecretReference::new("test-key-provider", "key-1")?;
+    let payload = format!("opaque-{operation_id}").into_bytes();
+    let payload_sha256 = fixture_sha256(&payload);
+    let payload_length = u64::try_from(payload.len())?;
+    let ordering_scopes = scopes
+        .iter()
+        .map(|scope| label(scope))
+        .collect::<Result<Vec<_>, OrsError>>()?;
+    let heads = heads.unwrap_or_else(|| scopes.iter().map(|_| genesis_head()).collect());
+    assert_eq!(heads.len(), scopes.len(), "heads cover every scope");
+    let prepared_transition_sha256 = fixture_digest(&json!({
+        "operation_id": operation_identity.as_str(),
+        "write_intent_id": write_intent_id.as_str(),
+        "idempotency_key": idempotency_key.as_str(),
+        "ordering_scopes": ordering_scopes.iter().map(OpaqueLabel::as_str).collect::<Vec<_>>(),
+        "expected_heads": heads,
+        "authority_epoch": writer_epoch,
+        "state_fence": state_fence,
+    }))?;
+    let admission_contract_set_digest =
+        fixture_digest(&json!(["kernel-write-coordinator-fixture-v1"]))?;
+    let operation_manifest_digest = label(&fixture_digest(&json!([
+        "kernel-write-coordinator-operation-manifest-v1"
+    ]))?)?;
+    let canonical_request_sha256 = fixture_digest(&json!({
+        "operation_id": operation_identity.as_str(),
+        "write_intent_id": write_intent_id.as_str(),
+        "idempotency_key": idempotency_key.as_str(),
+        "ordering_scopes": ordering_scopes.iter().map(OpaqueLabel::as_str).collect::<Vec<_>>(),
+        "expected_heads": heads,
+        "prepared_transition_sha256": prepared_transition_sha256,
+        "authority_epoch": writer_epoch,
+        "state_fence": state_fence,
+    }))?;
     let envelope = RecoveryPayloadEnvelope::encrypted(
         RecoveryEnvelopeContext {
-            operation_or_checkpoint_id: label(operation_id)?,
-            privacy_and_visibility_class: RecoveryAccessClass {
-                privacy: PrivacyClass::Private,
-                visibility: label("owner-only")?,
-                instruction_taint: InstructionTaint::DataOnly,
-            },
+            operation_or_checkpoint_id: operation_identity.clone(),
+            privacy_and_visibility_class: recovery_access_class.clone(),
             authority_epoch: writer_epoch.clone(),
-            state_fence,
+            state_fence: state_fence.clone(),
             created_at_ms: 10,
             known_at_ms: 11,
             expires_at_ms: Some(10_000),
         },
-        SecretReference::new("test-key-provider", "key-1")?,
-        format!("opaque-{operation_id}").into_bytes(),
+        payload_key_reference.clone(),
+        payload,
     )?;
-    let heads = heads.unwrap_or_else(|| scopes.iter().map(|_| genesis_head()).collect());
-    assert_eq!(heads.len(), scopes.len(), "heads cover every scope");
+    assert_eq!(
+        envelope.payload_sha256, payload_sha256,
+        "write binding payload digest is the exact encrypted fixture payload digest"
+    );
+    assert_eq!(
+        envelope.payload_length, payload_length,
+        "write binding payload length is the exact encrypted fixture payload length"
+    );
+    let write_binding = RecoveryWriteBinding {
+        write_envelope_protocol_version: 1,
+        recovery_envelope_contract_version: envelope.contract_version,
+        recovery_access_class,
+        payload_created_at_ms: envelope.created_at_ms,
+        payload_known_at_ms: envelope.known_at_ms,
+        payload_expires_at_ms: envelope.expires_at_ms,
+        operation_id: operation_identity,
+        write_intent_id,
+        idempotency_key,
+        canonical_request_sha256,
+        prepared_transition_sha256: prepared_transition_sha256.clone(),
+        ordering_scopes: ordering_scopes.clone(),
+        admission_contract_set_digest,
+        operation_manifest_digest,
+        authority_epoch: writer_epoch.clone(),
+        state_fence: state_fence.clone(),
+        protected_payload_sha256: payload_sha256,
+        protected_payload_length: payload_length,
+        payload_key_reference,
+    };
+    let envelope = envelope.with_write_binding(write_binding)?;
     Ok(ReservationRequest {
-        reservation_id: label(reservation_id)?,
+        reservation_id: reservation_identity,
         envelope,
         writer_epoch,
-        scopes: scopes
-            .iter()
+        scopes: ordering_scopes
+            .into_iter()
             .zip(heads)
             .map(|(scope, expected_head)| {
                 Ok(ScopeReservationRequest {
@@ -159,7 +238,7 @@ fn request(
                 })
             })
             .collect::<Result<Vec<_>, OrsError>>()?,
-        prepared_transition_sha256: "11".repeat(32),
+        prepared_transition_sha256,
         expires_at_ms: 1_000,
         recovery_owner: label("kernel-recovery-owner")?,
     })
@@ -206,7 +285,15 @@ fn receipt(token: &WriterReservationToken) -> TestResult<ReceiptEnvelope> {
         "operation": {
             "operation_id": token.operation_id.as_str(),
             "request_id": request_id,
-            "idempotency_key": token.reservation_id.as_str(),
+            "idempotency_key": token
+                .write_binding
+                .as_ref()
+                .ok_or(OrsError::InvalidField {
+                    field: "recovery_write_binding",
+                    reason: "required for a canonical write receipt",
+                })?
+                .idempotency_key
+                .as_str(),
             "operation_kind": "canonical-write",
             "effect": "REVERSIBLE_MUTATION",
             "state_fence": state_fence
