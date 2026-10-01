@@ -138,7 +138,8 @@ pub use restore_journal::{
 pub use snapshot_model::{OrsSnapshotReceipt, OrsSnapshotRequest};
 pub use staged_write_recovery::{
     StagedEnvelopeRecoveryCursor, StagedEnvelopeRecoveryEntry, StagedEnvelopeRecoveryPage,
-    StagedWriteReconciliation, StagedWriteRecoveryReport, recover_staged_write_envelopes,
+    StagedEnvelopeReservationBinding, StagedWriteReconciliation, StagedWriteRecoveryReport,
+    recover_staged_write_envelopes,
 };
 pub use status::{
     observe_supervision_status, open_existing_read_only, read_current_supervision_lease_read_only,

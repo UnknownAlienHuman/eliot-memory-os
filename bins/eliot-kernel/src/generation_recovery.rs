@@ -21,7 +21,7 @@ use eliot_kernel_core::{
 };
 use eliot_kernel_service::KernelService;
 use eliot_ors::{
-    CutoverRouteSnapshot, CutoverRouteTable, OrsError, RedbRecoveryStore, StagedWriteRecoveryReport,
+    CutoverRouteSnapshot, CutoverRouteTable, OrsError, RedbRecoveryStore, StagedWriteReconciliation,
 };
 use eliot_runtime_contracts::{
     GenerationCutoverRecord as RuntimeGenerationCutoverRecord, GenerationCutoverState,
@@ -308,34 +308,96 @@ impl OrsGenerationCoordinator {
     /// nothing, and never removes a staged row. A corrupted or undecryptable
     /// payload is retained by ORS as a durable Recovery Problem and stays
     /// available for explicit disposition; it is never deleted and never falls
-    /// back to plaintext. The pass therefore cannot report a clean outcome it
-    /// did not earn: a non-exhaustive scan and a retained Recovery Problem are
-    /// both returned to composition, which records the stage as incomplete
-    /// rather than folding either into a recovered composition.
+    /// back to plaintext.
+    ///
+    /// # Readiness
+    ///
+    /// I05-06: "`ACCEPTED_PENDING` proves only that the complete opaque
+    /// operation was durably staged under the same identity. Normal writer
+    /// readiness after restart requires ORS enumeration, receipt/store
+    /// reconciliation and residual-unknown disposition". This pass owns that
+    /// enumeration, so it REFUSES — through the same mechanism as the
+    /// generation, cutover and admission-reservation passes above it — whenever
+    /// it cannot present one:
+    ///
+    /// - a truncated scan has proved nothing about the rows it did not reach;
+    /// - a retained Recovery Problem is an undispositioned residual unknown;
+    /// - a staged row whose owner index did not resolve is a record enumerated
+    ///   under its own key that could be bound to neither a receipt nor a
+    ///   retained problem, so its disposition is still open.
+    ///
+    /// A refusal returns `Err`, so composition assembly propagates it and the
+    /// readiness evidence and success observation that follow this pass are never
+    /// recorded. The pass therefore cannot report a clean outcome it did not
+    /// earn, and it never folds a non-exhaustive or problem-bearing pass into a
+    /// recovered composition.
+    ///
+    /// An envelope in `StagedWriteReconciliation::Staged` does NOT refuse. A
+    /// validated record whose reservation has not yet reached its canonical
+    /// receipt is healthy in-flight work, not a fault: I05-06 orders
+    /// `ACCEPTED_PENDING` (step 14) BEFORE serialization, execution and receipt
+    /// reconciliation (steps 15-17), so a restart between them legitimately
+    /// leaves a staged, unreceipted row. Refusing composition on it would be a
+    /// permanent block rather than a safety property, because the reservation is
+    /// discharged by executing and reconciling it — work this same composition
+    /// gates, so a composition that refused here could never reach the step that
+    /// closes it. Receipt/store reconciliation stays with the Store-receipt owner
+    /// that observes those receipts.
     ///
     /// # Errors
     ///
     /// Returns the store's typed ORS failure when the staged-envelope table is
     /// unreadable, when a row's owner index does not resolve, or when retaining
-    /// a Recovery Problem for a failed record failed as well. No failure is
+    /// a Recovery Problem for a failed record failed as well — and returns the
+    /// bounded reason this pass did not earn a clean outcome. No failure is
     /// downgraded to an empty or clean report.
-    pub(crate) fn recover_staged_write_envelopes(
-        &self,
-    ) -> Result<StagedWriteRecoveryReport, String> {
+    pub(crate) fn recover_staged_write_envelopes(&self) -> Result<(), String> {
         observe_recovery("kernel.recovery.staged_writes_requested", "attempt");
         let report = self
             .ors
             .recover_staged_write_envelopes(eliot_ors::MAX_RECOVERY_PAGE)
             .map_err(|error| error.to_string())?;
-        // A truncated pass has proved nothing about the rows it did not reach, so
-        // it is reported as such rather than folded into a success outcome.
-        let outcome = if report.truncated {
-            "truncated"
+        let unresolved = report
+            .reconciliations
+            .iter()
+            .filter(|reconciliation| {
+                matches!(
+                    reconciliation,
+                    StagedWriteReconciliation::RecoveryProblem { .. }
+                        | StagedWriteReconciliation::UnresolvedReservation { .. }
+                )
+            })
+            .count();
+        // A truncated pass has proved nothing about the rows it did not reach, a
+        // retained problem is an undispositioned residual unknown, and an
+        // unresolved owner index leaves that record's disposition open. Each one
+        // is reported as such and refused, never folded into a success.
+        let (outcome, refusal) = if report.truncated {
+            (
+                "truncated",
+                Some(
+                    "the staged write recovery scan stopped at its whole-scan bound, so the \
+                     staged envelope table was not enumerated exhaustively"
+                        .to_owned(),
+                ),
+            )
+        } else if unresolved > 0 {
+            (
+                "incomplete",
+                Some(format!(
+                    "the staged write recovery pass reported {unresolved} staged operation(s) \
+                     under a durable Recovery Problem or an unresolved owner index, so \
+                     residual-unknown disposition is not complete"
+                )),
+            )
         } else {
-            "success"
+            ("success", None)
         };
         observe_recovery("kernel.recovery.staged_writes_reconciled", outcome);
-        Ok(report)
+        match refusal {
+            Some(reason) => Err(reason),
+            None => Ok(()),
+        }
     }
 
     pub(crate) fn recover(

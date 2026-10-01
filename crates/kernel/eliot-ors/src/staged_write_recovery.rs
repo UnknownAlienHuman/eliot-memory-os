@@ -28,12 +28,19 @@
 //!   This module performs no integrity arithmetic of its own and cannot introduce
 //!   a second integrity scheme.
 //! - **Reconcile.** A validated envelope is matched back to its reservation by
-//!   exact operation identity. A reservation that reached a terminal state while
-//!   carrying its durable `terminal_receipt_id` — committed (`Finalized`) or
-//!   terminally rejected (`Released`), both of which record the receipt identity
-//!   — is reported as reconciled into that canonical receipt. A reservation that
-//!   has not reached its receipt is reported as still staged; it is NOT called a
-//!   problem, because a healthy pending stage is not a fault.
+//!   exact operation identity. A reservation that carries a durable
+//!   `terminal_receipt_id` — committed (`Finalized`) or terminally rejected
+//!   (`Released`), both of which record the receipt identity — is reported as
+//!   reconciled into that canonical receipt only after the store has re-read the
+//!   durable Ordering Scope receipts ORS recorded with it through its own
+//!   existing binding check
+//!   ([`OperationalRecoveryStore::verify_staged_terminal_receipt`]). The
+//!   PRESENCE of a receipt id is never the evidence: a reservation whose
+//!   recorded receipt is absent from, or disagrees with, its own durable scope
+//!   receipt is a failed check, not a reconciled operation (A13.6). A
+//!   reservation that has not reached its receipt is reported as still staged;
+//!   it is NOT called a problem, because a healthy pending stage is not a
+//!   fault.
 //! - **Record a problem.** A decode failure, hash mismatch, missing record
 //!   binding, or envelope/token/idempotency divergence makes
 //!   `verify_staged_envelope` retain a durable [`RecoveryProblem`] and fail
@@ -50,6 +57,13 @@
 //! substitutes an empty or "clean" report for a check it could not perform.
 //! A scan that stopped at the whole-scan bound is reported `truncated`, which
 //! the caller must not read as exhaustive coverage.
+//!
+//! A staged row whose owner index does not resolve is neither of those: it is a
+//! fault on ONE row, so the store retains the durable problem it can bind and
+//! reports the row as [`StagedWriteReconciliation::UnresolvedReservation`]
+//! (or [`StagedWriteReconciliation::RecoveryProblem`]) instead of abandoning
+//! every other row the pass had not yet reached. It is never skipped, and never
+//! reported as reconciled, staged, or absent.
 
 use crate::{
     MAX_RECOVERY_PAGE, OpaqueLabel, OperationIdentity, OperationalRecoveryStore, OrsError,
@@ -99,6 +113,47 @@ impl StagedEnvelopeRecoveryCursor {
     }
 }
 
+/// How one enumerated staged envelope row resolves to the reservation that owns
+/// it, through the owner's own durable operation index.
+///
+/// The binding is a CLOSED outcome, not a field that may be blank: a staged row
+/// either resolves to the reservation whose recorded operation identity is that
+/// row's exact key, or it does not resolve at all. There is no third spelling in
+/// which a row is enumerated and quietly reported as an owned, clean record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StagedEnvelopeReservationBinding {
+    /// The owner's own durable operation index resolved this row to a
+    /// reservation whose recorded operation identity IS this row's key.
+    Resolved {
+        /// Reservation this operation identity resolves to, read in the same
+        /// read snapshot as the row.
+        reservation_id: OperationIdentity,
+        /// Lifecycle position of that reservation.
+        reservation_state: ReservationState,
+    },
+    /// The owner's own durable operation index did not resolve this row to a
+    /// reservation (issue #1925, A13.6).
+    ///
+    /// `problem` is the durable [`RecoveryProblem`] ORS retained for this exact
+    /// staged operation identity, whenever the durable bindings a problem record
+    /// must carry were recoverable. It is `None` only where the reservation that
+    /// would carry them — the authority epoch, state fence and recovery owner —
+    /// is itself what is missing: ORS does not invent those bindings, so the row
+    /// is reported under its own key with `cause` instead. Either way the row is
+    /// REPORTED, never skipped, and it can never become a clean or reconciled
+    /// outcome.
+    Unresolved {
+        /// Reservation identity the durable operation index named, when it named
+        /// one. `None` when the index row itself is absent.
+        reservation_id: Option<OperationIdentity>,
+        /// The durable problem ORS retained for this staged operation identity,
+        /// when it could be bound.
+        problem: Option<RecoveryProblem>,
+        /// Bounded operator-visible cause owned by ORS, never payload text.
+        cause: OpaqueLabel,
+    },
+}
+
 /// One staged write envelope as the startup owner enumerated it.
 ///
 /// A reference to durable owner state, never a payload. Enumeration reads only
@@ -115,17 +170,21 @@ impl StagedEnvelopeRecoveryCursor {
 /// has no trustworthy recorded bindings to report. They are restated only on a
 /// `StagedWriteReconciliation::Reconciled` outcome, i.e. only after the owner
 /// validated them.
+///
+/// The recorded `terminal_receipt_id` is absent for the same reason. A receipt
+/// id sitting in a reservation row is a RECORDED VALUE, not a checked receipt,
+/// so reporting it here would hand the caller a presence it could mistake for
+/// the reconciliation it is not. The owner reads it back through
+/// [`OperationalRecoveryStore::verify_staged_terminal_receipt`], which compares
+/// it against the durable Ordering Scope receipts ORS committed with it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StagedEnvelopeRecoveryEntry {
-    /// Exact key the staged envelope is enumerated under.
+    /// Exact key the staged envelope is enumerated under. It is also the key of
+    /// any Recovery Problem ORS retained for this row, so the operator finds the
+    /// record under the identity the row is actually stored at.
     pub operation_id: OperationIdentity,
-    /// Reservation this operation identity resolves to through the owner's own
-    /// durable operation index, read in the same read snapshot.
-    pub reservation_id: OperationIdentity,
-    /// Lifecycle position of that reservation.
-    pub reservation_state: ReservationState,
-    /// Canonical terminal receipt ORS already recorded, if any.
-    pub terminal_receipt_id: Option<OpaqueLabel>,
+    /// What that exact key resolves to through the owner's own durable index.
+    pub reservation: StagedEnvelopeReservationBinding,
 }
 
 /// One bounded page of enumerated staged write envelopes.
@@ -148,8 +207,9 @@ pub struct StagedEnvelopeRecoveryPage {
 /// claim.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StagedWriteReconciliation {
-    /// Validated against its recorded integrity bindings, and its reservation
-    /// already carries the canonical terminal receipt for that operation.
+    /// Validated against its recorded integrity bindings, and its reservation's
+    /// canonical terminal receipt was re-read from the durable Ordering Scope
+    /// receipts ORS committed with it and matched exactly.
     Reconciled {
         operation_id: OperationIdentity,
         reservation_id: OperationIdentity,
@@ -163,6 +223,19 @@ pub enum StagedWriteReconciliation {
         operation_id: OperationIdentity,
         reservation_id: OperationIdentity,
         state: ReservationState,
+    },
+    /// The owner's own durable operation index did not resolve this staged row
+    /// to a reservation, so no receipt comparison was possible at all
+    /// (issue #1925, A13.6).
+    ///
+    /// This is deliberately NOT a clean outcome and NOT a skipped row: the pass
+    /// reports it under the exact key the staged row is stored at, together with
+    /// the owner's own bounded cause, so the record is visible, locatable, and
+    /// never mistaken for a reconciled or an absent operation.
+    UnresolvedReservation {
+        operation_id: OperationIdentity,
+        /// Bounded operator-visible cause owned by ORS, never payload text.
+        cause: OpaqueLabel,
     },
     /// Validation failed and ORS retained a durable Recovery Problem for this
     /// operation. The staged row is untouched and remains available for
@@ -262,37 +335,42 @@ pub fn recover_staged_write_envelopes(
 ///
 /// The integrity decision belongs entirely to the store's existing
 /// `verify_staged_envelope` owner read, which validates the recorded digest
-/// value and retains the durable Recovery Problem on failure. This function
-/// only classifies that typed outcome.
+/// value and retains the durable Recovery Problem on failure, and to the
+/// store's existing `verify_staged_terminal_receipt` binding check, which
+/// re-reads the durable scope receipts a recorded terminal receipt must match.
+/// This function only classifies those typed outcomes.
 fn reconcile_one_staged_envelope(
     store: &impl OperationalRecoveryStore,
     entry: &StagedEnvelopeRecoveryEntry,
 ) -> Result<StagedWriteReconciliation, OrsError> {
-    match store.verify_staged_envelope(&entry.operation_id) {
-        Ok(envelope) => match entry.terminal_receipt_id.clone() {
-            // A terminal reservation that also carries the canonical receipt
-            // identity is reconciled into that receipt — whether the canonical
-            // owner committed it (`Finalized`) or terminally rejected it
-            // (`Released`). Both dispositions record the receipt id, so the
-            // receipt's presence is the evidence, not the spelling of the
-            // terminal state. The digest and length restated here are the
-            // envelope's OWN recorded values, already checked by the owner read
-            // above.
-            Some(terminal_receipt_id) if entry.reservation_state.is_terminal() => {
-                Ok(StagedWriteReconciliation::Reconciled {
-                    operation_id: entry.operation_id.clone(),
-                    reservation_id: entry.reservation_id.clone(),
-                    terminal_receipt_id,
-                    payload_sha256: envelope.payload_sha256,
-                    payload_length: envelope.payload_length,
-                })
-            }
-            _ => Ok(StagedWriteReconciliation::Staged {
+    let (reservation_id, reservation_state) = match &entry.reservation {
+        // The owner's own index did not resolve this row. ORS already retained
+        // the durable problem for this exact staged operation identity where it
+        // could be bound, so that record is reported rather than re-derived.
+        StagedEnvelopeReservationBinding::Unresolved {
+            problem: Some(problem),
+            ..
+        } => {
+            return Ok(StagedWriteReconciliation::RecoveryProblem {
+                problem: problem.clone(),
+            });
+        }
+        // No reservation resolved, so there is no receipt to compare and no
+        // durable binding a problem record could carry. The row is still
+        // reported, under its own key and with the owner's own cause.
+        StagedEnvelopeReservationBinding::Unresolved { cause, .. } => {
+            return Ok(StagedWriteReconciliation::UnresolvedReservation {
                 operation_id: entry.operation_id.clone(),
-                reservation_id: entry.reservation_id.clone(),
-                state: entry.reservation_state,
-            }),
-        },
+                cause: cause.clone(),
+            });
+        }
+        StagedEnvelopeReservationBinding::Resolved {
+            reservation_id,
+            reservation_state,
+        } => (reservation_id, *reservation_state),
+    };
+    let envelope = match store.verify_staged_envelope(&entry.operation_id) {
+        Ok(envelope) => envelope,
         // A durable Recovery Problem is retained for this operation. Read the
         // retained record back so the startup report carries the owner's own
         // durable problem rather than a synthesized one. The staged row is
@@ -307,12 +385,35 @@ fn reconcile_one_staged_envelope(
                              retained for"
                         .to_owned(),
                 })?;
-            Ok(StagedWriteReconciliation::RecoveryProblem { problem })
+            return Ok(StagedWriteReconciliation::RecoveryProblem { problem });
         }
         // Every other typed failure is a failed check and propagates unchanged.
         // In particular `RecoveryProblemRecordFailed` means NO durable problem
         // exists for this operation, so the pass must fail rather than report
         // the operation as clean or absent.
-        Err(error) => Err(error),
+        Err(error) => return Err(error),
+    };
+    // A canonical receipt is the reconciliation evidence, so it is only
+    // reported once the store has re-read the durable Ordering Scope receipts it
+    // was committed with and found them bound to that exact receipt identity
+    // (A13.6). Whether the canonical owner committed the write (`Finalized`) or
+    // terminally rejected it (`Released`), both dispositions record the receipt,
+    // and the durable scope receipt is what decides the question — not the
+    // presence of an id and not the spelling of the terminal state. The digest
+    // and length restated below are the envelope's OWN recorded values, already
+    // checked by the owner read above.
+    match store.verify_staged_terminal_receipt(&entry.operation_id)? {
+        Some(terminal_receipt_id) => Ok(StagedWriteReconciliation::Reconciled {
+            operation_id: entry.operation_id.clone(),
+            reservation_id: reservation_id.clone(),
+            terminal_receipt_id,
+            payload_sha256: envelope.payload_sha256,
+            payload_length: envelope.payload_length,
+        }),
+        None => Ok(StagedWriteReconciliation::Staged {
+            operation_id: entry.operation_id.clone(),
+            reservation_id: reservation_id.clone(),
+            state: reservation_state,
+        }),
     }
 }
