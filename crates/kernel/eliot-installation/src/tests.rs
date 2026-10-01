@@ -1594,8 +1594,9 @@ fn installer_plan_parts(
                 // a `UserModeSupervisionAuthorityProvisionPlan` in hand. Refuse
                 // rather than invent a `PlannedChange` target for an effect
                 // this fixture cannot plan.
-                InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. } =>
-                    panic!("fixture must not plan a UserMode supervision authority effect"),
+                InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. } => {
+                    panic!("fixture must not plan a UserMode supervision authority effect")
+                }
             },
             precondition_refs: vec![test_handle("evidence:installer-precondition")],
             postcondition_refs: vec![test_handle("evidence:installer-postcondition")],
@@ -2033,8 +2034,9 @@ fn system_registration_transaction() -> InstallationTransaction {
             // carries none. `installer_plan_parts` never plans that effect, so
             // meeting it here would mean the fixture changed shape underneath
             // this loop; refuse instead of silently skipping the rebinding.
-            InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. } =>
-                panic!("Host-image rebinding must not meet a UserMode authority effect"),
+            InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. } => {
+                panic!("Host-image rebinding must not meet a UserMode authority effect")
+            }
         }
     }
     let mut ordered_effects = installer_effects
@@ -2382,8 +2384,9 @@ fn fully_applied_system_registration_transaction() -> InstallationTransaction {
             // current-user authority effect, so no credential receipt exists to
             // bind here; refuse rather than leave such an effect silently
             // un-applied if the fixture ever starts planning one.
-            InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. } =>
-                panic!("fully-applied fixture must not meet a UserMode authority effect"),
+            InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. } => {
+                panic!("fully-applied fixture must not meet a UserMode authority effect")
+            }
             InstallerEffectPlan::MaterializePhaseB { .. } => {
                 let change = transaction
                     .planned_changes
