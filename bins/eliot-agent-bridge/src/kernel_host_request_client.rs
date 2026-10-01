@@ -1970,7 +1970,7 @@ fn host_request_observe_submit_frame(
 ///
 /// | tool | bridge entry | Kernel operation | completion boundary |
 /// |---|---|---|---|
-/// | `eliot.state` | submit frame (digest-only, dispatch-time revalidated) | `agent_host_request_submit` | admission handle only; bridge revalidates session/fence/connection/payload linkage at dispatch and the Kernel submit gate revalidates the state dispatch binding pre-staging; projection-owner readback (Kernel pair + daemon flight + task/scope projection owner) is the remaining join |
+/// | `eliot.state` | invoke-read frame (tool bytes, dispatch-time revalidated) | `agent_host_request_invoke_read` | exact bounded owner-backed state preview with revision via the polled state flight; the Kernel retains the State pair on the bounded local-read carrier and the daemon claims it under a fenced attempt (#2564 item 1) |
 /// | `eliot.packet` | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | exact bounded compiler result with revision via Governor read owner |
 /// | `eliot.observe` | submit frame (tool bytes, dispatch-time revalidated) | `agent_host_request_submit` | daemon observe flight claims the retained pair, decodes the closed vocabulary and routes to the Governor observation owner; retained result via the governed submit leg; the bridge answers completed only with the owner-retained receipt |
 /// | `eliot.query` | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | exact bounded read result with revision via Governor read owner |
@@ -2025,19 +2025,6 @@ enum CanonicalDispatchEntry {
     /// tool bytes are retained here. The Accepted reply stays an operation
     /// handle until the fabric owner completes it.
     SubmitCoordinateGated { completion_join: &'static str },
-    /// State projection dispatch with dispatch-time revalidation (issue
-    /// #1739 W5; projection-owner readback join still open).
-    ///
-    /// The bridge revalidates only what it owns at dispatch time (state
-    /// shape, live session/fence/connection binding, exact payload-digest
-    /// linkage) and rides the same `agent_host_request_submit` entry; the
-    /// Kernel submit entry revalidates the state dispatch binding
-    /// pre-staging (`check_state_submit_binding`). The current authorized
-    /// task/scope/attention/health projection stays the projection owner's
-    /// to serve at the future live state claim/flight, not here; no tool
-    /// bytes are retained here. The Accepted reply stays an operation
-    /// handle until the projection owner completes it.
-    SubmitStateGated { completion_join: &'static str },
     /// Observe submit carrying the exact canonical tool bytes (issue #2565).
     /// Rides the same `agent_host_request_submit` entry as the digest-only
     /// submits; the bridge revalidates the observe dispatch binding
@@ -2061,10 +2048,17 @@ enum CanonicalDispatchEntry {
 /// above. Behavior is byte-identical to the previous scattered predicates.
 fn canonical_dispatch_entry(tool: &ToolRequest) -> CanonicalDispatchEntry {
     match tool {
-        ToolRequest::State(_) => CanonicalDispatchEntry::SubmitStateGated {
-            completion_join: "projection-owner readback: submit-record execution (Kernel pair + daemon flight + task/scope projection owner)",
-        },
-        ToolRequest::Packet(_)
+        // #2564 item 1: `eliot.state` is a bounded READ class, so it rides
+        // the same linkage-checked invoke-read carrier as query/packet rather
+        // than the digest-only submit entry. The exact serialized
+        // `ToolRequest::State` bytes travel in the frame payload; the Kernel
+        // `route_and_retain_invoke_read_lane` re-derives the State form with
+        // `check_local_state_admission` and RETAINS the pair on the bounded
+        // local-read carrier, so the daemon poll claims real State input and
+        // the retained result comes back through the existing readback. The
+        // Accepted reply stays an operation handle until that flight submits.
+        ToolRequest::State(_)
+        | ToolRequest::Packet(_)
         | ToolRequest::Query(_)
         | ToolRequest::SkillInject(_)
         | ToolRequest::SkillDisplay(_)
@@ -2196,20 +2190,22 @@ fn revalidate_coordinate_dispatch(
 }
 
 /// Dispatch-time revalidation for one `eliot.state` projection dispatch
-/// (issue #1739 W5; projection-owner readback join still open).
+/// (issue #2564 item 1: State rides the invoke-read carrier).
 ///
 /// Re-checks at dispatch, against live Kernel-issued facts, only what the
 /// bridge owns: the tool is still the exact `eliot.state` request admitted,
 /// the envelope still names the live session/fence/connection, and the
 /// canonical payload digest still binds the exact tool bytes. A swapped
-/// packet, forged binding, or stale fence fails closed here before any
-/// submit frame is built; the current authorized task/scope/attention/
-/// health projection stays the future live state claim/flight's to serve,
-/// and the durable operation identity stays the Kernel admission owner's
-/// to mint — this seam neither interprets projection semantics nor
-/// synthesizes a projection (I01-08 read path; I07-08 step 9). Failures are
-/// typed (I07-20): fence mismatch stays `FenceMismatch`, binding mismatches
-/// stay `TransportBindingRejected`, a missing session stays `PlanGap`.
+/// packet, forged binding, or stale fence fails closed here before the
+/// invoke-read frame is built, so the Kernel linkage gate and
+/// `check_local_state_admission` only ever see bytes the bridge already bound
+/// to the admitted envelope. The owner-backed task/scope/attention/health
+/// projection stays the polled state flight's to serve, and the durable
+/// operation identity stays the Kernel admission owner's to mint -- this seam
+/// neither interprets projection semantics nor synthesizes a projection
+/// (I01-08 read path; I07-08 step 9). Failures are typed (I07-20): fence
+/// mismatch stays `FenceMismatch`, binding mismatches stay
+/// `TransportBindingRejected`, a missing session stays `PlanGap`.
 fn revalidate_state_dispatch(
     request: &HostInvocationRequest,
     envelope: &HostRequestEnvelope,
@@ -3201,12 +3197,22 @@ fn invalid_result(detail: &str) -> PortFailure {
 /// digest. The readback leg ([`decode_record_view`]) already refuses a
 /// present-but-invalid lineage through the shared retained rule, so this
 /// gate adds only the missing half: an ABSENT lineage cannot be the
-/// retained outcome. Invoke-read rows (`eliot.packet`, `eliot.query`,
-/// `eliot.finish`, skill carriers) keep their existing receipt (admission
-/// receipt plus the retained digest chain): their producer mints no
-/// lineage, so absence there is the established contract, never a missing
-/// receipt. The non-hot operator carrier keeps its own leg's contract and
-/// is never subject to this gate.
+/// retained outcome. Invoke-read rows (`eliot.state`, `eliot.packet`,
+/// `eliot.query`, `eliot.finish`, skill carriers) keep their existing
+/// receipt (admission receipt plus the retained digest chain): their
+/// producer mints no lineage, so absence there is the established contract,
+/// never a missing receipt. The non-hot operator carrier keeps its own leg's
+/// contract and is never subject to this gate.
+///
+/// #2564 item 1 moved `eliot.state` from the digest-only submit entry onto
+/// the invoke-read carrier, so its retained result arrives through
+/// `submit_local_read_result` like every other bounded read. That producer
+/// persists the digest-bound pair and mints NO `result_lineage`, exactly as
+/// it does for `eliot.packet` / `eliot.query`; leaving State in this list
+/// would refuse its own legitimate retained result as receiptless. State is
+/// therefore gated by the read lane's own rule instead: the correlation,
+/// idempotency, tool and exact canonical-request-digest joins in
+/// [`decode_stored_response`], plus the retained result digest binding.
 ///
 /// A receiptless submit-leg result fails closed as a transport binding
 /// rejection (the same family as a bodyless result), never as a bare
@@ -3220,7 +3226,7 @@ fn require_submit_completion_receipt(
 ) -> Result<(), PortFailure> {
     let submit_leg = matches!(
         tool_name,
-        "eliot.state" | "eliot.observe" | "eliot.act" | "eliot.verify" | "eliot.coordinate"
+        "eliot.observe" | "eliot.act" | "eliot.verify" | "eliot.coordinate"
     );
     if submit_leg && record.result_lineage.is_none() {
         return Err(invalid_result(
@@ -3557,6 +3563,17 @@ fn invoke_request_frame(
 ) -> Result<Frame, PortFailure> {
     Ok(match canonical_dispatch_entry(&request.tool) {
         CanonicalDispatchEntry::InvokeRead => {
+            // #2564 item 1: `eliot.state` shares this arm with query/packet.
+            // The Bridge still owns the dispatch-time session/fence/
+            // connection/payload-digest binding for State (the Kernel's
+            // `check_local_state_admission` re-checks capability and payload
+            // linkage on arrival), so a swapped packet or stale fence fails
+            // closed here before the invoke-read frame is built. This is the
+            // SAME revalidation the digest-only submit entry used, applied on
+            // the carrier that now carries State; no new binding scheme.
+            if matches!(request.tool, ToolRequest::State(_)) {
+                revalidate_state_dispatch(request, envelope, facts)?;
+            }
             host_request_invoke_read_frame(request, envelope, facts)?
         }
         CanonicalDispatchEntry::SubmitAdmitOnly { .. } => {
@@ -3568,10 +3585,6 @@ fn invoke_request_frame(
         }
         CanonicalDispatchEntry::SubmitCoordinateGated { .. } => {
             revalidate_coordinate_dispatch(request, envelope, facts)?;
-            host_request_frame_for_envelope(AGENT_HOST_REQUEST_SUBMIT_OPERATION, envelope, facts)?
-        }
-        CanonicalDispatchEntry::SubmitStateGated { .. } => {
-            revalidate_state_dispatch(request, envelope, facts)?;
             host_request_frame_for_envelope(AGENT_HOST_REQUEST_SUBMIT_OPERATION, envelope, facts)?
         }
         CanonicalDispatchEntry::SubmitCarryingBytes => {
@@ -4496,9 +4509,31 @@ mod tests {
     #[test]
     fn local_read_tools_ride_invoke_read_with_tool_bytes() {
         let (request, facts, envelope) = test_envelope();
+        // #2564 item 1: `eliot.state` moved from the digest-only submit entry
+        // onto this linkage-checked invoke-read carrier, so the Kernel retains
+        // the exact State pair and the daemon flight can claim it.
         assert!(
-            !invokes_local_read(&request),
-            "eliot.state keeps the admission-only submit entry"
+            invokes_local_read(&request),
+            "eliot.state rides the invoke-read entry"
+        );
+        let state_frame = host_request_invoke_read_frame(&request, &envelope, &facts)
+            .expect("invoke-read frame must build");
+        let state_payload = match &state_frame.payload {
+            ProtocolPayload::Json(payload) => payload.clone(),
+            _ => panic!("invoke-read frame must carry JSON"),
+        };
+        assert_eq!(
+            state_payload
+                .get("operation")
+                .and_then(|operation| operation.as_str()),
+            Some(AGENT_HOST_REQUEST_INVOKE_READ_OPERATION)
+        );
+        assert_eq!(
+            state_payload
+                .get("tool")
+                .and_then(|tool| tool.get("name"))
+                .and_then(|name| name.as_str()),
+            Some("eliot.state")
         );
         for tool_json in [
             serde_json::json!({"name":"eliot.query","arguments":{
