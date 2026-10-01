@@ -668,11 +668,11 @@ pub fn evaluate_material_request(
 mod tests {
     #![allow(clippy::expect_used)] // test-only panic-acceptable (#838).
     use super::super::{
-        ColdStartController, GenerationEvidence, GoverningSource, GoverningSourceRole,
-        GoverningSourceSet, OnboardingLease, OnboardingLeaseState, PrivacyProfile,
-        RepositoryLineageIdentity, ResourceExecutionIdentity, ScopeBinding, ScopeBindingGuard,
-        ScopeIdentity, ScopeKind, ScopeLifecycle, SourceStatus, TaskBindingInput,
-        WorkScopeCandidate, WorkspaceInstanceIdentity,
+        AuthorityBasis, ColdStartController, GenerationEvidence, GoverningSource,
+        GoverningSourceRole, GoverningSourceSet, OnboardingLease, OnboardingLeaseState,
+        PrivacyProfile, RepositoryLineageIdentity, ResourceExecutionIdentity, ScopeBinding,
+        ScopeBindingGuard, ScopeIdentity, ScopeKind, ScopeLifecycle, SourceStatus,
+        TaskBindingInput, WorkScopeCandidate, WorkspaceInstanceIdentity,
     };
     use super::*;
     use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
@@ -681,6 +681,8 @@ mod tests {
     use std::num::NonZeroU64;
 
     const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+    /// Human decision owner that admitted the governing sources in fixtures.
+    const TEST_OWNER_A: &str = "owner:example";
 
     fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
         EpochId::new(
@@ -788,7 +790,12 @@ mod tests {
                 status: SourceStatus::Admitted,
                 domains: Vec::new(),
                 digest: "a".repeat(64),
-                authority_basis: None,
+                // An admitted source names the authority that promoted it
+                // (#1791): this scope is owned by the human decision owner
+                // whose task intake produced the current task contract.
+                authority_basis: Some(AuthorityBasis::HumanOwner {
+                    owner_ref: TEST_OWNER_A.into(),
+                }),
             }],
             Vec::new(),
         ) {
@@ -897,7 +904,7 @@ mod tests {
             task_ref: "task:one".into(),
             task_revision: 1,
             acceptance_digest: "digest:acceptance:one".into(),
-            selection_source_ref: "owner:example".into(),
+            selection_source_ref: TEST_OWNER_A.into(),
             evidence_ref: "intake:example".into(),
         }
     }
