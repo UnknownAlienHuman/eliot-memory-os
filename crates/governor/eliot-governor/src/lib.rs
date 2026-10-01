@@ -331,7 +331,8 @@ pub use wasm_resolution::{
     GovernorWasmAdmission, PromotionExpectations,
 };
 pub use work_scope_source_admission::{
-    PreparedWorkScopeSourceAdmission, WorkScopeSourceAdmissionError,
+    ApprovedNormativeSource, GoverningSourceApproval, PreparedWorkScopeSourceAdmission,
+    VerifiedGoverningSourceApproval, WorkScopeSourceAdmissionError,
     prepare_initial_work_scope_source_admission,
 };
 
