@@ -45,11 +45,16 @@
 //! evaluates presented evidence and returns a disposition.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use eliot_agent_api::AttemptId;
 use eliot_agent_api::LowercaseSha256;
 use eliot_agent_api::RouteFingerprint;
 use eliot_agent_coordinator::{HumanModelPreferencePolicy, ModelRole};
+use eliot_host_state::{
+    ModelPreferenceCasOutcome, ModelPreferencePublicationReceipt, ModelPreferenceStore,
+    ModelPreferenceStoreError, PreferenceCasExpected,
+};
 
 use crate::route_receipts::{
     GovernorRouteAttempt, RouteAdmissionVisibility, RouteReceiptError, RuntimeObservedFacts,
@@ -591,6 +596,78 @@ fn check_critical(
 /// Returns true for a bounded non-blank capability name.
 fn is_capability_name(value: &str) -> bool {
     !value.trim().is_empty() && !value.chars().any(char::is_control)
+}
+
+/// Publishes one authenticated Human model-preference replacement through the
+/// settings owner (issue #485, audit 5872395796; production caller for CHECK
+/// R1-contract-prerequisite and CHECK R4-publication-receipt).
+///
+/// Chain (STITCH with the exact owner seam; nothing is re-decided here):
+/// [`ModelPreferenceStore::open`] (absolute-path and symlink/reparse guards)
+/// → [`ModelPreferenceStore::load_model_preferences`] (fresh predecessor
+/// re-read) → [`PreferenceCasExpected::from_candidate_anchor`] (candidate
+/// triple pinned against that fresh load; mismatch fails closed as stale) →
+/// [`ModelPreferenceStore::compare_and_swap_model_preferences`] (atomic
+/// predecessor recheck inside the owner's write transaction; an identical
+/// replacement replays without writing) →
+/// [`ModelPreferenceStore::read_publication_receipt`] (immutable receipt
+/// rebuilt from the retained committed bytes, so a restart re-read returns
+/// the same receipt A-02/A-08 read back).
+///
+/// Provenance: the submit leg threads the anchor triple
+/// (`expected_policy_id`, `expected_policy_revision`,
+/// `expected_policy_digest`) and the full replacement (`policy`) of one
+/// authenticated, sealed `SwarmCommandKind::ReplacePreferencePolicy`
+/// candidate (`ControlBoard::swarm_command_candidate` over
+/// `OperatorAction::ReplaceSwarmPolicy`, compiled by
+/// `compile_replace_policy_candidate`). The triple crosses as three plain
+/// strings, matching the owner's import boundary; the replacement names the
+/// single contract schema (`HumanModelPreferencePolicy`), and no
+/// caller-supplied digest is ever retained — the owner recomputes every
+/// digest it stores. Role/capability admission for the submitting principal
+/// stays with the candidate leg; this caller mints no authority, performs no
+/// provider call or catalogue refresh, and owns no settings database beyond
+/// the one configured store path it is given.
+///
+/// Outcomes: `Committed` carries the newly committed store revision with the
+/// prior revision/digest link recorded in the receipt; `Replayed` names the
+/// unchanged retained revision (exact replay is idempotent). `Stale` means
+/// the predecessor moved under the candidate: the submit leg reloads,
+/// re-pins, and retries, and the atomic recheck inside the owner transaction
+/// is what makes the retry converge. A missing receipt after a successful
+/// CAS names a store that no longer retains the committed document and
+/// surfaces as [`ModelPreferenceStoreError::Unavailable`] instead of an
+/// invented receipt.
+///
+/// STITCH status: this is the production entry point the owner's module docs
+/// name as the separate daemon/publication wiring. It is not yet reached
+/// from the live submit leg; that wiring arrives with its own review and
+/// must pass the sealed candidate's triple and replacement through — never
+/// a second settings store, a caller-recomputed digest, or a direct store
+/// write around the owner.
+pub fn publish_replace_preference_policy_candidate(
+    store_path: &Path,
+    expected_policy_id: &str,
+    expected_policy_revision: &str,
+    expected_policy_digest: &str,
+    replacement: &HumanModelPreferencePolicy,
+) -> Result<
+    (ModelPreferenceCasOutcome, ModelPreferencePublicationReceipt),
+    ModelPreferenceStoreError,
+> {
+    let store = ModelPreferenceStore::open(store_path)?;
+    let current = store.load_model_preferences()?;
+    let expected = PreferenceCasExpected::from_candidate_anchor(
+        current.as_ref(),
+        expected_policy_id,
+        expected_policy_revision,
+        expected_policy_digest,
+    )?;
+    let outcome = store.compare_and_swap_model_preferences(&expected, replacement)?;
+    let receipt = store
+        .read_publication_receipt()?
+        .ok_or(ModelPreferenceStoreError::Unavailable)?;
+    Ok((outcome, receipt))
 }
 
 #[cfg(test)]
