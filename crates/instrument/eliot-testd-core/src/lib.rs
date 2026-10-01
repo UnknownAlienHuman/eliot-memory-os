@@ -1280,6 +1280,11 @@ const ADMITTED_IDENTITIES: TableDefinition<&str, &[u8]> =
 /// one-use token binding and bounded status projection.
 const BLOB_PROCESS_STREAM_CALLS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("testd_blob_process_stream_calls_v1");
+/// Current one-use Kernel-issued token for each immutable stream grant. This
+/// is separate from the signed launch grant so successor issuance never
+/// rewrites the original material projection or its digest.
+const BLOB_PROCESS_STREAM_TOKEN_HEADS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("testd_blob_process_stream_token_heads_v1");
 
 /// Persistent daemon failures.
 #[derive(Debug, Error)]
@@ -1879,10 +1884,14 @@ impl TestdBlobProcessStreamGrant {
         }
         for (index, token) in self.tokens.iter().enumerate() {
             validate_text(&token.reference, "blob_stream.token.reference")?;
-            if token.ordinal as usize != index + 1 {
+            if token.ordinal == 0
+                || (index > 0
+                    && token.ordinal
+                        != self.tokens[index - 1].ordinal.saturating_add(1))
+            {
                 return Err(TestdError::Invalid {
                     field: "blob_stream.tokens",
-                    reason: "token ordinals must be contiguous from one",
+                    reason: "token ordinals must be positive and contiguous",
                 });
             }
             if self.tokens[..index]
@@ -3980,6 +3989,16 @@ fn blob_process_stream_call_key(
     Ok(blake3::hash(&canonical).to_hex().to_string())
 }
 
+fn blob_process_stream_token_head_key(
+    job_id: &str,
+    capability_ref: &str,
+) -> Result<String, TestdError> {
+    let canonical =
+        eliot_contracts::canonical_json_bytes(&("token-head", job_id, capability_ref))
+            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+    Ok(blake3::hash(&canonical).to_hex().to_string())
+}
+
 fn decode_project_sequence(bytes: &[u8]) -> Result<u64, TestdError> {
     serde_json::from_slice(bytes).map_err(|_| corrupt("project sequence metadata is invalid"))
 }
@@ -4023,6 +4042,7 @@ fn validate_sequence_inventory(
 }
 
 /// One durable test-daemon state owner.
+#[derive(Clone)]
 pub struct TestdStore {
     database: Arc<Database>,
     retry: RetryPolicy,
@@ -4118,6 +4138,11 @@ impl TestdStore {
         let write = db.begin_write().map_err(database)?;
         drop(write.open_table(ADMITTED_IDENTITIES).map_err(database)?);
         drop(write.open_table(BLOB_PROCESS_STREAM_CALLS).map_err(database)?);
+        drop(
+            write
+                .open_table(BLOB_PROCESS_STREAM_TOKEN_HEADS)
+                .map_err(database)?,
+        );
         write.commit().map_err(database)?;
         Ok(Self {
             database: Arc::new(db),
@@ -4211,10 +4236,33 @@ impl TestdStore {
         }
         if let Some(existing) = &job.blob_process_stream_grant {
             if existing == &grant {
+                let head_key = blob_process_stream_token_head_key(job_id, &grant.capability_ref)?;
+                let heads = write
+                    .open_table(BLOB_PROCESS_STREAM_TOKEN_HEADS)
+                    .map_err(database)?;
+                if heads.get(head_key.as_str()).map_err(database)?.is_none() {
+                    let initial = grant
+                        .tokens
+                        .first()
+                        .ok_or(TestdError::InvalidBinding)?;
+                    let encoded = serde_json::to_vec(initial)
+                        .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+                    heads
+                        .insert(head_key.as_str(), encoded.as_slice())
+                        .map_err(database)?;
+                    drop(heads);
+                    write.commit().map_err(database)?;
+                }
                 return Ok(job);
             }
             return Err(TestdError::JobConflict(job_id.to_owned()));
         }
+        let initial_token = grant
+            .tokens
+            .first()
+            .cloned()
+            .ok_or(TestdError::InvalidBinding)?;
+        let head_key = blob_process_stream_token_head_key(job_id, &grant.capability_ref)?;
         job.blob_process_stream_grant = Some(grant);
         let encoded = serde_json::to_vec(&job)
             .map_err(|error| TestdError::Corrupt(error.to_string()))?;
@@ -4224,6 +4272,13 @@ impl TestdStore {
                 .insert(job_id, encoded.as_slice())
                 .map_err(database)?;
         }
+        let head_encoded = serde_json::to_vec(&initial_token)
+            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        write
+            .open_table(BLOB_PROCESS_STREAM_TOKEN_HEADS)
+            .map_err(database)?
+            .insert(head_key.as_str(), head_encoded.as_slice())
+            .map_err(database)?;
         write.commit().map_err(database)?;
         Ok(job)
     }
@@ -4252,6 +4307,41 @@ impl TestdStore {
             Ok(TestdBlobProcessStreamGrantResolution::Revoked)
         } else {
             Ok(TestdBlobProcessStreamGrantResolution::Active(grant))
+        }
+    }
+
+    /// Resolves the current one-use token head independently of the immutable
+    /// launch-grant projection. Kernel call reconciliation remains bound to
+    /// the exact consumed token retained in the call table.
+    pub fn resolve_blob_process_stream_token_head(
+        &self,
+        job_id: &str,
+        capability_ref: &str,
+    ) -> Result<Option<TestdBlobProcessStreamTokenRef>, TestdError> {
+        validate_text(job_id, "blob_stream.job_id")?;
+        validate_text(capability_ref, "blob_stream.capability_ref")?;
+        let grant = match self.resolve_blob_process_stream_grant(job_id, capability_ref)? {
+            TestdBlobProcessStreamGrantResolution::Active(grant) => grant,
+            TestdBlobProcessStreamGrantResolution::NotFound
+            | TestdBlobProcessStreamGrantResolution::Revoked => return Ok(None),
+        };
+        let key = blob_process_stream_token_head_key(job_id, capability_ref)?;
+        let read = self.database.begin_read().map_err(database)?;
+        let table = read
+            .open_table(BLOB_PROCESS_STREAM_TOKEN_HEADS)
+            .map_err(database)?;
+        if let Some(value) = table.get(key.as_str()).map_err(database)? {
+            let token: TestdBlobProcessStreamTokenRef = serde_json::from_slice(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+            validate_text(&token.reference, "blob_stream.token.reference")?;
+            if token.ordinal == 0 {
+                return Err(TestdError::Corrupt(
+                    "durable Blob token head has a zero ordinal".to_owned(),
+                ));
+            }
+            Ok(Some(token))
+        } else {
+            Ok(grant.tokens.first().cloned())
         }
     }
 
@@ -4334,10 +4424,26 @@ impl TestdStore {
                 TestdBlobProcessStreamCallOutcome::Unavailable,
             ));
         }
+        let head_key = blob_process_stream_token_head_key(job_id, capability_ref)?;
+        let current_token = {
+            let heads = write
+                .open_table(BLOB_PROCESS_STREAM_TOKEN_HEADS)
+                .map_err(database)?;
+            match heads.get(head_key.as_str()).map_err(database)? {
+                Some(value) => serde_json::from_slice::<TestdBlobProcessStreamTokenRef>(
+                    value.value(),
+                )
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?,
+                None => grant
+                    .tokens
+                    .first()
+                    .cloned()
+                    .ok_or(TestdError::InvalidBinding)?,
+            }
+        };
         if grant.capability_ref != capability_ref
-            || grant.tokens.get(ordinal as usize).is_none_or(|token| {
-                token.ordinal != ordinal || token.reference != token_ref
-            })
+            || current_token.ordinal != ordinal
+            || current_token.reference != token_ref
         {
             return Err(TestdError::InvalidBinding);
         }
@@ -4421,6 +4527,7 @@ impl TestdStore {
             ordinal,
             operation_sha256,
             None,
+            None,
         )
     }
 
@@ -4443,6 +4550,39 @@ impl TestdStore {
             ordinal,
             operation_sha256,
             Some(outcome),
+            None,
+        )
+    }
+
+    /// Atomically retains one completed response reference and advances the
+    /// durable grant to the Kernel-issued successor token. The caller may
+    /// enqueue the successor only after this transaction commits.
+    pub fn complete_blob_process_stream_call_and_advance(
+        &self,
+        job_id: &str,
+        capability_ref: &str,
+        token_ref: &str,
+        ordinal: u32,
+        operation_sha256: &str,
+        outcome: TestdBlobProcessStreamCallOutcome,
+        successor: TestdBlobProcessStreamTokenRef,
+    ) -> Result<(), TestdError> {
+        validate_blob_process_stream_outcome(&outcome)?;
+        validate_text(&successor.reference, "blob_stream.token.reference")?;
+        if !matches!(&outcome, TestdBlobProcessStreamCallOutcome::Completed { .. })
+            || ordinal == u32::MAX
+            || successor.ordinal != ordinal + 1
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        self.update_blob_process_stream_call(
+            job_id,
+            capability_ref,
+            token_ref,
+            ordinal,
+            operation_sha256,
+            Some(outcome),
+            Some(successor),
         )
     }
 
@@ -4500,6 +4640,7 @@ impl TestdStore {
         ordinal: u32,
         operation_sha256: &str,
         outcome: Option<TestdBlobProcessStreamCallOutcome>,
+        successor: Option<TestdBlobProcessStreamTokenRef>,
     ) -> Result<(), TestdError> {
         validate_blob_call_binding(job_id, capability_ref, token_ref, operation_sha256)?;
         let write = self.database.begin_write().map_err(database)?;
@@ -4525,30 +4666,118 @@ impl TestdStore {
         )?;
         match (record.state.clone(), outcome) {
             (TestdBlobProcessStreamCallState::Reserved, None) => {
+                if successor.is_some() {
+                    return Err(TestdError::InvalidBinding);
+                }
                 record.state = TestdBlobProcessStreamCallState::Dispatched;
             }
-            (TestdBlobProcessStreamCallState::Dispatched, None) => return Ok(()),
+            (TestdBlobProcessStreamCallState::Dispatched, None) => {
+                if successor.is_some() {
+                    return Err(TestdError::InvalidBinding);
+                }
+                return Ok(());
+            }
             (TestdBlobProcessStreamCallState::Reserved, Some(outcome))
                 if matches!(outcome, TestdBlobProcessStreamCallOutcome::NotStarted
                     | TestdBlobProcessStreamCallOutcome::Unavailable) =>
             {
+                if successor.is_some() {
+                    return Err(TestdError::InvalidBinding);
+                }
                 record.state = TestdBlobProcessStreamCallState::Completed(outcome);
             }
             (TestdBlobProcessStreamCallState::Dispatched, Some(outcome)) => {
                 record.state = TestdBlobProcessStreamCallState::Completed(outcome);
             }
             (TestdBlobProcessStreamCallState::Completed(existing), Some(outcome))
-                if existing == outcome => return Ok(()),
+                if existing == outcome => {
+                    if successor.is_none() {
+                        return Ok(());
+                    }
+                }
             // A protected reconciliation can resolve an earlier Unknown for
             // this exact logical call. Unknown is explicitly unresolved, so
             // replacing it with the retained owner outcome does not change
             // the request binding or authorize another Store dispatch.
             (TestdBlobProcessStreamCallState::Completed(
-                TestdBlobProcessStreamCallOutcome::Unknown,
+            TestdBlobProcessStreamCallOutcome::Unknown,
             ), Some(outcome)) => {
+                if successor.is_some() {
+                    return Err(TestdError::InvalidBinding);
+                }
                 record.state = TestdBlobProcessStreamCallState::Completed(outcome);
             }
             _ => return Err(TestdError::InvalidBinding),
+        }
+        if let Some(successor) = successor {
+            let job = {
+                let table = write.open_table(JOBS).map_err(database)?;
+                let value = table
+                    .get(job_id)
+                    .map_err(database)?
+                    .ok_or(TestdError::InvalidBinding)?;
+                serde_json::from_slice::<TestJob>(value.value())
+                    .map_err(|error| TestdError::Corrupt(error.to_string()))?
+            };
+            let grant = job
+                .blob_process_stream_grant
+                .as_ref()
+                .ok_or(TestdError::InvalidBinding)?;
+            if grant.capability_ref != capability_ref || grant.revoked_at_ms.is_some() {
+                return Err(TestdError::InvalidBinding);
+            }
+            let head_key = blob_process_stream_token_head_key(job_id, capability_ref)?;
+            let current_head = {
+                let heads = write
+                    .open_table(BLOB_PROCESS_STREAM_TOKEN_HEADS)
+                    .map_err(database)?;
+                match heads.get(head_key.as_str()).map_err(database)? {
+                    Some(value) => serde_json::from_slice::<TestdBlobProcessStreamTokenRef>(
+                        value.value(),
+                    )
+                    .map_err(|error| TestdError::Corrupt(error.to_string()))?,
+                    None => grant
+                        .tokens
+                        .first()
+                        .cloned()
+                        .ok_or(TestdError::InvalidBinding)?,
+                }
+            };
+            let current_is_consumed =
+                current_head.ordinal == ordinal && current_head.reference == token_ref;
+            let already_advanced = current_head == successor;
+            if !current_is_consumed && already_advanced {
+                // Idempotent recovery after the previous transaction committed.
+                if !matches!(&record.state, TestdBlobProcessStreamCallState::Completed(_)) {
+                    return Err(TestdError::InvalidBinding);
+                }
+            } else if !current_is_consumed {
+                return Err(TestdError::InvalidBinding);
+            } else {
+                let calls = write
+                    .open_table(BLOB_PROCESS_STREAM_CALLS)
+                    .map_err(database)?;
+                for item in calls.iter().map_err(database)? {
+                    let (_, value) = item.map_err(database)?;
+                    let prior: TestdBlobProcessStreamCallRecord =
+                        serde_json::from_slice(value.value())
+                            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+                    if prior.job_id == job_id
+                        && prior.capability_ref == capability_ref
+                        && prior.token_ref == successor.reference
+                    {
+                        return Err(TestdError::InvalidBinding);
+                    }
+                }
+                drop(calls);
+                let encoded_successor = serde_json::to_vec(&successor)
+                    .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+                write
+                    .open_table(BLOB_PROCESS_STREAM_TOKEN_HEADS)
+                    .map_err(database)?
+                    .insert(head_key.as_str(), encoded_successor.as_slice())
+                    .map_err(database)?;
+            }
         }
         let encoded = serde_json::to_vec(&record)
             .map_err(|error| TestdError::Corrupt(error.to_string()))?;
