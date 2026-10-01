@@ -3124,6 +3124,7 @@ pub fn admit_prepared_transition_with_owner_selection(
         ));
     }
 
+    let (governing_sources, privacy_profile) = owner.source_closure();
     admit_task_bound_with_observed_scope(
         Some(evidence),
         &admitted_task_ref,
@@ -3131,6 +3132,8 @@ pub fn admit_prepared_transition_with_owner_selection(
         observed_scope,
         live_fence,
         CompatibilityDisposition::Compatible,
+        Some((governing_sources, privacy_profile)),
+        eliot_workscope::GuardTrigger::CanonicalWrite,
     )
 }
 
