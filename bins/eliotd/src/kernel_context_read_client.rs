@@ -736,15 +736,31 @@ impl KernelContextReadClient {
     /// plan — travels end to end: per-role provider failures become
     /// per-role dispositions inside [`SevenRoleInputs`], while a bad request,
     /// a missing closure, or observed source churn fails the whole call as
-    /// [`ContextInputsError`]. The daemon state/packet dispatch invokes this
-    /// edge with the admitted pair's fence, scope, and selectors; this
-    /// function performs no admission decision and no consistency algorithm
-    /// of its own.
+    /// [`ContextInputsError`]. Before any role is acquired, the read owner's
+    /// own declared surface is resolved once
+    /// (`eliot_read::owner_inventory::read_owner_inventory`), so an owner
+    /// whose Store-dependency inventory no longer resolves fails the whole call
+    /// as [`ContextInputsError::ReadOwnerSurfaceUnresolved`] instead of
+    /// serving reads under an unverified declared surface. The daemon
+    /// state/packet dispatch invokes this edge with the admitted pair's fence,
+    /// scope, and selectors; this function performs no admission decision and
+    /// no consistency algorithm of its own.
     pub async fn reconstruct_context_inputs(
         &self,
         ctx: &RequestMetadata,
         request: &ContextReconstructionRequest,
     ) -> Result<SevenRoleInputs, ContextInputsError> {
+        // The read owner's declared surface is resolved BEFORE any role is
+        // acquired, once per reconstruction rather than once per read. This is
+        // the only place the aggregate inventory is resolved, and it is
+        // deliberately on the production edge: the Store-dependency set in it
+        // is derived from the owner's own import surface, so a dependency the
+        // owner gained (or a row it kept after losing one) fails this call with
+        // the symbol's name instead of being reported as a complete inventory
+        // that nothing ever checks. It creates no state and no freshness; it
+        // is still not evidence that any read executed.
+        eliot_read::owner_inventory::read_owner_inventory()
+            .map_err(|error| ContextInputsError::ReadOwnerSurfaceUnresolved(error.to_string()))?;
         let service = ReadService::new(Self {
             kernel: Arc::clone(&self.kernel),
         });

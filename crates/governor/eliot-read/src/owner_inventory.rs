@@ -35,6 +35,19 @@
 //!   JSON schema its own `JsonSchema` derive produces, so whether an unknown
 //!   property is refused is observed rather than asserted.
 //!
+//! The Store-dependency SET is **derived too**, and from a source outside this
+//! file: [`imported_store_symbols`] reads the `eliot_store_api` imports out of
+//! this crate's own embedded text, so the set cannot be widened or narrowed by
+//! anything written here. [`STORE_DEPENDENCIES`] is then only a witness table —
+//! one real call per imported symbol — and
+//! [`resolve_store_dependency_rows`] refuses unless the two agree in BOTH
+//! directions. That is what makes the inventory able to notice a dependency
+//! nobody wrote a row for: a ninth Store call enters the derived set the moment
+//! it is written, and resolution fails with that symbol's name until the row
+//! that observes it exists. (This crate previously carried a hand-typed
+//! eight-row list beside its own resolver, which reported a complete inventory
+//! while twelve of the twenty symbols it imported had no row at all.)
+//!
 //! The language offers no reflection over enum variants, over the items of a
 //! module, or over the test set of a package. Where a closed enumeration is
 //! unavoidable it is declared here, and the declaration is the only hand-typed
@@ -54,8 +67,10 @@ use std::collections::BTreeSet;
 
 use eliot_contracts::ContractVersion;
 use eliot_store_api::{
-    EXPERIENCE_BANK_READ_NAME, EXPERIENCE_FEEDBACK_READ_NAME, NamedOperationManifest,
-    NamedReadOperation, ReadConsistency, activated_read_operations, declared_read_parameters,
+    AutomationContinuationFailure, EXPERIENCE_BANK_READ_NAME, EXPERIENCE_FEEDBACK_READ_NAME,
+    EXPERIENCE_PAGE_STATE_FENCE, NamedOperationManifest, NamedReadOperation, NamedReadRequest,
+    NamedReadResponse, OrderingHead, ReadConsistency, RevisionHead, RevisionKey, ScopeId,
+    StoreError, activated_read_operations, declared_read_parameters, generated_operation_manifests,
     named_read_operation_name, parameter_schema_digest, project_parameter_schema,
 };
 use schemars::JsonSchema;
@@ -431,9 +446,12 @@ pub struct OwnerContractIdentity {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoreDependencyRow {
-    /// The depended-upon item, named as the Store exports it.
+    /// The depended-upon item, named exactly as this crate imports it.
     pub symbol: String,
-    /// Value observed by calling the item at inventory time.
+    /// What a real use of that item reported: the count a Store declaration
+    /// call returned, the byte length of the fully qualified path the
+    /// compiler reports for a Store type, or the number of dispatch points
+    /// this crate makes through the Store read port. Never a stored constant.
     pub observed: usize,
     /// How this row was established.
     pub provenance: InventoryProvenance,
@@ -591,19 +609,28 @@ impl ReadOwnerInventory {
 /// Resolves the whole owner inventory from the registries the read path reads.
 ///
 /// This resolves this package's declared surface in aggregate, and it is a pure
-/// function of crate constants and the Store declaration tables: it holds no
-/// state, is never cached, and creates no freshness.
+/// function of crate constants, this crate's own source text and the Store
+/// declaration tables: it holds no state, is never cached, and creates no
+/// freshness.
 ///
-/// It is NOT the resolution path a read takes. The two
-/// [`LocalReadPort`](crate::LocalReadPort) methods resolve their declared row
-/// through [`local_read_port_binding`], the narrow form, precisely so the read
-/// path does not pay for rows it never reads. Nothing in this repository calls
-/// this function: it is a declared public inventory surface (it carries its own
-/// row in `PUBLIC_ITEM_DECLARATIONS`), not a step of any read, so resolving it
-/// proves that the declared surface is resolvable — it is not evidence that any
-/// read was served. The read path's real production entry is
-/// `ReadService::execute`, reached from the `eliotd` reconstruction route; see
-/// the crate's "Disposition" section for that call chain.
+/// It is NOT the per-read resolution path. The two
+/// [`LocalReadPort`](crate::LocalReadPort) methods and the single read engine
+/// resolve the one row they need through
+/// [`local_read_port_binding`] / [`compare_operation_with_store_read_model`],
+/// the narrow forms, precisely so one read does not pay for rows it never
+/// reads.
+///
+/// It does have a production caller, and that is the point: a completeness
+/// check nothing runs is a claim, not a check.
+/// `KernelContextReadClient::reconstruct_context_inputs`
+/// (`bins/eliotd/src/kernel_context_read_client.rs`) resolves this inventory
+/// before it serves a reconstruction, so the derived Store-dependency
+/// completeness check runs on the daemon's live `eliot.query`
+/// `context_reconstruction` route and an unresolved declared surface refuses
+/// that read instead of being reported as a complete inventory nobody looked
+/// at. Resolving it still proves only that the declared surface is resolvable:
+/// it is not evidence that any read was served, and `evidence_execution` stays
+/// [`InventoryEvidenceClass::NotExecuted`].
 pub fn read_owner_inventory() -> Result<ReadOwnerInventory, ReadError> {
     let read_model_comparisons = compare_activated_read_model()?;
     verify_context_reconstruction_table(&read_model_comparisons)?;
@@ -612,7 +639,7 @@ pub fn read_owner_inventory() -> Result<ReadOwnerInventory, ReadError> {
         contract: resolve_contract_identity()?,
         mutable_state: OwnerMutableState::StatelessOverCallerOwnedStoreClient,
         public_api: resolve_public_api_rows()?,
-        store_dependencies: resolve_store_dependency_rows(),
+        store_dependencies: resolve_store_dependency_rows()?,
         test_targets: resolve_test_target_rows(),
         serialization_shapes: resolve_serialization_rows()?,
         reverse_consumer_source: ReverseConsumerSource::CargoWorkspaceMetadata,
@@ -1100,15 +1127,31 @@ const TEST_TARGETS: [&str; 3] = [
 ];
 
 /// One declared Store dependency with the real call that observes it.
+///
+/// `witness` is never a stored constant: it calls the depended-upon item, or
+/// asks the compiler about it, and the row records what that call reported.
+/// The declaration names an OBSERVATION, not the dependency set — the set
+/// itself is derived from this crate's own import surface by
+/// [`imported_store_symbols`], and [`resolve_store_dependency_rows`] refuses
+/// unless the two agree in both directions.
 struct StoreDependency {
-    /// The depended-upon item, named as the Store exports it.
+    /// The depended-upon item, named exactly as this crate imports it.
     symbol: &'static str,
-    /// A real call into that item.
+    /// A real call into, or a real naming of, that item.
     witness: fn() -> usize,
 }
 
 /// Store items the read path depends on, each with a real call as its witness.
-const STORE_DEPENDENCIES: [StoreDependency; 8] = [
+///
+/// Every `eliot_store_api` symbol this crate imports has exactly one row here,
+/// and no row may name a symbol the crate does not import. Both directions are
+/// enforced by [`resolve_store_dependency_rows`] against the derived import
+/// surface, so this list is a witness table rather than a second, hand-typed
+/// copy of the dependency set: adding a ninth Store call to the read path makes
+/// the derived set grow, and resolution fails with the symbol's name until the
+/// row that observes it exists.
+const STORE_DEPENDENCIES: [StoreDependency; 22] = [
+    // Store declaration functions: each is called.
     StoreDependency {
         symbol: "activated_read_operations",
         witness: activated_read_operation_count,
@@ -1133,15 +1176,224 @@ const STORE_DEPENDENCIES: [StoreDependency; 8] = [
         symbol: "named_read_operation_name",
         witness: canonical_name_agreement_count,
     },
+    // Store-declared wire names: each is read, and the read is proved against
+    // the activated catalogue rather than against a spelling written here.
+    StoreDependency {
+        symbol: "EXPERIENCE_BANK_READ_NAME",
+        witness: resolved_bank_read_name_count,
+    },
+    StoreDependency {
+        symbol: "EXPERIENCE_FEEDBACK_READ_NAME",
+        witness: resolved_feedback_read_name_count,
+    },
+    StoreDependency {
+        symbol: "EXPERIENCE_PAGE_STATE_FENCE",
+        witness: experience_page_fence_member_len,
+    },
+    // The Store's own bounded-page contract. Its observation is the real call
+    // the owner's coverage gate makes through it: the number of activated
+    // reads whose page this owner gates on, which falls to zero the moment
+    // the Store stops declaring the two range reads this type describes.
     StoreDependency {
         symbol: "ExperienceRangePage",
         witness: typed_coverage_statement_operation_count,
     },
+    // Remaining Store types: each is named to the compiler, and the compiler's
+    // own reported path for it is the observation.
     StoreDependency {
-        symbol: "EXPERIENCE_BANK_READ_NAME + EXPERIENCE_FEEDBACK_READ_NAME",
-        witness: resolved_experience_read_name_count,
+        symbol: "AutomationContinuationFailure",
+        witness: store_type_observation::<AutomationContinuationFailure>,
+    },
+    StoreDependency {
+        symbol: "NamedOperationManifest",
+        witness: store_type_observation::<NamedOperationManifest>,
+    },
+    StoreDependency {
+        symbol: "NamedReadOperation",
+        witness: store_type_observation::<NamedReadOperation>,
+    },
+    StoreDependency {
+        symbol: "NamedReadRequest",
+        witness: store_type_observation::<NamedReadRequest>,
+    },
+    StoreDependency {
+        symbol: "NamedReadResponse",
+        witness: store_type_observation::<NamedReadResponse>,
+    },
+    StoreDependency {
+        symbol: "OrderingHead",
+        witness: store_type_observation::<OrderingHead>,
+    },
+    StoreDependency {
+        symbol: "ReadConsistency",
+        witness: store_type_observation::<ReadConsistency>,
+    },
+    StoreDependency {
+        symbol: "RevisionHead",
+        witness: store_type_observation::<RevisionHead>,
+    },
+    StoreDependency {
+        symbol: "RevisionKey",
+        witness: store_type_observation::<RevisionKey>,
+    },
+    StoreDependency {
+        symbol: "ScopeId",
+        witness: store_type_observation::<ScopeId>,
+    },
+    StoreDependency {
+        symbol: "StoreError",
+        witness: store_type_observation::<StoreError>,
+    },
+    // The Store read port every read dispatches through.
+    StoreDependency {
+        symbol: "CanonicalReadClient",
+        witness: store_read_port_dispatch_point_count,
     },
 ];
+
+/// This crate's own sources, as the compiler embeds them.
+///
+/// `include_str!` reads the file it is written in, so the Store-dependency
+/// set is read out of the crate's ACTUAL import surface at compile time
+/// instead of out of a table written beside its own resolver. Each entry is
+/// the repository path the text came from, so a row can name where a
+/// dependency is imported from.
+///
+/// This crate reaches the Store read contract ONLY through named imports —
+/// [`generated_manifests`] imports the one Store function it calls rather
+/// than qualifying it — and that rule is what makes the import surface the
+/// dependency set. A qualified `eliot_store_api::` path would be a dependency
+/// this derivation cannot see, so none is written here.
+const CRATE_SOURCES: [(&str, &str); 3] = [
+    (
+        "crates/governor/eliot-read/src/lib.rs",
+        include_str!("lib.rs"),
+    ),
+    (
+        "crates/governor/eliot-read/src/owner_inventory.rs",
+        include_str!("owner_inventory.rs"),
+    ),
+    (
+        "crates/governor/eliot-read/src/provider_memory_feed.rs",
+        include_str!("provider_memory_feed.rs"),
+    ),
+];
+
+/// Prefix of an `eliot_store_api` import this crate writes.
+const STORE_IMPORT_PREFIX: &str = "use eliot_store_api::";
+
+/// Marker where this crate's in-source test module begins.
+const IN_SOURCE_TEST_MARKER: &str = "#[cfg(test)]";
+
+/// Derives the distinct `eliot_store_api` symbols this crate imports.
+///
+/// This is the independent source the Store-dependency inventory is checked
+/// against: it is read from the crate's own text, so it cannot be widened or
+/// narrowed by anything written in this module. A ninth Store call appears in
+/// it the moment it is written, whether or not anyone remembers this file.
+///
+/// Only the production text is read: each source is cut at its
+/// [`IN_SOURCE_TEST_MARKER`], because a test-only import is not a dependency
+/// of this owner's read path and must not be able to invent or hide one.
+fn imported_store_symbols() -> BTreeSet<String> {
+    let mut symbols = BTreeSet::new();
+    for (_, source) in CRATE_SOURCES {
+        let production = source
+            .split_once(IN_SOURCE_TEST_MARKER)
+            .map_or(source, |(production, _)| production);
+        collect_store_imports(production, &mut symbols);
+    }
+    symbols
+}
+
+/// Collects every name one source imports from the Store read contract.
+///
+/// Both import shapes are read: the braced group and the single path (see
+/// [`STORE_IMPORT_PREFIX`]). The last path segment of each entry is the symbol
+/// a consumer writes, which is the spelling the Store exports and the spelling
+/// a row must match.
+fn collect_store_imports(source: &str, symbols: &mut BTreeSet<String>) {
+    let mut rest = source;
+    while let Some(index) = rest.find(STORE_IMPORT_PREFIX) {
+        rest = &rest[index + STORE_IMPORT_PREFIX.len()..];
+        if let Some(group) = rest.strip_prefix('{') {
+            let Some(close) = group.find("};") else {
+                return;
+            };
+            for entry in group[..close].split(',') {
+                insert_imported_symbol(entry, symbols);
+            }
+            rest = &group[close + 2..];
+        } else {
+            let end = rest
+                .find(|character: char| !(character.is_alphanumeric() || character == '_'))
+                .unwrap_or(rest.len());
+            insert_imported_symbol(&rest[..end], symbols);
+            // A malformed import (`use eliot_store_api::;`) contributes no
+            // symbol, so the scan must still move past it rather than revisit
+            // the same position forever.
+            rest = &rest[end.max(1)..];
+        }
+    }
+}
+
+/// Inserts one import entry's symbol name, ignoring `self` and empty entries.
+fn insert_imported_symbol(entry: &str, symbols: &mut BTreeSet<String>) {
+    let name = entry.trim().rsplit("::").next().unwrap_or_default().trim();
+    if name.is_empty() || name == "self" {
+        return;
+    }
+    symbols.insert(name.to_owned());
+}
+
+/// Resolves every Store dependency row and checks the row set against the
+/// crate's real import surface in both directions.
+///
+/// The declared rows are witness registrations, not the dependency set: this
+/// resolves the set from [`imported_store_symbols`], which is read from this
+/// crate's own text, and refuses unless every imported symbol has a row that
+/// observes it AND every declared row names a symbol the crate actually
+/// imports. A new Store dependency therefore fails resolution with its own
+/// name instead of being silently absent from the inventory, and a row left
+/// behind by a removed import is refused rather than reported as a dependency
+/// this owner still has.
+fn resolve_store_dependency_rows() -> Result<Vec<StoreDependencyRow>, ReadError> {
+    let imported = imported_store_symbols();
+    let mut declared = BTreeSet::new();
+    let mut rows = Vec::with_capacity(imported.len());
+    for dependency in STORE_DEPENDENCIES {
+        if !imported.contains(dependency.symbol) {
+            return Err(ReadError::InvalidField {
+                field: "store_dependencies".to_owned(),
+                reason: format!(
+                    "declared row {} is not imported from eliot_store_api by this crate",
+                    dependency.symbol
+                ),
+            });
+        }
+        declared.insert(dependency.symbol);
+        rows.push(StoreDependencyRow {
+            symbol: dependency.symbol.to_owned(),
+            observed: (dependency.witness)(),
+            provenance: InventoryProvenance::DerivedAtCallTime,
+        });
+    }
+    let missing: Vec<&str> = imported
+        .iter()
+        .map(String::as_str)
+        .filter(|symbol| !declared.contains(symbol))
+        .collect();
+    if !missing.is_empty() {
+        return Err(ReadError::InvalidField {
+            field: "store_dependencies".to_owned(),
+            reason: format!(
+                "imported from eliot_store_api with no declared row: {}",
+                missing.join(", ")
+            ),
+        });
+    }
+    Ok(rows)
+}
 
 /// Resolves the exact contract identity of this owner from its own shape.
 fn resolve_contract_identity() -> Result<OwnerContractIdentity, ReadError> {
@@ -1232,18 +1484,6 @@ fn resolve_test_target_rows() -> Vec<TestTargetRow> {
             target: (*target).to_owned(),
             evidence_execution: InventoryEvidenceClass::NotExecuted,
             provenance: InventoryProvenance::DeclaredByOwner,
-        })
-        .collect()
-}
-
-/// Resolves every Store dependency row by calling the depended-upon item.
-fn resolve_store_dependency_rows() -> Vec<StoreDependencyRow> {
-    STORE_DEPENDENCIES
-        .iter()
-        .map(|dependency| StoreDependencyRow {
-            symbol: dependency.symbol.to_owned(),
-            observed: (dependency.witness)(),
-            provenance: InventoryProvenance::DerivedAtCallTime,
         })
         .collect()
 }
@@ -1647,7 +1887,7 @@ fn read_manifest<'a>(
 
 /// Returns the generated Store operation catalogue.
 fn generated_manifests() -> Result<Vec<NamedOperationManifest>, ReadError> {
-    eliot_store_api::generated_operation_manifests()
+    generated_operation_manifests()
         .map_err(StoreReadFailure::from)
         .map_err(ReadError::Store)
 }
@@ -1839,16 +2079,65 @@ fn typed_coverage_statement_operation_count() -> usize {
 ///
 /// The coverage gate names the two experience range reads by the Store's exported
 /// constants rather than by `NamedReadOperation` variants, so this is the real
-/// call that proves those two names still denote activated reads: if the Store
-/// renamed or repointed either read, the gate would silently stop matching it and
-/// this count would fall below the two names the gate declares.
-fn resolved_experience_read_name_count() -> usize {
-    [EXPERIENCE_BANK_READ_NAME, EXPERIENCE_FEEDBACK_READ_NAME]
-        .into_iter()
-        .filter(|name| {
-            activated_read_operations()
-                .into_iter()
-                .any(|operation| named_read_operation_name(operation) == *name)
-        })
+/// call that proves the bank name still denotes an activated read: if the Store
+/// renamed or repointed it, the gate would silently stop matching and this count
+/// would fall below one.
+fn resolved_bank_read_name_count() -> usize {
+    resolves_to_activated_read(EXPERIENCE_BANK_READ_NAME)
+}
+
+/// The same real call for the feedback range read's own name.
+fn resolved_feedback_read_name_count() -> usize {
+    resolves_to_activated_read(EXPERIENCE_FEEDBACK_READ_NAME)
+}
+
+/// Returns one when the Store's own read name denotes an activated read.
+fn resolves_to_activated_read(name: &str) -> usize {
+    usize::from(
+        activated_read_operations()
+            .into_iter()
+            .any(|operation| named_read_operation_name(operation) == name),
+    )
+}
+
+/// Observes the member name the Store publishes a page's projection fence
+/// under.
+///
+/// The coverage gate reads this exact exported constant off the page it is
+/// classifying, so the observation is the name it actually reads: a Store
+/// rename changes this row, and the gate and the row cannot name different
+/// members.
+fn experience_page_fence_member_len() -> usize {
+    EXPERIENCE_PAGE_STATE_FENCE.len()
+}
+
+/// Observes one Store type through the compiler's own report of it.
+///
+/// A Store type carries no call to make — the read path names it, passes it
+/// and matches on it — so what can honestly be observed is what the compiler
+/// says the type is: the fully qualified path it reports for this very type.
+/// The byte length of that path is the recorded value, so a Store that re-homes
+/// or renames the type changes the row instead of leaving it silently true.
+fn store_type_observation<T: ?Sized>() -> usize {
+    std::any::type_name::<T>().len()
+}
+
+/// Observes how many times this crate dispatches through the Store read port.
+///
+/// `CanonicalReadClient` is a trait this owner binds as its dispatch bound and
+/// never calls as a value: it has no instance to call and, because its
+/// dispatch points are `async`, no object-safe type to name either. What the
+/// compiler does check, at every one of them, is that the call goes through
+/// this trait — so the honest observation is how many such dispatch points the
+/// single read engine has.
+///
+/// It is counted in the source of the read engine (`lib.rs`) and not in this
+/// module's, so the needle this count is written with cannot count itself.
+fn store_read_port_dispatch_point_count() -> usize {
+    let (_, engine) = CRATE_SOURCES[0];
+    engine
+        .split_once(IN_SOURCE_TEST_MARKER)
+        .map_or(engine, |(production, _)| production)
+        .matches(".store.")
         .count()
 }
