@@ -41,7 +41,8 @@ use blake3::Hasher;
 pub use eliot_blob_api::{
     BlobCapacityCause, BlobCapacityCleanup, BlobCapacityEffect, BlobCapacityEvidence,
     BlobCapacityFailure, BlobCapacityIdentity, BlobCapacityRecovery, BlobCapacityStage, BlobError,
-    BlobPublicationFence, BlobPublicationObligation, PublishState,
+    BlobProcessStreamReadbackRequest, BlobProcessStreamSourceBinding, BlobPublicationFence,
+    BlobPublicationObligation, BlobStageRecovery, BlobStageRecoveryRequest, PublishState,
 };
 pub mod backup_io;
 pub use backup_io::{
@@ -61,10 +62,11 @@ pub use demand::{
 };
 use eliot_blob_api::{
     BlobCasCapability, BlobCasDurability, BlobCasFailure, BlobCasOutcome, BlobCasReceipt,
-    BlobCasRequest, BlobCasState, BlobCasSuccessKind, BlobFuture, BlobGcReceipt, BlobGcRequest,
+    BlobCasNamespace, BlobCasRequest, BlobCasState, BlobCasSuccessKind, BlobFuture, BlobGcReceipt, BlobGcRequest,
     BlobHash, BlobHealth, BlobId, BlobIssuerTrustAnchor, BlobKeyOperation, BlobKeyRecoveryCeiling,
     BlobLiveSetProof, BlobLocator, BlobPolicyBinding, BlobReachabilityRequest,
-    BlobReachabilityView, BlobReadChunk, BlobReadRequest, BlobReadyReceipt, BlobReceiptBinding,
+    BlobProcessStreamReadbackRequest, BlobReachabilityView, BlobReadChunk, BlobReadRequest,
+    BlobReadyReceipt, BlobReceiptBinding,
     BlobReceiptContext, BlobReferenceObservation, BlobReferenceRequest, BlobRootLease,
     BlobStageRequest, BlobStoreClient, CompressionDescriptor, CryptoDescriptor, GcState,
     SealedBlobRead, SignedBlobReceiptWire, VerifiedBlobReceipt, metadata_path, payload_path,
@@ -1676,6 +1678,36 @@ impl StoredMetadata {
             self.crypto.clone(),
             self.policy.clone(),
         )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StageIntent {
+    request: BlobStageRecoveryRequest,
+    revision: u64,
+    phase: StageIntentPhase,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum StageIntentPhase {
+    Reserved,
+    Dispatched,
+}
+
+impl StageIntent {
+    fn validate(&self) -> Result<(), BlobError> {
+        self.request.validate()?;
+        let revision_is_valid = match self.phase {
+            StageIntentPhase::Reserved => self.revision.is_multiple_of(2),
+            StageIntentPhase::Dispatched => !self.revision.is_multiple_of(2),
+        };
+        if revision_is_valid {
+            Ok(())
+        } else {
+            Err(BlobError::MetadataPayloadMismatch)
+        }
     }
 }
 
@@ -4302,6 +4334,369 @@ where
         self.stage_locked(request, hash)
     }
 
+    fn stage_intent_path(request: &BlobStageRecoveryRequest) -> Result<WorkScopePath, BlobError> {
+        WorkScopePath::new(format!(
+            "transactions/process-source-{}.intent",
+            request.process_source_intent_key()?
+        ))
+        .map_err(|error| BlobError::InvalidContract(error.to_string()))
+    }
+
+    fn read_stage_intent(
+        &self,
+        request: &BlobStageRecoveryRequest,
+    ) -> Result<Option<(StageIntent, Vec<u8>)>, BlobError> {
+        let path = Self::stage_intent_path(request)?;
+        let Some((intent, bytes)) = self.read_stage_intent_at(&path)? else {
+            return Ok(None);
+        };
+        if intent.request != *request {
+            return Err(BlobError::IdempotencyConflict);
+        }
+        Ok(Some((intent, bytes)))
+    }
+
+    fn read_stage_intent_at(
+        &self,
+        path: &WorkScopePath,
+    ) -> Result<Option<(StageIntent, Vec<u8>)>, BlobError> {
+        self.contained(path)?;
+        match self.platform_stat(path)? {
+            BlobPathState::Missing => Ok(None),
+            BlobPathState::File { length, .. } if length <= MAX_JOURNAL_BYTES => {
+                let bytes = self.read_bounded_file(path, MAX_JOURNAL_BYTES)?;
+                let intent: StageIntent = serde_json::from_slice(&bytes)
+                    .map_err(|_| BlobError::MetadataPayloadMismatch)?;
+                intent.validate()?;
+                let canonical = serde_json::to_vec(&intent)
+                    .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+                if canonical != bytes {
+                    return Err(BlobError::IdempotencyConflict);
+                }
+                Ok(Some((intent, bytes)))
+            }
+            BlobPathState::File { .. }
+            | BlobPathState::Directory
+            | BlobPathState::ReparsePoint
+            | BlobPathState::Other => Err(BlobError::MetadataPayloadMismatch),
+        }
+    }
+
+    fn stage_intent_cas(
+        &self,
+        request: &BlobStageRecoveryRequest,
+        path: &WorkScopePath,
+        expected: BlobCasState,
+        intent: &StageIntent,
+    ) -> Result<(), BlobError> {
+        intent.validate()?;
+        let bytes = serde_json::to_vec(intent)
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        let generation = self.platform_backend_generation()?;
+        let identity_material = serde_json::to_vec(&(
+            "blob-stage-intent-cas-v1",
+            request,
+            path.normalized_identity(),
+            intent.revision,
+            intent.phase,
+        ))
+        .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        let identity = format!("blob-stage-intent-{}", &sha256_hex(&identity_material)[..32]);
+        let mut context = request.stage_context.clone();
+        context.operation.operation_id = OperationId::new(identity.clone())
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        context.operation.idempotency_key = identity;
+        context.operation.operation_kind = "blob-stage-intent-cas".to_owned();
+        let cas = BlobCasRequest::new(
+            context,
+            request.root_lease.clone(),
+            BlobCasNamespace::StageJournal,
+            path.clone(),
+            expected,
+            sha256_hex(&bytes),
+            bytes.len() as u64,
+            generation,
+            BlobCasDurability::Requested,
+        )?;
+        self.platform_compare_and_replace(&cas, &bytes)
+    }
+
+    fn reserve_stage_intent_locked(
+        &self,
+        request: &BlobStageRecoveryRequest,
+    ) -> Result<StageIntent, BlobError> {
+        if let Some((intent, _)) = self.read_stage_intent(request)? {
+            return Ok(intent);
+        }
+        let intent = StageIntent {
+            request: request.clone(),
+            revision: 0,
+            phase: StageIntentPhase::Reserved,
+        };
+        let path = Self::stage_intent_path(request)?;
+        match self.stage_intent_cas(request, &path, BlobCasState::Missing, &intent) {
+            Ok(()) => Ok(intent),
+            Err(error)
+                if matches!(
+                    &error,
+                    BlobError::CasFailure { failure }
+                        if matches!(failure.as_ref(), BlobCasFailure::ExpectedStateConflict { .. })
+                ) =>
+            {
+                self.read_stage_intent(request)?
+                    .map(|(intent, _)| intent)
+                    .ok_or(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn advance_stage_intent_locked(
+        &self,
+        request: &BlobStageRecoveryRequest,
+        current: &StageIntent,
+        phase: StageIntentPhase,
+    ) -> Result<StageIntent, BlobError> {
+        let path = Self::stage_intent_path(request)?;
+        let current_bytes = serde_json::to_vec(current)
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        let next = StageIntent {
+            request: request.clone(),
+            revision: current
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| BlobError::PlanGap("stage intent revision overflow".to_owned()))?,
+            phase,
+        };
+        self.stage_intent_cas(
+            request,
+            &path,
+            BlobCasState::Digest(sha256_hex(&current_bytes)),
+            &next,
+        )?;
+        Ok(next)
+    }
+
+    fn recover_stage_locked(
+        &self,
+        request: &BlobStageRecoveryRequest,
+    ) -> Result<BlobStageRecovery, BlobError> {
+        let Some((intent, _)) = self.read_stage_intent(request)? else {
+            return Ok(BlobStageRecovery::Unknown);
+        };
+        let operation_id = request.stage_context.operation.operation_id.as_str();
+        let idempotency_key = request.stage_context.operation.idempotency_key.as_str();
+        let commit_path = Self::operation_path(&request.stage_context, "commit")?;
+        self.contained(&commit_path)?;
+        let mut commit_state = self.platform_stat(&commit_path)?;
+        if commit_state == BlobPathState::Missing {
+            let journal_path = Self::operation_path(&request.stage_context, "stage")?;
+            self.contained(&journal_path)?;
+            let journal_state = self.platform_stat(&journal_path)?;
+            if journal_state != BlobPathState::Missing {
+                if intent.phase != StageIntentPhase::Dispatched {
+                    return Ok(BlobStageRecovery::Unknown);
+                }
+                if let Err(error) = self.reconcile_stage_path(&journal_path) {
+                    if matches!(&error, BlobError::UnknownPublishOutcome { .. }) {
+                        return Ok(BlobStageRecovery::Unknown);
+                    }
+                    return Err(error);
+                }
+                commit_state = self.platform_stat(&commit_path)?;
+            }
+            if commit_state == BlobPathState::Missing {
+                return Ok(if intent.phase == StageIntentPhase::Reserved {
+                    BlobStageRecovery::NotStarted
+                } else {
+                    BlobStageRecovery::Unknown
+                });
+            }
+        } else if intent.phase != StageIntentPhase::Dispatched {
+            return Ok(BlobStageRecovery::Unknown);
+        }
+        let commit_bytes = self.read_bounded_file(&commit_path, MAX_JOURNAL_BYTES)?;
+        let commit = decode_commit(&commit_bytes)?;
+        if commit.operation_id != operation_id || commit.idempotency_key != idempotency_key {
+            return Err(BlobError::IdempotencyConflict);
+        }
+        if commit.locator.root_generation != request.root_lease.root_generation
+            || commit.locator.residency != request.residency
+            || commit.locator.hash != request.expected_content_hash
+        {
+            return Err(BlobError::IdempotencyConflict);
+        }
+
+        let scope = ResidencyScope {
+            digest: commit.residency_sha256.clone(),
+        };
+        let (stored, metadata_bytes) = self.load_metadata(&commit.locator, &scope)?;
+        if sha256_hex(&metadata_bytes) != commit.metadata_sha256
+            || stored.policy != request.policy
+            || stored.plaintext_sha256 != request.expected_plaintext_sha256
+            || stored.plaintext_length != request.expected_plaintext_length
+        {
+            return Err(BlobError::IdempotencyConflict);
+        }
+        let verified = self.verify_metadata_receipt(&stored)?;
+        let ready = stored.ready(verified, &self.issuer_anchor, commit.metadata_sha256.clone())?;
+        let receipt_id = ready.receipt().identity.receipt_id.to_string();
+        if request
+            .expected_ready_receipt_id
+            .as_ref()
+            .is_some_and(|expected| expected != &receipt_id)
+        {
+            return Err(BlobError::MetadataPayloadMismatch);
+        }
+        let read = BlobReadRequest {
+            context: request.read_context.clone(),
+            root_lease: request.root_lease.clone(),
+            locator: ready.locator().clone(),
+            expected_metadata_sha256: ready.metadata_sha256().to_owned(),
+            expected_ready_receipt_id: receipt_id,
+            max_bytes: ready.plaintext_length().max(1),
+        };
+        let (observed_ready, plaintext, _) = self.read_verified(&read)?;
+        if observed_ready != ready
+            || plaintext.len() as u64 != request.expected_plaintext_length
+            || sha256_hex(&plaintext) != request.expected_plaintext_sha256
+        {
+            return Err(BlobError::IntegrityMismatch);
+        }
+        Ok(BlobStageRecovery::Ready(Box::new(ready)))
+    }
+
+    /// Read-only owner reconciliation. Missing intent is unknown; it never
+    /// creates evidence that could authorize a retry.
+    fn recover_stage_sync(
+        &self,
+        request: BlobStageRecoveryRequest,
+    ) -> Result<BlobStageRecovery, BlobError> {
+        request.validate()?;
+        self.ensure_lease(&request.root_lease)?;
+        let operation_id = request.stage_context.operation.operation_id.as_str();
+        let idempotency_key = request.stage_context.operation.idempotency_key.as_str();
+        let _operation_guard = self.lock_shards(&[operation_shard(operation_id, idempotency_key)])?;
+        self.recover_stage_locked(&request)
+    }
+
+    /// Resolves process source identity only from the durable owner intent,
+    /// then reads through the exact lease/read context retained there. No
+    /// caller-supplied Blob path, receipt context, or lease is accepted.
+    fn read_process_stream_source_sync(
+        &self,
+        request: BlobProcessStreamReadbackRequest,
+    ) -> Result<BlobReadChunk, BlobError> {
+        request.validate()?;
+        let path = WorkScopePath::new(format!(
+            "transactions/process-source-{}.intent",
+            request.process_source_intent_key()?
+        ))
+        .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        let Some((observed, _)) = self.read_stage_intent_at(&path)? else {
+            return Err(BlobError::NotFound);
+        };
+        let recovery = observed.request;
+        if recovery.process_source_binding != request.process_source_binding
+            || recovery.expected_content_hash != request.expected_content_hash
+            || recovery.expected_plaintext_sha256 != request.expected_plaintext_sha256
+            || recovery.expected_plaintext_length != request.expected_plaintext_length
+        {
+            return Err(BlobError::IdempotencyConflict);
+        }
+        let operation_id = recovery.stage_context.operation.operation_id.as_str();
+        let idempotency_key = recovery.stage_context.operation.idempotency_key.as_str();
+        let content_idx = content_shard(&request.expected_content_hash);
+        let operation_idx = operation_shard(operation_id, idempotency_key);
+        let _guards = self.lock_shards(&[content_idx, operation_idx])?;
+        let Some((current, _)) = self.read_stage_intent_at(&path)? else {
+            return Err(BlobError::NotFound);
+        };
+        if current.request != recovery {
+            return Err(BlobError::IdempotencyConflict);
+        }
+        let ready = match self.recover_stage_locked(&recovery)? {
+            BlobStageRecovery::Ready(ready) => *ready,
+            BlobStageRecovery::NotStarted => return Err(BlobError::NotFound),
+            BlobStageRecovery::Unknown => {
+                return Err(BlobError::ProviderUnavailable(
+                    "process source publication outcome remains unknown",
+                ));
+            }
+        };
+        if ready.receipt().identity.receipt_id.as_str() != request.ready_receipt_id
+            || ready.locator().hash != request.expected_content_hash
+            || ready.plaintext_sha256() != request.expected_plaintext_sha256
+            || ready.plaintext_length() != request.expected_plaintext_length
+        {
+            return Err(BlobError::MetadataPayloadMismatch);
+        }
+        drop(_guards);
+        self.read_sync(&BlobReadRequest {
+            context: recovery.read_context,
+            root_lease: recovery.root_lease,
+            locator: ready.locator().clone(),
+            expected_metadata_sha256: ready.metadata_sha256().to_owned(),
+            expected_ready_receipt_id: request.ready_receipt_id,
+            max_bytes: request.max_bytes.max(1),
+        })
+    }
+
+    fn stage_with_recovery_sync(
+        &self,
+        stage: BlobStageRequest,
+        recovery: BlobStageRecoveryRequest,
+    ) -> Result<BlobReadyReceipt, BlobError> {
+        stage.validate()?;
+        recovery.validate()?;
+        if stage.context != recovery.stage_context
+            || stage.root_lease != recovery.root_lease
+            || stage.policy != recovery.policy
+            || stage.residency != recovery.residency
+            || BlobHash::new(blake3::hash(&stage.bytes).to_hex().to_string())?
+                != recovery.expected_content_hash
+            || stage.bytes.len() as u64 != recovery.expected_plaintext_length
+            || sha256_hex(&stage.bytes) != recovery.expected_plaintext_sha256
+        {
+            return Err(BlobError::IdempotencyConflict);
+        }
+        self.ensure_lease(&recovery.root_lease)?;
+        let hash = BlobHash::new(blake3::hash(&stage.bytes).to_hex().to_string())?;
+        let operation_id = recovery.stage_context.operation.operation_id.as_str();
+        let idempotency_key = recovery.stage_context.operation.idempotency_key.as_str();
+        let content_idx = content_shard(&hash);
+        let operation_idx = operation_shard(operation_id, idempotency_key);
+        let _guards = self.lock_shards(&[content_idx, operation_idx])?;
+
+        let mut intent = self.reserve_stage_intent_locked(&recovery)?;
+        match self.recover_stage_locked(&recovery)? {
+            BlobStageRecovery::Ready(ready) => return Ok(*ready),
+            BlobStageRecovery::NotStarted => {}
+            BlobStageRecovery::Unknown => {
+                return Err(BlobError::ProviderUnavailable(
+                    "same-operation Blob stage outcome remains unknown",
+                ));
+            }
+        }
+        if intent.phase != StageIntentPhase::Reserved {
+            return Err(BlobError::ProviderUnavailable(
+                "same-operation Blob stage is already dispatched",
+            ));
+        }
+        self.advance_stage_intent_locked(
+            &recovery,
+            &intent,
+            StageIntentPhase::Dispatched,
+        )?;
+        // Once Dispatched is durable, even a typed error from a later layer
+        // cannot prove that no filesystem effect happened: an error may be
+        // reported after the platform accepted a write. Keep the intent
+        // Dispatched and let exact-operation recovery inspect the durable
+        // transaction evidence. This can conservatively retain Unknown, but
+        // never converts an ambiguous result into permission to replay.
+        self.stage_locked(stage, hash)
+    }
+
     fn read_sync(&self, request: &BlobReadRequest) -> Result<BlobReadChunk, BlobError> {
         let content_idx = content_shard(&request.locator.hash);
         let _guard = self.lock_shards(&[content_idx])?;
@@ -5056,6 +5451,16 @@ where
     pub fn reconcile(&self, lease: &BlobRootLease) -> Result<(), BlobError> {
         self.core.reconcile(lease)
     }
+
+    /// Recovers only an owner-committed stage matching the original operation
+    /// identity and expected byte commitment. `Unknown` never authorizes a
+    /// second stage request.
+    pub fn recover_stage(
+        &self,
+        request: BlobStageRecoveryRequest,
+    ) -> Result<BlobStageRecovery, BlobError> {
+        self.core.recover_stage_sync(request)
+    }
 }
 
 impl<P, C, K, A, L> BlobStoreClient for BlobStoreService<P, C, K, A, L>
@@ -5069,6 +5474,31 @@ where
     fn stage(&self, request: BlobStageRequest) -> BlobFuture<'_, BlobReadyReceipt> {
         let core = Arc::clone(&self.core);
         Box::pin(async move { core.stage_sync(request) })
+    }
+
+    fn recover_stage(
+        &self,
+        request: BlobStageRecoveryRequest,
+    ) -> BlobFuture<'_, BlobStageRecovery> {
+        let core = Arc::clone(&self.core);
+        Box::pin(async move { core.recover_stage_sync(request) })
+    }
+
+    fn read_process_stream_source(
+        &self,
+        request: BlobProcessStreamReadbackRequest,
+    ) -> BlobFuture<'_, BlobReadChunk> {
+        let core = Arc::clone(&self.core);
+        Box::pin(async move { core.read_process_stream_source_sync(request) })
+    }
+
+    fn stage_with_recovery(
+        &self,
+        request: BlobStageRequest,
+        recovery: BlobStageRecoveryRequest,
+    ) -> BlobFuture<'_, BlobReadyReceipt> {
+        let core = Arc::clone(&self.core);
+        Box::pin(async move { core.stage_with_recovery_sync(request, recovery) })
     }
 
     fn read(&self, request: BlobReadRequest) -> BlobFuture<'_, BlobReadChunk> {

@@ -42,9 +42,11 @@ mod stream_sink;
 pub use stream_sink::{
     PROCESS_STREAM_SINK_SCHEMA_VERSION, ProcessStreamDigestAlgorithm, ProcessStreamSinkAbortReason,
     ProcessStreamSinkAbortRequest, ProcessStreamSinkAppend, ProcessStreamSinkAppendDisposition,
-    ProcessStreamSinkClient, ProcessStreamSinkError, ProcessStreamSinkFinalizeRequest,
+    ProcessStreamSinkCapacityCause, ProcessStreamSinkClient, ProcessStreamSinkError,
+    ProcessStreamSinkFenceReason, ProcessStreamSinkFinalizeRequest,
     ProcessStreamSinkFuture, ProcessStreamSinkLimits, ProcessStreamSinkModel,
     ProcessStreamSinkOpenRequest, ProcessStreamSinkReadback, ProcessStreamSinkSession,
+    ProcessStreamSinkIntegrityReason,
     ProcessStreamSinkSessionId, ProcessStreamSinkSessionView, ProcessStreamSinkSourceId,
     ProcessStreamSinkState, ProcessStreamSinkTerminal, ProcessStreamSinkTerminalCommandIdentity,
     ProcessStreamSinkTerminalCommandKind, ProcessStreamSinkTerminalId,
