@@ -1,21 +1,24 @@
 //! Pre-launch admission submission to the canonical instrument registry (issue #1814 W1).
 //!
-//! [`submit_admission_snapshot`] runs at the shared admission boundary: it
+//! [`prepare_admission_submission`] runs at the shared admission boundary: it
 //! carries the admitted [`InstrumentSpec`](crate::profile::InstrumentSpec)
 //! plus the executable supply-chain receipt bound to one launch as the
-//! `snapshot_json` of the closed `ApplyInstrumentRegistryState` store
-//! mutation, runs the shared snapshot acceptance boundary, and reads the
-//! same record back through [`InstrumentRegistry::recover`], validating the
-//! original recorded values. The receipt binds the exact bytes that launch:
+//! `snapshot_json` that the original registration owner persisted through the
+//! closed `ApplyInstrumentRegistryState` store mutation, and runs the shared
+//! snapshot acceptance boundary through [`InstrumentRegistry::recover`],
+//! validating the original recorded values. The original registration receipt
+//! and exact named readback are supplied separately by the read-only owner
+//! port before launch. The receipt binds the exact bytes that launch:
 //! the canonicalized path arrives from the owner-observed identity
 //! (canonicalize-at-use), the digest is hashed from that same observed
 //! object (hash-same-object), and provenance is the admitted spec digest at
 //! the admitted registry generation. The bytes travel to durable storage
 //! through the Governor write path; this module never writes canonical
-//! state itself.
+//! state itself. Stage use has no canonical write capability.
 
 use std::collections::BTreeMap;
 
+use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_store_api::{
     NamedMutationOperation, NamedReadOperation, NamedReadResponse, WriteReceipt,
     WriteReceiptStatus, decode_instrument_registry_mutation,
@@ -34,6 +37,11 @@ use crate::registry::{ResolvedExecutableIdentity, SupplyChainReceipt};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdmissionSubmission {
     snapshot_json: String,
+    profile: String,
+    profile_revision: u64,
+    stage_id: String,
+    registry_generation: u64,
+    spec_id: String,
     spec_digest: String,
     supply_digest: String,
     executable_path: String,
@@ -137,6 +145,36 @@ impl AdmissionSubmission {
         &self.snapshot_json
     }
 
+    /// Canonical payload whose digest the original Governor action must bind.
+    /// The payload pins the exact profile, stage, registry/spec revision and
+    /// observed executable that the subsequent canonical write will preserve.
+    pub fn action_payload(&self) -> Value {
+        serde_json::json!({
+            "wire_id": "eliot.instrument-registry-stage-admission",
+            "wire_version": 1,
+            "profile": self.profile,
+            "profile_revision": self.profile_revision,
+            "stage_id": self.stage_id,
+            "registry_generation": self.registry_generation,
+            "spec_id": self.spec_id,
+            "spec_digest": self.spec_digest,
+            "supply_digest": self.supply_digest,
+            "executable_path": self.executable_path,
+            "content_digest": self.content_digest,
+        })
+    }
+
+    /// SHA-256 of the exact closed payload the Governor action contract must
+    /// authorize. Callers compare this with the live admitted action digest.
+    pub fn action_payload_sha256(&self) -> Result<String, ProfileError> {
+        let bytes = canonical_json_bytes(&self.action_payload()).map_err(|error| {
+            ProfileError::Snapshot {
+                detail: format!("registry action payload encoding failed: {error}"),
+            }
+        })?;
+        Ok(sha256_hex(&bytes))
+    }
+
     /// Mutation parameters: exactly the `snapshot_json` the store decoder accepts.
     pub fn parameters(&self) -> BTreeMap<String, Value> {
         BTreeMap::from([(
@@ -184,7 +222,7 @@ impl AdmissionSubmission {
 /// admits the stage's spec, or [`ProfileError::Snapshot`] when the spec,
 /// receipt, or generation drifted, the observation no longer matches the
 /// receipt, or the snapshot fails acceptance or readback.
-pub fn submit_admission_snapshot(
+pub fn prepare_admission_submission(
     registry: &InstrumentRegistry,
     stage: &AdmittedStage,
     observed: &ResolvedExecutableIdentity,
@@ -232,6 +270,11 @@ pub fn submit_admission_snapshot(
     let snapshot_json = registry.persist()?;
     let submission = AdmissionSubmission {
         snapshot_json,
+        profile: stage.profile.clone(),
+        profile_revision: stage.profile_revision,
+        stage_id: stage.stage_id.clone(),
+        registry_generation: registry.generation(),
+        spec_id: kind.to_owned(),
         spec_digest: stage.spec_digest.clone(),
         supply_digest: admitted_supply.clone(),
         executable_path: observed.canonical_path.clone(),

@@ -835,6 +835,7 @@ impl KernelService {
                 })?;
             }
             HostRequestKind::Invocation
+                | HostRequestKind::InstrumentRegistryRegistration
             | HostRequestKind::Cancellation
             | HostRequestKind::Status
             | HostRequestKind::Reconciliation => {

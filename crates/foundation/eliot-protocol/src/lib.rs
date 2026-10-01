@@ -3798,6 +3798,9 @@ pub enum HostRequestKind {
     Activation,
     /// Invocation of an exact admitted capability under a bound Session.
     Invocation,
+    /// Typed instrument-registry registration admitted as a distinct owner
+    /// mutation on the HostRequest transport.
+    InstrumentRegistryRegistration,
     /// Cancellation of one exact previously admitted operation.
     Cancellation,
     /// Observation-only status read of one exact admitted operation.
@@ -3813,10 +3816,113 @@ impl HostRequestKind {
         match self {
             Self::Activation => "ACTIVATION",
             Self::Invocation => "INVOCATION",
+            Self::InstrumentRegistryRegistration => "INSTRUMENT_REGISTRY_REGISTRATION",
             Self::Cancellation => "CANCELLATION",
             Self::Status => "STATUS",
             Self::Reconciliation => "RECONCILIATION",
         }
+    }
+}
+
+/// Closed HostRequest body for an explicitly admitted Instrument Registry
+/// registration. The body names exact snapshot bytes; it does not itself
+/// grant mutation authority. Governor must issue the matching current
+/// AuthorityOwner/GrantGraph admission before committing them.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InstrumentRegistryRegistrationInvocation {
+    /// Stable closed payload wire identity.
+    pub wire_id: String,
+    /// Payload contract version.
+    pub wire_version: u16,
+    /// Exact authenticated request identity retained from the outer Host
+    /// frame. Kernel binds this byte-for-byte before queueing so the daemon
+    /// does not reconstruct original request metadata from the envelope.
+    pub request_identity: RequestIdentity,
+    /// Exact InstrumentRegistry snapshot bytes to register.
+    pub snapshot_json: String,
+}
+
+impl InstrumentRegistryRegistrationInvocation {
+    /// Stable closed payload wire identity.
+    pub const WIRE_ID: &'static str = "eliot.instrument-registry-registration";
+    /// Current payload contract version.
+    pub const WIRE_VERSION: u16 = 1;
+    /// HostRequest schema identifier for this payload.
+    pub const PAYLOAD_SCHEMA_ID: &'static str = "eliot.instrument-registry-registration.v1";
+    /// Maximum exact snapshot payload size.
+    pub const MAX_SNAPSHOT_BYTES: usize = 1_048_576;
+
+    /// Validates the closed payload and its exact HostRequest envelope joins.
+    pub fn validate_for_envelope(
+        &self,
+        envelope: &HostRequestEnvelope,
+    ) -> Result<(), ProtocolError> {
+        self.request_identity.validate()?;
+        if self.wire_id != Self::WIRE_ID || self.wire_version != Self::WIRE_VERSION {
+            return Err(ProtocolError::InvalidField {
+                field: "instrument_registry_registration.wire",
+                reason: "unsupported registration payload",
+            });
+        }
+        if self.snapshot_json.is_empty() || self.snapshot_json.len() > Self::MAX_SNAPSHOT_BYTES {
+            return Err(ProtocolError::InvalidField {
+                field: "instrument_registry_registration.snapshot_json",
+                reason: "snapshot bytes are empty or exceed the registration bound",
+            });
+        }
+        let _: serde_json::Value = serde_json::from_str(&self.snapshot_json).map_err(|_| {
+            ProtocolError::InvalidField {
+                field: "instrument_registry_registration.snapshot_json",
+                reason: "snapshot is not valid JSON",
+            }
+        })?;
+        let expected_session = self
+            .request_identity
+            .request
+            .metadata
+            .session_id
+            .as_ref()
+            .map(ToString::to_string);
+        let expected_task = self
+            .request_identity
+            .request
+            .metadata
+            .task_id
+            .as_ref()
+            .map(ToString::to_string);
+        if envelope.kind != HostRequestKind::InstrumentRegistryRegistration
+            || envelope.identity.capability != "instrument_registry.register"
+            || envelope.identity.payload_schema_id != Self::PAYLOAD_SCHEMA_ID
+            || envelope.identity.request_id.as_str()
+                != self.request_identity.request.metadata.request_id.as_str()
+            || envelope.identity.idempotency_key != self.request_identity.idempotency_key
+            || envelope.identity.cancellation_id != self.request_identity.cancellation_id
+            || envelope.identity.deadline_unix_ms != self.request_identity.deadline_unix_ms
+            || envelope.identity.session_id.as_ref() != expected_session.as_ref()
+            || envelope.identity.task_id.as_ref() != expected_task.as_ref()
+            || envelope.state_fence != self.request_identity.request.state_fence
+            || envelope.identity.payload_sha256 != self.action_payload_sha256()?
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "instrument_registry_registration.envelope",
+                reason: "registration body differs from its typed HostRequest identity",
+            });
+        }
+        Ok(())
+    }
+
+    /// Canonical digest bound by both HostRequest and the Governor action.
+    pub fn action_payload_sha256(&self) -> Result<String, ProtocolError> {
+        let payload = serde_json::json!({
+            "wire_id": Self::WIRE_ID,
+            "wire_version": Self::WIRE_VERSION,
+            "request_identity": self.request_identity,
+            "snapshot_json": self.snapshot_json,
+        });
+        let bytes = eliot_contracts::canonical_json_bytes(&payload)
+            .map_err(|error| ProtocolError::Json(error.to_string()))?;
+        Ok(eliot_contracts::sha256_hex(&bytes))
     }
 }
 
@@ -4061,7 +4167,7 @@ impl HostRequestIdentity {
                     });
                 }
             }
-            HostRequestKind::Invocation => {
+            HostRequestKind::Invocation | HostRequestKind::InstrumentRegistryRegistration => {
                 if self
                     .correlation_projection
                     .as_ref()

@@ -678,6 +678,8 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "watchdog_export_result" => "watchdog_export_result",
         "campaign_packet_claim" => "campaign_packet_claim",
         "campaign_packet_result" => "campaign_packet_result",
+        "instrument_registry_registration_claim" => "instrument_registry_registration_claim",
+        "instrument_registry_registration_result" => "instrument_registry_registration_result",
         "task_controller_claim" => "task_controller_claim",
         "task_controller_result" => "task_controller_result",
         "finish_claim" => "finish_claim",
@@ -4013,6 +4015,70 @@ impl KernelComposition {
                             // possible work stays `unknown` in the diagnostic
                             // stream alongside the folded expired response.
                             // Observation only.
+                            observe_daemon_request("kernel.daemon_response_unknown", "unknown");
+                            Ok(Self::expired_activation_daemon_response())
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "instrument_registry_registration_claim" => {
+                #[cfg(windows)]
+                {
+                    if payload.as_object().is_none_or(|object| object.len() != 1) {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    self.claim_instrument_registry_registration_pair(session)
+                        .map(|pair| match pair {
+                            Some((envelope, invocation, request_identity, attempt)) => {
+                                serde_json::json!({
+                                    "status": "known",
+                                    "value": {
+                                        "pair": {
+                                            "envelope": envelope,
+                                            "invocation": invocation,
+                                            "request_identity": request_identity,
+                                            "attempt": attempt,
+                                        }
+                                    },
+                                    "recovery": null,
+                                })
+                            }
+                            None => serde_json::json!({
+                                "status": "known",
+                                "value": { "pair": null },
+                                "recovery": null,
+                            }),
+                        })
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "instrument_registry_registration_result" => {
+                #[cfg(windows)]
+                {
+                    let result_value = payload
+                        .get("result")
+                        .cloned()
+                        .ok_or(TransportError::SessionFenced)?;
+                    let body: HostRequestResultBody = serde_json::from_value(result_value)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    match self.submit_instrument_registry_registration_result(session, &body) {
+                        Ok(host_request_route::LocalReadSubmitDisposition::Persisted(_)) => {
+                            Ok(Self::accepted_daemon_response())
+                        }
+                        Ok(host_request_route::LocalReadSubmitDisposition::StaleAttempt(
+                            observation,
+                        )) => Ok(Self::stale_attempt_daemon_response(&observation)),
+                        Err(TransportError::Timeout) => {
                             observe_daemon_request("kernel.daemon_response_unknown", "unknown");
                             Ok(Self::expired_activation_daemon_response())
                         }

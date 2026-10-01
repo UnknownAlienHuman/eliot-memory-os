@@ -1905,11 +1905,9 @@ impl StageLauncher for StageRoute {
         Ok(invocation)
     }
 
-    fn persist_admission<'a>(
+    fn read_admission<'a>(
         &'a self,
-        _stage: &'a PlannedStage,
-        _observed: &'a eliot_instrument_runner::registry::ResolvedExecutableIdentity,
-        _submission: AdmissionSubmission,
+        _submission: &'a AdmissionSubmission,
     ) -> Pin<
         Box<
             dyn Future<Output = Result<(WriteReceipt, NamedReadResponse), RunnerError>>
@@ -1919,7 +1917,7 @@ impl StageLauncher for StageRoute {
     > {
         Box::pin(async {
             Err(RunnerError::Binding(
-                "standalone profile resolution has no authenticated canonical registry owner; use an admitted owner-dispatched profile run".to_owned(),
+                "standalone profile resolution has no original registration receipt/readback owner; use an admitted owner-dispatched profile run".to_owned(),
             ))
         })
     }

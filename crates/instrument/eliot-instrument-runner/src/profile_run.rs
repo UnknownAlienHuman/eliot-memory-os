@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::admission_submission::{
-    AdmissionSubmission, AdmissionSubmissionReadback, submit_admission_snapshot,
+    AdmissionSubmission, AdmissionSubmissionReadback, prepare_admission_submission,
 };
 use crate::profile::{AdmissionError, AdmittedProfile, AdmittedStage, InstrumentRegistry};
 use crate::registry::{
@@ -304,15 +304,13 @@ pub trait StageLauncher: Send + Sync {
     /// orchestrator records the stage as missing instead of failing the plan.
     fn invocation(&self, stage: &PlannedStage) -> Result<InstrumentInvocation, RunnerError>;
 
-    /// Commits one admitted executable/spec submission through the real owner
-    /// and returns its original write receipt plus the named registry read.
-    /// The orchestrator validates that pair against the exact submission
-    /// before it asks the process executor to create a child.
-    fn persist_admission<'a>(
+    /// Reads the original registration receipt and the same-fence canonical
+    /// registry snapshot through the real owner. The orchestrator validates
+    /// that original proof against the exact admitted submission before it
+    /// asks the process executor to create a child.
+    fn read_admission<'a>(
         &'a self,
-        stage: &'a PlannedStage,
-        observed: &'a ResolvedExecutableIdentity,
-        submission: AdmissionSubmission,
+        submission: &'a AdmissionSubmission,
     ) -> Pin<
         Box<
             dyn Future<Output = Result<(WriteReceipt, NamedReadResponse), RunnerError>>
@@ -1341,7 +1339,7 @@ impl StageOrchestrator {
                     "external stage lacks a live owner registry and persisted admission".to_owned(),
                 );
             };
-            let submission = match submit_admission_snapshot(registry, &planned.stage, &identity) {
+            let submission = match prepare_admission_submission(registry, &planned.stage, &identity) {
                 Ok(submission) => submission,
                 Err(error) => {
                     return InstrumentRun::missing(
@@ -1351,14 +1349,14 @@ impl StageOrchestrator {
                 }
             };
             let (receipt, readback) = match launcher
-                .persist_admission(planned, &identity, submission.clone())
+                .read_admission(&submission)
                 .await
             {
                 Ok(proof) => proof,
                 Err(error) => {
                     return InstrumentRun::missing(
                         route,
-                        format!("canonical registry persistence refused: {error}"),
+                        format!("canonical registry proof read refused: {error}"),
                     );
                 }
             };
@@ -1431,20 +1429,18 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
 pub struct MappedStageLauncher<'p> {
     invocations: BTreeMap<String, InstrumentInvocation>,
     port: &'p dyn InstrumentRequestPort,
-    persistence: &'p dyn AdmissionSubmissionPort,
+    proof: &'p dyn AdmissionSubmissionProofPort,
     sink: Arc<dyn ProcessEvidenceSink>,
 }
 
-/// Owner port that commits one instrument registry snapshot and returns the
-/// exact canonical receipt and named readback for the runner's verification.
-pub trait AdmissionSubmissionPort: Send + Sync {
-    /// Persists and reads the submitted record under the original admitted
-    /// request context retained by the implementation.
-    fn persist<'a>(
+/// Owner port that returns the original registration receipt and exact
+/// canonical named readback for the runner's verification.
+pub trait AdmissionSubmissionProofPort: Send + Sync {
+    /// Reads the original registration proof under its retained owner
+    /// context. This has no mutation capability.
+    fn read_admission<'a>(
         &'a self,
-        stage: &'a PlannedStage,
-        observed: &'a ResolvedExecutableIdentity,
-        submission: AdmissionSubmission,
+        submission: &'a AdmissionSubmission,
     ) -> Pin<
         Box<
             dyn Future<Output = Result<(WriteReceipt, NamedReadResponse), RunnerError>>
@@ -1459,13 +1455,13 @@ impl<'p> MappedStageLauncher<'p> {
     pub fn new(
         invocations: BTreeMap<String, InstrumentInvocation>,
         port: &'p dyn InstrumentRequestPort,
-        persistence: &'p dyn AdmissionSubmissionPort,
+        proof: &'p dyn AdmissionSubmissionProofPort,
         sink: Arc<dyn ProcessEvidenceSink>,
     ) -> Self {
         Self {
             invocations,
             port,
-            persistence,
+            proof,
             sink,
         }
     }
@@ -1479,11 +1475,9 @@ impl StageLauncher for MappedStageLauncher<'_> {
         })
     }
 
-    fn persist_admission<'a>(
+    fn read_admission<'a>(
         &'a self,
-        stage: &'a PlannedStage,
-        observed: &'a ResolvedExecutableIdentity,
-        submission: AdmissionSubmission,
+        submission: &'a AdmissionSubmission,
     ) -> Pin<
         Box<
             dyn Future<Output = Result<(WriteReceipt, NamedReadResponse), RunnerError>>
@@ -1491,7 +1485,7 @@ impl StageLauncher for MappedStageLauncher<'_> {
                 + 'a,
         >,
     > {
-        self.persistence.persist(stage, observed, submission)
+        self.proof.read_admission(submission)
     }
 
     fn port(&self, _stage: &PlannedStage) -> &dyn InstrumentRequestPort {

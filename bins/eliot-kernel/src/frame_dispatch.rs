@@ -1621,6 +1621,8 @@ fn is_daemon_operation(operation: &str) -> bool {
             | "task_controller_result"
             | "campaign_packet_claim"
             | "campaign_packet_result"
+            | "instrument_registry_registration_claim"
+            | "instrument_registry_registration_result"
             // Issue #1741: the finish claim/result legs are separate admitted
             // operations with their own queue and attempt type, so the frame
             // must reach their own dispatch instead of falling through to the

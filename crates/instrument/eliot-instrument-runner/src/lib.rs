@@ -34,7 +34,7 @@ pub mod testd_profile_dispatch;
 pub mod verification_profile;
 
 pub use admission_submission::{
-    AdmissionSubmission, AdmissionSubmissionReadback, submit_admission_snapshot,
+    AdmissionSubmission, AdmissionSubmissionReadback, prepare_admission_submission,
 };
 pub use build_projection::{
     AffectedEdge, BuildCacheDecision, BuildCancellation, BuildClaimOrder, BuildCleanupPass,
@@ -88,7 +88,7 @@ pub use profile::{
     package_verification_profile, test_profile,
 };
 pub use profile_run::{
-    AdmissionSubmissionPort, AggregateStatus, InstrumentRun, MappedStageLauncher, PlannedStage,
+    AdmissionSubmissionProofPort, AggregateStatus, InstrumentRun, MappedStageLauncher, PlannedStage,
     ProfileAggregate, ProfileRunError, ProviderDispatch, RetainedExitOutcome,
     RetainedToolIdentity, StageEvidence, StageIdentity, StageLauncher, StageOrchestrator,
     StagePlan, StageTargetLayout, TestExecutionPlaneRoute, TestdPlaneAdmission,

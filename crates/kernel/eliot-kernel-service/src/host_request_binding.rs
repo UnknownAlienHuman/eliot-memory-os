@@ -618,7 +618,9 @@ impl<'a, P: KernelGovernorPort + ?Sized> KernelHostRequestBinder<'a, P> {
     ) -> Result<StagedAdmission, PortFailure> {
         if matches!(
             envelope.kind,
-            HostRequestKind::Invocation | HostRequestKind::Cancellation
+            HostRequestKind::Invocation
+                | HostRequestKind::InstrumentRegistryRegistration
+                | HostRequestKind::Cancellation
         ) && (envelope.identity.correlation_projection.is_none()
             || envelope.identity.session_id.is_none())
         {
@@ -636,7 +638,9 @@ impl<'a, P: KernelGovernorPort + ?Sized> KernelHostRequestBinder<'a, P> {
         let staged = requested_host_request_record(envelope)?;
         let stored = if matches!(
             staged.kind,
-            OrsHostRequestKind::Invocation | OrsHostRequestKind::Cancellation
+            OrsHostRequestKind::Invocation
+                | OrsHostRequestKind::InstrumentRegistryRegistration
+                | OrsHostRequestKind::Cancellation
         ) {
             self.store.resolve_or_stage_host_request(&staged)
         } else {
@@ -1014,7 +1018,10 @@ impl<'a> KernelHostRequestBinder<'a, NoProviderPort> {
         peer_receipt: &AgentBridgePeerAdmissionReceipt,
         tool: &serde_json::Value,
     ) -> HostBinderLegDisposition {
-        if !matches!(envelope.kind, HostRequestKind::Invocation) {
+        if !matches!(
+            envelope.kind,
+            HostRequestKind::Invocation | HostRequestKind::InstrumentRegistryRegistration
+        ) {
             return HostBinderLegDisposition::Rejected;
         }
         if envelope.validate().is_err() {
@@ -1143,6 +1150,9 @@ fn requested_host_request_record(
         kind: match envelope.kind {
             HostRequestKind::Activation => OrsHostRequestKind::Activation,
             HostRequestKind::Invocation => OrsHostRequestKind::Invocation,
+            HostRequestKind::InstrumentRegistryRegistration => {
+                OrsHostRequestKind::InstrumentRegistryRegistration
+            }
             HostRequestKind::Cancellation => OrsHostRequestKind::Cancellation,
             HostRequestKind::Status => OrsHostRequestKind::Status,
             HostRequestKind::Reconciliation => OrsHostRequestKind::Reconciliation,

@@ -5128,7 +5128,9 @@ impl persistence_codec::PersistedValue for HostRequestLegacyPresence {
         crate::model::validate_text(&self.occurrence, "host_request_legacy_presence_occurrence")?;
         if !matches!(
             self.kind,
-            crate::HostRequestKind::Invocation | crate::HostRequestKind::Cancellation
+            crate::HostRequestKind::Invocation
+                | crate::HostRequestKind::InstrumentRegistryRegistration
+                | crate::HostRequestKind::Cancellation
         ) {
             return Err(OrsError::InvalidField {
                 field: "host_request_legacy_presence_kind",
@@ -7493,7 +7495,9 @@ impl RedbRecoveryStore {
         }
         if matches!(
             record.kind,
-            crate::HostRequestKind::Invocation | crate::HostRequestKind::Cancellation
+            crate::HostRequestKind::Invocation
+                | crate::HostRequestKind::InstrumentRegistryRegistration
+                | crate::HostRequestKind::Cancellation
         ) && (record.correlation_projection.is_none()
             || (record.session_ref.is_none()
                 && !matches!(
@@ -7562,6 +7566,11 @@ impl RedbRecoveryStore {
                 session,
                 occurrence,
             ),
+            crate::HostRequestKind::InstrumentRegistryRegistration => host_request_legacy_presence_key(
+                HostRequestLogicalKind::InstrumentRegistryRegistration,
+                session,
+                occurrence,
+            ),
             crate::HostRequestKind::Cancellation => host_request_legacy_presence_key(
                 HostRequestLogicalKind::Cancellation,
                 session,
@@ -7620,7 +7629,9 @@ impl RedbRecoveryStore {
     ) -> Result<bool, OrsError> {
         if !matches!(
             kind,
-            crate::HostRequestKind::Invocation | crate::HostRequestKind::Cancellation
+            crate::HostRequestKind::Invocation
+                | crate::HostRequestKind::InstrumentRegistryRegistration
+                | crate::HostRequestKind::Cancellation
         ) {
             return Err(OrsError::InvalidField {
                 field: "host_request_legacy_presence_kind",
@@ -7699,7 +7710,9 @@ impl RedbRecoveryStore {
     ) -> Result<Option<String>, OrsError> {
         if !matches!(
             record.kind,
-            crate::HostRequestKind::Invocation | crate::HostRequestKind::Cancellation
+            crate::HostRequestKind::Invocation
+                | crate::HostRequestKind::InstrumentRegistryRegistration
+                | crate::HostRequestKind::Cancellation
         ) {
             return Ok(None);
         }
@@ -7721,6 +7734,9 @@ impl RedbRecoveryStore {
             Some(projection) => {
                 let kind = match record.kind {
                     crate::HostRequestKind::Invocation => HostRequestLogicalKind::Invocation,
+                    crate::HostRequestKind::InstrumentRegistryRegistration => {
+                        HostRequestLogicalKind::InstrumentRegistryRegistration
+                    }
                     crate::HostRequestKind::Cancellation => HostRequestLogicalKind::Cancellation,
                     _ => return Ok(None),
                 };
@@ -7881,7 +7897,9 @@ impl RedbRecoveryStore {
         }
         if matches!(
             record.kind,
-            crate::HostRequestKind::Invocation | crate::HostRequestKind::Cancellation
+            crate::HostRequestKind::Invocation
+                | crate::HostRequestKind::InstrumentRegistryRegistration
+                | crate::HostRequestKind::Cancellation
         ) && (record.correlation_projection.is_none() || record.session_ref.is_none())
         {
             return Err(OrsError::HostRequestLegacyCorrelationUnresolved);
@@ -7985,7 +8003,9 @@ impl RedbRecoveryStore {
         Self::validate_host_request_identity_bindings(record, identity_bindings)?;
         if matches!(
             record.kind,
-            crate::HostRequestKind::Invocation | crate::HostRequestKind::Cancellation
+            crate::HostRequestKind::Invocation
+                | crate::HostRequestKind::InstrumentRegistryRegistration
+                | crate::HostRequestKind::Cancellation
         ) && (record.correlation_projection.is_none() || record.session_ref.is_none())
         {
             return Err(OrsError::HostRequestLegacyCorrelationUnresolved);
@@ -8457,6 +8477,7 @@ impl RedbRecoveryStore {
         match kind {
             crate::HostRequestKind::Activation => "activation",
             crate::HostRequestKind::Invocation => "invocation",
+            crate::HostRequestKind::InstrumentRegistryRegistration => "instrument_registry_registration",
             crate::HostRequestKind::Cancellation => "cancellation",
             crate::HostRequestKind::Status => "status",
             crate::HostRequestKind::Reconciliation => "reconciliation",
@@ -8775,7 +8796,9 @@ impl RedbRecoveryStore {
             if record.correlation_projection.is_none()
                 && matches!(
                     record.kind,
-                    crate::HostRequestKind::Invocation | crate::HostRequestKind::Cancellation
+                    crate::HostRequestKind::Invocation
+                        | crate::HostRequestKind::InstrumentRegistryRegistration
+                        | crate::HostRequestKind::Cancellation
                 )
                 && let Some(session) = record.session_ref.as_ref()
             {
