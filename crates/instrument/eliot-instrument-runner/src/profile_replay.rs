@@ -25,9 +25,21 @@ use eliot_workscope::{GoverningSource, GoverningSourceRole, SourceStatus, WorkSc
 use thiserror::Error;
 
 use crate::{
-    profile::{InstrumentRegistry, ProfileCompiler},
+    profile::{InstrumentRegistry, ProfileCompiler, ProfileError},
     registry::{InvalidationSet, ProviderRegistry, RegistryEntry, RegistryError, RegistryFreshness},
 };
+
+/// Builds the exact builtin four-profile registry admitted for productive
+/// TestD execution at one local registry generation.
+///
+/// This is the production replay registry factory. Callers pass the stage's
+/// retained generation only as a selector; replay still compares the exact
+/// profile, registry, DAG, parser, and stage identities before dispatch.
+pub fn testd_builtin_profile_registry(
+    generation: u64,
+) -> Result<InstrumentRegistry, ProfileError> {
+    InstrumentRegistry::with_verification_route_profiles(generation, Vec::new())
+}
 
 /// Exact independent observations available at the governed process finish
 /// boundary. The worker fills this from its actual source/tool/environment
