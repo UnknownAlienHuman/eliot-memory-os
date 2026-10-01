@@ -23,7 +23,7 @@
 //!   evaluation remain separate closed axes: admitting a stream sets no
 //!   parser/evaluator status, and parser success sets no evaluator status.
 
-use eliot_contracts::{ClockReading, EpochId, StateFence};
+use eliot_contracts::{ClockReading, EpochId, StateFence, canonical_json_bytes};
 use eliot_process::{
     DurableStreamLocatorKind, DurableStreamRepresentation, ProcessEvidence,
     ProcessExecutionBinding, ProcessStreamEvidence, ProcessStreamKind, ProcessStreamPolicyBinding,
@@ -647,6 +647,103 @@ pub struct ProcessStreamSourceReadbackObservation {
     pub observed_at: ClockReading,
     /// Availability/integrity outcome of the readback.
     pub disposition: TestdStreamDisposition,
+    /// Fresh Kernel owner facts and catalog admission that authorized this
+    /// read. Ephemeral only; never copied to a durable TestD receipt.
+    #[serde(skip)]
+    pub replay_owner_readback: Option<TestdReplayOwnerReadback>,
+}
+
+/// Canonical owner-facts and catalog-admission payloads returned with a fresh
+/// authenticated source readback. These JSON values are carried only to the
+/// replay authority, which performs the typed owner-specific validation.
+#[derive(Clone, Eq, PartialEq)]
+pub struct TestdReplayOwnerReadback {
+    /// Exact pending/ready process-source-admission record for this stream.
+    pub process_source_admission_readback_json: String,
+    /// SHA-256 of the exact canonical process-source-admission bytes.
+    pub process_source_admission_readback_sha256: String,
+    /// Canonical verified WorkScope/source/policy owner facts.
+    pub owner_facts_json: String,
+    /// SHA-256 of the exact canonical owner-facts JSON bytes.
+    pub owner_facts_sha256: String,
+    /// Canonical current Module Catalog owner readback.
+    pub module_catalog_owner_readback_json: String,
+    /// SHA-256 of the exact canonical catalog readback bytes.
+    pub module_catalog_owner_readback_sha256: String,
+    /// Canonical accepted GenerationAdmission.
+    pub generation_admission_json: String,
+    /// SHA-256 of the exact canonical GenerationAdmission bytes.
+    pub generation_admission_sha256: String,
+}
+
+impl std::fmt::Debug for TestdReplayOwnerReadback {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TestdReplayOwnerReadback")
+            .field("owner_facts_sha256", &self.owner_facts_sha256)
+            .field(
+                "module_catalog_owner_readback_sha256",
+                &self.module_catalog_owner_readback_sha256,
+            )
+            .field(
+                "generation_admission_sha256",
+                &self.generation_admission_sha256,
+            )
+            .finish()
+    }
+}
+
+impl TestdReplayOwnerReadback {
+    /// Validates exact canonical JSON and SHA-256 pairings for all three
+    /// authenticated owner readbacks.
+    pub fn validate(&self) -> Result<(), TestdEvidenceError> {
+        for (json_field, json, digest_field, digest) in [
+            (
+                "source_readback.process_source_admission_readback_json",
+                self.process_source_admission_readback_json.as_str(),
+                "source_readback.process_source_admission_readback_sha256",
+                self.process_source_admission_readback_sha256.as_str(),
+            ),
+            (
+                "source_readback.owner_facts_json",
+                self.owner_facts_json.as_str(),
+                "source_readback.owner_facts_sha256",
+                self.owner_facts_sha256.as_str(),
+            ),
+            (
+                "source_readback.module_catalog_owner_readback_json",
+                self.module_catalog_owner_readback_json.as_str(),
+                "source_readback.module_catalog_owner_readback_sha256",
+                self.module_catalog_owner_readback_sha256.as_str(),
+            ),
+            (
+                "source_readback.generation_admission_json",
+                self.generation_admission_json.as_str(),
+                "source_readback.generation_admission_sha256",
+                self.generation_admission_sha256.as_str(),
+            ),
+        ] {
+            let value: serde_json::Value = serde_json::from_str(json).map_err(|_| {
+                TestdEvidenceError::BindingMismatch {
+                    reason: "fresh replay owner facts are not valid JSON",
+                }
+            })?;
+            let canonical = canonical_json_bytes(&value).map_err(|_| {
+                TestdEvidenceError::BindingMismatch {
+                    reason: "fresh replay owner facts cannot be canonically serialized",
+                }
+            })?;
+            if String::from_utf8(canonical.clone()).ok().as_deref() != Some(json)
+                || sha256_hex(&canonical) != digest
+            {
+                let _ = (json_field, digest_field);
+                return Err(TestdEvidenceError::BindingMismatch {
+                    reason: "fresh replay owner facts disagree with their canonical digest",
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for ProcessStreamSourceReadbackObservation {
@@ -664,6 +761,7 @@ impl std::fmt::Debug for ProcessStreamSourceReadbackObservation {
             .field("observed_fence", &self.observed_fence)
             .field("observed_at", &self.observed_at)
             .field("disposition", &self.disposition)
+            .field("replay_owner_readback", &self.replay_owner_readback)
             .finish()
     }
 }
@@ -699,7 +797,15 @@ impl ProcessStreamSourceReadbackObservation {
             observed_fence,
             observed_at,
             disposition,
+            replay_owner_readback: None,
         }
+    }
+
+    /// Adds the exact fresh owner PULL payloads associated with this readback.
+    #[must_use]
+    pub fn with_replay_owner_readback(mut self, owner: TestdReplayOwnerReadback) -> Self {
+        self.replay_owner_readback = Some(owner);
+        self
     }
 
     /// Borrows the ephemeral source bytes for immediate parser input.
@@ -785,6 +891,12 @@ impl ProcessStreamSourceReadbackObservation {
                 reason: "the provider returned more bytes than the admitted bound",
             });
         }
+        let Some(owner_readback) = self.replay_owner_readback.as_ref() else {
+            return Err(TestdEvidenceError::BindingMismatch {
+                reason: "source readback omitted fresh authenticated replay owner facts",
+            });
+        };
+        owner_readback.validate()?;
         if self.locator_kind != request.locator_kind
             || self.locator != request.locator
             || self.ready_receipt_ref != request.ready_receipt_ref
@@ -877,13 +989,14 @@ pub trait AsyncProcessStreamSourceReadbackPort: Send + Sync {
 /// Deliberately not serializable, so resolved bytes cannot be embedded in a
 /// durable job or receipt by construction. The [`Debug`] projection reports
 /// only the length, never the bytes.
-pub struct EphemeralSourceBytes(Vec<u8>);
+pub struct EphemeralSourceBytes(Vec<u8>, TestdReplayOwnerReadback);
 
 impl std::fmt::Debug for EphemeralSourceBytes {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("EphemeralSourceBytes")
             .field("len", &self.0.len())
+            .field("replay_owner_readback", &self.1)
             .finish()
     }
 }
@@ -893,6 +1006,14 @@ impl EphemeralSourceBytes {
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
         &self.0
+    }
+
+    /// Borrows the fresh authenticated owner readbacks paired with these
+    /// bytes. This metadata is ephemeral and must be revalidated by the
+    /// runner's verified replay-context constructor before use.
+    #[must_use]
+    pub fn replay_owner_readback(&self) -> &TestdReplayOwnerReadback {
+        &self.1
     }
 
     /// Returns the resolved byte length.
@@ -1479,7 +1600,15 @@ impl TestdStreamEvidenceBinding {
         } else {
             TestdStreamDisposition::PartialSource
         };
-        Ok(EphemeralSourceBytes(observation.bytes.clone()))
+        Ok(EphemeralSourceBytes(
+            observation.bytes.clone(),
+            observation
+                .replay_owner_readback
+                .clone()
+                .ok_or(TestdEvidenceError::BindingMismatch {
+                    reason: "source readback omitted fresh authenticated replay owner facts",
+                })?,
+        ))
     }
 
     /// Builds the readback request from the admitted source fields.

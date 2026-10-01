@@ -62,7 +62,7 @@ pub use typed_evidence::{
     TestdEvaluationStatus, TestdEvaluatorSlot, TestdEvidenceDisposition, TestdEvidenceError,
     TestdParserSlot, TestdParsingObservation, TestdParsingStatus, TestdProcessEvidenceBundle,
     TestdReadbackContext, TestdStreamDisposition, TestdStreamEvidenceBinding,
-    TestdStreamResolution, TestdStreamSlot,
+    TestdReplayOwnerReadback, TestdStreamResolution, TestdStreamSlot,
 };
 
 /// The admitted execution lane for a profile stage. `DecoderOnly` names an
@@ -1858,12 +1858,21 @@ pub struct TestJob {
 #[serde(deny_unknown_fields)]
 pub struct TestdBlobProcessStreamGrant {
     pub capability_ref: String,
-    pub binding_sha256: String,
     pub process_binding_sha256: String,
     pub fence_sha256: String,
     pub policy_sha256: String,
-    pub source_set_sha256: String,
-    pub currentness_sha256: String,
+    /// Exact fresh Kernel owner-facts digest; distinct from source and job currentness.
+    pub owner_facts_sha256: String,
+    /// Exact retained WorkScope snapshot digest from the owner projection.
+    pub work_scope_snapshot_sha256: String,
+    /// Exact current Module Catalog owner readback digest.
+    pub module_catalog_owner_readback_sha256: String,
+    /// Exact accepted Module Catalog generation admission digest.
+    pub generation_admission_sha256: String,
+    /// Fresh owner-currentness digest; distinct from the job's provider tuple.
+    pub owner_currentness_sha256: String,
+    /// Job currentness tuple over provider freshness, catalog lifecycle, tools and environment.
+    pub job_currentness_sha256: String,
     pub revoked_at_ms: Option<u64>,
     pub tokens: Vec<TestdBlobProcessStreamTokenRef>,
 }
@@ -1872,39 +1881,63 @@ impl TestdBlobProcessStreamGrant {
     pub fn validate(&self) -> Result<(), TestdError> {
         for (field, value) in [
             ("blob_stream.capability_ref", self.capability_ref.as_str()),
-            ("blob_stream.binding_sha256", self.binding_sha256.as_str()),
             (
                 "blob_stream.process_binding_sha256",
                 self.process_binding_sha256.as_str(),
             ),
             ("blob_stream.fence_sha256", self.fence_sha256.as_str()),
             ("blob_stream.policy_sha256", self.policy_sha256.as_str()),
+            ("blob_stream.owner_facts_sha256", self.owner_facts_sha256.as_str()),
             (
-                "blob_stream.source_set_sha256",
-                self.source_set_sha256.as_str(),
+                "blob_stream.work_scope_snapshot_sha256",
+                self.work_scope_snapshot_sha256.as_str(),
             ),
             (
-                "blob_stream.currentness_sha256",
-                self.currentness_sha256.as_str(),
+                "blob_stream.module_catalog_owner_readback_sha256",
+                self.module_catalog_owner_readback_sha256.as_str(),
+            ),
+            (
+                "blob_stream.generation_admission_sha256",
+                self.generation_admission_sha256.as_str(),
+            ),
+            (
+                "blob_stream.owner_currentness_sha256",
+                self.owner_currentness_sha256.as_str(),
+            ),
+            (
+                "blob_stream.job_currentness_sha256",
+                self.job_currentness_sha256.as_str(),
             ),
         ] {
             validate_text(value, field)?;
         }
         for (field, value) in [
-            ("blob_stream.binding_sha256", self.binding_sha256.as_str()),
             (
                 "blob_stream.process_binding_sha256",
                 self.process_binding_sha256.as_str(),
             ),
             ("blob_stream.fence_sha256", self.fence_sha256.as_str()),
             ("blob_stream.policy_sha256", self.policy_sha256.as_str()),
+            ("blob_stream.owner_facts_sha256", self.owner_facts_sha256.as_str()),
             (
-                "blob_stream.source_set_sha256",
-                self.source_set_sha256.as_str(),
+                "blob_stream.work_scope_snapshot_sha256",
+                self.work_scope_snapshot_sha256.as_str(),
             ),
             (
-                "blob_stream.currentness_sha256",
-                self.currentness_sha256.as_str(),
+                "blob_stream.module_catalog_owner_readback_sha256",
+                self.module_catalog_owner_readback_sha256.as_str(),
+            ),
+            (
+                "blob_stream.generation_admission_sha256",
+                self.generation_admission_sha256.as_str(),
+            ),
+            (
+                "blob_stream.owner_currentness_sha256",
+                self.owner_currentness_sha256.as_str(),
+            ),
+            (
+                "blob_stream.job_currentness_sha256",
+                self.job_currentness_sha256.as_str(),
             ),
         ] {
             if !is_binding_digest(value) {
@@ -1914,10 +1947,10 @@ impl TestdBlobProcessStreamGrant {
                 });
             }
         }
-        if self.tokens.is_empty() || self.tokens.len() > 8_336 {
+        if self.tokens.len() != 1 || self.tokens[0].ordinal != 1 {
             return Err(TestdError::Invalid {
                 field: "blob_stream.tokens",
-                reason: "grant must contain a bounded non-empty token sequence",
+                reason: "launch grant must contain exactly the initial one-based token",
             });
         }
         if self.revoked_at_ms == Some(0) {
@@ -4269,7 +4302,7 @@ impl TestdStore {
             environment,
         ))
         .map_err(|error| TestdError::Corrupt(error.to_string()))?;
-        if sha256_hex(&currentness_bytes) != grant.currentness_sha256
+        if sha256_hex(&currentness_bytes) != grant.job_currentness_sha256
             || !is_testd_executor_profile(&job.invocation.profile)
         {
             return Err(TestdError::Invalid {
@@ -4381,6 +4414,38 @@ impl TestdStore {
         } else {
             Ok(grant.tokens.first().cloned())
         }
+    }
+
+    /// Resolves the durable call record attached to the current token head,
+    /// if that token was already consumed. This is read-only and gives Kernel
+    /// enough original identity to reconcile without resending an operation.
+    pub fn resolve_blob_process_stream_call_at_token_head(
+        &self,
+        job_id: &str,
+        capability_ref: &str,
+    ) -> Result<Option<TestdBlobProcessStreamCallRecord>, TestdError> {
+        let Some(head) = self.resolve_blob_process_stream_token_head(job_id, capability_ref)? else {
+            return Ok(None);
+        };
+        let key = blob_process_stream_call_key(job_id, capability_ref, &head.reference)?;
+        let read = self.database.begin_read().map_err(database)?;
+        let calls = read
+            .open_table(BLOB_PROCESS_STREAM_CALLS)
+            .map_err(database)?;
+        let Some(value) = calls.get(key.as_str()).map_err(database)? else {
+            return Ok(None);
+        };
+        let record: TestdBlobProcessStreamCallRecord = serde_json::from_slice(value.value())
+            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        validate_blob_process_stream_call_record(
+            &record,
+            job_id,
+            capability_ref,
+            &head.reference,
+            head.ordinal,
+            &record.operation_sha256,
+        )?;
+        Ok(Some(record))
     }
 
     /// Permanently revokes the exact retained capability. Repeated revocation
@@ -4745,13 +4810,15 @@ impl TestdStore {
             // this exact logical call. Unknown is explicitly unresolved, so
             // replacing it with the retained owner outcome does not change
             // the request binding or authorize another Store dispatch.
-            (
-                TestdBlobProcessStreamCallState::Completed(
-                    TestdBlobProcessStreamCallOutcome::Unknown,
-                ),
-                Some(outcome),
-            ) => {
-                if successor.is_some() {
+            (TestdBlobProcessStreamCallState::Completed(
+            TestdBlobProcessStreamCallOutcome::Unknown,
+            ), Some(outcome)) => {
+                if successor.is_some()
+                    && !matches!(
+                        &outcome,
+                        TestdBlobProcessStreamCallOutcome::Completed { .. }
+                    )
+                {
                     return Err(TestdError::InvalidBinding);
                 }
                 record.state = TestdBlobProcessStreamCallState::Completed(outcome);
