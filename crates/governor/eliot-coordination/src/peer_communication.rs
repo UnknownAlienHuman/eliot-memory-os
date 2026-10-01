@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use eliot_agent_contracts::{
     CoordinationMapView, DeliveryPolicy, LivePeerMessageKind, LivePeerMessagePayload,
     MAX_LIVE_PEER_PAYLOAD_BYTES, MAX_LIVE_PEER_REFERENCES, MessageUrgency, PublicReference,
-    RequestedReaction,
+    RequestedReaction, ReviewBatch,
 };
 use eliot_contracts::{
     BoardEntryState, ClockReading, EpochId, EpochRelation, PeerBoardKind, StateFence,
@@ -4058,14 +4058,19 @@ pub struct PeerReviewObligation {
     /// separate from the submit-time `anchor_resolution` claim.
     /// `Some(Exact)` iff the admitted head still carries the reviewed
     /// revision *and* digest: identical bytes, hence identical locations.
-    /// That is the only continuity this owner asserts. `None` in every
-    /// other case: without resolver-supplied candidates and resolution
-    /// evidence the owner cannot tell Moved from Modified from Ambiguous,
-    /// so it reports an incomplete current target instead of attaching to
-    /// a nearest match. A submit-time Modified claim behind the head
-    /// inherits no approval, and an unrun search stays incomplete.
+    /// That is the only continuity this owner asserts. Otherwise a retained
+    /// resolver observation for the review (recorded through
+    /// `record_review_resolution`) is reported when one exists: only
+    /// non-attaching statuses are ever recorded there, so an `ambiguous`
+    /// verdict remains explicit and is never attached to a similar
+    /// fragment. `None` in every other case: without resolver-supplied
+    /// candidates and resolution evidence the owner cannot tell Moved from
+    /// Modified from Ambiguous, so it reports an incomplete current target
+    /// instead of attaching to a nearest match. A submit-time Modified claim
+    /// behind the head inherits no approval, and an unrun search stays
+    /// incomplete.
     /// Always `None` from `From<&AnchoredReview>`; `peer_review_batches`
-    /// binds it against the admitted head.
+    /// binds it against the admitted head and retained observations.
     pub current_resolution: Option<AnchorResolution>,
     pub lifecycle: PeerReviewLifecycle,
     pub standing: PeerReviewStanding,
@@ -4193,6 +4198,47 @@ pub struct PeerReviewBatch {
     pub obligations: Vec<PeerReviewObligation>,
 }
 
+/// Submission receipt for one review batch: one per-item receipt per
+/// envelope entry, in envelope order.
+///
+/// The envelope itself is derived only: it is validated for exact coverage
+/// and never persisted, so it carries no lifecycle of its own. Every item
+/// keeps its own lifecycle and disposition; answering, resolving or
+/// rejecting one item never touches another.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PeerReviewBatchReceipt {
+    pub batch_id: String,
+    pub review_receipts: Vec<PeerReviewReceipt>,
+}
+
+/// Escalation draft for one retained review blocker.
+///
+/// The caller supplies the blackboard identity, scope and visibility; the
+/// review supplies authorship, anchor and lineage. The entry is always a
+/// public `blocker`: reviews target public artifacts only, and the
+/// escalation carries no effect authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EscalateReviewBlocker {
+    pub request_id: String,
+    pub entry_id: String,
+    pub scope: String,
+    pub audience_scope: String,
+    pub content_digest: String,
+    pub authority_epoch: EpochId,
+    pub state_fence: StateFence,
+}
+
+/// Escalation receipt for one review blocker: the blocking review identity
+/// and the blocker retained by the existing board owner.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewBlockerEscalationReceipt {
+    pub review_id: String,
+    pub blocker: BoardEntryReceipt,
+}
+
 fn recommendations_conflict(left: ReviewRecommendation, right: ReviewRecommendation) -> bool {
     let approves = |recommendation: ReviewRecommendation| {
         matches!(
@@ -4203,6 +4249,28 @@ fn recommendations_conflict(left: ReviewRecommendation, right: ReviewRecommendat
     approves(left) != approves(right)
         && !matches!(left, ReviewRecommendation::Abstain)
         && !matches!(right, ReviewRecommendation::Abstain)
+}
+
+/// Whether a retained review is a real blocker (I10.18).
+///
+/// Only a live objection or requested change that explicitly requests
+/// changes blocks dependent effects. Questions, corrections, missing
+/// evidence, scope and acceptance notes never escalate however they are
+/// recommended, and neither does a disposed, stale-lifecycle or superseded
+/// record. Classification reads the retained record only and grants
+/// nothing: reviews carry no authority.
+#[must_use]
+pub fn review_is_blocker(review: &AnchoredReview) -> bool {
+    matches!(
+        review.kind,
+        ReviewKind::Objection | ReviewKind::RequestedChange
+    ) && matches!(review.recommendation, ReviewRecommendation::RequestChanges)
+        && matches!(
+            review.lifecycle,
+            PeerReviewLifecycle::PendingDelivery
+                | PeerReviewLifecycle::Delivered
+                | PeerReviewLifecycle::Answered
+        )
 }
 
 /// Derives the digest-bound current identity of one reviewed revision
@@ -4911,7 +4979,12 @@ impl CoordinationOwner {
                         head,
                         obligation.artifact_revision,
                         obligation.artifact_digest.as_str(),
-                    );
+                    )
+                    .or_else(|| {
+                        self.peer_review_resolutions
+                            .get(&obligation.review_id)
+                            .copied()
+                    });
                 }
                 let submitted = obligations.len() as u64;
                 let disposed = obligations
@@ -4943,5 +5016,183 @@ impl CoordinationOwner {
                 kind: "peer_review",
                 id: review_id.to_owned(),
             })
+    }
+}
+
+impl CoordinationOwner {
+    /// Submits every item of one review batch through the existing
+    /// per-item owner path (issue #1823 A1; I10.18 derived envelope).
+    ///
+    /// The envelope is validated with its own contract
+    /// (`ReviewBatch::validate`) and must cover the drafts exactly: every
+    /// envelope entry needs its draft and every draft must be an envelope
+    /// entry, so no item can be smuggled into or dropped from a batch.
+    /// Each draft is admitted by `submit_peer_review` with full per-item
+    /// validation, replay and idempotency; the envelope itself is never
+    /// stored. Receipts return in envelope order. Lifecycle stays per item
+    /// afterwards: `advance_peer_review` addresses one `review_id`, and
+    /// `peer_review_batches` disposes each obligation on its own outcome,
+    /// so answering one item neither resolves nor hides another.
+    pub fn submit_peer_review_batch(
+        &mut self,
+        batch: &ReviewBatch,
+        drafts: &[SubmitPeerReview],
+        clock: &dyn PeerClockPort,
+        durability: &dyn PeerDurabilityPort,
+    ) -> Result<PeerReviewBatchReceipt, CoordinationError> {
+        batch
+            .validate()
+            .map_err(|_| CoordinationError::InvalidField("review_batch"))?;
+        if drafts.len() != batch.review_item_ids.len() {
+            return Err(CoordinationError::InvalidField("review_batch"));
+        }
+        let mut review_receipts = Vec::with_capacity(batch.review_item_ids.len());
+        for item_id in &batch.review_item_ids {
+            let draft = drafts
+                .iter()
+                .find(|candidate| candidate.review_id == item_id.as_str())
+                .ok_or(CoordinationError::InvalidField("review_batch"))?;
+            review_receipts.push(self.submit_peer_review(draft, clock, durability)?);
+        }
+        Ok(PeerReviewBatchReceipt {
+            batch_id: batch.batch_id.as_str().to_owned(),
+            review_receipts,
+        })
+    }
+
+    /// Records one rebuildable resolver verdict against a retained review
+    /// without attaching it (issue #1823 A2; I10.18/I10.21).
+    ///
+    /// Only non-attaching statuses are recorded (`ambiguous`, `stale`,
+    /// `deleted`, `unavailable`): an attaching verdict (`exact`, `moved`,
+    /// `modified`) is refused here because attachment requires resolver
+    /// evidence this owner cannot verify — attachment stays with the
+    /// digest-bound derivation and the authorized correction path. The
+    /// immutable original anchor is never rewritten; the verdict is
+    /// surfaced through the obligation projection (`current_resolution`)
+    /// and a later verdict for the same review supersedes the earlier one.
+    /// The review must be live (`pending_delivery`, `delivered`,
+    /// `answered`); disposed, stale-lifecycle and superseded records keep
+    /// their disposition. Every refusal is a typed `CoordinationError`.
+    pub fn record_review_resolution(
+        &mut self,
+        review_id: &str,
+        status: AnchorResolution,
+    ) -> Result<PeerReviewObligation, CoordinationError> {
+        peer_text(review_id, "review_id")?;
+        let review = self.peer_reviews.get(review_id).cloned().ok_or_else(|| {
+            CoordinationError::NotFound {
+                kind: "peer_review",
+                id: review_id.to_owned(),
+            }
+        })?;
+        if !matches!(
+            review.lifecycle,
+            PeerReviewLifecycle::PendingDelivery
+                | PeerReviewLifecycle::Delivered
+                | PeerReviewLifecycle::Answered
+        ) {
+            return Err(CoordinationError::InvalidState);
+        }
+        if status.satisfies_required_review() {
+            return Err(CoordinationError::InvalidState);
+        }
+        self.peer_review_resolutions
+            .insert(review_id.to_owned(), status);
+        let mut obligation = PeerReviewObligation::from(&review);
+        let head = self.peer_artifact_heads.get(&review.artifact_id);
+        obligation.current_resolution = current_anchor_resolution(
+            head,
+            obligation.artifact_revision,
+            obligation.artifact_digest.as_str(),
+        )
+        .or(Some(status));
+        Ok(obligation)
+    }
+
+    /// Escalates one retained review blocker to the existing blackboard
+    /// owner as a `blocker` entry (issue #1823 W6; I10.18).
+    ///
+    /// Only real blockers escalate: `review_is_blocker` must hold for the
+    /// retained record, otherwise the call is refused with a typed error
+    /// and nothing is posted. The blocker is retained by the existing
+    /// `post_board_entry` owner — review creates no second problem,
+    /// conflict or attention system. Authorship stays with the review's own
+    /// session (which must still be live), the entry anchors the reviewed
+    /// artifact revision, and lineage cites the review and its request, so
+    /// the blocker is traceable without granting the review any write,
+    /// effect, goal or acceptance authority. A repeated `request_id`
+    /// replays through the board owner instead of posting a duplicate;
+    /// the same key for a different review or entry is an idempotency
+    /// conflict.
+    pub fn escalate_review_blocker(
+        &mut self,
+        review_id: &str,
+        draft: &EscalateReviewBlocker,
+        clock: &dyn PeerClockPort,
+        durability: &dyn PeerDurabilityPort,
+    ) -> Result<ReviewBlockerEscalationReceipt, CoordinationError> {
+        peer_text(review_id, "review_id")?;
+        let review = self.peer_reviews.get(review_id).cloned().ok_or_else(|| {
+            CoordinationError::NotFound {
+                kind: "peer_review",
+                id: review_id.to_owned(),
+            }
+        })?;
+        if !review_is_blocker(&review) {
+            return Err(CoordinationError::InvalidState);
+        }
+        if let Some(indexed) = self.peer_board_requests.get(&draft.request_id) {
+            let (stored_id, _) = indexed
+                .rsplit_once(':')
+                .ok_or(CoordinationError::InvalidState)?;
+            let replays = stored_id == draft.entry_id
+                && self.peer_board_heads.get(stored_id).is_some_and(|entry| {
+                    entry
+                        .lineage
+                        .iter()
+                        .any(|line| line == &format!("review:{}", review.review_id))
+                });
+            if !replays {
+                return Err(CoordinationError::IdempotencyConflict(
+                    draft.request_id.clone(),
+                ));
+            }
+        }
+        let entry = PostBoardEntry {
+            request_id: draft.request_id.clone(),
+            entry_id: draft.entry_id.clone(),
+            scope: draft.scope.clone(),
+            kind: PeerBoardKind::Blocker,
+            author_session_id: review.reviewer_session_id.clone(),
+            audience_scope: draft.audience_scope.clone(),
+            source_refs: vec![
+                format!("review:{}", review.review_id),
+                format!("artifact:{}:{}", review.artifact_id, review.artifact_revision),
+            ],
+            anchor: Some(BoardAnchor {
+                artifact_id: review.artifact_id.clone(),
+                revision: review.artifact_revision,
+                digest: review.artifact_digest.clone(),
+            }),
+            content_digest: draft.content_digest.clone(),
+            content_handle: None,
+            privacy: PrivacyClass::Open,
+            disclosure_handle: None,
+            required_evidence: true,
+            dissent: false,
+            withheld: false,
+            lineage: vec![
+                format!("review:{}", review.review_id),
+                format!("review-request:{}", review.request_id),
+            ],
+            authority_epoch: draft.authority_epoch.clone(),
+            state_fence: draft.state_fence.clone(),
+        };
+        let blocker = self.post_board_entry(&entry, clock, durability)?;
+        Ok(ReviewBlockerEscalationReceipt {
+            review_id: review_id.to_owned(),
+            blocker,
+        })
     }
 }
