@@ -99,6 +99,10 @@ pub const PROBLEM_PARAM_EXPECTED_CURRENT_OWNER_REVOKED: &str =
 /// Store-owned owner row inside the transaction.
 pub const PROBLEM_PARAM_EXPECTED_CURRENT_LEASE_IDENTITY: &str =
     "expected_current_lease_identity";
+/// Full grant retained by the current predecessor, compared inside the Store
+/// transaction independently from the grant carried by the candidate head.
+pub const PROBLEM_PARAM_EXPECTED_CURRENT_OWNER_LEASE_GRANT: &str =
+    "expected_current_owner_lease_grant";
 
 /// `closure_json.kind` for an accepted risk.
 pub const PROBLEM_CLOSURE_WAIVED: &str = "WAIVED";
@@ -237,6 +241,8 @@ pub struct DecodedProblemOwnerState {
     pub expected_current_owner_revoked: Option<bool>,
     /// Current predecessor's exact lease identity, absent only for `CREATE`.
     pub expected_current_lease_identity: Option<Value>,
+    /// Exact prior grant held by the owner row; absent only for `CREATE`.
+    pub expected_current_owner_lease_grant: Option<Value>,
     /// The retained closure record, present for exactly `WAIVE` and
     /// `SUPERSEDE`.
     pub closure_json: Option<Value>,
@@ -837,6 +843,25 @@ pub fn validate_problem_owner_state_params(
             });
         }
     }
+    match (
+        transition,
+        parameters.get(PROBLEM_PARAM_EXPECTED_CURRENT_OWNER_LEASE_GRANT),
+    ) {
+        (ProblemOwnerTransition::Create, None) => {}
+        (ProblemOwnerTransition::Create, Some(_)) => {
+            return Err(StoreError::InvalidField {
+                field: PROBLEM_PARAM_EXPECTED_CURRENT_OWNER_LEASE_GRANT,
+                reason: "CREATE has no predecessor grant",
+            });
+        }
+        (_, Some(Value::Object(_))) => {}
+        (_, _) => {
+            return Err(StoreError::InvalidField {
+                field: PROBLEM_PARAM_EXPECTED_CURRENT_OWNER_LEASE_GRANT,
+                reason: "non-CREATE transition must bind the exact predecessor grant",
+            });
+        }
+    }
     if !matches!(
         parameters.get(PROBLEM_PARAM_RECORD_JSON),
         Some(Value::Object(_))
@@ -922,6 +947,9 @@ pub fn decode_problem_owner_state_mutation(
             .and_then(Value::as_bool),
         expected_current_lease_identity: parameters
             .get(PROBLEM_PARAM_EXPECTED_CURRENT_LEASE_IDENTITY)
+            .cloned(),
+        expected_current_owner_lease_grant: parameters
+            .get(PROBLEM_PARAM_EXPECTED_CURRENT_OWNER_LEASE_GRANT)
             .cloned(),
         closure_json: parameters.get(PROBLEM_PARAM_CLOSURE_JSON).cloned(),
     };

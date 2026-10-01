@@ -1632,7 +1632,10 @@ fn append_problem_owner_lease_statement(
     );
     bindings.insert(
         "problem_owner_expected_lease_grant".to_owned(),
-        decoded.owner_lease_grant.clone(),
+        decoded
+            .expected_current_owner_lease_grant
+            .clone()
+            .unwrap_or(Value::Null),
     );
     let current_lease = decoded
         .expected_current_lease_identity

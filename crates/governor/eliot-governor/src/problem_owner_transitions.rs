@@ -81,7 +81,7 @@ use std::collections::BTreeMap;
 use eliot_canonical::CanonicalWriteEnvelope;
 use eliot_contracts::{ArtifactId, EpochId, canonical_json_bytes, sha256_hex};
 use eliot_problem::{
-    AuthenticatedOwnerLease, AuthorizedWaiver, ClosureEvidence, OwnerLeaseLoss, Problem,
+    AuthenticatedOwnerLease, AuthorizedWaiver, ClosureEvidence, OwnerLeaseGrant, OwnerLeaseLoss, Problem,
     ProblemClass, ProblemHypothesis, ProblemId, ProblemState, RepairRecord, Signal, Supersession,
     SupersessionRecord, WaiverRecord,
 };
@@ -91,6 +91,7 @@ use eliot_store_api::{
     PROBLEM_CLOSURE_SUPERSEDED_BY, PROBLEM_CLOSURE_WAIVED, PROBLEM_PARAM_AUTHORIZATION_DIGEST,
     PROBLEM_PARAM_CLOSURE_JSON, PROBLEM_PARAM_EXPECTED_CURRENT_RECORD_DIGEST,
     PROBLEM_PARAM_EXPECTED_CURRENT_LEASE_IDENTITY,
+    PROBLEM_PARAM_EXPECTED_CURRENT_OWNER_LEASE_GRANT,
     PROBLEM_PARAM_EXPECTED_CURRENT_OWNER_REVOKED,
     PROBLEM_PARAM_EXPECTED_REVISION, PROBLEM_PARAM_PROBLEM_ID,
     PROBLEM_PARAM_RECORD_DIGEST, PROBLEM_PARAM_RECORD_JSON, PROBLEM_PARAM_SOURCE_SIGNAL_ID,
@@ -285,6 +286,11 @@ pub struct ProblemOwnerTransitionRequest<'a> {
     /// The current authorization. Only an [`AuthenticatedOwnerLease`] can appear
     /// here, so no caller can present a principal string instead.
     pub lease: &'a AuthenticatedOwnerLease,
+    /// Full predecessor grant read from committed owner history. Required for
+    /// every transition except CREATE and compared against the Store owner row
+    /// inside the transaction. For ASSIGN this is deliberately distinct from
+    /// `lease`, which is the separately authenticated successor grant.
+    pub current_owner_lease_grant: Option<&'a OwnerLeaseGrant>,
     /// Current time in Unix milliseconds, for the assignment lease's validity
     /// window.
     pub now_ms: u64,
@@ -292,10 +298,9 @@ pub struct ProblemOwnerTransitionRequest<'a> {
     pub body: &'a ProblemOwnerTransitionBody,
 }
 
-/// Inputs for a production transition whose current lease is proved from the
-/// complete committed Problem readback. Callers cannot provide an
-/// [`AuthenticatedOwnerLease`] in this form; the canonical readback owns that
-/// step.
+/// Inputs for an ordinary production transition bound to a complete committed
+/// Problem readback. The current assigned lease is authenticated from the
+/// readback itself; successor lease admission stays on its separate owner path.
 pub struct ProblemOwnerTransitionFromReadback<'a> {
     /// Admitted request identity.
     pub identity: &'a eliot_protocol::RequestIdentity,
@@ -569,6 +574,7 @@ fn problem_owner_parameters(
     lease: &AuthenticatedOwnerLease,
     body: &ProblemOwnerTransitionBody,
     current: Option<&Problem>,
+    current_owner_lease_grant: Option<&OwnerLeaseGrant>,
 ) -> Result<(BTreeMap<String, Value>, String), CompositionError> {
     let record_json = serde_json::to_value(candidate)
         .map_err(|error| owner_refused(format!("cannot render the candidate record: {error}")))?;
@@ -665,6 +671,25 @@ fn problem_owner_parameters(
         None => {
             return Err(owner_refused(
                 "non-CREATE owner transition must bind its committed predecessor".to_owned(),
+            ));
+        }
+    }
+    match (current, current_owner_lease_grant) {
+        (None, None) => {}
+        (Some(_), Some(grant)) => {
+            parameters.insert(
+                PROBLEM_PARAM_EXPECTED_CURRENT_OWNER_LEASE_GRANT.to_owned(),
+                serde_json::to_value(grant).map_err(|error| {
+                    owner_refused(format!("cannot render the committed predecessor lease grant: {error}"))
+                })?,
+            );
+        }
+        (None, Some(_)) => {
+            return Err(owner_refused("create cannot bind a predecessor owner grant".to_owned()));
+        }
+        (Some(_), None) => {
+            return Err(owner_refused(
+                "non-create transition requires the original committed owner lease grant".to_owned(),
             ));
         }
     }
@@ -1017,6 +1042,7 @@ pub fn prepare_problem_owner_transition(
         lease,
         request.body,
         current,
+        request.current_owner_lease_grant,
     )?;
     let envelope = problem_owner_envelope(
         identity,

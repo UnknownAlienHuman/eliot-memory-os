@@ -2116,9 +2116,10 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
         .await
     }
 
-    /// Commits a named transition using the current lease authenticated from
-    /// the same complete committed readback that supplied the record. A
-    /// principal or serialized readback cannot supply the lease authority.
+    /// Commits an ordinary named transition using the current lease
+    /// authenticated from the same complete committed readback that supplied
+    /// the predecessor. Successor assignment requires a separate admitted
+    /// lease-owner path.
     pub async fn commit_problem_owner_transition_from_readback(
         &self,
         readback: &crate::ProblemReadback,
@@ -2134,6 +2135,11 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
                 "Problem transition needs a complete committed readback".to_owned(),
             ));
         }
+        let current_owner_lease_grant = readback
+            .current_owner_lease_grant()
+            .ok_or_else(|| CompositionError::Owner(
+                "complete committed readback has no original predecessor grant".to_owned(),
+            ))?;
         let lease = readback
             .authenticate_current_lease()
             .map_err(|error| CompositionError::Owner(format!(
@@ -2146,6 +2152,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
             expected_revision: input.expected_revision,
             source_signal: input.source_signal,
             lease: &lease,
+            current_owner_lease_grant: Some(current_owner_lease_grant),
             now_ms: input.now_ms,
             body: input.body,
         };

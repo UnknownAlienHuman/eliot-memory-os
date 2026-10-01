@@ -157,6 +157,27 @@ impl OwnerLeaseIssuer for ProblemReadback {
 }
 
 impl ProblemReadback {
+    /// Returns the exact prior lease grant only when this readback is complete
+    /// and that grant derives the full retained predecessor lease identity.
+    /// The Store still compares it against the live owner row inside the write
+    /// transaction; this accessor is evidence transfer, not authorization.
+    #[must_use]
+    pub fn current_owner_lease_grant(&self) -> Option<&OwnerLeaseGrant> {
+        if !self.history_complete {
+            return None;
+        }
+        let grant = self.lease_grants.last()?;
+        let commitment = grant.expected_commitment().ok()?;
+        let identity = grant.identity(commitment).ok()?;
+        let retained = match &self.head.ownership {
+            eliot_problem::Ownership::Assigned(assigned) => Some(&assigned.lease),
+            eliot_problem::Ownership::Unassigned(unassigned) => {
+                unassigned.lost_lease.as_ref()
+            }
+        }?;
+        retained.is_exactly(&identity).then_some(grant)
+    }
+
     /// Authenticates the current assigned lease from the complete committed
     /// Problem history this read returned. Truncated pages and serialized
     /// readbacks have no issuer capability and cannot produce an authenticated
