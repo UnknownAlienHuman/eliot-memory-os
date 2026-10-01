@@ -69,6 +69,7 @@ pub use backup_snapshot::{
     OrsFamilyCursor, OrsFamilyRowChain, OrsFamilySnapshotIdentity, OrsOperationalContinuation,
     OrsOperationalCursor, OrsOperationalSnapshotIdentity, PerEntryOutcome, RowDisposition,
     RowFamilyDisposition, RowFamilyKind, RowPayloadState, StoredEffectClass,
+    check_outcome_identities,
 };
 pub use control_reserve::{
     ORS_DURABLE_BYTES_BOTTLENECK, ORS_TRANSACTION_BOTTLENECK, OrsDimension,
