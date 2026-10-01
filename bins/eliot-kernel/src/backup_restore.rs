@@ -1417,6 +1417,82 @@ impl KernelBackupRestore {
         // work root is compared RESOLVED against this owner's own `self.work_root`
         // rather than caller text, and a `config` artifact must carry the
         // admitted `manifest_digest`.
+        //
+        // The refusal below is LOAD-BEARING, and this block records why, so
+        // that a red test row is not misread as a defect. It is not a TODO,
+        // not a placeholder for a check that ought to pass, and not a wiring
+        // mistake. The repository's existing wording for exactly this posture
+        // is `BackupCallerAuth::authenticate`
+        // (`bins/eliot-host/src/backup_preparation.rs`): "This is a real
+        // refusal, not a placeholder for a passing check ... and no code path
+        // relaxes it."
+        //
+        // WHAT REFUSES. The arm below, with this crate's own
+        // `KernelRestoreError::DestinationNotAdmitted`, for every
+        // `RestorePorts` whose `manifest_evidence` is `None`. Nothing on the
+        // Kernel side can mint, recompute or default that record; the
+        // reasoning is the block above.
+        //
+        // WHY IT IS CORRECT. The only lawful producer is
+        // `RestorePorts::with_owner_destination_evidence`
+        // (`backup_restore_ports.rs`), which forwards an evidence record some
+        // EXTERNAL owner issued. `KernelIsolatedDestination::open` derives
+        // `<work_root>/.eliot/restore-isolated/<label>` from a label the
+        // request chose, so a directory that exists is not an admission and a
+        // path this operation built for itself is not a proof. Importing
+        // without the record stages events, receipts, projections, blobs and
+        // the final evidence into an installation no owner ever named. The
+        // refusal is raised before `compile_plan` and before the destination
+        // root exists, so nothing has to be undone.
+        //
+        // ARCHITECTURE BASIS.
+        // `docs/architecture/A13-07-backups-restore-and-migration.md` line 5
+        // makes the isolated area a precondition of restore, and line 9 of its
+        // verification list is "provenance and integrity" — the destination is
+        // what that provenance is about. The same file's line 30 states
+        // `ARCH-RES-03` — Recovery cannot resurrect invalid state:
+        // "Backup, restore, reindex, and migration preserve history, purge,
+        // revocation, and fencing." A restore that picked its own destination
+        // is not preserving an owner-established position, it is inventing one.
+        //
+        // WHO MUST CHANGE IT, AND IT IS NOT THIS CRATE. The destination owner
+        // must issue the admission. In this issue's plan that is package BK3
+        // (Host): `dispatch_backup_owner_operation` executes Prepare once
+        // through the queue against an authenticated principal and persists a
+        // durable, operation-bound `DestinationManifestAdmission`, which the
+        // Kernel resolves into this `DestinationManifestEvidence`; Cutover
+        // stays refused. Package BK5 owns the Kernel composition side that
+        // must then hand the engine a `RestorePorts` carrying it. Neither
+        // package changes this arm, and the implementation that supplies the
+        // evidence must not change this arm's condition or its error variant.
+        //
+        // THE SYMPTOM TODAY, SO IT IS NOT MISREAD. In
+        // `bins/eliot-kernel/tests/backup_restore.rs` the `production_ports`
+        // helper (line 233) sets `manifest_evidence: None`, so every case in
+        // that file which drives `restore` through that helper reports this
+        // error. That is the refusal working on a caller that supplied no
+        // owner evidence, not a broken harness.
+        //
+        // DO NOT "FIX" THE FIXTURE. Re-pointing `production_ports` at the
+        // `manifest_evidence(&root)` helper that file already has (line 134)
+        // does NOT make those cases pass. It only relocates them to the second
+        // refusal on this path, `check_purge_revision_closure` below, which
+        // reports `FenceMismatch { subject: "purge ledger revision" }` for a
+        // different and equally deliberate reason stated at its own site. The
+        // red count would stay the same and only the message would change.
+        // That is the useful signal: two independent gates each refuse an
+        // uncorroborated value, so these refusals are load-bearing and not
+        // mis-wired. Do not change the fixture to get past either one.
+        //
+        // ONE SEARCH ALREADY DONE, SO IT IS NOT REPEATED. That trait
+        // `RestoreDestinationAdmissionOwner`
+        // (`crates/storage/eliot-backup/src/destination_manifest_evidence.rs`,
+        // line 194) has no `impl` block on any branch, and
+        // `DestinationManifestAdmission` is constructed nowhere under `bins/`.
+        // Implementing that trait would therefore change no result on this
+        // path. The evidence this arm wants arrives as the concrete
+        // `DestinationManifestEvidence` the destination owner issues, not as a
+        // new trait implementation on this side.
         let Some(evidence) = ports.manifest_evidence.as_ref() else {
             return Err(KernelRestoreError::DestinationNotAdmitted);
         };
@@ -4298,6 +4374,79 @@ fn check_purge_revision_closure(
     // reconciled against the owner here in the empty arm exactly as it is for a
     // carried ledger, and an uncorroborated declaration — including one no owner
     // was ever asked about — refuses instead of being passed over.
+    //
+    // The comparison below is LOAD-BEARING, and this block records why, so
+    // that a red test row is not misread as a defect. It is not a TODO, and it
+    // is not a comparison that ought to be relaxed for an empty ledger. The
+    // repository's existing wording for this posture is
+    // `BackupCallerAuth::authenticate`
+    // (`bins/eliot-host/src/backup_preparation.rs`): "This is a real refusal,
+    // not a placeholder for a passing check ... and no code path relaxes it."
+    //
+    // WHAT REFUSES. This arm, with the seam's existing typed
+    // `BackupError::FenceMismatch` naming `purge ledger revision`, which
+    // crosses the layer boundary as `KernelRestoreError::RetainedForResume`
+    // because a failed purge phase retains its staged material for resume.
+    //
+    // WHY IT IS CORRECT. `declared` is a POST-apply ledger position: the
+    // source observed it only after applying its own ledger, which is why the
+    // owner's counter is read AFTER this phase moves it (see
+    // `apply_purge_entries` above). An archive carrying no purge entry cannot
+    // move any owner, so a destination can hold the declared position only if
+    // a purge owner reports it. `None` is the answer of an owner that was
+    // never asked, and absence of an answer is not agreement. Accepting `None`
+    // here would publish a privacy-purge closure this restore never
+    // established.
+    //
+    // ARCHITECTURE BASIS.
+    // `docs/architecture/A13-07-backups-restore-and-migration.md` line 5 makes
+    // the isolated area a precondition of restore, and its verification list
+    // names, at line 10, "privacy purge and revocation closure" — the exact
+    // quantity reconciled here. The same file's line 30 states
+    // `ARCH-RES-03` — Recovery cannot resurrect invalid state: "Backup,
+    // restore, reindex, and migration preserve history, purge, revocation, and
+    // fencing." Reconciling the declared position against the caller's own
+    // emptiness instead of against the owner is precisely the resurrection of
+    // state that anchor forbids.
+    //
+    // WHO MUST CHANGE IT, AND IT IS NOT THIS COMPARISON. Two distinct owners,
+    // neither of them this arm:
+    //
+    // * The owner answer. `apply_purge_entries` reads
+    //   `RedbRecoveryStore::purge_ledger_revision`, and can only do so when
+    //   the composition supplied that store.
+    //   `KernelBackupRestore::restore_with_ors_journal` (line 1056) is the
+    //   composition entry that passes `Some(ors)`; `restore` (line 1333)
+    //   passes `ors: None`, so an owner was never asked. The Kernel restore
+    //   and composition side must drive `restore_with_ors_journal` with a live
+    //   `RedbRecoveryStore`; in this issue's plan that is package BK5. The
+    //   implementation that makes that call-site change must not change this
+    //   comparison.
+    // * The declaration. The number an archive declares must be the ledger
+    //   position its own source actually reached. A bundle declaring a position
+    //   over an empty ledger asserts a position no owner corroborates, and the
+    //   correct answer to that is to stop asserting it at the archive
+    //   producer, not to stop asking here.
+    //
+    // THE SYMPTOM TODAY, SO IT IS NOT MISREAD. In
+    // `bins/eliot-kernel/tests/backup_restore.rs` the bundle helper declares
+    // `purge_ledger_revision: 1` (line 71) over an empty `purge_ledger`
+    // (line 65), and these cases drive `restore`, which passes `ors: None`.
+    // `apply_purge_entries` therefore returns `(None, Vec::new())` for the
+    // empty ledger, from its absent-owner arm above, and the comparison below
+    // sees `None != Some(1)`. The one case in that file which DOES supply
+    // owner-issued destination evidence, `foreign_or_stale_destination_refused`
+    // (line 288), passes the destination arm and reaches this one, so its
+    // first `expect` (line 309) surfaces `RetainedForResume { primary:
+    // FenceMismatch { subject: "purge ledger revision" } }` — a second,
+    // independent gate behind the destination one, not the same failure seen
+    // twice.
+    //
+    // DO NOT WEAKEN THIS ARM. Do not guard it with `entries.is_empty()`, do
+    // not read `None` as agreement, and do not derive the declared position
+    // from `entries.len()` or from any caller-supplied value. Each of those is
+    // a move that turns this refusal into a vacuous check and publishes a
+    // purge closure that was never established.
     if owner_revision != Some(declared) {
         return Err(BackupError::FenceMismatch {
             subject: PURGE_LEDGER_REVISION_SUBJECT.to_owned(),
