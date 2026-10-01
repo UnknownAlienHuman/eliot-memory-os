@@ -107,8 +107,7 @@ fn transition(
         // is derived from the generated catalogue rather than pinned to the
         // former `"a".repeat(64)` placeholder, which no positive path could
         // ever satisfy.
-        admission_contract_set_digest:
-            eliot_store_api::supported_admission_contract_set_digest()?,
+        admission_contract_set_digest: eliot_store_api::supported_admission_contract_set_digest()?,
         operation_manifest_digest: manifest()?.digest,
         // Issue-#18 digests are derived below via `bind_issue18_digests`,
         // never defaulted; no semantic source is bound here (`[]`).
