@@ -4698,12 +4698,12 @@ pub enum CompositionReadiness {
 /// restart recovery still belongs to the `WorkScope` owner path.
 const MAX_RETAINED_SCOPE_QUARANTINE_RECORDS: usize = 8;
 
-/// Exact owner-bound inputs for initial WorkScope admission.
+/// Exact owner-bound inputs for initial `WorkScope` admission.
 ///
 /// The request groups the original source/privacy tuple and authenticated
 /// invocation coordinates without converting or reconstructing them. A
 /// retained snapshot is present only when the caller independently read the
-/// exact canonical WorkScope owner row; `None` identifies the seeded-empty
+/// exact canonical `WorkScope` owner row; `None` identifies the seeded-empty
 /// first-write path.
 pub struct InitialScopeBindingAdmissionRequest<'a> {
     pub now: u64,
@@ -7751,6 +7751,75 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             }
         }
         Ok(())
+    }
+
+    fn initial_scope_grant_path_covers_class(
+        &self,
+        leaf: &GrantActivationIntent,
+        validation: &InitialScopeGrantValidation<'_>,
+        class_label: &str,
+    ) -> bool {
+        let mut current = Some(leaf);
+        let mut seen = BTreeSet::new();
+        while let Some(intent) = current {
+            if !seen.insert(intent.grant_id.as_str())
+                || intent.mechanical_subset.binding.state_fence != *validation.fence
+                || intent.mechanical_subset.holder_principal != intent.holder_principal
+                || intent.mechanical_subset.session_id != intent.session_id
+                || intent.mechanical_subset.scope_id != intent.scope_id
+                || intent.issued_at_ms > validation.now_ms
+                || intent
+                    .expires_at_ms
+                    .is_none_or(|expires_at_ms| validation.now_ms >= expires_at_ms)
+                || intent
+                    .mechanical_subset
+                    .data_classes
+                    .iter()
+                    .all(|authorized| authorized != class_label)
+            {
+                return false;
+            }
+            let Some(grant) = validation
+                .grants
+                .iter()
+                .find(|grant| grant.grant_id == intent.grant_id)
+            else {
+                return false;
+            };
+            let Ok(issued_at_ms) = i64::try_from(grant.issued_at) else {
+                return false;
+            };
+            let Ok(expires_at_ms) = i64::try_from(grant.expires_at) else {
+                return false;
+            };
+            if intent.issued_at_ms != issued_at_ms
+                || intent.expires_at_ms != Some(expires_at_ms)
+                || intent.mechanical_subset.issued_at_ms != issued_at_ms
+                || intent.mechanical_subset.expires_at_ms != Some(expires_at_ms)
+                || crate::owner_closure_provider::verify_mechanical_subset_against_current_grant_record(
+                    intent, grant,
+                )
+                .is_err()
+            {
+                return false;
+            }
+            let Ok(grant_id) = GrantId::new(intent.grant_id.clone()) else {
+                return false;
+            };
+            if !self.owners.authority.grants.grant_is_admitted(&grant_id) {
+                return false;
+            }
+            current = intent.parent_grant_id.as_deref().and_then(|parent| {
+                validation.intents.iter().copied().find(|candidate| {
+                    candidate.grant_id == parent
+                        && candidate.grant_graph_revision == validation.graph_revision
+                })
+            });
+            if intent.parent_grant_id.is_some() && current.is_none() {
+                return false;
+            }
+        }
+        true
     }
 
     /// Installs an admitted `WorkScope` owner as the in-memory binding
