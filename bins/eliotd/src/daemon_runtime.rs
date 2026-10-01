@@ -6094,8 +6094,7 @@ async fn route_and_reconcile_improvement_candidate(
         // handoff" reviewable after this pass ends, rather than a fact that lived
         // only in the pass that observed it. A stale candidate revision is a typed
         // refusal that commits nothing.
-        record_improvement_terminal_decision(composition, artifact, &outcome.decision, fence)
-            .await;
+        record_improvement_terminal_decision(composition, artifact, &outcome.decision, fence).await;
     }
     report_improvement_candidate_route(&artifact.candidate.candidate_id, routed, retained)
 }

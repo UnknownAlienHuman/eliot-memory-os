@@ -718,7 +718,10 @@ fn classify_terminal_decision(
     if let Some(evaluation) = decision.evaluation.as_ref() {
         for (name, value) in [
             ("evidence_id", evaluation.evidence_id.as_str()),
-            ("content_revision_ref", evaluation.content_revision_ref.as_str()),
+            (
+                "content_revision_ref",
+                evaluation.content_revision_ref.as_str(),
+            ),
         ] {
             if value.trim().is_empty() {
                 return Err(refused(format!(
