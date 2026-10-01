@@ -2568,22 +2568,20 @@ impl TestdProcessToolIntent {
             validate_canonical_tool_directory(&fixture_root.to_string_lossy())?
                 .to_string_lossy()
                 .into_owned();
-        let derived_fixture_root = envelope
+        let fixture_environment = envelope
             .fixture_environment()
-            .map_err(|error| TestdError::Contract(error.to_string()))?
-            .into_iter()
+            .map_err(|error| TestdError::Contract(error.to_string()))?;
+        let derived_fixture_root = fixture_environment
+            .iter()
             .find(|(name, _)| name == FIXTURE_ROOT_ENV)
-            .map(|(_, value)| value);
-        if derived_fixture_root.as_deref() != Some(canonical_fixture_root.as_str()) {
+            .map(|(_, value)| value.as_str());
+        if derived_fixture_root != Some(canonical_fixture_root.as_str()) {
             return Err(TestdError::Invalid {
                 field: "process_tool.fixture_root",
                 reason: "the envelope fixture root is not the canonical fixture directory",
             });
         }
-        for (name, value) in envelope
-            .fixture_environment()
-            .map_err(|error| TestdError::Contract(error.to_string()))?
-        {
+        for (name, value) in fixture_environment {
             values.insert(name, value);
         }
 
