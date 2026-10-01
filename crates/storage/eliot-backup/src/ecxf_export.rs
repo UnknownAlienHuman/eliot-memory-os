@@ -1154,34 +1154,99 @@ fn ecxf_error(error: eliot_ecxf::EcxfError) -> BackupError {
 // ---------------------------------------------------------------------------
 // Kernel-fence projection (issue #2569 item 2)
 //
-// `eliot_ecxf::ExportFence` (`crates/storage/eliot-ecxf/src/lib.rs:217-243`) and
-// this crate's own `ExportFence` (`crates/storage/eliot-backup/src/lib.rs:189`)
+// # The exact disagreement, re-measured
+//
+// Every `file:line` below was re-measured on `origin/main@4eb7a9a9edde04f39`,
+// the base this note is written against. The citations this block carried before
+// were stale in three ways: the boundary receipt was cited as a repository-root
+// path that does not exist there and at a line 1679 short of the real row; the
+// two fence spans and five consumer sites were off by 2 to 5 lines each; and
+// `unobserved_member` was cited at a line that holds an unrelated doc paragraph.
+// They are corrected here because this block IS the artifact a later reader
+// re-runs to decide whether the two fences may be carried, and a citation that
+// no longer resolves is the same defect as a missing one.
+//
+// `eliot_ecxf::ExportFence` (`crates/storage/eliot-ecxf/src/lib.rs:219-243`) and
+// this crate's own `ExportFence` (`crates/storage/eliot-backup/src/lib.rs:194-205`)
 // are two fences that share a name and are not the same object. Eight members
 // have identical types on both sides (`export_id`, `store_generation`,
 // `state_fence`, `scope_id`, `revision_heads`, `ordering_heads`, `event_range`
 // -- which is the very same `eliot_ecxf::EventRange`, re-exported at
-// `lib.rs:184` -- and `consistent`), so those carry the source value verbatim.
+// `lib.rs:189` -- and `consistent`), so those carry the source value verbatim.
 // The two fences differ in exactly two places, and both differences are
 // refusals below rather than conversions:
 //
-// * the interchange fence carries `schema_generation` and the kernel fence has
-//   no member for it, so there is nothing to carry it into. The kernel fence is
-//   pinned (`shipped_serde_boundaries.toml:68661`, `ExportFence:187`,
-//   `span_start = 187`, `span_end = 200`), so adding a member is not this
-//   crate's to do either. If kernel semantics later require the generation, its
-//   own owner adds the member;
-// * the interchange fence's `blob_reachability_manifest` is an OBSERVATION whose
-//   declared set holds RESIDENCY-key digests (`eliot-ecxf/src/lib.rs:198-215`
-//   and `:231-241`: issue #1871 D1 -- reachability is keyed on residency and
-//   not on content, because I05-13 forbids merging records whose content
-//   digests match). The kernel fence's member is a `Vec<BlobHash>` that its
-//   consumers read as a bijection over CONTENT digests:
-//   `lib.rs:732` requires every `blob.locator.hash` to be in that set,
-//   `lib.rs:738` requires its length to equal the carried blob count, and
-//   `bins/eliot-kernel/src/backup_capture.rs:1660-1662` states that explicitly
-//   ("the fence bijection is still over CONTENT digests"). Re-parsing a
-//   residency key through `BlobHash::new` would type-check and would still
-//   assert a content identity that no owner ever proved, so it refuses.
+// * the interchange fence carries `schema_generation:
+//   Option<SchemaGenerationObservation>` (`eliot-ecxf/src/lib.rs:224`, the
+//   observation type at `:191-196`) and the kernel fence has no member for it,
+//   so there is nothing to carry it into. THE KERNEL PATH DOES NOT GO WITHOUT A
+//   GENERATION, though -- it carries one as a bare, unobserved `String` on two
+//   OTHER members: `EcxfManifest::schema_generation` (`lib.rs:548`) and
+//   `BackupInput::schema_generation` (`lib.rs:586`), each shape-checked only by
+//   `text()` (`lib.rs:564`). So "add the member to the fence" is not by itself
+//   what would make the kernel generation owner-observed; that value is a
+//   wire-visible decision about two more members in this crate, not one.
+//   All three kernel-side members are carried by the shipped-serde boundary
+//   receipt `crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml`
+//   as `derive`-kind candidates with a span digest each: `BackupInput` at
+//   lines 70164-70177, `EcxfManifest` at 70252-70265 and `ExportFence` at
+//   70340-70353. The ownership question the previous wording of this note left
+//   open ("if kernel semantics later require the generation, its own owner adds
+//   the member") is answered by those rows, and not in this crate's favour:
+//   every one of them reads `owner = "UNASSIGNED"`,
+//   `repair_readiness = "BLOCKED"`,
+//   `blocked_reason = "missing-owner: no bounded repair child for this path"`,
+//   `safety = "NOT_SAFE"`, `disposition = "needs-repair"` and yet
+//   `admission = "ship"`. So the symbol that would have to change is owned by
+//   NOBODY on main, and whoever is assigned that boundary has to accept a
+//   shipped-member change (and supply the bounded repair child) before any
+//   kernel generation becomes owner-observed;
+// * the interchange fence's `blob_reachability_manifest` is
+//   `Option<BlobReachabilityObservation>` (`eliot-ecxf/src/lib.rs:241`, the
+//   observation at `:206-215`) whose declared set holds RESIDENCY-key digests
+//   (`residency_key_digests: Vec<String>`, `eliot-ecxf/src/lib.rs:212`: issue
+//   #1871 D1 -- reachability is keyed on residency and not on content, because
+//   I05-13 forbids merging records whose content digests match). The kernel
+//   fence's member is a `Vec<BlobHash>` (`lib.rs:202`) that its consumers read
+//   as a bijection over CONTENT digests: `lib.rs:737` requires every
+//   `blob.locator.hash` to be in that set and `lib.rs:743` requires its length
+//   to equal the carried blob count, and `BlobLocator::hash` is defined as
+//   "Exact content identity. Must equal `residency.content_digest.digest`"
+//   (`crates/storage/eliot-blob-api/src/lib.rs:282-283`).
+//   `bins/eliot-kernel/src/backup_capture.rs:1817-1819` states the consequence
+//   in this repository's own words ("the fence bijection is still over CONTENT
+//   digests"). Re-parsing a residency key through `BlobHash::new` would
+//   type-check and would still assert a content identity that no owner ever
+//   proved, so it refuses.
+//
+// # Why this conversion cannot be made total by re-typing either fence
+//
+// The two differences above are NECESSARY and NOT SUFFICIENT. Even after both
+// fence types were reconciled, no `eliot_ecxf::ExportFence` would exist to
+// carry, because the one source port that has to produce one refuses
+// unconditionally and its refusal is derived from the store owner's own census,
+// not from this crate:
+//
+// * `StoreOwnerEcxfSource::coherent_export` returns
+//   `Err(BackupError::UnobservedSourceMember { .. })` on every input
+//   (`bins/eliot-store-surreal/src/ecxf_export.rs:235-237`), naming the first
+//   member its own capture declared unobserved (`:271-285`);
+// * the gap list it names is never empty: `observed_capture_gaps` appends five
+//   entries from no observation whatever
+//   (`crates/storage/eliot-store-surreal-adapter/src/backup_snapshot.rs:856-862`);
+// * `capture_completeness` maps that non-empty list to
+//   `SnapshotCompleteness::Partial` (`backup_snapshot.rs:2278-2284`), and
+//   `prove_coherent_boundary` refuses anything that is not complete BEFORE it
+//   reads a single member (`ecxf_export.rs:505-507`).
+//
+// So the ceiling here is TWO owners deep, and a future attempt that starts by
+// adding a kernel fence member would be closing the wrong half of it: the
+// evidence those two fences would carry has to be observed and carried by the
+// store owner first. That is what `SourceObservation` (`observed_by` plus
+// `observed_at`, `eliot-ecxf/src/lib.rs:165-170`) exists to keep falsifiable,
+// and it is why `eliot_ecxf::ExportFence::validate` refuses a fence with no
+// observation (`:253-265`, called from `:309`) rather than reading the absence
+// as any generation at all.
 //
 // Issue #1871, A2 additionally made both differing members observations, so an
 // absent observation is a state this projection can see. It refuses that state
@@ -1202,7 +1267,7 @@ use eliot_blob_api::BlobHash;
 /// The first refusal in source-member order is returned, matching the
 /// single-variant shape of this crate's other boundary mappings
 /// ([`ecxf_error`], and `unobserved_member` in
-/// `bins/eliot-store-surreal/src/ecxf_export.rs:170`).
+/// `bins/eliot-store-surreal/src/ecxf_export.rs:271`).
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum FenceBridgeRefusal {
     /// The source member carries no source-store observation at all.
@@ -1290,15 +1355,23 @@ impl TryFrom<&eliot_ecxf::ExportFence> for super::ExportFence {
             return Err(FenceBridgeRefusal::ResidencyKeyIsNotContentIdentity);
         }
         // The source fence carries `schema_generation`; the kernel fence has no
-        // member to carry it into and this crate may not add one (pinned row
-        // above). Discarding an owner-issued generation would silently drop an
-        // owner value, so a source that observed one is refused rather than
-        // downgraded. An owner-issued fence always observes one, because
-        // `eliot_ecxf::ExportFence::validate` refuses a fence that carries no
-        // generation observation at all; the conversion is therefore
+        // member to carry it into and this crate may not add one (the pinned row
+        // and the two unobserved kernel `String` members are measured in the
+        // block comment above). Discarding an owner-issued generation would
+        // silently drop an owner value, so a source that observed one is refused
+        // rather than downgraded. An owner-issued fence always observes one,
+        // because `eliot_ecxf::ExportFence::validate` refuses a fence that
+        // carries no generation observation at all; the conversion is therefore
         // total-refusing in practice and says so rather than returning a value
         // that looks convertible and is not. This bridge never supplies a
         // generation of its own in either state.
+        //
+        // Reconciling the two fences would not make this reachable, either: the
+        // one `EcxfSourceStore` implementation in the repository refuses on
+        // every input before it can hand over an `eliot_ecxf::ExportFence` at
+        // all (see "Why this conversion cannot be made total by re-typing either
+        // fence" above). So the refusal below is a property of the evidence, not
+        // only of the two shapes.
         if source.schema_generation.is_some() {
             return Err(FenceBridgeRefusal::NoTargetMember {
                 member: "schema_generation",

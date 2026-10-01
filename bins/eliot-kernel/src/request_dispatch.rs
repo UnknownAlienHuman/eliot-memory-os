@@ -848,6 +848,14 @@ fn cancellation_reply(idempotency_key: &str, owner_reason: &str) -> Value {
 /// `missing_owner` and `reason` only, which is why the operator surface admits
 /// exactly that key set for a create refusal.
 ///
+/// Items 1 and 2 are re-measured from their own owners, not restated here: the
+/// kernel `ExportFence` this evidence would have to carry has no owner-issued
+/// producer and no convertible source, measured in
+/// `crates/storage/eliot-backup/src/ecxf_export.rs` ("Kernel-fence projection"),
+/// and `BlobArchivePublicationOwner` is never constructed anywhere in the
+/// repository, so `bind` has no caller. The refusal reason below names all
+/// three ceilings so the operator's answer is not narrower than this comment.
+///
 /// # WHAT THE ROUTE DOES ADMIT, AND IN WHICH ORDER
 ///
 /// Order is shape, then admission, then the owner attempt. That is the SAME
@@ -939,15 +947,30 @@ fn handle_backup_create(
     // admission verify already applied and the reason this arm is no longer the
     // one backup operation that answers whoever asked.
     admit_backup_caller(session)?;
+    // The refusal reason names the SAME three ceilings the doc comment above
+    // records, because a `missing_owner` token that under-reports what is missing
+    // is a half-answer to the operator who has to route the gap. Each clause
+    // names the owning symbol, not a symptom, and none of them is something this
+    // front door may satisfy by projecting a value. All three are measured on
+    // `origin/main@4eb7a9a9edde04f39`.
     Ok(refused_reply(
         BACKUP_CREATE_OPERATION,
         idempotency_key,
         "plan_gap",
         BACKUP_CREATE_MISSING_OWNER,
         "capture owner entry KernelBackupCapture::capture is unreachable: \
-         #959's BlobArchivePublicationOwner cannot be bound because no \
-         production BlobStoreService exists, and no producer supplies the \
-         accepted CaptureRequest evidence",
+         request_from_ports has no production caller and no owner issues the \
+         CaptureRequest evidence it builds -- in particular export_fence is an \
+         eliot_backup::ExportFence that no owner constructs outside test code \
+         (the one producer-shaped source, eliot_ecxf::ExportFence, cannot be \
+         carried into it: crates/storage/eliot-backup/src/ecxf_export.rs \
+         TryFrom<&eliot_ecxf::ExportFence> for ExportFence refuses by name, \
+         and its one EcxfSourceStore implementation refuses on every input); \
+         #959's BlobArchivePublicationOwner cannot be bound because nothing \
+         constructs it and bind has no caller, no production BlobStoreService \
+         exists, and BlobPlatformPort, BlobCompressionPort and BlobLiveSetPort \
+         have no production implementor; and no owner issues FrozenCapturePlan's \
+         build_digest and policy_digest",
     ))
 }
 
