@@ -2034,7 +2034,7 @@ pub struct MaterialBootstrap {
 ///
 /// Measured on this tree, this entry has **zero call sites**: no code in any
 /// crate names it other than its defining line; every other mention in the tree
-/// is a `[`admit_bootstrap_context`]` prose back-link. Both designated callers
+/// is a [`admit_bootstrap_context`] prose back-link. Both designated callers
 /// above are themselves uncalled —
 /// `DaemonComposition::read_cold_start_surface_for_attach` has zero call sites
 /// (`caller: STITCH`), and
@@ -2844,7 +2844,7 @@ fn material_effect_guard_detail(report: &eliot_workscope::TriggerReport) -> Stri
 ///
 /// Measured on this tree, this entry has **zero call sites**: no code in any
 /// crate names it other than its defining line; every other mention in the tree
-/// is a `[`revalidate_dispatched_binding`]` prose back-link. The designated
+/// is a [`revalidate_dispatched_binding`] prose back-link. The designated
 /// caller above is itself uncalled (zero production call sites — see this
 /// module's "Measured reachability" section).
 /// The daemon holds no retained `ScopeBinding` — that requires the uncalled,
