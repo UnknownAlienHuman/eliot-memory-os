@@ -1226,7 +1226,6 @@ fn bind_cleanup_capacity(
             failure.cleanup = BlobCapacityCleanup::Unknown;
             failure.cleanup_stage = Some(BlobCapacityStage::Cleanup);
             failure.cleanup_evidence = Some(failure.evidence);
-            failure.cleanup = BlobCapacityCleanup::Failed;
             if failure.validate().is_err() {
                 failure.cleanup_stage = None;
                 failure.cleanup_evidence = None;
@@ -6441,10 +6440,15 @@ mod tests {
             panic!("expected typed publication capacity failure");
         };
         assert_eq!(failure.stage, BlobCapacityStage::PayloadPublication);
-        assert!(matches!(
+        // #864 separates an installed-but-possible effect from confirmation
+        // that the durable rename boundary completed.
+        assert_eq!(
             failure.evidence.effect,
-            BlobCapacityEffect::PossiblePublication { .. }
-        ));
+            BlobCapacityEffect::DurabilityUnconfirmed {
+                state: PublishState::JournalPrepared,
+                possible_effect: true,
+            }
+        );
         assert_eq!(
             failure.recovery,
             BlobCapacityRecovery::ReconcileSameOperationThenRevalidate
@@ -6475,6 +6479,8 @@ mod tests {
             }
         ));
         assert_eq!(failure.cleanup, BlobCapacityCleanup::Unknown);
+        assert_eq!(failure.cleanup_stage, Some(BlobCapacityStage::Cleanup));
+        assert_eq!(failure.cleanup_evidence, Some(failure.evidence));
         assert_eq!(
             failure.recovery,
             BlobCapacityRecovery::ReconcileSameOperationThenRevalidate
