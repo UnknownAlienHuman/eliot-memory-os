@@ -22,7 +22,10 @@
 //! observation and reads the real Git substrate (`.git/HEAD` plus the
 //! resolved ref, loose or packed) around those reads, so a filesystem hint
 //! confirms against actual Git/content re-read evidence instead of content
-//! polling over one image. A filesystem hint without that Git readback is
+//! polling over one image. Two agreeing not-found observations confirm as
+//! a proven deletion (an immutable unknown-origin deletion until
+//! reconciled); any other read failure is refused, never a deletion claim.
+//! A filesystem hint without that Git readback is
 //! refused with [`ChangeMonitorError::InvalidGitEvidence`]: an inferred
 //! transition no admission explains never becomes a `FilesystemNotification`
 //! on polling alone. No porcelain status is claimed: the Kernel observes the
@@ -913,6 +916,40 @@ fn read_substrate_in(
     })
 }
 
+/// Reads one hinted tracked source twice with agreeing-absence semantics
+/// (I10.21 AUD2/AUD5): two agreeing present reads prove stable bytes, two
+/// agreeing not-found observations prove absence (the deletion evidence
+/// [`confirm_hint`] admits as an immutable `Absent` observation), and any
+/// other outcome — permissions, transient I/O, or disagreeing reads —
+/// proves nothing and is refused as [`ChangeMonitorError::UnstableReadback`],
+/// never a deletion claim. The shape mirrors the in-crate capture/readback
+/// tracked-source read because both lanes need the same stability proof;
+/// the opens themselves stay here so the adapter's confirmation rests on
+/// its own pairwise-independent reads, never on caller-supplied bytes.
+fn read_hinted_source_twice(
+    tracked: &Path,
+) -> Result<(ContentRead, ContentRead), ChangeMonitorError> {
+    let read_once = |path: &Path| -> Result<Option<Vec<u8>>, ChangeMonitorError> {
+        match std::fs::read(path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(ChangeMonitorError::UnstableReadback),
+        }
+    };
+    let to_read = |bytes: Option<Vec<u8>>| match bytes {
+        Some(bytes) => ContentRead::Present {
+            sha256: crate::sha256_hex(&bytes),
+        },
+        None => ContentRead::Absent,
+    };
+    let first_read = to_read(read_once(&tracked)?);
+    let reread = to_read(read_once(&tracked)?);
+    if first_read != reread {
+        return Err(ChangeMonitorError::UnstableReadback);
+    }
+    Ok((first_read, reread))
+}
+
 /// Observes one filesystem hint against actual Git/content re-read
 /// evidence and feeds the result through the existing owner port
 /// ([`ingest_hint`] + [`confirm_hint`], I10.21 W2): no second ledger, no
@@ -923,7 +960,8 @@ fn read_substrate_in(
 /// (audit 5910747803 defect 2: a polled transition is never labeled an OS
 /// notification). [`HintOrigin::HostEvent`] is refused: the host-event
 /// route ingests directly. The adapter opens the hinted tracked source
-/// itself twice (pairwise-independent reads that must agree), with a real
+/// itself twice (pairwise-independent reads that must agree, with agreeing
+/// absence proving deletion — see [`read_hinted_source_twice`]), with a real
 /// Git HEAD-substrate read before the first content read and another after
 /// the re-read; a HEAD move under observation is
 /// [`ChangeMonitorError::UnstableReadback`], exactly like disagreeing
@@ -934,8 +972,11 @@ fn read_substrate_in(
 /// [`ChangeMonitorError::NoGitSubstrate`], an unreadable or unstable
 /// tracked source is [`ChangeMonitorError::UnstableReadback`], a conflicting
 /// identity under the derived hint is [`ChangeMonitorError::HintConflict`].
-/// (Deletion readback is a separate lane: an absent tracked source is
-/// refused here rather than represented.)
+/// A proven deletion (two agreeing not-found observations against actual
+/// Git-substrate evidence) is represented as an immutable unknown-origin
+/// deletion observation through the same port — it blocks governed
+/// acceptance until reconciled — while any other read failure stays a
+/// refusal, never a deletion claim.
 ///
 /// Caller (I10.21 W2): `crate::process_execution::KernelGovernedProcessEffectPort`
 /// poll-reconcile leg today; the OS-watcher lane once attached (with
@@ -965,13 +1006,7 @@ pub(crate) fn observe_filesystem_notification(
     }
     let tracked = workspace_root.join(notification.path.as_str());
     let substrate_before = read_git_head_substrate(workspace_root)?;
-    let first_bytes = std::fs::read(&tracked).map_err(|_| ChangeMonitorError::UnstableReadback)?;
-    let reread_bytes = std::fs::read(&tracked).map_err(|_| ChangeMonitorError::UnstableReadback)?;
-    let first = crate::sha256_hex(&first_bytes);
-    let reread = crate::sha256_hex(&reread_bytes);
-    if first != reread {
-        return Err(ChangeMonitorError::UnstableReadback);
-    }
+    let (first_read, reread) = read_hinted_source_twice(&tracked)?;
     let substrate_after = read_git_head_substrate(workspace_root)?;
     if substrate_before.head != substrate_after.head {
         return Err(ChangeMonitorError::UnstableReadback);
@@ -1012,8 +1047,8 @@ pub(crate) fn observe_filesystem_notification(
     ingest_hint(hint).map(|_| ())?;
     let verification = HintVerification {
         before_digest: before_digest.map(str::to_owned),
-        first_read: ContentRead::Present { sha256: first },
-        reread: ContentRead::Present { sha256: reread },
+        first_read,
+        reread,
         git: Some(git),
     };
     confirm_hint(&hint_id, &verification)
