@@ -242,6 +242,10 @@ fn transition(ctx: &RequestMeta, authority: &ExactJsonBytes) -> PreparedTransiti
             idempotency_key: "issue10-idempotency".into(),
             canonical_request_hash: "a".repeat(64),
         },
+        // The fixture's own stable intent, distinct from the per-attempt
+        // operation identity and the per-correction idempotency key.
+        write_intent_id: "intent-issue10-write".to_owned(),
+        write_envelope_protocol_version: 1,
         state_fence: ctx.state_fence.clone(),
         scope_id: ScopeId::new("scope").expect("scope"),
         task_id: None,

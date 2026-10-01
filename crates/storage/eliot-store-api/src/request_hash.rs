@@ -675,9 +675,28 @@ mod tests {
     #[test]
     fn golden_request_hash_is_stable_across_crates() {
         let view = golden_view();
+        // #1925 RE-PIN REQUIRED — the literal below is a deliberate fail-closed
+        // sentinel, NOT a digest. It must be replaced with the value
+        // `canonical_request_hash` actually emits over the current fixture.
+        //
+        // The previously pinned
+        // `55e62e405f35c7f137fe9fcdf177c66a1cba54a5b75fb547deaa11f001a89ec1`
+        // was ALREADY stale on `main` before this change: commit `2c22f4b45`
+        // (#4728) added `ordering_scopes` to the hashed request input and
+        // re-pinned neither this assertion nor the two comments that mirrored
+        // it, and it left this file's own `golden_view` literal missing the
+        // new field so the whole lib test target did not compile. #1925 fixes
+        // the literal and adds the two write-intent identity members, moving
+        // the digest again.
+        //
+        // Both moves follow this module's documented discipline: a retained
+        // digest computed under pre-binding bytes is never reinterpreted
+        // under the new bytes. The value cannot be derived by reading this
+        // file; it is whatever the shared owner function emits, so it is left
+        // as a failing sentinel rather than invented.
         assert_eq!(
             canonical_request_hash(&view).expect("golden hash computes"),
-            "55e62e405f35c7f137fe9fcdf177c66a1cba54a5b75fb547deaa11f001a89ec1"
+            "REPIN-REQUIRED-1925-NOT-A-DIGEST"
         );
     }
 

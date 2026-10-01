@@ -1597,15 +1597,27 @@ mod tests {
     /// shared hash over those fixed inputs (not hand-written):
     /// `eliot-store-api` and `eliot-store-memory` assert the same literal.
     ///
-    /// #1925 re-pin: the hashed request input gained the two write-intent
-    /// identity members, so the digest changes by design under the
-    /// documented `request_hash.rs` discipline (a retained pre-carry digest
-    /// is never reinterpreted under the new bytes). The literal is the value
-    /// `canonical_request_hash` emits over the current fixture, including the
-    /// `ordering_scopes` field added by #4728, which the previous pin never
-    /// covered.
-    const ISSUE_63_GOLDEN_CHAIN_DIGEST: &str =
-        "REPIN_PENDING_ISSUE_63_GOLDEN_CHAIN_DIGEST";
+    /// #1925 RE-PIN REQUIRED — the literal below is a deliberate fail-closed
+    /// sentinel, NOT a digest. It must be replaced with the value
+    /// `canonical_request_hash` actually emits over the current fixture
+    /// before this assertion can pass, and the SAME value must be installed
+    /// in `eliot-store-memory`'s `ISSUE_63_GOLDEN_CHAIN_DIGEST`.
+    ///
+    /// Why the digest moved, twice, by design:
+    ///
+    /// 1. #4728 (`2c22f4b45`) added `ordering_scopes` to the hashed request
+    ///    input without re-pinning, so the previous
+    ///    `32d9235499c0e63f72509808c0b1439cd7e879c754fbc1bc5e965bb6af4d6a36`
+    ///    was ALREADY stale on `main` before this change.
+    /// 2. #1925 adds the two write-intent identity members to the same hashed
+    ///    input, which moves it again.
+    ///
+    /// Both moves follow the documented `request_hash.rs` discipline: a
+    /// retained digest computed under pre-binding bytes is never
+    /// reinterpreted under the new bytes. The value cannot be derived by
+    /// reading this file; it is whatever the shared owner function emits, so
+    /// it is deliberately left as a failing sentinel rather than invented.
+    const ISSUE_63_GOLDEN_CHAIN_DIGEST: &str = "REPIN-REQUIRED-1925-NOT-A-DIGEST";
 
     #[test]
     fn golden_chain_envelope_hash_matches_the_pinned_cross_crate_digest() {

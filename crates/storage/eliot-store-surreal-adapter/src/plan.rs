@@ -1275,6 +1275,10 @@ mod tests {
                 idempotency_key: format!("idem-{operation}"),
                 canonical_request_hash: "a".repeat(64),
             },
+            // The fixture's own stable intent, distinct from the per-attempt
+            // operation identity and the per-correction idempotency key.
+            write_intent_id: format!("intent-{operation}"),
+            write_envelope_protocol_version: 1,
             state_fence,
             scope_id: ScopeId::new("scope-1")?,
             task_id: None,
@@ -1410,9 +1414,19 @@ mod tests {
         // `"a".repeat(64)` is a placeholder (proof below: it never equals the
         // recomputed digest), so the new validators bind the recomputed value.
         // Cross-crate stability: this uses the same `canonical_request_hash`
-        // that yields the Slice A golden
+        // whose Slice A golden vector is pinned in
+        // `eliot-store-api`'s `request_hash.rs`
+        // (`golden_request_hash_is_stable_across_crates`).
+        //
+        // #1925: the previously quoted literal
         // `55e62e405f35c7f137fe9fcdf177c66a1cba54a5b75fb547deaa11f001a89ec1`
-        // in `eliot-store-api`.
+        // is NO LONGER the value that helper emits and this comment no longer
+        // claims it is: it was already stale on `main` (commit `2c22f4b45`
+        // added `ordering_scopes` to the hashed input without re-pinning), and
+        // #1925 adds the two write-intent identity members on top. The digest
+        // is emitted by the owner function, not derived by reading this file,
+        // so the literal was removed here rather than restated as a value
+        // nobody has computed. The owning assertion is the one place to pin.
         let (context, mut transition) = fixture()?;
         let recomputed = recomputed_canonical_request_hash(&context, &transition, &[], &[])?;
         assert_ne!(
