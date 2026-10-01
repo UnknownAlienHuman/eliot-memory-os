@@ -664,6 +664,35 @@ pub fn verify_exact_replay(
     Err(SwarmError::PayloadConflict)
 }
 
+/// Verifies an exact replay of a prior dispatch against a full candidate dispatch.
+///
+/// [`verify_exact_replay`] proves the [`LaunchIntent`] half; this helper adds
+/// the [`DispatchLineage`] half, so replay identity is exact input equality
+/// over the complete dispatch: the same child identity (operation/attempt/
+/// work) with the same intent payload AND the same job/plan/slot/fence/route
+/// lineage re-observes idempotently, while any same-identity drift in either
+/// half — intent payload or lineage (route class/generation/fingerprint/
+/// evidence, fence, plan revision) — is [`SwarmError::PayloadConflict`]. A
+/// different identity stays [`ReplayVerdict::ForeignIdentity`]: it is a new
+/// dispatch, never a replay, and proceeds on its own lineage.
+///
+/// Changed prompt, provider/route/model, budget, capabilities, or plan
+/// revision must arrive as a new identity through an explicit parent-plan
+/// revision; reusing the same identity with changed input conflicts here
+/// instead of relaunching silently. Payload fields outside the dispatch
+/// envelope (item text, budget accounts) are not observable to this check and
+/// stay the owning slice's responsibility.
+pub fn verify_exact_replay_full(
+    prior: &DispatchedLaunch,
+    candidate: &DispatchedLaunch,
+) -> Result<ReplayVerdict, SwarmError> {
+    let verdict = verify_exact_replay(prior, &candidate.intent)?;
+    if verdict == ReplayVerdict::Idempotent && prior.lineage != candidate.lineage {
+        return Err(SwarmError::PayloadConflict);
+    }
+    Ok(verdict)
+}
+
 /// Fence-qualified canonical identities for one sealed child dispatch.
 ///
 /// The dispatch envelope carries the admitted-work projection
