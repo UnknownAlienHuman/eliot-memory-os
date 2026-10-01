@@ -2733,8 +2733,7 @@ fn record_matches_original_envelope(
         && record.capability_ref.as_deref() == Some(envelope.identity.capability.as_str())
         && record.payload_digest.as_deref() == Some(envelope.identity.payload_sha256.as_str())
         && record.deadline_unix_ms == Some(envelope.identity.deadline_unix_ms)
-        && record.parent_operation_id.as_deref()
-            == envelope.identity.parent_operation_id.as_deref()
+        && record.parent_operation_id.as_deref() == envelope.identity.parent_operation_id.as_deref()
         && record.correlation_projection.as_ref()
             == envelope.identity.correlation_projection.as_ref()
 }
@@ -2759,7 +2758,7 @@ fn decode_staged_write_submission(value: &serde_json::Value) -> Option<WriteSubm
     (submission.state == WriteSubmissionState::Staged
         && submission.ors_stage_ref.is_some()
         && submission.canonical_receipt_ref.is_none())
-        .then_some(submission)
+    .then_some(submission)
 }
 
 /// What the bridge asked the resolve entry to prove (issue #2571).
@@ -3421,11 +3420,8 @@ fn staged_resolved_observe_outcome(
     let handle = HostOperationHandle::new(record.operation_id.clone()).map_err(|_| limitation())?;
     let idempotency_key = format!("{occurrence}:invoke");
     let request_digest = record.request_digest.as_deref().ok_or_else(limitation)?;
-    let canonical_request_sha256 = expected_canonical_request_digest_by_parts(
-        request_digest,
-        occurrence,
-        &idempotency_key,
-    )?;
+    let canonical_request_sha256 =
+        expected_canonical_request_digest_by_parts(request_digest, occurrence, &idempotency_key)?;
     let response = McpResponse {
         request_id: occurrence.to_owned(),
         idempotency_key,
@@ -3638,9 +3634,7 @@ impl KernelHostRequestPort for KernelHostRequestClient {
                         let deadline_reached = record
                             .deadline_unix_ms
                             .is_some_and(|deadline| now_ms >= deadline);
-                        if waits_for_commit(request)
-                            && record.deadline_unix_ms.is_none()
-                        {
+                        if waits_for_commit(request) && record.deadline_unix_ms.is_none() {
                             return Err(unknown_resolve_outcome(logical_key.as_str()));
                         }
                         if accepts_after_stage(request) || deadline_reached {
@@ -3717,13 +3711,7 @@ impl KernelHostRequestPort for KernelHostRequestClient {
             Ok(reply) => reply,
             Err(error @ PortFailure::AgentResponse { .. }) => return Err(error),
             Err(_) => {
-                return self.probe_settles_invocation(
-                    request,
-                    &facts,
-                    &session,
-                    &envelope,
-                    now_ms,
-                );
+                return self.probe_settles_invocation(request, &facts, &session, &envelope, now_ms);
             }
         };
         if is_legacy_correlation_unresolved_reply(&reply, &envelope) {
@@ -3748,8 +3736,7 @@ impl KernelHostRequestPort for KernelHostRequestClient {
                         HostRequestRecordState::PossiblyEffected
                             | HostRequestRecordState::Unknown
                             | HostRequestRecordState::Reconciling
-                    )
-                {
+                    ) {
                     match self.rehydrate_operation(&envelope, &receipt) {
                         Ok(mut refreshed) => {
                             let stage = refreshed.staged_write_submission.take();
@@ -3764,16 +3751,15 @@ impl KernelHostRequestPort for KernelHostRequestClient {
                 } else {
                     (record, None)
                 };
-                let wait_deadline_reached = if waits_for_commit(request)
-                    && is_nonterminal_request_state(record.state)
-                {
-                    let deadline = record
-                        .deadline_unix_ms
-                        .ok_or_else(|| unknown_outcome(&envelope.envelope_sha256))?;
-                    unix_ms()? >= deadline
-                } else {
-                    false
-                };
+                let wait_deadline_reached =
+                    if waits_for_commit(request) && is_nonterminal_request_state(record.state) {
+                        let deadline = record
+                            .deadline_unix_ms
+                            .ok_or_else(|| unknown_outcome(&envelope.envelope_sha256))?;
+                        unix_ms()? >= deadline
+                    } else {
+                        false
+                    };
                 if (accepts_after_stage(request) || wait_deadline_reached)
                     && is_nonterminal_request_state(record.state)
                 {
@@ -4079,15 +4065,10 @@ impl KernelHostRequestClient {
         match decode_admitted_reply(&reply, &probe) {
             Some(_) => {
                 let stage_is_due = accepts_after_stage(request)
-                    || (waits_for_commit(request)
-                        && now_ms >= envelope.identity.deadline_unix_ms);
+                    || (waits_for_commit(request) && now_ms >= envelope.identity.deadline_unix_ms);
                 if stage_is_due {
-                    let record = self.resolve_original_invocation(
-                        envelope,
-                        facts,
-                        session_id,
-                        now_ms,
-                    )?;
+                    let record =
+                        self.resolve_original_invocation(envelope, facts, session_id, now_ms)?;
                     let occurrence = record
                         .request_id
                         .clone()
@@ -4095,9 +4076,7 @@ impl KernelHostRequestClient {
                     let logical_key = request
                         .correlation_projection
                         .as_ref()
-                        .and_then(|projection| {
-                            logical_invocation_key(projection, session_id).ok()
-                        })
+                        .and_then(|projection| logical_invocation_key(projection, session_id).ok())
                         .ok_or_else(|| unknown_outcome(&digest))?;
                     if !is_nonterminal_request_state(record.state) {
                         return submit_outcome_for_resolved(
