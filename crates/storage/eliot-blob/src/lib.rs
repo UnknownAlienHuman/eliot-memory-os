@@ -45,12 +45,14 @@ pub use eliot_blob_api::{
     BlobPublicationObligation, BlobStageRecovery, BlobStageRecoveryRequest, PublishState,
 };
 pub mod backup_io;
+pub mod compression_port;
 pub use backup_io::{
     BACKUP_MAX_PLAINTEXT_BYTES, CaptureOutcome, CapturePorts, ConsumerEvidencePack, ExportedPage,
     PageInterrupt, PlaintextFetch, RestoreBinding, SealedMember, SealedStage, bind_restore_set,
     complete_export, export_page, open_member, run_capture, seal_associated_data, seal_member,
     seal_nonce_context, verify_capture_record, verify_destination_scope,
 };
+pub use compression_port::{RLE_COMPRESSION_ALGORITHM, RLE_COMPRESSION_VERSION, RleCompressionPort};
 pub mod demand;
 pub mod key_ports;
 pub mod publication_owner;
@@ -72,7 +74,7 @@ use eliot_blob_api::{
     SealedBlobRead, SignedBlobReceiptWire, VerifiedBlobReceipt, metadata_path, payload_path,
     verify_receipt,
 };
-use eliot_platform::WorkScopePath;
+use eliot_platform::{PlatformHandle, WorkScopePath};
 use eliot_receipts::{
     ArtifactBinding, OperationId, ProofCeiling, Receipt, ReceiptCore, ReceiptDisposition,
     ReceiptKind, contract_identity,
@@ -465,6 +467,36 @@ impl BlobRootOwner {
             .lock()
             .ok()
             .and_then(|failure| failure.clone())
+    }
+
+    /// Derives the service lease from this retained root owner and one
+    /// already-authenticated request binding. The request fence remains the
+    /// caller's authority evidence; this method contributes only the root,
+    /// owner, lease identity, and its generation. It does not mint request or
+    /// policy authority.
+    pub fn lease_for_request(
+        &self,
+        fence_binding: eliot_receipts::RequestBinding,
+    ) -> Result<BlobRootLease, BlobError> {
+        if let Some(error) = self.heartbeat_failure() {
+            return Err(error);
+        }
+        let root_id = PlatformHandle::new(self.root_id.clone())
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        let lease_id = BlobId::new(format!(
+            "owner-lease-{}",
+            sha256_hex(self.lease.token.as_bytes())
+        ))?;
+        let root_generation = fence_binding.state_fence.resource_generation.value();
+        let lease = BlobRootLease {
+            root_id,
+            owner_id: self.owner_id.clone(),
+            lease_id,
+            root_generation,
+            fence_binding,
+        };
+        lease.validate()?;
+        Ok(lease)
     }
 }
 
