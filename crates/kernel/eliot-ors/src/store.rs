@@ -6009,7 +6009,15 @@ impl RedbRecoveryStore {
                     reason: "pull disappeared before owner completion".to_owned(),
                 })?;
             existing.validate()?;
-            if existing.pull_ref != completed.pull_ref || !existing.same_request(completed) {
+            if existing.pull_ref != completed.pull_ref
+                || !existing.same_request(completed)
+                || existing.prepared_write_transition_json
+                    != completed.prepared_write_transition_json
+                || existing.prepared_write_transition_sha256
+                    != completed.prepared_write_transition_sha256
+                || existing.prepared_write_canonical_request_hash
+                    != completed.prepared_write_canonical_request_hash
+            {
                 return Err(OrsError::IntegrityProblem {
                     record_type: "blob_process_stream_owner_facts_pull",
                     reason: "completion does not match the exact durable pull".to_owned(),
