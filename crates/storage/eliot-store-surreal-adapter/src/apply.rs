@@ -27,9 +27,10 @@ use eliot_store_api::{
     ERASURE_PARAM_SURFACES, ExactJsonBytes, NamedMutationOperation, ORDERING_LINK_GENESIS_HASH,
     OperationId, OrderingHead, OrderingHeadExpectation, OrderingScopeId, RecoveryRecord,
     RequestMeta, ReservedWriteRequest, RevisionHead, RevisionHeadExpectation, RevisionKey,
-    StateFence, StoreError, StoreGenesisRequest, StoreRecoveryRequest, StoreRecoverySnapshot,
-    TransitionClass, WriteReceipt, decode_erasure_surfaces, generated_operation_manifests,
-    operation_manifest_set_digest,
+    SequenceDispositionChoice, SequenceDispositionRequest, StateFence, StoreError,
+    StoreGenesisRequest, StoreRecoveryRequest, StoreRecoverySnapshot, TransitionClass,
+    WriteReceipt, canonical_json_bytes, decode_erasure_surfaces, generated_operation_manifests,
+    operation_manifest_set_digest, sha256_hex,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -952,6 +953,143 @@ pub(crate) async fn apply_reserved_write(
         }
     }
     Err(AdapterError::Store(StoreError::Unavailable))
+}
+
+/// Applies a governed sequence disposition directly through the canonical
+/// Store transaction (issue #1684). This control path bypasses the reserved
+/// scheduler because the original operation blocks that queue; it still uses
+/// the Store's bounded write lane, exact current head predicates, normal
+/// idempotency replay, and atomic event/head/receipt transaction.
+pub(crate) async fn apply_sequence_disposition(
+    adapter: &SurrealStoreAdapter,
+    context: &RequestMeta,
+    request: SequenceDispositionRequest,
+) -> Result<WriteReceipt, AdapterError> {
+    context.validate().map_err(StoreError::Foundation)?;
+    request.validate()?;
+    if context.state_fence != request.state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+
+    // The original operation is immutable owner evidence. A caller-supplied
+    // DEAD_LETTER label or self-hash is not enough: read the canonical receipt,
+    // compare its content digest, and require its actual terminal failure
+    // envelope before admitting the control transition.
+    let original_receipt = read_receipt(adapter, request.operation.original.operation_id.clone())
+        .await?
+        .ok_or(AdapterError::Store(StoreError::ReceiptNotFound))?;
+    let original_bytes = canonical_json_bytes(&original_receipt)
+        .map_err(|error| AdapterError::Store(StoreError::Serialization(error.to_string())))?;
+    if original_receipt.status != eliot_store_api::WriteReceiptStatus::DeadLetter
+        || sha256_hex(&original_bytes)
+            != request.operation.original.dead_letter_receipt_sha256
+        || original_receipt.idempotency_key != request.operation.original.idempotency_key
+        || original_receipt.canonical_request_hash
+            != request.operation.original.canonical_request_hash
+        || original_receipt.state_fence != request.state_fence
+        || original_receipt.ordering_sequences.len() != request.operation.affected_scopes.len()
+        || original_receipt
+            .require_reconciliation_envelope()?
+            .core
+            .disposition
+            .kind()
+            != eliot_receipts::ReceiptDispositionKind::Failure
+    {
+        return Err(AdapterError::Store(StoreError::StaleDisposition {
+            detail: "the canonical dead-letter receipt does not bind this exact open gap",
+        }));
+    }
+    for scope in &request.operation.affected_scopes {
+        if !original_receipt.ordering_sequences.iter().any(|head| {
+            head.scope == scope.reserved.scope
+                && head.sequence == scope.reserved.reserved_sequence
+                && head.state_fence == request.state_fence
+        }) {
+            return Err(AdapterError::Store(StoreError::StaleDisposition {
+                detail: "the canonical dead-letter receipt does not cover every reserved scope",
+            }));
+        }
+    }
+
+    let current_heads = read_ordering_heads(
+        adapter,
+        request
+            .operation
+            .affected_scopes
+            .iter()
+            .map(|scope| scope.reserved.scope.clone())
+            .collect(),
+    )
+    .await?;
+    for scope in &request.operation.affected_scopes {
+        let observed = current_heads
+            .iter()
+            .find(|head| head.scope == scope.reserved.scope)
+            .ok_or(AdapterError::Store(StoreError::StaleDisposition {
+                detail: "an affected canonical ordering head is absent",
+            }))?;
+        let head_bytes = canonical_json_bytes(observed)
+            .map_err(|error| AdapterError::Store(StoreError::Serialization(error.to_string())))?;
+        if observed.sequence != scope.expected_head_sequence
+            || observed.state_fence != request.state_fence
+            || sha256_hex(&head_bytes) != scope.expected_head_sha256
+        {
+            return Err(AdapterError::Store(StoreError::StaleDisposition {
+                detail: "an affected canonical ordering head changed after status observation",
+            }));
+        }
+    }
+
+    // The transition's durable named-owner payload must carry the exact
+    // choice and original record being decided. This makes the immutable
+    // control receipt a readback source after a crash between Store commit and
+    // ORS reconciliation; a transition that merely names an operation is not
+    // sufficient evidence.
+    let expected_control_payload = serde_json::to_value(
+        eliot_store_api::SequenceDispositionEvidence {
+            operation: request.operation.clone(),
+            choice: request.choice.clone(),
+            expected_ordering_heads: request.expected_ordering_heads.clone(),
+        },
+    )
+    .map_err(|error| AdapterError::Store(StoreError::Serialization(error.to_string())))?;
+    if request.control_transition.named_operations[0]
+        .parameters
+        .get("sequence_disposition")
+        != Some(&expected_control_payload)
+    {
+        return Err(AdapterError::Store(StoreError::StaleDisposition {
+            detail: "the governed Problem-owner transition does not carry this exact disposition",
+        }));
+    }
+
+    validate_transition(context, &request.control_transition)?;
+    let authorities: Vec<Option<ExactJsonBytes>> =
+        vec![None; request.control_transition.named_operations.len()];
+    let db = client(adapter).await?;
+    ensure_ready(adapter, db).await?;
+    let _admission = adapter.exclusive_admission.ordinary_write().await;
+    let expected_ordering_heads = if request.choice.dispositions_reserved_position() {
+        request.expected_ordering_heads
+    } else {
+        // A dependent-only choice records its complete bounded outcomes but
+        // does not disposition the gap's reserved position. Its exact current
+        // heads were read and bound above; no canonical head is advanced and
+        // ORS retains the affected-scope block until a later skip/replace
+        // receipt is reconciled.
+        Vec::new()
+    };
+    Box::pin(apply_with_retry(
+        adapter,
+        db,
+        context,
+        request.control_transition,
+        request.expected_revision_heads,
+        expected_ordering_heads,
+        &authorities,
+        TxLane::PooledWrite,
+    ))
+    .await
 }
 
 /// Maps one executed reserved outcome onto the client boundary.

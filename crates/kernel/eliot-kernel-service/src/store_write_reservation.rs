@@ -143,9 +143,10 @@ use eliot_contracts::{EpochId, RequestMetadata, StateFence};
 use eliot_ors::{
     CanonicalDisposition, CanonicalReconciliation, CanonicalScopeObservation, EpochIdentity,
     EpochLineage, ExpectedOrderingHead, OpaqueLabel, OperationIdentity as OrsOperationIdentity,
-    OperationalRecoveryStore, RecoveryAccessClass, RecoveryCursor, RecoveryEnvelopeContext,
-    RecoveryOwner, RecoveryPage, RecoveryPayloadEnvelope, RedbRecoveryStore, ReservationRecord,
-    ReservationRequest, ReservationState, ScopeReservationRequest, StateFenceSnapshot,
+    OperationalRecoveryStore, PoisonAttemptClassification, RecoveryAccessClass, RecoveryCursor,
+    RecoveryEnvelopeContext, RecoveryOwner, RecoveryPage, RecoveryPayloadEnvelope,
+    RedbRecoveryStore, ReservationRecord, ReservationRequest, ReservationState,
+    ScopeReservationRequest, SequenceGapReconciliation, StateFenceSnapshot,
     WriterReservationToken,
 };
 use eliot_platform::SecretReference;
@@ -155,7 +156,8 @@ use eliot_store_api::{
     CAPABILITY_RESERVED_WRITE, CanonicalRequestView, OperationId, OrderingHeadExpectation,
     OrderingScopeId, PreparedTransition, ReceiptEnvelope, ReservedScopeBinding,
     ReservedWriteRequest, RevisionHeadExpectation, WriteAdmissionParams, WriteAdmissionProjection,
-    WriteReceipt, WriteReceiptStatus, WriterEpochBinding, prepared_transition_digest, sha256_hex,
+    SequenceDispositionRequest, WriteReceipt, WriteReceiptStatus, WriterEpochBinding,
+    poison_operation_record_digest, prepared_transition_digest, sha256_hex,
     verify_canonical_request_hash,
 };
 
@@ -1264,6 +1266,122 @@ pub fn finalize_reservation(
     reconciliation: &CanonicalReconciliation,
 ) -> Result<ReservationRecord, ReservationWriteError> {
     Ok(owner.ors.reconcile(reconciliation)?)
+}
+
+/// Reconciles one committed Store sequence-disposition receipt into the
+/// composition-owned ORS reservation (issue #1684). The Store control receipt
+/// is checked against the exact retained token, poison-attempt counter and
+/// no-effect evidence before the existing all-scope ORS disposition commits.
+pub fn dispose_sequence_gap(
+    owner: &CompositionReservation,
+    reservation: &ReservationRecord,
+    request: &SequenceDispositionRequest,
+    receipt: &WriteReceipt,
+) -> Result<ReservationRecord, ReservationWriteError> {
+    request.validate()?;
+    let operation_id = reservation.token.operation_id.as_str().to_owned();
+    let reject = |detail: &str| ReservationWriteError::Binding {
+        operation_id: operation_id.clone(),
+        detail: detail.to_owned(),
+    };
+    if !matches!(
+        reservation.state,
+        ReservationState::Executing | ReservationState::Reconciling
+    ) || reservation.token.operation_id.as_str()
+        != request.operation.original.operation_id.as_str()
+    {
+        return Err(reject("the exact open reservation is not bound to the disposition"));
+    }
+    let Some(poison) = reservation.poison.as_ref() else {
+        return Err(reject("the reservation has no durable poison-attempt record"));
+    };
+    if poison.last_classification != PoisonAttemptClassification::TerminalProvenNoEffect
+        || poison.policy_revision != request.operation.original.retry_policy.revision
+        || poison.max_attempts != request.operation.original.retry_policy.max_attempts
+        || poison.attempts != request.operation.original.retry_policy.attempts
+        || poison.no_effect_evidence_sha256.as_deref()
+            != Some(
+                request
+                    .operation
+                    .original
+                    .no_effect_evidence
+                    .evidence_sha256
+                    .as_str(),
+            )
+    {
+        return Err(reject(
+            "the disposition record does not match ORS's terminal no-effect proof",
+        ));
+    }
+    let operation_epoch = &request.operation.original.writer_epoch;
+    if request.operation.original.prepared_transition_digest
+        != reservation.token.prepared_transition_sha256
+        || operation_epoch.lineage_id != reservation.token.writer_epoch.current.lineage_id.as_str()
+        || operation_epoch.epoch != reservation.token.writer_epoch.current.epoch
+        || operation_epoch.predecessor_lineage_id.as_deref()
+            != reservation
+                .token
+                .writer_epoch
+                .predecessor
+                .as_ref()
+                .map(|predecessor| predecessor.lineage_id.as_str())
+        || operation_epoch.predecessor_epoch
+            != reservation
+                .token
+                .writer_epoch
+                .predecessor
+                .as_ref()
+                .map(|predecessor| predecessor.epoch)
+    {
+        return Err(reject(
+            "the poison operation identity, transition digest, or writer epoch differs from ORS",
+        ));
+    }
+    if request.operation.affected_scopes.len() != reservation.token.scopes.len() {
+        return Err(reject("the disposition omits a reserved ordering scope"));
+    }
+    for reserved in &reservation.token.scopes {
+        let Some(scope) = request
+            .operation
+            .affected_scopes
+            .iter()
+            .find(|scope| scope.reserved.scope.as_str() == reserved.scope.as_str())
+        else {
+            return Err(reject("the disposition substitutes a reserved ordering scope"));
+        };
+        if scope.reserved.reserved_sequence != reserved.reserved_sequence
+            || scope.reserved.expected_sequence != reserved.expected_head.sequence
+            || scope.reserved.expected_head_digest != reserved.expected_head.head_sha256
+            || scope.expected_head_sequence != reserved.expected_head.sequence
+            || scope.expected_head_sha256 != reserved.expected_head.head_sha256
+        {
+            return Err(reject(
+                "the disposition changes a reserved sequence or its recorded head",
+            ));
+        }
+    }
+    if !request.choice.dispositions_reserved_position() {
+        return Err(reject(
+            "cancel_dependents records outcomes but does not close the reserved position",
+        ));
+    }
+    receipt.validate()?;
+    let envelope = receipt.require_reconciliation_envelope()?;
+    let poison_record_sha256 = poison_operation_record_digest(&request.operation)?;
+    let reconciliation = SequenceGapReconciliation {
+        reservation_id: reservation.token.reservation_id.clone(),
+        operation_id: reservation.token.operation_id.clone(),
+        reservation_order: reservation.token.reservation_order,
+        state_fence: reservation.token.state_fence.clone(),
+        recovery_owner: reservation.token.recovery_owner.clone(),
+        scopes: reservation.token.scopes.clone(),
+        receipt: envelope.clone(),
+        poison_record_sha256,
+    };
+    owner
+        .ors
+        .dispose_gap(&reconciliation)
+        .map_err(ReservationWriteError::Ors)
 }
 
 /// Lists every unresolved (non-terminal) reservation ordered by the ORS

@@ -337,6 +337,7 @@ pub use sequence_disposition::{
     MAX_NO_EFFECT_EVIDENCE_BYTES, MAX_SEQUENCE_DISPOSITION_DEPENDENTS, NoEffectEvidence,
     NoEffectEvidenceKind, PoisonAttemptOutcome, PoisonOperationRecord, PoisonRefusalReason,
     ReplacementLink, SEQUENCE_DISPOSITION_CONTRACT_VERSION, SequenceDispositionChoice,
+    SequenceDispositionEvidence,
     SequenceDispositionRequest, SequenceGapIdentity, SequenceGapStatus,
     poison_operation_record_digest,
 };

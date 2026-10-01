@@ -100,8 +100,9 @@ use eliot_store_api::{
     NamedReadRequest, NamedReadResponse, OperationIdentity, OrderingHead, OrderingHeadExpectation,
     OrderingScopeId, PreparedTransition, RecoveryRecord, RecoveryRecordKey, RequestMeta,
     ReservedWriteRequest, RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation,
-    RevisionKey, ScopeId, ScopeRevisionView, StoreError, StoreGenesisRequest, StoreHealth,
-    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, WriteReceiptStatus, WriteSubmission,
+    RevisionKey, ScopeId, ScopeRevisionView, SequenceDispositionRequest, StoreError,
+    StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
+    WriteReceiptStatus, WriteSubmission,
     admit_write_submission, canonical_request_hash, dreamer_job_queue_key,
     generated_operation_manifests, operation_manifest_set_digest, verify_canonical_request_hash,
 };
@@ -117,9 +118,10 @@ use crate::commit_recovery::{
 use crate::store_client::DreamerCommitEvidence;
 use crate::store_write_reservation::{
     CompositionReservation, ReservationSeed, ReservedSubmission, ResolvedSendOutcome,
-    StagedWriteRecovery, begin_execute_after_send, cancel_before_send, ensure_eligible,
-    finalize_reservation, mark_unknown_outcome, reconcile_receipt, reserve_for_transition,
-    retain_unsupported_prepared_plan, writer_epoch_for_fence_from_epoch,
+    StagedWriteRecovery, begin_execute_after_send, cancel_before_send, dispose_sequence_gap,
+    ensure_eligible, finalize_reservation, mark_unknown_outcome, reconcile_receipt,
+    reserve_for_transition, retain_unsupported_prepared_plan, unresolved_reservations,
+    writer_epoch_for_fence_from_epoch,
 };
 use crate::user_automation_execution::{
     UserAutomationDueWakeResolution, UserAutomationDurableJobMaterial,
@@ -1583,6 +1585,109 @@ impl KernelStoreGateway {
                 Err(refusal)
             }
         }
+    }
+
+    /// Commits a Governor-prepared sequence-gap disposition through the
+    /// protected Store control route and then reconciles its exact receipt to
+    /// the same ORS owner. An ambiguous Store result leaves the reservation
+    /// blocked; a restart can replay the immutable control identity and finish
+    /// this handoff from the canonical receipt.
+    pub async fn apply_sequence_disposition(
+        &self,
+        context: &RequestMetadata,
+        request: SequenceDispositionRequest,
+    ) -> Result<WriteReceipt, String> {
+        let _flight = self.flight.enter()?;
+        if self.is_fenced() {
+            return Err("canonical-store gateway is fenced for rebind".to_owned());
+        }
+        context
+            .validate()
+            .map_err(|error| error.to_string())?;
+        request.validate().map_err(|error| error.to_string())?;
+        if context.state_fence != request.state_fence {
+            return Err("sequence disposition is outside the request state fence".to_owned());
+        }
+        let commit_ors = self.commit_ors.clone().ok_or_else(|| {
+            "sequence disposition requires the composition-bound ORS".to_owned()
+        })?;
+        let owner = self.bind_reservation_owner_for_fence(&commit_ors, &request.state_fence)?;
+        let original_operation_id = request.operation.original.operation_id.as_str();
+        let reservation = unresolved_reservations(&owner, 256)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|record| record.token.operation_id.as_str() == original_operation_id)
+            .ok_or_else(|| {
+                format!("no open ORS reservation owns sequence gap for {original_operation_id}")
+            })?;
+        if !matches!(
+            reservation.state,
+            eliot_ors::ReservationState::Executing | eliot_ors::ReservationState::Reconciling
+        ) {
+            return Err("sequence gap reservation is not executing or reconciling".to_owned());
+        }
+
+        // The protected reserve is the existing control authority for this
+        // operation; it consumes no normal-work admission capacity and the
+        // service mutex is released before the Store call.
+        let control_identity = format!(
+            "sequence-disposition:{}",
+            reservation.token.reservation_id.as_str()
+        );
+        let _control = self
+            .service
+            .lock()
+            .map_err(|_| "Kernel service lock poisoned".to_owned())?
+            .acquire_protected_control(&control_identity)
+            .map_err(|error| error.to_string())?;
+
+        let control_operation = request.control_transition.identity.clone();
+        let returned = self
+            .store
+            .apply_sequence_disposition(context, request.clone())
+            .await
+            .map_err(|error| {
+                format!(
+                    "sequence disposition outcome for control operation {} remains unresolved: {error}",
+                    control_operation.operation_id.as_str()
+                )
+            })?;
+        let observed = self
+            .store
+            .receipt_exact(
+                control_operation.operation_id.clone(),
+                control_operation.canonical_request_hash.as_str(),
+            )
+            .await
+            .map_err(|error| {
+                format!(
+                    "sequence disposition control receipt {} was not read back exactly: {error}",
+                    control_operation.operation_id.as_str()
+                )
+            })?;
+        if returned != observed {
+            return Err("sequence disposition response differs from canonical receipt readback".to_owned());
+        }
+
+        if request.choice.dispositions_reserved_position() {
+            // Rebind the exact active writer epoch after the Store round-trip,
+            // then reload ORS evidence so a stale executor cannot close a
+            // reservation that changed while the Store call was in flight.
+            let owner = self.bind_reservation_owner_for_fence(&commit_ors, &request.state_fence)?;
+            let current = unresolved_reservations(&owner, 256)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|record| record.token == reservation.token)
+                .ok_or_else(|| "sequence gap reservation changed before ORS reconciliation".to_owned())?;
+            dispose_sequence_gap(&owner, &current, &request, &observed)
+                .map_err(|error| {
+                    format!(
+                        "canonical sequence disposition {} committed but ORS handoff remains unresolved: {error}",
+                        control_operation.operation_id.as_str()
+                    )
+                })?;
+        }
+        Ok(observed)
     }
 
     /// Binds the reservation owner from the live composition fence tuple.

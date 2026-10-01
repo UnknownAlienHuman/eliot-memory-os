@@ -602,6 +602,11 @@ pub fn validate_problem_owner_state_params(
         }
         None => {}
     }
+    if let Some(value) = parameters.get("sequence_disposition") {
+        let evidence: crate::SequenceDispositionEvidence = serde_json::from_value(value.clone())
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        evidence.validate()?;
+    }
     Ok(())
 }
 

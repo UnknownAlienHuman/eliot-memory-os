@@ -56,8 +56,9 @@ use eliot_store_api::{
     CAPABILITY_RESERVED_WRITE, CanonicalSnapshotPort, CanonicalStoreClient,
     CanonicalValidationSnapshot, ExactJsonBytes, GENESIS_MANIFEST_NAME, NamedOperationManifest,
     NamedReadRequest, NamedReadResponse, OperationId, OrderingHead, OrderingHeadExpectation,
-    OrderingScopeId, PreparedTransition, RequestMeta, ReservedWriteRequest, RevisionHead,
-    RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SnapshotBeginRequest,
+    OrderingScopeId, PreparedTransition, RequestMeta, ReservedWriteRequest,
+    RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView,
+    SequenceDispositionRequest, SnapshotBeginRequest,
     SnapshotCursor, SnapshotEndReceipt, SnapshotHandle, SnapshotPage, StateFence, StoreError,
     StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
     generated_operation_manifests, operation_manifest_set_digest,
@@ -696,6 +697,16 @@ impl CanonicalStoreClient for SurrealStoreAdapter {
         request: ReservedWriteRequest,
     ) -> Result<WriteReceipt, StoreError> {
         apply::apply_reserved_write(self, request)
+            .await
+            .map_err(AdapterError::into_store_error)
+    }
+
+    async fn apply_sequence_disposition(
+        &self,
+        context: &RequestMeta,
+        request: SequenceDispositionRequest,
+    ) -> Result<WriteReceipt, StoreError> {
+        apply::apply_sequence_disposition(self, context, request)
             .await
             .map_err(AdapterError::into_store_error)
     }

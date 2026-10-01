@@ -783,6 +783,78 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
         }
     }
 
+    async fn apply_sequence_disposition(
+        &self,
+        context: &RequestMeta,
+        request: eliot_store_api::SequenceDispositionRequest,
+    ) -> Result<WriteReceipt, StoreError> {
+        context.validate().map_err(StoreError::Foundation)?;
+        request.validate()?;
+        self.validate_requirement_fence(&context.state_fence)?;
+        self.validate_requirement_fence(&request.state_fence)?;
+        self.validate_requirement_fence(&request.control_transition.state_fence)?;
+        if context.state_fence != request.state_fence {
+            return Err(StoreError::FenceMismatch);
+        }
+        let control = &request.control_transition;
+        let operation_id = control.identity.operation_id.clone();
+        let idempotency_key = control.identity.idempotency_key.clone();
+        let result = self
+            .execute_raw(
+                StoreRequest::SequenceDisposition {
+                    context: context.clone(),
+                    request: request.clone(),
+                },
+                Some(context),
+                &idempotency_key,
+            )
+            .await;
+        match result {
+            Ok(StoreResponse::Transaction { receipt }) => {
+                receipt.validate()?;
+                if receipt.operation_id != operation_id
+                    || receipt.idempotency_key != idempotency_key
+                    || receipt.canonical_request_hash != control.identity.canonical_request_hash
+                    || receipt.state_fence != request.state_fence
+                    || receipt.transition_class != control.transition_class
+                    || receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+                    || receipt.require_reconciliation_envelope()?.core.disposition.kind()
+                        != eliot_receipts::ReceiptDispositionKind::Success
+                {
+                    return Err(StoreError::InvalidReceipt);
+                }
+                let mut expected_sequences = if request.choice.dispositions_reserved_position() {
+                    request
+                        .operation
+                        .affected_scopes
+                        .iter()
+                        .map(|scope| {
+                            (
+                                scope.reserved.scope.clone(),
+                                scope.reserved.reserved_sequence,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                expected_sequences.sort();
+                let mut observed_sequences = receipt
+                    .ordering_sequences
+                    .iter()
+                    .map(|head| (head.scope.clone(), head.sequence))
+                    .collect::<Vec<_>>();
+                observed_sequences.sort();
+                if observed_sequences != expected_sequences {
+                    return Err(StoreError::InvalidReceipt);
+                }
+                Ok(receipt)
+            }
+            Ok(_) => Err(StoreError::InvalidReceipt),
+            Err(error) => Err(error.into_store_error()),
+        }
+    }
+
     async fn recovery(
         &self,
         request: StoreRecoveryRequest,

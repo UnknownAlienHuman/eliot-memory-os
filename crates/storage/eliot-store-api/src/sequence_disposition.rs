@@ -654,7 +654,12 @@ pub struct SequenceDispositionRequest {
     /// The separately identified, Governor-prepared control transition that
     /// records the disposition and its Problem-owner consequence. Its own
     /// immutable receipt is the handoff evidence ORS consumes; it must never
-    /// reuse the original dead-letter operation identity.
+    /// reuse the original dead-letter operation identity. Its sole
+    /// `ApplyProblemOwnerState` parameter map carries
+    /// `sequence_disposition: { operation, choice, expected_ordering_heads }`
+    /// exactly as this request presents them, so the committed owner receipt
+    /// can be read back after a crash and compared without reconstructing the
+    /// decision.
     pub control_transition: PreparedTransition,
     /// Exact revision heads admitted by the control transition.
     pub expected_revision_heads: Vec<RevisionHeadExpectation>,
@@ -662,6 +667,47 @@ pub struct SequenceDispositionRequest {
     /// The Store rechecks both these sequence values and the recorded head
     /// digests inside the same transaction that commits the disposition.
     pub expected_ordering_heads: Vec<OrderingHeadExpectation>,
+}
+
+/// Exact sequence-disposition evidence embedded in the separately identified
+/// Problem-owner control transition. This keeps the original immutable record,
+/// selected choice, and the complete head snapshot in the canonical receipt
+/// body so restart reconciliation can compare the committed decision byte for
+/// byte.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SequenceDispositionEvidence {
+    /// Original operation and its complete affected-scope bindings.
+    pub operation: PoisonOperationRecord,
+    /// Choice applied by the control transition.
+    pub choice: SequenceDispositionChoice,
+    /// Full, independent current ordering-head snapshot.
+    pub expected_ordering_heads: Vec<OrderingHeadExpectation>,
+}
+
+impl SequenceDispositionEvidence {
+    /// Validates the owner evidence shape and exact all-scope head binding.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        self.operation.validate()?;
+        self.choice.validate(&self.operation.original)?;
+        let mut expected: Vec<_> = self.operation.affected_scopes.iter()
+            .map(|scope| (scope.reserved.scope.clone(), scope.expected_head_sequence))
+            .collect();
+        expected.sort();
+        let mut supplied = Vec::with_capacity(self.expected_ordering_heads.len());
+        for head in &self.expected_ordering_heads {
+            head.validate()?;
+            supplied.push((head.scope.clone(), head.expected_sequence));
+        }
+        supplied.sort();
+        if supplied != expected {
+            return Err(StoreError::InvalidField {
+                field: "sequence_disposition.expected_ordering_heads",
+                reason: "must bind every affected scope exactly once",
+            });
+        }
+        Ok(())
+    }
 }
 
 impl SequenceDispositionRequest {
@@ -706,7 +752,13 @@ impl SequenceDispositionRequest {
             .operation
             .affected_scopes
             .iter()
-            .map(|scope| (scope.reserved.scope.clone(), scope.expected_head_sequence))
+            .map(|scope| {
+                (
+                    scope.reserved.scope.clone(),
+                    scope.expected_head_sequence,
+                    scope.reserved.reserved_sequence,
+                )
+            })
             .collect();
         expected_heads.sort();
         let mut supplied_heads: Vec<_> = self
@@ -715,12 +767,31 @@ impl SequenceDispositionRequest {
             .map(|head| (head.scope.clone(), head.expected_sequence))
             .collect();
         supplied_heads.sort();
-        if !self.control_transition.ordering_scopes.is_empty()
-            || supplied_heads != expected_heads
+        let mut transition_scopes = self.control_transition.ordering_scopes.clone();
+        transition_scopes.sort();
+        let closes_gap = self.choice.dispositions_reserved_position();
+        let required_transition_scopes = if closes_gap {
+            expected_heads
+                .iter()
+                .map(|(scope, _, _)| scope.clone())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let expected_scope_heads: Vec<_> = expected_heads
+            .iter()
+            .map(|(scope, sequence, _)| (scope.clone(), *sequence))
+            .collect();
+        if transition_scopes != required_transition_scopes
+            || supplied_heads != expected_scope_heads
+            || (closes_gap
+                && expected_heads
+                    .iter()
+                    .any(|(_, head, reserved)| head.checked_add(1) != Some(*reserved)))
         {
             return Err(StoreError::InvalidField {
                 field: "disposition.control_transition.ordering_heads",
-                reason: "the control transition must bypass the blocked queue and separately carry every exact observed head",
+                reason: "a closing control transition must advance every affected scope into the reserved position; dependent-only control leaves the gap open",
             });
         }
         for head in &self.expected_ordering_heads {

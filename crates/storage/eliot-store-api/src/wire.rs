@@ -105,6 +105,11 @@ pub const CAPABILITIES: &[&str] = &[
     CAPABILITY_ORDERING_HEADS,
     CAPABILITY_VALIDATION_SNAPSHOT,
     CAPABILITY_RECOVERY,
+    // Separate Kernel control route. Ordinary `Apply` / `ReservedWrite`
+    // requests still cannot express a gap disposition; the canonical Store
+    // owner validates the Governor-prepared control transition and current
+    // dead-letter evidence before committing it.
+    CAPABILITY_SEQUENCE_DISPOSITION,
     CAPABILITY_INITIALIZE_GENESIS,
     CAPABILITY_DREAMER_JOB_SUBMIT,
     CAPABILITY_DREAMER_JOB_LEASE_NEXT,
