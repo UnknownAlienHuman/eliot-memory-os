@@ -36,11 +36,11 @@
 //! | Role | Permitted operations |
 //! |---|---|
 //! | REQUESTER | REQUEST_CAPTURE, READ_SNAPSHOT_PAGE, VERIFY_ARCHIVE, PREPARE_ISOLATED_RESTORE, RESTORE_STATUS, RECONCILE_RESTORE (no success receipts) |
-//! | CAPTURE_OWNER | own bounded snapshot only (READ_SNAPSHOT_PAGE, RESTORE_STATUS, RECONCILE_RESTORE) |
-//! | STORE_OWNER / ORS_OWNER | own phase only (RESTORE_STEP, RESTORE_STATUS, RECONCILE_RESTORE) |
-//! | SPOOL_OWNER | own spool only (READ_SNAPSHOT_PAGE, RECONCILE_RESTORE); deliberately narrower than STORE_OWNER / ORS_OWNER: no RESTORE_STEP, no RESTORE_STATUS |
-//! | VERIFIER | VERIFY_ARCHIVE + COMPLETE_REHEARSAL + RESTORE_STATUS only |
-//! | INSTALLATION_AUTHORITY | PREPARE_ISOLATED_RESTORE + ADMIT_CUTOVER + RESTORE_STATUS alone |
+//! | `CAPTURE_OWNER` | own bounded snapshot only (`READ_SNAPSHOT_PAGE`, `RESTORE_STATUS`, `RECONCILE_RESTORE`) |
+//! | `STORE_OWNER` / `ORS_OWNER` | own phase only (`RESTORE_STEP`, `RESTORE_STATUS`, `RECONCILE_RESTORE`) |
+//! | `SPOOL_OWNER` | own spool only (`READ_SNAPSHOT_PAGE`, `RECONCILE_RESTORE`); deliberately narrower than `STORE_OWNER` / `ORS_OWNER`: no `RESTORE_STEP`, no `RESTORE_STATUS` |
+//! | `VERIFIER` | `VERIFY_ARCHIVE` + `COMPLETE_REHEARSAL` + `RESTORE_STATUS` only |
+//! | `INSTALLATION_AUTHORITY` | `PREPARE_ISOLATED_RESTORE` + `ADMIT_CUTOVER` + `RESTORE_STATUS` alone |
 //! | HOST_FORENSIC | observe-only; never active authority |
 //!
 //! Port table (owner -> attestation fn -> receipt type):
@@ -389,7 +389,7 @@ fn code_only(source: &str) -> String {
             // this, one `r#match` would be read as an unterminated raw string
             // and blank the rest of the file, which would silently disable
             // every token in this guard.
-            ('r', next) if matches!(next, Some('"' | '#')) => {
+            ('r', Some('"' | '#')) => {
                 let hashes = raw_hash_run(&chars, index + 1);
                 if chars.get(index + 1 + hashes).copied() != Some('"') {
                     out.push(current);
