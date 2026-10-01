@@ -270,10 +270,9 @@ mod tests {
     fn durable_runtime_join_uses_the_exact_installation_root() {
         let program_data = crate::protected_program_data_root()
             .expect("SystemService test requires the proved ProgramData anchor");
-        let program_data_handle = crate::PlatformHandle::new(
-            program_data.to_string_lossy().into_owned(),
-        )
-        .expect("ProgramData path is a valid handle");
+        let program_data_handle =
+            crate::PlatformHandle::new(program_data.to_string_lossy().into_owned())
+                .expect("ProgramData path is a valid handle");
         let anchors = crate::ProfileRootAnchors {
             program_files: Some(
                 crate::PlatformHandle::new(r"C:\Program Files")
@@ -285,14 +284,8 @@ mod tests {
             repository_root: None,
         };
         let profile = InstallationProfile::SystemService;
-        let governed = crate::select_profile_roots(
-            profile,
-            "eliot-host",
-            "1.0.0",
-            None,
-            &anchors,
-        )
-        .expect("I3.1 SystemService roots should resolve from explicit anchors");
+        let governed = crate::select_profile_roots(profile, "eliot-host", "1.0.0", None, &anchors)
+            .expect("I3.1 SystemService roots should resolve from explicit anchors");
         let valid_runtime_roots = RuntimeStateRoots::derive_profiled(
             profile,
             program_data_handle.clone(),
@@ -319,12 +312,9 @@ mod tests {
             "c".repeat(64)
         ))
         .expect("foreign installation path is a valid handle");
-        let foreign_runtime_roots = RuntimeStateRoots::derived(
-            profile,
-            program_data_handle,
-            foreign_installation_root,
-        )
-        .expect("runtime topology remains valid under the explicit profile anchor");
+        let foreign_runtime_roots =
+            RuntimeStateRoots::derived(profile, program_data_handle, foreign_installation_root)
+                .expect("runtime topology remains valid under the explicit profile anchor");
         assert!(matches!(
             governed.into_installation_roots(foreign_runtime_roots),
             Err(InstallationError::ProfileViolation(reason))

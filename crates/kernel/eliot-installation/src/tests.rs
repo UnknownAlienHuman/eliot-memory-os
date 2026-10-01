@@ -1946,8 +1946,7 @@ fn system_registration_transaction() -> InstallationTransaction {
         None,
         &anchors,
     ));
-    descriptor.profile_governed_roots =
-        must(governed_roots.into_installation_roots(roots.clone()));
+    descriptor.profile_governed_roots = must(governed_roots.into_installation_roots(roots.clone()));
     descriptor.kernel_work_root = roots.kernel_work_root.clone();
     descriptor.authority_descriptor_path = system_path("authority.json");
     descriptor.eliotd_executable_path = system_path("eliotd.exe");
