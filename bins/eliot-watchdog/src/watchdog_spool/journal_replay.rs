@@ -59,7 +59,7 @@
 use std::path::Path;
 
 use eliot_contracts::sha256_hex;
-use redb::{ReadableTable, TableDefinition, WriteTransaction};
+use redb::{ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
 
 use crate::SpoolError;
 
@@ -763,16 +763,19 @@ fn evict_journal_evidence(
     let mut table = write
         .open_table(JOURNAL_REPLAY_EVIDENCE_TABLE)
         .map_err(|error| SpoolError::Database(error.to_string()))?;
-    let Some(value) = table
-        .get(ledger_key.as_str())
-        .map_err(|error| SpoolError::Database(error.to_string()))?
-    else {
-        return Err(SpoolError::Corrupt(
-            "journal replay evidence sequence has a hole; refusing to evict past it".to_owned(),
-        ));
+    let raw: Vec<u8> = {
+        let Some(value) = table
+            .get(ledger_key.as_str())
+            .map_err(|error| SpoolError::Database(error.to_string()))?
+        else {
+            return Err(SpoolError::Corrupt(
+                "journal replay evidence sequence has a hole; refusing to evict past it".to_owned(),
+            ));
+        };
+        value.value().to_vec()
     };
     let evidence: StoredJournalEvidence =
-        serde_json::from_slice(value.value()).map_err(|error| {
+        serde_json::from_slice(raw.as_slice()).map_err(|error| {
             SpoolError::Corrupt(format!("journal replay evidence row is invalid: {error}"))
         })?;
     evidence.validate(cursor_key)?;
