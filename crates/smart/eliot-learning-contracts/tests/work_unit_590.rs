@@ -1471,7 +1471,18 @@ fn required_optional_conditional_slots() {
             declared: 3,
             observed: 1,
         },
-        completeness: Completeness::Partial,
+        // I12.24: "`PARTIAL` may support a narrower safe attempt only when
+        // omitted fields are explicitly non-load-bearing" and I10.15: "A
+        // missing/stale load-bearing owner ref blocks only the dependent
+        // compilation." The three declared requirements each derive their own
+        // way here: the Required slot is projected Current and withholds
+        // nothing, the Optional slot is omitted without degrading anything,
+        // and the Conditional slot is inside the required denominator (its
+        // dependency is present, so its condition fires) yet unvisited. A
+        // frontier record is the view admitting it never read that field; it
+        // is not a declaration that the field is non-load-bearing. The
+        // dependent compilation is therefore BLOCKED, not PARTIAL.
+        completeness: Completeness::Blocked,
         omissions: vec![recipe.slots[1].slot_id.clone()],
         frontier: vec![recipe.slots[2].slot_id.clone()],
         owner_disagreements: vec![],
@@ -1481,6 +1492,18 @@ fn required_optional_conditional_slots() {
         canonical_digest: String::new(),
     };
     must(view.seal_content_addressed());
+    // The declared completeness above is the derived one, not a caller choice.
+    assert_eq!(view.derived_completeness(&recipe), Completeness::Blocked);
+    // An unvisited Conditional slot whose dependency is projected is never a
+    // silent fill: it stays blocked, and omitting the Optional slot is the only
+    // gap this recipe tolerates.
+    let mut unfilled = view.clone();
+    unfilled.completeness = Completeness::Partial;
+    must(unfilled.seal());
+    assert!(matches!(
+        unfilled.validate_against(&recipe),
+        Err(LearningContractError::IncompleteCoverage)
+    ));
     must(view.validate_against(&recipe));
 }
 
