@@ -4468,8 +4468,7 @@ mod tests {
     };
     use eliot_kernel_core::{
         AutomationExecutionReference, AutomationFailureNotificationProjection,
-        UserAutomationConfigurationState, UserAutomationOperation,
-        UserAutomationOperatorIntent,
+        UserAutomationConfigurationState, UserAutomationOperation, UserAutomationOperatorIntent,
     };
     use eliot_protocol::JobState;
     use eliot_receipts::ReceiptEnvelope;

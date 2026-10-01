@@ -11537,8 +11537,9 @@ mod live_surreal_evidence_pack_e2e {
             ordering_scopes: vec![OrderingScopeId::new(scope.as_str()).expect("ordering scope")],
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: eliot_store_api::supported_admission_contract_set_digest()
-                .expect("admission contract set computes"),
+            admission_contract_set_digest:
+                eliot_store_api::supported_admission_contract_set_digest()
+                    .expect("admission contract set computes"),
             operation_manifest_digest: set_digest,
             // Issue-#18 digests are derived, never defaulted; no semantic
             // source is bound here (`[]`).
