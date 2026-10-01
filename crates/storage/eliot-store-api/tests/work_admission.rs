@@ -176,7 +176,22 @@ fn owner_attribution(
             "automation_policy_ref": "automation-policy-1",
             "cost_authority_ref": "cost-authority-1",
             "provider_tool": {"provider_ref": "provider-1", "tool_ref": "claude"}
-        }}}
+        }, "reservations": [{
+            "idempotency_key": "budget-reservation-idem-1",
+            "receipt": {
+                "reservation_id": "budget-reservation-1",
+                "envelope_id": "budget-envelope-1",
+                "idempotency_key": "budget-reservation-idem-1",
+                "operation": {
+                    "operation_id": "provider-operation-1",
+                    "request_id": "provider-request-1",
+                    "idempotency_key": "budget-reservation-idem-1",
+                    "state_fence": state_fence
+                },
+                "authority": {"state_fence": state_fence},
+                "provider_tool": {"provider_ref": "provider-1", "tool_ref": "claude"}
+            }
+        }]}}
     });
     let mut task_readback = readback(
         WorkAdmissionOwnerRole::Task,
@@ -267,6 +282,8 @@ fn owner_attribution(
             policy_snapshot_id: "policy-snapshot-1".to_owned(),
             automation_policy_ref: "automation-policy-1".to_owned(),
             cost_authority_ref: "cost-authority-1".to_owned(),
+            reservation_id: "budget-reservation-1".to_owned(),
+            reservation_idempotency_key: "budget-reservation-idem-1".to_owned(),
             provider_ref: "provider-1".to_owned(),
             tool_ref: "claude".to_owned(),
             swarm: WorkAdmissionSwarmBudgetAttribution::NotApplicable {
@@ -455,6 +472,14 @@ fn work_admission_accepts_exact_original_transition_and_receipt() {
     submission
         .validate_receipt(&receipt(&transition))
         .expect("exact committed receipt");
+}
+
+#[test]
+fn work_admission_refuses_a_foreign_budget_reservation_link() {
+    let mut admitted = record();
+    admitted.owner_attribution.budget_attribution.reservation_id =
+        "budget-reservation-foreign".to_owned();
+    assert!(admitted.validate().is_err());
 }
 
 #[test]

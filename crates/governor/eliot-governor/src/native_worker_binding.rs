@@ -1,7 +1,7 @@
 //! Governor-owned native-worker executable binding projection (T9-01, M1).
 //!
 //! M1 (`T9.md` 3.2, accepted by #22): the Governor publishes one versioned
-//! record, [`NativeWorkerExecutableBinding`] v2, through the existing canonical
+//! record, [`NativeWorkerExecutableBinding`] v3, through the existing canonical
 //! admission path (`PreparedTransition` / `KernelTransitionPort`) when the
 //! attempt is registered. The field denominator below is `T9.md` 3.2:
 //! installation/principal/session; claim and registration; admitted
@@ -59,7 +59,7 @@ use serde::{Deserialize, Serialize};
 pub const NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_ID: &str =
     "eliot.governor.native-worker-executable-binding";
 /// Current wire revision of the Governor-owned executable binding.
-pub const NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_VERSION: u16 = 2;
+pub const NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_VERSION: u16 = 3;
 
 /// Why an authenticated native-worker publication no longer admits reuse.
 ///
@@ -310,6 +310,13 @@ pub struct NativeWorkerLifecycleBinding {
 pub struct NativeWorkerExecutableBinding {
     /// Distinct claim operation identity.
     pub claim_id: String,
+    /// Kernel-owned parent Durable-Job identity from the original claim row.
+    pub parent_job_id: String,
+    /// Original logical decision identity from the claim row.
+    pub decision_id: String,
+    /// Opaque original attempt identity from the claim row. This is distinct
+    /// from the numeric launch counter in `attempt`.
+    pub attempt_id: String,
     /// Registration the attempt was registered under.
     pub registration_id: String,
     /// Admitted task identity.
@@ -431,7 +438,7 @@ impl NativeWorkerExecutableBinding {
             );
         }
         if self.wire_version != NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_VERSION {
-            return Err("wire_version must be 2".to_owned());
+            return Err("wire_version must be 3".to_owned());
         }
         let canonical_facet_ref = canonical_native_worker_facet_ref()?;
         if self.facet_manifest_ref != canonical_facet_ref {
@@ -442,6 +449,9 @@ impl NativeWorkerExecutableBinding {
         }
         for (value, field) in [
             (&self.claim_id, "claim_id"),
+            (&self.parent_job_id, "parent_job_id"),
+            (&self.decision_id, "decision_id"),
+            (&self.attempt_id, "attempt_id"),
             (&self.registration_id, "registration_id"),
             (&self.task_id, "task_id"),
             (&self.work_unit_id, "work_unit_id"),

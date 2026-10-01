@@ -175,10 +175,13 @@ fn native_worker_claim_matches_binding(
     binding: &NativeWorkerExecutableBinding,
 ) -> bool {
     claim.claim_id.as_str() == binding.claim_id
+        && claim.parent_job_id.as_str() == binding.parent_job_id
         && claim.registration_id.as_str() == binding.registration_id
         && claim.worker_generation == binding.worker_generation
         && claim.task_id.as_str() == binding.task_id
         && claim.work_scope_id.as_str() == binding.work_scope_id
+        && claim.decision_id.as_str() == binding.decision_id
+        && claim.attempt_id.as_str() == binding.attempt_id
         && claim.operation_id.as_str() == binding.operation_id
         && claim.authority_epoch == binding.authority_epoch.sequence.get()
         && claim.executable_binding_digest == binding.binding_digest
@@ -9726,6 +9729,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     pub fn publish_native_worker_binding(
         &self,
         claim_id: &str,
+        parent_job_id: &str,
+        decision_id: &str,
+        attempt_id: &str,
         registration_id: &str,
         installation_id: &str,
         task_id: &str,
@@ -9807,6 +9813,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         )?;
         let mut binding = NativeWorkerExecutableBinding {
             claim_id: claim_id.to_owned(),
+            parent_job_id: parent_job_id.to_owned(),
+            decision_id: decision_id.to_owned(),
+            attempt_id: attempt_id.to_owned(),
             registration_id: registration_id.to_owned(),
             task_id: task_id.to_owned(),
             work_unit_id: work_unit_id.to_owned(),
@@ -9892,6 +9901,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     pub fn publish_native_worker_binding_for_invocation(
         &self,
         claim_id: &str,
+        parent_job_id: &str,
+        decision_id: &str,
+        attempt_id: &str,
         registration_id: &str,
         installation_id: &str,
         task_id: &str,
@@ -9939,6 +9951,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .map_err(CompositionError::Recovery)?;
         self.publish_native_worker_binding(
             claim_id,
+            parent_job_id,
+            decision_id,
+            attempt_id,
             registration_id,
             installation_id,
             task_id,

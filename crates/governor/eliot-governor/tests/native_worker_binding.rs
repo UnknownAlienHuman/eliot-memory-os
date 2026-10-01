@@ -507,6 +507,9 @@ fn publish_valid(composition: &GovernorComposition<TestKernel>) -> NativeWorkerE
     composition
         .publish_native_worker_binding(
             "claim-1",
+            "job-parent-1",
+            "decision-1",
+            "attempt-owner-1",
             "reg-1",
             "install-1",
             "task-1",
@@ -567,7 +570,7 @@ fn publish_produces_valid_binding_with_stable_digest() {
     let composition = build_composition();
     let binding = publish_valid(&composition);
     assert_eq!(binding.wire_id, NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_ID);
-    assert_eq!(binding.wire_version, 2);
+    assert_eq!(binding.wire_version, 3);
     binding.validate().expect("valid binding");
     let first = binding.compute_digest().expect("digest");
     let second = binding.compute_digest().expect("digest");

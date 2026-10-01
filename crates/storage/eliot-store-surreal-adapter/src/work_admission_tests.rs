@@ -139,7 +139,22 @@ fn owner_attribution(fence: &StateFence) -> WorkAdmissionOwnerAttribution {
             "envelope_id": "budget-envelope-1", "policy_snapshot_id": "policy-snapshot-1",
             "automation_policy_ref": "automation-policy-1", "cost_authority_ref": "cost-authority-1",
             "provider_tool": {"provider_ref": "provider-1", "tool_ref": "claude"}
-        }}}
+        }, "reservations": [{
+            "idempotency_key": "budget-reservation-idem-1",
+            "receipt": {
+                "reservation_id": "budget-reservation-1",
+                "envelope_id": "budget-envelope-1",
+                "idempotency_key": "budget-reservation-idem-1",
+                "operation": {
+                    "operation_id": "provider-operation-1",
+                    "request_id": "provider-request-1",
+                    "idempotency_key": "budget-reservation-idem-1",
+                    "state_fence": fence
+                },
+                "authority": {"state_fence": fence},
+                "provider_tool": {"provider_ref": "provider-1", "tool_ref": "claude"}
+            }
+        }]}}
     });
     let mut owner_readbacks = vec![
         task_readback,
@@ -210,6 +225,8 @@ fn owner_attribution(fence: &StateFence) -> WorkAdmissionOwnerAttribution {
             policy_snapshot_id: "policy-snapshot-1".to_owned(),
             automation_policy_ref: "automation-policy-1".to_owned(),
             cost_authority_ref: "cost-authority-1".to_owned(),
+            reservation_id: "budget-reservation-1".to_owned(),
+            reservation_idempotency_key: "budget-reservation-idem-1".to_owned(),
             provider_ref: "provider-1".to_owned(),
             tool_ref: "claude".to_owned(),
             swarm: WorkAdmissionSwarmBudgetAttribution::NotApplicable {

@@ -331,6 +331,11 @@ pub struct WorkAdmissionBudgetAttribution {
     pub policy_snapshot_id: String,
     pub automation_policy_ref: String,
     pub cost_authority_ref: String,
+    /// Exact BudgetLedger reservation retained by the original admission
+    /// owner readback. This prevents a later result caller from selecting a
+    /// different same-route reservation for the same work.
+    pub reservation_id: String,
+    pub reservation_idempotency_key: String,
     pub provider_ref: String,
     pub tool_ref: String,
     pub swarm: WorkAdmissionSwarmBudgetAttribution,
@@ -344,6 +349,11 @@ impl WorkAdmissionBudgetAttribution {
             ("work_admission.budget.policy_snapshot_id", self.policy_snapshot_id.as_str()),
             ("work_admission.budget.automation_policy_ref", self.automation_policy_ref.as_str()),
             ("work_admission.budget.cost_authority_ref", self.cost_authority_ref.as_str()),
+            ("work_admission.budget.reservation_id", self.reservation_id.as_str()),
+            (
+                "work_admission.budget.reservation_idempotency_key",
+                self.reservation_idempotency_key.as_str(),
+            ),
             ("work_admission.budget.provider_ref", self.provider_ref.as_str()),
             ("work_admission.budget.tool_ref", self.tool_ref.as_str()),
         ] {
@@ -645,6 +655,20 @@ impl WorkAdmissionOwnerAttribution {
             .map_err(|error| StoreError::Serialization(error.to_string()))?;
         let envelope = budget_value.pointer("/state/ledger/envelope");
         let provider_tool = envelope.and_then(|value| value.get("provider_tool"));
+        let reservations = budget_value
+            .pointer("/state/ledger/reservations")
+            .and_then(serde_json::Value::as_array);
+        let matching_reservations: Vec<&serde_json::Value> = reservations
+            .into_iter()
+            .flatten()
+            .filter(|entry| {
+                entry.get("idempotency_key").and_then(serde_json::Value::as_str)
+                    == Some(self.budget_attribution.reservation_idempotency_key.as_str())
+            })
+            .collect();
+        let admitted_reservation = matching_reservations
+            .first()
+            .and_then(|entry| entry.get("receipt"));
         if owner_revision != Some(budget_readback.owner_revision)
             || budget_value.get("state_fence") != Some(&owner_fence)
             || envelope.and_then(|value| value.get("envelope_id")).and_then(serde_json::Value::as_str)
@@ -659,10 +683,37 @@ impl WorkAdmissionOwnerAttribution {
                 != Some(self.budget_attribution.provider_ref.as_str())
             || provider_tool.and_then(|value| value.get("tool_ref")).and_then(serde_json::Value::as_str)
                 != Some(self.budget_attribution.tool_ref.as_str())
+            || matching_reservations.len() != 1
+            || admitted_reservation
+                .and_then(|value| value.get("reservation_id"))
+                .and_then(serde_json::Value::as_str)
+                != Some(self.budget_attribution.reservation_id.as_str())
+            || admitted_reservation
+                .and_then(|value| value.get("idempotency_key"))
+                .and_then(serde_json::Value::as_str)
+                != Some(self.budget_attribution.reservation_idempotency_key.as_str())
+            || admitted_reservation
+                .and_then(|value| value.get("envelope_id"))
+                .and_then(serde_json::Value::as_str)
+                != Some(self.budget_attribution.envelope_id.as_str())
+            || admitted_reservation
+                .and_then(|value| value.pointer("/provider_tool/provider_ref"))
+                .and_then(serde_json::Value::as_str)
+                != Some(self.budget_attribution.provider_ref.as_str())
+            || admitted_reservation
+                .and_then(|value| value.pointer("/provider_tool/tool_ref"))
+                .and_then(serde_json::Value::as_str)
+                != Some(self.budget_attribution.tool_ref.as_str())
+            || admitted_reservation
+                .and_then(|value| value.pointer("/operation/state_fence"))
+                != Some(&owner_fence)
+            || admitted_reservation
+                .and_then(|value| value.pointer("/authority/state_fence"))
+                != Some(&owner_fence)
         {
             return Err(StoreError::InvalidField {
                 field: "work_admission.budget_attribution",
-                reason: "must match the exact current configured Budget owner envelope and fence",
+                reason: "must match the exact current Budget envelope and one original reservation row under this fence",
             });
         }
         match &self.budget_attribution.swarm {
