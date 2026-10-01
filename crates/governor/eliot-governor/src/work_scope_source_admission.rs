@@ -883,6 +883,30 @@ impl PreparedWorkScopeSourceAdmission {
         }
         Ok(())
     }
+
+    /// Confirms the post-commit named owner read is exactly this prepared
+    /// snapshot at its incremented owner revision and current fence.
+    pub fn validate_owner_readback(
+        &self,
+        readback: &WorkScopeOwnerSnapshotReadback,
+    ) -> Result<(), WorkScopeSourceAdmissionError> {
+        let WorkScopeOwnerSnapshotReadback::Bound(owner) = readback else {
+            return Err(WorkScopeSourceAdmissionError::OwnerReadbackMismatch);
+        };
+        let expected_bytes = canonical_json_bytes(&self.snapshot)
+            .map_err(|error| WorkScopeSourceAdmissionError::Snapshot(error.to_string()))?;
+        let expected_digest = sha256_hex(&expected_bytes);
+        if owner.state_fence != self.snapshot.state_fence
+            || owner.owner_revision != self.snapshot.owner_revision
+            || owner.snapshot.state_fence != self.snapshot.state_fence
+            || owner.snapshot.owner_revision != self.snapshot.owner_revision
+            || owner.value_digest != expected_digest
+            || owner.snapshot != self.snapshot
+        {
+            return Err(WorkScopeSourceAdmissionError::OwnerReadbackMismatch);
+        }
+        Ok(())
+    }
 }
 
 /// Refusal while preparing an initial WorkScope source-admission transition.
@@ -936,6 +960,9 @@ pub enum WorkScopeSourceAdmissionError {
     /// Store committed the row without the exact authority/causal/scope bindings.
     #[error("WorkScope write receipt differs from the admitted authority or Policy parent")]
     CommittedReceiptMismatch,
+    /// Fresh named WorkScope readback differs from the exact prepared snapshot.
+    #[error("fresh WorkScope owner readback differs from the committed snapshot")]
+    OwnerReadbackMismatch,
 }
 
 /// Creates a source-admission snapshot from genuine initial-scope inputs and
