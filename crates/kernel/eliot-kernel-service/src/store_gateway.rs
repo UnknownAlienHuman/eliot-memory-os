@@ -2837,7 +2837,7 @@ impl KernelStoreGateway {
             identity: request.identity.clone(),
             intent: request.intent.clone(),
         };
-        let (mut transition, manifest_digest) =
+        let (transition, manifest_digest) =
             CanonicalUserAutomationStore::<BorrowedCanonicalStoreClient<'_>>::build_normalization_transition(
                 &store_request,
                 revision,
@@ -2868,12 +2868,15 @@ impl KernelStoreGateway {
                 "committed normalization retention was not visible on exact readback",
             )
         })?;
+        CanonicalUserAutomationStore::<BorrowedCanonicalStoreClient<'_>>::
+            validate_normalization_write_receipt(&record, &receipt)
+            .map_err(user_automation_gateway_unknown)?;
         let (original, retained_revision, retained_envelope) =
             super::user_automation_store::validate_normalization_record(&record)
                 .map_err(user_automation_gateway_unknown)?;
         if !Self::same_normalization_intent(&original, request)
-            || retained_revision != *revision
-            || retained_envelope != *envelope
+            || retained_revision != **revision
+            || retained_envelope != **envelope
         {
             return Err(user_automation_gateway_unknown(
                 "committed normalization does not match its exact readback",

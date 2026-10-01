@@ -2251,15 +2251,15 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
         request: &UserAutomationStoreRequest,
     ) -> Result<BTreeMap<String, Value>, StoreError> {
         match &request.intent.operation {
-            operation @ UserAutomationOperation::Create {
+            operation @ (UserAutomationOperation::Create {
                 revision,
                 normalization_receipt_envelope,
             }
-            | operation @ UserAutomationOperation::Edit {
+            | UserAutomationOperation::Edit {
                 revision,
                 normalization_receipt_envelope,
                 ..
-            } => {
+            }) => {
                 self.validate_owner_normalization_result(
                     request,
                     revision,
