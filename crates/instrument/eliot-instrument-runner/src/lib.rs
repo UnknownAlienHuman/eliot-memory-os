@@ -92,6 +92,9 @@ pub use profile_run::{
     StageIdentity, StageLauncher, StageOrchestrator, StagePlan, StageTargetLayout,
     TestExecutionPlaneRoute, TestdPlaneAdmission, compose_provider_dispatch,
 };
+pub use profile_replay::{
+    ProfileReplayError, ProfileReplayReceipt, VerifiedTestdReplayContext, replay_profile_stream,
+};
 pub use provider_denominator::{
     ADVERTISED_INSTRUMENTS, AvailabilityInputs, ConformanceCase, ConformanceCorpus,
     ConformanceError, DENOMINATOR_CONTRACT, DENOMINATOR_CONTRACT_VERSION, ProviderAvailability,

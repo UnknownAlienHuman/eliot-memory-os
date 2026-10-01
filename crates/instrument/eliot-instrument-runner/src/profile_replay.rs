@@ -4,9 +4,13 @@ use std::collections::BTreeSet;
 
 use eliot_contracts::{ArtifactId, ClockReading, StateFence, sha256_hex};
 use eliot_instrument_api::{EvidenceCoverage, RawEvidence, RawEvidenceSource, VerificationOutcome};
+use eliot_process::{ExitDisposition, ExitStatus};
 use eliot_instrument_nextest::{
     NEXTEST_INSTRUMENT, NEXTEST_STDOUT_CONTENT_TYPE, parse_jsonl, parse_list_json,
 };
+use eliot_instrument_cargo::{CONTRACT_NAME as CARGO_INSTRUMENT, parse_jsonl as parse_cargo_jsonl};
+use eliot_instrument_rustc::{RUSTC_INSTRUMENT, parse_clippy_jsonl};
+use eliot_instrument_rustfmt::{RUSTFMT_INSTRUMENT, parse_output as parse_rustfmt_output};
 use eliot_testd_core::{
     EphemeralSourceBytes, InstrumentStageRequest, StageExecutionKind, TESTD_LIST_PROFILE,
     TestdEvaluationObservation, TestdEvaluationStatus, TestdParsingObservation, TestdParsingStatus,
@@ -16,8 +20,105 @@ use thiserror::Error;
 
 use crate::{
     profile::{InstrumentRegistry, ProfileCompiler},
-    registry::{ProviderRegistry, RegistryEntry, RegistryError, RegistryFreshness},
+    registry::{InvalidationSet, ProviderRegistry, RegistryEntry, RegistryError, RegistryFreshness},
 };
+
+/// Kernel/owner-issued replay context bound to one exact accepted catalog row
+/// and one independently observed provider fingerprint set.
+///
+/// The context is deliberately not constructible from a Testd material
+/// projection. Callers mint it from a current `ModuleCatalogOwnerReadback`,
+/// the corresponding accepted `GenerationAdmission`, and current fingerprint
+/// observations, then retain the required profile/provider IDs separately
+/// from the stage projection.
+#[derive(Clone, Debug)]
+pub struct VerifiedTestdReplayContext {
+    profile_registry: InstrumentRegistry,
+    provider_registry: ProviderRegistry,
+    fingerprints: InvalidationSet,
+    required_profile_ids: BTreeSet<String>,
+    required_provider_ids: BTreeSet<(String, String)>,
+    required_test_ids: BTreeSet<String>,
+}
+
+impl VerifiedTestdReplayContext {
+    /// Issues a replay context only after the exact current catalog readback
+    /// revalidates its accepted module generation. `required_provider_ids`
+    /// are `(instrument, adapter)` identities selected independently by the
+    /// caller; they are not derived from Testd's stage material.
+    pub fn from_owner_readback(
+        profile_registry: InstrumentRegistry,
+        readback: &eliot_module_registry::ModuleCatalogOwnerReadback,
+        expected_owner_revision: u64,
+        expected_catalog_revision: u64,
+        expected_state_fence: &StateFence,
+        admission: &eliot_module_registry::GenerationAdmission,
+        normative_pair_digest: String,
+        fingerprints: InvalidationSet,
+        required_profile_ids: BTreeSet<String>,
+        required_provider_ids: BTreeSet<(String, String)>,
+        required_test_ids: BTreeSet<String>,
+    ) -> Result<Self, ProfileReplayError> {
+        let lifecycle = readback.verify_generation_admission(
+            expected_owner_revision,
+            expected_catalog_revision,
+            expected_state_fence,
+            admission,
+        )?;
+        if required_profile_ids.is_empty() {
+            return Err(ProfileReplayError::EmptyRequiredProfiles);
+        }
+        if required_provider_ids.is_empty() {
+            return Err(ProfileReplayError::EmptyRequiredProviders);
+        }
+        let provider_registry = ProviderRegistry::ready_for_catalog_generation(
+            lifecycle,
+            normative_pair_digest,
+            &fingerprints,
+        )?;
+        Ok(Self {
+            profile_registry,
+            provider_registry,
+            fingerprints,
+            required_profile_ids,
+            required_provider_ids,
+            required_test_ids,
+        })
+    }
+
+    /// Replays bytes already read back from the owner through the context's
+    /// exact current registries and independently retained required IDs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn replay_stream(
+        &self,
+        stage: &InstrumentStageRequest,
+        source: &TestdStreamEvidenceBinding,
+        bytes: &EphemeralSourceBytes,
+        terminal: Option<&ExitStatus>,
+        started_at: ClockReading,
+        finished_at: ClockReading,
+    ) -> Result<ProfileReplayReceipt, ProfileReplayError> {
+        let provider_freshness = RegistryFreshness {
+            generation: self.provider_registry.generation(),
+            normative_pair_digest: self.provider_registry.normative_pair_digest(),
+            fingerprints: &self.fingerprints,
+        };
+        replay_profile_stream_admitted(
+            &self.profile_registry,
+            &self.provider_registry,
+            &provider_freshness,
+            stage,
+            source,
+            bytes,
+            &self.required_profile_ids,
+            &self.required_provider_ids,
+            &self.required_test_ids,
+            terminal,
+            started_at,
+            finished_at,
+        )
+    }
+}
 
 /// Parser/evaluator identities and result from replaying one immutable source.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -62,6 +163,21 @@ pub enum ProfileReplayError {
     /// The provider registry could not resolve a current entry.
     #[error(transparent)]
     Registry(#[from] RegistryError),
+    /// Exact catalog readback failed its owner-revision/admission checks.
+    #[error(transparent)]
+    Catalog(#[from] eliot_module_registry::ModuleRegistryAdmissionError),
+    /// Production replay context omitted its independently retained profile set.
+    #[error("replay context has no required profile IDs")]
+    EmptyRequiredProfiles,
+    /// Production replay context omitted its independently retained provider set.
+    #[error("replay context has no required provider IDs")]
+    EmptyRequiredProviders,
+    /// Stage profile is outside the independently retained required profile set.
+    #[error("retained profile is not in the required profile set")]
+    UnrequiredProfile,
+    /// Resolved provider is outside the independently retained provider set.
+    #[error("resolved provider is not in the required provider set")]
+    UnrequiredProvider,
     /// Typed source binding is not an exact, complete verified readback.
     #[error("typed source is not replayable: {detail}")]
     SourceBinding { detail: String },
@@ -109,13 +225,82 @@ pub fn replay_profile_stream(
     started_at: ClockReading,
     finished_at: ClockReading,
 ) -> Result<ProfileReplayReceipt, ProfileReplayError> {
+    replay_profile_stream_inner(
+        profile_registry,
+        provider_registry,
+        freshness,
+        stage,
+        source,
+        bytes,
+        None,
+        None,
+        required_test_ids,
+        None,
+        started_at,
+        finished_at,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replay_profile_stream_admitted(
+    profile_registry: &InstrumentRegistry,
+    provider_registry: &ProviderRegistry,
+    freshness: &RegistryFreshness<'_>,
+    stage: &InstrumentStageRequest,
+    source: &TestdStreamEvidenceBinding,
+    bytes: &EphemeralSourceBytes,
+    required_profile_ids: &BTreeSet<String>,
+    required_provider_ids: &BTreeSet<(String, String)>,
+    required_test_ids: &BTreeSet<String>,
+    terminal: Option<&ExitStatus>,
+    started_at: ClockReading,
+    finished_at: ClockReading,
+) -> Result<ProfileReplayReceipt, ProfileReplayError> {
+    replay_profile_stream_inner(
+        profile_registry,
+        provider_registry,
+        freshness,
+        stage,
+        source,
+        bytes,
+        Some(required_profile_ids),
+        Some(required_provider_ids),
+        required_test_ids,
+        Some(terminal),
+        started_at,
+        finished_at,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replay_profile_stream_inner(
+    profile_registry: &InstrumentRegistry,
+    provider_registry: &ProviderRegistry,
+    freshness: &RegistryFreshness<'_>,
+    stage: &InstrumentStageRequest,
+    source: &TestdStreamEvidenceBinding,
+    bytes: &EphemeralSourceBytes,
+    required_profile_ids: Option<&BTreeSet<String>>,
+    required_provider_ids: Option<&BTreeSet<(String, String)>>,
+    required_test_ids: &BTreeSet<String>,
+    terminal: Option<&ExitStatus>,
+    started_at: ClockReading,
+    finished_at: ClockReading,
+) -> Result<ProfileReplayReceipt, ProfileReplayError> {
     stage
         .validate()
         .map_err(|error| ProfileReplayError::InvalidStage {
             detail: error.to_string(),
         })?;
-    let (entry, parser_revision) =
-        current_selection(profile_registry, provider_registry, freshness, stage)?;
+    let (entry, parser_revision) = current_selection(profile_registry, provider_registry, freshness, stage)?;
+    if required_profile_ids.is_some_and(|required| !required.contains(&stage.profile_name)) {
+        return Err(ProfileReplayError::UnrequiredProfile);
+    }
+    if required_provider_ids.is_some_and(|required| {
+        !required.contains(&(entry.instrument.as_str().to_owned(), entry.adapter.clone()))
+    }) {
+        return Err(ProfileReplayError::UnrequiredProvider);
+    }
     let verified = verify_source(source, bytes)?;
     if source.stream == eliot_process::ProcessStreamKind::Stderr {
         return stderr_receipt(source, verified, entry, parser_revision, finished_at);
@@ -130,20 +315,27 @@ pub fn replay_profile_stream(
     {
         return Err(ProfileReplayError::UnsupportedContentType);
     }
-    if stage.profile_name == TESTD_LIST_PROFILE {
+    if stage.stage_id == "nextest-list" && entry.instrument.as_str() == NEXTEST_INSTRUMENT {
         return list_receipt(source, verified, bytes, entry, parser_revision, finished_at);
     }
-    run_receipt(
-        source,
-        verified,
-        bytes,
-        stage,
-        entry,
-        parser_revision,
-        required_test_ids,
-        started_at,
-        finished_at,
-    )
+    match entry.instrument.as_str() {
+        CARGO_INSTRUMENT => cargo_receipt(source, verified, bytes, entry, parser_revision, terminal, finished_at),
+        RUSTC_INSTRUMENT => rustc_receipt(source, verified, bytes, entry, parser_revision, terminal, finished_at),
+        RUSTFMT_INSTRUMENT => rustfmt_receipt(source, verified, bytes, entry, parser_revision, terminal, finished_at),
+        NEXTEST_INSTRUMENT => run_receipt(
+            source,
+            verified,
+            bytes,
+            stage,
+            entry,
+            parser_revision,
+            required_test_ids,
+            terminal,
+            started_at,
+            finished_at,
+        ),
+        _ => Err(ProfileReplayError::UnsupportedProfile { profile: stage.profile_name.clone() }),
+    }
 }
 
 fn current_selection<'a>(
@@ -215,6 +407,16 @@ fn current_selection<'a>(
             return Err(ProfileReplayError::StageMismatch { field });
         }
     }
+    let retained_command = stage
+        .stage_command
+        .as_ref()
+        .ok_or(ProfileReplayError::StageMismatch { field: "stage_command" })?;
+    if retained_command.executable != selected.command.executable
+        || retained_command.argv != selected.command.argv
+        || retained_command.spec_digest != selected.spec_digest
+    {
+        return Err(ProfileReplayError::StageMismatch { field: "stage_command" });
+    }
     let entry = provider_registry.resolve_current(&stage.invocation, freshness)?;
     let retained_freshness = stage
         .provider_freshness
@@ -251,10 +453,14 @@ fn current_selection<'a>(
             return Err(ProfileReplayError::StageMismatch { field });
         }
     }
-    if stage.execution != StageExecutionKind::Process
-        || stage.kind != eliot_instrument_api::InstrumentKind::Test
-        || entry.instrument.as_str() != NEXTEST_INSTRUMENT
-    {
+    let supported_process = match entry.instrument.as_str() {
+        CARGO_INSTRUMENT => matches!(stage.kind, eliot_instrument_api::InstrumentKind::Build | eliot_instrument_api::InstrumentKind::Test),
+        RUSTC_INSTRUMENT => stage.kind == eliot_instrument_api::InstrumentKind::Build,
+        RUSTFMT_INSTRUMENT => stage.kind == eliot_instrument_api::InstrumentKind::Format,
+        NEXTEST_INSTRUMENT => stage.kind == eliot_instrument_api::InstrumentKind::Test,
+        _ => false,
+    };
+    if stage.execution != StageExecutionKind::Process || !supported_process {
         return Err(ProfileReplayError::UnsupportedProfile {
             profile: stage.profile_name.clone(),
         });
@@ -378,6 +584,177 @@ fn list_receipt(
     ))
 }
 
+fn cargo_receipt(
+    source: &TestdStreamEvidenceBinding,
+    verified: VerifiedSource<'_>,
+    bytes: &EphemeralSourceBytes,
+    entry: &RegistryEntry,
+    parser_revision: String,
+    terminal: Option<&ExitStatus>,
+    finished_at: ClockReading,
+) -> Result<ProfileReplayReceipt, ProfileReplayError> {
+    let report = match parse_cargo_jsonl(bytes.bytes()) {
+        Ok(report) => report,
+        Err(error) => return parse_failed_receipt(source, verified, entry, parser_revision, error.to_string(), finished_at),
+    };
+    // Cargo's build-finished record and error diagnostics are its evaluator
+    // contract. Missing build-finished remains Unknown.
+    let outcome = terminal_outcome(report.outcome(), terminal);
+    evaluated_report_receipt(
+        source,
+        verified,
+        entry,
+        parser_revision,
+        outcome,
+        "cargo-json-message-outcome",
+        finished_at,
+    )
+}
+
+fn rustc_receipt(
+    source: &TestdStreamEvidenceBinding,
+    verified: VerifiedSource<'_>,
+    bytes: &EphemeralSourceBytes,
+    entry: &RegistryEntry,
+    parser_revision: String,
+    terminal: Option<&ExitStatus>,
+    finished_at: ClockReading,
+) -> Result<ProfileReplayReceipt, ProfileReplayError> {
+    let report = match parse_clippy_jsonl(bytes.bytes()) {
+        Ok(report) => report,
+        Err(error) => return parse_failed_receipt(source, verified, entry, parser_revision, error.to_string(), finished_at),
+    };
+    // Clippy's JSON has no terminal-success record. Diagnostics can prove a
+    // compiler error; absence of errors alone cannot prove a successful exit.
+    let outcome = terminal_outcome(report.outcome(), terminal);
+    evaluated_report_receipt(
+        source,
+        verified,
+        entry,
+        parser_revision,
+        outcome,
+        "clippy-json-diagnostic-outcome",
+        finished_at,
+    )
+}
+
+fn rustfmt_receipt(
+    source: &TestdStreamEvidenceBinding,
+    verified: VerifiedSource<'_>,
+    bytes: &EphemeralSourceBytes,
+    entry: &RegistryEntry,
+    parser_revision: String,
+    terminal: Option<&ExitStatus>,
+    finished_at: ClockReading,
+) -> Result<ProfileReplayReceipt, ProfileReplayError> {
+    match parse_rustfmt_output(bytes.bytes()) {
+        Ok(report) => evaluated_report_receipt(
+            source,
+            verified,
+            entry,
+            parser_revision,
+            // Rustfmt needs the exact process exit from the ProcessExecutor
+            // observation; a missing or nonterminal status remains Unknown.
+            report.outcome(terminal_code(terminal), terminal_cancelled(terminal)),
+            "rustfmt-output-and-terminal-outcome",
+            finished_at,
+        ),
+        Err(error) => parse_failed_receipt(source, verified, entry, parser_revision, error.to_string(), finished_at),
+    }
+}
+
+fn terminal_code(terminal: Option<&ExitStatus>) -> Option<i32> {
+    terminal
+        .filter(|status| status.disposition() == ExitDisposition::Completed)
+        .and_then(ExitStatus::code)
+}
+
+fn terminal_cancelled(terminal: Option<&ExitStatus>) -> bool {
+    terminal.is_some_and(|status| status.disposition() == ExitDisposition::Cancelled)
+}
+
+fn terminal_outcome(parsed: VerificationOutcome, terminal: Option<&ExitStatus>) -> VerificationOutcome {
+    match terminal.map(ExitStatus::disposition) {
+        Some(ExitDisposition::Completed) if terminal_code(terminal) == Some(0) => parsed,
+        Some(ExitDisposition::Completed) => VerificationOutcome::Fail,
+        Some(ExitDisposition::Cancelled) => VerificationOutcome::Cancelled,
+        Some(ExitDisposition::Signalled | ExitDisposition::ResourceLimit | ExitDisposition::Unknown)
+        | None => match parsed {
+            VerificationOutcome::Fail => VerificationOutcome::Fail,
+            _ => VerificationOutcome::Unknown,
+        },
+    }
+}
+
+fn parse_failed_receipt(
+    source: &TestdStreamEvidenceBinding,
+    verified: VerifiedSource<'_>,
+    entry: &RegistryEntry,
+    parser_revision: String,
+    detail: String,
+    finished_at: ClockReading,
+) -> Result<ProfileReplayReceipt, ProfileReplayError> {
+    let parsing = parsing_observation(
+        source,
+        verified.readback_receipt_id,
+        entry,
+        parser_revision,
+        TestdParsingStatus::ParseFailed,
+        finished_at,
+    )?;
+    Ok(receipt_base(source, verified, Some(parsing), None, None, None, Some(detail)))
+}
+
+fn evaluated_report_receipt(
+    source: &TestdStreamEvidenceBinding,
+    verified: VerifiedSource<'_>,
+    entry: &RegistryEntry,
+    parser_revision: String,
+    outcome: VerificationOutcome,
+    evaluator_scope: &str,
+    finished_at: ClockReading,
+) -> Result<ProfileReplayReceipt, ProfileReplayError> {
+    let parsing = parsing_observation(
+        source,
+        verified.readback_receipt_id,
+        entry,
+        parser_revision.clone(),
+        TestdParsingStatus::Parsed,
+        finished_at,
+    )?;
+    let evaluation_status = match outcome {
+        VerificationOutcome::Pass => TestdEvaluationStatus::Pass,
+        VerificationOutcome::Fail => TestdEvaluationStatus::Fail,
+        VerificationOutcome::Partial
+        | VerificationOutcome::Blocked
+        | VerificationOutcome::Cancelled
+        | VerificationOutcome::Unknown => TestdEvaluationStatus::Inconclusive,
+    };
+    let evaluation = TestdEvaluationObservation::new(
+        entry.evaluator.to_string(),
+        entry.evaluator_version.to_string(),
+        evaluation_status,
+        evaluator_scope,
+        source.evidence_identity_sha256.clone(),
+        entry.parser.to_string(),
+        parser_revision,
+        verified.digest,
+        false,
+        verified.fence.clone(),
+        finished_at,
+    )
+    .map_err(|error| ProfileReplayError::Evaluator { detail: error.to_string() })?;
+    Ok(receipt_base(
+        source,
+        verified,
+        Some(parsing),
+        Some(evaluation),
+        Some(outcome),
+        None,
+        None,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_receipt(
     source: &TestdStreamEvidenceBinding,
@@ -387,6 +764,7 @@ fn run_receipt(
     entry: &RegistryEntry,
     parser_revision: String,
     required_test_ids: &BTreeSet<String>,
+    terminal: Option<&ExitStatus>,
     started_at: ClockReading,
     finished_at: ClockReading,
 ) -> Result<ProfileReplayReceipt, ProfileReplayError> {
@@ -405,6 +783,7 @@ fn run_receipt(
             parser_id,
             parser_revision,
             required_test_ids,
+            terminal,
             started_at,
             finished_at,
         );
@@ -438,6 +817,7 @@ fn evaluate_run(
     parser_id: String,
     parser_revision: String,
     required_test_ids: &BTreeSet<String>,
+    terminal: Option<&ExitStatus>,
     started_at: ClockReading,
     finished_at: ClockReading,
 ) -> Result<ProfileReplayReceipt, ProfileReplayError> {
@@ -471,7 +851,8 @@ fn evaluate_run(
         TestdParsingStatus::Parsed,
         finished_at,
     )?;
-    let evaluation_status = match run.outcome {
+    let outcome = terminal_outcome(run.outcome, terminal);
+    let evaluation_status = match outcome {
         VerificationOutcome::Pass => TestdEvaluationStatus::Pass,
         VerificationOutcome::Fail => TestdEvaluationStatus::Fail,
         VerificationOutcome::Partial
@@ -500,7 +881,7 @@ fn evaluate_run(
         verified,
         Some(parsing),
         Some(evaluation),
-        Some(run.outcome),
+        Some(outcome),
         Some(run.coverage),
         None,
     ))
