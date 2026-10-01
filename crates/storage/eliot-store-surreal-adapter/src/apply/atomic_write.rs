@@ -140,6 +140,8 @@ const SEMANTIC_CONFLICT_MARKERS: &[&str] = &[
     "finish_owner_create_conflict",
     "finish_task_owner_missing",
     "finish_task_owner_stale",
+    "finish_task_owner_ambiguous",
+    "finish_task_owner_malformed",
     "canonical_owner_cas_conflict",
     "canonical_owner_create_conflict",
     "module_registry_owner_cas_conflict",
@@ -1265,7 +1267,7 @@ fn append_finish_owner_statement(
     if receipt_json.len() > eliot_store_api::MAX_RECOVERY_RECORD_BYTES {
         return Err(AdapterError::Store(StoreError::PayloadTooLarge));
     }
-    let (task_id, task_revision) = finish_decision_task_binding(receipt_json)?;
+    let (task_id, task_revision) = finish_decision_task_binding(receipt_json, attempt_id)?;
     append_finish_task_owner_guard(sql, bindings, transition, &task_id, task_revision)?;
 
     let finish_key =
@@ -1356,57 +1358,56 @@ fn finish_evidence_task_binding(snapshot_json: &str) -> Result<(String, u64), Ad
     Ok((task_id.to_owned(), task_revision))
 }
 
-/// Extracts one exact task/revision binding from the persisted decision
-/// receipts. Every receipt in the existing payload must agree; a mixed or
-/// empty image cannot authorize a task-currentness assertion.
-fn finish_decision_task_binding(receipt_json: &str) -> Result<(String, u64), AdapterError> {
+/// Selects the admitted operation's exact receipt from the historical receipt
+/// collection by its attempt identity. Older receipts remain part of the owner
+/// image, but they do not describe the task state this operation asserts as
+/// current.
+fn finish_decision_task_binding(
+    receipt_json: &str,
+    attempt_id: &str,
+) -> Result<(String, u64), AdapterError> {
     let receipts: Vec<Value> = serde_json::from_str(receipt_json).map_err(|_| {
         AdapterError::Store(StoreError::InvalidField {
             field: "finish.receipt_json",
             reason: "must contain canonical Finish decision receipts",
         })
     })?;
-    let mut binding: Option<(String, u64)> = None;
-    for receipt in receipts {
-        let task_id = receipt
-            .get("task_id")
-            .and_then(Value::as_str)
-            .filter(|task_id| !task_id.trim().is_empty())
-            .ok_or(AdapterError::Store(StoreError::InvalidField {
-                field: "finish.receipt_json",
-                reason: "missing Finish decision task id",
-            }))?;
-        let task_revision = receipt
-            .get("task_revision")
-            .and_then(Value::as_u64)
-            .filter(|revision| *revision > 0)
-            .ok_or(AdapterError::Store(StoreError::InvalidField {
-                field: "finish.receipt_json",
-                reason: "missing Finish decision task revision",
-            }))?;
-        let current = (task_id.to_owned(), task_revision);
-        if binding
-            .as_ref()
-            .is_some_and(|previous| previous != &current)
-        {
-            return Err(AdapterError::Store(StoreError::InvalidField {
-                field: "finish.receipt_json",
-                reason: "Finish decisions disagree on task identity or revision",
-            }));
-        }
-        binding = Some(current);
-    }
-    binding.ok_or(AdapterError::Store(StoreError::InvalidField {
+    let mut admitted_receipts = receipts.iter().filter(|receipt| {
+        receipt.get("attempt_id").and_then(Value::as_str) == Some(attempt_id)
+    });
+    let receipt = admitted_receipts.next().ok_or(AdapterError::Store(StoreError::InvalidField {
         field: "finish.receipt_json",
-        reason: "must contain at least one Finish decision receipt",
-    }))
+        reason: "missing Finish decision receipt for the admitted attempt",
+    }))?;
+    if admitted_receipts.next().is_some() {
+        return Err(AdapterError::Store(StoreError::InvalidField {
+            field: "finish.receipt_json",
+            reason: "multiple Finish decision receipts match the admitted attempt",
+        }));
+    }
+    let task_id = receipt
+        .get("task_id")
+        .and_then(Value::as_str)
+        .filter(|task_id| !task_id.trim().is_empty())
+        .ok_or(AdapterError::Store(StoreError::InvalidField {
+            field: "finish.receipt_json",
+            reason: "missing Finish decision task id",
+        }))?;
+    let task_revision = receipt
+        .get("task_revision")
+        .and_then(Value::as_u64)
+        .filter(|revision| *revision > 0)
+        .ok_or(AdapterError::Store(StoreError::InvalidField {
+            field: "finish.receipt_json",
+            reason: "missing Finish decision task revision",
+        }))?;
+    Ok((task_id.to_owned(), task_revision))
 }
 
-/// Appends an atomic assertion against the same admitted TaskControl event
-/// history used by `GetTaskState`. Every canonical write first CASes the
-/// shared canonical fence, so a TaskControl commit that wins the race appears
-/// in this transaction's history; a later competing write cannot pass that
-/// fence CAS after this guard.
+/// Appends an atomic assertion against the same typed TaskControl projection
+/// used by `GetTaskState`. Every canonical write first CASes the shared
+/// canonical fence, so this comparison and the owner writes share the
+/// serialization point with every `UpdateTaskState` commit.
 fn append_finish_task_owner_guard(
     sql: &mut String,
     bindings: &mut Map<String, Value>,
@@ -1426,28 +1427,17 @@ fn append_finish_task_owner_guard(
             reason: "revision has no TaskControl predecessor",
         })
     })?;
-    let task_id_marker = format!(
-        "\"task_id\":{}",
-        serde_json::to_string(task_id).map_err(|error| {
-            AdapterError::Serialization(format!("Finish task id could not be encoded: {error}"))
-        })?
-    );
-    let task_revision_marker = format!(
-        "\"expected_revision\":{}",
-        serde_json::to_string(&prior_revision.to_string()).map_err(|error| {
-            AdapterError::Serialization(format!(
-                "Finish task revision could not be encoded: {error}"
-            ))
-        })?
-    );
     bindings.insert(
         "finish_task_scope".to_owned(),
         json!(transition.scope_id.as_str()),
     );
-    bindings.insert("finish_task_id_marker".to_owned(), json!(task_id_marker));
     bindings.insert(
-        "finish_task_revision_marker".to_owned(),
-        json!(task_revision_marker),
+        "finish_task_id".to_owned(),
+        json!(task_id),
+    );
+    bindings.insert(
+        "finish_task_expected_revision".to_owned(),
+        json!(prior_revision.to_string()),
     );
     sql.push_str(schema::TX_FINISH_TASK_OWNER_GUARD);
     Ok(())
