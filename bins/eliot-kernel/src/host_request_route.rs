@@ -1553,6 +1553,29 @@ impl KernelComposition {
         &self,
         record: &HostRequestRecord,
     ) -> Result<Option<eliot_store_api::WriteSubmission>, TransportError> {
+        self.validated_original_staged_observe_submission_with_terminal_reservation(record, false)
+    }
+
+    /// Reconstructs the same validated ORS-stage projection when the caller's
+    /// original response deadline has elapsed (or the mode is stage-only).
+    ///
+    /// A canonical Store receipt can finalize/release the reservation before
+    /// the daemon persists the correlated Host result. The retained terminal
+    /// reservation still proves that this exact original operation was staged;
+    /// the result path therefore exposes the original stage as pending until
+    /// the Host row carries the receipt. This never creates or infers a receipt.
+    fn validated_original_staged_observe_submission_after_stage(
+        &self,
+        record: &HostRequestRecord,
+    ) -> Result<Option<eliot_store_api::WriteSubmission>, TransportError> {
+        self.validated_original_staged_observe_submission_with_terminal_reservation(record, true)
+    }
+
+    fn validated_original_staged_observe_submission_with_terminal_reservation(
+        &self,
+        record: &HostRequestRecord,
+        allow_terminal_reservation: bool,
+    ) -> Result<Option<eliot_store_api::WriteSubmission>, TransportError> {
         if record.capability_ref.as_str() != OBSERVE_CAPABILITY
             || matches!(
                 record.state,
@@ -1588,7 +1611,7 @@ impl KernelComposition {
         else {
             return Ok(None);
         };
-        if reservation.state.is_terminal() {
+        if reservation.state.is_terminal() && !allow_terminal_reservation {
             return Ok(None);
         }
         let (operation, _, _, staged) =
@@ -1615,7 +1638,7 @@ impl KernelComposition {
             .load_write_reservation_by_operation(&operation_identity)
             .map_err(|_| TransportError::SessionFenced)?
             .ok_or(TransportError::SessionFenced)?;
-        if reservation.state.is_terminal() {
+        if reservation.state.is_terminal() && !allow_terminal_reservation {
             return Ok(None);
         }
         let write_binding = reservation
@@ -1811,11 +1834,15 @@ impl KernelComposition {
             if terminal {
                 return Ok((current, None));
             }
-            let stage = self.validated_original_staged_observe_submission(&current)?;
+            let remaining_ms = current.deadline_unix_ms.saturating_sub(unix_ms());
+            let stage = if response_mode == "accept_after_stage" || remaining_ms == 0 {
+                self.validated_original_staged_observe_submission_after_stage(&current)?
+            } else {
+                self.validated_original_staged_observe_submission(&current)?
+            };
             if response_mode == "accept_after_stage" && stage.is_some() {
                 return Ok((current, stage));
             }
-            let remaining_ms = current.deadline_unix_ms.saturating_sub(unix_ms());
             if remaining_ms == 0 {
                 return Ok((current, stage));
             }
