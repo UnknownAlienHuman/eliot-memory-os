@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{ArtifactId, StateFence};
-use eliot_epistemic_contracts::MAX_HANDLES;
+use eliot_epistemic_contracts::{MAX_HANDLES, MAX_SHORT_TEXT, MAX_STATEMENT_TEXT};
 use eliot_evidence::{Assertability, EvidenceEnvelope};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -21,8 +21,16 @@ use thiserror::Error;
 pub enum EpistemicError {
     #[error("{field} must be non-blank and free of control characters")]
     InvalidText { field: &'static str },
+    #[error("{field} exceeds its documented character ceiling")]
+    TextTooLong { field: &'static str },
     #[error("epistemic input has no records")]
     EmptyInput,
+    #[error("{field} carries {count} entries, above its admitted ceiling of {max}")]
+    TooManyEntries {
+        field: &'static str,
+        count: usize,
+        max: usize,
+    },
     #[error("epistemic input contains duplicate handle {0}")]
     DuplicateHandle(ArtifactId),
     #[error("record {handle} supersedes itself")]
@@ -51,12 +59,23 @@ pub enum EpistemicError {
     InvalidInquiry(String),
 }
 
-fn text(value: &str, field: &'static str) -> Result<(), EpistemicError> {
+/// Validates caller-supplied text and bounds it by an admitted ceiling.
+///
+/// The blank and control-character rules are the resolver's own; the ceiling is
+/// not invented here. It is taken from the owner crate `eliot_epistemic_contracts`,
+/// whose `error` module owns every variable-length bound for this domain
+/// (`MAX_SHORT_TEXT` / `MAX_STATEMENT_TEXT`) and applies the same two constants to
+/// the same shapes in its own `PositionRequest` and admitted-record contracts.
+/// Without this bound a direct library caller could present unbounded
+/// caller text; the wire boundary is not the only protection.
+fn text(value: &str, field: &'static str, max: usize) -> Result<(), EpistemicError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
-        Err(EpistemicError::InvalidText { field })
-    } else {
-        Ok(())
+        return Err(EpistemicError::InvalidText { field });
     }
+    if value.chars().count() > max {
+        return Err(EpistemicError::TextTooLong { field });
+    }
+    Ok(())
 }
 
 /// The resolver's position algebra. `Assumed` is deliberately a position
@@ -94,8 +113,8 @@ impl EpistemicRecord {
         requested_scope: &str,
         fence: &StateFence,
     ) -> Result<(), EpistemicError> {
-        text(self.subject.as_str(), "record.subject")?;
-        text(self.scope.as_str(), "record.scope")?;
+        text(self.subject.as_str(), "record.subject", MAX_SHORT_TEXT)?;
+        text(self.scope.as_str(), "record.scope", MAX_SHORT_TEXT)?;
         if self.scope != requested_scope {
             return Err(EpistemicError::ScopeMismatch {
                 handle: self.handle.clone(),
@@ -127,7 +146,7 @@ impl EpistemicRecord {
             }
         }
         if let Some(note) = &self.note {
-            text(note, "record.note")?;
+            text(note, "record.note", MAX_STATEMENT_TEXT)?;
         }
         Ok(())
     }
@@ -155,14 +174,41 @@ impl PositionRequest {
     /// reaching [`crate::resolve`] as ordinary absence. The refusal happens at
     /// this boundary, so no evidence is destroyed: [`crate::resolve`] derives
     /// no position and drops no provenance for a request it never admits.
+    ///
+    /// The text, record and edge ceilings are established here, before the
+    /// handle index is built, so this method is the protection for a direct
+    /// library caller and not merely a second check behind a wire boundary.
     pub fn validate(&self) -> Result<(), EpistemicError> {
-        text(self.question.as_str(), "question")?;
-        text(self.scope.as_str(), "scope")?;
+        text(self.question.as_str(), "question", MAX_STATEMENT_TEXT)?;
+        text(self.scope.as_str(), "scope", MAX_SHORT_TEXT)?;
         self.state_fence
             .validate()
             .map_err(|_| EpistemicError::InvalidFence)?;
         if self.records.is_empty() {
             return Err(EpistemicError::EmptyInput);
+        }
+        // The read set and every supersession edge are bounded by the ceiling the
+        // owner crate admits for one request's records and supersession links, so
+        // the index and the lineage walk below are sized by an admitted limit
+        // rather than by whatever a direct library caller presented. This runs
+        // before the index is built, as the validation boundary requires.
+        if self.records.len() > MAX_HANDLES {
+            return Err(EpistemicError::TooManyEntries {
+                field: "records",
+                count: self.records.len(),
+                max: MAX_HANDLES,
+            });
+        }
+        if let Some(record) = self
+            .records
+            .iter()
+            .find(|record| record.supersedes.len() > MAX_HANDLES)
+        {
+            return Err(EpistemicError::TooManyEntries {
+                field: "record.supersedes",
+                count: record.supersedes.len(),
+                max: MAX_HANDLES,
+            });
         }
         // Unique handles are established first, because the lineage walk below
         // needs exactly one record per handle to be well defined.
