@@ -772,7 +772,7 @@ impl OrsReserve {
         issued_at_ms: u64,
     ) -> CapacityPermitBinding {
         let sequence = self.inner.permit_sequence.fetch_add(1, Ordering::AcqRel);
-        let binding = CapacityPermitBinding {
+        CapacityPermitBinding {
             permit_id: format!(
                 "ORS-{}-{sequence}-{}",
                 request.operation.as_contract_str(),
@@ -795,8 +795,7 @@ impl OrsReserve {
             owner_evidence_refs: vec![
                 self.issue_evidence(dimension, request.operation.capacity_class()),
             ],
-        };
-        binding
+        }
     }
 
     /// Records the owner's contemporaneous partition observation for one issuance.
