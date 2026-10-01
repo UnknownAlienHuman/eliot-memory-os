@@ -51,14 +51,25 @@
 //!   one disposition;
 //! - the public hook branch itself, end to end through argv, bounded
 //!   acquisition, decode, the real [`EliotHookService`], and the host decision
-//!   write: one accepted payload and one refused over-limit payload, where the
-//!   refused run is observed to have written no spool record.
+//!   write, with the runtime root supplied by the caller: an accepted payload
+//!   spools exactly one record into that root, and an over-limit payload is
+//!   refused carrying the published ceiling and the terminator finding, leaving
+//!   the record count where the accepted run left it.
 //!
-//! They do not run [`run_hook_intake`], which takes no reader and can only be
-//! served with the process's own standard input; it is exercised through
-//! [`run_hook_intake_with`], which is that function's entire body. Nothing
-//! here is proved about the decision document the process writes to its own
-//! stdout, because tests cannot capture the process stdout port.
+//! They do not run [`run_hook_intake`], which takes no reader and no root and
+//! can only be served with the process's own standard input and the process's
+//! own runtime home; it is exercised through [`run_hook_intake_with`], which is
+//! that function's entire body apart from those two supplies. The runtime root
+//! is therefore a parameter rather than an ambient read: a test must not move
+//! process-global state to relocate the spool, and `std::env::set_var` /
+//! `remove_var` are `unsafe` in edition 2024, which this crate forbids outright
+//! (`#![forbid(unsafe_code)]`) — there is no honest way to observe this branch's
+//! spool from a test without threading the root in, and threading it in keeps
+//! one production resolution path rather than adding a second. Nothing here is
+//! proved about [`hook_runtime_root`]'s own environment reading, for the same
+//! reason, and nothing here is proved about the decision document the process
+//! writes to its own stdout, because tests cannot capture the process stdout
+//! port.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -353,34 +364,54 @@ fn decode_hook_payload(record: &[u8]) -> Result<serde_json::Value, HookIntakeErr
 ///
 /// This is the argv entry point the binary's `main` calls with the process's
 /// real standard input. It adds nothing to [`run_hook_intake_with`] beyond
-/// supplying that reader.
+/// supplying that reader and resolving the runtime root from the process
+/// environment, which is the ONLY place the shipped process reads
+/// `ELIOT_GOVERNOR_CONFIG` / `LOCALAPPDATA` for this branch.
 pub fn run_hook_intake(argv: &[String]) -> Result<(), HookIntakeError> {
     let stdin = std::io::stdin();
     let stdin = stdin.lock();
-    run_hook_intake_with(argv, &mut std::io::BufReader::new(stdin))
+    let runtime_root = hook_runtime_root()?;
+    run_hook_intake_with(argv, &mut std::io::BufReader::new(stdin), &runtime_root)
 }
 
-/// Serves one `hook <event>` invocation against an injected host stdin.
+/// Serves one `hook <event>` invocation against an injected host stdin and an
+/// injected runtime root.
 ///
 /// The stdin/attach/decision contract is the retired `run_hook` contract:
 /// empty input parses as `{}`, a set non-empty `ELIOT_TASK_ID` attaches the
 /// session to a task, and only `result.decision.stdout` is written. Host stdin
 /// is first acquired under the published finite ceiling by
 /// [`acquire_hook_payload`], then decoded by [`decode_hook_payload`]; only an
-/// accepted and decodable payload is dispatched to [`EliotHookService`].
+/// accepted and decodable payload is dispatched to [`EliotHookService`], which
+/// spools under `runtime_root`.
 ///
-/// This is the whole public hook branch behind [`run_hook_intake`], and it
-/// takes host stdin as an ordinary `BufRead` parameter rather than reaching
-/// for the process handle. The seam exists so the branch is testable with a
-/// finite reader: there is no fake service, no substituted decision, and no
-/// no-op stand-in below this signature, so what a test observes is what the
-/// shipped process does. The event name still comes from argv alone, the
-/// `ELIOT_TASK_ID` attach signal and the runtime home are still read from the
-/// process environment exactly as before, and stdout is still the process
-/// stdout.
+/// This is the whole public hook branch behind [`run_hook_intake`]. It takes
+/// host stdin as an ordinary `BufRead` parameter rather than reaching for the
+/// process handle, and it takes the runtime root as an ordinary `&Path`
+/// parameter rather than resolving it from the process environment here. Both
+/// are supplies the caller owes the branch, and [`run_hook_intake`] supplies
+/// exactly what the shipped process supplies: the real standard input and the
+/// one real [`hook_runtime_root`] resolution.
+///
+/// The root is a parameter and not an ambient read for a reason beyond
+/// convenience. `std::env::set_var` / `std::env::remove_var` are `unsafe` in
+/// edition 2024 and this crate is `#![forbid(unsafe_code)]`, so relocating a
+/// run's spool by pointing `ELIOT_GOVERNOR_CONFIG` at a temporary directory is
+/// not an option a test here may take — the alternative would be to wrap those
+/// calls in `unsafe` or to `#[allow]` the lint, and both would be worse than
+/// passing the value the caller already has. Because the service takes its root
+/// as a plain constructor argument, one parameter carries it all the way down,
+/// so this adds no second resolution path: production still resolves the root
+/// exactly once, still from the same environment, and still hands it to the
+/// same [`EliotHookService::for_session`].
+///
+/// The event name still comes from argv alone, the `ELIOT_TASK_ID` attach
+/// signal is still read from the process environment exactly as before, and
+/// stdout is still the process stdout.
 pub fn run_hook_intake_with<R: std::io::BufRead>(
     argv: &[String],
     stdin: &mut R,
+    runtime_root: &Path,
 ) -> Result<(), HookIntakeError> {
     if argv.len() != 1 {
         return Err(HookIntakeError::MissingEvent(argv.len()));
@@ -392,7 +423,7 @@ pub fn run_hook_intake_with<R: std::io::BufRead>(
     let task_attached = std::env::var("ELIOT_TASK_ID")
         .ok()
         .is_some_and(|value| !value.trim().is_empty());
-    let result = EliotHookService::for_session(hook_runtime_root()?, task_attached)
+    let result = EliotHookService::for_session(runtime_root.to_path_buf(), task_attached)
         .process(kind, &payload)?;
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
@@ -774,10 +805,11 @@ mod tests {
     /// What it does NOT prove, and no reader should take from it: that no
     /// service was ever BUILT. `exit_code()` is a pure match that returns the
     /// argument exit for every intake refusal whether or not a service exists,
-    /// so the executed half cannot observe construction. The observed
-    /// no-spool-record half of the same property is proved where a real run can
-    /// be watched, in
-    /// `public_hook_branch_serves_an_accepted_payload_and_refuses_an_oversize_one_without_spooling`.
+    /// so the executed half cannot observe construction. What the executed half
+    /// does observe is that the refusal carried the right typed disposition and
+    /// that no additional spool record appeared under the root the same branch
+    /// runs against; that half is asserted in
+    /// `public_hook_branch_serves_an_accepted_payload_and_refuses_an_oversize_one`,
     ///
     /// A fake service is not used (forbidden), so the ordering is what carries
     /// the rest: the source scan below pins it in the real file.
@@ -843,64 +875,25 @@ mod tests {
         );
     }
 
-    /// Records that a test is holding `ELIOT_GOVERNOR_CONFIG` right now, so
-    /// no other test in this binary moves the same process environment
-    /// variable underneath it.
-    static GOVERNOR_CONFIG_SET: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
-
-    /// Points `ELIOT_GOVERNOR_CONFIG` at a `governor.toml` under `root`, so the
-    /// branch resolves its runtime home to `root` — the grandparent of the
-    /// config file — instead of the developer's `LOCALAPPDATA`. The value is
-    /// restored on drop, including on panic, so the branch's process
-    /// environment is not changed for anything that follows.
-    struct HookRuntimeHome {
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl HookRuntimeHome {
-        fn scoped(root: &std::path::Path) -> Self {
-            // A relative path would be joined onto whatever working directory the
-            // harness happens to use, so the temp root is made absolute first:
-            // `hook_runtime_root` takes the grandparent of this config file as the
-            // runtime home, and that must be this test's own directory.
-            let absolute = std::fs::canonicalize(root).expect("temp root must resolve");
-            let previous = std::env::var_os("ELIOT_GOVERNOR_CONFIG");
-            std::env::set_var("ELIOT_GOVERNOR_CONFIG", absolute.join("governor"));
-            assert!(
-                !GOVERNOR_CONFIG_SET.swap(true, Ordering::SeqCst),
-                "two tests must not hold ELIOT_GOVERNOR_CONFIG at once"
-            );
-            Self { previous }
-        }
-    }
-
-    impl Drop for HookRuntimeHome {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(previous) => std::env::set_var("ELIOT_GOVERNOR_CONFIG", previous),
-                None => std::env::remove_var("ELIOT_GOVERNOR_CONFIG"),
-            }
-            GOVERNOR_CONFIG_SET.store(false, Ordering::SeqCst);
-        }
-    }
-
     /// A private directory under the OS temp root that removes itself, so this
     /// test's spool observations are its own and leave nothing behind.
-    struct PrivateTempDir(std::path::PathBuf);
+    ///
+    /// The name carries the process id and the tag only. Two runs of this test
+    /// live in different processes (and two harnesses in different sessions),
+    /// and the tag is distinct per call, so that pair is unique without a clock:
+    /// adding a timestamp would only reintroduce the `u128`-versus-`u64`
+    /// uniqueness arithmetic that the pid makes unnecessary here.
+    struct PrivateTempDir(PathBuf);
 
     impl PrivateTempDir {
         fn new(tag: &str) -> Self {
-            let unique = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_nanos())
-                ^ u64::from(std::process::id());
-            let path = std::env::temp_dir().join(format!("eliot-hook-4601-{tag}-{unique}"));
+            let path =
+                std::env::temp_dir().join(format!("eliot-hook-4601-{tag}-{}", std::process::id()));
             std::fs::create_dir_all(&path).expect("temp dir must be creatable");
             Self(path)
         }
 
-        fn path(&self) -> &std::path::Path {
+        fn path(&self) -> &Path {
             &self.0
         }
 
@@ -918,38 +911,60 @@ mod tests {
         }
     }
 
-    /// D2: the public hook branch is driven end to end with finite readers.
+    /// D2: the public hook branch is driven end to end with finite readers and
+    /// a caller-supplied runtime root.
     ///
     /// This runs the same code the process runs for `hook session-start`,
     /// through argv, bounded acquisition, decode, the real
-    /// [`EliotHookService`], and the host decision write — with host stdin
-    /// injected instead of taken from the process. Nothing below is
-    /// substituted: there is no fake service and no stand-in decision, so the
-    /// spool directory the run touches is the owner's own.
+    /// [`EliotHookService`], and the host decision write — with host stdin and
+    /// the runtime root injected instead of taken from the process. Nothing
+    /// below is substituted: there is no fake service and no stand-in decision,
+    /// so the spool directory the run touches is the owner's own, under a
+    /// temporary root instead of the developer's `LOCALAPPDATA`.
     ///
-    /// It asserts, from the filesystem:
+    /// It asserts:
     ///
     /// - an accepted payload runs the whole branch and spools exactly one
-    ///   record — the accepted payload is dispatched, not silently dropped;
-    /// - an over-limit payload is refused as `StdinOversize` with the published
-    ///   limit and the argument exit code, and the run leaves no spool record
-    ///   at all, so over-limit input provably never reached the service or
-    ///   wrote spool state.
+    ///   record into that root — the accepted payload is dispatched, not
+    ///   silently dropped;
+    /// - an over-limit payload is refused as `StdinOversize`, carrying the
+    ///   published ceiling and `found_terminator: true` for the terminator the
+    ///   bounded resynchronization found, and exiting with the argument status.
     ///
-    /// The host decision document itself is written to the process's stdout
-    /// port, which a unit test cannot capture, so the decision CONTENT is not
-    /// asserted here and is not claimed to be.
+    /// It then asserts, from the filesystem, that the refused run left the
+    /// record count exactly where the accepted run put it: one. That is the
+    /// observed no-spool half of the property, and it is observed against the
+    /// branch's own root rather than asserted from an ordering, so an
+    /// over-limit payload that dispatched would show up here as a second
+    /// record.
+    ///
+    /// The root reaches this run as a parameter, and the honest reason is the
+    /// one recorded on [`run_hook_intake_with`]: this crate is
+    /// `#![forbid(unsafe_code)]` and `std::env::set_var` / `remove_var` are
+    /// `unsafe` in edition 2024, so there is no way to point
+    /// `ELIOT_GOVERNOR_CONFIG` at a temporary directory from a test without
+    /// wrapping the call in `unsafe` or allowing the lint. Threading the root
+    /// in — to a service that takes its root as a plain constructor argument —
+    /// relocates the spool without touching process-global state and leaves one
+    /// production resolution path, which is [`run_hook_intake`] calling
+    /// [`hook_runtime_root`] exactly once.
+    ///
+    /// What this therefore does NOT cover, stated so no reader over-trusts it:
+    /// [`hook_runtime_root`]'s own reading of `ELIOT_GOVERNOR_CONFIG` and
+    /// `LOCALAPPDATA` is unexercised here and remains covered only by its own
+    /// contract, and the host decision document itself is written to the
+    /// process's stdout port, which a unit test cannot capture, so the decision
+    /// CONTENT is not asserted and is not claimed to be.
     #[test]
-    fn public_hook_branch_serves_an_accepted_payload_and_refuses_an_oversize_one_without_spooling()
-    {
+    fn public_hook_branch_serves_an_accepted_payload_and_refuses_an_oversize_one() {
         let temp = PrivateTempDir::new("public-branch");
-        let _home = HookRuntimeHome::scoped(temp.path());
+        let root = temp.path();
         let event = vec!["session-start".to_owned()];
 
         // Accepted: the retired empty-input contract, so the payload is `{}`
         // and no host field is required.
         let mut empty_stdin = ChunkReader::new(b"", 4);
-        run_hook_intake_with(&event, &mut empty_stdin)
+        run_hook_intake_with(&event, &mut empty_stdin, root)
             .expect("the public branch must serve an accepted empty payload");
         assert_eq!(
             temp.spool_records(),
@@ -968,7 +983,7 @@ mod tests {
         over.push(b'\r');
         over.push(b'\n');
         let mut over_stdin = ChunkReader::new(&over, CR_SPLIT_FILL_CHUNK);
-        let error = run_hook_intake_with(&event, &mut over_stdin)
+        let error = run_hook_intake_with(&event, &mut over_stdin, root)
             .expect_err("an over-limit payload must be refused by the public branch");
         assert_eq!(error.code(), "HOOK_STDIN_OVERSIZE");
         assert_eq!(error.exit_code(), crate::INVALID_ARGUMENT_EXIT);
