@@ -972,7 +972,7 @@ impl Frame {
 /// established local EBP session and carries opaque capability/call references
 /// instead of a caller-minted `RequestIdentity`. This only admits its exact
 /// top-level selector at the framing layer; Kernel still performs the
-/// authenticated TestD role check and decodes the complete closed Blob DTO
+/// authenticated `TestD` role check and decodes the complete closed Blob DTO
 /// before consulting durable grant state or calling Store.
 fn is_identityless_blob_kernel_exchange(frame: &Frame) -> bool {
     if frame.kind != FrameKind::Request
@@ -986,8 +986,7 @@ fn is_identityless_blob_kernel_exchange(frame: &Frame) -> bool {
     let ProtocolPayload::Json(payload) = &frame.payload else {
         return false;
     };
-    payload.get("wire_id").and_then(Value::as_str)
-        == Some("eliot.kernel.blob-process-stream")
+    payload.get("wire_id").and_then(Value::as_str) == Some("eliot.kernel.blob-process-stream")
         && payload.get("wire_revision").and_then(Value::as_u64) == Some(1)
 }
 

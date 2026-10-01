@@ -57,8 +57,8 @@ use eliot_process::{ProcessEvidenceSink, ProcessExecutor};
 use eliot_store::BlobStore;
 use eliot_types::BlobRef;
 use serde::Serialize;
-use std::num::NonZeroU64;
 use std::collections::BTreeMap;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use super::rejected;
@@ -573,8 +573,7 @@ impl GovernedProfileService {
             inner: launcher,
             selections: &selections,
         };
-        let runs =
-            StageOrchestrator::launch_plan(runner, &plan, &bound_launcher).await;
+        let runs = StageOrchestrator::launch_plan(runner, &plan, &bound_launcher).await;
         render_resolved_report(&resolved, &admitted, &plan, runs, &selections, blob_store)
     }
 
@@ -797,10 +796,7 @@ impl StageLauncher for ProviderBoundStageLauncher<'_> {
         self.inner.port(stage)
     }
 
-    fn sink(
-        &self,
-        stage: &eliot_instrument_runner::PlannedStage,
-    ) -> Arc<dyn ProcessEvidenceSink> {
+    fn sink(&self, stage: &eliot_instrument_runner::PlannedStage) -> Arc<dyn ProcessEvidenceSink> {
         self.inner.sink(stage)
     }
 
@@ -886,9 +882,10 @@ fn selected_stage_admission(
                 ProviderDisposition::Unsupported { .. } => {
                     (None, "unresolved:unsupported".to_owned())
                 }
-                ProviderDisposition::UnsupportedByTestd { adapter, .. } => {
-                    (Some(adapter.clone()), "refused:unsupported-by-testd".to_owned())
-                }
+                ProviderDisposition::UnsupportedByTestd { adapter, .. } => (
+                    Some(adapter.clone()),
+                    "refused:unsupported-by-testd".to_owned(),
+                ),
                 ProviderDisposition::UnsupportedPlatform { .. } => {
                     (None, "refused:unsupported-platform".to_owned())
                 }

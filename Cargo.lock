@@ -961,6 +961,7 @@ name = "eliot-blob-api"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "eliot-contracts",
  "eliot-platform",
  "eliot-receipts",
  "eliot-security-contracts",
@@ -2372,6 +2373,7 @@ dependencies = [
 name = "eliot-kernel-service"
 version = "0.1.0"
 dependencies = [
+ "eliot-blob-api",
  "eliot-canonical",
  "eliot-contracts",
  "eliot-doctor-core",
@@ -3255,6 +3257,7 @@ version = "0.1.0"
 dependencies = [
  "eliot-backup",
  "eliot-blob",
+ "eliot-blob-api",
  "eliot-contracts",
  "eliot-installation",
  "eliot-ipc",
@@ -3262,6 +3265,7 @@ dependencies = [
  "eliot-observability-runtime",
  "eliot-platform",
  "eliot-platform-windows",
+ "eliot-process",
  "eliot-protocol",
  "eliot-runtime-contracts",
  "eliot-store-api",
@@ -3354,9 +3358,11 @@ dependencies = [
 name = "eliot-testd"
 version = "0.1.0"
 dependencies = [
+ "eliot-blob-api",
  "eliot-cli",
  "eliot-contracts",
  "eliot-instrument-api",
+ "eliot-instrument-runner",
  "eliot-platform",
  "eliot-platform-windows",
  "eliot-process",

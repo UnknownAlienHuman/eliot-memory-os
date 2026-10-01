@@ -104,18 +104,18 @@ use eliot_contracts::{
     RequestMetadata, ResourceGeneration, SourceId, StateFence, sha256_hex,
 };
 use eliot_instrument_api::{InstrumentContractError, InstrumentInvocation};
+use eliot_instrument_runner::registry::InvalidationSet;
 use eliot_instrument_runner::{
     ADMITTED_SCOPE_CLASS, AdmittedProfile, AvailabilityInputs, DeclaredEnvironmentDependency,
     ISOLATED_PROCESS_CLASS, InstrumentRegistry, InstrumentRequestPort, InstrumentRunner,
-    InstrumentSpec, ParityVerdict, PlannedStage, ProfileAggregate, ProfileCompiler, ProviderDispatch,
-    ProviderRegistry, RegistryEntry, RunnerError, StageEnvironment, StageEvidence, StageLauncher,
-    StageOrchestrator, SupplyChainReceipt, TargetLayout, VerificationProfileReceipt,
-    VerificationRouteRequest, WorkScope, admitted_profile_for_alias, compose_provider_dispatch,
-    host_platform, parity_summary,
+    InstrumentSpec, ParityVerdict, PlannedStage, ProfileAggregate, ProfileCompiler,
+    ProviderDispatch, ProviderRegistry, RegistryEntry, RunnerError, StageEnvironment,
+    StageEvidence, StageLauncher, StageOrchestrator, SupplyChainReceipt, TargetLayout,
+    VerificationProfileReceipt, VerificationRouteRequest, WorkScope, admitted_profile_for_alias,
+    compose_provider_dispatch, host_platform, parity_summary,
     profile::{PROFILE_ALIASES, TOOLCHAIN_PATH_ENV, builtin_specs},
     resolve_verification_route, verify_profile_parity,
 };
-use eliot_instrument_runner::registry::InvalidationSet;
 use eliot_process::{
     ActionLeaseRef, CancellationReceipt, DispatchAuthorityId, DispatchPermitAuthority,
     DispatchValidationContext, EnvironmentInheritance, EnvironmentProjection, EvidenceSinkError,

@@ -34,9 +34,9 @@ impl BlobCompressionPort for RleCompressionPort {
             {
                 count += 1;
             }
-            compressed
-                .try_reserve(2)
-                .map_err(|_| BlobError::Provider("Blob compression allocation failed".to_owned()))?;
+            compressed.try_reserve(2).map_err(|_| {
+                BlobError::Provider("Blob compression allocation failed".to_owned())
+            })?;
             compressed.push(count);
             compressed.push(value);
             cursor += usize::from(count);
@@ -72,19 +72,17 @@ impl BlobCompressionPort for RleCompressionPort {
                     "zero-length Blob run is invalid".to_owned(),
                 ));
             }
-            output_length = output_length
-                .checked_add(u64::from(count))
-                .ok_or_else(|| {
-                    BlobError::InvalidContract("Blob decompression length overflow".to_owned())
-                })?;
+            output_length = output_length.checked_add(u64::from(count)).ok_or_else(|| {
+                BlobError::InvalidContract("Blob decompression length overflow".to_owned())
+            })?;
             if output_length > max_output_bytes {
                 return Err(BlobError::InvalidContract(
                     "Blob decompression output ceiling exceeded".to_owned(),
                 ));
             }
-            plaintext
-                .try_reserve(usize::from(count))
-                .map_err(|_| BlobError::Provider("Blob decompression allocation failed".to_owned()))?;
+            plaintext.try_reserve(usize::from(count)).map_err(|_| {
+                BlobError::Provider("Blob decompression allocation failed".to_owned())
+            })?;
             plaintext.extend(std::iter::repeat_n(pair[1], usize::from(count)));
         }
         Ok(plaintext)

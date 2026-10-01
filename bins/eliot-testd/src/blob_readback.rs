@@ -16,8 +16,8 @@ use eliot_contracts::{ClockReading, canonical_json_bytes};
 use eliot_process::{DurableStreamLocatorKind, ProcessStreamKind};
 use eliot_testd_core::{
     AsyncProcessStreamSourceReadbackPort, ProcessStreamSourceReadbackFuture,
-    ProcessStreamSourceReadbackObservation, ProcessStreamSourceReadbackRequest,
-    TestdEvidenceError, TestdStreamDisposition, sha256_hex,
+    ProcessStreamSourceReadbackObservation, ProcessStreamSourceReadbackRequest, TestdEvidenceError,
+    TestdStreamDisposition, sha256_hex,
 };
 use serde::Serialize;
 
@@ -75,9 +75,10 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
         let mut offset = 0_u64;
         let mut bytes = Vec::new();
         bytes
-            .try_reserve(usize::try_from(request.expected_byte_length).map_err(|_| {
-                integrity_error(stream)
-            })?)
+            .try_reserve(
+                usize::try_from(request.expected_byte_length)
+                    .map_err(|_| integrity_error(stream))?,
+            )
             .map_err(|_| integrity_error(stream))?;
         let mut owner_generation = None;
         let mut readback_receipt_id: Option<String> = None;
@@ -94,12 +95,8 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
                 process_binding_json: process_binding_json.clone(),
                 process_binding_sha256: sha256_hex(process_binding_json.as_bytes()),
                 stream: match stream {
-                    ProcessStreamKind::Stdout => {
-                        eliot_blob_api::wire::ProcessStreamKind::Stdout
-                    }
-                    ProcessStreamKind::Stderr => {
-                        eliot_blob_api::wire::ProcessStreamKind::Stderr
-                    }
+                    ProcessStreamKind::Stdout => eliot_blob_api::wire::ProcessStreamKind::Stdout,
+                    ProcessStreamKind::Stderr => eliot_blob_api::wire::ProcessStreamKind::Stderr,
                 },
                 locator_kind: match request.locator_kind {
                     DurableStreamLocatorKind::Blob => {
@@ -122,7 +119,9 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
                 chunk_limit: PROCESS_STREAM_READBACK_MAX_CHUNK_BYTES,
                 deadline_ms: request.deadline_ms,
             };
-            wire_request.validate().map_err(|_| invalid_stream(stream))?;
+            wire_request
+                .validate()
+                .map_err(|_| invalid_stream(stream))?;
             let response = self.exchange.read_source_chunk(&wire_request).await?;
             let (
                 chunk,
@@ -218,8 +217,8 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
             return Err(integrity_error(stream));
         }
         let observed_at_unix_ms = observed_at.ok_or_else(|| integrity_error(stream))?;
-        let observed_at_unix_ms = i64::try_from(observed_at_unix_ms)
-            .map_err(|_| integrity_error(stream))?;
+        let observed_at_unix_ms =
+            i64::try_from(observed_at_unix_ms).map_err(|_| integrity_error(stream))?;
         Ok(ProcessStreamSourceReadbackObservation::new(
             bytes,
             request.expected_sha256.clone(),

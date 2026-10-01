@@ -3,11 +3,11 @@
 //! opens or authenticates a second transport.
 
 use eliot_blob_api::wire::{
-    BLOB_PROCESS_STREAM_CAPABILITY, BlobProcessStreamFrameRequest,
-    BlobProcessStreamFrameResponse, BlobProcessStreamOperationRequest,
-    BlobProcessStreamOperationResponse, PROCESS_STREAM_READBACK_MAX_CHUNK_BYTES,
-    ProcessStreamSinkWireRequest, ProcessStreamSinkWireResponse,
-    ProcessStreamSourceReadbackRequest, ProcessStreamSourceReadbackResponse,
+    BLOB_PROCESS_STREAM_CAPABILITY, BlobProcessStreamFrameRequest, BlobProcessStreamFrameResponse,
+    BlobProcessStreamOperationRequest, BlobProcessStreamOperationResponse,
+    PROCESS_STREAM_READBACK_MAX_CHUNK_BYTES, ProcessStreamSinkWireRequest,
+    ProcessStreamSinkWireResponse, ProcessStreamSourceReadbackRequest,
+    ProcessStreamSourceReadbackResponse,
 };
 use eliot_contracts::StateFence;
 use eliot_ipc::DeliveryOutcome;
@@ -39,9 +39,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             )));
         }
         let (fence, deadline_ms) = match &request.operation {
-            BlobProcessStreamOperationRequest::Sink { request } => {
-                sink_request_identity(request)
-            }
+            BlobProcessStreamOperationRequest::Sink { request } => sink_request_identity(request),
             BlobProcessStreamOperationRequest::SourceReadback { request } => {
                 (&request.fence, request.deadline_ms)
             }
@@ -84,9 +82,10 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
                 return Err(StoreClientError::BlobProcessStreamUnknownOutcome);
             }
         }
-        let response = transport.receive_frame(self.limits).await.map_err(|_| {
-            StoreClientError::BlobProcessStreamUnknownOutcome
-        })?;
+        let response = transport
+            .receive_frame(self.limits)
+            .await
+            .map_err(|_| StoreClientError::BlobProcessStreamUnknownOutcome)?;
         let decoded = decode_blob_frame_response(
             &response,
             self.requirement.connection_id.as_str(),
@@ -235,14 +234,24 @@ fn decode_blob_frame_response(
 
 fn sink_request_identity(request: &ProcessStreamSinkWireRequest) -> (&StateFence, u64) {
     match request {
-        ProcessStreamSinkWireRequest::Open { fence, deadline_ms, .. }
-        | ProcessStreamSinkWireRequest::Append { fence, deadline_ms, .. }
-        | ProcessStreamSinkWireRequest::Finalize { fence, deadline_ms, .. }
-        | ProcessStreamSinkWireRequest::Abort { fence, deadline_ms, .. }
-        | ProcessStreamSinkWireRequest::Readback { fence, deadline_ms, .. }
-        | ProcessStreamSinkWireRequest::Reconcile { fence, deadline_ms, .. } => {
-            (fence, *deadline_ms)
+        ProcessStreamSinkWireRequest::Open {
+            fence, deadline_ms, ..
         }
+        | ProcessStreamSinkWireRequest::Append {
+            fence, deadline_ms, ..
+        }
+        | ProcessStreamSinkWireRequest::Finalize {
+            fence, deadline_ms, ..
+        }
+        | ProcessStreamSinkWireRequest::Abort {
+            fence, deadline_ms, ..
+        }
+        | ProcessStreamSinkWireRequest::Readback {
+            fence, deadline_ms, ..
+        }
+        | ProcessStreamSinkWireRequest::Reconcile {
+            fence, deadline_ms, ..
+        } => (fence, *deadline_ms),
     }
 }
 
@@ -266,8 +275,7 @@ fn valid_chunk_response(
         } => {
             *chunk_offset == request.offset
                 && bytes.len() <= PROCESS_STREAM_READBACK_MAX_CHUNK_BYTES as usize
-                && chunk_offset.saturating_add(bytes.len() as u64)
-                    <= request.expected_byte_length
+                && chunk_offset.saturating_add(bytes.len() as u64) <= request.expected_byte_length
                 && *observed_byte_length == bytes.len() as u64
                 && observed_sha256 == &eliot_contracts::sha256_hex(bytes)
                 && ready_receipt_ref == &request.ready_receipt_ref

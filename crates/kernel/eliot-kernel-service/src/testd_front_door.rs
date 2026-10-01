@@ -66,8 +66,8 @@
 //! `eliot_testd_core::KernelProcessAdmissionRequest` names that owner type.
 
 use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
-use eliot_testd_core::InstrumentStageRequest;
 use eliot_process::FencingToken;
+use eliot_testd_core::InstrumentStageRequest;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -865,10 +865,12 @@ impl TestdAdmission {
             });
         }
         if let Some(stage) = &self.stage_request {
-            stage.validate().map_err(|_| KernelServiceError::InvalidField {
-                field: "testd_admission.stage_request",
-                reason: "stored profile stage identity is invalid",
-            })?;
+            stage
+                .validate()
+                .map_err(|_| KernelServiceError::InvalidField {
+                    field: "testd_admission.stage_request",
+                    reason: "stored profile stage identity is invalid",
+                })?;
             if stage.execution != eliot_testd_core::StageExecutionKind::Process {
                 return Err(KernelServiceError::InvalidField {
                     field: "testd_admission.stage_request",

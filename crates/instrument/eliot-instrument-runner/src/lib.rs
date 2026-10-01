@@ -84,14 +84,12 @@ pub use profile::{
     admitted_profile_for_alias, bundle_verification_profile, compiler_profile,
     package_verification_profile, test_profile,
 };
+pub use profile_replay::{ProfileReplayError, ProfileReplayReceipt, replay_profile_stream};
 pub use profile_run::{
     AggregateStatus, InstrumentRun, MappedStageLauncher, PlannedStage, ProfileAggregate,
     ProfileRunError, ProviderDispatch, RetainedExitOutcome, RetainedToolIdentity, StageEvidence,
     StageIdentity, StageLauncher, StageOrchestrator, StagePlan, StageTargetLayout,
     TestExecutionPlaneRoute, TestdPlaneAdmission, compose_provider_dispatch,
-};
-pub use profile_replay::{
-    ProfileReplayError, ProfileReplayReceipt, replay_profile_stream,
 };
 pub use provider_denominator::{
     ADVERTISED_INSTRUMENTS, AvailabilityInputs, ConformanceCase, ConformanceCorpus,
@@ -103,8 +101,8 @@ pub use provider_denominator::{
 pub use registry::{
     ATTESTED_IDENTITY_SLOTS, ExecutableIdentityCause, IdentitySlot, InvalidationSet,
     PROFILE_IDENTITY_SLOTS, ProfileIdentities, ProfileIdentityParams, ProviderRegistry,
-    RegistryEntry, RegistryError, RegistryFreshness, ResolvedExecutableIdentity,
-    SupplyChainReceipt, SupplyChainTable, REQUIRED_IDENTITY_SLOTS,
+    REQUIRED_IDENTITY_SLOTS, RegistryEntry, RegistryError, RegistryFreshness,
+    ResolvedExecutableIdentity, SupplyChainReceipt, SupplyChainTable,
 };
 pub use testd_port::{
     OmissionReason, RawEvidence, TestdAdmission, TestdAdmissionPort, TestdPortError,

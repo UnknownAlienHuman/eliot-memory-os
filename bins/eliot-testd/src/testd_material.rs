@@ -81,8 +81,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
-use eliot_testd_core::{InstrumentStageRequest, StageExecutionKind};
 use eliot_process::{ActionLeaseRef, FencingToken, Generation};
+use eliot_testd_core::{InstrumentStageRequest, StageExecutionKind};
 use serde::{Deserialize, Serialize};
 
 /// Bins-local dispatch file name, read from the executable directory only.
@@ -688,14 +688,20 @@ fn validate_blob_stream_material(
                     .to_owned(),
             )
         })?;
-        validate_wire_text(&stream.capability_ref, "testd_material.blob_stream.capability_ref")?;
+        validate_wire_text(
+            &stream.capability_ref,
+            "testd_material.blob_stream.capability_ref",
+        )?;
         if stream.tokens.is_empty() || stream.tokens.len() > 8_336 {
             return Err(TestdMaterialError::Contract(
                 "productive testd Blob stream grant has no bounded call-token table".to_owned(),
             ));
         }
         for (index, token) in stream.tokens.iter().enumerate() {
-            validate_wire_text(&token.reference, "testd_material.blob_stream.token.reference")?;
+            validate_wire_text(
+                &token.reference,
+                "testd_material.blob_stream.token.reference",
+            )?;
             if token.ordinal as usize != index + 1
                 || stream.tokens[..index]
                     .iter()

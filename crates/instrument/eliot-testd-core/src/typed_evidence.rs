@@ -2187,18 +2187,14 @@ async fn resolve_slot_async(
             stream: slot.stream,
             reason: "the admitted source is already purged",
         },
-        TestdStreamDisposition::RetentionBlocked => {
-            TestdEvidenceError::SourceRetentionBlocked {
-                stream: slot.stream,
-                reason: "retention still blocks readback of the admitted source",
-            }
-        }
-        TestdStreamDisposition::IntegrityBroken => {
-            TestdEvidenceError::SourceIntegrityBroken {
-                stream: slot.stream,
-                reason: "the admitted source already failed integrity verification",
-            }
-        }
+        TestdStreamDisposition::RetentionBlocked => TestdEvidenceError::SourceRetentionBlocked {
+            stream: slot.stream,
+            reason: "retention still blocks readback of the admitted source",
+        },
+        TestdStreamDisposition::IntegrityBroken => TestdEvidenceError::SourceIntegrityBroken {
+            stream: slot.stream,
+            reason: "the admitted source already failed integrity verification",
+        },
         TestdStreamDisposition::Stale => TestdEvidenceError::SourceStale {
             stream: slot.stream,
             reason: "the admitted source is already stale",

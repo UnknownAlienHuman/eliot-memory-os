@@ -55,12 +55,10 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use eliot_blob_api::wire::{BlobProcessStreamFrameRequest, BlobProcessStreamFrameResponse};
 use eliot_contracts::{
     ArtifactId, HostCorrelationDomain, HostCorrelationProjection, OperationId, RequestMetadata,
     ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
-};
-use eliot_blob_api::wire::{
-    BlobProcessStreamFrameRequest, BlobProcessStreamFrameResponse,
 };
 use eliot_ipc::NamedPipeTransport;
 use eliot_kernel_core::GenerationRoute;

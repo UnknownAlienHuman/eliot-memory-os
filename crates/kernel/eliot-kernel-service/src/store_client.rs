@@ -290,12 +290,9 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             protocol_version: server.selected_protocol,
             limits,
             request_counter: AtomicU64::new(1),
-            blob_process_stream_capability: server
-                .allowed_capabilities
-                .iter()
-                .any(|capability| {
-                    capability == eliot_blob_api::wire::BLOB_PROCESS_STREAM_CAPABILITY
-                }),
+            blob_process_stream_capability: server.allowed_capabilities.iter().any(|capability| {
+                capability == eliot_blob_api::wire::BLOB_PROCESS_STREAM_CAPABILITY
+            }),
             fault: AtomicU8::new(StoreClientFault::NONE),
         };
         client.verify_readiness().await?;
@@ -2719,9 +2716,7 @@ fn decode_server_hello(
         || !expected_capabilities.is_subset(&observed_capabilities)
         || observed_capabilities
             .difference(&expected_capabilities)
-            .any(|capability| {
-                *capability != eliot_blob_api::wire::BLOB_PROCESS_STREAM_CAPABILITY
-            })
+            .any(|capability| *capability != eliot_blob_api::wire::BLOB_PROCESS_STREAM_CAPABILITY)
         || observed_effects != expected_effects
     {
         return Err(StoreClientError::Contract(

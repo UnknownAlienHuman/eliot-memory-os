@@ -107,14 +107,13 @@ use eliot_blob_api::{
 };
 use eliot_process::{
     DurableProcessStreamSource, DurableStreamLocatorKind, PROCESS_STREAM_SINK_SCHEMA_VERSION,
-    ProcessStreamEvidence, ProcessStreamPrefixPreview, ProcessStreamSinkAbortReason,
-    ProcessStreamSinkAbortRequest, ProcessStreamSinkAppend, ProcessStreamSinkAppendDisposition,
-    ProcessStreamSinkCapacityCause, ProcessStreamSinkClient, ProcessStreamSinkError,
-    ProcessStreamSinkFenceReason, ProcessStreamSinkFinalizeRequest,
-    ProcessStreamSinkFuture, ProcessStreamSinkOpenRequest, ProcessStreamSinkReadback,
-    ProcessStreamSinkIntegrityReason, ProcessStreamKind,
-    ProcessStreamSinkSession, ProcessStreamSinkSessionView, ProcessStreamSinkState,
-    ProcessStreamSinkTerminal, ProcessStreamSinkTerminalCommandIdentity,
+    ProcessStreamEvidence, ProcessStreamKind, ProcessStreamPrefixPreview,
+    ProcessStreamSinkAbortReason, ProcessStreamSinkAbortRequest, ProcessStreamSinkAppend,
+    ProcessStreamSinkAppendDisposition, ProcessStreamSinkCapacityCause, ProcessStreamSinkClient,
+    ProcessStreamSinkError, ProcessStreamSinkFenceReason, ProcessStreamSinkFinalizeRequest,
+    ProcessStreamSinkFuture, ProcessStreamSinkIntegrityReason, ProcessStreamSinkOpenRequest,
+    ProcessStreamSinkReadback, ProcessStreamSinkSession, ProcessStreamSinkSessionView,
+    ProcessStreamSinkState, ProcessStreamSinkTerminal, ProcessStreamSinkTerminalCommandIdentity,
     ProcessStreamSinkUnknownOutcome, StreamEvidenceGap, StreamPersistenceStatus,
     StreamPreviewRepresentation, StreamTransportStatus,
 };

@@ -1254,7 +1254,6 @@ pub struct BlobProcessStreamReadbackRequest {
 impl BlobProcessStreamReadbackRequest {
     pub fn validate(&self) -> Result<(), BlobError> {
         self.process_source_binding.validate()?;
-        self.expected_content_hash.validate()?;
         canonical_sha256(&self.expected_plaintext_sha256, "expected_plaintext_sha256")?;
         valid_text(&self.ready_receipt_id, "ready_receipt_id")?;
         if self.expected_plaintext_length > BLOB_MAX_PLAINTEXT_BYTES
@@ -1351,27 +1350,23 @@ impl BlobStageRecoveryRequest {
         valid_text(&self.session_id, "session_id")?;
         valid_text(&self.terminal_id, "terminal_id")?;
         canonical_sha256(&self.open_request_sha256, "open_request_sha256")?;
-        canonical_sha256(
-            &self.terminal_command_sha256,
-            "terminal_command_sha256",
-        )?;
-        self.stage_context.validate_for(EffectClass::ReversibleMutation)?;
+        canonical_sha256(&self.terminal_command_sha256, "terminal_command_sha256")?;
+        self.stage_context
+            .validate_for(EffectClass::ReversibleMutation)?;
         self.read_context.validate_for(EffectClass::Read)?;
         self.root_lease.validate_context(&self.stage_context)?;
         self.root_lease.validate_context(&self.read_context)?;
         if self.stage_context.work_scope != self.read_context.work_scope
             || self.stage_context.task != self.read_context.task
             || self.stage_context.session != self.read_context.session
-            || self.stage_context.authority.authority_id
-                != self.read_context.authority.authority_id
+            || self.stage_context.authority.authority_id != self.read_context.authority.authority_id
             || self.stage_context.authority.authority_owner
                 != self.read_context.authority.authority_owner
             || self.stage_context.authority.authority_epoch
                 != self.read_context.authority.authority_epoch
             || self.stage_context.authority.proof_ceiling
                 != self.read_context.authority.proof_ceiling
-            || self.stage_context.authority.state_fence
-                != self.read_context.authority.state_fence
+            || self.stage_context.authority.state_fence != self.read_context.authority.state_fence
         {
             return Err(BlobError::AuthorityRequired(
                 "stage recovery contexts must share the exact owner/session authority",
@@ -1379,7 +1374,6 @@ impl BlobStageRecoveryRequest {
         }
         self.policy.validate_for_residency(&self.residency)?;
         self.process_source_binding.validate()?;
-        self.expected_content_hash.validate()?;
         canonical_sha256(&self.expected_plaintext_sha256, "expected_plaintext_sha256")?;
         if self.expected_plaintext_length > BLOB_MAX_PLAINTEXT_BYTES {
             return Err(BlobError::InvalidField {

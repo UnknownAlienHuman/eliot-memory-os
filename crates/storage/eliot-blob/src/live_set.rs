@@ -15,10 +15,7 @@ use crate::{BlobLiveSetPort, ConditionalDeleteOutcome, LiveSetRevalidation};
 pub struct UnavailableBlobLiveSetPort;
 
 impl BlobLiveSetPort for UnavailableBlobLiveSetPort {
-    fn revalidate(
-        &mut self,
-        _proof: &BlobLiveSetProof,
-    ) -> Result<LiveSetRevalidation, BlobError> {
+    fn revalidate(&mut self, _proof: &BlobLiveSetProof) -> Result<LiveSetRevalidation, BlobError> {
         Err(BlobError::PlanGap(
             "independent canonical live-set sources are unavailable; Blob GC is refused".to_owned(),
         ))

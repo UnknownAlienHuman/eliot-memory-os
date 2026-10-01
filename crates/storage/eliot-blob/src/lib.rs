@@ -52,7 +52,9 @@ pub use backup_io::{
     complete_export, export_page, open_member, run_capture, seal_associated_data, seal_member,
     seal_nonce_context, verify_capture_record, verify_destination_scope,
 };
-pub use compression_port::{RLE_COMPRESSION_ALGORITHM, RLE_COMPRESSION_VERSION, RleCompressionPort};
+pub use compression_port::{
+    RLE_COMPRESSION_ALGORITHM, RLE_COMPRESSION_VERSION, RleCompressionPort,
+};
 pub mod demand;
 pub mod key_ports;
 pub mod live_set;
@@ -65,16 +67,15 @@ pub use demand::{
     staged_recovery_demand,
 };
 use eliot_blob_api::{
-    BlobCasCapability, BlobCasDurability, BlobCasFailure, BlobCasOutcome, BlobCasReceipt,
-    BlobCasNamespace, BlobCasRequest, BlobCasState, BlobCasSuccessKind, BlobFuture, BlobGcReceipt, BlobGcRequest,
-    BlobHash, BlobHealth, BlobId, BlobIssuerTrustAnchor, BlobKeyOperation, BlobKeyRecoveryCeiling,
-    BlobLiveSetProof, BlobLocator, BlobPolicyBinding, BlobReachabilityRequest,
-    BlobProcessStreamReadbackRequest, BlobReachabilityView, BlobReadChunk, BlobReadRequest,
-    BlobReadyReceipt, BlobReceiptBinding,
-    BlobReceiptContext, BlobReferenceObservation, BlobReferenceRequest, BlobRootLease,
-    BlobStageRequest, BlobStoreClient, CompressionDescriptor, CryptoDescriptor, GcState,
-    SealedBlobRead, SignedBlobReceiptWire, VerifiedBlobReceipt, metadata_path, payload_path,
-    verify_receipt,
+    BlobCasCapability, BlobCasDurability, BlobCasFailure, BlobCasNamespace, BlobCasOutcome,
+    BlobCasReceipt, BlobCasRequest, BlobCasState, BlobCasSuccessKind, BlobFuture, BlobGcReceipt,
+    BlobGcRequest, BlobHash, BlobHealth, BlobId, BlobIssuerTrustAnchor, BlobKeyOperation,
+    BlobKeyRecoveryCeiling, BlobLiveSetProof, BlobLocator, BlobPolicyBinding,
+    BlobProcessStreamReadbackRequest, BlobReachabilityRequest, BlobReachabilityView, BlobReadChunk,
+    BlobReadRequest, BlobReadyReceipt, BlobReceiptBinding, BlobReceiptContext,
+    BlobReferenceObservation, BlobReferenceRequest, BlobRootLease, BlobStageRequest,
+    BlobStoreClient, CompressionDescriptor, CryptoDescriptor, GcState, SealedBlobRead,
+    SignedBlobReceiptWire, VerifiedBlobReceipt, metadata_path, payload_path, verify_receipt,
 };
 use eliot_platform::{PlatformHandle, WorkScopePath};
 use eliot_receipts::{
@@ -2936,9 +2937,7 @@ where
     /// persisted owner record; it never authorizes a fresh effect by itself.
     fn ensure_current_owner(&self) -> Result<(), BlobError> {
         self.owner.lease.validate()?;
-        let observed = self
-            .platform_read()?
-            .inspect_root(&self.owner.lease)?;
+        let observed = self.platform_read()?.inspect_root(&self.owner.lease)?;
         observed.validate(&self.owner.lease)?;
         if observed != self.owner.claim {
             return Err(BlobError::OwnerConflict);
@@ -4487,7 +4486,10 @@ where
             intent.phase,
         ))
         .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
-        let identity = format!("blob-stage-intent-{}", &sha256_hex(&identity_material)[..32]);
+        let identity = format!(
+            "blob-stage-intent-{}",
+            &sha256_hex(&identity_material)[..32]
+        );
         let mut context = request.stage_context.clone();
         context.operation.operation_id = OperationId::new(identity.clone())
             .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
@@ -4642,7 +4644,11 @@ where
             return Err(BlobError::IdempotencyConflict);
         }
         let verified = self.verify_metadata_receipt(&stored)?;
-        let ready = stored.ready(verified, &self.issuer_anchor, commit.metadata_sha256.clone())?;
+        let ready = stored.ready(
+            verified,
+            &self.issuer_anchor,
+            commit.metadata_sha256.clone(),
+        )?;
         let receipt_id = ready.receipt().identity.receipt_id.to_string();
         if request
             .expected_ready_receipt_id
@@ -4683,7 +4689,8 @@ where
         self.ensure_lease(&request.root_lease)?;
         let operation_id = request.stage_context.operation.operation_id.as_str();
         let idempotency_key = request.stage_context.operation.idempotency_key.as_str();
-        let _operation_guard = self.lock_shards(&[operation_shard(operation_id, idempotency_key)])?;
+        let _operation_guard =
+            self.lock_shards(&[operation_shard(operation_id, idempotency_key)])?;
         self.recover_stage_locked(&request)
     }
 
@@ -4696,7 +4703,9 @@ where
         current_read: BlobReadRequest,
     ) -> Result<BlobReadChunk, BlobError> {
         request.validate()?;
-        current_read.context.validate_for(eliot_receipts::EffectClass::Read)?;
+        current_read
+            .context
+            .validate_for(eliot_receipts::EffectClass::Read)?;
         self.ensure_lease(&current_read.root_lease)?;
         let path = WorkScopePath::new(format!(
             "transactions/process-source-{}.intent",
@@ -4808,11 +4817,7 @@ where
                 "same-operation Blob stage is already dispatched",
             ));
         }
-        self.advance_stage_intent_locked(
-            &recovery,
-            &intent,
-            StageIntentPhase::Dispatched,
-        )?;
+        self.advance_stage_intent_locked(&recovery, &intent, StageIntentPhase::Dispatched)?;
         // Once Dispatched is durable, even a typed error from a later layer
         // cannot prove that no filesystem effect happened: an error may be
         // reported after the platform accepted a write. Keep the intent

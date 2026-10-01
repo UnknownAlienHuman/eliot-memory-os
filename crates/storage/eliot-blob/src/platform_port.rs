@@ -14,9 +14,7 @@ use eliot_blob_api::{
     BlobCasState, BlobCasSuccessKind, BlobError, BlobIssuerTrustAnchor, BlobRootLease,
 };
 use eliot_platform::{PortError, ProviderErrorCode, WorkScopePath};
-use eliot_platform_windows::{
-    WindowsBlobPathState, WindowsBlobStorePlatform,
-};
+use eliot_platform_windows::{WindowsBlobPathState, WindowsBlobStorePlatform};
 use serde::{Deserialize, Serialize};
 
 use crate::{BlobPathState, BlobPlatformPort, RootClaimProof, cas_unknown, sha256_hex};
@@ -65,9 +63,9 @@ impl WindowsBlobPlatformPort {
         let root_identity = filesystem
             .root_identity()
             .map_err(|error| BlobError::Provider(format!("identify Blob root: {error}")))?;
-        let backend_generation = filesystem
-            .root_generation()
-            .map_err(|error| BlobError::Provider(format!("identify Blob root generation: {error}")))?;
+        let backend_generation = filesystem.root_generation().map_err(|error| {
+            BlobError::Provider(format!("identify Blob root generation: {error}"))
+        })?;
         Ok(Self {
             filesystem,
             root_identity,
@@ -88,39 +86,69 @@ impl WindowsBlobPlatformPort {
             .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
         let secret = match self.filesystem.stat(&path) {
             Ok(WindowsBlobPathState::Missing) => {
-                let generated = self.filesystem.random_secret_bytes(32)
-                    .map_err(|_| BlobError::Provider("Windows Blob issuer entropy unavailable".to_owned()))?;
-                let protected = self.filesystem.protect_secret_bytes(&generated)
-                    .map_err(|_| BlobError::Provider("DPAPI could not protect Blob issuer key".to_owned()))?;
-                self.filesystem.write_new_durable(&path, &protected)
-                    .map_err(|_| BlobError::Provider("durable Blob issuer key creation failed".to_owned()))?;
-                let persisted = self.filesystem.read_bounded(&path, 16 * 1024)
-                    .map_err(|_| BlobError::Provider("Blob issuer key readback failed".to_owned()))?;
+                let generated = self.filesystem.random_secret_bytes(32).map_err(|_| {
+                    BlobError::Provider("Windows Blob issuer entropy unavailable".to_owned())
+                })?;
+                let protected = self
+                    .filesystem
+                    .protect_secret_bytes(&generated)
+                    .map_err(|_| {
+                        BlobError::Provider("DPAPI could not protect Blob issuer key".to_owned())
+                    })?;
+                self.filesystem
+                    .write_new_durable(&path, &protected)
+                    .map_err(|_| {
+                        BlobError::Provider("durable Blob issuer key creation failed".to_owned())
+                    })?;
+                let persisted = self
+                    .filesystem
+                    .read_bounded(&path, 16 * 1024)
+                    .map_err(|_| {
+                        BlobError::Provider("Blob issuer key readback failed".to_owned())
+                    })?;
                 if persisted != protected {
                     return Err(BlobError::IntegrityMismatch);
                 }
-                let unprotected = self.filesystem.unprotect_secret_bytes(&persisted)
-                    .map_err(|_| BlobError::Provider("DPAPI could not verify Blob issuer key".to_owned()))?;
+                let unprotected =
+                    self.filesystem
+                        .unprotect_secret_bytes(&persisted)
+                        .map_err(|_| {
+                            BlobError::Provider("DPAPI could not verify Blob issuer key".to_owned())
+                        })?;
                 if unprotected != generated {
                     return Err(BlobError::IntegrityMismatch);
                 }
                 unprotected
             }
             Ok(WindowsBlobPathState::File { .. }) => {
-                let protected = self.filesystem.read_bounded(&path, 16 * 1024)
+                let protected = self
+                    .filesystem
+                    .read_bounded(&path, 16 * 1024)
                     .map_err(|_| BlobError::Provider("Blob issuer key read failed".to_owned()))?;
-                self.filesystem.unprotect_secret_bytes(&protected)
-                    .map_err(|_| BlobError::Provider("DPAPI could not open Blob issuer key".to_owned()))?
+                self.filesystem
+                    .unprotect_secret_bytes(&protected)
+                    .map_err(|_| {
+                        BlobError::Provider("DPAPI could not open Blob issuer key".to_owned())
+                    })?
             }
-            Ok(_) => return Err(BlobError::InvalidContract(
-                "Blob issuer key path is not a regular file".to_owned(),
-            )),
-            Err(_) => return Err(BlobError::Provider("Blob issuer key state unavailable".to_owned())),
+            Ok(_) => {
+                return Err(BlobError::InvalidContract(
+                    "Blob issuer key path is not a regular file".to_owned(),
+                ));
+            }
+            Err(_) => {
+                return Err(BlobError::Provider(
+                    "Blob issuer key state unavailable".to_owned(),
+                ));
+            }
         };
         if secret.len() < 32 {
             return Err(BlobError::IntegrityMismatch);
         }
-        let key_id = format!("s04-issuer-{}", &sha256_hex(self.root_identity.as_bytes())[..16]);
+        let key_id = format!(
+            "s04-issuer-{}",
+            &sha256_hex(self.root_identity.as_bytes())[..16]
+        );
         BlobIssuerTrustAnchor::new("eliot-s04-store", key_id, secret)
     }
 
@@ -180,12 +208,14 @@ impl WindowsBlobPlatformPort {
                 if self.filesystem.stat(&path).ok() == Some(WindowsBlobPathState::Missing) {
                     return Ok(None);
                 }
-                return Err(BlobError::Provider("read Blob CAS status failed".to_owned()));
+                return Err(BlobError::Provider(
+                    "read Blob CAS status failed".to_owned(),
+                ));
             }
             Err(error) => return Err(BlobError::Provider(error.to_string())),
         };
-        let record: CasStatusRecord = serde_json::from_slice(&bytes)
-            .map_err(|_| BlobError::IntegrityMismatch)?;
+        let record: CasStatusRecord =
+            serde_json::from_slice(&bytes).map_err(|_| BlobError::IntegrityMismatch)?;
         if record.version != 1 || record.operation_id != operation_id {
             return Err(BlobError::IntegrityMismatch);
         }
@@ -193,15 +223,13 @@ impl WindowsBlobPlatformPort {
     }
 
     fn write_cas_record(&self, record: &CasStatusRecord, create: bool) -> Result<(), PortError> {
-        let bytes = serde_json::to_vec(record)
-            .map_err(|_| PortError::InvalidPath)?;
-        let path = Self::cas_record_path(&record.operation_id).map_err(|_| PortError::InvalidPath)?;
+        let bytes = serde_json::to_vec(record).map_err(|_| PortError::InvalidPath)?;
+        let path =
+            Self::cas_record_path(&record.operation_id).map_err(|_| PortError::InvalidPath)?;
         if create {
-            self.filesystem
-                .write_new_durable(&path, &bytes)
+            self.filesystem.write_new_durable(&path, &bytes)
         } else {
-            self.filesystem
-                .replace_durable(&path, &bytes)
+            self.filesystem.replace_durable(&path, &bytes)
         }
     }
 
@@ -211,7 +239,8 @@ impl WindowsBlobPlatformPort {
         effect: BlobCapacityEffect,
         observed: Option<BlobCasState>,
     ) -> Option<BlobError> {
-        if !matches!(error, PortError::Provider(provider) if provider.code == ProviderErrorCode::StorageFull) {
+        if !matches!(error, PortError::Provider(provider) if provider.code == ProviderErrorCode::StorageFull)
+        {
             return None;
         }
         Some(BlobError::StorageCapacity {
@@ -268,9 +297,9 @@ impl BlobPlatformPort for WindowsBlobPlatformPort {
         if lease.root_id.as_str() != self.root_identity {
             return Err(BlobError::OwnerConflict);
         }
-        self.filesystem
-            .prove_root_writable()
-            .map_err(|error| BlobError::Provider(format!("prove Blob root permissions: {error}")))?;
+        self.filesystem.prove_root_writable().map_err(|error| {
+            BlobError::Provider(format!("prove Blob root permissions: {error}"))
+        })?;
         let proof = RootClaimProof {
             root_id: self.root_identity.clone(),
             owner_id: lease.owner_id.to_string(),
@@ -307,7 +336,11 @@ impl BlobPlatformPort for WindowsBlobPlatformPort {
             .ok_or(BlobError::OwnerConflict)
     }
 
-    fn prove_contained(&self, lease: &BlobRootLease, path: &WorkScopePath) -> Result<(), BlobError> {
+    fn prove_contained(
+        &self,
+        lease: &BlobRootLease,
+        path: &WorkScopePath,
+    ) -> Result<(), BlobError> {
         self.require_root(lease)?;
         self.filesystem
             .prove_contained(path)
@@ -315,62 +348,105 @@ impl BlobPlatformPort for WindowsBlobPlatformPort {
     }
 
     fn read_bounded(&self, path: &WorkScopePath, max_bytes: u64) -> Result<Vec<u8>, BlobError> {
-        self.filesystem.read_bounded(path, max_bytes).map_err(|error| match error {
-            eliot_platform::PortError::Provider(_) if self.filesystem.stat(path).ok() == Some(WindowsBlobPathState::Missing) => BlobError::NotFound,
-            other => BlobError::Provider(other.to_string()),
-        })
+        self.filesystem
+            .read_bounded(path, max_bytes)
+            .map_err(|error| match error {
+                eliot_platform::PortError::Provider(_)
+                    if self.filesystem.stat(path).ok() == Some(WindowsBlobPathState::Missing) =>
+                {
+                    BlobError::NotFound
+                }
+                other => BlobError::Provider(other.to_string()),
+            })
     }
 
     fn write_new_durable(&mut self, path: &WorkScopePath, bytes: &[u8]) -> Result<(), BlobError> {
-        self.filesystem.write_new_durable(path, bytes).map_err(|error| match error {
-            eliot_platform::PortError::Provider(_) if self.filesystem.stat(path).ok() != Some(WindowsBlobPathState::Missing) => BlobError::IdempotencyConflict,
-            other => BlobError::Provider(other.to_string()),
-        })
+        self.filesystem
+            .write_new_durable(path, bytes)
+            .map_err(|error| match error {
+                eliot_platform::PortError::Provider(_)
+                    if self.filesystem.stat(path).ok() != Some(WindowsBlobPathState::Missing) =>
+                {
+                    BlobError::IdempotencyConflict
+                }
+                other => BlobError::Provider(other.to_string()),
+            })
     }
 
     fn replace_durable(&mut self, path: &WorkScopePath, bytes: &[u8]) -> Result<(), BlobError> {
-        self.filesystem.replace_durable(path, bytes).map_err(|error| BlobError::Provider(error.to_string()))
+        self.filesystem
+            .replace_durable(path, bytes)
+            .map_err(|error| BlobError::Provider(error.to_string()))
     }
 
     fn cas_capability(&self) -> BlobCasCapability {
         BlobCasCapability::AtomicCompareAndReplace
     }
 
-    fn compare_and_replace_durable(&mut self, request: &BlobCasRequest, bytes: &[u8]) -> Result<BlobCasProviderResult, BlobError> {
+    fn compare_and_replace_durable(
+        &mut self,
+        request: &BlobCasRequest,
+        bytes: &[u8],
+    ) -> Result<BlobCasProviderResult, BlobError> {
         request.validate()?;
         self.require_root(&request.root_lease)?;
-        let _serial = self.cas_serialization.lock().map_err(|_| BlobError::Provider("Blob CAS serialization lock poisoned".to_owned()))?;
+        let _serial = self
+            .cas_serialization
+            .lock()
+            .map_err(|_| BlobError::Provider("Blob CAS serialization lock poisoned".to_owned()))?;
         let operation_id = request.context.operation.operation_id.to_string();
         let request_commitment_sha256 = request.request_commitment_sha256()?;
-        if bytes.len() as u64 != request.replacement_length || sha256_hex(bytes) != request.replacement_sha256 {
-            return Err(BlobError::CasFailure { failure: Box::new(BlobCasFailure::Internal {
-                request: Box::new(request.clone()),
-                reason: eliot_blob_api::BlobCasInternalReason::CommitmentMismatch,
-            }) });
+        if bytes.len() as u64 != request.replacement_length
+            || sha256_hex(bytes) != request.replacement_sha256
+        {
+            return Err(BlobError::CasFailure {
+                failure: Box::new(BlobCasFailure::Internal {
+                    request: Box::new(request.clone()),
+                    reason: eliot_blob_api::BlobCasInternalReason::CommitmentMismatch,
+                }),
+            });
         }
         if let Some(previous) = self.read_cas_record(&operation_id)? {
             if previous.request_commitment_sha256 != request_commitment_sha256 {
-                return Err(BlobError::CasFailure { failure: Box::new(BlobCasFailure::IdentityConflict { request: Box::new(request.clone()) }) });
+                return Err(BlobError::CasFailure {
+                    failure: Box::new(BlobCasFailure::IdentityConflict {
+                        request: Box::new(request.clone()),
+                    }),
+                });
             }
             if let Some(result) = previous.result {
                 return Ok(result);
             }
-            return Err(cas_unknown(request, None, Some(self.backend_generation), BlobCasDurability::Unconfirmed));
+            return Err(cas_unknown(
+                request,
+                None,
+                Some(self.backend_generation),
+                BlobCasDurability::Unconfirmed,
+            ));
         }
         if self.backend_generation != request.expected_backend_generation {
-            return Err(BlobError::CasFailure { failure: Box::new(BlobCasFailure::Internal {
-                request: Box::new(request.clone()),
-                reason: eliot_blob_api::BlobCasInternalReason::BackendGenerationMismatch,
-            }) });
+            return Err(BlobError::CasFailure {
+                failure: Box::new(BlobCasFailure::Internal {
+                    request: Box::new(request.clone()),
+                    reason: eliot_blob_api::BlobCasInternalReason::BackendGenerationMismatch,
+                }),
+            });
         }
         let observed = self.observe_cas_state(request)?;
         if observed != request.expected {
-            return Err(BlobError::CasFailure { failure: Box::new(BlobCasFailure::ExpectedStateConflict {
-                request: Box::new(request.clone()),
-                observed,
-            }) });
+            return Err(BlobError::CasFailure {
+                failure: Box::new(BlobCasFailure::ExpectedStateConflict {
+                    request: Box::new(request.clone()),
+                    observed,
+                }),
+            });
         }
-        let pending = CasStatusRecord { version: 1, operation_id: operation_id.clone(), request_commitment_sha256: request_commitment_sha256.clone(), result: None };
+        let pending = CasStatusRecord {
+            version: 1,
+            operation_id: operation_id.clone(),
+            request_commitment_sha256: request_commitment_sha256.clone(),
+            result: None,
+        };
         if let Err(error) = self.write_cas_record(&pending, true) {
             return Err(Self::cas_journal_capacity(
                 request,
@@ -390,7 +466,12 @@ impl BlobPlatformPort for WindowsBlobPlatformPort {
             }
         };
         if install.is_err() {
-            return Err(cas_unknown(request, self.observe_cas_state(request).ok(), Some(self.backend_generation), BlobCasDurability::Unconfirmed));
+            return Err(cas_unknown(
+                request,
+                self.observe_cas_state(request).ok(),
+                Some(self.backend_generation),
+                BlobCasDurability::Unconfirmed,
+            ));
         }
         let result = BlobCasProviderResult {
             operation_id: operation_id.clone(),
@@ -400,9 +481,18 @@ impl BlobPlatformPort for WindowsBlobPlatformPort {
             replacement_length: request.replacement_length,
             backend_generation: self.backend_generation,
             observed_durability: BlobCasDurability::Confirmed,
-            success: if no_op { BlobCasSuccessKind::NoOp } else { BlobCasSuccessKind::Applied },
+            success: if no_op {
+                BlobCasSuccessKind::NoOp
+            } else {
+                BlobCasSuccessKind::Applied
+            },
         };
-        let complete = CasStatusRecord { version: 1, operation_id: operation_id.clone(), request_commitment_sha256, result: Some(result.clone()) };
+        let complete = CasStatusRecord {
+            version: 1,
+            operation_id: operation_id.clone(),
+            request_commitment_sha256,
+            result: Some(result.clone()),
+        };
         if let Err(error) = self.write_cas_record(&complete, false) {
             if let Some(capacity) = Self::cas_journal_capacity(
                 request,
@@ -412,19 +502,38 @@ impl BlobPlatformPort for WindowsBlobPlatformPort {
             ) {
                 return Err(capacity);
             }
-            return Err(cas_unknown(request, Some(BlobCasState::Digest(request.replacement_sha256.clone())), Some(self.backend_generation), BlobCasDurability::Unconfirmed));
+            return Err(cas_unknown(
+                request,
+                Some(BlobCasState::Digest(request.replacement_sha256.clone())),
+                Some(self.backend_generation),
+                BlobCasDurability::Unconfirmed,
+            ));
         }
-        self.cas_statuses.lock().map_err(|_| BlobError::Provider("Blob CAS status cache poisoned".to_owned()))?.insert(operation_id, complete);
+        self.cas_statuses
+            .lock()
+            .map_err(|_| BlobError::Provider("Blob CAS status cache poisoned".to_owned()))?
+            .insert(operation_id, complete);
         Ok(result)
     }
 
     fn cas_status(&self, operation_id: &str) -> Result<Option<BlobCasProviderResult>, BlobError> {
-        if let Some(record) = self.cas_statuses.lock().map_err(|_| BlobError::Provider("Blob CAS status cache poisoned".to_owned()))?.get(operation_id).cloned() {
+        if let Some(record) = self
+            .cas_statuses
+            .lock()
+            .map_err(|_| BlobError::Provider("Blob CAS status cache poisoned".to_owned()))?
+            .get(operation_id)
+            .cloned()
+        {
             return Ok(record.result);
         }
-        let Some(record) = self.read_cas_record(operation_id)? else { return Ok(None); };
+        let Some(record) = self.read_cas_record(operation_id)? else {
+            return Ok(None);
+        };
         let result = record.result.clone();
-        self.cas_statuses.lock().map_err(|_| BlobError::Provider("Blob CAS status cache poisoned".to_owned()))?.insert(operation_id.to_owned(), record);
+        self.cas_statuses
+            .lock()
+            .map_err(|_| BlobError::Provider("Blob CAS status cache poisoned".to_owned()))?
+            .insert(operation_id.to_owned(), record);
         Ok(result)
     }
 
@@ -432,29 +541,50 @@ impl BlobPlatformPort for WindowsBlobPlatformPort {
         Ok(self.backend_generation)
     }
 
-    fn rename_no_replace_durable(&mut self, source: &WorkScopePath, destination: &WorkScopePath) -> Result<(), BlobError> {
-        self.filesystem.rename_no_replace_durable(source, destination).map_err(|error| BlobError::Provider(error.to_string()))
+    fn rename_no_replace_durable(
+        &mut self,
+        source: &WorkScopePath,
+        destination: &WorkScopePath,
+    ) -> Result<(), BlobError> {
+        self.filesystem
+            .rename_no_replace_durable(source, destination)
+            .map_err(|error| BlobError::Provider(error.to_string()))
     }
 
     fn remove_durable(&mut self, path: &WorkScopePath) -> Result<(), BlobError> {
-        self.filesystem.remove_durable(path).map_err(|error| BlobError::Provider(error.to_string()))
+        self.filesystem
+            .remove_durable(path)
+            .map_err(|error| BlobError::Provider(error.to_string()))
     }
 
     fn stat(&self, path: &WorkScopePath) -> Result<BlobPathState, BlobError> {
-        self.filesystem.stat(path).map(|state| match state {
-            WindowsBlobPathState::Missing => BlobPathState::Missing,
-            WindowsBlobPathState::File { length, modified_unix_ms } => BlobPathState::File { length, modified_unix_ms },
-            WindowsBlobPathState::Directory => BlobPathState::Directory,
-            WindowsBlobPathState::ReparsePoint => BlobPathState::ReparsePoint,
-            WindowsBlobPathState::Other => BlobPathState::Other,
-        }).map_err(|error| BlobError::Provider(error.to_string()))
+        self.filesystem
+            .stat(path)
+            .map(|state| match state {
+                WindowsBlobPathState::Missing => BlobPathState::Missing,
+                WindowsBlobPathState::File {
+                    length,
+                    modified_unix_ms,
+                } => BlobPathState::File {
+                    length,
+                    modified_unix_ms,
+                },
+                WindowsBlobPathState::Directory => BlobPathState::Directory,
+                WindowsBlobPathState::ReparsePoint => BlobPathState::ReparsePoint,
+                WindowsBlobPathState::Other => BlobPathState::Other,
+            })
+            .map_err(|error| BlobError::Provider(error.to_string()))
     }
 
     fn list(&self, prefix: &WorkScopePath) -> Result<Vec<WorkScopePath>, BlobError> {
-        self.filesystem.list(prefix).map_err(|error| BlobError::Provider(error.to_string()))
+        self.filesystem
+            .list(prefix)
+            .map_err(|error| BlobError::Provider(error.to_string()))
     }
 
     fn now_unix_ms(&mut self) -> Result<u64, BlobError> {
-        self.filesystem.now_unix_ms().map_err(|error| BlobError::Provider(error.to_string()))
+        self.filesystem
+            .now_unix_ms()
+            .map_err(|error| BlobError::Provider(error.to_string()))
     }
 }

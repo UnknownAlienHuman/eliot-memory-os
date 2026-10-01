@@ -229,9 +229,9 @@ pub use store_client::{
     StoreClientFault, StoreClientFaultHarness,
 };
 #[cfg(windows)]
-pub use store_gateway::KernelStoreGateway;
-#[cfg(windows)]
 pub use store_gateway::BlobProcessStreamGatewayError;
+#[cfg(windows)]
+pub use store_gateway::KernelStoreGateway;
 #[cfg(windows)]
 pub use store_gateway::NamedReadGatewayError;
 #[cfg(windows)]

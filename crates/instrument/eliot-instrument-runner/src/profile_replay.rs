@@ -8,9 +8,9 @@ use eliot_instrument_nextest::{
     NEXTEST_INSTRUMENT, NEXTEST_STDOUT_CONTENT_TYPE, parse_jsonl, parse_list_json,
 };
 use eliot_testd_core::{
-    EphemeralSourceBytes, InstrumentStageRequest, StageExecutionKind, TestdEvaluationObservation,
-    TestdEvaluationStatus, TestdParsingObservation, TestdParsingStatus, TestdStreamDisposition,
-    TestdStreamEvidenceBinding, TESTD_LIST_PROFILE,
+    EphemeralSourceBytes, InstrumentStageRequest, StageExecutionKind, TESTD_LIST_PROFILE,
+    TestdEvaluationObservation, TestdEvaluationStatus, TestdParsingObservation, TestdParsingStatus,
+    TestdStreamDisposition, TestdStreamEvidenceBinding,
 };
 use thiserror::Error;
 
@@ -114,15 +114,20 @@ pub fn replay_profile_stream(
         .map_err(|error| ProfileReplayError::InvalidStage {
             detail: error.to_string(),
         })?;
-    let (entry, parser_revision) = current_selection(profile_registry, provider_registry, freshness, stage)?;
+    let (entry, parser_revision) =
+        current_selection(profile_registry, provider_registry, freshness, stage)?;
     let verified = verify_source(source, bytes)?;
     if source.stream == eliot_process::ProcessStreamKind::Stderr {
         return stderr_receipt(source, verified, entry, parser_revision, finished_at);
     }
     if source.stream != eliot_process::ProcessStreamKind::Stdout {
-        return Err(source_error("only stdout and stderr are valid process streams"));
+        return Err(source_error(
+            "only stdout and stderr are valid process streams",
+        ));
     }
-    if source.representation != Some(eliot_process::DurableStreamRepresentation::ExactTransportBytes) {
+    if source.representation
+        != Some(eliot_process::DurableStreamRepresentation::ExactTransportBytes)
+    {
         return Err(ProfileReplayError::UnsupportedContentType);
     }
     if stage.profile_name == TESTD_LIST_PROFILE {
@@ -166,11 +171,17 @@ fn current_selection<'a>(
         .ok_or(ProfileReplayError::StageMismatch { field: "stage_id" })?;
     for (matches, field) in [
         (selected.spec == stage.spec, "spec"),
-        (selected.spec_revision == stage.spec_revision, "spec_revision"),
+        (
+            selected.spec_revision == stage.spec_revision,
+            "spec_revision",
+        ),
         (selected.spec_digest == stage.spec_digest, "spec_digest"),
         (selected.kind == stage.kind, "kind"),
         (selected.parser == stage.parser, "parser"),
-        (selected.parser_generation == stage.parser_generation, "parser_generation"),
+        (
+            selected.parser_generation == stage.parser_generation,
+            "parser_generation",
+        ),
     ] {
         if !matches {
             return Err(ProfileReplayError::StageMismatch { field });
@@ -201,7 +212,10 @@ fn current_selection<'a>(
     }
     for (matches, field) in [
         (stage.adapter == entry.adapter, "adapter"),
-        (stage.adapter_version == entry.adapter_version, "adapter_version"),
+        (
+            stage.adapter_version == entry.adapter_version,
+            "adapter_version",
+        ),
         (stage.parser == entry.parser, "provider_parser"),
         (stage.evaluator == entry.evaluator, "evaluator"),
     ] {
@@ -224,9 +238,11 @@ fn verify_source<'a>(
     source: &'a TestdStreamEvidenceBinding,
     bytes: &EphemeralSourceBytes,
 ) -> Result<VerifiedSource<'a>, ProfileReplayError> {
-    source.validate().map_err(|error| ProfileReplayError::SourceBinding {
-        detail: error.to_string(),
-    })?;
+    source
+        .validate()
+        .map_err(|error| ProfileReplayError::SourceBinding {
+            detail: error.to_string(),
+        })?;
     if source.disposition != TestdStreamDisposition::CompleteSource {
         return Err(source_error("complete-source disposition is required"));
     }
@@ -271,7 +287,15 @@ fn stderr_receipt(
         TestdParsingStatus::NotApplicable,
         finished_at,
     )?;
-    Ok(receipt_base(source, verified, Some(parsing), None, None, None, None))
+    Ok(receipt_base(
+        source,
+        verified,
+        Some(parsing),
+        None,
+        None,
+        None,
+        None,
+    ))
 }
 
 fn list_receipt(
@@ -282,7 +306,9 @@ fn list_receipt(
     parser_revision: String,
     finished_at: ClockReading,
 ) -> Result<ProfileReplayReceipt, ProfileReplayError> {
-    let detail = parse_list_json(bytes.bytes()).err().map(|error| error.to_string());
+    let detail = parse_list_json(bytes.bytes())
+        .err()
+        .map(|error| error.to_string());
     let status = if detail.is_some() {
         TestdParsingStatus::ParseFailed
     } else {
@@ -296,7 +322,15 @@ fn list_receipt(
         status,
         finished_at,
     )?;
-    Ok(receipt_base(source, verified, Some(parsing), None, None, None, detail))
+    Ok(receipt_base(
+        source,
+        verified,
+        Some(parsing),
+        None,
+        None,
+        None,
+        detail,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]

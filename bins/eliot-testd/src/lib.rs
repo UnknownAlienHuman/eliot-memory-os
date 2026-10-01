@@ -27,13 +27,13 @@ use eliot_process::{
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_testd_core::{
-    EvidenceCollector, KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider,
-    InstrumentStageRequest, KernelProcessAdmissionRequest, Lease, ProcessAdmissionPermit,
-    RetryPolicy, SchedulingDecision, StageExecutionKind,
-    SourceObservationGitPort, TargetRoots, TestJob, TestdError, TestdSourceObservation,
-    TestdStore, is_admitted_testd_profile, issue_process_admission, testd_profile_binding,
+    EvidenceCollector, InstrumentStageRequest, KernelProcessAdmissionEvidence,
+    KernelProcessAdmissionProvider, KernelProcessAdmissionRequest, Lease, ProcessAdmissionPermit,
+    RetryPolicy, SchedulingDecision, SourceObservationGitPort, StageExecutionKind,
+    TESTD_PRODUCTIVE_ADAPTER, TargetRoots, TestJob, TestdError, TestdSourceObservation, TestdStore,
+    is_admitted_testd_profile, issue_process_admission, testd_profile_binding,
     testd_profile_resource_limits, validate_running_lease, verify_envelope_layout_binding,
-    verify_layout_binding, TESTD_PRODUCTIVE_ADAPTER,
+    verify_layout_binding,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -44,8 +44,8 @@ pub use eliot_testd_core::{
     verification_receipt_sha256,
 };
 
-pub mod kernel_client;
 pub mod blob_readback;
+pub mod kernel_client;
 pub mod testd_material;
 pub mod worker;
 pub use kernel_client::{
@@ -414,8 +414,7 @@ impl TestdComposition {
                 reason: "profile is not registered by the current Testd execution plane",
             });
         }
-        let productive =
-            eliot_testd_core::is_productive_testd_profile(&request.invocation.profile);
+        let productive = eliot_testd_core::is_productive_testd_profile(&request.invocation.profile);
         if productive && request.stage.is_none() {
             return Err(TestdError::Invalid {
                 field: "stage",
@@ -514,16 +513,7 @@ impl TestdComposition {
     ) -> Result<ProcessStartReceipt, TestdError> {
         let operation_id = permit.request().operation_id().clone();
         let collector = EvidenceCollector::for_operation(operation_id);
-        start_claimed_from_store(
-            &self.store,
-            job,
-            lease,
-            now,
-            permit,
-            executor,
-            &collector,
-        )
-        .await
+        start_claimed_from_store(&self.store, job, lease, now, permit, executor, &collector).await
     }
 }
 

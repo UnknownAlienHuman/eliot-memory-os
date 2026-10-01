@@ -40,13 +40,13 @@ use crate::registry::{
     RegistryEntry, RegistryError, ResolvedExecutableIdentity, SupplyChainReceipt,
 };
 use crate::testd_port::{TestdAdmission, TestdAdmissionPort, TestdPortError, testd_dispatchable};
-use eliot_testd_core::{
-    InstrumentStageRequest, StageExecutionKind, TestdProviderFingerprints,
-    TestdProviderRegistryFreshness,
-};
 use crate::{
     InstrumentBinding, InstrumentRequestPort, InstrumentRunner, InstrumentStartReceipt,
     RunnerError, bridge_executor_observation,
+};
+use eliot_testd_core::{
+    InstrumentStageRequest, StageExecutionKind, TestdProviderFingerprints,
+    TestdProviderRegistryFreshness,
 };
 
 /// Failures raised while planning or recording profile runs.
@@ -1306,10 +1306,7 @@ impl StageOrchestrator {
         let entry = match launcher.provider_entry(planned) {
             Ok(entry) => entry,
             Err(error) => {
-                return InstrumentRun::missing(
-                    route,
-                    format!("stage admission refused: {error}"),
-                );
+                return InstrumentRun::missing(route, format!("stage admission refused: {error}"));
             }
         };
         let stage_request = match stage_request(plan, planned, &invocation, entry) {
@@ -1331,7 +1328,10 @@ impl StageOrchestrator {
                         && run.stage.profile_revision == route.stage().profile_revision
                         && run.stage.stage_id == route.stage().stage_id
                         && run.executable_digest.is_none()
-                        && run.grant_digest.is_none() => run,
+                        && run.grant_digest.is_none() =>
+                {
+                    run
+                }
                 Ok(_) => InstrumentRun::missing(
                     route,
                     "decoder result does not retain the admitted artifact stage identity",

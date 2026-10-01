@@ -13,13 +13,11 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_platform::{PortError, WorkScopePath};
-use sha2::{Digest, Sha256};
+use sha2::Digest;
 
-use crate::{
-    PublicationOutcome, WindowsPlatform, flush_directory, pin_ancestors, validate_containment,
-};
+use crate::{PublicationOutcome, WindowsPlatform, pin_ancestors, validate_containment};
 
-/// Filesystem state observed through a checked WorkScope path.
+/// Filesystem state observed through a checked `WorkScope` path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WindowsBlobPathState {
     /// No entry exists at the target path.
@@ -56,8 +54,8 @@ impl WindowsBlobStorePlatform {
         let root = root.into();
         let platform = WindowsPlatform::new(root.clone())?;
         #[cfg(windows)]
-        let protected_root = crate::ProtectedRootLease::open_existing(&root)
-            .map_err(|_| PortError::InvalidPath)?;
+        let protected_root =
+            crate::ProtectedRootLease::open_existing(&root).map_err(|_| PortError::InvalidPath)?;
         Ok(Self {
             platform,
             #[cfg(windows)]
@@ -76,8 +74,8 @@ impl WindowsBlobStorePlatform {
     /// Canonical identity of the pinned root, used to compare a Blob lease.
     pub fn root_identity(&self) -> Result<String, PortError> {
         self.verify_root_pin()?;
-        let canonical = fs::canonicalize(&self.platform.root)
-            .map_err(|_| PortError::InvalidPath)?;
+        let canonical =
+            fs::canonicalize(&self.platform.root).map_err(|_| PortError::InvalidPath)?;
         validate_containment(&canonical, &canonical)?;
         let mut identity = canonical.to_string_lossy().replace('\\', "/");
         if cfg!(windows) {
@@ -91,13 +89,13 @@ impl WindowsBlobStorePlatform {
         self.verify_root_pin()?;
         #[cfg(windows)]
         {
-            let identity = crate::file_identity_from_handle(&self.platform._root_pin)
+            let identity = crate::file_identity_from_handle(&self.platform.root_pin)
                 .map_err(|_| PortError::InvalidPath)?;
             let material = format!("{}:{}", identity.volume_serial_number, identity.file_index);
             let digest = sha2::Sha256::digest(material.as_bytes());
             let mut prefix = [0_u8; 8];
             prefix.copy_from_slice(&digest[..8]);
-            return Ok(u64::from_be_bytes(prefix).max(1));
+            Ok(u64::from_be_bytes(prefix).max(1))
         }
         #[cfg(not(windows))]
         {
@@ -134,11 +132,12 @@ impl WindowsBlobStorePlatform {
             return Err(PortError::InvalidPath);
         }
         let mut bytes = vec![0; length];
-        crate::fill_system_random(&mut bytes)
-            .map_err(|_| PortError::Provider(eliot_platform::ProviderError {
+        crate::fill_system_random(&mut bytes).map_err(|_| {
+            PortError::Provider(eliot_platform::ProviderError {
                 code: eliot_platform::ProviderErrorCode::Unavailable,
                 retryable: false,
-            }))?;
+            })
+        })?;
         Ok(bytes)
     }
 
@@ -147,10 +146,12 @@ impl WindowsBlobStorePlatform {
         self.platform
             .protect_secret(secret)
             .map(|protected| protected.as_bytes().to_vec())
-            .map_err(|_| PortError::Provider(eliot_platform::ProviderError {
-                code: eliot_platform::ProviderErrorCode::Failed,
-                retryable: false,
-            }))
+            .map_err(|_| {
+                PortError::Provider(eliot_platform::ProviderError {
+                    code: eliot_platform::ProviderErrorCode::Failed,
+                    retryable: false,
+                })
+            })
     }
 
     /// Unprotects a DPAPI-owned receipt-issuer secret for the current user.
@@ -160,10 +161,12 @@ impl WindowsBlobStorePlatform {
         self.platform
             .unprotect_secret(&protected)
             .map(|secret| secret.expose().to_vec())
-            .map_err(|_| PortError::Provider(eliot_platform::ProviderError {
-                code: eliot_platform::ProviderErrorCode::Failed,
-                retryable: false,
-            }))
+            .map_err(|_| {
+                PortError::Provider(eliot_platform::ProviderError {
+                    code: eliot_platform::ProviderErrorCode::Failed,
+                    retryable: false,
+                })
+            })
     }
 
     /// Revalidates the entire extant path and pins its parent directories.
@@ -186,20 +189,26 @@ impl WindowsBlobStorePlatform {
     pub fn read_bounded(&self, path: &WorkScopePath, max_bytes: u64) -> Result<Vec<u8>, PortError> {
         self.verify_root_pin()?;
         let (target, parent_pins) = self.resolve_and_pin_parent(path)?;
-        let mut file = open_blob_file_read(&target)?;
-        let before = file.metadata().map_err(|error| PortError::Provider(super::provider_from_io(&error)))?;
+        let file = open_blob_file_read(&target)?;
+        let before = file
+            .metadata()
+            .map_err(|error| PortError::Provider(super::provider_from_io(&error)))?;
         if !before.is_file() || before.len() > max_bytes {
             return Err(PortError::InvalidPath);
         }
-        let identity = super::file_identity_from_handle(&file)
-            .map_err(|_| PortError::InvalidPath)?;
-        let modified = before.modified().map_err(|error| PortError::Provider(super::provider_from_io(&error)))?;
+        let identity =
+            super::file_identity_from_handle(&file).map_err(|_| PortError::InvalidPath)?;
+        let modified = before
+            .modified()
+            .map_err(|error| PortError::Provider(super::provider_from_io(&error)))?;
         let mut bytes = Vec::new();
         let capacity = usize::try_from(before.len()).map_err(|_| PortError::InvalidPath)?;
-        bytes.try_reserve_exact(capacity).map_err(|_| PortError::Provider(eliot_platform::ProviderError {
-            code: eliot_platform::ProviderErrorCode::Failed,
-            retryable: false,
-        }))?;
+        bytes.try_reserve_exact(capacity).map_err(|_| {
+            PortError::Provider(eliot_platform::ProviderError {
+                code: eliot_platform::ProviderErrorCode::Failed,
+                retryable: false,
+            })
+        })?;
         file.take(max_bytes.saturating_add(1))
             .read_to_end(&mut bytes)
             .map_err(|error| PortError::Provider(super::provider_from_io(&error)))?;
@@ -211,7 +220,8 @@ impl WindowsBlobStorePlatform {
             || fs::symlink_metadata(&target)
                 .map_err(|error| PortError::Provider(super::provider_from_io(&error)))?
                 .modified()
-                .map_err(|error| PortError::Provider(super::provider_from_io(&error)))? != modified
+                .map_err(|error| PortError::Provider(super::provider_from_io(&error)))?
+                != modified
         {
             return Err(PortError::InvalidPath);
         }
@@ -236,10 +246,12 @@ impl WindowsBlobStorePlatform {
         self.prove_contained(path)?;
         match self.platform.publish_atomic_outcome(path, bytes)? {
             PublicationOutcome::Published(_) => Ok(()),
-            PublicationOutcome::Unknown(_) => Err(PortError::Provider(eliot_platform::ProviderError {
-                code: eliot_platform::ProviderErrorCode::Failed,
-                retryable: false,
-            })),
+            PublicationOutcome::Unknown(_) => {
+                Err(PortError::Provider(eliot_platform::ProviderError {
+                    code: eliot_platform::ProviderErrorCode::Failed,
+                    retryable: false,
+                }))
+            }
         }
     }
 
@@ -297,11 +309,16 @@ impl WindowsBlobStorePlatform {
                     .as_millis()
                     .try_into()
                     .unwrap_or(u64::MAX);
-                Ok(WindowsBlobPathState::File { length: metadata.len(), modified_unix_ms })
+                Ok(WindowsBlobPathState::File {
+                    length: metadata.len(),
+                    modified_unix_ms,
+                })
             }
             Ok(metadata) if metadata.is_dir() => Ok(WindowsBlobPathState::Directory),
             Ok(_) => Ok(WindowsBlobPathState::Other),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(WindowsBlobPathState::Missing),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(WindowsBlobPathState::Missing)
+            }
             Err(error) => Err(PortError::Provider(super::provider_from_io(&error))),
         }
     }
@@ -321,7 +338,7 @@ impl WindowsBlobStorePlatform {
             return Err(PortError::InvalidPath);
         }
         let mut entries = Vec::new();
-        self.walk(prefix.normalized_identity().to_owned(), &target, &mut entries)?;
+        self.walk(prefix.normalized_identity(), &target, &mut entries)?;
         self.verify_root_pin()?;
         Ok(entries)
     }
@@ -334,7 +351,10 @@ impl WindowsBlobStorePlatform {
             .map_err(|_| PortError::InvalidPath)
     }
 
-    fn resolve_and_pin_parent(&self, path: &WorkScopePath) -> Result<(PathBuf, Vec<fs::File>), PortError> {
+    fn resolve_and_pin_parent(
+        &self,
+        path: &WorkScopePath,
+    ) -> Result<(PathBuf, Vec<fs::File>), PortError> {
         let target = self.platform.resolve(&path.adapter_input())?;
         validate_containment(&self.platform.root, &target)?;
         let mut parent = target.parent().ok_or(PortError::InvalidPath)?;
@@ -362,7 +382,9 @@ impl WindowsBlobStorePlatform {
     fn ensure_parent_directories(&self, path: &WorkScopePath) -> Result<(), PortError> {
         let target = self.platform.resolve(&path.adapter_input())?;
         let parent = target.parent().ok_or(PortError::InvalidPath)?;
-        let relative = parent.strip_prefix(&self.platform.root).map_err(|_| PortError::InvalidPath)?;
+        let relative = parent
+            .strip_prefix(&self.platform.root)
+            .map_err(|_| PortError::InvalidPath)?;
         let mut current = self.platform.root.clone();
         for component in relative.components() {
             current.push(component.as_os_str());
@@ -371,7 +393,8 @@ impl WindowsBlobStorePlatform {
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(PortError::Provider(super::provider_from_io(&error))),
             }
-            let metadata = fs::symlink_metadata(&current).map_err(|error| PortError::Provider(super::provider_from_io(&error)))?;
+            let metadata = fs::symlink_metadata(&current)
+                .map_err(|error| PortError::Provider(super::provider_from_io(&error)))?;
             if !metadata.is_dir() || super::is_reparse_point(&metadata) {
                 return Err(PortError::InvalidPath);
             }
@@ -380,11 +403,20 @@ impl WindowsBlobStorePlatform {
         Ok(())
     }
 
-    fn walk(&self, prefix: String, directory: &Path, entries: &mut Vec<WorkScopePath>) -> Result<(), PortError> {
+    fn walk(
+        &self,
+        prefix: &str,
+        directory: &Path,
+        entries: &mut Vec<WorkScopePath>,
+    ) -> Result<(), PortError> {
         let _pins = pin_ancestors(&self.platform.root, directory)?;
-        for entry in fs::read_dir(directory).map_err(|error| PortError::Provider(super::provider_from_io(&error)))? {
-            let entry = entry.map_err(|error| PortError::Provider(super::provider_from_io(&error)))?;
-            let metadata = fs::symlink_metadata(entry.path()).map_err(|error| PortError::Provider(super::provider_from_io(&error)))?;
+        for entry in fs::read_dir(directory)
+            .map_err(|error| PortError::Provider(super::provider_from_io(&error)))?
+        {
+            let entry =
+                entry.map_err(|error| PortError::Provider(super::provider_from_io(&error)))?;
+            let metadata = fs::symlink_metadata(entry.path())
+                .map_err(|error| PortError::Provider(super::provider_from_io(&error)))?;
             if super::is_reparse_point(&metadata) {
                 return Err(PortError::InvalidPath);
             }
@@ -392,7 +424,7 @@ impl WindowsBlobStorePlatform {
             let identity = format!("{prefix}/{name}");
             let path = WorkScopePath::new(identity.clone()).map_err(|_| PortError::InvalidPath)?;
             if metadata.is_dir() {
-                self.walk(identity, &entry.path(), entries)?;
+                self.walk(&identity, &entry.path(), entries)?;
             } else if metadata.is_file() {
                 entries.push(path);
             } else {
@@ -413,8 +445,12 @@ fn open_blob_file_read(path: &Path) -> Result<fs::File, PortError> {
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
         .map_err(|error| PortError::Provider(super::provider_from_io(&error)))?;
-    if file.metadata().map_err(|error| PortError::Provider(super::provider_from_io(&error)))?.file_attributes()
-        & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT != 0
+    if file
+        .metadata()
+        .map_err(|error| PortError::Provider(super::provider_from_io(&error)))?
+        .file_attributes()
+        & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+        != 0
     {
         return Err(PortError::InvalidPath);
     }

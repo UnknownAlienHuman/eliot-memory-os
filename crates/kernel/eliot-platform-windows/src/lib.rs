@@ -91,6 +91,7 @@ thread_local! {
     };
 }
 
+pub mod blob_store_platform;
 mod directory_publication;
 mod event_log;
 mod installer_authority_key;
@@ -116,7 +117,6 @@ mod supervision_authority_key;
 mod tcp_listener_owner;
 mod terminal_containment;
 mod user_owned_leases;
-pub mod blob_store_platform;
 
 use crate::service_registration::{exact_path_text, utf16_text};
 
@@ -2844,7 +2844,7 @@ impl Drop for OwnedSecurityDescriptor {
 pub struct WindowsPlatform {
     root: PathBuf,
     #[cfg(windows)]
-    _root_pin: std::fs::File,
+    root_pin: std::fs::File,
 }
 
 impl WindowsPlatform {
@@ -2862,7 +2862,7 @@ impl WindowsPlatform {
         Ok(Self {
             root,
             #[cfg(windows)]
-            _root_pin: root_pin,
+            root_pin: root_pin,
         })
     }
 

@@ -13,8 +13,7 @@ pub use eliot_build_test_graph::{
     RuntimeEnvironmentLease,
 };
 use eliot_contracts::{
-    ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, RequestId,
-    canonical_json_bytes,
+    ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, RequestId, canonical_json_bytes,
 };
 pub use eliot_instrument_api::KernelProcessAdmissionRequest;
 use eliot_instrument_api::{
@@ -56,10 +55,9 @@ pub use target_layout::{
     verify_layout_binding,
 };
 pub use typed_evidence::{
-    AsyncProcessStreamSourceReadbackPort, EphemeralSourceBytes,
-    ProcessStreamSourceReadbackFuture, ProcessStreamSourceReadbackObservation,
-    ProcessStreamSourceReadbackPort, ProcessStreamSourceReadbackRequest, TestdArtifactBinding,
-    TestdEvaluationObservation,
+    AsyncProcessStreamSourceReadbackPort, EphemeralSourceBytes, ProcessStreamSourceReadbackFuture,
+    ProcessStreamSourceReadbackObservation, ProcessStreamSourceReadbackPort,
+    ProcessStreamSourceReadbackRequest, TestdArtifactBinding, TestdEvaluationObservation,
     TestdEvaluationStatus, TestdEvaluatorSlot, TestdEvidenceDisposition, TestdEvidenceError,
     TestdParserSlot, TestdParsingObservation, TestdParsingStatus, TestdProcessEvidenceBundle,
     TestdReadbackContext, TestdStreamDisposition, TestdStreamEvidenceBinding,
@@ -122,20 +120,33 @@ impl TestdProviderRegistryFreshness {
             return Err(TestdError::InvalidBinding);
         }
         for (field, value) in [
-            ("provider_source_fingerprint", self.fingerprints.source.as_str()),
+            (
+                "provider_source_fingerprint",
+                self.fingerprints.source.as_str(),
+            ),
             ("provider_lock_fingerprint", self.fingerprints.lock.as_str()),
             (
                 "provider_toolchain_fingerprint",
                 self.fingerprints.toolchain.as_str(),
             ),
-            ("provider_environment_fingerprint", self.fingerprints.env.as_str()),
-            ("provider_executable_fingerprint", self.fingerprints.exe.as_str()),
-            ("provider_profile_fingerprint", self.fingerprints.profile.as_str()),
-            ("provider_parser_fingerprint", self.fingerprints.parser.as_str()),
+            (
+                "provider_environment_fingerprint",
+                self.fingerprints.env.as_str(),
+            ),
+            (
+                "provider_executable_fingerprint",
+                self.fingerprints.exe.as_str(),
+            ),
+            (
+                "provider_profile_fingerprint",
+                self.fingerprints.profile.as_str(),
+            ),
+            (
+                "provider_parser_fingerprint",
+                self.fingerprints.parser.as_str(),
+            ),
         ] {
-            if value.trim().is_empty()
-                || value.len() > 1024
-                || value.chars().any(char::is_control)
+            if value.trim().is_empty() || value.len() > 1024 || value.chars().any(char::is_control)
             {
                 return Err(TestdError::Invalid {
                     field,
@@ -1695,8 +1706,14 @@ impl TestdBlobProcessStreamGrant {
             ),
             ("blob_stream.fence_sha256", self.fence_sha256.as_str()),
             ("blob_stream.policy_sha256", self.policy_sha256.as_str()),
-            ("blob_stream.source_set_sha256", self.source_set_sha256.as_str()),
-            ("blob_stream.currentness_sha256", self.currentness_sha256.as_str()),
+            (
+                "blob_stream.source_set_sha256",
+                self.source_set_sha256.as_str(),
+            ),
+            (
+                "blob_stream.currentness_sha256",
+                self.currentness_sha256.as_str(),
+            ),
         ] {
             validate_text(value, field)?;
         }
@@ -1708,8 +1725,14 @@ impl TestdBlobProcessStreamGrant {
             ),
             ("blob_stream.fence_sha256", self.fence_sha256.as_str()),
             ("blob_stream.policy_sha256", self.policy_sha256.as_str()),
-            ("blob_stream.source_set_sha256", self.source_set_sha256.as_str()),
-            ("blob_stream.currentness_sha256", self.currentness_sha256.as_str()),
+            (
+                "blob_stream.source_set_sha256",
+                self.source_set_sha256.as_str(),
+            ),
+            (
+                "blob_stream.currentness_sha256",
+                self.currentness_sha256.as_str(),
+            ),
         ] {
             if !is_binding_digest(value) {
                 return Err(TestdError::Invalid {
@@ -3968,7 +3991,11 @@ impl TestdStore {
         // stores migrate idempotently without rewriting job payloads.
         let write = db.begin_write().map_err(database)?;
         drop(write.open_table(ADMITTED_IDENTITIES).map_err(database)?);
-        drop(write.open_table(BLOB_PROCESS_STREAM_CALLS).map_err(database)?);
+        drop(
+            write
+                .open_table(BLOB_PROCESS_STREAM_CALLS)
+                .map_err(database)?,
+        );
         write.commit().map_err(database)?;
         Ok(Self {
             database: Arc::new(db),
@@ -4033,12 +4060,9 @@ impl TestdStore {
                 reason: "stream capability requires retained process environment",
             });
         };
-        let currentness_bytes = canonical_json_bytes(&(
-            stage_freshness,
-            tool_observation,
-            environment,
-        ))
-        .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        let currentness_bytes =
+            canonical_json_bytes(&(stage_freshness, tool_observation, environment))
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?;
         if sha256_hex(&currentness_bytes) != grant.currentness_sha256
             || job.invocation.profile != TESTD_PRODUCTIVE_PROFILE
         {
@@ -4054,12 +4078,10 @@ impl TestdStore {
             return Err(TestdError::JobConflict(job_id.to_owned()));
         }
         job.blob_process_stream_grant = Some(grant);
-        let encoded = serde_json::to_vec(&job)
-            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        let encoded =
+            serde_json::to_vec(&job).map_err(|error| TestdError::Corrupt(error.to_string()))?;
         let mut table = write.open_table(JOBS).map_err(database)?;
-        table
-            .insert(job_id, encoded.as_slice())
-            .map_err(database)?;
+        table.insert(job_id, encoded.as_slice()).map_err(database)?;
         write.commit().map_err(database)?;
         Ok(job)
     }
@@ -4124,8 +4146,8 @@ impl TestdStore {
             .ok_or(TestdError::InvalidBinding)?;
         if grant.revoked_at_ms.is_none() {
             grant.revoked_at_ms = Some(now_ms);
-            let encoded = serde_json::to_vec(&job)
-                .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+            let encoded =
+                serde_json::to_vec(&job).map_err(|error| TestdError::Corrupt(error.to_string()))?;
             write
                 .open_table(JOBS)
                 .map_err(database)?
@@ -4171,9 +4193,10 @@ impl TestdStore {
             ));
         }
         if grant.capability_ref != capability_ref
-            || grant.tokens.get(ordinal as usize).is_none_or(|token| {
-                token.ordinal != ordinal || token.reference != token_ref
-            })
+            || grant
+                .tokens
+                .get(ordinal as usize)
+                .is_none_or(|token| token.ordinal != ordinal || token.reference != token_ref)
         {
             return Err(TestdError::InvalidBinding);
         }
@@ -4194,13 +4217,15 @@ impl TestdStore {
                 {
                     return Err(TestdError::InvalidBinding);
                 }
-                return Ok(TestdBlobProcessStreamReserve::Replay(match existing.state {
-                    TestdBlobProcessStreamCallState::Completed(outcome) => outcome,
-                    TestdBlobProcessStreamCallState::Reserved
-                    | TestdBlobProcessStreamCallState::Dispatched => {
-                        TestdBlobProcessStreamCallOutcome::Unknown
-                    }
-                }));
+                return Ok(TestdBlobProcessStreamReserve::Replay(
+                    match existing.state {
+                        TestdBlobProcessStreamCallState::Completed(outcome) => outcome,
+                        TestdBlobProcessStreamCallState::Reserved
+                        | TestdBlobProcessStreamCallState::Dispatched => {
+                            TestdBlobProcessStreamCallOutcome::Unknown
+                        }
+                    },
+                ));
             }
         }
         let mut highest = None;
@@ -4214,7 +4239,8 @@ impl TestdStore {
                     serde_json::from_slice(value.value())
                         .map_err(|error| TestdError::Corrupt(error.to_string()))?;
                 if row.job_id == job_id && row.capability_ref == capability_ref {
-                    highest = Some(highest.map_or(row.ordinal, |value: u32| value.max(row.ordinal)));
+                    highest =
+                        Some(highest.map_or(row.ordinal, |value: u32| value.max(row.ordinal)));
                 }
             }
         }
@@ -4229,8 +4255,8 @@ impl TestdStore {
             operation_sha256: operation_sha256.to_owned(),
             state: TestdBlobProcessStreamCallState::Reserved,
         };
-        let encoded = serde_json::to_vec(&record)
-            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        let encoded =
+            serde_json::to_vec(&record).map_err(|error| TestdError::Corrupt(error.to_string()))?;
         write
             .open_table(BLOB_PROCESS_STREAM_CALLS)
             .map_err(database)?
@@ -4302,9 +4328,8 @@ impl TestdStore {
         let Some(value) = table.get(key.as_str()).map_err(database)? else {
             return Ok(TestdBlobProcessStreamResolution::NotReady);
         };
-        let record: TestdBlobProcessStreamCallRecord =
-            serde_json::from_slice(value.value())
-                .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        let record: TestdBlobProcessStreamCallRecord = serde_json::from_slice(value.value())
+            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
         validate_blob_process_stream_call_record(
             &record,
             job_id,
@@ -4365,8 +4390,11 @@ impl TestdStore {
             }
             (TestdBlobProcessStreamCallState::Dispatched, None) => return Ok(()),
             (TestdBlobProcessStreamCallState::Reserved, Some(outcome))
-                if matches!(outcome, TestdBlobProcessStreamCallOutcome::NotStarted
-                    | TestdBlobProcessStreamCallOutcome::Unavailable) =>
+                if matches!(
+                    outcome,
+                    TestdBlobProcessStreamCallOutcome::NotStarted
+                        | TestdBlobProcessStreamCallOutcome::Unavailable
+                ) =>
             {
                 record.state = TestdBlobProcessStreamCallState::Completed(outcome);
             }
@@ -4374,20 +4402,26 @@ impl TestdStore {
                 record.state = TestdBlobProcessStreamCallState::Completed(outcome);
             }
             (TestdBlobProcessStreamCallState::Completed(existing), Some(outcome))
-                if existing == outcome => return Ok(()),
+                if existing == outcome =>
+            {
+                return Ok(());
+            }
             // A protected reconciliation can resolve an earlier Unknown for
             // this exact logical call. Unknown is explicitly unresolved, so
             // replacing it with the retained owner outcome does not change
             // the request binding or authorize another Store dispatch.
-            (TestdBlobProcessStreamCallState::Completed(
-                TestdBlobProcessStreamCallOutcome::Unknown,
-            ), Some(outcome)) => {
+            (
+                TestdBlobProcessStreamCallState::Completed(
+                    TestdBlobProcessStreamCallOutcome::Unknown,
+                ),
+                Some(outcome),
+            ) => {
                 record.state = TestdBlobProcessStreamCallState::Completed(outcome);
             }
             _ => return Err(TestdError::InvalidBinding),
         }
-        let encoded = serde_json::to_vec(&record)
-            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        let encoded =
+            serde_json::to_vec(&record).map_err(|error| TestdError::Corrupt(error.to_string()))?;
         write
             .open_table(BLOB_PROCESS_STREAM_CALLS)
             .map_err(database)?

@@ -12,14 +12,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use sha2::{Digest as _, Sha256};
+use eliot_blob::BlobStoreStreamSink;
 use eliot_blob::{
-    BlobRootOwner, BlobStoreService,
-    BlobStreamSinkStoreBinding, DpapiUserAeadPort, RleCompressionPort,
-    DpapiUserKeyPort, WindowsBlobPlatformPort,
+    BlobRootOwner, BlobStoreService, BlobStreamSinkStoreBinding, DpapiUserAeadPort,
+    DpapiUserKeyPort, RleCompressionPort, WindowsBlobPlatformPort,
 };
 use eliot_blob_api::BlobStoreClient;
-use eliot_blob::BlobStoreStreamSink;
 use eliot_contracts::StateFence;
 use eliot_installation::{
     InstallationProfile, ValidatedRuntimeRootLeases, WindowsRuntimeRootLease,
@@ -35,15 +33,15 @@ use eliot_kernel_service::{
 };
 use eliot_platform::{ClockObservation, PlatformHandle};
 use eliot_platform_windows::WindowsPlatform;
-use eliot_protocol::{
-    ClientHello, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolRange,
-    ProtocolVersion, RequestIdentity, ServerHello,
-};
 use eliot_process::stream_sink::{
     ProcessStreamSinkAbortRequest, ProcessStreamSinkAppend, ProcessStreamSinkAppendDisposition,
     ProcessStreamSinkClient, ProcessStreamSinkError, ProcessStreamSinkFinalizeRequest,
-    ProcessStreamSinkOpenRequest, ProcessStreamSinkSession, ProcessStreamSinkTerminal,
-    ProcessStreamSinkUnknownOutcome, ProcessStreamSinkReadback,
+    ProcessStreamSinkOpenRequest, ProcessStreamSinkReadback, ProcessStreamSinkSession,
+    ProcessStreamSinkTerminal, ProcessStreamSinkUnknownOutcome,
+};
+use eliot_protocol::{
+    ClientHello, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolRange,
+    ProtocolVersion, RequestIdentity, ServerHello,
 };
 use eliot_store_api::{
     BackupOperationReconciliation, CAPABILITIES, CanonicalRequestView, CanonicalRestoreBatch,
@@ -74,6 +72,7 @@ use eliot_store_surreal_adapter::{
 use secrecy::SecretString;
 #[cfg(test)]
 use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 pub mod boundary_map;
@@ -564,9 +563,10 @@ impl StoreComposition {
             .lease_for_request(identity.request.clone())
             .map_err(|error| format!("derive Store-owned Blob root lease: {error}"))?;
         let client = self.blob_client_for_lease(lease)?;
-        Ok(client.health().await.is_ok_and(|health| {
-            health.validate().is_ok() && health.ready && health.owner_matches
-        }))
+        Ok(client
+            .health()
+            .await
+            .is_ok_and(|health| health.validate().is_ok() && health.ready && health.owner_matches))
     }
 
     /// Reports whether this composition can serve the capability after a
@@ -575,11 +575,9 @@ impl StoreComposition {
     pub fn blob_process_stream_supported(&self) -> bool {
         !self.blob_root_path.as_os_str().is_empty()
             && self.blob_root_path.is_absolute()
-            && self.blob.owns_service_root(
-                self.blob_root_path
-                    .to_str()
-                    .unwrap_or_default(),
-            )
+            && self
+                .blob
+                .owns_service_root(self.blob_root_path.to_str().unwrap_or_default())
     }
 
     /// Current, capability-specific availability for Store handshake
@@ -595,9 +593,10 @@ impl StoreComposition {
         let Some(client) = client else {
             return false;
         };
-        client.health().await.is_ok_and(|health| {
-            health.validate().is_ok() && health.ready && health.owner_matches
-        })
+        client
+            .health()
+            .await
+            .is_ok_and(|health| health.validate().is_ok() && health.ready && health.owner_matches)
     }
 
     /// Installs the one trusted Store-side authority owner for process stream
@@ -717,7 +716,9 @@ impl StoreComposition {
         binding_ref: &str,
         request: ProcessStreamSinkAppend,
     ) -> Result<ProcessStreamSinkAppendDisposition, ProcessStreamSinkError> {
-        let (sink, session) = self.blob_sink_handle(transport, identity, capability_ref, binding_ref).await?;
+        let (sink, session) = self
+            .blob_sink_handle(transport, identity, capability_ref, binding_ref)
+            .await?;
         sink.append(session, request).await
     }
 
@@ -729,7 +730,9 @@ impl StoreComposition {
         binding_ref: &str,
         request: ProcessStreamSinkFinalizeRequest,
     ) -> Result<ProcessStreamSinkTerminal, ProcessStreamSinkError> {
-        let (sink, session) = self.blob_sink_handle(transport, identity, capability_ref, binding_ref).await?;
+        let (sink, session) = self
+            .blob_sink_handle(transport, identity, capability_ref, binding_ref)
+            .await?;
         sink.finalize(session, request).await
     }
 
@@ -741,7 +744,9 @@ impl StoreComposition {
         binding_ref: &str,
         request: ProcessStreamSinkAbortRequest,
     ) -> Result<ProcessStreamSinkTerminal, ProcessStreamSinkError> {
-        let (sink, session) = self.blob_sink_handle(transport, identity, capability_ref, binding_ref).await?;
+        let (sink, session) = self
+            .blob_sink_handle(transport, identity, capability_ref, binding_ref)
+            .await?;
         sink.abort(session, request).await
     }
 
@@ -752,7 +757,9 @@ impl StoreComposition {
         capability_ref: &str,
         binding_ref: &str,
     ) -> Result<ProcessStreamSinkReadback, ProcessStreamSinkError> {
-        let (sink, session) = self.blob_sink_handle(transport, identity, capability_ref, binding_ref).await?;
+        let (sink, session) = self
+            .blob_sink_handle(transport, identity, capability_ref, binding_ref)
+            .await?;
         sink.readback(session).await
     }
 
@@ -764,7 +771,9 @@ impl StoreComposition {
         binding_ref: &str,
         outcome: ProcessStreamSinkUnknownOutcome,
     ) -> Result<ProcessStreamSinkReadback, ProcessStreamSinkError> {
-        let (sink, session) = self.blob_sink_handle(transport, identity, capability_ref, binding_ref).await?;
+        let (sink, session) = self
+            .blob_sink_handle(transport, identity, capability_ref, binding_ref)
+            .await?;
         sink.reconcile(session, outcome).await
     }
 
@@ -774,10 +783,18 @@ impl StoreComposition {
         identity: &RequestIdentity,
         capability_ref: &str,
         binding_ref: &str,
-    ) -> Result<(Arc<BlobStoreStreamSink<Arc<dyn BlobStoreClient>>>, ProcessStreamSinkSession), ProcessStreamSinkError> {
+    ) -> Result<
+        (
+            Arc<BlobStoreStreamSink<Arc<dyn BlobStoreClient>>>,
+            ProcessStreamSinkSession,
+        ),
+        ProcessStreamSinkError,
+    > {
         validate_blob_sink_transport(transport, identity, capability_ref)?;
         let sinks = self.blob_stream_sinks.lock().await;
-        let Some(retained) = sinks.get(&(transport.connection_id().to_owned(), binding_ref.to_owned())) else {
+        let Some(retained) =
+            sinks.get(&(transport.connection_id().to_owned(), binding_ref.to_owned()))
+        else {
             return Err(ProcessStreamSinkError::ProviderUnavailable);
         };
         if retained.capability_ref != capability_ref || retained.binding_ref != binding_ref {
@@ -2354,15 +2371,16 @@ pub fn validate_blob_process_stream_request_frame(
     if identity.request.metadata.request_id != *request_id
         || identity.request.state_fence != session.state_fence
     {
-        return Err("Blob process-stream identity does not match request or session fence".to_owned());
+        return Err(
+            "Blob process-stream identity does not match request or session fence".to_owned(),
+        );
     }
     let ProtocolPayload::Json(payload) = &frame.payload else {
         return Err("Blob process-stream payload must use JSON v1".to_owned());
     };
     let decoded: eliot_blob_api::wire::BlobProcessStreamFrameRequest =
-        serde_json::from_value(payload.clone()).map_err(|error| {
-            format!("invalid closed Blob process-stream frame: {error}")
-        })?;
+        serde_json::from_value(payload.clone())
+            .map_err(|error| format!("invalid closed Blob process-stream frame: {error}"))?;
     decoded.validate().map_err(|error| error.to_string())?;
     let bound = BoundIdentity::new(
         session.connection_id.clone(),

@@ -122,16 +122,15 @@ use eliot_protocol::dreamer_job::{DurableJobResponse, JobState};
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use eliot_testd_core::{
     BUILD_ROOT_DIRECTORY, BuildClass, BuildFingerprint, BuildMode, GovernedWorkEnvelope,
-    InstrumentStageRequest, JobClass,
-    JobState as TestdJobState, JobSubmissionMetadata, KernelProcessAdmissionEvidence,
-    KernelProcessAdmissionProvider, KernelProcessAdmissionRequest, LaneIdentity, ProcessAdmission,
-    ResourceWeight, RetryPolicy, TARGET_LAYOUT_REVISION, TESTD_OWNER_SUBMIT_OPERATION,
-    TESTD_OWNER_SUBMIT_WIRE_VERSION, TESTD_PRODUCTIVE_PROFILE, TargetLayoutBinding, TargetRoots,
-    StageExecutionKind, TestResourceProfile, TestdBlobProcessStreamGrant,
-    TestdBlobProcessStreamTokenRef, TestdOwnerSubmitDirective, TestdOwnerSubmitRequest,
-    TestdOwnerSubmitResponse, TestdStore, TestdVerifierDispatchBinding, TestdVerifierJobSubmission,
-    issue_process_admission, testd_profile_binding, verification_receipt_sha256,
-    verify_envelope_layout_binding,
+    InstrumentStageRequest, JobClass, JobState as TestdJobState, JobSubmissionMetadata,
+    KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider, KernelProcessAdmissionRequest,
+    LaneIdentity, ProcessAdmission, ResourceWeight, RetryPolicy, StageExecutionKind,
+    TARGET_LAYOUT_REVISION, TESTD_OWNER_SUBMIT_OPERATION, TESTD_OWNER_SUBMIT_WIRE_VERSION,
+    TESTD_PRODUCTIVE_PROFILE, TargetLayoutBinding, TargetRoots, TestResourceProfile,
+    TestdBlobProcessStreamGrant, TestdBlobProcessStreamTokenRef, TestdOwnerSubmitDirective,
+    TestdOwnerSubmitRequest, TestdOwnerSubmitResponse, TestdStore, TestdVerifierDispatchBinding,
+    TestdVerifierJobSubmission, issue_process_admission, testd_profile_binding,
+    verification_receipt_sha256, verify_envelope_layout_binding,
 };
 use serde::{Deserialize, Serialize};
 
@@ -2004,24 +2003,27 @@ fn capture_testd_launch_owner_binding(
         grant
             .validate()
             .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
-        let stage_freshness = stage
-            .provider_freshness
-            .as_ref()
-            .ok_or_else(|| DispatchLaunchError::Gate(
+        let stage_freshness = stage.provider_freshness.as_ref().ok_or_else(|| {
+            DispatchLaunchError::Gate(
                 "productive TestD launch has no provider freshness record".to_owned(),
-            ))?;
+            )
+        })?;
         let tool_observation = job.provider_tool_observation.as_ref().ok_or_else(|| {
             DispatchLaunchError::Gate(
                 "productive TestD launch has no retained provider tool observation".to_owned(),
             )
         })?;
-        let environment = job.provider_environment_projection.as_ref().ok_or_else(|| {
-            DispatchLaunchError::Gate(
-                "productive TestD launch has no retained provider environment".to_owned(),
-            )
-        })?;
-        let currentness_bytes = canonical_json_bytes(&(stage_freshness, tool_observation, environment))
-            .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+        let environment = job
+            .provider_environment_projection
+            .as_ref()
+            .ok_or_else(|| {
+                DispatchLaunchError::Gate(
+                    "productive TestD launch has no retained provider environment".to_owned(),
+                )
+            })?;
+        let currentness_bytes =
+            canonical_json_bytes(&(stage_freshness, tool_observation, environment))
+                .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
         if sha256_hex(&currentness_bytes) != grant.currentness_sha256 {
             return Err(DispatchLaunchError::Gate(
                 "durable TestD Blob grant is bound to different provider currentness material"
@@ -4777,7 +4779,10 @@ pub fn prepare_testd_launch(
         })?;
     let grant = dispatch_grant_for(
         DispatchedWorkerKind::Testd,
-        &testd_material_identity_digest(&admission, owner_binding.blob_process_stream_grant.as_ref())?,
+        &testd_material_identity_digest(
+            &admission,
+            owner_binding.blob_process_stream_grant.as_ref(),
+        )?,
         &authority_epoch,
         generation,
         admission.admitted_at_unix_nanos,

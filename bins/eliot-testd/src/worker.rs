@@ -71,9 +71,9 @@ use eliot_process::{
 };
 use eliot_testd_core::{
     EvidenceCollector, JobState, KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider,
-    Lease, SourceObservationGitPort, TestJob, TestdError,
-    TestdSourceObservation, TestdSourceObservationRange, TestdStore, TestdToolObservation,
-    evaluate_testd_verification, issue_process_admission,
+    Lease, SourceObservationGitPort, TestJob, TestdError, TestdSourceObservation,
+    TestdSourceObservationRange, TestdStore, TestdToolObservation, evaluate_testd_verification,
+    issue_process_admission,
 };
 
 use crate::kernel_client::{
@@ -256,7 +256,8 @@ fn receipt_or_corrupt(
 #[allow(
     clippy::too_many_arguments,
     reason = "DISPATCH-LIVE residual: one admitted-shot context (composition, store, job, lease, presented material, executor, owner, now); a params-struct refactor is deferred until the dispatch-launch seam fixes the call shape, never a bare allow"
-)]fn drive_claimed<E: ProcessExecutor + 'static>(
+)]
+fn drive_claimed<E: ProcessExecutor + 'static>(
     store: &TestdStore,
     job: &TestJob,
     lease: &mut Lease,
@@ -1039,4 +1040,3 @@ pub(crate) fn block_on_one_shot<F: Future>(future: F) -> F::Output {
         }
     }
 }
-

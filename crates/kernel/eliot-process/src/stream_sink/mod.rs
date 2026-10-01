@@ -261,11 +261,15 @@ pub enum ProcessStreamSinkError {
         possible_effect: bool,
     },
     /// The owner rejected a stale or conflicting authority fence.
-    #[error("storage authority was fenced: {reason}")]
-    AdmissionFenced { reason: ProcessStreamSinkFenceReason },
+    #[error("storage authority was fenced: {reason:?}")]
+    AdmissionFenced {
+        reason: ProcessStreamSinkFenceReason,
+    },
     /// Storage verification rejected source bytes or their metadata binding.
-    #[error("stored source integrity failed: {reason}")]
-    IntegrityFailure { reason: ProcessStreamSinkIntegrityReason },
+    #[error("stored source integrity failed: {reason:?}")]
+    IntegrityFailure {
+        reason: ProcessStreamSinkIntegrityReason,
+    },
     /// The owner could not establish whether the original operation took effect.
     #[error("storage effect remains possible and unresolved at {operation}")]
     PossibleEffectUnknown { operation: &'static str },

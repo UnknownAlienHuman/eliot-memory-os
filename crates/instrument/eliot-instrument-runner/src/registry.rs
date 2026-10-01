@@ -1139,7 +1139,9 @@ impl ProviderRegistry {
             dotnet_entry(fingerprints, generation)?,
         ];
         for entry in &mut entries {
-            entry.normative_pair_digest.clone_from(&normative_pair_digest);
+            entry
+                .normative_pair_digest
+                .clone_from(&normative_pair_digest);
         }
         let registry = Self::build(entries, generation, normative_pair_digest)?;
         registry.verify_profile_identities()?;
@@ -2192,4 +2194,3 @@ mod tests {
         ));
     }
 }
-

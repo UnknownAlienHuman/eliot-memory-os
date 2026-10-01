@@ -38,7 +38,11 @@ pub const BLOB_PROCESS_STREAM_KERNEL_MAX_FRAME_BYTES: usize = 3 * 1024 * 1024;
 
 /// Operation tag inside the distinct Blob EBP channel.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "operation", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[serde(
+    tag = "operation",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    deny_unknown_fields
+)]
 pub enum BlobProcessStreamOperationRequest {
     /// Process stream sink mutation/readback operation.
     Sink {
@@ -91,7 +95,11 @@ impl BlobProcessStreamFrameRequest {
 
 /// Operation tag inside a Blob EBP response.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "operation", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[serde(
+    tag = "operation",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    deny_unknown_fields
+)]
 pub enum BlobProcessStreamOperationResponse {
     /// Process stream sink operation result.
     Sink {
@@ -220,8 +228,8 @@ impl BlobProcessStreamKernelRequest {
         if sha256_hex(&operation) != self.operation_sha256 {
             return Err(WireValidationError::InvalidField("operation_sha256"));
         }
-        let encoded = serde_json::to_vec(self)
-            .map_err(|_| WireValidationError::InvalidField("frame"))?;
+        let encoded =
+            serde_json::to_vec(self).map_err(|_| WireValidationError::InvalidField("frame"))?;
         if encoded.len() > BLOB_PROCESS_STREAM_KERNEL_MAX_FRAME_BYTES {
             return Err(WireValidationError::InvalidField("frame"));
         }
@@ -231,7 +239,11 @@ impl BlobProcessStreamKernelRequest {
 
 /// Result of one narrow authenticated TestD-to-Kernel capability operation.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "outcome", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[serde(
+    tag = "outcome",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    deny_unknown_fields
+)]
 pub enum BlobProcessStreamKernelOutcome {
     /// Exact typed owner response retained for this token and operation digest.
     Completed {
@@ -312,15 +324,14 @@ impl BlobProcessStreamKernelResponse {
             }
             BlobProcessStreamKernelOutcome::NotStarted { operation_sha256 }
             | BlobProcessStreamKernelOutcome::Unavailable {
-                operation_sha256,
-                ..
+                operation_sha256, ..
             }
             | BlobProcessStreamKernelOutcome::Unknown { operation_sha256 } => {
                 validate_digest("operation_sha256", operation_sha256)?;
             }
         }
-        let encoded = serde_json::to_vec(self)
-            .map_err(|_| WireValidationError::InvalidField("frame"))?;
+        let encoded =
+            serde_json::to_vec(self).map_err(|_| WireValidationError::InvalidField("frame"))?;
         if encoded.len() > BLOB_PROCESS_STREAM_KERNEL_MAX_FRAME_BYTES {
             return Err(WireValidationError::InvalidField("frame"));
         }
@@ -340,18 +351,18 @@ impl BlobProcessStreamKernelResponse {
         }
         let operation_sha256 = match &self.outcome {
             BlobProcessStreamKernelOutcome::Completed {
-                operation_sha256,
-                ..
+                operation_sha256, ..
             }
             | BlobProcessStreamKernelOutcome::NotStarted { operation_sha256 }
             | BlobProcessStreamKernelOutcome::Unavailable {
-                operation_sha256,
-                ..
+                operation_sha256, ..
             }
             | BlobProcessStreamKernelOutcome::Unknown { operation_sha256 } => operation_sha256,
         };
         if operation_sha256 != &request.operation_sha256 {
-            return Err(WireValidationError::InvalidField("response_operation_sha256"));
+            return Err(WireValidationError::InvalidField(
+                "response_operation_sha256",
+            ));
         }
         Ok(())
     }
@@ -575,7 +586,11 @@ impl ProcessStreamSinkBindingRef {
 /// before using any field. No operation accepts arbitrary commands, paths,
 /// Blob contexts, leases, or caller-issued receipts.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "operation", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[serde(
+    tag = "operation",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    deny_unknown_fields
+)]
 pub enum ProcessStreamSinkWireRequest {
     /// Open a stream from the admitted process binding.
     Open {
@@ -703,8 +718,8 @@ impl ProcessStreamSinkWireRequest {
             binding.validate()?;
         }
         if let Some(body) = body {
-            let encoded = serde_json::to_vec(body)
-                .map_err(|_| WireValidationError::InvalidField("body"))?;
+            let encoded =
+                serde_json::to_vec(body).map_err(|_| WireValidationError::InvalidField("body"))?;
             if !body.is_object() || encoded.len() > PROCESS_STREAM_SINK_MAX_BODY_BYTES {
                 return Err(WireValidationError::InvalidField("body"));
             }
@@ -720,7 +735,11 @@ impl ProcessStreamSinkWireRequest {
 
 /// Closed owner outcomes for process-stream sink operations.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "outcome", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[serde(
+    tag = "outcome",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    deny_unknown_fields
+)]
 pub enum ProcessStreamSinkWireResponse {
     /// Open accepted under the exact original binding.
     Opened {
@@ -755,7 +774,11 @@ pub enum ProcessStreamSinkWireResponse {
 
 /// Closed outcome of a source readback/reconciliation request.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "outcome", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[serde(
+    tag = "outcome",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    deny_unknown_fields
+)]
 pub enum ProcessStreamSourceReadbackResponse {
     /// Exact ready source bytes plus owner-issued receipt evidence.
     Ready {
