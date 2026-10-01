@@ -378,7 +378,9 @@ impl DreamerJobLedgerRecord {
             let expected_prior = index
                 .checked_sub(1)
                 .and_then(|previous| self.admission_history.get(previous))
-                .map_or(WorkAdmissionState::Admitted, |previous| previous.admission_state);
+                .map_or(WorkAdmissionState::Admitted, |previous| {
+                    previous.admission_state
+                });
             if revision.revision != expected_revision
                 || revision.job_id != self.record.submission.job_id
                 || revision.attempt_id != self.record.submission.attempt_id

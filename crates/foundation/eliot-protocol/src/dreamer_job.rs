@@ -1128,7 +1128,11 @@ impl WorkAdmissionState {
             Self::BlockedDependency => matches!(next, Self::Ready),
             Self::Ready | Self::Admitted | Self::DeferredCapacity => matches!(
                 next,
-                Self::Ready | Self::Admitted | Self::DeferredCapacity | Self::Cancelled | Self::Stale
+                Self::Ready
+                    | Self::Admitted
+                    | Self::DeferredCapacity
+                    | Self::Cancelled
+                    | Self::Stale
             ),
             Self::Cancelled | Self::Stale => false,
         }
@@ -1334,7 +1338,10 @@ impl JobAdmissionRevision {
             }
             (None, _) => {}
         }
-        if !self.prior_admission_state.can_transition_to(self.admission_state) {
+        if !self
+            .prior_admission_state
+            .can_transition_to(self.admission_state)
+        {
             return Err(DurableJobError::InvalidField {
                 field: "admission.admission_state",
                 reason: "illegal admission transition",
@@ -1389,17 +1396,16 @@ impl JobAdmissionRevision {
         } else if outcome.is_some() {
             return Err(DurableJobError::OperationMismatch);
         }
-            // Capacity deferral happens before admission, so no external
-            // attempt may exist for the deferred work.
-            if self.admission_state == WorkAdmissionState::DeferredCapacity
-                && (record.lease.is_some()
-                    || !matches!(record.state, JobState::NotStarted | JobState::Queued))
-            {
-                return Err(DurableJobError::InvalidField {
-                    field: "admission.admission_state",
-                    reason: "DEFERRED_CAPACITY precedes admission and owns no attempt",
-                });
-            }
+        // Capacity deferral happens before admission, so no external
+        // attempt may exist for the deferred work.
+        if self.admission_state == WorkAdmissionState::DeferredCapacity
+            && (record.lease.is_some()
+                || !matches!(record.state, JobState::NotStarted | JobState::Queued))
+        {
+            return Err(DurableJobError::InvalidField {
+                field: "admission.admission_state",
+                reason: "DEFERRED_CAPACITY precedes admission and owns no attempt",
+            });
         }
         Ok(())
     }
