@@ -1117,7 +1117,7 @@ pub fn automation_normalization_read_request(
     ]);
     let request = NamedReadRequest {
         operation: NamedReadOperation::GetUserAutomationState,
-        scope_id: None,
+        scope_id: Some(ScopeId::new(USER_AUTOMATION_SCOPE)?),
         consistency: ReadConsistency::ExactFence,
         state_fence,
         parameters,
