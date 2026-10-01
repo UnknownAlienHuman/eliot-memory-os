@@ -1615,8 +1615,12 @@ impl KernelStoreGateway {
             // The Store owner proved the mutation was not applied, so the
             // still-`Eligible` token releases cleanly and nothing orphans.
             Err(ReservedWriteSendFault::Refused(fault)) => {
-                let refusal =
-                    refuse_determinate_reserved_write(&owner, &sealed.token, fault.error(), &operation_id);
+                let refusal = refuse_determinate_reserved_write(
+                    &owner,
+                    &sealed.token,
+                    fault.error(),
+                    &operation_id,
+                );
                 drop(lease);
                 Err(refusal)
             }

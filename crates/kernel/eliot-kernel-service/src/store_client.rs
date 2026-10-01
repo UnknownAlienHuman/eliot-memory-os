@@ -605,7 +605,9 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         &self,
         request: ReservedWriteRequest,
     ) -> Result<WriteReceipt, ReservedWriteSendFault> {
-        request.validate().map_err(ReservedWriteSendFault::refused)?;
+        request
+            .validate()
+            .map_err(ReservedWriteSendFault::refused)?;
         request
             .context
             .validate()
