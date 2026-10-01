@@ -286,7 +286,8 @@ fn crosses_authority_root(from_root: &str, to_root: &str) -> bool {
 /// `GrantGraph::transitions` only through
 /// [`AdmittedRootTransition::admit`] or CURRENT-receipt
 /// [`AdmittedRootTransition::admit_restored`], which read CURRENT owner
-/// state. Snapshot-local restore admits nothing. A decoded structural
+/// state including its current policy revision and current retained semantic
+/// decision. Snapshot-local restore admits nothing. A decoded structural
 /// record never reaches
 /// this map, so this predicate can no longer be satisfied by caller material.
 fn edge_is_authorized(
@@ -396,7 +397,7 @@ impl CapabilityGrant {
 /// `GrantGraph::transitions` — a crossing becomes executable authority only
 /// through [`AdmittedRootTransition::admit`], which additionally requires the
 /// retained semantic decision, the validated Kernel activation receipt, and a
-/// CURRENT owner readback.
+/// CURRENT owner readback of the current policy revision alongside it.
 fn admit_transition_record(
     grants: &BTreeMap<GrantId, CapabilityGrant>,
     record: &crate::root_transition::RootTransitionRecord,
@@ -622,7 +623,8 @@ impl GrantGraphRecoverySnapshot {
     /// before invoking this helper; the original input remains intact for
     /// audit and reconciliation. Re-admission runs only through
     /// [`AdmittedRootTransition::admit_restored`] with a CURRENT receipt plus
-    /// CURRENT grants, revision, and fence.
+    /// CURRENT grants, revision, fence, policy revision, and retained semantic
+    /// decisions.
     #[allow(
         clippy::too_many_lines,
         reason = "restore keeps evidence admission, partitioning, quarantine and revocation in one fail-closed sequence"

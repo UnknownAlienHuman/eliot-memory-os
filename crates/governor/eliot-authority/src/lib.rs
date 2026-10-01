@@ -17,8 +17,8 @@ mod revocation_history;
 mod root_transition;
 
 pub use root_transition::{
-    AdmittedRootTransition, AdmittedRootTransitionRecord, ROOT_TRANSITION_OPERATION_KIND,
-    ROOT_TRANSITION_RECEIPT_SCHEMA, ROOT_TRANSITION_RECEIPT_VERSION,
+    AdmittedRootTransition, AdmittedRootTransitionRecord, CurrentTransitionReadback,
+    ROOT_TRANSITION_OPERATION_KIND, ROOT_TRANSITION_RECEIPT_SCHEMA, ROOT_TRANSITION_RECEIPT_VERSION,
     RootTransitionActivationReceipt, RootTransitionActivationRequest, RootTransitionDisposition,
     RootTransitionRecord, grant_commitment,
 };
