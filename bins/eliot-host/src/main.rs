@@ -315,6 +315,8 @@ fn console_process_exit_code() -> i32 {
 // B12 shutdown/cancellation (`finish_console_shutdown`, ShutdownDrain): the
 //     single `host.stop()` call is preserved; the `Ok`/`Stopped` outcomes
 //     are distinguished with identical results; drain outcome observed only.
+//     A dispatch-attempted stop prohibits the second call (item 2: one
+//     terminal, unchanged cleanup count).
 // B13 terminal exit codes (`console_process_exit_code`): unchanged.
 // B14 service-entry start failures (windows-only, ScmDispatch): the
 //     `service_main` sites that never cross lib.rs. Each named site below
@@ -634,11 +636,11 @@ fn run_console() -> (bool, Option<HostLaunchOptions>) {
         service: SERVICE_NAME,
         protocol: PROTOCOL_VERSION,
     }) {
-        // Audit 5910117501 item 1 (cases 9, 11): the Ready write is the
-        // primary console outcome. Drain exactly once, but the failure stays
-        // failure even when cleanup succeeds, so `main` still emits the
-        // existing `console_failed` terminal/capsule/exit.
-        let drained = finish_console_shutdown(&mut host, "ready response failed", &launch_options);
+        // Audit 5910117501 items 1+2: the Ready write is the primary
+        // console outcome (stays failed even when cleanup succeeds); no
+        // dispatch ran on this path so no stop was attempted.
+        let drained =
+            finish_console_shutdown(&mut host, "ready response failed", &launch_options, false);
         return (console_run_ok(false, drained), Some(launch_options));
     }
     // F-LOG-HOST-7 B7 (issue #982): Ready bytes unchanged; this record never
@@ -648,10 +650,13 @@ fn run_console() -> (bool, Option<HostLaunchOptions>) {
         "ready_written",
     );
     observe_console_ready(&host, &launch_options);
-    // Audit 5910117501 item 1 (cases 8, 9, 11): the primary console outcome
-    // tracked separately from the single drain below. A read/write/protocol
-    // failure sets this; the run then stays failed even if cleanup succeeds.
+    // Audit 5910117501 items 1+2: the primary console outcome tracked
+    // separately from the single drain below (a read/write/protocol
+    // failure sets this; the run stays failed even if cleanup succeeds),
+    // plus the stop-attempt latch (dispatch-invoked stop prohibits the
+    // second semantic call; admission-refused stops stay unlatched).
     let mut primary_failed = false;
+    let mut stop_attempted = false;
     for line in io::stdin().lock().lines() {
         let (response, terminate, served) = match line {
             // Blank input still skips silently by design: not a failure, so
@@ -683,6 +688,12 @@ fn run_console() -> (bool, Option<HostLaunchOptions>) {
                 )
             }
         };
+        // Audit 5910117501 item 2: carry the attempted stop disposition
+        // into shutdown. Placed before both breaks so a Stop whose frame
+        // never reached the peer still prohibits the second semantic call.
+        if console_stop_was_attempted(served, terminate) {
+            stop_attempted = true;
+        }
         // F-LOG-HOST-7 B10 (issue #982): write failure breaks to the identical
         // shutdown path; the condition is split only to observe it, preserving
         // evaluation order and outcome. The failure flag keeps this primary
@@ -708,7 +719,12 @@ fn run_console() -> (bool, Option<HostLaunchOptions>) {
             break;
         }
     }
-    let drained = finish_console_shutdown(&mut host, "console input ended", &launch_options);
+    let drained = finish_console_shutdown(
+        &mut host,
+        "console input ended",
+        &launch_options,
+        stop_attempted,
+    );
     (console_run_ok(!primary_failed, drained), Some(launch_options))
 }
 
@@ -1281,10 +1297,23 @@ fn dispatch(
     }
 }
 
+/// Carries the dispatch stop disposition into shutdown (audit 5910117501
+/// item 2, cases 10-12).
+///
+/// Only a served `Stop` that terminated the loop actually invoked
+/// `HostComposition::stop()` in `dispatch`; an admission-refused stop
+/// returns `terminate == false` without touching the host, so it must not
+/// latch. The latch lets `finish_console_shutdown` prohibit the second
+/// semantic stop call: one terminal, unchanged callback/cleanup count.
+fn console_stop_was_attempted(served: Option<HostConsoleRequest>, terminate: bool) -> bool {
+    terminate && served == Some(HostConsoleRequest::Stop)
+}
+
 fn finish_console_shutdown(
     host: &mut HostComposition,
     cause: &str,
     options: &HostLaunchOptions,
+    stop_attempted: bool,
 ) -> bool {
     // F-LOG-HOST-7 B11/B12 (issue #982): drain entered; `cause` is one of the
     // two frozen caller literals, so it is safe detail. EOF is a normal drain,
@@ -1315,6 +1344,30 @@ fn finish_console_shutdown(
             .with_launch_options(options),
         );
         return true;
+    }
+    if stop_attempted {
+        // Audit 5910117501 item 2: dispatch already executed the one
+        // semantic stop for this request and lib.rs emitted its single
+        // terminal there. The host is still running only because that
+        // stop failed, so a second `host.stop()` here would arm a fresh
+        // `HostTerminalGuard` (duplicate terminal) and rerun semantic
+        // cleanup. Report the drain failed without re-calling: static
+        // words only, no error payload (I15.4, I07.20).
+        eliot_host::host_diagnostics::observe_entrypoint_with_detail(
+            eliot_host::host_diagnostics::EntrypointStage::ShutdownDrain,
+            "durable_shutdown_failed",
+        );
+        // #889 projection: the drain stop was already attempted and failed,
+        // so no request identity is re-derived; the non-`Host` detail stays
+        // out of the reason, mirroring the read-failure precedent.
+        observe_host_request(
+            &HostRequestProjection::failed_without_reason(
+                eliot_host::host_diagnostics::EntrypointStage::ShutdownDrain,
+            )
+            .with_operation(AdmittedEvent::ServiceStop)
+            .with_launch_options(options),
+        );
+        return false;
     }
     match host.stop() {
         Ok(()) => {
@@ -3179,6 +3232,33 @@ mod tests {
                 "variant names must never carry error payloads"
             );
         }
+    }
+
+    // Audit 5910117501 item 2 (cases 10-12): the stop disposition latch.
+    #[test]
+    fn console_attempted_stop_is_carried_into_shutdown() {
+        // Positive: a served Stop that terminated the loop invoked
+        // `HostComposition::stop()`, so shutdown must see it attempted.
+        assert!(console_stop_was_attempted(
+            Some(HostConsoleRequest::Stop),
+            true
+        ));
+    }
+
+    #[test]
+    fn console_refused_or_unrelated_request_is_not_carried_into_shutdown() {
+        // Refusals: an admission-refused stop never touched the host, and
+        // non-Stop requests never attempt a stop, so neither latches.
+        assert!(!console_stop_was_attempted(
+            Some(HostConsoleRequest::Stop),
+            false
+        ));
+        assert!(!console_stop_was_attempted(
+            Some(HostConsoleRequest::Status),
+            true
+        ));
+        assert!(!console_stop_was_attempted(None, true));
+        assert!(!console_stop_was_attempted(None, false));
     }
 
     fn windows_test_options(state_root: &std::path::Path) -> HostLaunchOptions {
