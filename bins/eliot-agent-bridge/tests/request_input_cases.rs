@@ -160,10 +160,17 @@ fn production_call_chain_has_no_unbounded_bypass_or_cloned_decoder() {
     let http_connection = main
         .split_once("fn serve_loopback_http_connection(")
         .expect("loopback HTTP connection handler must exist")
-        .1;
+        .1
+        .split_once("\n/// Validates the `Authorization` header as the scoped bearer credential,")
+        .expect("loopback HTTP handler must have a bounded function body")
+        .0;
     assert!(
         http_connection.contains(".set_read_timeout(Some(HTTP_REQUEST_READ_TIMEOUT))"),
         "loopback HTTP handler must apply its declared read deadline"
+    );
+    assert!(
+        !decoder.contains("set_read_timeout"),
+        "blocking stdin decoder must not claim an enforced read deadline"
     );
     // No cloned or test-only decoder: typed `Request` construction happens
     // exactly once, inside the bounded entry point, and the pre-scan never
