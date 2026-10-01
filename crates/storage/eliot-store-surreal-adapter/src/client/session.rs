@@ -212,7 +212,12 @@ impl RpcSession {
             .owner
             .upgrade()
             .ok_or(AdapterError::ProviderUnavailable)?;
-        let read_response = async -> Result<Value, AdapterError> {
+        // The deadline maps only its own expiry onto a transport loss. A
+        // response-size refusal is an exact, typed outcome of the admitted
+        // budget and is returned unchanged: folding it into
+        // `ProviderUnavailable` would report an over-budget source as a lost
+        // provider and let a bounded refusal read as retryable.
+        timeout(self.request_timeout, async {
             let mut socket = self.socket.lock().await;
             if prove_connection_owner {
                 let (client_local_endpoint, peer_endpoint) =
@@ -235,7 +240,9 @@ impl RpcSession {
                 match message {
                     Message::Text(text) => {
                         let response = match ceiling {
-                            Some(ceiling) => parse_response_bounded(text.as_str().as_bytes(), ceiling)?,
+                            Some(ceiling) => {
+                                parse_response_bounded(text.as_str().as_bytes(), ceiling)?
+                            }
                             None => parse_response(text.as_str())?,
                         };
                         if response.id.as_ref() == Some(&expected_id) {
@@ -268,15 +275,9 @@ impl RpcSession {
                     Message::Close(_) => return Err(AdapterError::ProviderUnavailable),
                 }
             }
-        };
-        // The deadline maps only its own expiry onto a transport loss. A
-        // response-size refusal is an exact, typed outcome of the admitted
-        // budget and is returned unchanged: folding it into
-        // `ProviderUnavailable` would report an over-budget source as a lost
-        // provider and let a bounded refusal read as retryable.
-        timeout(self.request_timeout, read_response)
-            .await
-            .map_err(|_| AdapterError::ProviderUnavailable)?
+        })
+        .await
+        .map_err(|_| AdapterError::ProviderUnavailable)?
     }
 }
 

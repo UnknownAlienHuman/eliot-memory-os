@@ -7,7 +7,9 @@
 use std::cell::Cell;
 use std::fmt;
 
-use serde::de::{DeserializeSeed, Deserializer, Error as SerdeError, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::de::{
+    DeserializeSeed, Deserializer, Error as SerdeError, IgnoredAny, MapAccess, SeqAccess, Visitor,
+};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -407,7 +409,7 @@ impl<'de> Visitor<'de> for BoundedResultVisitor<'_> {
                 .saturating_sub(statement_charge_bytes(&statement));
             if self.remaining_bytes == 0 {
                 self.budget_exceeded.set(true);
-                return Err(A::Error::custom(RESPONSE_BYTE_BUDGET_REFUSAL));
+                return Err(<A::Error as SerdeError>::custom(RESPONSE_BYTE_BUDGET_REFUSAL));
             }
             self.statements.push(statement);
         }

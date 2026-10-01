@@ -2219,8 +2219,12 @@ async fn read_enumeration(
     adapter: &SurrealStoreAdapter,
     ceiling: ResponseCeiling,
 ) -> Result<(CapturePoint, Vec<Vec<Map<String, Value>>>), StoreError> {
-    let mut response =
-        run_pinned_snapshot_query(adapter, crate::client::SNAPSHOT_MEMBERS_OPERATION, ceiling).await?;
+    let mut response = run_pinned_snapshot_query(
+        adapter,
+        crate::client::SNAPSHOT_MEMBERS_OPERATION,
+        ceiling,
+    )
+    .await?;
     let errors = response.take_errors();
     if !errors.is_empty() {
         if errors
