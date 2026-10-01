@@ -18097,7 +18097,7 @@ impl RedbRecoveryStore {
                 });
             }
             let owner = Self::checked_bridge_observation_owner_index(
-                &owners, &scope, lineage, principal, &namespace,
+                &owners, scope, lineage, principal, &namespace,
             )?;
             if sequence <= query.after_owner_sequence {
                 continue;

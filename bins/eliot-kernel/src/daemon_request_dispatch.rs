@@ -13,6 +13,22 @@
 
 use super::*;
 use tracing::Instrument;
+
+#[cfg(windows)]
+type GovernorObservationAdmissionScope = (
+    super::startup_coordinator::GovernorObservationAdmissionIdentity,
+    Option<serde_json::Value>,
+    eliot_ors::OpaqueLabel,
+    eliot_ors::OpaqueLabel,
+);
+
+#[cfg(windows)]
+type GovernorObservationUnavailable = (
+    &'static str,
+    Option<super::startup_coordinator::GovernorObservationAdmissionIdentity>,
+    Option<serde_json::Value>,
+);
+
 #[path = "store_receipt_dispatch.rs"]
 mod store_receipt_dispatch;
 use std::collections::{BTreeMap, BTreeSet};
@@ -2944,7 +2960,7 @@ impl KernelComposition {
     /// Rejoins a Governor projection to the exact latest ORS observation page
     /// on this authenticated transport before advancing the existing profile.
     /// This source slice cannot establish native-host conformance,
-    /// independent ALL_EVENTS denominator, Watchdog, or trace evidence, so any
+    /// independent `ALL_EVENTS` denominator, Watchdog, or trace evidence, so any
     /// positive authorization axis is refused.
     #[cfg(windows)]
     fn publish_governor_authority_observation(
@@ -2995,7 +3011,7 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         let consumed_readback = self.consume_governor_observation_readback(
-            readback,
+            readback.as_ref(),
             session,
             current_admission.as_ref(),
             operation.source_selectors.as_ref(),
@@ -3025,7 +3041,7 @@ impl KernelComposition {
     #[cfg(windows)]
     fn consume_governor_observation_readback(
         &self,
-        readback: Option<super::startup_coordinator::GovernorAuthorityObservationReadback>,
+        readback: Option<&super::startup_coordinator::GovernorAuthorityObservationReadback>,
         session: &Session,
         current_admission: Option<
             &super::startup_coordinator::GovernorObservationAdmissionIdentity,
@@ -3035,12 +3051,10 @@ impl KernelComposition {
         Option<super::startup_coordinator::GovernorAuthorityObservationReadback>,
         TransportError,
     > {
-        let snapshot = readback
-            .as_ref()
-            .and_then(|readback| readback.source_snapshot.as_ref());
+        let snapshot = readback.and_then(|readback| readback.source_snapshot.as_ref());
         match (source_selectors, snapshot) {
             (Some(selectors), Some(snapshot))
-                if readback.as_ref().is_some_and(|readback| {
+                if readback.is_some_and(|readback| {
                     self.governor_observation_readback_matches(
                         readback,
                         session,
@@ -3049,7 +3063,7 @@ impl KernelComposition {
                     )
                 }) =>
             {
-                let readback = readback.as_ref().ok_or(TransportError::SessionFenced)?;
+                let readback = readback.ok_or(TransportError::SessionFenced)?;
                 if selectors.after_owner_sequence != readback.selectors.after_owner_sequence
                     || selectors.after_event_sequence != readback.selectors.after_event_sequence
                     || selectors.page_limit != readback.selectors.page_limit
@@ -3062,7 +3076,6 @@ impl KernelComposition {
                 Ok(Some(readback.clone()))
             }
             (None, _) => Ok(readback
-                .as_ref()
                 .filter(|readback| {
                     self.governor_observation_readback_matches(
                         readback,
@@ -3163,13 +3176,14 @@ impl KernelComposition {
         let (admission_identity, admission_wire, authority_lineage, principal) =
             match self.governor_observation_admission_scope() {
                 Ok(scope) => scope,
-                Err((reason, admission_identity, admission_wire)) => {
+                Err(unavailable) => {
+                    let (reason, admission_identity, admission_wire) = *unavailable;
                     return self.unavailable_governor_observation(
                         session,
                         bridge_peer_set_revision,
                         admission_identity,
                         selectors,
-                        &admission_wire,
+                        admission_wire.as_ref(),
                         reason,
                     );
                 }
@@ -3193,7 +3207,7 @@ impl KernelComposition {
                     bridge_peer_set_revision,
                     Some(admission_identity.clone()),
                     selectors,
-                    &admission_wire,
+                    admission_wire.as_ref(),
                     reason,
                 );
             }
@@ -3213,7 +3227,7 @@ impl KernelComposition {
                     bridge_peer_set_revision,
                     Some(admission_identity.clone()),
                     selectors,
-                    &admission_wire,
+                    admission_wire.as_ref(),
                     reason,
                 );
             }
@@ -3222,28 +3236,16 @@ impl KernelComposition {
             session,
             bridge_peer_set_revision,
             admission_identity,
-            admission_wire,
+            admission_wire.as_ref(),
             selectors,
-            source_snapshot,
+            &source_snapshot,
         )
     }
 
     #[cfg(windows)]
     fn governor_observation_admission_scope(
         &self,
-    ) -> Result<
-        (
-            super::startup_coordinator::GovernorObservationAdmissionIdentity,
-            Option<serde_json::Value>,
-            eliot_ors::OpaqueLabel,
-            eliot_ors::OpaqueLabel,
-        ),
-        (
-            &'static str,
-            Option<super::startup_coordinator::GovernorObservationAdmissionIdentity>,
-            Option<serde_json::Value>,
-        ),
-    > {
+    ) -> Result<GovernorObservationAdmissionScope, Box<GovernorObservationUnavailable>> {
         let admission = self
             .agent_bridge_profile
             .lock()
@@ -3251,7 +3253,7 @@ impl KernelComposition {
             .as_ref()
             .map(|profile| profile.admission.clone());
         let Some(admission) = admission else {
-            return Err(("no_active_original_admission", None, None));
+            return Err(Box::new(("no_active_original_admission", None, None)));
         };
         let identity = super::startup_coordinator::GovernorObservationAdmissionIdentity {
             descriptor_sha256: admission.descriptor_sha256.clone(),
@@ -3266,17 +3268,21 @@ impl KernelComposition {
             "executable_sha256": admission.executable_sha256,
         }));
         if self.validate_active_bridge_profile(&admission).is_err() {
-            return Err((
+            return Err(Box::new((
                 "active_original_admission_not_validated",
                 Some(identity),
                 wire,
-            ));
+            )));
         }
         let authority_lineage =
             eliot_ors::OpaqueLabel::new(admission.state_fence.authority_epoch.lineage_id.as_str());
         let principal = eliot_ors::OpaqueLabel::new(admission.approved_user_sid.as_str());
         let (Ok(authority_lineage), Ok(principal)) = (authority_lineage, principal) else {
-            return Err(("active_source_scope_invalid", Some(identity), wire));
+            return Err(Box::new((
+                "active_source_scope_invalid",
+                Some(identity),
+                wire,
+            )));
         };
         Ok((identity, wire, authority_lineage, principal))
     }
@@ -3287,9 +3293,9 @@ impl KernelComposition {
         session: &Session,
         bridge_peer_set_revision: u64,
         admission: super::startup_coordinator::GovernorObservationAdmissionIdentity,
-        admission_wire: Option<serde_json::Value>,
+        admission_wire: Option<&serde_json::Value>,
         selectors: super::startup_coordinator::GovernorObservationSelectors,
-        source_snapshot: super::startup_coordinator::GovernorObservationSourceSnapshot,
+        source_snapshot: &super::startup_coordinator::GovernorObservationSourceSnapshot,
     ) -> Result<serde_json::Value, TransportError> {
         self.startup_coordinator
             .lock()
@@ -3345,7 +3351,7 @@ impl KernelComposition {
         bridge_peer_set_revision: u64,
         admission: Option<super::startup_coordinator::GovernorObservationAdmissionIdentity>,
         selectors: super::startup_coordinator::GovernorObservationSelectors,
-        admission_wire: &Option<serde_json::Value>,
+        admission_wire: Option<&serde_json::Value>,
         reason: &'static str,
     ) -> Result<serde_json::Value, TransportError> {
         self.startup_coordinator

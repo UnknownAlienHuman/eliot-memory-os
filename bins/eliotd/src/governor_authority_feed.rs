@@ -171,7 +171,7 @@ async fn read_governor_authority_observation(
                 reason: reason.to_owned(),
             },
         };
-    let response = match kernel
+    let Ok(response) = kernel
         .transact_async(
             READ_GOVERNOR_AUTHORITY_OBSERVATION_OPERATION,
             serde_json::json!({
@@ -181,15 +181,11 @@ async fn read_governor_authority_observation(
             }),
         )
         .await
-    {
-        Ok(response) => response,
-        Err(_) => {
-            return unavailable(None, "authenticated Kernel observation read failed");
-        }
+    else {
+        return unavailable(None, "authenticated Kernel observation read failed");
     };
-    let value = match kind_value(&response, GOVERNOR_AUTHORITY_OBSERVATION_KIND) {
-        Ok(value) => value,
-        Err(_) => return unavailable(None, "Kernel observation response kind was invalid"),
+    let Ok(value) = kind_value(&response, GOVERNOR_AUTHORITY_OBSERVATION_KIND) else {
+        return unavailable(None, "Kernel observation response kind was invalid");
     };
     let wire: GovernorAuthorityObservationResponseWire =
         match serde_json::from_value::<GovernorAuthorityObservationResponseWire>(value) {
