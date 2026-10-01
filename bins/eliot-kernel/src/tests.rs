@@ -5418,13 +5418,15 @@ async fn c183_probe_ready_shares_store_rebind_gate_and_requires_committed_public
         KernelComposition::production_store_rebind_discriminator(),
         KERNEL_STORE_REBIND_PRODUCTION_DISCRIMINATOR
     );
-    let dir = std::env::temp_dir().join(format!(
+    let root = std::env::temp_dir().join(format!(
         "c183-probe-gate-{}-{}",
         std::process::id(),
         unix_ms()
     ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let dir = std::fs::canonicalize(&dir).unwrap();
+    // Exclusive creation proves this test owns the cleanup root. Reusing an
+    // existing temp path would let cleanup remove another operation's files.
+    std::fs::create_dir(&root).unwrap();
+    let dir = std::fs::canonicalize(&root).unwrap();
     let requirement = HostStoreBootstrapRequirement {
         route_identity: PlatformHandle::new("store_bridge").unwrap(),
         canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store").unwrap(),
@@ -5442,7 +5444,6 @@ async fn c183_probe_ready_shares_store_rebind_gate_and_requires_committed_public
     let root_lease = eliot_platform_windows::UserOwnedRootLease::open_existing(&dir)
         .expect("retain PortableDev repository root");
     let repository_root_identity = root_lease.identity();
-    drop(root_lease);
     let supervision_key_request =
         eliot_platform_windows::PortableDevSupervisionAuthorityKeyRequest {
             transaction_id: format!("c183-key-transaction-{}", std::process::id()),
@@ -5506,7 +5507,7 @@ async fn c183_probe_ready_shares_store_rebind_gate_and_requires_committed_public
             host_epoch: AuthorityEpoch::new(1).unwrap(),
             kernel_epoch: test_epoch(1),
             activation_id: PlatformHandle::new("activation-1").unwrap(),
-            artifact_hash: PlatformHandle::new("artifact-1").unwrap(),
+            artifact_hash: PlatformHandle::new("a".repeat(64)).unwrap(),
             config_hash: PlatformHandle::new("config-1").unwrap(),
             job_object_id: PlatformHandle::new("Local\\Eliot-Host-Kernel-test").unwrap(),
             pipe_identity: PlatformHandle::new(KERNEL_CONTROL_PIPE).unwrap(),
@@ -5531,7 +5532,7 @@ async fn c183_probe_ready_shares_store_rebind_gate_and_requires_committed_public
                     },
                 },
             },
-            supervision_incarnation: supervision_incarnation(),
+            supervision_incarnation: incarnation.clone(),
             restart_budget: eliot_kernel_service::RestartBudget::new(1, 1).unwrap(),
             agent_bridge_admission: None,
             containment_action: None,
@@ -5575,6 +5576,17 @@ async fn c183_probe_ready_shares_store_rebind_gate_and_requires_committed_public
         svc.publish_ready(ready).unwrap();
         cand
     };
+    let peer = eliot_ipc::PeerIdentity::authenticated_for_test(
+        eliot_ipc::ProcessBinding::from_observation(
+            candidate.host_process.process_id,
+            candidate.host_process.start_time_100ns,
+            candidate.host_process.image_path.clone(),
+        )
+        .unwrap(),
+        "S-1-5-18".to_owned(),
+        "0".to_owned(),
+    )
+    .unwrap();
     let signer = ProtectedSupervisionLeaseSigner::new_for_profile(
         dir.clone(),
         eliot_installation::InstallationProfile::PortableDev,
@@ -5586,30 +5598,53 @@ async fn c183_probe_ready_shares_store_rebind_gate_and_requires_committed_public
     let now_ms = unix_ms();
     let lease_id = OperationIdentity::new(incarnation.supervision_lease_id.clone())
         .expect("current supervision lease identity");
+    let (kernel_front_door_server_sid, kernel_front_door_session_id) = match &peer {
+        eliot_ipc::PeerIdentity::Authenticated {
+            user_identity,
+            session_identity,
+            ..
+        } => (
+            user_identity.clone(),
+            session_identity.parse::<u32>().unwrap(),
+        ),
+        eliot_ipc::PeerIdentity::Unavailable { .. } => {
+            panic!("the test lease requires its authenticated Kernel peer")
+        }
+    };
+    let kernel_generation = ResourceGeneration::new(incarnation.kernel_generation.sequence)
+        .unwrap();
+    let expected_generation_binding = SupervisionGenerationBinding {
+        target_id: incarnation.observation_scope.targets[0].clone(),
+        target_generation: kernel_generation,
+        module_id: incarnation.observation_scope.targets[0].clone(),
+        module_generation: kernel_generation,
+        process_id: format!(
+            "pid:{}:start:{}",
+            candidate.job_binding.root.process.process_id,
+            candidate.job_binding.root.process.start_time_100ns
+        ),
+        process_generation: kernel_generation,
+    };
     let lease_binding = eliot_ors::SupervisionLeaseBinding {
         scope_ref: OperationIdentity::new(
             incarnation.derived_scope_ref().expect("derived lease scope ref"),
         )
         .expect("supervision scope identity"),
-        observation_scope: eliot_runtime_contracts::canonical_observation_scope(),
-        installation_id: OperationIdentity::new("installation-1").unwrap(),
+        observation_scope: incarnation.observation_scope.clone(),
+        installation_id: OperationIdentity::new(candidate.installation_id.as_str()).unwrap(),
         host_epoch: candidate.host_epoch.clone(),
-        activation_id: OperationIdentity::new("activation-1").unwrap(),
-        activation_generation: ResourceGeneration::genesis(),
-        kernel_epoch: test_epoch(1),
-        kernel_front_door_server_sid: "S-1-5-18".to_owned(),
-        kernel_front_door_session_id: 0,
-        kernel_front_door_artifact_sha256: "a".repeat(64),
-        watchdog_epoch: AuthorityEpoch::genesis(),
-        generation_binding: SupervisionGenerationBinding {
-            target_id: "eliotd-artifact".to_owned(),
-            target_generation: ResourceGeneration::genesis(),
-            module_id: "eliotd".to_owned(),
-            module_generation: ResourceGeneration::genesis(),
-            process_id: "pid:42:start:10".to_owned(),
-            process_generation: ResourceGeneration::genesis(),
-        },
-        state_fence: StateFence::new(test_epoch(1), ResourceGeneration::genesis()),
+        activation_id: OperationIdentity::new(candidate.activation_id.as_str()).unwrap(),
+        activation_generation: ResourceGeneration::new(
+            incarnation.activation_generation.sequence,
+        )
+        .unwrap(),
+        kernel_epoch: candidate.kernel_epoch.clone(),
+        kernel_front_door_server_sid: kernel_front_door_server_sid.clone(),
+        kernel_front_door_session_id,
+        kernel_front_door_artifact_sha256: candidate.artifact_hash.as_str().to_owned(),
+        watchdog_epoch: AuthorityEpoch::new(incarnation.watchdog_epoch.sequence).unwrap(),
+        generation_binding: expected_generation_binding.clone(),
+        state_fence: StateFence::new(candidate.kernel_epoch.clone(), ResourceGeneration::genesis()),
         issued_at_ms: now_ms,
         expires_at_ms: now_ms.saturating_add(60_000),
         renew_before_ms: now_ms.saturating_add(30_000),
@@ -5658,20 +5693,64 @@ async fn c183_probe_ready_shares_store_rebind_gate_and_requires_committed_public
         .expect("read current supervision lease")
         .expect("current supervision lease exists before ProbeReady");
     assert_eq!(current_lease.record.state, LeaseState::Active);
+    assert_eq!(
+        current_lease.record.lease_id.as_str(),
+        candidate
+            .supervision_incarnation
+            .supervision_lease_id
+            .as_str()
+    );
     current_lease
         .validate()
         .expect("current supervision lease is structurally valid");
-    let peer = eliot_ipc::PeerIdentity::authenticated_for_test(
-        eliot_ipc::ProcessBinding::from_observation(
-            candidate.host_process.process_id,
-            candidate.host_process.start_time_100ns,
-            candidate.host_process.image_path.clone(),
-        )
-        .unwrap(),
-        "S-1-5-18".to_owned(),
-        "0".to_owned(),
-    )
-    .unwrap();
+    let active_payload = &current_lease.record.artifact.payload;
+    assert_eq!(current_lease.record.artifact, envelope);
+    let readback_context = verification_context_for_supervision_payload(
+        trust_anchor,
+        active_payload,
+        active_payload.issued_at_ms,
+    );
+    trust_anchor
+        .verify(&current_lease.record.artifact, &readback_context)
+        .expect("retained current lease still has its admitted signature");
+    assert_eq!(
+        active_payload.scope_ref,
+        incarnation.derived_scope_ref().unwrap()
+    );
+    assert_eq!(
+        active_payload.observation_scope,
+        candidate.supervision_incarnation.observation_scope
+    );
+    assert_eq!(active_payload.installation_id, candidate.installation_id.as_str());
+    assert_eq!(active_payload.host_epoch, candidate.host_epoch);
+    assert_eq!(active_payload.activation_id, candidate.activation_id.as_str());
+    assert_eq!(
+        active_payload.activation_generation,
+        ResourceGeneration::new(incarnation.activation_generation.sequence).unwrap()
+    );
+    assert_eq!(active_payload.kernel_epoch, candidate.kernel_epoch);
+    assert_eq!(
+        active_payload.kernel_front_door_server_sid,
+        kernel_front_door_server_sid
+    );
+    assert_eq!(
+        active_payload.kernel_front_door_session_id,
+        kernel_front_door_session_id
+    );
+    assert_eq!(
+        active_payload.kernel_front_door_artifact_sha256,
+        candidate.artifact_hash.as_str()
+    );
+    assert_eq!(
+        active_payload.watchdog_epoch,
+        AuthorityEpoch::new(incarnation.watchdog_epoch.sequence).unwrap()
+    );
+    assert_eq!(active_payload.generation_binding, expected_generation_binding);
+    assert_eq!(active_payload.state_fence.authority_epoch, candidate.kernel_epoch);
+    assert_eq!(
+        active_payload.state_fence,
+        StateFence::new(candidate.kernel_epoch.clone(), ResourceGeneration::genesis())
+    );
     assert_eq!(
         kernel.service.lock().unwrap().state(),
         KernelServiceState::Ready
@@ -5964,7 +6043,9 @@ async fn c183_probe_ready_shares_store_rebind_gate_and_requires_committed_public
     );
     drop(gate_before_replay);
     let _ = replay_fut.await;
-    let _ = std::fs::remove_dir_all(dir);
+    root_lease.verify_path_identity().unwrap();
+    drop(root_lease);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[cfg(windows)]
