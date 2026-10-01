@@ -81,6 +81,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
+use eliot_testd_core::{InstrumentStageRequest, StageExecutionKind};
 use eliot_process::{ActionLeaseRef, FencingToken, Generation};
 use serde::{Deserialize, Serialize};
 
@@ -216,6 +217,10 @@ pub struct TestdMaterialAdmission {
     /// fields. The per-host installed artifact digest binds later at Drive
     /// time through the intent's `executable_sha256`.
     pub profile_binding_digest: String,
+    /// Exact runner-admitted stage loaded from the durable Kernel owner row.
+    /// It is covered by this admission digest and the launch grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_request: Option<InstrumentStageRequest>,
     /// Exact non-secret environment bindings carried by the Kernel receipt.
     pub environment: Vec<(String, String)>,
     /// Whether the job was admitted cancelled; cancelled admissions never
@@ -262,6 +267,8 @@ pub struct ValidatedTestdMaterial {
     pub sealed_slot_suffix: Vec<String>,
     /// Canonical definition digest over the static admitted profile fields.
     pub profile_binding_digest: String,
+    /// Exact stored runner-admitted stage, when this is a productive job.
+    pub stage_request: Option<InstrumentStageRequest>,
     /// Exact non-secret environment bindings admitted for this profile.
     pub environment: Vec<(String, String)>,
     /// Canonical digest of the exact admitted request envelope.
@@ -479,6 +486,7 @@ fn validate_material(
         profile: file.admission.profile.clone(),
         sealed_slot_suffix: file.admission.sealed_slot_suffix.clone(),
         profile_binding_digest: file.admission.profile_binding_digest.clone(),
+        stage_request: file.admission.stage_request.clone(),
         environment: file.admission.environment.clone(),
         request_digest: file.admission.request_digest,
         admission_digest: file.admission.admission_digest,
@@ -548,6 +556,13 @@ fn validate_admission(
             "testd admits only registered probe or productive nextest profiles".to_owned(),
         ));
     }
+    if admission.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE
+        && admission.stage_request.is_none()
+    {
+        return Err(TestdMaterialError::Contract(
+            "productive testd material is missing its durable stage identity".to_owned(),
+        ));
+    }
     validate_wire_digest(
         &admission.profile_binding_digest,
         "testd_material.profile_binding_digest",
@@ -571,6 +586,20 @@ fn validate_admission(
         return Err(TestdMaterialError::Contract(
             "testd_material.profile_binding_digest mismatch".to_owned(),
         ));
+    }
+    if let Some(stage) = &admission.stage_request {
+        stage.validate().map_err(|error| {
+            TestdMaterialError::Contract(format!(
+                "testd_material.stage_request is invalid: {}",
+                truncate_detail(&error.to_string())
+            ))
+        })?;
+        if stage.execution != StageExecutionKind::Process {
+            return Err(TestdMaterialError::Contract(
+                "testd_material.stage_request cannot be decoder-only in process dispatch"
+                    .to_owned(),
+            ));
+        }
     }
     let expected_environment = if admission.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE
         || admission.profile == eliot_testd_core::TESTD_LIST_PROFILE
@@ -686,7 +715,7 @@ fn validate_grant(
     .map_err(|error| TestdMaterialError::Contract(truncate_detail(&error.to_string())))?;
     let lease = ActionLeaseRef::new(grant.idempotency_key.clone())
         .map_err(|error| TestdMaterialError::Contract(truncate_detail(&error.to_string())))?;
-    if recomputed_grant_digest(grant, &admission.request_digest)? != grant.grant_digest {
+    if recomputed_grant_digest(grant, &admission.admission_digest)? != grant.grant_digest {
         return Err(TestdMaterialError::Contract(
             "testd_material.grant_digest mismatch".to_owned(),
         ));
@@ -700,7 +729,7 @@ fn validate_grant(
 }
 
 /// Recomputes the grant digest over the exact kernel binding
-/// (`identity_digest | epoch_json | fence_generation | fence_nonce |
+/// (`admission_digest | epoch_json | fence_generation | fence_nonce |
 /// idempotency_key | expires_at`, canonical owner: `dispatch_grant_for` in
 /// `bins/eliot-kernel/src/dispatch_launch.rs`). The epoch serializes via the
 /// same `serde_json::to_string` over the same `EpochId` shape, so equal
@@ -777,6 +806,7 @@ impl TestdMaterialAdmission {
             operation_id: &'a str,
             profile: &'a str,
             profile_binding_digest: &'a str,
+            stage_request: &'a Option<InstrumentStageRequest>,
             environment: &'a [(String, String)],
             cancelled: bool,
             admitted_at_unix_nanos: u64,
@@ -789,6 +819,7 @@ impl TestdMaterialAdmission {
             operation_id: &self.operation_id,
             profile: &self.profile,
             profile_binding_digest: &self.profile_binding_digest,
+            stage_request: &self.stage_request,
             environment: &self.environment,
             cancelled: self.cancelled,
             admitted_at_unix_nanos: self.admitted_at_unix_nanos,

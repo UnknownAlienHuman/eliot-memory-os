@@ -66,6 +66,7 @@
 //! `eliot_testd_core::KernelProcessAdmissionRequest` names that owner type.
 
 use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
+use eliot_testd_core::InstrumentStageRequest;
 use eliot_process::FencingToken;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -721,8 +722,10 @@ impl TestdAdmissionAttemptRequest {
 /// digest is canonical over every field, so a substituted profile or
 /// widened binding fails the digest. Rebuilding with the durable admission
 /// time reproduces the exact same admission on replay. Durable job state
-/// (payload binding, sequencing, leases) lives in the testd owner's store;
-/// this receipt binds the front-door admission, never the durable job row.
+/// (payload binding, sequencing, leases) lives in the testd owner's store.
+/// The initial front-door response leaves `stage_request` absent; immediately
+/// before process dispatch, Kernel copies the exact durable owner-row stage
+/// into this protected material projection and recomputes the admission digest.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TestdAdmission {
@@ -751,6 +754,13 @@ pub struct TestdAdmission {
     /// timeout/output caps). The per-host installed artifact digest binds
     /// later at Drive time through the intent's `executable_sha256`.
     pub profile_binding_digest: String,
+    /// Exact runner-admitted stage loaded from the durable owner row and
+    /// copied into protected dispatch material. The ordinary front-door
+    /// response leaves this absent; productive dispatch attaches the stored
+    /// value before sealing the material admission digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<serde_json::Value>")]
+    pub stage_request: Option<InstrumentStageRequest>,
     /// Exact environment bindings admitted with the profile. These bytes
     /// travel in protected dispatch material and are rechecked by the child.
     pub environment: Vec<(String, String)>,
@@ -778,6 +788,7 @@ impl TestdAdmission {
             operation_id: &'a str,
             profile: &'a str,
             profile_binding_digest: &'a str,
+            stage_request: &'a Option<InstrumentStageRequest>,
             environment: &'a [(String, String)],
             cancelled: bool,
             admitted_at_unix_nanos: u64,
@@ -790,6 +801,7 @@ impl TestdAdmission {
             operation_id: &self.operation_id,
             profile: &self.profile,
             profile_binding_digest: &self.profile_binding_digest,
+            stage_request: &self.stage_request,
             environment: &self.environment,
             cancelled: self.cancelled,
             admitted_at_unix_nanos: self.admitted_at_unix_nanos,
@@ -851,6 +863,18 @@ impl TestdAdmission {
                 field: "testd_admission.profile_binding_digest",
                 reason: "profile binding digest mismatch",
             });
+        }
+        if let Some(stage) = &self.stage_request {
+            stage.validate().map_err(|_| KernelServiceError::InvalidField {
+                field: "testd_admission.stage_request",
+                reason: "stored profile stage identity is invalid",
+            })?;
+            if stage.execution != eliot_testd_core::StageExecutionKind::Process {
+                return Err(KernelServiceError::InvalidField {
+                    field: "testd_admission.stage_request",
+                    reason: "decoder-only stage cannot enter process dispatch",
+                });
+            }
         }
         let expected_environment = if matches!(
             self.profile.as_str(),
@@ -1254,6 +1278,7 @@ fn build_testd_admission(
             profile,
             sealed_slot_suffix,
         )?,
+        stage_request: None,
         environment: if matches!(
             profile,
             TESTD_PRODUCTIVE_PROFILE | TESTD_LIST_PROFILE | TESTD_SCOPED_PROFILE
