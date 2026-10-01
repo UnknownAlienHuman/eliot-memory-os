@@ -86,7 +86,10 @@ impl fmt::Display for GenerationError {
                 write!(f, "staged declaration is not update-compatible: {detail}")
             }
             Self::CanaryNotAccepted { detail } => {
-                write!(f, "canary verdict did not accept the staged generation: {detail}")
+                write!(
+                    f,
+                    "canary verdict did not accept the staged generation: {detail}"
+                )
             }
             Self::NoRetainedGeneration => {
                 write!(f, "no retained generation is available for recovery")

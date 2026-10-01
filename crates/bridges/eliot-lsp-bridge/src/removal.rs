@@ -205,7 +205,9 @@ impl BridgeStatusProjection {
         receipt: Option<&ObservationReceipt>,
         per_operation_exits: &BTreeMap<String, i32>,
     ) -> Self {
-        let overall = receipt.map(ObservedHealth::from_receipt).unwrap_or(ObservedHealth::Unknown);
+        let overall = receipt
+            .map(ObservedHealth::from_receipt)
+            .unwrap_or(ObservedHealth::Unknown);
         Self::project(current, retained, overall, per_operation_exits)
     }
 
@@ -297,9 +299,7 @@ impl RevocationRecord {
     pub fn operation(reference: impl Into<String>) -> Result<Self, RemovalError> {
         let reference = reference.into();
         if reference.trim().is_empty() {
-            return Err(RemovalError::BlankReference {
-                field: "operation",
-            });
+            return Err(RemovalError::BlankReference { field: "operation" });
         }
         Ok(Self {
             kind: RevocationKind::Operation,

@@ -169,9 +169,8 @@ impl BridgeStatusProjection {
             bridge_route: current.route_executable().to_owned(),
             declared_upstream_version: current.upstream_version().to_owned(),
             declared_operations: current.admitted_operations().to_owned(),
-            retained_upstream_version: retained.map(|generation| {
-                generation.upstream_version().to_owned()
-            }),
+            retained_upstream_version: retained
+                .map(|generation| generation.upstream_version().to_owned()),
             overall: ObservedHealth::from_last_exit(last_exit),
             operations,
         }
