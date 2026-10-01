@@ -355,17 +355,10 @@ async fn named_read_payload(
             evidence_pack_payload(query, state_fence, &rows, &suppression)
                 .map_err(AdapterError::Store)
         }
-        NamedReadOperation::GetTaskState => {
-            let rows = read_authority_records(db, &adapter.config).await?;
-            task_state_payload(query, state_fence, &rows).map_err(AdapterError::Store)
-        }
-        NamedReadOperation::GetAttentionAndProblems => {
-            let rows = read_authority_records(db, &adapter.config).await?;
-            attention_problems_payload(query, state_fence, &rows).map_err(AdapterError::Store)
-        }
-        NamedReadOperation::GetUnderstandingProjectionInputs => {
-            let rows = read_authority_records(db, &adapter.config).await?;
-            understanding_inputs_payload(query, state_fence, &rows).map_err(AdapterError::Store)
+        NamedReadOperation::GetTaskState
+        | NamedReadOperation::GetAttentionAndProblems
+        | NamedReadOperation::GetUnderstandingProjectionInputs => {
+            cognitive_authority_payload(db, &adapter.config, query, state_fence).await
         }
         NamedReadOperation::GetCapabilityEvidenceState => {
             let rows = read_authority_records(db, &adapter.config).await?;
@@ -385,6 +378,9 @@ async fn named_read_payload(
         }
         NamedReadOperation::GetResourceSnapshot => {
             resource_snapshot_payload(db, &adapter.config, query, state_fence).await
+        }
+        NamedReadOperation::GetInstrumentRegistryState => {
+            instrument_registry_payload(db, &adapter.config, query, state_fence).await
         }
         NamedReadOperation::GetUserAutomationState => {
             automation_state_payload(db, &adapter.config, query, state_fence, read_heads).await
@@ -409,6 +405,37 @@ async fn named_read_payload(
         }
         NamedReadOperation::GetAuditRange => {
             audit_range_payload(db, &adapter.config, query, state_fence).await
+        }
+        other => Err(AdapterError::NamedOperationUnavailable {
+            operation: format!("{other:?}"),
+        }),
+    }
+}
+
+/// Serves the authority-record-backed cognitive reads through one shared fetch.
+///
+/// `GetTaskState`, `GetAttentionAndProblems`, and
+/// `GetUnderstandingProjectionInputs` project different views over the same
+/// sealed authority rows; fetching once here keeps the dispatch above a pure
+/// projection choice instead of repeating the read per arm. Behavior is the
+/// dispatch it replaces: the same fetch, the same per-operation projection,
+/// and the same typed errors.
+async fn cognitive_authority_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+) -> Result<Value, AdapterError> {
+    let rows = read_authority_records(db, config).await?;
+    match query.operation {
+        NamedReadOperation::GetTaskState => {
+            task_state_payload(query, state_fence, &rows).map_err(AdapterError::Store)
+        }
+        NamedReadOperation::GetAttentionAndProblems => {
+            attention_problems_payload(query, state_fence, &rows).map_err(AdapterError::Store)
+        }
+        NamedReadOperation::GetUnderstandingProjectionInputs => {
+            understanding_inputs_payload(query, state_fence, &rows).map_err(AdapterError::Store)
         }
         other => Err(AdapterError::NamedOperationUnavailable {
             operation: format!("{other:?}"),
@@ -2216,6 +2243,41 @@ async fn resource_snapshot_payload(
         "uri": uri,
         "content_sha256": content_sha256,
         "content_base64": content_base64,
+        "revision": revision,
+        "state_fence": state_fence,
+    }))
+}
+
+/// Reads the instrument-registry head row and projects the same-fence
+/// canonical snapshot view (issue #1814 W1.2).
+///
+/// Row shape mirrors the writer (verbatim opaque `snapshot_json`,
+/// `revision`, `state_fence`). An absent head (or a head from another
+/// fence) projects explicit absence (null snapshot, revision 0) — never
+/// fabricated bytes. Digest agreement was proven at write time and is
+/// re-checked by the consumer (`InstrumentRegistry::recover`) against
+/// the returned bytes.
+async fn instrument_registry_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+) -> Result<Value, AdapterError> {
+    eliot_store_api::validate_typed_read_parameters(
+        NamedReadOperation::GetInstrumentRegistryState,
+        &query.parameters,
+    )
+    .map_err(AdapterError::Store)?;
+    if query.state_fence != *state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    let row = super::surreal_instrument_registry::read_head_for_read(db, config).await?;
+    let (snapshot_json, revision) = match row {
+        Some(row) if row.state_fence == *state_fence => (json!(row.snapshot_json), row.revision),
+        _ => (Value::Null, 0),
+    };
+    Ok(json!({
+        "snapshot_json": snapshot_json,
         "revision": revision,
         "state_fence": state_fence,
     }))

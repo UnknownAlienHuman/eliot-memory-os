@@ -19,6 +19,7 @@ eliot-instrument-scip = { path = "../eliot-instrument-scip", version = "0.1.0" }
 eliot-process.workspace = true
 eliot-process-executor = { path = "../eliot-process-executor", version = "0.1.0" }
 eliot-receipts.workspace = true
+eliot-store-api.workspace = true
 eliot-test-selection = { path = "../eliot-test-selection", version = "0.1.0" }
 eliot-testd-core.workspace = true
 eliot-verifier = { path = "../eliot-verifier", version = "0.1.0" }
