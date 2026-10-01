@@ -10,17 +10,32 @@ use eliot_runtime_contracts::{
 
 const KERNEL: &str = include_str!("../../../../bins/eliot-kernel/hot-path.toml");
 const DAEMON: &str = include_str!("../../../../bins/eliotd/hot-path.toml");
-const OPERATIONS: [&str; 3] = ["local_read_claim", "local_read", "local_read_result"];
+// #2564: the daemon also declares the retained `eliot.state` legs, so the two
+// services no longer share one operation set. Each service asserts its own.
+const KERNEL_OPERATIONS: [&str; 3] = ["local_read_claim", "local_read", "local_read_result"];
+const DAEMON_OPERATIONS: [&str; 5] = [
+    "local_read_claim",
+    "local_state_claim",
+    "local_read",
+    "local_read_result",
+    "local_state_result",
+];
 
-fn assert_shipped_manifest(service: &str, text: &str, items: u64) -> Result<(), Box<dyn Error>> {
+fn assert_shipped_manifest(
+    service: &str,
+    text: &str,
+    items: u64,
+    operations: &[&str],
+) -> Result<(), Box<dyn Error>> {
     let admitted = admit_hot_path_manifest(Path::new(service), text.as_bytes())?;
     assert_eq!(admitted.set.owning_service, service);
     assert_eq!(
         admitted.manifest_file_digest,
         eliot_contracts::sha256_hex(text.as_bytes())
     );
-    assert_eq!(admitted.set.supported_operations.len(), OPERATIONS.len());
-    for operation in OPERATIONS {
+    assert_eq!(admitted.set.supported_operations.len(), operations.len());
+    for operation in operations {
+        let operation = *operation;
         let row = admitted.operation(operation)?;
         assert_eq!(row.owning_service, service);
         assert_eq!(row.hot_path_profile_ref, HotPathProfileRef::default());
@@ -55,6 +70,25 @@ fn assert_shipped_manifest(service: &str, text: &str, items: u64) -> Result<(), 
                     matches!(&row.fallback_or_degradation, HotPathDegradation::RecoveryDirective { directive_ref } if directive_ref == "eliot_runtime_contracts::RecoveryDirective")
                 );
             }
+            // #2564: the state legs are bounded and synchronous-free exactly
+            // like their query siblings - one queue, one in-flight item, the
+            // 4 MiB byte bound, the 30 s front-door deadline. The claim carries
+            // the same `host_request_result_body` handle as the query claim
+            // because a partial or unavailable owner verdict is still
+            // submitted as a retained record; the result leg carries the same
+            // recovery directive as the query result.
+            "local_state_claim" => {
+                assert!(row.synchronous_external_calls.is_empty());
+                assert!(
+                    matches!(&row.fallback_or_degradation, HotPathDegradation::Handle { handle_ref } if handle_ref == "host_request_result_body")
+                );
+            }
+            "local_state_result" => {
+                assert!(row.synchronous_external_calls.is_empty());
+                assert!(
+                    matches!(&row.fallback_or_degradation, HotPathDegradation::RecoveryDirective { directive_ref } if directive_ref == "eliot_runtime_contracts::RecoveryDirective")
+                );
+            }
             _ => unreachable!("closed test operation set"),
         }
     }
@@ -64,7 +98,7 @@ fn assert_shipped_manifest(service: &str, text: &str, items: u64) -> Result<(), 
 
 #[test]
 fn shipped_kernel_manifest_loads() -> Result<(), Box<dyn Error>> {
-    assert_shipped_manifest("eliot-kernel", KERNEL, 64)?;
+    assert_shipped_manifest("eliot-kernel", KERNEL, 64, &KERNEL_OPERATIONS)?;
     let admitted = admit_hot_path_manifest(Path::new("eliot-kernel"), KERNEL.as_bytes())?;
     let claim = admitted.operation("local_read_claim")?;
     let snapshots = &claim.immutable_snapshot_dependencies;
@@ -82,7 +116,7 @@ fn shipped_kernel_manifest_loads() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn shipped_daemon_manifest_loads() -> Result<(), Box<dyn Error>> {
-    assert_shipped_manifest("eliotd", DAEMON, 1)
+    assert_shipped_manifest("eliotd", DAEMON, 1, &DAEMON_OPERATIONS)
 }
 
 #[test]
