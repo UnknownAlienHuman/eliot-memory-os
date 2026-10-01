@@ -712,6 +712,22 @@ async fn completion_requires_candidate_patch_verifiers() -> TestResult {
             verifier_runs: &verifier_runs,
         },
     );
+    let mut rollback_failed_patch_run = patch_run.clone();
+    rollback_failed_patch_run.status = PatchRunStatus::RollbackFailed;
+    let rollback_failed_base = CompletionGate::decide_with_patch_context(
+        &proof,
+        Some(&rollback_failed_patch_run),
+        &verifier_runs,
+    );
+    let rollback_failed_missing_candidate = CompletionGate::decide_with_candidate_context(
+        &proof,
+        CandidateCompletionContext {
+            candidate_diff: None,
+            candidate_review: Some(&review),
+            patch_run: Some(&rollback_failed_patch_run),
+            verifier_runs: &verifier_runs,
+        },
+    );
     let mut substituted_runs = verifier_runs.clone();
     let substituted_index = substituted_runs
         .iter()
@@ -738,6 +754,16 @@ async fn completion_requires_candidate_patch_verifiers() -> TestResult {
 
     assert_eq!(decision.final_status, CompletionStatus::DoneVerified);
     assert_eq!(missing.final_status, CompletionStatus::PartialProgress);
+    assert_eq!(
+        rollback_failed_missing_candidate.final_status,
+        CompletionStatus::UnsafeToFinish
+    );
+    assert!(rollback_failed_base.reasons.iter().all(|reason| {
+        rollback_failed_missing_candidate.reasons.contains(reason)
+    }));
+    assert!(rollback_failed_missing_candidate
+        .reasons
+        .contains(&"missing_candidate_diff".to_owned()));
     assert_eq!(unbound.final_status, CompletionStatus::PartialProgress);
     assert!(unbound.reasons.contains(&format!(
         "patch_run_verifier_ref_missing:{original_id}"
