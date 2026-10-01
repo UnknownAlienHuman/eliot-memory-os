@@ -17,7 +17,7 @@ use eliot_types::{
     MemoryValueComparison, MemoryValueExperiment, OBSERVABILITY_SCHEMA_VERSION, ObservabilityKind,
     ObservabilityWriteEnvelope, ObservabilityWriteReceipt, PlanningDecisionRecord, ProjectId,
     SemanticCommand, SessionId, TaintClass, TaskId, ToolObservationRecordCommand,
-    UnderstandingOutcomeRecord, Visibility, WriteId, WriteReceiptRef,
+    UnderstandingOutcomeRecord, Visibility, WorkItemId, WriteId, WriteReceiptRef,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -596,7 +596,9 @@ impl CausalCandidateInspectorService {
     /// The production inspector path is STITCH, stated not papered over: no
     /// production inspector reads this view yet. The view is the typed
     /// inspector surface that path renders when it arrives.
-    pub fn inspect(candidate: &CausalCandidate) -> Result<CausalCandidateInspectorView, EngineError> {
+    pub fn inspect(
+        candidate: &CausalCandidate,
+    ) -> Result<CausalCandidateInspectorView, EngineError> {
         candidate.validate_material().map_err(|error| {
             EngineError::WriteRejected(format!(
                 "causal candidate {} is not material: {error}",
