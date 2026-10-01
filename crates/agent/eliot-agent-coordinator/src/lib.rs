@@ -29,7 +29,10 @@ mod tests;
 
 pub use crate::admitted_provider::{AdmittedProviderFactory, OwnerLoadedClaimRow};
 pub use crate::core::AgentCoordinator;
-pub use crate::fair_pull_loop::{FAIR_PULL_LOOP_PROOF_CEILING, FairPullOutcome, FairPullStart};
+pub use crate::fair_pull_loop::{
+    FAIR_PULL_LOOP_PROOF_CEILING, FairPullOutcome, FairPullStaleDisposition, FairPullStaleRefusal,
+    FairPullStart,
+};
 pub use crate::model::*;
 pub use crate::model_control::*;
 pub use crate::model_registry::{
