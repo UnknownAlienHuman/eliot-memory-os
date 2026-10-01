@@ -5,35 +5,12 @@ description: "Verify ELIOT work and memory writeback"
 
 # ELIOT finish
 
-## Meta principle
+Finish has two acceptance surfaces: verify requested behavior with its owning verifier; write novel project knowledge and plugin self-test evidence through the Governor, then fetch it exactly with `eliot_fetch_l2`.
 
-Finish has two acceptance surfaces:
+For new records report receipt, revision, exact handles, missing/forbidden lists, lifecycle/projection state and independent readback when available. Distinguish product SLO, test body/wall, build overhead, provider time and plugin response time. Run read-only curation preview after adding data; never auto-promote weak or sleep output. Do not bypass the Governor with raw DB.
 
-1. the requested project/system behavior was checked with the owning verifier;
-2. novel project knowledge and plugin self-test evidence were written through
-   the Governor and fetched back exactly with `eliot_fetch_l2`.
+Run the packet verifier against the current accepted artifact scope. Report failed, skipped, stale and unknown checks honestly.
 
-For new records, report the receipt, revision, exact returned handles,
-missing/forbidden lists, lifecycle/projection state, and independent readback
-when available. Keep product SLO, test body/wall, build overhead, provider time,
-and plugin response time distinct. Run read-only curation preview when data was
-added; never auto-promote weak or sleep output. Ordinary data building must not
-bypass the Governor with raw database access.
+Ack each payload-injected item acted on: changed action = `used_and_changed_action` plus outcome ref; verified = `used_for_verification` plus outcome ref; prevented recurrence = `prevented_repeated_failure` plus run ref; not used = `seen_but_not_used` or `loaded_without_delta`; stale/wrong scope = `suppressed_as_stale` or `suppressed_as_wrong_scope`.
 
-Run the packet's verifier against the current accepted artifact scope. Report
-failed, skipped, stale, or unknown checks honestly.
-
-Ack every payload-injected item you acted on:
-
-- changed action: `used_and_changed_action` plus outcome ref;
-- verified work: `used_for_verification` plus outcome ref;
-- prevented recurrence: `prevented_repeated_failure` plus run ref;
-- not used: `seen_but_not_used` or `loaded_without_delta`;
-- stale/wrong scope: `suppressed_as_stale` or
-  `suppressed_as_wrong_scope`.
-
-Submit only non-obvious reusable lessons through `eliot-remember`. Then stop:
-do not write summaries into memory and do not restate the diff as a lesson. If
-the canonical trace, verifier, projection, or reconciliation authority is
-missing, leave the task/candidate open and report partial status instead of
-manufacturing completion.
+Submit only non-obvious reusable lessons through `eliot-remember`. Then stop: do not write memory summaries or restate the diff as a lesson. If canonical trace, verifier, projection or reconciliation authority is missing, leave task/candidate open and report partial status; never manufacture completion.
