@@ -996,13 +996,19 @@ impl AgentCoordinator {
     /// The `capability` is plain validated data extracted by the daemon
     /// caller from its authenticated Kernel session (durable ORS claim row
     /// plus observed Governor currentness): the coordinator performs no I/O
-    /// and launches nothing. Every proof re-runs the T9-04 pure Kernel
-    /// verifier, so stale, revoked, foreign, or conflicting evidence fails
-    /// closed exactly like the plan-only gap, but with live Kernel backing.
+    /// and launches nothing. The capability must carry its factory-witnessed
+    /// durable owner row; a rowless capability fails closed with
+    /// [`CoordinatorError::StaleProviderBinding`] before any verifier is
+    /// built, so no caller half can reach an effecting proof unwitnessed.
+    /// Every proof re-runs the T9-04 pure Kernel verifier against the
+    /// retained row per call, so stale, revoked, foreign, or conflicting
+    /// evidence fails closed exactly like the plan-only gap, but with live
+    /// Kernel backing.
     pub fn new_with_admitted_provider(
         config: CoordinatorConfig,
         capability: AdmittedProviderCapability,
     ) -> Result<Self, CoordinatorError> {
+        crate::factory::require_witnessed_binding(&capability)?;
         Self::with_provider(config, Box::new(KernelProviderVerifier::new(capability)))
     }
 
@@ -3890,15 +3896,20 @@ impl AgentCoordinator {
     /// issue #1108).
     ///
     /// The daemon re-queries Kernel and passes a fresh `capability`: the
-    /// snapshot's stored binding must equal the live binding derived from it,
-    /// and every replayed event re-verifies through the T9-04 pure verifier,
-    /// so a serialized `Verified` label alone never restores authority and
-    /// revoked or stale Kernel evidence fails closed.
+    /// capability must carry its factory-witnessed durable owner row, else
+    /// restore fails closed with [`CoordinatorError::StaleProviderBinding`]
+    /// before any replay, so missing provider evidence stays blocked and
+    /// never silently resumes effecting operations. The snapshot's stored
+    /// binding must equal the live binding derived from it, and every
+    /// replayed event re-verifies through the T9-04 pure verifier reading the
+    /// retained row per call, so a serialized `Verified` label alone never
+    /// restores authority and revoked or stale Kernel evidence fails closed.
     pub fn restore_with_admitted_provider(
         snapshot: CoordinatorSnapshot,
         live_config: CoordinatorConfig,
         capability: AdmittedProviderCapability,
     ) -> Result<Self, CoordinatorError> {
+        crate::factory::require_witnessed_binding(&capability)?;
         Self::restore_with_provider(
             snapshot,
             live_config,

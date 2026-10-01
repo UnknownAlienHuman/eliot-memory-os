@@ -9,6 +9,7 @@
 
 mod admitted_provider;
 mod core;
+mod factory;
 mod fair_pull_loop;
 mod model;
 mod model_control;
