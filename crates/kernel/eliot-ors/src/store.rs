@@ -20032,6 +20032,61 @@ impl RedbRecoveryStore {
         Ok(())
     }
 
+    /// Re-anchors a missing or stale-view drain resume at the certified prefix
+    /// start (issue #2730, audit 5845038022): the scan restarts at
+    /// `after = 0` while an earlier entry already drained and deleted the
+    /// certified prefix below the first retained position, so the
+    /// `resume + 1` guard would stop forever on the first entry and
+    /// re-persist `after = 0`. Positions are written once with their event
+    /// row and never updated, and a sequence at or below the compacted
+    /// boundary is never re-admitted as fresh
+    /// (`check_bridge_retained_replay_in` answers the retired disposition
+    /// there), so a leading gap fully covered by the certified compacted
+    /// range of this exact owner incarnation and stream is already-drained
+    /// history: resume past it. A leading gap the certified range does not
+    /// cover keeps the fail-closed resume, so an unexplained hole is never
+    /// skipped and no deletion ever leaves the certified boundary.
+    fn anchor_drain_resume_to_certified_prefix(
+        write: &redb::WriteTransaction,
+        access: &BridgeStreamAccess,
+        owner: &BridgeStreamOwnerRow,
+        after: u64,
+        first: Option<u64>,
+    ) -> Result<u64, OrsError> {
+        let Some(first) = first else {
+            return Ok(after);
+        };
+        if first <= after.saturating_add(1) {
+            return Ok(after);
+        }
+        let certified: Option<BridgeEventCompactedRange> = {
+            let ranges = write
+                .open_table(BRIDGE_EVENT_COMPACTED_RANGES)
+                .map_err(storage)?;
+            ranges
+                .get(access.namespace.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let covered = match certified {
+            Some(range) => {
+                range.validate()?;
+                range.owner_namespace == access.namespace
+                    && range.stream_id == owner.local_stream
+                    && range.owner_incarnation == owner.incarnation
+                    && range.start_sequence <= after.saturating_add(1)
+                    && first.saturating_sub(1) <= range.end_sequence
+            }
+            None => false,
+        };
+        if covered {
+            Ok(first.saturating_sub(1))
+        } else {
+            Ok(after)
+        }
+    }
+
     /// Drains one bounded slice of the certified position prefix (issue
     /// #2885, items 6-7): positions at or below the compacted boundary
     /// whose event record and handoff are both gone. Only the contiguous
@@ -20045,7 +20100,17 @@ impl RedbRecoveryStore {
     /// expected owner revision/incarnation and recovery view; a view
     /// change from another writer restarts the slice at the certified
     /// prefix start, which only ever moves forward because the deletions
-    /// are the durable progress. The drain removes only history every
+    /// are the durable progress. A missing or stale scan restarts with
+    /// `after = 0` while an earlier entry already drained the certified
+    /// prefix below the first retained position, so the resume
+    /// re-anchors past a leading gap that the certified compacted range
+    /// of this exact owner incarnation and stream already covers (audit
+    /// 5845038022): those positions drained under an earlier boundary
+    /// and their sequences are never re-admitted below the boundary, so
+    /// the second and later compaction cycles keep draining instead of
+    /// stopping forever on the first entry. A leading gap outside the
+    /// certified coverage still stops the slice, so an unexplained hole
+    /// is never skipped. The drain removes only history every
     /// other scan already treats as skippable, so it never bumps the
     /// recovery revision itself: repair, retirement, and reconcile
     /// progress stay valid while a long drain converges (issue #2885,
@@ -20109,7 +20174,13 @@ impl RedbRecoveryStore {
         }
         drop(positions);
         let mut drained = 0_u64;
-        let mut resume = after;
+        let mut resume = Self::anchor_drain_resume_to_certified_prefix(
+            write,
+            access,
+            owner,
+            after,
+            page.first().map(|(first, _)| *first),
+        )?;
         let mut stopped = false;
         {
             let records = write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
