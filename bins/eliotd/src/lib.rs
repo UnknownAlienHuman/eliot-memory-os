@@ -4618,8 +4618,7 @@ impl DaemonComposition {
         self.governor
             .select_current_task_binding_for_cold_start(
                 now,
-                principal_ref,
-                session_ref,
+                (principal_ref, session_ref),
                 scope_ref,
                 state_fence,
                 expected_task_ref,
