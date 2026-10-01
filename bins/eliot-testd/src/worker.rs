@@ -154,8 +154,13 @@ pub struct TestdReplayObservedInputs {
     pub source: TestdSourceObservationRange,
     /// Tool files and selected toolchain remeasured at the finish boundary.
     pub tools: TestdToolObservation,
-    /// Exact secret-safe environment projection retained from Kernel submit.
+    /// Exact secret-safe child environment from the sealed launch request.
     pub environment: eliot_process::EnvironmentProjection,
+    /// Secret-safe environment projection from the exact sealed
+    /// `ProcessRequest` immediately before launch. This is kept distinct from
+    /// the durable submit-time provider projection above so replay cannot
+    /// relabel old owner data as a fresh observation.
+    pub submitted_environment: eliot_process::EnvironmentProjection,
     /// SHA-256 of the exact current Cargo.lock bytes at the admitted root.
     pub cargo_lock_sha256: String,
     /// Exact bounded repository normative-pair receipt bytes. The replay
@@ -418,8 +423,9 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
     // Internally built from this exact attempt (#456 Wave B): admits only
     // records carrying the presented operation; start refuses other sinks.
     let collector = Arc::new(EvidenceCollector::for_operation(operation_id.clone()));
+    let mut process_environment = None;
     if eliot_testd_core::is_productive_testd_profile(&job.invocation.profile) {
-        let observation = match observe_tool_identity(&job, permit.request()) {
+        let (observation, launch_environment) = match observe_tool_identity(&job, permit.request()) {
             Ok(observation) => observation,
             Err(error) => {
                 finish_unknown(
@@ -435,6 +441,7 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
             }
         };
         collector.record_tool_observation(observation)?;
+        process_environment = Some(launch_environment);
     }
     // The consuming start proves nothing about the outcome by itself:
     // `start_claimed` maps every executor failure (including the
@@ -467,6 +474,7 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
         &collector,
         SupervisionInput::for_start(operation_id, start_note, lease_ms),
         started_at,
+        process_environment,
     )?;
     Ok(crate::receipt(&store.get(&job.job_id)?.ok_or_else(
         || TestdError::Corrupt("job disappeared after finish".to_owned()),
@@ -480,7 +488,7 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
 fn observe_tool_identity(
     job: &TestJob,
     request: &ProcessRequest,
-) -> Result<TestdToolObservation, TestdError> {
+) -> Result<(TestdToolObservation, eliot_process::EnvironmentProjection), TestdError> {
     let observation = job
         .provider_tool_observation
         .clone()
@@ -512,7 +520,13 @@ fn observe_tool_identity(
     {
         return Err(TestdError::InvalidBinding);
     }
-    let environment = request.environment().non_secret();
+    let process_environment = eliot_process::EnvironmentProjection::new(
+        request.environment().non_secret().clone(),
+        request.environment().secret_refs().to_vec(),
+        request.environment().inheritance(),
+    )
+    .map_err(|error| TestdError::Contract(error.to_string()))?;
+    let environment = process_environment.non_secret();
     let required = |key: &'static str| {
         environment.get(key).cloned().ok_or(TestdError::Invalid {
             field: "tool_environment",
@@ -542,7 +556,7 @@ fn observe_tool_identity(
         }
     }
     reobserve_tool_files(&observation)?;
-    Ok(observation)
+    Ok((observation, process_environment))
 }
 
 fn reobserve_tool_files(observation: &TestdToolObservation) -> Result<(), TestdError> {
@@ -592,6 +606,7 @@ fn observe_and_finish<E: ProcessExecutor + 'static>(
     collector: &EvidenceCollector,
     supervision: SupervisionInput,
     started_at: ClockReading,
+    process_environment: Option<eliot_process::EnvironmentProjection>,
 ) -> Result<(), TestdError> {
     let started_at_ms = clock_ms(&started_at).unwrap_or_else(current_clock_ms);
     let lease_ms = supervision.lease_ms;
@@ -640,6 +655,7 @@ fn observe_and_finish<E: ProcessExecutor + 'static>(
         },
         outcome,
         started_at,
+        process_environment,
     )
 }
 
@@ -843,6 +859,7 @@ fn observe_terminal_source<E: ProcessExecutor + 'static>(
 fn build_replay_observed_inputs(
     job: &TestJob,
     source: &TestdSourceObservationRange,
+    process_environment: Option<eliot_process::EnvironmentProjection>,
 ) -> Result<TestdReplayObservedInputs, TestdError> {
     source.validate()?;
     if source.before.repository_root != job.target_roots.source_root
@@ -856,16 +873,35 @@ fn build_replay_observed_inputs(
         .ok_or(TestdError::InvalidBinding)?;
     tools.validate()?;
     reobserve_tool_files(&tools)?;
-    let environment = job
+    let submitted_environment = job
         .provider_environment_projection
         .clone()
         .ok_or(TestdError::InvalidBinding)?;
     eliot_process::EnvironmentProjection::new(
-        environment.non_secret().clone(),
-        environment.secret_refs().to_vec(),
-        environment.inheritance(),
+        submitted_environment.non_secret().clone(),
+        submitted_environment.secret_refs().to_vec(),
+        submitted_environment.inheritance(),
     )
     .map_err(|error| TestdError::Contract(error.to_string()))?;
+    let process_environment = process_environment.ok_or(TestdError::Invalid {
+        field: "provider_currentness.environment",
+        reason: "the exact sealed launch environment was not observed before execution",
+    })?;
+    let mut expected_process_environment = submitted_environment.non_secret().clone();
+    expected_process_environment.insert(
+        "CARGO_TARGET_DIR".to_owned(),
+        job.target_roots.target_root.clone(),
+    );
+    expected_process_environment.insert("CARGO_HOME".to_owned(), job.target_roots.cache_root.clone());
+    let expected_process_environment = eliot_process::EnvironmentProjection::new(
+        expected_process_environment,
+        submitted_environment.secret_refs().to_vec(),
+        submitted_environment.inheritance(),
+    )
+    .map_err(|error| TestdError::Contract(error.to_string()))?;
+    if process_environment != expected_process_environment {
+        return Err(TestdError::InvalidBinding);
+    }
     let lock_path = Path::new(&job.target_roots.source_root).join("Cargo.lock");
     let lock_bytes = std::fs::read(lock_path).map_err(|_| TestdError::Invalid {
         field: "provider_currentness.lock",
@@ -914,7 +950,8 @@ fn build_replay_observed_inputs(
     Ok(TestdReplayObservedInputs {
         source: source.clone(),
         tools,
-        environment,
+        environment: process_environment,
+        submitted_environment,
         cargo_lock_sha256: eliot_testd_core::sha256_hex(&lock_bytes),
         normative_pair_receipt,
         required_test_ids,
@@ -955,6 +992,7 @@ fn finish_observed_attempt<E: ProcessExecutor + 'static>(
     inputs: &FinishInputs<'_>,
     outcome: SupervisionOutcome,
     started_at: ClockReading,
+    process_environment: Option<eliot_process::EnvironmentProjection>,
 ) -> Result<(), TestdError> {
     let FinishInputs { claimed, observed } = *inputs;
     let SupervisionOutcome {
@@ -971,7 +1009,7 @@ fn finish_observed_attempt<E: ProcessExecutor + 'static>(
         reason = message;
     }
     let replay_observed_inputs = match source_observation.as_ref() {
-        Some(source) => match build_replay_observed_inputs(claimed, source) {
+        Some(source) => match build_replay_observed_inputs(claimed, source, process_environment) {
             Ok(inputs) => Some(inputs),
             Err(error) => {
                 execution = ExecutionStatus::Unknown;
