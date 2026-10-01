@@ -64,7 +64,7 @@
 //! `eliot-dreamer-memory-revision` and `eliot-dreamer-failure`, and the
 //! `eliotd` row of `config/architecture-boundaries.toml` lists
 //! `eliot-dreamer` under `forbidden_prefix` (issue #18), so all three are
-//! reported as `runtime_root_forbidden_direct_dependency` HARD_VIOLATIONs by
+//! reported as `runtime_root_forbidden_direct_dependency` `HARD_VIOLATIONs` by
 //! `scripts/audit-architecture-boundaries.py`. The first two are named only
 //! here; the third is named in `negative_memory_action_gate.rs`, which carries
 //! its own reachability note.
