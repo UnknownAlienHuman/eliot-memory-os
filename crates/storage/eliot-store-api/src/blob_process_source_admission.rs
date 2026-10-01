@@ -19,8 +19,7 @@ use crate::{
 };
 
 pub const BLOB_PROCESS_SOURCE_ADMISSION_SCHEMA: &str = "eliot.blob.process-source-admission.v1";
-pub const BLOB_PROCESS_SOURCE_ADMISSION_ROW_SCHEMA: &str =
-    "eliot.governor.owner.snapshot.v1";
+pub const BLOB_PROCESS_SOURCE_ADMISSION_ROW_SCHEMA: &str = "eliot.governor.owner.snapshot.v1";
 
 /// Lifecycle of one admitted process output source.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -45,7 +44,10 @@ pub struct BlobProcessSourceAdmissionIdentity {
 impl BlobProcessSourceAdmissionIdentity {
     pub fn validate(&self) -> Result<(), StoreError> {
         for (field, value) in [
-            ("blob_process_source.work_scope_ref", self.work_scope_ref.as_str()),
+            (
+                "blob_process_source.work_scope_ref",
+                self.work_scope_ref.as_str(),
+            ),
             ("blob_process_source.session_id", self.session_id.as_str()),
             ("blob_process_source.source_id", self.source_id.as_str()),
         ] {
@@ -140,7 +142,10 @@ impl BlobProcessSourceAdmission {
                 reason: "owner and WorkScope revisions must be non-zero",
             });
         }
-        validate_text(&self.pending_operation_id, "blob_process_source.pending_operation_id")?;
+        validate_text(
+            &self.pending_operation_id,
+            "blob_process_source.pending_operation_id",
+        )?;
         validate_sha256(
             &self.pending_request_identity_sha256,
             "blob_process_source.pending_request_identity_sha256",
@@ -191,7 +196,10 @@ impl BlobProcessSourceAdmission {
         match (&self.phase, &self.ready, self.owner_revision) {
             (BlobProcessSourceAdmissionPhase::Pending, None, 1) => Ok(()),
             (BlobProcessSourceAdmissionPhase::Ready, Some(ready), 2) => {
-                validate_text(&ready.ready_operation_id, "blob_process_source.ready_operation_id")?;
+                validate_text(
+                    &ready.ready_operation_id,
+                    "blob_process_source.ready_operation_id",
+                )?;
                 validate_sha256(
                     &ready.ready_request_identity_sha256,
                     "blob_process_source.ready_request_identity_sha256",
@@ -381,7 +389,10 @@ pub fn blob_process_source_admission_mutation(
         .map_err(|error| StoreError::Serialization(error.to_string()))?;
     let parameters = BTreeMap::from([
         ("admission_ref".to_owned(), json!(admission_ref)),
-        ("expected_revision".to_owned(), json!(expected_revision.to_string())),
+        (
+            "expected_revision".to_owned(),
+            json!(expected_revision.to_string()),
+        ),
         ("expected_digest".to_owned(), json!(expected_digest)),
         ("snapshot_json".to_owned(), json!(snapshot_json)),
     ]);
@@ -391,7 +402,10 @@ pub fn blob_process_source_admission_mutation(
     })
 }
 
-fn same_pending_identity_and_facts(pending: &BlobProcessSourceAdmission, ready: &BlobProcessSourceAdmission) -> bool {
+fn same_pending_identity_and_facts(
+    pending: &BlobProcessSourceAdmission,
+    ready: &BlobProcessSourceAdmission,
+) -> bool {
     pending.schema == ready.schema
         && pending.state_fence == ready.state_fence
         && pending.identity == ready.identity
@@ -408,7 +422,11 @@ fn same_pending_identity_and_facts(pending: &BlobProcessSourceAdmission, ready: 
         && pending.owner_facts_sha256 == ready.owner_facts_sha256
 }
 
-fn validate_canonical_object(json_text: &str, field: &'static str, digest: &str) -> Result<(), StoreError> {
+fn validate_canonical_object(
+    json_text: &str,
+    field: &'static str,
+    digest: &str,
+) -> Result<(), StoreError> {
     if json_text.is_empty() || json_text.len() > crate::MAX_RECOVERY_RECORD_BYTES {
         return Err(StoreError::InvalidField {
             field,

@@ -61,8 +61,8 @@ pub use typed_evidence::{
     ProcessStreamSourceReadbackRequest, TestdArtifactBinding, TestdEvaluationObservation,
     TestdEvaluationStatus, TestdEvaluatorSlot, TestdEvidenceDisposition, TestdEvidenceError,
     TestdParserSlot, TestdParsingObservation, TestdParsingStatus, TestdProcessEvidenceBundle,
-    TestdReadbackContext, TestdStreamDisposition, TestdStreamEvidenceBinding,
-    TestdReplayOwnerReadback, TestdStreamResolution, TestdStreamSlot,
+    TestdReadbackContext, TestdReplayOwnerReadback, TestdStreamDisposition,
+    TestdStreamEvidenceBinding, TestdStreamResolution, TestdStreamSlot,
 };
 
 /// The admitted execution lane for a profile stage. `DecoderOnly` names an
@@ -1887,7 +1887,10 @@ impl TestdBlobProcessStreamGrant {
             ),
             ("blob_stream.fence_sha256", self.fence_sha256.as_str()),
             ("blob_stream.policy_sha256", self.policy_sha256.as_str()),
-            ("blob_stream.owner_facts_sha256", self.owner_facts_sha256.as_str()),
+            (
+                "blob_stream.owner_facts_sha256",
+                self.owner_facts_sha256.as_str(),
+            ),
             (
                 "blob_stream.work_scope_snapshot_sha256",
                 self.work_scope_snapshot_sha256.as_str(),
@@ -1918,7 +1921,10 @@ impl TestdBlobProcessStreamGrant {
             ),
             ("blob_stream.fence_sha256", self.fence_sha256.as_str()),
             ("blob_stream.policy_sha256", self.policy_sha256.as_str()),
-            ("blob_stream.owner_facts_sha256", self.owner_facts_sha256.as_str()),
+            (
+                "blob_stream.owner_facts_sha256",
+                self.owner_facts_sha256.as_str(),
+            ),
             (
                 "blob_stream.work_scope_snapshot_sha256",
                 self.work_scope_snapshot_sha256.as_str(),
@@ -4424,7 +4430,8 @@ impl TestdStore {
         job_id: &str,
         capability_ref: &str,
     ) -> Result<Option<TestdBlobProcessStreamCallRecord>, TestdError> {
-        let Some(head) = self.resolve_blob_process_stream_token_head(job_id, capability_ref)? else {
+        let Some(head) = self.resolve_blob_process_stream_token_head(job_id, capability_ref)?
+        else {
             return Ok(None);
         };
         let key = blob_process_stream_call_key(job_id, capability_ref, &head.reference)?;
@@ -4810,9 +4817,12 @@ impl TestdStore {
             // this exact logical call. Unknown is explicitly unresolved, so
             // replacing it with the retained owner outcome does not change
             // the request binding or authorize another Store dispatch.
-            (TestdBlobProcessStreamCallState::Completed(
-            TestdBlobProcessStreamCallOutcome::Unknown,
-            ), Some(outcome)) => {
+            (
+                TestdBlobProcessStreamCallState::Completed(
+                    TestdBlobProcessStreamCallOutcome::Unknown,
+                ),
+                Some(outcome),
+            ) => {
                 if successor.is_some()
                     && !matches!(
                         &outcome,

@@ -65,7 +65,8 @@ pub(super) fn append_work_scope_owner_statement(
         }));
     }
     let snapshot_json = text_param("snapshot_json")?;
-    if snapshot_json.is_empty() || snapshot_json.len() > eliot_store_api::MAX_RECOVERY_RECORD_BYTES {
+    if snapshot_json.is_empty() || snapshot_json.len() > eliot_store_api::MAX_RECOVERY_RECORD_BYTES
+    {
         return Err(AdapterError::Store(if snapshot_json.is_empty() {
             StoreError::Empty {
                 field: "work_scope.snapshot_json",

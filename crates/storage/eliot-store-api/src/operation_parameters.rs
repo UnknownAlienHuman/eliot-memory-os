@@ -1274,16 +1274,48 @@ static GET_TASK_CONTRACT_ACCEPTANCE_SET_PARAMETERS: [ParameterDeclaration; 2] = 
     },
 ];
 static GET_BLOB_PROCESS_SOURCE_ADMISSION_PARAMETERS: [ParameterDeclaration; 4] = [
-    ParameterDeclaration { name: "work_scope_ref", shape: ParameterShape::Subject, required: true },
-    ParameterDeclaration { name: "session_id", shape: ParameterShape::Subject, required: true },
-    ParameterDeclaration { name: "source_id", shape: ParameterShape::Subject, required: true },
-    ParameterDeclaration { name: "process_binding_sha256", shape: ParameterShape::Subject, required: true },
+    ParameterDeclaration {
+        name: "work_scope_ref",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "session_id",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "source_id",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "process_binding_sha256",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
 ];
 static RECORD_BLOB_PROCESS_SOURCE_ADMISSION_PARAMETERS: [ParameterDeclaration; 4] = [
-    ParameterDeclaration { name: "admission_ref", shape: ParameterShape::Subject, required: true },
-    ParameterDeclaration { name: "expected_revision", shape: ParameterShape::Subject, required: true },
-    ParameterDeclaration { name: "expected_digest", shape: ParameterShape::Subject, required: true },
-    ParameterDeclaration { name: "snapshot_json", shape: ParameterShape::Subject, required: true },
+    ParameterDeclaration {
+        name: "admission_ref",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "expected_revision",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "expected_digest",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "snapshot_json",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
 ];
 static BLACKBOARD_ITEM_LOOKUP_PARAMETERS: [ParameterDeclaration; 2] = [
     ParameterDeclaration {
@@ -1380,9 +1412,7 @@ pub const fn named_read_operation_by_name(name: &str) -> Option<NamedReadOperati
             Some(NamedReadOperation::GetCapabilityEvidenceRecordRange)
         }
         b"GetTaskContractAcceptanceSet" => Some(NamedReadOperation::GetTaskContractAcceptanceSet),
-        b"GetBlobProcessSourceAdmission" => {
-            Some(NamedReadOperation::GetBlobProcessSourceAdmission)
-        }
+        b"GetBlobProcessSourceAdmission" => Some(NamedReadOperation::GetBlobProcessSourceAdmission),
         _ => None,
     }
 }
@@ -1624,9 +1654,7 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::RecordModuleCatalogSnapshot => {
             &RECORD_MODULE_CATALOG_SNAPSHOT_PARAMETERS
         }
-        NamedMutationOperation::RecordWorkScopeSnapshot => {
-            &RECORD_WORK_SCOPE_SNAPSHOT_PARAMETERS
-        }
+        NamedMutationOperation::RecordWorkScopeSnapshot => &RECORD_WORK_SCOPE_SNAPSHOT_PARAMETERS,
         NamedMutationOperation::RecordBlobProcessSourceAdmission => {
             &RECORD_BLOB_PROCESS_SOURCE_ADMISSION_PARAMETERS
         }

@@ -1829,7 +1829,11 @@ impl KernelComposition {
         if let Some((state, outcome)) = non_success {
             let mut terminal = dispatched;
             terminal.state = state;
-            if self.p07_ors.complete_blob_process_stream_call(&terminal).is_err() {
+            if self
+                .p07_ors
+                .complete_blob_process_stream_call(&terminal)
+                .is_err()
+            {
                 return BlobProcessStreamKernelOutcome::Unknown {
                     operation_sha256: request.operation_sha256.clone(),
                 };

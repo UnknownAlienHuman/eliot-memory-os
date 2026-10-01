@@ -50,7 +50,8 @@ pub(super) fn append_blob_process_source_admission(
         })?;
     let expected_digest = text_param("expected_digest")?;
     let snapshot_json = text_param("snapshot_json")?;
-    if snapshot_json.is_empty() || snapshot_json.len() > eliot_store_api::MAX_RECOVERY_RECORD_BYTES {
+    if snapshot_json.is_empty() || snapshot_json.len() > eliot_store_api::MAX_RECOVERY_RECORD_BYTES
+    {
         return Err(AdapterError::Store(StoreError::PayloadTooLarge));
     }
     let admission: BlobProcessSourceAdmission = serde_json::from_str(snapshot_json)
@@ -61,7 +62,12 @@ pub(super) fn append_blob_process_source_admission(
     {
         return Err(AdapterError::Store(StoreError::FenceMismatch));
     }
-    match (expected_revision, expected_digest, admission.phase, admission.owner_revision) {
+    match (
+        expected_revision,
+        expected_digest,
+        admission.phase,
+        admission.owner_revision,
+    ) {
         (0, "absent", BlobProcessSourceAdmissionPhase::Pending, 1) => {}
         (1, digest, BlobProcessSourceAdmissionPhase::Ready, 2)
             if valid_sha256(digest)
@@ -84,7 +90,10 @@ pub(super) fn append_blob_process_source_admission(
             reason: "must be the exact canonical typed admission object",
         }));
     }
-    let key = admission.identity.record_key().map_err(AdapterError::Store)?;
+    let key = admission
+        .identity
+        .record_key()
+        .map_err(AdapterError::Store)?;
     let key_json = canonical_json_bytes(&key)
         .map_err(|error| AdapterError::Serialization(error.to_string()))?;
     let row_id = sha256_hex(&key_json);

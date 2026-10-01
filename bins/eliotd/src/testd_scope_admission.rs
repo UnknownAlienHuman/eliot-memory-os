@@ -64,7 +64,9 @@ pub fn canonical_current_work_scope_source_receipt(
         .sources
         .iter()
         .find(|item| item.source_ref == governing_source_ref)
-        .ok_or_else(|| "current WorkScope admission omits the requested governing source".to_owned())?;
+        .ok_or_else(|| {
+            "current WorkScope admission omits the requested governing source".to_owned()
+        })?;
     let work_scope_bytes = canonical_json_bytes(snapshot)
         .map_err(|error| format!("canonical WorkScope owner encoding failed: {error}"))?;
     let guard_bytes = canonical_json_bytes(&snapshot.guard_receipt)

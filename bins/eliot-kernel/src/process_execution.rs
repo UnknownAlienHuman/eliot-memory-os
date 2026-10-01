@@ -1781,8 +1781,7 @@ pub(crate) struct KernelIssuedBlobProcessStreamGrant {
     pub(crate) capability: eliot_blob_api::wire::ProcessStreamSinkCapabilityRef,
     pub(crate) initial_call_token: eliot_blob_api::wire::BlobProcessStreamCallToken,
     pub(crate) owner_projection: KernelBlobProcessStreamOwnerProjection,
-    pub(crate) owner_facts_response:
-        eliot_blob_api::wire::BlobProcessStreamOwnerFactsPullResponse,
+    pub(crate) owner_facts_response: eliot_blob_api::wire::BlobProcessStreamOwnerFactsPullResponse,
 }
 
 /// Exact launch-time owner-facts projection. These digest domains stay
@@ -2961,12 +2960,13 @@ impl ProcessExecutionGateway {
     ) -> Result<eliot_blob_api::wire::BlobProcessStreamOwnerFactsPullResponse, ProcessExecutionError>
     {
         use eliot_blob_api::wire::{
+            BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_ID, BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_REVISION,
             BlobProcessStreamOwnerFactsPullOutcome, BlobProcessStreamOwnerFactsPullPurpose,
-            BlobProcessStreamOwnerFactsPullRequest,
-            BlobProcessStreamOwnerFactsPullResponse, BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_ID,
-            BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_REVISION,
+            BlobProcessStreamOwnerFactsPullRequest, BlobProcessStreamOwnerFactsPullResponse,
         };
-        use eliot_contracts::{ContractId, StateFence, TransactionSequence, canonical_json_bytes, sha256_hex};
+        use eliot_contracts::{
+            ContractId, StateFence, TransactionSequence, canonical_json_bytes, sha256_hex,
+        };
         use eliot_ors::{
             BLOB_PROCESS_STREAM_ORS_VERSION, BlobProcessStreamOwnerFactsPullRecord,
             BlobProcessStreamOwnerFactsPullState,
@@ -3906,10 +3906,9 @@ impl KernelComposition {
                     policy_sha256: policy_sha256.clone(),
                     owner_currentness_sha256: currentness_sha256.clone(),
                     work_scope_snapshot_sha256: work_scope_snapshot_sha256.clone(),
-                    module_catalog_owner_readback_json:
-                        module_catalog_owner_readback_json.clone(),
-                    module_catalog_owner_readback_sha256:
-                        module_catalog_owner_readback_sha256.clone(),
+                    module_catalog_owner_readback_json: module_catalog_owner_readback_json.clone(),
+                    module_catalog_owner_readback_sha256: module_catalog_owner_readback_sha256
+                        .clone(),
                     generation_admission_json: generation_admission_json.clone(),
                     generation_admission_sha256: generation_admission_sha256.clone(),
                 }

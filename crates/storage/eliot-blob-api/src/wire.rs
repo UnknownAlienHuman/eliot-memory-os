@@ -627,7 +627,9 @@ impl BlobProcessStreamOwnerFactsPullRequest {
             {
                 validate_text(
                     "source_admission_operation_id",
-                    self.source_admission_operation_id.as_deref().unwrap_or_default(),
+                    self.source_admission_operation_id
+                        .as_deref()
+                        .unwrap_or_default(),
                 )?;
                 validate_canonical_owner_json(
                     "open_request_json",
@@ -636,8 +638,12 @@ impl BlobProcessStreamOwnerFactsPullRequest {
                 )?;
                 validate_canonical_owner_json(
                     "owner_update_identity_json",
-                    self.owner_update_identity_json.as_deref().unwrap_or_default(),
-                    self.owner_update_identity_sha256.as_deref().unwrap_or_default(),
+                    self.owner_update_identity_json
+                        .as_deref()
+                        .unwrap_or_default(),
+                    self.owner_update_identity_sha256
+                        .as_deref()
+                        .unwrap_or_default(),
                 )?;
             }
             BlobProcessStreamOwnerFactsPullPurpose::SourceReadback
@@ -651,7 +657,9 @@ impl BlobProcessStreamOwnerFactsPullRequest {
             {
                 validate_text(
                     "source_admission_operation_id",
-                    self.source_admission_operation_id.as_deref().unwrap_or_default(),
+                    self.source_admission_operation_id
+                        .as_deref()
+                        .unwrap_or_default(),
                 )?;
                 validate_canonical_owner_json(
                     "source_admission_json",
@@ -1081,14 +1089,12 @@ impl BlobProcessStreamOwnerFactsPullResponse {
             return Err(WireValidationError::InvalidField("work_scope_binding"));
         }
         if let BlobProcessStreamOwnerFactsPullOutcome::Available {
-            owner_facts_json,
-            ..
+            owner_facts_json, ..
         } = &self.outcome
         {
-            let owner_facts: BlobProcessStreamVerifiedOwnerFacts = serde_json::from_str(
-                owner_facts_json,
-            )
-            .map_err(|_| WireValidationError::InvalidField("owner_facts_json"))?;
+            let owner_facts: BlobProcessStreamVerifiedOwnerFacts =
+                serde_json::from_str(owner_facts_json)
+                    .map_err(|_| WireValidationError::InvalidField("owner_facts_json"))?;
             if owner_facts.causal_binding_json != request.kernel_causal_binding_json
                 || owner_facts.causal_binding_sha256 != request.kernel_causal_binding_sha256
                 || owner_facts.authority_binding_json != request.kernel_authority_binding_json
@@ -1893,7 +1899,8 @@ impl ProcessStreamSourceReadbackResponse {
             generation_admission_sha256,
             process_source_admission_readback_json,
             process_source_admission_readback_sha256,
-        } = self else {
+        } = self
+        else {
             return Ok(());
         };
         validate_digest("whole_source_sha256", whole_source_sha256)?;
@@ -1983,10 +1990,10 @@ fn validate_canonical_owner_json(
     digest: &str,
 ) -> Result<(), WireValidationError> {
     validate_digest(field, digest)?;
-    let value: serde_json::Value = serde_json::from_str(json)
-        .map_err(|_| WireValidationError::InvalidField(field))?;
-    let canonical = serde_json::to_string(&value)
-        .map_err(|_| WireValidationError::InvalidField(field))?;
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|_| WireValidationError::InvalidField(field))?;
+    let canonical =
+        serde_json::to_string(&value).map_err(|_| WireValidationError::InvalidField(field))?;
     if !matches!(&value, serde_json::Value::Object(_))
         || canonical.as_bytes() != json.as_bytes()
         || sha256_hex(json.as_bytes()) != digest

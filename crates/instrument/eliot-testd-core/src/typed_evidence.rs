@@ -723,16 +723,14 @@ impl TestdReplayOwnerReadback {
                 self.generation_admission_sha256.as_str(),
             ),
         ] {
-            let value: serde_json::Value = serde_json::from_str(json).map_err(|_| {
-                TestdEvidenceError::BindingMismatch {
+            let value: serde_json::Value =
+                serde_json::from_str(json).map_err(|_| TestdEvidenceError::BindingMismatch {
                     reason: "fresh replay owner facts are not valid JSON",
-                }
-            })?;
-            let canonical = canonical_json_bytes(&value).map_err(|_| {
-                TestdEvidenceError::BindingMismatch {
+                })?;
+            let canonical =
+                canonical_json_bytes(&value).map_err(|_| TestdEvidenceError::BindingMismatch {
                     reason: "fresh replay owner facts cannot be canonically serialized",
-                }
-            })?;
+                })?;
             if String::from_utf8(canonical.clone()).ok().as_deref() != Some(json)
                 || sha256_hex(&canonical) != digest
             {
@@ -1602,12 +1600,11 @@ impl TestdStreamEvidenceBinding {
         };
         Ok(EphemeralSourceBytes(
             observation.bytes.clone(),
-            observation
-                .replay_owner_readback
-                .clone()
-                .ok_or(TestdEvidenceError::BindingMismatch {
+            observation.replay_owner_readback.clone().ok_or(
+                TestdEvidenceError::BindingMismatch {
                     reason: "source readback omitted fresh authenticated replay owner facts",
-                })?,
+                },
+            )?,
         ))
     }
 
@@ -1620,8 +1617,7 @@ impl TestdStreamEvidenceBinding {
         if self.binding.job_id().as_str() != context.job_id
             || self.binding.operation_id().as_str() != context.expected_operation_id
             || self.binding.process_tree_id().as_str() != context.expected_process_tree_id
-            || self.binding.state_fence().generation().get()
-                != context.expected_process_generation
+            || self.binding.state_fence().generation().get() != context.expected_process_generation
             || !self
                 .binding
                 .authority_epoch()

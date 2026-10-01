@@ -28,7 +28,9 @@ use thiserror::Error;
 
 use crate::{
     profile::{InstrumentRegistry, ProfileCompiler, ProfileError},
-    registry::{InvalidationSet, ProviderRegistry, RegistryEntry, RegistryError, RegistryFreshness},
+    registry::{
+        InvalidationSet, ProviderRegistry, RegistryEntry, RegistryError, RegistryFreshness,
+    },
 };
 
 /// Builds the exact builtin four-profile registry admitted for productive
@@ -37,9 +39,7 @@ use crate::{
 /// This is the production replay registry factory. Callers pass the stage's
 /// retained generation only as a selector; replay still compares the exact
 /// profile, registry, DAG, parser, and stage identities before dispatch.
-pub fn testd_builtin_profile_registry(
-    generation: u64,
-) -> Result<InstrumentRegistry, ProfileError> {
+pub fn testd_builtin_profile_registry(generation: u64) -> Result<InstrumentRegistry, ProfileError> {
     InstrumentRegistry::with_verification_route_profiles(generation, Vec::new())
 }
 
@@ -245,7 +245,9 @@ fn decode_canonical_owner_json<T>(
 where
     T: serde::de::DeserializeOwned + serde::Serialize,
 {
-    let expected_sha256 = expected_sha256.strip_prefix("sha256:").unwrap_or(expected_sha256);
+    let expected_sha256 = expected_sha256
+        .strip_prefix("sha256:")
+        .unwrap_or(expected_sha256);
     if !valid_sha256_text(expected_sha256) || sha256_hex(bytes) != expected_sha256 {
         return Err(ProfileReplayError::CurrentnessObservation(format!(
             "{label} digest does not match its exact owner response bytes"
@@ -255,7 +257,9 @@ where
         ProfileReplayError::CurrentnessObservation(format!("{label} JSON is invalid: {error}"))
     })?;
     let canonical = canonical_json_bytes(&json).map_err(|error| {
-        ProfileReplayError::CurrentnessObservation(format!("{label} canonicalization failed: {error}"))
+        ProfileReplayError::CurrentnessObservation(format!(
+            "{label} canonicalization failed: {error}"
+        ))
     })?;
     if canonical != bytes {
         return Err(ProfileReplayError::CurrentnessObservation(format!(
