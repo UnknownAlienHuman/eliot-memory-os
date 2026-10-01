@@ -190,7 +190,6 @@ impl PacketQualityService {
                 report.estimated_tokens = estimated_tokens;
                 report.signal_density = signal_density;
             }
-            packet.token_budget_report.estimated_tokens = estimated_tokens;
             if serde_json::to_vec(&packet)? == serialized {
                 break;
             }
