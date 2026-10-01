@@ -3981,6 +3981,8 @@ pub struct InstrumentRegistryEffectReservationStageResponse {
     pub receipt_operation_order: u64,
     /// Exact current ORS row operation identity.
     pub row_operation_id: String,
+    /// Original ORS stage operation identity retained on the record.
+    pub stage_operation_id: String,
     /// Exact StateFenceSnapshot read from the ORS row.
     pub state_fence: serde_json::Value,
     /// Exact epoch lineage read from the ORS row.
@@ -4011,6 +4013,8 @@ pub struct InstrumentRegistryEffectReservationActivateResponse {
     pub receipt_operation_order: u64,
     /// Exact current ORS row operation identity.
     pub row_operation_id: String,
+    /// Original ORS stage operation identity retained on the active record.
+    pub stage_operation_id: String,
     /// Exact StateFenceSnapshot read from the ORS row.
     pub state_fence: serde_json::Value,
     /// Exact epoch lineage read from the ORS row.
