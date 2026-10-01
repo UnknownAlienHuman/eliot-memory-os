@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+mod destination_manifest_evidence;
 mod ecxf_export;
 mod isolated_restore;
 mod owner_adapters;
@@ -35,6 +36,10 @@ mod restore_journal_admission;
 mod restore_runner;
 mod watchdog_spool_restore;
 
+pub use destination_manifest_evidence::{
+    DestinationAdmissionOperation, DestinationManifestAdmission, DurableDestinationRecord,
+    RestoreDestinationAdmissionOwner,
+};
 pub use ecxf_export::{
     CoherentSourceExport, EcxfExportReport, EcxfExportRequest, EcxfSourceStore, SealedBlobEntry,
     WRITE_RECEIPT_RECORD_TYPE, export_ecxf_package,
