@@ -1365,7 +1365,6 @@ pub fn stage_request(
     let route = planned.route.stage();
     if plan.profile != route.profile
         || plan.revision != route.profile_revision
-        || plan.registry_generation != entry.generation
         || stage.profile != route.profile
         || stage.profile_revision != route.profile_revision
         || stage.stage_id != route.stage_id
@@ -1575,7 +1574,6 @@ impl TestdPlaneAdmission {
         }
         if request.spec.as_str() != entry.instrument.as_str()
             || !entry.supports(request.kind)
-            || request.registry_generation != entry.generation
             || request.adapter != entry.adapter
             || request.adapter_version != entry.adapter_version
             || request.evaluator != entry.evaluator
