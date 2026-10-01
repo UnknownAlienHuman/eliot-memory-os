@@ -35,6 +35,11 @@ use super::user_automation_execution::{
     UserAutomationRuntimeError,
 };
 
+/// Closed leg name of the user-automation failure-history commit, so its
+/// declared write intent can never collide with another leg that happens to
+/// commit the same revision identity (#1925).
+const USER_AUTOMATION_FAILURE_WRITE_INTENT_LEG: &str = "user-automation-failure-history";
+
 /// Canonical Store adapter implementing the failure-history port.
 ///
 /// Generic over any [`CanonicalStoreClient`] so production backends and
@@ -154,6 +159,20 @@ pub fn build_failure_transition(
     let automation_id = request.revision.automation_id.clone();
     let mut transition = PreparedTransition {
         contract_version: eliot_store_api::CONTRACT_VERSION,
+        // #1925: this leg's stable intent is the owner-issued automation
+        // revision whose failure it records. It is a THIRD identity beside the
+        // per-attempt `operation_id` and the per-correction `idempotency_key`,
+        // declared through the OWNER's single derivation rather than a local
+        // spelling, so this leg and the Governor's legs cannot disagree.
+        write_intent_id: eliot_store_api::admission_write_intent(
+            USER_AUTOMATION_FAILURE_WRITE_INTENT_LEG,
+            &automation_id,
+        )
+        .ok_or(StoreError::InvalidField {
+            field: "write_intent_id",
+            reason: "the automation revision declares no stable failure-history write intent",
+        })?,
+        write_envelope_protocol_version: eliot_store_api::WRITE_ENVELOPE_PROTOCOL_VERSION,
         identity: request.identity.clone(),
         state_fence: request.context.state_fence.clone(),
         scope_id: ScopeId::new(USER_AUTOMATION_SCOPE)?,

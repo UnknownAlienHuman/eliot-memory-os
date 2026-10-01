@@ -73,6 +73,12 @@ use crate::lifecycle_admission::{
 };
 use crate::{KernelService, KernelServiceError, KernelServiceState, validate_text};
 
+/// Closed leg name of the admitted lifecycle hop, so its declared write intent
+/// can never collide with the bound lifecycle leg below or any other (#1925).
+const LIFECYCLE_HOP_WRITE_INTENT_LEG: &str = "lifecycle-hop";
+/// Closed leg name of the bound lifecycle transition.
+const LIFECYCLE_BOUND_WRITE_INTENT_LEG: &str = "lifecycle-bound";
+
 /// Authenticated lifecycle session bound from live Kernel state.
 #[derive(Clone, Debug)]
 pub struct AuthenticatedLifecycleSession {
@@ -875,6 +881,18 @@ fn mutation_transition_for(
                 .map_err(LifecyclePersistError::from_store)?;
             let mut transition = PreparedTransition {
                 contract_version: eliot_store_api::CONTRACT_VERSION,
+                // #1925: this leg's stable intent is the owner-issued scope of
+                // the candidate the hop persists, declared through the OWNER's
+                // single derivation rather than a local spelling.
+                write_intent_id: eliot_store_api::admission_write_intent(
+                    LIFECYCLE_HOP_WRITE_INTENT_LEG,
+                    payload.candidate.scope.as_str(),
+                )
+                .ok_or(LifecyclePersistError::InvalidField {
+                    field: "lifecycle.persist.write_intent_id",
+                    reason: "the hop scope declares no stable lifecycle write intent",
+                })?,
+                write_envelope_protocol_version: eliot_store_api::WRITE_ENVELOPE_PROTOCOL_VERSION,
                 identity: input.identity.clone(),
                 state_fence: bindings.fence.clone(),
                 scope_id: ScopeId::new(payload.candidate.scope.as_str()).map_err(|_| {
@@ -955,6 +973,20 @@ fn transition_for(
 ) -> Result<PreparedTransition, LifecyclePersistError> {
     let mut transition = PreparedTransition {
         contract_version: eliot_store_api::CONTRACT_VERSION,
+        // #1925: this leg's stable intent is the owner-issued scope the bound
+        // transition addresses, declared through the OWNER's single derivation
+        // rather than a local spelling. The bound SCOPE is stable across typed
+        // corrections of the same lifecycle leg, which the per-attempt
+        // `operation_id` and the per-correction `idempotency_key` are not.
+        write_intent_id: eliot_store_api::admission_write_intent(
+            LIFECYCLE_BOUND_WRITE_INTENT_LEG,
+            bindings.scope.as_str(),
+        )
+        .ok_or(LifecyclePersistError::InvalidField {
+            field: "lifecycle.bind.write_intent_id",
+            reason: "the bound scope declares no stable lifecycle write intent",
+        })?,
+        write_envelope_protocol_version: eliot_store_api::WRITE_ENVELOPE_PROTOCOL_VERSION,
         identity: identity.clone(),
         state_fence: bindings.fence.clone(),
         scope_id: bindings.scope.clone(),

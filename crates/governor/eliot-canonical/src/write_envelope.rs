@@ -41,9 +41,16 @@ use super::{CanonicalError, CanonicalWriteEnvelope, WriteResponseMode};
 
 /// Versioned write-envelope protocol handled by this boundary.
 ///
-/// Only version 1 is admitted. A version bump requires a new validator and an
-/// explicit migration; unknown versions fail closed.
-pub const WRITE_ENVELOPE_PROTOCOL_VERSION: u32 = 1;
+/// The literal itself is owned by
+/// [`eliot_store_api::WRITE_ENVELOPE_PROTOCOL_VERSION`], the lowest of the
+/// three write-envelope boundary crates: a Kernel leg that constructs a
+/// `PreparedTransition` depends on `eliot-store-api` and not on this crate, so
+/// the revision a leg records and the revision admission admits must be ONE
+/// constant rather than two literals that agree today. This boundary performs
+/// the admission-side equality check against it. Only version 1 is admitted. A
+/// version bump requires a new validator and an explicit migration; unknown
+/// versions fail closed.
+pub const WRITE_ENVELOPE_PROTOCOL_VERSION: u32 = eliot_store_api::WRITE_ENVELOPE_PROTOCOL_VERSION;
 
 /// Canonical text of the `wait_for_commit` agent response mode.
 pub const WAIT_FOR_COMMIT_MODE: &str = "wait_for_commit";
@@ -88,6 +95,17 @@ pub fn validate_write_intent_id(value: &str) -> Result<(), CanonicalError> {
     }
     Ok(())
 }
+
+/// Declares the stable write intent of ONE internal admission leg.
+///
+/// A thin re-export of the OWNER's single derivation.
+/// [`eliot_store_api::admission_write_intent`](eliot_store_api::admission_write_intent)
+/// lives in the crate that owns the `write_intent_id` member on
+/// `PreparedTransition`, beside the genesis exemption, because the Kernel's own
+/// legs depend on `eliot-store-api` and NOT on this crate. Re-exporting rather
+/// than re-deriving keeps one derivation: a copy here would be a second scheme
+/// producing a second value for one leg.
+pub use eliot_store_api::admission_write_intent;
 
 /// A versioned, fully validated write submission ready for admission.
 ///

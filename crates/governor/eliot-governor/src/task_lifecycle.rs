@@ -684,11 +684,9 @@ fn task_envelope(
             "task-lifecycle-transition",
             record.task_id.as_str(),
         )
-        .ok_or_else(|| {
-            TaskLifecycleError::Owner(TaskError::InvalidField(
-                "task_lifecycle has no owner-issued subject to declare",
-            ))
-        })?,
+        .ok_or(TaskLifecycleError::Owner(TaskError::InvalidField(
+            "task_lifecycle has no owner-issued subject to declare",
+        )))?,
         write_envelope_protocol_version:
             crate::write_intent::GOVERNOR_ADMISSION_WRITE_ENVELOPE_PROTOCOL_VERSION,
         scope_id,

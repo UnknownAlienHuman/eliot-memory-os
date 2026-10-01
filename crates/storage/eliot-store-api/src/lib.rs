@@ -445,6 +445,67 @@ pub const GENESIS_STORE_SEED_WRITE_INTENT: &str = "store.genesis.seed";
 /// named operations.
 pub const GENESIS_STORE_SEED_WRITE_ENVELOPE_PROTOCOL_VERSION: u32 = 1;
 
+/// Domain separator for every internal admission leg's declared write intent.
+///
+/// Versioned with the derivation, so a future change of spelling is a new value
+/// and never a silent reinterpretation of an intent already retained under it.
+const ADMISSION_WRITE_INTENT_DOMAIN: &str = "eliot.governor.admission_write_intent.v1";
+
+/// The single write-envelope protocol revision this boundary records on a
+/// prepared transition.
+///
+/// This crate is the LOWEST of the three write-envelope boundary crates — it
+/// depends only on `eliot-contracts` — so it is where the revision literal has
+/// to live for a Kernel leg that constructs a [`PreparedTransition`] to read it.
+/// `eliot_canonical::write_envelope` re-exports this exact value and performs
+/// the admission-side equality check against it, so the constant a leg records
+/// and the constant admission admits are the same one by construction, not two
+/// literals that agree today.
+pub const WRITE_ENVELOPE_PROTOCOL_VERSION: u32 = 1;
+
+/// Declares the stable write intent of ONE internal admission leg.
+///
+/// This crate owns the `write_intent_id` member on [`PreparedTransition`] and
+/// the genesis exemption beside it, so the derivation of an internal leg's
+/// intent and the validation of that intent belong HERE, next to
+/// [`GENESIS_STORE_SEED_WRITE_INTENT`]. Every leg that must supply a
+/// `write_intent_id` without an agent submission — the Governor's own admission
+/// legs, the Kernel's automation/notification/reactive/lifecycle legs, the Store
+/// adapters' fixtures — calls THIS function. A second, crate-local spelling
+/// would produce two different values for one leg and is a second scheme, not
+/// an implementation detail.
+///
+/// `leg` names the closed admission leg (for example
+/// `"experience-bank-commit"`) and `subject` is that leg's own owner-issued,
+/// stable semantic subject: the exact committed record digest, the admitted
+/// candidate digest, the automation/notification/reactive scope, or the chain
+/// head. The declared value is stable across typed correction attempts of the
+/// same subject, and is domain-separated per leg, so it is never conflated with
+/// the per-attempt `operation_id` or the per-correction `idempotency_key`.
+///
+/// It is deliberately not a default, not an `Option` field and not a second
+/// identity type. A caller that has no owner-issued subject receives `None` and
+/// must REFUSE: substituting a placeholder would make "no owner supplied one"
+/// silently acceptable.
+///
+/// Returns `None` when `leg` or `subject` is blank or contains a control
+/// character.
+#[must_use]
+pub fn admission_write_intent(leg: &str, subject: &str) -> Option<String> {
+    if !is_declared_text(leg) || !is_declared_text(subject) {
+        return None;
+    }
+    let shape = (ADMISSION_WRITE_INTENT_DOMAIN, leg, subject);
+    // `canonical_json_bytes` cannot fail for this tuple of owned strings, so the
+    // digest is total; a caller never sees a partially declared intent.
+    let bytes = canonical_json_bytes(&shape).ok()?;
+    Some(format!("governor-intent-{}", sha256_hex(&bytes)))
+}
+
+fn is_declared_text(value: &str) -> bool {
+    !value.trim().is_empty() && !value.chars().any(char::is_control)
+}
+
 /// Compatibility spelling used by the store boundary.
 pub type RequestMeta = RequestMetadata;
 

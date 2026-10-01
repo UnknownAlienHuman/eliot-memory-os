@@ -480,7 +480,7 @@ fn skill_envelope(
             "skill-lifecycle-admission",
             candidate.candidate_digest.as_str(),
         )
-        .ok_or_else(|| SkillError::IdentityMismatch)?,
+        .ok_or(SkillError::IdentityMismatch)?,
         write_envelope_protocol_version:
             crate::write_intent::GOVERNOR_ADMISSION_WRITE_ENVELOPE_PROTOCOL_VERSION,
         scope_id,
