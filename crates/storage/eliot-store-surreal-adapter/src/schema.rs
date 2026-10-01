@@ -354,7 +354,7 @@ DEFINE INDEX snapshot_uri ON resource_snapshot FIELDS uri UNIQUE;
 /// joined automation/revision key with the verbatim revision document;
 /// `automation_normalization` independently retains the exact owner
 /// normalization request, normalized revision, original receipt, and
-/// PreparedTransition provenance without activating an automation;
+/// `PreparedTransition` provenance without activating an automation;
 /// `automation_current` carries one
 /// compare-and-set pointer per automation with the current revision and
 /// the closed admission state; `automation_invocation` carries one
