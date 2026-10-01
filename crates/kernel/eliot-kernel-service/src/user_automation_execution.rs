@@ -4504,8 +4504,12 @@ mod tests {
         }
     }
 
-    fn revision(state: UserAutomationConfigurationState) -> UserAutomationRevision {
-        UserAutomationRevision {
+    fn revision(
+        context: &RequestMetadata,
+        state: UserAutomationConfigurationState,
+        normalization_operation_id: &str,
+    ) -> UserAutomationRevision {
+        let draft = UserAutomationRevision {
             automation_id: "automation-1".to_owned(),
             revision: "revision-7".to_owned(),
             supersedes: None,
@@ -4518,30 +4522,15 @@ mod tests {
             natural_language_intent: "run the qualified deterministic check".to_owned(),
             schedule: NormalizedSchedule {
                 kind: ScheduleKind::Recurring,
-                expression: "at 12:00".to_owned(),
-                calendar: "gregorian".to_owned(),
+                expression: "local-daily:2026-09-21T12:00:00/1".to_owned(),
+                calendar: "gregorian-local".to_owned(),
                 timezone: "America/New_York".to_owned(),
                 dst_fold: DstFoldPolicy::First,
                 dst_gap: DstGapPolicy::ShiftForward,
                 start_at: "2026-09-21T00:00:00Z".to_owned(),
                 end_at: None,
-                next_occurrences: vec!["2026-09-21T12:00:00-04:00".to_owned()],
-                // This fixture carries a retired shape-only occurrence key, so
-                // the owning calendar adapter has not issued a normalization
-                // binding for it and the revision requires re-normalization.
-                // Empty evidence can never satisfy the required binding, so the
-                // fixture stays refused instead of becoming admitted.
-                normalization_receipt: Box::new(
-                    eliot_kernel_core::user_automation::ScheduleNormalizationReceipt {
-                        receipt_id: String::new(),
-                        normalizer_authority: String::new(),
-                        source_digest: String::new(),
-                        zone_database_revision:
-                            eliot_kernel_core::user_automation::PINNED_ZONE_DATABASE_REVISION
-                                .to_owned(),
-                        occurrences_digest: String::new(),
-                    },
-                ),
+                next_occurrences: Vec::new(),
+                normalization_receipt: Box::new(Default::default()),
             },
             mode: UserAutomationExecutionMode::DeterministicProcess,
             task: AutomationTaskBinding {
@@ -4583,7 +4572,38 @@ mod tests {
             work_class: AutomationWorkClass::Maintenance,
             current_execution_refs: Vec::new(),
             execution_history_query_ref: "history:automation-1".to_owned(),
-        }
+        };
+        let request = crate::user_automation::UserAutomationServiceRequest {
+            context: context.clone(),
+            authenticated_principal: "human-1".to_owned(),
+            identity: OperationIdentity {
+                operation_id: OperationId::new(normalization_operation_id)
+                    .expect("normalization operation"),
+                idempotency_key: format!("idem-{normalization_operation_id}"),
+                canonical_request_hash: "0".repeat(64),
+            },
+            intent: crate::user_automation::UserAutomationOperatorIntent {
+                intent_id: format!("intent-{normalization_operation_id}"),
+                principal_ref: "human-1".to_owned(),
+                state_fence: context.state_fence.clone(),
+                operation: UserAutomationOperation::NormalizeSchedule {
+                    revision: Box::new(draft),
+                    occurrence_count: 1,
+                },
+            },
+        };
+        let (revision, normalization_receipt) =
+            crate::user_automation_store::normalize_user_automation_operation(&request)
+                .expect("Kernel normalization fixture");
+        revision
+            .schedule
+            .validate_normalization_receipt_envelope(
+                &revision.schedule.normalization_receipt,
+                &normalization_receipt,
+                &revision,
+            )
+            .expect("normalization receipt binds the produced revision");
+        revision
     }
 
     fn source_receipt(context: &RequestMetadata) -> ReceiptEnvelope {
@@ -4663,12 +4683,13 @@ mod tests {
     fn projection(
         context: &RequestMetadata,
         state: UserAutomationConfigurationState,
+        normalization_operation_id: &str,
     ) -> (
         UserAutomationInvocation,
         UserAutomationPreflightProjection,
         WakeIntent,
     ) {
-        let revision = revision(state);
+        let revision = revision(context, state, normalization_operation_id);
         let invocation = UserAutomationInvocation {
             automation_id: revision.automation_id.clone(),
             automation_revision: revision.revision.clone(),
@@ -4882,8 +4903,11 @@ mod tests {
         let service = UserAutomationService::new(&store);
 
         let active_context = metadata();
-        let (active_invocation, active_projection, active_wake) =
-            projection(&active_context, UserAutomationConfigurationState::Active);
+        let (active_invocation, active_projection, active_wake) = projection(
+            &active_context,
+            UserAutomationConfigurationState::Active,
+            "automation-normalization-active",
+        );
         let active_runtime = RecordingRuntime::default();
         let active_composition = UserAutomationRuntimeComposition::new(
             &active_runtime,
@@ -4944,6 +4968,7 @@ mod tests {
         let (blocked_invocation, blocked_projection, blocked_wake) = projection(
             &blocked_context,
             UserAutomationConfigurationState::BlockedConfig,
+            "automation-normalization-blocked",
         );
         let blocked_runtime = RecordingRuntime::default();
         let blocked_composition = UserAutomationRuntimeComposition::new(
