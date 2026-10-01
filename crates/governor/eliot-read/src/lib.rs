@@ -271,6 +271,14 @@
 //! [`ReadError::Outcome`]. No failure collapses into a string, a generic code,
 //! or another state.
 //!
+//! One bounded-page fact sits beside that vocabulary rather than inside it: a
+//! page that does not prove the read's exact bound fence is
+//! [`ReadError::CoverageFenceUnproven`], its own typed outcome. It is not
+//! `Unknown` (the source did answer, so the answer was not unobserved) and it
+//! is not `Partial` (nothing in it claims rows exist past the bound), and
+//! collapsing it into either would make a page about another fence's rows
+//! readable as a statement about this read's rows.
+//!
 //! # Read cell, owner and proof surface (A10)
 //!
 //! The read cell is resolved by #13, and the part of that this package owns is
@@ -322,9 +330,9 @@ use eliot_contracts::{
 };
 use eliot_store_api::{
     AutomationContinuationFailure, CanonicalReadClient, EXPERIENCE_BANK_READ_NAME,
-    EXPERIENCE_FEEDBACK_READ_NAME, ExperienceRangePage, NamedReadOperation, NamedReadRequest,
-    NamedReadResponse, OrderingHead, ReadConsistency, RevisionHead, RevisionKey, ScopeId,
-    StoreError, named_read_operation_name,
+    EXPERIENCE_FEEDBACK_READ_NAME, EXPERIENCE_PAGE_STATE_FENCE, ExperienceRangePage,
+    NamedReadOperation, NamedReadRequest, NamedReadResponse, OrderingHead, ReadConsistency,
+    RevisionHead, RevisionKey, ScopeId, StoreError, named_read_operation_name,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -1408,6 +1416,27 @@ pub enum ReadError {
     /// Store response changed the requested operation or fence.
     #[error("named read response does not match request fence or operation")]
     ResponseMismatch,
+    /// The Store's own page coverage statement does not prove this read's
+    /// exact bound fence.
+    ///
+    /// A bounded page publishes the fence it was projected under
+    /// ([`EXPERIENCE_PAGE_STATE_FENCE`]), and that member is what lets a
+    /// consumer tell a coverage statement about the rows this read asked for
+    /// from one about somebody else's rows. When the page states no readable
+    /// fence, or states one other than the read's bound fence, the truncation
+    /// flag it carries describes a different identity and must not be read as
+    /// this read's coverage.
+    ///
+    /// This is deliberately neither `Unknown` nor `Partial`: the source did
+    /// answer (so the answer was not unobserved), and nothing in it states
+    /// that rows exist past the bound (so it is not a bounded-subset
+    /// statement either). The two source-side identities remain what they are
+    /// at the Store boundary — [`StoreError::FenceMismatch`] for a page read
+    /// under a foreign fence and [`StoreError::InvalidField`] for a
+    /// malformed one — and this variant is the owner-level fact they share:
+    /// the page does not prove the bound identity.
+    #[error("named read page coverage statement does not prove the read's exact bound fence")]
+    CoverageFenceUnproven,
     /// Stable read observed a revision change during assembly.
     #[error("read dependency revisions changed during stable read")]
     RevisionChurn,
@@ -1966,7 +1995,7 @@ impl<C: CanonicalReadClient> ReadService<C> {
         {
             return Err(ReadError::StaleRevision);
         }
-        classify_payload_coverage(operation, &response.payload)?;
+        classify_payload_coverage(operation, &ctx.state_fence, &response.payload)?;
         let _ = ReadProvenance::from_handles(handles)?;
         let identity = ReadIdentity {
             principal: ReadPrincipal::from_metadata(ctx),
@@ -2125,22 +2154,32 @@ impl<C: CanonicalReadClient> ReadApi for ReadService<C> {
 
 /// Refuses a successful response that does not observe its own bound identity.
 ///
-/// Two cases are refused, and neither may become a successful empty or current
+/// Three cases are refused, and none may become a successful empty or current
 /// result:
 ///
 /// * a payload that is a bare JSON `null` is an unobserved in-memory value, not
 ///   an authoritative statement that the projection is empty — it is `Unknown`;
 /// * for the operations whose Store contract types a page coverage statement
-///   ([`ExperienceRangePage`]), the statement must decode and must describe the
-///   records it carries — an undecodable or undescribed statement is `Unknown`,
-///   and a statement that proves further rows exist past the declared bound is
-///   `Partial`.
+///   ([`ExperienceRangePage`]), the statement must first prove the read's exact
+///   bound fence, then decode, then describe the records it carries. A page
+///   whose own fence statement ([`EXPERIENCE_PAGE_STATE_FENCE`]) is absent,
+///   unreadable or bound to another fence is [`ReadError::CoverageFenceUnproven`]
+///   — not `Unknown`, because the source did answer, and not `Partial`, because
+///   nothing in it claims rows exist past the bound. An undecodable or
+///   undescribed statement is `Unknown`, and a statement that proves further
+///   rows exist past the declared bound is `Partial`.
+///
+/// The fence is checked BEFORE any coverage member is read, and that order is
+/// the guarantee: a truncated flag on a page projected under another fence
+/// describes that other fence's rows, so reading it first would publish a
+/// bounded-subset fact about an identity this read never bound.
 ///
 /// Every other operation keeps its payload opaque here: its own consumer owns
 /// the payload contract, and this owner states only that the read is bound to
 /// the exact [`ReadCoverage`] identity the one Store comparison resolved.
 fn classify_payload_coverage(
     operation: NamedReadOperation,
+    bound_fence: &StateFence,
     payload: &Value,
 ) -> Result<(), ReadError> {
     if payload.is_null() {
@@ -2148,6 +2187,19 @@ fn classify_payload_coverage(
     }
     if !declares_store_coverage_statement(operation) {
         return Ok(());
+    }
+    // The page's own fence member, read through the Store's exported key
+    // constant rather than a spelling restated here. It is read before the
+    // page is decoded so that a page which states no readable fence keeps
+    // that exact fact instead of collapsing into the decode-failure answer.
+    let page_fence = payload
+        .get(EXPERIENCE_PAGE_STATE_FENCE)
+        .cloned()
+        .ok_or(ReadError::CoverageFenceUnproven)?;
+    let page_fence: StateFence =
+        serde_json::from_value(page_fence).map_err(|_| ReadError::CoverageFenceUnproven)?;
+    if page_fence != *bound_fence {
+        return Err(ReadError::CoverageFenceUnproven);
     }
     let page: ExperienceRangePage = serde_json::from_value(payload.clone())
         .map_err(|_| ReadError::Outcome(ReadOutcome::Unknown))?;

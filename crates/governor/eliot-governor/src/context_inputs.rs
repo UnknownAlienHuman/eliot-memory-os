@@ -1052,6 +1052,15 @@ fn classify_read_error(error: ReadError) -> Result<ProjectionState, ContextInput
         ReadError::ResponseMismatch => Ok(ProjectionState::Stale {
             reason: "named read response changed operation or fence".to_owned(),
         }),
+        // The bounded page answered, but it does not prove the fence this
+        // reconstruction bound: its truncation flag (if any) describes another
+        // fence's rows, so this is neither a role outcome nor an empty one. It
+        // is `Stale` rather than `Partial` on purpose — `Partial` would claim
+        // the source stated a bounded subset of the rows this read asked for,
+        // which is exactly what an unproven fence leaves unsaid.
+        ReadError::CoverageFenceUnproven => Ok(ProjectionState::Stale {
+            reason: "page coverage statement does not prove the read's exact fence".to_owned(),
+        }),
         ReadError::RevisionChurn => Ok(ProjectionState::Stale {
             reason: "dependency revisions changed during the read".to_owned(),
         }),
