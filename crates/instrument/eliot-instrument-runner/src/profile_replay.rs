@@ -169,6 +169,11 @@ fn current_selection<'a>(
             field: "provider_catalog_lifecycle",
         });
     }
+    if retained_lifecycle.state_fence != stage.invocation.request.state_fence {
+        return Err(ProfileReplayError::StageMismatch {
+            field: "provider_catalog_state_fence",
+        });
+    }
     let admitted = ProfileCompiler::new(profile_registry)
         .compile_exact(&stage.profile_name, stage.profile_revision)
         .map_err(|error| ProfileReplayError::InvalidStage {
