@@ -852,9 +852,7 @@ fn close_terminal_attempt_learning(
             let detail = if receipt.delivered {
                 format!("committed; admitted delivery surface is live; {promotion}{prior}")
             } else {
-                format!(
-                    "committed; unadmitted, behavioural effect withheld; {promotion}{prior}"
-                )
+                format!("committed; unadmitted, behavioural effect withheld; {promotion}{prior}")
             };
             (detail, Some(*receipt))
         }

@@ -6128,24 +6128,23 @@ async fn run_improvement_intake(
             }
         }
     };
-    let delta_rows =
-        match eliotd::improvement_intake_dispatch::read_durable_learning_delta_scope(
-            kernel,
-            &delta_fence,
-        )
-        .await
-        {
-            Ok(rows) => rows,
-            Err(error) => {
-                let _ = eliotd::diagnostics::ErrorRecord::of(
-                    eliotd::diagnostics::OwningComponent::DaemonRuntime,
-                    "improvement-learning-delta-read",
-                    &error.to_string(),
-                )
-                .emit();
-                return retained.cloned();
-            }
-        };
+    let delta_rows = match eliotd::improvement_intake_dispatch::read_durable_learning_delta_scope(
+        kernel,
+        &delta_fence,
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            let _ = eliotd::diagnostics::ErrorRecord::of(
+                eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                "improvement-learning-delta-read",
+                &error.to_string(),
+            )
+            .emit();
+            return retained.cloned();
+        }
+    };
     // Phase 1d: claim whatever authenticated owners have already recorded over
     // improvement briefs (issue #1867 A2, I12.24:65). Unguarded, and LAST of the
     // pre-assembly phases, because claiming is an authenticated Kernel exchange

@@ -880,12 +880,13 @@ pub fn parse_claimed_owner_decision(
     if decision.is_null() {
         return Ok(None);
     }
-    let claimed: ClaimedOwnerDecision = serde_json::from_value(decision.clone()).map_err(|error| {
-        format!("Kernel improvement_decision_claim decision does not decode: {error}")
+    let claimed: ClaimedOwnerDecision =
+        serde_json::from_value(decision.clone()).map_err(|error| {
+            format!("Kernel improvement_decision_claim decision does not decode: {error}")
+        })?;
+    claimed.validate().map_err(|error| {
+        format!("Kernel improvement_decision_claim decision is invalid: {error}")
     })?;
-    claimed
-        .validate()
-        .map_err(|error| format!("Kernel improvement_decision_claim decision is invalid: {error}"))?;
     Ok(Some(claimed))
 }
 

@@ -967,8 +967,8 @@ fn brief_fields_from_observed_closure(
     // itself (see `RepeatedVerifierFailure::brief_evidence_clause`); `None`
     // leaves every brief field exactly as it was, so a pass with no recorded
     // repeat is unchanged.
-    let repeat_clause = repeated_failure
-        .map_or_else(String::new, RepeatedVerifierFailure::brief_evidence_clause);
+    let repeat_clause =
+        repeated_failure.map_or_else(String::new, RepeatedVerifierFailure::brief_evidence_clause);
     let next_step_clause =
         repeated_failure.map_or_else(String::new, RepeatedVerifierFailure::brief_next_step_clause);
 
@@ -3554,19 +3554,20 @@ fn served_learning_delta_page(
             "the served page is not well formed: {error}"
         ))
     })?;
-    let payload_fence: StateFence =
-        serde_json::from_value(response.payload.get(EXPERIENCE_PAGE_STATE_FENCE).cloned().ok_or_else(
-            || {
+    let payload_fence: StateFence = serde_json::from_value(
+        response
+            .payload
+            .get(EXPERIENCE_PAGE_STATE_FENCE)
+            .cloned()
+            .ok_or_else(|| {
                 ImprovementDispatchError::ClosureRead(
                     "the served page carries no state fence".to_owned(),
                 )
-            },
-        )?)
-        .map_err(|_| {
-            ImprovementDispatchError::ClosureRead(
-                "the served page fence does not decode".to_owned(),
-            )
-        })?;
+            })?,
+    )
+    .map_err(|_| {
+        ImprovementDispatchError::ClosureRead("the served page fence does not decode".to_owned())
+    })?;
     if payload_fence != response.state_fence {
         return Err(ImprovementDispatchError::ClosureRead(
             "the served page fence contradicts the response fence".to_owned(),
