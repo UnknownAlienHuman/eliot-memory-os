@@ -10973,8 +10973,7 @@ where
                         .to_owned(),
                 ));
             }
-            transaction
-                .recorded_service_registration_identity(InstallerServiceRole::Watchdog)?;
+            transaction.recorded_service_registration_identity(InstallerServiceRole::Watchdog)?;
             let request = effect_request(
                 transaction,
                 watchdog_index,
@@ -10985,8 +10984,7 @@ where
             let observed = match self.port.reconcile(&request) {
                 PortOutcome::Known(observed) => {
                     observed.validate()?;
-                    observed
-                        .validate_for_effect(&transaction.installer_effects[watchdog_index])?;
+                    observed.validate_for_effect(&transaction.installer_effects[watchdog_index])?;
                     observed
                 }
                 other => {
