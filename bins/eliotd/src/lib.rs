@@ -1310,6 +1310,54 @@ impl DaemonComposition {
         Ok(receipt)
     }
 
+    /// Commits only the closed process-source admission mutation through the
+    /// retained Kernel canonical gateway after the current WorkScope guard
+    /// and original governing-source closure have been revalidated.
+    pub(crate) async fn commit_blob_process_source_admission(
+        &self,
+        identity: &RequestIdentity,
+        envelope: eliot_canonical::CanonicalWriteEnvelope,
+        observed_work_scope: &eliot_governor::ScopeBinding,
+        sources: &eliot_governor::GoverningSourceSet,
+        privacy: &eliot_governor::PrivacyProfile,
+    ) -> Result<eliot_store_api::WriteReceipt, String> {
+        identity
+            .validate()
+            .map_err(|error| format!("invalid source-admission RequestIdentity: {error}"))?;
+        if envelope.request != identity.request.metadata
+            || envelope.idempotency_key != identity.idempotency_key
+            || envelope.request.state_fence != identity.request.state_fence
+            || envelope.transition_class != eliot_store_api::TransitionClass::RecoverySchema
+            || envelope.semantic_commands.len() != 1
+            || envelope.semantic_commands[0].operation
+                != eliot_store_api::NamedMutationOperation::RecordBlobProcessSourceAdmission
+        {
+            return Err(
+                "canonical source-admission transition differs from its exact identity or operation"
+                    .to_owned(),
+            );
+        }
+        self.governor
+            .check_canonical_write_work_scope(
+                envelope.scope_id.as_str(),
+                observed_work_scope,
+                Some((sources, privacy)),
+            )
+            .map_err(|error| format!("WorkScope source-admission gate refused: {error}"))?;
+        let manifests = eliot_store_api::generated_operation_manifests()
+            .map_err(|error| format!("read current named-operation catalogue: {error}"))?;
+        let prepared = envelope
+            .prepare()
+            .map_err(|error| format!("prepare source-admission transition: {error}"))?;
+        prepared
+            .validate_against_catalogue(&manifests)
+            .map_err(|error| format!("source-admission transition is not currently admitted: {error}"))?;
+        self.governor
+            .commit_canonical(identity, envelope)
+            .await
+            .map_err(|error| format!("commit source-admission transition through Kernel: {error}"))
+    }
+
     /// Requires the cached revision fence to match the live Kernel fence
     /// exactly (issue #18 W6/A5).
     ///
@@ -2014,6 +2062,37 @@ impl DaemonComposition {
             return Ok(None);
         }
         Ok(Some(snapshot))
+    }
+
+    /// Freshly reads WorkScope with the Store-issued revision and original
+    /// payload digest retained for a downstream process-source admission CAS.
+    pub fn current_testd_blob_work_scope_readback(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<Option<eliot_governor::WorkScopeOwnerReadback>, String> {
+        state_fence
+            .validate()
+            .map_err(|error| format!("invalid owner-facts fence: {error}"))?;
+        if self.governor.kernel_snapshot().state_fence() != *state_fence {
+            return Err("owner-facts fence is not the current Governor fence".to_owned());
+        }
+        let Some(readback) = self
+            .governor
+            .read_current_work_scope_owner_readback_with_provenance(state_fence)
+            .map_err(|error| format!("current WorkScope owner read failed: {error}"))?
+        else {
+            return Ok(None);
+        };
+        readback
+            .snapshot
+            .validate()
+            .map_err(|error| format!("current WorkScope guard is invalid: {error}"))?;
+        if readback.snapshot.guard_receipt.disposition
+            != eliot_governor::ScopeBindingDisposition::Matched
+        {
+            return Ok(None);
+        }
+        Ok(Some(readback))
     }
 
     /// Freshly resolves the exact process-stream admission row selected by

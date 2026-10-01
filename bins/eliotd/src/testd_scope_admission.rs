@@ -11,6 +11,7 @@ use eliot_blob_api::wire::{
     BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_ID, BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_REVISION,
     BlobProcessStreamOwnerFactsPullOutcome, BlobProcessStreamOwnerFactsPullRequest,
     BlobProcessStreamOwnerFactsPullResponse, BlobProcessStreamOwnerFactsUnavailableReason,
+    BlobProcessStreamOwnerFactsPullPurpose, BlobProcessStreamVerifiedOwnerFacts,
 };
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use serde::Serialize;
@@ -93,13 +94,11 @@ pub fn read_current_blob_policy_residency(
     })
 }
 
-/// Packages the exact owner-read WorkScope and selected admitted source record
-/// in canonical form. The source reference remains the original owner value;
-/// the JSON digest commits only the canonical transport projection, not a new
-/// receipt identity or content digest.
+/// Packages the exact owner-read WorkScope and its admitted governing-source
+/// closure in canonical form. This is deliberately independent from a newly
+/// generated process-stream SourceId, which is admitted in a separate owner.
 pub fn canonical_current_work_scope_source_receipt(
     snapshot: &eliot_governor::WorkScopeBindingSnapshot,
-    governing_source_ref: &str,
 ) -> Result<CurrentWorkScopeSourceReceipt, String> {
     snapshot
         .validate()
@@ -107,24 +106,16 @@ pub fn canonical_current_work_scope_source_receipt(
     let source = snapshot
         .source_admission()
         .ok_or_else(|| "WorkScope owner has no retained source admission".to_owned())?;
-    let source_record = source
-        .sources
-        .sources
-        .iter()
-        .find(|item| item.source_ref == governing_source_ref)
-        .ok_or_else(|| {
-            "current WorkScope admission omits the requested governing source".to_owned()
-        })?;
     let work_scope_bytes = canonical_json_bytes(snapshot)
         .map_err(|error| format!("canonical WorkScope owner encoding failed: {error}"))?;
     let guard_bytes = canonical_json_bytes(&snapshot.guard_receipt)
         .map_err(|error| format!("canonical WorkScope guard encoding failed: {error}"))?;
-    // The source record retains its original owner reference and original
-    // content digest. Hashing its canonical projection commits this bounded
-    // transport representation; it does not replace or reinterpret the
-    // source's own digest.
-    let source_bytes = canonical_json_bytes(source_record)
-        .map_err(|error| format!("canonical source record encoding failed: {error}"))?;
+    // This preserves the complete owner-admitted governing-source set,
+    // including its original per-source refs, digests, statuses, authority
+    // basis, and generation. The transport digest is only a commitment to this
+    // canonical projection; it does not replace any source digest.
+    let source_bytes = canonical_json_bytes(source)
+        .map_err(|error| format!("canonical source admission encoding failed: {error}"))?;
     let source_receipt_sha256 = sha256_hex(&source_bytes);
     Ok(CurrentWorkScopeSourceReceipt {
         work_scope_ref: snapshot.binding.scope.scope_ref.clone(),
@@ -134,7 +125,7 @@ pub fn canonical_current_work_scope_source_receipt(
         matched_guard_receipt_sha256: sha256_hex(&guard_bytes),
         matched_guard_receipt_json: String::from_utf8(guard_bytes)
             .map_err(|error| format!("WorkScope guard UTF-8 encoding failed: {error}"))?,
-        canonical_source_receipt_ref: source_record.source_ref.clone(),
+        canonical_source_receipt_ref: source.sources.scope_ref.clone(),
         canonical_source_receipt_json: String::from_utf8(source_bytes)
             .map_err(|error| format!("source admission UTF-8 encoding failed: {error}"))?,
         canonical_source_receipt_sha256,
@@ -227,6 +218,7 @@ fn unavailable_blob_owner_facts(
         wire_id: BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_ID.to_owned(),
         wire_revision: BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_REVISION,
         pull_ref: request.pull_ref.clone(),
+        purpose: request.purpose,
         job_id: request.job_id.clone(),
         invocation_id: request.invocation_id.clone(),
         process_binding_sha256: request.process_binding_sha256.clone(),
@@ -240,15 +232,150 @@ fn unavailable_blob_owner_facts(
     Ok(response)
 }
 
+fn available_launch_owner_facts(
+    request: &BlobProcessStreamOwnerFactsPullRequest,
+    scope: &CurrentWorkScopeSourceReceipt,
+    policy: &CurrentBlobPolicyResidency,
+    catalog: &CurrentModuleCatalogGeneration,
+) -> Result<BlobProcessStreamOwnerFactsPullResponse, String> {
+    let authority: eliot_receipts::AuthorityBinding =
+        serde_json::from_str(&request.kernel_authority_binding_json)
+            .map_err(|error| format!("Kernel authority binding is invalid: {error}"))?;
+    let causal: eliot_receipts::CausalBinding =
+        serde_json::from_str(&request.kernel_causal_binding_json)
+            .map_err(|error| format!("Kernel causal binding is invalid: {error}"))?;
+    if authority.state_fence != request.state_fence
+        || authority.authority_epoch != request.state_fence.authority_epoch
+        || causal.state_fence != request.state_fence
+        || (causal.transaction_sequence.value() > 1
+            && causal.parent_receipt_id.as_ref().is_none_or(|parent| {
+                !causal.predecessor_receipt_ids.iter().any(|item| item == parent)
+            }))
+    {
+        return Err("Kernel causal or authority binding differs from the authenticated fence".to_owned());
+    }
+    let facts = BlobProcessStreamVerifiedOwnerFacts {
+        work_scope_binding_sha256: scope.work_scope_snapshot_sha256.clone(),
+        work_scope_binding_json: scope.work_scope_snapshot_json.clone(),
+        matched_guard_receipt_json: scope.matched_guard_receipt_json.clone(),
+        matched_guard_receipt_sha256: scope.matched_guard_receipt_sha256.clone(),
+        canonical_source_receipt_json: scope.canonical_source_receipt_json.clone(),
+        canonical_source_receipt_sha256: scope.canonical_source_receipt_sha256.clone(),
+        policy_json: policy.policy_json.clone(),
+        policy_sha256: policy.policy_sha256.clone(),
+        residency_json: policy.residency_json.clone(),
+        residency_sha256: policy.residency_sha256.clone(),
+        causal_binding_json: request.kernel_causal_binding_json.clone(),
+        causal_binding_sha256: request.kernel_causal_binding_sha256.clone(),
+        authority_binding_json: request.kernel_authority_binding_json.clone(),
+        authority_binding_sha256: request.kernel_authority_binding_sha256.clone(),
+        currentness_sha256: String::new(),
+    };
+    #[derive(Serialize)]
+    struct Currentness<'a> {
+        state_fence: &'a eliot_contracts::StateFence,
+        work_scope_ref: &'a str,
+        work_scope_sha256: &'a str,
+        guard_sha256: &'a str,
+        source_sha256: &'a str,
+        policy_owner_revision: u64,
+        policy_owner_digest: &'a str,
+        policy_sha256: &'a str,
+        residency_sha256: &'a str,
+        catalog_owner_sha256: &'a str,
+        generation_admission_sha256: &'a str,
+        causal_binding_sha256: &'a str,
+        authority_binding_sha256: &'a str,
+        process_binding_sha256: &'a str,
+        source_root_identity_sha256: &'a str,
+    }
+    let currentness_bytes = canonical_json_bytes(&Currentness {
+        state_fence: &request.state_fence,
+        work_scope_ref: &scope.work_scope_ref,
+        work_scope_sha256: &scope.work_scope_snapshot_sha256,
+        guard_sha256: &scope.matched_guard_receipt_sha256,
+        source_sha256: &scope.canonical_source_receipt_sha256,
+        policy_owner_revision: policy.policy_owner_revision,
+        policy_owner_digest: &policy.policy_owner_digest,
+        policy_sha256: &policy.policy_sha256,
+        residency_sha256: &policy.residency_sha256,
+        catalog_owner_sha256: &catalog.owner_readback_sha256,
+        generation_admission_sha256: &catalog.generation_admission_sha256,
+        causal_binding_sha256: &request.kernel_causal_binding_sha256,
+        authority_binding_sha256: &request.kernel_authority_binding_sha256,
+        process_binding_sha256: &request.process_binding_sha256,
+        source_root_identity_sha256: &request.source_root_identity_sha256,
+    })
+    .map_err(|error| format!("currentness input encoding failed: {error}"))?;
+    let currentness_sha256 = sha256_hex(&currentness_bytes);
+    let facts = BlobProcessStreamVerifiedOwnerFacts {
+        currentness_sha256: currentness_sha256.clone(),
+        ..facts
+    };
+    facts
+        .validate()
+        .map_err(|error| format!("verified owner facts are invalid: {error}"))?;
+    let facts_bytes = canonical_json_bytes(&facts)
+        .map_err(|error| format!("verified owner facts encoding failed: {error}"))?;
+    let facts_sha256 = sha256_hex(&facts_bytes);
+    let facts_json = String::from_utf8(facts_bytes)
+        .map_err(|error| format!("verified owner facts are not UTF-8: {error}"))?;
+    let policy_ref = serde_json::from_str::<serde_json::Value>(&policy.policy_json)
+        .ok()
+        .and_then(|value| value.get("policy_ref").and_then(serde_json::Value::as_str).map(str::to_owned))
+        .ok_or_else(|| "selected policy has no typed policy reference".to_owned())?;
+    let response = BlobProcessStreamOwnerFactsPullResponse {
+        wire_id: BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_ID.to_owned(),
+        wire_revision: BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_REVISION,
+        pull_ref: request.pull_ref.clone(),
+        purpose: request.purpose,
+        job_id: request.job_id.clone(),
+        invocation_id: request.invocation_id.clone(),
+        process_binding_sha256: request.process_binding_sha256.clone(),
+        outer_request_sha256: request.outer_request_sha256.clone(),
+        observed_state_fence: request.state_fence.clone(),
+        outcome: BlobProcessStreamOwnerFactsPullOutcome::Available {
+            work_scope_ref: scope.work_scope_ref.clone(),
+            owner_facts_ref: facts_sha256.clone(),
+            owner_facts_sha256: facts_sha256,
+            work_scope_snapshot_sha256: scope.work_scope_snapshot_sha256.clone(),
+            matched_guard_receipt_ref: scope.matched_guard_receipt_sha256.clone(),
+            matched_guard_receipt_sha256: scope.matched_guard_receipt_sha256.clone(),
+            canonical_source_receipt_ref: scope.canonical_source_receipt_ref.clone(),
+            canonical_source_receipt_sha256: scope.canonical_source_receipt_sha256.clone(),
+            policy_ref,
+            policy_sha256: policy.policy_sha256.clone(),
+            residency_ref: policy.residency_sha256.clone(),
+            residency_sha256: policy.residency_sha256.clone(),
+            causal_receipt_ref: request.kernel_causal_binding_sha256.clone(),
+            causal_receipt_sha256: request.kernel_causal_binding_sha256.clone(),
+            authority_ref: request.kernel_authority_binding_sha256.clone(),
+            authority_sha256: request.kernel_authority_binding_sha256.clone(),
+            currentness_sha256,
+            owner_facts_json: facts_json,
+            module_catalog_owner_readback_json: catalog.owner_readback_json.clone(),
+            module_catalog_owner_readback_sha256: catalog.owner_readback_sha256.clone(),
+            generation_admission_json: catalog.generation_admission_json.clone(),
+            generation_admission_sha256: catalog.generation_admission_sha256.clone(),
+            process_source_admission_json: None,
+            process_source_admission_sha256: None,
+            source_admission_write_receipt_json: None,
+            source_admission_write_receipt_sha256: None,
+        },
+    };
+    response
+        .validate_for_request(request)
+        .map_err(|error| format!("invalid available owner-facts response: {error}"))?;
+    Ok(response)
+}
+
 /// Produces a closed owner answer for one Kernel-retained pull.
 ///
-/// A positive result requires process-source admission that binds the
-/// stream's generated source ID to the exact admitted process operation,
-/// WorkScope, and governing-source closure, plus Blob-specific policy,
-/// residency, causal, and authority owners. WorkScope governing-document
-/// references are a distinct identity domain from process-stream source IDs.
-/// Until the independent process-source owner is installed, this composition
-/// cannot produce an `Available` result.
+/// Launch grants resolve the current named WorkScope, module generation, and
+/// Config policy owners. Stream-open/readback purposes require their separate
+/// durable process-source admission and remain unavailable until that exact
+/// row has been written/read or found current. Governing-document references
+/// are a distinct identity domain from generated process-stream source IDs.
 pub fn resolve_blob_owner_facts(
     composition: &DaemonComposition,
     request: &BlobProcessStreamOwnerFactsPullRequest,
@@ -256,25 +383,51 @@ pub fn resolve_blob_owner_facts(
     request
         .validate()
         .map_err(|error| format!("invalid blob owner-facts pull: {error}"))?;
+    if unix_ms() >= request.deadline_ms {
+        return unavailable_blob_owner_facts(
+            request,
+            BlobProcessStreamOwnerFactsUnavailableReason::DeadlineElapsed,
+        );
+    }
+    if request.purpose != BlobProcessStreamOwnerFactsPullPurpose::LaunchGrant {
+        return unavailable_blob_owner_facts(
+            request,
+            BlobProcessStreamOwnerFactsUnavailableReason::SourceReceiptUnavailable,
+        );
+    }
+    let Some(expected_scope_ref) = request.expected_work_scope_ref.as_deref() else {
+        return unavailable_blob_owner_facts(
+            request,
+            BlobProcessStreamOwnerFactsUnavailableReason::ScopeGuardUnavailable,
+        );
+    };
+    let catalog = match read_current_module_catalog_generation(
+        composition,
+        &request.state_fence,
+        request.expected_module_id.as_deref(),
+        request.expected_generation_id.as_deref(),
+    ) {
+        Ok(value) => value,
+        Err(_) => {
+            return unavailable_blob_owner_facts(
+                request,
+                BlobProcessStreamOwnerFactsUnavailableReason::StaleBinding,
+            );
+        }
+    };
     let reason = if unix_ms() >= request.deadline_ms {
         BlobProcessStreamOwnerFactsUnavailableReason::DeadlineElapsed
     } else {
-        match composition.current_testd_blob_work_scope(&request.state_fence) {
+        match composition.current_testd_blob_work_scope_readback(&request.state_fence) {
             Err(_) => BlobProcessStreamOwnerFactsUnavailableReason::StaleBinding,
             Ok(None) => BlobProcessStreamOwnerFactsUnavailableReason::ScopeGuardUnavailable,
-            Ok(Some(snapshot)) => {
-                match request.expected_work_scope_ref.as_deref() {
-                    Some(expected) if expected != snapshot.binding.scope.scope_ref.as_str() => {
-                        BlobProcessStreamOwnerFactsUnavailableReason::StaleBinding
-                    }
-                    // Without a verified Kernel-selected scope ref, the
-                    // current singleton owner snapshot is not evidence that
-                    // its scope governs this product/source/task identity.
-                    None => BlobProcessStreamOwnerFactsUnavailableReason::ScopeGuardUnavailable,
-                    Some(_) => match snapshot.source_admission.as_ref() {
-                        None => {
-                            BlobProcessStreamOwnerFactsUnavailableReason::SourceReceiptUnavailable
-                        }
+            Ok(Some(readback)) => {
+                let snapshot = &readback.snapshot;
+                if expected_scope_ref != snapshot.binding.scope.scope_ref.as_str() {
+                    BlobProcessStreamOwnerFactsUnavailableReason::StaleBinding
+                } else {
+                    match snapshot.source_admission.as_ref() {
+                        None => BlobProcessStreamOwnerFactsUnavailableReason::SourceReceiptUnavailable,
                         Some(source)
                             if source.sources.scope_ref != snapshot.binding.scope.scope_ref
                                 || source.sources.generation
@@ -283,26 +436,37 @@ pub fn resolve_blob_owner_facts(
                             BlobProcessStreamOwnerFactsUnavailableReason::SourceReceiptUnavailable
                         }
                         Some(_) => {
-                            if read_current_blob_policy_residency(
+                            let scope = match canonical_current_work_scope_source_receipt(snapshot) {
+                                Ok(value) if value.work_scope_snapshot_sha256 == readback.value_digest => value,
+                                _ => {
+                                    return unavailable_blob_owner_facts(
+                                        request,
+                                        BlobProcessStreamOwnerFactsUnavailableReason::StaleBinding,
+                                    );
+                                }
+                            };
+                            let policy = match read_current_blob_policy_residency(
                                 composition,
                                 &request.state_fence,
                                 snapshot.binding.scope.scope_ref.as_str(),
-                            )
-                            .is_err()
-                            {
-                                return unavailable_blob_owner_facts(
+                            ) {
+                                Ok(value) => value,
+                                Err(_) => {
+                                    return unavailable_blob_owner_facts(
+                                        request,
+                                        BlobProcessStreamOwnerFactsUnavailableReason::PolicyUnavailable,
+                                    );
+                                }
+                            };
+                            return match available_launch_owner_facts(request, &scope, &policy, &catalog) {
+                                Ok(response) => Ok(response),
+                                Err(_) => unavailable_blob_owner_facts(
                                     request,
-                                    BlobProcessStreamOwnerFactsUnavailableReason::PolicyUnavailable,
-                                );
-                            }
-                            // request.source_id is minted for this output
-                            // stream, not selected from the governing source
-                            // document set. It needs a separate durable
-                            // pre-capture admission bound to the process
-                            // operation and this WorkScope.
-                            BlobProcessStreamOwnerFactsUnavailableReason::SourceReceiptUnavailable
+                                    BlobProcessStreamOwnerFactsUnavailableReason::AuthorityUnavailable,
+                                ),
+                            };
                         }
-                    },
+                    }
                 }
             }
         }

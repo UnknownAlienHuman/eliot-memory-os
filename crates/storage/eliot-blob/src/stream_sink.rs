@@ -280,6 +280,10 @@ struct SinkState {
     next_sequence: u64,
     next_offset: u64,
     terminal: Option<ProcessStreamSinkTerminal>,
+    /// Exact owner-issued Blob receipt retained with a successful terminal.
+    /// This is a bounded typed receipt, not a second plaintext or authority
+    /// source; later consumers still validate it against the durable owner.
+    ready_receipt: Option<BlobReadyReceipt>,
     terminal_command: Option<ProcessStreamSinkTerminalCommandIdentity>,
     /// The one bounded phase record of the one reserved terminal command.
     finalization: Option<FinalizeReservation>,
@@ -419,6 +423,7 @@ impl SinkState {
             next_sequence: 0,
             next_offset: 0,
             terminal: None,
+            ready_receipt: None,
             terminal_command: None,
             finalization: None,
             finalization_incarnation: 0,
@@ -468,6 +473,46 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
 
     fn lock(&self) -> MutexGuard<'_, SinkState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Returns the exact Blob owner receipt retained for this successful
+    /// terminal. A terminal's digest/locator projection alone is insufficient
+    /// to create the later source-admission Ready revision.
+    pub fn finalized_ready_receipt(
+        &self,
+        session: &ProcessStreamSinkSession,
+        terminal: &ProcessStreamSinkTerminal,
+    ) -> Result<BlobReadyReceipt, ProcessStreamSinkError> {
+        let state = self.lock();
+        let existing = Self::check_session(&state, session)?;
+        if terminal.state() != ProcessStreamSinkState::CompleteSource
+            || terminal.session_id() != existing.session_id()
+            || terminal.source_id() != existing.source_id()
+            || terminal.terminal_id() != existing.terminal_id()
+            || terminal.open_request_sha256() != existing.open_request_sha256()
+            || state.terminal.as_ref() != Some(terminal)
+        {
+            return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+        }
+        let ready = state
+            .ready_receipt
+            .as_ref()
+            .ok_or(ProcessStreamSinkError::ProviderUnavailable)?;
+        ready.validate().map_err(|error| map_blob_error(&error))?;
+        let source = terminal
+            .evidence()
+            .source()
+            .ok_or(ProcessStreamSinkError::ProviderUnavailable)?;
+        if source.sha256() != ready.plaintext_sha256()
+            || source.byte_length() != ready.plaintext_length()
+            || source.ready_receipt_ref() != ready.receipt().identity.receipt_id.as_str()
+            || source.locator() != format!("{BLOB_SOURCE_LOCATOR_SCHEME}:{}", ready.locator().hash)
+        {
+            return Err(ProcessStreamSinkError::EvidenceInvariant {
+                reason: "retained Blob ready receipt differs from the exact terminal source".to_owned(),
+            });
+        }
+        Ok(ready.clone())
     }
 
     fn ready<T: Send + 'static>(
@@ -1383,7 +1428,9 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             ticket.admitted_sha256,
             evidence,
         )?;
-        Self::record_locked(&mut self.lock(), ticket.identity, publication, terminal)
+        let mut state = self.lock();
+        state.ready_receipt = Some(ready);
+        Self::record_locked(&mut state, ticket.identity, publication, terminal)
     }
 
     /// Mints the withheld (never-published) terminal for a gapped,

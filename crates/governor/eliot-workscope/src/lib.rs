@@ -7,7 +7,7 @@
 
 use std::collections::BTreeSet;
 
-use eliot_contracts::StateFence;
+use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_security_contracts::{
     FreshnessStatus, IntegrityStatus, ObservationDomainRef, PrivacyClass, QuarantineState,
     SourceAssurance,
@@ -486,6 +486,15 @@ pub struct WorkScopeSourceAdmission {
     pub sources: GoverningSourceSet,
     /// Exact privacy profile against which the source closure was admitted.
     pub privacy: PrivacyProfile,
+    /// Original, parser-verified Bootstrap NormativePair source capture. This
+    /// is carried as canonical typed bytes to keep WorkScope independent of
+    /// the parser implementation while preserving its exact receipt identity,
+    /// role refs, entry refs, compatibility refs, and content digests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normative_pair_source_capture_json: Option<String>,
+    /// SHA-256 of the exact canonical capture JSON above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normative_pair_source_capture_sha256: Option<String>,
 }
 
 /// The canonical owner for one current `WorkScope` binding.
@@ -3192,6 +3201,39 @@ impl WorkScopeBindingSnapshot {
         Ok(snapshot)
     }
 
+    /// Constructs a current binding that retains the exact original Bootstrap
+    /// source capture alongside its separately admitted governing-source
+    /// closure. The capture is evidence only; the source closure and matched
+    /// guard remain the admission decision.
+    pub fn new_with_normative_pair_source_capture(
+        state_fence: StateFence,
+        owner_revision: u64,
+        binding: ScopeBinding,
+        guard_receipt: ScopeBindingGuardReceipt,
+        sources: GoverningSourceSet,
+        privacy: PrivacyProfile,
+        capture_json: String,
+        capture_sha256: String,
+    ) -> Result<Self, WorkScopeError> {
+        let mut snapshot = Self::new_with_source_admission(
+            state_fence,
+            owner_revision,
+            binding,
+            guard_receipt,
+            sources,
+            privacy,
+        )?;
+        let admission = snapshot
+            .source_admission
+            .as_mut()
+            .ok_or(WorkScopeError::SourceSetMismatch)?;
+        validate_normative_pair_capture(&capture_json, &capture_sha256)?;
+        admission.normative_pair_source_capture_json = Some(capture_json);
+        admission.normative_pair_source_capture_sha256 = Some(capture_sha256);
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
     /// Returns the exact source admission retained with this owner snapshot.
     #[must_use]
     pub fn source_admission(&self) -> Option<&WorkScopeSourceAdmission> {
@@ -3255,7 +3297,12 @@ impl WorkScopeSourceAdmission {
             return Err(WorkScopeError::SourceSetMismatch);
         }
         let _ = (state_fence, binding);
-        Ok(Self { sources, privacy })
+        Ok(Self {
+            sources,
+            privacy,
+            normative_pair_source_capture_json: None,
+            normative_pair_source_capture_sha256: None,
+        })
     }
 
     fn validate_for(
@@ -3265,6 +3312,17 @@ impl WorkScopeSourceAdmission {
         guard_receipt: &ScopeBindingGuardReceipt,
     ) -> Result<(), WorkScopeError> {
         self.sources.validate_for(&binding.scope, &self.privacy)?;
+        match (
+            self.normative_pair_source_capture_json.as_deref(),
+            self.normative_pair_source_capture_sha256.as_deref(),
+        ) {
+            (None, None) => {}
+            (Some(json), Some(sha256)) => {
+                validate_normative_pair_capture(json, sha256)?;
+                validate_normative_pair_sources(json, &self.sources)?;
+            }
+            _ => return Err(WorkScopeError::InvalidSourceEvidence),
+        }
         if self.sources.generation != binding.governing_source_generation
             || guard_receipt.disposition != ScopeBindingDisposition::Matched
             || guard_receipt.source_generation != self.sources.generation
@@ -3276,6 +3334,73 @@ impl WorkScopeSourceAdmission {
         let _ = state_fence;
         Ok(())
     }
+}
+
+fn validate_normative_pair_capture(json: &str, expected_sha256: &str) -> Result<(), WorkScopeError> {
+    if json.is_empty() {
+        return Err(WorkScopeError::InvalidSourceEvidence);
+    }
+    digest(expected_sha256, "normative_pair_source_capture_sha256")?;
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|_| WorkScopeError::InvalidSourceEvidence)?;
+    let bytes = canonical_json_bytes(&value)
+        .map_err(|_| WorkScopeError::InvalidSourceEvidence)?;
+    if !value.is_object() || bytes != json.as_bytes() || sha256_hex(&bytes) != expected_sha256 {
+        return Err(WorkScopeError::InvalidSourceEvidence);
+    }
+    Ok(())
+}
+
+fn validate_normative_pair_sources(
+    capture_json: &str,
+    sources: &GoverningSourceSet,
+) -> Result<(), WorkScopeError> {
+    let capture: serde_json::Value = serde_json::from_str(capture_json)
+        .map_err(|_| WorkScopeError::InvalidSourceEvidence)?;
+    let receipt_pair = capture
+        .get("receipt")
+        .and_then(|receipt| receipt.get("pair"))
+        .ok_or(WorkScopeError::InvalidSourceEvidence)?;
+    for (role, field, pair_field) in [
+        ("architecture", "architecture", "architecture_sha256"),
+        ("implementation", "implementation", "implementation_sha256"),
+    ] {
+        let document = capture
+            .get(field)
+            .ok_or(WorkScopeError::InvalidSourceEvidence)?;
+        let captured_role = document
+            .get("role")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(WorkScopeError::InvalidSourceEvidence)?;
+        let source_ref = document
+            .get("source_ref")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(WorkScopeError::InvalidSourceEvidence)?;
+        let content_sha256 = document
+            .get("content_sha256")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(WorkScopeError::InvalidSourceEvidence)?;
+        let receipt_sha256 = receipt_pair
+            .get(pair_field)
+            .and_then(serde_json::Value::as_str)
+            .ok_or(WorkScopeError::InvalidSourceEvidence)?;
+        if captured_role != role || content_sha256 != receipt_sha256 {
+            return Err(WorkScopeError::InvalidSourceEvidence);
+        }
+        let admitted_matches = sources
+            .sources
+            .iter()
+            .filter(|source| {
+                source.status == SourceStatus::Admitted
+                    && source.source_ref == source_ref
+                    && source.digest == content_sha256
+            })
+            .count();
+        if admitted_matches != 1 {
+            return Err(WorkScopeError::SourceSetMismatch);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
