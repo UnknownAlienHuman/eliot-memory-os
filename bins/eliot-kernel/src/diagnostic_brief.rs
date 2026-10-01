@@ -18,9 +18,12 @@
 //! - It carries **references**, never content. A brief holds a
 //!   [`LogWindowRef`] (source, process/module generation, time/sequence
 //!   range, hash, redaction status, retention) plus a bounded
-//!   [`CausalEventRef`] timeline of audit handles. No rolling log body, page,
-//!   or dump crosses this boundary, so a full rolling operational log can
-//!   never enter canonical state or agent context by default (I16.7).
+//!   [`CausalEventRef`] timeline of audit handles and the replayed
+//!   `TraceManifest` of the newest sealed operation. The manifest is itself a
+//!   record of references decoded back out of the retained chain, not new
+//!   observed content. No rolling log body, page, or dump crosses this
+//!   boundary, so a full rolling operational log can never enter canonical
+//!   state or agent context by default (I16.7).
 //! - It never assigns a cause. Correlated changes are carried as
 //!   [`ChangeHypothesis`] values, and when the required telemetry does not
 //!   exist the brief reports an [`ObservationGap`] naming the exact requested
@@ -34,6 +37,11 @@
 //! declarations, and severity is the existing
 //! [`AuditEventKind::assurance_class`] I16.9 assurance class. This module
 //! therefore adds no second lineage, fence, severity, or lifecycle owner.
+//!
+//! The brief is also the production reader of the issue #1838 trace manifest:
+//! [`DiagnosticBrief::trace_manifest`] is decoded back out of the retained
+//! `trace.manifest_sealed` record, so the manifest a run sealed is replayable
+//! from the same chain the brief already reads (I16.12).
 
 #![forbid(unsafe_code)]
 
@@ -43,6 +51,7 @@ use eliot_contracts::StateFence;
 use serde::{Deserialize, Serialize};
 
 use super::kernel_audit::{AuditAssuranceClass, AuditEventKind, AuditRecord};
+use super::trace_manifest::TraceManifest;
 
 /// I16.9 redaction status of one bounded operational log window.
 ///
@@ -686,12 +695,13 @@ impl BriefStateFence {
 /// One compiled problem-diagnostic brief (I16.7).
 ///
 /// The brief joins the symptom and severity, the affected trace/work scope,
-/// the bounded causal event timeline from the canonical audit chain, the exact
-/// bounded `LogWindowRef` references, the correlated change hypotheses, the
-/// dependency relations, the prior failures and attempted repairs, the
-/// unknowns, the observation gaps, and exactly one next step — all under one
-/// State Fence and one invalidation condition. It never carries a cause, and
-/// it never carries rolling log content.
+/// the replayed canonical trace manifest, the bounded causal event timeline
+/// from the canonical audit chain, the exact bounded `LogWindowRef`
+/// references, the correlated change hypotheses, the dependency relations, the
+/// prior failures and attempted repairs, the unknowns, the observation gaps,
+/// and exactly one next step — all under one State Fence and one invalidation
+/// condition. It never carries a cause, and it never carries rolling log
+/// content.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiagnosticBrief {
@@ -699,6 +709,18 @@ pub struct DiagnosticBrief {
     pub symptom: DiagnosticSymptom,
     /// Affected Module/WorkScope/tasks read from the trigger lineage.
     pub affected_scope: AffectedScope,
+    /// Replayed canonical trace manifest of the newest sealed operation on
+    /// the retained chain (issue #1838; I16.12).
+    ///
+    /// The replay read path for the persisted manifest. Every element an
+    /// operator reads here — the action contract, the State Fence, the
+    /// caller/session, the lease, the requested and actual route, the
+    /// local-port input/output handles, the result receipt, the finish
+    /// decision, and the explicit missing parts — comes back from the sealed
+    /// record itself. `None` when the chain holds no seal or when the recorded
+    /// completion claim is not carried by the slots that body itself records.
+    #[serde(default)]
+    pub trace_manifest: Option<TraceManifest>,
     /// Bounded causal timeline, in canonical audit sequence order.
     pub causal_timeline: Vec<CausalEventRef>,
     /// Exact bounded operational log windows the brief points at.
@@ -839,6 +861,10 @@ const GENERATION_CHANGE_KINDS: &[&str] = &[
 /// when the window is not a bounded range of the supplied chain, or when the
 /// trigger record carries no State Fence. A refused compilation yields no
 /// brief, never a partially attributed cause.
+///
+/// The brief also replays the newest sealed trace manifest on the same
+/// retained chain (issue #1838; I16.12), so the record a run sealed is read
+/// back through the one evidence owner this projection already uses.
 pub fn compile_diagnostic_brief(
     records: &[AuditRecord],
     problem: &DiagnosticProblem,
@@ -868,6 +894,7 @@ pub fn compile_diagnostic_brief(
     Ok(DiagnosticBrief {
         symptom: project_symptom(trigger, problem.trigger),
         affected_scope,
+        trace_manifest: replay_trace_manifest(records),
         causal_timeline: selected.iter().map(CausalEventRef::from_record).collect(),
         log_window_refs,
         change_hypotheses,
@@ -883,6 +910,30 @@ pub fn compile_diagnostic_brief(
             invalidation_conditions: BriefInvalidation::ALL.to_vec(),
         },
     })
+}
+
+/// Replays the newest sealed trace manifest on the retained canonical chain
+/// (issue #1838; I16.12).
+///
+/// This is the production reader for the persisted manifest: it takes the
+/// operation identity from the newest `trace.manifest_sealed` record on the
+/// same retained chain and decodes that operation's sealed body through
+/// [`TraceManifest::find_sealed`], so the brief's replayed elements are read
+/// back out of the record the seal wrote rather than re-derived from live
+/// request state.
+///
+/// `None` when the chain holds no seal, when that record names no operation,
+/// or when the recorded completion claim is not carried by the slots the body
+/// itself records. Replay is then limited, never invented (I16.12).
+fn replay_trace_manifest(records: &[AuditRecord]) -> Option<TraceManifest> {
+    let operation_id = records.iter().rev().find_map(|record| {
+        if record.kind == AuditEventKind::TRACE_MANIFEST_SEALED {
+            record.lineage.operation_id.clone()
+        } else {
+            None
+        }
+    })?;
+    TraceManifest::find_sealed(records, &operation_id)
 }
 
 /// Selects the exact bounded window out of the retained canonical chain.

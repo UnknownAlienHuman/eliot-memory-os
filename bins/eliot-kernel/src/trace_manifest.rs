@@ -5,17 +5,22 @@
 //! A10.8 honest finish vocabulary.
 //!
 //! A [`TraceManifest`] is the Kernel-owned replayable record for one bound
-//! result, keyed by trace/operation ID. It binds the Task/Action contract and
-//! State Fence; the presenting caller and its semantic Session; the lease
-//! attempt; the policy snapshot when the fence is policy-bound; the requested
-//! and actual route; the local-port call with immutable input/output handles;
-//! observed side effects; canonical receipts; the finish decision; and an
-//! explicit missing-parts list. I16.12 slots this path cannot produce (the
-//! semantic principal, a policy snapshot without a policy-bound fence, the
-//! Active View/packet manifest, the independent verifier result, and the
-//! executor identity when the owner does not name one) are enumerated in
-//! `unavailable`: missing evidence limits replay and is never silently
-//! treated as success.
+//! result, keyed by trace/operation ID. It binds exactly the evidence classes
+//! I16.12 names for a replayable Material/Critical trace: the Task/Action
+//! contract and State Fence; the Active View/packet manifest; the principal,
+//! the presenting caller with its semantic Session, the lease attempt, and the
+//! policy snapshot; the requested and actual route with the invoked local-port
+//! operation and its immutable input/output handles; the observed side effects;
+//! the verifier/artifact result; the canonical receipt; and the finish
+//! decision.
+//!
+//! Every one of those classes is a [`TRACE_MANIFEST_REQUIRED_SLOTS`] name, so
+//! a class the run did not produce is named in `missing_parts` and forces
+//! [`TraceFinish::DegradedNoProof`] instead of being reported as an
+//! unqualified success (I16.12: missing trace "does not invent failure or
+//! success"). The executor identity — the one I16.12 class this path cannot
+//! produce when the owner does not name one, and which I16.12 does not name as
+//! its own class — is enumerated in `unavailable`.
 //!
 //! The executor observation is not a second copy: it is projected from the
 //! durable ORS row that retained it with the completion (issue #1853 W2), so
@@ -29,7 +34,10 @@
 //! second manifest store, no parallel chain, and no alternate receipt scheme.
 //! Replay reads the sealed body back with [`TraceManifest::find_sealed`],
 //! which serves the recorded body only when its recorded completion claim is
-//! carried by the slots that body itself records.
+//! carried by the slots that body itself records. The production reader is the
+//! problem-diagnostic projection
+//! ([`crate::diagnostic_brief::compile_diagnostic_brief`]), which replays the
+//! newest sealed manifest onto the brief an operator reads.
 //!
 //! Posture matches the audit chain: sealing is observational and never
 //! changes a submit disposition (the durable ORS record owns lifecycle
@@ -57,21 +65,29 @@ pub const TRACE_MANIFEST_FORMAT_VERSION: u16 = 1;
 
 /// Required manifest slots, in stable enumeration order.
 ///
-/// Every slot must resolve from the admitted envelope, the durable record,
-/// the presenting session, or the submitted execution evidence. An absent
-/// required slot lands in [`TraceManifest::missing_parts`] and forces
+/// One name per I16.12 evidence class, including the four the earlier cut left
+/// out of this set: `active_view_packet_manifest` (the Active View/packet
+/// manifest), `principal` and `policy_snapshot` (principal and policy
+/// snapshots), and `verifier_result` (verifier/artifact results). Every slot
+/// must resolve from the admitted envelope, the durable record, the presenting
+/// session, or the submitted execution evidence. An absent required slot lands
+/// in [`TraceManifest::missing_parts`] and forces
 /// [`TraceFinish::DegradedNoProof`].
-pub const TRACE_MANIFEST_REQUIRED_SLOTS: [&str; 12] = [
+pub const TRACE_MANIFEST_REQUIRED_SLOTS: [&str; 16] = [
     "action_contract",
     "state_fence",
+    "active_view_packet_manifest",
+    "principal",
     "caller_session",
     "lease",
+    "policy_snapshot",
     "requested_route",
     "actual_route",
     "invoked_operation",
     "input_handle",
     "output_handle",
     "side_effects",
+    "verifier_result",
     "adapter_identity",
     "result_receipt",
 ];
@@ -180,13 +196,16 @@ pub struct TraceManifest {
     pub executor_identity: Option<String>,
     /// Observed side-effect declaration (`none` or an effect reference).
     pub side_effects: Option<String>,
-    /// Semantic principal (resolved by eliotd, never by Kernel).
+    /// Semantic principal, from the durable result lineage's authenticated
+    /// producer reference (resolved by eliotd, never by Kernel).
     pub principal: Option<String>,
     /// Policy revision snapshot, when the fence is policy-bound.
     pub policy_snapshot: Option<String>,
-    /// Active View/packet manifest reference.
+    /// Active View/packet manifest reference: the admitted campaign-view
+    /// publication identity carried by a packet result.
     pub active_view_packet_manifest: Option<String>,
-    /// Independent verifier/artifact result.
+    /// Verifier/artifact result: the durable result lineage's immutable
+    /// output artifact handle.
     pub verifier_result: Option<String>,
     /// Canonical digest over the exact bounded response bytes.
     pub result_digest: Option<String>,
@@ -205,12 +224,11 @@ impl TraceManifest {
     ///
     /// Binds the admitted envelope (or, when queue memory already retired
     /// it, the durable record), the presenting session, the executor-observed
-    /// evidence as it was RETAINED on the durable record, and the persisted
-    /// receipt. Required slots without
-    /// a value land in `missing_parts` and force
-    /// [`TraceFinish::DegradedNoProof`]; anything else seals
-    /// [`TraceFinish::VerifiedComplete`]. Call sites run only after the ORS
-    /// persist, so the seal never precedes the binding it describes.
+    /// evidence as it was RETAINED on the durable record, the durable result
+    /// lineage, and the persisted receipt. Required slots without a value land
+    /// in `missing_parts` and force [`TraceFinish::DegradedNoProof`]; anything
+    /// else seals [`TraceFinish::VerifiedComplete`]. Call sites run only after
+    /// the ORS persist, so the seal never precedes the binding it describes.
     ///
     /// The evidence is read from `persisted`, not from the submitted body
     /// (issue #1853 W2). The manifest is a projection of the durable record,
@@ -218,6 +236,18 @@ impl TraceManifest {
     /// therefore never claim an executor observation that recovery cannot also
     /// read back from the row, and the sealed body and the durable row can never
     /// disagree about what was observed.
+    ///
+    /// The four classes the earlier cut wrote as literal `None` are bound from
+    /// the same two production inputs. `principal` and `verifier_result` read
+    /// the durable result lineage the completion retained — its authenticated
+    /// producer reference and its immutable output artifact handle, which are
+    /// the principal and the verifier/artifact result I16.12 names.
+    /// `policy_snapshot` reads the bound State Fence's policy revision.
+    /// `active_view_packet_manifest` reads the admitted campaign-view
+    /// publication identity out of the exact result bytes. A run that retained
+    /// none of them withholds the class, so the required set reports it in
+    /// `missing_parts` and the run seals `DEGRADED_NO_PROOF`; the seal never
+    /// substitutes a value it did not observe.
     #[must_use]
     pub fn seal(
         session: &Session,
@@ -244,6 +274,23 @@ impl TraceManifest {
                     .map(|session| session.as_str().to_owned())
             });
         let evidence = persisted.result_evidence.as_ref();
+        // The durable result lineage is the owner's retained read of who
+        // produced the bytes and which immutable artifact they are. Both are
+        // the exact retained references; an absent one stays absent.
+        let lineage = persisted.result_lineage.as_ref();
+        let principal = lineage.and_then(|retained| retained.producer_ref.clone());
+        let verifier_result =
+            lineage.and_then(|retained| retained.output_artifact_ref.clone());
+        // The Active View/packet manifest is the admitted campaign-view
+        // publication the result carries; the result leg that admits it has
+        // already proved it against the stored capability, task, scope, and
+        // fence. The identity is read from the exact sealed response bytes.
+        let active_view_packet_manifest = body
+            .response
+            .get("campaign_learning_state_view")
+            .and_then(|publication| publication.get("view_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
         let policy_snapshot = state_fence.as_ref().and_then(|fence| {
             fence
                 .policy_revision
@@ -303,10 +350,10 @@ impl TraceManifest {
             adapter_identity: evidence.and_then(|evidence| evidence.adapter_identity.clone()),
             executor_identity: evidence.and_then(|evidence| evidence.executor_identity.clone()),
             side_effects: evidence.and_then(|evidence| evidence.side_effects.clone()),
-            principal: None,
+            principal,
             policy_snapshot,
-            active_view_packet_manifest: None,
-            verifier_result: None,
+            active_view_packet_manifest,
+            verifier_result,
             result_digest: Some(body.result_digest.clone()),
             durable_state: Some(format!("{:?}", persisted.state)),
             finish: TraceFinish::VerifiedComplete,
@@ -333,6 +380,11 @@ impl TraceManifest {
     /// [`TRACE_MANIFEST_FORMAT_VERSION`], or when the recorded completion
     /// claim is not supported by the slots that very body records: replay is
     /// then limited, never invented.
+    ///
+    /// The production reader is
+    /// [`crate::diagnostic_brief::compile_diagnostic_brief`], which calls this
+    /// for the newest sealed operation on the retained chain and carries the
+    /// decoded body into the brief an operator reads.
     ///
     /// The check reads only the recorded body. It never re-derives the
     /// classification from live request state, so a readback either
@@ -380,21 +432,32 @@ impl TraceManifest {
     }
 
     /// Returns true when one required slot carries a value.
+    ///
+    /// One arm per [`TRACE_MANIFEST_REQUIRED_SLOTS`] name, so the required set
+    /// has exactly one declaration of what each class means. The four I16.12
+    /// classes the earlier cut left outside that set resolve here like every
+    /// other one: with no value the class is absent, it lands in
+    /// [`TraceManifest::missing_parts`], and the run seals
+    /// [`TraceFinish::DegradedNoProof`] instead of an unqualified success.
     fn required_slot_present(&self, slot: &str) -> bool {
         match slot {
             "action_contract" => self.capability.is_some() && self.payload_digest.is_some(),
             "state_fence" => self.state_fence.is_some(),
+            "active_view_packet_manifest" => self.active_view_packet_manifest.is_some(),
+            "principal" => self.principal.is_some(),
             // A1 names caller AND session: the presenting transport
             // connection alone does not identify the semantic caller, so
             // withholding the session leaves the slot absent.
             "caller_session" => self.connection_id.is_some() && self.session_id.is_some(),
             "lease" => self.lease_attempt_id.is_some(),
+            "policy_snapshot" => self.policy_snapshot.is_some(),
             "requested_route" => self.requested_route.is_some(),
             "actual_route" => self.actual_route.is_some(),
             "invoked_operation" => self.invoked_operation.is_some(),
             "input_handle" => self.input_handle.is_some(),
             "output_handle" => self.output_handle.is_some(),
             "side_effects" => self.side_effects.is_some(),
+            "verifier_result" => self.verifier_result.is_some(),
             "adapter_identity" => self.adapter_identity.is_some(),
             "result_receipt" => self.result_digest.is_some() && self.durable_state.is_some(),
             _ => false,
@@ -402,21 +465,16 @@ impl TraceManifest {
     }
 
     /// Returns the I16.12 evidence slots this path cannot produce.
+    ///
+    /// The executor identity is the only remaining one: I16.12 names no such
+    /// class of its own, so its absence limits replay without making the run
+    /// incomplete. Every class I16.12 does name is a required slot, so a
+    /// withheld one is reported by [`TraceManifest::missing_parts`] and is
+    /// never diverted into this list instead.
     fn unavailable_parts(&self) -> Vec<String> {
         let mut unavailable = Vec::new();
-        for (slot, name) in [
-            (self.principal.is_some(), "principal"),
-            (self.policy_snapshot.is_some(), "policy_snapshot"),
-            (
-                self.active_view_packet_manifest.is_some(),
-                "active_view_packet_manifest",
-            ),
-            (self.verifier_result.is_some(), "verifier_result"),
-            (self.executor_identity.is_some(), "executor_identity"),
-        ] {
-            if !slot {
-                unavailable.push(name.to_owned());
-            }
+        if self.executor_identity.is_none() {
+            unavailable.push("executor_identity".to_owned());
         }
         unavailable
     }
