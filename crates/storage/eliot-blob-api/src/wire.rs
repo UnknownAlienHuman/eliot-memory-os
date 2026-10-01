@@ -383,10 +383,12 @@ impl BlobProcessStreamKernelSourceReadbackRequest {
         fence: StateFence,
         capability: ProcessStreamSinkCapabilityRef,
         binding: ProcessStreamSinkBindingRef,
+        owner_facts: BlobProcessStreamVerifiedOwnerFacts,
     ) -> Result<ProcessStreamSourceReadbackRequest, WireValidationError> {
         self.validate()?;
         capability.validate()?;
         binding.validate()?;
+        owner_facts.validate()?;
         let request = ProcessStreamSourceReadbackRequest {
             wire_revision: self.wire_revision,
             capability,
@@ -406,6 +408,7 @@ impl BlobProcessStreamKernelSourceReadbackRequest {
             policy: self.policy.clone(),
             policy_json: self.policy_json.clone(),
             policy_sha256: self.policy_sha256.clone(),
+            owner_facts,
             fence,
             max_bytes: self.max_bytes,
             offset: self.offset,
@@ -1149,6 +1152,9 @@ pub struct ProcessStreamSourceReadbackRequest {
     pub policy_json: String,
     /// SHA-256 of the exact serialized policy bytes.
     pub policy_sha256: String,
+    /// Kernel-retained metadata-only owner facts independently checked by
+    /// Store against the current source authority.
+    pub owner_facts: BlobProcessStreamVerifiedOwnerFacts,
     /// Exact state fence under which readback is admitted.
     pub fence: StateFence,
     /// Maximum source size accepted by the caller.
@@ -1206,6 +1212,7 @@ impl ProcessStreamSourceReadbackRequest {
         self.fence
             .validate()
             .map_err(|_| WireValidationError::InvalidField("fence"))?;
+        self.owner_facts.validate()?;
         for (field, value) in [
             ("policy_ref", self.policy.policy_ref.as_str()),
             ("privacy_ref", self.policy.privacy_ref.as_str()),
@@ -1309,6 +1316,9 @@ pub enum ProcessStreamSinkWireRequest {
         capability: ProcessStreamSinkCapabilityRef,
         /// Exact closed ProcessStreamSinkOpenRequest JSON object.
         body: Box<serde_json::Value>,
+        /// Kernel-retained metadata-only owner facts independently checked by
+        /// Store at the source and policy authority boundary.
+        owner_facts: BlobProcessStreamVerifiedOwnerFacts,
         /// Authenticated request fence.
         fence: StateFence,
         /// Absolute Unix-millisecond operation deadline.
@@ -1386,9 +1396,13 @@ impl ProcessStreamSinkWireRequest {
             Self::Open {
                 capability,
                 body,
+                owner_facts,
                 fence,
                 deadline_ms,
-            } => (capability, None, Some(body), fence, *deadline_ms),
+            } => {
+                owner_facts.validate()?;
+                (capability, None, Some(body), fence, *deadline_ms)
+            }
             Self::Append {
                 capability,
                 binding,
