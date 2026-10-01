@@ -1725,9 +1725,7 @@ pub(crate) async fn submit_testd_owner_job(
                 .to_owned(),
         ));
     }
-    let profile_registry = eliot_instrument_runner::testd_builtin_profile_registry(
-        stage_request.registry_generation,
-    )
+    let profile_registry = eliot_instrument_runner::testd_builtin_profile_registry()
     .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let replay_context = eliot_instrument_runner::VerifiedTestdReplayContext::from_canonical_owner_readback_json(
         profile_registry,
