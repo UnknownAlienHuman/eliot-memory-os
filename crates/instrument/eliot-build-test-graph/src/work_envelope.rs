@@ -77,6 +77,28 @@ pub const CARGO_TARGET_DIR_ENV: &str = "CARGO_TARGET_DIR";
 /// the user-global Cargo cache instead of its own lane's root.
 pub const CARGO_HOME_ENV: &str = "CARGO_HOME";
 
+/// Directory name under the local application data root that anchors every
+/// governed fixture root. It is the fixture sibling of [`BUILD_ROOT_DIRECTORY`]:
+/// fixture state is mutable runtime state, so it lives outside the build tree
+/// while sharing the one admitted root both derivations are anchored to.
+pub const FIXTURE_ROOT_DIRECTORY: &str = "fixtures";
+
+/// Environment variable a governed child process's fixture namespace is bound
+/// to.
+///
+/// Without it the child has no way to learn which namespace it was admitted
+/// under, and every test it runs would resolve the same ambient fixture
+/// location that its concurrent neighbours use.
+pub const FIXTURE_NAMESPACE_ENV: &str = "ELIOT_TESTD_FIXTURE_NAMESPACE";
+
+/// Environment variable a governed child process's physical fixture root is
+/// bound to.
+///
+/// The namespace is the derived identity and this is the directory it resolves
+/// to. A child that writes fixtures writes under this root, so two work items
+/// with different namespaces touch different directories.
+pub const FIXTURE_ROOT_ENV: &str = "ELIOT_TESTD_FIXTURE_ROOT";
+
 /// Target and cache mode of one governed work item.
 ///
 /// I2.22 names three cache modes. They are a closed set because the mode is a
@@ -312,6 +334,63 @@ pub struct LaneIdentity {
     pub local_app_data: PathBuf,
 }
 
+impl LaneIdentity {
+    /// The namespace this work item's fixtures live under.
+    ///
+    /// The same derivation as [`GovernedWorkEnvelope::fixture_namespace`], read
+    /// off the pre-allocation identity: a submitting owner declares its
+    /// resource claims from this value, so the claims it declares and the
+    /// namespace the store later derives cannot be two different derivations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkEnvelopeError`] when a tuple element or the fingerprint is
+    /// invalid.
+    pub fn fixture_namespace(&self) -> Result<String, WorkEnvelopeError> {
+        validate_lane_elements(
+            &self.work_item_id,
+            &self.workspace_id,
+            &self.worktree_id,
+            &self.fingerprint,
+        )?;
+        fixture_namespace_of(&self.work_item_id, self.build_mode, &self.fingerprint)
+    }
+
+    /// The physical fixture directory this work item's fixtures live under.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkEnvelopeError`] when a tuple element or the fingerprint is
+    /// invalid.
+    pub fn fixture_root(&self) -> Result<PathBuf, WorkEnvelopeError> {
+        Ok(fixture_root_of(
+            &self.local_app_data,
+            &self.fixture_namespace()?,
+        ))
+    }
+
+    /// The exclusive runtime resources this lane declares before it executes.
+    ///
+    /// The productive verifier run writes mutable fixture state, and a worktree
+    /// does not isolate runtime state, so the fixture root it was allocated is
+    /// an exclusive resource of its own. The claim is named by the derived
+    /// fixture root rather than by a fixed label, so two work items with
+    /// different namespaces claim different resources and receive different
+    /// leases, while two work items that somehow resolved one root are refused
+    /// by the allocator instead of sharing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkEnvelopeError`] when the namespace cannot be derived.
+    pub fn fixture_resource_claims(&self) -> Result<Vec<ResourceClaim>, WorkEnvelopeError> {
+        let root = self.fixture_root()?;
+        Ok(vec![ResourceClaim {
+            kind: crate::ResourceKind::Fixture,
+            name: path_text(&root),
+        }])
+    }
+}
+
 impl GovernedWorkEnvelope {
     /// Allocates the complete tuple for one mutating work item.
     ///
@@ -523,12 +602,50 @@ impl GovernedWorkEnvelope {
     /// is invalid.
     pub fn fixture_namespace(&self) -> Result<String, WorkEnvelopeError> {
         self.validate()?;
-        Ok(format!(
-            "fx-{}-{}-{}",
-            self.work_item_id,
-            self.build_mode.as_str(),
-            self.normalized_fingerprint()?
+        fixture_namespace_of(&self.work_item_id, self.build_mode, &self.fingerprint)
+    }
+
+    /// The physical fixture directory this work item's fixtures live under.
+    ///
+    /// Exactly
+    /// `%LOCALAPPDATA%\Eliot\fixtures\<fixture namespace>`. The namespace is
+    /// derived from the whole lane tuple, so two work items never share one
+    /// directory, and the directory lives outside the build root so the Cargo
+    /// lane never owns or cleans runtime fixture state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkEnvelopeError`] when the fingerprint or a tuple element
+    /// is invalid.
+    pub fn fixture_root(&self) -> Result<PathBuf, WorkEnvelopeError> {
+        self.validate()?;
+        Ok(fixture_root_of(
+            &self.local_app_data,
+            &self.fixture_namespace()?,
         ))
+    }
+
+    /// The exact fixture bindings a governed child process of this work item
+    /// runs with.
+    ///
+    /// The namespace is the derived identity, the root is the directory it
+    /// resolves to, and both are emitted together: a child that knows the root
+    /// without the namespace cannot prove which lane allocated it, and a child
+    /// that knows the namespace without the root still resolves an ambient
+    /// fixture location. A work item with no fixture root therefore cannot be
+    /// started by any governed instrument.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkEnvelopeError`] when the fingerprint or a tuple element
+    /// is invalid.
+    pub fn fixture_environment(&self) -> Result<Vec<(String, String)>, WorkEnvelopeError> {
+        let namespace = self.fixture_namespace()?;
+        let root = fixture_root_of(&self.local_app_data, &namespace);
+        Ok(vec![
+            (FIXTURE_NAMESPACE_ENV.to_owned(), namespace),
+            (FIXTURE_ROOT_ENV.to_owned(), path_text(&root)),
+        ])
     }
 
     /// The runtime-environment leases this work item holds, in stable order.
@@ -643,6 +760,55 @@ impl GovernedWorkEnvelope {
         }
         Ok(environment)
     }
+}
+
+/// The one fixture-namespace derivation, shared by the pre-allocation
+/// [`LaneIdentity`] and the allocated [`GovernedWorkEnvelope`].
+///
+/// It reads only tuple elements, so the claims a submitting owner declares from
+/// the lane identity and the namespace the store later derives are the same
+/// value by construction rather than by two derivations agreeing.
+fn fixture_namespace_of(
+    work_item_id: &str,
+    build_mode: BuildMode,
+    fingerprint: &BuildFingerprint,
+) -> Result<String, WorkEnvelopeError> {
+    Ok(format!(
+        "fx-{work_item_id}-{}-{}",
+        build_mode.as_str(),
+        fingerprint.digest()?
+    ))
+}
+
+/// The physical fixture directory one namespace resolves to.
+fn fixture_root_of(local_app_data: &Path, namespace: &str) -> PathBuf {
+    local_app_data
+        .join("Eliot")
+        .join(FIXTURE_ROOT_DIRECTORY)
+        .join(namespace)
+}
+
+/// Rejects a pre-allocation lane whose elements or fingerprint are unusable.
+///
+/// This is the [`LaneIdentity`] half of the element and fingerprint checks
+/// [`GovernedWorkEnvelope::validate`] performs, so the claims an owner declares
+/// before the envelope exists are derived from a tuple that would have been
+/// admitted anyway.
+fn validate_lane_elements(
+    work_item_id: &str,
+    workspace_id: &str,
+    worktree_id: &str,
+    fingerprint: &BuildFingerprint,
+) -> Result<(), WorkEnvelopeError> {
+    for (value, field) in [
+        (work_item_id, "work_item_id"),
+        (workspace_id, "workspace_id"),
+        (worktree_id, "worktree_id"),
+    ] {
+        segment(value, field)?;
+    }
+    fingerprint.validate()?;
+    Ok(())
 }
 
 /// Rejects a tuple element that cannot be one path segment.
