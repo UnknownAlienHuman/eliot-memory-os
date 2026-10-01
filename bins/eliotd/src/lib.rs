@@ -325,6 +325,8 @@ pub use notification_state_emit::{
     emit_blocked_automation_notification, notification_already_recorded,
     read_notification_ordering_head,
 };
+#[cfg(windows)]
+pub use observation_adapters::WatchdogExportDrainStep;
 pub use owner_feed::{
     KernelOwnerPublishPort, OwnerFeedPlan, OwnerFeedTrigger, capture_owner_feed_plan,
     maintain_owner_feed,

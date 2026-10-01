@@ -76,8 +76,10 @@ use eliot_protocol::{
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HOST_REQUEST_PAYLOAD_SCHEMA_ID,
     HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestAdmissionReceipt, HostRequestEnvelope,
     HostRequestInvokeReadPayload, HostRequestKind, HostRequestResultBody, LocalReadAttempt,
-    WatchdogIntentKind, WatchdogSpoolIntentBatchPayload, WatchdogSpoolIntentSubmission,
-    host_request_operation_id,
+    WatchdogIntentKind, WatchdogSpoolEntryKind, WatchdogSpoolEntryOutcome,
+    WatchdogSpoolExportBatchPayload, WatchdogSpoolExportOutcomeSubmission,
+    WatchdogSpoolExportResultPayload, WatchdogSpoolExportSubmission,
+    WatchdogSpoolIntentBatchPayload, WatchdogSpoolIntentSubmission, host_request_operation_id,
 };
 use eliot_runtime_contracts::RecoveryDirective;
 use eliot_store_api::{
@@ -316,6 +318,19 @@ pub(crate) fn is_bridge_event_operation(operation: &str) -> bool {
 /// from the front door through [`is_watchdog_intent_operation`].
 pub(crate) fn is_watchdog_intent_operation(operation: &str) -> bool {
     operation == WATCHDOG_INTENT_SUBMIT_OPERATION
+}
+
+/// Returns whether the operation string selects the fenced Watchdog spool
+/// export-drain route.
+///
+/// Like [`is_watchdog_intent_operation`], this is a separate closed entry with
+/// its own payload, envelope validation, and named durable mutation. It is a
+/// distinct route rather than a second intent shape because a drain window is a
+/// bounded observation intake over the whole retained spool, not the
+/// owner-ruled escalation subset of it, and folding the two together would let
+/// an intent envelope widen into a full drain submission.
+pub(crate) fn is_watchdog_export_operation(operation: &str) -> bool {
+    operation == WATCHDOG_EXPORT_SUBMIT_OPERATION
 }
 
 /// Connection-scoped reference to one staged host-request operation.
@@ -901,7 +916,12 @@ impl KernelComposition {
         // admitted. A stale generation, a superseded epoch, or a lease the
         // Kernel does not hold therefore fences here and can never stage a
         // record.
-        let admitted_generation = self.admitted_watchdog_generation(payload)?;
+        let admitted_generation = self.admitted_watchdog_generation(
+            &payload.installation_id,
+            payload.watchdog_generation,
+            payload.watchdog_epoch,
+            &payload.supervision_lease_id,
+        )?;
         // The mechanical envelope joins run before any durable write, so a
         // forged or stale window never stages a record.
         validate_watchdog_spool_batch_envelope(
@@ -940,27 +960,31 @@ impl KernelComposition {
     /// Kernel holds, and the named installation must match it exactly. A
     /// missing authority, an unknown lease, a non-current record, a different
     /// installation, or any divergence fences closed before a durable write, so
-    /// a stale Watchdog generation can never stage a pending intent.
+    /// a stale Watchdog generation can never stage a pending intent or a
+    /// pending export projection.
     fn admitted_watchdog_generation(
         &self,
-        payload: &WatchdogSpoolIntentBatchPayload,
+        installation_id: &str,
+        watchdog_generation: u64,
+        watchdog_epoch: u64,
+        supervision_lease_id: &str,
     ) -> Result<u64, TransportError> {
         let authority = self
             .supervision_lease_authority
             .as_ref()
             .ok_or(TransportError::SessionFenced)?;
         let snapshot = authority
-            .current_snapshot(&payload.supervision_lease_id)
+            .current_snapshot(supervision_lease_id)
             .map_err(|_| TransportError::SessionFenced)?
             .ok_or(TransportError::SessionFenced)?;
         let binding = &snapshot.record.binding;
-        if binding.installation_id.as_str() != payload.installation_id
-            || binding.watchdog_epoch.value() != payload.watchdog_epoch
-            || binding.activation_generation.value() != payload.watchdog_generation
+        if binding.installation_id.as_str() != installation_id
+            || binding.watchdog_epoch.value() != watchdog_epoch
+            || binding.activation_generation.value() != watchdog_generation
         {
             return Err(TransportError::SessionFenced);
         }
-        Ok(payload.watchdog_generation)
+        Ok(watchdog_generation)
     }
 
     /// Stages the durable pending-intent projection for one submitted intent.
@@ -1036,6 +1060,403 @@ impl KernelComposition {
             state: admitted.state,
             admitted_now,
         })
+    }
+
+    /// Admits one Watchdog spool export batch through the fenced named Kernel
+    /// export mutation, exactly once per retained spool record.
+    ///
+    /// This is the Kernel half of the I8.1 spool-drain path, and it is the
+    /// sibling of [`Self::admit_watchdog_intent_batch`] rather than a widening
+    /// of it: a drain window is a bounded observation intake, not an intent,
+    /// so it carries its own closed route, payload, envelope validation, and
+    /// durable record. Each submitted export entry becomes one durable ORS
+    /// `Reconciliation` host-request record whose durable identity is the
+    /// derived export reconciliation key, so the first submission wins and a
+    /// later submission of the same retained spool record replays to that same
+    /// record instead of creating a second projection. Changed bytes under the
+    /// same key are an identity conflict, not a second export entry.
+    ///
+    /// The record commits with its CONTENT, not just its existence: the exact
+    /// typed entry and its batch envelope are bound onto the row's
+    /// `payload_body`, so the later Governor admission reads the original
+    /// submitted bytes off the durable record instead of a queue copy.
+    ///
+    /// The distinction the issue requires is preserved by construction: the
+    /// Kernel stops at the durable `Admitted` state and never writes a result
+    /// body, so the projection stays a *pending export awaiting the Governor's
+    /// canonical admission*. The Watchdog's own cursor advance is therefore
+    /// never implied here; the canonical observation commit and every other
+    /// semantic decision stay owned by the Governor consuming this record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::SessionFenced`] when the payload, envelope
+    /// joins, fence, session, or service state are unusable, and
+    /// [`TransportError::IdentityConflict`] when a submission replays under a
+    /// key already bound to different bytes.
+    pub(crate) fn admit_watchdog_export_batch(
+        &self,
+        session: &Session,
+        payload: &WatchdogSpoolExportBatchPayload,
+    ) -> Result<Vec<WatchdogExportProjection>, TransportError> {
+        let _transition = self.agent_bridge_transition_read()?;
+        payload
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let now = unix_ms();
+        if self
+            .service_state()
+            .map_err(|_| TransportError::SessionFenced)?
+            != KernelServiceState::Ready
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        session
+            .peer
+            .validate()
+            .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        if !session.accepts(&session.authority_epoch, session.session_epoch) {
+            return Err(TransportError::SessionFenced);
+        }
+        // The submission must ride the *current* supervision lease the Kernel
+        // itself retains, exactly as the intent route does: a front-door
+        // session proves who is connected, while only the retained supervision
+        // lease proves which Watchdog generation and epoch are currently
+        // admitted.
+        let admitted_generation = self.admitted_watchdog_generation(
+            &payload.installation_id,
+            payload.watchdog_generation,
+            payload.watchdog_epoch,
+            &payload.supervision_lease_id,
+        )?;
+        // The mechanical window joins run before any durable write, so a forged
+        // or stale window never stages a record.
+        validate_watchdog_export_envelope(session, payload, admitted_generation, now)?;
+        let mut projections = Vec::with_capacity(payload.entries.len());
+        for entry in &payload.entries {
+            projections.push(self.stage_watchdog_export_projection(payload, entry)?);
+        }
+        self.enqueue_watchdog_export_drain(payload)?;
+        Ok(projections)
+    }
+
+    /// Stages the durable pending-export projection for one submitted entry.
+    ///
+    /// The durable identity is the derived export reconciliation key, so
+    /// `stage_host_request` first-writer-wins semantics give exactly-once
+    /// admission per retained spool record: an exact replay returns the stored
+    /// record unchanged, and changed bytes under the same key fail as
+    /// `HostRequestIdentityConflict`.
+    fn stage_watchdog_export_projection(
+        &self,
+        payload: &WatchdogSpoolExportBatchPayload,
+        entry: &WatchdogSpoolExportSubmission,
+    ) -> Result<WatchdogExportProjection, TransportError> {
+        let operation_id = OperationIdentity::new(format!(
+            "{WATCHDOG_EXPORT_OPERATION_ID_PREFIX}{}",
+            entry.idempotency_key
+        ))
+        .map_err(|_| TransportError::SessionFenced)?;
+        let record = watchdog_export_projection_record(payload, entry, &operation_id)?;
+        let stored = self
+            .generation_gateway
+            .ors
+            .stage_host_request(&record)
+            .map_err(|error| match error {
+                OrsError::HostRequestIdentityConflict { .. } => TransportError::IdentityConflict,
+                _ => TransportError::SessionFenced,
+            })?;
+        let admitted_now = stored.state == HostRequestState::Requested;
+        let admitted = if admitted_now {
+            self.generation_gateway
+                .ors
+                .advance_host_request(
+                    &operation_id,
+                    &record.request_digest,
+                    HostRequestState::Admitted,
+                    None,
+                )
+                .map_err(|error| match error {
+                    OrsError::HostRequestIdentityConflict { .. } => {
+                        TransportError::IdentityConflict
+                    }
+                    _ => TransportError::SessionFenced,
+                })?
+                .ok_or(TransportError::SessionFenced)?
+        } else {
+            stored
+        };
+        // A result body is never *written* here: the canonical observation commit
+        // is the Governor's, and this Kernel entry must never imply one. A
+        // result that already exists was written by the Governor's own outcome
+        // leg through `record_watchdog_export_outcomes`, so it is read back here
+        // and reported as what it is — never reinterpreted by this route.
+        let outcome = match (admitted.state, admitted.result_response.as_ref()) {
+            (HostRequestState::ResultReceived, Some(body)) => {
+                Some(decode_watchdog_export_outcome(body)?)
+            }
+            (HostRequestState::ResultReceived, None) => {
+                return Err(TransportError::SessionFenced);
+            }
+            _ => None,
+        };
+        // Content binding: the durable row must hold the exact submitted bytes,
+        // not merely exist. A row without them cannot be answered from, so it is
+        // fenced instead of being served as a drain window with no content.
+        if admitted.payload_body.is_none() {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(WatchdogExportProjection {
+            sequence: entry.sequence,
+            idempotency_key: entry.idempotency_key.clone(),
+            entry_kind: entry.entry_kind,
+            record_digest: entry.record_digest.clone(),
+            payload_digest: entry.payload_digest.clone(),
+            operation_id: admitted.operation_id.as_str().to_owned(),
+            state: admitted.state,
+            admitted_now,
+            outcome,
+        })
+    }
+
+    /// Records the Governor's own terminal dispositions for one claimed drain
+    /// window, exactly once per retained spool record.
+    ///
+    /// This is the daemon-side outcome leg, and it is deliberately narrow: the
+    /// submitted payload names the same installation, batch, and derived
+    /// reconciliation keys the drain route staged, so a result can only be bound
+    /// to an entry this Kernel already holds a durable pending projection for.
+    /// The disposition is persisted through the owner's own ORS result path, so
+    /// an identical resubmission replays to the same durable record while a
+    /// changed disposition under the same identity is an identity conflict, never
+    /// a second decision.
+    ///
+    /// A pending entry the Governor has not decided is simply absent from the
+    /// submitted payload: there is no way to express "not yet" as a disposition,
+    /// so a missing outcome leaves the record pending and the Watchdog's cursor
+    /// exactly where it is.
+    pub(crate) fn record_watchdog_export_outcomes(
+        &self,
+        session: &Session,
+        payload: &WatchdogSpoolExportResultPayload,
+    ) -> Result<Vec<WatchdogExportProjection>, TransportError> {
+        let _transition = self.agent_bridge_transition_read()?;
+        payload
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let now = unix_ms();
+        if self
+            .service_state()
+            .map_err(|_| TransportError::SessionFenced)?
+            != KernelServiceState::Ready
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        session
+            .peer
+            .validate()
+            .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        if !session.accepts(&session.authority_epoch, session.session_epoch) {
+            return Err(TransportError::SessionFenced);
+        }
+        let mut projections = Vec::with_capacity(payload.outcomes.len());
+        for outcome in &payload.outcomes {
+            projections.push(self.stage_watchdog_export_outcome(payload, outcome, now)?);
+        }
+        Ok(projections)
+    }
+
+    /// Binds one Governor-recorded terminal disposition onto its durable drain
+    /// projection.
+    fn stage_watchdog_export_outcome(
+        &self,
+        payload: &WatchdogSpoolExportResultPayload,
+        outcome: &WatchdogSpoolExportOutcomeSubmission,
+        now_ms: u64,
+    ) -> Result<WatchdogExportProjection, TransportError> {
+        let operation_id = OperationIdentity::new(format!(
+            "{WATCHDOG_EXPORT_OPERATION_ID_PREFIX}{}",
+            outcome.idempotency_key
+        ))
+        .map_err(|_| TransportError::SessionFenced)?;
+        let stored = self
+            .generation_gateway
+            .ors
+            .load_host_request(&operation_id, &outcome.record_digest)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::UnknownRequest)?;
+        // The stored row must be this route's own durable drain projection for
+        // the exact window the outcome answers. Anything else is a
+        // requested-versus-actual route divergence, never a silent fence.
+        if stored.capability_ref.as_str() != WATCHDOG_EXPORT_CAPABILITY {
+            return Err(TransportError::SessionFenced);
+        }
+        let Some(retained) = stored.payload_body.as_ref() else {
+            return Err(TransportError::SessionFenced);
+        };
+        if retained.get("batch_id").and_then(serde_json::Value::as_str)
+            != Some(payload.batch_id.as_str())
+            || retained
+                .get("batch_digest")
+                .and_then(serde_json::Value::as_str)
+                != Some(payload.batch_digest.as_str())
+            || retained
+                .get("installation_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(payload.installation_id.as_str())
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        // The retained entry must be the exact record this outcome answers, so a
+        // result can never be bound to a different sequence or digest than the
+        // drain projected.
+        let retained_entry = retained
+            .get("entry")
+            .and_then(serde_json::Value::as_object)
+            .ok_or(TransportError::SessionFenced)?;
+        let retained_entry: WatchdogSpoolExportSubmission =
+            serde_json::from_value(serde_json::Value::Object(retained_entry.clone()))
+                .map_err(|_| TransportError::SessionFenced)?;
+        if retained_entry.sequence != outcome.sequence
+            || retained_entry.record_digest != outcome.record_digest
+            || retained_entry.idempotency_key != outcome.idempotency_key
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        if now_ms >= stored.deadline_unix_ms {
+            return Err(TransportError::Timeout);
+        }
+        let recorded = serde_json::to_value(outcome).map_err(|_| TransportError::SessionFenced)?;
+        let result_digest = sha256_json(&recorded).map_err(|_| TransportError::SessionFenced)?;
+        let admitted_now = stored.state != HostRequestState::ResultReceived;
+        let persisted = self
+            .generation_gateway
+            .ors
+            .persist_host_request_result(
+                &operation_id,
+                &outcome.record_digest,
+                &result_digest,
+                &recorded,
+                None,
+                None,
+            )
+            .map_err(|error| match error {
+                OrsError::HostRequestIdentityConflict { .. } => TransportError::IdentityConflict,
+                _ => TransportError::SessionFenced,
+            })?
+            .ok_or(TransportError::UnknownRequest)?;
+        Ok(WatchdogExportProjection {
+            sequence: outcome.sequence,
+            idempotency_key: outcome.idempotency_key.clone(),
+            entry_kind: retained_entry.entry_kind,
+            record_digest: outcome.record_digest.clone(),
+            payload_digest: retained_entry.payload_digest,
+            operation_id: persisted.operation_id.as_str().to_owned(),
+            state: persisted.state,
+            admitted_now,
+            outcome: Some(outcome.outcome.clone()),
+        })
+    }
+
+    /// Records one admitted export window in the bounded Kernel-owned pending
+    /// drain queue the daemon poller serves from.
+    ///
+    /// The durable owner of one export entry is its ORS `Reconciliation`
+    /// record, not this queue: the queue only carries the exact submitted window
+    /// bytes, and the daemon re-proves every entry against its own durable row
+    /// before admitting it. An exact replay of the same window is recognised by
+    /// its derived batch identity and does not queue a second copy, and the
+    /// ceiling fences closed instead of dropping a window that would otherwise
+    /// be lost.
+    fn enqueue_watchdog_export_drain(
+        &self,
+        payload: &WatchdogSpoolExportBatchPayload,
+    ) -> Result<(), TransportError> {
+        let mut queue = self
+            .watchdog_export_drain
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if queue.iter().any(|pending| {
+            pending.batch_id == payload.batch_id && pending.batch_digest == payload.batch_digest
+        }) {
+            return Ok(());
+        }
+        if queue.len() >= MAX_WATCHDOG_EXPORT_DRAIN_WINDOWS {
+            return Err(TransportError::Backpressure);
+        }
+        queue.push_back(payload.clone());
+        Ok(())
+    }
+
+    /// Claims the next pending Watchdog spool export window for the daemon's
+    /// canonical admission.
+    ///
+    /// The claim serves only windows whose every durable ORS row is still the
+    /// non-canonical `Admitted` pending export this route staged, and whose row
+    /// still carries the exact submitted bytes: a window that already gained a
+    /// result, lost its content binding, or lost a row is dropped from the queue
+    /// instead of being answered from, so the daemon can never admit a window
+    /// the durable owner cannot prove. `None` is a null poll, not an error.
+    pub(crate) fn claim_watchdog_export_batch(
+        &self,
+        session: &Session,
+    ) -> Result<Option<WatchdogSpoolExportBatchPayload>, TransportError> {
+        let _transition = self.agent_bridge_transition_read()?;
+        session
+            .peer
+            .validate()
+            .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        let mut queue = self
+            .watchdog_export_drain
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        while let Some(candidate) = queue.front().cloned() {
+            if self.watchdog_export_drain_is_admissible(&candidate)? {
+                queue.pop_front();
+                return Ok(Some(candidate));
+            }
+            queue.pop_front();
+        }
+        Ok(None)
+    }
+
+    /// Proves every entry of one queued window is still a durable drain
+    /// projection of this exact batch whose submitted content the Kernel holds.
+    ///
+    /// A window stays claimable while ANY entry is still undecided, so a
+    /// partially decided window is re-claimed and its decided entries replay
+    /// idempotently against their own durable record rather than being stranded.
+    /// A window is dropped only when its content binding or its route identity
+    /// is gone, which the durable owner can no longer prove.
+    fn watchdog_export_drain_is_admissible(
+        &self,
+        payload: &WatchdogSpoolExportBatchPayload,
+    ) -> Result<bool, TransportError> {
+        for entry in &payload.entries {
+            let operation_id = OperationIdentity::new(format!(
+                "{WATCHDOG_EXPORT_OPERATION_ID_PREFIX}{}",
+                entry.idempotency_key
+            ))
+            .map_err(|_| TransportError::SessionFenced)?;
+            let stored = self
+                .generation_gateway
+                .ors
+                .load_host_request(&operation_id, &entry.record_digest)
+                .map_err(|_| TransportError::SessionFenced)?;
+            let Some(stored) = stored else {
+                return Ok(false);
+            };
+            if stored.capability_ref.as_str() != WATCHDOG_EXPORT_CAPABILITY
+                || stored.payload_body.is_none()
+                || !matches!(
+                    stored.state,
+                    HostRequestState::Admitted | HostRequestState::ResultReceived
+                )
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Admits one typed cancellation envelope for its exact parent operation.
@@ -7419,6 +7840,83 @@ impl KernelComposition {
         Ok(KernelFrameAction::Reply(reply))
     }
 
+    /// The caller ([`crate::KernelComposition::dispatch_frame`]) has already run
+    /// the closed gateway gates; those joins are re-checked here so a direct
+    /// caller cannot bypass them. The frame must ride the same connection as the
+    /// presenting admitted Session, and the correlation identity must be present.
+    /// The typed batch decode, the mechanical envelope validation, and the durable
+    /// named export mutation live in [`Self::admit_watchdog_export_batch`]. This
+    /// entry creates no Session, grants no capability beyond the one drain
+    /// submission the batch already presents, mints no canonical truth, and never
+    /// advances the Watchdog's own export cursor.
+    pub(crate) fn dispatch_watchdog_export_frame(
+        &self,
+        session: &Session,
+        frame: &Frame,
+    ) -> Result<KernelFrameAction, TransportError> {
+        if self
+            .service_state()
+            .map_err(|_| TransportError::SessionFenced)?
+            != KernelServiceState::Ready
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        session
+            .peer
+            .validate()
+            .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        let request_id = frame
+            .request_id
+            .clone()
+            .ok_or(TransportError::SessionFenced)?;
+        let identity = frame
+            .request_identity
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        if !session
+            .module_generation
+            .state_fence
+            .is_compatible_with(&identity.request.state_fence)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        if frame.connection_id != session.connection_id {
+            return Err(TransportError::SessionFenced);
+        }
+        let payload = match &frame.payload {
+            ProtocolPayload::Json(payload) => payload.clone(),
+            _ => return Err(TransportError::SessionFenced),
+        };
+        let operation = payload
+            .get("operation")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TransportError::SessionFenced)?;
+        if !is_watchdog_export_operation(operation) {
+            return Err(TransportError::SessionFenced);
+        }
+        // The typed batch is bounded before decode: an oversized frame never
+        // reaches the parser or any durable write.
+        let batch_bytes = payload
+            .get("export_batch")
+            .ok_or(TransportError::SessionFenced)
+            .and_then(|batch| {
+                eliot_contracts::canonical_json_bytes(batch)
+                    .map_err(|_| TransportError::SessionFenced)
+            })?;
+        if batch_bytes.len() > MAX_WATCHDOG_EXPORT_BATCH_BYTES {
+            return Err(TransportError::SessionFenced);
+        }
+        let batch = watchdog_export_batch_from_payload(&payload)?;
+        let projections = self.admit_watchdog_export_batch(session, &batch)?;
+        let value = watchdog_export_batch_response(&projections, &batch.sink_id);
+        let mut reply = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
+        reply.request_id = Some(request_id);
+        reply
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(KernelFrameAction::Reply(reply))
+    }
+
     /// Returns a snapshot of the retained admitted bridge transport Session.
     ///
     /// The front-door post-activation loop drives every host-request frame
@@ -7502,6 +8000,312 @@ pub(crate) fn watchdog_intent_batch_from_payload(
         return Err(TransportError::SessionFenced);
     }
     Ok(batch)
+}
+
+/// One durable pending-export projection produced by the named Kernel mutation.
+///
+/// `operation_id` and `state` are the durable ORS facts; `admitted_now`
+/// distinguishes a first admission from an exact replay, which is what lets the
+/// caller answer the Watchdog's submit-once contract honestly.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WatchdogExportProjection {
+    pub(crate) sequence: u64,
+    pub(crate) idempotency_key: String,
+    pub(crate) entry_kind: WatchdogSpoolEntryKind,
+    pub(crate) record_digest: String,
+    pub(crate) payload_digest: String,
+    pub(crate) operation_id: String,
+    pub(crate) state: HostRequestState,
+    pub(crate) admitted_now: bool,
+    /// The Governor's own recorded terminal disposition, when this durable
+    /// record already carries one.
+    ///
+    /// `None` means the entry is a durable *pending* export awaiting the
+    /// Governor's canonical admission — never a cursor advance. The Watchdog
+    /// maps `None` onto its non-terminal `AdmittedCandidate` disposition and
+    /// keeps its cursor exactly where it is; only a recorded terminal
+    /// disposition can reach the Watchdog's own advance table.
+    pub(crate) outcome: Option<WatchdogSpoolEntryOutcome>,
+}
+
+/// Opaque durable-operation prefix of one Watchdog export projection.
+///
+/// The durable identity is the prefix plus the derived reconciliation key, so
+/// the prefix itself is never a semantic decision: it names only "a pending
+/// Watchdog spool export awaiting Governor admission".
+const WATCHDOG_EXPORT_OPERATION_ID_PREFIX: &str = "watchdog-export:";
+
+/// Exact capability the Watchdog's fenced export route is admitted under.
+///
+/// The Watchdog is admitted for this one drain-submission capability and nothing
+/// else. It is not a canonical-write, task, Architecture, completion, or budget
+/// capability, and no other capability membership is granted by this entry.
+const WATCHDOG_EXPORT_CAPABILITY: &str = "eliot.watchdog.export.submit";
+
+/// Runs the mechanical window joins of one export submission before any durable
+/// write.
+///
+/// The payload's own `validate()` already proved the closed shape, the entry
+/// consecutiveness, and the predecessor continuation; this adds the two joins
+/// only this layer owns: the presented connection and the live Kernel fence, and
+/// the owner's own acknowledgement window against the Kernel clock. An elapsed
+/// acknowledgement window is a `Timeout` so the caller retries with a fresh
+/// export rather than fencing its connection.
+fn validate_watchdog_export_envelope(
+    session: &Session,
+    payload: &WatchdogSpoolExportBatchPayload,
+    admitted_generation: u64,
+    now_ms: u64,
+) -> Result<(), TransportError> {
+    if session.connection_id.is_empty() {
+        return Err(TransportError::SessionFenced);
+    }
+    if payload.watchdog_generation != admitted_generation {
+        return Err(TransportError::SessionFenced);
+    }
+    if payload.last_sequence > payload.high_water_sequence
+        || payload.predecessor_sequence > payload.high_water_sequence
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    if now_ms >= payload.expires_at_ms {
+        return Err(TransportError::Timeout);
+    }
+    Ok(())
+}
+
+/// Builds the durable pending-export record for one submitted Watchdog entry.
+///
+/// The record is a `Reconciliation` host request: an observation-only durable
+/// row keyed by the derived export reconciliation key, carrying the exact
+/// submitted entry and its batch envelope under `payload_body` bound to
+/// `payload_digest`, plus the retained record and payload digests and nothing
+/// more. It has no field in which a canonical semantic decision could be
+/// expressed, and the `Reconciliation` kind forbids a fresh result body, so the
+/// canonical observation commit cannot be smuggled through this path.
+///
+/// The recorded `fence_digest`, `authority_epoch`, and `generation` are derived
+/// from the *Watchdog's own* submitted lineage, not from the presenting Kernel
+/// fence. That fence is still checked mechanically at admission, so a stale
+/// submission is still fenced; keeping it out of the durable binding is what
+/// lets an exactly-once replay survive an epoch rotation, because
+/// `stage_host_request` compares the whole binding and a Kernel-side fence
+/// change would otherwise turn a legitimate retry into an identity conflict and
+/// a second projection.
+fn watchdog_export_projection_record(
+    payload: &WatchdogSpoolExportBatchPayload,
+    entry: &WatchdogSpoolExportSubmission,
+    operation_id: &OperationIdentity,
+) -> Result<HostRequestRecord, TransportError> {
+    let label =
+        |value: &str| OpaqueLabel::new(value.to_owned()).map_err(|_| TransportError::SessionFenced);
+    let epoch_lineage = eliot_contracts::EpochLineageId::new(&payload.watchdog_epoch_lineage_id)
+        .map_err(|_| TransportError::SessionFenced)?;
+    let epoch_sequence =
+        std::num::NonZeroU64::new(payload.watchdog_epoch).ok_or(TransportError::SessionFenced)?;
+    let authority_epoch = eliot_contracts::EpochId::new(epoch_lineage, epoch_sequence)
+        .map_err(|_| TransportError::SessionFenced)?;
+    let resource_generation = eliot_contracts::ResourceGeneration::new(payload.watchdog_generation)
+        .map_err(|_| TransportError::SessionFenced)?;
+    let submitted_fence = eliot_contracts::StateFence::new(authority_epoch, resource_generation);
+    let body = serde_json::json!({
+        "wire_id": eliot_protocol::WATCHDOG_SPOOL_EXPORT_BATCH_WIRE_ID,
+        "route": payload.route,
+        "batch_id": payload.batch_id,
+        "batch_digest": payload.batch_digest,
+        "installation_id": payload.installation_id,
+        "schema_version": payload.schema_version,
+        "byte_size": payload.byte_size,
+        "watchdog_generation": payload.watchdog_generation,
+        "watchdog_epoch": payload.watchdog_epoch,
+        "watchdog_epoch_lineage_id": payload.watchdog_epoch_lineage_id,
+        "supervision_lease_id": payload.supervision_lease_id,
+        "sink_id": payload.sink_id,
+        "predecessor_sequence": payload.predecessor_sequence,
+        "first_sequence": payload.first_sequence,
+        "last_sequence": payload.last_sequence,
+        "high_water_sequence": payload.high_water_sequence,
+        "created_at_ms": payload.created_at_ms,
+        "expires_at_ms": payload.expires_at_ms,
+        "entry": serde_json::to_value(entry).map_err(|_| TransportError::SessionFenced)?,
+    });
+    let payload_digest = sha256_json(&body).map_err(|_| TransportError::SessionFenced)?;
+    Ok(HostRequestRecord {
+        contract_version: ORS_CONTRACT_VERSION,
+        send_claim_protocol_version: 0,
+        transport_channel_binding_sha256: None,
+        operation_id: operation_id.clone(),
+        kind: OrsHostRequestKind::Reconciliation,
+        // The request identity is the derived export reconciliation key: one
+        // retained spool record, one durable request identity, forever.
+        request_id: label(&entry.idempotency_key)?,
+        correlation_projection: None,
+        idempotency_key: label(&entry.idempotency_key)?,
+        cancellation_id: label(&format!(
+            "{WATCHDOG_EXPORT_OPERATION_ID_PREFIX}{}:cancel",
+            entry.idempotency_key
+        ))?,
+        parent_operation_id: None,
+        request_digest: entry.record_digest.clone(),
+        payload_digest,
+        // The exact submitted entry and its batch envelope are committed with
+        // this row, so the later Governor admission reads the original bytes off
+        // the durable record rather than from a queue copy.
+        payload_schema_id: Some(label(eliot_protocol::WATCHDOG_SPOOL_EXPORT_BATCH_WIRE_ID)?),
+        payload_body: Some(body),
+        connection_ref: label(&payload.sink_id)?,
+        session_ref: None,
+        task_ref: None,
+        scope_ref: None,
+        capability_ref: label(WATCHDOG_EXPORT_CAPABILITY)?,
+        fence_digest: sha256_json(&submitted_fence).map_err(|_| TransportError::SessionFenced)?,
+        authority_epoch: submitted_fence.authority_epoch.clone(),
+        generation: payload.watchdog_generation,
+        deadline_unix_ms: payload.expires_at_ms,
+        state: HostRequestState::Requested,
+        attempt: None,
+        attempt_history: Vec::new(),
+        cancellation_target: None,
+        result_digest: None,
+        result_response: None,
+        result_evidence: None,
+        result_lineage: None,
+        commit_order: 0,
+    })
+}
+
+/// Decodes the closed terminal disposition recorded on one durable drain row.
+///
+/// The body is the exact typed outcome the Governor's outcome leg submitted, so
+/// the read is a typed decode of a named contract rather than an interpretation
+/// of free JSON. A body that does not decode is fenced instead of being read as
+/// a disposition.
+fn decode_watchdog_export_outcome(
+    body: &serde_json::Value,
+) -> Result<WatchdogSpoolEntryOutcome, TransportError> {
+    // The retained result body is the exact typed outcome submission the
+    // Governor's outcome leg persisted, so the disposition is read out of that
+    // named contract rather than interpreted from the body.
+    let submission: WatchdogSpoolExportOutcomeSubmission =
+        serde_json::from_value(body.clone()).map_err(|_| TransportError::SessionFenced)?;
+    Ok(submission.outcome)
+}
+
+/// Decodes the exact typed Watchdog spool export result from a daemon frame
+/// payload.
+///
+/// The payload must carry the full typed result; its shape, its own canonical
+/// digest, the window it answers, and every terminal outcome's derived
+/// reconciliation key are re-validated here, so this is typed dispatch rather
+/// than generic JSON routing.
+pub(crate) fn watchdog_export_result_from_payload(
+    payload: &serde_json::Value,
+) -> Result<WatchdogSpoolExportResultPayload, TransportError> {
+    let result_value = payload
+        .get("export_result")
+        .cloned()
+        .ok_or(TransportError::SessionFenced)?;
+    let result: WatchdogSpoolExportResultPayload =
+        serde_json::from_value(result_value).map_err(|_| TransportError::SessionFenced)?;
+    result
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    if result.route != WATCHDOG_SPOOL_EXPORT_ROUTE {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(result)
+}
+
+/// Typed answer for one recorded Watchdog export result.
+///
+/// The response carries the durable projection of each answered entry with the
+/// disposition the Governor's own outcome leg recorded, and nothing else. It
+/// grants the Watchdog no authority of its own: the cursor decision still runs
+/// through the spool owner's own acknowledgement validation.
+pub(crate) fn watchdog_export_result_response(
+    projections: &[WatchdogExportProjection],
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": "known",
+        "value": {
+            "accepted": true,
+            "entries": projections
+                .iter()
+                .map(|projection| serde_json::json!({
+                    "sequence": projection.sequence,
+                    "idempotency_key": projection.idempotency_key,
+                    "record_digest": projection.record_digest,
+                    "state": projection.state,
+                    "outcome": projection.outcome,
+                    "recorded_now": projection.admitted_now,
+                }))
+                .collect::<Vec<_>>(),
+        },
+        "recovery": null,
+    })
+}
+
+/// Decodes the exact typed Watchdog spool export batch from a frame payload.
+///
+/// The payload must carry the closed operation string plus the full typed batch;
+/// the batch shape, its own canonical digest, and every covered export entry
+/// (including the derived reconciliation key and the owner-computed digests) are
+/// re-validated here, so this is typed dispatch rather than generic JSON
+/// routing.
+pub(crate) fn watchdog_export_batch_from_payload(
+    payload: &serde_json::Value,
+) -> Result<WatchdogSpoolExportBatchPayload, TransportError> {
+    let batch_value = payload
+        .get("export_batch")
+        .cloned()
+        .ok_or(TransportError::SessionFenced)?;
+    let batch: WatchdogSpoolExportBatchPayload =
+        serde_json::from_value(batch_value).map_err(|_| TransportError::SessionFenced)?;
+    batch
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    if batch.route != WATCHDOG_SPOOL_EXPORT_ROUTE {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(batch)
+}
+
+/// Typed answer for one admitted Watchdog export batch.
+///
+/// The response carries the durable projection per submitted spool entry plus the
+/// reconciliation key the Kernel derived, and nothing else. In particular it
+/// carries no Problem/Incident state, no Current Epistemic Position, and no
+/// task, Architecture, completion, or budget decision: those remain the
+/// Governor's, and the durable record behind this projection is a non-canonical
+/// pending export. A durable `Admitted` state is therefore reported as what it
+/// is — stored, awaiting the Governor's canonical admission — and never as a
+/// canonical application the Watchdog's cursor could advance on.
+pub(crate) fn watchdog_export_batch_response(
+    projections: &[WatchdogExportProjection],
+    sink_id: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": "known",
+        "value": {
+            "accepted": true,
+            "sink_id": sink_id,
+            "entries": projections
+                .iter()
+                .map(|projection| serde_json::json!({
+                    "sequence": projection.sequence,
+                    "idempotency_key": projection.idempotency_key,
+                    "entry_kind": projection.entry_kind.as_str(),
+                    "record_digest": projection.record_digest,
+                    "payload_digest": projection.payload_digest,
+                    "operation_id": projection.operation_id,
+                    "state": projection.state,
+                    "admitted_now": projection.admitted_now,
+                    "outcome": projection.outcome,
+                }))
+                .collect::<Vec<_>>(),
+        },
+        "recovery": null,
+    })
 }
 
 /// Typed answer for one admitted Watchdog intent batch.
@@ -8929,6 +9733,41 @@ pub use eliot_protocol::WATCHDOG_SPOOL_BATCH_ROUTE;
 /// the operation string only selects this entry, and the payload must still
 /// present the exact typed [`WatchdogSpoolIntentBatchPayload`] for validation.
 pub(crate) const WATCHDOG_INTENT_SUBMIT_OPERATION: &str = "watchdog_intent_submit";
+
+/// Closed EBP route identity for one Watchdog spool export batch.
+///
+/// The route string is owned once by the protocol crate
+/// ([`WATCHDOG_SPOOL_EXPORT_ROUTE`]) and re-exported here, so the Kernel gate
+/// and the Watchdog submission cannot drift into two route vocabularies.
+pub use eliot_protocol::WATCHDOG_SPOOL_EXPORT_ROUTE;
+
+/// Closed frame operation carrying one Watchdog spool export batch through the
+/// front-door gateway.
+///
+/// The operation string only selects this entry; the payload must still present
+/// the exact typed [`WatchdogSpoolExportBatchPayload`] for validation.
+pub(crate) const WATCHDOG_EXPORT_SUBMIT_OPERATION: &str = "watchdog_export_submit";
+
+/// Bounded frame size of one Watchdog spool export batch.
+///
+/// One batch carries at most `eliot_protocol::MAX_WATCHDOG_SPOOL_EXPORT_ENTRIES`
+/// owner-neutral export views. Each view is a bounded sequence, revision,
+/// timestamp, closed class label, and two digests, so the ceiling keeps the
+/// whole batch under the transport frame limit without depending on the
+/// caller's declaration. It equals the Watchdog owner's own one-export raw-byte
+/// ceiling, so a whole owner-generated window still fits while an oversized one
+/// can never be admitted.
+const MAX_WATCHDOG_EXPORT_BATCH_BYTES: usize = 512 * 1024;
+
+/// Bounded number of admitted Watchdog export windows waiting for the daemon's
+/// canonical admission.
+///
+/// The Watchdog's own export window is replayed verbatim on every live tick
+/// until its cursor advances, so the queue holds one copy per distinct
+/// owner-generated window, never one copy per tick. The ceiling is a safety net
+/// against an unbounded producer; the route fences closed at it rather than
+/// dropping a window.
+pub(crate) const MAX_WATCHDOG_EXPORT_DRAIN_WINDOWS: usize = 16;
 
 /// Bounded frame size of one Watchdog spool intent batch.
 ///

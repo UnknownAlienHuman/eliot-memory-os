@@ -1494,7 +1494,10 @@ impl KernelComposition {
             .clone();
         Self::validate_watchdog_client_binding(&policy, client)?;
         let mut session = Session::establish(connection_id, peer, client, policy.protocol_range)?;
-        session.capabilities = vec![WATCHDOG_INTENT_SUBMIT_OPERATION.to_owned()];
+        session.capabilities = vec![
+            WATCHDOG_INTENT_SUBMIT_OPERATION.to_owned(),
+            WATCHDOG_EXPORT_SUBMIT_OPERATION.to_owned(),
+        ];
         session
             .privacy_classes
             .retain(|class| policy.allowed_privacy_classes.contains(class));

@@ -51,7 +51,7 @@ use eliot_contracts::{
     ResourceGeneration, RuntimeBundleId, SourceCrateRef, SupportStatus,
 };
 use eliot_platform_windows::ProtectedPathLease;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex, OnceLock,
@@ -2200,6 +2200,8 @@ impl KernelComposition {
             agent_activation_changed: tokio::sync::Notify::new(),
             #[cfg(windows)]
             host_request_connection_index: Mutex::new(BTreeMap::new()),
+            #[cfg(windows)]
+            watchdog_export_drain: Mutex::new(VecDeque::new()),
             #[cfg(windows)]
             hot_spine,
             #[cfg(windows)]

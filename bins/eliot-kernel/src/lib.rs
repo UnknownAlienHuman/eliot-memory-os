@@ -365,6 +365,8 @@ use generation_recovery::update_handshake_policy;
 #[cfg(windows)]
 use host_request_route::HostRequestOperationRef;
 #[cfg(windows)]
+use host_request_route::WATCHDOG_EXPORT_SUBMIT_OPERATION;
+#[cfg(windows)]
 use host_request_route::WATCHDOG_INTENT_SUBMIT_OPERATION;
 use runtime_identity::stable_owner_principal_digest;
 #[cfg(windows)]
@@ -850,6 +852,18 @@ pub struct KernelComposition {
     /// `Unknown` without enumerating the store.
     #[cfg(windows)]
     host_request_connection_index: Mutex<BTreeMap<String, Vec<HostRequestOperationRef>>>,
+    /// Bounded Kernel-owned queue of admitted Watchdog spool export windows
+    /// awaiting the daemon's canonical admission (#2899).
+    ///
+    /// The durable owner of one export entry is its ORS `Reconciliation`
+    /// record; this queue only carries the exact submitted window bytes the
+    /// daemon poller serves from and re-proves against those rows. It is
+    /// process-local: a Kernel restart empties it, and the Watchdog resubmits
+    /// the identical window because its own cursor has not advanced, which
+    /// re-stages the same durable records under the same derived keys. It fails
+    /// closed at its ceiling instead of dropping a window.
+    #[cfg(windows)]
+    watchdog_export_drain: Mutex<VecDeque<eliot_protocol::WatchdogSpoolExportBatchPayload>>,
     /// The live I12.14 hot-spine binding and the queue capacity it enforces
     /// (issue #1733). Bound once during composition assembly against the
     /// running build's real registered settings, so a composition that exists
