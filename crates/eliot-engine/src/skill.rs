@@ -772,12 +772,14 @@ pub struct SkillInfluenceReportInput {
 impl SkillInfluenceReportInput {
     /// Canonical aggregate context cost for the reported Skill set.
     ///
-    /// Every measured Skill contributes its own typed projection, so the same
+/// Every measured Skill contributes its own typed projection, so the same
     /// Skill revision always contributes the same amount and the aggregate
     /// seals over the ordered chain of the parts' content digests. `Ok(None)`
     /// means no Skill bytes were supplied (measurement absent); a
     /// serialization or measurement failure is a typed `Err` rather than a
-    /// silent drop that would report a cheaper value.
+    /// silent drop that would report a cheaper value. A projection that
+    /// measures but does not close is dropped by `sum_skill_context_stu` as
+    /// unavailable evidence and never folded in as a zero.
     fn canonical_context_cost(
         &self,
     ) -> Result<Option<SkillContextMeasurementProjection>, EngineError> {
@@ -787,7 +789,7 @@ impl SkillInfluenceReportInput {
         let mut projections = Vec::with_capacity(skills.len());
         for skill in skills {
             let measurement = measure_skill_context_envelope(skill)?;
-            projections.push(measurement.projection());
+            projections.push(measurement.projection_or_unavailable(skill));
         }
         sum_skill_context_stu(&projections)
             .map_err(|error| EngineError::WriteRejected(error.to_string()))

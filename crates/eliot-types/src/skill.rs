@@ -1117,6 +1117,278 @@ pub struct SkillCurationRejectedAction {
     pub proposal_id: String,
     pub attempted_action: SkillCurationAction,
     pub reason: SkillCurationGateReason,
-    #[serde(with = "time::serde::rfc3339")]
     pub rejected_at: OffsetDateTime,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        SKILL_CONTEXT_MEASUREMENT_SCHEMA_VERSION, SkillContextMeasurementError,
+        SkillContextMeasurementProjection, SkillContextMeasurementStatus,
+        SkillContextMeasurementUnit, SkillContextStuDelta, SkillId,
+        sum_skill_context_stu,
+    };
+
+    /// A closed, unvalidated-STU projection of `bytes` measured bytes, bound to
+    /// the `revision` it was measured for.
+    fn measured(revision: &str, stu: u64, bytes: u64) -> SkillContextMeasurementProjection {
+        let rendered_utf8_bytes = format!("{stu:08}");
+        let content_digest = format!("{revision:0<64}");
+        SkillContextMeasurementProjection::sealed(SkillContextMeasurementProjection {
+            schema_version: SKILL_CONTEXT_MEASUREMENT_SCHEMA_VERSION.to_owned(),
+            skill_ref: format!("skill-{revision}"),
+            skill_version: revision.to_owned(),
+            value: Some(stu),
+            unit: SkillContextMeasurementUnit::Stu,
+            status: SkillContextMeasurementStatus::UnvalidatedStu,
+            empirical: false,
+            rendered_utf8_bytes: bytes,
+            serializer_id: "serde_json".to_owned(),
+            serializer_version: "eliot-skill-card-v2/v1".to_owned(),
+            serializer_options_digest: "a".repeat(64),
+            serializer_profile_digest: "b".repeat(56) + &rendered_utf8_bytes,
+            content_digest,
+            actual_tokens: None,
+            value_digest: String::new(),
+        })
+    }
+
+    // WORK_UNIT_CASE: 880/2
+    /// 880/2 + 880/5: one projection of one Skill revision is closed when
+    /// sealed, is stable across recomputation, and is not the digest of the
+    /// same envelope measured one revision later.
+    #[test]
+    fn measured_projection_is_closed_and_stable() {
+        let projection = measured("v1", 64, 190);
+        assert_eq!(projection.validate(), Ok(()));
+        assert_eq!(projection.stu_value(), Some(64));
+        assert_eq!(projection.validated_value(), Some(64));
+        assert_eq!(
+            projection.compute_value_digest(),
+            projection.value_digest,
+            "the seal must be reproducible from the projected body alone"
+        );
+        assert_eq!(projection.value_digest.len(), 64);
+        assert_ne!(
+            projection.value_digest,
+            measured("v2", 64, 190).value_digest,
+            "a changed revision must not seal to the same measurement identity"
+        );
+        assert_ne!(
+            projection.value_digest,
+            measured("v1", 65, 195).value_digest,
+            "changed content must not seal to the same measurement identity"
+        );
+    }
+
+    // WORK_UNIT_CASE: 880/2
+    /// 880/2 + 880/5 + 880/17: relabelling a measured STU as tokens, or
+    /// editing the value, the status, the unit or the byte binding, is refused
+    /// rather than read under the same field names.
+    #[test]
+    fn edited_measurement_is_refused() {
+        let projection = measured("v1", 64, 190);
+
+        let mut relabelled = projection.clone();
+        relabelled.unit = SkillContextMeasurementUnit::TokenizerTokens;
+        assert_eq!(
+            relabelled.validate(),
+            Err(SkillContextMeasurementError::UnitStatusMismatch("unit"))
+        );
+
+        let mut forged_tokens = projection.clone();
+        forged_tokens.value = Some(31);
+        assert_eq!(
+            forged_tokens.validate(),
+            Err(SkillContextMeasurementError::ValueDigestMismatch)
+        );
+
+        let mut repointed = projection.clone();
+        repointed.content_digest = "b".repeat(64);
+        assert_eq!(
+            repointed.validate(),
+            Err(SkillContextMeasurementError::ValueDigestMismatch),
+            "the projected value must be bound to the content digest it names"
+        );
+
+        let mut rebound_bytes = projection.clone();
+        rebound_bytes.rendered_utf8_bytes = 192;
+        assert_eq!(
+            rebound_bytes.validate(),
+            Err(SkillContextMeasurementError::ValueDigestMismatch)
+        );
+
+        let mut no_binding = projection.clone();
+        no_binding.content_digest = "not-a-digest".to_owned();
+        assert_eq!(
+            no_binding.validate(),
+            Err(SkillContextMeasurementError::MalformedDigest("content_digest"))
+        );
+    }
+
+    // WORK_UNIT_CASE: 880/9
+    /// 880/9: an actual-token observation under an STU projection is refused,
+    /// and a measured STU is never readable as a token count.
+    #[test]
+    fn actual_tokens_may_not_hang_off_an_stu_projection() {
+        let mut projection = measured("v1", 64, 190);
+        projection.actual_tokens = Some(super::SkillContextTokenizerObservation {
+            tokenizer_id: "cl100k_base".to_owned(),
+            tokenizer_version: "1".to_owned(),
+            tokenizer_hash: "c".repeat(64),
+            tokens: 12,
+        });
+        assert_eq!(
+            projection.validate(),
+            Err(SkillContextMeasurementError::UnitNotRefutedByObservation {
+                claimed: "non-tokenizer",
+                observed: "present",
+            })
+        );
+    }
+
+    // WORK_UNIT_CASE: 880/16
+    /// 880/16 + 880/17: unavailable is typed absence - no value, no borrowed
+    /// measurement binding - where the removed `u64::MAX` sentinel used to put
+    /// control state inside the numeric domain.
+    #[test]
+    fn unavailable_is_typed_absence() {
+        let projection = SkillContextMeasurementProjection::unavailable(&SkillId::new_v7(), "v1");
+        assert_eq!(projection.validate(), Ok(()));
+        assert_eq!(projection.value, None);
+        assert_eq!(projection.unit, SkillContextMeasurementUnit::Unavailable);
+        assert_eq!(projection.status, SkillContextMeasurementStatus::Unavailable);
+        assert_eq!(projection.stu_value(), None);
+        assert_eq!(projection.validated_value(), None);
+        assert_eq!(projection.rendered_utf8_bytes, 0);
+        assert!(projection.content_digest.is_empty());
+        assert_ne!(
+            projection.value_digest,
+            measured("v1", 0, 0).value_digest,
+            "an absent measurement must not seal to the digest of a measured zero"
+        );
+    }
+
+    // WORK_UNIT_CASE: 880/16
+    /// 880/16 + 880/17: an unavailable projection may not be back-filled with a
+    /// value, and a measured one may not be emptied to hide its cost.
+    #[test]
+    fn absence_cannot_be_dressed_as_a_measurement() {
+        let mut invented = SkillContextMeasurementProjection::unavailable(&SkillId::new_v7(), "v1");
+        invented.value = Some(0);
+        assert_eq!(
+            invented.validate(),
+            Err(SkillContextMeasurementError::UnitStatusMismatch("value"))
+        );
+
+        let mut hidden = measured("v1", 64, 190);
+        hidden.value = None;
+        assert_eq!(
+            hidden.validate(),
+            Err(SkillContextMeasurementError::UnitStatusMismatch("value"))
+        );
+
+        let mut borrowed_binding =
+            SkillContextMeasurementProjection::unavailable(&SkillId::new_v7(), "v1");
+        borrowed_binding.content_digest = measured("v1", 64, 190).content_digest;
+        assert_eq!(
+            borrowed_binding.validate(),
+            Err(SkillContextMeasurementError::ValueDigestMismatch),
+            "unavailable must not carry a measured binding borrowed from elsewhere"
+        );
+    }
+
+    // WORK_UNIT_CASE: 880/5
+    /// 880/5: the aggregate is the checked sum of its parts in the parts' unit,
+    /// and it is typed absence - not a total of zero - when nothing measured.
+    #[test]
+    fn aggregate_sums_its_parts_and_refuses_a_foreign_binding() {
+        let parts = [measured("v1", 64, 190), measured("v2", 26, 80)];
+        let aggregate = sum_skill_context_stu(&parts)
+            .expect("same serializer and profile")
+            .expect("two measured parts");
+        assert_eq!(aggregate.validate(), Ok(()));
+        assert_eq!(aggregate.stu_value(), Some(90));
+        assert_eq!(aggregate.unit, SkillContextMeasurementUnit::Stu);
+        assert_eq!(aggregate.rendered_utf8_bytes, 270);
+
+        assert_eq!(
+            sum_skill_context_stu(&[]),
+            Ok(None),
+            "no measured part is typed absence, not a zero total"
+        );
+        assert_eq!(
+            sum_skill_context_stu(&[
+                SkillContextMeasurementProjection::unavailable(&SkillId::new_v7(), "v1")
+            ]),
+            Ok(None)
+        );
+
+        let mut foreign = measured("v3", 64, 190);
+        foreign.serializer_profile_digest = "f".repeat(64);
+        let foreign = SkillContextMeasurementProjection::sealed(foreign);
+        assert_eq!(
+            sum_skill_context_stu(&[parts[0].clone(), foreign]),
+            Err(SkillContextMeasurementError::UnitStatusMismatch(
+                "serializer_profile"
+            ))
+        );
+    }
+
+    // WORK_UNIT_CASE: 880/17
+    /// 880/17: an aggregate that cannot be represented in the value domain is
+    /// a typed overflow, never a saturating maximum that reads as a cost.
+    #[test]
+    fn aggregate_overflow_is_typed() {
+        assert_eq!(
+            sum_skill_context_stu(&[measured("v1", u64::MAX, 190), measured("v2", 1, 190)]),
+            Err(SkillContextMeasurementError::ValueOverflow)
+        );
+        assert_eq!(
+            sum_skill_context_stu(&[measured("v1", u64::MAX, u64::MAX), measured("v2", 0, 1)]),
+            Err(SkillContextMeasurementError::ValueOverflow)
+        );
+    }
+
+    // WORK_UNIT_CASE: 880/6
+    /// 880/6: the STU delta carries its unit in the type and on the wire, and
+    /// keeps the sign of the curation effect.
+    #[test]
+    fn stu_delta_carries_its_unit() {
+        let delta = SkillContextStuDelta(190).divided_by_stu(4).negated_stu();
+        assert_eq!(delta, SkillContextStuDelta(-47));
+        assert_eq!(
+            serde_json::to_value(delta).expect("delta is serializable"),
+            serde_json::json!(-47)
+        );
+        assert!(
+            serde_json::from_value::<SkillContextStuDelta>(serde_json::json!("12"))
+                .is_err(),
+            "a string is not an STU"
+        );
+        assert!(
+            serde_json::from_value::<SkillContextStuDelta>(serde_json::json!(true)).is_err(),
+            "a bool is not an STU"
+        );
+        assert!(
+            serde_json::from_value::<SkillContextStuDelta>(serde_json::json!(12)).is_ok(),
+            "the plain signed integer is the whole wire contract"
+        );
+    }
+
+    // WORK_UNIT_CASE: 880/16
+    /// 880/16: a schema version other than the one named boundary is refused
+    /// rather than read under the same field names.
+    #[test]
+    fn unknown_schema_version_is_refused() {
+        let mut projection = measured("v1", 64, 190);
+        projection.schema_version = "eliot-skill-context-measurement/v2".to_owned();
+        assert_eq!(
+            projection.validate(),
+            Err(SkillContextMeasurementError::UnsupportedSchemaVersion {
+                expected: SKILL_CONTEXT_MEASUREMENT_SCHEMA_VERSION.to_owned(),
+                actual: "eliot-skill-context-measurement/v2".to_owned(),
+            })
+        );
+    }
 }
