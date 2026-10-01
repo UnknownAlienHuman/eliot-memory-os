@@ -1166,6 +1166,7 @@ fn requested_host_request_record(
                 reason: "state fence cannot be canonicalized".to_owned(),
             }
         })?,
+        admitted_state_fence: Some(envelope.state_fence.clone()),
         authority_epoch: envelope.state_fence.authority_epoch.clone(),
         generation: envelope.state_fence.resource_generation.value(),
         deadline_unix_ms: envelope.identity.deadline_unix_ms,
@@ -1805,6 +1806,7 @@ mod local_read_result_tests {
             scope_ref: None,
             capability_ref: label("eliot.query"),
             fence_digest: "c".repeat(64),
+            admitted_state_fence: None,
             authority_epoch: test_fence().authority_epoch.clone(),
             generation: 7,
             deadline_unix_ms: 2_000_000,

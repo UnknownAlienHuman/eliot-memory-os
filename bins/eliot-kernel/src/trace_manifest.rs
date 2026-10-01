@@ -8,14 +8,15 @@
 //! result, keyed by trace/operation ID. It binds the Task/Action contract and
 //! State Fence; the presenting caller and its semantic Session; the lease
 //! attempt; the policy snapshot when the fence is policy-bound; the requested
-//! and actual route; the local-port call with immutable input/output handles;
-//! observed side effects; canonical receipts; the finish decision; and an
+//! and actual route; the local-port call with observed input/output digests
+//! and an exact ORS owner-row reference for retrieving retained bytes; observed
+//! side effects; canonical receipts; the finish decision; and an
 //! explicit missing-parts list. I16.12 slots this path cannot produce (the
 //! semantic principal, a policy snapshot without a policy-bound fence, the
-//! Active View/packet manifest, the independent verifier result, and the
-//! executor identity when the owner does not name one) are enumerated in
-//! `unavailable`: missing evidence limits replay and is never silently
-//! treated as success.
+//! Active View/packet manifest, the independent verifier result, and executor
+//! identity when the owner does not name one) are enumerated in `unavailable`
+//! and `missing_parts`:
+//! missing evidence limits replay and is never silently treated as success.
 //!
 //! The executor observation is not a second copy: it is projected from the
 //! durable ORS row that retained it with the completion (issue #1853 W2), so
@@ -53,19 +54,23 @@ use serde::{Deserialize, Serialize};
 use crate::kernel_audit::{AuditEventKind, AuditRecord, authority_epoch_text};
 
 /// Canonical trace-manifest format version.
-pub const TRACE_MANIFEST_FORMAT_VERSION: u16 = 1;
+pub const TRACE_MANIFEST_FORMAT_VERSION: u16 = 2;
 
 /// Required manifest slots, in stable enumeration order.
 ///
 /// Every slot must resolve from the admitted envelope, the durable record,
-/// the presenting session, or the submitted execution evidence. An absent
+/// the presenting session, or retained execution evidence. An absent
 /// required slot lands in [`TraceManifest::missing_parts`] and forces
 /// [`TraceFinish::DegradedNoProof`].
-pub const TRACE_MANIFEST_REQUIRED_SLOTS: [&str; 12] = [
+pub const TRACE_MANIFEST_REQUIRED_SLOTS: [&str; 18] = [
+    "retained_owner_row",
     "action_contract",
     "state_fence",
+    "active_view_packet_manifest",
+    "principal",
     "caller_session",
     "lease",
+    "policy_snapshot",
     "requested_route",
     "actual_route",
     "invoked_operation",
@@ -73,7 +78,9 @@ pub const TRACE_MANIFEST_REQUIRED_SLOTS: [&str; 12] = [
     "output_handle",
     "side_effects",
     "adapter_identity",
+    "executor_identity",
     "result_receipt",
+    "verifier_result",
 ];
 
 /// Honest finish vocabulary for one sealed manifest (A10.8).
@@ -140,10 +147,17 @@ pub struct TraceManifest {
     pub trace_id: String,
     /// Kernel operation handle (`hostreq:<sha>`).
     pub operation_id: String,
+    /// Original request digest paired with `operation_id` for exact ORS row
+    /// lookup. That row owns the admitted payload and retained result bytes.
+    pub retained_request_digest: Option<String>,
     /// Daemon-claimable lane that served the read (`query`, `campaign-packet`).
     pub lane: Option<String>,
     /// Admitted capability name (Task/Action contract selector).
     pub capability: Option<String>,
+    /// Exact admitted payload-schema identity for the action contract.
+    pub action_contract_ref: Option<String>,
+    /// Whether the referenced ORS owner row retains the exact admitted bytes.
+    pub admitted_payload_retained: bool,
     /// Digest over the exact admitted payload bytes.
     pub payload_digest: Option<String>,
     /// Exact fence observed with the authority decision.
@@ -190,6 +204,10 @@ pub struct TraceManifest {
     pub verifier_result: Option<String>,
     /// Canonical digest over the exact bounded response bytes.
     pub result_digest: Option<String>,
+    /// Whether the referenced ORS owner row retains the exact result bytes.
+    pub result_bytes_retained: bool,
+    /// Canonical semantic receipt retained with the exact result, if any.
+    pub result_receipt: Option<String>,
     /// Durable ORS state at bind time.
     pub durable_state: Option<String>,
     /// Finish decision for the bound result.
@@ -203,13 +221,12 @@ pub struct TraceManifest {
 impl TraceManifest {
     /// Seals the manifest for one persisted result.
     ///
-    /// Binds the admitted envelope (or, when queue memory already retired
-    /// it, the durable record), the presenting session, the executor-observed
+    /// Binds durable identity and result evidence, the executor-observed
     /// evidence as it was RETAINED on the durable record, and the persisted
     /// receipt. Required slots without
     /// a value land in `missing_parts` and force
-    /// [`TraceFinish::DegradedNoProof`]; anything else seals
-    /// [`TraceFinish::VerifiedComplete`]. Call sites run only after the ORS
+    /// [`TraceFinish::DegradedNoProof`]; only a manifest with every required
+    /// evidence item seals [`TraceFinish::VerifiedComplete`]. Call sites run only after the ORS
     /// persist, so the seal never precedes the binding it describes.
     ///
     /// The evidence is read from `persisted`, not from the submitted body
@@ -220,29 +237,19 @@ impl TraceManifest {
     /// disagree about what was observed.
     #[must_use]
     pub fn seal(
-        session: &Session,
-        body: &HostRequestResultBody,
+        _session: &Session,
+        _body: &HostRequestResultBody,
         persisted: &HostRequestRecord,
-        envelope: Option<&HostRequestEnvelope>,
+        _envelope: Option<&HostRequestEnvelope>,
         lane: &'static str,
     ) -> Self {
-        let capability = envelope
-            .map(|envelope| envelope.identity.capability.clone())
-            .or_else(|| Some(persisted.capability_ref.as_str().to_owned()));
-        let payload_digest = envelope
-            .map(|envelope| envelope.identity.payload_sha256.clone())
-            .or_else(|| Some(persisted.payload_digest.clone()));
-        let state_fence = envelope
-            .map(|envelope| envelope.state_fence.clone())
-            .or_else(|| Some(session.module_generation.state_fence.clone()));
-        let session_id = envelope
-            .and_then(|envelope| envelope.identity.session_id.clone())
-            .or_else(|| {
-                persisted
-                    .session_ref
-                    .as_ref()
-                    .map(|session| session.as_str().to_owned())
-            });
+        let capability = Some(persisted.capability_ref.as_str().to_owned());
+        let payload_digest = Some(persisted.payload_digest.clone());
+        let state_fence = persisted.admitted_state_fence.clone();
+        let session_id = persisted
+            .session_ref
+            .as_ref()
+            .map(|session| session.as_str().to_owned());
         let evidence = persisted.result_evidence.as_ref();
         let policy_snapshot = state_fence.as_ref().and_then(|fence| {
             fence
@@ -258,38 +265,33 @@ impl TraceManifest {
 
         let mut manifest = Self {
             format_version: TRACE_MANIFEST_FORMAT_VERSION,
-            trace_id: envelope.map_or_else(
-                || persisted.request_id.as_str().to_owned(),
-                |envelope| envelope.identity.request_id.as_str().to_owned(),
-            ),
-            operation_id: body.operation_id.clone(),
+            trace_id: persisted.request_id.as_str().to_owned(),
+            operation_id: persisted.operation_id.as_str().to_owned(),
+            retained_request_digest: Some(persisted.request_digest.clone()),
             lane: Some(lane.to_owned()),
             capability: capability.clone(),
+            action_contract_ref: persisted
+                .payload_schema_id
+                .as_ref()
+                .map(|schema| schema.as_str().to_owned()),
+            admitted_payload_retained: persisted.payload_body.is_some(),
             payload_digest,
             state_fence,
-            connection_id: Some(session.connection_id.clone()),
+            connection_id: Some(persisted.connection_ref.as_str().to_owned()),
             session_id,
-            task_id: envelope
-                .and_then(|envelope| envelope.identity.task_id.clone())
-                .or_else(|| {
-                    persisted
-                        .task_ref
-                        .as_ref()
-                        .map(|task| task.as_str().to_owned())
-                }),
-            work_scope_id: envelope
-                .and_then(|envelope| envelope.identity.work_scope_id.clone())
-                .or_else(|| {
-                    persisted
-                        .scope_ref
-                        .as_ref()
-                        .map(|scope| scope.as_str().to_owned())
-                }),
-            lease_attempt_id: body
+            task_id: persisted
+                .task_ref
+                .as_ref()
+                .map(|task| task.as_str().to_owned()),
+            work_scope_id: persisted
+                .scope_ref
+                .as_ref()
+                .map(|scope| scope.as_str().to_owned()),
+            lease_attempt_id: persisted
                 .attempt
                 .as_ref()
                 .map(|attempt| attempt.attempt_id.clone()),
-            fencing_generation: body
+            fencing_generation: persisted
                 .attempt
                 .as_ref()
                 .map(|attempt| attempt.fencing_generation),
@@ -307,7 +309,12 @@ impl TraceManifest {
             policy_snapshot,
             active_view_packet_manifest: None,
             verifier_result: None,
-            result_digest: Some(body.result_digest.clone()),
+            result_digest: persisted.result_digest.clone(),
+            result_bytes_retained: persisted.result_response.is_some(),
+            result_receipt: persisted
+                .result_lineage
+                .as_ref()
+                .and_then(|lineage| lineage.semantic_receipt_ref.clone()),
             durable_state: Some(format!("{:?}", persisted.state)),
             finish: TraceFinish::VerifiedComplete,
             missing_parts: Vec::new(),
@@ -347,7 +354,7 @@ impl TraceManifest {
                     && record.lineage.operation_id.as_deref() == Some(operation_id)
             })
             .and_then(|record| serde_json::from_value(record.event_body.clone()).ok())
-            .filter(Self::records_supported_completion)
+            .filter(|manifest| manifest.records_supported_completion(operation_id))
     }
 
     /// Returns true when the recorded completion claim is carried by the
@@ -359,9 +366,19 @@ impl TraceManifest {
     /// serves an unqualified success. A recorded degraded or partial
     /// classification over complete slots is conservative, never an
     /// over-claim, so it is served as recorded.
-    fn records_supported_completion(&self) -> bool {
-        self.format_version == TRACE_MANIFEST_FORMAT_VERSION
-            && (!self.finish.is_complete() || self.missing_parts().is_empty())
+    fn records_supported_completion(&self, operation_id: &str) -> bool {
+        if self.format_version != TRACE_MANIFEST_FORMAT_VERSION
+            || operation_id.trim().is_empty()
+            || self.operation_id.trim().is_empty()
+            || self.operation_id != operation_id
+        {
+            return false;
+        }
+
+        let missing = self.missing_parts();
+        self.missing_parts == missing
+            && self.unavailable == self.unavailable_parts()
+            && (!self.finish.is_complete() || missing.is_empty())
     }
 
     /// Returns the required slots with no value, in stable order.
@@ -382,21 +399,52 @@ impl TraceManifest {
     /// Returns true when one required slot carries a value.
     fn required_slot_present(&self, slot: &str) -> bool {
         match slot {
-            "action_contract" => self.capability.is_some() && self.payload_digest.is_some(),
+            "retained_owner_row" => {
+                nonblank(&self.operation_id)
+                    && self
+                        .retained_request_digest
+                        .as_deref()
+                        .is_some_and(nonblank)
+            }
+            "action_contract" => {
+                self.capability.as_deref().is_some_and(nonblank)
+                    && self.action_contract_ref.as_deref().is_some_and(nonblank)
+                    && self.payload_digest.as_deref().is_some_and(nonblank)
+                    && self.admitted_payload_retained
+            }
             "state_fence" => self.state_fence.is_some(),
+            "active_view_packet_manifest" => self
+                .active_view_packet_manifest
+                .as_deref()
+                .is_some_and(nonblank),
+            "principal" => self.principal.as_deref().is_some_and(nonblank),
             // A1 names caller AND session: the presenting transport
             // connection alone does not identify the semantic caller, so
             // withholding the session leaves the slot absent.
-            "caller_session" => self.connection_id.is_some() && self.session_id.is_some(),
-            "lease" => self.lease_attempt_id.is_some(),
-            "requested_route" => self.requested_route.is_some(),
-            "actual_route" => self.actual_route.is_some(),
-            "invoked_operation" => self.invoked_operation.is_some(),
-            "input_handle" => self.input_handle.is_some(),
-            "output_handle" => self.output_handle.is_some(),
-            "side_effects" => self.side_effects.is_some(),
-            "adapter_identity" => self.adapter_identity.is_some(),
-            "result_receipt" => self.result_digest.is_some() && self.durable_state.is_some(),
+            "caller_session" => {
+                self.connection_id.as_deref().is_some_and(nonblank)
+                    && self.session_id.as_deref().is_some_and(nonblank)
+            }
+            "lease" => {
+                self.lease_attempt_id.as_deref().is_some_and(nonblank)
+                    && self.fencing_generation.is_some()
+            }
+            "policy_snapshot" => self.policy_snapshot.as_deref().is_some_and(nonblank),
+            "requested_route" => self.requested_route.as_deref().is_some_and(nonblank),
+            "actual_route" => self.actual_route.as_deref().is_some_and(nonblank),
+            "invoked_operation" => self.invoked_operation.as_deref().is_some_and(nonblank),
+            "input_handle" => self.input_handle.as_deref().is_some_and(nonblank),
+            "output_handle" => self.output_handle.as_deref().is_some_and(nonblank),
+            "side_effects" => self.side_effects.as_deref().is_some_and(nonblank),
+            "adapter_identity" => self.adapter_identity.as_deref().is_some_and(nonblank),
+            "executor_identity" => self.executor_identity.as_deref().is_some_and(nonblank),
+            "result_receipt" => {
+                self.result_digest.as_deref().is_some_and(nonblank)
+                    && self.result_bytes_retained
+                    && self.result_receipt.as_deref().is_some_and(nonblank)
+                    && self.durable_state.as_deref().is_some_and(nonblank)
+            }
+            "verifier_result" => self.verifier_result.as_deref().is_some_and(nonblank),
             _ => false,
         }
     }
@@ -419,5 +467,121 @@ impl TraceManifest {
             }
         }
         unavailable
+    }
+}
+
+fn nonblank(value: &str) -> bool {
+    !value.trim().is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TRACE_MANIFEST_FORMAT_VERSION, TraceFinish, TraceManifest};
+    use crate::kernel_audit::{
+        AuditAssuranceClass, AuditCaptureMode, AuditEventKind, AuditLineage, AuditRecord,
+    };
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
+    use std::num::NonZeroU64;
+
+    fn state_fence() -> StateFence {
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("valid epoch lineage");
+        let epoch = EpochId::new(lineage, NonZeroU64::new(7).expect("nonzero epoch"))
+            .expect("valid epoch");
+        StateFence::new(epoch, ResourceGeneration::new(3).expect("nonzero generation"))
+    }
+
+    fn absent_evidence_manifest() -> TraceManifest {
+        TraceManifest {
+            format_version: TRACE_MANIFEST_FORMAT_VERSION,
+            trace_id: "request:trace-test".to_owned(),
+            operation_id: "hostreq:trace-test".to_owned(),
+            retained_request_digest: Some("request-digest".to_owned()),
+            lane: Some("query".to_owned()),
+            capability: Some("eliot.query".to_owned()),
+            action_contract_ref: Some("eliot.query.v1".to_owned()),
+            admitted_payload_retained: true,
+            payload_digest: Some("payload-digest".to_owned()),
+            state_fence: Some(state_fence()),
+            connection_id: Some("connection:trace-test".to_owned()),
+            session_id: Some("session:trace-test".to_owned()),
+            task_id: None,
+            work_scope_id: None,
+            lease_attempt_id: Some("attempt:trace-test".to_owned()),
+            fencing_generation: Some(1),
+            authority_epoch: Some("550e8400-e29b-41d4-a716-446655440000:7".to_owned()),
+            module_generation: Some("3".to_owned()),
+            requested_route: Some("eliot.query".to_owned()),
+            actual_route: Some("route-receipt".to_owned()),
+            invoked_operation: Some("local_read".to_owned()),
+            input_handle: Some("request-digest".to_owned()),
+            output_handle: Some("result-digest".to_owned()),
+            adapter_identity: Some("adapter:trace-test".to_owned()),
+            executor_identity: Some("executor:trace-test".to_owned()),
+            side_effects: Some("none".to_owned()),
+            principal: None,
+            policy_snapshot: None,
+            active_view_packet_manifest: None,
+            verifier_result: None,
+            result_digest: Some("result-digest".to_owned()),
+            result_bytes_retained: true,
+            result_receipt: None,
+            durable_state: Some("ResultReceived".to_owned()),
+            finish: TraceFinish::DegradedNoProof,
+            missing_parts: Vec::new(),
+            unavailable: Vec::new(),
+        }
+    }
+
+    fn seal_record(manifest: &TraceManifest) -> AuditRecord {
+        let mut lineage = AuditLineage::empty();
+        lineage.operation_id = Some(manifest.operation_id.clone());
+        AuditRecord {
+            format_version: 1,
+            chain_id: "chain:trace-test".to_owned(),
+            seq: 1,
+            prev_hash: "0".repeat(64),
+            kind: AuditEventKind::TRACE_MANIFEST_SEALED.to_owned(),
+            lineage,
+            event_digest: "event-digest".to_owned(),
+            event_body: serde_json::to_value(manifest).expect("manifest serializes"),
+            assurance: AuditAssuranceClass::Critical,
+            capture_mode: AuditCaptureMode::Full,
+            emitted_at_ms: 1,
+            current_hash: "record-hash".to_owned(),
+        }
+    }
+
+    #[test]
+    fn find_sealed_replays_degraded_manifest_with_exact_missing_evidence() {
+        let mut manifest = absent_evidence_manifest();
+        manifest.missing_parts = manifest.missing_parts();
+        manifest.unavailable = manifest.unavailable_parts();
+        let records = [seal_record(&manifest)];
+
+        let replay = TraceManifest::find_sealed(&records, &manifest.operation_id)
+            .expect("honest degraded trace remains replayable");
+
+        assert_eq!(replay.finish, TraceFinish::DegradedNoProof);
+        assert_eq!(replay, manifest);
+        assert!(replay.state_fence.is_some());
+        for required in ["principal", "active_view_packet_manifest", "verifier_result"] {
+            assert!(replay.missing_parts.iter().any(|part| part == required));
+        }
+    }
+
+    #[test]
+    fn find_sealed_refuses_withheld_required_evidence_claimed_complete() {
+        let mut manifest = absent_evidence_manifest();
+        manifest.finish = TraceFinish::VerifiedComplete;
+        manifest.missing_parts.clear();
+        manifest.unavailable = manifest.unavailable_parts();
+        let records = [seal_record(&manifest)];
+
+        assert!(TraceManifest::find_sealed(&records, &manifest.operation_id).is_none());
+
+        manifest.operation_id.clear();
+        let records = [seal_record(&manifest)];
+        assert!(TraceManifest::find_sealed(&records, "hostreq:trace-test").is_none());
     }
 }

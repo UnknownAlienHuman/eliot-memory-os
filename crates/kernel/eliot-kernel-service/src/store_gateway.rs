@@ -4232,6 +4232,7 @@ impl KernelStoreGateway {
                 obligation.kind.capability_ref().to_owned(),
             )?,
             fence_digest,
+            admitted_state_fence: Some(sealed.context.state_fence.clone()),
             authority_epoch: sealed.context.state_fence.authority_epoch.clone(),
             generation: sealed.context.state_fence.resource_generation.value(),
             deadline_unix_ms: observed_unix_ms,

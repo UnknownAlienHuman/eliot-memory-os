@@ -37345,6 +37345,7 @@ mod host_request_result_tests {
             scope_ref: None,
             capability_ref: label("eliot.query"),
             fence_digest: "c".repeat(64),
+            admitted_state_fence: None,
             authority_epoch: test_epoch(),
             generation: 1,
             deadline_unix_ms: 9_999_999,

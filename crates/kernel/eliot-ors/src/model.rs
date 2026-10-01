@@ -7968,6 +7968,15 @@ pub struct HostRequestRecord {
     pub scope_ref: Option<OpaqueLabel>,
     pub capability_ref: OpaqueLabel,
     pub fence_digest: String,
+    /// Original admitted request fence snapshot when retained with the row.
+    ///
+    /// Historical rows may omit this field; absence leaves replay without the
+    /// original State Fence and must never be filled from a current Session.
+    /// When present, validation checks its canonical digest against the
+    /// original `fence_digest` without replacing that recorded identity.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admitted_state_fence: Option<StateFence>,
     /// Lineage-aware authority epoch (Implements #64).
     ///
     /// Widened from the `u64` contour because `host_request_binding`
@@ -8088,6 +8097,10 @@ impl HostRequestRecord {
             && self.scope_ref == other.scope_ref
             && self.capability_ref == other.capability_ref
             && self.fence_digest == other.fence_digest
+            && Self::same_admitted_state_fence(
+                self.admitted_state_fence.as_ref(),
+                other.admitted_state_fence.as_ref(),
+            )
             && self.authority_epoch == other.authority_epoch
             && self.generation == other.generation
             && self.deadline_unix_ms == other.deadline_unix_ms
@@ -8100,6 +8113,15 @@ impl HostRequestRecord {
     /// W2 binding existed, never a changed schema: only two present but
     /// different schemas disagree.
     fn same_payload_schema(left: Option<&OpaqueLabel>, right: Option<&OpaqueLabel>) -> bool {
+        match (left, right) {
+            (Some(left), Some(right)) => left == right,
+            _ => true,
+        }
+    }
+
+    /// A historical row may lack the retained original snapshot. Two present
+    /// snapshots must agree; the digest binding is always compared separately.
+    fn same_admitted_state_fence(left: Option<&StateFence>, right: Option<&StateFence>) -> bool {
         match (left, right) {
             (Some(left), Some(right)) => left == right,
             _ => true,
@@ -8121,6 +8143,24 @@ impl HostRequestRecord {
         }
         validate_text(self.capability_ref.as_str(), "host_request_capability_ref")?;
         validate_digest(&self.fence_digest, "host_request_fence_digest")?;
+        if let Some(fence) = &self.admitted_state_fence {
+            let canonical = canonical_json_bytes(fence)
+                .map_err(|error| OrsError::Encoding(error.to_string()))?;
+            if sha256_hex(&canonical) != self.fence_digest {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_admitted_state_fence",
+                    reason: "original admitted fence does not match the recorded fence digest",
+                });
+            }
+            if fence.authority_epoch != self.authority_epoch
+                || fence.resource_generation.value() != self.generation
+            {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_admitted_state_fence",
+                    reason: "original admitted fence epoch or generation does not match the row",
+                });
+            }
+        }
         // `EpochId` is always validated; only generation retains a scalar check.
         if self.generation == 0 {
             return Err(OrsError::InvalidField {
