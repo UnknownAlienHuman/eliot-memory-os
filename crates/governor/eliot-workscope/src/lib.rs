@@ -939,10 +939,10 @@ pub fn resolve_bridge_ingest_disclosure(
             side: BRIDGE_INGEST_WITHHELD_RETENTION_TERMS_UNDECIDED,
         });
     }
-    if let Some(class) = source_class {
-        if recipient_grant.iter().any(|granted| granted == class) {
-            return Ok(BridgeIngestDisclosure::Admitted);
-        }
+    if let Some(class) = source_class
+        && recipient_grant.iter().any(|granted| granted == class)
+    {
+        return Ok(BridgeIngestDisclosure::Admitted);
     }
     let side = if recipient_grant.is_empty() {
         BRIDGE_INGEST_WITHHELD_RECIPIENT_GRANT_EMPTY
