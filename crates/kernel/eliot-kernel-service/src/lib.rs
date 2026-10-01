@@ -273,7 +273,7 @@ pub use store_write_reservation::{
 };
 pub use store_write_status::{
     CanonicalStoreWriteStatus, CanonicalStoreWriteStatusRefusal,
-    project_canonical_store_write_status,
+    project_canonical_store_write_status, project_canonical_store_write_status_from_journal,
 };
 pub use testd_front_door::{
     AuthenticatedTestdSession, TESTD_ADMISSION_ADVERTISED, TESTD_ADMISSION_WIRE_ID,
