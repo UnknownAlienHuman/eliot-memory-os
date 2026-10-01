@@ -503,7 +503,9 @@ impl RecoveryRecord {
         Ok(())
     }
 
-    fn validate_for_fence(&self, expected: &StateFence) -> Result<(), StoreError> {
+    /// Validates this existing durable record and its exact independently
+    /// supplied fence without replacing or recomputing its recorded digest.
+    pub fn validate_for_fence(&self, expected: &StateFence) -> Result<(), StoreError> {
         self.validate()?;
         ensure_same_fence(expected, &self.state_fence)
     }
@@ -717,6 +719,11 @@ impl StoreGenesisRequest {
 #[serde(deny_unknown_fields)]
 pub struct StoreWorkScopeOwnerRequest {
     pub contract_version: ContractVersion,
+    /// Exact original Task Controller operation identity retained by Kernel.
+    /// This is distinct from the daemon publisher's `RequestMeta.request_id`.
+    pub operation_id: OperationId,
+    /// Exact original Host idempotency key, independently rechecked by Kernel.
+    pub idempotency_key: String,
     pub state_fence: StateFence,
     /// Protected Kernel launch digest carried by the authenticated owner
     /// admission. Kernel verifies it against the active protected handoff;
@@ -740,8 +747,8 @@ impl StoreWorkScopeOwnerRequest {
             .map_err(|error| StoreError::Serialization(error.to_string()))
     }
 
-    /// Computes the canonical request hash over the exact admitted owner
-    /// record, protected launch digest, fence and expected current revision.
+    /// Computes the canonical request hash over every owner-CAS field,
+    /// including the original operation and idempotency identities.
     pub fn compute_digest(&self) -> Result<String, StoreError> {
         Ok(sha256_hex(&self.canonical_unsigned_bytes()?))
     }
@@ -761,6 +768,8 @@ impl StoreWorkScopeOwnerRequest {
         self.state_fence
             .validate()
             .map_err(StoreError::Foundation)?;
+        validate_text(self.operation_id.as_str(), "operation_id")?;
+        validate_text(&self.idempotency_key, "idempotency_key")?;
         if self.state_fence != context.state_fence {
             return Err(StoreError::FenceMismatch);
         }
