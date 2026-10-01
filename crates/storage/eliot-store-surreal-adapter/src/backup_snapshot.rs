@@ -516,9 +516,9 @@ pub(crate) enum CanonicalSourceClass {
     /// generation's own baseline.
     ///
     /// `SurrealAdapterConfig::validate` pins `expected_schema_generation` to
-    /// `GENERATION_V2` today, and the v2 baseline (`schema.rs`) defines exactly
-    /// the eleven tables this enumeration reads: the two
-    /// [`CanonicalSourceClass::CapturePoint`] rows plus the nine
+    /// `GENERATION_V3`, and the v3 baseline (`schema.rs`) defines exactly the
+    /// thirteen tables this enumeration reads: the two
+    /// [`CanonicalSourceClass::CapturePoint`] rows plus the eleven
     /// [`CanonicalSourceClass::Member`] rows. The twelve classes below are not
     /// among them. Reading a table the admitted generation does not define
     /// inside one `BEGIN … COMMIT` batch aborts the whole transaction (see the
@@ -530,12 +530,15 @@ pub(crate) enum CanonicalSourceClass {
     /// owner's own table list.
     ///
     /// This disposition is a property of the *admitted* generation, not of the
-    /// table. The additive v3 baseline re-defines `erasure_intent` and
-    /// `erasure_outcome`, so under a v3 pin those two rows are no longer outside
-    /// the admitted generation and the census refuses that pin instead of
-    /// dropping the erasure ledger from a v3 store's capture; a bridge that
-    /// admits v3 must give them captured [`CanonicalSourceClass::Member`]
-    /// dispositions first.
+    /// table. The two erasure tables were the rows that made it so: they are
+    /// defined only from the v3 baseline onward, so while the owner pinned the
+    /// second generation they had to be declared here, and moving the pin to the
+    /// third generation required promoting them to captured
+    /// [`CanonicalSourceClass::Member`] rows in the same change. A future
+    /// generation that adds a table this enumeration reads as declared-not-
+    /// admitted must promote it here first, or `verify_canonical_source_classes`
+    /// will refuse the pin — which is the intended direction of failure: the
+    /// census refuses rather than silently dropping a real table from a capture.
     OutsideAdmittedGeneration {
         /// Physical table name owned by [`crate::schema`].
         table: &'static str,
@@ -649,12 +652,38 @@ pub(crate) const CANONICAL_SOURCE_CLASSES: &[CanonicalSourceClass] = &[
         table: crate::schema::table::CANONICAL_FENCE,
         statement: crate::schema::READ_FENCE,
     },
-    CanonicalSourceClass::OutsideAdmittedGeneration {
+    // The privacy purge ledger, captured as two whole canonical records. Both
+    // rows are `Record` members: each is read in full inside the same bounded
+    // `BEGIN`/`COMMIT` member batch as every other captured class, and each
+    // carries its own `scope_id` column in the admitted generation's baseline —
+    // the intent row the frozen scope was admitted on, and the sealed outcome
+    // row's own verbatim copy of it. `SnapshotMemberType::Reference` is
+    // deliberately NOT used for either: a reference member is a typed edge whose
+    // entire content is a pointer into another captured class (see
+    // `relation_record`), while an erasure row carries the surfaces, subjects
+    // and per-surface outcomes that are the ledger's own evidence and would be
+    // lost if the row were read as an edge. `digest_field` is `None` because
+    // neither row carries a store-owned `value_digest`, so the member digest is
+    // over its own captured canonical bytes rather than a carried-forward
+    // owner-issued digest.
+    CanonicalSourceClass::Member(MemberClass {
+        token: "erasure-intent",
         table: crate::schema::table::ERASURE_INTENT,
-    },
-    CanonicalSourceClass::OutsideAdmittedGeneration {
+        member_type: SnapshotMemberType::Record,
+        domain: BlobResidencyDomain::InlineCanonical,
+        key_fields: &["operation_id"],
+        digest_field: None,
+        reference: None,
+    }),
+    CanonicalSourceClass::Member(MemberClass {
+        token: "erasure-outcome",
         table: crate::schema::table::ERASURE_OUTCOME,
-    },
+        member_type: SnapshotMemberType::Record,
+        domain: BlobResidencyDomain::InlineCanonical,
+        key_fields: &["operation_id"],
+        digest_field: None,
+        reference: None,
+    }),
     CanonicalSourceClass::OutsideAdmittedGeneration {
         table: crate::schema::table::NOTIFICATION_RECORD,
     },
@@ -760,12 +789,12 @@ fn admitted_generation_ddl(generation: &str) -> Option<&'static str> {
 /// before any provider I/O. The marker carries the trailing space, so
 /// `relation_record_extra` can never satisfy `relation_record`.
 ///
-/// The v3 baseline is additive over v2 and re-defines the two erasure tables, so
-/// a bridge that ever admits v3 must give those two classes a captured
-/// disposition instead of the declared-outside one they carry today; until it
-/// does, `verify_canonical_source_classes` refuses that pin as the composition
-/// defect it is, rather than reading v2's baseline and silently omitting the
-/// erasure ledger from a v3 store's capture.
+/// The third-generation baseline is additive over the second and defines the
+/// two erasure tables, which is why those two classes are captured members
+/// here: the pin and the census were moved together, so the baseline this
+/// function reads declares every table the member rows above claim. A generation
+/// that added a table this enumeration reads as declared-not-admitted would be
+/// refused here rather than captured against a baseline that does not define it.
 fn admitted_generation_defines(ddl: &'static str, table: &str) -> bool {
     let marker = format!("DEFINE TABLE {table} ");
     ddl.contains(&marker)
@@ -2034,7 +2063,7 @@ fn check_active_source_identity(
 ///
 /// The gap this leaves is real and is not papered over: no owner-issued live
 /// resource-generation counter exists to observe. `SurrealAdapterConfig` holds
-/// `SchemaGeneration`, a migration version *string* pinned to `GENERATION_V2`
+/// `SchemaGeneration`, a migration version *string* pinned to one generation
 /// (`config.rs`), not a counter, and the store API carries no such field on
 /// `SnapshotSourceIdentity`'s provider side. Binding a claimed generation to
 /// an independently observed provider counter needs a contract owner outside

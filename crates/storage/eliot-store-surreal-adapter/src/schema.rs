@@ -171,6 +171,13 @@ pub(crate) const MIGRATION_ID_V1_TO_V2: &str = "eliot.store.surreal.schema.v1_to
 /// Additive erasure-table migration: creates only `erasure_intent` and
 /// `erasure_outcome` on top of a v2 baseline (688-B).
 pub(crate) const MIGRATION_ID_V2_TO_V3: &str = "eliot.store.surreal.schema.v2_to_v3";
+/// Third-generation fresh-database baseline: the complete assembled schema,
+/// applied only as the one plan an empty database admits at generation 3.
+///
+/// A store that already carries a `schema_meta` row never uses this identity;
+/// it reaches generation 3 through `MIGRATION_ID_V2_TO_V3` so its recorded
+/// history stays the chain it actually walked.
+pub(crate) const MIGRATION_ID_V3: &str = "eliot.store.surreal.schema.v3";
 /// Schema generation reached by the erasure-table migration. The tables are
 /// additive, so v3 contains every v2 table verbatim plus the two erasure
 /// tables below.

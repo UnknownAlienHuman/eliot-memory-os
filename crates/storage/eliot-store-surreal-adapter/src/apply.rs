@@ -292,13 +292,17 @@ fn migration_preflight(
 ) -> Result<MigrationPreflight, AdapterError> {
     admit_migration(migration)?;
     let Some(record) = record else {
-        if migration.migration_id == schema::MIGRATION_ID_V2
-            && migration.generation_after.as_str() == schema::GENERATION_V2
+        // An empty database admits exactly one plan: the fresh-database
+        // baseline for the pinned generation. The identity is compared against
+        // the published constant rather than matched loosely, so a delta plan or
+        // a baseline for another generation cannot bootstrap an empty database.
+        if migration.migration_id == schema::MIGRATION_ID_V3
+            && migration.generation_after.as_str() == schema::GENERATION_V3
         {
             return Ok(MigrationPreflight::Empty);
         }
         return Err(AdapterError::Config(
-            "empty database admits exactly the v2 initial plan".to_owned(),
+            "empty database admits exactly the pinned generation's baseline plan".to_owned(),
         ));
     };
     if record.migration_state == schema::MIGRATION_STATE_APPLYING {
@@ -343,6 +347,28 @@ fn migration_preflight(
             return Err(AdapterError::PartialOutcome);
         }
         return Ok(MigrationPreflight::V1ToV2);
+    }
+    // The forward step into the generation the capture census is built for. The
+    // recorded row has already been validated as a complete admitted v2 record
+    // by `validate_schema_meta_record` above, so the head it carries is one of
+    // the two admitted ways of reaching generation 2; this arm compares the
+    // plan against the generation the row actually recorded rather than
+    // assuming a particular v2 route, because a store may have reached
+    // generation 2 either by the fresh-database baseline or by the v1-to-v2
+    // delta and both are admitted predecessors of the same step.
+    if record.generation == schema::GENERATION_V2
+        && record.migrations.len() == 2
+        && migration.generation_after.as_str() == schema::GENERATION_V3
+        && schema_inventory::required_predecessor_generation(&migration.migration_id)
+            == Some(schema::GENERATION_V2)
+    {
+        let recorded_head = &record.migrations[1];
+        if recorded_head.generation != schema::GENERATION_V2
+            || migration.predecessor_generation.as_deref() != Some(schema::GENERATION_V2)
+        {
+            return Err(AdapterError::PartialOutcome);
+        }
+        return Ok(MigrationPreflight::V2ToV3);
     }
     Err(AdapterError::Config(
         "schema migration identity does not match the admitted plan".to_owned(),
@@ -744,7 +770,9 @@ async fn apply_migration_direct(
         MigrationPreflight::Empty => {
             handle_empty_migration(db, &adapter.config, migration, state_fence, &updated_at).await
         }
-        MigrationPreflight::V1ToV2 | MigrationPreflight::IntentRecorded => {
+        MigrationPreflight::V1ToV2
+        | MigrationPreflight::V2ToV3
+        | MigrationPreflight::IntentRecorded => {
             let fence = read_fence(db, &adapter.config).await?;
             let Some(fence) = fence else {
                 return Err(AdapterError::PartialOutcome);

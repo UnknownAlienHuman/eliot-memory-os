@@ -590,8 +590,15 @@ impl SurrealStoreAdapter {
     /// Builds the first-generation schema migration for the given target
     /// generation. The composition owner applies it through
     /// [`SurrealStoreAdapter::apply_migration`] under migration authority.
+    ///
+    /// This is the fresh-database baseline only: it is admitted for a database
+    /// that carries no `schema_meta` row at all. A store that already carries
+    /// one is not bootstrapped by this constructor and must be moved forward by
+    /// the explicit forward step for its recorded generation.
     pub fn initial_schema_migration(generation: SchemaGeneration) -> CompiledMigration {
-        if generation.as_str() == schema::GENERATION_V2 {
+        if generation.as_str() == schema::GENERATION_V3 {
+            CompiledMigration::new(schema::MIGRATION_ID_V3, schema::SCHEMA_DDL_V3, generation)
+        } else if generation.as_str() == schema::GENERATION_V2 {
             CompiledMigration::new(schema::MIGRATION_ID_V2, schema::SCHEMA_DDL_V2, generation)
         } else {
             CompiledMigration::new(schema::MIGRATION_ID_V1, schema::SCHEMA_DDL, generation)
@@ -608,8 +615,28 @@ impl SurrealStoreAdapter {
         )
     }
 
-    /// Builds the v2 baseline migration (full schema). Empty databases admit
-    /// exactly this plan.
+    /// Builds the additive v2-to-v3 forward migration. The delta DDL creates
+    /// only the two erasure tables, and the sealed outcome row it defines
+    /// carries the same `scope_id` the intent opened the transaction with, so a
+    /// capture of generation 3 can attribute a purge to the scope whose data it
+    /// purged.
+    ///
+    /// This is the only admitted plan that reaches the generation
+    /// `SurrealAdapterConfig` pins, so a store still at generation 2 reaches
+    /// generation 3 through this plan under migration authority and never by a
+    /// second baseline.
+    pub fn v2_to_v3_migration() -> CompiledMigration {
+        CompiledMigration::new(
+            schema::MIGRATION_ID_V2_TO_V3,
+            schema::SCHEMA_MIGRATION_V2_TO_V3_DDL,
+            SchemaGeneration::v3(),
+        )
+    }
+
+    /// Builds the v2 baseline migration (full schema). This is the forward route
+    /// for a store still at generation 1 and the empty-database route for the
+    /// generation below the pinned one; a store at the pinned generation is not
+    /// bootstrapped by it.
     pub fn v2_baseline_migration() -> CompiledMigration {
         CompiledMigration::new(
             schema::MIGRATION_ID_V2,

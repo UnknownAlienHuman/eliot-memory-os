@@ -41,6 +41,10 @@ impl SchemaGeneration {
         Self("2.0.0".to_owned())
     }
 
+    pub fn v3() -> Self {
+        Self(crate::schema::GENERATION_V3.to_owned())
+    }
+
     /// Returns the stable generation identifier text.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -242,7 +246,19 @@ impl SurrealAdapterConfig {
                 expected: PINNED_SURREALDB_MAJOR,
             });
         }
-        if self.expected_schema_generation.as_str() != crate::schema::GENERATION_V2 {
+        // The pin names the ONE generation this adapter's capture census is built
+        // for, and `CANONICAL_SOURCE_CLASSES` in `backup_snapshot` is a `const`
+        // classified against that one generation's baseline: every class holds a
+        // single disposition, and `verify_canonical_source_classes` proves each
+        // one against `expected_schema_generation`. Admitting a set here would
+        // therefore admit a configuration that constructs successfully and is
+        // then refused at capture, which is a worse failure than refusing it
+        // here. A store still at the generation below is migrated forward by
+        // the explicit `v2_to_v3_migration` plan under migration authority
+        // before this adapter will admit it: nothing here waives the migration,
+        // and `validate_schema_meta_record` refuses a v3 `schema_meta` row whose
+        // history is not the full admitted v1 -> v2 -> v3 chain.
+        if self.expected_schema_generation.as_str() != crate::schema::GENERATION_V3 {
             return Err(ConfigError::InvalidField {
                 field: "expected_schema_generation",
             });

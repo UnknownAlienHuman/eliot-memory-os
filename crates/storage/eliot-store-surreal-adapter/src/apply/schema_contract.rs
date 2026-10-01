@@ -42,6 +42,12 @@ pub(super) enum MigrationPreflight {
     Empty,
     ExactReplay,
     V1ToV2,
+    /// The forward step from the second generation into the third, which is the
+    /// generation the capture census is built for. It reuses the same forward
+    /// transaction, intent record and predecessor compare-and-set as
+    /// [`MigrationPreflight::V1ToV2`]; only the generation the step starts from
+    /// differs, and it is compared against the row read back from the provider.
+    V2ToV3,
     /// The durable `schema_meta` row already carries this plan's intent, so
     /// this operation still owns the row and the DDL transaction it left
     /// uncommitted. The intent is written in its own committed transaction
@@ -63,21 +69,25 @@ pub(super) fn schema_meta_record(
     migration: &CompiledMigration,
     updated_at: &str,
 ) -> SchemaMetaRecord {
+    let head = || SchemaMigrationIdentity {
+        migration_id: migration.migration_id.clone(),
+        migration_checksum_sha256: migration.checksum_sha256.clone(),
+        generation: migration.generation_after.as_str().to_owned(),
+    };
     let migrations = if migration.generation_after.as_str() == schema::GENERATION_V2 {
-        vec![
-            v1_identity(),
-            SchemaMigrationIdentity {
-                migration_id: migration.migration_id.clone(),
-                migration_checksum_sha256: migration.checksum_sha256.clone(),
-                generation: migration.generation_after.as_str().to_owned(),
-            },
-        ]
+        // A fresh second-generation baseline subsumes the first generation, so
+        // its recorded history starts at the first-generation identity.
+        vec![v1_identity(), head()]
+    } else if migration.generation_after.as_str() == schema::GENERATION_V3 {
+        // A fresh third-generation baseline subsumes both earlier generations,
+        // so its recorded history is the complete chain rather than only its
+        // own head. Each earlier entry is the identity that owner publishes for
+        // that generation, never this plan's own values, and the digests are the
+        // digests of the published DDL bodies. This is the same construction the
+        // second-generation case already used for the first generation.
+        vec![v1_identity(), v2_baseline_identity(), head()]
     } else {
-        vec![SchemaMigrationIdentity {
-            migration_id: migration.migration_id.clone(),
-            migration_checksum_sha256: migration.checksum_sha256.clone(),
-            generation: migration.generation_after.as_str().to_owned(),
-        }]
+        vec![head()]
     };
     SchemaMetaRecord {
         generation: migration.generation_after.as_str().to_owned(),
@@ -147,6 +157,58 @@ pub(super) fn applied_record_from_intent(intent: &SchemaMetaRecord) -> SchemaMet
         migration_checksum_sha256: intent.migration_checksum_sha256.clone(),
         updated_at: intent.updated_at.clone(),
     }
+}
+
+/// The identity a fresh second-generation baseline records for itself.
+///
+/// The digest is derived from the published baseline DDL, the same bytes the
+/// plan for that generation is built from, so the recorded entry is the owner's
+/// own identity rather than a value supplied by a caller.
+fn v2_baseline_identity() -> SchemaMigrationIdentity {
+    SchemaMigrationIdentity {
+        migration_id: schema::MIGRATION_ID_V2.to_owned(),
+        migration_checksum_sha256: eliot_store_api::sha256_hex(schema::SCHEMA_DDL_V2.as_bytes()),
+        generation: schema::GENERATION_V2.to_owned(),
+    }
+}
+
+/// Reports whether one recorded history entry is the admitted head of the
+/// second generation.
+///
+/// A store reaches generation 2 either by the fresh-database v2 baseline or by
+/// the additive v1-to-v2 delta, so the entry that closed generation 2 is one of
+/// exactly two admitted identities. Each is compared against the digest of the
+/// DDL bytes this owner publishes for it, so the expected pair is derived from
+/// [`crate::schema`] and never from the entry being checked: a third way of
+/// reaching generation 2 is a refusal rather than a silently widened case.
+///
+/// Both the second-generation record and the third-generation record below are
+/// checked against this one pair, so a v3 history carries the same v2 evidence
+/// a v2 record did rather than a restatement of it.
+fn is_admitted_v2_entry(entry: &SchemaMigrationIdentity) -> bool {
+    let full = eliot_store_api::sha256_hex(schema::SCHEMA_DDL_V2.as_bytes());
+    let delta = eliot_store_api::sha256_hex(schema::SCHEMA_MIGRATION_V1_TO_V2_DDL.as_bytes());
+    (entry.migration_id == schema::MIGRATION_ID_V2 && entry.migration_checksum_sha256 == full)
+        || (entry.migration_id == schema::MIGRATION_ID_V1_TO_V2
+            && entry.migration_checksum_sha256 == delta)
+}
+
+/// Reports whether one recorded history entry is the admitted head of the third
+/// generation.
+///
+/// Generation 3 has exactly two admitted routes into it — the additive v2-to-v3
+/// delta, which a store that already carries a row takes, and the third-
+/// generation fresh-database baseline, which only an empty database takes — so
+/// this is a pair rather than a single identity. Each entry is compared against
+/// the digest of the published DDL body it names, so the expected set is derived
+/// from [`crate::schema`] and never from the entry being checked.
+fn is_admitted_v3_entry(entry: &SchemaMigrationIdentity) -> bool {
+    let delta = eliot_store_api::sha256_hex(schema::SCHEMA_MIGRATION_V2_TO_V3_DDL.as_bytes());
+    let baseline = eliot_store_api::sha256_hex(schema::SCHEMA_DDL_V3.as_bytes());
+    (entry.migration_id == schema::MIGRATION_ID_V2_TO_V3
+        && entry.migration_checksum_sha256 == delta)
+        || (entry.migration_id == schema::MIGRATION_ID_V3
+            && entry.migration_checksum_sha256 == baseline)
 }
 
 pub(super) fn validate_schema_meta_record(record: &SchemaMetaRecord) -> Result<(), AdapterError> {
@@ -226,18 +288,44 @@ fn validate_schema_meta_record_in_state(
         {
             return Err(AdapterError::PartialOutcome);
         }
-        let v2_checksum_full = eliot_store_api::sha256_hex(schema::SCHEMA_DDL_V2.as_bytes());
-        let v2_checksum_delta =
-            eliot_store_api::sha256_hex(schema::SCHEMA_MIGRATION_V1_TO_V2_DDL.as_bytes());
         let last = &record.migrations[1];
         if last.generation != schema::GENERATION_V2 {
             return Err(AdapterError::PartialOutcome);
         }
-        if !(last.migration_id == schema::MIGRATION_ID_V2
-            && last.migration_checksum_sha256 == v2_checksum_full
-            || last.migration_id == schema::MIGRATION_ID_V1_TO_V2
-                && last.migration_checksum_sha256 == v2_checksum_delta)
+        if !is_admitted_v2_entry(last) {
+            return Err(AdapterError::PartialOutcome);
+        }
+        if record.migration_id != last.migration_id
+            || record.migration_checksum_sha256 != last.migration_checksum_sha256
         {
+            return Err(AdapterError::PartialOutcome);
+        }
+    } else if record.generation == schema::GENERATION_V3 {
+        // The third generation is additive over the second, so its history is
+        // the complete admitted v1 and v2 evidence plus exactly one v2-to-v3
+        // entry. Every position is compared against the published identity it
+        // must carry and the recorded head must equal the last entry, so a v3
+        // row can neither skip a generation nor claim a head the chain did not
+        // reach. A record of any other length, or whose second entry is not one
+        // of the two admitted ways of reaching generation 2, is refused rather
+        // than accepted as a shorter or differently-arrived history.
+        if record.migrations.len() != 3 {
+            return Err(AdapterError::PartialOutcome);
+        }
+        let first = &record.migrations[0];
+        let expected_v1 = v1_identity();
+        if first.migration_id != expected_v1.migration_id
+            || first.migration_checksum_sha256 != expected_v1.migration_checksum_sha256
+            || first.generation != expected_v1.generation
+        {
+            return Err(AdapterError::PartialOutcome);
+        }
+        let second = &record.migrations[1];
+        if second.generation != schema::GENERATION_V2 || !is_admitted_v2_entry(second) {
+            return Err(AdapterError::PartialOutcome);
+        }
+        let last = &record.migrations[2];
+        if !is_admitted_v3_entry(last) {
             return Err(AdapterError::PartialOutcome);
         }
         if record.migration_id != last.migration_id
