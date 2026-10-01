@@ -296,7 +296,7 @@ pub struct InstrumentStageRequest {
 
 /// Closed executable selector and argv copied from one compiled runner stage.
 ///
-/// The selector is a catalog identity (`cargo` or `cargo-nextest`), never a
+/// The selector is a catalog identity (`cargo`, `cargo-nextest`, or `dotnet`), never a
 /// filesystem path. The runtime resolves it only through owner-observed tool
 /// identities retained with the durable job.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -314,7 +314,7 @@ impl InstrumentStageCommand {
     /// Validates closed selector, argument bounds, and exact specification
     /// linkage without granting execution authority.
     pub fn validate_for(&self, stage: &InstrumentStageRequest) -> Result<(), TestdError> {
-        if !matches!(self.executable.as_str(), "cargo" | "cargo-nextest")
+        if !matches!(self.executable.as_str(), "cargo" | "cargo-nextest" | "dotnet")
             || self.argv.is_empty()
             || self.argv.len() > 64
             || self.argv.iter().any(|argument| {
@@ -2930,6 +2930,17 @@ impl TestdVerifierJobSubmission {
         })?;
         stage.validate()?;
         self.provider_tool_observation.validate()?;
+        if stage
+            .stage_command
+            .as_ref()
+            .is_some_and(|command| command.executable == "dotnet")
+            && self.provider_tool_observation.dotnet_path.is_none()
+        {
+            return Err(TestdError::Invalid {
+                field: "provider_tool_observation.dotnet",
+                reason: "dotnet stage requires its own owner-observed executable path and digest",
+            });
+        }
         EnvironmentProjection::new(
             self.provider_environment_projection.non_secret().clone(),
             self.provider_environment_projection.secret_refs().to_vec(),
@@ -3154,6 +3165,12 @@ pub struct TestdToolObservation {
     pub cargo_sha256: String,
     pub rustc_path: String,
     pub rustc_sha256: String,
+    /// Independently observed .NET CLI path when the admitted stage selects it.
+    #[serde(default)]
+    pub dotnet_path: Option<String>,
+    /// SHA-256 over the exact observed `dotnet` executable bytes.
+    #[serde(default)]
+    pub dotnet_sha256: Option<String>,
     pub selected_toolchain: String,
 }
 
@@ -3175,6 +3192,34 @@ impl TestdToolObservation {
                 return Err(TestdError::Invalid {
                     field,
                     reason: "owner-observed tool identity must use absolute traversal-free paths",
+                });
+            }
+        }
+        match (&self.dotnet_path, &self.dotnet_sha256) {
+            (Some(path), Some(digest)) => {
+                validate_text(path, "dotnet_path")?;
+                if !Path::new(path).is_absolute()
+                    || Path::new(path)
+                        .components()
+                        .any(|component| matches!(component, Component::ParentDir))
+                {
+                    return Err(TestdError::Invalid {
+                        field: "dotnet_path",
+                        reason: "owner-observed tool identity must use an absolute traversal-free path",
+                    });
+                }
+                if !is_binding_digest(digest) {
+                    return Err(TestdError::Invalid {
+                        field: "dotnet_sha256",
+                        reason: "owner-observed tool identity requires a lowercase SHA-256",
+                    });
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(TestdError::Invalid {
+                    field: "dotnet_tool_observation",
+                    reason: "dotnet path and digest must be present together",
                 });
             }
         }
@@ -3231,6 +3276,12 @@ impl TestdProcessToolIntent {
         }
         let cargo = validate_canonical_tool_file(&self.observation.cargo_path)?;
         let rustc = validate_canonical_tool_file(&self.observation.rustc_path)?;
+        let dotnet = self
+            .observation
+            .dotnet_path
+            .as_deref()
+            .map(validate_canonical_tool_file)
+            .transpose()?;
         for (path, expected) in [
             (&nextest, self.observation.nextest_sha256.as_str()),
             (&cargo, self.observation.cargo_sha256.as_str()),
@@ -3243,6 +3294,21 @@ impl TestdProcessToolIntent {
             if eliot_contracts::sha256_hex(&bytes) != expected {
                 return Err(TestdError::Invalid {
                     field: "process_tool.executable",
+                    reason: "owner-observed tool bytes changed before admission",
+                });
+            }
+        }
+        if let (Some(path), Some(expected)) = (
+            dotnet.as_ref(),
+            self.observation.dotnet_sha256.as_deref(),
+        ) {
+            let bytes = std::fs::read(path).map_err(|_| TestdError::Invalid {
+                field: "process_tool.dotnet",
+                reason: "owner-observed tool cannot be reread before admission",
+            })?;
+            if eliot_contracts::sha256_hex(&bytes) != expected {
+                return Err(TestdError::Invalid {
+                    field: "process_tool.dotnet",
                     reason: "owner-observed tool bytes changed before admission",
                 });
             }
@@ -3287,6 +3353,11 @@ impl TestdProcessToolIntent {
         let expected_dirs: BTreeSet<PathBuf> = [&nextest, &cargo, &rustc]
             .into_iter()
             .filter_map(|path| path.parent().map(Path::to_path_buf))
+            .chain(
+                dotnet
+                    .as_ref()
+                    .and_then(|path| path.parent().map(Path::to_path_buf)),
+            )
             .collect();
         let path_value = std::env::join_paths(&expected_dirs).map_err(|_| TestdError::Invalid {
             field: "process_tool.PATH",
@@ -3324,6 +3395,13 @@ impl TestdProcessToolIntent {
             ("PATH".to_owned(), path_value),
             ("CARGO_TARGET_DIR".to_owned(), governed_root.clone()),
         ]);
+        if let (Some(path), Some(digest)) = (
+            self.observation.dotnet_path.as_ref(),
+            self.observation.dotnet_sha256.as_ref(),
+        ) {
+            values.insert("ELIOT_TESTD_DOTNET".to_owned(), path.clone());
+            values.insert("ELIOT_TESTD_DOTNET_SHA256".to_owned(), digest.clone());
+        }
         // Issue #1897 (W4/AUD2): the fixture namespace and the physical root it
         // resolves to travel into the child. Without them the child resolves an
         // ambient fixture location shared with every concurrent run, and the

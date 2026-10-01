@@ -1368,7 +1368,7 @@ impl KernelBlobStreamCallSequence {
             TestdIpcError::Transport("Blob operation sequence lock poisoned".to_owned())
         })?;
         let operation = BlobProcessStreamKernelOperationRequest::SourceReadback {
-            request: request.clone(),
+            request: Box::new(request.clone()),
         };
         match self.exchange_under_sequence(operation.clone()) {
             Err(TestdIpcError::BlobCallOperationConflict) => {

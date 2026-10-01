@@ -29,7 +29,10 @@ use eliot_instrument_api::{InstrumentInvocation, InstrumentKind};
 use eliot_instrument_cargo::{
     CONTRACT_NAME as CARGO_CONTRACT_NAME, CONTRACT_VERSION as CARGO_CONTRACT_VERSION,
 };
-use eliot_instrument_dotnet::{CONTRACT_ID as DOTNET_CONTRACT_ID, DOTNET_EXECUTABLE};
+use eliot_instrument_dotnet::{
+    CONTRACT_ID as DOTNET_CONTRACT_ID, DOTNET_EXECUTABLE, OUTPUT_EVALUATOR_ID,
+    OUTPUT_PARSER_ID,
+};
 use eliot_instrument_nextest::{MAX_NEXTEST_OUTPUT_BYTES, NEXTEST_INSTRUMENT};
 use eliot_instrument_rustc::{MAX_RUSTC_OUTPUT_BYTES, RUSTC_INSTRUMENT};
 use eliot_instrument_rustfmt::{MAX_RUSTFMT_OUTPUT_BYTES, RUSTFMT_INSTRUMENT};
@@ -1754,9 +1757,9 @@ fn dotnet_entry(
         environment_class: ISOLATED_PROCESS.to_owned(),
         resource_contract: resource_contract.to_owned(),
         cancellation_contract: cancellation_contract.to_owned(),
-        parser: diagnostic_id()?,
+        parser: contract_id(OUTPUT_PARSER_ID)?,
         normalizer: diagnostic_id()?,
-        evaluator: diagnostic_id()?,
+        evaluator: contract_id(OUTPUT_EVALUATOR_ID)?,
         evaluator_version: ContractVersion::new(1, 0, 0),
         normative_pair_digest: String::new(),
         verifier: verifier_id()?,
