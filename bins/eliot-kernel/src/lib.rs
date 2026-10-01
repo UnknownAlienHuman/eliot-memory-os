@@ -334,6 +334,7 @@ pub use health_view::KernelActivationView;
 mod host_request_route;
 #[cfg(windows)]
 mod hot_path_runtime;
+pub mod integration_apply;
 pub mod integration_candidate;
 pub mod integration_lease;
 pub mod integration_owner;
