@@ -2299,10 +2299,9 @@ mod tests {
         AttributedMemoryUseRecord, AttributedUseIdentity, AttributionCeiling, ComparisonBasis,
         CostEvidence, CostValueStatus, CoverageState, DecisionOpportunityDenominator,
         DeliveryExposureDisposition, DeliveryExposureEvidence, HarmDisposition,
-        IneligibleSubjectRef, InclusionDisposition, MemoryOutcome, MemoryOutcomeEconomicsRecord,
-        ObservableInfluence,
-        ObservationWindowSpec, ObservationWindowStatus, ProtectedRole, RegretDisposition,
-        UseDisposition as AttributedUseDisposition,
+        InclusionDisposition, IneligibleSubjectRef, MemoryOutcome, MemoryOutcomeEconomicsRecord,
+        ObservableInfluence, ObservationWindowSpec, ObservationWindowStatus, ProtectedRole,
+        RegretDisposition, UseDisposition as AttributedUseDisposition,
     };
     use std::num::NonZeroU64;
 
@@ -2932,26 +2931,44 @@ mod tests {
         }
         request.attributed_evaluation.attributed_use.use_disposition =
             AttributedUseDisposition::QualifyingNonUse;
-        request.attributed_evaluation.attributed_use.observable_influence =
-            ObservableInfluence::NotObserved;
-        request.attributed_evaluation.attributed_use.qualifying_use_ref = None;
-        request.attributed_evaluation.attributed_use.disposition_reason =
-            Some("delivered in full and never observably used".to_owned());
+        request
+            .attributed_evaluation
+            .attributed_use
+            .observable_influence = ObservableInfluence::NotObserved;
+        request
+            .attributed_evaluation
+            .attributed_use
+            .qualifying_use_ref = None;
+        request
+            .attributed_evaluation
+            .attributed_use
+            .disposition_reason = Some("delivered in full and never observably used".to_owned());
         let result = propose_accessibility_or_influence_adjustment(&request)
             .expect("dormancy shortfall is an outcome");
         assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
         assert_ne!(result.outcome, AdjustmentOutcome::Complete);
         // The strongest canonical outcome still does not license global scope.
         let mut grounded = request.clone();
-        grounded.attributed_evaluation.attributed_use.use_disposition =
-            AttributedUseDisposition::QualifyingUse;
-        grounded.attributed_evaluation.attributed_use.observable_influence =
-            ObservableInfluence::ChangedDecisionOrAction;
-        grounded.attributed_evaluation.attributed_use.qualifying_use_ref =
-            Some("decision-action-1".to_owned());
-        grounded.attributed_evaluation.attributed_use.disposition_reason = None;
-        grounded.attributed_evaluation.attributed_use.attribution_ceiling =
-            AttributionCeiling::CompositeBenefit;
+        grounded
+            .attributed_evaluation
+            .attributed_use
+            .use_disposition = AttributedUseDisposition::QualifyingUse;
+        grounded
+            .attributed_evaluation
+            .attributed_use
+            .observable_influence = ObservableInfluence::ChangedDecisionOrAction;
+        grounded
+            .attributed_evaluation
+            .attributed_use
+            .qualifying_use_ref = Some("decision-action-1".to_owned());
+        grounded
+            .attributed_evaluation
+            .attributed_use
+            .disposition_reason = None;
+        grounded
+            .attributed_evaluation
+            .attributed_use
+            .attribution_ceiling = AttributionCeiling::CompositeBenefit;
         grounded.attributed_evaluation.outcome.outcome = MemoryOutcome::Improved;
         grounded.attributed_evaluation.outcome.attribution_ceiling =
             AttributionCeiling::CompositeBenefit;
@@ -3385,7 +3402,11 @@ mod tests {
         // An outcome claimed without the evidence that bounds it is an
         // unbounded claim, not a short success tally; it fails closed too.
         let mut over_outcome = valid_request();
-        over_outcome.attributed_evaluation.outcome.evidence_refs.clear();
+        over_outcome
+            .attributed_evaluation
+            .outcome
+            .evidence_refs
+            .clear();
         assert!(propose_accessibility_or_influence_adjustment(&over_outcome).is_err());
     }
 
@@ -4289,13 +4310,17 @@ mod tests {
         // The same ceiling from the outcome side.
         let mut over_outcome = valid_request();
         over_outcome.policy.max_evidence_items = 4;
-        over_outcome.attributed_evaluation.outcome.cost_evidence.push(CostEvidence {
-            component: "rework".to_owned(),
-            status: CostValueStatus::NotExposed,
-            value: None,
-            units: "not exposed".to_owned(),
-            source: "evaluation owner".to_owned(),
-        });
+        over_outcome
+            .attributed_evaluation
+            .outcome
+            .cost_evidence
+            .push(CostEvidence {
+                component: "rework".to_owned(),
+                status: CostValueStatus::NotExposed,
+                value: None,
+                units: "not exposed".to_owned(),
+                source: "evaluation owner".to_owned(),
+            });
         assert!(propose_accessibility_or_influence_adjustment(&over_outcome).is_err());
         let mut empty = valid_request();
         empty.affected.clear();
