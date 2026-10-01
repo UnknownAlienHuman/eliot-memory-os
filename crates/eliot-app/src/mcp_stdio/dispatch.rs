@@ -255,13 +255,38 @@ pub(super) async fn handle_message(
     correlation.emit();
     Some(match result {
         Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-        Err(error) => dispatch_error_response(&id, &error),
+        // A measurement that cannot be republished is not a tool diagnostic to
+        // render: the structured error body is itself the thing that would carry
+        // the bad figure. `dispatch_error_response` is fallible so that failure
+        // aborts instead of degrading to a saturated, defaulted or estimated
+        // number (W4/A16/A23), and that failure is reported as a JSON-RPC
+        // internal error - never as the `None` that means "not a JSON-RPC
+        // message", which would drop the response with no error at all.
+        Err(error) => dispatch_error_response(&id, &error).map_or_else(
+            |measurement_error| {
+                error_response(
+                    &id,
+                    -32603,
+                    &format!(
+                        "measurement could not be republished for this error: {measurement_error:#}"
+                    ),
+                )
+            },
+            |response| response,
+        ),
     })
 }
 
-fn dispatch_error_response(id: &Value, error: &anyhow::Error) -> Value {
+/// Build the JSON-RPC error body for one handler failure.
+///
+/// W4/A16/A23: fallible rather than total, because several arms republish
+/// engine-owned measurement figures (`estimated_tokens`, `section_tokens`, rows
+/// 783/15-783/16). A figure that cannot be represented in the published unit is
+/// a typed error that reaches the caller, never a saturation to `u64::MAX`,
+/// `/4`, a character count, zero or one.
+fn dispatch_error_response(id: &Value, error: &anyhow::Error) -> Result<Value> {
     if let Some(input) = error.downcast_ref::<eliot_types::ToolInputError>() {
-        error_response_with_data(id, -32602, "invalid tool input", &input.data)
+        Ok(error_response_with_data(id, -32602, "invalid tool input", &input.data))
     } else if let Some(eliot_engine::EngineError::EncodingRejected { violations }) =
         error.downcast_ref::<eliot_engine::EngineError>()
     {
@@ -284,7 +309,7 @@ fn dispatch_error_response(id: &Value, error: &anyhow::Error) -> Value {
                 .collect(),
             minimal_valid_example: Value::Null,
         };
-        error_response_with_data(id, -32602, "encoding rejected", &data)
+        Ok(error_response_with_data(id, -32602, "encoding rejected", &data))
     } else if matches!(
         error.downcast_ref::<eliot_engine::EngineError>(),
         Some(eliot_engine::EngineError::ObservabilityConflict)
@@ -295,7 +320,12 @@ fn dispatch_error_response(id: &Value, error: &anyhow::Error) -> Value {
             invalid: Vec::new(),
             minimal_valid_example: Value::Null,
         };
-        error_response_with_data(id, -32602, "observability write_id conflict", &data)
+        Ok(error_response_with_data(
+            id,
+            -32602,
+            "observability write_id conflict",
+            &data
+        ))
     } else if let Some(eliot_engine::PacketCompileError::HardCeiling(details)) =
         error.downcast_ref::<eliot_engine::PacketCompileError>()
     {
@@ -303,9 +333,11 @@ fn dispatch_error_response(id: &Value, error: &anyhow::Error) -> Value {
         // over exact serialized bytes. The app republishes those recorded values
         // with their unit and status; it never re-sums, re-rounds or estimates
         // them, so a section figure cannot drift from the aggregate the same
-        // operation recorded.
-        let section_measurements = recorded_section_wire(&details.section_tokens);
-        error_response_with_data(
+        // operation recorded. A figure that cannot be represented in the
+        // published unit is a typed failure, never a saturated number.
+        let section_measurements = recorded_section_wire(&details.section_tokens)
+            .context("republish packet hard-ceiling section figures")?;
+        Ok(error_response_with_data(
             id,
             -32602,
             "context packet hard ceiling exceeded",
@@ -318,7 +350,7 @@ fn dispatch_error_response(id: &Value, error: &anyhow::Error) -> Value {
                 "section_measurements": section_measurements,
                 "expansion_handles": details.expansion_handles,
             }),
-        )
+        ))
     } else if let Some(eliot_engine::EngineError::PacketFloorExceedsBudget {
         max_tokens,
         estimated_tokens,
@@ -330,8 +362,17 @@ fn dispatch_error_response(id: &Value, error: &anyhow::Error) -> Value {
         // recorded per-section accounting. Both are republished verbatim under
         // an explicit unit/status; the app recomputes neither and has no `/4`,
         // character-count or minimum-one rule of its own on this path.
-        let section_measurements = recorded_section_wire(section_tokens);
-        error_response_with_data(
+        //
+        // W4/A16/A23: both conversions are fallible. A figure that does not fit
+        // the published `u64` unit is a typed error that aborts the projection;
+        // it is never saturated to `u64::MAX`, which is the engine's reserved
+        // *unavailable* sentinel and would publish a real engine figure as the
+        // one value on this seam that means "not measured".
+        let estimated_tokens_u64 = u64::try_from(*estimated_tokens)
+            .context("packet estimated_tokens exceeds the published u64 measurement unit")?;
+        let section_measurements =
+            recorded_section_wire(section_tokens).context("republish packet section figures")?;
+        Ok(error_response_with_data(
             id,
             -32602,
             "context packet floor exceeds budget",
@@ -340,13 +381,13 @@ fn dispatch_error_response(id: &Value, error: &anyhow::Error) -> Value {
                 "max_tokens": max_tokens,
                 "estimated_tokens": estimated_tokens,
                 "estimated_tokens_measurement":
-                    recorded_planning_wire("stu_estimate", Some(u64::try_from(*estimated_tokens).unwrap_or(u64::MAX))),
+                    recorded_planning_wire("stu_estimate", Some(estimated_tokens_u64)),
                 "section_tokens": section_tokens,
                 "section_measurements": section_measurements,
             }),
-        )
+        ))
     } else {
-        error_response(id, -32603, &error.to_string())
+        Ok(error_response(id, -32603, &error.to_string()))
     }
 }
 

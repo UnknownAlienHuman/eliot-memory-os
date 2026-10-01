@@ -428,18 +428,25 @@ pub(crate) fn recorded_planning_wire(unit: &str, value: Option<u64>) -> Value {
 /// `section_tokens` accounting over exact serialized bytes; the app neither sums
 /// nor re-rounds them, so a per-section figure can never drift from the aggregate
 /// the same operation recorded.
-fn recorded_section_wire(section_tokens: &BTreeMap<String, usize>) -> Value {
+///
+/// W4/A16/A23: a section figure that cannot be represented in the published
+/// unit is a typed failure that aborts the projection, never a saturation to
+/// `u64::MAX`. `u64::MAX` is the engine's own *unavailable* sentinel for
+/// context cost, so a silent saturating conversion here would publish a real
+/// engine figure as the reserved "not measured" value - the exact
+/// absent-becomes-a-number collapse this migration forbids, and the one
+/// documented as the opposite of [`MeasurementStatus::Unavailable`], which is
+/// the only representation of "unmeasured" on this seam.
+fn recorded_section_wire(
+    section_tokens: &BTreeMap<String, usize>,
+) -> Result<Value> {
     let mut sections = serde_json::Map::new();
     for (name, value) in section_tokens {
-        sections.insert(
-            name.clone(),
-            recorded_planning_wire(
-                "stu_estimate",
-                Some(u64::try_from(*value).unwrap_or(u64::MAX)),
-            ),
-        );
+        let value =
+            u64::try_from(*value).with_context(|| format!("section figure {name} exceeds u64"))?;
+        sections.insert(name.clone(), recorded_planning_wire("stu_estimate", Some(value)));
     }
-    Value::Object(sections)
+    Ok(Value::Object(sections))
 }
 
 /// Synthetic record reference used by the combined legacy description figure.
