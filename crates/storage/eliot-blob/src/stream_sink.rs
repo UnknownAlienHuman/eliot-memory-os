@@ -72,7 +72,7 @@ use eliot_blob_api::{
     BlobRootLease, BlobStageRequest, BlobStoreClient, ObjectResidencyKey, VersionedContentDigest,
 };
 use eliot_process::{
-    PROCESS_STREAM_SINK_SCHEMA_VERSION, DurableProcessStreamSource, DurableStreamLocatorKind,
+    DurableProcessStreamSource, DurableStreamLocatorKind, PROCESS_STREAM_SINK_SCHEMA_VERSION,
     ProcessStreamEvidence, ProcessStreamPrefixPreview, ProcessStreamSinkAbortReason,
     ProcessStreamSinkAbortRequest, ProcessStreamSinkAppend, ProcessStreamSinkAppendDisposition,
     ProcessStreamSinkClient, ProcessStreamSinkError, ProcessStreamSinkFinalizeRequest,
@@ -444,8 +444,8 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             final_sequence: reservation.next_sequence,
             final_offset: reservation.next_offset,
         };
-        let bytes = serde_json::to_vec(&wire)
-            .map_err(|error| ProcessStreamSinkError::Serialization {
+        let bytes =
+            serde_json::to_vec(&wire).map_err(|error| ProcessStreamSinkError::Serialization {
                 field: "finalize_uncertainty",
                 reason: error.to_string(),
             })?;
@@ -718,13 +718,12 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         incarnation: u64,
     ) {
         let mut state = self.lock();
-        if let Some(reservation) = state.finalization.as_mut() {
-            if reservation.identity == *identity
-                && reservation.incarnation == incarnation
-                && matches!(reservation.phase, FinalizePhase::StageOutcomeUnknown)
-            {
-                reservation.phase = FinalizePhase::Reserved;
-            }
+        if let Some(reservation) = state.finalization.as_mut()
+            && reservation.identity == *identity
+            && reservation.incarnation == incarnation
+            && matches!(reservation.phase, FinalizePhase::StageOutcomeUnknown)
+        {
+            reservation.phase = FinalizePhase::Reserved;
         }
     }
 
@@ -857,8 +856,8 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             request.expected_final_offset(),
         )?;
         Self::check_observed(&state, request.observed_sha256(), request.observed_bytes())?;
-        let publishes = request.gaps().is_empty()
-            && request.transport() == StreamTransportStatus::Complete;
+        let publishes =
+            request.gaps().is_empty() && request.transport() == StreamTransportStatus::Complete;
         if publishes {
             if request.transformation().is_some() {
                 return Err(ProcessStreamSinkError::EvidenceInvariant {
@@ -897,32 +896,68 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         }
 
         if !publishes {
-            // No durable publication except for the complete-source path: a
-            // gapped, policy-prohibited, or failed-redaction finalize must
-            // not stage raw bytes as a second object.
-            let withheld = if request
-                .gaps()
-                .contains(&StreamEvidenceGap::PolicyProhibited)
-            {
-                ProcessStreamSinkState::PolicyProhibited
-            } else if request.gaps().contains(&StreamEvidenceGap::RedactionFailed) {
-                ProcessStreamSinkState::RedactionFailed
-            } else {
-                ProcessStreamSinkState::SourceUnavailable
-            };
-            return Ok(FinalizePlan::Withheld(Box::new(WithheldTicket {
-                session: existing,
-                request: request.clone(),
-                identity,
-                next_sequence: state.next_sequence,
-                next_offset: state.next_offset,
-                admitted_sha256,
-                state: withheld,
-            })));
+            return Self::withheld_plan(&state, existing, request, identity, admitted_sha256);
         }
 
         // One reservation per session: bound to this session, this exact
         // command digest and the one bound blob stage operation.
+        Ok(self.reserve_publish(
+            &mut state,
+            existing,
+            request,
+            identity,
+            admitted_sha256,
+        ))
+    }
+
+    /// Builds the never-published terminal plan for a non-publishing
+    /// finalize.
+    ///
+    /// No durable publication except for the complete-source path: a gapped,
+    /// policy-prohibited, or failed-redaction finalize must not stage raw
+    /// bytes as a second object. This step cannot fail, so it mints no error
+    /// and reserves nothing.
+    fn withheld_plan(
+        state: &SinkState,
+        session: ProcessStreamSinkSession,
+        request: &ProcessStreamSinkFinalizeRequest,
+        identity: ProcessStreamSinkTerminalCommandIdentity,
+        admitted_sha256: String,
+    ) -> FinalizePlan {
+        let withheld = if request
+            .gaps()
+            .contains(&StreamEvidenceGap::PolicyProhibited)
+        {
+            ProcessStreamSinkState::PolicyProhibited
+        } else if request.gaps().contains(&StreamEvidenceGap::RedactionFailed) {
+            ProcessStreamSinkState::RedactionFailed
+        } else {
+            ProcessStreamSinkState::SourceUnavailable
+        };
+        FinalizePlan::Withheld(Box::new(WithheldTicket {
+            session,
+            request: request.clone(),
+            identity,
+            next_sequence: state.next_sequence,
+            next_offset: state.next_offset,
+            admitted_sha256,
+            state: withheld,
+        }))
+    }
+
+    /// Creates the one reservation of this session and its publish plan.
+    ///
+    /// One reservation per session, bound to this session, this exact command
+    /// digest and the one bound blob stage operation. The phase starts
+    /// `Reserved`: nothing has been handed to the blob owner yet.
+    fn reserve_publish(
+        &self,
+        state: &mut SinkState,
+        session: ProcessStreamSinkSession,
+        request: &ProcessStreamSinkFinalizeRequest,
+        identity: ProcessStreamSinkTerminalCommandIdentity,
+        admitted_sha256: String,
+    ) -> FinalizePlan {
         let incarnation = state.finalization_incarnation.saturating_add(1);
         state.finalization_incarnation = incarnation;
         state.finalization = Some(FinalizeReservation {
@@ -939,11 +974,16 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
                 .operation_id
                 .as_str()
                 .to_owned(),
-            stage_idempotency_key: self.binding.stage_context().operation.idempotency_key.clone(),
+            stage_idempotency_key: self
+                .binding
+                .stage_context()
+                .operation
+                .idempotency_key
+                .clone(),
             phase: FinalizePhase::Reserved,
         });
-        Ok(FinalizePlan::Publish(Box::new(PublishTicket {
-            session: existing,
+        FinalizePlan::Publish(Box::new(PublishTicket {
+            session,
             request: request.clone(),
             identity,
             incarnation,
@@ -953,7 +993,7 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             step: PublishStep::Stage {
                 staged: state.staged.clone(),
             },
-        })))
+        }))
     }
 
     /// Records the terminal exactly once under the command identity, drops
@@ -1150,14 +1190,11 @@ struct FinalizeHold<'a, C: BlobStoreClient> {
 impl<C: BlobStoreClient> Drop for FinalizeHold<'_, C> {
     fn drop(&mut self) {
         let mut state = self.sink.lock();
-        let releasable = state
-            .finalization
-            .as_ref()
-            .is_some_and(|reservation| {
-                reservation.identity == self.identity
-                    && reservation.incarnation == self.incarnation
-                    && matches!(reservation.phase, FinalizePhase::Reserved)
-            });
+        let releasable = state.finalization.as_ref().is_some_and(|reservation| {
+            reservation.identity == self.identity
+                && reservation.incarnation == self.incarnation
+                && matches!(reservation.phase, FinalizePhase::Reserved)
+        });
         if releasable {
             state.finalization = None;
             state.finalization_incarnation = state.finalization_incarnation.saturating_add(1);
@@ -1289,12 +1326,12 @@ impl<C: BlobStoreClient> ProcessStreamSinkClient for BlobStoreStreamSink<C> {
             // as the retained unknown outcome, never as an open session and
             // never as a success. A `Reserved` phase (nothing handed off) is
             // the only resumable nonterminal state.
-            if let Some(reservation) = &state.finalization {
-                if reservation.effect_possible() {
-                    return Ok(ProcessStreamSinkReadback::UnknownOutcome {
-                        outcome: Self::reservation_uncertainty(&existing, reservation)?,
-                    });
-                }
+            if let Some(reservation) = &state.finalization
+                && reservation.effect_possible()
+            {
+                return Ok(ProcessStreamSinkReadback::UnknownOutcome {
+                    outcome: Self::reservation_uncertainty(&existing, reservation)?,
+                });
             }
             Self::session_view(&existing, &state)
         });
