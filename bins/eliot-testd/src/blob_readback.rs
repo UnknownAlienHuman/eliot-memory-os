@@ -488,6 +488,12 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
             )?
             .ok_or_else(|| integrity_error(request.stream))?;
         receipt.validate().map_err(|_| integrity_error(request.stream))?;
+        let ready_receipt: serde_json::Value = serde_json::from_str(&receipt.receipt_json)
+            .map_err(|_| integrity_error(request.stream))?;
+        let ready_blob_hash = ready_receipt
+            .pointer("/locator/hash")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| integrity_error(request.stream))?;
         if receipt.process_binding_sha256 != process_binding_sha256
             || receipt.binding_ref.is_empty()
             || receipt.session_id != identity.session_id
@@ -496,6 +502,8 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
             || receipt.ready_receipt_ref != request.ready_receipt_ref
             || receipt.source_sha256 != request.expected_sha256
             || receipt.source_byte_length != request.expected_byte_length
+            || request.locator_kind != DurableStreamLocatorKind::Blob
+            || request.locator != format!("blob:{ready_blob_hash}")
             || receipt.receipt_json != ready.blob_ready_receipt_json
             || receipt.receipt_sha256 != ready.blob_ready_receipt_sha256
         {
