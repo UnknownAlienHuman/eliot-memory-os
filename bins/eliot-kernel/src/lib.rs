@@ -5597,11 +5597,11 @@ impl KernelComposition {
             snapshots.len(),
             snapshots
                 .iter()
-                .map(|snapshot| snapshot.operation_order())
+                .map(eliot_ors::GenerationCutoverSnapshot::operation_order)
                 .min(),
             snapshots
                 .iter()
-                .map(|snapshot| snapshot.operation_order())
+                .map(eliot_ors::GenerationCutoverSnapshot::operation_order)
                 .max()
                 .unwrap_or(0),
             fenced_identities,
