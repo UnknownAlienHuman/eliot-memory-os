@@ -9,6 +9,7 @@ use eliot_protocol::{
 use eliot_receipts::{
     ArtifactBinding, GrantClosureReceipt, ProofCeiling, SessionBinding, admit_dispatch_surface,
 };
+use eliot_receipts::tool_exposure::ExposureIdentities;
 use eliot_source_assurance::{
     AdmissionOutcome, AssuranceFinding, OwnerSourceEvidence, SourceAssurance, SourceAssuranceError,
     canonical_digest,
@@ -25,7 +26,8 @@ use crate::{
     HostCorrelationId, HostCorrelationReceipt, HostGatewayError, HostInvocationRequest,
     HostObservedContext, HostOperationHandle, LEGACY_FINISH_INPUT_REJECTED, McpProtocolVersion,
     PermittedTaskSurface, QueryInput, QueryMode, SemanticRegistry, TaskSurfaceConditions,
-    ToolRequest, ToolSchema, TypedRejection, bind_act_owner_inputs, bind_list_surface_budget,
+    ToolRequest, ToolSchema, ToolSurfaceDecision, TypedRejection, admit_exposure_history,
+    advertise_exposure_history, bind_act_owner_inputs, bind_list_surface_budget,
     canonical_registry, canonical_tool_schemas, classify_tool_request,
     compile_discovery_surface_decision, compile_task_relative_surface,
     decode_protected_request_bytes, derive_permitted_surface, published_mcp_tool_surface,
@@ -2356,7 +2358,66 @@ pub fn tools_list_result() -> Result<Value, WireRejection> {
     let surface = derive_permitted_surface(&registry, &decision, &schemas).map_err(|_| {
         WireRejection::new(WIRE_INTERNAL_ERROR, "tool surface decision is unavailable")
     })?;
+    // Publication is the advertisement stage's own evidence: the listing is not
+    // rendered until every considered method carries the publish-seam exposure
+    // history and that history is admitted against the same independent
+    // considered set. A history that cannot be recorded or admitted withholds
+    // the listing rather than advertising without owner evidence.
+    bind_published_surface_history(&decision, &surface)?;
     tools_list_result_for_permitted_surface(&surface)
+}
+
+/// Records the publish-seam exposure history for every considered method and
+/// admits it against the independent considered set (I7.24).
+///
+/// The expected set comes from the decision's own `considered` list, which was
+/// compiled from the live semantic registry plus owner conditions before this
+/// seam ran — never from the entries being checked, and never from the
+/// advertised subset under test. Each considered method yields exactly one
+/// entry through [`advertise_exposure_history`], which populates only the
+/// `registered`, `advertised_to_route`, and
+/// `eligible_under_scope_policy_and_grant` stages and leaves selection, call,
+/// transport, delivery, retry, use, and outcome explicitly unresolved; every
+/// entry is then admitted through [`admit_exposure_history`], which revalidates
+/// the entry against the considered method/version set and route.
+///
+/// # Errors
+///
+/// Returns a wire rejection when the decision and derived surface disagree
+/// about the considered set, a method is missing from one of them, or an entry
+/// fails its owner or admission validation.
+fn bind_published_surface_history(
+    decision: &ToolSurfaceDecision,
+    surface: &PermittedTaskSurface,
+) -> Result<(), WireRejection> {
+    if decision.considered.is_empty() {
+        return Err(WireRejection::new(
+            WIRE_INTERNAL_ERROR,
+            "tool surface decision considered no methods",
+        ));
+    }
+    // The turn/run/attempt owners have not joined this discovery publication;
+    // each stays explicitly unresolved rather than being minted here. The
+    // surface identity is required for the entry to join a revision lineage and
+    // defaults inside `advertise_exposure_history` to the decision's task ref.
+    let identities = ExposureIdentities::default();
+    for candidate in &decision.considered {
+        let method = &candidate.method.canonical_name;
+        let entry = advertise_exposure_history(decision, surface, method, identities.clone())
+            .map_err(|_| {
+                WireRejection::new(
+                    WIRE_INTERNAL_ERROR,
+                    "tool exposure history could not be recorded at the publish seam",
+                )
+            })?;
+        admit_exposure_history(decision, &entry).map_err(|_| {
+            WireRejection::new(
+                WIRE_INTERNAL_ERROR,
+                "tool exposure history was not admitted against the considered set",
+            )
+        })?;
+    }
+    Ok(())
 }
 
 /// Projects a #1745 permitted subset onto the advertised `tools/list` shape.
