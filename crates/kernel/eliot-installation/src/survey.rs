@@ -594,21 +594,47 @@ fn map_identity_io(error: std::io::Error) -> IdentityObservationFailure {
 /// about installation, health, support or capability admission, and it is not
 /// itself evidence in the `I3.4` sense: it carries observations for the
 /// Governor-owned capability registry to weigh.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct InstallationSurvey {
     /// Catalogue origin this report was produced from.
-    pub catalogue_origin: PlatformHandle,
+    pub(crate) catalogue_origin: PlatformHandle,
     /// Catalogue revision this report was produced from.
-    pub catalogue_revision: u64,
+    pub(crate) catalogue_revision: u64,
     /// One report per catalogue entry, ascending by family identity.
-    pub families: Vec<SurveyFamilyReport>,
+    pub(crate) families: Vec<SurveyFamilyReport>,
+    /// In-memory brand installed only by the sealed survey coordinator.
+    #[serde(skip)]
+    #[schemars(skip)]
+    source_seal: SurveySourceSeal,
 }
 
+/// Private non-wire brand for one survey produced by the ordered coordinator.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq)]
+struct SurveySourceSeal;
+
 impl InstallationSurvey {
+    /// Returns the accepted catalogue origin observed by this survey.
+    #[must_use]
+    pub const fn catalogue_origin(&self) -> &PlatformHandle {
+        &self.catalogue_origin
+    }
+
+    /// Returns the accepted catalogue revision observed by this survey.
+    #[must_use]
+    pub const fn catalogue_revision(&self) -> u64 {
+        self.catalogue_revision
+    }
+
+    /// Returns each family report in canonical family order.
+    #[must_use]
+    pub fn families(&self) -> &[SurveyFamilyReport] {
+        &self.families
+    }
+
     /// Validates stage order, coverage partitioning, alias ordering and the
     /// probe-stage candidate correspondence.
     pub fn validate(&self) -> Result<(), InstallationError> {
+        let _source_seal = self.source_seal;
         handle(&self.catalogue_origin, "survey.catalogue_origin")?;
         if self.catalogue_revision == 0 {
             return Err(InstallationError::InvalidField {
@@ -732,6 +758,7 @@ pub fn survey_installation(
         catalogue_origin: catalogue.origin.clone(),
         catalogue_revision: catalogue.revision,
         families,
+        source_seal: SurveySourceSeal,
     };
     survey.validate()?;
     Ok(survey)

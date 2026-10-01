@@ -197,8 +197,9 @@ pub use managed_change_admission::{
     validate_advertisement,
 };
 
-pub use managed_change_plan::{
-    ManagedEnvironmentChangePlan, compile_managed_change_plan, revalidate_managed_change_plan,
+pub use managed_change_plan::ManagedEnvironmentChangePlan;
+pub(crate) use managed_change_plan::{
+    compile_managed_change_plan, revalidate_managed_change_plan,
 };
 
 pub use survey::{

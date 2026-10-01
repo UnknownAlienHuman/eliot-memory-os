@@ -60,16 +60,15 @@ use super::{
 /// is planned against. For every other action the request must name an identity
 /// the survey actually observed, because a change to something the survey never
 /// saw is not a change to a current installation.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct ManagedEnvironmentChangePlan {
     /// The governing request, bound unchanged.
-    pub request: ManagedEnvironmentChangeRequest,
+    pub(crate) request: ManagedEnvironmentChangeRequest,
     /// Exact independently signed approval row retained with this plan.
     ///
     /// This is a carrier for revalidation, not authority by itself. Every use
     /// compares it with the row reloaded from the accepted signed publication.
-    pub approval: ManagedChangeApproval,
+    pub(crate) approval: ManagedChangeApproval,
     /// Lowercase SHA-256 of the canonical exact survey this plan was compiled
     /// from.
     ///
@@ -77,51 +76,102 @@ pub struct ManagedEnvironmentChangePlan {
     /// label, so a survey replaced after planning no longer matches. It is a
     /// content digest of a value the caller still holds; it is not preserved
     /// evidence standing in for unavailable bytes.
-    pub survey_content_digest: PlatformHandle,
+    pub(crate) survey_content_digest: PlatformHandle,
     /// Catalogue origin of the accepted revision this plan was compiled from.
-    pub catalogue_origin: PlatformHandle,
+    pub(crate) catalogue_origin: PlatformHandle,
     /// Accepted catalogue revision this plan was compiled from.
-    pub catalogue_revision: u64,
+    pub(crate) catalogue_revision: u64,
     /// Retained signed configuration publication that admitted that revision.
-    pub catalogue_publication_ref: PlatformHandle,
+    pub(crate) catalogue_publication_ref: PlatformHandle,
     /// System Owner whose verified signature admitted that revision.
-    pub catalogue_accepted_by: PlatformHandle,
+    pub(crate) catalogue_accepted_by: PlatformHandle,
     /// Catalogue family this plan changes.
-    pub family_id: PlatformHandle,
+    pub(crate) family_id: PlatformHandle,
     /// Discovery category carried by the validated catalogue entry.
-    pub category: super::IntegrationCategory,
+    pub(crate) category: super::IntegrationCategory,
     /// Every exact identity the survey observed for this family, ascending.
-    pub observed_target_identities: Vec<PlatformHandle>,
+    pub(crate) observed_target_identities: Vec<PlatformHandle>,
     /// The one current target identity this request resolves to, when the
     /// action acts on an observed installation.
-    pub target_identity: Option<PlatformHandle>,
+    pub(crate) target_identity: Option<PlatformHandle>,
     /// The bounded, non-secret probe invocation the accepted revision admits for
     /// the exact target identity, frozen into this plan.
     ///
     /// `None` means the accepted revision admits no probe for this identity;
     /// it never means "run something else". The plan stays valid when this is
     /// `None`, because a family need not declare any probe.
-    pub target_probe: Option<super::BoundedProbeInvocation>,
+    pub(crate) target_probe: Option<super::BoundedProbeInvocation>,
     /// System Owner the admitted authority confirmed.
-    pub confirmed_owner: PlatformHandle,
+    pub(crate) confirmed_owner: PlatformHandle,
     /// Profile the admitted authority was verified under.
-    pub profile: InstallationProfile,
+    pub(crate) profile: InstallationProfile,
     /// Runtime root topology digest the admitted authority was verified under.
-    pub runtime_state_roots_digest: PlatformHandle,
+    pub(crate) runtime_state_roots_digest: PlatformHandle,
     /// Durable setup revision the admitted authority was verified under.
-    pub setup_revision: u64,
+    pub(crate) setup_revision: u64,
     /// Signed configuration snapshot the admitted authority was verified
     /// against.
-    pub configuration_snapshot_ref: PlatformHandle,
+    pub(crate) configuration_snapshot_ref: PlatformHandle,
+    /// In-memory brand installed only by accepted-survey plan compilation.
+    #[serde(skip)]
+    #[schemars(skip)]
+    compilation_seal: PlanCompilationSeal,
 }
 
+/// Private non-wire brand for a plan compiled from one accepted survey.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq)]
+struct PlanCompilationSeal;
+
 impl ManagedEnvironmentChangePlan {
+    /// Returns the exact request compiled into this plan.
+    #[must_use]
+    pub const fn request(&self) -> &ManagedEnvironmentChangeRequest {
+        &self.request
+    }
+
+    /// Returns the exact owner-signed approval compiled into this plan.
+    #[must_use]
+    pub const fn approval(&self) -> &ManagedChangeApproval {
+        &self.approval
+    }
+
+    /// Returns the family covered by this plan.
+    #[must_use]
+    pub const fn family_id(&self) -> &PlatformHandle {
+        &self.family_id
+    }
+
+    /// Returns the candidate identity observed at planning time.
+    #[must_use]
+    pub const fn target_identity(&self) -> Option<&PlatformHandle> {
+        self.target_identity.as_ref()
+    }
+
+    /// Returns the exact accepted bounded probe contract, when one resolves.
+    #[must_use]
+    pub const fn target_probe(&self) -> Option<&super::BoundedProbeInvocation> {
+        self.target_probe.as_ref()
+    }
+
+    /// Returns the accepted catalogue revision.
+    #[must_use]
+    pub const fn catalogue_revision(&self) -> u64 {
+        self.catalogue_revision
+    }
+
+    /// Returns the digest of the exact survey compiled into this plan.
+    #[must_use]
+    pub const fn survey_content_digest(&self) -> &PlatformHandle {
+        &self.survey_content_digest
+    }
+
     /// Revalidates every internal binding without touching a survey, a
     /// catalogue or an external effect.
     ///
     /// The request is checked through its own existing `validate()` rather than
     /// a second copy of those rules.
     pub fn validate(&self) -> Result<(), InstallationError> {
+        let _compilation_seal = self.compilation_seal;
         self.request.validate()?;
         self.validate_bound_values()?;
         if self.family_id != self.request.target_family {
@@ -357,7 +407,7 @@ fn approval_refusal(error: CatalogueAdmissionError) -> InstallationError {
 /// authority is invalid, when the survey does not come from the accepted
 /// catalogue revision, when the survey does not cover the requested family, or
 /// when the request and the admitted authority disagree.
-pub fn compile_managed_change_plan(
+pub(crate) fn compile_managed_change_plan(
     request: &ManagedEnvironmentChangeRequest,
     accepted: &AcceptedIntegrationCatalogue,
     survey: &InstallationSurvey,
@@ -414,6 +464,7 @@ pub fn compile_managed_change_plan(
     let plan = ManagedEnvironmentChangePlan {
         request: request.clone(),
         approval,
+        compilation_seal: PlanCompilationSeal,
         target_probe,
         survey_content_digest: survey_content_digest(survey)?,
         catalogue_origin: survey.catalogue_origin.clone(),
@@ -452,7 +503,7 @@ pub fn compile_managed_change_plan(
 /// # Errors
 /// Returns [`InstallationError`] when the plan, survey, catalogue or authority
 /// is invalid, or when any bound value has changed since planning.
-pub fn revalidate_managed_change_plan(
+pub(crate) fn revalidate_managed_change_plan(
     plan: &ManagedEnvironmentChangePlan,
     accepted: &AcceptedIntegrationCatalogue,
     survey: &InstallationSurvey,

@@ -1274,13 +1274,34 @@ pub fn admit_installation_survey_and_compile_change_on_host(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AcceptedInstallationSurvey {
     /// The bounded, System Owner accepted catalogue revision that was surveyed.
-    pub accepted: AcceptedIntegrationCatalogue,
+    pub(crate) accepted: AcceptedIntegrationCatalogue,
     /// The ordered metadata-only survey of that exact revision.
-    pub survey: InstallationSurvey,
+    pub(crate) survey: InstallationSurvey,
     /// Every bounded, non-secret probe invocation admitted by that exact
     /// revision for the identities the survey resolved, ascending by family
     /// then probe identity.
-    pub admitted_probes: Vec<BoundedProbeInvocation>,
+    pub(crate) admitted_probes: Vec<BoundedProbeInvocation>,
+}
+
+impl AcceptedInstallationSurvey {
+    /// Returns the exact accepted catalogue revision behind this survey.
+    #[must_use]
+    pub const fn accepted(&self) -> &AcceptedIntegrationCatalogue {
+        &self.accepted
+    }
+
+    /// Returns the ordered survey produced by the sealed observation source.
+    #[must_use]
+    pub const fn survey(&self) -> &InstallationSurvey {
+        &self.survey
+    }
+
+    /// Returns the recipes resolved from observed identities, without
+    /// authorizing their execution.
+    #[must_use]
+    pub fn admitted_probes(&self) -> &[BoundedProbeInvocation] {
+        &self.admitted_probes
+    }
 }
 
 /// Surveys the accepted catalogue revision and resolves its bounded probes.
