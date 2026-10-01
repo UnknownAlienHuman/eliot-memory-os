@@ -532,13 +532,53 @@ fn decide_campaign_packet_tick(flight: &CampaignPacketFlight) -> CampaignPacketT
     }
 }
 
+/// The Windows run attempt the owner recorded, as the status surface shows it.
+///
+/// This repeats the record's own attempt verbatim. It carries the I18.22
+/// failure class on the same attempt that carries the I18.24 outcome, so why a
+/// run did not complete stays readable next to what it would have proven
+/// without a second axis being introduced here.
+#[derive(Debug, Serialize)]
+pub(super) struct ProductProofAttemptWire {
+    /// Identity of the attempted run.
+    pub(super) run_id: String,
+    /// Lifecycle position the attempt actually reached.
+    pub(super) execution: eliot_instrument_api::ExecutionStatus,
+    /// I18.22 failure class; absent exactly when the attempt completed.
+    pub(super) failure_class: Option<eliot_reports::product_proof::ProductProofFailureClass>,
+    /// Factual reason for that position.
+    pub(super) reason: String,
+}
+
+/// The executable identity the owner retained, as the status surface shows it.
+#[derive(Debug, Serialize)]
+pub(super) struct ProductProofExecutableWire {
+    /// Executable name as the owner resolved it.
+    pub(super) executable_name: String,
+    /// Content digest of the exact bytes, when known.
+    pub(super) content_digest: Option<String>,
+    /// Whether an installed-route execution was observed for those bytes.
+    pub(super) installed: bool,
+}
+
+/// The environment identity the owner retained, as the status surface shows it.
+#[derive(Debug, Serialize)]
+pub(super) struct ProductProofEnvironmentWire {
+    /// Exact target platform the proof targets.
+    pub(super) platform: String,
+    /// Installation identity on that platform, when one exists.
+    pub(super) installation_id: Option<String>,
+}
+
 /// The published product-proof status for one acceptance item (issue #1903).
 ///
 /// This is the wire view of the ProductProof/FinishService acceptance owner's
 /// terminal record and its fail-closed rollup. It is a projection of those two
 /// values: the disposition is the rollup's own verdict, and the remaining
 /// fields repeat the record's outcome, reason, owner, authority, required
-/// missing evidence, and retained build-evidence handle. The build handle is
+/// missing evidence, retained build-evidence handle, recorded attempt, retained
+/// raw log handles, executable and environment identity, and the
+/// observed-or-missing installed-route stage receipt. The build handle is
 /// present as non-product proof only, so a successful release build is never
 /// read as a live pass.
 #[derive(Debug, Serialize)]
@@ -563,6 +603,17 @@ pub(super) struct ProductProofStatusWire {
     pub(super) build_evidence_id: Option<String>,
     /// Whether the required installed-route execution was observed.
     pub(super) installed_route_observed: bool,
+    /// The recorded run attempt; absent exactly while the run is parked.
+    pub(super) attempt: Option<ProductProofAttemptWire>,
+    /// Raw log handles retained for forensic readback, in canonical order.
+    pub(super) raw_log_refs: Vec<String>,
+    /// Executable identity, when one is retained.
+    pub(super) executable: Option<ProductProofExecutableWire>,
+    /// Environment identity, when one is retained.
+    pub(super) environment: Option<ProductProofEnvironmentWire>,
+    /// The installed-route stage receipt: observed with its receipt identity,
+    /// or explicitly missing with the proof that is still required.
+    pub(super) installed_route: eliot_reports::product_proof::ProductProofStageReceipt,
 }
 
 impl ProductProofStatusWire {
@@ -572,8 +623,16 @@ impl ProductProofStatusWire {
     /// here, so a second verdict cannot exist: this function cannot turn a
     /// refused record into a pass. A refused record still publishes, because
     /// the current product state *is* a refusal — an operator must be able to
-    /// read the exact outcome, reason, owner, authority, and required missing
-    /// evidence without the record ever becoming a pass.
+    /// read the exact outcome, reason, owner, authority, required missing
+    /// evidence, attempt, and retained evidence without the record ever
+    /// becoming a pass.
+    ///
+    /// Every retained field is a copy of a value the record already holds, so
+    /// publishing more of the record cannot make it say more than the record
+    /// does. The stage receipt is the record's own variant, serialized as it
+    /// stands: a `Missing` receipt publishes as an explicit missing stage with
+    /// the proof it would have proven, never as an absent field that a reader
+    /// could mistake for an omission.
     fn project(
         status: &eliot_reports::product_proof::ProductProofStatus,
         rollup: &eliot_reports::product_proof::ProductProofRollup,
@@ -596,6 +655,27 @@ impl ProductProofStatusWire {
                 .as_ref()
                 .map(|build| build.evidence.evidence_id.clone()),
             installed_route_observed: status.retained.installed_route_observed(),
+            attempt: status.attempt.as_ref().map(|attempt| ProductProofAttemptWire {
+                run_id: attempt.run_id.clone(),
+                execution: attempt.execution,
+                failure_class: attempt.failure_class,
+                reason: attempt.reason.clone(),
+            }),
+            raw_log_refs: status.retained.raw_log_refs.clone(),
+            executable: status.retained.executable.as_ref().map(|executable| {
+                ProductProofExecutableWire {
+                    executable_name: executable.executable_name.clone(),
+                    content_digest: executable.content_digest.clone(),
+                    installed: executable.installed,
+                }
+            }),
+            environment: status.retained.environment.as_ref().map(|environment| {
+                ProductProofEnvironmentWire {
+                    platform: environment.platform.clone(),
+                    installation_id: environment.installation_id.clone(),
+                }
+            }),
+            installed_route: status.retained.stage_receipts.installed_route.clone(),
         }
     }
 }
@@ -919,14 +999,8 @@ pub(super) fn run() -> Result<(), String> {
     // refuses leaves the field absent, which is a recorded absence rather than
     // a fabricated verdict, and readiness, protocol framing, and exit behavior
     // are unchanged.
-    let product_proof = match composition.product_proof_status() {
-        Ok((record, rollup)) => Some(ProductProofStatusWire::project(&record, &rollup)),
-        Err(error) => {
-            tracing::warn!(target: "eliotd::diagnostics", "product proof status unavailable: {error}");
-            None
-        }
-    };
-    write_json(&ready_message(&status, product_proof))?;
+    let product_proof = product_proof_wire(&composition);
+    publish_product_proof_status(&status, product_proof)?;
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -5164,6 +5238,7 @@ fn settle_task_controller_completion(
 /// What one completed finish poll resolves to before the loop acts (issue
 /// #1741). A null claim backs off until the next tick; a claimed pair serves
 /// through the Governor finish owner and submits one fenced result body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FinishPollOutcome {
     IdleBackoff,
     Accepted,
@@ -5463,19 +5538,62 @@ async fn run_finish_poll(
     let body = Box::pin(eliotd::serve_finish_claim(kernel, &composition, claimed))
         .await
         .map_err(|error| format!("daemon finish dispatch: {error}"))?;
-    match kernel.submit_finish_result_async(&body).await {
-        Ok(FinishSubmitOutcome::Accepted) => Ok(FinishPollOutcome::Accepted),
-        Ok(FinishSubmitOutcome::Expired) => Ok(FinishPollOutcome::Expired),
-        Ok(FinishSubmitOutcome::StaleAttempt) => Ok(FinishPollOutcome::StaleAttempt),
+    let outcome = match kernel.submit_finish_result_async(&body).await {
+        Ok(FinishSubmitOutcome::Accepted) => FinishPollOutcome::Accepted,
+        Ok(FinishSubmitOutcome::Expired) => FinishPollOutcome::Expired,
+        Ok(FinishSubmitOutcome::StaleAttempt) => FinishPollOutcome::StaleAttempt,
         Err(first_error) => match kernel.submit_finish_result_async(&body).await {
-            Ok(FinishSubmitOutcome::Accepted) => Ok(FinishPollOutcome::Accepted),
-            Ok(FinishSubmitOutcome::Expired) => Ok(FinishPollOutcome::Expired),
-            Ok(FinishSubmitOutcome::StaleAttempt) => Ok(FinishPollOutcome::StaleAttempt),
-            Err(second_error) => Err(format!(
-                "Kernel finish result submit: {first_error}; retry: {second_error}"
-            )),
+            Ok(FinishSubmitOutcome::Accepted) => FinishPollOutcome::Accepted,
+            Ok(FinishSubmitOutcome::Expired) => FinishPollOutcome::Expired,
+            Ok(FinishSubmitOutcome::StaleAttempt) => FinishPollOutcome::StaleAttempt,
+            Err(second_error) => {
+                return Err(format!(
+                    "Kernel finish result submit: {first_error}; retry: {second_error}"
+                ));
+            }
         },
+    };
+    // Issue #1903: an admitted finish decision is the next observed attempt
+    // for the ProductProof/FinishService acceptance owner, so this is the point
+    // the status surface must show the record the owner rebuilt from it rather
+    // than the startup snapshot. The record is re-read through the same
+    // composition and the same `write_json` status surface the startup
+    // publication uses; there is no second endpoint and no second verdict. Only
+    // an `Accepted` result committed a decision, so an expired or stale attempt
+    // republishes nothing: there is no new owner fact to show.
+    if outcome == FinishPollOutcome::Accepted {
+        publish_finish_product_proof_status(&composition).await?;
     }
+    Ok(outcome)
+}
+
+/// Republishes the acceptance owner's current product-proof rollup after a
+/// committed finish decision (issue #1903).
+///
+/// The composition lock is held for the read only and released before the
+/// status write, so no Kernel exchange or blocking write crosses it. A refused
+/// record is the current product state and publishes as a refusal; a status
+/// write failure is reported rather than swallowed, because a surface that
+/// silently stopped showing the record would look exactly like a record that
+/// stopped changing.
+async fn publish_finish_product_proof_status(
+    composition: &SharedComposition,
+) -> Result<(), String> {
+    let (status, product_proof) = {
+        let mut guard = composition.lock().await;
+        // The decision receipt was committed by the exchange after the last
+        // `refresh_from_kernel`, so the owner's projection does not hold it yet.
+        // Re-reading through the existing owner publication entry point is what
+        // makes this the record built from the receipt the owner actually
+        // admitted, rather than the one it held before the attempt. A refresh
+        // failure is reported: publishing the pre-attempt record here would look
+        // exactly like an attempt that never happened.
+        guard
+            .refresh_testd_terminal_owner()
+            .map_err(|error| format!("product proof owner refresh after finish attempt: {error}"))?;
+        (guard.status(), product_proof_wire(&guard))
+    };
+    publish_product_proof_status(&status, product_proof)
 }
 
 async fn drain_finish_on_shutdown(flight: &mut FinishFlight) -> Result<RunLoopExit, String> {
@@ -7272,6 +7390,40 @@ fn unix_ms(now: SystemTime) -> Result<u64, String> {
 
 fn activation_deadline_expired(now: u64, deadline: u64) -> bool {
     now >= deadline
+}
+
+/// Projects the acceptance owner's current product-proof record, or `None` when
+/// the owner refused to build one.
+///
+/// A refusal is an ordinary result, not a failure: it is the current product
+/// state. It is logged at warn level so a reader can tell an absent field from
+/// a lost owner, and it never changes readiness, protocol framing, or exit
+/// behavior.
+fn product_proof_wire(
+    composition: &DaemonComposition,
+) -> Option<ProductProofStatusWire> {
+    match composition.product_proof_status() {
+        Ok((record, rollup)) => Some(ProductProofStatusWire::project(&record, &rollup)),
+        Err(error) => {
+            tracing::warn!(target: "eliotd::diagnostics", "product proof status unavailable: {error}");
+            None
+        }
+    }
+}
+
+/// Publishes the current product-proof rollup on the daemon's existing status
+/// surface (issue #1903).
+///
+/// This is the one status write for the record: startup and every later
+/// installed-attempt settlement go through it, so the surface cannot carry two
+/// different answers for one acceptance item. It re-reads the owner rather than
+/// reusing the startup value, so the record the surface shows is the record the
+/// owner rebuilt from the durable finish receipts after the last attempt.
+fn publish_product_proof_status(
+    status: &DaemonStatus,
+    product_proof: Option<ProductProofStatusWire>,
+) -> Result<(), String> {
+    write_json(&ready_message(status, product_proof))
 }
 
 fn ready_message(

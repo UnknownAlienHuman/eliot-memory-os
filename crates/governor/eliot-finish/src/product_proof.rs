@@ -378,9 +378,26 @@ fn fail_closed_rollup(
 /// I18.24 outcome type; it declares no new outcome axis. An execution
 /// position is mapped separately, so a launch failure is never conflated with
 /// a policy block.
-pub fn outcome_of_decision(decision: &FinishDecision) -> VerificationOutcome {
+///
+/// The installed-route observation is part of the input, and that is the
+/// structural point: a finish decision proves the *candidate* contract, not the
+/// installed-route product property this record describes. So a decision that
+/// closed as `VerifiedComplete` while the required installed-route execution
+/// was never observed does not become a product `PASS` — the required stage did
+/// not run, so the recorded product outcome is `Blocked`, which is the same
+/// honest state the parked record carries and the same state the record's own
+/// `validate()` would otherwise refuse. Reading the observation here rather
+/// than leaving it to `validate()` is what keeps the record publishable instead
+/// of collapsing to an absent field.
+pub fn outcome_of_decision(
+    decision: &FinishDecision,
+    installed_route_observed: bool,
+) -> VerificationOutcome {
     match decision.outcome {
-        FinishDecisionOutcome::VerifiedComplete => VerificationOutcome::Pass,
+        FinishDecisionOutcome::VerifiedComplete if installed_route_observed => {
+            VerificationOutcome::Pass
+        }
+        FinishDecisionOutcome::VerifiedComplete => VerificationOutcome::Blocked,
         FinishDecisionOutcome::FailedVerification => VerificationOutcome::Fail,
         FinishDecisionOutcome::Partial => VerificationOutcome::Partial,
         FinishDecisionOutcome::DegradedNoProof => VerificationOutcome::Unknown,

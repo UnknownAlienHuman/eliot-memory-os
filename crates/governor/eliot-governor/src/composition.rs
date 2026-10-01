@@ -1179,6 +1179,16 @@ fn installed_route_receipt_id<'a>(binding: &'a str, expected: &str) -> Option<&'
         .find(|segment| segment.trim() == expected)
 }
 
+/// Whether one retained finish receipt actually observed the installed route.
+///
+/// This reads the same independent binding join
+/// [`observed_installed_route_stage`] performs, so the executable's `installed`
+/// flag and the record's installed-route stage can never disagree about
+/// whether an installed-route execution was observed.
+fn installed_route_observed_in(receipt: &FinishDecisionReceipt) -> bool {
+    observed_installed_route_stage(receipt).is_some_and(|stage| stage.is_observed())
+}
+
 /// The installed-route stage receipt a real finish receipt justifies.
 ///
 /// The stage cites the installed-route receipt the decision actually carried —
@@ -6279,6 +6289,16 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// `Blocked`, and the rollup is `Refused`. Nothing in this method relaxes
     /// the `PASS` refusal: a record is only a pass when the owner actually
     /// observed an installed-route execution.
+    ///
+    /// This is a read of durable owner state, not an in-memory projection: the
+    /// composition rehydrates [`GovernorOwners::finish`] from the `Finish`
+    /// owner named read on every [`Self::refresh_from_kernel`], and that read
+    /// is the same committed canonical projection the finish decision path
+    /// writes through `RecordFinishDecision`. The record is therefore rebuilt
+    /// from the owner's own durable receipts after a restart instead of being
+    /// retained beside this composition, and the fold below is a pure function
+    /// of those receipts — the same receipts in the same owner order produce
+    /// the same record before and after a restart.
     pub fn product_proof_status(
         &self,
     ) -> Result<
@@ -6289,14 +6309,19 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         CompositionError,
     > {
         let snapshot = &self.snapshot;
+        // The stage receipts this owner already holds. They are read first
+        // because the executable's `installed` flag is an observation, not a
+        // constant: it is `true` exactly when a retained decision carried the
+        // Product Proof plan's own installed-route receipt.
+        let receipts = self.owners.finish.receipts();
+        let installed_route_observed = receipts.iter().any(installed_route_observed_in);
         // The identity this record would launch is the exact Host-approved
         // generation this composition is running under, so the record names the
-        // bytes that would run. `installed` stays `false` because an
-        // installed-route execution has not launched them.
+        // bytes that would run.
         let executable = eliot_reports::product_proof::ProductProofExecutableIdentity::new(
             format!("{}.exe", snapshot.service),
             Some(snapshot.artifact_digest.clone()),
-            false,
+            installed_route_observed,
         )
         .map_err(product_proof_error)?;
         // The platform is this process's real compiled target, read from the
@@ -6320,7 +6345,6 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         // decision's own receipt digest, so the parked record's build handle
         // cites a real receipt rather than an assumed one. The installed-route
         // stage is left absent: only the revision below can observe it.
-        let receipts = self.owners.finish.receipts();
         let observed = receipts
             .iter()
             .find(|receipt| receipt.decision.outcome == FinishDecisionOutcome::VerifiedComplete);
@@ -6339,21 +6363,21 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         };
         // The owner builds the parked record first — a parked run was never
         // attempted, so it is exactly the current state — and the same record is
-        // then revised from the owner's latest retained receipt, so the next
-        // installed Windows attempt updates this one acceptance item in place
-        // instead of a second record appearing. The revision is what carries a
-        // real observation, so `parked` never has to accept one: with no
-        // retained receipt the parked record stands unchanged, which is the
-        // current truthful state.
+        // then revised from every retained finish receipt, in the owner's own
+        // `FinishService::receipts()` order, so the latest retained attempt is
+        // the one that describes the record and no earlier attempt's evidence
+        // is skipped. The revision is what carries a real observation, so
+        // `parked` never has to accept one: with no retained receipt the parked
+        // record stands unchanged, which is the current truthful state.
         let parked = self
             .owners
             .finish
             .product_proof_parked(&inputs)
             .map_err(product_proof_error)?;
-        let status = match receipts.last() {
-            Some(receipt) => self.revise_product_proof_status(&parked, receipt)?.0,
-            None => parked,
-        };
+        let mut status = parked;
+        for receipt in &receipts {
+            status = self.revise_product_proof_status(&status, receipt)?.0;
+        }
         let rollup = status.rollup();
         Ok((status, rollup))
     }
@@ -6366,13 +6390,18 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// already derived and retained, so the same acceptance item keeps one
     /// record and is updated in place rather than a parallel record appearing.
     /// Nothing is invented here — the run identity is the receipt's own
-    /// `decision_id`, the semantic outcome is
-    /// [`outcome_of_decision`](eliot_finish::product_proof::outcome_of_decision)
-    /// of the receipt's own decision, the execution position is that same
-    /// decision mapped to its lifecycle action, and the I18.22 failure class is
+    /// `decision_id`, the execution position is that receipt's lifecycle action
+    /// mapped to its lifecycle position, and the I18.22 failure class is
     /// [`failure_class_of_execution`](eliot_finish::product_proof::failure_class_of_execution)
-    /// of that position. The fail-closed rule is untouched: a `Pass` still
-    /// requires an observed installed-route execution.
+    /// of that position. The semantic outcome is
+    /// [`outcome_of_decision`](eliot_finish::product_proof::outcome_of_decision)
+    /// over the receipt's own decision *and this call's own stage observation*,
+    /// so a candidate the Finish service verified but whose installed-route
+    /// execution never ran is recorded `Blocked`, not as a product `Pass`. The
+    /// fail-closed rule is untouched and is now stated at its source rather than
+    /// left to a later `validate()` refusal: a `Pass` still requires an observed
+    /// installed-route execution, and the record stays publishable as a refusal
+    /// instead of collapsing to an absent field.
     pub fn revise_product_proof_status(
         &self,
         previous: &eliot_reports::product_proof::ProductProofStatus,
@@ -6392,7 +6421,13 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         // rolled up as `PASS`.
         let installed_route = installed_route_stage(receipt);
         let observed = installed_route.is_observed();
-        let outcome = eliot_finish::product_proof::outcome_of_decision(&receipt.decision);
+        // The stage observation travels into the outcome mapping, so a decision
+        // that verified the candidate but never executed the installed route is
+        // recorded as `Blocked`, not as a product `PASS` the record's own
+        // `validate()` would refuse. This is the same fail-closed rule stated
+        // at its source rather than left to a later refusal.
+        let outcome =
+            eliot_finish::product_proof::outcome_of_decision(&receipt.decision, observed);
         let attempt = match eliot_finish::product_proof::failure_class_of_execution(execution) {
             Some(failure_class) => {
                 eliot_reports::product_proof::ProductProofRunAttempt::incomplete(
@@ -6424,11 +6459,20 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             }
             eliot_reports::product_proof::ProductProofStageReceipt::Missing { .. } => None,
         };
-        // The retained evidence is rebuilt from this same record's identities
-        // plus the receipt's own raw-log handles, so the revision never drops a
-        // previously retained fact and never invents one.
+        // The retained evidence is the union of what this record already holds
+        // and what THIS attempt's own receipt carries, so the revision never
+        // drops a previously retained handle and never invents one. Carrying
+        // only `previous` — as this did before — meant the next attempt's raw
+        // log handles were read, never written back, so the retained evidence
+        // of the current attempt was silently absent from the record. The
+        // union is sorted and deduplicated so an attempt that cites an
+        // already-retained handle cannot create a duplicate.
+        let mut raw_log_refs = previous.retained.raw_log_refs.clone();
+        raw_log_refs.extend(receipt.decision.proof.artifact_and_verifier_bindings.iter().cloned());
+        raw_log_refs.sort();
+        raw_log_refs.dedup();
         let retained = eliot_reports::product_proof::ProductProofRetainedEvidence {
-            raw_log_refs: previous.retained.raw_log_refs.clone(),
+            raw_log_refs,
             executable: previous.retained.executable.clone(),
             environment: previous.retained.environment.clone(),
             stage_receipts: eliot_reports::product_proof::ProductProofStageReceipts {
