@@ -54,6 +54,54 @@
 //!   and that the manifest's declared purge state equals the ledger the package
 //!   actually carries.
 //!
+//! # Every fence value is compared with an independently read expected value
+//!
+//! Issue #1871 item A2 requires the manifest's fence generation, revision,
+//! ordering-head, event-range and blob-reachability values to be *checkable
+//! against the source Store*. A fence value compared with a copy of itself is
+//! not checkable, so each comparison below reads its expected side from a
+//! **different owner record** than the value it proves, and every expected side
+//! is an owner-issued field this crate never derives, renders or defaults:
+//!
+//! | fence member | emitted from | expected value read from |
+//! |---|---|---|
+//! | `state_fence` | the capture's observed fence | the authenticated request's admitted `context.state_fence` |
+//! | `schema_generation`, `store_generation` | the source owner's observed generation labels | the store-contract/configuration/policy generation identity every delivered `WriteReceipt` recorded in its own `policy_config_schema_versions`, required to be one single identity across the package and to name the capture fence's own policy revision |
+//! | `revision_heads` | the source's observed `revision_head` rows | the `revision_before_after` advances of the delivered `WriteReceipt`s: adjacency (no unexplained revision gap, I5.13) and a last committed advance equal to the declared revision |
+//! | `ordering_heads` | the source's observed `ordering_head` rows | the `ordering_links` of the delivered `CanonicalEvent`s: the last committed position plus the store-issued chain hash that links it to its predecessor |
+//! | `event_range` | the source's declared interval | the store-issued `event_ordinal` on the delivered events |
+//! | `blob_reachability_manifest` | the source's declared reachable residency keys | the residency-key digest inside each delivered blob's own `BlobReadyReceipt` |
+//!
+//! The declared generation labels are the one fence member with no typed
+//! counterpart anywhere in the source view: [`CoherentSourceExport`] carries the
+//! store's own observed strings and nothing that renders them back into a
+//! generation identity. Inventing a rendering between a free-form label and
+//! `PolicyConfigSchemaVersions::schema_revision` would make the check agree with
+//! itself, so this crate does not do it. What is checked is the property the
+//! label is used for: every record the package carries was written under one
+//! store-contract, configuration and policy generation, and that generation is
+//! the capture fence's own. The label stays the source owner's value and remains
+//! the importer's authenticity obligation.
+//!
+//! # An ordering head is proved by order and is excluded from scope closure
+//!
+//! `A00-07` defines an **Ordering Scope** as "The smallest domain in which
+//! conflicting transitions must be ordered", and I5.7 selects one by "the state
+//! whose preconditions may mutually invalidate". An `OrderingScopeId` is
+//! therefore an *order* domain, not a WorkScope: nothing in `eliot-store-api`
+//! relates one to a `ScopeId`, the store's own `WriteReceipt` records
+//! `ordering_sequences` and no scope identity at all, and several unrelated
+//! heads legitimately sit under one caller-visible scope label. A `scope_id`
+//! written onto an ordering head would be a fact about whichever writer advanced
+//! that head last, presented as the head's own scope.
+//!
+//! So this module never reads, derives, stores or compares a scope identity on an
+//! ordering head. The fence's `ordering_heads` member is deliberately **excluded
+//! from scope closure** and is proved against the only evidence an ordering head
+//! actually has: the `ordering_sequence` the store assigned at commit and the
+//! store-issued chain hash that links it to its predecessor
+//! ([`prove_fence_ordering_heads_against_store`]).
+//!
 //! # There is no live-DB-file backup path (issue #1141, W4)
 //!
 //! I05-10 states the export "is independent of `SurrealQL`" and I05-13 states the
@@ -107,7 +155,7 @@ use std::path::{Path, PathBuf};
 use eliot_blob_api::BlobReadyReceipt;
 use eliot_security_contracts::PurgeLedgerEntry;
 use eliot_store_api::{
-    CanonicalEvent, OrderingHead, OrderingScopeId, RevisionHead, RevisionKey, ScopeId,
+    CanonicalEvent, OrderingHead, OrderingLink, OrderingScopeId, RevisionHead, RevisionKey, ScopeId,
     ScopeRevisionView, SnapshotCompleteness, WriteReceipt,
 };
 pub use eliot_store_api::{EcxfExportReport, EcxfExportRequest};
@@ -316,6 +364,11 @@ pub async fn export_ecxf_package<S: EcxfSourceStore + ?Sized>(
         .into_iter()
         .map(SealedBlobEntry::into_ecxf)
         .collect();
+    // `snapshot.blobs` is consumed by the projection above; the declared
+    // reachability set is a different field and is still the source owner's own
+    // declaration, so it can be compared against what the projected blobs carry
+    // without either side having been produced by this crate.
+    prove_blob_reachability_against_store(&snapshot.reachable_blob_residency_keys, &blobs)?;
     let archive = eliot_ecxf::EcxfArchive::build(eliot_ecxf::EcxfExportInput {
         manifest,
         sections,
@@ -472,7 +525,12 @@ fn prove_coherent_boundary(
         .iter()
         .map(|record| record.record_id.as_str())
         .collect();
-    prove_event_range_against_store(snapshot, &orderings)?;
+    let frontier = prove_event_range_against_store(snapshot, &orderings)?;
+    // Issue #1871 item A2: every remaining fence member is proved here against
+    // an expected value read from a different owner record of the same capture.
+    prove_fence_ordering_heads_against_store(snapshot, &frontier)?;
+    prove_fence_revision_heads_against_store(snapshot)?;
+    prove_fence_generation_against_store(snapshot)?;
     for receipt in &snapshot.receipts {
         receipt.validate().map_err(BackupError::Store)?;
         if !receipt
@@ -567,10 +625,15 @@ fn prove_coherent_boundary(
 /// here to stand in for owner-issued material: a record that does not carry the
 /// store's own canonical event cannot be evidence for the fence at all, so it
 /// refuses rather than being read for an ordinal.
+///
+/// The committed ordering frontier those same links describe is returned rather
+/// than discarded, so [`prove_fence_ordering_heads_against_store`] proves the
+/// declared Ordering Heads against evidence this crate never chose.
 fn prove_event_range_against_store(
     snapshot: &CoherentSourceExport,
     orderings: &BTreeMap<&OrderingScopeId, u64>,
-) -> Result<(), BackupError> {
+) -> Result<ObservedOrderingFrontier, BackupError> {
+    let mut frontier = ObservedOrderingFrontier::default();
     let mut observed: Option<(u64, u64)> = None;
     for record in &snapshot.events {
         let Ok(event) = serde_json::from_value::<CanonicalEvent>(record.payload.clone()) else {
@@ -608,6 +671,7 @@ fn prove_event_range_against_store(
                     ),
                 });
             }
+            frontier.record(link)?;
         }
         observed = Some(match observed {
             Some((first, last)) => (
@@ -633,6 +697,300 @@ fn prove_event_range_against_store(
         return Err(BackupError::FenceMismatch {
             subject: "export event range count".to_owned(),
         });
+    }
+    Ok(frontier)
+}
+
+/// One committed ordering position and the store-issued chain hashes around it.
+///
+/// Both hashes come from the source's own `canonical_event` row: `event_hash`
+/// identifies the position this event committed and `previous_event_hash`
+/// identifies the position it follows. Neither is derived from the fence's
+/// ordering heads, which is what makes the comparison against them a check
+/// rather than a restatement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CommittedOrderingPosition {
+    previous_event_hash: String,
+    event_hash: String,
+}
+
+/// The committed ordering frontier the source's delivered canonical events prove.
+///
+/// This is the expected side of the fence's Ordering Head comparison, read from
+/// the `ordering_links` of the delivered `CanonicalEvent` records. An ordering
+/// head carries no scope identity anywhere in the store's own model, so the only
+/// evidence it has is order: the position the store assigned at commit and the
+/// chain hash that links it to its predecessor.
+#[derive(Debug, Default)]
+struct ObservedOrderingFrontier {
+    /// Per ordering scope, every committed position and its chain hashes, keyed
+    /// by the position the store assigned.
+    positions: BTreeMap<String, BTreeMap<u64, CommittedOrderingPosition>>,
+}
+
+impl ObservedOrderingFrontier {
+    /// Records one delivered ordering link.
+    ///
+    /// A second link claiming an already-recorded position with a different
+    /// chain hash is a source whose own records disagree about its committed
+    /// order; it is refused rather than resolved by preferring either record.
+    fn record(&mut self, link: &OrderingLink) -> Result<(), BackupError> {
+        let position = CommittedOrderingPosition {
+            previous_event_hash: link.previous_event_hash.clone(),
+            event_hash: link.event_hash.clone(),
+        };
+        let recorded = self
+            .positions
+            .entry(link.ordering_scope.as_str().to_owned())
+            .or_default()
+            .entry(link.ordering_sequence)
+            .or_insert_with(|| position.clone());
+        if *recorded != position {
+            return Err(BackupError::IntegrityMismatch {
+                subject: format!(
+                    "source ordering position {}:{} carries two committed chain hashes",
+                    link.ordering_scope.as_str(),
+                    link.ordering_sequence
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns the highest committed position the delivered events prove for one
+    /// ordering scope.
+    fn committed_frontier(&self, scope: &str) -> Option<u64> {
+        self.positions
+            .get(scope)
+            .and_then(|positions| positions.keys().next_back().copied())
+    }
+
+    /// Requires the delivered positions of one scope to form the store's own
+    /// hash-linked chain.
+    ///
+    /// Only adjacency is required: the position after `k` must record the
+    /// `event_hash` of position `k` as its own `previous_event_hash`. I5.7 lets
+    /// a reservation be "closed or explicitly gapped" by a deterministic
+    /// rejection or dead-letter, so a missing position is not by itself a defect,
+    /// while two adjacent delivered positions that do not chain are.
+    fn prove_chain(&self, scope: &str) -> Result<(), BackupError> {
+        let Some(positions) = self.positions.get(scope) else {
+            return Ok(());
+        };
+        let mut previous: Option<(u64, &CommittedOrderingPosition)> = None;
+        for (position, committed) in positions {
+            if let Some((before, predecessor)) = previous
+                && before.checked_add(1) == Some(*position)
+                && predecessor.event_hash != committed.previous_event_hash
+            {
+                return Err(BackupError::IntegrityMismatch {
+                    subject: format!("source ordering chain for scope {scope}"),
+                });
+            }
+            previous = Some((*position, committed));
+        }
+        Ok(())
+    }
+}
+
+/// Proves the fence's declared Ordering Heads against the committed order the
+/// source's own delivered canonical events prove (issue #1871 item A2).
+///
+/// This is the honest check for an ordering head, and it is deliberately *not* a
+/// scope-closure check. `A00-07` defines an Ordering Scope as "The smallest
+/// domain in which conflicting transitions must be ordered" and I5.7 selects one
+/// by "the state whose preconditions may mutually invalidate": an
+/// `OrderingScopeId` is an order domain, not a WorkScope. The store's own
+/// `WriteReceipt` records `ordering_sequences` and no scope identity, so a
+/// `scope_id` on an ordering head could only be a fact about whichever writer
+/// advanced that head last. The fence's ordering-head member is therefore
+/// excluded from scope closure and is proved by order alone, against the
+/// store-issued `ordering_sequence` and chain hash on the delivered
+/// `canonical_event` links — never against the `ordering_head` rows the fence
+/// itself carries.
+///
+/// The comparison is an equality, not a bound, because I5.7 gives the head a
+/// single meaning: "Canonical Store `OrderingHead` owns the last committed
+/// sequence/hash of durable semantic history". A head above the last committed
+/// position, or a head for a scope this export committed nothing in, would name
+/// an order the package does not carry.
+fn prove_fence_ordering_heads_against_store(
+    snapshot: &CoherentSourceExport,
+    frontier: &ObservedOrderingFrontier,
+) -> Result<(), BackupError> {
+    for head in &snapshot.ordering_heads {
+        let scope = head.scope.as_str();
+        frontier.prove_chain(scope)?;
+        let Some(committed) = frontier.committed_frontier(scope) else {
+            return Err(BackupError::FenceMismatch {
+                subject: format!(
+                    "ordering head {scope} has no committed position in the exported events"
+                ),
+            });
+        };
+        if committed != head.sequence {
+            return Err(BackupError::FenceMismatch {
+                subject: format!("ordering head {scope}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Proves the fence's declared Revision Heads against the revision advances the
+/// source's own delivered write receipts recorded (issue #1871 item A2).
+///
+/// A `RevisionDelta` is the store owner's own record of one committed revision
+/// change, carrying the revision it read and the revision it wrote. Three
+/// independent comparisons meet here, and none of them reads the
+/// `revision_head` rows the fence itself carries:
+///
+/// * **completeness** — a declared head whose key no delivered receipt advanced
+///   has no source evidence at all, so it is refused rather than emitted as an
+///   unreproved number;
+/// * **no unexplained revision gap** — consecutive delivered advances for one
+///   key must hand over exactly (`after` of the earlier equals `before` of the
+///   later). I5.13 states that "an unexplained revision gap ... fails that class
+///   rather than producing a partial 'successful' backup", and a missing advance
+///   in the middle of a chain is exactly that;
+/// * **equality with the head** — the last delivered advance for the key must be
+///   the declared revision, because the head is the store's current committed
+///   revision and not an upper bound over it.
+///
+/// Adjacency is checked, not a unit step: `WriteReceipt::validate` requires each
+/// delta to advance (`after > before`) without requiring `after == before + 1`,
+/// so only the handover between two delivered advances is asserted.
+fn prove_fence_revision_heads_against_store(
+    snapshot: &CoherentSourceExport,
+) -> Result<(), BackupError> {
+    let mut advances: BTreeMap<&RevisionKey, Vec<(u64, u64)>> = BTreeMap::new();
+    for receipt in &snapshot.receipts {
+        for delta in &receipt.revision_before_after {
+            advances
+                .entry(&delta.key)
+                .or_default()
+                .push((delta.before, delta.after));
+        }
+    }
+    for head in &snapshot.revision_heads {
+        let mut committed = advances.get(&head.key).cloned().ok_or_else(|| {
+            BackupError::FenceMismatch {
+                subject: format!(
+                    "revision head {} has no committed advance in the exported receipts",
+                    head.key
+                ),
+            }
+        })?;
+        committed.sort_unstable();
+        for handover in committed.windows(2) {
+            if handover[0].1 != handover[1].0 {
+                return Err(BackupError::IntegrityMismatch {
+                    subject: format!(
+                        "revision {} has an unexplained gap between committed revisions {} and {}",
+                        head.key, handover[0].1, handover[1].0
+                    ),
+                });
+            }
+        }
+        if committed.last().map_or(0, |advance| advance.1) != head.revision {
+            return Err(BackupError::FenceMismatch {
+                subject: format!("revision head {}", head.key),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Proves that every record this package carries was written under one store
+/// generation (issue #1871 item A2).
+///
+/// The declared `schema_generation` and `store_generation` labels are the source
+/// owner's own observed strings, and no source-view member renders them back
+/// into a generation identity, so this check does not pretend to compare them
+/// with a value it derived from itself. It proves the property the labels exist
+/// for, using the generation identity the store records on the only records the
+/// source delivers alongside events:
+///
+/// * each delivered `WriteReceipt` carries `policy_config_schema_versions`, the
+///   "Policy, configuration and schema version identities in force for the
+///   admitted transition" (`PolicyConfigSchemaVersions`), copied from the
+///   admitted transition rather than supplied by a caller. Its recorded policy
+///   revision must be the capture fence's own policy revision, so every exported
+///   record was admitted under the fence the manifest publishes;
+/// * all of those receipts must agree on one store-contract revision and one
+///   configuration profile. A package holding records written under two schema
+///   or configuration generations is a mixed moment, which I5.10 forbids outright
+///   ("mixing unrelated table moments into one 'backup' is forbidden").
+///
+/// A capture with no receipt at all has no record to contradict the labels; the
+/// source owner's own authenticity claim then stands alone, exactly as it does
+/// for the architecture and normative-pair digests.
+fn prove_fence_generation_against_store(
+    snapshot: &CoherentSourceExport,
+) -> Result<(), BackupError> {
+    let mut generation: Option<&eliot_store_api::PolicyConfigSchemaVersions> = None;
+    for receipt in &snapshot.receipts {
+        let recorded = &receipt.policy_config_schema_versions;
+        if recorded.policy_revision != snapshot.state_fence.policy_revision {
+            return Err(BackupError::FenceMismatch {
+                subject: format!(
+                    "receipt {} recorded policy generation",
+                    receipt.operation_id
+                ),
+            });
+        }
+        match generation {
+            None => generation = Some(recorded),
+            Some(first)
+                if first.schema_revision != recorded.schema_revision
+                    || first.config_profile != recorded.config_profile =>
+            {
+                return Err(BackupError::InconsistentBoundary);
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Proves the fence's declared blob reachability set against the residency
+/// identities the delivered blobs actually carry (issue #1871 item A2, I5.13
+/// "Missing blobs ... fails that class rather than producing a partial
+/// 'successful' backup").
+///
+/// The declared side is the source owner's own reachable-residency set; the
+/// expected side is the residency-key digest inside each delivered blob's
+/// already-bound `BlobReadyReceipt`, read through the single normative
+/// derivation [`eliot_ecxf::EcxfBlob::residency_key_digest`]. This crate never
+/// re-hashes, re-renders or guesses a residency key, and the expected set is not
+/// a copy of the declared one: a source that under-declares reachability drops a
+/// key that a delivered blob proves, and a source that over-declares names a key
+/// no delivered residency identity carries. Both are refused. A residency key
+/// delivered twice is refused as well, because reachability is a set identity
+/// (I5.13 forbids merging records whose content digests match, so equal bytes in
+/// two residency domains are two distinct reachable objects).
+///
+/// `eliot-ecxf` re-proves the same equality inside `EcxfArchive::build` over the
+/// same single derivation; that is the format owner's re-proof of the value it
+/// is about to write, not a second scheme.
+fn prove_blob_reachability_against_store(
+    declared: &[String],
+    blobs: &[eliot_ecxf::EcxfBlob],
+) -> Result<(), BackupError> {
+    let expected: BTreeSet<String> = blobs
+        .iter()
+        .map(|blob| blob.residency_key_digest().map_err(ecxf_error))
+        .collect::<Result<BTreeSet<_>, BackupError>>()?;
+    let declared_set: BTreeSet<&str> = declared.iter().map(String::as_str).collect();
+    if declared_set.len() != declared.len() {
+        return Err(BackupError::Duplicate {
+            field: "ecxf.reachable_blob_residency_keys",
+        });
+    }
+    if declared_set.len() != expected.len()
+        || !declared_set.iter().all(|key| expected.contains(*key))
+    {
+        return Err(BackupError::InconsistentBoundary);
     }
     Ok(())
 }
