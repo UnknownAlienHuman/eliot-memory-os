@@ -2263,6 +2263,49 @@ function Assert-RuntimeArtifactBindings([string]$Bundle) {
             }
         }
     }
+    $expectedSymbols = @(
+        @{ role = 'host'; executable = 'runtime/eliot-host.exe'; path = 'symbols/host/eliot-host.pdb' },
+        @{ role = 'kernel'; executable = 'runtime/eliot-kernel.exe'; path = 'symbols/kernel/eliot-kernel.pdb' }
+    )
+    $runtimeSymbols = @($runtime.symbol_artifacts)
+    $releaseSymbols = @($release.symbol_artifacts)
+    if ($runtimeSymbols.Count -ne 2 -or $releaseSymbols.Count -ne 2) {
+        throw 'runtime/release manifests must carry exactly the Host and Kernel symbol records'
+    }
+    foreach ($expected in $expectedSymbols) {
+        $symbolMatches = @($runtimeSymbols | Where-Object { [string]$_.role -ceq [string]$expected.role })
+        $releaseMatches = @($releaseSymbols | Where-Object { [string]$_.role -ceq [string]$expected.role })
+        $exeMatches = @($runtimeArtifacts | Where-Object { [string]$_.path -ceq [string]$expected.executable })
+        if ($symbolMatches.Count -ne 1 -or $releaseMatches.Count -ne 1 -or $exeMatches.Count -ne 1) {
+            throw "runtime/release symbol role is missing or duplicated: $([string]$expected.role)"
+        }
+        $symbol = $symbolMatches[0]
+        $releaseSymbol = $releaseMatches[0]
+        $symbolPath = [string]$symbol.artifact_ref
+        if ([string]$symbol.package -cne "eliot-$([string]$expected.role)" -or
+            [string]$symbol.binary -cne "eliot-$([string]$expected.role)" -or
+            [string]$symbol.executable_path -cne [string]$expected.executable -or
+            [string]$symbol.executable_sha256 -cne [string]$exeMatches[0].sha256 -or
+            [string]$symbol.build_fingerprint -cne [string]$release.source_commit -or
+            [string]$symbol.build_profile -cne 'release' -or
+            $symbolPath -cne [string]$expected.path -or
+            [string]$symbol.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            [int64]$symbol.bytes -le 0 -or
+            [string]$symbol.retention_reference -cne 'SHA256SUMS.json') {
+            throw "runtime symbol record is malformed or detached from its executable: $([string]$expected.role)"
+        }
+        foreach ($field in @('package', 'binary', 'role', 'executable_path', 'executable_sha256', 'build_fingerprint', 'build_profile', 'artifact_ref', 'sha256', 'bytes', 'retention_reference')) {
+            if ([string]$releaseSymbol.$field -cne [string]$symbol.$field) {
+                throw "RELEASE.json symbol binding differs from RUNTIME_ARTIFACTS.json for $([string]$expected.role): $field"
+            }
+        }
+        $pdbPath = Join-Path $Bundle $symbolPath
+        if (-not (Test-Path -LiteralPath $pdbPath -PathType Leaf) -or
+            (Get-FileHash -LiteralPath $pdbPath -Algorithm SHA256).Hash.ToLowerInvariant() -cne [string]$symbol.sha256 -or
+            [int64](Get-Item -LiteralPath $pdbPath).Length -ne [int64]$symbol.bytes) {
+            throw "retained PDB digest differs from runtime symbol record: $symbolPath"
+        }
+    }
     [ordered]@{
         source_commit = [string]$release.source_commit
         version = [string]$release.version
@@ -2912,6 +2955,17 @@ function Update-SignedReleaseManifests([string]$Bundle, [object]$Plan, [object]$
         }
         [pscustomobject]$copy
     }
+    $runtimeSymbols = foreach ($symbol in @($runtime.symbol_artifacts)) {
+        $path = [string]$symbol.executable_path
+        $matches = @($runtimeArtifacts | Where-Object { [string]$_.path -ceq $path })
+        if ($matches.Count -ne 1) {
+            throw "runtime symbol record has no unique finalized executable: $path"
+        }
+        $copy = [ordered]@{}
+        foreach ($property in $symbol.PSObject.Properties) { $copy[$property.Name] = $property.Value }
+        $copy['executable_sha256'] = [string]$matches[0].sha256
+        [pscustomobject]$copy
+    }
     $bundleSigningArtifacts = foreach ($artifact in @($runtime.bundle_signing_artifacts)) {
         $path = ([string]$artifact.path).Replace('\', '/')
         $role = [string]$artifact.role
@@ -2935,6 +2989,7 @@ function Update-SignedReleaseManifests([string]$Bundle, [object]$Plan, [object]$
     Set-ObjectProperty $runtime 'signature_evidence' $signatureEvidence
     Set-ObjectProperty $runtime 'signed_scope' $script:AuthenticodeSigningScope
     Set-ObjectProperty $runtime 'artifacts' @($runtimeArtifacts)
+    Set-ObjectProperty $runtime 'symbol_artifacts' @($runtimeSymbols)
     # Preserve the exact staged generation_binding through signing so the
     # RELEASE/RUNTIME_ARTIFACTS repetition invoke byte-compares is retained.
     Set-ObjectProperty $runtime 'generation_binding' $stagedGenerationBinding
@@ -2959,12 +3014,23 @@ function Update-SignedReleaseManifests([string]$Bundle, [object]$Plan, [object]$
         }
         [pscustomobject]$copy
     }
+    $releaseSymbols = foreach ($symbol in @($release.symbol_artifacts)) {
+        $matches = @($runtimeSymbols | Where-Object { [string]$_.role -ceq [string]$symbol.role })
+        if ($matches.Count -ne 1) {
+            throw "RELEASE.json symbol record has no unique runtime binding: $([string]$symbol.role)"
+        }
+        $copy = [ordered]@{}
+        foreach ($property in $symbol.PSObject.Properties) { $copy[$property.Name] = $property.Value }
+        $copy['executable_sha256'] = [string]$matches[0].executable_sha256
+        [pscustomobject]$copy
+    }
     Set-ObjectProperty $release 'signed' $true
     Set-ObjectProperty $release 'signature_policy' $script:AuthenticodeSigningPolicy
     Set-ObjectProperty $release 'signature_evidence' $signatureEvidence
     Set-ObjectProperty $release 'signed_scope' $script:AuthenticodeSigningScope
     Set-ObjectProperty $release 'public_distribution_ready' $true
     Set-ObjectProperty $release 'runtime_artifacts' @($releaseArtifacts)
+    Set-ObjectProperty $release 'symbol_artifacts' @($releaseSymbols)
     # Preserve the exact staged generation_binding through signing so the
     # RELEASE/RUNTIME_ARTIFACTS repetition invoke byte-compares is retained.
     Set-ObjectProperty $release 'generation_binding' $stagedGenerationBinding

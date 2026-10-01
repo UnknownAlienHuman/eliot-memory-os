@@ -8,14 +8,16 @@ use std::path::{Path, PathBuf};
 use eliot_contracts::{EpochId, EpochLineageId};
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationExpectation};
 use eliot_installation::{
-    AgentBridgeSourceMaterializationFactory, AgentBridgeSourceMaterializationPlan,
-    GenerationPackagePlanner, InstallationEpoch, InstallationError, InstallationProfile,
+    AdmittedSymbolBinding, AgentBridgeSourceMaterializationFactory,
+    AgentBridgeSourceMaterializationPlan, GenerationPackagePlanner, InstallationEpoch,
+    InstallationError, InstallationProfile,
     InstallationRecoveryStage, LOCAL_SERVICE_SID, PHASE_B_PENDING_MARKER, PackageArtifactDigest,
     PlatformHandle, ProfileSelectionInput, ProfileSelectionResolution,
     RedbInstallationTransactionStore, ResourceGeneration, RuntimeLaunchDescriptor,
     SOURCE_BUNDLE_PUBLICATION_JOURNAL_WIRE_VERSION, SourceBundlePublicationJournal,
     SourceBundlePublicationJournalState, SourceBundlePublicationRole, StateFence,
-    SupervisionAuthorityBinding, agent_bridge_source_plan_from_observed_kernel,
+    SupervisionAuthorityBinding, SymbolExecutableRole,
+    agent_bridge_source_plan_from_observed_kernel,
     provider_bootstrap_credential_target_for_store_target, source_bundle_publication_operation_id,
 };
 use eliot_kernel_service::EliotdLaunchDescriptor;
@@ -50,7 +52,7 @@ fn materializer_genesis_epoch() -> Result<EpochId, MaterializeError> {
     EpochId::new(lineage, sequence).map_err(|error| MaterializeError::Contract(error.to_string()))
 }
 
-/// The only source roles admitted to Phase A.
+/// The legacy source roles admitted to Phase A.
 ///
 /// `authority.json` and `store-bootstrap.json` are intentionally absent. They
 /// are Host-owned Phase-B material and can never be supplied by this command.
@@ -71,6 +73,21 @@ pub const REQUIRED_ROLES: [(&str, bool); 15] = [
     ("eliotd-governor.json", false),
     ("eliotd.json", false),
 ];
+
+/// Optional retained release symbols are copied only when their original
+/// signed release receipt and exact PDB bytes are supplied and validated.
+pub const RELEASE_SYMBOL_ROLES: [(&str, bool); 2] = [
+    ("symbols/host/eliot-host.pdb", false),
+    ("symbols/kernel/eliot-kernel.pdb", false),
+];
+
+fn phase_a_roles(include_symbols: bool) -> Vec<(&'static str, bool)> {
+    let mut roles = REQUIRED_ROLES.to_vec();
+    if include_symbols {
+        roles.extend(RELEASE_SYMBOL_ROLES);
+    }
+    roles
+}
 
 /// Explicit inputs for one immutable source-bundle publication.
 #[derive(Clone, Debug)]
@@ -99,6 +116,9 @@ pub struct CanarySourceBundleMaterializeInput {
     pub eliot_user_broker_exe: PathBuf,
     /// Release `eliot-notify.exe` path (per-user one-shot adapter, I1.3).
     pub eliot_notify_exe: PathBuf,
+    /// Optional exact finalized release bundle supplying the admitted symbol
+    /// receipt and PDB bytes. Omission preserves the legacy no-symbol path.
+    pub release_bundle_root: Option<PathBuf>,
     /// Optional explicit external agent-bridge executable source.
     pub agent_bridge_exe: Option<PathBuf>,
     /// Optional account name resolved by Windows to the approved stable SID.
@@ -194,7 +214,7 @@ pub struct CanarySourceBundleReceipt {
     pub generation: String,
     /// Exact I3.1 root binding retained by publication and Generate.
     pub profile_governed_roots: eliot_installation::InstallationRoots,
-    /// Full fifteen-role canonical artifact evidence digest.
+    /// Full canonical 15-role legacy or 17-role symbol-bearing artifact evidence digest.
     pub evidence_digest: String,
     /// Exact role inventory, identities and byte facts.
     pub files: Vec<MaterializedRoleReceipt>,
@@ -205,7 +225,7 @@ pub struct CanarySourceBundleReceipt {
 }
 
 /// The non-wire proof handed directly to the generation planner.  It carries
-/// only the exact published root identity, ordered fifteen-role byte facts and
+/// only the exact published root identity, ordered 15/17-role byte facts and
 /// full evidence digest; the planner independently reopens and observes the
 /// path before accepting these facts.
 #[derive(Clone, Debug)]
@@ -220,13 +240,23 @@ impl CanarySourceBundleReceipt {
     pub(crate) fn planner_binding(
         &self,
     ) -> Result<SourceBundlePublicationBinding, MaterializeError> {
-        if self.files.len() != REQUIRED_ROLES.len()
+        if (self.files.len() != REQUIRED_ROLES.len()
+            && self.files.len() != REQUIRED_ROLES.len() + RELEASE_SYMBOL_ROLES.len())
             || self.source_identity != self.directory_publication.source_identity
             || self.source_identity != self.directory_publication.destination_identity
         {
             return Err(MaterializeError::Invalid(
-                "published source receipt is not an exact fifteen-role directory publication"
+                "published source receipt is not an exact legacy or symbol-bearing directory publication"
                     .to_owned(),
+            ));
+        }
+        let roles = phase_a_roles(
+            self.files.len() == REQUIRED_ROLES.len() + RELEASE_SYMBOL_ROLES.len(),
+        );
+        validate_role_inventory(&roles)?;
+        if self.files.iter().zip(&roles).any(|(file, (role, _))| file.relative_path != *role) {
+            return Err(MaterializeError::Invalid(
+                "published source receipt role order differs from the canonical inventory".to_owned(),
             ));
         }
         let files = self
@@ -265,7 +295,7 @@ pub enum CanarySourceBundleReconciliationReason {
     /// The platform move committed but exact directory receipt readback was
     /// unavailable.
     DirectoryPublicationUnknown,
-    /// Directory publication was exact, but the complete fifteen-role
+    /// Directory publication was exact, but the complete 15/17-role
     /// post-commit source-bundle readback was rejected.
     #[allow(
         dead_code,
@@ -284,7 +314,7 @@ pub struct CanarySourceBundleReconciliation {
     pub generation: String,
     /// Exact I3.1 root binding retained by the durable publication journal.
     pub profile_governed_roots: eliot_installation::InstallationRoots,
-    /// Full fifteen-role canonical artifact evidence digest.
+    /// Full canonical 15-role legacy or 17-role symbol-bearing artifact evidence digest.
     pub evidence_digest: String,
     /// Complete role facts measured before the atomic commit.
     pub precommit_files: Vec<MaterializedRolePrecommitReceipt>,
@@ -363,6 +393,33 @@ struct ValidatedExecutable {
 }
 
 #[derive(Clone, Debug)]
+struct ValidatedSymbolArtifact {
+    binding: AdmittedSymbolBinding,
+    bytes: Vec<u8>,
+    source_identity: FileIdentity,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ValidatedReleaseSymbols {
+    host: Option<ValidatedSymbolArtifact>,
+    kernel: Option<ValidatedSymbolArtifact>,
+}
+
+impl ValidatedReleaseSymbols {
+    fn is_complete(&self) -> bool {
+        self.host.is_some() && self.kernel.is_some()
+    }
+
+    fn role(&self, role: &str) -> Option<&ValidatedSymbolArtifact> {
+        match role {
+            "symbols/host/eliot-host.pdb" => self.host.as_ref(),
+            "symbols/kernel/eliot-kernel.pdb" => self.kernel.as_ref(),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 struct JsonRole {
     name: &'static str,
     bytes: Vec<u8>,
@@ -371,6 +428,7 @@ struct JsonRole {
 #[derive(Clone, Debug)]
 struct TypedBundle {
     json_roles: Vec<JsonRole>,
+    symbol_artifacts: ValidatedReleaseSymbols,
     expected: Vec<PackageArtifactDigest>,
     manifest: PackageManifest,
     evidence_digest: PlatformHandle,
@@ -514,18 +572,310 @@ fn validate_executable(
     })
 }
 
-fn validate_role_inventory(roles: &[(&str, bool)]) -> Result<(), MaterializeError> {
-    if roles.len() != REQUIRED_ROLES.len() {
+fn json_string<'a>(
+    value: &'a serde_json::Value,
+    field: &str,
+) -> Result<&'a str, MaterializeError> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| MaterializeError::Invalid(format!("release receipt field {field} is missing")))
+}
+
+fn json_array<'a>(
+    value: &'a serde_json::Value,
+    field: &str,
+) -> Result<&'a [serde_json::Value], MaterializeError> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .ok_or_else(|| MaterializeError::Invalid(format!("release receipt array {field} is missing")))
+}
+
+fn read_release_file(
+    root: &Path,
+    relative: &str,
+    maximum_bytes: usize,
+) -> Result<(Vec<u8>, FileIdentity), MaterializeError> {
+    validate_package_relative_path(Path::new(relative))
+        .map_err(|error| MaterializeError::Invalid(format!("release path {relative}: {error}")))?;
+    let path = root.join(relative);
+    let mut parent = Some(path.as_path());
+    while let Some(current) = parent {
+        if current == root {
+            break;
+        }
+        if is_reparse(current)? {
+            return Err(MaterializeError::Invalid(format!(
+                "release path contains a reparse point: {relative}"
+            )));
+        }
+        parent = current.parent();
+    }
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|error| MaterializeError::Platform(format!("observe {relative}: {error}")))?;
+    if !metadata.is_file() || is_reparse(&path)? || metadata.len() > maximum_bytes as u64 {
+        return Err(MaterializeError::Invalid(format!(
+            "release file is not a bounded regular file: {relative}"
+        )));
+    }
+    let identity_before = eliot_platform_windows::file_identity_for_path(&path)
+        .map_err(|error| MaterializeError::Platform(error.to_string()))?;
+    let bytes = fs::read(&path)
+        .map_err(|error| MaterializeError::Platform(format!("read {relative}: {error}")))?;
+    let identity_after = eliot_platform_windows::file_identity_for_path(&path)
+        .map_err(|error| MaterializeError::Platform(error.to_string()))?;
+    if bytes.is_empty()
+        || bytes.len() > maximum_bytes
+        || identity_before != identity_after
+        || bytes.len() as u64 != metadata.len()
+    {
+        return Err(MaterializeError::Invalid(format!(
+            "release file changed or has invalid length: {relative}"
+        )));
+    }
+    Ok((bytes, identity_after))
+}
+
+fn parse_release_json(root: &Path, relative: &str) -> Result<serde_json::Value, MaterializeError> {
+    let (bytes, _) = read_release_file(root, relative, 16 * 1024 * 1024)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| MaterializeError::Invalid(format!("parse {relative}: {error}")))
+}
+
+fn release_symbol_array<'a>(
+    receipt: &'a serde_json::Value,
+    field: &str,
+) -> Result<Option<&'a [serde_json::Value]>, MaterializeError> {
+    match receipt.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => value
+            .as_array()
+            .map(|items| Some(items.as_slice()))
+            .ok_or_else(|| MaterializeError::Invalid(format!("{field} must be an array"))),
+    }
+}
+
+fn checksum_file<'a>(
+    checksum: &'a serde_json::Value,
+    path: &str,
+) -> Result<&'a serde_json::Value, MaterializeError> {
+    let matches = json_array(checksum, "files")?
+        .iter()
+        .filter(|entry| entry.get("path").and_then(serde_json::Value::as_str) == Some(path))
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(MaterializeError::Invalid(format!(
+            "SHA256SUMS.json must bind exactly one file {path}"
+        )));
+    }
+    Ok(matches[0])
+}
+
+fn valid_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_release_symbols(
+    input: &CanarySourceBundleMaterializeInput,
+    executables: &[ValidatedExecutable],
+) -> Result<ValidatedReleaseSymbols, MaterializeError> {
+    let Some(root) = input.release_bundle_root.as_deref() else {
+        return Ok(ValidatedReleaseSymbols::default());
+    };
+    validate_absolute(root, "release_bundle_root")?;
+    if is_reparse(root)? || !fs::metadata(root).is_ok_and(|metadata| metadata.is_dir()) {
         return Err(MaterializeError::Invalid(
-            "Phase-A source bundle must contain exactly fifteen roles".to_owned(),
+            "release_bundle_root must be an existing non-reparse directory".to_owned(),
         ));
     }
-    for (actual, expected) in roles.iter().zip(REQUIRED_ROLES) {
-        if actual != &expected {
+    let release = parse_release_json(root, "RELEASE.json")?;
+    let runtime = parse_release_json(root, "runtime/RUNTIME_ARTIFACTS.json")?;
+    let checksum = parse_release_json(root, "SHA256SUMS.json")?;
+    if json_string(&release, "source_commit")? != json_string(&runtime, "source_commit")? {
+        return Err(MaterializeError::Invalid(
+            "RELEASE.json and RUNTIME_ARTIFACTS.json source commits differ".to_owned(),
+        ));
+    }
+    let release_symbols = release_symbol_array(&release, "symbol_artifacts")?;
+    let runtime_symbols = release_symbol_array(&runtime, "symbol_artifacts")?;
+    let runtime_symbols = match (release_symbols, runtime_symbols) {
+        (None, None) => return Ok(ValidatedReleaseSymbols::default()),
+        (Some(release_symbols), Some(runtime_symbols))
+            if release_symbols.len() == 2
+                && runtime_symbols.len() == 2
+                && release_symbols == runtime_symbols => runtime_symbols,
+        _ => {
+            return Err(MaterializeError::Invalid(
+                "release symbol receipts are absent, incomplete, or not exact repeats".to_owned(),
+            ));
+        }
+    };
+    if release.get("signed").and_then(serde_json::Value::as_bool) != Some(true)
+        || checksum.get("signed").and_then(serde_json::Value::as_bool) != Some(true)
+    {
+        return Err(MaterializeError::Invalid(
+            "symbol admission requires the existing finalized signed release receipt".to_owned(),
+        ));
+    }
+    let source_commit = json_string(&release, "source_commit")?;
+    if json_string(&checksum, "source_commit")? != source_commit {
+        return Err(MaterializeError::Invalid(
+            "SHA256SUMS.json source commit differs from the signed release receipt".to_owned(),
+        ));
+    }
+    if source_commit.len() != 40
+        || !source_commit
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(MaterializeError::Invalid(
+            "release source_commit is not the original lowercase 40-hex build fingerprint".to_owned(),
+        ));
+    }
+    let runtime_artifacts = json_array(&runtime, "artifacts")?;
+    let mut result = ValidatedReleaseSymbols::default();
+    for (role, package, executable_name, reference, symbol_role) in [
+        (
+            "host",
+            "eliot-host",
+            "eliot-host.exe",
+            RELEASE_SYMBOL_ROLES[0].0,
+            SymbolExecutableRole::Host,
+        ),
+        (
+            "kernel",
+            "eliot-kernel",
+            "eliot-kernel.exe",
+            RELEASE_SYMBOL_ROLES[1].0,
+            SymbolExecutableRole::Kernel,
+        ),
+    ] {
+        let matching = runtime_symbols
+            .iter()
+            .filter(|entry| entry.get("role").and_then(serde_json::Value::as_str) == Some(role))
+            .collect::<Vec<_>>();
+        if matching.len() != 1 {
             return Err(MaterializeError::Invalid(format!(
-                "role inventory must be the exact ordered fifteen-role Phase-A set; got {}",
-                actual.0
+                "release symbol role {role} is missing or duplicated"
             )));
+        }
+        let entry = matching[0];
+        let executable_path = format!("runtime/{executable_name}");
+        let executable_record = runtime_artifacts
+            .iter()
+            .filter(|item| {
+                item.get("path").and_then(serde_json::Value::as_str)
+                    == Some(executable_path.as_str())
+                    && item.get("package").and_then(serde_json::Value::as_str) == Some(package)
+                    && item.get("binary").and_then(serde_json::Value::as_str)
+                        == Some(package)
+                    && item.get("role").and_then(serde_json::Value::as_str) == Some(role)
+            })
+            .collect::<Vec<_>>();
+        let exe = executables
+            .iter()
+            .find(|item| item.name == executable_name)
+            .ok_or_else(|| MaterializeError::Invalid(format!("missing {executable_name}")))?;
+        let exe_sha = json_string(entry, "executable_sha256")?;
+        if executable_record.len() != 1
+            || json_string(entry, "package")? != package
+            || json_string(entry, "binary")? != package
+            || json_string(entry, "executable_path")? != executable_path
+            || json_string(entry, "build_fingerprint")? != source_commit
+            || json_string(entry, "build_profile")? != "release"
+            || json_string(entry, "artifact_ref")? != reference
+            || json_string(entry, "retention_reference")? != "SHA256SUMS.json"
+            || !valid_lower_sha256(exe_sha)
+            || json_string(executable_record[0], "sha256")? != exe_sha
+            || exe.sha256 != exe_sha
+        {
+            return Err(MaterializeError::Invalid(format!(
+                "release symbol role {role} does not bind its exact admitted executable"
+            )));
+        }
+        let symbol_sha = json_string(entry, "sha256")?;
+        let symbol_bytes = entry
+            .get("bytes")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| MaterializeError::Invalid(format!("{role} PDB byte length missing")))?;
+        if !valid_lower_sha256(symbol_sha) || symbol_bytes == 0 {
+            return Err(MaterializeError::Invalid(format!(
+                "release symbol role {role} has invalid PDB identity"
+            )));
+        }
+        let (bytes, source_identity) = read_release_file(root, reference, MAX_EXECUTABLE_BYTES)?;
+        if bytes.len() as u64 != symbol_bytes || sha256_hex(&bytes) != symbol_sha {
+            return Err(MaterializeError::Invalid(format!(
+                "retained PDB bytes differ from the {role} release symbol receipt"
+            )));
+        }
+        let checksum_entry = checksum_file(&checksum, reference)?;
+        if json_string(checksum_entry, "sha256")? != symbol_sha
+            || checksum_entry.get("bytes").and_then(serde_json::Value::as_u64)
+                != Some(symbol_bytes)
+        {
+            return Err(MaterializeError::Invalid(format!(
+                "SHA256SUMS.json does not retain exact {role} PDB bytes"
+            )));
+        }
+        let executable_checksum = checksum_file(&checksum, &executable_path)?;
+        if json_string(executable_checksum, "sha256")? != exe_sha {
+            return Err(MaterializeError::Invalid(format!(
+                "SHA256SUMS.json does not bind final signed {role} executable"
+            )));
+        }
+        let binding = AdmittedSymbolBinding {
+            role: symbol_role,
+            executable_sha256: make_digest(exe_sha.to_owned(), "symbol executable digest")?,
+            build_fingerprint: make_digest(source_commit.to_owned(), "symbol build fingerprint")?,
+            build_profile: make_digest("release".to_owned(), "symbol build profile")?,
+            symbol_artifact_ref: make_digest(reference.to_owned(), "symbol artifact ref")?,
+            symbol_artifact_sha256: make_digest(symbol_sha.to_owned(), "symbol artifact digest")?,
+            retention_reference: make_digest(
+                json_string(entry, "retention_reference")?.to_owned(),
+                "symbol retention reference",
+            )?,
+            retention_id: input.generation.clone(),
+        };
+        let artifact = ValidatedSymbolArtifact {
+            binding,
+            bytes,
+            source_identity,
+        };
+        match symbol_role {
+            SymbolExecutableRole::Host => result.host = Some(artifact),
+            SymbolExecutableRole::Kernel => result.kernel = Some(artifact),
+        }
+    }
+    if !result.is_complete() {
+        return Err(MaterializeError::Invalid(
+            "finalized release must admit both Host and Kernel PDBs".to_owned(),
+        ));
+    }
+    Ok(result)
+}
+
+fn validate_role_inventory(roles: &[(&str, bool)]) -> Result<(), MaterializeError> {
+    let legacy = roles == REQUIRED_ROLES.as_slice();
+    let with_symbols = roles == phase_a_roles(true).as_slice();
+    if !legacy && !with_symbols {
+        return Err(MaterializeError::Invalid(
+            "role inventory must be the exact ordered legacy or symbol-bearing Phase-A set"
+                .to_owned(),
+        ));
+    }
+    if !legacy {
+        for (role, executable) in RELEASE_SYMBOL_ROLES {
+            if executable || !roles.contains(&(role, false)) {
+                return Err(MaterializeError::Invalid(format!(
+                    "release symbol role must be non-executable: {role}"
+                )));
+            }
         }
     }
     Ok(())
@@ -742,12 +1092,14 @@ fn build_typed_bundle(
 ) -> Result<TypedBundle, MaterializeError> {
     let selection = GenerationPackagePlanner::resolve_profile_selection(&input.profile_selection)
         .map_err(|error| MaterializeError::Contract(error.to_string()))?;
-    build_typed_bundle_with_selection(input, executables, &selection)
+    let symbols = validate_release_symbols(input, executables)?;
+    build_typed_bundle_with_selection(input, executables, &symbols, &selection)
 }
 
 fn build_typed_bundle_with_selection(
     input: &CanarySourceBundleMaterializeInput,
     executables: &[ValidatedExecutable],
+    symbols: &ValidatedReleaseSymbols,
     selection: &ProfileSelectionResolution,
 ) -> Result<TypedBundle, MaterializeError> {
     let roots = selection.roots.runtime_state_roots.clone();
@@ -826,6 +1178,22 @@ fn build_typed_bundle_with_selection(
             &governor_sha256,
         )?,
     ];
+    let mut template_facts = template_facts;
+    if symbols.is_complete() {
+        for (role, symbol) in [
+            (RELEASE_SYMBOL_ROLES[0].0, symbols.host.as_ref()),
+            (RELEASE_SYMBOL_ROLES[1].0, symbols.kernel.as_ref()),
+        ] {
+            let symbol = symbol.ok_or_else(|| {
+                MaterializeError::Invalid(format!("admitted symbol bytes missing: {role}"))
+            })?;
+            template_facts.push(package_digest(
+                role,
+                symbol.bytes.len() as u64,
+                symbol.binding.symbol_artifact_sha256.as_str(),
+            )?);
+        }
+    }
     let template_digest =
         GenerationPackagePlanner::phase_a_template_content_digest(&template_facts)
             .map_err(|error| MaterializeError::Contract(error.to_string()))?;
@@ -999,6 +1367,7 @@ fn build_typed_bundle_with_selection(
         runtime_state_roots: roots.clone(),
         kernel_work_root: roots.kernel_work_root.clone(),
         kernel_artifact_digest: make_digest(kernel.sha256.clone(), "kernel digest")?,
+        kernel_symbol_binding: symbols.kernel.as_ref().map(|item| item.binding.clone()),
         eliotd_executable_path: eliotd_path,
         eliotd_artifact_digest: make_digest(eliotd.sha256.clone(), "eliotd digest")?,
         eliotd_config_path: governor_path,
@@ -1027,6 +1396,7 @@ fn build_typed_bundle_with_selection(
         canonical_store_arguments,
         host_executable_path: host_path,
         host_artifact_digest: make_digest(host.sha256.clone(), "Host digest")?,
+        host_symbol_binding: symbols.host.as_ref().map(|item| item.binding.clone()),
         watchdog_executable_path: watchdog_path,
         watchdog_artifact_digest: make_digest(watchdog.sha256.clone(), "Watchdog digest")?,
         doctor_artifact_digest: make_digest(doctor.sha256.clone(), "Doctor digest")?,
@@ -1111,11 +1481,18 @@ fn build_typed_bundle_with_selection(
             bytes: descriptor_bytes.clone(),
         },
     ];
-    let mut expected = Vec::with_capacity(REQUIRED_ROLES.len());
-    for (role, executable) in REQUIRED_ROLES {
+    let roles = phase_a_roles(symbols.is_complete());
+    validate_role_inventory(&roles)?;
+    let mut expected = Vec::with_capacity(roles.len());
+    for (role, executable) in roles.iter().copied() {
         let (size, digest) = if executable {
             let executable = by_name(role)?;
             (executable.size, executable.sha256.clone())
+        } else if let Some(symbol) = symbols.role(role) {
+            (
+                symbol.bytes.len() as u64,
+                symbol.binding.symbol_artifact_sha256.as_str().to_owned(),
+            )
         } else {
             let json = json_roles
                 .iter()
@@ -1125,7 +1502,7 @@ fn build_typed_bundle_with_selection(
         };
         expected.push(package_digest(role, size, &digest)?);
     }
-    let specs = REQUIRED_ROLES
+    let specs = roles
         .iter()
         .map(|(role, executable)| {
             let expected = expected
@@ -1145,6 +1522,7 @@ fn build_typed_bundle_with_selection(
             .map_err(|error| MaterializeError::Contract(error.to_string()))?;
     Ok(TypedBundle {
         json_roles,
+        symbol_artifacts: symbols.clone(),
         expected,
         manifest,
         evidence_digest,
@@ -1198,9 +1576,13 @@ fn role_bytes<'a>(
     role: &str,
     executables: &'a [ValidatedExecutable],
     json_roles: &'a [JsonRole],
+    symbols: &'a ValidatedReleaseSymbols,
 ) -> Result<&'a [u8], MaterializeError> {
     if let Some(executable) = executables.iter().find(|item| item.name == role) {
         return Ok(executable.bytes.as_slice());
+    }
+    if let Some(symbol) = symbols.role(role) {
+        return Ok(symbol.bytes.as_slice());
     }
     json_roles
         .iter()
@@ -1215,16 +1597,32 @@ fn validate_published_observation(
     expected: &[PackageArtifactDigest],
 ) -> Result<BTreeMap<String, eliot_platform_windows::PackageSourceFileObservation>, MaterializeError>
 {
+    let include_symbols = manifest.files.len() == REQUIRED_ROLES.len() + RELEASE_SYMBOL_ROLES.len();
+    let roles = phase_a_roles(include_symbols);
+    validate_role_inventory(&roles)?;
+    if manifest.files.len() != roles.len()
+        || manifest
+            .files
+            .iter()
+            .zip(&roles)
+            .any(|(spec, (role, executable))| {
+                spec.relative_path != *role || spec.executable != *executable
+            })
+    {
+        return Err(MaterializeError::Invalid(
+            "published source manifest is not the exact admitted role inventory".to_owned(),
+        ));
+    }
     let observed = bundle.observe().map_err(|error| {
         MaterializeError::Platform(format!("observe published bundle: {error}"))
     })?;
-    if observed.files.len() != REQUIRED_ROLES.len() {
+    if observed.files.len() != roles.len() {
         return Err(MaterializeError::Invalid(
             "published source bundle has an incomplete role inventory".to_owned(),
         ));
     }
     let mut by_role = BTreeMap::new();
-    for (role, executable) in REQUIRED_ROLES {
+    for (role, executable) in roles {
         let item = observed
             .files
             .iter()
@@ -1309,14 +1707,29 @@ fn typed_bundle_from_journal(
     ),
     MaterializeError,
 > {
-    if journal.precommit_files.len() != REQUIRED_ROLES.len() {
+    let has_host_symbols = journal
+        .precommit_files
+        .iter()
+        .any(|file| file.relative_path == RELEASE_SYMBOL_ROLES[0].0);
+    let has_kernel_symbols = journal
+        .precommit_files
+        .iter()
+        .any(|file| file.relative_path == RELEASE_SYMBOL_ROLES[1].0);
+    if has_host_symbols != has_kernel_symbols {
         return Err(MaterializeError::Invalid(
-            "publication journal does not retain the complete fifteen-role inventory".to_owned(),
+            "publication journal retains only one release symbol role".to_owned(),
         ));
     }
-    let mut manifest_files = Vec::with_capacity(REQUIRED_ROLES.len());
-    let mut expected = Vec::with_capacity(REQUIRED_ROLES.len());
-    for (role, executable) in REQUIRED_ROLES {
+    let roles = phase_a_roles(has_host_symbols);
+    validate_role_inventory(&roles)?;
+    if journal.precommit_files.len() != roles.len() {
+        return Err(MaterializeError::Invalid(
+            "publication journal does not retain the exact admitted role inventory".to_owned(),
+        ));
+    }
+    let mut manifest_files = Vec::with_capacity(roles.len());
+    let mut expected = Vec::with_capacity(roles.len());
+    for (role, executable) in roles {
         let fact = journal
             .precommit_files
             .iter()
@@ -1396,7 +1809,7 @@ fn reconcile_journal_destination(
         ));
     }
     let observed = validate_published_observation(&bundle, &manifest, &expected)?;
-    let mut files = Vec::with_capacity(REQUIRED_ROLES.len());
+    let mut files = Vec::with_capacity(expected.len());
     for prepared in &precommit_files {
         let actual = observed.get(&prepared.relative_path).ok_or_else(|| {
             MaterializeError::Invalid(format!(
@@ -1760,7 +2173,14 @@ fn materialize_with_executables(
 ) -> Result<CanarySourceBundleMaterializeOutcome, MaterializeError> {
     let selection = GenerationPackagePlanner::resolve_profile_selection(&input.profile_selection)
         .map_err(|error| MaterializeError::Contract(error.to_string()))?;
-    materialize_with_resolved_selection(input, executables, stop_after_durable_intent, &selection)
+    let symbols = validate_release_symbols(input, executables)?;
+    materialize_with_resolved_selection(
+        input,
+        executables,
+        &symbols,
+        stop_after_durable_intent,
+        &selection,
+    )
 }
 
 #[allow(
@@ -1770,10 +2190,12 @@ fn materialize_with_executables(
 fn materialize_with_resolved_selection(
     input: &CanarySourceBundleMaterializeInput,
     executables: &[ValidatedExecutable],
+    symbols: &ValidatedReleaseSymbols,
     stop_after_durable_intent: bool,
     selection: &ProfileSelectionResolution,
 ) -> Result<CanarySourceBundleMaterializeOutcome, MaterializeError> {
-    validate_role_inventory(&REQUIRED_ROLES)?;
+    let roles = phase_a_roles(symbols.is_complete());
+    validate_role_inventory(&roles)?;
     validate_absolute(&input.output_bundle, "output_bundle")?;
     validate_absolute(
         Path::new(input.profile_selection.profile_anchor_root.as_str()),
@@ -1804,13 +2226,13 @@ fn materialize_with_resolved_selection(
     }
 
     validate_materializer_selection(input, selection)?;
-    let typed = build_typed_bundle_with_selection(input, executables, selection)?;
+    let typed = build_typed_bundle_with_selection(input, executables, symbols, selection)?;
     let publication = OwnedDirectoryPublication::create(&input.output_bundle)
         .map_err(|error| MaterializeError::Platform(error.to_string()))?;
     let temp = publication.temporary_path().to_path_buf();
     let mut source_identities = BTreeMap::<String, FileIdentity>::new();
-    for (role, executable) in REQUIRED_ROLES {
-        let bytes = role_bytes(role, executables, &typed.json_roles)?;
+    for (role, executable) in roles.iter().copied() {
+        let bytes = role_bytes(role, executables, &typed.json_roles, &typed.symbol_artifacts)?;
         let destination = temp.join(role);
         write_create_new(&destination, bytes)?;
         let identity =
@@ -1823,7 +2245,7 @@ fn materialize_with_resolved_selection(
             )));
         }
         source_identities.insert(role.to_owned(), identity);
-        if executable {
+        if executable || typed.symbol_artifacts.role(role).is_some() {
             let expected = typed
                 .expected
                 .iter()
@@ -1872,8 +2294,8 @@ fn materialize_with_resolved_selection(
         ));
     }
 
-    let mut precommit_files = Vec::with_capacity(REQUIRED_ROLES.len());
-    for (role, executable) in REQUIRED_ROLES {
+    let mut precommit_files = Vec::with_capacity(roles.len());
+    for (role, executable) in roles.iter().copied() {
         let expected = typed
             .expected
             .iter()
@@ -1900,6 +2322,8 @@ fn materialize_with_resolved_selection(
                 Some(source.pe.clone()),
                 Some(source.authenticode.clone()),
             )
+        } else if let Some(source) = typed.symbol_artifacts.role(role) {
+            (source.source_identity, None, None)
         } else {
             (created_identity, None, None)
         };
@@ -1984,7 +2408,7 @@ fn materialize_with_resolved_selection(
     }
 }
 
-/// Materialize one exact fifteen-role Phase-A source bundle.
+/// Materialize one exact legacy or symbol-bearing Phase-A source bundle.
 pub fn materialize_canary_source_bundle(
     input: &CanarySourceBundleMaterializeInput,
 ) -> Result<CanarySourceBundleMaterializeOutcome, InstallationError> {
@@ -2019,7 +2443,8 @@ pub fn materialize_canary_source_bundle(
         .into_iter()
         .map(|(path, role)| validate_executable(&path, role).map_err(to_installation_error))
         .collect::<Result<Vec<_>, _>>()?;
-    materialize_with_resolved_selection(input, &executables, false, &selection)
+    let symbols = validate_release_symbols(input, &executables).map_err(to_installation_error)?;
+    materialize_with_resolved_selection(input, &executables, &symbols, false, &selection)
         .map_err(to_installation_error)
 }
 
@@ -2147,6 +2572,7 @@ mod tests {
             eliot_wasm_host_exe: PathBuf::new(),
             eliot_user_broker_exe: PathBuf::new(),
             eliot_notify_exe: PathBuf::new(),
+            release_bundle_root: None,
             agent_bridge_exe: None,
             agent_bridge_account: None,
             output_bundle: output_bundle.clone(),

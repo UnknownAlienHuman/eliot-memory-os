@@ -507,6 +507,7 @@ mod tests {
             runtime_state_roots: roots.clone(),
             kernel_work_root: roots.kernel_work_root.clone(),
             kernel_artifact_digest: hex_handle("4"),
+            kernel_symbol_binding: None,
             eliotd_executable_path: path("eliotd.exe"),
             eliotd_artifact_digest: hex_handle("e"),
             eliotd_config_path: path("eliotd-governor.json"),
@@ -579,6 +580,7 @@ mod tests {
             ],
             host_executable_path: path("eliot-host.exe"),
             host_artifact_digest: hex_handle("e"),
+            host_symbol_binding: None,
             watchdog_executable_path: path("eliot-watchdog.exe"),
             // The approved digest names the exact bytes of this test binary:
             // the fixture watchdog IS this process, so artifact identity holds.
