@@ -910,6 +910,24 @@ pub fn validate_read_against_catalogue(
 /// named `ApplyErasure` operation (`ERASURE_STATE_IRREVERSIBLE`, enforced
 /// below): no generic reversible-effect executor admits the erasure class
 /// through this gate.
+/// Checks an operation-less transition against the genesis manifest.
+fn check_genesis_manifest(
+    transition: &PreparedTransition,
+    entries: &[NamedOperationManifest],
+) -> Result<(), StoreError> {
+    let entry = find_entry(entries, GENESIS_MANIFEST_NAME)?;
+    if transition.operation_manifest_digest != entry.digest {
+        return Err(StoreError::ManifestMismatch);
+    }
+    if !entry.admits(
+        transition.transition_class,
+        transition.requested_effect_ceiling,
+    ) {
+        return Err(StoreError::TransitionClassExceeded);
+    }
+    Ok(())
+}
+
 pub fn validate_transition_against_catalogue(
     transition: &PreparedTransition,
     entries: &[NamedOperationManifest],
@@ -927,17 +945,7 @@ pub fn validate_transition_against_catalogue(
         }
     }
     if transition.named_operations.is_empty() {
-        let entry = find_entry(entries, GENESIS_MANIFEST_NAME)?;
-        if transition.operation_manifest_digest != entry.digest {
-            return Err(StoreError::ManifestMismatch);
-        }
-        if !entry.admits(
-            transition.transition_class,
-            transition.requested_effect_ceiling,
-        ) {
-            return Err(StoreError::TransitionClassExceeded);
-        }
-        return Ok(());
+        return check_genesis_manifest(transition, entries);
     }
     validate_named_plan_manifest_and_erasure(transition, entries)?;
     for command in &transition.named_operations {
