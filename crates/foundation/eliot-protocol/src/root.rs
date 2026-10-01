@@ -106,6 +106,7 @@ pub use task_controller::{
 mod native_worker_material;
 pub use native_worker_material::{
     MAX_NATIVE_WORKER_RETAINED_PROVIDER_MATERIAL_BYTES,
+    NativeWorkerProviderProcessIdentityV1,
     NativeWorkerRetainedProviderMaterialReadbackV1,
     NativeWorkerRetainedProviderMaterialRefV1,
 };
