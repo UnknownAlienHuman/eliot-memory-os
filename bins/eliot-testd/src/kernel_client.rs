@@ -1612,7 +1612,9 @@ impl KernelProcessStreamSinkClient {
             }
             BlobProcessStreamKernelOutcome::Completed {
                 response,
+                operation_sha256,
                 original_terminal_request,
+                original_terminal_operation_sha256,
                 ..
             } => {
                 let original_terminal =
@@ -1629,6 +1631,11 @@ impl KernelProcessStreamSinkClient {
                         blob_ready_receipt_json,
                         blob_ready_receipt_sha256,
                     } => {
+                        if original_terminal_operation_sha256.as_deref()
+                            != Some(operation_sha256.as_str())
+                        {
+                            return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+                        }
                         let operation = original_terminal
                             .as_ref()
                             .ok_or(ProcessStreamSinkError::ProviderUnavailable)?;
@@ -1651,6 +1658,11 @@ impl KernelProcessStreamSinkClient {
                         Ok(ProcessStreamSinkReadback::Terminal { terminal })
                     }
                     ProcessStreamSinkWireResponse::Aborted { body } => {
+                        if original_terminal_operation_sha256.as_deref()
+                            != Some(operation_sha256.as_str())
+                        {
+                            return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+                        }
                         let operation = original_terminal
                             .as_ref()
                             .ok_or(ProcessStreamSinkError::ProviderUnavailable)?;
@@ -1943,15 +1955,34 @@ fn completed_ready_receipt(
 ) -> Option<TestdBlobProcessStreamReadyReceipt> {
     let BlobProcessStreamKernelOutcome::Completed {
         response,
+        operation_sha256,
         original_terminal_request,
+        original_terminal_operation_sha256,
         ..
     } = &response.outcome
     else {
         return None;
     };
-    let original = original_terminal_request
-        .as_deref()
-        .or(requested_operation)?;
+    let original = match (
+        original_terminal_request.as_deref(),
+        original_terminal_operation_sha256.as_deref(),
+    ) {
+        (Some(original), Some(original_sha256))
+            if original_sha256 == operation_sha256 =>
+        {
+            original
+        }
+        (None, None) => {
+            let requested = requested_operation?;
+            if sha256_hex(&canonical_json_bytes(requested).ok()?).as_str()
+                != operation_sha256.as_str()
+            {
+                return None;
+            }
+            requested
+        }
+        _ => return None,
+    };
     if requested_operation.is_some_and(|requested| requested != original) {
         return None;
     }
