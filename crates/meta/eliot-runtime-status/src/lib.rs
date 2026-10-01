@@ -2658,10 +2658,63 @@ pub fn transaction_stage_gap_for() -> String {
 }
 
 #[cfg(test)]
+// Shared fixture helpers. These live at module scope rather than inside one
+// test module because several sibling `#[cfg(test)]` modules in this file build
+// the same `RuntimeLaunchDescriptor` and `HostState` fixtures; a helper owned by
+// exactly one of them is unreachable from the others, which is a compile error
+// rather than a duplication worth encoding.
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod shared_test_fixtures {
+    use eliot_installation::{
+        INSTALLATION_ROOT_BINDING_VERSION, InstallationRoots, RuntimeStateRoots,
+    };
+    use std::path::Path;
+
+    /// The I3.1 four-root binding for a portable development root.
+    ///
+    /// `PortableDev` derives `immutable_binaries` from the retained repository
+    /// root and keeps its mutable state under `.eliot-dev`, which is the
+    /// profile's own documented root topology rather than an arbitrary layout
+    /// chosen to satisfy the field list.
+    pub(super) fn fixture_profile_roots(
+        portable_root: &Path,
+        generation: &str,
+        runtime_state_roots: &RuntimeStateRoots,
+    ) -> InstallationRoots {
+        InstallationRoots {
+            binding_version: INSTALLATION_ROOT_BINDING_VERSION,
+            immutable_binaries: portable_root
+                .join("target")
+                .join("eliot-dev")
+                .join(generation)
+                .to_string_lossy()
+                .into_owned(),
+            durable_data: portable_root
+                .join(".eliot-dev")
+                .join("state")
+                .to_string_lossy()
+                .into_owned(),
+            user_config: portable_root
+                .join(".eliot-dev")
+                .join("config")
+                .to_string_lossy()
+                .into_owned(),
+            user_cache: portable_root
+                .join(".eliot-dev")
+                .join("cache")
+                .to_string_lossy()
+                .into_owned(),
+            runtime_state_roots: runtime_state_roots.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
 // Test fixtures intentionally use unwrap/expect to keep failed setup distinct
 // from the production fail-closed assertions under test.
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod honest_tests {
+    use super::shared_test_fixtures::fixture_profile_roots;
     use super::*;
     use std::path::Path;
     use std::time::{Duration, Instant};
@@ -3022,38 +3075,6 @@ mod honest_tests {
 
     fn fixture_path(root: &Path, name: &str) -> eliot_installation::PlatformHandle {
         fixture_handle(root.join(name).to_string_lossy().into_owned())
-    }
-
-    fn fixture_profile_roots(
-        portable_root: &Path,
-        generation: &str,
-        runtime_state_roots: &eliot_installation::RuntimeStateRoots,
-    ) -> eliot_installation::InstallationRoots {
-        eliot_installation::InstallationRoots {
-            binding_version: eliot_installation::INSTALLATION_ROOT_BINDING_VERSION,
-            immutable_binaries: portable_root
-                .join("target")
-                .join("eliot-dev")
-                .join(generation)
-                .to_string_lossy()
-                .into_owned(),
-            durable_data: portable_root
-                .join(".eliot-dev")
-                .join("state")
-                .to_string_lossy()
-                .into_owned(),
-            user_config: portable_root
-                .join(".eliot-dev")
-                .join("config")
-                .to_string_lossy()
-                .into_owned(),
-            user_cache: portable_root
-                .join(".eliot-dev")
-                .join("cache")
-                .to_string_lossy()
-                .into_owned(),
-            runtime_state_roots: runtime_state_roots.clone(),
-        }
     }
 
     fn fixture_provisioned_supervision_authority(
@@ -3642,6 +3663,7 @@ mod honest_tests {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod store_currentness_production_tests {
+    use super::shared_test_fixtures::fixture_profile_roots;
     use super::*;
     use eliot_host_state::{
         AppliedOperation, HostInstallationEpoch, HostState, IdempotencyIdentity, StoreRebindRecord,
@@ -3750,30 +3772,15 @@ mod store_currentness_production_tests {
             nonce: h("nonce-1"),
             recovery: None,
         };
-        HostState {
+        HostState::from_projection(
             host,
-            sequence: 10,
-            last_checksum: None,
-            activation: None,
-            kernel: None,
-            kernel_history: Vec::new(),
-            prior_kernel: None,
-            prior_kernel_unknown: false,
-            dependencies: Vec::new(),
-            drain: None,
-            drain_commit: None,
-            wakes: Vec::new(),
-            observations: Vec::new(),
-            readiness_observations: Vec::new(),
-            store_rebinds: records,
-            reactive_context: None,
-            pending_cutover: None,
-            clean_marker: None,
-            retained_epochs: Vec::new(),
-            retired_epochs: Vec::new(),
-            applied_operations: applied,
-            epoch_retirements: Vec::new(),
-        }
+            eliot_host_state::HostStateProjection {
+                sequence: 10,
+                store_rebinds: records,
+                applied_operations: applied,
+                ..eliot_host_state::HostStateProjection::default()
+            },
+        )
     }
     fn manifest_roots(portable: &str, host_root: &str) -> eliot_installation::RuntimeStateRoots {
         eliot_installation::RuntimeStateRoots {
@@ -4075,6 +4082,7 @@ mod store_currentness_production_tests {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod live_production_observer_tests {
+    use super::shared_test_fixtures::fixture_profile_roots;
     use super::*;
     use eliot_host_state::{
         EpochTransition, HostInstallationEpoch, HostState, HostStateRecord, KernelJobBinding,
@@ -4261,11 +4269,11 @@ mod live_production_observer_tests {
             checksum: "chk".to_owned(),
             sequence: 5,
         };
-        let host_state = HostState {
-            host: host_epoch.clone(),
-            sequence: 10,
-            last_checksum: None,
-            activation: Some(eliot_host_state::EliotActivationRecord {
+        let host_state = HostState::from_projection(
+            host_epoch.clone(),
+            eliot_host_state::HostStateProjection {
+                sequence: 10,
+                activation: Some(eliot_host_state::EliotActivationRecord {
                 fence: fence.clone(),
                 operation: eliot_host_state::IdempotencyIdentity {
                     operation_id: h("op-act"),
@@ -4305,26 +4313,14 @@ mod live_production_observer_tests {
                     stopped_at: None,
                 },
                 failure_and_recovery_directive: None,
-            }),
-            kernel: Some(kernel),
-            kernel_history: Vec::new(),
-            prior_kernel: None,
-            prior_kernel_unknown: false,
-            dependencies: Vec::new(),
-            drain: None,
-            drain_commit: None,
-            wakes: Vec::new(),
-            observations: Vec::new(),
-            readiness_observations: vec![observation],
-            store_rebinds: vec![store],
-            reactive_context: None,
-            pending_cutover: None,
-            clean_marker: None,
-            retained_epochs: Vec::new(),
-            retired_epochs: Vec::new(),
-            applied_operations: vec![applied],
-            epoch_retirements: Vec::new(),
-        };
+                }),
+                kernel: Some(kernel),
+                readiness_observations: vec![observation],
+                store_rebinds: vec![store],
+                applied_operations: vec![applied],
+                ..eliot_host_state::HostStateProjection::default()
+            },
+        );
         let manifest = {
             let portable = if cfg!(windows) {
                 r"C:\tmpmp\portable"
@@ -4680,30 +4676,13 @@ mod live_production_observer_tests {
             lease_verified: true,
         };
         let observer = FakeWatchdogObserver { snap: Some(snap) };
-        let host = HostState {
-            host: make_host(),
-            sequence: 1,
-            last_checksum: None,
-            activation: None,
-            kernel: None,
-            kernel_history: Vec::new(),
-            prior_kernel: None,
-            prior_kernel_unknown: false,
-            dependencies: Vec::new(),
-            drain: None,
-            drain_commit: None,
-            wakes: Vec::new(),
-            observations: Vec::new(),
-            readiness_observations: Vec::new(),
-            store_rebinds: Vec::new(),
-            reactive_context: None,
-            pending_cutover: None,
-            clean_marker: None,
-            retained_epochs: Vec::new(),
-            retired_epochs: Vec::new(),
-            applied_operations: Vec::new(),
-            epoch_retirements: Vec::new(),
-        };
+        let host = HostState::from_projection(
+            make_host(),
+            eliot_host_state::HostStateProjection {
+                sequence: 1,
+                ..eliot_host_state::HostStateProjection::default()
+            },
+        );
         let manifest = host_with_kernel_and_store().1;
         let ors = OrsContour {
             state: ComponentState::Healthy,
@@ -4743,30 +4722,13 @@ mod live_production_observer_tests {
             lease_verified: true,
         };
         let observer = FakeWatchdogObserver { snap: Some(snap) };
-        let host = HostState {
-            host: make_host(),
-            sequence: 1,
-            last_checksum: None,
-            activation: None,
-            kernel: None,
-            kernel_history: Vec::new(),
-            prior_kernel: None,
-            prior_kernel_unknown: false,
-            dependencies: Vec::new(),
-            drain: None,
-            drain_commit: None,
-            wakes: Vec::new(),
-            observations: Vec::new(),
-            readiness_observations: Vec::new(),
-            store_rebinds: Vec::new(),
-            reactive_context: None,
-            pending_cutover: None,
-            clean_marker: None,
-            retained_epochs: Vec::new(),
-            retired_epochs: Vec::new(),
-            applied_operations: Vec::new(),
-            epoch_retirements: Vec::new(),
-        };
+        let host = HostState::from_projection(
+            make_host(),
+            eliot_host_state::HostStateProjection {
+                sequence: 1,
+                ..eliot_host_state::HostStateProjection::default()
+            },
+        );
         let manifest = host_with_kernel_and_store().1;
         let ors = OrsContour {
             state: ComponentState::Healthy,

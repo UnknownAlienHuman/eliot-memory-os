@@ -3112,7 +3112,107 @@ pub struct HostState {
     pub epoch_retirements: Vec<EpochRetirementRecord>,
 }
 
+/// The public, non-journal-writable projection fields a caller may supply when
+/// building a [`HostState`] outside this crate.
+///
+/// This is a **read-model builder**, not a second writer. Every field here is a
+/// projection the journal reducer owns; a caller that sets one is producing an
+/// equivalent state to replay, not committing a transition. It exists because
+/// `wake_cancellation_batches` is crate-private and is rebuilt on journal open
+/// ([`HostState::rebuild_cancellation_index`]), so no out-of-crate consumer can
+/// use struct-literal syntax for the type at all. Without this, every external
+/// reader of a `HostState` would have to deserialize journal bytes to obtain one
+/// — which would make the read model unreachable to exactly the projections a
+/// reader wants to inspect.
+///
+/// Fields not listed are either crate-private/rebuilt (`wake_cancellation_batches`)
+/// or absent from every externally observed state, and take their empty default.
+#[derive(Clone, Debug, Default)]
+pub struct HostStateProjection {
+    /// Last committed journal sequence this projection reflects.
+    pub sequence: u64,
+    /// Checksum of the last applied record.
+    pub last_checksum: Option<String>,
+    /// Current activation lineage, when one is open.
+    pub activation: Option<EliotActivationRecord>,
+    /// Current Kernel record, when one is present.
+    pub kernel: Option<KernelRecord>,
+    /// Retained prior Kernel generations.
+    pub kernel_history: Vec<KernelRecord>,
+    /// Exact previous-generation Kernel projection across a cutover.
+    pub prior_kernel: Option<KernelRecord>,
+    /// Whether retained evidence exists without an exact prior Kernel record.
+    pub prior_kernel_unknown: bool,
+    /// Managed dependency rows.
+    pub dependencies: Vec<ManagedDependencyRecord>,
+    /// In-flight drain record.
+    pub drain: Option<DrainRecord>,
+    /// Committed drain record.
+    pub drain_commit: Option<DrainCommitRecord>,
+    /// Wake intent rows.
+    pub wakes: Vec<WakeRecord>,
+    /// Host observation rows.
+    pub observations: Vec<HostObservationRecord>,
+    /// Kernel readiness observation rows.
+    pub readiness_observations: Vec<KernelReadinessObservationRecord>,
+    /// Store rebind rows.
+    pub store_rebinds: Vec<StoreRebindRecord>,
+    /// Durable reactive-context queue projection.
+    pub reactive_context: Option<ReactiveContextQueueState>,
+    /// Outstanding cutover intent.
+    pub pending_cutover: Option<CutoverIntentRecord>,
+    /// Durable backup destination preparation outcomes.
+    pub backup_preparations: Vec<BackupPreparationRecord>,
+    /// Current-generation module build/source rows.
+    pub module_build_provenance: Vec<ModuleBuildProvenanceRecord>,
+    /// Clean-shutdown marker.
+    pub clean_marker: Option<CleanMarker>,
+    /// Retained epoch evidence.
+    pub retained_epochs: Vec<EpochEvidence>,
+    /// Retired epoch identities.
+    pub retired_epochs: Vec<HostInstallationEpoch>,
+    /// Applied operation rows.
+    pub applied_operations: Vec<AppliedOperation>,
+    /// Resolved retirement records.
+    pub epoch_retirements: Vec<EpochRetirementRecord>,
+}
+
 impl HostState {
+    /// Builds a `HostState` from its host epoch and an explicit projection.
+    ///
+    /// The cancellation-batch index is left empty because it is derived state
+    /// rebuilt on journal open; a caller that needs it populated must go through
+    /// [`HostStateJournal`], which is the only writer that maintains it.
+    pub fn from_projection(host: HostInstallationEpoch, projection: HostStateProjection) -> Self {
+        Self {
+            host,
+            sequence: projection.sequence,
+            last_checksum: projection.last_checksum,
+            activation: projection.activation,
+            kernel: projection.kernel,
+            kernel_history: projection.kernel_history,
+            prior_kernel: projection.prior_kernel,
+            prior_kernel_unknown: projection.prior_kernel_unknown,
+            dependencies: projection.dependencies,
+            drain: projection.drain,
+            drain_commit: projection.drain_commit,
+            wakes: projection.wakes,
+            observations: projection.observations,
+            readiness_observations: projection.readiness_observations,
+            store_rebinds: projection.store_rebinds,
+            reactive_context: projection.reactive_context,
+            pending_cutover: projection.pending_cutover,
+            backup_preparations: projection.backup_preparations,
+            module_build_provenance: projection.module_build_provenance,
+            clean_marker: projection.clean_marker,
+            retained_epochs: projection.retained_epochs,
+            retired_epochs: projection.retired_epochs,
+            applied_operations: projection.applied_operations,
+            wake_cancellation_batches: Arc::default(),
+            epoch_retirements: projection.epoch_retirements,
+        }
+    }
+
     pub(crate) fn new(host: HostInstallationEpoch, retained_epochs: Vec<EpochEvidence>) -> Self {
         Self {
             host,

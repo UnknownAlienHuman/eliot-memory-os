@@ -43,7 +43,7 @@ pub use model::{
     DependencyLifecycleBudget, DependencyRecord, DependencyResourceBudget, DependencyState,
     DrainCommitRecord, DrainRecord, DrainState, EliotActivationRecord, EpochEvidence,
     EpochRetirementRecord, FailureRecoveryDirective, HostInstallationEpoch, HostKernelStoreLineage,
-    HostObservationRecord, HostState, HostStateRecord, IdempotencyIdentity,
+    HostObservationRecord, HostState, HostStateProjection, HostStateRecord, IdempotencyIdentity,
     ImmutableProcessManifest, JournalManifest, KernelJobBinding, KernelReadinessObservationRecord,
     KernelRecord, LifecycleTimestamps, ManagedDependencyRecord, ModuleBuildProvenanceRecord,
     NonceState, OneTimeNonceState, PREDECESSOR_RETIREMENT_RELATION_CONTRACT,
