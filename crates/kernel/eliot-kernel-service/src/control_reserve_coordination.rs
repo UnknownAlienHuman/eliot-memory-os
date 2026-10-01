@@ -131,10 +131,12 @@ pub fn revalidate_staged_claim_at_activation(
             reason: "must-be-non-blank",
         });
     }
-    current.validate().map_err(|_| KernelServiceError::InvalidField {
-        field: "reserve.capacity-profile",
-        reason: "profile-invalid",
-    })?;
+    current
+        .validate()
+        .map_err(|_| KernelServiceError::InvalidField {
+            field: "reserve.capacity-profile",
+            reason: "profile-invalid",
+        })?;
     if claim.profile_id != current.profile_id {
         return Err(KernelServiceError::InvalidField {
             field: "reserve.capacity-claim.profile-id",
