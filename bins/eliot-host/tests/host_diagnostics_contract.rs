@@ -569,13 +569,12 @@ fn host_reference_failure_and_registration_are_singular() {
 fn projection_phase_record_carries_identity_tuple() {
     // Positive: a projection holding owner identities emits one host.phase
     // record carrying the exact handle values, with no _missing flags.
-    let projection = eliot_host::host_diagnostics::HostRequestProjection::observed(
-        EntrypointStage::ConsoleLoop,
-    )
-    .with_transaction_handle("tx-op-1")
-    .with_effect_handle("eff-op-1")
-    .with_request_digest("req-op-1")
-    .with_fence_handle("fence-op-1");
+    let projection =
+        eliot_host::host_diagnostics::HostRequestProjection::observed(EntrypointStage::ConsoleLoop)
+            .with_transaction_handle("tx-op-1")
+            .with_effect_handle("eff-op-1")
+            .with_request_digest("req-op-1")
+            .with_fence_handle("fence-op-1");
     let sink = CaptureSink::default();
     let writer_sink = sink.clone();
     let captured = {
@@ -615,9 +614,8 @@ fn projection_phase_record_carries_identity_tuple() {
 fn projection_missing_slots_render_missing_never_guessed() {
     // Refusal: a bare projection renders every identity slot missing and
     // never substitutes a caller string or placeholder for owner data.
-    let projection = eliot_host::host_diagnostics::HostRequestProjection::observed(
-        EntrypointStage::ConsoleLoop,
-    );
+    let projection =
+        eliot_host::host_diagnostics::HostRequestProjection::observed(EntrypointStage::ConsoleLoop);
     let sink = CaptureSink::default();
     let writer_sink = sink.clone();
     let captured = {
@@ -649,13 +647,12 @@ fn projection_missing_slots_render_missing_never_guessed() {
 fn empty_handle_input_renders_missing() {
     // Refusal: an empty handle is not-held input and must render missing,
     // never an empty present value a reader could mistake for identity.
-    let projection = eliot_host::host_diagnostics::HostRequestProjection::observed(
-        EntrypointStage::ConsoleLoop,
-    )
-    .with_transaction_handle("")
-    .with_effect_handle("")
-    .with_request_digest("")
-    .with_fence_handle("");
+    let projection =
+        eliot_host::host_diagnostics::HostRequestProjection::observed(EntrypointStage::ConsoleLoop)
+            .with_transaction_handle("")
+            .with_effect_handle("")
+            .with_request_digest("")
+            .with_fence_handle("");
     let sink = CaptureSink::default();
     let writer_sink = sink.clone();
     let captured = {
@@ -691,11 +688,10 @@ fn terminal_projection_shares_phase_identity() {
     // Positive: the terminal record for an operation carries the same
     // identity tuple as its phase records, so one failure correlates to
     // its operation under concurrency.
-    let projection = eliot_host::host_diagnostics::HostRequestProjection::observed(
-        EntrypointStage::ConsoleLoop,
-    )
-    .with_transaction_handle("tx-op-9")
-    .with_effect_handle("eff-op-9");
+    let projection =
+        eliot_host::host_diagnostics::HostRequestProjection::observed(EntrypointStage::ConsoleLoop)
+            .with_transaction_handle("tx-op-9")
+            .with_effect_handle("eff-op-9");
     let sink = CaptureSink::default();
     let writer_sink = sink.clone();
     let captured = {
@@ -717,5 +713,8 @@ fn terminal_projection_shares_phase_identity() {
         "must emit the terminal event"
     );
     assert!(text.contains("tx-op-9"), "terminal must carry tx identity");
-    assert!(text.contains("eff-op-9"), "terminal must carry effect identity");
+    assert!(
+        text.contains("eff-op-9"),
+        "terminal must carry effect identity"
+    );
 }
