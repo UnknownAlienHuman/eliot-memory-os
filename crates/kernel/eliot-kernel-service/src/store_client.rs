@@ -229,6 +229,9 @@ pub struct EbpCanonicalStoreClient<T> {
     protocol_version: ProtocolVersion,
     limits: TransportLimits,
     request_counter: AtomicU64,
+    /// Blob process-stream capability negotiated independently of the
+    /// canonical Store API catalogue.
+    blob_process_stream_capability: bool,
     /// One-shot production fault hook (issue #2030). The harness-gated
     /// `arm_fault` arms it, observation reads it, and the write paths consume
     /// it through this atomic; the transport path never invents faults on
@@ -282,6 +285,12 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             protocol_version: server.selected_protocol,
             limits,
             request_counter: AtomicU64::new(1),
+            blob_process_stream_capability: server
+                .allowed_capabilities
+                .iter()
+                .any(|capability| {
+                    capability == eliot_blob_api::wire::BLOB_PROCESS_STREAM_CAPABILITY
+                }),
             fault: AtomicU8::new(StoreClientFault::NONE),
         };
         client.verify_readiness().await?;
@@ -316,6 +325,13 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
     #[must_use]
     pub const fn requirement(&self) -> &HostStoreBootstrapRequirement {
         &self.requirement
+    }
+
+    /// Whether the authenticated Store handshake admitted the distinct Blob
+    /// process-stream surface. Absence is an explicit capability gap.
+    #[must_use]
+    pub const fn blob_process_stream_available(&self) -> bool {
+        self.blob_process_stream_capability
     }
 
     async fn verify_readiness(&self) -> Result<(), StoreClientError> {
@@ -2651,6 +2667,9 @@ fn client_hello(
         capabilities: CAPABILITIES
             .iter()
             .map(|value| (*value).to_owned())
+            .chain(std::iter::once(
+                eliot_blob_api::wire::BLOB_PROCESS_STREAM_CAPABILITY.to_owned(),
+            ))
             .collect(),
         privacy_classes: vec!["PUBLIC".to_owned()],
         max_frame: u32::try_from(eliot_protocol::MAX_FRAME_BYTES)
@@ -2692,7 +2711,12 @@ fn decode_server_hello(
         || server.rejection_reason.is_some()
         || artifact_hash != Some(requirement.approved_artifact_hash.as_str())
         || config_hash != Some(requirement.approved_config_hash.as_str())
-        || observed_capabilities != expected_capabilities
+        || !expected_capabilities.is_subset(&observed_capabilities)
+        || observed_capabilities
+            .difference(&expected_capabilities)
+            .any(|capability| {
+                *capability != eliot_blob_api::wire::BLOB_PROCESS_STREAM_CAPABILITY
+            })
         || observed_effects != expected_effects
     {
         return Err(StoreClientError::Contract(
