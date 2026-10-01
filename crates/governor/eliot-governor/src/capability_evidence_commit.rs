@@ -114,6 +114,8 @@
 //! fresh process from the served `limitations_and_negative_evidence` rather than
 //! remembered.
 
+use std::collections::BTreeMap;
+
 use eliot_canonical::CanonicalWriteEnvelope;
 use eliot_contracts::{OperationId, StateFence};
 use eliot_protocol::RequestIdentity;
@@ -124,6 +126,7 @@ use eliot_store_api::{
     decode_instrument_registry_mutation, generated_operation_manifests,
     operation_manifest_set_digest, reject_direct_capability_evidence_write, sha256_hex,
 };
+use serde_json::Value;
 
 use crate::capability_evidence::{
     CapabilityEvidenceRecord, OwnerEvidenceRevision, is_evidence_ref,
@@ -432,6 +435,178 @@ fn instrument_registry_operation_text(snapshot_digest: &str) -> String {
     format!("instrument-registry-{snapshot_digest}")
 }
 
+/// Whether `value` is a lowercase SHA-256 hex digest.
+fn is_registry_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// File name of a canonical executable path, lowercased without an `.exe`
+/// suffix.
+///
+/// This mirrors the runner observation's file-name rule textually (same
+/// separators, same case fold, same suffix strip) rather than by shared code:
+/// the runner crate is not a dependency here, so the entry-side executable
+/// binding agrees with the launch-side one by identical rule text, stated in
+/// both places.
+fn registry_executable_file_name(canonical_path: &str) -> String {
+    let tail = canonical_path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(canonical_path);
+    let lower = tail.to_ascii_lowercase();
+    lower.strip_suffix(".exe").unwrap_or(&lower).to_owned()
+}
+
+/// Re-runs the admission drift and observation checks entry-side, against the
+/// snapshot this entry is about to commit (issue #1814).
+///
+/// Every presented pin must agree with the snapshot bytes: the snapshot
+/// generation equals the admitted generation pin, the admitted kind is still
+/// present in the spec table, and the snapshot's own receipt row for the kind
+/// carries the admitted spec digest, executable object, and receipt digest —
+/// the receipt digest recomputed here over the row fields with the registry's
+/// exact digest material, so a substituted row refuses even when its fields
+/// look individually plausible. An admission that carried no receipt (empty
+/// supply pin) must still carry none in the snapshot. The spec-bytes binding
+/// itself stays runner-side (see the entry docs); what refuses here is any
+/// pin that disagrees with the committed bytes.
+///
+/// # Errors
+///
+/// Returns [`CompositionError::Owner`] when a pin is malformed, the snapshot
+/// is not JSON, or any pin disagrees with the snapshot content.
+fn check_registry_commit_admission(
+    snapshot_json: &str,
+    kind: &str,
+    spec_digest: &str,
+    supply_digest: &str,
+    executable_path: &str,
+    content_digest: &str,
+    registry_generation: u64,
+) -> Result<(), CompositionError> {
+    for (field, pin) in [
+        ("spec_digest", spec_digest),
+        ("content_digest", content_digest),
+    ] {
+        if !is_registry_digest(pin) {
+            return Err(CompositionError::Owner(format!(
+                "instrument registry admission pin '{field}' is not a snapshot digest"
+            )));
+        }
+    }
+    if !supply_digest.is_empty() && !is_registry_digest(supply_digest) {
+        return Err(CompositionError::Owner(
+            "instrument registry admission pin 'supply_digest' is not a snapshot digest"
+                .to_owned(),
+        ));
+    }
+    let document: Value = serde_json::from_str(snapshot_json).map_err(|error| {
+        CompositionError::Owner(format!("instrument registry snapshot is not JSON: {error}"))
+    })?;
+    let generation = document
+        .get("generation")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            CompositionError::Owner(
+                "instrument registry snapshot carries no generation".to_owned(),
+            )
+        })?;
+    if generation != registry_generation {
+        return Err(CompositionError::Owner(format!(
+            "instrument registry snapshot generation {generation} differs from the admitted generation {registry_generation}"
+        )));
+    }
+    let specs =
+        document
+            .get("specs")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                CompositionError::Owner(
+                    "instrument registry snapshot carries no spec table".to_owned(),
+                )
+            })?;
+    let spec_present = specs.iter().any(|row| {
+        row.get("kind")
+            .and_then(|kind_value| kind_value.get("name"))
+            .and_then(Value::as_str)
+            == Some(kind)
+    });
+    if !spec_present {
+        return Err(CompositionError::Owner(format!(
+            "instrument registry snapshot no longer admits kind '{kind}'"
+        )));
+    }
+    let receipts =
+        document
+            .get("receipts")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                CompositionError::Owner(
+                    "instrument registry snapshot carries no receipt table".to_owned(),
+                )
+            })?;
+    let receipt = receipts
+        .iter()
+        .find(|row| row.get("instrument").and_then(Value::as_str) == Some(kind));
+    match (receipt, supply_digest.is_empty()) {
+        (None, true) => Ok(()),
+        (Some(_), true) | (None, false) => Err(CompositionError::Owner(
+            "instrument registry snapshot receipt presence differs from the admission".to_owned(),
+        )),
+        (Some(row), false) => {
+            let field = |name: &str| {
+                row.get(name).and_then(Value::as_str).ok_or_else(|| {
+                    CompositionError::Owner(format!(
+                        "instrument registry snapshot receipt for '{kind}' carries no '{name}'"
+                    ))
+                })
+            };
+            let executable = field("executable")?;
+            let row_content = field("content_digest")?;
+            let row_spec = field("spec_digest")?;
+            let row_generation =
+                row.get("generation")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| {
+                        CompositionError::Owner(format!(
+                            "instrument registry snapshot receipt for '{kind}' carries no generation"
+                        ))
+                    })?;
+            let version = row.get("tool_version").and_then(Value::as_str).unwrap_or("");
+            // The registry's exact receipt-digest material (same field order,
+            // same separators): a substituted row fails here even when every
+            // field is individually well-formed.
+            let material = format!(
+                "{kind}\0{executable}\0{row_content}\0{version}\0{row_spec}\0{row_generation}"
+            );
+            if eliot_contracts::sha256_hex(material.as_bytes()) != supply_digest {
+                return Err(CompositionError::Owner(format!(
+                    "instrument registry snapshot receipt for '{kind}' differs from the admitted receipt"
+                )));
+            }
+            if row_content != content_digest {
+                return Err(CompositionError::Owner(format!(
+                    "instrument registry snapshot receipt for '{kind}' names a different executable object than admitted"
+                )));
+            }
+            if row_spec != spec_digest {
+                return Err(CompositionError::Owner(format!(
+                    "instrument registry snapshot receipt for '{kind}' is verified against a different spec than admitted"
+                )));
+            }
+            if registry_executable_file_name(executable_path) != executable.to_ascii_lowercase() {
+                return Err(CompositionError::Owner(format!(
+                    "instrument registry admission names a different executable file than the snapshot receipt for '{kind}'"
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Reports whether one canonical receipt really committed the named
 /// instrument-registry request, with no stale projection reported healthy
 /// (issue #223 P2 discipline).
@@ -503,34 +678,52 @@ fn check_instrument_registry_commit_freshness(
     Ok(())
 }
 
-/// Commits one prebuilt named instrument-registry request through the
-/// canonical owner (issue #1814).
+/// Commits one admitted instrument-registry snapshot through the canonical
+/// owner (issue #1814).
 ///
 /// This is the Governor-owned sibling of [`commit_capability_evidence_record`]
-/// for the closed `ApplyInstrumentRegistryState` mutation: it executes the
-/// admitted `AdmissionSubmission` snapshot the instrument admission boundary
-/// produced, so the snapshot reaches durable storage through
-/// canonical-store authority instead of any runner-invented write. It
-/// derives the real [`CanonicalWriteEnvelope`] from
-/// the caller identity, the decoded closed parameters of the single named
-/// registry command, the caller-addressed scope, proof refs, live head
-/// expectations, and the live store manifest digest — then invokes
-/// [`GovernorComposition::commit_canonical`](crate::composition::GovernorComposition::commit_canonical)
+/// for the closed `ApplyInstrumentRegistryState` mutation: it carries the
+/// admitted snapshot the instrument admission boundary produced to durable
+/// storage through canonical-store authority instead of any runner-invented
+/// write. The closed mutation parameters are built HERE, from the verified
+/// snapshot bytes — never from a caller-supplied parameter map — then the
+/// entry derives the real [`CanonicalWriteEnvelope`], invokes
+/// [`GovernorComposition::commit_canonical`](crate::composition::GovernorComposition::commit_canonical),
 /// and checks the returned receipt for freshness.
+///
+/// The boundary takes the admission's closed content (the verbatim snapshot
+/// bytes) plus the live-registry pins the admission boundary bound the launch
+/// under, as plain snapshot data: the runner's `AdmissionSubmission` lives in
+/// a crate this crate must not depend on, so the future Governor-side caller
+/// copies each pin from the submission's accessors. Before any commit the
+/// entry re-runs the drift and observation checks against the snapshot it is
+/// about to commit (see [`check_registry_commit_admission`]): the snapshot
+/// generation must equal the admitted generation pin, the admitted kind must
+/// still be present, the snapshot's own receipt row for the kind must agree
+/// with every presented pin (including a recomputed receipt digest over the
+/// row fields, so a substituted row refuses), and the admitted executable
+/// object must match the row's recorded object. A snapshot that drifted
+/// between admission and commit therefore refuses here instead of committing
+/// foreign bytes under an admitted identity.
 ///
 /// Envelope field provenance (every field bound, none synthesized; mirrors
 /// `commit_learning_record`):
 ///
 /// ```text
-/// operation_id            derived deterministically as
+/// operation_id            recomputed entry-side as
 ///                         `instrument-registry-{snapshot_digest}` over the
-///                         verbatim accepted snapshot bytes (stable across
-///                         retries, unique per snapshot revision: any spec,
-///                         receipt, or generation change is a new digest)
+///                         decoded snapshot bytes AFTER the pins verify: the
+///                         digest is never taken from caller parameters (they
+///                         are built here), so the SAME registry content always
+///                         addresses the same operation (a retry converges at
+///                         the store instead of appending a second head) and
+///                         ANY spec, receipt, or generation change addresses a
+///                         different one
 /// request                 the caller-supplied request metadata, cloned verbatim
-/// idempotency_key         the caller identity key: the registry mutation
-///                         declares no idempotency parameter, so there is no
-///                         named-request key to agree with; convergence across
+/// idempotency_key         the validated request identity's key
+///                         (`identity.validate()` runs before any commit):
+///                         the envelope rule the sibling commit paths apply,
+///                         not a caller-chosen value; convergence across
 ///                         retries comes from the deterministic operation_id
 ///                         plus the store's fenced compare-and-set
 /// scope_id                caller-addressed scope carried into the envelope
@@ -546,8 +739,10 @@ fn check_instrument_registry_commit_freshness(
 ///                         operation parameters and operation identity
 /// operation_manifest_digest
 ///                         computed live from `generated_operation_manifests`
-/// semantic_commands       the single named registry command, refused here
-///                         unless it is exactly ApplyInstrumentRegistryState
+/// semantic_commands       the single named registry command, built here from
+///                         the verified snapshot bytes and refused upstream
+///                         unless the pins agree: no caller parameter map is
+///                         ever accepted
 /// event/projection/relation intents
 ///                         empty: a durable registry snapshot is not a
 ///                         projection or relation; the registry is a
@@ -561,27 +756,34 @@ fn check_instrument_registry_commit_freshness(
 ///                         to the request fence
 /// ```
 ///
-/// Fail-closed checks before any commit: the closed-operation guard, the
-/// closed parameter decode through the shared snapshot acceptance boundary
-/// (unsupported schema/version refuses here, before any apply), and
-/// caller-identity validity. The live-registry content drift check itself
-/// already ran where the submission was built
-/// (`submit_admission_snapshot` refuses a replaced spec, receipt, or
-/// generation before producing the snapshot); what this entry refuses on is
-/// any request that is not exactly the admitted closed mutation.
+/// Fail-closed checks before any commit, in order: caller-identity validity;
+/// entry-side admission agreement (generation, kind presence, receipt-row pins
+/// with recomputed receipt digest, executable-object binding); the closed
+/// parameter decode through the shared snapshot acceptance boundary
+/// (unsupported schema/version refuses here, before any apply). The
+/// spec-bytes binding itself (spec digest recomputation over the spec
+/// definitions) stays runner-side in the submission builder's
+/// recover-and-compare: the registry digest functions live in the runner
+/// crate, which is not a dependency here, so this entry verifies pin
+/// agreement inside the snapshot it commits rather than re-deriving those
+/// digests. The machine-observation half (the launched file really is the
+/// pinned object) likewise stays at the runner boundary, which hashes the
+/// file at use; what this entry refuses on is any pin that disagrees with
+/// the committed snapshot bytes.
 ///
 /// Never accepts a caller-created `PreparedTransition` (there is no such
-/// parameter), never mints a revision from a local clock, never invents a
-/// store operation or a catalogue activation, and never reinterprets the
-/// receipt: the returned [`WriteReceipt`] is the owner's receipt,
-/// unmodified.
+/// parameter) or a caller-built parameter map, never mints a revision from a
+/// local clock, never invents a store operation or a catalogue activation,
+/// and never reinterprets the receipt: the returned [`WriteReceipt`] is the
+/// owner's receipt, unmodified.
 ///
-/// Downstream note, stated rather than worked around: the Kernel store
-/// gateway validates the prepared transition against the generated operation
-/// catalogue, which currently carries no activated
-/// `ApplyInstrumentRegistryState` entry, so execution fails closed there
-/// with a typed store refusal until the store owner activates the operation.
-/// That activation is a store-owned slice; this entry does not anticipate it.
+/// Catalogue state: the generated operation catalogue carries the activated
+/// `ApplyInstrumentRegistryState` mutation row
+/// (`TransitionClass::InstrumentRegistry`, bulk owner-snapshot bound, closed
+/// snapshot validator), so the prepared transition validates at the store
+/// gateway. The typed `GetInstrumentRegistryState` read stays
+/// known-but-unsupported until its catalogue row and canonical read handlers
+/// land with the store owner.
 #[allow(
     clippy::too_many_arguments,
     reason = "the commit caller joins every handoff-required envelope input in one typed call"
@@ -589,26 +791,52 @@ fn check_instrument_registry_commit_freshness(
 pub async fn commit_instrument_registry_snapshot<P: KernelGenerationPort + ?Sized>(
     composition: &GovernorComposition<P>,
     identity: &RequestIdentity,
-    request: NamedMutationRequest,
+    snapshot_json: String,
+    kind: &str,
+    spec_digest: &str,
+    supply_digest: &str,
+    executable_path: &str,
+    content_digest: &str,
+    registry_generation: u64,
+    registry_digest: &str,
     scope_id: ScopeId,
     proof_refs: Vec<String>,
     expected_revision_heads: Vec<RevisionHeadExpectation>,
     expected_ordering_heads: Vec<OrderingHeadExpectation>,
 ) -> Result<WriteReceipt, CompositionError> {
-    if request.operation != NamedMutationOperation::ApplyInstrumentRegistryState {
-        return Err(CompositionError::Owner(
-            "instrument registry guard: direct write outside the closed registry operation refused"
-                .to_owned(),
-        ));
-    }
-    let snapshot_json =
-        decode_instrument_registry_mutation(&request.parameters).map_err(|error| {
-            CompositionError::Owner(format!("instrument registry parameters: {error}"))
-        })?;
     identity.validate().map_err(|error| {
         CompositionError::Owner(format!("instrument registry identity invalid: {error}"))
     })?;
-    let snapshot_digest = sha256_hex(snapshot_json.as_bytes());
+    check_registry_commit_admission(
+        &snapshot_json,
+        kind,
+        spec_digest,
+        supply_digest,
+        executable_path,
+        content_digest,
+        registry_generation,
+    )?;
+    if !is_registry_digest(registry_digest) {
+        return Err(CompositionError::Owner(
+            "instrument registry digest pin is not a registry digest".to_owned(),
+        ));
+    }
+    // The closed parameters are built here from the verified snapshot bytes:
+    // no caller parameter map is accepted, so the committed digest can never
+    // be a caller-supplied value travelling beside different bytes. The
+    // registry digest pin above is shape-checked here and enforced for
+    // agreement runner-side (`launch_plan_live` refuses a plan compiled
+    // against a different live digest); it travels with the pin set so the
+    // commit caller's pins stay complete and auditable.
+    let parameters = BTreeMap::from([(
+        "snapshot_json".to_owned(),
+        Value::String(snapshot_json),
+    )]);
+    let admitted =
+        decode_instrument_registry_mutation(&parameters).map_err(|error| {
+            CompositionError::Owner(format!("instrument registry parameters: {error}"))
+        })?;
+    let snapshot_digest = sha256_hex(admitted.as_bytes());
     let operation_id = OperationId::new(instrument_registry_operation_text(&snapshot_digest))
         .map_err(|error| {
             CompositionError::Owner(format!("instrument registry identity invalid: {error}"))
@@ -632,7 +860,10 @@ pub async fn commit_instrument_registry_snapshot<P: KernelGenerationPort + ?Size
         requested_effect_ceiling: EffectClass::ReversibleMutation,
         admission_contract_set_digest: eliot_canonical::supported_admission_contract_set_digest()?,
         operation_manifest_digest: manifest_digest,
-        semantic_commands: vec![request],
+        semantic_commands: vec![NamedMutationRequest {
+            operation: NamedMutationOperation::ApplyInstrumentRegistryState,
+            parameters,
+        }],
         event_projection_relation_intents: EventProjectionRelationIntents {
             event_ids: Vec::new(),
             projection_kinds: Vec::new(),

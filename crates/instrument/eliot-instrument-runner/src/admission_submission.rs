@@ -17,8 +17,7 @@
 use std::collections::BTreeMap;
 
 use eliot_store_api::{
-    NamedMutationOperation, NamedMutationRequest, NamedReadOperation,
-    decode_instrument_registry_mutation,
+    NamedMutationOperation, NamedReadOperation, decode_instrument_registry_mutation,
 };
 use serde_json::Value;
 
@@ -30,7 +29,9 @@ use crate::registry::{ResolvedExecutableIdentity, SupplyChainReceipt};
 /// The snapshot carries every admitted spec and supply-chain receipt at the
 /// admitted registry generation, including this operation's spec and
 /// receipt; the bound digests pin exactly which record this launch was
-/// admitted under.
+/// admitted under. The trailing registry pins name the live registry the
+/// submission was built from, so the Governor-owned commit entry can re-run
+/// the drift checks entry-side against the same generation and digest.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdmissionSubmission {
     snapshot_json: String,
@@ -38,6 +39,8 @@ pub struct AdmissionSubmission {
     supply_digest: String,
     executable_path: String,
     content_digest: String,
+    registry_generation: u64,
+    registry_digest: String,
 }
 
 impl AdmissionSubmission {
@@ -64,21 +67,6 @@ impl AdmissionSubmission {
         )])
     }
 
-    /// Closed store mutation request this submission executes.
-    ///
-    /// The single named `ApplyInstrumentRegistryState` command carrying
-    /// exactly the accepted `snapshot_json` parameters: the exact request
-    /// the Governor-owned instrument-registry commit entry executes through
-    /// the canonical owner. Building it here, from the same accessors the
-    /// acceptance boundary validated, keeps the executed bytes identical to
-    /// the admitted bytes by construction.
-    pub fn mutation_request(&self) -> NamedMutationRequest {
-        NamedMutationRequest {
-            operation: self.operation(),
-            parameters: self.parameters(),
-        }
-    }
-
     /// Admitted spec digest this launch was bound under.
     pub fn spec_digest(&self) -> &str {
         &self.spec_digest
@@ -97,6 +85,16 @@ impl AdmissionSubmission {
     /// Content digest of the exact executable bytes that launch.
     pub fn content_digest(&self) -> &str {
         &self.content_digest
+    }
+
+    /// Live-registry generation this launch was admitted under.
+    pub fn registry_generation(&self) -> u64 {
+        self.registry_generation
+    }
+
+    /// Live-registry digest the plan was compiled against.
+    pub fn registry_digest(&self) -> &str {
+        &self.registry_digest
     }
 }
 
@@ -199,5 +197,7 @@ pub fn submit_admission_snapshot(
         supply_digest: admitted_supply,
         executable_path: observed.canonical_path.clone(),
         content_digest: observed.content_digest.clone(),
+        registry_generation: registry.generation(),
+        registry_digest: registry.digest(),
     })
 }

@@ -61,8 +61,10 @@
 //! plus the provider-independent genesis bootstrap entry sourced by
 //! [`genesis_manifest`](crate::genesis_manifest). Every other operation stays
 //! known-but-unsupported and unadvertised: this includes issue #1814's
-//! typed `GetInstrumentRegistryState` / `ApplyInstrumentRegistryState`
-//! contract until canonical read/write handlers are available. No other
+//! typed `GetInstrumentRegistryState` read until its catalogue row and
+//! canonical read handlers land. The matching `ApplyInstrumentRegistryState`
+//! mutation is activated below (`TransitionClass::InstrumentRegistry` with
+//! the bulk owner-snapshot bound and the closed snapshot validator). No other
 //! mutation on base has a
 //! proven handler, schema, and consumer triple, so C1 advertises no other
 //! mutation entry and any transition carrying another named command fails

@@ -995,6 +995,15 @@ impl StageOrchestrator {
     /// become blocked missing proofs. Terminal observation and evidence
     /// retention stay with the supervising lane; this walk never holds an
     /// ordering slot while a tool runs.
+    ///
+    /// Issue #1814: the registry-less walk admits no external stage. With no
+    /// live registry the pre-launch drift gate
+    /// ([`submit_admission_snapshot`](crate::admission_submission::submit_admission_snapshot))
+    /// cannot run, so every external stage fails closed as a missing run
+    /// instead of launching on compiled admission alone. Production callers
+    /// hold a live registry and must route through
+    /// [`launch_plan_live`](Self::launch_plan_live). Pure (non-external)
+    /// stages keep their existing testd-plane refusal.
     pub async fn launch_plan<E: ProcessExecutor + 'static>(
         runner: &InstrumentRunner<E>,
         plan: &StagePlan,
@@ -1238,50 +1247,13 @@ impl StageOrchestrator {
     /// process. The tool version stays unobserved (`None`): no version is
     /// attested on this path, so none is claimed, while a spec-pinned
     /// version still gates inside admission.
-    /// Refuses anything but the admitted closed mutation request.
     ///
-    /// Issue #1814: builds the snapshot when a live registry is present
-    /// (`None` registry preserves the recorded registry-less-caller
-    /// residual), then invokes the Governor-owned commit entry's closed
-    /// mutation request over it: the exact `ApplyInstrumentRegistryState`
-    /// command the canonical owner executes. Anything but the admitted
-    /// closed mutation refuses here, before any child exists.
-    fn refuse_unadmitted_stage(
-        live: Option<&InstrumentRegistry>,
-        planned: &PlannedStage,
-        identity: &ResolvedExecutableIdentity,
-        route: &TestExecutionPlaneRoute,
-    ) -> Option<InstrumentRun> {
-        let registry = live?;
-        let submission = match submit_admission_snapshot(registry, &planned.stage, identity) {
-            Ok(submission) => submission,
-            Err(error) => {
-                return Some(InstrumentRun::missing(
-                    route,
-                    format!("stage admission refused: {error}"),
-                ));
-            }
-        };
-        let request = submission.mutation_request();
-        let admitted = request.operation
-            == eliot_store_api::NamedMutationOperation::ApplyInstrumentRegistryState
-            && eliot_store_api::decode_instrument_registry_mutation(&request.parameters)
-                .is_ok_and(|snapshot| snapshot == submission.snapshot_json());
-        if admitted {
-            return None;
-        }
-        Some(InstrumentRun::missing(
-            route,
-            format!(
-                "stage admission refused: {}",
-                crate::profile::ProfileError::Snapshot {
-                    detail: "admission mutation is not the admitted closed registry request"
-                        .to_owned(),
-                }
-            ),
-        ))
-    }
-
+    /// Issue #1814: the live-registry drift gate runs here, after the grant
+    /// checks and before any child exists. With a live registry the admitted
+    /// snapshot is rebuilt from the CURRENT registry and a replaced spec,
+    /// receipt, or generation (or an observation that no longer matches the
+    /// receipt) refuses as a missing run. Without a live registry the launch
+    /// fails closed: a registry-less path admits no external stage.
     async fn launch_one<E: ProcessExecutor + 'static>(
         runner: &InstrumentRunner<E>,
         live: Option<&InstrumentRegistry>,
@@ -1356,8 +1328,35 @@ impl StageOrchestrator {
         ) {
             return InstrumentRun::missing(route, reason);
         }
-        if let Some(refusal) = Self::refuse_unadmitted_stage(live, planned, &identity, route) {
-            return refusal;
+        // Issue #1814: the live-registry drift gate. With a live registry the
+        // submission rebuilds the admitted snapshot from the CURRENT registry
+        // and refuses a replaced spec, receipt, or generation (or an
+        // observation that no longer matches the receipt) here, before any
+        // child exists. Without a live registry the launch fails closed: a
+        // registry-less path admits no external stage. The built submission
+        // is the exact snapshot the Governor-owned instrument-registry commit
+        // entry executes; executing it needs the Governor composition handle
+        // and the ingress-authenticated request identity, which this runner
+        // boundary does not hold and must not synthesize, so the commit
+        // entry's Governor-side caller is a separate slice. The discarded
+        // value is intentional: the gate is the drift check, not the value.
+        match live {
+            Some(registry) => {
+                if let Err(error) =
+                    submit_admission_snapshot(registry, &planned.stage, &identity)
+                {
+                    return InstrumentRun::missing(
+                        route,
+                        format!("stage admission refused: {error}"),
+                    );
+                }
+            }
+            None => {
+                return InstrumentRun::missing(
+                    route,
+                    "stage admission refused: no live instrument registry on the launch path; external stages launch only under live-registry admission",
+                );
+            }
         }
         let mut binding = match InstrumentBinding::from_request(invocation, process_request) {
             Ok(binding) => binding,
@@ -1398,6 +1397,11 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
     /// the returned [`ProfileAggregate`] observes success, partial failure,
     /// missing stages, and evidence handles without declaring any task
     /// complete.
+    ///
+    /// Issue #1814: this is the registry-less walk
+    /// ([`StageOrchestrator::launch_plan`]): external stages fail closed as
+    /// missing runs. Production callers that hold the live registry use
+    /// [`run_profile_stages_live`](Self::run_profile_stages_live).
     pub async fn run_profile_stages(
         &self,
         admitted: &AdmittedProfile,
@@ -1405,6 +1409,25 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
     ) -> ProfileAggregate {
         let plan = StageOrchestrator::plan(admitted);
         let runs = StageOrchestrator::launch_plan(self, &plan, launcher).await;
+        ProfileAggregate::assemble(&plan, runs)
+    }
+
+    /// Runs one admitted profile end to end against the live registry.
+    ///
+    /// Issue #1814: this is the production walk
+    /// ([`StageOrchestrator::launch_plan_live`]) for composition roots that
+    /// hold the registry the plan was compiled against. The plan generation
+    /// and digest must still match the live registry, and every external
+    /// stage additionally passes the pre-launch drift gate; anything else
+    /// becomes an explicit missing run instead of a child process.
+    pub async fn run_profile_stages_live(
+        &self,
+        registry: &InstrumentRegistry,
+        admitted: &AdmittedProfile,
+        launcher: &dyn StageLauncher,
+    ) -> ProfileAggregate {
+        let plan = StageOrchestrator::plan(admitted);
+        let runs = StageOrchestrator::launch_plan_live(self, registry, &plan, launcher).await;
         ProfileAggregate::assemble(&plan, runs)
     }
 }
