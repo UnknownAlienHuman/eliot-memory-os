@@ -685,6 +685,16 @@ impl CanonicalStoreClient for SurrealStoreAdapter {
             .map_err(AdapterError::into_store_error)
     }
 
+    async fn write_work_scope_owner(
+        &self,
+        context: &RequestMeta,
+        request: eliot_store_api::StoreWorkScopeOwnerRequest,
+    ) -> Result<eliot_store_api::StoreWorkScopeOwnerResponse, StoreError> {
+        apply::write_work_scope_owner(self, context, request)
+            .await
+            .map_err(AdapterError::into_store_error)
+    }
+
     async fn receipt(&self, operation_id: OperationId) -> Result<Option<WriteReceipt>, StoreError> {
         apply::read_receipt(self, operation_id)
             .await
