@@ -4296,13 +4296,15 @@ mod tests {
     use super::*;
     use eliot_agent_bridge::{GovernanceEvidence, ReadinessDisposition, ScopeLevel};
     use eliot_agent_bridge_core::{
-        ClockReading, EventCursor, EventId, HOST_EVENT_CONTRACT_VERSION,
+        ActivationPortOutcome, ActivationPortResult, ClockReading, EventCursor, EventId,
+        HOST_EVENT_CONTRACT_VERSION,
         HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition, HostEventNormalizationReceipt,
-        HostEventPrivacyClass, LowercaseSha256, NativeSession, NativeSessionLocator,
+        HostActivationPort, HostEventPrivacyClass, LowercaseSha256, NativeSession, NativeSessionLocator,
         NormalizationCoverage, NormalizedHostEventEnvelope, NormalizedHostEventPayload,
-        ProviderObservationLineage, QualifiedSourceDigest, RawSourceRecord,
+        PrincipalId, ProviderFailure, ProviderObservationLineage, ProviderReadiness,
+        QualifiedSourceDigest, RawSourceRecord,
         RestrictedRawSourceHandle, SessionLifecycleObservation, SessionLifecycleTransition,
-        SessionObservation, UnsupportedDisposition,
+        SessionId, SessionObservation, TaskId, UnsupportedDisposition, WorkUnitId,
     };
     use eliot_integration_coverage::{
         ALL_EVENTS, DispatchOrdering, EventCompleteness, EventCoverage, EventDisposition,
@@ -5376,6 +5378,63 @@ mod tests {
         .expect("test runner composes")
     }
 
+    fn attached_bootstrap_fixture_runner() -> BridgeRunner {
+        struct StaticActivation {
+            result: ActivationPortResult,
+        }
+
+        impl HostActivationPort for StaticActivation {
+            fn activate(
+                &mut self,
+                _request: &AttachRequest,
+            ) -> Result<ActivationPortOutcome, ProviderFailure> {
+                Ok(ActivationPortOutcome::Authenticated(self.result.clone()))
+            }
+        }
+
+        let generation = Generation::new(7).expect("non-zero fixture generation");
+        let fence = FencingToken::new(
+            EpochId::new(
+                eliot_contracts::EpochLineageId::new(
+                    "550e8400-e29b-41d4-a716-446655440000",
+                )
+                .expect("valid fixture lineage"),
+                std::num::NonZeroU64::new(3).expect("non-zero fixture epoch"),
+            )
+            .expect("valid fixture epoch"),
+            generation,
+            "fence-bootstrap-7",
+        )
+        .expect("valid fixture fence");
+        let result = ActivationPortResult::authenticated(
+            PrincipalId::new("principal-1").expect("valid fixture principal"),
+            SessionId::new("session-bootstrap-1").expect("valid fixture session"),
+            generation,
+            fence,
+            TaskId::new("task-bootstrap-1").expect("valid fixture task"),
+            WorkUnitId::new("work-unit-bootstrap-1").expect("valid fixture work unit"),
+            "workscope-1",
+            "task-revision-1",
+            "plan-bootstrap-1",
+            "plan-revision-1",
+        )
+        .expect("valid fixture activation result");
+        let mut runner = BridgeRunner::new(
+            Profile::SpineFunctional,
+            ProviderReadiness::all_admitted(),
+            Some(Box::new(StaticActivation { result })),
+            None,
+        )
+        .expect("attached fixture runner composes");
+        runner
+            .attach(AttachRequest::managed(
+                DemandId::new("demand-bootstrap-1").expect("valid fixture demand"),
+                ConnectionId::new("conn-bootstrap-1").expect("valid fixture connection"),
+            ))
+            .expect("authenticated fixture attach succeeds");
+        runner
+    }
+
     #[test]
     fn loopback_http_idle_peer_times_out_without_a_request() {
         let listener =
@@ -5444,7 +5503,11 @@ mod tests {
         // carries the bounded bootstrap with the actual governance
         // evidence; the second carries none, while explicit retrieval
         // stays available (including via the admitted stdio op above).
-        let mut runner = fixture_runner();
+        let mut runner = attached_bootstrap_fixture_runner();
+        assert!(
+            runner.attach_view().is_some(),
+            "owner snapshot fixture requires the exact authenticated live attach"
+        );
         let context = fixture_bootstrap_context();
         runner
             .note_bootstrap_context(context)
