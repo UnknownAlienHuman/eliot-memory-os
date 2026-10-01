@@ -3122,6 +3122,7 @@ fn run_mcp_front_door(
                 if let Err(error) = eliot_agent_bridge::mcp_correlation::observe_mcp_emission(
                     runner,
                     &request,
+                    &response,
                     request.get("method").and_then(Value::as_str).unwrap_or(""),
                     None,
                     observed,
