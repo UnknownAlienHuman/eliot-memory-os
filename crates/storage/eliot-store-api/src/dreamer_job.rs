@@ -1,6 +1,6 @@
 //! Store-neutral Dreamer ledger contract (S0 named family, owner #773).
 //!
-//! This module publishes one closed named family over the thirteen K0
+//! This module publishes one closed named family over the fourteen K0
 //! [`JobOperation`](eliot_protocol::dreamer_job::JobOperation) variants. It
 //! composes K0 control values with a store-owned event cursor, expected-state
 //! compare-and-swap, immutable mutation identity, deterministic digests, and
@@ -21,8 +21,9 @@ use eliot_contracts::{
     ArtifactId, OperationId, ReceiptId, StateFence, TaskId, canonical_json_bytes, sha256_hex,
 };
 use eliot_protocol::dreamer_job::{
-    DurableJobError, DurableJobRecord, DurableJobRequest, DurableJobResponse, JobCheckpoint,
-    JobLease, JobOperation, JobOutputApplicabilityRevision, JobRole, JobState, OpaqueContentRef,
+    DurableJobError, DurableJobRecord, DurableJobRequest, DurableJobResponse, JobAdmissionRevision,
+    JobCheckpoint, JobLease, JobOperation, JobOutputApplicabilityRevision, JobRole, JobState,
+    OpaqueContentRef, WorkAdmissionState,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -126,7 +127,7 @@ fn ensure_same_fence(left: &StateFence, right: &StateFence) -> Result<(), StoreE
     Ok(())
 }
 
-/// Checks the closed thirteen-kind operation vocabulary without accepting a
+/// Checks the closed fourteen-kind operation vocabulary without accepting a
 /// generic command string.
 fn validate_closed_operation_kind(kind: &str) -> Result<(), StoreError> {
     const CLOSED: &[&str] = &[
@@ -143,6 +144,7 @@ fn validate_closed_operation_kind(kind: &str) -> Result<(), StoreError> {
         "REQUEST_CANCEL",
         "RECONCILE_MUTATION",
         "RECORD_APPLICABILITY",
+        "RECORD_ADMISSION",
     ];
     if CLOSED.contains(&kind) {
         Ok(())
@@ -180,7 +182,7 @@ fn validate_lease_shape(lease: &JobLease) -> Result<(), StoreError> {
 ///
 /// The operation identifier, idempotency key, and canonical request hash come
 /// from the answered K0 request; the operation kind must name the closed
-/// thirteen-operation vocabulary. Proposed ledger digests live on the record
+/// fourteen-operation vocabulary. Proposed ledger digests live on the record
 /// and event themselves (see their `compute_digest` methods) so this
 /// identity stays free of self-referential hashes. No payload bytes travel
 /// here.
@@ -262,9 +264,11 @@ pub fn dreamer_job_queue_key(job_id: &TaskId, attempt_id: &ArtifactId) -> String
 
 /// Store-owned ledger record: one K0 history plus cursor, queue key, active
 /// versus historical leases, preserved verification result, bounded output
-/// applicability history, immutable mutation identity, real receipt
+/// applicability history, bounded admission history, immutable mutation identity, real receipt
 /// reference, and digest. Empty applicability history is omitted so legacy
 /// records retain their original canonical digest and decode as unknown.
+/// Empty admission history is omitted so legacy records without admission
+/// proof retain their original canonical digest and never read as admitted.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DreamerJobLedgerRecord {
@@ -276,6 +280,8 @@ pub struct DreamerJobLedgerRecord {
     pub result_under_verification: Option<OpaqueContentRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub applicability_history: Vec<JobOutputApplicabilityRevision>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub admission_history: Vec<JobAdmissionRevision>,
     pub last_mutation: DreamerJobMutationIdentity,
     pub last_receipt_id: Option<ReceiptId>,
     pub record_digest: String,
@@ -311,6 +317,7 @@ impl DreamerJobLedgerRecord {
         self.validate_lease_split()?;
         self.validate_verification()?;
         self.validate_applicability_history()?;
+        self.validate_admission_history()?;
         self.validate_mutation_receipt_digest()?;
         Ok(())
     }
@@ -343,6 +350,41 @@ impl DreamerJobLedgerRecord {
             if revision.revision != expected_revision
                 || revision.job_id != self.record.submission.job_id
                 || revision.attempt_id != self.record.submission.attempt_id
+            {
+                return Err(StoreError::IdentityConflict);
+            }
+        }
+        Ok(())
+    }
+
+    /// Bounded, contiguous admission history. Each revision is validated
+    /// against the durable record itself, so a capacity deferral cannot claim
+    /// an external attempt and a superseding revision must name the exact
+    /// outcome the record already holds. `prior_admission_state` is checked
+    /// against an independent expectation: the previous revision's own state,
+    /// or the submitted admission receipt for the first one.
+    fn validate_admission_history(&self) -> Result<(), StoreError> {
+        if self.admission_history.len() > MAX_DREAMER_JOB_HISTORY {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        for (index, revision) in self.admission_history.iter().enumerate() {
+            revision
+                .validate_against_record(&self.record)
+                .map_err(map_durable_error)?;
+            let expected_revision = u64::try_from(index)
+                .ok()
+                .and_then(|value| value.checked_add(1))
+                .ok_or(StoreError::PayloadTooLarge)?;
+            let expected_prior = index
+                .checked_sub(1)
+                .and_then(|previous| self.admission_history.get(previous))
+                .map_or(WorkAdmissionState::Admitted, |previous| {
+                    previous.admission_state
+                });
+            if revision.revision != expected_revision
+                || revision.job_id != self.record.submission.job_id
+                || revision.attempt_id != self.record.submission.attempt_id
+                || revision.prior_admission_state != expected_prior
             {
                 return Err(StoreError::IdentityConflict);
             }
@@ -520,6 +562,7 @@ impl DreamerJobLedgerEvent {
         let is_status = matches!(self.operation, JobOperation::Status { .. });
         let is_record_applicability =
             matches!(self.operation, JobOperation::RecordApplicability { .. });
+        let is_record_admission = matches!(self.operation, JobOperation::RecordAdmission { .. });
         if is_status {
             if self.prior_state != self.next_state || self.prior_revision != self.next_revision {
                 return Err(StoreError::InvalidField {
@@ -530,11 +573,11 @@ impl DreamerJobLedgerEvent {
             if self.receipt_id.is_some() {
                 return Err(StoreError::InvalidReceipt);
             }
-        } else if is_record_applicability {
+        } else if is_record_applicability || is_record_admission {
             if self.prior_state != self.next_state || self.prior_revision != self.next_revision {
                 return Err(StoreError::InvalidField {
-                    field: "dreamer_job.applicability_event",
-                    reason: "applicability does not rewrite execution history",
+                    field: "dreamer_job.projection_event",
+                    reason: "admission and applicability do not rewrite execution history",
                 });
             }
         } else if self.next_revision != self.prior_revision
@@ -612,7 +655,8 @@ pub fn validate_ledger_bundle(
     validate_bundle_revision_state(request, response, record, event)?;
     validate_bundle_mutation_receipt(request, response, record, event)?;
     validate_bundle_leases_results(request, response, record, event)?;
-    validate_bundle_applicability(request, record, event)
+    validate_bundle_applicability(request, record, event)?;
+    validate_bundle_admission(request, record, event)
 }
 
 /// Binds job, attempt, scope, and fence across request, response, record, and
@@ -693,12 +737,17 @@ fn validate_bundle_identities(
                 return Err(StoreError::IdentityConflict);
             }
         }
+        JobOperation::RecordAdmission { update } => {
+            if response.job_id != update.job_id || response.attempt_id != update.attempt_id {
+                return Err(StoreError::IdentityConflict);
+            }
+        }
     }
     Ok(())
 }
 
 /// Binds revision, cursor, and lifecycle state across response, record, and
-/// event for the closed thirteen-operation family.
+/// event for the closed fourteen-operation family.
 #[allow(clippy::too_many_lines)]
 fn validate_bundle_revision_state(
     request: &DurableJobRequest,
@@ -766,7 +815,7 @@ fn validate_bundle_revision_state(
                 return Err(StoreError::IdentityConflict);
             }
         }
-        JobOperation::RecordApplicability { .. } => {
+        JobOperation::RecordApplicability { .. } | JobOperation::RecordAdmission { .. } => {
             if event.prior_state != event.next_state
                 || event.prior_revision != event.next_revision
                 || response.disposition
@@ -862,6 +911,9 @@ fn validate_bundle_leases_results(
     if response.applicability_history != record.applicability_history {
         return Err(StoreError::IdentityConflict);
     }
+    if response.admission_history != record.admission_history {
+        return Err(StoreError::IdentityConflict);
+    }
     if record.record.state.is_terminal() && record.active_lease.is_some() {
         return Err(StoreError::RevisionConflict);
     }
@@ -890,6 +942,52 @@ fn validate_bundle_applicability(
     let expected = JobOutputApplicabilityRevision::from_update(
         update,
         &record.record,
+        expected_revision
+            .checked_add(1)
+            .ok_or(StoreError::PayloadTooLarge)?,
+    )
+    .map_err(map_durable_error)?;
+    if latest != &expected
+        || event.operation != request.operation
+        || event.prior_state != record.record.state
+        || event.next_state != record.record.state
+        || event.prior_revision != record.record.revision
+        || event.next_revision != record.record.revision
+    {
+        return Err(StoreError::IdentityConflict);
+    }
+    Ok(())
+}
+
+/// Binds a requester admission operation to exactly one appended admission
+/// revision. The revision is recomputed from the durable record the Store
+/// holds, so a requester cannot supply the prior admission state or claim an
+/// outcome the record does not carry. The record's execution state, revision
+/// and outcome are unchanged by the operation.
+fn validate_bundle_admission(
+    request: &DurableJobRequest,
+    record: &DreamerJobLedgerRecord,
+    event: &DreamerJobLedgerEvent,
+) -> Result<(), StoreError> {
+    let JobOperation::RecordAdmission { update } = &request.operation else {
+        return Ok(());
+    };
+    let Some(latest) = record.admission_history.last() else {
+        return Err(StoreError::InvalidProjection);
+    };
+    let expected_revision = u64::try_from(record.admission_history.len() - 1)
+        .map_err(|_| StoreError::PayloadTooLarge)?;
+    if update.expected_admission_revision != expected_revision {
+        return Err(StoreError::RevisionConflict);
+    }
+    let expected = JobAdmissionRevision::from_update(
+        update,
+        &record.record,
+        record
+            .admission_history
+            .len()
+            .checked_sub(2)
+            .and_then(|previous| record.admission_history.get(previous)),
         expected_revision
             .checked_add(1)
             .ok_or(StoreError::PayloadTooLarge)?,

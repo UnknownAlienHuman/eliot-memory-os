@@ -72,8 +72,57 @@ use eliot_context_contracts::{
 };
 use eliot_receipts::ProofCeiling;
 
+// Host-only owner evidence: the `wasm32` guest contour must never see Governor
+// state or the governed registries, so the presented-carriage arm of
+// `LearningGovernance` exists only in a native build, exactly like
+// `learning_gate` itself.
+#[cfg(not(target_arch = "wasm32"))]
+use eliot_improvement::PresentedLearning;
+
 const UNKNOWN_AVAILABILITY_CONSTRAINT: &str =
     "candidate availability is unknown; admission deferred until availability is known";
+
+/// The learning carriage one admission decision is composed with.
+///
+/// The governance a caller must state is an explicit arm rather than something
+/// the callee infers, because a learning mark is intrinsic to the candidate:
+/// any marked or ticketed input reaches selection only through
+/// [`LearningGovernance::Presented`], and every other arm refuses it.
+pub enum LearningGovernance<'a> {
+    /// No live owner-issued learning carriage accompanies this admission.
+    ///
+    /// The ordinary learning refusal applies: a learning-marked candidate or a
+    /// learning ticket refuses the whole decision with
+    /// `ContextError::InvalidField("learning.governed_path_required")` before
+    /// any selection.
+    Unpresented,
+    /// The live owner-issued carriage this admission is decided under.
+    ///
+    /// The owner-bound carriage check and the per-mark screen both run against
+    /// this value before selection. Host-only: a `wasm32` guest closure never
+    /// carries Governor state or the governed registries.
+    #[cfg(not(target_arch = "wasm32"))]
+    Presented(PresentedLearning<'a>),
+}
+
+/// The downstream reservation one admission decision is composed with.
+///
+/// Absence is a stated arm, not an implicit `None`: a caller declares either
+/// the owner-issued reservation evidence or that no reservation accompanies the
+/// compilation, and the composed decision reports which of the two it ran.
+pub enum DownstreamReservation<'a> {
+    /// No owner-issued reservation accompanies this compilation.
+    ///
+    /// There is no reservation evidence for the bounded headroom check to
+    /// verify, so the composed decision reports
+    /// [`HeadroomCheck::NotReserved`] and the selector applies the pre-existing
+    /// nominal-capacity fit without holding back the recipe's own declared
+    /// output and review reserves. A caller that does hold a reservation must
+    /// say so: I12.13 requires it before optional filling.
+    NotReserved,
+    /// The owner-issued reservation evidence for this compilation.
+    Reserved(&'a HeadroomContext<'a>),
+}
 
 /// Admit one immutable candidate set under one exact recipe and route profile.
 ///
@@ -86,8 +135,11 @@ const UNKNOWN_AVAILABILITY_CONSTRAINT: &str =
 /// refused fail-closed here; governed influence must use
 /// `admit_context_with_learning`.
 pub fn admit_context(input: &AdmissionInput) -> Result<AdmissionResult, ContextError> {
-    refuse_ungoverned_learning(input)?;
-    admit_context_inner(input)
+    into_admission_result(admit_context_composed(
+        input,
+        &LearningGovernance::Unpresented,
+        &DownstreamReservation::NotReserved,
+    ))
 }
 
 fn refuse_ungoverned_learning(input: &AdmissionInput) -> Result<(), ContextError> {
@@ -104,8 +156,52 @@ fn refuse_ungoverned_learning(input: &AdmissionInput) -> Result<(), ContextError
     Ok(())
 }
 
-pub(crate) fn admit_context_inner(input: &AdmissionInput) -> Result<AdmissionResult, ContextError> {
-    admit_context_inner_with_headroom(input, None)
+/// Run the learning carriage gate that must precede selection.
+///
+/// [`LearningGovernance::Unpresented`] applies the ordinary learning refusal;
+/// [`LearningGovernance::Presented`] runs the owner-bound carriage check and
+/// the per-mark screen. This is the only learning gate in the crate, so no
+/// entrypoint can reach selection without the one its own carriage requires.
+fn check_learning_carriage(
+    input: &AdmissionInput,
+    learning: &LearningGovernance<'_>,
+) -> Result<(), ContextError> {
+    match learning {
+        LearningGovernance::Unpresented => refuse_ungoverned_learning(input),
+        #[cfg(not(target_arch = "wasm32"))]
+        LearningGovernance::Presented(presented) => {
+            crate::learning_gate::check_governed_admission_carriage(input, *presented)
+        }
+    }
+}
+
+/// One composed admission decision, before any rank trace is derived.
+///
+/// The admitted arm carries the bounded headroom decision that was proven, or
+/// explicitly stated absent, alongside the result; the refused arm carries the
+/// attempted recipe and binding with no admitted set.
+pub(crate) enum ComposedAdmission {
+    Admitted {
+        result: Box<AdmissionResult>,
+        check: HeadroomCheck,
+    },
+    Refused(Box<HeadroomRefusalRecord>),
+}
+
+/// The result-only projection of one composed decision.
+///
+/// A [`ComposedAdmission::Refused`] arm is unreachable for
+/// [`DownstreamReservation::NotReserved`], because a refusal record is only
+/// ever built from owner-issued reservation evidence. The arm is still
+/// projected onto the refusal's own typed `ContextError` rather than dropped,
+/// so a refusal on this path stays typed across the layer.
+pub(crate) fn into_admission_result(
+    composed: Result<ComposedAdmission, ContextError>,
+) -> Result<AdmissionResult, ContextError> {
+    match composed? {
+        ComposedAdmission::Admitted { result, .. } => Ok(*result),
+        ComposedAdmission::Refused(refusal) => Err(refusal.error),
+    }
 }
 
 /// The validated owner evidence the pure compiler receives before optional
@@ -161,6 +257,13 @@ pub enum HeadroomCheck {
     },
     /// A demanded dimension was not reserved, or its reservation is stale.
     Refused(HeadroomRefusal),
+    /// No owner-issued reservation accompanied this decision.
+    ///
+    /// The caller declared [`DownstreamReservation::NotReserved`], so the
+    /// bounded headroom check had no owner evidence to verify. It is a named
+    /// state rather than a silent skip: it can never be read as a granted
+    /// reservation, and it reports no occupancy figure because none was proven.
+    NotReserved,
 }
 
 impl HeadroomCheck {
@@ -168,7 +271,7 @@ impl HeadroomCheck {
     #[must_use]
     pub fn refusal(&self) -> Option<&HeadroomRefusal> {
         match self {
-            Self::Admitted { .. } => None,
+            Self::Admitted { .. } | Self::NotReserved => None,
             Self::Refused(refusal) => Some(refusal),
         }
     }
@@ -278,6 +381,198 @@ fn check_reserved_occupancy(
     Ok(())
 }
 
+/// The owner reason identity a withheld reservation names.
+///
+/// It is an existing owner record, never a minted placeholder: the recipe's
+/// own invalidation identity when it declared one, otherwise the admission
+/// rule evidence that produced the failure.
+///
+/// Both sources are already owner-issued [`eliot_contracts::ArtifactId`]s
+/// (`ContextRecipe::invalidation` and `SafetyFloorIdentity::rule_evidence`),
+/// and `HeadroomRefusal`'s `reason` is that same type, so the owner identity is
+/// COPIED here and never rebuilt. No identifier is constructed at this site, so
+/// `ArtifactId::new` is not called and no reason can fail the identifier's
+/// blank/control-character rules on the way in: the value was validated when its
+/// owner minted it, and re-validating a copy here could only reject an identity
+/// the owner had already admitted.
+fn headroom_reason_ref(input: &AdmissionInput) -> eliot_contracts::ArtifactId {
+    input
+        .recipe
+        .invalidation
+        .clone()
+        .unwrap_or_else(|| input.floor.floor.rule_evidence.clone())
+}
+
+/// Build the typed refusal record one withheld reservation carries.
+fn headroom_refusal_record(
+    input: &AdmissionInput,
+    reason: HeadroomRefusal,
+    error: ContextError,
+) -> Box<HeadroomRefusalRecord> {
+    Box::new(HeadroomRefusalRecord {
+        reason,
+        error,
+        attempted_recipe_digest: input.recipe.recipe_sha256.clone(),
+        attempted_binding: input.binding.clone(),
+    })
+}
+
+/// Name the typed refusal one withheld reservation carries.
+///
+/// The reason names an existing owner record, never a minted placeholder: the
+/// recipe's own invalidation identity when it declared one, otherwise the
+/// admission rule evidence that produced the failure.
+fn headroom_refusal_reason(
+    input: &AdmissionInput,
+    headroom: &HeadroomContext<'_>,
+    error: &ContextError,
+) -> HeadroomRefusal {
+    let reason_ref = headroom_reason_ref(input);
+    match error {
+        ContextError::StaleFloor | ContextError::InvalidFence => {
+            HeadroomRefusal::Stale { reason: reason_ref }
+        }
+        ContextError::MissingFloor | ContextError::OversizedFloor => HeadroomRefusal::Unavailable {
+            dimensions: headroom_limiting_dimensions(headroom.request, headroom.result),
+        },
+        ContextError::CapacityExceeded | ContextError::Overflow => {
+            HeadroomRefusal::PostRenderOverflow { reason: reason_ref }
+        }
+        _ => HeadroomRefusal::IdentityChanged { reason: reason_ref },
+    }
+}
+
+/// The composed admission decision: both governance screens, then exactly one
+/// selection.
+///
+/// #1869/#1725 composition. Every entrypoint of this cell reaches the selector
+/// through this function, and both checks that must precede selection run here
+/// first, so no caller can reach it with only half the governance:
+///
+/// 1. **The learning carriage gate.** [`LearningGovernance::Unpresented`] applies
+///    the ordinary learning refusal, so a learning-marked or ticketed input
+///    refuses with `ContextError::InvalidField("learning.governed_path_required")`
+///    here instead of reaching selection. [`LearningGovernance::Presented`] runs
+///    the owner-bound carriage check and the per-mark screen against the live
+///    issuance, and either refusal withholds the whole decision.
+/// 2. **The bounded headroom gate.** [`DownstreamReservation::Reserved`] runs
+///    the owner-evidence checks above plus the reservation-aware occupancy fit
+///    the selector applies, and a withheld reservation refuses with the
+///    attempted recipe and binding and no admitted set.
+///    [`DownstreamReservation::NotReserved`] is a stated arm with no owner
+///    evidence to verify; the decision then reports
+///    [`HeadroomCheck::NotReserved`] rather than reading as a granted
+///    reservation.
+/// 3. **One selection**, through the unchanged
+///    [`admit_context_inner_with_headroom`], after both gates.
+///
+/// A withheld reservation is a TYPED REFUSAL, not a transport error: it is
+/// carried as [`ComposedAdmission::Refused`], never as an `Err`, which would
+/// erase the limiting dimensions the caller needs in order to narrow or
+/// decompose.
+pub(crate) fn admit_context_composed<'a>(
+    input: &AdmissionInput,
+    learning: &LearningGovernance<'a>,
+    reservation: &DownstreamReservation<'a>,
+) -> Result<ComposedAdmission, ContextError> {
+    check_learning_carriage(input, learning)?;
+    let headroom = match reservation {
+        DownstreamReservation::NotReserved => None,
+        DownstreamReservation::Reserved(headroom) => Some(*headroom),
+    };
+    let check = match headroom {
+        Some(headroom) => match check_headroom(input, headroom) {
+            // A refused dimension means no optional filling happened at all, so
+            // the typed refusal carries the same exact error the floor path
+            // reports for an unsatisfiable required floor, plus the limiting
+            // dimensions.
+            Ok(HeadroomCheck::Refused(reason)) => {
+                return Ok(ComposedAdmission::Refused(headroom_refusal_record(
+                    input,
+                    reason,
+                    ContextError::MissingFloor,
+                )));
+            }
+            Ok(check) => check,
+            Err(error) => return Ok(composed_headroom_refusal(input, headroom, error)),
+        },
+        None => HeadroomCheck::NotReserved,
+    };
+    match admit_context_inner_with_headroom(input, headroom) {
+        Ok(result) => Ok(ComposedAdmission::Admitted {
+            result: Box::new(result),
+            check,
+        }),
+        Err(error) => match headroom {
+            Some(headroom) => Ok(composed_headroom_refusal(input, headroom, error)),
+            None => Err(error),
+        },
+    }
+}
+
+/// The typed refusal one withheld reservation or refused selection carries.
+fn composed_headroom_refusal(
+    input: &AdmissionInput,
+    headroom: &HeadroomContext<'_>,
+    error: ContextError,
+) -> ComposedAdmission {
+    let reason = headroom_refusal_reason(input, headroom, &error);
+    ComposedAdmission::Refused(headroom_refusal_record(input, reason, error))
+}
+
+/// The composed admission entrypoint with its per-material rank traces.
+///
+/// This is `admit_context_composed` — the single governance composition and the
+/// single selection of this crate — plus the rank-trace join the traced
+/// entrypoints promise. The two governance screens and their order are
+/// documented there and are not restated or reordered here.
+///
+/// # DO NOT "restore" by-value parameters here as a reuse guard
+///
+/// These two parameters were by value in the first delivery of this composition,
+/// and it is tempting to read that as the thing stopping one downstream
+/// reservation from backing two admissions. It never was, and restoring it would
+/// buy nothing while making the signature lie about what enforces the rule.
+///
+/// `DownstreamReservation::Reserved` holds a `&HeadroomContext`, and
+/// `HeadroomContext` is plain shared references plus a `u64`: no interior
+/// mutability, no `consume`/`take`, and the enum is public and not
+/// `#[non_exhaustive]`. A caller holding one `&HeadroomContext` can therefore
+/// write `DownstreamReservation::Reserved(ctx)` once per call and drive any
+/// number of admissions from it. By-value moves the TOKEN, not the RESERVATION,
+/// so it never prevented that — `admit_context_traced_with_headroom` below
+/// already mints a fresh token from a borrowed context on every call.
+/// `LearningGovernance` is weaker still: `PresentedLearning` is `Copy` with
+/// all-public fields, so it is re-constructible from its own parts.
+///
+/// The by-value signature was therefore a SPELLING of the requirement, not an
+/// enforcement of it. Enforcement lives in the owner-side check that
+/// `check_headroom` runs on every call:
+/// `DownstreamHeadroomResult::validate_against` re-derives this compilation's
+/// request digest and binding, compares the binding against the live fence, and
+/// requires every granted permit to carry the live authority epoch and
+/// requesting generation and to be unexpired at the caller's `now_ms`. A reused
+/// or superseded reservation fails there on its own facts. Anyone restoring
+/// by-value should restore the comment's reasoning with it: the guarantee is
+/// re-verification per admission, not ownership of a token.
+pub fn admit_context_governed<'a>(
+    input: &AdmissionInput,
+    learning: &LearningGovernance<'a>,
+    reservation: &DownstreamReservation<'a>,
+) -> Result<HeadroomAdmissionOutcome, ContextError> {
+    match admit_context_composed(input, learning, reservation)? {
+        ComposedAdmission::Admitted { result, check } => {
+            let traces = trace_material(input, &result)?;
+            Ok(HeadroomAdmissionOutcome::Admitted {
+                result,
+                traces,
+                check,
+            })
+        }
+        ComposedAdmission::Refused(refusal) => Ok(HeadroomAdmissionOutcome::Refused(refusal)),
+    }
+}
+
 /// Admit one candidate set under one granted downstream reservation.
 ///
 /// I12.13: "Before filling optional context, Context Compiler requests the
@@ -289,6 +584,14 @@ fn check_reserved_occupancy(
 /// `recheck_headroom_handoff` returns the release instructions rather than
 /// releasing anything itself.
 ///
+/// The learning carriage this compilation presents is declared by the caller:
+/// this entry presents [`LearningGovernance::Unpresented`], so a
+/// learning-marked or ticketed input refuses fail-closed here instead of
+/// reaching selection. A compilation that holds a live owner-issued carriage
+/// calls [`admit_context_governed`] with [`LearningGovernance::Presented`],
+/// which runs the owner-bound carriage check and the per-mark screen before the
+/// same selection.
+///
 /// A withheld reservation returns
 /// [`HeadroomAdmissionOutcome::Refused`] with the attempted recipe and binding
 /// and no admitted set, so a dependent operation can never observe a nominally
@@ -297,73 +600,18 @@ pub fn admit_context_traced_with_headroom(
     input: &AdmissionInput,
     headroom: &HeadroomContext<'_>,
 ) -> Result<HeadroomAdmissionOutcome, ContextError> {
-    // The refusal names an existing owner record, never a minted placeholder:
-    // the recipe's own invalidation identity when it declared one, otherwise
-    // the admission rule evidence that produced the failure.
-    let reason_ref = input
-        .recipe
-        .invalidation
-        .clone()
-        .unwrap_or_else(|| input.floor.floor.rule_evidence.clone());
-    let refusal = |error: ContextError| {
-        HeadroomAdmissionOutcome::Refused(Box::new(HeadroomRefusalRecord {
-            reason: match &error {
-                ContextError::StaleFloor | ContextError::InvalidFence => HeadroomRefusal::Stale {
-                    reason: reason_ref.clone(),
-                },
-                ContextError::MissingFloor | ContextError::OversizedFloor => {
-                    HeadroomRefusal::Unavailable {
-                        dimensions: headroom_limiting_dimensions(headroom.request, headroom.result),
-                    }
-                }
-                ContextError::CapacityExceeded | ContextError::Overflow => {
-                    HeadroomRefusal::PostRenderOverflow {
-                        reason: reason_ref.clone(),
-                    }
-                }
-                _ => HeadroomRefusal::IdentityChanged {
-                    reason: reason_ref.clone(),
-                },
-            },
-            error,
-            attempted_recipe_digest: input.recipe.recipe_sha256.clone(),
-            attempted_binding: input.binding.clone(),
-        }))
-    };
-    // A headroom failure is a TYPED REFUSAL, not a transport error, so it is
-    // returned as `Ok(Refused(..))` on the same footing as the floor-path
-    // refusal below - never as `Err(..)`, which would erase the limiting
-    // dimensions the caller needs in order to narrow or decompose.
-    let check = match check_headroom(input, headroom) {
-        Ok(check) => check,
-        Err(error) => return Ok(refusal(error)),
-    };
-    // A refused dimension means no optional filling happened at all, so the
-    // typed refusal carries the same exact error the floor path reports for an
-    // unsatisfiable required floor, plus the limiting dimensions.
-    if let HeadroomCheck::Refused(reason) = &check {
-        return Ok(HeadroomAdmissionOutcome::Refused(Box::new(
-            HeadroomRefusalRecord {
-                reason: reason.clone(),
-                error: ContextError::MissingFloor,
-                attempted_recipe_digest: input.recipe.recipe_sha256.clone(),
-                attempted_binding: input.binding.clone(),
-            },
-        )));
-    }
-    match admit_context_inner_with_headroom(input, Some(headroom)) {
-        Ok(result) => {
-            let traces = trace_material(input, &result)?;
-            Ok(HeadroomAdmissionOutcome::Admitted {
-                result: Box::new(result),
-                traces,
-                check,
-            })
-        }
-        Err(error) => Ok(refusal(error)),
-    }
+    admit_context_governed(
+        input,
+        &LearningGovernance::Unpresented,
+        &DownstreamReservation::Reserved(headroom),
+    )
 }
 
+/// The one place in this crate where candidate selection happens.
+///
+/// Reached only from `admit_context_composed`, after that function has run both
+/// the learning carriage gate and the bounded headroom gate, so no entrypoint
+/// can reach the selector with only one of them.
 fn admit_context_inner_with_headroom(
     input: &AdmissionInput,
     headroom: Option<&HeadroomContext<'_>>,
@@ -587,9 +835,16 @@ fn validate_admission_contract(input: &AdmissionInput) -> Result<(), ContextErro
 pub fn admit_context_traced(
     input: &AdmissionInput,
 ) -> Result<(AdmissionResult, Vec<MaterialRankTrace>), ContextError> {
-    let result = admit_context(input)?;
-    let traces = trace_material(input, &result)?;
-    Ok((result, traces))
+    // The reservation-free composed decision, taken with the rank traces it
+    // already produced rather than rebuilding them through `admit_context`.
+    match admit_context_governed(
+        input,
+        &LearningGovernance::Unpresented,
+        &DownstreamReservation::NotReserved,
+    )? {
+        HeadroomAdmissionOutcome::Admitted { result, traces, .. } => Ok((*result, traces)),
+        HeadroomAdmissionOutcome::Refused(refusal) => Err(refusal.error),
+    }
 }
 
 /// Admit with owner-issued warning evidence and return rank traces.

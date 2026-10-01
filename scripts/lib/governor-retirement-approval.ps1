@@ -1694,15 +1694,14 @@ function Test-GovernorRetirementOwnerReceiptSignature(
     [byte[]]$ReceiptBytes,
     [object]$Readback,
     [object]$Policy,
-    [object]$Approval = $null,
-    [object]$SignatureVerification = $null) {
+    [object]$Approval = $null) {
     # Cryptographic authentication of the detached owner receipt, plus its
     # semantic read-back against THIS operation. Any failure is data (a refusal
     # result), never a throw, so the caller reports ISSUER_UNAVAILABLE instead of
     # crashing on unverified bytes.
     $refused = {
         param([string]$Reason)
-        [pscustomobject]@{ verified = $false; reason = $Reason; receipt_kind = $script:GovernorRetirementOwnerReceiptKind; signature_status = 'UNVERIFIED'; signer_thumbprint = $null; signer_subject = $null; certificate_chain_trusted = $null; certificate_not_before_utc = $null; certificate_not_after_utc = $null; signing_time_utc = $null; receipt_sha256 = $null; receipt_content_sha256 = $null }
+        [pscustomobject]@{ verified = $false; reason = $Reason; receipt_kind = $script:GovernorRetirementOwnerReceiptKind; signature_status = 'UNVERIFIED'; signature_algorithm = $null; signer_thumbprint = $null; signer_subject = $null; certificate_chain_trusted = $null; certificate_not_before_utc = $null; certificate_not_after_utc = $null; signing_time_utc = $null; receipt_sha256 = $null; receipt_content_sha256 = $null }
     }
     try {
         if (-not $Readback -or [string]$Readback.state -cne 'SUPPLIED') {
@@ -1818,37 +1817,69 @@ function Test-GovernorRetirementOwnerReceiptSignature(
             # owner-receipt content digest read above.
             $signatureStatus = 'UNVERIFIED'
             $algorithm = $null
+            $digest = $null
             $signedAttributeBytes = [System.Text.Encoding]::ASCII.GetBytes($signer.SignedAttrs)
-            if ($null -ne $SignatureVerification) {
-                $algorithm = [string](Read-GovernorApprovalField $SignatureVerification 'algorithm')
-                switch ($algorithm) {
-                    'RSA' {
-                        $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPublicKey($certificate)
-                        if ($null -eq $rsa) { return (& $refused 'the admitted issuer certificate exposes no RSA public key') }
-                        try {
-                            $verified = $rsa.VerifyHash([byte[]]$signer.Signature, $signedAttributeBytes, [System.Security.Cryptography.HashAlgorithmName]::SHA256, [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
-                        }
-                        finally {
-                            $rsa.Dispose()
-                        }
-                        $signatureStatus = if ($verified) { 'VALID' } else { 'INVALID' }
-                        break
+            # The receipt names its OWN algorithms. A detached CMS SignerInfo
+            # declares both the signature algorithm and the message-digest
+            # algorithm, and both are read from the parsed receipt rather than
+            # from any caller-supplied claim, so a caller cannot talk this gate
+            # into accepting a weaker algorithm. Only the two algorithms this
+            # contract admits are dispatched; an unknown or absent algorithm is
+            # a refusal and NEVER a default (no "assume RSA", no fallback).
+            $signatureOid = $null
+            $digestOid = $null
+            try {
+                $signatureOid = [string]$signer.SignatureAlgorithm.Value
+                $digestOid = [string]$signer.DigestAlgorithm.Value
+            }
+            catch {
+                return (& $refused "the detached owner receipt declares no readable CMS signature/digest algorithm: $([string]$_.Exception.Message)")
+            }
+            if ([string]::IsNullOrWhiteSpace($signatureOid) -or [string]::IsNullOrWhiteSpace($digestOid)) {
+                return (& $refused 'the detached owner receipt declares no CMS signature/digest algorithm; an unnamed algorithm is refused, not assumed')
+            }
+            switch ($signatureOid) {
+                '1.2.840.113549.1.1.1' { $algorithm = 'RSA' }
+                '1.2.840.113549.1.1.11' { $algorithm = 'RSA' }
+                '1.2.840.10045.4.1' { $algorithm = 'ECDSA' }
+                '1.2.840.10045.4.3.2' { $algorithm = 'ECDSA' }
+                default {
+                    return (& $refused "the detached owner receipt signature algorithm is not admitted: $signatureOid")
+                }
+            }
+            switch ($digestOid) {
+                '2.16.840.1.101.3.4.2.1' { $digest = [System.Security.Cryptography.HashAlgorithmName]::SHA256 }
+                default {
+                    return (& $refused "the detached owner receipt digest algorithm is not admitted: $digestOid")
+                }
+            }
+            switch ($algorithm) {
+                'RSA' {
+                    $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPublicKey($certificate)
+                    if ($null -eq $rsa) { return (& $refused 'the admitted issuer certificate exposes no RSA public key') }
+                    try {
+                        $verified = $rsa.VerifyHash([byte[]]$signer.Signature, $signedAttributeBytes, $digest, [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
                     }
-                    'ECDSA' {
-                        $ecdsa = [System.Security.Cryptography.X509Certificates.ECDsaCertificateExtensions]::GetECDsaPublicKey($certificate)
-                        if ($null -eq $ecdsa) { return (& $refused 'the admitted issuer certificate exposes no ECDSA public key') }
-                        try {
-                            $verified = $ecdsa.VerifyHash([byte[]]$signer.Signature, $signedAttributeBytes, [System.Security.Cryptography.HashAlgorithmName]::SHA256)
-                        }
-                        finally {
-                            $ecdsa.Dispose()
-                        }
-                        $signatureStatus = if ($verified) { 'VALID' } else { 'INVALID' }
-                        break
+                    finally {
+                        $rsa.Dispose()
                     }
-                    default {
-                        return (& $refused "the detached owner receipt signature algorithm is not admitted: $algorithm")
+                    $signatureStatus = if ($verified) { 'VALID' } else { 'INVALID' }
+                    break
+                }
+                'ECDSA' {
+                    $ecdsa = [System.Security.Cryptography.X509Certificates.ECDsaCertificateExtensions]::GetECDsaPublicKey($certificate)
+                    if ($null -eq $ecdsa) { return (& $refused 'the admitted issuer certificate exposes no ECDSA public key') }
+                    try {
+                        $verified = $ecdsa.VerifyHash([byte[]]$signer.Signature, $signedAttributeBytes, $digest)
                     }
+                    finally {
+                        $ecdsa.Dispose()
+                    }
+                    $signatureStatus = if ($verified) { 'VALID' } else { 'INVALID' }
+                    break
+                }
+                default {
+                    return (& $refused "the detached owner receipt signature algorithm is not admitted: $signatureOid")
                 }
             }
             if ($signatureStatus -cne 'VALID') {
@@ -1884,6 +1915,7 @@ function Test-GovernorRetirementOwnerReceiptSignature(
             reason = $null
             receipt_kind = $script:GovernorRetirementOwnerReceiptKind
             signature_status = $signatureStatus
+            signature_algorithm = ([string]$algorithm + '/' + [string]$digestOid)
             signer_thumbprint = $observedThumbprint
             signer_subject = $subject
             certificate_chain_trusted = $chainTrusted
@@ -2809,7 +2841,7 @@ function Resolve-GovernorRetirementIssuanceInputs(
     }
     $receiptBytes = Read-GovernorRetirementDetachedBytes $OwnerReceiptPath ([string]$readback.receipt_sha256) 'detached owner retirement receipt'
     $verification = Test-GovernorRetirementOwnerReceiptSignature `
-        ([byte[]]$receiptBytes.bytes) $readback $trustRoot.trust_policy $null $null
+        ([byte[]]$receiptBytes.bytes) $readback $trustRoot.trust_policy $null
     $issuer = Resolve-GovernorRetirementIssuer $trustRoot.trust_policy $readback.decision $verification
     if ([string]$issuer.state -cne 'ISSUER_AVAILABLE') {
         return [pscustomobject]@{

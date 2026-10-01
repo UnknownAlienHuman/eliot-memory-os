@@ -479,6 +479,16 @@
 //! the run loop's single-owner intake flight; it is `None` on the first pass and
 //! after a restart.
 //!
+//! Those are the ONLY two absences, and this module states the rule that keeps
+//! them the only two. A pass that published no current record does not CLEAR the
+//! record: it publishes none, and the caller settles on the record the flight
+//! already held. So `retained_next` below is `None` for every non-admitted
+//! disposition, and that `None` means "this pass admitted nothing", NOT "there is
+//! no record" — the caller distinguishes the two and keeps the prior one. A pass
+//! that admitted nothing is not evidence that the last admitted record stopped
+//! existing, and treating it as such is what would make a second attempt at a
+//! repeated failed experiment read as a first one (I12.24:43, I12.24:67).
+//!
 //! The current record it is compared against is read out of that handoff AFTER
 //! [`check_handoff_consumable`] has refused anything this build cannot read, so
 //! a record under a foreign wire revision or content identity never reaches a
@@ -490,10 +500,13 @@
 //!
 //! On this workspace the branch is not taken: the execution gate refuses first
 //! (see above), so `repeat` is `None` and `retained_next` is `None` on every
-//! live pass today. That is the honest live report, not missing coverage. Two
-//! prerequisites this daemon cannot supply are named rather than faked: the
-//! INDEPENDENT EXECUTED EVALUATION only the Instrument verifier owner family
-//! (`#20`/`#1111`) can produce, and a DURABLE owner for
+//! live pass today. That is the honest live report, not missing coverage — and
+//! because `retained_next` is `None` on every live pass, the retention rule
+//! below is exactly what keeps a future pass from losing a record it had already
+//! earned: `None` here must be read as "admitted nothing", never as "hold
+//! nothing". Two prerequisites this daemon cannot supply are named rather than
+//! faked: the INDEPENDENT EXECUTED EVALUATION only the Instrument verifier owner
+//! family (`#20`/`#1111`) can produce, and a DURABLE owner for
 //! `RetainedImprovementProposal` (the run-loop flight is process-local, so the
 //! record does not survive a restart). Neither is stubbed here, and an absent
 //! record is passed to the pipeline as no record at all, which it disposes as
@@ -625,9 +638,11 @@ const RECONCILIATION_COMMIT_DEADLINE_MS: u64 = 30_000;
 ///
 /// `retained` is the pipeline's own checked current record from an earlier
 /// ADMITTED pass, or `None` when this process holds none (the first pass, or any
-/// pass after a restart). Absence is the denying direction and is presented to
-/// the pipeline as no retained record at all, which it disposes as its own
-/// `NoRetainedPrior` case; it is never read as novelty.
+/// pass after a restart). Those are the only two absences, because a pass that
+/// admitted nothing leaves the record the flight already held in place. Absence
+/// is the denying direction and is presented to the pipeline as no retained
+/// record at all, which it disposes as its own `NoRetainedPrior` case; it is
+/// never read as novelty.
 #[derive(Clone, Copy, Debug)]
 pub struct ImprovementRouteDispatch<'a> {
     /// The advisory candidate/brief/owner-decision artifact this daemon
@@ -681,11 +696,20 @@ pub struct ImprovementRouteOutcome {
     /// The pipeline-derived repeat assessment, when a checked current record and
     /// a retained prior record both existed.
     pub repeat: Option<ImprovementReplayAssessment>,
-    /// The record the NEXT pass must retain for its own repeat assessment.
+    /// The record the NEXT pass must retain for its own repeat assessment, when
+    /// THIS pass published one.
     ///
     /// The same checked record, re-projected into the retained shape. `None`
     /// whenever the pass was not admitted, so an unadmitted pass never
     /// accumulates a record to compare against.
+    ///
+    /// `None` means THIS pass admitted nothing. It does not mean the next pass
+    /// has nothing to compare against, and a caller must not read it that way:
+    /// the record an earlier pass committed survives an unadmitted pass, because
+    /// the only two ways it is ever absent are the first pass and a restart. A
+    /// caller that stored this field's `None` back over its own prior record
+    /// would erase it, and the pass after that would see `NoRetainedPrior` for a
+    /// candidate that has in fact been admitted before.
     pub retained_next: Option<RetainedImprovementProposal>,
     /// What the disposition says about the external effect it names, read
     /// through the Governor owner's own retry gate and retained-result
@@ -859,6 +883,11 @@ fn route_operation_owner(
 /// authority, and it performs no durability of its own: the caller commits
 /// through the existing [`crate::DaemonComposition::commit_learning_record`]
 /// seam and retains the next pass's record in the intake flight it already owns.
+///
+/// `retained_next` is the record THIS pass published, so it is `None` on every
+/// non-admitted disposition. Deciding what the next pass retains from that is the
+/// CALLER's single write, and the rule it applies is the one the module
+/// documentation states: publish or keep, never clear.
 ///
 /// The route is bounded and non-looping: one call, one decision, per pass. It
 /// never promotes, activates, installs, completes, or issues authority, and a
