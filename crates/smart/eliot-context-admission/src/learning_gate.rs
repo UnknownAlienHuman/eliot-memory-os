@@ -247,7 +247,7 @@ pub fn admit_context_with_learning(
 ) -> Result<AdmissionResult, ContextError> {
     into_admission_result(crate::admit_context_composed(
         input,
-        LearningGovernance::Presented(presented),
-        DownstreamReservation::NotReserved,
+        &LearningGovernance::Presented(presented),
+        &DownstreamReservation::NotReserved,
     ))
 }

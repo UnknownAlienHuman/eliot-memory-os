@@ -137,8 +137,8 @@ pub enum DownstreamReservation<'a> {
 pub fn admit_context(input: &AdmissionInput) -> Result<AdmissionResult, ContextError> {
     into_admission_result(admit_context_composed(
         input,
-        LearningGovernance::Unpresented,
-        DownstreamReservation::NotReserved,
+        &LearningGovernance::Unpresented,
+        &DownstreamReservation::NotReserved,
     ))
 }
 
@@ -164,13 +164,13 @@ fn refuse_ungoverned_learning(input: &AdmissionInput) -> Result<(), ContextError
 /// entrypoint can reach selection without the one its own carriage requires.
 fn check_learning_carriage(
     input: &AdmissionInput,
-    learning: LearningGovernance<'_>,
+    learning: &LearningGovernance<'_>,
 ) -> Result<(), ContextError> {
     match learning {
         LearningGovernance::Unpresented => refuse_ungoverned_learning(input),
         #[cfg(not(target_arch = "wasm32"))]
         LearningGovernance::Presented(presented) => {
-            crate::learning_gate::check_governed_admission_carriage(input, presented)
+            crate::learning_gate::check_governed_admission_carriage(input, *presented)
         }
     }
 }
@@ -472,13 +472,13 @@ fn headroom_refusal_reason(
 /// decompose.
 pub(crate) fn admit_context_composed<'a>(
     input: &AdmissionInput,
-    learning: LearningGovernance<'a>,
-    reservation: DownstreamReservation<'a>,
+    learning: &LearningGovernance<'a>,
+    reservation: &DownstreamReservation<'a>,
 ) -> Result<ComposedAdmission, ContextError> {
     check_learning_carriage(input, learning)?;
     let headroom = match reservation {
         DownstreamReservation::NotReserved => None,
-        DownstreamReservation::Reserved(headroom) => Some(headroom),
+        DownstreamReservation::Reserved(headroom) => Some(*headroom),
     };
     let check = match headroom {
         Some(headroom) => match check_headroom(input, headroom) {
@@ -531,7 +531,7 @@ pub fn admit_context_governed<'a>(
     learning: LearningGovernance<'a>,
     reservation: DownstreamReservation<'a>,
 ) -> Result<HeadroomAdmissionOutcome, ContextError> {
-    match admit_context_composed(input, learning, reservation)? {
+    match admit_context_composed(input, &learning, &reservation)? {
         ComposedAdmission::Admitted { result, check } => {
             let traces = trace_material(input, &result)?;
             Ok(HeadroomAdmissionOutcome::Admitted {
