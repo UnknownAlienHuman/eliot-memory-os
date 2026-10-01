@@ -858,7 +858,10 @@ fn mcp_observation_envelope(
 ) -> Result<CanonicalWriteEnvelope, CompositionError> {
     let same_selection = match (&submission.task_selection, task_selection) {
         (Some(retained), Some(selection)) => retained == selection.evidence(),
-        (None, None) => identity.request.metadata.task_id.is_none(),
+        // The authenticated request may retain a task hint even when there is
+        // no unique owner-issued selection. That metadata remains in `request`
+        // below, but it does not make this raw capture task-relative.
+        (None, None) => true,
         _ => false,
     };
     if !same_selection {
@@ -883,12 +886,10 @@ fn mcp_observation_envelope(
         request: identity.request.metadata.clone(),
         idempotency_key: identity.idempotency_key.clone(),
         scope_id: ScopeId::new(work_scope_ref).map_err(|error| owner_refused(error.to_string()))?,
-        task_id: identity
-            .request
-            .metadata
-            .task_id
-            .as_ref()
-            .map(|task| task.as_str().to_owned()),
+        // Only retained selection evidence may project a semantic task
+        // binding onto the capture transition. Keep the original authenticated
+        // RequestMeta intact above; absent selection stays a cold candidate.
+        task_id: task_selection.map(|selection| selection.task_ref().to_owned()),
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
         admission_contract_set_digest: canonical_digest(submission)?,
@@ -1466,9 +1467,10 @@ fn capture_task_selection_evidence(
             }
             Ok(Some(selection.evidence().clone()))
         }
-        (Some(_), None) => Err(CompositionError::Kernel(
-            KernelPortError::TaskSelectionRequired,
-        )),
+        // Missing or ambiguous selection permits only the raw cold capture.
+        // Its task association remains absent in the submission even when
+        // authenticated request metadata carries a task hint.
+        (Some(_), None) => Ok(None),
         (None, Some(_)) => Err(CompositionError::Kernel(
             KernelPortError::TaskScopeIncompatible,
         )),
@@ -1547,13 +1549,15 @@ fn validate_observation_origin_current(
                 .as_ref()
                 .ok_or_else(|| identity_refused("application Observe request has no Session"))?;
             if session_id.as_str() != authenticated_session_ref
-                || identity
-                    .request
-                    .metadata
-                    .task_id
-                    .as_ref()
-                    .map(TaskId::as_str)
-                    != task_selection.map(|selection| selection.task_ref.as_str())
+                || task_selection.is_some_and(|selection| {
+                    identity
+                        .request
+                        .metadata
+                        .task_id
+                        .as_ref()
+                        .map(TaskId::as_str)
+                        != Some(selection.task_ref.as_str())
+                })
             {
                 return Err(identity_refused(
                     "completed Observe task identity differs from its retained task selection or application origin",
