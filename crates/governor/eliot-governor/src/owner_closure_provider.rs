@@ -2593,10 +2593,9 @@ mod owner_closure_provider_tests {
                 ROOT_OBSERVED_AT_MS,
             )
             .expect("root hydration admitted");
-        let hydrations: AdmittedHydrationsSnapshot = serde_json::from_slice(
-            &admitted.export_registry().expect("registry export"),
-        )
-        .expect("canonical hydration registry");
+        let hydrations: AdmittedHydrationsSnapshot =
+            serde_json::from_slice(&admitted.export_registry().expect("registry export"))
+                .expect("canonical hydration registry");
         // The child grant narrows the root, and its owner record is the durable
         // graph; the root hydration registry entry is unchanged by it, so the
         // final payload is the same root record the owner admitted.
@@ -2609,15 +2608,18 @@ mod owner_closure_provider_tests {
         .expect("owner snapshot")
     }
 
-    /// The bare authority-owner payload these fixtures bootstrap from: an
-    /// EMPTY grant graph with an empty but shape-valid hydration registry at
-    /// the exact same fence and graph revision. This is the only graph shape a
-    /// bare owner payload may carry, because
+    /// The bare authority-owner payload these fixtures bootstrap from: a
+    /// caller-supplied grant graph with an empty but shape-valid hydration
+    /// registry at the exact same fence and graph revision. A non-empty graph
+    /// carries no hydration yet because the caller admits the real hydration
+    /// through the production path immediately afterwards - which is the point
+    /// of the bootstrap, so the hydration is never hand-written.
+    ///
     /// `AuthorityOwnerSnapshot::validate` refuses a non-empty grant graph that
-    /// has no grant hydration and `AuthorityOwnerSnapshot::new` refuses to
-    /// substitute an empty registry for one.
-    fn raw_authority_snapshot(fence: &StateFence) -> AuthorityOwnerSnapshot {
-        let graph = GrantGraph::from_grants(std::iter::empty(), 7).expect("empty graph");
+    /// has no grant hydration, and `AuthorityOwnerSnapshot::new` refuses to
+    /// substitute an empty registry for one, so the graph and its hydrations
+    /// must be produced together rather than separately.
+    fn raw_authority_snapshot(fence: &StateFence, graph: &GrantGraph) -> AuthorityOwnerSnapshot {
         AuthorityOwnerSnapshot::new_with_owner_hydrations(
             fence.clone(),
             graph.recovery_snapshot().expect("snapshot"),
