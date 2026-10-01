@@ -250,14 +250,6 @@ fn doctor_fence_echo(
     })
 }
 
-/// Canonical digest helper for admission-contract digests.
-fn canonical_digest(value: &impl serde::Serialize) -> Result<String, CompositionError> {
-    let bytes = canonical_json_bytes(value).map_err(|error| {
-        CompositionError::Owner(format!("cannot canonicalize admission bytes: {error}"))
-    })?;
-    Ok(sha256_hex(&bytes))
-}
-
 /// Reconstructs the production adapter manifest digest.
 ///
 /// The shape mirrors `default_manifest` exactly (same adapter name, contract
@@ -440,7 +432,7 @@ fn observation_envelope(
             .map(|task| task.as_str().to_owned()),
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
-        admission_contract_set_digest: canonical_digest(submission)?,
+        admission_contract_set_digest: eliot_canonical::supported_admission_contract_set_digest()?,
         operation_manifest_digest: manifest_digest.clone(),
         semantic_commands: vec![NamedMutationRequest {
             operation: NamedMutationOperation::CaptureObservation,
@@ -527,7 +519,7 @@ fn recovery_envelope(
             .map(|task| task.as_str().to_owned()),
         transition_class: TransitionClass::RecoverySchema,
         requested_effect_ceiling: EffectClass::ReversibleMutation,
-        admission_contract_set_digest: canonical_digest(verified.report())?,
+        admission_contract_set_digest: eliot_canonical::supported_admission_contract_set_digest()?,
         operation_manifest_digest: manifest_digest.clone(),
         semantic_commands: vec![NamedMutationRequest {
             operation: NamedMutationOperation::ReconcileRecovery,
@@ -812,7 +804,7 @@ fn maintenance_observation_envelope(
             .map(|task| task.as_str().to_owned()),
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
-        admission_contract_set_digest: canonical_digest(submission)?,
+        admission_contract_set_digest: eliot_canonical::supported_admission_contract_set_digest()?,
         operation_manifest_digest: manifest_digest.clone(),
         semantic_commands: vec![NamedMutationRequest {
             operation: NamedMutationOperation::CaptureObservation,
@@ -1411,7 +1403,7 @@ fn negative_memory_gate_envelope(
             .map(|task| task.as_str().to_owned()),
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
-        admission_contract_set_digest: canonical_digest(submission)?,
+        admission_contract_set_digest: eliot_canonical::supported_admission_contract_set_digest()?,
         operation_manifest_digest: manifest_digest.clone(),
         semantic_commands: vec![NamedMutationRequest {
             operation: NamedMutationOperation::CaptureObservation,
@@ -1796,7 +1788,7 @@ fn watchdog_observation_envelope(
             .map(|task| task.as_str().to_owned()),
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
-        admission_contract_set_digest: canonical_digest(submission)?,
+        admission_contract_set_digest: eliot_canonical::supported_admission_contract_set_digest()?,
         operation_manifest_digest: manifest_digest.clone(),
         semantic_commands: vec![NamedMutationRequest {
             operation: NamedMutationOperation::CaptureObservation,

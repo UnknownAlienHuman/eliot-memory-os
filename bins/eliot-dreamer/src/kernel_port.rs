@@ -1941,6 +1941,7 @@ mod tests {
             KernelPortError::StaleGeneration { .. } => "StaleGeneration",
             KernelPortError::SemanticInputUnavailable => "SemanticInputUnavailable",
             KernelPortError::SemanticInputStale(_) => "SemanticInputStale",
+            KernelPortError::OwnerRecordStale(_) => "OwnerRecordStale",
             KernelPortError::StaleClaimBinding => "StaleClaimBinding",
             KernelPortError::BadNonce => "BadNonce",
             KernelPortError::BadGrant(_) => "BadGrant",

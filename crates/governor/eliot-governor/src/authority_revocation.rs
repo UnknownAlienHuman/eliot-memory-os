@@ -214,17 +214,7 @@ pub fn authority_revocation_envelope(
             .map(|task| task.as_str().to_owned()),
         transition_class: TransitionClass::RecoverySchema,
         requested_effect_ceiling: EffectClass::ReversibleMutation,
-        admission_contract_set_digest: canonical_digest(&(
-            origin_ref,
-            closure_id,
-            closure_revision,
-            affected_digest,
-            affected_count,
-            invalidation_reason,
-            fence_digest,
-            operation_id.as_str(),
-            identity.idempotency_key.clone(),
-        ))?,
+        admission_contract_set_digest: eliot_canonical::supported_admission_contract_set_digest()?,
         operation_manifest_digest: manifest_digest,
         semantic_commands: vec![NamedMutationRequest {
             operation: NamedMutationOperation::RecordAuthorityRevocation,
@@ -326,8 +316,9 @@ pub fn canonical_receipt_identity(
 /// canonical envelope already hash-binds and the store already compares for
 /// this exact operation: the typed
 /// [`InfluenceDependencyClosure`](eliot_store_api::InfluenceDependencyClosure)
-/// in `security`, and the `admission_contract_set_digest` over the same
-/// payload. Both are inside the envelope's canonical request view, so a replay
+/// in `security`, the typed command parameters, and a proof-reference digest
+/// for the remaining durable closure coordinates. These are inside the
+/// envelope's canonical request view, so a replay
 /// of this operation that presents a different closure conflicts at the store
 /// instead of recording a second record under one identity.
 ///
@@ -353,13 +344,10 @@ pub fn canonical_receipt_identity(
 /// field, so this binds the standing limit set the closure's complete-verdict
 /// gate runs under rather than a value supplied per closure.
 ///
-/// Grouping them into one serializable shape keeps the shared canonical codec
-/// hashing field names rather than a positional tuple, and makes the bound set
-/// reviewable as a whole: the stable operation and idempotency identities, the
-/// closure's own canonical request digest, the origin and affected set, the
-/// snapshot/epoch/fence, the transition receipt and its committed disposition,
-/// the canonical reconciliation link, the proof ceilings with the preserved
-/// alternate paths, and the traversal bounds.
+/// Content identity for the durable closure coordinates that do not fit in
+/// the closed seven-field revocation command. The digest remains a proof
+/// reference in the envelope; the contract-set field is reserved for current
+/// receiving-build support.
 #[derive(serde::Serialize)]
 struct DurableRevocationCoordinates<'a> {
     operation_id: &'a str,
@@ -382,7 +370,7 @@ struct DurableRevocationCoordinates<'a> {
     preserved: &'a [eliot_receipts::GrantClosureAlternatePath],
     bounds: &'a RevocationBounds,
 }
-
+///
 /// Proves every owner-approved field the revocation record carries is the
 /// durable closure's own recorded value.
 ///
@@ -474,7 +462,7 @@ fn bind_durable_closure_coordinates(
     let fence_digest = canonical_digest(&closure.authority.state_fence)?;
     let closure_revision = closure.declaration.grant_graph_revision.to_string();
     let affected_count = affected.len().to_string();
-    envelope.admission_contract_set_digest = canonical_digest(&DurableRevocationCoordinates {
+    let closure_coordinates_digest = canonical_digest(&DurableRevocationCoordinates {
         operation_id: envelope.operation_id.as_str(),
         idempotency_key: envelope.idempotency_key.as_str(),
         closure_request_digest: &closure.idempotency_digest,
@@ -495,6 +483,11 @@ fn bind_durable_closure_coordinates(
         preserved: &closure.declaration.preserved,
         bounds: &bounds,
     })?;
+    envelope.admission_contract_set_digest =
+        eliot_canonical::supported_admission_contract_set_digest()?;
+    envelope
+        .required_proof_and_approval_refs
+        .push(closure_coordinates_digest);
     envelope.security.influence_closure = Some(influence_closure);
     // The envelope was already valid once; the durable binding added fields to
     // two hash-bound surfaces, so it is re-validated rather than trusted.

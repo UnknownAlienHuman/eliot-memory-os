@@ -618,6 +618,14 @@ mod tests {
             // Multi-element and already sorted, so the pinned bytes also
             // cover the set-like ordering rule.
             semantic_source_revisions: vec!["revision-a@1".to_owned(), "revision-b@2".to_owned()],
+            // Carried ordering scopes are hash-bound set-like input, so this
+            // golden view declares the same scope its expected ordering head
+            // names. It is not decoration: `from_apply_rebinds_context_and_expected_heads`
+            // asserts that rebuilding the view from the prepared transition
+            // reproduces this one exactly, and the transition carries exactly
+            // this scope set, so any other value here would fail that identity
+            // rather than this fixture's subject.
+            ordering_scopes: vec![OrderingScopeId::new("scope-golden").expect("ordering scope")],
             expected_revision_heads: vec![
                 RevisionHeadExpectation {
                     key: RevisionKey::new("revision-a").expect("key"),
@@ -646,6 +654,21 @@ mod tests {
             "55e62e405f35c7f137fe9fcdf177c66a1cba54a5b75fb547deaa11f001a89ec1"
         );
     }
+    // The pinned literal above is STALE and this assertion is expected to fail
+    // until the build owner regenerates it. It was frozen before `ordering_scopes`
+    // became hash-bound set-like input (2c22f4b45, #63/#4728), so adding the
+    // field to `golden_view` necessarily forks the digest: the view that
+    // produced this value was not the view the contract now defines.
+    //
+    // It is deliberately left at its historical value rather than rewritten
+    // here. The correct replacement is whatever the compiled
+    // `canonical_request_hash` produces for this exact fixture, and that is a
+    // fact only an executed build can establish — a hand-written digest would be
+    // a guess presented as cross-crate evidence. The regeneration must also
+    // update the two cross-crate references that cite this vector by name
+    // (`eliot-store-surreal-adapter/src/plan.rs`,
+    // `eliot-store-memory/src/lib.rs`), so it is one owner task, not a
+    // local edit. See issue #3977.
 
     #[test]
     fn load_bearing_mutations_change_the_hash_and_map_to_the_typed_error() {

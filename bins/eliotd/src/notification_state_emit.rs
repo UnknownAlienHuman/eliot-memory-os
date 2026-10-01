@@ -690,16 +690,12 @@ pub async fn emit_blocked_automation_notification(
     parameters.insert(NOTIFY_PARAM_RECORD_JSON.to_owned(), record_json);
     parameters.insert(NOTIFY_PARAM_SOURCE_RECEIPT_JSON.to_owned(), source_receipt);
     // Issue #1927: the whole I5.6 admission sequence runs in one place, and
-    // the plan it returns is the plan that is submitted. The admitted semantic
-    // contract set for this notification is exactly the decision's own
-    // identity, so its digest is that identity's canonical-JSON digest — the
-    // same value the record's evidence handle and the source receipt's artifact
-    // carry.
+    // the plan it returns is the plan that is submitted. The notification
+    // record, dedup key, and source receipt stay bound in operation parameters.
     let submitted = super::notification_plan_admission::admit_notification_transition(
         &super::notification_plan_admission::NotificationPlanAdmission {
             identity: &identity,
             operation_text: &operation_text,
-            admission_contract_set_digest: &key.fingerprint,
             parameters,
             ordering_head: &ordering_head,
         },

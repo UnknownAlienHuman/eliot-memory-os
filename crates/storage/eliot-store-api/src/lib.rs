@@ -356,6 +356,27 @@ pub const CONTRACT_NAME: &str = "eliot.storage.store-api";
 /// Current wire revision of this contract surface.
 pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
 
+/// Digest of the admission contracts supported by this receiving build.
+///
+/// It is independent of any request, proposal, report, or transition and
+/// binds the Store API and write-admission versions to the generated
+/// operation catalogue. A recorded plan is admissible only when this build
+/// supports the same contract set.
+pub fn supported_admission_contract_set_digest() -> Result<String, StoreError> {
+    let manifests = generated_operation_manifests()?;
+    let manifest_set_digest = operation_manifest_set_digest(&manifests)?;
+    let bytes = canonical_json_bytes(&serde_json::json!({
+        "store_contract": {
+            "name": CONTRACT_NAME,
+            "version": CONTRACT_VERSION,
+        },
+        "write_admission_contract_version": WRITE_ADMISSION_CONTRACT_VERSION,
+        "operation_manifest_set_digest": manifest_set_digest,
+    }))
+    .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    Ok(sha256_hex(&bytes))
+}
+
 /// Versioned schema for store recovery packets.
 pub const RECOVERY_PACKET_SCHEMA: &str = "eliot.storage.recovery.v1";
 /// Versioned schema for opaque Governor owner snapshots.
@@ -4881,6 +4902,11 @@ pub struct PreparedTransition {
     pub ordering_scopes: Vec<OrderingScopeId>,
     pub transition_class: TransitionClass,
     pub requested_effect_ceiling: EffectClass,
+    /// Receiving-build support identity for the versioned Store API,
+    /// write-admission contract, and generated operation catalogue.
+    ///
+    /// It is independent of request content and is compared by content at
+    /// each admission boundary.
     pub admission_contract_set_digest: String,
     pub operation_manifest_digest: OperationManifestDigest,
     /// I05-06 step-12 admission-DECISION digest (lowercase hex SHA-256).
@@ -4888,8 +4914,8 @@ pub struct PreparedTransition {
     /// This binds the admission DECISION, never the contract-set input
     /// alone: its documented byte layout is owned by
     /// [`admission_digest_hex`]. It is distinct from
-    /// `admission_contract_set_digest`, which carries the admitted
-    /// contract-set input digest.
+    /// `admission_contract_set_digest`, which carries the receiving build's
+    /// supported contract-set identity.
     pub admission_digest: String,
     /// I05-06 `mutation_plan_hash` (lowercase hex SHA-256).
     ///
@@ -4965,6 +4991,9 @@ impl PreparedTransition {
             &self.admission_contract_set_digest,
             "admission_contract_set_digest",
         )?;
+        if self.admission_contract_set_digest != supported_admission_contract_set_digest()? {
+            return Err(StoreError::ManifestMismatch);
+        }
         self.event_projection_relation_intents.validate()?;
         unique(
             self.required_proof_and_approval_refs.iter().cloned(),
@@ -5195,7 +5224,7 @@ pub fn genesis_transition(
         ordering_scopes: vec![OrderingScopeId::new(GENESIS_RECEIPT_ORDERING_SCOPE)?],
         transition_class: TransitionClass::RecoverySchema,
         requested_effect_ceiling: EffectClass::ReversibleMutation,
-        admission_contract_set_digest: manifest.digest.as_str().to_owned(),
+        admission_contract_set_digest: supported_admission_contract_set_digest()?,
         operation_manifest_digest: manifest.digest.clone(),
         // The genesis decision/plan digests are derived, never defaulted:
         // the empty plan still binds its canonical bytes. Genesis binds no

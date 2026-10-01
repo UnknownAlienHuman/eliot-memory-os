@@ -43,10 +43,7 @@
 use std::collections::BTreeMap;
 
 use eliot_canonical::CanonicalWriteEnvelope;
-use eliot_contracts::{
-    OperationId, RequestMetadata, StateFence, TaskId, TaskRevision, canonical_json_bytes,
-    sha256_hex,
-};
+use eliot_contracts::{OperationId, RequestMetadata, StateFence, TaskId, TaskRevision};
 use eliot_learning_contracts::{
     CampaignSourceBinding, CampaignSourceRole, LearningStateViewRecipe,
     TASK_CONTROLLER_CAMPAIGN_OWNER_ID,
@@ -604,10 +601,6 @@ fn task_envelope(
         .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?;
     let ordering_scope = OrderingScopeId::new(GOVERNOR_ORDERING_SCOPE)
         .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?;
-    let admission_digest = sha256_hex(
-        &canonical_json_bytes(event)
-            .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?,
-    );
     let mut parameters = BTreeMap::new();
     parameters.insert(
         "task_id".to_owned(),
@@ -691,7 +684,8 @@ fn task_envelope(
             .map(|task| task.as_str().to_owned()),
         transition_class: TransitionClass::TaskControl,
         requested_effect_ceiling: EffectClass::ReversibleMutation,
-        admission_contract_set_digest: admission_digest,
+        admission_contract_set_digest: eliot_canonical::supported_admission_contract_set_digest()
+            .map_err(CompositionError::Canonical)?,
         operation_manifest_digest: manifest_digest,
         semantic_commands: vec![NamedMutationRequest {
             operation: NamedMutationOperation::UpdateTaskState,

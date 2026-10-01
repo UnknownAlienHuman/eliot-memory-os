@@ -756,7 +756,7 @@ pub async fn commit_negative_memory_activation<P: KernelGenerationPort + ?Sized>
         task_id: None,
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
-        admission_contract_set_digest: document.document_digest()?,
+        admission_contract_set_digest: eliot_canonical::supported_admission_contract_set_digest()?,
         operation_manifest_digest: manifest_digest,
         semantic_commands: vec![mutation],
         event_projection_relation_intents: EventProjectionRelationIntents {

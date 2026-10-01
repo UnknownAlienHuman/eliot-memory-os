@@ -65,15 +65,21 @@
 //!
 //! # Pollability and durability
 //!
-//! The runtime queue poll snapshots its head under a short composition
-//! lock, then drives the verified async seam with the composition guard
-//! held across the await: `agent_fabric_new_verified_async` resolves the
-//! session halves and verifies through the Kernel provider-admission
-//! verifier on `&DaemonComposition`, so the guard cannot drop before the
-//! fabric exists. The poll flight stays single-flighted, so ticks never
-//! overlap a drive. Until the owner ports bind (B-MOD #694 for the route,
-//! the native-worker executable-binding digest for execution), the drive
-//! fails closed with the typed owner residual before admission,
+//! The runtime queue poll snapshots its head plus the expected
+//! task/route/admission/fence revisions under a short composition lock and
+//! releases that guard before any await. The verified drive then borrows the
+//! composition across the seam await: `agent_fabric_new_verified_async`
+//! resolves the session halves and verifies through the Kernel
+//! provider-admission verifier on `&DaemonComposition`, so the borrow cannot
+//! drop before the fabric exists without forking the closed admission path
+//! (a prepare/adopt split of the seam itself is a lib.rs residual). The
+//! poll flight stays single-flighted, so ticks never overlap a drive and
+//! other composition users queue on the mutex only for the bounded seam
+//! await. Both the drive adopt and the queue adopt revalidate the consumed
+//! revisions before adopting; a stale or moved revision refuses typed with
+//! the head left queued. Until the owner ports bind (B-MOD #694 for the
+//! route, the native-worker executable-binding digest for execution), the
+//! drive fails closed with the typed owner residual before admission,
 //! activation, or dispatch. The test-only historical dispatch projection is
 //! persisted under the daemon state root before `emit`; uncertain ownership
 //! is never released without an observed terminal disposition.
@@ -1313,6 +1319,102 @@ fn check_dispatch_record(
     Ok(())
 }
 
+/// Returns true when the live queue head still carries the consumed revisions.
+///
+/// The compared tuple is the prepare/adopt contract: operation/claim/attempt
+/// identity, task and candidate binding, route and capacity revisions, worker
+/// generation, binding digests, and the presented fence. Anything else about
+/// the head may evolve; a move in this tuple means the consumed plan no
+/// longer addresses the queued head.
+fn intake_revisions_match(live: &SoloDelegateIntake, consumed: &SoloDelegateIntake) -> bool {
+    live.claimed.operation_id == consumed.claimed.operation_id
+        && live.claimed.claim_id == consumed.claimed.claim_id
+        && live.claimed.attempt_id == consumed.claimed.attempt_id
+        && live.claimed.route_revision == consumed.claimed.route_revision
+        && live.claimed.capacity_revision == consumed.claimed.capacity_revision
+        && live.claimed.worker_generation == consumed.claimed.worker_generation
+        && live.claimed.binding_digest == consumed.claimed.binding_digest
+        && live.claimed.executable_digest == consumed.claimed.executable_digest
+        && fences_match_exact(
+            &live.claimed.presented_fence,
+            &consumed.claimed.presented_fence,
+        )
+        && live.plan.launch.task_id.as_str() == consumed.plan.launch.task_id.as_str()
+        && live.plan.candidate_id == consumed.plan.candidate_id
+        && live.delegate.source_digest == consumed.delegate.source_digest
+}
+
+/// Revalidates the consumed revisions after owner IO, before the adopt step
+/// touches the fabric (issue #2567 AUD9).
+///
+/// The fence check the drive already had is the first of four: a fence that
+/// moved under the seam await refuses with a typed stale fence; a live
+/// authority epoch that no longer matches the consumed expectation refuses
+/// with a typed stale epoch; a queue head that no longer carries the
+/// consumed task/route revisions refuses with a typed identity conflict;
+/// and a live slot that another unsettled operation now holds refuses with
+/// a typed identity conflict (a settled slot clears under the same rule as
+/// the prepare step). Every refusal leaves the queue head queued for a
+/// fresh evaluation instead of adopting verified material under another
+/// generation, task, route, or admission.
+fn recheck_adopt_revisions(
+    composition: &DaemonComposition,
+    kernel: &Arc<DaemonKernelClient>,
+    intake: &SoloDelegateIntake,
+    prepared: &VerifiedProviderMaterial,
+) -> Result<(), DaemonError> {
+    let live = kernel.kernel_fence();
+    if !fences_match_exact(&live, &prepared.presented_fence) {
+        return Err(DaemonError::ProviderAdmission(FabricError::StaleFence(
+            "solo adopt refuses a fence moved during owner IO".to_owned(),
+        )));
+    }
+    if !live
+        .authority_epoch
+        .is_same_authority(&prepared.expectation.live_authority_epoch)
+    {
+        return Err(DaemonError::ProviderAdmission(FabricError::StaleEpoch(
+            "solo adopt refuses an epoch moved during owner IO".to_owned(),
+        )));
+    }
+    {
+        let mut state = composition.solo_state.lock().map_err(|_| {
+            DaemonError::Composition(CompositionError::Recovery(
+                "solo driver state lock poisoned".to_owned(),
+            ))
+        })?;
+        let Some(head) = state.queue.front() else {
+            return Err(DaemonError::ProviderAdmission(
+                FabricError::IdentityConflict(
+                    "solo adopt refuses: queue head left during owner IO".to_owned(),
+                ),
+            ));
+        };
+        if !intake_revisions_match(head, intake) {
+            return Err(DaemonError::ProviderAdmission(
+                FabricError::IdentityConflict(
+                    "solo adopt refuses a task or route moved during owner IO".to_owned(),
+                ),
+            ));
+        }
+        if let Some(live_operation) = state.live_operation.clone()
+            && live_operation != prepared.operation_id
+        {
+            let settled = load_projection(composition.state_root(), &live_operation)
+                .is_ok_and(|projection| projection_settled(&projection));
+            if !settled {
+                return Err(DaemonError::ProviderAdmission(
+                    FabricError::IdentityConflict(
+                        "solo adopt refuses: live slot moved during owner IO".to_owned(),
+                    ),
+                ));
+            }
+            state.live_operation = None;
+        }
+    }
+    Ok(())
+}
+
 /// Drives one admitted solo delegate intake through the verified async
 /// seam to a retained dispatch (issue #1108 W4/A2).
 ///
@@ -1367,11 +1469,13 @@ async fn drive_solo_delegate_verified_async(
 ///
 /// Prepare/IO/adopt: readiness, intake shape, solo recipe, binding
 /// cross-check, and single live slot are prepared under short borrows; the
-/// snapshot below is cloned before the seam await so the adopt step can
-/// revalidate the exact consumed revisions after owner IO; the fabric chain
-/// (`define_and_plan` -> `stage_reservation` -> `commit_admission` ->
-/// `activate` -> launch-gate revalidation -> `dispatch` -> persist ->
-/// frame) adopts the typed result only when every revision still binds.
+/// snapshot below is cloned before the seam await so the adopt step
+/// (`recheck_adopt_revisions`) can revalidate the exact consumed
+/// fence/epoch, task/route, and live-slot admission revisions after owner
+/// IO; the fabric chain (`define_and_plan` -> `stage_reservation` ->
+/// `commit_admission` -> `activate` -> launch-gate revalidation ->
+/// `dispatch` -> persist -> frame) adopts the typed result only when every
+/// revision still binds.
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::needless_pass_by_value)]
 async fn drive_admitted_material_async(
@@ -1438,14 +1542,11 @@ async fn drive_admitted_material_async(
         .agent_fabric_new_verified_async(kernel, ports, material, &intake.claimed)
         .await?;
     // AUD9: adopt revalidates the consumed revisions after owner IO, before
-    // touching the fabric. A fence that moved under the seam await refuses
-    // with a typed stale fence instead of adopting verified material under
-    // another generation; the queue head stays queued for a fresh evaluation.
-    if !fences_match_exact(&kernel.kernel_fence(), &prepared.presented_fence) {
-        return Err(DaemonError::ProviderAdmission(FabricError::StaleFence(
-            "solo adopt refuses a fence moved during owner IO".to_owned(),
-        )));
-    }
+    // touching the fabric (see `recheck_adopt_revisions`): fence, epoch,
+    // task/route, and live-slot admission. Any move refuses with a typed
+    // stale/conflict instead of adopting verified material under another
+    // generation; the queue head stays queued for a fresh evaluation.
+    recheck_adopt_revisions(composition, kernel, &intake, &prepared)?;
     // Issue #1702 W2: the drive runs against the daemon state root, so every
     // owner-separated revision published on this fabric is committed and
     // verified durably before anything reports it current. Attaching the store
@@ -2468,18 +2569,25 @@ pub fn solo_poll_queue(
 }
 
 /// Async runtime poll hook. It leaves the head item queued when the verified
-/// drive refuses, preserving the exact operation for a later fresh
-/// evaluation.
+/// drive refuses or when the post-drive adopt recheck finds moved revisions,
+/// preserving the exact operation for a later fresh evaluation.
 ///
-/// The head intake drives through [`drive_solo_delegate_verified_async`]:
-/// the composition guard is held across the seam await because
-/// [`DaemonComposition::agent_fabric_new_verified_async`] resolves the
+/// Prepare/IO/adopt (issue #2567 AUD9/AUD10): the head intake is snapshotted
+/// under a short `try_lock` and that guard is released before any await. The
+/// verified drive then borrows the composition across the seam await because
+/// the sole-path seam
+/// ([`DaemonComposition::agent_fabric_new_verified_async`]) resolves the
 /// session halves and verifies through the Kernel provider-admission
-/// verifier on `&DaemonComposition`. The poll flight stays single-flighted
-/// (see `daemon_runtime`), so ticks never overlap a drive. Until the owner
-/// ports bind, the drive refuses with the typed missing-prerequisite
-/// residual and the head stays queued; a refusal is a refusal, never a
-/// degraded drive.
+/// verifier on `&DaemonComposition`; invoking it without that borrow would
+/// fork the closed admission path, so a prepare/adopt split of the seam
+/// itself stays a lib.rs residual (see below). The poll flight stays
+/// single-flighted (see `daemon_runtime`), so ticks never overlap a drive,
+/// and the drive adopt plus the queue adopt below both revalidate the
+/// consumed task/route/admission/fence revisions before adopting. Other
+/// composition users queue on the mutex during the bounded seam await. Until
+/// the owner ports bind, the drive refuses with the typed
+/// missing-prerequisite residual and the head stays queued; a refusal is a
+/// refusal, never a degraded drive.
 pub async fn solo_poll_queue_async(
     composition: &tokio::sync::Mutex<DaemonComposition>,
     kernel: &Arc<DaemonKernelClient>,
@@ -2506,29 +2614,67 @@ pub async fn solo_poll_queue_async(
         }
         head
     };
+    // The expected revisions travel as an owned clone: the intake moves into
+    // the drive below, and the queue adopt revalidates the live head against
+    // this snapshot after the await.
+    let expected = intake.clone();
     // Issue #1108 W4/A2: the runtime drive chain
     // (`run_loop` -> `solo_poll_queue_async` -> verified drive) enters the
     // async seam here with the driver's claimed halves. The composition
     // guard is held across this await: the seam needs `&DaemonComposition`
-    // for the production ports, the session-half resolution, and the
-    // capability construction, and the single live slot it mutates must not
-    // move underneath the drive.
+    // for the production ports, the session-half resolution, and the closed
+    // capability construction, and the single live slot the drive adopts
+    // must not move underneath it. Releasing this borrow across the owner
+    // IO needs a prepare/adopt split of the seam itself
+    // (`agent_fabric_new_verified_async` takes `&self` across its internal
+    // verifier awaits), which lives in `lib.rs` and is out of this slice's
+    // scope; the single-flighted poll flight bounds the hold to one drive.
     let outcome = {
         let composition = composition.lock().await;
         drive_solo_delegate_verified_async(&composition, kernel, intake, crate::unix_ms()).await?
     };
+    // Queue adopt (issue #2567 AUD9): recheck the consumed revisions under a
+    // short lock before dequeuing. The drive adopt already revalidated
+    // post-seam; this closes the remaining window over the sync fabric
+    // chain and persist. A head that left or moved (task/route), or a live
+    // fence/epoch that no longer binds the consumed fence, refuses with a
+    // typed stale/conflict and the head stays queued instead of dequeuing
+    // another operation's intake.
     {
         let composition = composition.lock().await;
+        let live = kernel.kernel_fence();
         let mut state = composition.solo_state.lock().map_err(|_| {
             DaemonError::Composition(CompositionError::Recovery(
                 "solo driver state lock poisoned".to_owned(),
             ))
         })?;
-        if state
-            .queue
-            .front()
-            .is_some_and(|head| head.claimed.operation_id == outcome.operation_id)
-        {
+        let Some(head) = state.queue.front() else {
+            return Err(DaemonError::ProviderAdmission(
+                FabricError::IdentityConflict(
+                    "solo queue adopt refuses: head left during the verified drive".to_owned(),
+                ),
+            ));
+        };
+        if !intake_revisions_match(head, &expected) {
+            return Err(DaemonError::ProviderAdmission(
+                FabricError::IdentityConflict(
+                    "solo queue adopt refuses a task or route moved during the verified drive"
+                        .to_owned(),
+                ),
+            ));
+        }
+        if !fences_match_exact(&live, &expected.claimed.presented_fence) {
+            return Err(DaemonError::ProviderAdmission(FabricError::StaleFence(
+                "solo queue adopt refuses a fence moved during the verified drive".to_owned(),
+            )));
+        }
+        let expected_epoch = &expected.claimed.expectation.live_authority_epoch;
+        if !live.authority_epoch.is_same_authority(expected_epoch) {
+            return Err(DaemonError::ProviderAdmission(FabricError::StaleEpoch(
+                "solo queue adopt refuses an epoch moved during the verified drive".to_owned(),
+            )));
+        }
+        if head.claimed.operation_id == outcome.operation_id {
             state.queue.pop_front();
         }
     }

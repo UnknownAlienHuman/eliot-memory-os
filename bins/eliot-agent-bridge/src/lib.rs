@@ -6877,9 +6877,13 @@ mod tests {
             trace_context: BTreeMap::new(),
         };
         let decoded = decode_activation_response(&resp_frame, &req, &receipt).expect("decode");
+        // `decode_activation_response` yields the additive open disposition view,
+        // which adds `CanonicalDenied` alongside the closed `Denied` wire form.
+        // Matching the closed enum here would name a type the decode path never
+        // returns, so the arm has to name the open one.
         assert!(matches!(
             decoded.disposition,
-            eliot_protocol::AgentBridgeActivationDisposition::Denied { .. }
+            eliot_protocol::OpenAgentBridgeActivationDisposition::Denied { .. }
         ));
         let mut bad_req = req.clone();
         bad_req.request_sha256 = "0".repeat(64);
@@ -7124,6 +7128,11 @@ mod tests {
                     task_revision: "task-revision-1".to_owned(),
                     plan_id: "plan-1".to_owned(),
                     plan_revision: "plan-revision-1".to_owned(),
+                    // A ready activation carries no scanner question: this case
+                    // exercises the authenticated decode path, and
+                    // `SCAN_PRIVACY_BOUNDARY_REQUIRED` is the only admissible
+                    // value, which would misdescribe this fixture's state.
+                    cold_start_question: None,
                 }),
             },
             response_sha256: String::new(),

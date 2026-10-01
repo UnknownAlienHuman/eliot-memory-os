@@ -31,10 +31,9 @@
 //!                         the ingress metadata binding
 //! transition_class        CaptureCandidate; ceiling Candidate
 //! admission_contract_set_digest
-//!                         the admitted record digest: the admission
-//!                         decision digest over the exact admitted bytes,
-//!                         mirroring the observation path which digests
-//!                         the admitted submission
+//!                         the current supported Store API admission contract
+//!                         set; the record digest remains bound in the named
+//!                         operation parameters and record identity
 //! operation_manifest_digest
 //!                         computed live from
 //!                         `generated_operation_manifests`
@@ -319,7 +318,7 @@ pub async fn commit_experience_bank<P: KernelGenerationPort + ?Sized>(
         task_id: record.scope.task_ref.clone(),
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
-        admission_contract_set_digest: record.digest.clone(),
+        admission_contract_set_digest: eliot_canonical::supported_admission_contract_set_digest()?,
         operation_manifest_digest: manifest_digest,
         semantic_commands: vec![leg.mutation],
         event_projection_relation_intents: EventProjectionRelationIntents {
@@ -387,7 +386,7 @@ pub async fn commit_experience_feedback<P: KernelGenerationPort + ?Sized>(
         task_id: record.scope.task_ref.clone(),
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
-        admission_contract_set_digest: record.digest.clone(),
+        admission_contract_set_digest: eliot_canonical::supported_admission_contract_set_digest()?,
         operation_manifest_digest: manifest_digest,
         semantic_commands: vec![leg.mutation],
         event_projection_relation_intents: EventProjectionRelationIntents {

@@ -1647,7 +1647,10 @@ fn canonical_owner_snapshot_envelope(
         task_id: Some(task_id.to_owned()),
         transition_class: TransitionClass::RecoverySchema,
         requested_effect_ceiling: EffectClass::ReversibleMutation,
-        admission_contract_set_digest: sha256_hex(&snapshot_bytes),
+        admission_contract_set_digest: eliot_canonical::supported_admission_contract_set_digest()
+            .map_err(|error| {
+            FinishAttemptError::Composition(CompositionError::Canonical(error))
+        })?,
         operation_manifest_digest: production_manifest_digest()?,
         semantic_commands: vec![NamedMutationRequest {
             operation: NamedMutationOperation::RecordFinishEvidence,
@@ -1743,6 +1746,7 @@ fn finish_envelope(
         .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?;
     let contract_bytes = canonical_json_bytes(&(attempt, context, receipts))
         .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?;
+    let contract_digest = sha256_hex(&contract_bytes);
     let mut parameters = BTreeMap::new();
     parameters.insert(
         "attempt_id".to_owned(),
@@ -1766,7 +1770,10 @@ fn finish_envelope(
         task_id: Some(context.task_id.clone()),
         transition_class: TransitionClass::RecoverySchema,
         requested_effect_ceiling: EffectClass::ReversibleMutation,
-        admission_contract_set_digest: sha256_hex(&contract_bytes),
+        admission_contract_set_digest: eliot_canonical::supported_admission_contract_set_digest()
+            .map_err(|error| {
+            FinishAttemptError::Composition(CompositionError::Canonical(error))
+        })?,
         operation_manifest_digest: production_manifest_digest()?,
         semantic_commands: vec![NamedMutationRequest {
             operation: NamedMutationOperation::RecordFinishDecision,
@@ -1778,7 +1785,10 @@ fn finish_envelope(
             relation_kinds: Vec::new(),
         },
         security: SecurityContext::default(),
-        required_proof_and_approval_refs: vec![context.finish_authority_ref.clone()],
+        required_proof_and_approval_refs: vec![
+            context.finish_authority_ref.clone(),
+            contract_digest,
+        ],
         expected_revision_heads: Vec::new(),
         expected_ordering_heads: Vec::new(),
     })
