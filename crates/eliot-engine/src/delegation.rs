@@ -1111,11 +1111,19 @@ fn apply_provider_call_ledger_reconciliation(
     path: &Path,
     reconciliation: &ProviderCallLedgerReconciliation,
 ) -> Result<ProviderCallLedgerReconciliationOutcome, EngineError> {
-    let unknown = load_provider_call_ledger(path).map_err(|_| {
-        rejected(
-            "provider call ledger is not in an unknown state; there is no preserved corrupt candidate to reconcile",
-        )
-    })?;
+    // Reconciliation is only meaningful while the ledger is in the UNKNOWN
+    // state. `load_provider_call_ledger` returns `Ok` only when no candidate
+    // exists at all (absence, not corruption), so binding its `Err` value is
+    // what makes the refused-candidate set the real per-candidate faults rather
+    // than anything read off an admitted ledger.
+    let unknown = match load_provider_call_ledger(path) {
+        Ok(_) => {
+            return Err(rejected(
+                "provider call ledger is not in an unknown state; there is no preserved corrupt candidate to reconcile",
+            ));
+        }
+        Err(unknown) => unknown,
+    };
     let refused = unknown
         .faults
         .iter()
