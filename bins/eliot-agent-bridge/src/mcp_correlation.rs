@@ -43,7 +43,7 @@ use eliot_agent_bridge_core::{
     DeadlineSweepRequest, EliotEmissionObservation, EmissionCause, FaultEdgeSubmission,
     HandlerOutcome, HostEventEnvelope, HostEventJoinKeys, NormalizedHostEventPayload,
     OperationIdentity, OwnerValidatedOperationBinding, StdioEmissionReceipt,
-    TerminalReconcileRequest, reconcile_deadline_sweep, reconcile_terminal_event,
+    TerminalReconcileRequest, read_host_coverage, reconcile_deadline_sweep, reconcile_terminal_event,
     submit_derived_fault,
 };
 use eliot_contracts::{ResourceGeneration, StateFence};
@@ -667,6 +667,19 @@ impl BridgeRunner {
         // refusal rather than a silent attribution to whichever record happened
         // to be retained first. Correct attribution is the join's job — the
         // host event's own invocation scope, or nothing.
+        //
+        // Contour #5 (issue #7 W2), Desktop-visible terminal state: the stale-UI
+        // fact is read from the OWNER's own journal projection via
+        // `read_host_coverage`, exactly as the coverage denominator already is
+        // a few lines below in `reconcile_terminal_event`. It is the same
+        // `stale_ui_noted` the owner computed there and never had read, so the
+        // join no longer hardcodes a literal. A journal that never noted a stale
+        // UI disposition leaves this `false`, which is the conservative value:
+        // it yields no `RefreshDesktopView` for a completed invocation, so the
+        // absence of host/UI evidence stays `PARTIAL/UNKNOWN` rather than
+        // becoming an asserted fact (issue #7 W3, I7.23). No caller-supplied or
+        // host-asserted value can widen it.
+        let ui_confirmed_stale = read_host_coverage(&self.core).stale_ui_noted;
         let mut accepted: Option<(usize, Assessment)> = None;
         for index in 0..candidate_count {
             let request = {
@@ -681,7 +694,7 @@ impl BridgeRunner {
                     assessments: &record.assessments,
                     operation_binding: record.binding.as_ref(),
                     canonical: &record.canonical,
-                    ui_confirmed_stale: false,
+                    ui_confirmed_stale,
                     now_unix_ms: Some(now_unix_ms),
                 }
             };
