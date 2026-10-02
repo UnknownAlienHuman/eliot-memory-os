@@ -7627,11 +7627,12 @@ impl KernelComposition {
         // acknowledgement replays to the existing handoff instead of
         // a second record; a handoff failure fails closed here while
         // the durable row stays staged for reconcile recovery.
+        let owner_namespace = outcome
+            .get("owner_namespace")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TransportError::SessionFenced)?;
         let handoff = serde_json::json!({
-            "owner_namespace": outcome
-                .get("owner_namespace")
-                .and_then(serde_json::Value::as_str)
-                .ok_or(TransportError::SessionFenced)?,
+            "owner_namespace": owner_namespace,
             "event_id": event.event_id,
             "sequence": event.sequence,
             "envelope_sha256": envelope_sha,
@@ -7678,7 +7679,106 @@ impl KernelComposition {
                 _ => return Err(TransportError::SessionFenced),
             }
         }
+        // #2730: retain the RECEIVING owner's acceptance receipt for this
+        // exact handoff, once the handoff it must join is durably present.
+        //
+        // This is the point where acceptance is demonstrable, and it is not
+        // the stage: by here the caller has already cleared the authority,
+        // fence, generation and privacy gates, the ORS stage entry has
+        // returned the store's own `DURABLE` phase for the exact staged
+        // bytes, and this route has confirmed it. Nothing above is the
+        // receiving owner's terminal disposition — it is one operation's
+        // local commit — so the receipt records precisely that, with its own
+        // disposition and its own digest, rather than inheriting the
+        // reconciled flag or the batch reconcile key.
+        //
+        // The handoff leg is already durable, so a receipt failure here does
+        // not undo the staged event or the handoff: it fails the frame closed
+        // and leaves the obligation un-receipted, which is the honest state.
+        // A later reconcile replays to the same handoff and records the same
+        // receipt, because the receipt is keyed by handoff identity and the
+        // first one stands.
+        let receipt_outcome = Self::bridge_event_owner_receipt(
+            &outcome,
+            owner_namespace,
+            event,
+            BRIDGE_OWNER_RECEIPT_APPLIED,
+        )?;
+        if let Err(error) = self
+            .generation_gateway
+            .ors
+            .record_bridge_event_owner_receipt_checked(&receipt_outcome)
+        {
+            match error {
+                OrsError::InvalidTransition => {
+                    // The handoff is already gone (terminalized by a
+                    // concurrent retirement entry), so there is nothing
+                    // left to join a receipt to and nothing to undo.
+                }
+                _ => return Err(TransportError::SessionFenced),
+            }
+        }
         Ok(bridge_event_forward_response(&outcome, true))
+    }
+
+    /// Builds the receiving-owner receipt request for one determined bridge
+    /// event outcome (issue #2730).
+    ///
+    /// `outcome` is the ORS entry's own answer for this exact identity, so
+    /// every leg is read back from the store's answer rather than rebuilt from
+    /// the presented envelope: the receipt must describe the row that exists,
+    /// not the bytes the caller sent. A missing `sequence` or
+    /// `envelope_sha256` on that answer is a store-answer defect and fails
+    /// closed instead of being filled in from the presentation.
+    ///
+    /// `receipt_digest` is the SHA-256 of the canonical outcome bytes, which
+    /// makes the receipt a commitment to real returned evidence rather than a
+    /// restatement of the request. `receiving_operation_id` is this Kernel
+    /// operation's own request-stable identity, derived over the identity legs
+    /// plus the disposition, so the retained receipt is attributable to the
+    /// operation that took it.
+    fn bridge_event_owner_receipt(
+        outcome: &serde_json::Value,
+        owner_namespace: &str,
+        event: &EventEnvelope,
+        disposition: &str,
+    ) -> Result<serde_json::Value, TransportError> {
+        let sequence = outcome
+            .get("sequence")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(TransportError::SessionFenced)?;
+        let envelope_sha256 = outcome
+            .get("envelope_sha256")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TransportError::SessionFenced)?;
+        let outcome_bytes = eliot_contracts::canonical_json_bytes(outcome)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let receipt_digest = eliot_contracts::sha256_hex(&outcome_bytes);
+        let operation_material = serde_json::json!({
+            "domain": "eliot.bridge-event-owner-receipt",
+            "version": 1,
+            "operation": AGENT_BRIDGE_EVENT_FORWARD_OPERATION,
+            "adapter_version": BRIDGE_EVENT_ADAPTER_VERSION,
+            "owner_namespace": owner_namespace,
+            "event_id": event.event_id,
+            "sequence": sequence,
+            "envelope_sha256": envelope_sha256,
+            "disposition": disposition,
+        });
+        let operation_bytes = eliot_contracts::canonical_json_bytes(&operation_material)
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(serde_json::json!({
+            "owner_namespace": owner_namespace,
+            "event_id": event.event_id,
+            "sequence": sequence,
+            "envelope_sha256": envelope_sha256,
+            "receiving_operation_id": format!(
+                "bridge-event-owner-receipt:{}",
+                eliot_contracts::sha256_hex(&operation_bytes)
+            ),
+            "disposition": disposition,
+            "receipt_digest": receipt_digest,
+        }))
     }
 
     /// Answers a same-identity content conflict with the proven owner's
@@ -9299,6 +9399,16 @@ fn host_request_busy_backpressure_directive() -> Option<serde_json::Value> {
 /// `DURABLE` only on this exact persisted phase; anything else fails closed
 /// instead of promoting a weaker fact.
 const BRIDGE_EVENT_PHASE_DURABLE: &str = "DURABLE";
+/// Receiving-owner terminal disposition this route records once it has
+/// obtained the ORS stage entry's own `DURABLE` phase for the exact staged
+/// bytes and confirmed that handoff is durably present (issue #2730). The
+/// closed vocabulary is owned by the ORS receipt row; this is the one member
+/// of it this route can determine, because this route is the receiving
+/// operation. `REJECTED` and `UNKNOWN` are deliberately never synthesized
+/// here: a determined conflict is answered to the caller as a conflict without
+/// a durable handoff to join a receipt to, and an undetermined outcome is
+/// reported as a transport failure rather than recorded as an acceptance.
+const BRIDGE_OWNER_RECEIPT_APPLIED: &str = "APPLIED";
 
 /// Kernel-derived owner evidence for one bridge-event operation (issue
 /// #2729).

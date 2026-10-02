@@ -94,8 +94,8 @@
 //! not refused. The census names the store's tables by referencing `store.rs`'s
 //! own constants, so a renamed table cannot drift from its entry, and it compares
 //! that list with the tables redb reports for the file being read, under the same
-//! transaction as the pages. Counted at the time of writing: 74 distinct declared
-//! tables, 45 backing a dispositioned row family and 29 carrying an explicit
+//! transaction as the pages. Counted at the time of writing: 75 distinct declared
+//! tables, 45 backing a dispositioned row family and 30 carrying an explicit
 //! source-bound nonrestorable/forensic exclusion with the reason written next to
 //! it; 43 dispositioned families, each bound to at least one table, so none is
 //! excused from having one. A table with no disposition is refused with
@@ -934,7 +934,7 @@ struct DispositionedTable {
 /// in this issue. Until it exists, a table added to `store.rs` is on the author.
 ///
 /// Split in four so no half can grow past the point where a reader stops
-/// checking it: 46 table-backed tables and 28 source-bound exclusions.
+/// checking it: 45 table-backed tables and 29 source-bound exclusions.
 fn dispositioned_tables() -> Vec<DispositionedTable> {
     let mut tables = family_backed_tables();
     tables.extend(source_bound_exclusions());
@@ -1142,7 +1142,7 @@ fn restore_journal_family_tables() -> Vec<DispositionedTable> {
     ]
 }
 
-/// The 28 tables that are explicitly NOT backup row families, each with the
+/// The 29 tables that are explicitly NOT backup row families, each with the
 /// disposition and the reason that excludes it.
 ///
 /// Grouped by what makes a table un-restorable rather than alphabetically, so
@@ -1373,6 +1373,17 @@ fn projection_family_exclusions() -> Vec<DispositionedTable> {
             super::BRIDGE_EVENT_REPLAY_COMMITMENTS,
             RowDisposition::ForensicOnly,
             "replay commitments are minted against the committing store's own evidence; a restored one names a commitment this installation never made",
+        ),
+        // #2730. A receiving-owner receipt is the acceptance of ONE receiving
+        // operation, witnessed by that operation and bound to the owner epoch
+        // that took it. Restoring it into a destination would present a
+        // different installation's owner as having accepted an event here, and
+        // the retirement gate would then join a handoff against an acceptance
+        // this installation never performed.
+        excluded(
+            super::BRIDGE_EVENT_OWNER_RECEIPTS,
+            RowDisposition::ForensicOnly,
+            "receiving-owner receipts record one installation's witnessed acceptance of a handoff; a restored receipt would present a foreign owner's acceptance as this installation's and would join a handoff against it",
         ),
     ]
 }

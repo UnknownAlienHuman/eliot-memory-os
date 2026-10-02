@@ -2974,8 +2974,11 @@ pub async fn commit_improvement_artifact(
     // comes from the admission that actually admitted this candidate, and a
     // stale epoch, a drifted fence or a Governor that stopped admitting makes
     // the record non-effective instead of being claimed effective.
-    let admission =
-        verify_learning_admission(composition.improvement_governor(), &admitted.permit, state_fence)?;
+    let admission = verify_learning_admission(
+        composition.improvement_governor(),
+        &admitted.permit,
+        state_fence,
+    )?;
     let (receipt, effective) = composition
         .commit_learning_record(
             &identity,
@@ -2990,14 +2993,8 @@ pub async fn commit_improvement_artifact(
         .await
         .map_err(|error| ImprovementDispatchError::Commit(error.to_string()))?;
     for archived in &admitted.report.archived {
-        commit_archive_receipt(
-            composition,
-            archived,
-            &scope,
-            state_fence,
-            &admitted.permit,
-        )
-        .await?;
+        commit_archive_receipt(composition, archived, &scope, state_fence, &admitted.permit)
+            .await?;
     }
     Ok((receipt, effective))
 }
@@ -3091,11 +3088,8 @@ async fn commit_lineage_merge_receipt(
     // permit, re-verified against the live owner and fence. It previously
     // passed `None, false, false`, which made the record permanently
     // non-effective for want of an admission rather than by a verdict on one.
-    let admission = verify_learning_admission(
-        composition.improvement_governor(),
-        permit,
-        state_fence,
-    )?;
+    let admission =
+        verify_learning_admission(composition.improvement_governor(), permit, state_fence)?;
     let (receipt, _effective) = composition
         .commit_learning_record(
             &identity,
@@ -3178,11 +3172,8 @@ async fn commit_archive_receipt(
     // to make room), so the receipt is bound to that owner-issued permit,
     // re-verified against the live owner and fence. It previously passed
     // `None, false, false`.
-    let admission = verify_learning_admission(
-        composition.improvement_governor(),
-        permit,
-        state_fence,
-    )?;
+    let admission =
+        verify_learning_admission(composition.improvement_governor(), permit, state_fence)?;
     let (receipt, _effective) = composition
         .commit_learning_record(
             &identity,
