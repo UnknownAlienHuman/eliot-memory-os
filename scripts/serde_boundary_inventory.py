@@ -39,16 +39,37 @@ Freshness and integrity:
   itself. Every load-bearing row and allocation field is inside that payload,
   so a hand edit to an owner, readiness, caller, classification, allocation,
   profile/limit, fixture or invalidation field fails closed.
-- ``base_sha`` records the commit the writer stood on. It is explicitly
-  non-authoritative, outside the proof ceiling, and never proof. It cannot equal
-  the commit that carries the artifact and it restates on every commit that
-  changes nothing this inventory observes, so it is the single field exempt from
-  the stored-versus-fresh comparison - by a closed constant, never by omission.
-  It remains inside the canonical payload, so a substituted or hand-edited value
-  is refused by the recomputed stored aggregate, and it must additionally match
-  the Git object-id grammar and its declared source. The validated per-row and
-  aggregate input digests are the actual evidence. The artifact never appears in
-  its own input universe.
+- ``base_sha`` records the commit the writer stood on. It is HEAD-derived, so it
+  restates on *every* commit - including the commit that carries the artifact
+  itself, and including commits that change nothing this inventory observes. A
+  field that restates with every commit cannot be a member of a digest that is
+  supposed to be stable across commits: inside the payload it guarantees that
+  the artifact never converges and every future commit produces a second diff.
+  It is therefore outside the canonical payload and outside ``aggregate_digest``,
+  by the closed ``CANONICAL_EXCLUDED_FIELDS`` constant which the artifact must
+  declare verbatim. ``aggregate_digest`` is then a function of what the inventory
+  observes only.
+- ``base_sha`` is not thereby ignored. It is held to account by closed rules
+  that never depend on knowing the writer's commit: it must satisfy the Git
+  object-id grammar (40 lowercase hex) or be the explicit ``unknown-base``
+  sentinel, else ``MALFORMED_PROVENANCE``; ``base_sha_source`` must equal the
+  declared ``BASE_SHA_SOURCE``; ``provenance_authority`` must equal the declared
+  observational marker; and the declared exclusion set must equal the constant,
+  so a hand edit can neither widen it nor smuggle a payload field out of the
+  aggregate. ``base_sha_source``, ``provenance_authority`` and
+  ``canonical_excludes`` are themselves inside the payload, so a hand edit to any
+  of them is refused by the recomputed stored aggregate as well.
+- ``sync`` carries the recorded ``base_sha`` forward unchanged whenever the
+  canonical payload is unchanged, so ``sync`` -> commit -> ``sync`` is
+  byte-identical and the tree stays clean. It restates only when the payload
+  itself restates, which is the only moment the commit the writer stood on
+  becomes information this artifact claims.
+- The honest limit of this classification: a **well-formed but wrong**
+  ``base_sha`` is NOT detectable, because nothing observable in the repository
+  records which commit the writer stood on. That is exactly why the field is
+  classified non-authoritative and outside the proof ceiling; the validated
+  per-row and aggregate input digests are the actual evidence. The artifact
+  never appears in its own input universe.
 - A row ``id`` is a stable *name* for one declaration, derived only from
   ``package : path : kind : type : enclosing-function``. The declaration's
   line number is deliberately excluded: it is bound as validated fields
@@ -91,8 +112,8 @@ import tomllib
 from pathlib import Path
 
 SCHEMA = "eliot.serde-boundary-inventory.v1"
-TOOL_VERSION = "0.5.0"
-RULE_REVISION = "929.5"
+TOOL_VERSION = "0.6.0"
+RULE_REVISION = "929.6"
 ISSUE = 929
 OWNED_TOML_REL = (
     "crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml"
@@ -328,10 +349,14 @@ ALLOWED_COMMANDS = (
 # Only the fields in ``CANONICAL_EXCLUDED_FIELDS`` are left out, and the artifact
 # must declare that exclusion verbatim. Every owner, caller, classification,
 # readiness, allocation, span, prerequisite, profile/limit, fixture and
-# invalidation field - and the ``base_sha`` provenance - is inside the payload.
+# invalidation field is inside the payload.
 # ---------------------------------------------------------------------------
 BASE_SHA_SOURCE = "git-rev-parse-HEAD"
 PROVENANCE_AUTHORITY = "informational-observational-outside-proof-ceiling"
+# The only accepted non-object-id value of ``base_sha``: recorded when the commit
+# could not be observed. It is a declared sentinel, not a wildcard - any other
+# malformed value is refused with MALFORMED_PROVENANCE.
+UNKNOWN_BASE_SENTINEL = "unknown-base"
 
 # Fields deliberately outside the canonical payload:
 #
@@ -343,26 +368,29 @@ PROVENANCE_AUTHORITY = "informational-observational-outside-proof-ceiling"
 #   audit's defect 1 describes. ``check`` therefore does not trust it: it is
 #   re-observed from the current scan and bounded by it, so a fabricated count is
 #   refused while an honestly stale one is accepted.
+# - ``base_sha``: the HEAD-derived provenance. It restates on every commit,
+#   including the commit that carries the artifact, so a payload that contains it
+#   can never converge - ``sync`` -> commit -> ``sync`` would produce a second
+#   diff forever. A field that restates with every commit cannot be a member of a
+#   digest meant to be stable across commits. It is therefore outside the
+#   payload, which makes ``aggregate_digest`` a function of what the inventory
+#   observes only. It is *not* ignored: see ``validate_against_artifact``, which
+#   holds it to the Git object-id grammar (or the ``unknown-base`` sentinel) and
+#   holds ``base_sha_source``, ``provenance_authority`` and this exclusion set
+#   itself to closed constants. A well-formed but wrong ``base_sha`` is genuinely
+#   undetectable - nothing observable in the repository records which commit the
+#   writer stood on - and that is exactly why it is non-authoritative and outside
+#   the proof ceiling.
 #
-# Both are explicit, closed, declared by the artifact, and validated by ``check``
-# to account. Neither is proof. Every row, allocation, owner, caller,
+# All three are explicit, closed, declared by the artifact, and validated by
+# ``check`` to account. None is proof. Every row, allocation, owner, caller,
 # classification, readiness, prerequisite, profile/limit, fixture and
 # invalidation field is inside the payload.
 CANONICAL_EXCLUDED_FIELDS = (
     "aggregate_digest",
     "denominator.scan_file_count",
+    "base_sha",
 )
-
-# Fields that ARE inside the canonical payload - so a hand edit to them is
-# refused by the recomputed stored aggregate - but are excluded from the
-# stored-versus-fresh comparison, because they restate with the repository HEAD
-# rather than with anything this inventory observes. ``base_sha`` records the
-# commit the writer stood on; it can never equal the commit that carries the
-# artifact, and comparing it against the current HEAD would make the artifact
-# stale by construction. It is explicitly non-authoritative, outside the proof
-# ceiling, and never proof; the freshness comparison substitutes the stored value
-# rather than dropping the field, so it stays bound and tamper-evident.
-NON_FRESHNESS_BOUND_FIELDS = ("base_sha",)
 
 CANONICAL_HEADER_KEYS = (
     "schema",
@@ -370,7 +398,10 @@ CANONICAL_HEADER_KEYS = (
     "rule_revision",
     "proof_ceiling",
     "issue",
-    "base_sha",
+    # ``base_sha`` is deliberately absent: it is in CANONICAL_EXCLUDED_FIELDS
+    # because it restates with HEAD. ``base_sha_source``,
+    # ``provenance_authority`` and ``canonical_excludes`` stay inside the payload
+    # so a hand edit to any of them is refused by the stored aggregate.
     "base_sha_source",
     "provenance_authority",
     "canonical_excludes",
@@ -2160,7 +2191,10 @@ def build_inventory(root: Path, scan_rels: list[str] | None = None) -> dict:
     try:
         base_sha = _run_git(root, ["git", "rev-parse", "HEAD"]).decode("utf-8", errors="replace").strip()
     except InventoryError:
-        base_sha = "unknown-base"
+        base_sha = UNKNOWN_BASE_SENTINEL
+    if not _is_well_formed_base_sha(base_sha):
+        # The observed value is the sentinel, never a malformed pass-through.
+        base_sha = UNKNOWN_BASE_SENTINEL
 
     if scan_rels is None:
         scan_rels = _tracked_rust_files(root)
@@ -2774,9 +2808,24 @@ def artifact_path(root: Path) -> Path:
 def sync_inventory(root: Path) -> tuple[dict, bytes]:
     root = root.resolve()
     inventory = build_inventory(root)
+    # HEAD-derived provenance is carried forward while the canonical payload is
+    # unchanged, so the artifact converges: ``sync`` -> commit -> ``sync`` writes
+    # byte-identical bytes. ``base_sha`` is outside the canonical payload, so
+    # substituting the carried value cannot restate the aggregate.
+    inventory["header"]["base_sha"] = _carried_base_sha(root, inventory)
+    canonical = _canonical_payload(tomllib.loads(_render_toml(inventory).decode("utf-8")))
+    inventory["canonical_payload"] = canonical
+    _assert_exclusion_set_is_closed(canonical)
+    if _payload_digest(canonical) != inventory["header"]["aggregate_digest"]:
+        raise InventoryError(
+            "CANONICAL_EXCLUSION_VIOLATED",
+            "carrying forward base_sha restated the canonical aggregate; the excluded "
+            "field is not actually outside the payload",
+        )
     # The written bytes are exactly the bytes the aggregate digest was taken
     # over, so committing the artifact cannot itself invalidate it.
-    payload = inventory["rendered_payload"]
+    payload = _render_toml(inventory)
+    inventory["rendered_payload"] = payload
     target = artifact_path(root)
     target.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
@@ -2847,24 +2896,65 @@ def _fresh_canonical_payload(fresh: dict) -> dict:
     return _canonical_payload(tomllib.loads(payload.decode("utf-8")))
 
 
-def _pin_non_freshness_fields(fresh_canonical: dict, stored_canonical: dict) -> dict:
-    """Return the fresh payload with HEAD-derived fields pinned to stored values.
+def _is_well_formed_base_sha(value) -> bool:
+    """True for a Git object id or the explicit ``unknown-base`` sentinel."""
+    text = str(value)
+    return text == UNKNOWN_BASE_SENTINEL or bool(re.fullmatch(r"[0-9a-f]{40}", text))
 
-    ``NON_FRESHNESS_BOUND_FIELDS`` (currently ``base_sha``) restates with the
-    repository HEAD rather than with anything this inventory observes. Pinning
-    the stored value keeps those fields inside the compared and aggregated
-    payload - so a hand edit to them is still refused by the stored-aggregate
-    recomputation - while not demanding that the artifact's writing commit equal
-    the commit it is being checked from.
+
+def _assert_exclusion_set_is_closed(payload: dict) -> None:
+    """Fail closed if a declared exclusion is not actually outside the payload.
+
+    ``CANONICAL_EXCLUDED_FIELDS`` is a closed constant and the artifact must
+    declare it verbatim, so a hand edit cannot widen it. This is the matching
+    guarantee in the other direction: the named fields must genuinely be absent
+    from the canonical projection. If one of them ever reappeared inside the
+    payload, the artifact would restate on every commit and could never
+    converge, so that is refused instead of silently accepted.
     """
-    pinned = {
-        key: (list(value) if isinstance(value, list) else value)
-        for key, value in fresh_canonical.items()
-    }
-    for key in NON_FRESHNESS_BOUND_FIELDS:
-        if key in pinned.get("header", {}) and key in stored_canonical.get("header", {}):
-            pinned["header"][key] = stored_canonical["header"][key]
-    return pinned
+    present: dict[str, list[str]] = {}
+    for field in CANONICAL_EXCLUDED_FIELDS:
+        name = field.split(".", 1)[0]
+        if name in payload.get("header", {}):
+            present.setdefault(name, []).append("header")
+        if name in payload.get("denominator", {}):
+            present.setdefault(name, []).append("denominator")
+    if present:
+        raise InventoryError(
+            "CANONICAL_EXCLUSION_VIOLATED",
+            "declared-excluded fields are inside the canonical payload: %r" % (present,),
+        )
+
+
+def _carried_base_sha(root: Path, inventory: dict) -> str:
+    """Return the ``base_sha`` a re-sync should record.
+
+    The recorded provenance is carried forward unchanged whenever the canonical
+    payload is unchanged - that is, whenever everything this inventory observes
+    is byte-identical to what is already recorded. This is what makes
+    ``sync`` -> commit -> ``sync`` byte-identical: the artifact's own commit, and
+    any commit that changes nothing observable, no longer restates it. It
+    restates only when the payload itself restates, which is the only moment the
+    commit the writer stood on becomes information this artifact actually claims.
+
+    A stored value is carried forward only when it is well formed and its own
+    stored aggregate matches the freshly computed one, so a corrupt or
+    hand-edited artifact is restated rather than inherited.
+    """
+    observed = str(inventory["header"].get("base_sha", UNKNOWN_BASE_SENTINEL))
+    fresh_aggregate = str(inventory["header"].get("aggregate_digest", ""))
+    try:
+        doc = load_artifact_toml(root)
+    except InventoryError:
+        return observed
+    if str(doc.get("aggregate_digest", "")) != fresh_aggregate:
+        return observed
+    if list(doc.get("canonical_excludes", []) or []) != list(CANONICAL_EXCLUDED_FIELDS):
+        return observed
+    stored_base = doc.get("base_sha")
+    if not _is_well_formed_base_sha(stored_base):
+        return observed
+    return str(stored_base)
 
 
 def _first_difference(stored: dict, current: dict, keys) -> str:
@@ -2883,8 +2973,8 @@ def validate_against_artifact(root: Path, fresh: dict, doc: dict) -> list[dict]:
         raise InventoryError("STALE_RULE", "artifact schema %r != %r" % (doc.get("schema"), SCHEMA))
     if doc.get("rule_revision") != RULE_REVISION:
         raise InventoryError("STALE_RULE", "artifact rule %r != %r" % (doc.get("rule_revision"), RULE_REVISION))
-    # Provenance is classified, never silently presented as proof: base_sha is
-    # the commit the writer happened to stand on, it cannot equal the commit
+    # Provenance is classified, never silently presented as proof: ``base_sha``
+    # is the commit the writer happened to stand on, it cannot equal the commit
     # that carries the artifact, so it is explicitly informational and outside
     # the proof ceiling while the validated digests carry the actual evidence.
     if doc.get("provenance_authority") != PROVENANCE_AUTHORITY:
@@ -2901,29 +2991,38 @@ def validate_against_artifact(root: Path, fresh: dict, doc: dict) -> list[dict]:
             "STALE_RULE",
             "artifact canonical_excludes %r != %r" % (doc.get("canonical_excludes"), list(CANONICAL_EXCLUDED_FIELDS)),
         )
-    # Provenance is classified, never silently presented as proof: ``base_sha``
+    # Provenance is classified, never silently presented as proof. ``base_sha``
     # records the commit the writer stood on. It cannot equal the commit that
     # carries the artifact, and it restates on every commit that changes nothing
     # this inventory observes, so demanding it equal the current HEAD would
-    # reintroduce exactly the stale-by-construction artifact this repair closes.
+    # reintroduce exactly the stale-by-construction artifact this repair closes,
+    # and keeping it inside the canonical payload would make the artifact
+    # unconvergeable: every commit would produce a second diff forever.
     #
-    # It is still bound and held to account, never ignored:
+    # It is therefore OUTSIDE the canonical payload, and it is still held to
+    # account by closed rules that never depend on knowing the writer's commit:
     #
-    #   1. it is inside the canonical payload, so a substituted or hand-edited
-    #      value breaks the recomputed stored aggregate below;
-    #   2. it is excluded only from the stored-versus-fresh comparison, by the
-    #      closed ``NON_FRESHNESS_BOUND_FIELDS`` constant, which the comparison
-    #      honours by substituting the stored value rather than dropping the key;
-    #   3. the artifact must declare the canonical exclusion set verbatim, and
-    #      that set is a closed constant - it cannot be widened by a hand edit;
-    #   4. ``provenance_authority`` must be the exact observational marker and
-    #      ``base_sha_source`` the exact declared source;
-    #   5. ``base_sha`` must satisfy the Git object-id grammar below.
+    #   1. it must satisfy the Git object-id grammar below, or be the explicit
+    #      ``unknown-base`` sentinel - anything else is MALFORMED_PROVENANCE;
+    #   2. ``base_sha_source`` must be the exact declared source constant;
+    #   3. ``provenance_authority`` must be the exact observational marker;
+    #   4. the artifact must declare the canonical exclusion set verbatim, and
+    #      that set is a closed constant - a hand edit cannot widen it;
+    #   5. ``_assert_exclusion_set_is_closed`` refuses a payload in which a
+    #      declared-excluded field is actually inside the aggregate, which is
+    #      what would make the aggregate restate on an unrelated commit.
     #
-    # So it never appears as proof while being silently ignored by the verifier,
-    # and the validated per-row/aggregate input digests remain the evidence.
+    # ``base_sha_source``, ``provenance_authority`` and ``canonical_excludes``
+    # remain INSIDE the payload, so a hand edit to any of them is refused by the
+    # recomputed stored aggregate as well as by the constant comparisons above.
+    #
+    # The honest limit, stated rather than hidden: a WELL-FORMED but WRONG
+    # ``base_sha`` is NOT detectable, because nothing observable in the repository
+    # records which commit the writer stood on. That is exactly why the field is
+    # classified non-authoritative and outside the proof ceiling. The validated
+    # per-row and aggregate input digests remain the actual evidence.
     base_sha = str(doc.get("base_sha", ""))
-    if base_sha != "unknown-base" and not re.fullmatch(r"[0-9a-f]{40}", base_sha):
+    if not _is_well_formed_base_sha(base_sha):
         raise InventoryError(
             "MALFORMED_PROVENANCE",
             "artifact base_sha %r is neither a 40-hex Git object id nor the "
@@ -3000,6 +3099,7 @@ def validate_against_artifact(root: Path, fresh: dict, doc: dict) -> list[dict]:
     # profile/limit, fixture or invalidation field fail closed even when the
     # row digest and the aggregate string are both left untouched.
     stored_canonical = _canonical_payload(doc)
+    _assert_exclusion_set_is_closed(stored_canonical)
     stored_payload_digest = _payload_digest(stored_canonical)
     if stored_payload_digest != doc.get("aggregate_digest", ""):
         raise InventoryError(
@@ -3008,15 +3108,15 @@ def validate_against_artifact(root: Path, fresh: dict, doc: dict) -> list[dict]:
             "allocation content was hand-edited" % (stored_payload_digest, str(doc.get("aggregate_digest", ""))),
         )
     fresh_canonical = _fresh_canonical_payload(fresh)
+    _assert_exclusion_set_is_closed(fresh_canonical)
     # Stored vs fresh comparison is exact over every canonical key, in the fixed
-    # key order of each section. The only non-freshness-bound field is the
-    # HEAD-derived ``base_sha``; it is compared against itself here so it stays
-    # inside the bound payload (a hand edit is refused by the stored aggregate
-    # above) while not being demanded to equal the current HEAD.
-    pinned_fresh = _pin_non_freshness_fields(fresh_canonical, stored_canonical)
+    # key order of each section. The HEAD-derived ``base_sha`` is not a member of
+    # either payload - it is a declared exclusion, held to account by the closed
+    # rules above - so no field is pinned or dropped here, and the comparison is
+    # over identical key sets on both sides.
     for section in ("header", "denominator", "counts", "profile", "legacy"):
         difference = _first_difference(
-            stored_canonical[section], pinned_fresh[section],
+            stored_canonical[section], fresh_canonical[section],
             tuple(fresh_canonical[section].keys()),
         )
         if difference:
@@ -3048,10 +3148,10 @@ def validate_against_artifact(root: Path, fresh: dict, doc: dict) -> list[dict]:
                 "HAND_EDIT_OR_DRIFT", "row %s differs (%s); hand edits are rejected" % (rid, difference)
             )
     # The repository aggregate is recomputed here from the fresh per-row and
-    # allocation records, with the HEAD-derived provenance field pinned to its
-    # stored value, so a change in any observed input restates the aggregate
-    # while an unrelated commit does not.
-    fresh_aggregate = _payload_digest(pinned_fresh)
+    # allocation records. Because the HEAD-derived ``base_sha`` is a declared
+    # exclusion, the aggregate is a function of what the inventory observes only:
+    # a change in any observed input restates it, an unrelated commit does not.
+    fresh_aggregate = _payload_digest(fresh_canonical)
     if doc.get("aggregate_digest") != fresh_aggregate:
         raise InventoryError(
             "HAND_EDIT_OR_DRIFT",

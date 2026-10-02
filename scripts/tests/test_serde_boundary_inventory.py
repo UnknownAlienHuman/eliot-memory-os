@@ -17,6 +17,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "serde_boundary_inventory.py"
@@ -105,6 +106,25 @@ def _sync_and_load(tmp: Path) -> tuple[dict, str]:
     inventory, _payload = tool.sync_inventory(tmp)
     text = (tmp / tool.OWNED_TOML_REL).read_text(encoding="utf-8")
     return inventory, text
+
+
+def _head_git(head_sha: str):
+    """Return a ``_run_git`` stand-in that observes ``head_sha`` as HEAD.
+
+    ``git rev-parse HEAD`` is the tool's only observation of the commit the
+    writer stood on. Replacing just that one observation is precisely "the
+    artifact's own commit moved HEAD" - the state that used to make every sync
+    produce a second diff. Every other allowed git call passes through to the
+    real implementation unchanged, so the scan universe is untouched.
+    """
+    real = tool._run_git
+
+    def fake(run_root: Path, argv: list[str]) -> bytes:
+        if list(argv) == ["git", "rev-parse", "HEAD"]:
+            return (head_sha + "\n").encode("utf-8")
+        return real(run_root, argv)
+
+    return fake
 
 
 def _validate_text(tmp: Path, text: str) -> None:
@@ -638,6 +658,45 @@ class SerdeBoundaryInventoryTests(unittest.TestCase):
             [r["id"] for r in forward["rows"]], [r["id"] for r in backward["rows"]])
         self.assertEqual(tool._render_toml(forward), tool._render_toml(backward))
 
+        # Regression for the defect that made the artifact unconvergeable: the
+        # HEAD-derived provenance used to sit INSIDE the canonical payload, so
+        # committing the artifact moved HEAD, the next sync restated both
+        # base_sha and aggregate_digest, and every commit produced a second diff
+        # forever. Simulate exactly that - re-observe HEAD as a DIFFERENT commit
+        # id after the artifact is written - and the further sync must be
+        # byte-identical.
+        first_base_sha = next(
+            line for line in first.split("\n") if line.startswith("base_sha = ")
+        )
+        first_aggregate = next(
+            line for line in first.split("\n") if line.startswith("aggregate_digest = ")
+        )
+        with mock.patch.object(tool, "_run_git", _head_git("b" * 40)):
+            _inv3, after_commit = _sync_and_load(tmp)
+        # The artifact was written with no observable HEAD (a temp fixture is not
+        # a repository) ...
+        self.assertEqual(first_base_sha, 'base_sha = "unknown-base"')
+        # ... and the further sync re-observed a DIFFERENT commit, yet the
+        # recorded provenance is carried forward unchanged ...
+        self.assertIn(first_base_sha, after_commit.split("\n"))
+        # ... and the aggregate is byte-identical, so the tree stays clean.
+        self.assertEqual(
+            next(line for line in after_commit.split("\n")
+                 if line.startswith("aggregate_digest = ")),
+            first_aggregate,
+        )
+        self.assertEqual(after_commit, first)
+        # The fresh build really did observe the new commit - so the
+        # byte-identity above is the carry-forward at work, not a HEAD that
+        # never moved.
+        with mock.patch.object(tool, "_run_git", _head_git("b" * 40)):
+            rebuilt = tool.build_inventory(tmp)
+        self.assertEqual(rebuilt["header"]["base_sha"], "b" * 40)
+        self.assertEqual(rebuilt["header"]["aggregate_digest"], _inv["header"]["aggregate_digest"])
+        # ``check`` must still pass against the artifact recorded at the old
+        # HEAD: the excluded field is not proof and must not gate the check.
+        tool.check_cli(tmp)
+
     # WORK_UNIT_CASE: 929/22
     def test_22_check_is_read_only_and_catches_hand_edits(self) -> None:
         tmp = _make_root(
@@ -678,16 +737,62 @@ class SerdeBoundaryInventoryTests(unittest.TestCase):
             tool.check_cli(tmp)
         self.assertEqual(ctx.exception.code, "HAND_EDIT_OR_DRIFT")
         # Provenance is classified informational and outside the proof ceiling,
-        # yet it is inside the canonical payload: a substituted base_sha is still
-        # refused rather than ignored by the verifier.
+        # yet it is NOT ignored by the verifier: the closed rules that do not
+        # depend on knowing the writer's commit all still refuse a tamper.
         for key, new_line, code in (
-            ("base_sha", 'base_sha = "%s"' % ("0" * 40), "HAND_EDIT_OR_DRIFT"),
+            # MALFORMED_PROVENANCE: the Git object-id grammar is enforced, and
+            # the ``unknown-base`` sentinel is the only accepted non-object-id.
             ("base_sha", 'base_sha = "not-a-sha"', "MALFORMED_PROVENANCE"),
+            ("base_sha", 'base_sha = ""', "MALFORMED_PROVENANCE"),
+            ("base_sha", 'base_sha = "%s"' % ("A" * 40), "MALFORMED_PROVENANCE"),
+            # These two live INSIDE the canonical payload, so a hand edit is
+            # refused by the exact constant comparison and would also break the
+            # recomputed stored aggregate.
             ("base_sha_source", 'base_sha_source = "hand-edit"', "STALE_RULE"),
             ("provenance_authority", 'provenance_authority = "authoritative"', "STALE_RULE"),
+            # The exclusion set is a closed constant the artifact must declare
+            # verbatim, so a hand edit cannot widen it to smuggle a payload field
+            # out of the aggregate.
+            (
+                "canonical_excludes",
+                'canonical_excludes = ["aggregate_digest", "denominator.scan_file_count", '
+                '"base_sha", "rows"]',
+                "STALE_RULE",
+            ),
         ):
             with self.subTest(field=key, value=new_line):
                 _expect_line_rejection(self, tmp, pristine, key, new_line, code)
+        (tmp / tool.OWNED_TOML_REL).write_text(pristine, encoding="utf-8")
+        tool.check_cli(tmp)
+        # The declared sentinel is accepted, and the artifact still records the
+        # exclusion set verbatim.
+        sentinel = pristine.replace(
+            next(l for l in pristine.split("\n") if l.startswith("base_sha = ")),
+            'base_sha = "%s"' % tool.UNKNOWN_BASE_SENTINEL,
+            1,
+        )
+        (tmp / tool.OWNED_TOML_REL).write_text(sentinel, encoding="utf-8")
+        tool.check_cli(tmp)
+        self.assertIn(
+            tool.UNKNOWN_BASE_SENTINEL,
+            (tmp / tool.OWNED_TOML_REL).read_text(encoding="utf-8"),
+        )
+        self.assertEqual(
+            tool.CANONICAL_EXCLUDED_FIELDS,
+            (
+                "aggregate_digest",
+                "denominator.scan_file_count",
+                "base_sha",
+            ),
+        )
+        # The honest limit, asserted as a fact about the design rather than
+        # hidden: ``base_sha`` is outside the canonical payload, so a
+        # WELL-FORMED but WRONG value is NOT refused and cannot be - nothing
+        # observable in the repository records which commit the writer stood on.
+        # That is exactly why the field is non-authoritative and outside the
+        # proof ceiling; there is deliberately no assertion claiming otherwise.
+        self.assertNotIn("base_sha", tool.CANONICAL_HEADER_KEYS)
+        self.assertIn("base_sha", tool.CANONICAL_EXCLUDED_FIELDS)
         (tmp / tool.OWNED_TOML_REL).write_text(pristine, encoding="utf-8")
         tool.check_cli(tmp)
 
