@@ -272,31 +272,184 @@ fn all_dispositions() -> TestResult<Vec<AgentActivationResolutionDisposition>> {
     ])
 }
 
-// WORK_UNIT_CASE: 839/1
-#[test]
-fn current_ingress_maps_to_typed_submit_and_receiver_contract() -> TestResult {
-    assert_fixture_case(
-        1,
-        "current ingress, typed resolution, submission, and receiver contract",
+fn assert_activation_runtime_path(runtime: &str) -> TestResult {
+    let install_resolve = slice_between(
+        runtime,
+        "fn install_activation_resolve(",
+        "/// Starts the resolve-wait step for one validated ticket",
     )?;
-    let runtime = source("src/daemon_runtime.rs")?;
-    let claim_step = slice_between(
-        &runtime,
-        "fn start_valid_claim_step(",
-        "/// Bounded shutdown drain for one in-flight activation",
+    assert!(install_resolve.contains("start_activation_resolve("));
+
+    let settle_completion = slice_between(
+        runtime,
+        "fn settle_activation_completion(",
+        "/// Settles one completed activation dispatch",
     )?;
     assert_ordered(
-        claim_step,
+        settle_completion,
         &[
-            "activation_deadline_expired",
-            "resolve_agent_activation_v2",
-            "dispatch_agent_activation_result",
+            "ActivationClaimStep::Valid(ticket)",
+            "install_activation_resolve(kernel, composition, flight, *ticket)",
+            "ActivationCompletion::Resolve(resolve_outcome)",
+            "settle_activation_resolve_completion(kernel, flight, resolve_outcome)",
+            "ActivationCompletion::Dispatch(dispatch_outcome)",
         ],
     )?;
 
-    let client = source("src/daemon_kernel_client.rs")?;
+    let resolve = slice_between(
+        runtime,
+        "fn start_activation_resolve(",
+        "/// Settles one completed resolve-wait step",
+    )?;
+    assert!(resolve.contains("resolve_valid_ticket("));
+
+    let settle_resolve = slice_between(
+        runtime,
+        "fn settle_activation_resolve_completion(",
+        "/// Settles one invalid activation claim",
+    )?;
+    assert_ordered(
+        settle_resolve,
+        &["Ok(Some(resolved))", "start_activation_dispatch("],
+    )?;
+
+    let resolve_result = slice_between(
+        runtime,
+        "fn resolve_valid_ticket(",
+        "/// Starts the dispatch step for one resolved ticket",
+    )?;
+    assert_ordered(
+        resolve_result,
+        &[
+            "activation_deadline_expired",
+            "AgentActivationResolver::resolve_agent_activation_v2(composition, &ticket, now)",
+            "Ok(Some(Box::new(ActivationResolvedTicket",
+        ],
+    )?;
+
+    let start_dispatch = slice_between(
+        runtime,
+        "fn start_activation_dispatch(",
+        "/// Stage-aware shutdown drain for every already-started flight",
+    )?;
+    assert_ordered(
+        start_dispatch,
+        &[
+            "ticket_id: resolved.ticket.ticket_id.clone()",
+            "result_sha256: resolved.result.result_sha256.clone()",
+            "dispatch_agent_activation_result(",
+        ],
+    )?;
+    assert!(start_dispatch.contains("resolved.owner_readback"));
+    Ok(())
+}
+
+fn assert_activation_dispatch_reconciliation(runtime: &str) -> TestResult {
+    let dispatch = slice_between(
+        runtime,
+        "async fn dispatch_agent_activation_result(",
+        "/// Builds the lost-acknowledgement reconcile query",
+    )?;
+    assert_ordered(
+        dispatch,
+        &[
+            ".submit_agent_activation_result(&result, owner_readback)",
+            "classify_submit_ack(ticket, &result, &ack)?",
+            "Err(submit_error @ ActivationSubmitError::PossiblySubmitted { .. })",
+            "retained_reconcile_query(ticket, &result)?",
+            ".reconcile_agent_activation_result(&query)",
+            "classify_reconcile_ack(ticket, &result, &ack, &submit_detail)?",
+        ],
+    )?;
+    assert!(!dispatch.contains("resolve_agent_activation_v2"));
+    assert_source_excludes(
+        dispatch,
+        &[
+            "AgentActivationResolutionResult::new",
+            "Session::new",
+            "P07AuthorityPort",
+        ],
+    )?;
+
+    let reconcile_query = slice_between(
+        runtime,
+        "fn retained_reconcile_query(",
+        "/// Classifies a submit acknowledgement against the retained identity",
+    )?;
+    assert!(reconcile_query.contains(
+        "AgentActivationResultReconcile::new(ticket.ticket_id.clone(), result.result_sha256.clone())"
+    ));
+    assert!(!reconcile_query.contains("resolve_agent_activation_v2"));
+    assert!(!reconcile_query.contains("AgentActivationResolutionResult::new"));
+    Ok(())
+}
+
+fn assert_activation_ack_classifiers(runtime: &str) -> TestResult {
+    let classifier = slice_between(
+        runtime,
+        "fn classify_submit_ack(",
+        "/// Classifies a reconcile acknowledgement after a submit failure",
+    )?;
+    assert_source_excludes(
+        classifier,
+        &["Session::new", "P07AuthorityPort", "transact_async"],
+    )?;
+    assert_ordered(
+        classifier,
+        &[
+            "if ack.ticket_id != ticket.ticket_id",
+            "ack.ticket_id != result.ticket_id",
+            "ack.result_sha256 != result.result_sha256",
+            "match ack.outcome",
+            "AgentActivationResultAckOutcome::Accepted => {",
+            "ack.validate_against_result(result)",
+            "AgentActivationResultAckOutcome::Unknown => Err(ActivationDispatchError::Unknown",
+            "ticket_id: ticket.ticket_id.clone()",
+            "result_sha256: result.result_sha256.clone()",
+            "detail: format!(",
+        ],
+    )?;
+    let before_match = classifier
+        .split("match ack.outcome")
+        .next()
+        .ok_or("submit classifier is missing its outcome match")?;
+    assert!(!before_match.contains("ack.validate_against_result("));
+    let accepted = slice_between(
+        classifier,
+        "AgentActivationResultAckOutcome::Accepted => {",
+        "AgentActivationResultAckOutcome::Unknown =>",
+    )?;
+    assert!(accepted.contains("validate_against_result(result)"));
+    let unknown = classifier
+        .split("AgentActivationResultAckOutcome::Unknown =>")
+        .nth(1)
+        .ok_or("submit classifier is missing its Unknown arm")?;
+    assert!(!unknown.contains("ack.validate_against_result("));
+
+    let reconcile_classifier = slice_between(
+        runtime,
+        "fn classify_reconcile_ack(",
+        "/// Preserves the exact retained result identity",
+    )?;
+    let reconcile_unknown = reconcile_classifier
+        .split("AgentActivationResultAckOutcome::Unknown =>")
+        .nth(1)
+        .ok_or("reconcile classifier is missing its Unknown arm")?;
+    assert_ordered(
+        reconcile_unknown,
+        &[
+            "ActivationDispatchError::Unknown",
+            "ticket_id: ticket.ticket_id.clone()",
+            "result_sha256: result.result_sha256.clone()",
+            "{submit_detail}",
+        ],
+    )?;
+    Ok(())
+}
+
+fn assert_activation_transport_contract(client: &str, kernel: &str, protocol: &str) -> TestResult {
     let submit = slice_between(
-        &client,
+        client,
         "pub async fn submit_agent_activation_result(",
         "pub async fn reconcile_agent_activation_result(",
     )?;
@@ -305,26 +458,79 @@ fn current_ingress_maps_to_typed_submit_and_receiver_contract() -> TestResult {
         &[
             "AgentActivationResultSubmit::new_with_owner_readback",
             "\"agent_activation_submit\"",
-            "value.get(\"ack\")",
-            "AgentActivationResultAck",
-            "ack.validate_against_result(result)",
+            "let response: ActivationSubmitResponse",
+            "serde_json::from_value(value)",
+            "let ack = response",
+            ".ack",
+            ".ok_or_else",
+            "ack.validate()",
+            "ack.replay_key() != (result.ticket_id.as_str(), result.result_sha256.as_str())",
+            "Ok(ack)",
         ],
     )?;
+    assert!(!submit.contains("ack.validate_against_result("));
+    assert!(!submit.contains("Session::new"));
 
-    let kernel = source("../../bins/eliot-kernel/src/daemon_request_dispatch.rs")?;
-    let receiver = slice_between(
-        &kernel,
+    let reconcile = slice_between(
+        client,
+        "pub async fn reconcile_agent_activation_result(",
+        "    pub fn connect(",
+    )?;
+    assert_ordered(
+        reconcile,
+        &[
+            "query.validate()",
+            "\"agent_activation_reconcile\"",
+            "serde_json::json!({ \"reconcile\": query })",
+            "response.ack.validate()",
+            "response.ack.replay_key() != (query.ticket_id.as_str(), query.result_sha256.as_str())",
+            "Ok(response.ack)",
+        ],
+    )?;
+    assert!(!reconcile.contains("validate_against_result"));
+
+    let v2_submit = slice_between(
+        kernel,
         "\n            \"agent_activation_submit\" => {",
         "\n            \"agent_activation_reconcile\" => {",
     )?;
     assert_ordered(
-        receiver,
+        v2_submit,
         &[
-            "AgentActivationResultSubmit",
-            "submit_agent_activation_result",
+            "object.contains_key(\"decision\")",
+            "decode_agent_activation_result_submit",
+            "submit_agent_activation_result_authenticated",
             "activation_result_daemon_response",
         ],
     )?;
+    assert!(!v2_submit.contains("decode_activation_resolution_v1_import"));
+
+    let v2_decoder = slice_between(
+        protocol,
+        "pub fn decode_agent_activation_result_submit(",
+        "\n/// The Kernel answers purely from its retained per-ticket result record",
+    )?;
+    assert!(v2_decoder.contains("Result<AgentActivationResultSubmit, ProtocolError>"));
+    assert!(v2_decoder.contains("submit.validate()?"));
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 839/1
+#[test]
+fn current_ingress_maps_to_typed_submit_and_receiver_contract() -> TestResult {
+    assert_fixture_case(
+        1,
+        "current ingress, typed resolution, submission, and receiver contract",
+    )?;
+    let runtime = source("src/daemon_runtime.rs")?;
+    assert_activation_runtime_path(&runtime)?;
+    assert_activation_dispatch_reconciliation(&runtime)?;
+    assert_activation_ack_classifiers(&runtime)?;
+
+    let client = source("src/daemon_kernel_client.rs")?;
+    let kernel = source("../../bins/eliot-kernel/src/daemon_request_dispatch.rs")?;
+    let protocol = source("../../crates/foundation/eliot-protocol/src/activation_resolution.rs")?;
+    assert_activation_transport_contract(&client, &kernel, &protocol)?;
     Ok(())
 }
 
@@ -343,22 +549,38 @@ fn valid_ticket_reaches_actual_daemon_v2_dispatch_path() -> TestResult {
     }
 
     let runtime = source("src/daemon_runtime.rs")?;
-    let claim_step = slice_between(
+    let resolve = slice_between(
         &runtime,
-        "fn start_valid_claim_step(",
-        "/// Bounded shutdown drain for one in-flight activation",
+        "fn resolve_valid_ticket(",
+        "/// Starts the dispatch step for one resolved ticket",
     )?;
     assert_ordered(
-        claim_step,
+        resolve,
         &[
-            "resolve_agent_activation_v2",
-            "let retained = RetainedActivationIdentity",
-            "dispatch_agent_activation_result(&kernel_clone, &ticket, result, owner_readback)",
+            "activation_deadline_expired",
+            "AgentActivationResolver::resolve_agent_activation_v2(composition, &ticket, now)",
+            "let result = if result.resolved_binding().is_some()",
+            "Ok(Some(Box::new(ActivationResolvedTicket",
         ],
     )?;
-    assert!(!claim_step.contains("map_activation_snapshot"));
-    assert!(!claim_step.contains("AgentActivationResolutionDecision"));
-    assert!(!claim_step.contains("submit_agent_activation_decision"));
+    assert!(!resolve.contains("map_activation_snapshot"));
+    assert!(!resolve.contains("AgentActivationResolutionDecision"));
+    assert!(!resolve.contains("submit_agent_activation_decision"));
+    let start_dispatch = slice_between(
+        &runtime,
+        "fn start_activation_dispatch(",
+        "/// Stage-aware shutdown drain for every already-started flight",
+    )?;
+    assert_ordered(
+        start_dispatch,
+        &[
+            "ticket_id: resolved.ticket.ticket_id.clone()",
+            "result_sha256: resolved.result.result_sha256.clone()",
+            "dispatch_agent_activation_result(",
+        ],
+    )?;
+    assert!(start_dispatch.contains("resolved.result"));
+    assert!(start_dispatch.contains("resolved.owner_readback"));
     Ok(())
 }
 
@@ -383,12 +605,19 @@ fn accepted_exact_replay_reuses_one_resolution_identity() -> TestResult {
     assert_eq!(replay.result.as_ref(), Some(&result));
 
     let runtime = source("src/daemon_runtime.rs")?;
-    let claim_step = slice_between(
+    let resolver = slice_between(
         &runtime,
-        "fn start_valid_claim_step(",
-        "/// Bounded shutdown drain for one in-flight activation",
+        "fn resolve_valid_ticket(",
+        "/// Starts the dispatch step for one resolved ticket",
     )?;
-    assert_eq!(claim_step.matches("resolve_agent_activation_v2").count(), 1);
+    assert_eq!(
+        resolver
+            .matches(
+                "AgentActivationResolver::resolve_agent_activation_v2(composition, &ticket, now)"
+            )
+            .count(),
+        1
+    );
     let dispatch = slice_between(
         &runtime,
         "async fn dispatch_agent_activation_result(",
@@ -503,15 +732,44 @@ fn v1_compatibility_retired_v2_resolution_is_the_spine() -> TestResult {
     assert!(projection.contains("map_governor_outcome_to_protocol"));
 
     let runtime = source("src/daemon_runtime.rs")?;
-    let claim_step = slice_between(
+    let resolve = slice_between(
         &runtime,
-        "fn start_valid_claim_step(\n",
-        "/// Bounded shutdown drain for one in-flight activation",
+        "fn resolve_valid_ticket(\n",
+        "/// Starts the dispatch step for one resolved ticket",
     )?;
-    assert!(!claim_step.contains("map_activation_snapshot"));
-    assert!(!claim_step.contains("AgentActivationResolutionDecision"));
-    assert!(!claim_step.contains("submit_agent_activation_decision"));
-    assert!(claim_step.contains("resolve_agent_activation_v2"));
+    assert!(!resolve.contains("map_activation_snapshot"));
+    assert!(!resolve.contains("AgentActivationResolutionDecision"));
+    assert!(!resolve.contains("submit_agent_activation_decision"));
+    assert!(resolve.contains("AgentActivationResolver::resolve_agent_activation_v2"));
+
+    let kernel = source("../../bins/eliot-kernel/src/daemon_request_dispatch.rs")?;
+    let v2_submit = slice_between(
+        &kernel,
+        "\n            \"agent_activation_submit\" => {",
+        "\n            \"agent_activation_reconcile\" => {",
+    )?;
+    assert!(v2_submit.contains("decode_agent_activation_result_submit"));
+    assert!(!v2_submit.contains("decode_activation_resolution_v1_import"));
+    assert!(v2_submit.contains("object.contains_key(\"decision\")"));
+
+    let v1_import = slice_between(
+        &kernel,
+        "\n            AGENT_ACTIVATION_V1_IMPORT_OPERATION => {",
+        "\n            \"local_read_claim\" => {",
+    )?;
+    assert_ordered(
+        v1_import,
+        &[
+            "object.contains_key(\"result\")",
+            "AGENT_ACTIVATION_V1_IMPORT_OPERATION",
+            "object.contains_key(\"decision\")",
+            "activation_resolution_v1::decode_activation_resolution_v1_import",
+        ],
+    )?;
+    assert!(!v1_import.contains("submit_agent_activation_result_authenticated"));
+
+    let protocol_root = source("../../crates/foundation/eliot-protocol/src/root.rs")?;
+    assert!(protocol_root.contains("pub mod activation_resolution_v1;"));
     Ok(())
 }
 
@@ -611,12 +869,14 @@ fn required_activation_functions_are_production_reachable() -> TestResult {
     }
 
     let runtime = source("src/daemon_runtime.rs")?;
-    let claim_step = slice_between(
+    let resolve = slice_between(
         &runtime,
-        "fn start_valid_claim_step(",
-        "/// Bounded shutdown drain for one in-flight activation",
+        "fn resolve_valid_ticket(",
+        "/// Starts the dispatch step for one resolved ticket",
     )?;
-    assert!(claim_step.contains(".resolve_agent_activation_v2(&ticket, now)"));
+    assert!(resolve.contains(
+        "AgentActivationResolver::resolve_agent_activation_v2(composition, &ticket, now)"
+    ));
     let dispatch = slice_between(
         &runtime,
         "async fn dispatch_agent_activation_result(",
@@ -708,14 +968,14 @@ fn activation_source_excludes_unowned_effects_and_duplicate_paths() -> TestResul
     )?;
 
     let runtime = source("src/daemon_runtime.rs")?;
-    let claim_step = slice_between(
+    let resolve = slice_between(
         &runtime,
-        "fn start_valid_claim_step(",
-        "/// Bounded shutdown drain for one in-flight activation",
+        "fn resolve_valid_ticket(",
+        "/// Starts the dispatch step for one resolved ticket",
     )?;
-    assert!(!claim_step.contains("map_activation_snapshot"));
-    assert!(!claim_step.contains("AgentActivationResolutionDecision"));
-    assert!(!claim_step.contains("submit_agent_activation_decision"));
+    assert!(!resolve.contains("map_activation_snapshot"));
+    assert!(!resolve.contains("AgentActivationResolutionDecision"));
+    assert!(!resolve.contains("submit_agent_activation_decision"));
     let dispatch = slice_between(
         &runtime,
         "async fn dispatch_agent_activation_result(",
