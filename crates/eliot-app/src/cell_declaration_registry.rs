@@ -344,6 +344,24 @@ mod tests {
     }
 
     #[test]
+    fn a_status_that_is_no_longer_pending_is_refused() {
+        // Arm: the real contract's `status` is rewritten to a finished value
+        // while the executable registry is still #13 scope. Support and ceiling
+        // keep their residual, so only the status-marker check can catch a
+        // status that stops admitting the work is pending.
+        let result = markers_of_mutated_contract(
+            "status = \"DAEMON_DECLARATIONS_PRESENT_EXECUTABLE_REGISTRY_PENDING\"\n",
+            "status = \"DAEMON_DECLARATIONS_PRESENT_EXECUTABLE_REGISTRY_COMPLETE\"\n",
+        );
+
+        assert_eq!(
+            result,
+            Err("cell contract claims status DAEMON_DECLARATIONS_PRESENT_EXECUTABLE_REGISTRY_COMPLETE while the executable registry is still pending".to_owned()),
+            "a status that stops admitting the pending registry must be refused"
+        );
+    }
+
+    #[test]
     fn claiming_a_generated_executable_registry_is_refused() {
         // Arm: the real contract's `implementation_support` drops the
         // executable-registry residual and claims a generated registry, which
