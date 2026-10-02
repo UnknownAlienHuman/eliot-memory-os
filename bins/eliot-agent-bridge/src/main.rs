@@ -7,7 +7,7 @@ use eliot_agent_bridge::opencode_host_events::{
     BridgeIntroductionStore, HostEventsServiceError, serve_host_events,
 };
 use eliot_agent_bridge::{
-    AdmissionBasis, BootstrapContext, BootstrapTaskInputs, BridgeRunner, CliError,
+    AdmissionBasis, BootstrapContext, BootstrapError, BootstrapTaskInputs, BridgeRunner, CliError,
     CurrentAssessment, DeliveryStatus, FiringEvidence, HotResourceView, InjectionReceipt,
     ItemDisposition, KernelHostRequestClient, LoopbackHttpProfile, NormalizedCue,
     OwnerDryRunPreview, Profile, ToolResultReceipt, TransportAdmissionError, TransportProfile,
@@ -1021,9 +1021,15 @@ fn main() {
                 }
             },
             Ok(Request::Invoke { request }) => {
+                let owner_bootstrap = owner_bootstrap_requested(&request);
                 let mut response =
                     handle_invocation(host_gateway, &mut host_request_client, &request);
-                record_invocation_delivery(&mut runner, &mut response);
+                if owner_bootstrap {
+                    consume_owner_bootstrap_for_private_response(&mut runner, &mut response);
+                }
+                if !owner_bootstrap {
+                    record_invocation_delivery(&mut runner, &mut response);
+                }
                 drain_reactive_pending_into_invocation(
                     &mut runner,
                     request.correlation_id.as_str(),
@@ -1389,6 +1395,86 @@ fn handle_invocation<P: KernelHostRequestPort + ?Sized>(
             Err(()) => invocation_projection_error(),
         },
         Err(error) => host_gateway_error(&error),
+    }
+}
+
+/// An explicit owner-backed state request is the only route that can make
+/// this invocation's `UnderstandingBootstrap` owner-compiled.
+fn owner_bootstrap_requested(request: &HostInvocationRequest) -> bool {
+    matches!(&request.tool, ToolRequest::State(input) if input.bootstrap.is_some())
+}
+
+fn compose_owner_bootstrap_from_invocation(
+    runner: &mut BridgeRunner,
+    result: &HostInvocationResult,
+) -> Result<UnderstandingBootstrap, BootstrapError> {
+    let HostInvocationOutcome::Responded { response, .. } = result.outcome() else {
+        return Err(BootstrapError {
+            code: "BOOTSTRAP_OWNER_RESULT_MISSING",
+            detail: "explicit state bootstrap did not return a completed owner result".to_owned(),
+        });
+    };
+    runner.note_owner_bootstrap_response(&response.content)
+}
+
+/// Consumes the exact owner result before the private response is emitted.
+/// Raw ORS evidence remains retained in the runner; only the measured
+/// `UnderstandingBootstrap` projection is copied into the response.
+fn consume_owner_bootstrap_for_private_response(
+    runner: &mut BridgeRunner,
+    response: &mut Response,
+) {
+    let projection = match response {
+        Response::Invocation { result, .. } => {
+            compose_owner_bootstrap_from_invocation(runner, result)
+        }
+        _ => return,
+    };
+    match projection {
+        Ok(projection) => {
+            let Ok(projected_content) = serde_json::to_value(&projection) else {
+                *response = Response::Error {
+                    code: "BOOTSTRAP_RENDER_FAILED",
+                    detail: "owner bootstrap could not be serialized for the bounded response".to_owned(),
+                };
+                return;
+            };
+            let projected = if let Response::Invocation {
+                wire_result,
+                bootstrap,
+                ..
+            } = response
+            {
+                if let Some(response_value) = wire_result
+                    .get_mut("outcome")
+                    .and_then(|outcome| outcome.get_mut("response"))
+                    .and_then(Value::as_object_mut)
+                {
+                    response_value.insert("content".to_owned(), projected_content);
+                    response_value.insert("artifacts".to_owned(), serde_json::json!([]));
+                    response_value.insert("resource".to_owned(), Value::Null);
+                    response_value.insert("job".to_owned(), Value::Null);
+                    *bootstrap = Some(projection);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !projected {
+                *response = Response::Error {
+                    code: "BOOTSTRAP_RENDER_FAILED",
+                    detail: "owner invocation response lost its correlated result envelope".to_owned(),
+                };
+            }
+        }
+        Err(error) => {
+            *response = Response::Error {
+                code: error.code,
+                detail: error.detail,
+            };
+        }
     }
 }
 
@@ -3980,6 +4066,9 @@ fn handle_mcp_tools_call(
         Err(rejection) => return render_rejection(Some(id), &rejection),
     };
     match gateway.invoke_with_receipt(port, &request) {
+        Ok((result, _receipt)) if owner_bootstrap_requested(&request) => {
+            render_mcp_owner_bootstrap_invocation(runner, state, id, &correlation, &result)
+        }
         Ok((result, receipt)) => {
             render_mcp_invocation(port, runner, state, id, &correlation, &result, &receipt)
         }
@@ -3994,6 +4083,71 @@ fn handle_mcp_tools_call(
             )
         }
     }
+}
+
+/// Consumes the exact owner readback carried by an explicit state bootstrap
+/// call and replaces it on the wire with the existing composed, measured
+/// `UnderstandingBootstrap`. The original ORS row stays retained internally
+/// in the runner for expiry checks and explicit re-expansion.
+fn render_mcp_owner_bootstrap_invocation(
+    runner: &mut BridgeRunner,
+    state: &mut McpFrontDoor,
+    id: &JsonRpcId,
+    correlation: &str,
+    result: &HostInvocationResult,
+) -> Value {
+    let HostInvocationOutcome::Responded {
+        operation_handle,
+        response,
+    } = result.outcome()
+    else {
+        return render_error(
+            Some(id),
+            WIRE_INTERNAL_ERROR,
+            "explicit state bootstrap did not return a completed owner result",
+            serde_json::json!({"code": "BOOTSTRAP_OWNER_RESULT_MISSING"}),
+        );
+    };
+    state.retain_handle(correlation, operation_handle.clone());
+    let projection = match runner.note_owner_bootstrap_response(&response.content) {
+        Ok(projection) => projection,
+        Err(error) => {
+            return render_error(
+                Some(id),
+                WIRE_INTERNAL_ERROR,
+                &error.detail,
+                serde_json::json!({"code": error.code}),
+            );
+        }
+    };
+    let Ok(content) = serde_json::to_value(&projection) else {
+        return render_error(
+            Some(id),
+            WIRE_INTERNAL_ERROR,
+            "owner bootstrap could not be serialized for the bounded response",
+            serde_json::json!({"code": "BOOTSTRAP_RENDER_FAILED"}),
+        );
+    };
+    let mut projected_response = (**response).clone();
+    projected_response.content = content;
+    projected_response.artifacts.clear();
+    projected_response.resource = None;
+    projected_response.job = None;
+    let rendered = match render_responded_result(operation_handle, &projected_response, None) {
+        Ok(rendered) => rendered,
+        Err(rejection) => return render_rejection(Some(id), &rejection),
+    };
+    if serde_json::to_vec(&rendered).map_or(true, |bytes| {
+        bytes.len() > HARD_STRUCTURED_RESPONSE_BYTES
+    }) {
+        return render_error(
+            Some(id),
+            WIRE_INTERNAL_ERROR,
+            "measured owner bootstrap exceeds the structured response ceiling",
+            serde_json::json!({"code": "BOOTSTRAP_RESPONSE_TOO_LARGE"}),
+        );
+    }
+    render_result(id, rendered)
 }
 
 /// Renders one gateway invocation outcome as its negotiated `tools/call`
@@ -5285,7 +5439,10 @@ mod tests {
             panic!("first successful response must carry the bootstrap")
         };
         assert!(
-            !carried.governance.limiting_integration_evidence.is_empty(),
+            carried
+                .governance
+                .as_ref()
+                .is_some_and(|governance| !governance.limiting_integration_evidence.is_empty()),
             "bootstrap must carry limiting integration evidence"
         );
         let mut second = Response::Forwarded {
@@ -5308,7 +5465,13 @@ mod tests {
         let explicit = runner
             .get_understanding_bootstrap(&empty_tasks(), CurrentAssessment::Ready)
             .expect("explicit retrieval stays available");
-        assert_eq!(explicit.governance.profile_ref, "governance-profile-1");
+        assert_eq!(
+            explicit
+                .governance
+                .as_ref()
+                .map(|governance| governance.profile_ref.as_str()),
+            Some("governance-profile-1")
+        );
     }
 
     /// C3 production-path proof: supported Kernel read-result bytes reaching the normal

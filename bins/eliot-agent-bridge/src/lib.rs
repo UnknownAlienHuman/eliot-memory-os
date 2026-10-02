@@ -120,9 +120,10 @@ pub use transport_profile::{
 use understanding_bootstrap::validate_task_inputs_match_surface;
 pub use understanding_bootstrap::{
     AuthoritativeSelection, BootDelta, BootstrapContext, BootstrapError, BootstrapSession,
-    BootstrapTaskInputs, CurrentAssessment, GovernanceEvidence, ProjectionFreshness,
-    ProjectionProvenance, ReadinessDisposition, RoutePayloadMeasurement, ScopeLevel, SelectedTask,
-    TaskCandidate, TaskSelectionDisposition, TaskSelectionView, UnderstandingBootstrap,
+    BootstrapTaskInputs, CurrentAssessment, GovernanceEvidence, OwnerCompiledSurfaceEvidence,
+    OwnerCompiledSurfaceInput, ProjectionFreshness, ProjectionProvenance, ReadinessDisposition,
+    RoutePayloadMeasurement, ScopeLevel, SelectedTask, TaskCandidate, TaskSelectionDisposition,
+    TaskSelectionView, UnderstandingBootstrap, admit_owner_compiled_surface,
     get_understanding_bootstrap, measure_route_payload,
 };
 
@@ -4990,6 +4991,10 @@ pub struct BridgeRunner {
     reactive_ledger: ReactiveInjectionLedger,
     bootstrap_session: BootstrapSession,
     bootstrap_snapshot: Option<BootstrapSnapshot>,
+    /// Exact owner evidence retained when its paired profile/selection is not
+    /// sufficient to construct the required bootstrap projection. This is a
+    /// process-local diagnostic, not a second persistence owner.
+    bootstrap_diagnostic: Option<(BootstrapError, OwnerCompiledSurfaceEvidence)>,
     /// Bounded retention of ELIOT emission correlations awaiting a host-event
     /// join (#2899). See [`mcp_correlation`]: it is a first-in first-out window
     /// over records the OWNER already holds durably, never a second store, and
@@ -5071,9 +5076,77 @@ struct BootstrapSnapshot {
     tasks: BootstrapTaskInputs,
     binding: Option<AttachBinding>,
     owner_compiled: bool,
+    owner_evidence: Option<OwnerCompiledSurfaceEvidence>,
+}
+
+/// Closed owner payload returned by the authenticated `eliot.state` bootstrap
+/// read. The whole `McpResponse` remains request/digest correlated by the
+/// host-request client; these exact owner fields are then joined to the live
+/// attach before any bootstrap projection is retained or rendered.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerBootstrapReadbackResponse {
+    owner_bootstrap: eliot_governor::ColdStartOwnerBootstrapReadback,
+    current_selection: Option<eliot_governor::CurrentTaskSelection>,
+    coverage: Option<eliot_integration_coverage::IntegrationCoverageProfile>,
+    governance_profile: Option<eliot_integration_coverage::GovernanceProfile>,
+    state_fence: eliot_contracts::StateFence,
+}
+
+impl OwnerBootstrapReadbackResponse {
+    fn decode(content: &serde_json::Value) -> Result<Self, BootstrapError> {
+        let Some(object) = content.as_object() else {
+            return Err(BootstrapError {
+                code: "BOOTSTRAP_OWNER_RESPONSE_INVALID",
+                detail: "owner bootstrap content must be the exact bounded object returned by eliot.state".to_owned(),
+            });
+        };
+        const OWNER_FIELDS: [&str; 5] = [
+            "owner_bootstrap",
+            "current_selection",
+            "coverage",
+            "governance_profile",
+            "state_fence",
+        ];
+        if object.len() != OWNER_FIELDS.len()
+            || OWNER_FIELDS.iter().any(|field| !object.contains_key(*field))
+        {
+            return Err(BootstrapError {
+                code: "BOOTSTRAP_OWNER_RESPONSE_INVALID",
+                detail: "owner bootstrap content is missing or adds owner fields".to_owned(),
+            });
+        }
+        serde_json::from_value(content.clone()).map_err(|_| BootstrapError {
+            code: "BOOTSTRAP_OWNER_RESPONSE_INVALID",
+            detail: "owner bootstrap content does not match the closed Governor response types".to_owned(),
+        })
+    }
 }
 
 impl BootstrapSnapshot {
+    /// Refuses an owner-compiled snapshot after the exact original lease or
+    /// readiness receipt expires. The bridge rechecks at each compose rather
+    /// than extending freshness from its note-time decision.
+    fn validate_owner_freshness(&self, now_ms: u64) -> Result<(), BootstrapError> {
+        let Some(evidence) = &self.owner_evidence else {
+            return Ok(());
+        };
+        let readback = &evidence.owner_bootstrap().readback;
+        let lease_deadline = readback.lease.deadline;
+        let receipt_expiry = readback.receipt.expiry_tick;
+        if now_ms == 0
+            || lease_deadline != receipt_expiry
+            || now_ms > lease_deadline
+            || now_ms > receipt_expiry
+        {
+            return Err(BootstrapError {
+                code: "BOOTSTRAP_OWNER_EVIDENCE_EXPIRED",
+                detail: "the exact owner lease or readiness receipt expired before bootstrap delivery".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     /// Returns the live binding when it still equals the noted seal.
     ///
     /// Strict option equality: a snapshot noted while detached (`None`
@@ -5457,6 +5530,7 @@ impl BridgeRunner {
             reactive_ledger: ReactiveInjectionLedger::new(),
             bootstrap_session: BootstrapSession::default(),
             bootstrap_snapshot: None,
+            bootstrap_diagnostic: None,
             correlations: mcp_correlation::CorrelationTracker::default(),
             route_registry: CapabilityRouteRegistry::new(),
             bridge_route,
@@ -6125,6 +6199,7 @@ impl BridgeRunner {
             tasks: empty_tasks,
             binding,
             owner_compiled: false,
+            owner_evidence: None,
         });
         Ok(())
     }
@@ -6203,6 +6278,7 @@ impl BridgeRunner {
             tasks,
             binding,
             owner_compiled,
+            owner_evidence: None,
         });
         Ok(())
     }
@@ -6317,6 +6393,72 @@ impl BridgeRunner {
         // identities) is bypassed, not reused, here.
         self.retain_sealed_snapshot(context, tasks, true)
     }
+
+    /// Validates and retains one exact authenticated `eliot.state` owner
+    /// response, then renders the existing bootstrap projection from that
+    /// same retained evidence. The `McpResponse` request identity and result
+    /// digest are checked by `KernelHostRequestClient`; this join additionally
+    /// binds its closed owner content to the current attach and rechecks the
+    /// original lease at consumption and delivery.
+    pub fn note_owner_bootstrap_response(
+        &mut self,
+        content: &serde_json::Value,
+    ) -> Result<UnderstandingBootstrap, BootstrapError> {
+        // A refresh attempt invalidates a previously noted owner surface
+        // before consuming new bytes. Refusal must not fall back to an older
+        // same-process snapshot after the caller requested current evidence.
+        self.bootstrap_snapshot = None;
+        self.bootstrap_diagnostic = None;
+        self.bootstrap_session = BootstrapSession::default();
+        let response = OwnerBootstrapReadbackResponse::decode(content)?;
+        let surface_fence = &response.owner_bootstrap.readback.surface.state_fence;
+        if &response.state_fence != surface_fence {
+            return Err(BootstrapError {
+                code: "BOOTSTRAP_OWNER_FENCE_MISMATCH",
+                detail: "returned state fence differs from the exact owner surface fence".to_owned(),
+            });
+        }
+        let binding = self
+            .attach_view()
+            .map(|view| view.binding().clone())
+            .ok_or_else(|| BootstrapError {
+                code: "BOOTSTRAP_ATTACH_REQUIRED",
+                detail: "owner bootstrap response requires the currently retained authenticated attach".to_owned(),
+            })?;
+        let now = bridge_event_unix_ms().map_err(|_| BootstrapError {
+            code: "BOOTSTRAP_CLOCK_UNAVAILABLE",
+            detail: "fresh owner-readiness time is unavailable; refusing bootstrap retention".to_owned(),
+        })?;
+        let evidence = admit_owner_compiled_surface(&OwnerCompiledSurfaceInput {
+            owner_bootstrap: &response.owner_bootstrap,
+            attach_binding: &binding,
+            current_selection: response.current_selection.as_ref(),
+            coverage: response.coverage.as_ref(),
+            governance_profile: response.governance_profile.as_ref(),
+            now,
+        })?;
+        self.bootstrap_diagnostic = None;
+        let tasks = match understanding_bootstrap::task_inputs_from_owner_compiled_evidence(&evidence)
+        {
+            Ok(tasks) => tasks,
+            Err(error) => {
+                self.bootstrap_diagnostic = Some((error.clone(), evidence));
+                return Err(error);
+            }
+        };
+        let context = match BootstrapContext::from_owner_compiled_evidence(&evidence) {
+            Ok(context) => context,
+            Err(error) => {
+                self.bootstrap_diagnostic = Some((error.clone(), evidence));
+                return Err(error);
+            }
+        };
+        self.retain_sealed_snapshot(context, tasks.clone(), true)?;
+        if let Some(snapshot) = &mut self.bootstrap_snapshot {
+            snapshot.owner_evidence = Some(evidence);
+        }
+        self.get_understanding_bootstrap(&tasks, CurrentAssessment::Ready)
+    }
     /// Task inputs retained by the noted owner snapshot for auto-boot.
     ///
     /// Returns exactly what the owner supplied with the snapshot, or an
@@ -6354,7 +6496,14 @@ impl BridgeRunner {
         tasks: &BootstrapTaskInputs,
         requested_assessment: CurrentAssessment,
     ) -> Result<UnderstandingBootstrap, BootstrapError> {
+        let now_ms = bridge_event_unix_ms().map_err(|_| BootstrapError {
+            code: "BOOTSTRAP_CLOCK_UNAVAILABLE",
+            detail: "fresh owner-readiness time is unavailable; refusing bootstrap delivery".to_owned(),
+        })?;
         let Some(snapshot) = &self.bootstrap_snapshot else {
+            if let Some((diagnostic, _evidence)) = &self.bootstrap_diagnostic {
+                return Err(diagnostic.clone());
+            }
             return Err(BootstrapError {
                 code: "BOOTSTRAP_CONTEXT_MISSING",
                 detail: "no bootstrap context noted for this session".to_owned(),
@@ -6366,6 +6515,7 @@ impl BridgeRunner {
                 detail: "noted bootstrap seal disagrees with the live attach binding".to_owned(),
             });
         };
+        snapshot.validate_owner_freshness(now_ms)?;
         snapshot.delivery_tasks_match(tasks)?;
         let mut bootstrap =
             get_understanding_bootstrap(&snapshot.context, tasks, requested_assessment)?;
@@ -6384,6 +6534,9 @@ impl BridgeRunner {
         requested_assessment: CurrentAssessment,
     ) -> Option<UnderstandingBootstrap> {
         let snapshot = self.bootstrap_snapshot.clone()?;
+        snapshot
+            .validate_owner_freshness(bridge_event_unix_ms().ok()?)
+            .ok()?;
         let sealed = snapshot.sealed_live_binding(self.attach_view())?;
         snapshot.delivery_tasks_match(tasks).ok()?;
         let preview =
@@ -6418,6 +6571,9 @@ impl BridgeRunner {
         requested_assessment: CurrentAssessment,
     ) -> Option<UnderstandingBootstrap> {
         let snapshot = self.bootstrap_snapshot.clone()?;
+        snapshot
+            .validate_owner_freshness(bridge_event_unix_ms().ok()?)
+            .ok()?;
         let sealed = snapshot.sealed_live_binding(self.attach_view())?;
         snapshot.delivery_tasks_match(tasks).ok()?;
         let preview =
