@@ -429,6 +429,9 @@ impl super::RedbRecoveryStore {
         page: &OrsBackupPage,
         rows: &[ProcessStreamRecoveryProjection],
     ) -> Result<Vec<ProcessStreamRecoveryWriteOutcome>, OrsError> {
+        // This path COMMITS durable rows, so it carries the same census gate the
+        // three quarantine paths carry. It was the one writer that reached
+        // `import_process_stream_recovery_suspended` without it, which meant a
         validate_import_binding(&import.source, &import.destination)?;
         page.validate_binding()?;
         if page.expires_at_ms <= super::current_unix_ms()? {
@@ -439,6 +442,14 @@ impl super::RedbRecoveryStore {
             // One read transaction for the whole pre-pass, dropped before the
             // first write so no reader overlaps the write loop below.
             let read = self.database.begin_read().map_err(storage)?;
+            // This path COMMITS durable rows, so it carries the same census gate
+            // the three quarantine paths carry. It was the one writer that
+            // reached `import_process_stream_recovery_suspended` without it, so a
+            // store whose census was incomplete could still write recovery rows
+            // and the omission surfaced only later, on somebody's export. It is
+            // the same transaction as the pre-pass, so it describes the same
+            // moment (issue #953, A5).
+            check_row_family_census(&read)?;
             let destination_rows = read
                 .open_table(super::PROCESS_STREAM_RECOVERY)
                 .map_err(storage)?;
@@ -1766,9 +1777,11 @@ fn check_row_family_census(read: &ReadTransaction) -> Result<(), OrsError> {
             });
         }
     }
-    // Check 6 was already discharged by `check_declared_tables_are_censused`
-    // before the transaction was read, because it is the one check that must not
-    // depend on a materialised table.
+    // Check 6 runs inside this function and opens NO transaction and NO table:
+    // it is a pure comparison over crate-level constants, so it does not depend
+    // on a materialised table. Note the read transaction is ALREADY open at each
+    // of this function's three call sites - what check 6 guarantees is
+    // independence from materialisation, not ordering before `begin_read`.
     // Checks 3 and 4, against the family policy this module delegates to.
     let denominator = row_family_denominator();
     for entry in &census {
@@ -4692,11 +4705,13 @@ mod census_tests {
             "the census must also carry family-backed tables; a census of pure exclusions would \
              make the family binding vacuous"
         );
-        assert_eq!(
-            RedbRecoveryStore::backup_row_family_census_counts(),
-            (declared, dispositioned, exclusions),
-            "the public counts accessor must report the same derived numbers the check reads"
-        );
+        // The public accessor is deliberately NOT compared to the numbers this
+        // test just derived. `backup_row_family_census_counts` is a thin
+        // re-export of `census_counts`, so asserting it equals the values read
+        // from the same function compares a value with itself and cannot fail.
+        // What this test actually pins is the DERIVATION: that `declared` comes
+        // from the declaration lists independently of the census, that the two
+        // agree, and that the split is non-degenerate in both directions.
     }
 
     /// Every declared row family is bound to a physical table, and every

@@ -5131,13 +5131,14 @@ impl RedbRecoveryStore {
     /// transaction.
     ///
     /// This exists because those three numbers used to be written by hand in
-    /// this crate's doc comments, and they were wrong twice: once before the
-    /// restore-journal repair and once inside it, where the header said 75/46/29
-    /// while the code held 78/46/30. A transcribed number in a comment is not a
-    /// guarantee and cannot be made one by editing it again, so the counts are
-    /// computed from the same lists `backup_snapshot::check_declared_tables_are_censused` reads
-    /// and a test asserts them. Adding a table now shows up as a test failure
-    /// rather than as a sentence that quietly stopped being true.
+    /// this crate's doc comments, and they disagreed with each other in FOUR
+    /// places at once before this function existed. I am deliberately not
+    /// restating any of those figures here: naming them again is how the fifth
+    /// wrong one gets written, and a reviewer cannot check a number in prose
+    /// without re-deriving it. The counts are computed from the same lists
+    /// `backup_snapshot::check_declared_tables_are_censused` reads, and a test
+    /// asserts them, so adding a table shows up as a test failure rather than as
+    /// a sentence that quietly stopped being true.
     ///
     /// `declared == dispositioned` is the load-bearing relation: it is the
     /// issue's "every stored row family is included or has an explicit
