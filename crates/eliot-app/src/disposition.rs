@@ -2019,4 +2019,24 @@ mod default_members_guard_tests {
             Err("root Cargo.toml default-members section is malformed".to_owned())
         );
     }
+
+    /// Refusal arm W13 exists to hold: a well-formed `default-members` list
+    /// that promotes the facade back into the root default build set.
+    #[test]
+    fn refuses_when_facade_is_listed_in_default_members() {
+        let manifest = concat!(
+            "[workspace]\n",
+            "default-members = [\n",
+            "  \"bins/eliot\",\n",
+            "  \"crates/eliot-app\",\n",
+            "]\n",
+        );
+        assert_eq!(
+            default_members_section_refuses_facade(manifest),
+            Err(
+                "crates/eliot-app must not be in root default-members; facade is not a production root"
+                    .to_owned()
+            )
+        );
+    }
 }
