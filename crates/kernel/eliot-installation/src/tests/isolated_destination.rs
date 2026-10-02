@@ -9,13 +9,20 @@
 //! on is refused, that a materialised root is only ever recorded against the
 //! admission it actually realises, and that cleanup forgets a pair as one fact.
 //!
-//! They are deliberately projection-level: no lease, no directory and no
-//! filesystem is involved, so every refusal observed here is a decision this
+//! Most of these are deliberately projection-level: no lease, no directory and
+//! no filesystem is involved, so every refusal observed here is a decision this
 //! crate's OWN retained records produced. The filesystem half — creating the
 //! root and re-observing its identity — is proved by
 //! `materialise_prepared_isolated_destination` and the registry read/record
 //! seams on the production Host path, which need a retained protected-root
 //! lease.
+//!
+//! The last case in this file is the exception and is deliberately so: it drives
+//! that real materialise seam over a real retained protected-root lease in the
+//! real `ProgramData` contour and asserts on the FILESYSTEM, because the defect
+//! it proves is about what is on disk when a refusal arrives. A boolean the code
+//! returned cannot distinguish "refused before creating" from "created, then
+//! refused".
 //! Test-oracle-only: no production ownership or activation authority.
 
 use eliot_protocol::backup::BackupClassWire;
@@ -26,6 +33,11 @@ use crate::isolated_destination::{
     PreparedDestinationMaterialisation, ProposedRestorationRequirements,
     resolve_current_approved_target,
 };
+// The real-filesystem cases below drive the materialise seam itself, which needs
+// a retained protected-root lease and therefore a real Windows contour. The
+// import is gated with them so it is never an unused import elsewhere.
+#[cfg(windows)]
+use crate::isolated_destination::materialise_prepared_isolated_destination;
 use crate::{
     ApprovedGeneration, ApprovedGenerationRegistry, CandidateManifest, FileIdentity,
     InstallationActivationApproval, InstallationError, IsolatedDestinationError,
@@ -809,4 +821,310 @@ fn a_non_absent_leaf_observation_is_refused_by_both_records() {
             "{observation:?} is not the proof that this operation created that root"
         );
     }
+}
+
+/// A disposable isolated restore area in the REAL `ProgramData` contour, plus
+/// the retained no-follow lease over it.
+///
+/// This is the contour production runs in, so `ProtectedRootLease` accepts it
+/// without any test-only override: the owner resolves the protected root itself
+/// and the lease pins the real OS directory contour by retained handles. It also
+/// holds the `PRODUCTION_INSTALLER_TEST_LOCK` the rest of this crate's real-
+/// `ProgramData` proofs hold, because it writes into the same shared tree.
+#[cfg(windows)]
+struct LiveArea {
+    /// The retained no-follow lease over the area. Held for the whole case.
+    lease: crate::ProtectedRootLease,
+    /// The area path this operation created, used for cleanup and for the
+    /// "nothing else was written here" observation.
+    path: std::path::PathBuf,
+    /// The crate's real-`ProgramData` serialisation lock, held for the whole case.
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(windows)]
+impl LiveArea {
+    /// The area's own resolved canonical root text.
+    fn root_text(&self) -> String {
+        self.lease
+            .canonical_path()
+            .expect("the retained area lease resolves its own canonical root")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// The destination root the owner derives for one destination identity.
+    fn destination_root(&self, destination: &PlatformHandle) -> String {
+        crate::joined_windows_path(&self.root_text(), destination.as_str())
+    }
+
+    /// Drops the retained lease and removes the area this operation created.
+    ///
+    /// Ownership is what makes this legitimate: the path was derived under a name
+    /// unique to this case, created by this operation, and holds nothing but what
+    /// this operation published. The lease is dropped FIRST because its retained
+    /// handles exclude delete sharing and would otherwise block the removal.
+    fn release(self) {
+        let LiveArea {
+            lease,
+            path,
+            _serial,
+        } = self;
+        drop(lease);
+        let _ = std::fs::remove_dir_all(path);
+        drop(_serial);
+    }
+}
+
+#[cfg(windows)]
+fn live_isolated_area(name: &str) -> LiveArea {
+    let serial = super::PRODUCTION_INSTALLER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let program_data = must(crate::protected_program_data_root());
+    let path = program_data
+        .join("Eliot")
+        .join("isolated-restore")
+        .join(name)
+        .join(
+            super::NEXT_TRANSACTION_ROOT
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        );
+    let _ = std::fs::remove_dir_all(&path);
+    // The owner's own protected-directory creator, so the area carries the ACL
+    // and reparse-freedom the lease later demands rather than a bare
+    // `create_dir_all` the lease would have to accept on trust.
+    eliot_platform_windows::prepare_protected_directory(&path)
+        .expect("the isolated area fixture is creatable inside the protected root");
+    let lease = crate::ProtectedRootLease::open_existing(&path)
+        .expect("the isolated area fixture admits a retained protected-root lease");
+    LiveArea {
+        lease,
+        path,
+        _serial: serial,
+    }
+}
+
+/// The `ProgramData`-shaped source roots the materialise-time layout
+/// re-classification is run against, as real paths beside the live area.
+///
+/// `declared_installations_root_for_recorded_source` derives the declared
+/// installations root from the PARENT of the recorded source installation root,
+/// so recording a source root one leaf below `<program_data>\Eliot\installations`
+/// makes the derived declared root exactly the production shape. The live area is
+/// a different leaf under the same profile root, so it — and the destination
+/// derived under it — is classified `Unowned` against that declared root, which
+/// is the condition the materialise pre-effect proof requires.
+#[cfg(windows)]
+fn live_source_roots() -> (String, String) {
+    let installation = must(crate::protected_program_data_root())
+        .join("Eliot")
+        .join("installations")
+        .join(&"a".repeat(64));
+    let installation_root = installation.to_string_lossy().into_owned();
+    let host_root = crate::joined_windows_path(&installation_root, "host");
+    (installation_root, host_root)
+}
+
+/// One admission bound to the LIVE area lease, so the materialise seam's
+/// pre-effect proof passes on its own terms and the generation comparison is the
+/// only thing that can refuse it.
+///
+/// Every recorded value is read back from the live lease or derived with the
+/// owner's own join helper — never spelled out — so this fixture cannot disagree
+/// with production about separators, identity, or which root is the declared
+/// installations area.
+#[cfg(windows)]
+fn live_admission(
+    area: &LiveArea,
+    destination: &PlatformHandle,
+    source_active_generation: &PlatformHandle,
+) -> PreparedDestinationAdmission {
+    let (source_installation_root, source_host_root) = live_source_roots();
+    let target_schema_digest = test_handle("a".repeat(64));
+    let mut admission = PreparedDestinationAdmission {
+        wire: test_handle(PreparedDestinationAdmission::WIRE),
+        operation_id: test_handle("operation:958-live-materialise"),
+        source_installation: test_handle(&"a".repeat(64)),
+        destination_installation: destination.clone(),
+        archive_id: test_handle("archive:958-live"),
+        archive_digest: test_handle("b".repeat(64)),
+        archive_class: BackupClassWire::FullRecovery,
+        current_purge_ledger_revision: LIVE_PURGE_REVISION,
+        target_schema_digest: target_schema_digest.clone(),
+        approved_target_build: source_active_generation.clone(),
+        approved_target_profile: test_handle("system_service"),
+        restoration_requirements: requirements(&target_schema_digest),
+        isolation: IsolationEvidence {
+            wire: test_handle(IsolationEvidence::WIRE),
+            isolated_area_root: area.root_text(),
+            // The lease's OWN observed identity for the area, never a constant: the
+            // pre-effect proof compares this recorded value against the live one.
+            isolated_area_identity: area.lease.identity(),
+            destination_installation_root: area.destination_root(destination),
+            destination_installation_key: destination.clone(),
+            source_installation_root,
+            source_host_root,
+            source_active_generation: source_active_generation.clone(),
+            destination_leaf_observation: DestinationLeafObservation::Absent,
+            evidence_digest: test_handle(&"0".repeat(64)),
+        },
+        admission_digest: test_handle(&"0".repeat(64)),
+    };
+    admission.isolation.evidence_digest = must(admission.isolation.computed_digest());
+    admission.admission_digest = must(admission.computed_digest());
+    must(admission.validate());
+    admission
+}
+
+/// The DECISIVE case: a destination bound to a SUPERSEDED source generation is
+/// refused with NO DIRECTORY CREATED.
+///
+/// # What is being proved
+///
+/// `isolation.source_active_generation` used to be compared ONLY at record time,
+/// inside `record_prepared_isolated_destination_unchecked`. Production calls
+/// `materialise_prepared_isolated_destination` — which performs the real effect,
+/// `OwnedDirectoryPublication::create` then `.publish` — BEFORE it calls
+/// `record_prepared_isolated_destination_creation`. So a stale generation
+/// created a directory on disk and was then refused, leaving that created root
+/// unrecorded: an orphan the authority does not know about. A check that runs
+/// after the effect is not a gate on the effect.
+///
+/// The assertion is therefore on the FILESYSTEM, not on the returned value: a
+/// boolean cannot distinguish "refused before creating" from "created, then
+/// refused", and that distinction is the entire defect.
+///
+/// # Why it fails without the change
+///
+/// Without the comparison in the seam, `prove_isolated_destination_root` passes —
+/// this fixture's area, identity, derived root and disjointness are all live and
+/// consistent — and `OwnedDirectoryPublication` commits the directory. The
+/// call returns `Ok`, and the leaf exists. The refusal assertion fails AND the
+/// filesystem assertion fails, because the root this test requires to be absent
+/// is precisely the orphan the old ordering produced.
+///
+/// # Ownership
+///
+/// See [`LiveArea::release`]: the area and anything published under it are created
+/// by THIS operation under a name unique to this case, and removed by that same
+/// owned path after the retained lease is dropped.
+#[cfg(windows)]
+#[test]
+fn a_superseded_source_generation_creates_no_destination_directory() {
+    let fixture = fixture();
+    // A genuinely NEW installation identity: not the active installation, not the
+    // other approved one, and a valid owner installation key — so the refusal
+    // cannot be attributed to any destination-identity clause.
+    let destination = installation_key("9");
+    let area = live_isolated_area("stale-generation");
+    let destination_root = area.destination_root(&destination);
+    assert!(
+        !std::path::Path::new(&destination_root).exists(),
+        "the fixture starts from an absent leaf, so any root found below was created by this call"
+    );
+
+    // The admission binds the SUPERSEDED generation this authority retains but no
+    // longer has active. The approved set and the handle handed to the seam are
+    // the authority's own CURRENTLY ACTIVE row. Both arms are authority state and
+    // they disagree — which is exactly the condition that must refuse, and exactly
+    // what a forged self-consistent claim cannot produce.
+    let superseded = fixture
+        .registry
+        .generations
+        .iter()
+        .find(|generation| !generation.active)
+        .map(|generation| generation.manifest.generation.clone())
+        .expect("the fixture retains one approved generation that is not active");
+    let admission = live_admission(&area, &destination, &superseded);
+
+    let outcome = materialise_prepared_isolated_destination(
+        &admission,
+        &area.lease,
+        &fixture.registry.generations,
+        &fixture.active_generation,
+    );
+
+    assert!(
+        matches!(
+            outcome,
+            Err(IsolatedDestinationError::Installation(
+                InstallationError::IdentityConflict
+            ))
+        ),
+        "a preparation bound to a generation the source has moved on from is stale; the typed \
+         class is the same one the record-time clause produced, so one class spans both layers"
+    );
+    // THE DECISIVE ASSERTION: the filesystem, not the returned value.
+    assert!(
+        !std::path::Path::new(&destination_root).exists(),
+        "the refusal must arrive BEFORE the publication, but {destination_root} exists on disk: \
+         the stale preparation created an orphan root the authority never recorded"
+    );
+    // Nothing else was written either: no same-parent publication temporary was
+    // staged, because the create step never ran at all.
+    assert_eq!(
+        std::fs::read_dir(&area.path)
+            .expect("the live area is readable while this operation holds its lease")
+            .count(),
+        0,
+        "a pre-effect refusal leaves the isolated area exactly as it found it"
+    );
+
+    area.release();
+}
+
+/// The POSITIVE case: the SAME seam and the SAME live fixture, with the authority's
+/// current generation supplied, DOES create the destination on disk.
+///
+/// Without this the refusal case would pass for the wrong reason — a fixture that
+/// cannot materialise at all would also "create nothing". This case pins that the
+/// fixture is real: the destination root exists on disk afterwards, and the
+/// returned record carries the created object's own observed identity rather than a
+/// value this test supplied.
+#[cfg(windows)]
+#[test]
+fn a_current_source_generation_materialises_the_destination_on_disk() {
+    let fixture = fixture();
+    let destination = installation_key("8");
+    let area = live_isolated_area("current-generation");
+    let destination_root = area.destination_root(&destination);
+    assert!(
+        !std::path::Path::new(&destination_root).exists(),
+        "the fixture starts from an absent leaf, so the creation below is this operation's"
+    );
+    let admission = live_admission(&area, &destination, &fixture.active_generation);
+
+    let materialisation = must(materialise_prepared_isolated_destination(
+        &admission,
+        &area.lease,
+        &fixture.registry.generations,
+        &fixture.active_generation,
+    ));
+
+    assert!(
+        std::path::Path::new(&destination_root).is_dir(),
+        "the publication created the destination root at {destination_root}"
+    );
+    assert!(
+        materialisation.destination_root_identity.volume_serial_number != 0
+            && materialisation.destination_root_identity.file_index != 0,
+        "the creation receipt carries a real observed identity for the created object"
+    );
+    assert_eq!(
+        materialisation.destination_installation_root, destination_root,
+        "the recorded root is the owner-derived destination, not caller text"
+    );
+    assert_eq!(
+        materialisation.admission_digest, admission.admission_digest,
+        "the creation receipt realises this admission and no other"
+    );
+    assert_eq!(
+        materialisation.destination_leaf_observation,
+        DestinationLeafObservation::Absent,
+        "the receipt records the no-follow observation the create step made"
+    );
+
+    area.release();
 }

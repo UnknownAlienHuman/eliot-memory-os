@@ -4014,6 +4014,16 @@ impl ApprovedGenerationRegistry {
         // configuration snapshot the source has since moved on from was retained
         // as if it were current. A mismatch means the bound configuration is
         // stale, which is refused rather than recorded.
+        //
+        // This is the SECOND of two comparisons of the same field, and both are
+        // kept on purpose. `materialise_prepared_isolated_destination` runs the
+        // first BEFORE it creates anything, so a stale generation never produces
+        // a directory; this one re-proves the same property against the very
+        // projection that is about to retain the record, and it closes the window
+        // between the two — a cutover committed after the destination was created
+        // but before it was recorded. Removing this one would widen that window to
+        // the whole materialise step again; removing the other would only restore
+        // the "refused after the effect" ordering this pair exists to prevent.
         if Some(&admission.isolation.source_active_generation) != self.active_generation.as_ref() {
             return Err(InstallationError::IdentityConflict);
         }

@@ -6921,13 +6921,27 @@ impl HostComposition {
         // created object's own observed file identity and the admission digest it
         // was created under come back together, so the recorded admission and the
         // created root are the SAME fact rather than two facts a reader has to
-        // correlate. A refusal here is still PRE-EFFECT for the destination
-        // record: nothing is retained, and a publication that committed without a
-        // readable identity leaves the created root preserved, never removed by
-        // path name.
+        // correlate.
+        //
+        // The authority's OWN approved set and its currently active generation go
+        // in with the call, so the seam can refuse a destination bound to a
+        // SUPERSEDED source generation BEFORE the first step of the publication.
+        // The record-time comparison below cannot do that: it runs after this call
+        // has already committed a directory, so its refusal left a created root
+        // on disk that nothing recorded. Both values are read out of the registry
+        // projection this composition inspected above — `approved_generations()` is
+        // that projection's approved rows and `approved()` is its own ACTIVE row —
+        // so neither is a field of the admitted request.
+        //
+        // A refusal here is still PRE-EFFECT for the destination record: nothing
+        // is created and nothing is retained, and a publication that committed
+        // without a readable identity leaves the created root preserved, never
+        // removed by path name.
         let materialisation = eliot_installation::materialise_prepared_isolated_destination(
             &allocation.admission,
             &area_lease,
+            approved_generations,
+            &approved_target_generation,
         )
         .map_err(|error| Self::isolated_destination_reason(&error))?;
 

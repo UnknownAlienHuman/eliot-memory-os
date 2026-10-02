@@ -87,10 +87,13 @@
 //! # The destination is actually created, and the record proves it
 //!
 //! Admission is pure, so on its own it leaves an admitted-but-absent root.
-//! [`materialise_prepared_isolated_destination`] is the effect step: it creates
-//! the root through the installation authority's own create-new owned-directory
+//! [`materialise_prepared_isolated_destination`] is the effect step: it re-proves
+//! the admission's recorded source generation against the generation this
+//! installation authority CURRENTLY approves — before the first step of the
+//! publication, so a stale generation creates nothing — and then creates the
+//! root through the installation authority's own create-new owned-directory
 //! publication, under the retained [`ProtectedRootLease`] the admission was
-//! proved against, and returns a [`PreparedDestinationMaterialisation`] that
+//! proved against. It returns a [`PreparedDestinationMaterialisation`] that
 //! carries the created object's own observed `FileIdentity` and the
 //! `admission_digest` of the admission it realises. That second record is what
 //! makes "the recorded admission" and "the created root" the same fact rather
@@ -831,20 +834,23 @@ impl ProposedRestorationRequirements {
 ///
 /// Three of these fields exist to be COMPARED, and each has a named consumer:
 ///
-/// - [`Self::source_active_generation`] is compared by
+/// - [`Self::source_active_generation`] is compared FIRST by
+///   [`materialise_prepared_isolated_destination`], against the generation the
+///   installation authority's OWN approved rows currently mark active — before
+///   anything is created — and again by
 ///   [`crate::RedbInstallationRegistry::record_prepared_isolated_destination_creation`]
-///   against the source installation authority's OWN current active generation.
-///   An admission bound to a generation the source has since moved on from is
-///   refused as [`crate::InstallationError::IdentityConflict`], which is what
-///   stops a stale configuration snapshot from being bound as current.
+///   at record time. An admission bound to a generation the source has since
+///   moved on from is refused as [`crate::InstallationError::IdentityConflict`],
+///   which is what stops a stale configuration snapshot from being bound as
+///   current.
 ///
-///   The named consumer is the CREATION entry point rather than
-///   `record_prepared_isolated_destination` because that is the one production
-///   reaches: it delegates to
-///   `record_prepared_isolated_destination_unchecked`, which is where the
-///   comparison lives. The admission-only wrapper is a real function that
-///   performs the same comparison, but nothing outside this crate calls it, so
-///   naming it here would name a consumer no reader is served by.
+///   The materialise-time comparison is the load-bearing one, because that is
+///   where the effect happens. The record-time comparison alone ran after
+///   `OwnedDirectoryPublication::publish` had already committed a directory, so
+///   its refusal left that created root unrecorded — an orphan this authority
+///   does not know about. The two are not redundant: the first proves currency
+///   before the effect, the second re-proves it against the same registry that
+///   is about to retain the record.
 /// - [`Self::source_installation_root`] and [`Self::source_host_root`] are
 ///   re-compared by [`prove_isolated_destination_root`] at materialise time:
 ///   the destination is re-proved DISJOINT from the recorded source root, so a
@@ -871,11 +877,14 @@ pub struct IsolationEvidence {
     pub source_installation_root: String,
     /// Source Host root the preparation reads from.
     pub source_host_root: String,
-    /// Active generation the source installation authority currently holds.
+    /// Active generation the source installation authority held when this
+    /// admission was issued.
     ///
-    /// Compared against the authority's own current active generation by
-    /// [`crate::RedbInstallationRegistry::record_prepared_isolated_destination_creation`];
-    /// a mismatch is refused rather than recorded.
+    /// Compared against the authority's own CURRENTLY ACTIVE approved row by
+    /// [`materialise_prepared_isolated_destination`] BEFORE anything is created,
+    /// and again by
+    /// [`crate::RedbInstallationRegistry::record_prepared_isolated_destination_creation`]
+    /// at record time; a mismatch is refused rather than acted on or recorded.
     pub source_active_generation: PlatformHandle,
     /// The owner's own no-follow observation of the destination leaf at
     /// admission time, taken by [`observe_destination_leaf`].
@@ -2048,6 +2057,39 @@ pub fn admit_prepared_isolated_destination(
 /// a foreign owner now holds is refused at step 1 of
 /// [`OwnedDirectoryPublication::create`] rather than adopted.
 ///
+/// # The generation is proved CURRENT before anything is created
+///
+/// [`IsolationEvidence::source_active_generation`] is compared here, BEFORE the
+/// pre-effect proof and therefore before the first step of the publication,
+/// against the generation this installation authority CURRENTLY approves. That
+/// current generation is not taken on this function's word: `approved_generations`
+/// is the authority's OWN approved rows and `current_approved_target` is resolved
+/// through [`resolve_current_approved_target`], which requires the row it names to
+/// be the one that collection currently marks `active` — the same bit
+/// [`ApprovedGenerationRegistry::validate`](crate::ApprovedGenerationRegistry::validate)
+/// keeps equal to `active_generation()` and
+/// [`ApprovedGenerationRegistry::active`](crate::ApprovedGenerationRegistry::active)
+/// selects on. A handle naming no row is refused as an incomplete observation, and
+/// a retained row the authority has moved off is refused as an identity conflict,
+/// so neither arm can be reached by presenting a target and a source generation
+/// that agree with each other.
+///
+/// This is a GATE, not a report. The same binding was already compared at record
+/// time inside
+/// [`RedbInstallationRegistry::record_prepared_isolated_destination_creation`],
+/// and a comparison that runs after `OwnedDirectoryPublication::publish` has
+/// already committed a directory is not a gate on it: the refusal arrived after a
+/// root existed on disk, and that root was left unrecorded — an orphan this
+/// authority does not know about. A preparation bound to a superseded source
+/// generation is therefore refused with NO directory created.
+///
+/// It is NOT the record-time clause that was removed from the registry. That one
+/// compared the destination's `approved_target_build` against the source's own
+/// active generation — the same field of the same approved row in the production
+/// shape, so it was `a == a` and fired for every legitimate destination. Here the
+/// two arms are different facts from different owners: a durable record's recorded
+/// binding, and the authority's own currently-active approved row.
+///
 /// # What else is re-proved here
 ///
 /// The pre-effect proof also re-derives the destination from the retained lease
@@ -2073,7 +2115,13 @@ pub fn admit_prepared_isolated_destination(
 /// [`IsolatedDestinationRefusal::BoundRecordConflict`] when the derived root
 /// disagrees with the recorded one,
 /// [`IsolatedDestinationRefusal::ArbitraryDestination`] when the destination
-/// identity is not an owner installation key, and
+/// identity is not an owner installation key,
+/// [`IsolatedDestinationError::Installation`] with
+/// [`InstallationError::IncompleteObservation`] when the current approved
+/// target names no row of this authority's approved collection, with
+/// [`InstallationError::IdentityConflict`] when it names a retained row the
+/// authority no longer has active OR when the source generation the admission
+/// recorded is not the one the authority currently approves, and
 /// [`IsolatedDestinationError::Installation`] for a failed or unreconcilable
 /// publication. A publication that committed but whose identity could not be
 /// read back is reported as an installation uncertainty and the created root is
@@ -2082,6 +2130,8 @@ pub fn admit_prepared_isolated_destination(
 pub fn materialise_prepared_isolated_destination(
     admission: &PreparedDestinationAdmission,
     isolated_area_lease: &ProtectedRootLease,
+    approved_generations: &[ApprovedGeneration],
+    current_approved_target: &PlatformHandle,
 ) -> Result<PreparedDestinationMaterialisation, IsolatedDestinationError> {
     // The ORIGINAL retained record is re-validated, so a materialisation can
     // only ever be made for an admission that still validates against its own
@@ -2090,6 +2140,38 @@ pub fn materialise_prepared_isolated_destination(
     admission.validate()?;
     if !valid_installation_key(admission.destination_installation.as_str()) {
         return Err(IsolatedDestinationRefusal::ArbitraryDestination.into());
+    }
+
+    // (1) The source generation this admission was BOUND to is compared against
+    //     the generation THIS installation authority CURRENTLY approves, before
+    //     the pre-effect proof and therefore before the first step of the
+    //     publication. A preparation bound to a generation the source has since
+    //     moved on from creates NOTHING.
+    //
+    //     Why it lives here and not only at record time: the record-time
+    //     comparison inside `record_prepared_isolated_destination_creation` runs
+    //     AFTER this function has already performed its real effect. A check
+    //     that runs after the effect is not a gate on the effect — it left a
+    //     refusal that had already created a directory on disk and left that
+    //     created root unrecorded, an orphan the authority does not know about.
+    //
+    //     Why this is not the deleted record-time clause: that clause compared
+    //     the destination's APPROVED TARGET BUILD against the source's own active
+    //     generation, which in the production shape are the same field of the
+    //     same approved row, so it was `a == a`. This compares the admission's
+    //     RECORDED binding against the generation the authority's OWN retained
+    //     approved rows currently mark active, resolved through
+    //     `resolve_current_approved_target` — the same mechanism, and the same
+    //     `active` bit, that decides currency at admission. Both arms are
+    //     authority state: one is this durable record, the other is the
+    //     authority's own approved collection, so a forged pair of fields that
+    //     merely agree with each other cannot satisfy it.
+    let approved_target =
+        resolve_current_approved_target(approved_generations, current_approved_target)?;
+    if &admission.isolation.source_active_generation != &approved_target.manifest.generation {
+        return Err(IsolatedDestinationError::Installation(
+            InstallationError::IdentityConflict,
+        ));
     }
 
     // Everything before the create is one pre-effect proof of WHAT this
