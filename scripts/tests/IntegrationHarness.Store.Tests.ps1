@@ -188,6 +188,36 @@ function Get-StoreTestStartReceipt {
     return (Invoke-StoreStart -Binding $Binding -Allocation $Allocation -Acquisition (Get-StoreTestAcquisition) -Launcher $launcher -Entropy $entropy)
 }
 
+# Reconcile the run root this fixture actually owns. A launch or a stop whose
+# outcome could not be proven writes a reconciliation record into its own owned
+# run root, and an unresolved one deliberately blocks the next Start onto that
+# same root (IntegrationHarness.Store.psm1:1574). That is the product working:
+# a caller that proved the store never came up MUST resolve the record before it
+# replaces the instance, or it is exactly the orphan the record exists to stop.
+# The resolution here is the harness's OWN root, checked against the fixture
+# owner marker first so it can only ever touch what this suite created, and it
+# is bounded to roots this suite's fixture run id allocated. Nothing is weakened:
+# the guard still refuses any record that is not resolved.
+function Complete-StoreTestFixtureReconciliation {
+    param([hashtable]$Binding, [hashtable]$Allocation, [string]$Resolution)
+    if ($null -eq $Allocation) { return $null }
+    $fixtureRunId = '0123456789abcdef0123456789abcdef'
+    $runRoot = [System.IO.Path]::GetFullPath([string]$Allocation['runRoot'])
+    if ($runRoot.TrimEnd([System.IO.Path]::DirectorySeparatorChar) -notmatch ('eliot-store-' + $fixtureRunId + '-')) {
+        throw ('harness refused to reconcile a run root it did not allocate: ' + $runRoot)
+    }
+    $markerPath = Join-Path $runRoot '.eliot-harness-owner.json'
+    if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) { return $null }
+    $marker = $null
+    try { $marker = Get-Content -LiteralPath $markerPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch { return $null }
+    if ([string]$marker.run_id -cne [string]$Binding['runId'] -or
+        [string]$marker.owner -cne [string]$Binding['owner']) {
+        throw ('harness refused to reconcile a foreign-owned run root: ' + $runRoot)
+    }
+    return (Resolve-StoreReconciliationRecord -FileSystem (New-StoreDefaultFileSystem) -RunRoot $runRoot `
+        -RunId ([string]$Binding['runId']) -Resolution $Resolution)
+}
+
 function Read-StoreModuleSource {
     param([Parameter(Mandatory)][string]$Path)
     $info = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
@@ -838,6 +868,32 @@ function Test-StoreCase12 {
     Assert-StoreTrue $Failures (-not [bool]$result['retryPermitted']) '12-no-retry'
     Assert-StoreTrue $Failures ($calls['count'] -eq 1) '12-single-attempt'
     Assert-StoreTrue $Failures ($null -eq $result['observed']) '12-no-observed'
+    # The record that was just written is what makes the instance non-retryable,
+    # so the case shows the guard firing ON THE RECORD THIS CASE WROTE: a second
+    # Start onto the same owned run root is refused with the typed
+    # STORE-RECONCILIATION-REQUIRED refusal rather than silently relaunching.
+    $unresolvedRefusal = ''
+    try {
+        [void](Invoke-StoreStart -Binding $binding -Allocation $allocation -Acquisition (Get-StoreTestAcquisition) `
+            -Launcher (New-StoreTestLauncher) -Entropy { return '0123abcd' })
+    }
+    catch { $unresolvedRefusal = [string]$_.Exception.Message }
+    Assert-StoreTrue $Failures ($unresolvedRefusal -match '^STORE-RECONCILIATION-REQUIRED:') ('12-unresolved-record-blocks-replacement: ' + $unresolvedRefusal)
+    Assert-StoreTrue $Failures ($calls['count'] -eq 1) '12-blocked-replacement-made-no-launch'
+    # ...and it is the RECORD, not the call, that was blocking: once a caller
+    # reconciles its own owned root the same Start succeeds, so the guard is
+    # demanding reconciliation rather than refusing starts outright.
+    [void](Complete-StoreTestFixtureReconciliation -Binding $binding -Allocation $allocation `
+        -Resolution '12-case-proved-no-store-process-was-started')
+    $afterResolveRefusal = ''
+    $afterResolve = $null
+    try {
+        $afterResolve = Invoke-StoreStart -Binding $binding -Allocation $allocation -Acquisition (Get-StoreTestAcquisition) `
+            -Launcher (New-StoreTestLauncher) -Entropy { return '0123abcd' }
+    }
+    catch { $afterResolveRefusal = [string]$_.Exception.Message }
+    Assert-StoreTrue $Failures ([string]::IsNullOrWhiteSpace($afterResolveRefusal)) ('12-resolved-record-allows-replacement: ' + $afterResolveRefusal)
+    Assert-StoreTrue $Failures ([string]$afterResolve['startState'] -ceq 'StartRequested') '12-resolved-record-started'
 }
 
 # ---------------------------------------------------------------------------
