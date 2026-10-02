@@ -31,10 +31,27 @@ fn tool_digest(tool: &serde_json::Value) -> String {
     eliot_contracts::sha256_hex(&bytes)
 }
 
+/// The bounded evidence query the daemon poller pair serves.
+///
+/// `intent` carries BOTH halves the two admission owners read: `mode` is the
+/// query mode the closed selector owner projects
+/// (`host_request_route::local_read_selectors_from_tool`), and the remaining
+/// five fields are the I7.24 expensive-class intent the pre-dispatch owner
+/// demands (`tool_exposure::build_tool_call_request`, read through
+/// `eliot_receipts::ToolCallIntent`). `eliot.query` is admitted as
+/// `ToolCallClass::BroadSearch`, so it is never intent-exempt: a `mode`-only
+/// intent leaves the owner unable to build a `ToolCallRequest`, and the whole
+/// admission fails closed as `TransportError::SessionFenced`.
 fn query_tool() -> serde_json::Value {
     serde_json::json!({"name":"eliot.query","arguments":{
         "intent":{
-            "mode":"verification"
+            "mode":"verification",
+            "expected_delta":"the evidence pack for subject evidence-alpha",
+            "cheaper_route_insufficient":
+                "no cached or exact route carries this subject's revision heads",
+            "budget":"one bounded evidence pack",
+            "stop_conditions":"a complete evidence pack, or an empty pack",
+            "retry_conditions":"retry only while the deadline has not elapsed"
         },
         "query":"subject:evidence-alpha",
         "exact_resource_uri": null
