@@ -2006,4 +2006,79 @@ mod tests {
             );
         }
     }
+
+    /// The inventory proofs of the `ExtractToCurrentOwner` rows that
+    /// `expiry_condition_guard` skips. Rows 1-2 are the plugin directory names
+    /// owned by #13/#1719/#2968; rows 3-6 are the `apps/Eliot.Operator/**`
+    /// contracts owned by #18/#1213/#13/#1137.
+    const UNDATED_EXTRACT_ROW_PROOFS: [&str; 6] = [
+        "integrations/agent-runtimes/host-bundle.manifest.json",
+        "integrations/codex/route-profile.json",
+        "apps/Eliot.Operator/Protocol/OperatorContracts.cs",
+        "apps/Eliot.Operator/Protocol/OperatorIntent.cs",
+        "apps/Eliot.Operator/Protocol/OperatorResponseBounds.cs",
+        "apps/Eliot.Operator/README.md",
+    ];
+
+    #[test]
+    fn expiry_condition_guard_skips_every_row_without_a_dated_removal_condition() {
+        // The guard's only exemption is written at `expiry_condition_guard`
+        // (crates/eliot-app/src/disposition.rs:1555):
+        //     if entry.disposition != Disposition::TemporaryFixture { continue; }
+        // The skip runs before any `Err` can be produced, so an undated row is
+        // decided by the data, not by the guard. This reads that condition back
+        // over the shipped inventory and pins what it actually does.
+        let (extract_rows, fixture_rows) =
+            current_consumer_inventory()
+                .iter()
+                .partition(|entry| entry.disposition == Disposition::ExtractToCurrentOwner);
+
+        assert!(
+            !fixture_rows.is_empty(),
+            "the guard is blind without a temporary fixture row"
+        );
+
+        // Every row the guard does inspect carries the removal word and a dated
+        // condition, so the guard is refusing nothing today and all six of its
+        // refusal branches are currently unexercised by the shipped inventory.
+        for entry in &fixture_rows {
+            assert!(
+                entry.expiry.to_ascii_lowercase().contains("remove"),
+                "temporary fixture {} must record a removal condition",
+                entry.proof
+            );
+            assert!(
+                first_iso_date_digits(entry.expiry).is_some(),
+                "temporary fixture {} must record a YYYY-MM-DD removal date",
+                entry.proof
+            );
+        }
+
+        // The six skipped rows carry an undated `remove when ...` condition
+        // naming a downstream owner. `first_iso_date_digits` finds no date, so
+        // `expiry_condition_guard` has nothing to compare against INVENTORY_REVISION
+        // and never reaches the row.
+        let undated: Vec<&str> = extract_rows
+            .iter()
+            .filter(|entry| first_iso_date_digits(entry.expiry).is_none())
+            .map(|entry| entry.proof)
+            .collect();
+        assert_eq!(
+            undated, UNDATED_EXTRACT_ROW_PROOFS,
+            "the set of undated extract rows changed; the pinned six rows are \
+             disposition.rs:1210, 1217, 1266, 1273, 1280, 1287"
+        );
+
+        // Executed proof of the finding: with all six undated rows present, the
+        // guard as written still answers Ok. A consumer row carrying no dated
+        // removal condition is not covered by this guard at all. The test pins
+        // that behaviour rather than the behaviour the guard name suggests; the
+        // guard is NOT weakened and no expiry condition is invented.
+        assert_eq!(
+            expiry_condition_guard(),
+            Ok(()),
+            "with six undated ExtractToCurrentOwner rows present, expiry_condition_guard \
+             still answers Ok: an undated row passes unchecked"
+        );
+    }
 }
