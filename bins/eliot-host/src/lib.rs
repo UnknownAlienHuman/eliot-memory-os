@@ -210,6 +210,65 @@ fn runtime_control_request_terminal_correlation(
     )
 }
 
+/// Projects the owner-issued identity of one admitted backup runtime-control
+/// request into the immutable terminal correlation (F-LOG-HOST-2, #893 D2/D3).
+///
+/// The admitted backup dispatch request is a RUNTIME-CONTROL request, not a
+/// Phase-B transaction: it issued no materialization effect, and filling the
+/// `tx`/`effect` slots with its transport handles would claim a join to
+/// activation records that have nothing to do with this operation. Its
+/// owner-issued identity is exactly `(request_id, mutation_digest,
+/// request_digest)` — the same three handles and the same `req_id`/`mutation`/
+/// `req` spellings [`runtime_control_request_terminal_correlation`] binds for the
+/// sibling runtime-control requests, so a terminal and its subordinate dispatch
+/// records join by exact field equality (I13.11). Pure projection of handles the
+/// authenticated pipe already delivered: nothing is probed, synthesized, cached,
+/// or hashed here, and nonsecret digests only, never a credential value,
+/// payload, path, or arbitrary error text (I15.4).
+#[cfg(windows)]
+fn backup_dispatch_request_terminal_correlation(
+    request: &eliot_host_control_endpoint::BackupRuntimeControlRequest,
+) -> host_diagnostics::HostRequestIdentityCorrelation {
+    host_diagnostics::HostRequestIdentityCorrelation::bound(
+        request.request_id.as_str(),
+        request.mutation_digest.as_str(),
+        request.request_digest.as_str(),
+    )
+}
+
+/// Projects the owner-issued identity of one admitted cutover payload into the
+/// immutable terminal correlation (F-LOG-HOST-2, #893 D2/D3).
+///
+/// The admitted payload's owner-issued identity is exactly its own
+/// `operation.operation_id` / `operation.installation` /
+/// `operation.request_digest` — the triple the sealed cutover records of the
+/// same operation already render as `operation_id`/`installation`/
+/// `request_digest`. A cutover issues no Phase-B transaction and no
+/// materialization effect, so this binds through the request-identity projection
+/// rather than filling `tx`/`effect` with handles that were never issued under
+/// that vocabulary; the `req` slot carries the exact request digest, so two
+/// concurrent admitted cutovers that end in the same frozen
+/// `host-backup-cutover-failed` code stay distinguishable by a shared field
+/// rather than by record order (I13.11).
+///
+/// The projection binds at ARMING, before `admitted_cutover_operation` proves
+/// the presented body: it is a claim about WHICH admitted operation failed, not
+/// a re-proof of it, and it is what makes the pre-admission refusal arms of
+/// these two ports attributable at all. Pure projection of handles the
+/// authenticated pipe already delivered — no re-seal, no digest recomputation,
+/// no owner read, no lookup — and nonsecret handles only, never a credential
+/// value, payload, path, or error text (I15.4).
+#[cfg(windows)]
+fn cutover_request_terminal_correlation(
+    request: &crate::backup_cutover::CutoverRequest,
+) -> host_diagnostics::HostRequestIdentityCorrelation {
+    host_diagnostics::HostRequestIdentityCorrelation::bound(
+        request.operation.operation_id.as_str(),
+        request.operation.installation.as_str(),
+        request.operation.request_digest.as_str(),
+    )
+}
+
 /// Projects the owner-issued Phase-B operation identity of one live request
 /// into the immutable terminal correlation (F-LOG-HOST-2, #893 D1).
 ///
@@ -318,13 +377,16 @@ fn host_lifecycle_observe_identity(projection: &host_diagnostics::HostRequestPro
 /// starts explicitly uncorrelated — a boundary that has no operation subject
 /// yet says so — and the owner binds the identity through
 /// [`HostTerminalGuard::bind_operation`] once the live operation subject
-/// exists. The projection is fixed for the rest of the guarded operation:
-/// never re-armed, never cleared, never synthesized here. This mirrors the
+/// exists, or through [`HostTerminalGuard::bind_request_identity`] where that
+/// subject is an authenticated request rather than a Phase-B transaction. The
+/// projection is fixed for the rest of the guarded operation: never re-armed,
+/// never cleared, never synthesized here. This mirrors the
 /// `CredentialTerminalGuard` model in `credential_control.rs` without
 /// touching it.
 struct HostTerminalGuard {
     boundary: &'static HostLifecycleBoundary,
     correlation: host_diagnostics::HostTerminalCorrelation,
+    request_identity: Option<host_diagnostics::HostRequestIdentityCorrelation>,
     armed: bool,
 }
 
@@ -333,6 +395,7 @@ impl HostTerminalGuard {
         Self {
             boundary,
             correlation: host_diagnostics::HostTerminalCorrelation::unavailable(),
+            request_identity: None,
             armed: true,
         }
     }
@@ -353,6 +416,24 @@ impl HostTerminalGuard {
         self.correlation = correlation;
     }
 
+    /// Retains the owner-issued identity of a runtime-control style request the
+    /// guarded operation is executing (F-LOG-HOST-2, #893 D3).
+    ///
+    /// Sibling of [`HostTerminalGuard::bind_operation`], chosen when the failing
+    /// operation's subject is an authenticated REQUEST rather than a Phase-B
+    /// transaction: the admitted backup runtime-control request names its own
+    /// `request_id`/`mutation_digest`/`request_digest`, and those are the exact
+    /// `req_id`/`mutation`/`req` handles the subordinate dispatch records of the
+    /// same operation already render. Pure retention of handles already in hand:
+    /// nothing is probed, synthesized, cached, or hashed, and the record gains no
+    /// secret-bearing field.
+    fn bind_request_identity(
+        &mut self,
+        correlation: host_diagnostics::HostRequestIdentityCorrelation,
+    ) {
+        self.request_identity = Some(correlation);
+    }
+
     fn disarm(&mut self) {
         self.armed = false;
     }
@@ -360,9 +441,18 @@ impl HostTerminalGuard {
 
 impl Drop for HostTerminalGuard {
     fn drop(&mut self) {
-        if self.armed {
-            host_lifecycle_observe_terminal_with_correlation(self.boundary, &self.correlation);
+        if !self.armed {
+            return;
         }
+        // Exactly one terminal record either way. A boundary whose operation
+        // subject is an authenticated request emits through the request-identity
+        // projection; every other boundary keeps the Phase-B tx/effect/req
+        // projection, explicitly unavailable until `bind_operation` supplies it.
+        if let Some(request_identity) = &self.request_identity {
+            host_lifecycle_observe_terminal_with_request_identity(self.boundary, request_identity);
+            return;
+        }
+        host_lifecycle_observe_terminal_with_correlation(self.boundary, &self.correlation);
     }
 }
 
@@ -6768,6 +6858,15 @@ impl HostComposition {
         // named owner refusals for the prepare and cutover arms — emits exactly
         // one terminal record for this operation.
         let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_BACKUP_DISPATCH_TERMINAL);
+        // F-LOG-HOST-2 (#893 D2/D3): the operation's own subject is the admitted
+        // request the authenticated pipe delivered, in hand before anything else
+        // runs, and the reconciliation arm below names `request.request_id` as
+        // this operation's identity. It issued no Phase-B transaction, so the
+        // request-identity projection is the exact vocabulary, and every later
+        // `?` return — the closed-table miss, the reconciliation refusal arms and
+        // the two named owner refusals — emits a terminal carrying the same
+        // `req_id`/`mutation`/`req` token its subordinate dispatch records use.
+        host_terminal.bind_request_identity(backup_dispatch_request_terminal_correlation(request));
         let operation = request.operation;
         let Some(target) = HostComposition::backup_dispatch_target(operation) else {
             return Err(BackupDispatchRefusal::new(
@@ -7261,6 +7360,17 @@ impl HostComposition {
         // nonterminal and correlate beneath it. Operation failure stays
         // distinct from a separate process shutdown failure.
         let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_BACKUP_CUTOVER_TERMINAL);
+        // F-LOG-HOST-2 (#893 D2/D3): the admitted payload's own
+        // `operation_id`/`installation`/`request_digest` are already in hand at
+        // arming, so the terminal binds them here rather than reporting an empty
+        // correlation for a failure it can name. This is what makes the
+        // `admitted_cutover_operation(request)?` arm below — the pre-admission
+        // refusal — attributable to one exact operation: two concurrent
+        // cutovers with different request digests now end in distinguishable
+        // `req` fields instead of two byte-identical frozen codes (I13.11).
+        // Pure projection of handles already held; nothing is probed, re-proved,
+        // or synthesized, and the returned `Result` and its order are untouched.
+        host_terminal.bind_request_identity(cutover_request_terminal_correlation(request));
         // Real dispatch decision, resolved from the admitted cutover payload
         // itself rather than from the routing table: the presented body must
         // first prove it is the body the owner admitted, and only then does the
@@ -7574,6 +7684,15 @@ impl HostComposition {
         // shutdown failure. The leaf's `retire` refusal records stay
         // nonterminal beneath it.
         let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_BACKUP_CUTOVER_RETIRE_TERMINAL);
+        // F-LOG-HOST-2 (#893 D2/D3): same admitted payload identity the
+        // activation port binds, and for the same reason — the retirement is a
+        // separate operation with its own terminal, so its
+        // `admitted_cutover_operation(request)?` refusal and the
+        // not-separately-admitted refusal below must name WHICH admitted cutover
+        // they refused, not only which frozen code they share with the
+        // activation port (I13.11). Pure projection of handles already held; no
+        // probe, no re-proof, no change to the returned `Result`.
+        host_terminal.bind_request_identity(cutover_request_terminal_correlation(request));
         // Same admitted-payload resolution as the activation port: the body
         // must prove it is the body the owner admitted, and the separately
         // supplied selector must then agree with the operation that body
