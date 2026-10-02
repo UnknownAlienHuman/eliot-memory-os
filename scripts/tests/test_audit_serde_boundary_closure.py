@@ -1,9 +1,12 @@
 """Deterministic coordinator tests for serialized trust-boundary closure (#710, Slice B).
 
 Declared denominator: 20 cases, exactly 1..20.
-Slice B owns tests plus frozen synthetic fixtures only; the checker itself
-is owned by Slice A and is never imported as a hard dependency here.
-Frozen fixtures live under scripts/testdata/serde-boundary-closure/.
+Slice B owns tests plus frozen synthetic fixtures only; the 20 fixture cases
+below never import the checker, so they stay independent of its code.
+Issue #2701 adds the fake-API admission regressions at the end of this file
+(``CheckedInventoryAdmissionTests``): that class loads the coordinator by path
+because #2701's required completion 8 puts the smallest API-failure
+regressions here. Frozen fixtures live under scripts/testdata/serde-boundary-closure/.
 
 Base: dfa3547e62544e4df311a61a8ff3c61b629f89f7
 Branch: work/710-serde-closure-tests
@@ -11,14 +14,30 @@ Branch: work/710-serde-closure-tests
 
 from __future__ import annotations
 
+import ast
 import base64
+import contextlib
 import hashlib
+import importlib.util
+import io
 import json
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+COORDINATOR_SCRIPT = REPO_ROOT / "scripts" / "audit-serde-boundary-closure.py"
+INVENTORY_SCRIPT = REPO_ROOT / "scripts" / "serde_boundary_inventory.py"
 FIXTURE_DIR = REPO_ROOT / "scripts" / "testdata" / "serde-boundary-closure"
+
+_coordinator_spec = importlib.util.spec_from_file_location(
+    "audit_serde_boundary_closure", COORDINATOR_SCRIPT
+)
+assert _coordinator_spec is not None and _coordinator_spec.loader is not None
+coordinator = importlib.util.module_from_spec(_coordinator_spec)
+sys.modules[_coordinator_spec.name] = coordinator
+_coordinator_spec.loader.exec_module(coordinator)
 
 FROZEN_FIXTURES = [
     "case-01-denominator.json",
@@ -400,6 +419,352 @@ class SerdeBoundaryClosureTests(unittest.TestCase):
         tampered = dict(fix["json_output"])
         tampered["coverage"] = "0/20"
         self.assertNotEqual(sha256_hex(canonical_bytes(tampered)), fix["json_digest"])
+
+
+# ---------------------------------------------------------------------------
+# #2701: fake-API admission regressions for the #929 checked-result boundary.
+#
+# ``producer_shaped_result`` is constructed from #929's own key names, not
+# from a run: ``check(root)`` returns rows/digest/header,
+# ``validate_against_artifact`` projects exactly candidate_id/id/disposition/
+# owner/digest per row, and ``build_inventory`` names every header key. It
+# therefore proves the admission boundary admits genuine producer output
+# without a tree scan, and that the accepted key sets cannot silently drift
+# narrower than the producer's own shape.
+# ---------------------------------------------------------------------------
+
+SHA_A = "a" * 64
+SHA_B = "b" * 64
+SHA_C = "c" * 64
+BASE_SHA = "d" * 40
+
+
+def producer_shaped_result() -> dict:
+    """A ``check(root)`` result with exactly #929's producer key names."""
+    rows = [
+        {
+            "candidate_id": "cand.current",
+            "id": "cand.current",
+            "disposition": "current-closed",
+            "owner": "#930",
+            "digest": SHA_A,
+        },
+        {
+            "candidate_id": "cand.repair",
+            "id": "cand.repair",
+            "disposition": "needs-repair",
+            "owner": "#977",
+            "digest": SHA_B,
+        },
+        {
+            "candidate_id": "cand.unknown",
+            "id": "cand.unknown",
+            "disposition": "unknown",
+            "owner": "unknown",
+            "digest": SHA_C,
+        },
+    ]
+    header = {
+        "schema": "eliot.serde-boundary-inventory.v1",
+        "tool_version": "0.5.0",
+        "rule_revision": "929.5",
+        "proof_ceiling": "SOURCE_INVENTORY_AND_OWNERSHIP_ONLY",
+        "issue": 929,
+        "base_sha": BASE_SHA,
+        "base_sha_source": "git-rev-parse-HEAD",
+        "provenance_authority": (
+            "informational-observational-outside-proof-ceiling"
+        ),
+        "canonical_excludes": ["base_sha", "base_sha_source"],
+        "denominator_status": "COMPLETE",
+        "ambiguous_reason": "",
+        "coverage": "COMPLETE",
+        "family_readiness": "BLOCKED",
+        "family_blocked_reason": "unknown-evidence: 1 rows need explicit resolution",
+        "safety": "FINDINGS_REMAIN_BLOCKING",
+        "candidate_count": len(rows),
+        "classified_count": len(rows),
+        "unknown_count": 1,
+        # Only the unknown row has an empty #929 repair_child.
+        "unassigned_count": 1,
+        "ready_children": 1,
+        "blocked_children": 1,
+        "denominator_digest": SHA_B,
+        "aggregate_digest": SHA_A,
+    }
+    return {"rows": rows, "digest": header["aggregate_digest"], "header": header}
+
+
+def mutate(path: list, value) -> dict:
+    """Return a fresh producer-shaped result with one nested value replaced."""
+    result = producer_shaped_result()
+    cursor = result
+    for key in path[:-1]:
+        cursor = cursor[key]
+    cursor[path[-1]] = value
+    return result
+
+
+def producer_source_key_names() -> tuple:
+    """Read #929's own key names out of its source, without running it.
+
+    ``build_inventory``'s header literal, ``validate_against_artifact``'s row
+    projection and ``check``'s return value are the producer's real contract.
+    Reading them here keeps the admission proof anchored to the producer
+    instead of to this test's transcription of it.
+    """
+    tree = ast.parse(INVENTORY_SCRIPT.read_text(encoding="utf-8"))
+    functions = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+    }
+    header_assign = next(
+        node
+        for node in ast.walk(functions["build_inventory"])
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "header"
+            for target in node.targets
+        )
+        and isinstance(node.value, ast.Dict)
+    )
+    row_projection = next(
+        node
+        for node in ast.walk(functions["validate_against_artifact"])
+        if isinstance(node, ast.Return)
+        and isinstance(node.value, ast.ListComp)
+        and isinstance(node.value.elt, ast.Dict)
+    )
+    result_shape = next(
+        node
+        for node in ast.walk(functions["check"])
+        if isinstance(node, ast.Return) and isinstance(node.value, ast.Dict)
+    )
+    return (
+        {key.value for key in header_assign.value.keys},
+        {key.value for key in row_projection.value.elt.keys},
+        {key.value for key in result_shape.value.keys},
+    )
+
+
+class CheckedInventoryAdmissionTests(unittest.TestCase):
+    """The admission boundary admits #929 output and refuses malformed output."""
+
+    def assert_refused(self, result) -> str:
+        with self.assertRaises(coordinator.InventoryUnavailable) as caught:
+            coordinator._validate_checked_result(result)
+        cause = str(caught.exception)
+        self.assertTrue(
+            cause.startswith("inventory contract failure:"), cause
+        )
+        return cause
+
+    # WORK_UNIT_CASE: 2701/1
+    def test_01_genuine_producer_shape_admitted(self) -> None:
+        admitted = coordinator._validate_checked_result(producer_shaped_result())
+        self.assertEqual(
+            [row.candidate_id for row in admitted.rows],
+            ["cand.current", "cand.repair", "cand.unknown"],
+        )
+        # Legitimate findings survive admission as findings.
+        self.assertEqual(
+            sorted({row.disposition for row in admitted.rows}),
+            ["current-closed", "needs-repair", "unknown"],
+        )
+        self.assertEqual(admitted.aggregate_digest, SHA_A)
+        self.assertEqual(admitted.denominator_digest, SHA_B)
+        self.assertEqual(admitted.base_sha, BASE_SHA)
+        self.assertEqual(admitted.candidate_count, 3)
+        # The accepted key sets must never be narrower than #929's own shape:
+        # a contract that refuses the real producer output breaks the tool.
+        genuine = producer_shaped_result()
+        self.assertEqual(
+            set(coordinator.CHECKED_RESULT_REQUIRED_KEYS), set(genuine)
+        )
+        self.assertEqual(
+            set(coordinator.CHECKED_ROW_REQUIRED_KEYS), set(genuine["rows"][0])
+        )
+        self.assertEqual(
+            set(coordinator.CHECKED_HEADER_REQUIRED_KEYS), set(genuine["header"])
+        )
+        # Extra future keys are tolerated, not refused.
+        extended = producer_shaped_result()
+        extended["header"]["future_field"] = 1
+        extended["rows"][0]["future_row_field"] = "x"
+        self.assertEqual(len(coordinator._validate_checked_result(extended).rows), 3)
+        # #929's own explicit unknown-base fallback stays admitted.
+        fallback = mutate(["header", "base_sha"], coordinator.INVENTORY_UNKNOWN_BASE)
+        self.assertEqual(
+            coordinator._validate_checked_result(fallback).base_sha,
+            coordinator.INVENTORY_UNKNOWN_BASE,
+        )
+
+    # WORK_UNIT_CASE: 2701/2
+    def test_02_conflicting_row_identity_refused(self) -> None:
+        cause = self.assert_refused(
+            mutate(["rows", 0, "candidate_id"], "candidate-A")
+        )
+        self.assertIn("conflicting identities", cause)
+        missing = producer_shaped_result()
+        del missing["rows"][0]["id"]
+        self.assert_refused(missing)
+        blank = mutate(["rows", 0, "id"], "   ")
+        self.assert_refused(blank)
+        duplicate = producer_shaped_result()
+        duplicate["rows"].append(dict(duplicate["rows"][0]))
+        self.assertIn("duplicate row", self.assert_refused(duplicate))
+
+    # WORK_UNIT_CASE: 2701/3
+    def test_03_non_digest_identity_material_refused(self) -> None:
+        self.assert_refused(mutate(["digest"], "x"))
+        self.assert_refused(mutate(["header", "aggregate_digest"], "x"))
+        self.assert_refused(mutate(["header", "denominator_digest"], "y"))
+        self.assert_refused(mutate(["header", "base_sha"], ""))
+        self.assert_refused(mutate(["rows", 0, "digest"], ""))
+        self.assert_refused(mutate(["rows", 0, "owner"], ""))
+        # Uppercase hex is not the lowercase identity #929 emits.
+        self.assert_refused(mutate(["rows", 0, "digest"], "A" * 64))
+        # A truncated or over-long digest is refused as well.
+        self.assert_refused(mutate(["rows", 0, "digest"], SHA_A[:63]))
+        self.assert_refused(mutate(["rows", 0, "digest"], SHA_A + "a"))
+        # Base identity that is not the commit form is refused.
+        self.assert_refused(mutate(["header", "base_sha"], "not-a-commit"))
+
+    # WORK_UNIT_CASE: 2701/4
+    def test_04_foreign_ceiling_and_disposition_refused(self) -> None:
+        cause = self.assert_refused(
+            mutate(["header", "proof_ceiling"], "NOT_THE_929_CEILING")
+        )
+        self.assertIn("proof_ceiling", cause)
+        cause = self.assert_refused(mutate(["rows", 0, "disposition"], "almost-closed"))
+        self.assertIn("disposition", cause)
+        self.assert_refused(mutate(["rows", 1, "disposition"], ["needs-repair"]))
+        # Vocabulary-only accounting checks: not forced to the optimistic value.
+        self.assert_refused(mutate(["header", "denominator_status"], "MAYBE"))
+        self.assert_refused(mutate(["header", "coverage"], "PARTIAL"))
+        self.assert_refused(mutate(["header", "family_readiness"], "MOSTLY"))
+        for vocabulary in (
+            {"denominator_status": "INCOMPLETE", "coverage": "INCOMPLETE"},
+            {"family_readiness": "READY"},
+        ):
+            tolerant = producer_shaped_result()
+            tolerant["header"].update(vocabulary)
+            admitted = coordinator._validate_checked_result(tolerant)
+            self.assertEqual(len(admitted.rows), 3)
+
+    # WORK_UNIT_CASE: 2701/5
+    def test_05_boolean_and_inconsistent_counts_refused(self) -> None:
+        # Python bool is an int subclass; only a real integer count is admitted.
+        self.assert_refused(mutate(["header", "candidate_count"], True))
+        self.assert_refused(mutate(["header", "classified_count"], True))
+        self.assert_refused(mutate(["header", "unknown_count"], True))
+        self.assert_refused(mutate(["header", "unassigned_count"], True))
+        self.assert_refused(mutate(["header", "unknown_count"], 0))
+        self.assert_refused(mutate(["header", "candidate_count"], 999))
+        self.assert_refused(mutate(["header", "classified_count"], 2))
+        self.assert_refused(mutate(["header", "unknown_count"], "1"))
+        self.assert_refused(mutate(["header", "unassigned_count"], -1))
+        self.assert_refused(mutate(["header", "unassigned_count"], 4))
+        # Documented bound only: unassigned_count inside it is admitted.
+        bounded = mutate(["header", "unassigned_count"], 3)
+        self.assertEqual(
+            coordinator._validate_checked_result(bounded).candidate_count, 3
+        )
+        missing = producer_shaped_result()
+        del missing["header"]["unknown_count"]
+        self.assert_refused(missing)
+
+    # WORK_UNIT_CASE: 2701/6
+    def test_06_required_key_sets_refused(self) -> None:
+        for key in sorted(coordinator.CHECKED_HEADER_REQUIRED_KEYS):
+            missing = producer_shaped_result()
+            del missing["header"][key]
+            self.assert_refused(missing)
+        for key in sorted(coordinator.CHECKED_ROW_REQUIRED_KEYS):
+            missing = producer_shaped_result()
+            del missing["rows"][0][key]
+            self.assert_refused(missing)
+        for key in sorted(coordinator.CHECKED_RESULT_REQUIRED_KEYS):
+            missing = producer_shaped_result()
+            del missing[key]
+            self.assert_refused(missing)
+        self.assert_refused({"rows": [], "digest": SHA_A, "header": "nope"})
+        self.assert_refused({"rows": {}, "digest": SHA_A, "header": {}})
+        self.assert_refused(["rows"])
+
+    # WORK_UNIT_CASE: 2701/7
+    def test_07_unverified_count_relationship_is_self_describing(self) -> None:
+        admitted = coordinator._validate_checked_result(producer_shaped_result())
+        self.assertEqual(len(admitted.unverified_count_relationships), 1)
+        report = admitted.unverified_count_relationships[0]
+        self.assertEqual(report.relationship, coordinator.UNASSIGNED_COUNT_RELATIONSHIP)
+        self.assertIn("repair_child", report.relationship)
+        self.assertIn(
+            "0 <= unassigned_count(1) <= candidate_count(3)", report.checked_part
+        )
+        self.assertFalse(report.to_dict()["verified"])
+        result = coordinator.reconcile(
+            coordinator.ReconciliationInput(
+                rows=list(admitted.rows), inventory=admitted
+            )
+        )
+        payload = result.to_dict()["checked_inventory"]
+        self.assertEqual(
+            payload["verified_count_relationships"],
+            list(coordinator.VERIFIED_COUNT_RELATIONSHIPS),
+        )
+        self.assertEqual(len(payload["unverified_count_relationships"]), 1)
+        self.assertFalse(payload["unverified_count_relationships"][0]["verified"])
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            coordinator.print_human(result)
+        text = buffer.getvalue()
+        self.assertIn("inventory counts verified:", text)
+        self.assertIn("inventory NOT verified:", text)
+        self.assertIn("unassigned_count ==", text)
+        self.assertIn("repair_child", text)
+
+    # WORK_UNIT_CASE: 2701/8
+    def test_08_blocked_output_agrees_on_no_current_closure_cases(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="closure2701-") as tmp:
+            root = Path(tmp)
+            report_path = root / "blocked.json"
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code = coordinator.main(
+                    ["--root", str(root), "--json-out", str(report_path)]
+                )
+            cause = stderr.getvalue()
+            self.assertEqual(code, 2)
+            self.assertIn("SERDE_BOUNDARY_CLOSURE: BLOCKED:", cause)
+            # Text and JSON must not disagree about the same result.
+            self.assertIn("no current closure cases", cause)
+            payload = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["cases"], [])
+            self.assertFalse(payload["passed"])
+            self.assertIn("missing file:", payload["blocked_cause"])
+            self.assertIn(payload["blocked_cause"], cause)
+
+    # WORK_UNIT_CASE: 2701/9
+    def test_09_accepted_contract_matches_producer_source_key_names(self) -> None:
+        """The admission contract cannot outgrow or drift from #929's own shape."""
+        header_keys, row_keys, result_keys = producer_source_key_names()
+        # No over-narrowing: every accepted key really is a producer key.
+        self.assertEqual(coordinator.CHECKED_HEADER_REQUIRED_KEYS, header_keys)
+        self.assertEqual(coordinator.CHECKED_ROW_REQUIRED_KEYS, row_keys)
+        self.assertEqual(coordinator.CHECKED_RESULT_REQUIRED_KEYS, result_keys)
+        # #929's ceiling and disposition vocabulary are read from its source.
+        source = INVENTORY_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn(
+            'PROOF_CEILING = "%s"' % coordinator.INVENTORY_PROOF_CEILING, source
+        )
+        for disposition in coordinator.INVENTORY_DISPOSITIONS:
+            self.assertIn('"%s"' % disposition, source)
+        # The producer's row projection really is five keys: repair_child never
+        # crosses this boundary, which is why unassigned_count stays explicitly
+        # reported as unverified instead of silently compared.
+        self.assertNotIn("repair_child", row_keys)
 
 
 if __name__ == "__main__":

@@ -995,6 +995,169 @@ pub async fn run_runtime_supervision_reconcile(
     write_json(&report)
 }
 
+use eliot_engine::delegation::{
+    ProviderCallLedgerCandidate, ProviderCallLedgerCandidateAction,
+    ProviderCallLedgerCandidateDisposition, ProviderCallLedgerReconciliation,
+    ProviderCallReservationOwner,
+};
+
+/// The one operator report a completed provider-call ledger reconciliation is
+/// persisted as.
+///
+/// It is written through the report pair every other operation report in this
+/// module uses: `reports/<name>/latest.json` and `reports/<name>/latest.md`.
+/// The name is deliberately distinct from the operator block's own report, so a
+/// reconciliation never overwrites the record that the ledger was blocked.
+const PROVIDER_CALL_LEDGER_RECONCILE_REPORT: &str =
+    "delegation-provider-call-ledger-reconcile";
+
+/// Name one preserved corrupt provider-call ledger candidate role in a
+/// reconciliation report.
+///
+/// The three roles are the fixed codes the engine loader enumerates, so a report
+/// names a role and never a path or a byte.
+fn provider_call_ledger_candidate_code(
+    candidate: ProviderCallLedgerCandidate,
+) -> &'static str {
+    match candidate {
+        ProviderCallLedgerCandidate::Current => "current",
+        ProviderCallLedgerCandidate::Staged => "staged",
+        ProviderCallLedgerCandidate::Backup => "backup",
+    }
+}
+
+/// Name one explicitly chosen candidate action in a reconciliation report.
+fn provider_call_ledger_candidate_action_code(
+    action: ProviderCallLedgerCandidateAction,
+) -> &'static str {
+    match action {
+        ProviderCallLedgerCandidateAction::PreserveAsQuarantine => "preserve-as-quarantine",
+        ProviderCallLedgerCandidateAction::SupersedeWithRecoveredRecord => {
+            "supersede-with-recovered-record"
+        }
+    }
+}
+
+/// Parse one candidate role the operator named. There is no default role and no
+/// inferred one: a spelling the engine loader does not enumerate refuses.
+fn parse_provider_call_ledger_candidate(value: &str) -> Result<ProviderCallLedgerCandidate> {
+    match value {
+        "current" => Ok(ProviderCallLedgerCandidate::Current),
+        "staged" => Ok(ProviderCallLedgerCandidate::Staged),
+        "backup" => Ok(ProviderCallLedgerCandidate::Backup),
+        other => bail!(
+            "unknown provider call ledger candidate '{other}': name one of current, staged, backup \
+             exactly as the operator block reported it"
+        ),
+    }
+}
+
+/// Parse one action the operator chose. There is no default action and no
+/// implied "the backup is the good one": a spelling that is not one of the two
+/// declared actions refuses.
+fn parse_provider_call_ledger_candidate_action(
+    value: &str,
+) -> Result<ProviderCallLedgerCandidateAction> {
+    match value {
+        "preserve-as-quarantine" => Ok(ProviderCallLedgerCandidateAction::PreserveAsQuarantine),
+        "supersede-with-recovered-record" => {
+            Ok(ProviderCallLedgerCandidateAction::SupersedeWithRecoveredRecord)
+        }
+        other => bail!(
+            "unknown provider call ledger candidate action '{other}': name preserve-as-quarantine \
+             or supersede-with-recovered-record explicitly"
+        ),
+    }
+}
+
+/// Reconcile one unknown authoritative provider-call ledger under an explicit
+/// operator disposition.
+///
+/// Every field of the engine's reconciliation comes from operator input: the
+/// bounded operator identity, one disposition per preserved corrupt candidate,
+/// and the operator's own copy of the ORIGINAL recorded bytes. Nothing is
+/// defaulted, no candidate is inferred, and there is no repairing dry run — a
+/// dry run that still moved bytes would be the silent recovery this path exists
+/// to end.
+///
+/// The admission decision is the engine owner's alone: this function parses
+/// intent, refuses absent or unrecognised intent before a single byte is
+/// touched, calls the engine's `reconcile_provider_call_ledger` once, and
+/// persists the proven outcome. When nothing is admitted the engine reports
+/// `still_unknown` and this report keeps new provider calls blocked.
+pub fn run_provider_call_ledger_reconcile(
+    config_path: &Path,
+    operator_ref: &str,
+    dispositions: &[String],
+    recovered_record: Option<&Path>,
+) -> Result<()> {
+    if operator_ref.trim().is_empty() {
+        bail!("provider call ledger reconciliation requires an explicit --operator-ref identity");
+    }
+    if dispositions.is_empty() {
+        bail!(
+            "provider call ledger reconciliation requires an explicit \
+             --disposition CANDIDATE=ACTION for every preserved corrupt candidate; there is no \
+             default disposition and no inferred choice of candidate"
+        );
+    }
+    let mut named = Vec::new();
+    for raw in dispositions {
+        let Some((candidate, action)) = raw.split_once('=') else {
+            bail!(
+                "provider call ledger disposition '{raw}' must name both a candidate and an action \
+                 as CANDIDATE=ACTION"
+            );
+        };
+        named.push(ProviderCallLedgerCandidateDisposition {
+            candidate: parse_provider_call_ledger_candidate(candidate.trim())?,
+            action: parse_provider_call_ledger_candidate_action(action.trim())?,
+        });
+    }
+    let reconciliation = ProviderCallLedgerReconciliation {
+        dispositions: named,
+        recovered_record_from: recovered_record.map(Path::to_path_buf),
+        operator_ref: operator_ref.to_owned(),
+    };
+    let root = runtime_root(config_path);
+    let outcome =
+        ProviderCallReservationOwner::new(&root).reconcile_provider_call_ledger(&reconciliation)?;
+    let admitted_record_present = outcome.admitted.is_some();
+    let report = serde_json::json!({
+        "component": "provider_call_ledger_reconcile",
+        "operator_ref": reconciliation.operator_ref,
+        "explicit_dispositions": reconciliation
+            .dispositions
+            .iter()
+            .map(|disposition| serde_json::json!({
+                "candidate": provider_call_ledger_candidate_code(disposition.candidate),
+                "action": provider_call_ledger_candidate_action_code(disposition.action),
+            }))
+            .collect::<Vec<_>>(),
+        "recovered_record_supplied": reconciliation.recovered_record_from.is_some(),
+        "admitted": &outcome.admitted,
+        "admitted_record_present": admitted_record_present,
+        "quarantined": outcome
+            .quarantined
+            .iter()
+            .map(|entry| serde_json::json!({
+                "candidate": provider_call_ledger_candidate_code(entry.candidate),
+                "path": &entry.path,
+            }))
+            .collect::<Vec<_>>(),
+        "still_unknown": outcome.still_unknown,
+        "new_provider_calls_allowed": !outcome.still_unknown,
+        "reconciled_at": time::OffsetDateTime::now_utc(),
+    });
+    write_safety_report(
+        &root,
+        PROVIDER_CALL_LEDGER_RECONCILE_REPORT,
+        "Provider Call Ledger Reconciliation",
+        &report,
+    )?;
+    write_json(&report)
+}
+
 pub async fn run_legacy_authority_recovery(
     config_path: &Path,
     dry_run: bool,
@@ -1960,4 +2123,217 @@ fn read_module_manifest(path: &Path) -> Result<ModuleManifest> {
 fn typed_report_markdown<T: serde::Serialize>(title: &str, report: &T) -> Result<String> {
     let value = serde_json::to_value(report)?;
     Ok(report_markdown(title, &value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eliot_engine::ProviderCallCampaignRequest;
+    use eliot_types::TaskId;
+
+    const CAMPAIGN: &str = "provider-call-ledger-reconcile-campaign";
+    const OPERATOR: &str = "operator-936-reconcile";
+    const CORRUPT_CURRENT: &[u8] = b"{\"budgets\": not-json";
+
+    fn scratch_config() -> Result<(PathBuf, PathBuf)> {
+        let root = std::env::temp_dir()
+            .join(format!("eliot-app-ledger-reconcile-{}", TaskId::new_v7()));
+        let config_path = root.join("config").join("governor.toml");
+        let config_parent = config_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("the scratch config path has no parent"))?;
+        std::fs::create_dir_all(config_parent)?;
+        Ok((root, config_path))
+    }
+
+    fn reconcile_report_path(root: &Path) -> PathBuf {
+        root.join("reports")
+            .join(PROVIDER_CALL_LEDGER_RECONCILE_REPORT)
+            .join("latest.json")
+    }
+
+    /// A ledger that admitted a campaign and then lost its current bytes, plus
+    /// the original recorded bytes the operator still holds elsewhere. This is
+    /// the unknown state only explicit reconciliation ends.
+    fn blocked_ledger() -> Result<(PathBuf, PathBuf, Vec<u8>)> {
+        let (root, config_path) = scratch_config()?;
+        let owner = ProviderCallReservationOwner::new(&root);
+        owner.open_campaign(ProviderCallCampaignRequest {
+            campaign_id: CAMPAIGN.to_owned(),
+            max_calls: 2,
+            closed: false,
+        })?;
+        let ledger_path = root.join("runtime").join("provider-call-ledger.json");
+        let recorded = std::fs::read(&ledger_path)?;
+        std::fs::write(&ledger_path, CORRUPT_CURRENT)?;
+        assert!(
+            matches!(
+                owner.snapshot(),
+                Err(eliot_engine::EngineError::ProviderCallLedgerUnknown(_))
+            ),
+            "a corrupt authoritative provider-call ledger must refuse before it is reconciled"
+        );
+        Ok((root, config_path, recorded))
+    }
+
+    /// An explicit operator disposition admits the operator's own recorded bytes
+    /// and unblocks; nothing is inferred, nothing is deleted, and the corrupt
+    /// evidence survives byte-for-byte in quarantine.
+    #[test]
+    fn explicit_operator_disposition_admits_recorded_bytes() -> Result<()> {
+        let (root, config_path, recorded) = blocked_ledger()?;
+        let operator_copy = root.join("operator-recovered-provider-call-ledger.json");
+        std::fs::write(&operator_copy, &recorded)?;
+
+        // Exactly the one candidate the operator block preserved, and exactly
+        // the one action the operator chose for it. A candidate the block did
+        // not preserve, or an action the operator did not name, is not admitted
+        // by naming it here.
+        run_provider_call_ledger_reconcile(
+            &config_path,
+            OPERATOR,
+            &["current=supersede-with-recovered-record".to_owned()],
+            Some(&operator_copy),
+        )?;
+
+        let report: Value = serde_json::from_str(&std::fs::read_to_string(reconcile_report_path(
+            &root,
+        ))?)?;
+        assert_eq!(report["still_unknown"], Value::Bool(false));
+        assert_eq!(report["admitted_record_present"], Value::Bool(true));
+        assert_eq!(report["new_provider_calls_allowed"], Value::Bool(true));
+        assert_eq!(report["operator_ref"], Value::String(OPERATOR.to_owned()));
+        assert_eq!(
+            report["explicit_dispositions"][0],
+            serde_json::json!({"candidate": "current", "action": "supersede-with-recovered-record"})
+        );
+        // The admitted record is the operator's bytes, not a default ledger.
+        assert_eq!(
+            report["admitted"],
+            serde_json::from_slice::<Value>(&recorded)?
+        );
+        assert_eq!(
+            std::fs::read(root.join("runtime").join("provider-call-ledger.json"))?,
+            recorded
+        );
+        // The corrupt bytes were preserved, never deleted or truncated.
+        let superseded = report["quarantined"]
+            .as_array()
+            .and_then(|entries| entries.first())
+            .and_then(|entry| entry["path"].as_str())
+            .map(PathBuf::from);
+        let superseded = superseded.ok_or_else(|| {
+            anyhow::anyhow!("the superseded corrupt candidate was not preserved in quarantine")
+        })?;
+        assert_eq!(std::fs::read(&superseded)?, CORRUPT_CURRENT);
+        assert!(matches!(
+            ProviderCallReservationOwner::new(&root).snapshot(),
+            Ok(ledger) if !ledger.budgets.is_empty()
+        ));
+
+        std::fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    /// The refusal one intent must produce, or a panic naming the intent that
+    /// was wrongly admitted.
+    fn refused_reconciliation(
+        intent: &str,
+        operator_ref: &str,
+        dispositions: &[String],
+        recovered_record: Option<&Path>,
+        config_path: &Path,
+    ) -> anyhow::Error {
+        match run_provider_call_ledger_reconcile(
+            config_path,
+            operator_ref,
+            dispositions,
+            recovered_record,
+        ) {
+            Ok(()) => panic!("{intent} must refuse, not reconcile"),
+            Err(error) => error,
+        }
+    }
+
+    /// Absent, ambiguous or unauthorised intent refuses before the engine is
+    /// reached, and the refused ledger's bytes are still exactly where the
+    /// operator block left them: the state stays unknown.
+    #[test]
+    fn absent_or_unrecognised_reconciliation_intent_refuses_and_keeps_bytes() -> Result<()> {
+        let (root, config_path, _recorded) = blocked_ledger()?;
+        let ledger_path = root.join("runtime").join("provider-call-ledger.json");
+
+        let no_disposition = refused_reconciliation(
+            "a reconciliation that names no disposition",
+            OPERATOR,
+            &[],
+            Some(&root.join("operator-recovered-provider-call-ledger.json")),
+            &config_path,
+        );
+        assert!(
+            no_disposition.to_string().contains("no default disposition"),
+            "{no_disposition}"
+        );
+
+        let no_operator = refused_reconciliation(
+            "a reconciliation without an operator identity",
+            "  ",
+            &["current=supersede-with-recovered-record".to_owned()],
+            None,
+            &config_path,
+        );
+        assert!(
+            no_operator.to_string().contains("--operator-ref"),
+            "{no_operator}"
+        );
+
+        let unknown_candidate = refused_reconciliation(
+            "an unrecognised candidate name",
+            OPERATOR,
+            &["newest=preserve-as-quarantine".to_owned()],
+            None,
+            &config_path,
+        );
+        assert!(
+            unknown_candidate
+                .to_string()
+                .contains("unknown provider call ledger candidate"),
+            "{unknown_candidate}"
+        );
+
+        let malformed_pair = refused_reconciliation(
+            "a disposition that names no action",
+            OPERATOR,
+            &["current".to_owned()],
+            None,
+            &config_path,
+        );
+        assert!(
+            malformed_pair
+                .to_string()
+                .contains("must name both a candidate and an action"),
+            "{malformed_pair}"
+        );
+
+        // Every refusal left the corrupt bytes untouched and admitted nothing.
+        assert_eq!(std::fs::read(&ledger_path)?, CORRUPT_CURRENT);
+        assert!(!reconcile_report_path(&root).is_file());
+        assert!(
+            matches!(
+                ProviderCallReservationOwner::new(&root).snapshot(),
+                Err(eliot_engine::EngineError::ProviderCallLedgerUnknown(_))
+            ),
+            "a refused reconciliation must not leave a loadable ledger behind"
+        );
+        assert!(
+            !root
+                .join("runtime")
+                .join("provider-call-ledger.json.next")
+                .exists(),
+            "a refused reconciliation must not stage a repaired candidate"
+        );
+
+        std::fs::remove_dir_all(&root)?;
+        Ok(())
+    }
 }

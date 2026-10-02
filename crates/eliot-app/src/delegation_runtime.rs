@@ -187,6 +187,15 @@ const PROVIDER_CALL_LEDGER_UNKNOWN_BLOCK: &str = "provider_call_ledger_unknown";
 /// The report pair an operator reads to see that new provider calls are held.
 const PROVIDER_CALL_LEDGER_UNKNOWN_REPORT: &str = "delegation-provider-call-ledger";
 
+/// The exact entry point that reconciles this block.
+///
+/// It is the `eliot-governor runtime supervision provider-call-ledger-reconcile`
+/// command, and naming it here is what makes
+/// `reconciliation_entry_point_available: true` a promise an operator can act on
+/// rather than a claim about this module.
+const PROVIDER_CALL_LEDGER_RECONCILE_ENTRY_POINT: &str =
+    "eliot-governor runtime supervision provider-call-ledger-reconcile";
+
 /// The three persisted candidates exactly as
 /// `eliot_engine::delegation::load_provider_call_ledger` enumerates them: the
 /// current ledger, the staged `.next` file and the `.bak` backup. They are named
@@ -217,7 +226,7 @@ fn provider_call_ledger_unknown_block(root: &Path, refusal: &str) -> anyhow::Err
         "preserved_ledger_candidates": preserved,
         "refusal": refusal,
         "operator_reconciliation_required": true,
-        "reconciliation_entry_point_available": false,
+        "reconciliation_entry_point_available": true,
         "blocked_at": OffsetDateTime::now_utc(),
     });
     let persisted = write_report_pair(root, PROVIDER_CALL_LEDGER_UNKNOWN_REPORT, &block);
@@ -225,7 +234,8 @@ fn provider_call_ledger_unknown_block(root: &Path, refusal: &str) -> anyhow::Err
         "{PROVIDER_CALL_LEDGER_UNKNOWN_BLOCK}: new provider calls are blocked because the \
          authoritative provider-call ledger is unknown, not empty; preserved candidates \
          [{preserved_list}] keep their original bytes and explicit operator reconciliation of \
-         those bytes is required before any new provider call ({refusal})"
+         those bytes is required before any new provider call, through \
+         `{PROVIDER_CALL_LEDGER_RECONCILE_ENTRY_POINT}` ({refusal})"
     );
     if let Err(write_error) = persisted {
         message.push_str(&format!(
@@ -1650,8 +1660,8 @@ mod outcome_recovery_tests {
 #[cfg(test)]
 mod provider_call_ledger_block_tests {
     use super::{
-        PROVIDER_CALL_LEDGER_UNKNOWN_BLOCK, PROVIDER_CALL_LEDGER_UNKNOWN_REPORT, Result, WorkLeaseId,
-        provider_call_ledger_refusal,
+        PROVIDER_CALL_LEDGER_RECONCILE_ENTRY_POINT, PROVIDER_CALL_LEDGER_UNKNOWN_BLOCK,
+        PROVIDER_CALL_LEDGER_UNKNOWN_REPORT, Result, WorkLeaseId, provider_call_ledger_refusal,
     };
     use eliot_engine::{EngineError, ProviderCallReservationOwner};
     use serde_json::Value;
@@ -1714,6 +1724,11 @@ mod provider_call_ledger_block_tests {
         let message = refusal.to_string();
         assert!(message.contains(PROVIDER_CALL_LEDGER_UNKNOWN_BLOCK), "{message}");
         assert!(message.contains("runtime/provider-call-ledger.json"), "{message}");
+        // The block promises an entry point, so it has to name the one that exists.
+        assert!(
+            message.contains(PROVIDER_CALL_LEDGER_RECONCILE_ENTRY_POINT),
+            "{message}"
+        );
         assert_eq!(std::fs::read(&ledger)?, corrupt);
         let block: Value =
             serde_json::from_str(&std::fs::read_to_string(block_report_path(&root))?)?;
@@ -1728,7 +1743,7 @@ mod provider_call_ledger_block_tests {
         assert_eq!(block["operator_reconciliation_required"], Value::Bool(true));
         assert_eq!(
             block["reconciliation_entry_point_available"],
-            Value::Bool(false)
+            Value::Bool(true)
         );
         assert_eq!(
             block["preserved_ledger_candidates"],

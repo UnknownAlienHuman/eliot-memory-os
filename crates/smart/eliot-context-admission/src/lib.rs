@@ -56,9 +56,9 @@ pub use material_floor::{
     AdmittedDecisionFloor, AffectedLineageReference, AllowedFloorAction, ApplicableFloor,
     BoundSourceRevision, DecisionFloorRefusal, DispatchOwnerState, FloorAtomPolicy,
     FloorEvidenceStatus, MaterialDecisionRefusal, MaterialDispatchBinding, MaterialEntrypointKind,
-    OperationOwnerInputs, RequiredFloorAtom, ResumeHistoryInputs, admit_material_decision,
-    admit_material_resume, bind_material_dispatch, derive_applicable_floor,
-    revalidate_material_dispatch,
+    OperationOwnerInputs, OwnerLineageRecords, OwnerMaterialInputs, RequiredFloorAtom,
+    ResumeHistoryInputs, admit_material_decision, admit_material_resume, bind_material_dispatch,
+    derive_applicable_floor, owner_material_inputs, revalidate_material_dispatch,
 };
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};

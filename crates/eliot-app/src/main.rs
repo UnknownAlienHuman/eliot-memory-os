@@ -1425,7 +1425,7 @@ enum CollectiveCommand {
     },
 }
 
-#[derive(Clone, Copy, Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 enum RuntimeCommand {
     Health,
     Report,
@@ -1435,12 +1435,28 @@ enum RuntimeCommand {
     },
 }
 
-#[derive(Clone, Copy, Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 enum RuntimeSupervisionCommand {
     Status,
     Reconcile {
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Explicitly reconcile a provider-call ledger whose historical coverage is
+    /// unknown. Every candidate the operator block preserved needs its own
+    /// `--disposition CANDIDATE=ACTION`; there is no default disposition, no
+    /// inferred candidate and no repairing dry run.
+    ProviderCallLedgerReconcile {
+        /// The bounded identity authorizing this reconciliation.
+        #[arg(long, value_name = "OPERATOR")]
+        operator_ref: String,
+        /// One explicit `CANDIDATE=ACTION` per preserved corrupt candidate.
+        #[arg(long = "disposition", value_name = "CANDIDATE=ACTION")]
+        dispositions: Vec<String>,
+        /// The operator's own copy of the ORIGINAL recorded ledger bytes; it is
+        /// required exactly when a candidate is superseded.
+        #[arg(long, value_name = "PATH")]
+        recovered_record: Option<PathBuf>,
     },
 }
 
@@ -3654,6 +3670,18 @@ async fn dispatch_runtime_command(
         RuntimeCommand::Supervision {
             command: RuntimeSupervisionCommand::Reconcile { dry_run },
         } => commands::run_runtime_supervision_reconcile(config, dry_run, implicit_instance).await,
+        RuntimeCommand::Supervision {
+            command: RuntimeSupervisionCommand::ProviderCallLedgerReconcile {
+                operator_ref,
+                dispositions,
+                recovered_record,
+            },
+        } => commands::run_provider_call_ledger_reconcile(
+            config,
+            &operator_ref,
+            &dispositions,
+            recovered_record.as_deref(),
+        ),
     }
 }
 

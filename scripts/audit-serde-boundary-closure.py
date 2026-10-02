@@ -2,9 +2,11 @@
 """Read-only F-DENY serde-boundary closure reconciliation coordinator (issue #710).
 
 Slice A owns this file only: ``scripts/audit-serde-boundary-closure.py``.
-Sibling scope (``scripts/tests/test_audit_serde_boundary_closure.py`` and
-``scripts/testdata/serde-boundary-closure/``) belongs to WRITER-710B and is
-never mutated here.
+Sibling scope (``scripts/testdata/serde-boundary-closure/``) belongs to
+WRITER-710B and is never mutated here. Issue #2701 additionally owns the
+smallest fake-API admission regressions in
+``scripts/tests/test_audit_serde_boundary_closure.py``; that file is otherwise
+WRITER-710B's.
 
 Role: reconcile the complete protected-wire denominator against the single
 discovery/classification API owned by issue #929
@@ -84,6 +86,100 @@ PROTECTED_FIELDS = frozenset(
 )
 BYPASS_SHAPES = frozenset({"flatten", "untagged", "alias", "manual-visitor"})
 
+# ---------------------------------------------------------------------------
+# Accepted #929 ``check(root)`` result contract, frozen at this boundary.
+#
+# Documented from the owned producer, never rediscovered here: ``check`` returns
+# ``{"rows", "digest", "header"}``; the row list is
+# ``validate_against_artifact``'s five-key projection of every fresh row; and the
+# header is #929's complete fresh header (``build_inventory``). Additional
+# future keys are tolerated so they can be consciously versioned, but a missing
+# load-bearing key below is a contract failure, never an empty checked identity.
+# ---------------------------------------------------------------------------
+CHECKED_RESULT_REQUIRED_KEYS = frozenset({"rows", "digest", "header"})
+CHECKED_ROW_REQUIRED_KEYS = frozenset(
+    {"candidate_id", "id", "disposition", "owner", "digest"}
+)
+CHECKED_HEADER_REQUIRED_KEYS = frozenset(
+    {
+        "schema",
+        "tool_version",
+        "rule_revision",
+        "proof_ceiling",
+        "issue",
+        "base_sha",
+        "base_sha_source",
+        "provenance_authority",
+        "canonical_excludes",
+        "denominator_status",
+        "ambiguous_reason",
+        "coverage",
+        "family_readiness",
+        "family_blocked_reason",
+        "safety",
+        "candidate_count",
+        "classified_count",
+        "unknown_count",
+        "unassigned_count",
+        "ready_children",
+        "blocked_children",
+        "denominator_digest",
+        "aggregate_digest",
+    }
+)
+
+# #929's closed proof ceiling (its PROOF_CEILING). Equality is required: a
+# foreign ceiling is malformed API output, not a weaker kind of proof.
+INVENTORY_PROOF_CEILING = "SOURCE_INVENTORY_AND_OWNERSHIP_ONLY"
+# #929's closed disposition vocabulary (its DISPOSITIONS). ``unknown`` and
+# ``needs-repair`` are legitimate findings and pass through untouched; a
+# foreign disposition is refused here instead of becoming a closure verdict.
+INVENTORY_DISPOSITIONS = frozenset(
+    {
+        "current-closed",
+        "named-legacy",
+        "exact-internal",
+        "specific-owner",
+        "needs-repair",
+        "unknown",
+    }
+)
+# Closed accounting vocabularies, validated as vocabulary only. They are NOT
+# forced to the optimistic value: #929's own ``validate_against_artifact``
+# already raises AMBIGUOUS_RELEASE on INCOMPLETE accounting, and restating that
+# raise here would be extra hardening beyond the documented guarantee.
+INVENTORY_DENOMINATOR_STATUS_VOCABULARY = frozenset({"COMPLETE", "INCOMPLETE"})
+INVENTORY_COVERAGE_VOCABULARY = frozenset({"COMPLETE", "INCOMPLETE"})
+INVENTORY_FAMILY_READINESS_VOCABULARY = frozenset({"READY", "BLOCKED"})
+# #929's documented ``base_sha`` forms: ``git rev-parse HEAD``, or its explicit
+# unknown-base fallback when git cannot answer. Informational and outside the
+# proof ceiling, but still identity material that must not be blank.
+INVENTORY_UNKNOWN_BASE = "unknown-base"
+_HEX_DIGITS = frozenset("0123456789abcdef")
+_SHA256_HEX_LENGTH = 64
+_GIT_COMMIT_LENGTH = 40
+
+# Count relationships this adapter really checks against the returned rows.
+VERIFIED_COUNT_RELATIONSHIPS = (
+    "candidate_count == len(rows)",
+    "classified_count == len(rows)",
+    "unknown_count == count of returned rows with disposition 'unknown'",
+)
+# The one count relationship #929 exposes that this boundary cannot evaluate,
+# stated explicitly instead of silently passing as complete validation.
+UNASSIGNED_COUNT_RELATIONSHIP = (
+    "unassigned_count == count of returned rows whose #929 repair_child is "
+    '"" or "UNASSIGNED"'
+)
+UNASSIGNED_COUNT_UNVERIFIED_REASON = (
+    "#929 projects every checked row to five keys (candidate_id/id/"
+    "disposition/owner/digest), so row['repair_child'] never crosses this "
+    "adapter boundary. Enforcing equality would require either recomputing "
+    "#929's ownership inside this adapter (a second scanner, forbidden) or "
+    "widening #929's row projection (#929-owned). Only the documented bound is "
+    "checked here, and the gap is reported in the text and JSON output."
+)
+
 
 class InventoryUnavailable(Exception):
     """Raised when no checked #929 inventory is available; precise cause.
@@ -113,6 +209,28 @@ class InventoryRow:
 
 
 @dataclass(frozen=True)
+class UnverifiedRelationship:
+    """A #929 relationship this adapter admits but cannot cross-check.
+
+    Carried into the text and JSON output so a checked inventory never reads
+    as complete validation while a returned count relationship was never
+    evaluated (see I0.5: report wording cannot promote an unproven claim).
+    """
+
+    relationship: str
+    checked_part: str
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "relationship": self.relationship,
+            "verified": False,
+            "checked_part": self.checked_part,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
 class CheckedInventory:
     """One successful ``check(root)`` binding carried into reconciliation.
 
@@ -124,6 +242,10 @@ class CheckedInventory:
     ceiling — into the 20 cases and the text/JSON output. It never
     recomputes source identity and never relabels a copied digest pair
     as an independent source comparison.
+
+    ``unverified_count_relationships`` names every returned count
+    relationship this boundary did not check, so the emitted report
+    cannot be read as a complete admission proof.
     """
 
     rows: tuple[InventoryRow, ...]
@@ -132,6 +254,7 @@ class CheckedInventory:
     base_sha: str
     proof_ceiling: str
     candidate_count: int
+    unverified_count_relationships: tuple[UnverifiedRelationship, ...] = ()
 
 
 @dataclass
@@ -195,6 +318,7 @@ class ReconciliationResult:
     inventory_base_sha: str = ""
     inventory_proof_ceiling: str = ""
     inventory_candidate_count: int = 0
+    inventory_unverified_count_relationships: tuple[UnverifiedRelationship, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -211,6 +335,13 @@ class ReconciliationResult:
                 "base_sha": self.inventory_base_sha,
                 "proof_ceiling": self.inventory_proof_ceiling,
                 "candidate_count": self.inventory_candidate_count,
+                "verified_count_relationships": list(
+                    VERIFIED_COUNT_RELATIONSHIPS
+                ),
+                "unverified_count_relationships": [
+                    unverified.to_dict()
+                    for unverified in self.inventory_unverified_count_relationships
+                ],
             },
             "cases": [
                 {"case": r.case, "passed": r.passed, "detail": r.detail}
@@ -395,103 +526,222 @@ def load_checked_inventory(root: Path) -> CheckedInventory:
     return _validate_checked_result(result)
 
 
+def _contract_failure(detail: str) -> InventoryUnavailable:
+    """One admission-phase failure category (required completion 7)."""
+    return InventoryUnavailable("inventory contract failure: " + detail)
+
+
+def _is_sha256_hex(value: Any) -> bool:
+    """True for the lowercase 64-hex SHA-256 identities #929 emits."""
+    return (
+        isinstance(value, str)
+        and len(value) == _SHA256_HEX_LENGTH
+        and all(character in _HEX_DIGITS for character in value)
+    )
+
+
+def _is_inventory_base_sha(value: Any) -> bool:
+    """True for #929's documented ``base_sha`` forms (commit id or fallback)."""
+    if not isinstance(value, str) or not value.strip():
+        return False
+    if value == INVENTORY_UNKNOWN_BASE:
+        return True
+    return len(value) == _GIT_COMMIT_LENGTH and all(
+        character in _HEX_DIGITS for character in value
+    )
+
+
+def _require_keys(obj: Mapping[str, Any], required: frozenset[str], where: str) -> None:
+    """Require the closed load-bearing key set; extra future keys are allowed."""
+    missing = sorted(required - set(obj.keys()))
+    if missing:
+        raise _contract_failure(f"{where} lacks required keys {missing}")
+
+
+def _require_count(header: Mapping[str, Any], key: str) -> int:
+    """Require a real integer count; ``type(...) is int`` excludes Boolean."""
+    value = header[key]
+    if type(value) is not int:
+        raise _contract_failure(
+            f"header {key} {value!r} is not a real integer count"
+        )
+    if value < 0:
+        raise _contract_failure(f"header {key} {value!r} is negative")
+    return value
+
+
+def _require_vocabulary(value: Any, vocabulary: frozenset[str], where: str) -> None:
+    """Require a closed documented vocabulary without forcing one member."""
+    if not isinstance(value, str) or value not in vocabulary:
+        raise _contract_failure(
+            f"{where} {value!r} is outside its closed vocabulary "
+            f"{sorted(vocabulary)}"
+        )
+
+
 def _validate_checked_result(result: Any) -> CheckedInventory:
     """Validate ``check(root)``'s exact contract without rescanning source.
 
-    Rejects malformed result/row shapes, missing or duplicate
-    identities, digest mismatch between the result and its header, and
-    header counts inconsistent with the returned rows. Legitimate
-    unknown/needs-repair rows pass through untouched: #929's
-    classification stays authoritative and this adapter replaces none
-    of it.
+    Admission happens strictly before any closure case. It refuses malformed
+    result/row shapes, missing or conflicting identities, non-SHA-256 or
+    foreign identity material, Booleans or integers in the count fields,
+    foreign dispositions and returned counts that contradict the returned
+    rows. Legitimate ``unknown``/``needs-repair`` rows pass through
+    untouched: #929's classification stays authoritative and this adapter
+    replaces none of it.
+
+    The one returned count relationship that cannot be evaluated here
+    (#929's ``unassigned_count`` against ``row['repair_child']``, which the
+    producer's five-key row projection never carries) is reported in the
+    result rather than passed over silently.
     """
     if not isinstance(result, Mapping):
-        raise InventoryUnavailable(
-            "inventory contract failure: check(root) returned "
-            f"{type(result).__name__}, expected a mapping with "
-            "rows/digest/header"
+        raise _contract_failure(
+            f"check(root) returned {type(result).__name__}, expected a mapping "
+            "with rows/digest/header"
         )
-    rows_raw = result.get("rows")
+    _require_keys(result, CHECKED_RESULT_REQUIRED_KEYS, "check(root) result")
+    rows_raw = result["rows"]
     if not isinstance(rows_raw, list):
-        raise InventoryUnavailable(
-            "inventory contract failure: check(root) result has no rows list"
+        raise _contract_failure(
+            f"check(root) result rows is {type(rows_raw).__name__}, expected a list"
         )
-    digest = result.get("digest")
-    if not isinstance(digest, str) or not digest:
-        raise InventoryUnavailable(
-            "inventory contract failure: check(root) result has no "
-            "aggregate digest"
+    digest = result["digest"]
+    if not _is_sha256_hex(digest):
+        raise _contract_failure(
+            f"check(root) result digest {digest!r} is not a lowercase 64-hex "
+            "SHA-256 aggregate identity"
         )
-    header = result.get("header")
+    header = result["header"]
     if not isinstance(header, Mapping):
-        raise InventoryUnavailable(
-            "inventory contract failure: check(root) result has no header "
-            "mapping"
+        raise _contract_failure(
+            f"check(root) result header is {type(header).__name__}, expected a mapping"
         )
-    if header.get("aggregate_digest") != digest:
-        raise InventoryUnavailable(
-            "inventory contract failure: result digest does not match "
-            "header aggregate_digest"
+    _require_keys(header, CHECKED_HEADER_REQUIRED_KEYS, "check(root) header")
+    if header["aggregate_digest"] != digest:
+        raise _contract_failure(
+            "result digest does not match header aggregate_digest"
         )
-    denominator = header.get("denominator_digest")
-    if not isinstance(denominator, str) or not denominator:
-        raise InventoryUnavailable(
-            "inventory contract failure: header has no denominator_digest"
+    denominator = header["denominator_digest"]
+    if not _is_sha256_hex(denominator):
+        raise _contract_failure(
+            f"header denominator_digest {denominator!r} is not a lowercase 64-hex "
+            "SHA-256 identity"
         )
-    candidate_count = header.get("candidate_count")
-    if not isinstance(candidate_count, int) or candidate_count != len(rows_raw):
-        raise InventoryUnavailable(
-            "inventory contract failure: header candidate_count "
-            f"{candidate_count!r} != returned rows {len(rows_raw)}"
+    base_sha = header["base_sha"]
+    if not _is_inventory_base_sha(base_sha):
+        raise _contract_failure(
+            f"header base_sha {base_sha!r} is blank or not the #929 commit "
+            "identity form"
         )
-    base_sha = header.get("base_sha")
-    if not isinstance(base_sha, str):
-        raise InventoryUnavailable(
-            "inventory contract failure: header has no base_sha"
+    proof_ceiling = header["proof_ceiling"]
+    if proof_ceiling != INVENTORY_PROOF_CEILING:
+        raise _contract_failure(
+            f"header proof_ceiling {proof_ceiling!r} is not the accepted #929 "
+            f"ceiling {INVENTORY_PROOF_CEILING}"
         )
-    proof_ceiling = header.get("proof_ceiling")
-    if not isinstance(proof_ceiling, str):
-        raise InventoryUnavailable(
-            "inventory contract failure: header has no proof_ceiling"
-        )
+    _require_vocabulary(
+        header["denominator_status"],
+        INVENTORY_DENOMINATOR_STATUS_VOCABULARY,
+        "header denominator_status",
+    )
+    _require_vocabulary(
+        header["coverage"], INVENTORY_COVERAGE_VOCABULARY, "header coverage"
+    )
+    _require_vocabulary(
+        header["family_readiness"],
+        INVENTORY_FAMILY_READINESS_VOCABULARY,
+        "header family_readiness",
+    )
+    candidate_count = _require_count(header, "candidate_count")
+    classified_count = _require_count(header, "classified_count")
+    unknown_count = _require_count(header, "unknown_count")
+    unassigned_count = _require_count(header, "unassigned_count")
     rows: list[InventoryRow] = []
     seen: set[str] = set()
-    for entry in rows_raw:
+    unknown_rows = 0
+    for index, entry in enumerate(rows_raw):
         if not isinstance(entry, Mapping):
-            raise InventoryUnavailable(
-                "inventory contract failure: row is "
-                f"{type(entry).__name__}, expected a mapping"
+            raise _contract_failure(
+                f"row[{index}] is {type(entry).__name__}, expected a mapping"
             )
-        cid = entry.get("candidate_id") or entry.get("id")
-        if not isinstance(cid, str) or not cid:
-            raise InventoryUnavailable(
-                "inventory contract failure: row without candidate identity"
+        _require_keys(entry, CHECKED_ROW_REQUIRED_KEYS, f"row[{index}]")
+        # Both identity fields the current API returns are required, and they
+        # must agree: truthiness selection would collapse a conflicting pair.
+        candidate_id = entry["candidate_id"]
+        row_id = entry["id"]
+        if not isinstance(candidate_id, str) or not candidate_id.strip():
+            raise _contract_failure(
+                f"row[{index}] has a blank candidate_id identity"
             )
-        if cid in seen:
-            raise InventoryUnavailable(
-                f"inventory contract failure: duplicate row {cid}"
+        if not isinstance(row_id, str) or not row_id.strip():
+            raise _contract_failure(
+                f"row {candidate_id} has a blank id identity"
             )
-        seen.add(cid)
-        disposition = entry.get("disposition")
-        owner = entry.get("owner")
-        row_digest = entry.get("digest")
-        if (
-            not isinstance(disposition, str)
-            or not isinstance(owner, str)
-            or not isinstance(row_digest, str)
-        ):
-            raise InventoryUnavailable(
-                f"inventory contract failure: row {cid} has malformed "
-                "disposition/owner/digest"
+        if candidate_id != row_id:
+            raise _contract_failure(
+                f"row {candidate_id} claims conflicting identities "
+                f"candidate_id={candidate_id!r} id={row_id!r}"
             )
+        if candidate_id in seen:
+            raise _contract_failure(f"duplicate row {candidate_id}")
+        seen.add(candidate_id)
+        disposition = entry["disposition"]
+        _require_vocabulary(
+            disposition,
+            INVENTORY_DISPOSITIONS,
+            f"row {candidate_id} disposition",
+        )
+        owner = entry["owner"]
+        if not isinstance(owner, str) or not owner.strip():
+            raise _contract_failure(
+                f"row {candidate_id} has blank owner identity material"
+            )
+        row_digest = entry["digest"]
+        if not _is_sha256_hex(row_digest):
+            raise _contract_failure(
+                f"row {candidate_id} digest {row_digest!r} is not a lowercase "
+                "64-hex SHA-256 identity"
+            )
+        if disposition == "unknown":
+            unknown_rows += 1
         rows.append(
             InventoryRow(
-                candidate_id=cid,
+                candidate_id=candidate_id,
                 disposition=disposition,
                 owner=owner,
                 digest=row_digest,
             )
         )
+    if candidate_count != len(rows):
+        raise _contract_failure(
+            f"header candidate_count {candidate_count} != returned rows {len(rows)}"
+        )
+    if classified_count != len(rows):
+        raise _contract_failure(
+            f"header classified_count {classified_count} != returned rows "
+            f"{len(rows)}"
+        )
+    if unknown_count != unknown_rows:
+        raise _contract_failure(
+            f"header unknown_count {unknown_count} != returned 'unknown' rows "
+            f"{unknown_rows}"
+        )
+    if unassigned_count > candidate_count:
+        raise _contract_failure(
+            f"header unassigned_count {unassigned_count} exceeds candidate_count "
+            f"{candidate_count}"
+        )
+    unverified = (
+        UnverifiedRelationship(
+            relationship=UNASSIGNED_COUNT_RELATIONSHIP,
+            checked_part=(
+                f"0 <= unassigned_count({unassigned_count}) <= "
+                f"candidate_count({candidate_count})"
+            ),
+            reason=UNASSIGNED_COUNT_UNVERIFIED_REASON,
+        ),
+    )
     return CheckedInventory(
         rows=tuple(rows),
         aggregate_digest=digest,
@@ -499,6 +749,7 @@ def _validate_checked_result(result: Any) -> CheckedInventory:
         base_sha=base_sha,
         proof_ceiling=proof_ceiling,
         candidate_count=candidate_count,
+        unverified_count_relationships=unverified,
     )
 
 
@@ -1014,6 +1265,9 @@ def reconcile(data: ReconciliationInput) -> ReconciliationResult:
         inventory_candidate_count=binding.candidate_count
         if binding is not None
         else 0,
+        inventory_unverified_count_relationships=binding.unverified_count_relationships
+        if binding is not None
+        else (),
     )
 
 
@@ -1093,6 +1347,74 @@ def build_self_test_input() -> ReconciliationInput:
     )
 
 
+def _sha256_hex(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def build_producer_shaped_result() -> dict[str, Any]:
+    """A ``check(root)`` result shaped exactly like the real #929 producer.
+
+    Built by construction from #929's own key names: ``check`` returns
+    rows/digest/header, ``validate_against_artifact`` projects five keys per
+    row, and ``build_inventory`` names every header key. It proves the
+    admission boundary still admits genuine producer output (including
+    legitimate ``unknown``/``needs-repair`` findings) without running the
+    producer's tree scan, and it never touches the generated artifact.
+    """
+    rows = [
+        {
+            "candidate_id": "selftest.row-1",
+            "id": "selftest.row-1",
+            "disposition": "current-closed",
+            "owner": "#930",
+            "digest": _sha256_hex("selftest.row-1"),
+        },
+        {
+            "candidate_id": "selftest.row-2",
+            "id": "selftest.row-2",
+            "disposition": "needs-repair",
+            "owner": "#977",
+            "digest": _sha256_hex("selftest.row-2"),
+        },
+        {
+            "candidate_id": "selftest.row-3",
+            "id": "selftest.row-3",
+            "disposition": "unknown",
+            "owner": "unknown",
+            "digest": _sha256_hex("selftest.row-3"),
+        },
+    ]
+    # The single unknown row is the only row whose #929 repair_child is "".
+    header = {
+        "schema": "eliot.serde-boundary-inventory.v1",
+        "tool_version": "0.5.0",
+        "rule_revision": "929.5",
+        "proof_ceiling": INVENTORY_PROOF_CEILING,
+        "issue": INVENTORY_ISSUE,
+        "base_sha": "0" * 40,
+        "base_sha_source": "git-rev-parse-HEAD",
+        "provenance_authority": (
+            "informational-observational-outside-proof-ceiling"
+        ),
+        "canonical_excludes": ["base_sha", "base_sha_source"],
+        "denominator_status": "COMPLETE",
+        "ambiguous_reason": "",
+        "coverage": "COMPLETE",
+        "family_readiness": "BLOCKED",
+        "family_blocked_reason": "unknown-evidence: 1 rows need explicit resolution",
+        "safety": "FINDINGS_REMAIN_BLOCKING",
+        "candidate_count": len(rows),
+        "classified_count": len(rows),
+        "unknown_count": 1,
+        "unassigned_count": 1,
+        "ready_children": 1,
+        "blocked_children": 1,
+        "denominator_digest": _sha256_hex("selftest-denominator"),
+        "aggregate_digest": _sha256_hex("selftest-aggregate"),
+    }
+    return {"rows": rows, "digest": header["aggregate_digest"], "header": header}
+
+
 def self_test() -> ReconciliationResult:
     data = build_self_test_input()
     # Prove the lexical core really runs: the fixtures above must contain one
@@ -1105,6 +1427,22 @@ def self_test() -> ReconciliationResult:
     dupes = find_duplicate_keys(b'{"id":"1","id":"2"}')
     if dupes != ["id"]:
         raise AssertionError(f"self-test duplicate helper inert: {dupes}")
+    # Admission boundary, both directions: the genuine producer shape is
+    # admitted with its one unverifiable count relationship reported, and a
+    # malformed result of the same shape is still refused.
+    admitted = _validate_checked_result(build_producer_shaped_result())
+    if len(admitted.rows) != 3:
+        raise AssertionError("admission dropped legitimate producer rows")
+    if not admitted.unverified_count_relationships:
+        raise AssertionError("unverified count relationship is not self-described")
+    malformed = build_producer_shaped_result()
+    malformed["rows"][0]["candidate_id"] = "candidate-B"
+    try:
+        _validate_checked_result(malformed)
+    except InventoryUnavailable:
+        pass
+    else:
+        raise AssertionError("malformed checked result was admitted")
     result = reconcile(data)
     if not result.passed:
         raise AssertionError(
@@ -1153,6 +1491,19 @@ def print_human(result: ReconciliationResult) -> None:
             f"base={result.inventory_base_sha} "
             f"ceiling={result.inventory_proof_ceiling}"
         )
+        print(
+            "inventory counts verified: "
+            + "; ".join(VERIFIED_COUNT_RELATIONSHIPS)
+        )
+        # A checked inventory is not a complete admission proof while any
+        # returned count relationship was never cross-checked here.
+        for unverified in result.inventory_unverified_count_relationships:
+            print(
+                "inventory NOT verified: "
+                f"{unverified.relationship} "
+                f"(checked part only: {unverified.checked_part}; "
+                f"{unverified.reason})"
+            )
     print(f"cases: {result.passed_count}/20 passed")
     if result.failed_cases:
         print(f"failed: {list(result.failed_cases)}")
@@ -1170,6 +1521,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     except InventoryUnavailable as error:
         cause = str(error)
         print(f"SERDE_BOUNDARY_CLOSURE: BLOCKED: {cause}", file=sys.stderr)
+        # The JSON side already reports an empty case list; say the same thing
+        # in the human output so the two never disagree about the same result.
+        print(
+            "cases: 0/20 evaluated - no current closure cases "
+            '(the JSON report carries "cases": [])',
+            file=sys.stderr,
+        )
         if args.json_out is not None:
             args.json_out.write_text(
                 json.dumps(blocked_report(cause), indent=2, sort_keys=True)

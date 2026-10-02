@@ -907,6 +907,7 @@ mod decoder_boundary {
   "counterexamples": ["case:counter-1"],
   "applicability_classifier_features": ["package-local test wiring"],
   "required_local_probe": "run the owner package test",
+  "transfer_evidence": ["transfer:fixture-1"],
   "maturity": {
     "state": "PATTERN_CANDIDATE",
     "support_count": 2,
@@ -1120,10 +1121,11 @@ mod decoder_boundary {
         );
         assert_eq!(frame.codecortex_report_ref.as_deref(), Some("codecortex:fixture"));
 
-        let request = match serde_json::from_str::<ExperienceRecallRequest>(&recall_request(FRAME)) {
-            Ok(request) => request,
-            Err(error) => panic!("the canonical recall request must decode: {error}"),
-        };
+        let request =
+            match serde_json::from_str::<ExperienceRecallRequest>(&recall_request(FRAME)) {
+                Ok(request) => request,
+                Err(error) => panic!("the canonical recall request must decode: {error}"),
+            };
         assert_eq!(request.task_frame.task_id, "task-fixture-001");
         assert_eq!(request.need.need, MemoryNeed::CausalCase);
         assert_eq!(request.exposure_policy.mode, MemoryExposureMode::MatureExperienceOnly);
@@ -1207,7 +1209,10 @@ mod decoder_boundary {
         );
         assert!(
             serde_json::from_str::<ExperienceRecallRequest>(&recall_request(
-                &FRAME.replace(r#""task_id": "task-fixture-001","#, r#""task_id": "task-fixture-001", "authorized": true,"#)
+                &FRAME.replace(
+                    r#""task_id": "task-fixture-001","#,
+                    r#""task_id": "task-fixture-001", "authorized": true,"#
+                )
             ))
             .is_err(),
             "an added authorization member must not decode inside the recall request"
@@ -1256,6 +1261,7 @@ mod decoder_boundary {
         assert!(
             serde_json::from_str::<ExperienceRecallRequest>(&recall_request_with(
                 FRAME,
+                NEED,
                 &EXPOSURE.replace(
                     r#""mode": "mature_experience_only","#,
                     r#""mode": "mature_experience_only", "escalate": true,"#

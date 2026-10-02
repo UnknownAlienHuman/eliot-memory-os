@@ -30,6 +30,12 @@
 //!   representation rule for every closure member. It reads no caller packet,
 //!   recipe, compiled floor, tool name or `read_only` bit, so a caller cannot
 //!   narrow the floor. A successfully visited dependency is never discarded.
+//! - [`owner_material_inputs`] is the producer on the other side of that gate:
+//!   it turns the floor identity the owner published and the lineage records
+//!   their owners issued into exactly the two arguments the gate refuses to
+//!   accept from a caller. It authors no policy, no disposition and no
+//!   applicability; a relation no owner issued is a refusal naming that
+//!   relation, never an empty set, a zero floor or a defaulted disposition.
 //! - [`admit_material_decision`] first requires the prepared input's effective
 //!   floor closure (the existing [`crate::floor_closure`] logic) to cover the
 //!   owner-derived closure, so an owner-required edge the compiler was never
@@ -55,16 +61,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use eliot_agent_contracts::{PublicReference, RetainedHandoffCheckpoint};
 use eliot_authority::ImpactClass;
 use eliot_context_contracts::{
-    AdmissionDisposition, AdmissionInput, AdmittedContextSet, AtomAvailability, ContextCandidate,
-    ContextError, ContextOutcome, DecisionContextIncomplete, DecisionExecutionLineageRefs,
-    DecisionLineageCompleteness, DecisionLineagePhase, DecisionLineageRef, DecisionLineageSlot,
-    DecisionLineageSupersession, LossPolicy, OmissionRecord, RepresentationKind, RoleLossRule,
-    SemanticRole, canonical_digest,
+    AdmissionDisposition, AdmissionInput, AdmittedContextSet, AtomAvailability, ContextBinding,
+    ContextCandidate, ContextError, ContextOutcome, DecisionContextIncomplete,
+    DecisionExecutionLineageRefs, DecisionLineageActionContractRef, DecisionLineageAnchorLink,
+    DecisionLineageArtifact, DecisionLineageCompleteness, DecisionLineageEffect,
+    DecisionLineageEpochRefs, DecisionLineagePhase, DecisionLineageRef, DecisionLineageReview,
+    DecisionLineageRival, DecisionLineageSlot, DecisionLineageSupersession,
+    DecisionLineageVerifier, LossPolicy, OmissionRecord, RepresentationKind, RoleLossRule,
+    SafetyFloorIdentity, SemanticRole, canonical_digest,
 };
 use eliot_contracts::{
     ArtifactId, DecisionId, StateFence, TaskId, TaskRevision, fences_match_exact,
 };
-use eliot_receipts::ProofCeiling;
+use eliot_receipts::{OperationBinding, ProofCeiling, TaskBinding};
 use eliot_security_contracts::EffectCeiling;
 use serde::{Deserialize, Serialize};
 
@@ -83,6 +92,16 @@ const MAX_AFFECTED_REFERENCES: usize = 256;
 /// impact class and no applicable floor can be derived at all.
 const OWNER_FLOOR_POLICY: &str =
     "Context floor-policy owner together with the Governor action model";
+
+/// Owner named when an `I12.31` lineage relation has no owner-issued record and
+/// no policy-backed disposition.
+///
+/// The named owners are the ones `I12.31` assigns the relations to, restated as
+/// the refusal's `missing_owner` text and not as a policy: this crate owns no
+/// goal, task, evidence, rationale, `ActionContract` or effect record, and never
+/// writes one.
+const OWNER_DECISION_LINEAGE: &str =
+    "the goal, task, evidence, rationale, ActionContract and effect record owners named by I12.31";
 
 /// One owner-issued atom policy that can place an atom in the applicable
 /// Decision Safety Floor.
@@ -1861,6 +1880,327 @@ pub fn admit_material_resume(
         }
     }
     admit_material_decision(owners, policies, closure, lineage)
+}
+
+/// The `I12.31` lineage relations their owners issued for one decision.
+///
+/// Every member is a slot the owner of that relation filled: `Present` with the
+/// existing typed record, or the owner's own policy-backed disposition
+/// (`NotApplicable`, `NotYetProduced`, `Unknown`). `None` means exactly one
+/// thing — the owner has issued neither a record nor a disposition for that
+/// relation — and it is refused, never filled in here. This crate owns none of
+/// these records, so it can neither produce one nor decide that one is
+/// inapplicable; the only question it answers is whether the owner issued it.
+///
+/// The field order is the [`DecisionExecutionLineageRefs`] field order, and the
+/// refusal names the first relation in that order, so the reported gap does not
+/// depend on hashing or iteration order.
+pub struct OwnerLineageRecords {
+    /// Governing goal record, as its owner issued it.
+    pub goal: Option<DecisionLineageSlot<DecisionLineageRef>>,
+    /// Goal acceptance criteria, as their owner issued them.
+    pub acceptance: Option<DecisionLineageSlot<Vec<DecisionLineageRef>>>,
+    /// Canonical task binding, as the task owner issued it.
+    pub task: Option<DecisionLineageSlot<TaskBinding>>,
+    /// Observations used at the decision boundary.
+    pub observations: Option<DecisionLineageSlot<Vec<DecisionLineageRef>>>,
+    /// Source evidence and provenance.
+    pub evidence: Option<DecisionLineageSlot<Vec<DecisionLineageRef>>>,
+    /// Current epistemic position, referenced without importing its owner crate.
+    pub epistemic_position: Option<DecisionLineageSlot<DecisionLineageRef>>,
+    /// Material unknowns and unresolved conflicts.
+    pub material_unknowns: Option<DecisionLineageSlot<Vec<DecisionLineageRef>>>,
+    /// Rival hypotheses with their rejection reasons.
+    pub rivals: Option<DecisionLineageSlot<Vec<DecisionLineageRival>>>,
+    /// Chosen public option.
+    pub selected_option: Option<DecisionLineageSlot<DecisionLineageRef>>,
+    /// Public rationale, including why this decision is timely.
+    pub rationale: Option<DecisionLineageSlot<DecisionLineageRef>>,
+    /// Explicit `why now` rationale link.
+    pub why_now: Option<DecisionLineageSlot<DecisionLineageRef>>,
+    /// Conditions that require the decision to be revisited.
+    pub revisit_conditions: Option<DecisionLineageSlot<Vec<DecisionLineageRef>>>,
+    /// Existing `ActionContract` reference; the C4 contract is not copied.
+    pub action_contract: Option<DecisionLineageSlot<DecisionLineageActionContractRef>>,
+    /// Effect records with their proposal, authorization, observable, execution
+    /// and outcome slots exactly as their owners issued them.
+    pub effects: Vec<DecisionLineageEffect>,
+    /// Operation bindings the effect records propose.
+    pub operations: Option<DecisionLineageSlot<Vec<OperationBinding>>>,
+    /// Current and historical diff references.
+    pub diffs: Option<DecisionLineageSlot<Vec<DecisionLineageRef>>>,
+    /// Change observations linked to the operations and diffs.
+    pub change_observations: Option<DecisionLineageSlot<Vec<DecisionLineageRef>>>,
+    /// Historical/current anchor pairs with their resolution status.
+    pub anchors: Option<DecisionLineageSlot<Vec<DecisionLineageAnchorLink>>>,
+    /// Anchored review items and their dispositions.
+    pub reviews: Option<DecisionLineageSlot<Vec<DecisionLineageReview>>>,
+    /// Artifact identities and provenance.
+    pub artifacts: Option<DecisionLineageSlot<Vec<DecisionLineageArtifact>>>,
+    /// Verifier bindings and contract references.
+    pub verifiers: Option<DecisionLineageSlot<Vec<DecisionLineageVerifier>>>,
+    /// Decision outcomes and their public evidence.
+    pub outcomes: Option<DecisionLineageSlot<Vec<DecisionLineageRef>>>,
+    /// Memory revisions linked to the recorded outcome.
+    pub memory_revisions: Option<DecisionLineageSlot<Vec<DecisionLineageRef>>>,
+    /// Compaction or omission manifest references.
+    pub omissions: Option<DecisionLineageSlot<Vec<DecisionLineageRef>>>,
+    /// Handoff artifact reference for continuation.
+    pub handoff: Option<DecisionLineageSlot<DecisionLineageRef>>,
+    /// Fence and epoch history for the exact decision snapshot.
+    pub epoch: Option<DecisionLineageEpochRefs>,
+    /// Task/scope/attempt/fence/decision identity of the decision these
+    /// relations belong to. Unlike the slots it is not a relation, so it has no
+    /// absent state: it is checked against the operation's own identity.
+    pub context: ContextBinding,
+}
+
+/// The two gate arguments an owner-resolved material decision needs, produced
+/// from owner records instead of supplied by a caller.
+///
+/// [`admit_material_decision`] and [`admit_material_resume`] both take a
+/// `&[FloorAtomPolicy]` and a `&DecisionExecutionLineageRefs`; before this
+/// producer existed, nothing in production could build either one. A caller that
+/// wants a narrow floor could only do so by not presenting a policy at all, so
+/// the gate refused — the safe direction, but it made the material path
+/// unreachable rather than checked.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnerMaterialInputs {
+    /// Owner-issued atom policies applicable to the resolved impact class.
+    pub policies: Vec<FloorAtomPolicy>,
+    /// Phase-aware `I12.31` lineage assembled from owner-issued relations.
+    pub lineage: DecisionExecutionLineageRefs,
+}
+
+/// Produce the floor policies and the phase-aware lineage of one material
+/// decision from the owner records for that decision.
+///
+/// The floor policies come from the floor identity the owner published
+/// ([`SafetyFloorIdentity`]) — the same record
+/// `eliot_context::campaign_publication::context_safety_floor_identity` derives
+/// from the authenticated recipe body's own `GoverningContextRequirements::floor`
+/// and the resolved revision's `RecipeAdmissionPolicy::safety_floor` reference,
+/// and the same one the prepared closure carries. Nothing about it is read from
+/// the caller's packet, recipe or compiled floor, and no applicability, loss
+/// policy or representation is authored here: each member's role and dependency
+/// edges are the owner's own, the loss rule is the canonical
+/// non-droppable/whole-unit rule `I7.11` states for a floor of applicable
+/// atoms, and the applicability key is the owner-resolved impact class in
+/// [`OperationOwnerInputs`]. `DecisionSafetyFloor` carries no impact class of
+/// its own, so applicability here is established by boundary identity — the
+/// published record must be this decision's record at this fence — not by a
+/// class the owner never wrote.
+///
+/// The lineage comes from the relations their owners issued, and is checked
+/// only for what this crate can check without owning a record: that the context
+/// binding is this operation's, and that no relation is silently absent.
+/// Phase-relative completeness stays where `I12.31` puts it, in
+/// [`DecisionExecutionLineageRefs::validate_for_phase`], which the gate calls
+/// immediately afterwards — so an unknown or deferred relation is still refused
+/// downstream with its exact affected references rather than admitted here.
+///
+/// # Errors
+///
+/// [`MaterialDecisionRefusal::Incomplete`] with
+/// [`FloorEvidenceStatus::OwnerPolicyMissing`] when the published floor is not
+/// the floor rule this decision names, and with
+/// [`FloorEvidenceStatus::LineageIncomplete`] naming the exact relation no owner
+/// issued. [`MaterialDecisionRefusal::Boundary`] for a malformed owner input, a
+/// published floor that is not this decision's record, or a context binding that
+/// is not this operation's.
+///
+/// Production caller: the material act claim/flight of
+/// `bins/eliotd`, which presents both results to
+/// `bins/eliotd/src/daemon_kernel_client.rs::DaemonKernelClient::admit_material_act_dispatch`
+/// (and its resume counterpart). That flight is the W4 STITCH seam named on
+/// `DaemonKernelClient::admit_material_act_dispatch` itself; the
+/// `eliot.act` claim/flight pair does not exist yet, so this producer has no
+/// in-tree call site yet and is not faked with a self-call.
+pub fn owner_material_inputs(
+    owners: &OperationOwnerInputs<'_>,
+    published_floor: &SafetyFloorIdentity,
+    records: OwnerLineageRecords,
+) -> Result<OwnerMaterialInputs, MaterialDecisionRefusal> {
+    let policies = owner_floor_atom_policies(owners, published_floor)?;
+    let lineage = owner_decision_lineage(owners, records)?;
+    Ok(OwnerMaterialInputs { policies, lineage })
+}
+
+/// Derive the owner-issued atom policies for the resolved impact class from the
+/// published floor identity.
+///
+/// The four owner facts per member are read, never decided: the exact atom
+/// identity and its semantic role from the published floor's own member, the
+/// interpretation dependencies from that member's `required_dependencies`, the
+/// applicability key from the owner-resolved impact class, and the delivery rule
+/// from the canonical floor-member contract `resolve_floor_requirements` already
+/// applies to a floor member no policy describes — `NON_DROPPABLE`, whole unit
+/// only, which is the strictest reading of `I7.11`'s "all currently applicable
+/// non-droppable atoms" and never a weaker one.
+///
+/// Three owner checks precede that, each fail-closed: the published record is
+/// validated by its own contract; it must be bound to this decision, task, fence
+/// and acceptance revision, so a floor published for another boundary is a
+/// boundary failure rather than this decision's floor; and its `floor_id` must be
+/// the `rule_evidence` this decision names, so a floor rule the decision does not
+/// name is an incomplete result naming that exact reference.
+fn owner_floor_atom_policies(
+    owners: &OperationOwnerInputs<'_>,
+    published: &SafetyFloorIdentity,
+) -> Result<Vec<FloorAtomPolicy>, MaterialDecisionRefusal> {
+    owners
+        .validate()
+        .map_err(MaterialDecisionRefusal::Boundary)?;
+    published
+        .validate()
+        .map_err(MaterialDecisionRefusal::Boundary)?;
+    if published.decision.decision_id != *owners.decision_id
+        || published.floor.binding.decision_id != *owners.decision_id
+        || published.floor.binding.task_id != *owners.task_id
+    {
+        return Err(MaterialDecisionRefusal::Boundary(
+            ContextError::IdentityConflict,
+        ));
+    }
+    if !fences_match_exact(&published.floor.binding.state_fence, owners.state_fence)
+        || published.floor.binding.state_fence.task_revision != Some(owners.acceptance_revision)
+    {
+        return Err(MaterialDecisionRefusal::Boundary(
+            ContextError::InvalidFence,
+        ));
+    }
+    if published.floor_id != owners.rule_evidence {
+        return Err(typed_refusal(
+            owners,
+            FloorEvidenceStatus::OwnerPolicyMissing,
+            AllowedFloorAction::Refresh,
+            std::slice::from_ref(&published.floor_id),
+            "the published Decision Safety Floor is not the floor rule this decision names",
+            Some(OWNER_FLOOR_POLICY),
+            Vec::new(),
+        ));
+    }
+    Ok(published
+        .floor
+        .members
+        .iter()
+        .map(|member| FloorAtomPolicy {
+            atom_id: member.atom_id.clone(),
+            role: member.role,
+            loss_policy: LossPolicy::NonDroppable,
+            allowed_representations: vec![RepresentationKind::Whole],
+            required_dependencies: member.required_dependencies.clone(),
+            applicable_impact_classes: vec![owners.impact_class],
+        })
+        .collect())
+}
+
+/// Assemble the phase-aware lineage from the relations their owners issued.
+///
+/// This crate owns no goal, task, evidence, rival, `ActionContract` or effect
+/// record, so it writes no disposition: each slot is the owner's own
+/// [`DecisionLineageSlot`] carried verbatim, and a relation the owner has not
+/// issued at all is refused by name instead of becoming an empty set, a
+/// `NotApplicable` the owner never declared, or a fabricated receipt. Whether
+/// the assembled lineage is complete for the current phase is decided by
+/// [`DecisionExecutionLineageRefs::validate_for_phase`], which the gate calls
+/// next, so nothing is admitted by assembling it.
+fn owner_decision_lineage(
+    owners: &OperationOwnerInputs<'_>,
+    records: OwnerLineageRecords,
+) -> Result<DecisionExecutionLineageRefs, MaterialDecisionRefusal> {
+    owners
+        .validate()
+        .map_err(MaterialDecisionRefusal::Boundary)?;
+    records
+        .context
+        .validate()
+        .map_err(MaterialDecisionRefusal::Boundary)?;
+    if records.context.decision_id != *owners.decision_id
+        || records.context.task_id != *owners.task_id
+    {
+        return Err(MaterialDecisionRefusal::Boundary(
+            ContextError::IdentityConflict,
+        ));
+    }
+    if !fences_match_exact(&records.context.state_fence, owners.state_fence) {
+        return Err(MaterialDecisionRefusal::Boundary(
+            ContextError::InvalidFence,
+        ));
+    }
+    Ok(DecisionExecutionLineageRefs {
+        goal: issued_relation(owners, "goal", records.goal)?,
+        acceptance: issued_relation(owners, "acceptance", records.acceptance)?,
+        task: issued_relation(owners, "task", records.task)?,
+        observations: issued_relation(owners, "observations", records.observations)?,
+        evidence: issued_relation(owners, "evidence", records.evidence)?,
+        epistemic_position: issued_relation(
+            owners,
+            "epistemic_position",
+            records.epistemic_position,
+        )?,
+        material_unknowns: issued_relation(
+            owners,
+            "material_unknowns",
+            records.material_unknowns,
+        )?,
+        rivals: issued_relation(owners, "rivals", records.rivals)?,
+        selected_option: issued_relation(owners, "selected_option", records.selected_option)?,
+        rationale: issued_relation(owners, "rationale", records.rationale)?,
+        why_now: issued_relation(owners, "why_now", records.why_now)?,
+        revisit_conditions: issued_relation(
+            owners,
+            "revisit_conditions",
+            records.revisit_conditions,
+        )?,
+        context: records.context,
+        action_contract: issued_relation(owners, "action_contract", records.action_contract)?,
+        effects: records.effects,
+        operations: issued_relation(owners, "operations", records.operations)?,
+        diffs: issued_relation(owners, "diffs", records.diffs)?,
+        change_observations: issued_relation(
+            owners,
+            "change_observations",
+            records.change_observations,
+        )?,
+        anchors: issued_relation(owners, "anchors", records.anchors)?,
+        reviews: issued_relation(owners, "reviews", records.reviews)?,
+        artifacts: issued_relation(owners, "artifacts", records.artifacts)?,
+        verifiers: issued_relation(owners, "verifiers", records.verifiers)?,
+        outcomes: issued_relation(owners, "outcomes", records.outcomes)?,
+        memory_revisions: issued_relation(owners, "memory_revisions", records.memory_revisions)?,
+        omissions: issued_relation(owners, "omissions", records.omissions)?,
+        handoff: issued_relation(owners, "handoff", records.handoff)?,
+        epoch: issued_relation(owners, "epoch", records.epoch)?,
+    })
+}
+
+/// One relation its owner issued, or the refusal naming the relation it did not.
+///
+/// This is the whole of the "absent stays absent" rule for the producer: there is
+/// no arm that manufactures a slot, so an owner fact that is absent, stale or
+/// unknown can never reach the gate as a permissive default. The refusal is the
+/// existing typed `DECISION_CONTEXT_INCOMPLETE` limitation with the evidence
+/// status the lineage gap has, the expansion action, and the owner that must
+/// issue the relation.
+fn issued_relation<T>(
+    owners: &OperationOwnerInputs<'_>,
+    relation: &'static str,
+    slot: Option<DecisionLineageSlot<T>>,
+) -> Result<DecisionLineageSlot<T>, MaterialDecisionRefusal> {
+    slot.ok_or_else(|| {
+        typed_refusal(
+            owners,
+            FloorEvidenceStatus::LineageIncomplete,
+            AllowedFloorAction::Expand,
+            std::slice::from_ref(&owners.rule_evidence),
+            &format!(
+                "the I12.31 decision lineage relation `{relation}` has no owner-issued record and no policy-backed disposition"
+            ),
+            Some(OWNER_DECISION_LINEAGE),
+            Vec::new(),
+        )
+    })
 }
 
 /// Every public reference the lineage `omissions` relation names, whatever its

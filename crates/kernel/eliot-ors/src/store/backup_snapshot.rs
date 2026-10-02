@@ -94,8 +94,8 @@
 //! not refused. The census names the store's tables by referencing `store.rs`'s
 //! own constants, so a renamed table cannot drift from its entry, and it compares
 //! that list with the tables redb reports for the file being read, under the same
-//! transaction as the pages. Counted at the time of writing: 74 distinct declared
-//! tables, 45 backing a dispositioned row family and 29 carrying an explicit
+//! transaction as the pages. Counted at the time of writing: 76 distinct declared
+//! tables, 47 backing a dispositioned row family and 29 carrying an explicit
 //! source-bound nonrestorable/forensic exclusion with the reason written next to
 //! it; 43 dispositioned families, each bound to at least one table, so none is
 //! excused from having one. A table with no disposition is refused with
@@ -915,7 +915,7 @@ struct DispositionedTable {
 /// and there it comes from redb, not from this file.
 ///
 /// Counted against `store.rs`, `store/restore_journal.rs` and `status.rs` at the
-/// time of writing: 75 distinct declared tables, of which 46 back a dispositioned
+/// time of writing: 76 distinct declared tables, of which 47 back a dispositioned
 /// row family and 29 are explicit source-bound exclusions.
 /// `row_family_denominator` carries 43 families and every one of them is now bound
 /// to a table by this census.
@@ -934,7 +934,7 @@ struct DispositionedTable {
 /// in this issue. Until it exists, a table added to `store.rs` is on the author.
 ///
 /// Split in four so no half can grow past the point where a reader stops
-/// checking it: 46 table-backed tables and 28 source-bound exclusions.
+/// checking it: 47 table-backed tables and 29 source-bound exclusions.
 fn dispositioned_tables() -> Vec<DispositionedTable> {
     let mut tables = family_backed_tables();
     tables.extend(source_bound_exclusions());
@@ -969,7 +969,7 @@ fn excluded(
     }
 }
 
-/// The 45 tables that back a dispositioned row family.
+/// The 47 tables that back a dispositioned row family.
 fn family_backed_tables() -> Vec<DispositionedTable> {
     let mut tables = canonical_family_tables();
     tables.extend(supervision_and_replay_family_tables());
@@ -977,7 +977,7 @@ fn family_backed_tables() -> Vec<DispositionedTable> {
     tables
 }
 
-/// The 22 tables backing the canonical operational and recovery row families.
+/// The 24 tables backing the canonical operational and recovery row families.
 fn canonical_family_tables() -> Vec<DispositionedTable> {
     vec![
         family(super::ENVELOPES, RowFamilyKind::Envelopes),
@@ -1031,6 +1031,24 @@ fn canonical_family_tables() -> Vec<DispositionedTable> {
             RowFamilyKind::BackupVerificationResults,
         ),
         family(super::CUTOVER_OWNERSHIP, RowFamilyKind::CutoverOwnership),
+        // #1952 (I14.15): the daemon-generation cutover row is the durable record
+        // of which daemon generation owns new effect admission and which prior
+        // generation is fenced, so it is exactly the same kind of fact as the
+        // module cutover row beside it and is never re-dispatchable authority.
+        // `NonrestorableHistorical` is inherited from the same family: a restored
+        // archive is evidence that a cutover happened, not the authority to
+        // activate a generation (I05-27 / ARCH-RES-03). It is a FAMILY binding and
+        // not an exclusion because `row_family_denominator` already dispositions
+        // `CutoverOwnership`, so this entry is what check 3 and check 4 agree with.
+        // Nothing materialises this table until `commit_daemon_cutover` writes it,
+        // which is exactly why the omission stayed invisible for a store that had
+        // never replaced `eliotd`: check 2 compares the census against
+        // `list_tables()`, so only a store holding a committed daemon cutover saw
+        // it, and that store failed closed on every export with no loss of data.
+        family(
+            super::DAEMON_CUTOVER_OWNERSHIP,
+            RowFamilyKind::CutoverOwnership,
+        ),
         family(super::HOST_REQUESTS, RowFamilyKind::HostRequests),
         // #1945: evaluated tool-exposure receipts are operation-bound evidence
         // of past completions, never re-dispatchable routes, so they ride the
@@ -1050,7 +1068,7 @@ fn canonical_family_tables() -> Vec<DispositionedTable> {
     ]
 }
 
-/// The 17 tables backing the supervision, replay, doctor and retention families.
+/// The 20 tables backing the supervision, replay, doctor and retention families.
 ///
 /// A separate function from [`canonical_family_tables`] only because the whole
 /// census must stay inside one reviewable length; the split is at the
@@ -1142,7 +1160,7 @@ fn restore_journal_family_tables() -> Vec<DispositionedTable> {
     ]
 }
 
-/// The 28 tables that are explicitly NOT backup row families, each with the
+/// The 29 tables that are explicitly NOT backup row families, each with the
 /// disposition and the reason that excludes it.
 ///
 /// Grouped by what makes a table un-restorable rather than alphabetically, so
@@ -1521,7 +1539,7 @@ fn purge_ledger_exclusions() -> Vec<DispositionedTable> {
 ///    advertise a quarantined import path for a table that has no family and
 ///    therefore no import path.
 ///
-/// Cost is one `list_tables` plus a 71-entry linear scan, both bounded and both
+/// Cost is one `list_tables` plus a 76-entry linear scan, both bounded and both
 /// independent of store size: it is a schema census, not a data scan. It runs
 /// once per export entrypoint and once per quarantined import, never per page.
 ///
@@ -3695,7 +3713,7 @@ fn snapshot_completeness(
 /// pre-existing and unchanged in kind by this issue; the two-transaction witness
 /// that existed before behaved identically. It is recorded here because a witness
 /// described without its scope is the same defect as a witness that cannot fire.
-/// The 28 tables the census excludes with a written nonrestorable/forensic reason
+/// The 29 tables the census excludes with a written nonrestorable/forensic reason
 /// are consequently outside BOTH the denominator and this witness. That is the
 /// correct result for a table with no import path, and it is now a DECIDED
 /// exclusion rather than the old A5 gap: an earlier version of this comment
@@ -4343,4 +4361,132 @@ pub(super) fn reconcile_lost_import_response(
             },
         };
     replayed
+}
+
+/// The two census proofs for the daemon cutover table (issue #1952, I14.15).
+///
+/// The census is a hand-maintained list, so the only thing that keeps a new ORS
+/// table from being invisible is that somebody adds its entry AND a test proves
+/// the entry is load-bearing. Both cases below are about check 2 alone, which is
+/// the check that compares this list with `read.list_tables()`:
+///
+/// - a store that has committed one daemon cutover passes, because the table is
+///   now bound to [`RowFamilyKind::CutoverOwnership`];
+/// - a store holding a table no entry names is still refused, so the new entry
+///   is a disposition and not a way around the census.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test fixtures open a fresh throwaway ORS file and unwrap the store's own refusals"
+)]
+mod census_tests {
+    use std::path::PathBuf;
+
+    use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+    // `ReadableDatabase` reaches this module through `use super::*`, which is
+    // where `begin_read`/`begin_write` come from; only the test-local definition
+    // is named here.
+    use redb::TableDefinition;
+
+    use super::*;
+    use crate::OperationIdentity;
+    use crate::cutover_ownership::{
+        DaemonCutoverOwnership, InFlightDisposition, InFlightDispositionKind,
+        OldDaemonProposalFence,
+    };
+
+    /// A table name no census entry names, declared here so the refusal case is a
+    /// table that genuinely has no disposition rather than a renamed real one.
+    const UNDISPOSED: TableDefinition<&str, &str> =
+        TableDefinition::new("ors_census_test_undisposed_v1");
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn census_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "eliot-ors-census-daemon-cutover-{tag}-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ))
+    }
+
+    /// One committed daemon cutover, in the shape `RedbRecoveryStore::
+    /// commit_daemon_cutover` validates: a distinct candidate generation, a fence
+    /// on the prior generation and its epoch, and a new epoch that supersedes it.
+    ///
+    /// No prior daemon generation is declared, which is what the store's own
+    /// lineage rule requires of the FIRST cutover on a store: a prior generation
+    /// with no committed row behind it would be fencing something the durable
+    /// record never granted. The fence still names the generation and epoch the
+    /// cutover supersedes.
+    fn daemon_cutover(
+        cutover_id: &str,
+    ) -> Result<DaemonCutoverOwnership, Box<dyn std::error::Error>> {
+        Ok(DaemonCutoverOwnership {
+            cutover_id: cutover_id.to_owned(),
+            prior_daemon_generation: None,
+            candidate_daemon_generation: ResourceGeneration::new(2)?,
+            new_epoch: AuthorityEpoch::new(2)?,
+            old_proposal_fence: OldDaemonProposalFence {
+                generation: ResourceGeneration::new(1)?,
+                epoch: AuthorityEpoch::new(1)?,
+            },
+            staged_operation_ids: vec![OperationIdentity::new(format!(
+                "staged-{cutover_id}"
+            ))?],
+            in_flight: vec![InFlightDisposition {
+                operation_id: format!("inflight-{cutover_id}"),
+                kind: InFlightDispositionKind::BlockScopeUnknownOutcome,
+            }],
+            unresolved_scopes: vec![format!("scope-{cutover_id}")],
+            linearization_record_id: None,
+        })
+    }
+
+    /// A store that has committed one daemon cutover passes the row family census.
+    ///
+    /// Without the `super::DAEMON_CUTOVER_OWNERSHIP` entry this store's file
+    /// carries `ors_daemon_cutover_ownership_v1`, check 2 finds no census entry
+    /// naming it, and every export and quarantined import of that store is refused
+    /// with [`OrsError::MigrationRequired`].
+    #[test]
+    fn committed_daemon_cutover_table_is_censused() -> TestResult {
+        let path = census_path("commit");
+        let store = super::RedbRecoveryStore::open(&path)?;
+        store.commit_daemon_cutover(daemon_cutover("daemon-cutover-1")?)?;
+        let read = store.database.begin_read()?;
+        check_row_family_census(&read)?;
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    /// A table that genuinely has no census entry still fails closed.
+    ///
+    /// The refusal is the census's whole purpose, so it is proved beside the
+    /// positive case: a file carrying a table no entry names is refused, and the
+    /// refusal names that table rather than counting it or exporting around it.
+    #[test]
+    fn an_undisposed_table_is_still_refused() -> TestResult {
+        let path = census_path("undisposed");
+        let store = super::RedbRecoveryStore::open(&path)?;
+        {
+            let write = store.database.begin_write()?;
+            drop(write.open_table(UNDISPOSED)?);
+            write.commit()?;
+        }
+        let read = store.database.begin_read()?;
+        let refusal = check_row_family_census(&read).expect_err(
+            "a table no census entry names must refuse the census, not be exported around",
+        );
+        assert!(
+            matches!(&refusal, OrsError::MigrationRequired { reason } if reason
+                .contains("ors_census_test_undisposed_v1")),
+            "the refusal must name the undisposed table, got {refusal:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
 }
