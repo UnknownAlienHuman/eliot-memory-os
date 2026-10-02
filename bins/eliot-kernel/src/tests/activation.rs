@@ -23,8 +23,7 @@ struct ActivationTestRoot {
 #[cfg(windows)]
 impl ActivationTestRoot {
     fn create(name: &str) -> Self {
-        static ROOT_SEQUENCE: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
+        static ROOT_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
         let path = std::env::temp_dir().join(format!(
             "eliot-kernel-activation-v2-{name}-{}-{}-{}",
@@ -81,9 +80,9 @@ impl ActivationTestRoot {
                 "activation test root path no longer names its original directory".to_owned(),
             );
         }
-        final_lease
-            .verify_path_identity()
-            .map_err(|error| format!("activation test root path changed before cleanup: {error}"))?;
+        final_lease.verify_path_identity().map_err(|error| {
+            format!("activation test root path changed before cleanup: {error}")
+        })?;
         drop(final_lease);
         std::fs::remove_dir_all(&self.path)
             .map_err(|error| format!("activation test root cleanup failed: {error}"))
@@ -475,8 +474,8 @@ fn activation_bridge_request_frame(
     receipt: &eliot_protocol::AgentBridgePeerAdmissionReceipt,
     name: &str,
 ) -> Frame {
-    let request_id = RequestId::new(format!("activation-request-{name}"))
-        .expect("bridge activation request id");
+    let request_id =
+        RequestId::new(format!("activation-request-{name}")).expect("bridge activation request id");
     let cancellation_id = format!("activation-cancel-{name}");
     let state_fence = receipt.state_fence.clone();
     let request: AgentBridgeActivationRequest = serde_json::from_value(serde_json::json!({
@@ -600,8 +599,7 @@ fn activation_daemon_session(kernel: &KernelComposition, name: &str) -> Session 
 
 #[cfg(windows)]
 fn activation_submit_identity(session: &Session) -> RequestIdentity {
-    static SUBMISSION_SEQUENCE: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
+    static SUBMISSION_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let request_id = RequestId::new(format!(
         "activation-submit-{}-{}",
         unix_ms(),
@@ -667,7 +665,9 @@ fn retain_activation_result_for_test(
         )
         .expect("retain exact result for the claimed activation ticket");
     pending.mark_lifecycle(&ticket.ticket_id, AgentActivationLifecycle::Accepted);
-    pending.fifo.retain(|candidate| candidate != &ticket.ticket_id);
+    pending
+        .fifo
+        .retain(|candidate| candidate != &ticket.ticket_id);
 }
 
 #[cfg(windows)]
@@ -998,11 +998,9 @@ fn activation_kernel_with_live_bridge_ticket(
     let receipt_frame = kernel
         .agent_bridge_admission_receipt_frame(&connection_id)
         .expect("Kernel-authored bridge admission receipt");
-    let receipt = eliot_ipc::decode_agent_bridge_admission_receipt_frame(
-        &receipt_frame,
-        &connection_id,
-    )
-    .expect("decode exact bridge admission receipt");
+    let receipt =
+        eliot_ipc::decode_agent_bridge_admission_receipt_frame(&receipt_frame, &connection_id)
+            .expect("decode exact bridge admission receipt");
     assert_eq!(receipt.receipt_sha256, receipt_sha256);
     let request_frame = activation_bridge_request_frame(&receipt, name);
     let request_identity = request_frame
@@ -1056,7 +1054,10 @@ fn activation_kernel_with_live_bridge_ticket(
         .claim_agent_activation_ticket("activation-fixture/readiness", "revision-1")
         .expect("claim through Kernel lifecycle")
         .expect("one admitted activation ticket");
-    assert_eq!(claimed, ticket, "the normal claim returns the producer ticket");
+    assert_eq!(
+        claimed, ticket,
+        "the normal claim returns the producer ticket"
+    );
     let session = activation_daemon_session(&kernel, name);
     (root, kernel, ticket, session)
 }
