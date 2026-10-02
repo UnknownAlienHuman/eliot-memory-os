@@ -602,12 +602,12 @@ pub fn dispatch_lifecycle_message(
 ) -> Result<LifecycleMessageOutcome, TransportError> {
     frame.validate()?;
     match frame.message_type {
-        MessageType::Event => Ok(LifecycleMessageOutcome::Event(
-            dispatch_lifecycle_event(frame, ledger)?,
-        )),
-        MessageType::Cancel => Ok(LifecycleMessageOutcome::Cancel(
-            dispatch_lifecycle_cancel(frame, registry)?,
-        )),
+        MessageType::Event => Ok(LifecycleMessageOutcome::Event(dispatch_lifecycle_event(
+            frame, ledger,
+        )?)),
+        MessageType::Cancel => Ok(LifecycleMessageOutcome::Cancel(dispatch_lifecycle_cancel(
+            frame, registry,
+        )?)),
         MessageType::Fatal => Ok(LifecycleMessageOutcome::Control(lifecycle.fatal(frame)?)),
         _ => {
             let disposition = observe_lifecycle_deadline(frame, observed_unix_ms, registry)?;
@@ -630,10 +630,9 @@ fn apply_pending_control(
     if !matches!(disposition, LifecycleRequestOutcome::Pending) {
         return Ok(LifecycleMessageOutcome::Terminal(disposition));
     }
-    Ok(LifecycleMessageOutcome::Control(dispatch_lifecycle_control(
-        frame,
-        lifecycle,
-    )?))
+    Ok(LifecycleMessageOutcome::Control(
+        dispatch_lifecycle_control(frame, lifecycle)?,
+    ))
 }
 
 /// Recorded outcome of dispatching one I7.4 lifecycle frame.
@@ -713,8 +712,8 @@ pub fn observe_lifecycle_deadline(
     registry: &mut CancellationRegistry,
 ) -> Result<LifecycleRequestOutcome, TransportError> {
     frame.validate()?;
-    let identity =
-        eliot_protocol::require_lifecycle_request_identity(frame).map_err(TransportError::Protocol)?;
+    let identity = eliot_protocol::require_lifecycle_request_identity(frame)
+        .map_err(TransportError::Protocol)?;
     if registry.state(&identity.cancellation_id).is_none() {
         return Err(TransportError::UnknownRequest);
     }
@@ -749,8 +748,8 @@ pub fn observe_bound_lifecycle_deadline(
     registry: &mut CancellationRegistry,
 ) -> Result<LifecycleRequestOutcome, TransportError> {
     frame.validate()?;
-    let request =
-        eliot_protocol::require_lifecycle_request_identity(frame).map_err(TransportError::Protocol)?;
+    let request = eliot_protocol::require_lifecycle_request_identity(frame)
+        .map_err(TransportError::Protocol)?;
     if registry.state_bound(identity).is_none() {
         return Err(TransportError::UnknownRequest);
     }
@@ -758,11 +757,11 @@ pub fn observe_bound_lifecycle_deadline(
         registry.expire_bound(identity);
         return Ok(LifecycleRequestOutcome::Expired);
     }
-    terminal_outcome(
+    Ok(terminal_outcome(
         registry
             .state_bound(identity)
             .ok_or(TransportError::UnknownRequest)?,
-    )
+    ))
 }
 
 /// Records the terminal for one cancellation identity from a presented
@@ -4293,8 +4292,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_deadline_expiry_and_explicit_cancel_are_distinct_terminals()
-    -> TestResult {
+    fn lifecycle_deadline_expiry_and_explicit_cancel_are_distinct_terminals() -> TestResult {
         let mut registry = CancellationRegistry::default();
         registry.register("cancel-expired")?;
         registry.register("cancel-cancelled")?;
@@ -4409,8 +4407,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_message_dispatch_routes_each_message_to_its_explicit_owner()
-    -> TestResult {
+    fn lifecycle_message_dispatch_routes_each_message_to_its_explicit_owner() -> TestResult {
         let mut registry = CancellationRegistry::default();
         registry.register("cancel-1")?;
         registry.register("cancel-2")?;
@@ -4420,43 +4417,26 @@ mod tests {
         // A deadline-expired control is not applied; the terminal is reported.
         let execute = lifecycle_frame_with_deadline("cancel-1", 100, MessageType::Execute)?;
         assert_eq!(
-            dispatch_lifecycle_message(
-                &execute,
-                100,
-                &mut registry,
-                &mut lifecycle,
-                &mut ledger,
-            )?,
+            dispatch_lifecycle_message(&execute, 100, &mut registry, &mut lifecycle, &mut ledger,)?,
             LifecycleMessageOutcome::Terminal(LifecycleRequestOutcome::Expired)
         );
-        assert_eq!(lifecycle.phase(), eliot_protocol::ModuleLifecyclePhase::Active);
         assert_eq!(
-            registry.state("cancel-1"),
-            Some(CancellationState::Expired)
+            lifecycle.phase(),
+            eliot_protocol::ModuleLifecyclePhase::Active
         );
+        assert_eq!(registry.state("cancel-1"), Some(CancellationState::Expired));
 
         // A pending control is applied, and its retry replays the standing
         // disposition instead of a second effect.
         let quiesce = lifecycle_frame_with_deadline("cancel-2", 900, MessageType::Quiesce)?;
-        let first = dispatch_lifecycle_message(
-            &quiesce,
-            100,
-            &mut registry,
-            &mut lifecycle,
-            &mut ledger,
-        )?;
+        let first =
+            dispatch_lifecycle_message(&quiesce, 100, &mut registry, &mut lifecycle, &mut ledger)?;
         assert!(matches!(
             first,
             LifecycleMessageOutcome::Control(eliot_protocol::ModuleControlEffect::Quiesced)
         ));
         assert_eq!(
-            dispatch_lifecycle_message(
-                &quiesce,
-                200,
-                &mut registry,
-                &mut lifecycle,
-                &mut ledger,
-            )?,
+            dispatch_lifecycle_message(&quiesce, 200, &mut registry, &mut lifecycle, &mut ledger,)?,
             first,
             "a retry under the same idempotency identity replays its disposition"
         );
@@ -4488,13 +4468,7 @@ mod tests {
         // Fatal is the explicit terminal control flow.
         let fatal = lifecycle_frame_with_deadline("cancel-2", 900, MessageType::Fatal)?;
         assert_eq!(
-            dispatch_lifecycle_message(
-                &fatal,
-                100,
-                &mut registry,
-                &mut lifecycle,
-                &mut ledger,
-            )?,
+            dispatch_lifecycle_message(&fatal, 100, &mut registry, &mut lifecycle, &mut ledger,)?,
             LifecycleMessageOutcome::Control(eliot_protocol::ModuleControlEffect::FatalRecorded)
         );
         assert_eq!(
