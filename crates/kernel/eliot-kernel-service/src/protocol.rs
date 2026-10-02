@@ -78,13 +78,64 @@ fn handle(value: &PlatformHandle, field: &'static str) -> Result<(), KernelServi
 /// Stable identity for the Host↔Kernel lifecycle control wire.
 pub const KERNEL_CONTROL_WIRE_ID: &str = "eliot.kernel.host-control";
 /// Current version of the Host↔Kernel lifecycle control wire.
-pub const KERNEL_CONTROL_WIRE_VERSION: u16 = 7;
+///
+/// Version `8` because the Store-stop owner projection carried inside
+/// `RuntimeLeaseCensus::store_stop_obligations` gained two required count
+/// families: `restart_reconciliations` and `degraded_generations`. A census
+/// written under version `7` states neither, and the counts object carries no
+/// serde default, so this reader refuses those bytes as a missing field rather
+/// than reading two absent escalation families as zero. Zero there would be the
+/// fail-open CLEAN STOP those families exist to close. Both
+/// `KernelControlRequest` and `KernelControlResponse` pin this exact version,
+/// so the refusal lands on the envelope itself and not on one optional carrier.
+///
+/// I1.12 allows rollback "only to an artifact compatible with current durable
+/// formats and epoch lineage", and a version `7` census is exactly an artifact
+/// this reader cannot read, so admitting one would be the permissive direction
+/// I1.12 forbids. Nothing is defaulted here: an unstated family stays unstated,
+/// and its holder must be re-read from the owning Kernel rather than inferred
+/// from a wire version.
+///
+/// This is the same convention this crate already followed when
+/// `store_stop_obligations` itself was added to the census, which moved the
+/// control wire from `6` to `7` for one required census field. A required field
+/// nested inside that carrier is the same event on the same wire.
+pub const KERNEL_CONTROL_WIRE_VERSION: u16 = 8;
 /// Canonical authenticated Kernel front-door pipe.
 pub const KERNEL_CONTROL_PIPE: &str = r"\\.\pipe\eliot\kernel\frontdoor";
 /// Stable identity for the Kernel-owned `eliotd` launch descriptor.
 pub const ELIOTD_LAUNCH_DESCRIPTOR_WIRE_ID: &str = "eliot.kernel.eliotd-launch";
 /// Version of the exact `eliotd` child launch contract.
-pub const ELIOTD_LAUNCH_DESCRIPTOR_WIRE_VERSION: u16 = 2;
+///
+/// Version `3` because the approved launch material gained the two I1.9
+/// coordinates this descriptor did not state at all: the Job Object and
+/// resource limits, and the health/readiness contract reference. A descriptor
+/// written under version `2` states neither, so it is not this contract: it
+/// fails to decode, because both new fields are required on the wire and carry
+/// no serde default, and `validate` refuses every `wire_version` it does not
+/// admit. I1.12 allows rollback "only to an artifact compatible with current
+/// durable formats and epoch lineage", and a version `2` descriptor is exactly
+/// an artifact this reader cannot read, so admitting one would be the permissive
+/// direction I1.12 forbids. A reader holding a version `2` descriptor must have
+/// the approved launch material reissued for this generation by the owner that
+/// approves the launch, rather than infer either coordinate; nothing is
+/// defaulted, so an unstated coordinate stays unstated.
+///
+/// NOT version `4`, and the reason is worth keeping: this descriptor does NOT
+/// need a `protocol_sha256` or a `start_command` field to carry I1.9's
+/// remaining two launch coordinates, because it already carries both under the
+/// names its own contract uses. `protected_snapshot_digest` is the
+/// domain-separated identity of the protected Kernel/eliotd snapshot and is
+/// exactly the protocol digest the manifest records, and the canonical argv
+/// (`executable` plus `arguments`) is exactly the manifest's recorded start
+/// command. `daemon_candidate_launch_binding` in `bins/eliot-kernel/src/daemon_runtime.rs`
+/// projects both into `eliot_ors::KernelLaunchBinding` from the descriptor
+/// alone, and `verify_kernel_execution_restart` refuses the whole four-field
+/// binding under `ManifestCandidateBindingMismatch` when any of them differs
+/// from the admitted manifest. Adding a second spelling of either coordinate
+/// would be a second mechanism for one fact, and the two spellings could
+/// disagree.
+pub const ELIOTD_LAUNCH_DESCRIPTOR_WIRE_VERSION: u16 = 3;
 /// Exact module identity of the Kernel-supervised `eliotd` child.
 ///
 /// A restart policy admitted on the launch descriptor must name this child: a
@@ -596,6 +647,46 @@ pub struct EliotdLaunchDescriptor {
     /// ceiling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart_policy: Option<RestartPolicyV1>,
+    /// The exact Job Object and resource limits the approved generation admits
+    /// for this child, or `None` when the approved descriptor states none.
+    ///
+    /// Host owns the launch approval for this Kernel-owned child, so the
+    /// admitted declaration travels on the same Host-approved, digest-bound
+    /// descriptor that admits the launch. It is the shared
+    /// `eliot_ors::ManifestResourceLimits` value the Generation Registry
+    /// manifest records for this generation (I1.9): the declared Job Object
+    /// policy token, the hard process-count ceiling, the hard working-set byte
+    /// ceiling and the CPU rate-control percentage. It is not a second limits
+    /// vocabulary and it is not inferred from the Kernel executable, current
+    /// directory, environment or a default.
+    ///
+    /// Absence is preserved exactly on the wire and in the descriptor digest
+    /// (the same optional-carrier discipline as `restart_policy`): a descriptor
+    /// that states no limits serializes an explicit `null` for this field, and
+    /// that `null` is inside the bytes `descriptor_sha256` covers. It is the
+    /// fail-closed disposition, not a permissive default: a launch with no
+    /// stated limits is refused by the manifest-bound launch gate, not launched
+    /// with implicit ones.
+    ///
+    /// The field carries no `#[serde(default)]`. A descriptor written before
+    /// this wire version omits the key entirely and therefore fails to decode
+    /// as a missing field, which is the correct fail-closed outcome: an absent
+    /// key is a refusal, never a silent `None`.
+    pub job_object_limits: Option<eliot_ors::ManifestResourceLimits>,
+    /// The exact health/readiness contract reference used to evaluate this
+    /// child's readiness, or `None` when the approved descriptor states none.
+    ///
+    /// Host owns it on the same approved, digest-bound descriptor for the same
+    /// reason, and it is the same reference the Generation Registry manifest
+    /// records for this generation (I1.9). It is inert text: naming a contract
+    /// here grants no readiness and evaluates nothing by itself.
+    ///
+    /// Absence carries the same fail-closed meaning as an absent
+    /// `job_object_limits`: a launch whose approved descriptor states no
+    /// readiness contract is refused by the manifest-bound launch gate rather
+    /// than admitted against an unstated one. This field also carries no
+    /// `#[serde(default)]`, so a descriptor that omits the key fails to decode.
+    pub health_readiness_contract_ref: Option<String>,
     /// Lowercase SHA-256 digest over all descriptor fields except this field.
     pub descriptor_sha256: String,
 }
@@ -727,11 +818,44 @@ impl EliotdLaunchDescriptor {
                 });
             }
         }
+        // The two I1.9 launch coordinates are proved once, each by the OWN
+        // validator of the value it carries, so an admitted limits record the
+        // Generation Registry manifest's own vocabulary refuses never reaches a
+        // launch gate as a plausible one.
+        self.validate_observed_launch_coordinates()?;
         if self.compute_digest()? != self.descriptor_sha256 {
             return Err(KernelServiceError::InvalidField {
                 field: "eliotd.descriptor_sha256",
                 reason: "descriptor digest mismatch",
             });
+        }
+        Ok(())
+    }
+
+    /// Proves the two I1.9 launch coordinates this descriptor carries, each by
+    /// the OWN validator of the value it holds.
+    ///
+    /// An absent coordinate is NOT a validation failure here: refusing it is the
+    /// manifest-bound launch gate's decision - it refuses an unobserved
+    /// coordinate with its own recorded kind - and duplicating that refusal here
+    /// would create a second owner of the same seam. Both are therefore checked
+    /// when present and left absent when not, exactly as `restart_policy` is
+    /// treated by [`Self::validate`].
+    ///
+    /// `reason` is a STABLE code in both refusals and the validators' own prose is
+    /// not forwarded: it belongs to `ManifestResourceLimits::validate` and to the
+    /// crate's non-blank text rule, and is not part of this error's contract.
+    fn validate_observed_launch_coordinates(&self) -> Result<(), KernelServiceError> {
+        if let Some(limits) = &self.job_object_limits {
+            limits
+                .validate()
+                .map_err(|_| KernelServiceError::InvalidField {
+                    field: "eliotd.job_object_limits",
+                    reason: "admitted Job Object and resource limits are refused by the manifest resource limits contract",
+                })?;
+        }
+        if let Some(reference) = &self.health_readiness_contract_ref {
+            validate_text(reference, "eliotd.health_readiness_contract_ref")?;
         }
         Ok(())
     }
@@ -3671,6 +3795,14 @@ mod tests {
             authority_epoch: test_epoch(1),
             generation: ResourceGeneration::new(1).expect("generation"),
             restart_policy: None,
+            // The two I1.9 launch coordinates are stated absences here, exactly
+            // as the production materializer publishes them: this fixture proves
+            // wire shape, canonical argv and digest binding, and invents no
+            // approved limit or readiness contract. `validate` admits an absent
+            // coordinate, and the digest below is computed from the bytes these
+            // two `null`s produce.
+            job_object_limits: None,
+            health_readiness_contract_ref: None,
             descriptor_sha256: String::new(),
         }
         .with_computed_digest()
@@ -5058,5 +5190,248 @@ mod tests {
             serde_json::json!({"capability": "a", "effective_mode": "degraded"}),
         ]);
         assert_ne!(forward, altered, "substitution must change the digest");
+    }
+
+    /// Builds the verification context the Kernel admission boundary would
+    /// build for this exact signed payload.
+    ///
+    /// Every value is read back from the payload the ORS ticket itself
+    /// produced, so the context binds that payload rather than restating it.
+    fn census_supervision_context(
+        anchor: &eliot_runtime_contracts::SupervisionTrustAnchor,
+        payload: &eliot_runtime_contracts::SupervisionLease,
+        now_ms: u64,
+    ) -> eliot_runtime_contracts::SupervisionLeaseVerificationContext {
+        use eliot_runtime_contracts::SupervisionLeaseActiveStateBinding;
+        eliot_runtime_contracts::SupervisionLeaseVerificationContext {
+            now_ms,
+            lease_id: payload.lease_id.clone(),
+            host_epoch: payload.host_epoch,
+            activation_id: payload.activation_id.clone(),
+            activation_generation: payload.activation_generation,
+            kernel_epoch: payload.kernel_epoch.clone(),
+            watchdog_epoch: payload.watchdog_epoch,
+            state_fence: payload.state_fence.clone(),
+            scope_ref: payload.scope_ref.clone(),
+            observation_scope: payload.observation_scope.clone(),
+            target_id: payload.generation_binding.target_id.clone(),
+            module_id: payload.generation_binding.module_id.clone(),
+            process_id: payload.generation_binding.process_id.clone(),
+            target_generation: payload.generation_binding.target_generation,
+            module_generation: payload.generation_binding.module_generation,
+            process_generation: payload.generation_binding.process_generation,
+            public_key_fingerprint: anchor.public_key_fingerprint().to_owned(),
+            ors_mirror: payload.ors_mirror.clone(),
+            active_state: SupervisionLeaseActiveStateBinding {
+                state: payload.state,
+                revocation_id: payload.revocation_id.clone(),
+                revocation_epoch: payload.revocation_epoch,
+            },
+        }
+    }
+
+    /// Serves one exact-fence `RuntimeLeaseCensus` from a real ORS that holds a
+    /// recorded manifest-side restart escalation.
+    ///
+    /// The single `persist_kernel_restart_reconciliation` call is the real
+    /// writer for BOTH new families: it appends the escalation row and, in the
+    /// same transaction, moves the affected generation to `Degraded`. The two
+    /// counts below are therefore measured from the owner rather than stated,
+    /// and the census is composed exactly as
+    /// `bins/eliot-kernel/src/idle_lease_census.rs` composes it on the wire.
+    fn lease_census_with_recorded_escalation() -> RuntimeLeaseCensus {
+        use eliot_ors::{
+            KernelReconciliationItem, KernelReconciliationKind, OperationIdentity,
+            SupervisionLeaseBinding, SupervisionLeaseOperation, SupervisionLeasePrepareRequest,
+            test_support::KernelRouteStoreFixture,
+        };
+        use eliot_runtime_contracts::{
+            Ed25519SupervisionLeaseSigner, LeaseState, SupervisionGenerationBinding,
+            SupervisionLeaseSigner, SupervisionLeaseVerifier, SupervisionTrustAnchor,
+            canonical_observation_scope, canonical_wake_policy,
+        };
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis() as u64);
+        let fence = StateFence::new(
+            test_epoch(1),
+            ResourceGeneration::new(4).expect("generation"),
+        );
+        let lease_id = OperationIdentity::new("census-supervision-lease").expect("lease id");
+        let fixture = KernelRouteStoreFixture::open("1884-census-wire").expect("ORS fixture opens");
+        let ors = fixture.store();
+
+        let signer = Ed25519SupervisionLeaseSigner::from_secret_key(
+            "kernel-census",
+            "census-supervision-key",
+            [0x47; 32],
+        )
+        .expect("test signer");
+        let anchor = SupervisionTrustAnchor::new(
+            "installation-1",
+            signer.signer_id(),
+            signer.key_id(),
+            signer.public_key().to_vec(),
+        )
+        .expect("test trust anchor");
+        let binding = SupervisionLeaseBinding {
+            scope_ref: OperationIdentity::new("eliot-supervision-scope:v1:census")
+                .expect("scope ref"),
+            observation_scope: canonical_observation_scope(),
+            installation_id: OperationIdentity::new("installation-1").expect("installation"),
+            host_epoch: AuthorityEpoch::genesis(),
+            activation_id: OperationIdentity::new("activation-1").expect("activation"),
+            activation_generation: fence.resource_generation,
+            kernel_epoch: fence.authority_epoch.clone(),
+            kernel_front_door_server_sid: "S-1-5-19".to_owned(),
+            kernel_front_door_session_id: 0,
+            kernel_front_door_artifact_sha256: "a".repeat(64),
+            watchdog_epoch: AuthorityEpoch::genesis(),
+            generation_binding: SupervisionGenerationBinding {
+                target_id: "eliotd-artifact".to_owned(),
+                target_generation: ResourceGeneration::genesis(),
+                module_id: "eliotd".to_owned(),
+                module_generation: fence.resource_generation,
+                process_id: "pid:1884:start:1".to_owned(),
+                process_generation: ResourceGeneration::genesis(),
+            },
+            state_fence: fence.clone(),
+            issued_at_ms: now_ms,
+            expires_at_ms: now_ms.saturating_add(600_000),
+            renew_before_ms: now_ms.saturating_add(300_000),
+            wake_policy: canonical_wake_policy(),
+            state: LeaseState::Active,
+            terminal_disposition: None,
+            revocation_reason: None,
+            revocation_id: None,
+            revocation_epoch: None,
+        };
+        let stage = ors
+            .prepare_supervision_lease(SupervisionLeasePrepareRequest {
+                ticket_id: OperationIdentity::new("census-ticket").expect("ticket"),
+                operation_id: OperationIdentity::new("census-operation").expect("operation"),
+                lease_id: lease_id.clone(),
+                expected_revision: None,
+                operation: SupervisionLeaseOperation::Commit,
+                binding,
+            })
+            .expect("prepare supervision lease");
+        let envelope = stage
+            .ticket
+            .expected_payload()
+            .expect("canonical payload")
+            .sign(&signer)
+            .expect("sign payload");
+        let verified = anchor
+            .verify(
+                &envelope,
+                &census_supervision_context(&anchor, &envelope.payload, now_ms),
+            )
+            .expect("verify payload");
+        ors.commit_supervision_lease(&stage.ticket, &verified)
+            .expect("commit supervision lease");
+
+        // The real writer for both new families: one recorded refusal appends
+        // the escalation row AND degrades the affected generation in the same
+        // transaction, because a recorded degradation is what withholds its
+        // launch, routes and new effect operation leases.
+        ors.persist_kernel_restart_reconciliation(&KernelReconciliationItem {
+            kind: KernelReconciliationKind::ManifestAbsent,
+            module_id: "eliotd".to_owned(),
+            generation: fence.resource_generation,
+            bound_manifest_sha256: None,
+            recorded_manifest_sha256: None,
+            lease_id: None,
+            operation_id: None,
+            observed_at_ms: i64::try_from(now_ms).expect("clock fits i64"),
+        })
+        .expect("record restart escalation");
+
+        let rows = ors
+            .load_runtime_lease_census_by_state_fence(&fence, &lease_id)
+            .expect("read exact-fence census");
+        RuntimeLeaseCensus {
+            state_fence: fence,
+            supervision_lease_id: lease_id.as_str().to_owned(),
+            runtime_leases: rows.runtime_leases,
+            supervision_lease: rows.supervision,
+            store_stop_obligations: rows.store_stop,
+        }
+    }
+
+    #[test]
+    fn store_stop_escalation_counts_travel_the_lease_census_wire() {
+        // These two counts reach Host, the idle-retirement gate and
+        // `RuntimeLeaseCensus::is_fully_retired` ONLY through the
+        // `store_stop_obligations` carrier, so their presence on this wire is a
+        // property of this boundary and not of the ORS reader's internals.
+        let census = lease_census_with_recorded_escalation();
+        census.validate().expect("served census must validate");
+
+        // Measured, not restated: the one recorded escalation above is the one
+        // escalation and the one degraded generation the owner now reports.
+        assert_eq!(
+            census.store_stop_obligations.counts.restart_reconciliations, 1,
+            "the recorded escalation must be counted by the owner"
+        );
+        assert_eq!(
+            census.store_stop_obligations.counts.degraded_generations, 1,
+            "the degradation recorded with that escalation must be counted"
+        );
+        assert!(
+            !census.store_stop_obligations.is_known_zero(),
+            "a recorded escalation or degradation must block a clean stop"
+        );
+        assert!(
+            !census.is_fully_retired(),
+            "a census holding either new count is not fully retired"
+        );
+
+        // Byte-for-byte round trip of the WHOLE census: both new families are
+        // carried as stated counts, never as an absent key a reader could
+        // resolve to zero.
+        let bytes = serde_json::to_vec(&census).expect("census wire bytes");
+        let decoded: RuntimeLeaseCensus =
+            serde_json::from_slice(&bytes).expect("census wire round trip");
+        assert_eq!(decoded, census);
+        assert_eq!(
+            serde_json::to_vec(&decoded).expect("re-encoded census bytes"),
+            bytes,
+            "the census must re-encode to identical bytes"
+        );
+        assert_eq!(
+            decoded
+                .store_stop_obligations
+                .counts
+                .restart_reconciliations,
+            1
+        );
+        assert_eq!(
+            decoded.store_stop_obligations.counts.degraded_generations,
+            1
+        );
+        decoded
+            .validate()
+            .expect("round-tripped census must validate");
+
+        // Absence is a refusal, not a default. `StoreStopObligationCounts`
+        // carries no serde default on either new field, so counts bytes written
+        // before this delivery fail to decode as a missing field instead of
+        // reading as two silent zeros. Silently zeroing either key would reopen
+        // exactly the fail-open CLEAN STOP these families exist to close, which
+        // is the permissive direction I1.12 forbids.
+        let value = serde_json::to_value(&census).expect("census json");
+        for key in ["restart_reconciliations", "degraded_generations"] {
+            let mut omitted = value.clone();
+            omitted["store_stop_obligations"]["counts"]
+                .as_object_mut()
+                .expect("counts object")
+                .remove(key);
+            assert!(
+                serde_json::from_value::<RuntimeLeaseCensus>(omitted).is_err(),
+                "an absent {key} must be refused, never defaulted to zero"
+            );
+        }
     }
 }

@@ -79,7 +79,11 @@ pub use finish_attempt::{
     PreparedKernelExchange,
 };
 pub use governor_authority_projection::{GovernorAuthorityProjection, LiveGovernorAuthority};
-pub use module_registry_admission::{ModuleCatalogOwnerReadback, ModuleRegistryAdmissionError};
+pub use module_registry_admission::{
+    AdmittedGenerationProjection, CandidateGenerationAdmission, ModuleCatalogOwnerReadback,
+    ModuleRegistryAdmissionError, accept_candidate_generation_into_generation_registry,
+    admit_accepted_generation_into_generation_registry,
+};
 pub use negative_memory_activation::{
     NegativeMemoryActivationDocument, NegativeMemoryActivationEvidence,
     NegativeMemoryActivationReceipt, NegativeMemoryActivationRefusal,
@@ -119,6 +123,11 @@ mod learning_delta_integration;
 mod learning_promotion;
 mod learning_record_commit;
 mod migration_inventory;
+// Private module with crate-root re-exports: the accept chain and its types are
+// reachable as `eliot_governor::…`, which is the ONE public path to them. A second
+// `pub mod` route would be surface widening this issue does not ask for, and two
+// public paths to one item is how a caller ends up importing the same chain twice
+// under different names.
 mod module_registry_admission;
 mod negative_memory_activation;
 mod negative_memory_context;

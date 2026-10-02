@@ -2234,6 +2234,7 @@ impl WindowsProcessExecutor {
                 request.resource_limits().cpu_time_ms(),
                 request.resource_limits().memory_bytes(),
                 Some(active_limit),
+                request.resource_limits().cpu_rate_control_percent(),
             )
             .map_err(unavailable)?;
             let stdout_limit = request.resource_limits().stdout_bytes();
