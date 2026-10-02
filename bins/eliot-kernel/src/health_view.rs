@@ -39,6 +39,46 @@ fn observe_health(event: &'static str, outcome: &'static str) {
     );
 }
 
+/// Reuses the protocol's closed execution-evidence validator against the
+/// original ORS evidence. If a required handle was explicitly withheld, the
+/// owner row's original digest is supplied only to validate a retained route
+/// receipt; the returned projection still leaves the withheld handle absent.
+fn original_execution_evidence_is_valid(
+    evidence: Option<&eliot_ors::HostRequestEffectEvidence>,
+    owner_record: &eliot_ors::HostRequestRecord,
+    degraded: bool,
+    input_handle_missing: bool,
+    output_handle_missing: bool,
+) -> bool {
+    let Some(evidence) = evidence else {
+        return true;
+    };
+    let input_handle = evidence.input_handle.clone().or_else(|| {
+        (degraded && input_handle_missing).then(|| owner_record.request_digest.clone())
+    });
+    let output_handle = evidence.output_handle.clone().or_else(|| {
+        (degraded && output_handle_missing)
+            .then(|| owner_record.result_digest.clone())
+            .flatten()
+    });
+    eliot_protocol::LocalReadExecutionEvidence {
+        wire_id: eliot_protocol::LOCAL_READ_EXECUTION_EVIDENCE_WIRE_ID.to_owned(),
+        wire_version: eliot_protocol::LocalReadExecutionEvidence::CONTRACT_VERSION,
+        operation_id: evidence.operation_id.as_str().to_owned(),
+        invoked_operation: evidence.invoked_operation.clone(),
+        actual_route: evidence.actual_route.clone(),
+        actual_route_receipt: evidence.actual_route_receipt.clone(),
+        activation_resolution_result: evidence.activation_resolution_result.clone(),
+        adapter_identity: evidence.adapter_identity.clone(),
+        executor_identity: evidence.executor_identity.clone(),
+        input_handle,
+        output_handle,
+        side_effects: evidence.side_effects.clone(),
+    }
+    .validate()
+    .is_ok()
+}
+
 /// Confirms that a retained local-read capability was the exact attempt the
 /// verified audit chain dispatched for this request. The capability's local
 /// fencing generation is historical queue evidence; it is never compared to
@@ -362,6 +402,13 @@ fn degraded_trace_replay_without_source(
 
     let expected_named_operation =
         serde_json::to_value(eliot_kernel_service::NamedReadOperation::GetEvidencePack).ok()?;
+    let protocol_evidence_is_valid = original_execution_evidence_is_valid(
+        evidence,
+        owner_record,
+        manifest.finish == TraceFinish::DegradedNoProof,
+        missing("input_handle"),
+        missing("output_handle"),
+    );
     let owner_route_digest = evidence.and_then(|value| value.actual_route.as_deref());
     let owner_route_receipt = evidence.and_then(|value| value.actual_route_receipt.as_ref());
     let route_receipt_is_bound = match (owner_route_digest, owner_route_receipt) {
@@ -375,7 +422,8 @@ fn degraded_trace_replay_without_source(
                 .ok()?;
             let mut body = receipt.clone();
             body.as_object_mut()?.remove("receipt_digest");
-            [
+            protocol_evidence_is_valid
+                && [
                 "kind",
                 "operation_id",
                 "request_digest",
@@ -386,8 +434,8 @@ fn degraded_trace_replay_without_source(
                 "route_facts",
                 "receipt_digest",
             ]
-            .into_iter()
-            .all(|key| object.contains_key(key))
+                .into_iter()
+                .all(|key| object.contains_key(key))
                 && object.len() == 9
                 && is_lower_sha256(digest)
                 && digest == receipt_digest
@@ -443,11 +491,13 @@ fn degraded_trace_replay_without_source(
                         && manifest.actual_route_receipt.is_none()))
         }
         (digest, None) => {
-            digest.is_none_or(is_lower_sha256)
+            protocol_evidence_is_valid
+                && digest.is_none_or(is_lower_sha256)
                 && manifest.actual_route.as_deref() == digest
                 && manifest.actual_route_receipt.is_none()
                 && missing("actual_route")
         }
+        (None, Some(_)) => false,
     };
     if !route_receipt_is_bound {
         return None;
@@ -1085,6 +1135,19 @@ impl KernelComposition {
         let expected_named_operation =
             serde_json::to_value(NamedReadOperation::GetEvidencePack).ok();
         let expected_state_fence = serde_json::to_value(&owner_envelope.state_fence).ok();
+        let protocol_evidence_is_valid = original_execution_evidence_is_valid(
+            owner_evidence,
+            &owner_record,
+            manifest.finish == TraceFinish::DegradedNoProof,
+            manifest
+                .missing_parts
+                .iter()
+                .any(|part| part == "input_handle"),
+            manifest
+                .missing_parts
+                .iter()
+                .any(|part| part == "output_handle"),
+        );
         let owner_route_receipt_is_bound = match owner_actual_route_receipt {
             Some(receipt) => {
                 let Some(receipt_object) = receipt.as_object() else {
@@ -1113,7 +1176,8 @@ impl KernelComposition {
                 }) else {
                     return serde_json::json!({"status": "unknown"});
                 };
-                receipt_object.len() == 9
+                protocol_evidence_is_valid
+                    && receipt_object.len() == 9
                     && [
                         "kind",
                         "operation_id",
@@ -1178,7 +1242,8 @@ impl KernelComposition {
                             && manifest.actual_route_receipt.is_none()))
             }
             None => {
-                owner_actual_route_digest.is_none_or(is_lower_sha256)
+                protocol_evidence_is_valid
+                    && owner_actual_route_digest.is_none_or(is_lower_sha256)
                     && manifest.actual_route.as_deref() == owner_actual_route_digest
                     && manifest.actual_route_receipt.is_none()
                     && manifest.finish == TraceFinish::DegradedNoProof

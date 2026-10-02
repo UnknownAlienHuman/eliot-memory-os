@@ -25,7 +25,8 @@ use super::{
     ownership_secret_absence_evidence, phase_b_scm_digest,
     prove_no_service_profile_authority_dependency, sha256_handle, sha256_hex,
     validate_installer_effects, validate_package_binding, validate_phase_b_effect_bindings,
-    validate_staging_receipt_for_observation, validate_staging_receipt_for_plan,
+    validate_portable_dev_authority_effect_bindings, validate_staging_receipt_for_observation,
+    validate_staging_receipt_for_plan,
     validate_user_mode_authority_effect_bindings,
 };
 /// Store-volume observation used to evaluate the immutable free-space policy.
@@ -1528,6 +1529,11 @@ impl InstallationTransaction {
                 .as_ref()
                 .ok_or(InstallationError::IdentityConflict)?,
             &self.installer_effects,
+        )?;
+        validate_portable_dev_authority_effect_bindings(
+            &transaction_id,
+            &candidate_manifest,
+            &installer_effects,
         )?;
         validate_package_binding(
             &self.candidate_manifest,

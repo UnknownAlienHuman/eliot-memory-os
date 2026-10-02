@@ -10822,9 +10822,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         let image = |owner: RecoveryOwner, bytes: Vec<u8>| -> Result<AgentActivationOwnerImage, CompositionError> {
             let original = self.recovery.owner_read(owner)?;
-            if original.revision == 0 || original.state_fence != state_fence {
+            if original.state_fence != state_fence {
                 return Err(CompositionError::Recovery(format!(
-                    "activation owner {} has no current revision at the active fence",
+                    "activation owner {} is not read at the active fence",
                     owner.as_str()
                 )));
             }
@@ -10869,8 +10869,24 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             ));
         }
         let images = self.prepare_agent_activation_owner_images(command)?;
-        let manifest_digest = crate::task_lifecycle::production_manifest_digest()
+        // PreparedTransition validates against the generated named-operation
+        // catalogue. Bind this envelope to that exact set so the new closed
+        // owner mutation is in the admitted operation surface.
+        let operation_manifests = eliot_store_api::generated_operation_manifests()
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let manifest_digest =
+            eliot_store_api::operation_manifest_set_digest(&operation_manifests)
+                .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if !operation_manifests.iter().any(|manifest| {
+            manifest.name
+                == eliot_store_api::named_mutation_operation_name(
+                    eliot_store_api::NamedMutationOperation::ApplyAgentActivationOwners,
+                )
+        }) {
+            return Err(CompositionError::Recovery(
+                "generated operation catalogue omits ApplyAgentActivationOwners".to_owned(),
+            ));
+        }
         let scope_id = eliot_store_api::ScopeId::new(images.scope_ref.clone())
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         let envelope = CanonicalWriteEnvelope {
