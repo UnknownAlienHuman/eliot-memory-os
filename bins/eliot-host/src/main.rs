@@ -1389,9 +1389,8 @@ fn fail_scm_dispatcher(error: u32) -> ! {
         terminal = terminal.with_launch_options(options);
     }
     observe_host_request(&terminal);
-    let detail = format!(
-        "StartServiceCtrlDispatcherW failed with Win32 error {error} (0x{error:08X})"
-    );
+    let detail =
+        format!("StartServiceCtrlDispatcherW failed with Win32 error {error} (0x{error:08X})");
     let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
     persist_host_start_failure(
         HostStopCode::DispatcherFailed,
