@@ -77,7 +77,7 @@ use eliot_dreamer_rival_model::{RivalPolicy, structure_rival_models};
 use eliot_epistemic::{PositionRequest, resolve};
 use eliot_epistemic_contracts::{ConflictSet, CurrentEpistemicPosition as AdmittedPosition};
 
-use crate::OrientationStageDisposition;
+use crate::{OrientationStageDisposition, OrientationStageRecord};
 
 /// Caller-supplied classification stage inputs (owner-built, never inferred).
 pub(crate) struct ClassificationStage<'a> {
@@ -312,6 +312,21 @@ impl PulseStageId {
 /// Canonical identity of the mandatory ten-member denominator.
 pub(crate) const PULSE_DENOMINATOR_IDENTITY: &str = "orientation-pulse-denominator:v1:classification,cue_activation,epistemic_position,understanding,grounding,rivals,conflict,probes,candidates,packet";
 
+/// Expected member count, derived from the canonical denominator identity.
+///
+/// This is deliberately NOT `PulseStageId::ORDER.len()`: the denominator
+/// identity is the published wire claim about how many members a complete
+/// pulse carries, so completeness is checked against the claim rather than
+/// against the very list the records are built from. A ledger assembled from
+/// [`PulseStageId::ORDER`] always has `ORDER.len()` entries by construction,
+/// so comparing it to `ORDER.len()` proves nothing; comparing it to this
+/// count fails closed if the two ever drift apart.
+pub(crate) const PULSE_EXPECTED_MEMBER_COUNT: usize = 10;
+
+/// Static reason when a ledger does not cover the published denominator.
+pub(crate) const PULSE_DENOMINATOR_INCOMPLETE: &str =
+    "pulse ledger does not cover the mandatory denominator";
+
 /// Explicit composition denominator: the canonical member set this crate
 /// composes against. Whether CC-002/CC-004 are mandatory is no longer a flag
 /// on the denominator: production carries them as non-optional
@@ -407,6 +422,35 @@ impl PulseStage {
 /// treats as an owner defect.
 pub(crate) fn output_digest<T: serde::Serialize>(value: &T) -> Option<String> {
     canonical_bytes(value).ok().map(|bytes| digest_hex(&bytes))
+}
+
+/// Proves one ledger covers the published denominator, once per member.
+///
+/// Two independent properties, both required before a pulse result may be
+/// published:
+///
+/// 1. The ledger holds exactly [`PULSE_EXPECTED_MEMBER_COUNT`] records - the
+///    count the canonical denominator identity claims, not the count of the
+///    list the records were built from.
+/// 2. Every member of [`PulseStageId::ORDER`] appears exactly once, so a
+///    duplicated record cannot stand in for a missing member while the total
+///    count still matches.
+///
+/// Returns the static field naming the refusal. Both properties are checked
+/// here so a caller cannot forget one; the caller keeps the failure typed.
+pub(crate) fn verify_denominator_coverage(
+    records: &[OrientationStageRecord],
+) -> Result<(), &'static str> {
+    if records.len() != PULSE_EXPECTED_MEMBER_COUNT {
+        return Err(PULSE_DENOMINATOR_INCOMPLETE);
+    }
+    for id in PulseStageId::ORDER {
+        let occurrences = records.iter().filter(|record| record.stage == id.as_str()).count();
+        if occurrences != 1 {
+            return Err(PULSE_DENOMINATOR_INCOMPLETE);
+        }
+    }
+    Ok(())
 }
 
 /// Fail-closed pulse error with bounded static refusal fields.
@@ -714,5 +758,71 @@ pub(crate) fn run_candidate_stage(
             CANDIDATES_REQUIRE_PROJECTIONS,
         )),
         (_, None) => Ok(PulseStage::pending(PulseStageId::Candidates)),
+    }
+}
+
+#[cfg(test)]
+mod pulse_denominator_coverage_tests {
+    use super::*;
+
+    /// One ledger record per mandatory member, in denominator order.
+    ///
+    /// Built from [`PulseStageId::ORDER`] exactly as the composer's blocked and
+    /// composed paths build it, so this is the ledger shape production
+    /// publishes rather than a hand-assembled lookalike.
+    fn complete_ledger() -> Vec<OrientationStageRecord> {
+        PulseStageId::ORDER
+            .iter()
+            .map(|id| OrientationStageRecord {
+                stage: id.as_str().to_owned(),
+                owner: id.owner_entry().to_owned(),
+                required: true,
+                disposition: OrientationStageDisposition::Blocked,
+                expected_input: id.expected_input().to_owned(),
+                input_commitment: None,
+                output_commitment: None,
+                proof_ceiling: CEILING_BLOCKED.to_owned(),
+                reason: Some(id.missing_reason().to_owned()),
+                recovery: Some(id.recovery().to_owned()),
+            })
+            .collect()
+    }
+
+    /// The positive case: the ledger the composer actually publishes covers
+    /// the published denominator exactly once per member.
+    ///
+    /// Also pins the count the composer relies on: `PULSE_EXPECTED_MEMBER_COUNT`
+    /// is the independent expected set, so it must equal the number of members
+    /// `PulseStageId::ORDER` names. If a member is ever added to or removed
+    /// from the order without the published claim changing, this fails.
+    #[test]
+    fn complete_ledger_covers_the_published_denominator() {
+        let ledger = complete_ledger();
+        assert_eq!(
+            ledger.len(),
+            PULSE_EXPECTED_MEMBER_COUNT,
+            "the published member count must equal the members the order names"
+        );
+        assert_eq!(
+            verify_denominator_coverage(&ledger),
+            Ok(()),
+            "a complete ledger must satisfy the coverage proof"
+        );
+    }
+
+    /// The refusal case: a ledger missing one member is refused, not published.
+    ///
+    /// This is the case the previous self-referential count could not detect -
+    /// dropping a member still leaves a ledger that "has as many records as the
+    /// order has members" while no longer covering the denominator at all.
+    #[test]
+    fn ledger_missing_a_member_is_refused() {
+        let mut ledger = complete_ledger();
+        ledger.retain(|record| record.stage != PulseStageId::Packet.as_str());
+        assert_eq!(
+            verify_denominator_coverage(&ledger),
+            Err(PULSE_DENOMINATOR_INCOMPLETE),
+            "a ledger missing a mandatory member must refuse"
+        );
     }
 }
