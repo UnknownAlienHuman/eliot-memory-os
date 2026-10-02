@@ -89,6 +89,10 @@ mod kernel_config;
 pub mod kernel_diagnostics;
 mod process_execution;
 mod process_execution_client;
+#[cfg(windows)]
+mod installation_survey_route;
+#[cfg(windows)]
+mod installation_survey_stream_sink;
 mod supervision_lease_authority;
 mod testd_terminal_completion_route;
 mod tool_exposure;

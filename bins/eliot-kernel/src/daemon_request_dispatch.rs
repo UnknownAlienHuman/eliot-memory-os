@@ -641,6 +641,9 @@ fn daemon_terminal_code(error: &TransportError) -> &'static str {
 fn trusted_daemon_operation(operation: &str) -> &'static str {
     match operation {
         "snapshot" => "snapshot",
+        eliot_installation::INSTALLATION_SURVEY_PROBE_OPERATION => {
+            eliot_installation::INSTALLATION_SURVEY_PROBE_OPERATION
+        }
         "daemon_ready" => "daemon_ready",
         "origin_challenge_issue" => "origin_challenge_issue",
         "origin_control_decide" => "origin_control_decide",
@@ -3347,6 +3350,11 @@ impl KernelComposition {
         #[cfg(windows)]
         self.require_current_daemon_session(session)?;
         let result = match operation {
+            #[cfg(windows)]
+            eliot_installation::INSTALLATION_SURVEY_PROBE_OPERATION => {
+                let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+                self.installation_survey_probe_operation(session, identity, payload).await
+            }
             #[cfg(windows)]
             scan_disclosure_route::OPERATION => {
                 self.scan_disclosure_owner_operation(session, payload)

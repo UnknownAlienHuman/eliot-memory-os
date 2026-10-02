@@ -6,7 +6,8 @@ use eliot_platform::{PortError, PortOutcome, ProviderError, ProviderErrorCode, U
 use eliot_platform_windows::{
     AuthenticodeVerdict, FileIdentity, InstallerRootProfile, PackageManifest, PackageStager,
     PackageStagingError, PackageStagingObservation, PackageStagingStage, StagePackageAuthorization,
-    StagePackageExpectedFile, StagingReceipt, TrustedSourceBundle,
+    StagePackageExpectedFile, StagingReceipt, TrustedSourceBundle, open_no_follow_directory,
+    windows_paths_equal,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -27,7 +28,7 @@ pub(super) fn package_plan_error(error: &PackageStagingError) -> InstallationErr
     }
 }
 
-fn package_staging_profile(profile: super::InstallationProfile) -> InstallerRootProfile {
+pub(super) fn package_staging_profile(profile: super::InstallationProfile) -> InstallerRootProfile {
     match profile {
         super::InstallationProfile::SystemService => InstallerRootProfile::SystemService,
         super::InstallationProfile::UserMode => InstallerRootProfile::UserMode,
@@ -70,65 +71,117 @@ pub(super) fn validate_package_binding(
     }
     let expected_manifest_digest = candidate_manifest_digest(candidate_manifest)?;
     let mut package_count = 0_u8;
+    let mut managed_effect_count = 0_u8;
     for effect in effects {
-        let InstallerEffectPlan::StagePackage {
-            generation,
-            manifest,
-            staging_root,
-            destination_root,
-            candidate_manifest_digest: bound_manifest_digest,
-            package_manifest_digest: bound_package_manifest_digest,
-            ..
-        } = effect
-        else {
-            continue;
-        };
-        package_count = package_count.saturating_add(1);
-        if generation != &candidate_manifest.generation {
-            return Err(InstallationError::IdentityConflict);
-        }
-        if bound_manifest_digest != &expected_manifest_digest {
-            return Err(InstallationError::IdentityConflict);
-        }
-        if !same_windows_root(staging_root.as_str(), transaction_staging_root.as_str())? {
-            return Err(InstallationError::IdentityConflict);
-        }
-        let expected_destination = candidate_manifest
-            .runtime_launch
-            .profile_governed_roots
-            .immutable_binaries
-            .as_str();
-        if let Some(destination_root) = destination_root {
-            if !same_windows_root(destination_root.as_str(), expected_destination)? {
-                return Err(InstallationError::ProfileViolation(
-                    "StagePackage destination must equal the candidate's selected immutable_binaries root"
-                        .to_owned(),
-                ));
+        match effect {
+            InstallerEffectPlan::StagePackage {
+                generation,
+                manifest,
+                staging_root,
+                destination_root,
+                candidate_manifest_digest: bound_manifest_digest,
+                package_manifest_digest: bound_package_manifest_digest,
+                ..
+            } => {
+                package_count = package_count.saturating_add(1);
+                if generation != &candidate_manifest.generation {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                if bound_manifest_digest != &expected_manifest_digest {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                if !same_windows_root(staging_root.as_str(), transaction_staging_root.as_str())? {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                let expected_destination = candidate_manifest
+                    .runtime_launch
+                    .profile_governed_roots
+                    .immutable_binaries
+                    .as_str();
+                if let Some(destination_root) = destination_root {
+                    if !same_windows_root(destination_root.as_str(), expected_destination)? {
+                        return Err(InstallationError::ProfileViolation(
+                            "StagePackage destination must equal the candidate's selected immutable_binaries root"
+                                .to_owned(),
+                        ));
+                    }
+                } else if !same_windows_root(
+                    &Path::new(staging_root.as_str())
+                        .join(&manifest.generation)
+                        .to_string_lossy(),
+                    expected_destination,
+                )? {
+                    return Err(InstallationError::IncompleteObservation(
+                        "profile-bound StagePackage must retain its exact immutable destination"
+                            .to_owned(),
+                    ));
+                }
+                let validated_package_manifest =
+                    PackageManifest::new(&manifest.generation, manifest.files.clone())
+                        .map_err(|error| package_plan_error(&error))?;
+                sha256_handle(
+                    bound_package_manifest_digest,
+                    "installer_effect.package_manifest_digest",
+                )?;
+                if bound_package_manifest_digest.as_str()
+                    != validated_package_manifest.canonical_digest()
+                {
+                    return Err(InstallationError::IdentityConflict);
+                }
             }
-        } else if !same_windows_root(
-            &Path::new(staging_root.as_str())
-                .join(&manifest.generation)
-                .to_string_lossy(),
-            expected_destination,
-        )? {
-            return Err(InstallationError::IncompleteObservation(
-                "profile-bound StagePackage must retain its exact immutable destination".to_owned(),
-            ));
-        }
-        let validated_package_manifest =
-            PackageManifest::new(&manifest.generation, manifest.files.clone())
+            InstallerEffectPlan::ManagedEnvironmentChange {
+                managed_tools_root,
+                recipe,
+                ..
+            } => {
+                managed_effect_count = managed_effect_count.saturating_add(1);
+                recipe.validate()?;
+                recipe.require_supported().map_err(|requirement| {
+                    InstallationError::ProfileViolation(format!(
+                        "managed effect recipe requires unsupported capability {requirement:?}"
+                    ))
+                })?;
+                let expected_tools_root = recipe.target_root(Path::new(
+                    &candidate_manifest
+                        .runtime_launch
+                        .profile_governed_roots
+                        .immutable_binaries,
+                ));
+                if !same_windows_root(
+                    managed_tools_root.as_str(),
+                    &expected_tools_root.to_string_lossy(),
+                )? || !same_windows_root(
+                    transaction_staging_root.as_str(),
+                    candidate_manifest
+                        .runtime_launch
+                        .runtime_state_roots
+                        .installation_root
+                        .as_str(),
+                )?
+                {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                let validated_recipe_manifest = PackageManifest::new(
+                    &recipe.package_manifest.generation,
+                    recipe.package_manifest.files.clone(),
+                )
                 .map_err(|error| package_plan_error(&error))?;
-        sha256_handle(
-            bound_package_manifest_digest,
-            "installer_effect.package_manifest_digest",
-        )?;
-        if bound_package_manifest_digest.as_str() != validated_package_manifest.canonical_digest() {
-            return Err(InstallationError::IdentityConflict);
+                if validated_recipe_manifest != recipe.package_manifest {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            }
+            _ => {}
         }
     }
     if package_count > 1 {
         return Err(InstallationError::Duplicate {
             kind: "package staging effect".to_owned(),
+            identity: candidate_manifest.generation.as_str().to_owned(),
+        });
+    }
+    if managed_effect_count > 1 || (managed_effect_count != 0 && package_count != 0) {
+        return Err(InstallationError::Duplicate {
+            kind: "managed package staging effect".to_owned(),
             identity: candidate_manifest.generation.as_str().to_owned(),
         });
     }
@@ -169,15 +222,35 @@ pub(super) fn validate_staging_receipt_for_plan(
     effect: &InstallerEffectPlan,
     receipt: &StagingReceipt,
 ) -> Result<(), InstallationError> {
-    let InstallerEffectPlan::StagePackage {
-        manifest,
-        staging_root,
-        destination_root,
-        expected_file_digests,
-        ..
-    } = effect
-    else {
-        return Err(InstallationError::IdentityConflict);
+    let (manifest, expected_root, expected_file_digests) = match effect {
+        InstallerEffectPlan::StagePackage {
+            manifest,
+            staging_root,
+            destination_root,
+            expected_file_digests,
+            ..
+        } => (
+            manifest,
+            destination_root.as_ref().map_or_else(
+                || Path::new(staging_root.as_str()).join(&manifest.generation),
+                |root| PathBuf::from(root.as_str()),
+            ),
+            expected_file_digests.as_slice(),
+        ),
+        InstallerEffectPlan::ManagedEnvironmentChange {
+            recipe,
+            managed_tools_root,
+            ..
+        } => {
+            let expected_root = Path::new(managed_tools_root.as_str())
+                .join(&recipe.package_manifest.generation);
+            (
+                &recipe.package_manifest,
+                expected_root,
+                recipe.expected_files.as_slice(),
+            )
+        }
+        _ => return Err(InstallationError::IdentityConflict),
     };
     if receipt.generation != manifest.generation
         || receipt.manifest_sha256 != manifest.canonical_digest()
@@ -186,10 +259,6 @@ pub(super) fn validate_staging_receipt_for_plan(
     {
         return Err(InstallationError::IdentityConflict);
     }
-    let expected_root = destination_root.as_ref().map_or_else(
-        || Path::new(staging_root.as_str()).join(&manifest.generation),
-        |root| PathBuf::from(root.as_str()),
-    );
     if !eliot_platform_windows::windows_paths_equal(&receipt.root_path, &expected_root) {
         return Err(InstallationError::IdentityConflict);
     }
@@ -453,21 +522,81 @@ fn package_stager(
     else {
         return Err(PackageStagingError::Io);
     };
+    let stager = package_stager_for_source(
+        source_bundle,
+        source_bundle_identity,
+        staging_root,
+        destination_root.as_ref(),
+        package_staging_profile(request.profile),
+    )?;
+    Ok((stager, manifest.clone()))
+}
+
+/// Opens the existing bounded package stager from the exact source identity
+/// and target binding carried by one admitted effect recipe.
+pub(super) fn package_stager_for_source(
+    source_bundle: &PlatformHandle,
+    source_bundle_identity: &FileIdentity,
+    staging_root: &PlatformHandle,
+    destination_root: Option<&PlatformHandle>,
+    profile: InstallerRootProfile,
+) -> Result<PackageStager, PackageStagingError> {
     let source = TrustedSourceBundle::open(Path::new(source_bundle.as_str()))?;
     if source.identity() != *source_bundle_identity {
         return Err(PackageStagingError::IdentityMismatch);
     }
-    let profile = package_staging_profile(request.profile);
-    let stager = match destination_root {
+    match destination_root {
         Some(destination_root) => PackageStager::open_for_profile_destination(
             source,
             Path::new(staging_root.as_str()),
             Path::new(destination_root.as_str()),
             profile,
-        )?,
-        None => PackageStager::open_for_profile(source, Path::new(staging_root.as_str()), profile)?,
-    };
-    Ok((stager, manifest.clone()))
+        ),
+        None => PackageStager::open_for_profile(
+            source,
+            Path::new(staging_root.as_str()),
+            profile,
+        ),
+    }
+}
+
+/// Reopens one managed destination's parent without following reparse points
+/// and requires the exact original owner identity before receipt readback or
+/// deletion.
+pub(super) fn verify_managed_destination_parent_identity(
+    destination: &PlatformHandle,
+    expected: Option<FileIdentity>,
+) -> Result<(), PackageStagingError> {
+    let expected = expected.ok_or(PackageStagingError::IdentityMismatch)?;
+    if expected.volume_serial_number == 0 || expected.file_index == 0 {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    let parent = Path::new(destination.as_str())
+        .parent()
+        .ok_or(PackageStagingError::InvalidRelativePath)?;
+    let (identity, _directory) = open_no_follow_directory(parent).map_err(|error| match error {
+        eliot_platform_windows::ProtectedPathError::InvalidRoot
+        | eliot_platform_windows::ProtectedPathError::InvalidPath => {
+            PackageStagingError::RootUnavailable
+        }
+        eliot_platform_windows::ProtectedPathError::ReparsePoint => {
+            PackageStagingError::ReparsePoint
+        }
+        eliot_platform_windows::ProtectedPathError::IdentityMismatch => {
+            PackageStagingError::IdentityMismatch
+        }
+        eliot_platform_windows::ProtectedPathError::UnsupportedPlatform => {
+            PackageStagingError::UnsupportedPlatform
+        }
+        eliot_platform_windows::ProtectedPathError::AclMismatch
+        | eliot_platform_windows::ProtectedPathError::Io
+        | eliot_platform_windows::ProtectedPathError::SizeExceeded
+        | eliot_platform_windows::ProtectedPathError::Win32 { .. } => PackageStagingError::Io,
+    })?;
+    if identity != expected {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    Ok(())
 }
 
 fn stage_package_authorization(
@@ -486,6 +615,67 @@ fn stage_package_authorization(
     else {
         return Err(PackageStagingError::Io);
     };
+    stage_package_authorization_for_bound_package(
+        request,
+        source_bundle_identity,
+        generation,
+        manifest,
+        staging_root,
+        destination_root.as_ref(),
+        installation_root_identity,
+        destination_parent_identity,
+    )
+}
+
+/// Creates the same HMAC-bound marker authorization for a signed managed
+/// package recipe. Its source facts are taken only from the durable package
+/// precondition, and all identifiers remain the existing transaction's.
+pub(super) fn stage_package_authorization_for_bound_package(
+    request: &InstallationEffectRequest,
+    source_bundle_identity: &FileIdentity,
+    generation: &PlatformHandle,
+    manifest: &PackageManifest,
+    staging_root: &PlatformHandle,
+    destination_root: Option<&PlatformHandle>,
+    installation_root_identity: Option<FileIdentity>,
+    destination_parent_identity: Option<FileIdentity>,
+) -> Result<StagePackageAuthorization, PackageStagingError> {
+    match &request.plan {
+        InstallerEffectPlan::StagePackage {
+            source_bundle_identity: planned_source,
+            generation: planned_generation,
+            manifest: planned_manifest,
+            staging_root: planned_staging_root,
+            destination_root: planned_destination_root,
+            ..
+        } if planned_source == source_bundle_identity
+            && planned_generation == generation
+            && planned_manifest == manifest
+            && planned_staging_root == staging_root
+            && planned_destination_root.as_ref() == destination_root => {}
+        InstallerEffectPlan::ManagedEnvironmentChange {
+            recipe,
+            managed_tools_root,
+            ..
+        } => {
+            let expected_destination = Path::new(managed_tools_root.as_str())
+                .join(&recipe.package_manifest.generation);
+            if recipe.source_bundle_identity != *source_bundle_identity
+                || recipe.package_manifest.generation != generation.as_str()
+                || recipe.package_manifest != *manifest
+                || !windows_paths_equal(
+                    Path::new(staging_root.as_str()),
+                    Path::new(request.installation_root.as_str()),
+                )
+                || destination_root.is_none_or(|destination| {
+                    !windows_paths_equal(Path::new(destination.as_str()), &expected_destination)
+                })
+            {
+                return Err(PackageStagingError::IdentityMismatch);
+            }
+        }
+        _ => return Err(PackageStagingError::IdentityMismatch),
+    }
     let snapshot = request
         .precondition
         .package_snapshot
@@ -522,9 +712,7 @@ fn stage_package_authorization(
         source_bundle_identity: *source_bundle_identity,
         source_snapshot_digest: snapshot.digest.as_str().to_owned(),
         staging_root: PathBuf::from(staging_root.as_str()),
-        destination_root: destination_root
-            .as_ref()
-            .map(|root| PathBuf::from(root.as_str())),
+        destination_root: destination_root.map(|root| PathBuf::from(root.as_str())),
         installation_root_identity,
         destination_parent_identity,
         generation: generation.as_str().to_owned(),
@@ -745,12 +933,12 @@ fn package_staging_outcome<T>(error: &PackageStagingError) -> PortOutcome<T> {
     }
 }
 
-fn package_pending(error: &PackageStagingError) -> InstallationEffectObservation {
+pub(super) fn package_pending(error: &PackageStagingError) -> InstallationEffectObservation {
     let pending_ref = package_staging_error_reference(error);
     InstallationEffectObservation::Mismatch { pending_ref }
 }
 
-fn package_receipt_binding(
+pub(super) fn package_receipt_binding(
     request: &InstallationEffectRequest,
     receipt: &StagingReceipt,
 ) -> Result<(PlatformHandle, PlatformHandle, PlatformHandle), PortError> {
@@ -780,7 +968,7 @@ fn package_receipt_binding(
     Ok((receipt_digest, external_identity, postcondition_digest))
 }
 
-fn package_matching_observation(
+pub(super) fn package_matching_observation(
     request: &InstallationEffectRequest,
     receipt: StagingReceipt,
 ) -> Result<InstallationEffectObservation, PortError> {
@@ -805,7 +993,7 @@ fn package_matching_observation(
     })
 }
 
-fn validate_observed_against_plan(
+pub(super) fn validate_observed_against_plan(
     observed: &eliot_platform_windows::PackageSourceObservation,
     manifest: &PackageManifest,
     expected: &[PackageArtifactDigest],
@@ -859,7 +1047,7 @@ fn validate_observed_against_plan(
     Ok(())
 }
 
-fn build_package_snapshot(
+pub(super) fn build_package_snapshot(
     source_identity: FileIdentity,
     generation: PlatformHandle,
     manifest_digest: PlatformHandle,

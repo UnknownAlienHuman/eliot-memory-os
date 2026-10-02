@@ -24,6 +24,11 @@ use super::canary_removal::{
     CANARY_REMOVAL_WIRE_VERSION, CanaryRemovalOperation, CanaryRemovalOperationVersion,
     canary_removal_operation_id,
 };
+use super::managed_change_execution::{
+    InstallationManagedRootEffectProof, ManagedResourceKey, ManagedResourceProjection,
+    derive_managed_resource_projection, derive_managed_root_effect_proof,
+    validate_managed_prior_receipts, validate_managed_prior_root_effects,
+};
 use super::package_planner::{
     MODULE_BUILD_PROVENANCE_ROLES as SOURCE_BUNDLE_MODULE_PROVENANCE_ROLES,
     REQUIRED_PACKAGE_ROLES as SOURCE_BUNDLE_REQUIRED_ROLES, package_inventory_roles,
@@ -1284,10 +1289,188 @@ impl RedbInstallationTransactionStore {
         milestone: SetupMilestone,
         intent_digest: &PlatformHandle,
     ) -> Result<(), InstallationError> {
+        self.record_setup_effect_intent_record(
+            transaction_id,
+            milestone,
+            intent_digest,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// Persists the original PortableDev setup-key receipt as part of the
+    /// ServiceKeysGenerated intent, before the provider performs its one
+    /// create-only write. The receipt is public metadata and is bound by the
+    /// same digest as the original milestone intent; it is never reconstructed
+    /// after restart.
+    pub fn record_setup_portable_dev_signing_key_intent(
+        &mut self,
+        transaction_id: &PlatformHandle,
+        receipt: &eliot_platform_windows::PortableDevSupervisionAuthorityKeyReceipt,
+    ) -> Result<PlatformHandle, InstallationError> {
+        receipt
+            .validate()
+            .map_err(|_| InstallationError::IdentityConflict)?;
+        let request = &receipt.request;
+        if request.transaction_id != transaction_id.as_str()
+            || request.effect_id != SetupMilestone::ServiceKeysGenerated.effect_identity()
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let intent_digest = setup_portable_dev_signing_key_intent_digest(receipt)?;
+        self.record_setup_effect_intent_record(
+            transaction_id,
+            SetupMilestone::ServiceKeysGenerated,
+            &intent_digest,
+            Some(receipt),
+            None,
+            None,
+        )?;
+        Ok(intent_digest)
+    }
+
+    /// Persists the exact original UserMode setup signing-key receipt in the
+    /// ServiceKeysGenerated intent before the Credential Manager write. The
+    /// receipt is public metadata and is never rebuilt after a restart.
+    pub fn record_setup_user_mode_signing_key_intent(
+        &mut self,
+        transaction_id: &PlatformHandle,
+        receipt: &eliot_platform_windows::UserModeSupervisionAuthorityCredentialReceipt,
+    ) -> Result<PlatformHandle, InstallationError> {
+        receipt
+            .validate()
+            .map_err(|_| InstallationError::IdentityConflict)?;
+        let request = &receipt.request;
+        if request.transaction_id != transaction_id.as_str()
+            || request.effect_id != SetupMilestone::ServiceKeysGenerated.effect_identity()
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let intent_digest = setup_user_mode_signing_key_intent_digest(receipt)?;
+        self.record_setup_effect_intent_record(
+            transaction_id,
+            SetupMilestone::ServiceKeysGenerated,
+            &intent_digest,
+            None,
+            Some(receipt),
+            None,
+        )?;
+        Ok(intent_digest)
+    }
+
+    /// Persists the exact public SystemService setup-key preparation receipt
+    /// in the original ServiceKeysGenerated row. The first call records the
+    /// key/root/public-key facts before slot creation; a single monotonic
+    /// update may then add the exact native slot identity before the secret is
+    /// written. The digest excludes only that later physical outcome.
+    pub(crate) fn record_setup_system_service_signing_key_intent(
+        &mut self,
+        transaction_id: &PlatformHandle,
+        installation_id: &PlatformHandle,
+        confirmed_owner: &PlatformHandle,
+        authorized_principal_sid: &PlatformHandle,
+        receipt: &eliot_platform_windows::InstallationAuthorityKeyPreparationReceipt,
+    ) -> Result<PlatformHandle, InstallationError> {
+        receipt
+            .validate()
+            .map_err(|_| InstallationError::IdentityConflict)?;
+        handle(installation_id, "setup_effect_intent.installation_id")?;
+        handle(confirmed_owner, "setup_effect_intent.confirmed_owner")?;
+        handle(
+            authorized_principal_sid,
+            "setup_effect_intent.authorized_principal_sid",
+        )?;
+        if receipt.key_id != transaction_id.as_str()
+            || !authorized_principal_sid.as_str().starts_with("S-")
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let binding = SetupSystemServiceSigningKeyIntent {
+            installation_id: installation_id.clone(),
+            confirmed_owner: confirmed_owner.clone(),
+            authorized_principal_sid: authorized_principal_sid.clone(),
+            receipt: receipt.clone(),
+        };
+        let intent_digest = setup_system_service_signing_key_intent_digest(
+            transaction_id,
+            &binding,
+        )?;
+        self.record_setup_effect_intent_record(
+            transaction_id,
+            SetupMilestone::ServiceKeysGenerated,
+            &intent_digest,
+            None,
+            None,
+            Some(&binding),
+        )?;
+        Ok(intent_digest)
+    }
+
+    fn record_setup_effect_intent_record(
+        &mut self,
+        transaction_id: &PlatformHandle,
+        milestone: SetupMilestone,
+        intent_digest: &PlatformHandle,
+        portable_dev_signing_key_receipt: Option<
+            &eliot_platform_windows::PortableDevSupervisionAuthorityKeyReceipt,
+        >,
+        user_mode_signing_key_receipt: Option<
+            &eliot_platform_windows::UserModeSupervisionAuthorityCredentialReceipt,
+        >,
+        system_service_signing_key_intent: Option<&SetupSystemServiceSigningKeyIntent>,
+    ) -> Result<(), InstallationError> {
         handle(transaction_id, "setup_effect_intent.transaction_id")?;
         runtime_sha256_handle(intent_digest, "setup_effect_intent.intent_digest")?;
+        if let Some(receipt) = portable_dev_signing_key_receipt {
+            receipt
+                .validate()
+                .map_err(|_| InstallationError::IdentityConflict)?;
+            if milestone != SetupMilestone::ServiceKeysGenerated
+                || receipt.request.transaction_id != transaction_id.as_str()
+                || receipt.request.effect_id != milestone.effect_identity()
+                || setup_portable_dev_signing_key_intent_digest(receipt)? != *intent_digest
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+        }
+        if let Some(receipt) = user_mode_signing_key_receipt {
+            receipt
+                .validate()
+                .map_err(|_| InstallationError::IdentityConflict)?;
+            if milestone != SetupMilestone::ServiceKeysGenerated
+                || receipt.request.transaction_id != transaction_id.as_str()
+                || receipt.request.effect_id != milestone.effect_identity()
+                || setup_user_mode_signing_key_intent_digest(receipt)? != *intent_digest
+                || portable_dev_signing_key_receipt.is_some()
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+        }
+        if let Some(binding) = system_service_signing_key_intent {
+            binding
+                .receipt
+                .validate()
+                .map_err(|_| InstallationError::IdentityConflict)?;
+            if milestone != SetupMilestone::ServiceKeysGenerated
+                || binding.receipt.key_id != transaction_id.as_str()
+                || setup_system_service_signing_key_intent_digest(transaction_id, binding)?
+                    != *intent_digest
+                || portable_dev_signing_key_receipt.is_some()
+                || user_mode_signing_key_receipt.is_some()
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+        }
         let key = setup_effect_intent_key(transaction_id, milestone);
-        let bytes = encode_setup_effect_intent(transaction_id, milestone, intent_digest)?;
+        let bytes = encode_setup_effect_intent(
+            transaction_id,
+            milestone,
+            intent_digest,
+            portable_dev_signing_key_receipt.cloned(),
+            user_mode_signing_key_receipt.cloned(),
+            system_service_signing_key_intent.cloned(),
+        )?;
         let database = self.open_for_mutation()?;
         let write = database
             .begin_write()
@@ -1304,7 +1487,44 @@ impl RedbInstallationTransactionStore {
                 if existing.intent_digest.as_str() != intent_digest.as_str() {
                     return Err(InstallationError::IdentityConflict);
                 }
-                return Ok(());
+                if let Some(receipt) = portable_dev_signing_key_receipt
+                    && existing.portable_dev_signing_key_receipt.as_ref() != Some(receipt)
+                {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                if let Some(receipt) = user_mode_signing_key_receipt
+                    && existing.user_mode_signing_key_receipt.as_ref() != Some(receipt)
+                {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                let mut complete_native_identity = false;
+                if let Some(binding) = system_service_signing_key_intent {
+                    let Some(prior) = existing.system_service_signing_key_intent.as_ref() else {
+                        return Err(InstallationError::IdentityConflict);
+                    };
+                    if prior.installation_id != binding.installation_id
+                        || prior.confirmed_owner != binding.confirmed_owner
+                        || prior.authorized_principal_sid != binding.authorized_principal_sid
+                        || !same_prepared_system_service_key(&prior.receipt, &binding.receipt)
+                        || (prior.receipt.slot_file_identity.is_some()
+                            && prior.receipt.slot_file_identity
+                                != binding.receipt.slot_file_identity)
+                    {
+                        return Err(InstallationError::IdentityConflict);
+                    }
+                    complete_native_identity = prior.receipt.slot_file_identity.is_none()
+                        && binding.receipt.slot_file_identity.is_some();
+                }
+                if existing.system_service_signing_key_intent.is_some()
+                    && system_service_signing_key_intent.is_none()
+                    && (portable_dev_signing_key_receipt.is_some()
+                        || user_mode_signing_key_receipt.is_some())
+                {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                if !complete_native_identity {
+                    return Ok(());
+                }
             }
             table
                 .insert(key.as_str(), bytes.as_slice())
@@ -1313,6 +1533,109 @@ impl RedbInstallationTransactionStore {
         write
             .commit()
             .map_err(|error| InstallationError::Platform(error.to_string()))
+    }
+
+    /// Loads the exact original PortableDev setup-key receipt, or returns
+    /// `None` when no such prepared key effect was committed. An absent result
+    /// after an existing intent is a typed recovery condition; callers must
+    /// never prepare a replacement key for that milestone.
+    pub fn load_setup_portable_dev_signing_key_intent(
+        &self,
+        transaction_id: &PlatformHandle,
+    ) -> Result<
+        Option<eliot_platform_windows::PortableDevSupervisionAuthorityKeyReceipt>,
+        InstallationError,
+    > {
+        let key = setup_effect_intent_key(transaction_id, SetupMilestone::ServiceKeysGenerated);
+        let database = self.open_read_only()?;
+        let read = database
+            .begin_read()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let table = match read.open_table(SETUP_EFFECT_INTENT_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(InstallationError::Platform(error.to_string())),
+        };
+        let Some(value) = table
+            .get(key.as_str())
+            .map_err(|error| InstallationError::Platform(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let intent = decode_setup_effect_intent(value.value())?;
+        if intent.transaction_id != *transaction_id
+            || intent.milestone != SetupMilestone::ServiceKeysGenerated
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(intent.portable_dev_signing_key_receipt)
+    }
+
+    /// Loads the exact original UserMode setup-key receipt, or returns `None`
+    /// when the original profile-key intent did not contain one.
+    pub fn load_setup_user_mode_signing_key_intent(
+        &self,
+        transaction_id: &PlatformHandle,
+    ) -> Result<
+        Option<eliot_platform_windows::UserModeSupervisionAuthorityCredentialReceipt>,
+        InstallationError,
+    > {
+        let key = setup_effect_intent_key(transaction_id, SetupMilestone::ServiceKeysGenerated);
+        let database = self.open_read_only()?;
+        let read = database
+            .begin_read()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let table = match read.open_table(SETUP_EFFECT_INTENT_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(InstallationError::Platform(error.to_string())),
+        };
+        let Some(value) = table
+            .get(key.as_str())
+            .map_err(|error| InstallationError::Platform(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let intent = decode_setup_effect_intent(value.value())?;
+        if intent.transaction_id != *transaction_id
+            || intent.milestone != SetupMilestone::ServiceKeysGenerated
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(intent.user_mode_signing_key_receipt)
+    }
+
+    /// Loads the exact SystemService public setup-key receipt from the original
+    /// ServiceKeysGenerated row. A receipt without a slot identity is an
+    /// incomplete original effect and may never authorize adoption or key
+    /// replacement.
+    pub(crate) fn load_setup_system_service_signing_key_intent(
+        &self,
+        transaction_id: &PlatformHandle,
+    ) -> Result<Option<SetupSystemServiceSigningKeyIntent>, InstallationError> {
+        let key = setup_effect_intent_key(transaction_id, SetupMilestone::ServiceKeysGenerated);
+        let database = self.open_read_only()?;
+        let read = database
+            .begin_read()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let table = match read.open_table(SETUP_EFFECT_INTENT_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(InstallationError::Platform(error.to_string())),
+        };
+        let Some(value) = table
+            .get(key.as_str())
+            .map_err(|error| InstallationError::Platform(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let intent = decode_setup_effect_intent(value.value())?;
+        if intent.transaction_id != *transaction_id
+            || intent.milestone != SetupMilestone::ServiceKeysGenerated
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(intent.system_service_signing_key_intent)
     }
 
     /// Returns the recorded non-secret intent for one setup milestone, or
@@ -1603,8 +1926,8 @@ struct SetupBindingEnvelope {
 /// One durably recorded, non-secret setup effect intent.
 ///
 /// The record carries only the milestone's stable effect identity and the
-/// digest of the exact non-secret intent facts. No secret value, credential or
-/// provider output is ever retained here.
+/// digest of the exact non-secret intent facts. Typed profile-key receipts are
+/// public metadata only; secret values and credentials are never retained.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SetupEffectIntentEnvelope {
@@ -1618,6 +1941,26 @@ struct SetupEffectIntentRecord {
     transaction_id: PlatformHandle,
     milestone: SetupMilestone,
     intent_digest: PlatformHandle,
+    #[serde(default)]
+    portable_dev_signing_key_receipt:
+        Option<eliot_platform_windows::PortableDevSupervisionAuthorityKeyReceipt>,
+    #[serde(default)]
+    user_mode_signing_key_receipt:
+        Option<eliot_platform_windows::UserModeSupervisionAuthorityCredentialReceipt>,
+    #[serde(default)]
+    system_service_signing_key_intent: Option<SetupSystemServiceSigningKeyIntent>,
+}
+
+/// Original SystemService setup-key facts stored beside its stable milestone
+/// intent. The caller/owner bindings come from the immutable transaction and
+/// the actual user identity observation; the provider receipt is public-only.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SetupSystemServiceSigningKeyIntent {
+    pub(crate) installation_id: PlatformHandle,
+    pub(crate) confirmed_owner: PlatformHandle,
+    pub(crate) authorized_principal_sid: PlatformHandle,
+    pub(crate) receipt: eliot_platform_windows::InstallationAuthorityKeyPreparationReceipt,
 }
 
 fn setup_effect_intent_key(transaction_id: &PlatformHandle, milestone: SetupMilestone) -> String {
@@ -1632,6 +1975,13 @@ fn encode_setup_effect_intent(
     transaction_id: &PlatformHandle,
     milestone: SetupMilestone,
     intent_digest: &PlatformHandle,
+    portable_dev_signing_key_receipt: Option<
+        eliot_platform_windows::PortableDevSupervisionAuthorityKeyReceipt,
+    >,
+    user_mode_signing_key_receipt: Option<
+        eliot_platform_windows::UserModeSupervisionAuthorityCredentialReceipt,
+    >,
+    system_service_signing_key_intent: Option<SetupSystemServiceSigningKeyIntent>,
 ) -> Result<Vec<u8>, InstallationError> {
     serde_json::to_vec(&SetupEffectIntentEnvelope {
         wire_version: super::SETUP_BINDING_WIRE_VERSION,
@@ -1639,6 +1989,9 @@ fn encode_setup_effect_intent(
             transaction_id: transaction_id.clone(),
             milestone,
             intent_digest: intent_digest.clone(),
+            portable_dev_signing_key_receipt,
+            user_mode_signing_key_receipt,
+            system_service_signing_key_intent,
         },
     })
     .map_err(|error| InstallationError::CorruptRegistry {
@@ -1683,7 +2036,153 @@ fn decode_setup_effect_intent(bytes: &[u8]) -> Result<SetupEffectIntentRecord, I
         &envelope.intent.intent_digest,
         "setup_effect_intent.intent_digest",
     )?;
+    if let Some(receipt) = &envelope.intent.portable_dev_signing_key_receipt {
+        receipt
+            .validate()
+            .map_err(|_| InstallationError::CorruptRegistry {
+                reason: "PortableDev setup-key intent receipt is invalid".to_owned(),
+            })?;
+        if envelope.intent.milestone != SetupMilestone::ServiceKeysGenerated
+            || receipt.request.transaction_id != envelope.intent.transaction_id.as_str()
+            || receipt.request.effect_id != envelope.intent.milestone.effect_identity()
+            || setup_portable_dev_signing_key_intent_digest(receipt)?
+                != envelope.intent.intent_digest
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+    }
+    if let Some(receipt) = &envelope.intent.user_mode_signing_key_receipt {
+        receipt
+            .validate()
+            .map_err(|_| InstallationError::CorruptRegistry {
+                reason: "UserMode setup-key intent receipt is invalid".to_owned(),
+            })?;
+        if envelope.intent.milestone != SetupMilestone::ServiceKeysGenerated
+            || receipt.request.transaction_id != envelope.intent.transaction_id.as_str()
+            || receipt.request.effect_id != envelope.intent.milestone.effect_identity()
+            || setup_user_mode_signing_key_intent_digest(receipt)?
+                != envelope.intent.intent_digest
+            || envelope
+                .intent
+                .portable_dev_signing_key_receipt
+                .is_some()
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+    }
+    if let Some(binding) = &envelope.intent.system_service_signing_key_intent {
+        handle(
+            &binding.installation_id,
+            "setup_effect_intent.system_service.installation_id",
+        )?;
+        handle(
+            &binding.confirmed_owner,
+            "setup_effect_intent.system_service.confirmed_owner",
+        )?;
+        handle(
+            &binding.authorized_principal_sid,
+            "setup_effect_intent.system_service.authorized_principal_sid",
+        )?;
+        if !binding.authorized_principal_sid.as_str().starts_with("S-") {
+            return Err(InstallationError::IdentityConflict);
+        }
+        binding
+            .receipt
+            .validate()
+            .map_err(|_| InstallationError::CorruptRegistry {
+                reason: "SystemService setup-key intent receipt is invalid".to_owned(),
+            })?;
+        if envelope.intent.milestone != SetupMilestone::ServiceKeysGenerated
+            || binding.receipt.key_id != envelope.intent.transaction_id.as_str()
+            || setup_system_service_signing_key_intent_digest(
+                &envelope.intent.transaction_id,
+                binding,
+            )? != envelope.intent.intent_digest
+            || envelope
+                .intent
+                .portable_dev_signing_key_receipt
+                .is_some()
+            || envelope.intent.user_mode_signing_key_receipt.is_some()
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+    }
     Ok(envelope.intent)
+}
+
+fn same_prepared_system_service_key(
+    prior: &eliot_platform_windows::InstallationAuthorityKeyPreparationReceipt,
+    next: &eliot_platform_windows::InstallationAuthorityKeyPreparationReceipt,
+) -> bool {
+    let mut prior = prior.clone();
+    let mut next = next.clone();
+    prior.slot_file_identity = None;
+    next.slot_file_identity = None;
+    prior == next
+}
+
+fn setup_system_service_signing_key_intent_digest(
+    transaction_id: &PlatformHandle,
+    binding: &SetupSystemServiceSigningKeyIntent,
+) -> Result<PlatformHandle, InstallationError> {
+    let mut receipt = binding.receipt.clone();
+    receipt.slot_file_identity = None;
+    let bytes = serde_json::to_vec(&(
+        transaction_id.as_str(),
+        binding.installation_id.as_str(),
+        binding.confirmed_owner.as_str(),
+        binding.authorized_principal_sid.as_str(),
+        receipt,
+    ))
+    .map_err(|error| InstallationError::InvalidField {
+        field: "setup_effect_intent.system_service_signing_key_intent".to_owned(),
+        reason: error.to_string(),
+    })?;
+    let mut digest = Sha256::new();
+    digest.update(b"eliot.setup.system-service-signing-key-intent.v1\0");
+    digest.update(bytes);
+    PlatformHandle::new(format!("{:x}", digest.finalize())).map_err(|error| {
+        InstallationError::InvalidField {
+            field: "setup_effect_intent.intent_digest".to_owned(),
+            reason: error.to_string(),
+        }
+    })
+}
+
+fn setup_portable_dev_signing_key_intent_digest(
+    receipt: &eliot_platform_windows::PortableDevSupervisionAuthorityKeyReceipt,
+) -> Result<PlatformHandle, InstallationError> {
+    let bytes = serde_json::to_vec(receipt).map_err(|error| InstallationError::InvalidField {
+        field: "setup_effect_intent.portable_dev_signing_key_receipt".to_owned(),
+        reason: error.to_string(),
+    })?;
+    let mut digest = Sha256::new();
+    digest.update(b"eliot.setup.portable-dev-signing-key-intent.v1\0");
+    digest.update(bytes);
+    PlatformHandle::new(format!("{:x}", digest.finalize())).map_err(|error| {
+        InstallationError::InvalidField {
+            field: "setup_effect_intent.intent_digest".to_owned(),
+            reason: error.to_string(),
+        }
+    })
+}
+
+fn setup_user_mode_signing_key_intent_digest(
+    receipt: &eliot_platform_windows::UserModeSupervisionAuthorityCredentialReceipt,
+) -> Result<PlatformHandle, InstallationError> {
+    let bytes = serde_json::to_vec(receipt).map_err(|error| InstallationError::InvalidField {
+        field: "setup_effect_intent.user_mode_signing_key_receipt".to_owned(),
+        reason: error.to_string(),
+    })?;
+    let mut digest = Sha256::new();
+    digest.update(b"eliot.setup.user-mode-signing-key-intent.v1\0");
+    digest.update(bytes);
+    PlatformHandle::new(format!("{:x}", digest.finalize())).map_err(|error| {
+        InstallationError::InvalidField {
+            field: "setup_effect_intent.intent_digest".to_owned(),
+            reason: error.to_string(),
+        }
+    })
 }
 
 fn encode_setup_binding(binding: &SetupBinding) -> Result<Vec<u8>, InstallationError> {
@@ -2394,6 +2893,82 @@ impl InstallationTransactionStore for RedbInstallationTransactionStore {
         insert_planned(&database, transaction)
     }
 
+    fn managed_resource_projection(
+        &self,
+        key: &ManagedResourceKey,
+    ) -> Result<Option<ManagedResourceProjection>, InstallationError> {
+        key.validate()?;
+        let database = self.open_read_only()?;
+        let read = database
+            .begin_read()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let table = match read.open_table(TRANSACTION_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                classify_missing_v7_table(&read)?;
+                return Ok(None);
+            }
+            Err(error) => return Err(InstallationError::Platform(error.to_string())),
+        };
+        let mut transactions = Vec::new();
+        for row in table
+            .iter()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?
+        {
+            let (stored_id, bytes) =
+                row.map_err(|error| InstallationError::Platform(error.to_string()))?;
+            let transaction = decode(bytes.value())?;
+            if transaction.transaction_id.as_str() != stored_id.value() {
+                return Err(InstallationError::IdentityConflict);
+            }
+            transactions.push(transaction);
+        }
+        derive_managed_resource_projection(&transactions, key)
+    }
+
+    fn managed_root_effect_proof(
+        &self,
+        anchor_transaction_id: &PlatformHandle,
+        installation_root: &PlatformHandle,
+        profile: super::InstallationProfile,
+        root: &PlatformHandle,
+    ) -> Result<Option<InstallationManagedRootEffectProof>, InstallationError> {
+        let database = self.open_read_only()?;
+        let read = database
+            .begin_read()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let table = match read.open_table(TRANSACTION_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                classify_missing_v7_table(&read)?;
+                return Err(InstallationError::TransactionNotFound {
+                    transaction_id: anchor_transaction_id.as_str().to_owned(),
+                });
+            }
+            Err(error) => return Err(InstallationError::Platform(error.to_string())),
+        };
+        let mut transactions = Vec::new();
+        for row in table
+            .iter()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?
+        {
+            let (stored_id, bytes) =
+                row.map_err(|error| InstallationError::Platform(error.to_string()))?;
+            let transaction = decode(bytes.value())?;
+            if transaction.transaction_id.as_str() != stored_id.value() {
+                return Err(InstallationError::IdentityConflict);
+            }
+            transactions.push(transaction);
+        }
+        derive_managed_root_effect_proof(
+            &transactions,
+            anchor_transaction_id,
+            installation_root,
+            profile,
+            root,
+        )
+    }
+
     fn load(
         &self,
         transaction_id: &PlatformHandle,
@@ -2572,6 +3147,60 @@ fn insert_planned(
         let mut table = write
             .open_table(TRANSACTION_TABLE)
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        if let Some(managed_plan) = transaction
+            .installer_effects
+            .iter()
+            .find(|effect| matches!(effect, InstallerEffectPlan::ManagedEnvironmentChange { .. }))
+        {
+            let InstallerEffectPlan::ManagedEnvironmentChange {
+                request,
+                prior_resource,
+                ..
+            } = managed_plan
+            else {
+                return Err(InstallationError::IdentityConflict);
+            };
+            let key = ManagedResourceKey {
+                family_id: request.target_family.clone(),
+                exact_candidate: request.exact_candidate.clone(),
+            };
+            key.validate()?;
+            let mut stored_transactions = Vec::new();
+            for row in table
+                .iter()
+                .map_err(|error| InstallationError::Platform(error.to_string()))?
+            {
+                let (stored_id, stored_bytes) =
+                    row.map_err(|error| InstallationError::Platform(error.to_string()))?;
+                let stored = decode(stored_bytes.value())?;
+                if stored.transaction_id.as_str() != stored_id.value() {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                if stored.stage() != InstallationStage::Completed
+                    && stored.stage() != InstallationStage::RolledBack
+                    && stored.installer_effects.iter().any(|effect| {
+                        matches!(
+                            effect,
+                            InstallerEffectPlan::ManagedEnvironmentChange { request: active, .. }
+                                if active.target_family == key.family_id
+                                    && active.exact_candidate == key.exact_candidate
+                        )
+                    })
+                {
+                    return Err(InstallationError::IncompleteObservation(
+                        "another managed transaction still owns the exact resource key"
+                            .to_owned(),
+                    ));
+                }
+                stored_transactions.push(stored);
+            }
+            let current = derive_managed_resource_projection(&stored_transactions, &key)?;
+            if current.as_ref() != prior_resource.as_deref() {
+                return Err(InstallationError::IdentityConflict);
+            }
+            validate_managed_prior_receipts(&stored_transactions, managed_plan)?;
+            validate_managed_prior_root_effects(&stored_transactions, transaction)?;
+        }
         let key = transaction.transaction_id.as_str();
         if table
             .get(key)

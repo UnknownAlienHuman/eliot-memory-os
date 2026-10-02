@@ -38,7 +38,8 @@ use eliot_ors::{
 use eliot_platform::ClockObservation;
 use eliot_platform_windows::{
     ProtectedSecret, RecoverableJobBinding, RecoverableJobObject, RetainedProcessPathLease,
-    WindowsPlatform,
+    SurveyProbeAppContainerIdentity, SurveyProbeAppContainerProfile,
+    RetainedSurveyProbePathLease, WindowsPlatform, windows_paths_equal,
 };
 use eliot_process::{
     ActionLeaseRef, DispatchAuthorityId, DispatchValidationContext, FencingToken, Generation,
@@ -1757,6 +1758,9 @@ pub(crate) struct ProcessExecutionGateway {
     #[cfg(windows)]
     pub(crate) canonical_store: Arc<Mutex<Option<Arc<KernelStoreGateway>>>>,
     pub(crate) path_admission: Arc<KernelPathAdmission>,
+    /// Original installer-root lease retained until terminal executor cleanup
+    /// restores the scoped ACL and the installation owner rechecks its marker.
+    survey_probe_areas: Mutex<BTreeMap<OperationId, RetainedSurveyProbeArea>>,
     /// Launched-but-not-closed descendants (CHILD-1/CHILD-2).
     pub(crate) descendants: Arc<Mutex<DescendantRegistry>>,
     /// Governor-owned `ChangeMonitor` ingress for governed tool effects (#1824,
@@ -1769,6 +1773,14 @@ pub(crate) struct ProcessExecutionGateway {
     /// Pre-effect tracked-source baselines retained between `start` capture
     /// and `reconcile` readback, keyed by exact operation identity.
     effect_baselines: Mutex<BTreeMap<OperationId, GovernedProcessEffectBaseline>>,
+}
+
+#[derive(Clone)]
+struct RetainedSurveyProbeArea {
+    working_area: Arc<eliot_installation::SurveyProbeWorkingArea>,
+    #[cfg(windows)]
+    stream_sink:
+        Option<Arc<super::installation_survey_stream_sink::InstallationSurveyStreamSink>>,
 }
 
 #[cfg(windows)]
@@ -1999,11 +2011,46 @@ impl<P: ProcessStartPorts + ?Sized> Drop for ProcessStartReservation<'_, P> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone)]
 pub(crate) struct ProcessPathProof {
     pub(crate) executable: PathBuf,
     pub(crate) working_directory: PathBuf,
     pub(crate) lease: Arc<RetainedProcessPathLease>,
+    pub(crate) survey_probe: Option<SurveyProbePathProof>,
+}
+
+impl std::fmt::Debug for ProcessPathProof {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProcessPathProof")
+            .field("executable", &self.executable)
+            .field("working_directory", &self.working_directory)
+            .field("lease", &self.lease)
+            .field("survey_probe", &self.survey_probe.as_ref().map(|probe| &probe.operation_id))
+            .finish()
+    }
+}
+
+/// Fresh installer-owned metadata required to bind a closed survey probe to
+/// the original process-start operation. It carries no answer, permit or
+/// caller-controlled execution result.
+#[derive(Clone)]
+pub(crate) struct SurveyProbePathProof {
+    pub(crate) operation_id: OperationId,
+    pub(crate) working_area: Arc<eliot_installation::SurveyProbeWorkingArea>,
+    pub(crate) invocation: eliot_installation::BoundedProbeInvocation,
+    pub(crate) stream_policy: eliot_process::ProcessStreamPolicyBinding,
+}
+
+impl std::fmt::Debug for SurveyProbePathProof {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SurveyProbePathProof")
+            .field("operation_id", &self.operation_id)
+            .field("working_area", &self.working_area.path())
+            .field("invocation", &self.invocation)
+            .finish()
+    }
 }
 
 pub(crate) struct KernelPathAdmission {
@@ -2047,6 +2094,22 @@ impl KernelPathAdmission {
         }
     }
 
+    fn survey_probe_launch(
+        &self,
+        operation_id: &eliot_process::OperationId,
+    ) -> Result<Option<(Arc<RetainedProcessPathLease>, SurveyProbePathProof)>, ProcessExecutionError>
+    {
+        let proofs = self.proofs.lock().map_err(|_| {
+            ProcessExecutionError::Unavailable("path admission lock poisoned".to_owned())
+        })?;
+        Ok(proofs.get(operation_id).and_then(|proof| {
+            proof
+                .survey_probe
+                .as_ref()
+                .map(|probe| (Arc::clone(&proof.lease), probe.clone()))
+        }))
+    }
+
     fn remove(&self, operation_id: &eliot_process::OperationId) {
         if let Ok(mut proofs) = self.proofs.lock() {
             proofs.remove(operation_id);
@@ -2081,15 +2144,68 @@ impl ProcessLaunchAdmission for KernelPathAdmission {
         {
             return Err(eliot_process::ContractError::DispatchBindingMismatch);
         }
-        proof
-            .lease
-            .validate(
-                Path::new(request.executable()),
-                Path::new(request.working_directory()),
-                request.executable_sha256(),
-            )
-            .map_err(|_| eliot_process::ContractError::DispatchBindingMismatch)
+        let path_is_valid = if let Some(probe) = &proof.survey_probe {
+            survey_probe_request_matches(probe, &proof.lease, request)
+                && proof
+                    .lease
+                    .validate_executable(Path::new(request.executable()), request.executable_sha256())
+                    .is_ok()
+        } else {
+            proof
+                .lease
+                .validate(
+                    Path::new(request.executable()),
+                    Path::new(request.working_directory()),
+                    request.executable_sha256(),
+                )
+                .is_ok()
+        };
+        path_is_valid
+            .then_some(())
+            .ok_or(eliot_process::ContractError::DispatchBindingMismatch)
     }
+}
+
+fn survey_probe_request_matches(
+    proof: &SurveyProbePathProof,
+    executable_lease: &RetainedProcessPathLease,
+    request: &ProcessRequest,
+) -> bool {
+    let invocation = &proof.invocation;
+    let environment = request.environment();
+    let limits = request.resource_limits();
+    let Ok(app_container) = SurveyProbeAppContainerIdentity::for_operation_id(
+        proof.operation_id.as_str(),
+    ) else {
+        return false;
+    };
+    let expected_cwd = app_container.working_directory(proof.working_area.path());
+    request.operation_id() == &proof.operation_id
+        && request.process_tree_id().as_str() == proof.operation_id.as_str()
+        && request.job_id().as_str() == proof.operation_id.as_str()
+        && request.image_id().as_str() == invocation.executable_identity.as_str()
+        && request.argv().len() == 1
+        && request.argv()[0] == invocation.argument.as_str()
+        && windows_paths_equal(
+            Path::new(request.executable()),
+            executable_lease.executable_path(),
+        )
+        && request.executable_sha256().eq_ignore_ascii_case(executable_lease.executable_sha256())
+        && windows_paths_equal(Path::new(request.working_directory()), &expected_cwd)
+        && limits.wall_timeout_ms() == invocation.timeout_ms
+        && invocation.max_output_bytes >= 2
+        && limits.stdout_bytes().checked_add(limits.stderr_bytes())
+            == Some(invocation.max_output_bytes)
+        && limits.max_descendants() == invocation.max_descendant_processes
+        && limits.cpu_time_ms().is_none()
+        && limits.memory_bytes().is_none()
+        && environment.secret_refs().is_empty()
+        && environment.inheritance() == eliot_process::EnvironmentInheritance::None
+        && environment
+            .non_secret()
+            .keys()
+            .all(|name| invocation.environment_names.iter().any(|allowed| allowed.as_str() == name))
+        && windows_paths_equal(Path::new(invocation.working_area.as_str()), proof.working_area.path())
 }
 
 impl ProcessExecutionGateway {
@@ -2121,11 +2237,168 @@ impl ProcessExecutionGateway {
             #[cfg(windows)]
             canonical_store: Arc::new(Mutex::new(None)),
             path_admission,
+            survey_probe_areas: Mutex::new(BTreeMap::new()),
             descendants: Arc::new(Mutex::new(DescendantRegistry::new())),
             effect_port: Mutex::new(Some(effect_port)),
             effect_baselines: Mutex::new(BTreeMap::new()),
         }
     }
+
+    fn retain_survey_probe_area(
+        &self,
+        operation_id: OperationId,
+        area: Arc<eliot_installation::SurveyProbeWorkingArea>,
+    ) -> Result<bool, ProcessExecutionError> {
+        let mut areas = self.survey_probe_areas.lock().map_err(|_| {
+            ProcessExecutionError::Unavailable("survey probe lease lock poisoned".to_owned())
+        })?;
+        match areas.entry(operation_id) {
+            Entry::Vacant(entry) => {
+                entry.insert(RetainedSurveyProbeArea {
+                    working_area: area,
+                    #[cfg(windows)]
+                    stream_sink: None,
+                });
+                Ok(true)
+            }
+            Entry::Occupied(entry) if Arc::ptr_eq(&entry.get().working_area, &area) => Ok(false),
+            Entry::Occupied(_) => Err(ProcessExecutionError::Contract(
+                eliot_process::ContractError::DispatchBindingMismatch,
+            )),
+        }
+    }
+
+    #[cfg(windows)]
+    fn retained_or_create_survey_probe_stream_sink(
+        &self,
+        operation_id: &OperationId,
+        area: &Arc<eliot_installation::SurveyProbeWorkingArea>,
+        request: &eliot_process::ProcessRequest,
+        policy: &eliot_process::ProcessStreamPolicyBinding,
+    ) -> Result<Arc<super::installation_survey_stream_sink::InstallationSurveyStreamSink>, ProcessExecutionError> {
+        let mut areas = self
+            .survey_probe_areas
+            .lock()
+            .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
+        let retained = areas
+            .get_mut(operation_id)
+            .filter(|retained| Arc::ptr_eq(&retained.working_area, area))
+            .ok_or(ProcessExecutionError::UnknownOutcome)?;
+        match &retained.stream_sink {
+            Some(original) if !original.matches_request(request, policy) => {
+                Err(ProcessExecutionError::UnknownOutcome)
+            }
+            Some(original) => Ok(Arc::clone(original)),
+            None => {
+                let stream_sink = Arc::new(
+                    super::installation_survey_stream_sink::InstallationSurveyStreamSink::new(
+                        Arc::clone(area), request, policy.clone(),
+                    ).map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?,
+                );
+                retained.stream_sink = Some(Arc::clone(&stream_sink));
+                Ok(stream_sink)
+            }
+        }
+    }
+
+    fn complete_reconciled_survey_probe_area(
+        &self,
+        operation_id: &OperationId,
+        evidence: &ProcessEvidence,
+    ) -> Result<(), ProcessExecutionError> {
+        let retained = self
+            .survey_probe_areas
+            .lock()
+            .map_err(|_| {
+                ProcessExecutionError::Unavailable("survey probe lease lock poisoned".to_owned())
+            })?
+            .get(operation_id)
+            .cloned();
+        let Some(retained) = retained else {
+            return Ok(());
+        };
+        let area = &retained.working_area;
+        let view = evidence.view();
+        if view.lifecycle() != ProcessLifecycle::Exited
+            || !view
+                .descendants()
+                .is_some_and(|tree| tree.complete() && tree.tree_terminated())
+        {
+            return Err(ProcessExecutionError::UnknownOutcome);
+        }
+        #[cfg(windows)]
+        if let Some(stream_sink) = &retained.stream_sink {
+            stream_sink
+                .reconcile_for_owner_release()
+                .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
+        }
+        area.verify()
+            .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
+        let mut areas = self.survey_probe_areas.lock().map_err(|_| {
+            ProcessExecutionError::Unavailable("survey probe lease lock poisoned".to_owned())
+        })?;
+        if areas
+            .get(operation_id)
+            .is_some_and(|current| Arc::ptr_eq(&current.working_area, area))
+        {
+            areas.remove(operation_id);
+            Ok(())
+        } else {
+            Err(ProcessExecutionError::UnknownOutcome)
+        }
+    }
+
+    #[cfg(windows)]
+    fn complete_pre_resume_survey_probe_cleanup_area(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<(), ProcessExecutionError> {
+        let requires_survey_area = self
+            .executor
+            .pending_pre_resume_cleanup_requires_survey_area(operation_id);
+        let retained = self
+            .survey_probe_areas
+            .lock()
+            .map_err(|_| ProcessExecutionError::UnknownOutcome)?
+            .get(operation_id)
+            .cloned();
+        let Some(retained) = retained else {
+            if requires_survey_area {
+                return Err(ProcessExecutionError::UnknownOutcome);
+            }
+            self.executor
+                .finish_pre_resume_cleanup(operation_id);
+            return Ok(());
+        };
+        let area = &retained.working_area;
+        // This readback is last: the executor has already proved the exact
+        // suspended child terminal (if present), restored the original DACL,
+        // removed the operation cwd, and deleted the newly-created profile.
+        if let Some(stream_sink) = &retained.stream_sink {
+            stream_sink
+                .reconcile_for_owner_release()
+                .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
+        }
+        area.verify()
+            .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
+        let mut areas = self
+            .survey_probe_areas
+            .lock()
+            .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
+        if areas
+            .get(operation_id)
+            .is_some_and(|current| Arc::ptr_eq(&current.working_area, area))
+        {
+            areas.remove(operation_id);
+            drop(areas);
+            self.executor
+                .finish_pre_resume_cleanup(operation_id);
+            Ok(())
+        } else {
+            Err(ProcessExecutionError::UnknownOutcome)
+        }
+    }
+
 
     pub(crate) fn readiness_configuration_valid(&self) -> bool {
         let binding = self.snapshot_binding.to_wire();
@@ -3405,8 +3678,64 @@ impl ProcessExecutionGateway {
             return Err(error);
         }
         let effect_operation_id = operation_id.clone();
+        #[cfg(windows)]
+        match self
+            .executor
+            .reconcile_pending_pre_resume_cleanup(&effect_operation_id)
+        {
+            Ok(Some(primary_failure)) => {
+                if let Err(error) =
+                    self.complete_pre_resume_survey_probe_cleanup_area(&effect_operation_id)
+                {
+                    observe_process_in_context(
+                        context,
+                        "kernel.process.reconcile_unknown",
+                        "unknown",
+                    );
+                    super::kernel_diagnostics::observe_terminal_error_in_context(
+                        process_terminal_code(&error),
+                        context,
+                    );
+                    return Err(error);
+                }
+                record_process_context_field(
+                    context,
+                    "pre_resume_primary_failure",
+                    Some(&primary_failure),
+                );
+                observe_process_in_context(context, "kernel.process.reconcile_unknown", "unknown");
+                super::kernel_diagnostics::observe_terminal_error_in_context(
+                    process_terminal_code(&ProcessExecutionError::UnknownOutcome),
+                    context,
+                );
+                return Err(ProcessExecutionError::UnknownOutcome);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                observe_process_in_context(context, "kernel.process.reconcile_unknown", "unknown");
+                super::kernel_diagnostics::observe_terminal_error_in_context(
+                    process_terminal_code(&error),
+                    context,
+                );
+                return Err(error);
+            }
+        }
         match self.executor.reconcile(operation_id).await {
             Ok(evidence) => {
+                if let Err(error) =
+                    self.complete_reconciled_survey_probe_area(&effect_operation_id, &evidence)
+                {
+                    observe_process_in_context(
+                        context,
+                        "kernel.process.reconcile_unknown",
+                        "unknown",
+                    );
+                    super::kernel_diagnostics::observe_terminal_error_in_context(
+                        process_terminal_code(&error),
+                        context,
+                    );
+                    return Err(error);
+                }
                 // #1824 (I10.21 A1/W2): read the terminal source state against
                 // the retained pre-effect baseline and ingest the validated
                 // receipt. Monitor-path failure never fails the reconcile.
@@ -3942,6 +4271,7 @@ impl ProcessStartPorts for ProcessExecutionGateway {
         // handoff. A poisoned or conflicting registry refuses the launch: an
         // unregistered child must never start.
         let operation_id = request.operation_id().clone();
+        let survey_probe = self.path_admission.survey_probe_launch(&operation_id)?;
         let registration = RegisteredDescendant::new(
             operation_id.clone(),
             owner.module_id().to_owned(),
@@ -3994,8 +4324,125 @@ impl ProcessStartPorts for ProcessExecutionGateway {
                     Ok(binding)
                         if binding.job_identity().name() == candidate.job_object_id.as_str() =>
                     {
-                        self.executor
-                            .start_with_kernel_outer_job_binding(request, sink, binding)
+                        if let Some((executable_lease, probe)) = survey_probe {
+                            let area = Arc::clone(&probe.working_area);
+                            let mut retained_area_here = false;
+                            let started = (|| {
+                                if !survey_probe_request_matches(&probe, &executable_lease, &request) {
+                                    return Err(ProcessExecutionError::Contract(
+                                        eliot_process::ContractError::DispatchBindingMismatch,
+                                    ));
+                                }
+                                retained_area_here = self.retain_survey_probe_area(
+                                    operation_id.clone(),
+                                    Arc::clone(&area),
+                                )?;
+                                let stream_sink = self.retained_or_create_survey_probe_stream_sink(
+                                    &operation_id,
+                                    &area,
+                                    &request,
+                                    &probe.stream_policy,
+                                )?;
+                                let stream_sink: Arc<dyn eliot_process::ProcessStreamSinkClient> =
+                                    stream_sink;
+                                let profile_identity = SurveyProbeAppContainerIdentity::for_operation_id(
+                                    operation_id.as_str(),
+                                )
+                                .map_err(|error| {
+                                    ProcessExecutionError::Unavailable(error.to_string())
+                                })?;
+                                let profile = SurveyProbeAppContainerProfile::create(&profile_identity)
+                                    .map_err(|error| {
+                                        ProcessExecutionError::Unavailable(error.to_string())
+                                    })?;
+                                let path_scope = match area.retain_executor_path(
+                                    Arc::clone(&executable_lease),
+                                    operation_id.as_str(),
+                                    request.invocation_digest(),
+                                    Path::new(request.working_directory()),
+                                ) {
+                                    Ok(path_scope) => path_scope,
+                                    Err(
+                                        eliot_installation::SurveyProbeWorkingAreaPathError::Root(
+                                            error,
+                                        ),
+                                    ) => {
+                                        self.executor.retain_survey_probe_setup_failure(
+                                            operation_id.clone(),
+                                            profile,
+                                            None,
+                                            error.to_string(),
+                                            None,
+                                        );
+                                        return Err(ProcessExecutionError::UnknownOutcome);
+                                    }
+                                    Err(
+                                        eliot_installation::SurveyProbeWorkingAreaPathError::Native(
+                                            error,
+                                        ),
+                                    ) => {
+                                        let (primary, cleanup, path_scope) = error.into_parts();
+                                        self.executor.retain_survey_probe_setup_failure(
+                                            operation_id.clone(),
+                                            profile,
+                                            path_scope,
+                                            primary.to_string(),
+                                            cleanup.map(|error| error.to_string()),
+                                        );
+                                        return Err(ProcessExecutionError::UnknownOutcome);
+                                    }
+                                };
+                                self.executor.start_survey_probe_with_kernel_outer_job_binding(
+                                    request,
+                                    sink,
+                                    binding,
+                                    stream_sink,
+                                    probe.stream_policy,
+                                    profile,
+                                    path_scope,
+                                )
+                            })();
+                            match started {
+                                Err(error) if retained_area_here => {
+                                    if matches!(
+                                        &error,
+                                        ProcessExecutionError::UnknownOutcome
+                                    ) {
+                                        Err(error)
+                                    } else {
+                                        match self
+                                            .executor
+                                            .reconcile_pending_pre_resume_cleanup(&operation_id)
+                                        {
+                                            Ok(Some(_)) => {
+                                                match self
+                                                    .complete_pre_resume_survey_probe_cleanup_area(
+                                                        &operation_id,
+                                                    )
+                                                {
+                                                    Ok(()) => Err(error),
+                                                    Err(_) => Err(
+                                                        ProcessExecutionError::UnknownOutcome,
+                                                    ),
+                                                }
+                                            }
+                                            Ok(None) | Err(_) => {
+                                                // No authenticated native
+                                                // cleanup owner completed;
+                                                // preserve the area and make
+                                                // the original operation
+                                                // replay-only unknown.
+                                                Err(ProcessExecutionError::UnknownOutcome)
+                                            }
+                                        }
+                                    }
+                                }
+                                other => other,
+                            }
+                        } else {
+                            self.executor
+                                .start_with_kernel_outer_job_binding(request, sink, binding)
+                        }
                     }
                     Ok(_) => Err(ProcessExecutionError::Contract(
                         eliot_process::ContractError::DispatchBindingMismatch,
@@ -4119,7 +4566,491 @@ pub(crate) fn process_session_rejection(
     }
 }
 
+#[cfg(test)]
+#[path = "installation_survey_probe_tests.rs"]
+mod installation_survey_probe_tests;
+
+fn survey_probe_refusal() -> ProcessExecutionError {
+    ProcessExecutionError::Contract(eliot_process::ContractError::InvalidValue {
+        field: "installation_survey_probe",
+        reason: "the exact admitted probe could not be bound to a safe original process operation",
+    })
+}
+
+fn survey_probe_stream_answer_ref(
+    stream: Option<&ProcessStreamEvidence>,
+    expected: eliot_process::ProcessStreamKind,
+    binding: &eliot_process::ProcessExecutionBinding,
+) -> Result<eliot_installation::PlatformHandle, ProcessExecutionError> {
+    let stream = stream.ok_or_else(survey_probe_refusal)?;
+    if stream.stream() != expected
+        || stream.binding() != binding
+        || stream.transport() != eliot_process::StreamTransportStatus::Complete
+        || stream.persistence() != eliot_process::StreamPersistenceStatus::CompleteSource
+        || !stream.gaps().is_empty()
+    {
+        return Err(survey_probe_refusal());
+    }
+    let source = stream.source().ok_or_else(survey_probe_refusal)?;
+    if source.representation() != eliot_process::DurableStreamRepresentation::ExactTransportBytes
+        || source.byte_length() != stream.observed_bytes()
+    {
+        return Err(survey_probe_refusal());
+    }
+    eliot_installation::PlatformHandle::new(source.ready_receipt_ref().to_owned())
+        .map_err(|_| survey_probe_refusal())
+}
+
+fn validate_survey_probe_terminal(
+    invocation: &eliot_installation::BoundedProbeInvocation,
+    operation_id: &OperationId,
+    owner: &ProcessOwnerBinding,
+    caller: &eliot_process::ProcessCallerSession,
+    state_fence: &FencingToken,
+    executable: &Path,
+    executable_sha256: &str,
+    start: &ProcessStartReceipt,
+    terminal: &ProcessEvidence,
+) -> Result<Vec<eliot_installation::PlatformHandle>, ProcessExecutionError> {
+    start.validate()?;
+    terminal.validate()?;
+    let binding = start.binding();
+    let identity = start.identity();
+    let view = terminal.view();
+    let tree = view.descendants().ok_or_else(survey_probe_refusal)?;
+    let exit = view.exit().ok_or_else(survey_probe_refusal)?;
+    let expected_tree = eliot_process::ProcessTreeId::new(operation_id.as_str())?;
+    let expected_job = eliot_process::JobId::new(operation_id.as_str())?;
+    let expected_image = eliot_process::ImageId::new(invocation.executable_identity.as_str())?;
+    let descendant_count = u32::try_from(tree.process_ids().iter()
+        .filter(|process_id| *process_id != identity.process_id()).count())
+        .map_err(|_| survey_probe_refusal())?;
+    if start.operation_id() != operation_id
+        || terminal.operation_id() != operation_id
+        || start.lifecycle() != ProcessLifecycle::Running
+        || start.request_digest() != terminal.request_digest()
+        || binding != terminal.binding()
+        || view.lifecycle() != ProcessLifecycle::Exited
+        || view.identity() != Some(identity)
+        || identity.image_id() != &expected_image
+        || identity.session_id() != caller.session_id()
+        || identity.generation() != owner.generation()
+        || !windows_paths_equal(Path::new(identity.image_path()), executable)
+        || !identity
+            .executable_sha256()
+            .eq_ignore_ascii_case(executable_sha256)
+        || binding.process_tree_id() != &expected_tree
+        || binding.job_id() != &expected_job
+        || binding.image_id() != &expected_image
+        || binding.session_id() != caller.session_id()
+        || binding.generation() != owner.generation()
+        || binding.state_fence() != state_fence
+        || !owner
+            .authority_epoch()
+            .is_same_authority(binding.authority_epoch())
+        || exit.disposition() != eliot_process::ExitDisposition::Completed
+        || exit.code() != Some(0)
+        || !tree.complete()
+        || !tree.tree_terminated()
+        || descendant_count > invocation.max_descendant_processes
+    {
+        return Err(survey_probe_refusal());
+    }
+    let stdout = survey_probe_stream_answer_ref(
+        terminal.stdout(),
+        eliot_process::ProcessStreamKind::Stdout,
+        binding,
+    )?;
+    let stderr = survey_probe_stream_answer_ref(
+        terminal.stderr(),
+        eliot_process::ProcessStreamKind::Stderr,
+        binding,
+    )?;
+    let observed_bytes = terminal
+        .stdout()
+        .ok_or_else(survey_probe_refusal)?
+        .observed_bytes()
+        .checked_add(
+            terminal
+                .stderr()
+                .ok_or_else(survey_probe_refusal)?
+                .observed_bytes(),
+        )
+        .ok_or_else(survey_probe_refusal)?;
+    if observed_bytes > invocation.max_output_bytes {
+        return Err(survey_probe_refusal());
+    }
+    Ok(vec![stdout, stderr])
+}
+
 impl KernelComposition {
+    /// Returns a retained working-area lease only when the request selects an
+    /// existing original process operation owned by this authenticated daemon.
+    /// The identity is a lookup key; the gateway replay record supplies the
+    /// owner check, and the returned value is the original non-serializable
+    /// installer lease retained by that operation.
+    #[cfg(windows)]
+    pub(crate) fn retained_survey_probe_working_area(
+        &self,
+        session: &Session,
+        identity: &eliot_protocol::RequestIdentity,
+    ) -> Result<Option<Arc<eliot_installation::SurveyProbeWorkingArea>>, ProcessExecutionError> {
+        identity.validate().map_err(|_| survey_probe_refusal())?;
+        if identity.deadline_unix_ms <= super::unix_ms()
+            || identity.request.state_fence != session.module_generation.state_fence
+            || !identity
+                .request
+                .state_fence
+                .authority_epoch
+                .is_same_authority(&session.authority_epoch)
+        {
+            return Err(survey_probe_refusal());
+        }
+        self.require_current_daemon_session(session)
+            .map_err(|_| survey_probe_refusal())?;
+        let (owner, _) = super::caller_binding(session).map_err(|_| survey_probe_refusal())?;
+        let caller = self
+            .admitted_process_caller_session(session)
+            .map_err(|_| survey_probe_refusal())?;
+        if owner.module_id() != super::ACTIVE_DAEMON_CALLER
+            || caller.class() != eliot_process::ProcessSessionClass::EliotdGeneration
+            || caller.owner() != &owner
+            || identity.request.state_fence.resource_generation.value()
+                != session.module_generation.generation.value()
+            || owner.generation().get() != session.module_generation.generation.value()
+        {
+            return Err(survey_probe_refusal());
+        }
+        let operation_id = OperationId::new(
+            identity.request.metadata.request_id.as_str().to_owned(),
+        )?;
+        let Some(gateway) = &self.process_gateway else {
+            return Ok(None);
+        };
+        let record = gateway
+            .replay_store
+            .load_process_start(&operation_id)
+            .map_err(|_| survey_probe_refusal())?;
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        if record.owner != owner {
+            return Err(survey_probe_refusal());
+        }
+        let area = gateway
+            .survey_probe_areas
+            .lock()
+            .map_err(|_| survey_probe_refusal())?
+            .get(&operation_id)
+            .map(|retained| Arc::clone(&retained.working_area));
+        Ok(area)
+    }
+
+    /// Runs only the exact freshly rederived catalogue probe through the
+    /// original authenticated Kernel process admission and shared executor.
+    /// Start and terminal values stay inside this owner boundary; a positive
+    /// passive advertisement is formed only from the same live gateway call.
+    #[cfg(windows)]
+    #[allow(clippy::too_many_lines, reason = "the one-owner probe sequence keeps fresh qualification, original admission, and terminal readback ordered")]
+    pub(crate) async fn run_installation_survey_probe(
+        &self,
+        session: &Session,
+        identity: &eliot_protocol::RequestIdentity,
+        working_area: Arc<eliot_installation::SurveyProbeWorkingArea>,
+        probe_input: &super::installation_survey_route::InstallationSurveyProbeInput,
+        catalogue_context: &eliot_installation::AcceptedCatalogueContext<'_>,
+        source: &(dyn eliot_installation::SurveyObservationSource + Sync),
+        invocation: &eliot_installation::BoundedProbeInvocation,
+    ) -> Result<
+        (
+            eliot_installation::ManagedCapabilityAdvertisement,
+            ProcessStartReceipt,
+            ProcessEvidence,
+        ),
+        ProcessExecutionError,
+    > {
+        identity.validate().map_err(|_| survey_probe_refusal())?;
+        if identity.deadline_unix_ms <= super::unix_ms()
+            || identity.request.state_fence != session.module_generation.state_fence
+            || !identity
+                .request
+                .state_fence
+                .authority_epoch
+                .is_same_authority(&session.authority_epoch)
+            || identity.request.state_fence.resource_generation.value()
+                != session.module_generation.generation.value()
+            || !windows_paths_equal(working_area.path(), &self.work_root)
+            || !Path::new(invocation.working_area.as_str()).is_absolute()
+            || !windows_paths_equal(Path::new(invocation.working_area.as_str()), working_area.path())
+        {
+            return Err(survey_probe_refusal());
+        }
+        self.require_current_daemon_session(session)
+            .map_err(|_| survey_probe_refusal())?;
+        working_area.verify().map_err(|_| survey_probe_refusal())?;
+
+        let caller = self
+            .admitted_process_caller_session(session)
+            .map_err(|_| survey_probe_refusal())?;
+        let (owner, _) = super::caller_binding(session).map_err(|_| survey_probe_refusal())?;
+        if owner.module_id() != super::ACTIVE_DAEMON_CALLER
+            || caller.class() != eliot_process::ProcessSessionClass::EliotdGeneration
+            || caller.owner() != &owner
+        {
+            return Err(survey_probe_refusal());
+        }
+        let generation = Generation::new(
+            identity.request.state_fence.resource_generation.value(),
+        )?;
+        if generation != owner.generation() {
+            return Err(survey_probe_refusal());
+        }
+        let request_id = identity.request.metadata.request_id.as_str().to_owned();
+        let operation_id = OperationId::new(request_id.clone())?;
+        let action_lease = ActionLeaseRef::new(identity.idempotency_key.clone())?;
+        let state_fence = FencingToken::new(
+            identity.request.state_fence.authority_epoch.clone(),
+            generation,
+            request_id,
+        )?;
+
+        let advertisement = match probe_input {
+            super::installation_survey_route::InstallationSurveyProbeInput::Accepted(
+                accepted_change,
+            ) => {
+                if accepted_change.plan().target_probe() != Some(invocation)
+                    || accepted_change.plan().target_identity()
+                        != Some(&invocation.executable_identity)
+                    || accepted_change.plan().family_id() != &invocation.family_id
+                {
+                    return Err(survey_probe_refusal());
+                }
+                eliot_installation::requalify_managed_capability(
+                    accepted_change,
+                    catalogue_context,
+                    source,
+                )
+                .map_err(|_| survey_probe_refusal())?
+            }
+            super::installation_survey_route::InstallationSurveyProbeInput::Completed {
+                request,
+                completed_transaction_id,
+                expected,
+            } => {
+                let fresh = eliot_installation::requalify_completed_managed_change(
+                    catalogue_context,
+                    source,
+                    request,
+                    completed_transaction_id,
+                )
+                .map_err(|_| survey_probe_refusal())?;
+                if fresh.probe() != Some(invocation)
+                    || fresh.result().advertisement != expected.result().advertisement
+                    || fresh.result().runtime_hash != expected.result().runtime_hash
+                    || fresh.result().previous_runtime_hash
+                        != expected.result().previous_runtime_hash
+                {
+                    return Err(survey_probe_refusal());
+                }
+                fresh.result().advertisement.clone()
+            }
+        };
+        if &advertisement.requalified_against.runtime_state_roots_digest
+            != catalogue_context.authority.runtime_state_roots_digest()
+        {
+            return Err(survey_probe_refusal());
+        }
+        if advertisement.family_id != invocation.family_id
+            || advertisement.target_identity.as_ref() != Some(&invocation.executable_identity)
+            || !matches!(
+                &advertisement.state.status,
+                eliot_installation::ManagedCapabilityStatus::Declared { probe_id }
+                    if probe_id == &invocation.probe_id
+            )
+            || advertisement.state.missing.as_slice()
+                != [eliot_installation::MissingQualification::NotProbedByAnAdmittedExecutor]
+        {
+            return Err(survey_probe_refusal());
+        }
+        let fresh_survey = eliot_installation::survey_accepted_installation(
+            catalogue_context,
+            source,
+        )
+        .map_err(|_| survey_probe_refusal())?;
+        let fresh_survey_digest = fresh_survey
+            .survey_content_digest()
+            .map_err(|_| survey_probe_refusal())?;
+        if fresh_survey_digest != advertisement.requalified_against.survey_content_digest {
+            return Err(survey_probe_refusal());
+        }
+        let observed = fresh_survey
+            .executable_observation_for_probe(invocation)
+            .ok_or_else(survey_probe_refusal)?;
+        let version = observed.file_version.as_ref().ok_or_else(survey_probe_refusal)?;
+        let executable_sha256 = version
+            .sha256
+            .as_deref()
+            .ok_or_else(survey_probe_refusal)?
+            .to_ascii_lowercase();
+        let surveyed_file_identity = version.file_identity.ok_or_else(survey_probe_refusal)?;
+        if !matches!(
+            &version.outcome,
+            eliot_platform_windows::FileVersionOutcome::Present { .. }
+                | eliot_platform_windows::FileVersionOutcome::Absent
+        ) {
+            return Err(survey_probe_refusal());
+        }
+        let executable_path = PathBuf::from(observed.input.as_str());
+        if !executable_path.is_absolute() {
+            return Err(survey_probe_refusal());
+        }
+        let executable_lease = self
+            .platform
+            .retain_survey_probe_executable_lease(&executable_path, &executable_sha256)
+            .map_err(|_| survey_probe_refusal())?;
+        if executable_lease.executable_identity() != surveyed_file_identity
+            || executable_lease.executable_sha256() != executable_sha256.as_str()
+        {
+            return Err(survey_probe_refusal());
+        }
+        let executable = executable_lease
+            .executable_path()
+            .to_str()
+            .ok_or_else(survey_probe_refusal)?
+            .to_owned();
+
+        if invocation.max_output_bytes < 2 {
+            return Err(survey_probe_refusal());
+        }
+        let stdout_limit = invocation.max_output_bytes / 2;
+        let stderr_limit = invocation.max_output_bytes - stdout_limit;
+        let resource_limits = eliot_process::ResourceLimits::new(
+            invocation.timeout_ms,
+            None,
+            None,
+            stdout_limit,
+            stderr_limit,
+            invocation.max_descendant_processes,
+        )?;
+        let mut environment = BTreeMap::new();
+        for name in &invocation.environment_names {
+            if let Some(value) = std::env::var_os(name.as_str()) {
+                let value = value.into_string().map_err(|_| survey_probe_refusal())?;
+                environment.insert(name.as_str().to_owned(), value);
+            }
+        }
+        let environment = eliot_process::EnvironmentProjection::new(
+            environment,
+            Vec::new(),
+            eliot_process::EnvironmentInheritance::None,
+        )?;
+        let app_container = SurveyProbeAppContainerIdentity::for_operation_id(
+            operation_id.as_str(),
+        )
+        .map_err(|_| survey_probe_refusal())?;
+        let working_directory = app_container.working_directory(working_area.path());
+        let working_directory_text = working_directory
+            .to_str()
+            .ok_or_else(survey_probe_refusal)?
+            .to_owned();
+        let intent = eliot_process::ProcessIntent::new(
+            operation_id.clone(),
+            eliot_process::ProcessTreeId::new(operation_id.as_str())?,
+            eliot_process::JobId::new(operation_id.as_str())?,
+            eliot_process::ImageId::new(invocation.executable_identity.as_str())?,
+            caller.session_id().clone(),
+            generation,
+            executable,
+            executable_sha256.clone(),
+            vec![invocation.argument.as_str().to_owned()],
+            working_directory_text,
+            environment,
+            resource_limits,
+        )?;
+        eliot_process::validate_process_intent_session(
+            &intent,
+            &caller,
+            &owner,
+            &state_fence,
+        )?;
+        let admission = ProcessExecutionAdmissionRequest::new(
+            super::ACTIVE_DAEMON_CALLER,
+            intent,
+            action_lease,
+            state_fence.clone(),
+            identity.deadline_unix_ms,
+        )?;
+        let gateway = self
+            .process_gateway
+            .as_ref()
+            .ok_or_else(survey_probe_refusal)?;
+        let context = ProcessExecutionGateway::start_context_for(&owner, &admission);
+        let outer_binding = self
+            .reject_process_start_without_material_coverage_in_context(&admission, &context)
+            .map_err(|_| survey_probe_refusal())?;
+        // The current fixed nonsecret recipe supplies privacy/redaction,
+        // the authenticated caller fixes visibility, and the original native
+        // installer receipt fixes the admitted evidence area. These are exact
+        // existing references; a generic preview policy cannot admit storage.
+        let stream_policy = eliot_process::ProcessStreamPolicyBinding::new(
+            advertisement.requalified_against.catalogue_publication_ref.as_str(),
+            invocation.probe_id.as_str(),
+            caller.session_id().as_str(),
+            working_area.evidence_area_receipt_ref()
+                .map_err(|_| survey_probe_refusal())?.as_str(),
+            invocation.probe_id.as_str(),
+        ).map_err(|_| survey_probe_refusal())?;
+        let proof = ProcessPathProof {
+            executable: executable_path,
+            working_directory,
+            lease: Arc::new(executable_lease),
+            survey_probe: Some(SurveyProbePathProof {
+                operation_id: operation_id.clone(),
+                working_area,
+                invocation: invocation.clone(),
+                stream_policy,
+            }),
+        };
+        let expected_executable = proof.executable.clone();
+        let start = match gateway
+            .start_in_context(&owner, admission, proof, outer_binding, &context)
+            .await
+        {
+            Ok(start) => start,
+            Err(error) => {
+                if matches!(error, ProcessExecutionError::UnknownOutcome) {
+                    let _ = gateway
+                        .reconcile_in_context(&owner, operation_id.clone(), &context)
+                        .await;
+                }
+                return Err(error);
+            }
+        };
+        let terminal = gateway
+            .reconcile_in_context(&owner, operation_id.clone(), &context)
+            .await?;
+        let answer_refs = validate_survey_probe_terminal(
+            invocation,
+            &operation_id,
+            &owner,
+            &caller,
+            &state_fence,
+            &expected_executable,
+            &executable_sha256,
+            &start,
+            &terminal,
+        )?;
+        let mut advertisement = advertisement;
+        advertisement.state.missing.retain(|gap| {
+            *gap != eliot_installation::MissingQualification::NotProbedByAnAdmittedExecutor
+        });
+        advertisement.state.status = eliot_installation::ManagedCapabilityStatus::Probed {
+            probe_id: invocation.probe_id.clone(),
+            answer_refs,
+        };
+        Ok((advertisement, start, terminal))
+    }
+
     /// Returns the bounded refusal projection when an exact-fence process
     /// `Start` cannot be admitted under the current supervision coverage.
     ///
@@ -4342,6 +5273,7 @@ impl KernelComposition {
             executable,
             working_directory,
             lease: Arc::new(lease),
+            survey_probe: None,
         })
     }
     pub(super) fn validate_candidate_process_binding(

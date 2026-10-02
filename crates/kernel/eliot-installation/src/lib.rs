@@ -126,7 +126,13 @@ mod credential_provision;
 mod guard_containment;
 mod installation_registry;
 mod integration_discovery;
+mod initial_snapshot_publication;
+mod managed_change_admission;
+mod managed_change_coordinator;
+mod managed_change_execution;
 mod managed_change_plan;
+mod managed_effect_recipe;
+mod survey_working_area;
 mod package;
 mod package_planner;
 mod plan;
@@ -139,8 +145,10 @@ mod registry_wire;
 mod runtime_root_contract;
 mod scm_approval;
 mod setup_binding;
+mod setup_production;
 mod signed_activation;
 mod survey;
+mod survey_probe_wire;
 mod transaction;
 mod user_broker_profile;
 
@@ -182,19 +190,56 @@ pub use integration_discovery::{
     BoundedProbeInvocation, BoundedSafeProbe, CatalogueAdmissionError, DISCOVERY_CATALOGUE_SCHEMA,
     DISCOVERY_CATALOGUE_SETTING_KEY, INTEGRATION_SEED_FAMILIES, IntegrationCategory,
     IntegrationDiscoveryCatalogue, IntegrationDiscoveryCatalogueEntry, MAX_CATALOGUE_FAMILIES,
-    ManagedChangeAdmissionError, NON_SECRET_PROBE_ENVIRONMENT_NAMES, ProbeBehaviour,
+    ManagedChangeApproval, ManagedChangeApprovalError, ManagedChangeApprovalSet,
+    ManagedChangeAdmissionError, MANAGED_CHANGE_APPROVALS_SCHEMA,
+    MANAGED_CHANGE_APPROVALS_SETTING_KEY, MAX_MANAGED_CHANGE_APPROVALS,
+    NON_SECRET_PROBE_ENVIRONMENT_NAMES, ProbeBehaviour,
     admit_installation_survey_and_compile_change, integration_seed_family_ids,
     load_accepted_catalogue, resolve_bounded_probe, survey_accepted_installation,
 };
 
-pub use managed_change_plan::{
-    ManagedEnvironmentChangePlan, compile_managed_change_plan, revalidate_managed_change_plan,
+pub use managed_change_admission::{
+    AcceptedManagedChange, CompletedManagedChangeRequalification,
+    ManagedCapabilityAdvertisement, ManagedCapabilityState, ManagedCapabilityStatus,
+    MissingQualification, RequalificationBinding, requalify_completed_managed_change,
+    requalify_managed_capability,
 };
+pub use managed_change_coordinator::ManagedChangeOwnerContext;
+
+pub use managed_effect_recipe::{
+    MANAGED_TOOLS_RELATIVE_ROOT, ManagedEffectOperation, ManagedEffectPostcondition,
+    ManagedEffectRecipe, ManagedEffectRequirement, ManagedResourceChange,
+    PORTABLE_PACKAGE_RECIPE_ID,
+};
+pub use managed_change_execution::{
+    InstallationManagedRootEffectProof, ManagedResourceDisposition, ManagedResourceEffectRef, ManagedResourceKey,
+    ManagedResourceProjection,
+};
+
+pub use managed_change_plan::{
+    ManagedEnvironmentChangePlan,
+};
+use managed_change_plan::{compile_managed_change_plan, revalidate_managed_change_plan};
 
 pub use survey::{
     InstallationSurvey, SurveyCandidate, SurveyFamilyReport, SurveyInputObservation,
-    SurveyObservationSource, SurveyProbeAnswer, SurveyStage, SurveyStageOutcome, SurveyStageResult,
-    survey_installation,
+    SurveyObservationSource, SurveyProbeAnswer, SurveyStage,
+    SurveyStageOutcome, SurveyStageResult, WindowsSurveyObservationSource, survey_installation,
+};
+pub use survey_working_area::{SurveyProbeWorkingArea, SurveyProbeWorkingAreaPathError};
+pub use initial_snapshot_publication::{
+    InitialSnapshotOwnerConfiguration, InitialSnapshotPublicationError,
+    InitialSnapshotPublicationReceipt, load_system_owner_initial_snapshot_authority,
+    publish_system_owner_initial_snapshot,
+};
+pub use setup_production::{
+    SetupProductionError, prepare_deterministic_setup_for_initial_snapshot,
+};
+pub use survey_probe_wire::{
+    INSTALLATION_SURVEY_PROBE_OPERATION, InstallationSurveyObservationRequest,
+    InstallationSurveyProbeRequest,
+    InstallationSurveyProbeResult,
+    decode_installation_survey_observation,
 };
 
 pub use activation::{
@@ -254,7 +299,8 @@ pub use plan::{
     UserModeSupervisionAuthorityProvisionPlan,
 };
 use plan::{
-    validate_effect_profile, validate_installer_effects, validate_phase_b_effect_bindings,
+    validate_effect_profile, validate_installer_effects, validate_installer_effects_with_managed_root,
+    validate_phase_b_effect_bindings,
     validate_user_mode_authority_effect_bindings,
 };
 pub use profile_governed_roots::{ProfileGovernedRoots, ProfileRootAnchors, select_profile_roots};
@@ -3316,6 +3362,11 @@ pub struct InstallationEffectRequest {
     /// Public unpredictable nonce retained by the transaction and marker.
     #[serde(default)]
     pub registration_nonce: Option<PlatformHandle>,
+    /// Original created-root records retained for a managed destination.
+    /// These records are inert until the physical adapter verifies their
+    /// protected keyed markers and exact recorded postconditions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub managed_root_effects: Vec<InstallationManagedRootEffectProof>,
 }
 
 impl InstallationEffectRequest {
@@ -3361,6 +3412,7 @@ impl InstallationEffectRequest {
         }
         sha256_handle(&self.plan_digest, "effect.plan_digest")?;
         self.precondition.validate()?;
+        survey_working_area::validate_managed_root_effects(self)?;
         if let Some(bootstrap) = &self.service_bootstrap {
             bootstrap.validate()?;
         }
@@ -3464,6 +3516,36 @@ impl InstallationEffectRequest {
                     && self.precondition.package_snapshot.is_none()
                     && self.staging_receipt.is_none()
                     && self.attempt == 1 => {}
+            (InstallerEffectPlan::ManagedEnvironmentChange { recipe, .. }, InstallationEffectAction::Apply, None)
+                if self.precondition.os_snapshot.is_none()
+                    && self.precondition.credential_snapshot.is_none()
+                    && self.precondition.package_snapshot.is_none()
+                    && self.staging_receipt.is_none()
+                    && self.attempt == 1
+                    && recipe.require_supported().is_ok() => {}
+            (
+                InstallerEffectPlan::ManagedEnvironmentChange { recipe, .. },
+                InstallationEffectAction::Apply,
+                None,
+            ) if !managed_change_execution::managed_operation_stages(recipe.operation)
+                && self.precondition.package_snapshot.is_some()
+                && self.precondition.os_snapshot.is_none()
+                && self.precondition.credential_snapshot.is_none()
+                && self.staging_receipt.is_none() => {}
+            (
+                InstallerEffectPlan::ManagedEnvironmentChange { recipe, .. },
+                InstallationEffectAction::Apply,
+                Some(ownership),
+            ) if managed_change_execution::managed_operation_stages(recipe.operation)
+                && self.precondition.package_snapshot.is_some()
+                && self.precondition.os_snapshot.is_none()
+                && self.precondition.credential_snapshot.is_none()
+                && ownership.lifecycle != InstallationSecretLifecycle::Deleted
+                && matches!(
+                    ownership.secret_provision_disposition,
+                    InstallationSecretProvisionDisposition::NotAttempted
+                        | InstallationSecretProvisionDisposition::Created
+                ) => {}
             (
                 InstallerEffectPlan::StagePackage { .. },
                 InstallationEffectAction::Rollback,
@@ -3547,6 +3629,12 @@ impl InstallationEffectRequest {
                     reason: "exact package rollback requires the durable staging receipt"
                         .to_owned(),
                 });
+            }
+        } else if let InstallerEffectPlan::ManagedEnvironmentChange { recipe, .. } = &self.plan {
+            if self.staging_receipt.is_some()
+                && !managed_change_execution::managed_operation_stages(recipe.operation)
+            {
+                return Err(InstallationError::IdentityConflict);
             }
         } else if self.staging_receipt.is_some() {
             return Err(InstallationError::IdentityConflict);
@@ -3695,6 +3783,7 @@ impl InstallationEffectObservation {
             InstallerEffectPlan::RegisterService { .. }
                 | InstallerEffectPlan::StartService { .. }
                 | InstallerEffectPlan::StagePackage { .. }
+                | InstallerEffectPlan::ManagedEnvironmentChange { .. }
                 | InstallerEffectPlan::MaterializePhaseB { .. }
                 | InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
         ))?;
@@ -3756,11 +3845,21 @@ impl InstallationEffectObservation {
             ..
         } = self
         {
-            if !matches!(effect, InstallerEffectPlan::StagePackage { .. }) {
+            let managed_stage = matches!(
+                effect,
+                InstallerEffectPlan::ManagedEnvironmentChange { recipe, .. }
+                    if managed_change_execution::managed_operation_stages(recipe.operation)
+            );
+            if !matches!(effect, InstallerEffectPlan::StagePackage { .. }) && !managed_stage {
                 return Err(InstallationError::IdentityConflict);
             }
             validate_staging_receipt_for_plan(effect, receipt)?;
-        } else if matches!(effect, InstallerEffectPlan::StagePackage { .. })
+        } else if (matches!(effect, InstallerEffectPlan::StagePackage { .. })
+            || matches!(
+                effect,
+                InstallerEffectPlan::ManagedEnvironmentChange { recipe, .. }
+                    if managed_change_execution::managed_operation_stages(recipe.operation)
+            ))
             && matches!(self, Self::Matching { .. })
         {
             return Err(InstallationError::IncompleteObservation(
@@ -4117,12 +4216,19 @@ pub(crate) trait InstallationEffectPort: Send {
 struct WindowsInstallationEffectPort {
     primitive: WindowsInstallerRootPrimitive,
     secrets: WindowsInstallerSecretProvider,
+    #[cfg(test)]
+    test_secret_store: Option<InstallationTestSecretStore>,
     prepared_ownership_secret: Option<PreparedOwnershipSecret>,
     prepared_user_mode_authority: Option<PreparedUserModeSupervisionAuthorityCredential>,
     store_target_generator: WindowsStoreCredentialTargetGenerator,
     supervision_keys: WindowsSupervisionAuthorityKeyStore,
     user_mode_supervision_keys: WindowsUserModeSupervisionAuthorityCredentialProvider,
 }
+
+#[cfg(test)]
+type InstallationTestSecretStore = std::sync::Arc<
+    std::sync::Mutex<std::collections::BTreeMap<PlatformHandle, CredentialSecret>>,
+>;
 
 struct PreparedOwnershipSecret {
     reference: InstallationSecretReference,
@@ -4135,6 +4241,8 @@ impl WindowsInstallationEffectPort {
         Self {
             primitive: WindowsInstallerRootPrimitive::new(),
             secrets: WindowsInstallerSecretProvider::new(),
+            #[cfg(test)]
+            test_secret_store: None,
             prepared_ownership_secret: None,
             prepared_user_mode_authority: None,
             store_target_generator: WindowsStoreCredentialTargetGenerator::new(),
@@ -4142,6 +4250,117 @@ impl WindowsInstallationEffectPort {
             user_mode_supervision_keys: WindowsUserModeSupervisionAuthorityCredentialProvider::new(
             ),
         }
+    }
+
+    #[cfg(test)]
+    fn new_with_test_secret_store(store: InstallationTestSecretStore) -> Self {
+        Self {
+            test_secret_store: Some(store),
+            ..Self::new()
+        }
+    }
+
+    fn secret_principal_sid(
+        &self,
+    ) -> Result<PlatformHandle, eliot_platform_windows::WindowsAdapterError> {
+        self.secrets.principal_sid()
+    }
+
+    fn read_optional_ownership_secret(
+        &self,
+        target: &PlatformHandle,
+    ) -> Result<Option<CredentialSecret>, eliot_platform_windows::WindowsAdapterError> {
+        #[cfg(test)]
+        if let Some(store) = &self.test_secret_store {
+            let store = store
+                .lock()
+                .map_err(|_| eliot_platform_windows::WindowsAdapterError::Unavailable)?;
+            return store
+                .get(target)
+                .map(|secret| {
+                    if secret.expose().len() != 32 {
+                        return Err(eliot_platform_windows::WindowsAdapterError::InvalidInput);
+                    }
+                    CredentialSecret::from_bytes(secret.expose().to_vec())
+                })
+                .transpose();
+        }
+        self.secrets.read_optional(target)
+    }
+
+    fn read_ownership_secret(
+        &self,
+        target: &PlatformHandle,
+    ) -> Result<CredentialSecret, eliot_platform_windows::WindowsAdapterError> {
+        #[cfg(test)]
+        if self.test_secret_store.is_some() {
+            return self
+                .read_optional_ownership_secret(target)?
+                .ok_or(eliot_platform_windows::WindowsAdapterError::Unavailable);
+        }
+        self.secrets.read(target)
+    }
+
+    fn write_ownership_secret_if_absent(
+        &self,
+        target: &PlatformHandle,
+        secret: CredentialSecret,
+    ) -> Result<InstallerSecretCreateDisposition, eliot_platform_windows::WindowsAdapterError> {
+        #[cfg(test)]
+        if let Some(store) = &self.test_secret_store {
+            if secret.expose().len() != 32 {
+                return Err(eliot_platform_windows::WindowsAdapterError::InvalidInput);
+            }
+            let mut store = store
+                .lock()
+                .map_err(|_| eliot_platform_windows::WindowsAdapterError::Unavailable)?;
+            return match store.entry(target.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(secret);
+                    Ok(InstallerSecretCreateDisposition::Created)
+                }
+                std::collections::btree_map::Entry::Occupied(entry) => {
+                    if entry.get().expose().len() != 32 {
+                        return Err(eliot_platform_windows::WindowsAdapterError::InvalidInput);
+                    }
+                    Ok(InstallerSecretCreateDisposition::AlreadyExists)
+                }
+            };
+        }
+        self.secrets.write_exact_if_absent(target, secret)
+    }
+
+    fn delete_ownership_secret_target(
+        &self,
+        target: &PlatformHandle,
+    ) -> Result<(), eliot_platform_windows::WindowsAdapterError> {
+        #[cfg(test)]
+        if let Some(store) = &self.test_secret_store {
+            return store
+                .lock()
+                .map_err(|_| eliot_platform_windows::WindowsAdapterError::Unavailable)?
+                .remove(target)
+                .map(drop)
+                .ok_or(eliot_platform_windows::WindowsAdapterError::Unavailable);
+        }
+        self.secrets.delete(target)
+    }
+
+    fn inspect_ownership_secret_target(
+        &self,
+        target: &PlatformHandle,
+    ) -> Result<InstallerSecretObservation, eliot_platform_windows::WindowsAdapterError> {
+        #[cfg(test)]
+        if self.test_secret_store.is_some() {
+            return self.read_optional_ownership_secret(target).map(|secret| {
+                if secret.is_some() {
+                    InstallerSecretObservation::Present
+                } else {
+                    InstallerSecretObservation::Absent
+                }
+            });
+        }
+        self.secrets.inspect(target)
     }
 
     fn fresh_store_credential_target(
@@ -4547,7 +4766,7 @@ impl WindowsInstallationEffectPort {
         if ownership.lifecycle == InstallationSecretLifecycle::Deleted {
             return Err(PortError::InvalidRequestMetadata);
         }
-        let observed_sid = self.secrets.principal_sid().map_err(secret_port_error)?;
+        let observed_sid = self.secret_principal_sid().map_err(secret_port_error)?;
         if ownership.reference.scope != InstallationSecretScope::WindowsCredentialManagerCurrentUser
             || observed_sid != ownership.reference.expected_principal_sid
         {
@@ -4579,7 +4798,7 @@ impl WindowsInstallationEffectPort {
             .ownership_secret
             .as_ref()
             .ok_or(eliot_platform_windows::WindowsAdapterError::InvalidInput)?;
-        let secret = self.secrets.read(reference)?;
+        let secret = self.read_ownership_secret(reference)?;
         if !ownership_secret_creation_proof_matches(request, ownership, secret.expose()) {
             return Err(eliot_platform_windows::WindowsAdapterError::IdentityMismatch);
         }
@@ -6219,7 +6438,7 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
             Ok(target) => target,
             Err(error) => return secret_outcome(error),
         };
-        let expected_principal_sid = match self.secrets.principal_sid() {
+        let expected_principal_sid = match self.secret_principal_sid() {
             Ok(sid) => sid,
             Err(error) => return secret_outcome(error),
         };
@@ -6235,12 +6454,16 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
         request: &InstallationEffectRequest,
         reference: &InstallationSecretReference,
     ) -> PortOutcome<InstallationSecretCreationProof> {
-        if !matches!(
+        if !(matches!(
             request.plan,
             InstallerEffectPlan::CreateRoot { .. }
                 | InstallerEffectPlan::ProvisionStoreCredential { .. }
                 | InstallerEffectPlan::StagePackage { .. }
-        ) {
+        ) || matches!(
+            &request.plan,
+            InstallerEffectPlan::ManagedEnvironmentChange { recipe, .. }
+                if managed_change_execution::managed_operation_stages(recipe.operation)
+        )) {
             return PortOutcome::Error(PortError::InvalidRequestMetadata);
         }
         let secret = match self.secrets.generate_secret() {
@@ -6321,12 +6544,16 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
         &mut self,
         request: &InstallationEffectRequest,
     ) -> PortOutcome<InstallationSecretProvisionDisposition> {
-        if !matches!(
+        if !(matches!(
             request.plan,
             InstallerEffectPlan::CreateRoot { .. }
                 | InstallerEffectPlan::ProvisionStoreCredential { .. }
                 | InstallerEffectPlan::StagePackage { .. }
-        ) {
+        ) || matches!(
+            &request.plan,
+            InstallerEffectPlan::ManagedEnvironmentChange { recipe, .. }
+                if managed_change_execution::managed_operation_stages(recipe.operation)
+        )) {
             return PortOutcome::Error(PortError::InvalidRequestMetadata);
         }
         let Some(ownership) = request.ownership_secret.as_ref() else {
@@ -6350,7 +6577,7 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
                     retryable: false,
                 }));
             }
-            match self.secrets.read_optional(target) {
+            match self.read_optional_ownership_secret(target) {
                 Ok(Some(existing)) => {
                     if !ownership_secret_creation_proof_matches(
                         request,
@@ -6365,14 +6592,14 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
                     Ok(())
                 }
                 Ok(None) => {
-                    match self.secrets.write_exact_if_absent(target, prepared.secret) {
+                    match self.write_ownership_secret_if_absent(target, prepared.secret) {
                         Ok(
                             InstallerSecretCreateDisposition::Created
                             | InstallerSecretCreateDisposition::AlreadyExists,
                         ) => {}
                         Err(error) => return secret_outcome(error),
                     }
-                    let readback = match self.secrets.read(target) {
+                    let readback = match self.read_ownership_secret(target) {
                         Ok(readback) => readback,
                         Err(error) => return secret_outcome(error),
                     };
@@ -6391,7 +6618,7 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
                 Err(error) => return secret_outcome(error),
             }
         } else {
-            match self.secrets.read_optional(target) {
+            match self.read_optional_ownership_secret(target) {
                 Ok(Some(readback))
                     if ownership_secret_creation_proof_matches(
                         request,
@@ -6495,6 +6722,30 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
             };
             let outcome = execute_package(request, &key);
             return outcome;
+        }
+        if matches!(
+            &request.plan,
+            InstallerEffectPlan::ManagedEnvironmentChange { .. }
+        ) {
+            let key = if let InstallerEffectPlan::ManagedEnvironmentChange { recipe, .. } =
+                &request.plan
+            {
+                if managed_change_execution::managed_operation_stages(recipe.operation) {
+                    match self.credential_secret(request) {
+                        Ok(key) => key,
+                        Err(error) => return PortOutcome::Error(error),
+                    }
+                } else {
+                    Vec::new()
+                }
+            } else {
+                unreachable!()
+            };
+            let parent = match survey_working_area::managed_destination_parent_identity(self, request) {
+                Ok(parent) => parent,
+                Err(error) => return PortOutcome::Error(error),
+            };
+            return managed_change_execution::execute_managed_change(request, &key, parent);
         }
         if matches!(&request.plan, InstallerEffectPlan::RegisterService { .. }) {
             return self.execute_service(request);
@@ -6829,6 +7080,10 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
             self.inspect_service(request)
         } else if matches!(&request.plan, InstallerEffectPlan::StartService { .. }) {
             self.service_start_inspect(request)
+        } else if matches!(&request.plan, InstallerEffectPlan::ManagedEnvironmentChange { .. }) {
+            let parent = survey_working_area::managed_destination_parent_identity(self, request)?;
+            managed_change_execution::inspect_managed_change(request, parent)
+                .map_err(|error| package_port_error(&error))
         } else if matches!(&request.plan, InstallerEffectPlan::StagePackage { .. }) {
             inspect_package(request).map_err(|error| package_port_error(&error))
         } else if matches!(
@@ -6863,6 +7118,27 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
             self.reconcile_service(request)
         } else if matches!(&request.plan, InstallerEffectPlan::StartService { .. }) {
             self.service_start_reconcile(request)
+        } else if matches!(&request.plan, InstallerEffectPlan::ManagedEnvironmentChange { .. }) {
+            let key = if let InstallerEffectPlan::ManagedEnvironmentChange { recipe, .. } =
+                &request.plan
+            {
+                if managed_change_execution::managed_operation_stages(recipe.operation) {
+                    match self.credential_secret(request) {
+                        Ok(key) => key,
+                        Err(error) => return PortOutcome::Error(error),
+                    }
+                } else {
+                    Vec::new()
+                }
+            } else {
+                unreachable!()
+            };
+            let parent = match survey_working_area::managed_destination_parent_identity(self, request) {
+                Ok(parent) => parent,
+                Err(error) => return PortOutcome::Error(error),
+            };
+            managed_change_execution::reconcile_managed_change(request, &key, parent)
+                .map_err(|error| package_staging_unknown_port_error(request, &error))
         } else if matches!(&request.plan, InstallerEffectPlan::StagePackage { .. }) {
             let key = match self.credential_secret(request) {
                 Ok(key) => key,
@@ -6907,7 +7183,7 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
             Ok(target) => target,
             Err(error) => return PortOutcome::Error(error),
         };
-        let secret = match self.secrets.read(target) {
+        let secret = match self.read_ownership_secret(target) {
             Ok(secret) => secret,
             Err(error) => return secret_outcome(error),
         };
@@ -6917,7 +7193,7 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
                 retryable: false,
             }));
         }
-        match self.secrets.delete(target) {
+        match self.delete_ownership_secret_target(target) {
             Ok(()) => PortOutcome::Known(()),
             Err(error) => secret_outcome(error),
         }
@@ -6934,7 +7210,7 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
             Ok(target) => target,
             Err(error) => return PortOutcome::Error(error),
         };
-        match self.secrets.inspect(target) {
+        match self.inspect_ownership_secret_target(target) {
             Ok(InstallerSecretObservation::Absent) => PortOutcome::Known(true),
             Ok(InstallerSecretObservation::Present) => PortOutcome::Known(false),
             Err(error) => secret_outcome(error),
@@ -7362,11 +7638,24 @@ fn matching_created(
     receipt: &WindowsRootOwnershipReceipt,
     external_identity: PlatformHandle,
 ) -> Result<InstallationEffectObservation, PortError> {
+    matching_created_for_binding(
+        &request.effect_id, &request.plan_digest, root, marker, receipt, external_identity,
+    )
+}
+
+fn matching_created_for_binding(
+    effect_id: &PlatformHandle,
+    plan_digest: &PlatformHandle,
+    root: &InstallerRootObjectSnapshot,
+    marker: &InstallerRootObjectSnapshot,
+    receipt: &WindowsRootOwnershipReceipt,
+    external_identity: PlatformHandle,
+) -> Result<InstallationEffectObservation, PortError> {
     let evidence_digest = sha256_hex(
         &serde_json::to_vec(&(
             "owned-root-evidence-v2",
-            request.effect_id.as_str(),
-            request.plan_digest.as_str(),
+            effect_id.as_str(),
+            plan_digest.as_str(),
             root,
             marker,
             &receipt.mac,
@@ -7376,8 +7665,8 @@ fn matching_created(
     let postcondition_digest = PlatformHandle::new(sha256_hex(
         &serde_json::to_vec(&(
             "owned-root-postcondition-v2",
-            request.effect_id.as_str(),
-            request.plan_digest.as_str(),
+            effect_id.as_str(),
+            plan_digest.as_str(),
             root,
             marker,
             &receipt.mac,
@@ -8455,6 +8744,25 @@ use transaction_store_private::TransactionVersion;
 /// }
 /// ```
 pub trait InstallationTransactionStore: transaction_store_private::Sealed + Send {
+    /// Resolves the unique original transaction-created root in this
+    /// installation's existing transaction table. Returned data alone grants
+    /// no ownership; the effect adapter rechecks its current keyed OS marker.
+    fn managed_root_effect_proof(
+        &self,
+        anchor_transaction_id: &PlatformHandle,
+        installation_root: &PlatformHandle,
+        profile: InstallationProfile,
+        root: &PlatformHandle,
+    ) -> Result<Option<InstallationManagedRootEffectProof>, InstallationError>;
+
+    /// Derives an exact managed resource from original transaction rows.
+    /// The projection is lookup data; its original effect receipts remain
+    /// authoritative and must be reloaded before dependent effects.
+    fn managed_resource_projection(
+        &self,
+        key: &ManagedResourceKey,
+    ) -> Result<Option<ManagedResourceProjection>, InstallationError>;
+
     /// Creates a constructor-produced v3 `Planned`/`Pending` transaction.
     fn create_planned(
         &mut self,
@@ -8663,6 +8971,37 @@ where
         transaction_id: &PlatformHandle,
         now_ms: u64,
     ) -> Result<InstallationStepOutcome, InstallationError> {
+        fn retain_managed_staging_receipt(
+            transaction: &mut InstallationTransaction,
+            index: usize,
+            receipt: &StagingReceipt,
+        ) -> Result<Option<TransactionVersion>, InstallationError> {
+            validate_staging_receipt_for_plan(
+                &transaction.installer_effects[index],
+                receipt,
+            )?;
+            let Some(snapshot) = transaction.effect_progress[index]
+                .admitted_precondition
+                .as_ref()
+                .and_then(|precondition| precondition.package_snapshot.as_ref())
+            else {
+                return Err(InstallationError::IncompleteObservation(
+                    "managed package receipt requires its durable source observation".to_owned(),
+                ));
+            };
+            validate_staging_receipt_for_observation(snapshot, receipt)?;
+            if let Some(previous) = transaction.effect_progress[index].staging_receipt.as_ref() {
+                return (previous == receipt)
+                    .then_some(None)
+                    .ok_or(InstallationError::IdentityConflict);
+            }
+            let expected = TransactionVersion::of(transaction)?;
+            transaction.effect_progress[index].staging_receipt = Some(receipt.clone());
+            increment_revision(transaction)?;
+            transaction.validate()?;
+            Ok(Some(expected))
+        }
+
         let mut transaction = self.store.load(transaction_id)?.ok_or_else(|| {
             InstallationError::TransactionNotFound {
                 transaction_id: transaction_id.as_str().to_owned(),
@@ -8695,6 +9034,13 @@ where
                     pending_refs: transaction.pending_external_changes.clone(),
                 });
             }
+            if transaction.is_managed_child_transaction()
+                && transaction.stage != InstallationStage::Completed
+            {
+                let expected = TransactionVersion::of(&transaction)?;
+                transaction.complete_managed_operation()?;
+                self.store.compare_and_save(expected, &transaction)?;
+            }
             return Ok(InstallationStepOutcome::Applied {
                 stage: transaction.stage,
                 evidence_refs: transaction.observed_postconditions.clone(),
@@ -8711,10 +9057,16 @@ where
                 });
             }
         };
-        if matches!(
+        let managed_stage_effect = matches!(
+            &transaction.installer_effects[index],
+            InstallerEffectPlan::ManagedEnvironmentChange { recipe, .. }
+                if managed_change_execution::managed_operation_stages(recipe.operation)
+        );
+        if (matches!(
             transaction.installer_effects[index],
             InstallerEffectPlan::StagePackage { .. }
-        ) && transaction.stage == InstallationStage::Planned
+        ) || managed_stage_effect)
+            && transaction.stage == InstallationStage::Planned
         {
             let expected = TransactionVersion::of(&transaction)?;
             let evidence = PlatformHandle::new(format!(
@@ -8878,10 +9230,10 @@ where
             InstallationEffectProgressState::IntentCommitted { .. }
         );
         if was_intent
-            && matches!(
+            && (matches!(
                 transaction.installer_effects[index],
                 InstallerEffectPlan::StagePackage { .. }
-            )
+            ) || managed_stage_effect)
             && request.precondition.package_snapshot.is_none()
         {
             return self.persist_unknown(
@@ -8916,12 +9268,12 @@ where
             }
         }
         if was_intent
-            && matches!(
+            && (matches!(
                 transaction.installer_effects[index],
                 InstallerEffectPlan::CreateRoot { .. }
                     | InstallerEffectPlan::ProvisionStoreCredential { .. }
                     | InstallerEffectPlan::StagePackage { .. }
-            )
+            ) || managed_stage_effect)
             && transaction.effect_progress[index]
                 .ownership_secret
                 .as_ref()
@@ -8975,6 +9327,13 @@ where
                 }
                 match self.port.reconcile(&request) {
                     PortOutcome::Known(observation) => observation,
+                    other if managed_stage_effect => {
+                        return self.persist_unknown_after_managed_stage_result(
+                            transaction,
+                            index,
+                            port_pending(other),
+                        );
+                    }
                     other => return self.persist_unknown(transaction, index, port_pending(other)),
                 }
             }
@@ -9074,6 +9433,17 @@ where
                         .process_lineage = Some(lineage);
                 }
                 if !was_intent {
+                    if matches!(
+                        transaction.installer_effects[index],
+                        InstallerEffectPlan::ManagedEnvironmentChange { .. }
+                    ) {
+                        return self.persist_unknown(
+                            transaction,
+                            index,
+                            PlatformHandle::new("mismatch:uncommitted-created-disposition")
+                                .map_err(|error| platform_error(&error))?,
+                        );
+                    }
                     if disposition != InstallationEffectDisposition::PreexistingMatching {
                         return self.persist_unknown(
                             transaction,
@@ -9093,7 +9463,9 @@ where
                             | InstallerEffectPlan::StartService { .. }
                             | InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
                             | InstallerEffectPlan::MaterializePhaseB { .. }
+                            | InstallerEffectPlan::ManagedEnvironmentChange { .. }
                     )
+                    && !managed_stage_effect
                     && transaction.effect_progress[index]
                         .ownership_secret
                         .as_ref()
@@ -9121,8 +9493,76 @@ where
                         transaction,
                         index,
                         PlatformHandle::new("mismatch:preexisting-after-intent")
-                            .map_err(|error| platform_error(&error))?,
+                        .map_err(|error| platform_error(&error))?,
                     );
+                }
+                if matches!(
+                    transaction.installer_effects[index],
+                    InstallerEffectPlan::ManagedEnvironmentChange { .. }
+                ) && !managed_stage_effect
+                {
+                    if disposition != InstallationEffectDisposition::CreatedByTransaction {
+                        return self.persist_unknown(
+                            transaction,
+                            index,
+                            PlatformHandle::new("mismatch:unauthorized-post-execute-disposition")
+                                .map_err(|error| platform_error(&error))?,
+                        );
+                    }
+                    if managed_change_execution::validate_nonstaging_managed_readback(
+                        &request,
+                        &external_identity,
+                        &evidence,
+                        &postcondition_digest,
+                    )
+                    .is_err()
+                    {
+                        return self.persist_unknown(
+                            transaction,
+                            index,
+                            PlatformHandle::new("mismatch:precondition")
+                                .map_err(|error| platform_error(&error))?,
+                        );
+                    }
+                }
+                let staging_receipt = if managed_stage_effect {
+                    let Some(receipt) = staging_receipt.as_ref() else {
+                        return self.persist_unknown(
+                            transaction,
+                            index,
+                            PlatformHandle::new("mismatch:package-execution-receipt")
+                                .map_err(|error| platform_error(&error))?,
+                        );
+                    };
+                    let expected = match retain_managed_staging_receipt(
+                        &mut transaction,
+                        index,
+                        receipt,
+                    ) {
+                        Ok(expected) => expected,
+                        Err(_) => {
+                            return self.persist_unknown(
+                                transaction,
+                                index,
+                                PlatformHandle::new("mismatch:package-receipt-observation")
+                                    .map_err(|error| platform_error(&error))?,
+                            );
+                        }
+                    };
+                    if let Some(expected) = expected {
+                        self.store.compare_and_save(expected, &transaction)?;
+                    }
+                    None
+                } else {
+                    staging_receipt
+                };
+                let resume_managed_stage_recovery = managed_stage_effect
+                    && was_intent
+                    && transaction.stage == InstallationStage::RollbackRequired;
+                if resume_managed_stage_recovery
+                    && !managed_stage_recovery_is_bound(&transaction, index)
+                {
+                    return Err(InstallationError::IdentityConflict);
                 }
                 self.persist_applied(
                     transaction,
@@ -9135,6 +9575,7 @@ where
                     credential_receipt,
                     staging_receipt,
                     phase_b_receipt.map(|receipt| *receipt),
+                    resume_managed_stage_recovery,
                 )
             }
             InstallationEffectObservation::Mismatch { pending_ref } => {
@@ -9171,6 +9612,11 @@ where
                             && observed_precondition.package_snapshot.is_none()
                     }
                     InstallerEffectPlan::StagePackage { .. } => {
+                        observed_precondition.package_snapshot.is_some()
+                            && observed_precondition.os_snapshot.is_none()
+                            && observed_precondition.credential_snapshot.is_none()
+                    }
+                    InstallerEffectPlan::ManagedEnvironmentChange { .. } => {
                         observed_precondition.package_snapshot.is_some()
                             && observed_precondition.os_snapshot.is_none()
                             && observed_precondition.credential_snapshot.is_none()
@@ -9273,7 +9719,7 @@ where
                         | InstallerEffectPlan::ProvisionStoreCredential { .. }
                         | InstallerEffectPlan::StagePackage { .. }
                         | InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
-                );
+                ) || managed_stage_effect;
                 let next_attempt = if was_intent && !preserves_secret_attempt {
                     attempt
                         .checked_add(1)
@@ -9300,7 +9746,8 @@ where
                         InstallerEffectPlan::CreateRoot { .. }
                             | InstallerEffectPlan::ProvisionStoreCredential { .. }
                             | InstallerEffectPlan::StagePackage { .. }
-                    ) {
+                    ) || managed_stage_effect
+                    {
                         let reference = match self.port.fresh_ownership_secret_reference(&request) {
                             PortOutcome::Known(reference) => reference,
                             other => {
@@ -9413,13 +9860,14 @@ where
                         return Err(error);
                     }
                 };
-                if matches!(
+                if (matches!(
                     transaction.installer_effects[index],
                     InstallerEffectPlan::CreateRoot { .. }
                         | InstallerEffectPlan::ProvisionStoreCredential { .. }
                         | InstallerEffectPlan::StagePackage { .. }
-                ) && transaction.effect_progress[index]
-                    .ownership_secret
+                ) || managed_stage_effect)
+                    && transaction.effect_progress[index]
+                        .ownership_secret
                     .as_ref()
                     .is_some_and(|ownership| {
                         ownership.secret_provision_disposition
@@ -9457,13 +9905,14 @@ where
                         None,
                     )?;
                 }
-                if matches!(
+                if (matches!(
                     transaction.installer_effects[index],
                     InstallerEffectPlan::CreateRoot { .. }
                         | InstallerEffectPlan::StagePackage { .. }
                         | InstallerEffectPlan::ProvisionStoreCredential { .. }
                         | InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
-                ) && request.action == InstallationEffectAction::Apply
+                ) || managed_stage_effect)
+                    && request.action == InstallationEffectAction::Apply
                 {
                     // The provider mutation and Created CAS are not enough
                     // to authorize filesystem execution. Reload the exact
@@ -9596,6 +10045,15 @@ where
                         // drive uses the query-only ReconcilePhaseB operation;
                         // it never republishes the Host overlay blindly.
                         return Ok(InstallationStepOutcome::Rejected);
+                    }
+                    other if managed_stage_effect
+                        && request.action == InstallationEffectAction::Apply =>
+                    {
+                        return self.persist_unknown_after_managed_stage_result(
+                            transaction,
+                            index,
+                            port_pending(other),
+                        );
                     }
                     other => return self.persist_unknown(transaction, index, port_pending(other)),
                 };
@@ -9797,6 +10255,7 @@ where
                         | InstallerEffectPlan::ProvisionStoreCredential { .. }
                         | InstallerEffectPlan::MaterializePhaseB { .. }
                         | InstallerEffectPlan::StagePackage { .. }
+                        | InstallerEffectPlan::ManagedEnvironmentChange { .. }
                         | InstallerEffectPlan::StartService { .. },
                         Some(_),
                     ) => {
@@ -9814,7 +10273,8 @@ where
                         | InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
                         | InstallerEffectPlan::ProvisionStoreCredential { .. }
                         | InstallerEffectPlan::MaterializePhaseB { .. }
-                        | InstallerEffectPlan::StagePackage { .. },
+                        | InstallerEffectPlan::StagePackage { .. }
+                        | InstallerEffectPlan::ManagedEnvironmentChange { .. },
                         None,
                     )
                     | (InstallerEffectPlan::RegisterService { .. }, Some(_)) => {}
@@ -9903,6 +10363,40 @@ where
                         InstallationEffectAction::Apply,
                         None,
                     )?;
+                } else if managed_stage_effect {
+                    let Some(receipt) = execution.staging_receipt.as_ref() else {
+                        return self.persist_unknown(
+                            transaction,
+                            index,
+                            PlatformHandle::new("mismatch:package-execution-receipt")
+                                .map_err(|error| platform_error(&error))?,
+                        );
+                    };
+                    let expected = match retain_managed_staging_receipt(
+                        &mut transaction,
+                        index,
+                        receipt,
+                    ) {
+                        Ok(expected) => expected,
+                        Err(_) => {
+                            return self.persist_unknown(
+                                transaction,
+                                index,
+                                PlatformHandle::new("mismatch:package-receipt-observation")
+                                    .map_err(|error| platform_error(&error))?,
+                            );
+                        }
+                    };
+                    if let Some(expected) = expected {
+                        self.store.compare_and_save(expected, &transaction)?;
+                    }
+                    request = effect_request(
+                        &transaction,
+                        index,
+                        next_attempt,
+                        InstallationEffectAction::Apply,
+                        None,
+                    )?;
                 } else if execution.staging_receipt.is_some() {
                     return self.persist_unknown(
                         transaction,
@@ -9913,6 +10407,15 @@ where
                 }
                 let reconciled = match self.port.reconcile(&request) {
                     PortOutcome::Known(observation) => observation,
+                    other if managed_stage_effect
+                        && request.action == InstallationEffectAction::Apply =>
+                    {
+                        return self.persist_unknown_after_managed_stage_result(
+                            transaction,
+                            index,
+                            port_pending(other),
+                        );
+                    }
                     other => return self.persist_unknown(transaction, index, port_pending(other)),
                 };
                 reconciled.validate_for_effect(&transaction.installer_effects[index])?;
@@ -9989,6 +10492,72 @@ where
                         } else {
                             disposition
                         };
+                        let managed_nonstaging_proved = matches!(
+                            transaction.installer_effects[index],
+                            InstallerEffectPlan::ManagedEnvironmentChange { .. }
+                        ) && !managed_stage_effect;
+                        if managed_nonstaging_proved {
+                            if disposition != InstallationEffectDisposition::CreatedByTransaction {
+                                return self.persist_unknown(
+                                    transaction,
+                                    index,
+                                    PlatformHandle::new(
+                                        "mismatch:unauthorized-post-execute-disposition",
+                                    )
+                                    .map_err(|error| platform_error(&error))?,
+                                );
+                            }
+                            if managed_change_execution::validate_nonstaging_managed_readback(
+                                &request,
+                                &external_identity,
+                                &evidence,
+                                &postcondition_digest,
+                            )
+                            .is_err()
+                            {
+                                return self.persist_unknown(
+                                    transaction,
+                                    index,
+                                    PlatformHandle::new("mismatch:precondition")
+                                        .map_err(|error| platform_error(&error))?,
+                                );
+                            }
+                        }
+                        let managed_staging_receipt_proved =
+                            managed_stage_effect && staging_receipt.is_some();
+                        let staging_receipt = if managed_stage_effect {
+                            let Some(receipt) = staging_receipt.as_ref() else {
+                                return self.persist_unknown(
+                                    transaction,
+                                    index,
+                                    PlatformHandle::new("mismatch:package-execution-receipt")
+                                        .map_err(|error| platform_error(&error))?,
+                                );
+                            };
+                            let expected = match retain_managed_staging_receipt(
+                                &mut transaction,
+                                index,
+                                receipt,
+                            ) {
+                                Ok(expected) => expected,
+                                Err(_) => {
+                                    return self.persist_unknown(
+                                        transaction,
+                                        index,
+                                        PlatformHandle::new(
+                                            "mismatch:package-receipt-observation",
+                                        )
+                                        .map_err(|error| platform_error(&error))?,
+                                    );
+                                }
+                            };
+                            if let Some(expected) = expected {
+                                self.store.compare_and_save(expected, &transaction)?;
+                            }
+                            None
+                        } else {
+                            staging_receipt
+                        };
                         let ownership =
                             transaction.effect_progress[index].ownership_secret.as_ref();
                         let authorized = match disposition {
@@ -10008,6 +10577,8 @@ where
                                     transaction.installer_effects[index],
                                     InstallerEffectPlan::StagePackage { .. }
                                 ) && staging_receipt.is_some())
+                                || managed_staging_receipt_proved
+                                || managed_nonstaging_proved
                                 || (matches!(
                                     transaction.installer_effects[index],
                                     InstallerEffectPlan::MaterializePhaseB { .. }
@@ -10034,6 +10605,7 @@ where
                                 credential_receipt,
                                 staging_receipt,
                                 phase_b_receipt.map(|receipt| *receipt),
+                                false,
                             )
                         } else {
                             self.persist_unknown(
@@ -10235,17 +10807,17 @@ where
             transaction.validate()?;
             self.store.compare_and_save(expected, &transaction)?;
         }
-        // Issue #1352: an effect whose committed intent survived a typed
-        // request-correlated unknown is unresolved for the reason the
-        // transaction durably recorded, so the `unreconciled` scan reports that
-        // exact request-correlated cause rather than the intent digest and
-        // `persist_quarantined` keeps the stage, Win32 code and SCM sample.
+        // An effect whose committed intent survived a request-correlated
+        // unknown, or the exact managed package-stage failure/result, is
+        // unresolved for its durable cause. The `unreconciled` scan therefore
+        // reports that cause rather than replacing it with the intent digest.
         // Every other committed intent keeps the digest: a bare crash window
         // records no cause to report.
         let unreconciled = transaction
             .effect_progress
             .iter()
-            .find_map(|progress| match &progress.state {
+            .enumerate()
+            .find_map(|(index, progress)| match &progress.state {
                 InstallationEffectProgressState::Unknown { pending_ref } => {
                     Some(pending_ref.clone())
                 }
@@ -10255,6 +10827,11 @@ where
                         .iter()
                         .find(|pending| {
                             is_request_correlated_unknown(pending.as_str(), intent_digest)
+                                || (is_managed_stage_pending_cause(pending.as_str())
+                                    && managed_stage_intent_matches_current(
+                                        &transaction,
+                                        index,
+                                    ))
                         })
                         .cloned()
                         .or_else(|| Some(intent_digest.clone()))
@@ -10614,6 +11191,7 @@ where
         credential_receipt: Option<CredentialAccessReceipt>,
         staging_receipt: Option<StagingReceipt>,
         phase_b_receipt: Option<HostPhaseBMaterializationReceipt>,
+        resume_managed_stage_recovery: bool,
     ) -> Result<InstallationStepOutcome, InstallationError> {
         let expected = TransactionVersion::of(&transaction)?;
         match (
@@ -10691,6 +11269,53 @@ where
             postcondition_digest,
         };
         transaction.observed_postconditions.extend(evidence.clone());
+        if resume_managed_stage_recovery {
+            if transaction.stage != InstallationStage::RollbackRequired
+                || !transaction.is_managed_child_transaction()
+                || !matches!(
+                    transaction.installer_effects.get(index),
+                    Some(InstallerEffectPlan::ManagedEnvironmentChange { recipe, .. })
+                        if managed_change_execution::managed_operation_stages(recipe.operation)
+                )
+                || !matches!(
+                    &transaction.effect_progress[index].state,
+                    InstallationEffectProgressState::Applied {
+                        disposition: InstallationEffectDisposition::CreatedByTransaction,
+                        ..
+                    }
+                )
+                || transaction.effect_progress[index].staging_receipt.is_none()
+                || transaction.guard_revert.is_some()
+                || transaction.pending_external_changes.is_empty()
+                || transaction
+                    .pending_external_changes
+                    .iter()
+                    .any(|reference| !is_managed_stage_pending_cause(reference.as_str()))
+                || transaction
+                    .effect_progress
+                    .iter()
+                    .enumerate()
+                    .any(|(other, progress)| {
+                        other != index
+                            && !matches!(
+                                &progress.state,
+                                InstallationEffectProgressState::Applied { .. }
+                            )
+                    })
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            for reference in std::mem::take(&mut transaction.pending_external_changes) {
+                if !transaction.completed_stage_refs.contains(&reference) {
+                    transaction.completed_stage_refs.push(reference);
+                }
+            }
+            // Exact original-intent readback has settled the only managed
+            // package effect. Return this standalone operation to its normal
+            // staging terminal path; the next bounded drive records Completed
+            // from the already-persisted effect receipts without new effects.
+            transaction.stage = InstallationStage::Staging;
+        }
         if matches!(
             transaction.installer_effects[index],
             InstallerEffectPlan::StagePackage { .. }
@@ -10726,13 +11351,13 @@ where
     /// Records one unclassified observation against `index` and holds the
     /// transaction at `RollbackRequired`.
     ///
-    /// Issue #1352: an observation that could not be classified must not destroy
-    /// the identity of an operation that already committed its intent. When
-    /// [`has_reconcilable_service_registration_intent`] proves that this exact
-    /// observation is the request-correlated unknown of that committed intent —
-    /// service-registration, installer-root, package-staging, credential or
-    /// Phase-B — the intent is
-    /// preserved: the typed cause is recorded in `pending_external_changes`,
+    /// Issue #1352 and W6: an observation that could not be classified must not
+    /// destroy the identity of an operation that already committed its intent.
+    /// When [`has_reconcilable_service_registration_intent`] proves that this
+    /// exact observation belongs to the committed intent — using the existing
+    /// request-correlated grammar or the managed stage's exact original effect
+    /// row — the intent is preserved and the cause is recorded in
+    /// `pending_external_changes`,
     /// the transaction stays `RollbackRequired`, and the effect keeps the
     /// `attempt`/`intent_digest` that authorized the external object, so
     /// re-driving this transaction re-enters [`Self::drive_effect_at`]'s
@@ -10741,30 +11366,82 @@ where
     /// `UNKNOWN_OUTCOME`/`ROLLBACK_REQUIRED` "until read-back reconciliation",
     /// which requires exactly this retained identity.
     ///
-    /// Every other contour — a pre-intent observation, an intent this
-    /// transaction can no longer reconstruct, a different post-intent cause,
-    /// an uncorrelated reference and every non-reconcile effect observation —
-    /// keeps the existing terminal
+    /// Other contours — a pre-intent observation, an intent this transaction
+    /// can no longer reconstruct, a different post-intent cause, or a
+    /// non-reconcile effect observation — keep the existing terminal
     /// [`InstallationEffectProgressState::Unknown`] disposition unchanged.
     fn persist_unknown(
+        &mut self,
+        transaction: InstallationTransaction,
+        index: usize,
+        pending_ref: PlatformHandle,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        self.persist_unknown_with_managed_stage_intent(
+            transaction,
+            index,
+            pending_ref,
+            false,
+        )
+    }
+
+    /// Retains the managed package effect's original intent after its execute
+    /// or committed readback call returned an indeterminate result. The
+    /// retained identity only routes the next drive through readback; the
+    /// same-attempt Resume path still requires the managed repair's exact
+    /// candidate/prior absence proof.
+    fn persist_unknown_after_managed_stage_result(
+        &mut self,
+        transaction: InstallationTransaction,
+        index: usize,
+        pending_ref: PlatformHandle,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        self.persist_unknown_with_managed_stage_intent(
+            transaction,
+            index,
+            pending_ref,
+            true,
+        )
+    }
+
+    fn persist_unknown_with_managed_stage_intent(
         &mut self,
         mut transaction: InstallationTransaction,
         index: usize,
         pending_ref: PlatformHandle,
+        allow_managed_stage_intent: bool,
     ) -> Result<InstallationStepOutcome, InstallationError> {
         let expected = TransactionVersion::of(&transaction)?;
-        if !has_reconcilable_service_registration_intent(&transaction, index, &pending_ref) {
+        let managed_stage_intent = managed_stage_intent_matches_current(&transaction, index);
+        let reconcilable = has_reconcilable_service_registration_intent(
+            &transaction,
+            index,
+            &pending_ref,
+        ) || (allow_managed_stage_intent && managed_stage_intent);
+        if !reconcilable {
             transaction.effect_progress[index].state = InstallationEffectProgressState::Unknown {
                 pending_ref: pending_ref.clone(),
             };
         }
-        transaction.pending_external_changes = vec![pending_ref.clone()];
+        let mut pending_refs = if managed_stage_intent
+            && transaction
+                .pending_external_changes
+                .iter()
+                .any(|pending| is_managed_stage_pending_cause(pending.as_str()))
+        {
+            transaction.pending_external_changes.clone()
+        } else {
+            Vec::new()
+        };
+        if !pending_refs.contains(&pending_ref) {
+            pending_refs.push(pending_ref);
+        }
+        transaction.pending_external_changes = pending_refs.clone();
         transaction.stage = InstallationStage::RollbackRequired;
         increment_revision(&mut transaction)?;
         transaction.validate()?;
         self.store.compare_and_save(expected, &transaction)?;
         Ok(InstallationStepOutcome::RollbackRequired {
-            pending_refs: vec![pending_ref],
+            pending_refs,
         })
     }
 
@@ -11200,6 +11877,7 @@ where
         &mut self,
         transaction_id: &PlatformHandle,
     ) -> Result<InstallationStepOutcome, InstallationError> {
+        self.require_core_effect_path(transaction_id)?;
         self.inner.drive_effect(transaction_id)
     }
 
@@ -11210,6 +11888,7 @@ where
         transaction_id: &PlatformHandle,
         now_ms: u64,
     ) -> Result<InstallationStepOutcome, InstallationError> {
+        self.require_core_effect_path(transaction_id)?;
         self.inner.drive_effect_at(transaction_id, now_ms)
     }
 
@@ -11232,6 +11911,7 @@ where
         &mut self,
         transaction_id: &PlatformHandle,
     ) -> Result<InstallationStepOutcome, InstallationError> {
+        self.require_core_effect_path(transaction_id)?;
         let transaction = self.inner.store().load(transaction_id)?.ok_or_else(|| {
             InstallationError::TransactionNotFound {
                 transaction_id: transaction_id.as_str().to_owned(),
@@ -11297,6 +11977,7 @@ where
         &mut self,
         transaction_id: &PlatformHandle,
     ) -> Result<InstallationStepOutcome, InstallationError> {
+        self.require_core_effect_path(transaction_id)?;
         self.inner.drive_all_effects_until_blocked(transaction_id)
     }
 
@@ -11307,6 +11988,7 @@ where
         transaction_id: &PlatformHandle,
         now_ms: u64,
     ) -> Result<InstallationStepOutcome, InstallationError> {
+        self.require_core_effect_path(transaction_id)?;
         self.inner
             .drive_all_effects_until_blocked_at(transaction_id, now_ms)
     }
@@ -11816,6 +12498,7 @@ fn effect_request(
         &plan,
         InstallerEffectPlan::RegisterService { .. } | InstallerEffectPlan::StartService { .. }
     );
+    let managed_root_effects = survey_working_area::managed_root_effects(transaction, &plan)?;
     let request = InstallationEffectRequest {
         transaction_id: transaction.transaction_id.clone(),
         plan,
@@ -11882,6 +12565,7 @@ fn effect_request(
             )
             .transpose()?,
         registration_nonce: progress.registration_nonce.clone(),
+        managed_root_effects,
     };
     request.validate()?;
     Ok(request)
@@ -11950,12 +12634,6 @@ fn is_service_registration_unknown_sample_stage(stage: &str) -> bool {
     stage == "query-status"
 }
 
-fn is_lowercase_hex8(value: &str) -> bool {
-    value.len() == 8
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
 
 /// Accepts only the exact reference grammar this module produces, with the
 /// stage/sample relationship the platform owner actually establishes.
@@ -12037,6 +12715,107 @@ fn is_request_correlated_unknown(reference: &str, intent_digest: &PlatformHandle
         || is_request_correlated_phase_b_unknown(reference, intent_digest)
 }
 
+/// Whether a managed package-stage result carries a durable native cause.
+///
+/// Unlike the shared legacy package-staging correlation grammar, these
+/// references are associated with the exact managed effect row and verified
+/// against its reconstructed intent below. The three `unknown:` values are
+/// the existing closed `UnknownReason` display forms returned by a provider.
+fn is_managed_stage_pending_cause(reference: &str) -> bool {
+    is_typed_package_staging_reference(reference)
+        || matches!(
+            reference,
+            "unknown:Unsupported" | "unknown:NotObserved" | "unknown:Indeterminate"
+        )
+}
+
+/// Confirms the current effect is a managed package operation and that its
+/// persisted attempt still reconstructs the exact committed request digest.
+/// This check preserves the original identity only; it does not authorize a
+/// stage call, which remains behind the effect's competent reconciliation.
+fn managed_stage_intent_matches_current(
+    transaction: &InstallationTransaction,
+    index: usize,
+) -> bool {
+    let Some(progress) = transaction.effect_progress.get(index) else {
+        return false;
+    };
+    let InstallationEffectProgressState::IntentCommitted {
+        attempt,
+        intent_digest,
+    } = &progress.state
+    else {
+        return false;
+    };
+    if *attempt == 0
+        || !matches!(
+            transaction.installer_effects.get(index),
+            Some(InstallerEffectPlan::ManagedEnvironmentChange { recipe, .. })
+                if managed_change_execution::managed_operation_stages(recipe.operation)
+        )
+    {
+        return false;
+    }
+    effect_request(
+        transaction,
+        index,
+        *attempt,
+        InstallationEffectAction::Apply,
+        None,
+    )
+    .and_then(|request| request.intent_digest())
+    .is_ok_and(|digest| digest == *intent_digest)
+}
+
+/// Bounds the one recovery transition that returns an exact managed package
+/// operation from `RollbackRequired` after competent `Matching` readback.
+/// This never authorizes a new effect call: the same committed request must
+/// still reconstruct, every other effect must already be applied, and every
+/// retained cause must be a managed stage result that the readback now settles.
+fn managed_stage_recovery_is_bound(
+    transaction: &InstallationTransaction,
+    index: usize,
+) -> bool {
+    transaction.stage == InstallationStage::RollbackRequired
+        && transaction.is_managed_child_transaction()
+        && transaction
+            .installer_effects
+            .get(index)
+            .is_some_and(|effect| {
+                matches!(
+                    effect,
+                    InstallerEffectPlan::ManagedEnvironmentChange { recipe, .. }
+                        if managed_change_execution::managed_operation_stages(recipe.operation)
+                )
+            })
+        && managed_stage_intent_matches_current(transaction, index)
+        && transaction.effect_progress.get(index).is_some_and(|progress| {
+            progress.staging_receipt.is_some()
+                && progress
+                    .admitted_precondition
+                    .as_ref()
+                    .and_then(|precondition| precondition.package_snapshot.as_ref())
+                    .is_some()
+        })
+        && transaction.guard_revert.is_none()
+        && !transaction.pending_external_changes.is_empty()
+        && transaction
+            .pending_external_changes
+            .iter()
+            .all(|reference| is_managed_stage_pending_cause(reference.as_str()))
+        && transaction
+            .effect_progress
+            .iter()
+            .enumerate()
+            .all(|(other, progress)| {
+                other == index
+                    || matches!(
+                        &progress.state,
+                        InstallationEffectProgressState::Applied { .. }
+                    )
+            })
+}
+
 /// Whether `index` still holds the committed intent that `pending_ref` names as
 /// unresolved, and therefore still has to be reconciled under that intent.
 ///
@@ -12052,12 +12831,9 @@ fn is_request_correlated_unknown(reference: &str, intent_digest: &PlatformHandle
 ///
 /// 1. the effect is in `IntentCommitted` with a non-zero attempt (any other
 ///    state has no committed operation to preserve);
-/// 2. `pending_ref` is a well-formed request-correlated unknown reference of
-///    any effect class — service-registration, installer-root,
-///    package-staging, credential or Phase-B — whose embedded request identity
-///    equals that
-///    `intent_digest`, so the observation is provably this operation's own
-///    cause and not a sibling effect's or a bare crash window's;
+/// 2. `pending_ref` is either a well-formed request-correlated unknown
+///    reference whose embedded identity equals `intent_digest`, or an exact
+///    package-stage cause attached to this managed effect row;
 /// 3. [`effect_request`] still rebuilds a request for the persisted attempt
 ///    whose own [`InstallationEffectRequest::intent_digest`] equals the recorded
 ///    one, so the transaction still reproduces the intent verbatim.
@@ -12079,7 +12855,15 @@ fn has_reconcilable_service_registration_intent(
     else {
         return false;
     };
-    if *attempt == 0 || !is_request_correlated_unknown(pending_ref.as_str(), intent_digest) {
+    if *attempt == 0
+        || (!is_request_correlated_unknown(pending_ref.as_str(), intent_digest)
+            && !(is_typed_package_staging_reference(pending_ref.as_str())
+                && matches!(
+                    transaction.installer_effects.get(index),
+                    Some(InstallerEffectPlan::ManagedEnvironmentChange { recipe, .. })
+                        if managed_change_execution::managed_operation_stages(recipe.operation)
+                )))
+    {
         return false;
     }
     effect_request(
@@ -12235,12 +13019,51 @@ fn is_typed_package_staging_reference(value: &str) -> bool {
     ) {
         return false;
     }
+    let Some(second) = parts.next() else {
+        return false;
+    };
+    if is_lowercase_hex8(second) && parts.next().is_none() {
+        return true;
+    }
     let Some(code) = parts.next() else {
         return false;
     };
     parts.next().is_none()
-        && code.len() == 8
-        && code
+        && is_package_staging_site(second)
+        && is_lowercase_hex8(code)
+}
+
+fn is_package_staging_site(value: &str) -> bool {
+    matches!(
+        value,
+        "open"
+            | "marker-probe"
+            | "marker-read"
+            | "marker-create"
+            | "retain-generation-parent"
+            | "trusted-source-root"
+            | "trusted-source-read-dir"
+            | "trusted-source-entry"
+            | "trusted-source-metadata"
+            | "trusted-source-child-dir"
+            | "trusted-source-child-file"
+            | "generation-root-probe"
+            | "generation-root-create"
+            | "destination-directory-create"
+            | "source-open"
+            | "destination-file-create"
+            | "destination-walk-root"
+            | "destination-walk-read-dir"
+            | "destination-walk-entry"
+            | "destination-walk-metadata"
+            | "destination-walk-child-dir"
+            | "destination-walk-child-file"
+    )
+}
+
+fn is_lowercase_hex8(value: &str) -> bool {
+    value.len() == 8
+        && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }

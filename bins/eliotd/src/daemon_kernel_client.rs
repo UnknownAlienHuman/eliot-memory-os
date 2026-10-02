@@ -45,6 +45,11 @@ use eliot_contracts::{
 };
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError};
+#[cfg(windows)]
+use eliot_installation::{
+    INSTALLATION_SURVEY_PROBE_OPERATION, InstallationSurveyProbeRequest,
+    InstallationSurveyProbeResult,
+};
 use eliot_kernel_service::PROVIDER_CAPABILITY_WIRE_VERSION;
 use eliot_learning_contracts::LearningStateViewRecipe;
 use eliot_ors::OperationIdentity;
@@ -88,6 +93,14 @@ use super::{
 };
 
 const PROVIDER_CAPABILITY_VERIFY_OPERATION: &str = "native_worker.provider_capability.verify";
+
+#[cfg(windows)]
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
 
 /// Reads the sealed durable claim-row projection bound to one exact claim
 /// identity (issue #1108, A4/A5 daemon row source).
@@ -1500,6 +1513,83 @@ impl DaemonKernelClient {
                 "Kernel owner readback has an incoherent bound/revision/digest shape".to_owned(),
             )),
         }
+    }
+
+    /// Requests one bounded post-change survey from the authenticated Kernel
+    /// installation owner.
+    ///
+    /// The request remains lookup data: Kernel reopens the original signed
+    /// publication, current setup owner and retained working root before it
+    /// runs any admitted probe. This client requires a previously validated
+    /// Kernel session, uses the same retained client binding and ordinary
+    /// deterministic request-identity path as other owner operations, and
+    /// accepts only a reply correlated by the existing transport to that
+    /// request. A lost or undecodable response remains `Unknown`; this method
+    /// never retries or starts a second probe.
+    ///
+    /// The returned installation advertisement and optional executable hash
+    /// are passive observations. They are not bridge evidence, a capability
+    /// verdict, or production admission.
+    #[cfg(windows)]
+    pub async fn installation_survey_probe(
+        &self,
+        request: &InstallationSurveyProbeRequest,
+    ) -> Result<InstallationSurveyProbeResult, KernelClientError> {
+        request
+            .request
+            .validate()
+            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+        if !request.store_path.is_absolute() {
+            return Err(KernelClientError::Contract(
+                "installation survey requires the original absolute journal path".to_owned(),
+            ));
+        }
+        let retained_session = self
+            .owner_session_facts()
+            .ok_or_else(|| {
+                KernelClientError::Contract(
+                    "installation survey requires an already validated Kernel owner session"
+                        .to_owned(),
+                )
+            })?
+            .session_binding()
+            .to_owned();
+        let payload = serde_json::to_value(request)
+            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+        let response = self
+            .transact_async(INSTALLATION_SURVEY_PROBE_OPERATION, payload)
+            .await?;
+        let result: InstallationSurveyProbeResult = serde_json::from_value(response)
+            .map_err(|error| KernelClientError::Unknown(error.to_string()))?;
+        if result.advertisement.family_id != request.request.target_family
+            || result.advertisement.target_identity.as_ref()
+                != Some(&request.request.exact_candidate)
+        {
+            return Err(KernelClientError::Unknown(
+                "Kernel installation survey reply does not bind the requested family and exact candidate"
+                    .to_owned(),
+            ));
+        }
+        for (field, digest) in [
+            ("runtime_hash", result.runtime_hash.as_deref()),
+            (
+                "previous_runtime_hash",
+                result.previous_runtime_hash.as_deref(),
+            ),
+        ] {
+            if digest.is_some_and(|value| !is_lowercase_sha256(value)) {
+                return Err(KernelClientError::Unknown(format!(
+                    "Kernel installation survey {field} is not a lowercase SHA-256 digest"
+                )));
+            }
+        }
+        if self.validated_session_binding().as_deref() != Some(retained_session.as_str()) {
+            return Err(KernelClientError::Unknown(
+                "Kernel installation survey reply no longer belongs to the retained owner session"
+                    .to_owned(),
+            ));
+        }
+        Ok(result)
     }
 
     /// Submits one already-resolved v2 result through the existing authenticated

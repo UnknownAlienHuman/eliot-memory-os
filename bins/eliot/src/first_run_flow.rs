@@ -39,9 +39,15 @@ use eliot_config::first_run::{
     recommend_when_automation_disabled, to_settings,
 };
 use eliot_config::initial_snapshot::{
-    InitialSnapshotIdentity, PrivacyChoice, prepare_initial_snapshot_payload,
+    PrivacyChoice,
+};
+use eliot_installation::{
+    InitialSnapshotOwnerConfiguration, IntegrationDiscoveryCatalogue,
+    ManagedChangeApprovalSet, RedbInstallationTransactionStore,
+    prepare_deterministic_setup_for_initial_snapshot, publish_system_owner_initial_snapshot,
 };
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
+use eliot_platform::PlatformHandle;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
@@ -92,29 +98,34 @@ pub struct SetupRecommendArgs {
     pub scope: String,
 }
 
-/// Decoded `setup initial-config` arguments for the first signed configuration
-/// payload (I3.2 milestone 7).
+/// Decoded `setup initial-config` choices and owner-supplied signed settings.
 ///
-/// Every identity value is an observed or user-confirmed fact supplied by the
-/// installation owner; this module never invents an identity, a root, or a key.
+/// Installation, owner, key, profile, root digest, snapshot identity, and
+/// setup revision are deliberately absent: the installation publication owner
+/// reloads those values from the original transaction/setup binding and the
+/// protected key reference. The remaining machine/scope/fence fields are
+/// configuration observations only; they do not prove current Kernel or Host
+/// authority.
 #[allow(
     clippy::struct_excessive_bools,
     reason = "CLI-decoded flag bundle mirrors the clap surface"
 )]
 pub struct SetupInitialConfigArgs {
-    pub snapshot_id: String,
-    pub installation_id: String,
-    pub profile_ref: String,
-    pub owner_ref: String,
-    pub key_identity: String,
+    /// Exact installation identity explicitly confirmed by the local user.
+    /// This is compared to the original transaction and never supplies owner,
+    /// key, profile, root, or setup authority.
+    pub confirmed_installation_id: String,
     pub machine_id: String,
     pub scope_id: String,
-    pub runtime_state_roots_digest: String,
-    pub setup_revision: u64,
     pub authority_lineage: String,
     pub authority_sequence: u64,
     pub resource_generation: u64,
     pub privacy: String,
+    /// Strict JSON for the catalogue being accepted by the authenticated
+    /// System Owner in the signed genesis configuration.
+    pub catalogue_json: String,
+    /// Strict JSON for the exact owner approvals carried with that catalogue.
+    pub approvals_json: String,
     pub dreamer_route: Option<String>,
     pub watchdog_route: Option<String>,
     pub dreamer_displayed: bool,
@@ -635,16 +646,22 @@ pub fn run_setup_recommend(args: &SetupRecommendArgs) -> Result<i32> {
     Ok(0)
 }
 
-/// Runs `setup initial-config`: prepares the first signed configuration payload
-/// from the confirmed privacy mode and the confirmed first-run choices.
+/// Runs `setup initial-config` through the original installation setup owner.
 ///
-/// Preparation is deterministic, model-free and read-only. It signs nothing,
-/// publishes nothing, and starts nothing: the installation owner signs with
-/// the protected key reference, publishes through its own operational journal,
-/// re-reads and verifies the result, and only then advances the setup binding.
-/// Omitted model roles stay `UNASSIGNED`, so setup finishes without a model
-/// subscription.
-pub fn run_setup_initial_config(args: &SetupInitialConfigArgs) -> Result<i32> {
+/// The installation owner reopens the exact selected transaction and setup
+/// binding, confirms the current Windows principal, validates the accepted
+/// catalogue and approvals, and signs with the purpose-bound protected setup
+/// key. It persists the immutable envelope through the original snapshot
+/// journal, reads it back, verifies the out-of-envelope protected-key pin, and
+/// advances the original setup binding only after that readback. Caller text
+/// for machine, scope, and StateFence values remains signed configuration
+/// input; it is not a live Host or Kernel authority observation. Omitted model
+/// roles stay `UNASSIGNED`, so setup finishes without a model subscription.
+pub fn run_setup_initial_config(
+    args: &SetupInitialConfigArgs,
+    store: &mut RedbInstallationTransactionStore,
+    transaction_id: &PlatformHandle,
+) -> Result<i32> {
     let privacy = parse_privacy(&args.privacy)?;
     let decision = first_run_decision(
         route_choice(
@@ -671,30 +688,41 @@ pub fn run_setup_initial_config(args: &SetupInitialConfigArgs) -> Result<i32> {
         .map_err(|error| anyhow::anyhow!(error.to_string()))
         .context("resource generation")?;
     let state_fence = StateFence::new(authority_epoch, resource_generation);
-    let identity = InitialSnapshotIdentity {
-        snapshot_id: args.snapshot_id.trim().to_owned(),
-        installation_id: args.installation_id.trim().to_owned(),
-        profile_ref: args.profile_ref.trim().to_owned(),
-        owner_ref: args.owner_ref.trim().to_owned(),
-        key_identity: args.key_identity.trim().to_owned(),
+    let catalogue: IntegrationDiscoveryCatalogue = serde_json::from_str(&args.catalogue_json)
+        .context("decode the exact System Owner integration catalogue")?;
+    let approvals: ManagedChangeApprovalSet = serde_json::from_str(&args.approvals_json)
+        .context("decode the exact System Owner managed-change approvals")?;
+    prepare_deterministic_setup_for_initial_snapshot(
+        store,
+        transaction_id,
+        &args.confirmed_installation_id,
+        privacy,
+    )
+    .context("reconcile the original deterministic-setup milestones")?;
+    let configuration = InitialSnapshotOwnerConfiguration {
         machine_id: args.machine_id.trim().to_owned(),
         scope_id: args.scope_id.trim().to_owned(),
-        runtime_state_roots_digest: args.runtime_state_roots_digest.trim().to_owned(),
-        setup_revision: args.setup_revision,
+        privacy_choice: privacy,
         state_fence,
     };
-    let payload = prepare_initial_snapshot_payload(&identity, privacy, &decision)
-        .map_err(|error| anyhow::anyhow!(error.to_string()))
-        .context("prepare the first signed configuration payload")?;
+    let receipt = publish_system_owner_initial_snapshot(
+        store,
+        transaction_id,
+        &configuration,
+        &decision,
+        &catalogue,
+        &approvals,
+    )
+    .context("publish and read back the System Owner signed initial configuration")?;
     println!(
         "{}",
         serde_json::json!({
-            "payload": payload,
-            "payload_digest": payload
-                .digest()
-                .map_err(|error| anyhow::anyhow!(error.to_string()))
-                .context("canonical payload digest")?,
-            "privacy_choice": privacy,
+            "snapshot_id": receipt.snapshot_id,
+            "envelope_digest": receipt.envelope_digest,
+            "signer_key_id": receipt.signer_key_id,
+            "setup_revision": receipt.authority.setup_revision(),
+            "accepted_by": receipt.authority.confirmed_owner(),
+            "privacy_choice": receipt.authority.privacy_choice(),
         })
     );
     Ok(0)

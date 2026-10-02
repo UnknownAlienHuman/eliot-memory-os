@@ -143,20 +143,24 @@ use eliot_config::legacy_capability_import::{
 };
 use eliot_governor::{
     CapabilityEvidenceRecord, CapabilityRegistry, CapabilitySource, CapabilityStatus,
-    GovernorComposition, KernelGenerationPort, MAX_CAPABILITY_EVIDENCE_RECORDS,
+    GovernorComposition, KernelGenerationPort, KernelTransitionPort, MAX_CAPABILITY_EVIDENCE_RECORDS,
     OwnerEvidenceRevision, RouteScopeFingerprint, ScopeDependencySelector, SkillStanding,
     capability_evidence_idempotency_key, capability_evidence_mutation_request_for_record,
     commit_capability_evidence_record,
 };
 use eliot_store_api::{
-    EVIDENCE_PACK_MAX_RECORDS, MAX_CAPABILITY_EVIDENCE_PAGE_RECORDS,
+    EVIDENCE_PACK_MAX_RECORDS, EventProjectionRelationIntents, EffectClass,
+    MAX_CAPABILITY_EVIDENCE_PAGE_RECORDS,
     MAX_CAPABILITY_EVIDENCE_SKILL_ID_BYTES, NamedReadOperation, NamedReadRequest,
-    NamedReadResponse, ReadConsistency, ScopeId,
+    NamedReadResponse, ReadConsistency, ScopeId, SecurityContext, TransitionClass,
+    WriteReceipt, WriteReceiptStatus, generated_operation_manifests,
+    operation_manifest_set_digest, validate_store_receipt_envelope,
 };
 use thiserror::Error;
 
 use super::SERVICE_NAME;
 use super::route_receipts::{RouteAdmissionVisibility, RouteReceiptError};
+use crate::kernel_context_read_client::KernelContextReadClient;
 
 /// Fail-closed errors for the daemon capability-evidence bridge.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -1086,6 +1090,322 @@ where
     })
 }
 
+/// Commits a runtime-only change against one exact original capability row.
+///
+/// `affected_skill_id` and `affected_prior_scope` must be the canonical key of
+/// a row already retained by the Governor. The observed hash comes from the
+/// authenticated installation owner; every other route dimension remains
+/// unknown here. This entry first selects that exact prior row, then reuses the
+/// registry's declared runtime dependency rule and the same canonical
+/// restriction commit leg. It cannot invalidate another route or another
+/// skill merely because their runtime hashes differ from the observed one.
+pub async fn commit_targeted_runtime_scope_change_restriction<P>(
+    governor: &GovernorComposition<P>,
+    admission: &mut GovernorCapabilityAdmission,
+    affected_skill_id: &str,
+    affected_prior_scope: &RouteScopeFingerprint,
+    observed_runtime_hash: &str,
+    scope: &ScopeId,
+    fence: &eliot_contracts::StateFence,
+) -> Result<ScopeChangeRestrictionReport, EvidenceBridgeError>
+where
+    P: KernelGenerationPort + ?Sized,
+{
+    if affected_skill_id.trim().is_empty()
+        || affected_skill_id.chars().any(char::is_control)
+        || affected_skill_id.len() > MAX_CAPABILITY_EVIDENCE_SKILL_ID_BYTES
+    {
+        return Err(EvidenceBridgeError::BlankSkill);
+    }
+    if !eliot_governor::is_evidence_ref(observed_runtime_hash) {
+        return Err(EvidenceBridgeError::ScopeChange(
+            "observed runtime hash is not a lowercase SHA-256 digest".to_owned(),
+        ));
+    }
+    if !affected_prior_scope
+        .runtime_hash
+        .as_deref()
+        .is_some_and(eliot_governor::is_evidence_ref)
+    {
+        return Err(EvidenceBridgeError::ScopeChange(
+            "the original capability row has no valid observed runtime fingerprint".to_owned(),
+        ));
+    }
+
+    let observed = RouteScopeFingerprint {
+        runtime_hash: Some(observed_runtime_hash.to_owned()),
+        ..RouteScopeFingerprint::default()
+    };
+    let changed = ScopeDependencySelector {
+        runtime_hash: true,
+        ..ScopeDependencySelector::none()
+    };
+    let blocking_evidence_ref = observed.reference_digest();
+    let staled = prepare_targeted_runtime_scope_change(
+        admission,
+        affected_skill_id,
+        affected_prior_scope,
+        &observed,
+        changed,
+        &blocking_evidence_ref,
+    )?;
+    install_targeted_restrictions(admission, &staled)?;
+    let restricted = staled.records.len();
+    let mut committed = 0_usize;
+    for retained in &staled.records {
+        let outcome = commit_restriction_leg(
+            governor,
+            admission,
+            &retained.record,
+            retained.revision.owner_revision,
+            &blocking_evidence_ref,
+            scope,
+            fence,
+        )
+        .await;
+        if let Err(error) = outcome {
+            return Err(EvidenceBridgeError::RestrictionCommit(format!(
+                "{error} ({committed} of {restricted} targeted records were committed)"
+            )));
+        }
+        committed += 1;
+    }
+    Ok(ScopeChangeRestrictionReport {
+        blocking_evidence_ref,
+        restricted,
+        committed,
+    })
+}
+
+/// Restricts only canonical evidence rows that name the original runtime
+/// fingerprint retained by the installation owner, and reconciles those
+/// restrictions through the original Kernel receipt port.
+///
+/// The prior hash is an owner-produced lookup boundary, never a caller-authored
+/// scope. Every row selected by it is independently checked against its
+/// retained Governor fingerprint. An absent prior hash is an explicit gap and
+/// cannot fall back to a broad current-scope comparison.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn commit_exact_prior_runtime_scope_change_restriction<P, K>(
+    governor: &GovernorComposition<P>,
+    kernel: &K,
+    reads: &KernelContextReadClient,
+    admission: &mut GovernorCapabilityAdmission,
+    previous_runtime_hash: Option<&str>,
+    observed_runtime_hash: &str,
+    scope: &ScopeId,
+    fence: &eliot_contracts::StateFence,
+    deadline_unix_ms: u64,
+) -> Result<ScopeChangeRestrictionReport, EvidenceBridgeError>
+where
+    P: KernelGenerationPort + ?Sized,
+    K: KernelTransitionPort + ?Sized,
+{
+    let previous_runtime_hash =
+        checked_previous_runtime_hash(previous_runtime_hash, observed_runtime_hash)?;
+
+    let observed = RouteScopeFingerprint {
+        runtime_hash: Some(observed_runtime_hash.to_owned()),
+        ..RouteScopeFingerprint::default()
+    };
+    let blocking_evidence_ref = observed.reference_digest();
+    let staled = prepare_exact_prior_runtime_scope_change(
+        admission,
+        previous_runtime_hash,
+        &observed,
+        &blocking_evidence_ref,
+    )?;
+    install_targeted_restrictions(admission, &staled)?;
+    let restricted = staled.records.len();
+    let mut committed = 0_usize;
+    for retained in &staled.records {
+        if let Err(error) = commit_restriction_leg_with_receipt(
+            governor,
+            kernel,
+            reads,
+            admission,
+            &retained.record,
+            retained.revision.owner_revision,
+            &blocking_evidence_ref,
+            scope,
+            fence,
+            deadline_unix_ms,
+        )
+        .await
+        {
+            return Err(EvidenceBridgeError::RestrictionCommit(format!(
+                "{error} ({committed} of {restricted} exact-prior-runtime restrictions were committed)"
+            )));
+        }
+        committed += 1;
+    }
+    Ok(ScopeChangeRestrictionReport {
+        blocking_evidence_ref,
+        restricted,
+        committed,
+    })
+}
+
+/// Builds the exact pending mutations from rows whose retained fingerprint
+/// names the original runtime. A row already limited by this same change stays
+/// pending when its owner revision still points to the pre-change record; once
+/// the row's own bytes and owner-issued digest agree, the durable readback has
+/// completed the work and it is not submitted again.
+fn prepare_exact_prior_runtime_scope_change(
+    admission: &GovernorCapabilityAdmission,
+    previous_runtime_hash: &str,
+    observed: &RouteScopeFingerprint,
+    blocking_evidence_ref: &str,
+) -> Result<eliot_governor::InvalidatedCapabilityEvidence, EvidenceBridgeError> {
+    let changed = ScopeDependencySelector {
+        runtime_hash: true,
+        ..ScopeDependencySelector::none()
+    };
+    let mut targeted = CapabilityRegistry::new();
+    let mut pending = Vec::new();
+    for retained in admission.registry().retained().iter().filter(|retained| {
+        retained.record.scope_fingerprint.runtime_hash.as_deref()
+            == Some(previous_runtime_hash)
+    }) {
+        if retained.record.is_limited() {
+            if retained.record.blocking_limitation() == Some(blocking_evidence_ref)
+                && !retained_record_is_durable(retained)?
+            {
+                pending.push(retained.clone());
+            }
+            continue;
+        }
+        if !targeted.insert(retained.record.clone(), retained.revision.clone()) {
+            return Err(EvidenceBridgeError::CapacityExceeded);
+        }
+    }
+
+    let mut staled = targeted
+        .apply_scope_change(observed, changed, blocking_evidence_ref)
+        .map_err(|error| EvidenceBridgeError::ScopeChange(error.to_string()))?;
+    staled.records.extend(pending);
+    Ok(staled)
+}
+
+fn retained_record_is_durable(
+    retained: &eliot_governor::RetainedCapabilityEvidence,
+) -> Result<bool, EvidenceBridgeError> {
+    let bytes = eliot_contracts::canonical_json_bytes(&retained.record)
+        .map_err(|error| EvidenceBridgeError::RestrictionCommit(error.to_string()))?;
+    Ok(eliot_contracts::sha256_hex(&bytes) == retained.revision.evidence_ref)
+}
+
+fn checked_previous_runtime_hash<'a>(
+    previous_runtime_hash: Option<&'a str>,
+    observed_runtime_hash: &str,
+) -> Result<&'a str, EvidenceBridgeError> {
+    let previous_runtime_hash = previous_runtime_hash.ok_or_else(|| {
+        EvidenceBridgeError::ScopeChange(
+            "the original previous runtime fingerprint is unknown; exact runtime restriction is a visible gap"
+                .to_owned(),
+        )
+    })?;
+    if !eliot_governor::is_evidence_ref(previous_runtime_hash)
+        || !eliot_governor::is_evidence_ref(observed_runtime_hash)
+    {
+        return Err(EvidenceBridgeError::ScopeChange(
+            "original and observed runtime fingerprints must be lowercase SHA-256 digests"
+                .to_owned(),
+        ));
+    }
+    Ok(previous_runtime_hash)
+}
+
+/// Selects and narrows exactly one existing `(skill_id, scope_fingerprint)`
+/// row in a temporary view. The production caller later commits only these
+/// returned rows into the held/canonical owner; unrelated retained rows never
+/// enter the mutation set.
+fn prepare_targeted_runtime_scope_change(
+    admission: &GovernorCapabilityAdmission,
+    affected_skill_id: &str,
+    affected_prior_scope: &RouteScopeFingerprint,
+    observed: &RouteScopeFingerprint,
+    changed: ScopeDependencySelector,
+    blocking_evidence_ref: &str,
+) -> Result<eliot_governor::InvalidatedCapabilityEvidence, EvidenceBridgeError> {
+    let mut matches = admission.registry().retained().iter().filter(|retained| {
+        retained.record.skill_id == affected_skill_id
+            && retained
+                .record
+                .scope_fingerprint
+                .exact_match(affected_prior_scope)
+    });
+    let target = matches.next().ok_or_else(|| {
+        EvidenceBridgeError::ScopeChange(
+            "the exact original capability row is not retained".to_owned(),
+        )
+    })?;
+    if matches.next().is_some() {
+        return Err(EvidenceBridgeError::ScopeChange(
+            "the original capability key is ambiguous".to_owned(),
+        ));
+    }
+
+    let mut targeted = CapabilityRegistry::new();
+    if !targeted.insert(target.record.clone(), target.revision.clone()) {
+        return Err(EvidenceBridgeError::ScopeChange(
+            "the exact original capability row could not be retained for restriction".to_owned(),
+        ));
+    }
+    targeted
+        .apply_scope_change(observed, changed, blocking_evidence_ref)
+        .map_err(|error| EvidenceBridgeError::ScopeChange(error.to_string()))
+}
+
+/// Installs only the selected owner records into the held view before their
+/// canonical commit legs. Rebuilding the existing registry from its complete
+/// retained rows preserves its derived invalidation index; refusing a latched
+/// capacity failure prevents this reconstruction from clearing the registry's
+/// fail-closed admission state.
+fn install_targeted_restrictions(
+    admission: &mut GovernorCapabilityAdmission,
+    staled: &eliot_governor::InvalidatedCapabilityEvidence,
+) -> Result<(), EvidenceBridgeError> {
+    if staled.records.is_empty() {
+        return Ok(());
+    }
+    if admission.registry().restriction_capacity_exhausted() {
+        return Err(EvidenceBridgeError::CapacityExceeded);
+    }
+    let mut registry = CapabilityRegistry::new();
+    for retained in admission.registry().retained() {
+        let replacement = staled.records.iter().find(|restricted| {
+            restricted.record.skill_id == retained.record.skill_id
+                && restricted
+                    .record
+                    .scope_fingerprint
+                    .exact_match(&retained.record.scope_fingerprint)
+        });
+        let record = replacement.map_or_else(
+            || retained.record.clone(),
+            |restricted| restricted.record.clone(),
+        );
+        if !registry.insert(record, retained.revision.clone()) {
+            return Err(EvidenceBridgeError::CapacityExceeded);
+        }
+    }
+    if staled.records.iter().any(|restricted| {
+        !admission.registry().retained().iter().any(|retained| {
+            retained.record.skill_id == restricted.record.skill_id
+                && retained
+                    .record
+                    .scope_fingerprint
+                    .exact_match(&restricted.record.scope_fingerprint)
+        })
+    }) {
+        return Err(EvidenceBridgeError::ScopeChange(
+            "a targeted restriction no longer has its original retained key".to_owned(),
+        ));
+    }
+    admission.registry = registry;
+    Ok(())
+}
+
 /// Commits one restricted record's durable leg and installs the store-issued
 /// revision into the held view.
 ///
@@ -1147,6 +1467,240 @@ where
     Ok(())
 }
 
+/// Commits or reconciles one exact restriction using the retained Kernel
+/// receipt owner. The prepared canonical hash is reconstructed from the same
+/// closed mutation, fence, scope, proof and manifest before any existing
+/// receipt is accepted; the post-commit receipt readback must be byte-for-byte
+/// the receipt returned by the canonical writer.
+#[allow(clippy::too_many_arguments)]
+async fn commit_restriction_leg_with_receipt<P, K>(
+    governor: &GovernorComposition<P>,
+    kernel: &K,
+    reads: &KernelContextReadClient,
+    admission: &mut GovernorCapabilityAdmission,
+    restricted: &CapabilityEvidenceRecord,
+    expected_canonical_revision: u64,
+    blocking_evidence_ref: &str,
+    scope: &ScopeId,
+    fence: &eliot_contracts::StateFence,
+    deadline_unix_ms: u64,
+) -> Result<(), EvidenceBridgeError>
+where
+    P: KernelGenerationPort + ?Sized,
+    K: KernelTransitionPort + ?Sized,
+{
+    let idempotency_key =
+        capability_evidence_idempotency_key(restricted).map_err(restriction_commit_refused)?;
+    let operation_id = eliot_contracts::OperationId::new(idempotency_key.clone())
+        .map_err(|error| EvidenceBridgeError::RestrictionCommit(error.to_string()))?;
+    let request = capability_evidence_mutation_request_for_record(
+        restricted,
+        expected_canonical_revision,
+        idempotency_key.clone(),
+    )
+    .map_err(restriction_commit_refused)?;
+    let mut identity = restriction_commit_identity(&idempotency_key, fence)?;
+    // ClockReading::default() is valid but explicitly unknown. Fixing this
+    // clock for the original restriction identity keeps an unknown-outcome
+    // retry's canonical bytes identical; the shared identity producer retains
+    // its ordinary sampled clock for unrelated commit legs.
+    identity.request.metadata.clock = eliot_contracts::ClockReading::default();
+    identity.deadline_unix_ms = deadline_unix_ms;
+    identity
+        .validate()
+        .map_err(|error| EvidenceBridgeError::RestrictionCommit(error.to_string()))?;
+    let prior_receipt = kernel
+        .receipt(operation_id.clone())
+        .await
+        .map_err(|error| EvidenceBridgeError::RestrictionCommit(error.to_string()))?;
+    let ordering_head = match prior_receipt.as_ref() {
+        Some(receipt) => crate::installation_capability_observation::ordering_head_from_receipt(
+            receipt, scope, fence,
+        )
+        .map_err(EvidenceBridgeError::RestrictionCommit)?,
+        None => crate::installation_capability_observation::read_ordering_head(reads, scope, fence)
+            .await
+            .map_err(EvidenceBridgeError::RestrictionCommit)?,
+    };
+    let expected_ordering_heads = vec![ordering_head];
+    let (manifest_digest, prepared) = prepare_restriction_receipt_expectation(
+        &identity,
+        &request,
+        scope,
+        blocking_evidence_ref,
+        &operation_id,
+        &idempotency_key,
+        &expected_ordering_heads,
+    )?;
+
+    if let Some(receipt) = prior_receipt {
+        validate_restriction_receipt(
+            &receipt,
+            &identity,
+            &prepared,
+            &operation_id,
+            &idempotency_key,
+            &manifest_digest,
+            fence,
+        )?;
+        let revision = restriction_revision_after_commit(
+            &request,
+            expected_canonical_revision,
+        )?;
+        if !admission.insert(restricted.clone(), revision) {
+            return Err(EvidenceBridgeError::CapacityExceeded);
+        }
+        return Ok(());
+    }
+
+    let (receipt, revision) = commit_capability_evidence_record(
+        governor,
+        &identity,
+        request.clone(),
+        scope.clone(),
+        vec![blocking_evidence_ref.to_owned()],
+        Vec::new(),
+        expected_ordering_heads,
+    )
+    .await
+    .map_err(restriction_commit_refused)?;
+    validate_restriction_receipt(
+        &receipt,
+        &identity,
+        &prepared,
+        &operation_id,
+        &idempotency_key,
+        &manifest_digest,
+        fence,
+    )?;
+    let readback = kernel
+        .receipt(operation_id)
+        .await
+        .map_err(|error| EvidenceBridgeError::RestrictionCommit(error.to_string()))?
+        .ok_or_else(|| {
+            EvidenceBridgeError::RestrictionCommit(
+                "original restriction receipt is not yet readable; same operation must be reconciled"
+                    .to_owned(),
+            )
+        })?;
+    validate_restriction_receipt(
+        &readback,
+        &identity,
+        &prepared,
+        &receipt.operation_id,
+        &idempotency_key,
+        &manifest_digest,
+        fence,
+    )?;
+    if readback != receipt {
+        return Err(EvidenceBridgeError::RestrictionCommit(
+            "Kernel restriction receipt readback differs from the canonical commit receipt"
+                .to_owned(),
+        ));
+    }
+    if !admission.insert(restricted.clone(), revision) {
+        return Err(EvidenceBridgeError::CapacityExceeded);
+    }
+    Ok(())
+}
+
+fn prepare_restriction_receipt_expectation(
+    identity: &eliot_protocol::RequestIdentity,
+    request: &eliot_store_api::NamedMutationRequest,
+    scope: &ScopeId,
+    blocking_evidence_ref: &str,
+    operation_id: &eliot_contracts::OperationId,
+    idempotency_key: &str,
+    expected_ordering_heads: &[eliot_store_api::OrderingHeadExpectation],
+) -> Result<(eliot_store_api::OperationManifestDigest, eliot_canonical::PreparedTransition), EvidenceBridgeError> {
+    let manifest_digest = operation_manifest_set_digest(
+        &generated_operation_manifests().map_err(|error| {
+            EvidenceBridgeError::RestrictionCommit(format!("operation catalogue: {error}"))
+        })?,
+    )
+    .map_err(|error| EvidenceBridgeError::RestrictionCommit(error.to_string()))?;
+    let envelope = eliot_canonical::CanonicalWriteEnvelope {
+        operation_id: operation_id.clone(),
+        request: identity.request.metadata.clone(),
+        idempotency_key: idempotency_key.to_owned(),
+        scope_id: scope.clone(),
+        task_id: None,
+        transition_class: TransitionClass::CaptureCandidate,
+        requested_effect_ceiling: EffectClass::Candidate,
+        admission_contract_set_digest: eliot_canonical::supported_admission_contract_set_digest()
+            .map_err(|error| EvidenceBridgeError::RestrictionCommit(error.to_string()))?,
+        operation_manifest_digest: manifest_digest.clone(),
+        semantic_commands: vec![request.clone()],
+        event_projection_relation_intents: EventProjectionRelationIntents {
+            event_ids: Vec::new(),
+            projection_kinds: Vec::new(),
+            relation_kinds: Vec::new(),
+        },
+        security: SecurityContext::default(),
+        required_proof_and_approval_refs: vec![blocking_evidence_ref.to_owned()],
+        expected_revision_heads: Vec::new(),
+        expected_ordering_heads: expected_ordering_heads.to_vec(),
+    };
+    envelope
+        .validate()
+        .map_err(|error| EvidenceBridgeError::RestrictionCommit(error.to_string()))?;
+    let prepared = envelope
+        .prepare()
+        .map_err(|error| EvidenceBridgeError::RestrictionCommit(error.to_string()))?;
+    Ok((manifest_digest, prepared))
+}
+
+fn validate_restriction_receipt(
+    receipt: &WriteReceipt,
+    identity: &eliot_protocol::RequestIdentity,
+    prepared: &eliot_canonical::PreparedTransition,
+    operation_id: &eliot_contracts::OperationId,
+    idempotency_key: &str,
+    manifest_digest: &eliot_store_api::OperationManifestDigest,
+    fence: &eliot_contracts::StateFence,
+) -> Result<(), EvidenceBridgeError> {
+    receipt
+        .validate()
+        .map_err(|error| EvidenceBridgeError::RestrictionCommit(error.to_string()))?;
+    validate_store_receipt_envelope(&identity.request.metadata, prepared, receipt)
+        .map_err(|error| EvidenceBridgeError::RestrictionCommit(error.to_string()))?;
+    if receipt.status != WriteReceiptStatus::Committed
+        || receipt.operation_id != *operation_id
+        || receipt.idempotency_key != idempotency_key
+        || receipt.canonical_request_hash != prepared.identity.canonical_request_hash
+        || receipt.transition_class != TransitionClass::CaptureCandidate
+        || receipt.operation_manifest_digest != *manifest_digest
+        || receipt.state_fence != *fence
+        || receipt.envelope.is_none()
+    {
+        return Err(EvidenceBridgeError::RestrictionCommit(
+            "original restriction receipt does not match the frozen command, manifest, hash, and fence"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn restriction_revision_after_commit(
+    request: &eliot_store_api::NamedMutationRequest,
+    expected_canonical_revision: u64,
+) -> Result<OwnerEvidenceRevision, EvidenceBridgeError> {
+    let digest = request
+        .parameters
+        .get("record_digest")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            EvidenceBridgeError::RestrictionCommit(
+                "frozen restriction command has no exact evidence record digest".to_owned(),
+            )
+        })?;
+    let successor = expected_canonical_revision.checked_add(1).ok_or_else(|| {
+        EvidenceBridgeError::RestrictionCommit("restriction revision overflow".to_owned())
+    })?;
+    OwnerEvidenceRevision::issued(successor, digest)
+        .map_err(|error| EvidenceBridgeError::RestrictionCommit(error.to_string()))
+}
+
 /// Names one refused restriction commit leg without inventing a second error
 /// vocabulary for it.
 fn restriction_commit_refused(error: impl std::fmt::Display) -> EvidenceBridgeError {
@@ -1161,7 +1715,7 @@ fn restriction_commit_refused(error: impl std::fmt::Display) -> EvidenceBridgeEr
 /// cancellation identities are the house `{SERVICE_NAME}:{operation}` shape
 /// used by `improvement_intake_dispatch::improvement_commit_identity`;
 /// nothing here mints an authority the Kernel has not admitted.
-fn commit_leg_identity(
+pub(super) fn commit_leg_identity(
     idempotency_key: &str,
     fence: &eliot_contracts::StateFence,
 ) -> Result<eliot_protocol::RequestIdentity, String> {
@@ -1601,6 +2155,331 @@ mod tests {
             1
         );
         assert!(!admission.admit_production_route("skill-demo", &changed, 10));
+    }
+
+    #[test]
+    fn targeted_runtime_change_limits_only_the_exact_original_capability_key() {
+        let old_runtime = "a".repeat(64);
+        let new_runtime = "b".repeat(64);
+        let unrelated_runtime = "c".repeat(64);
+        let mut prior_scope = scope();
+        prior_scope.runtime_hash = Some(old_runtime);
+        let mut unrelated_scope = scope();
+        unrelated_scope.runtime_hash = Some(unrelated_runtime);
+        let observed = RouteScopeFingerprint {
+            runtime_hash: Some(new_runtime),
+            ..RouteScopeFingerprint::default()
+        };
+        let changed = ScopeDependencySelector {
+            runtime_hash: true,
+            ..ScopeDependencySelector::none()
+        };
+        let blocking_ref = observed.reference_digest();
+
+        let mut admission = GovernorCapabilityAdmission::new();
+        let target = CapabilityEvidenceRecord::verified(
+            "skill-target",
+            CapabilityStatus::ProbePassed,
+            CapabilitySource::ActiveProbe,
+            prior_scope.clone(),
+            1,
+        )
+        .expect("target probe is a valid evidence relation");
+        let sibling = CapabilityEvidenceRecord::verified(
+            "skill-sibling",
+            CapabilityStatus::ProbePassed,
+            CapabilitySource::ActiveProbe,
+            prior_scope.clone(),
+            1,
+        )
+        .expect("sibling probe is a valid evidence relation");
+        let other_route = CapabilityEvidenceRecord::verified(
+            "skill-target",
+            CapabilityStatus::ProbePassed,
+            CapabilitySource::ActiveProbe,
+            unrelated_scope.clone(),
+            1,
+        )
+        .expect("unrelated route probe is a valid evidence relation");
+        admission.insert(target, test_owner_revision(1));
+        admission.insert(sibling, test_owner_revision(1));
+        admission.insert(other_route, test_owner_revision(1));
+
+        let staled = prepare_targeted_runtime_scope_change(
+            &admission,
+            "skill-target",
+            &prior_scope,
+            &observed,
+            changed,
+            &blocking_ref,
+        )
+        .expect("exact retained prior key is selected");
+        assert_eq!(staled.newly_staled, 1);
+        assert_eq!(staled.records.len(), 1);
+        assert_eq!(staled.records[0].record.skill_id, "skill-target");
+        assert_eq!(staled.records[0].record.scope_fingerprint, prior_scope);
+
+        // The held view closes this exact key before the canonical leg, so a
+        // refused write cannot leave stale positive evidence live in-process.
+        install_targeted_restrictions(&mut admission, &staled)
+            .expect("only the exact original key is installed as restricted");
+        assert!(!admission.admit_production_route("skill-target", &prior_scope, 10));
+        assert!(admission.admit_production_route("skill-sibling", &prior_scope, 10));
+        assert!(admission.admit_production_route("skill-target", &unrelated_scope, 10));
+
+        // Model the owner commit leg advancing only the selected canonical
+        // row. Rows outside that original key remain admitted in the held view.
+        assert!(admission.insert(
+            staled.records[0].record.clone(),
+            test_owner_revision(2)
+        ));
+        assert!(!admission.admit_production_route("skill-target", &prior_scope, 10));
+        assert!(admission.admit_production_route("skill-sibling", &prior_scope, 10));
+        assert!(admission.admit_production_route("skill-target", &unrelated_scope, 10));
+    }
+
+    #[test]
+    fn targeted_runtime_change_refuses_a_missing_original_capability_key() {
+        let old_runtime = "a".repeat(64);
+        let observed = RouteScopeFingerprint {
+            runtime_hash: Some("b".repeat(64)),
+            ..RouteScopeFingerprint::default()
+        };
+        let prior_scope = RouteScopeFingerprint {
+            runtime_hash: Some(old_runtime),
+            ..scope()
+        };
+        let changed = ScopeDependencySelector {
+            runtime_hash: true,
+            ..ScopeDependencySelector::none()
+        };
+
+        assert!(matches!(
+            prepare_targeted_runtime_scope_change(
+                &GovernorCapabilityAdmission::new(),
+                "skill-target",
+                &prior_scope,
+                &observed,
+                changed,
+                &observed.reference_digest(),
+            ),
+            Err(EvidenceBridgeError::ScopeChange(_))
+        ));
+    }
+
+    #[test]
+    fn targeted_runtime_change_with_unchanged_hash_does_not_limit_the_original_key() {
+        let runtime = "a".repeat(64);
+        let prior_scope = RouteScopeFingerprint {
+            runtime_hash: Some(runtime.clone()),
+            ..scope()
+        };
+        let observed = RouteScopeFingerprint {
+            runtime_hash: Some(runtime),
+            ..RouteScopeFingerprint::default()
+        };
+        let changed = ScopeDependencySelector {
+            runtime_hash: true,
+            ..ScopeDependencySelector::none()
+        };
+        let mut admission = GovernorCapabilityAdmission::new();
+        let record = CapabilityEvidenceRecord::verified(
+            "skill-target",
+            CapabilityStatus::ProbePassed,
+            CapabilitySource::ActiveProbe,
+            prior_scope.clone(),
+            1,
+        )
+        .expect("target probe is a valid evidence relation");
+        admission.insert(record, test_owner_revision(1));
+
+        let staled = prepare_targeted_runtime_scope_change(
+            &admission,
+            "skill-target",
+            &prior_scope,
+            &observed,
+            changed,
+            &observed.reference_digest(),
+        )
+        .expect("exact retained prior key is selected");
+        assert_eq!(staled.newly_staled, 0);
+        assert!(staled.records.is_empty());
+        assert!(admission.admit_production_route("skill-target", &prior_scope, 10));
+    }
+
+    #[test]
+    fn exact_prior_runtime_change_limits_only_rows_bound_to_that_runtime() {
+        let old_runtime = "a".repeat(64);
+        let new_runtime = "b".repeat(64);
+        let unrelated_runtime = "c".repeat(64);
+        let mut prior_a = scope();
+        prior_a.runtime_hash = Some(old_runtime.clone());
+        let mut prior_b = scope();
+        prior_b.runtime_hash = Some(old_runtime.clone());
+        prior_b.adapter_id = Some("adapter-other".to_owned());
+        let mut unrelated = scope();
+        unrelated.runtime_hash = Some(unrelated_runtime);
+        let observed = RouteScopeFingerprint {
+            runtime_hash: Some(new_runtime),
+            ..RouteScopeFingerprint::default()
+        };
+        let blocking_ref = observed.reference_digest();
+        let mut admission = GovernorCapabilityAdmission::new();
+        for (skill, route) in [
+            ("skill-first", prior_a.clone()),
+            ("skill-second", prior_b.clone()),
+            ("skill-first", unrelated.clone()),
+        ] {
+            assert!(admission.insert(
+                CapabilityEvidenceRecord::verified(
+                    skill,
+                    CapabilityStatus::ProbePassed,
+                    CapabilitySource::ActiveProbe,
+                    route,
+                    1,
+                )
+                .expect("valid fixture evidence"),
+                test_owner_revision(1),
+            ));
+        }
+
+        let staled = prepare_exact_prior_runtime_scope_change(
+            &admission,
+            &old_runtime,
+            &observed,
+            &blocking_ref,
+        )
+        .expect("original digest narrows the affected rows");
+        assert_eq!(staled.newly_staled, 2);
+        assert_eq!(staled.records.len(), 2);
+        assert!(staled.records.iter().all(|row| {
+            row.record.is_limited()
+                && row.record.blocking_limitation() == Some(blocking_ref.as_str())
+                && row.record.scope_fingerprint.runtime_hash.as_deref()
+                    == Some(old_runtime.as_str())
+        }));
+
+        install_targeted_restrictions(&mut admission, &staled)
+            .expect("only exact prior runtime keys enter the held restriction view");
+        assert!(!admission.admit_production_route("skill-first", &prior_a, 10));
+        assert!(!admission.admit_production_route("skill-second", &prior_b, 10));
+        assert!(admission.admit_production_route("skill-first", &unrelated, 10));
+    }
+
+    #[test]
+    fn exact_prior_runtime_unchanged_fingerprint_keeps_matching_routes_admitted() {
+        let runtime = "a".repeat(64);
+        let mut route = scope();
+        route.runtime_hash = Some(runtime.clone());
+        let observed = RouteScopeFingerprint {
+            runtime_hash: Some(runtime.clone()),
+            ..RouteScopeFingerprint::default()
+        };
+        let blocking_ref = observed.reference_digest();
+        let mut admission = GovernorCapabilityAdmission::new();
+        assert!(admission.insert(
+            CapabilityEvidenceRecord::verified(
+                "skill-unchanged",
+                CapabilityStatus::ProbePassed,
+                CapabilitySource::ActiveProbe,
+                route.clone(),
+                1,
+            )
+            .expect("valid fixture evidence"),
+            test_owner_revision(1),
+        ));
+
+        let staled = prepare_exact_prior_runtime_scope_change(
+            &admission,
+            &runtime,
+            &observed,
+            &blocking_ref,
+        )
+        .expect("matching original fingerprint is a no-op");
+        assert!(staled.records.is_empty());
+        assert_eq!(staled.newly_staled, 0);
+        assert!(admission.admit_production_route("skill-unchanged", &route, 10));
+    }
+
+    #[test]
+    fn exact_prior_runtime_retry_keeps_uncommitted_original_restriction_pending() {
+        let old_runtime = "a".repeat(64);
+        let observed = RouteScopeFingerprint {
+            runtime_hash: Some("b".repeat(64)),
+            ..RouteScopeFingerprint::default()
+        };
+        let blocking_ref = observed.reference_digest();
+        let mut prior = scope();
+        prior.runtime_hash = Some(old_runtime.clone());
+        let mut admission = GovernorCapabilityAdmission::new();
+        let original = CapabilityEvidenceRecord::verified(
+            "skill-pending",
+            CapabilityStatus::ProbePassed,
+            CapabilitySource::ActiveProbe,
+            prior.clone(),
+            1,
+        )
+        .expect("valid fixture evidence");
+        assert!(admission.insert(original, test_owner_revision(1)));
+
+        let first = prepare_exact_prior_runtime_scope_change(
+            &admission,
+            &old_runtime,
+            &observed,
+            &blocking_ref,
+        )
+        .expect("first owner change limits its exact prior row");
+        assert_eq!(first.records.len(), 1);
+        install_targeted_restrictions(&mut admission, &first)
+            .expect("the held view closes before the durable commit");
+
+        let retry = prepare_exact_prior_runtime_scope_change(
+            &admission,
+            &old_runtime,
+            &observed,
+            &blocking_ref,
+        )
+        .expect("the same original change retains pending durable work");
+        assert_eq!(retry.newly_staled, 0);
+        assert_eq!(retry.records.len(), 1);
+        assert_eq!(retry.records[0].record, first.records[0].record);
+        assert_eq!(retry.records[0].revision, first.records[0].revision);
+        assert!(!retained_record_is_durable(&retry.records[0])
+            .expect("the pre-change owner digest is not the limited record digest"));
+
+        let limited = retry.records[0].record.clone();
+        let limited_digest = eliot_contracts::sha256_hex(
+            &eliot_contracts::canonical_json_bytes(&limited).expect("limited canonical bytes"),
+        );
+        let durable_revision = OwnerEvidenceRevision::issued(2, &limited_digest)
+            .expect("the store readback carries the limited row digest");
+        assert!(admission.insert(limited, durable_revision));
+        let durable_replay = prepare_exact_prior_runtime_scope_change(
+            &admission,
+            &old_runtime,
+            &observed,
+            &blocking_ref,
+        )
+        .expect("exact owner readback closes the original pending restriction");
+        assert!(durable_replay.records.is_empty());
+    }
+
+    #[test]
+    fn exact_prior_runtime_change_keeps_unknown_or_malformed_hash_visible() {
+        let observed = "b".repeat(64);
+        assert!(matches!(
+            checked_previous_runtime_hash(None, &observed),
+            Err(EvidenceBridgeError::ScopeChange(_))
+        ));
+        assert!(matches!(
+            checked_previous_runtime_hash(Some("not-a-digest"), &observed),
+            Err(EvidenceBridgeError::ScopeChange(_))
+        ));
+        assert_eq!(
+            checked_previous_runtime_hash(Some(&"a".repeat(64)), &observed)
+                .expect("original owner hash is exact"),
+            "a".repeat(64)
+        );
     }
 
     #[test]

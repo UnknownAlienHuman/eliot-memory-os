@@ -1,15 +1,18 @@
 //! Immutable installation-plan contracts and fail-closed plan validation.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 
-use eliot_platform_windows::{FileIdentity, PackageManifest};
+use eliot_platform_windows::{FileIdentity, PackageManifest, StagingReceipt};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::{
     AgentBridgeSourceMaterializationPlan, CandidateManifest, ELIOT_HOST_SERVICE_NAME,
     ELIOT_WATCHDOG_SERVICE_NAME, HostPhaseBStaticTemplate, InstallationError, InstallationProfile,
-    PlatformHandle, RuntimeStateRoots, StoreCredentialProvisionPlan, WindowsPathIdentity,
+    InstallationManagedRootEffectProof, ManagedEnvironmentChangeRequest, ManagedEffectRecipe,
+    ManagedResourceProjection, PlatformHandle, RuntimeStateRoots, StoreCredentialProvisionPlan,
+    WindowsPathIdentity,
     approved_path, handle, package_plan_error, phase_b_host_state_root_digest,
     phase_b_static_template_for_candidate, phase_b_watchdog_selector_digest, sha256_handle,
     validate_package_relative_text,
@@ -70,6 +73,38 @@ pub enum InstallerEffectPlan {
         candidate_manifest_digest: PlatformHandle,
         /// Canonical digest of the exact package manifest.
         package_manifest_digest: PlatformHandle,
+    },
+    /// Execute one System-Owner-signed, non-privileged portable managed-tool
+    /// operation through the existing durable transaction and PackageStager.
+    /// The private plan carries the exact catalogue/survey/approval bindings;
+    /// the optional projection is an immutable precondition that the redb
+    /// owner must compare with its same-store row before committing the effect.
+    ManagedEnvironmentChange {
+        /// Stable effect identity.
+        effect_id: PlatformHandle,
+        /// Serialized snapshot of the accepted non-deserializable plan. It is
+        /// data only: an accepted live carrier must match it before each
+        /// managed effect is driven or reconciled.
+        accepted_plan_json: String,
+        /// Exact governing request repeated from the transaction header.
+        request: ManagedEnvironmentChangeRequest,
+        /// Fixed managed-tools root derived from the transaction's retained
+        /// profile-governed immutable-binaries binding.
+        managed_tools_root: PlatformHandle,
+        /// Deserializable signed recipe; its authority still comes from the
+        /// accepted-plan byte binding and fresh admission check.
+        recipe: Box<ManagedEffectRecipe>,
+        /// Exact previous projection derived from the same transaction table.
+        prior_resource: Option<Box<ManagedResourceProjection>>,
+        /// Original receipts reloaded from each referenced owner transaction.
+        /// These are immutable preconditions; the redb owner rechecks them
+        /// against their transaction/effect pointers before the effect runs.
+        #[serde(default)]
+        prior_receipts: Vec<StagingReceipt>,
+        /// Original same-installation CreateRoot receipts for managed-tools
+        /// or family parents that predate this transaction.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        prior_root_effects: Vec<InstallationManagedRootEffectProof>,
     },
     /// Register one own-process SCM service.
     RegisterService {
@@ -151,6 +186,7 @@ impl InstallerEffectPlan {
             Self::CreateRoot { effect_id, .. }
             | Self::ApplyAcl { effect_id, .. }
             | Self::StagePackage { effect_id, .. }
+            | Self::ManagedEnvironmentChange { effect_id, .. }
             | Self::RegisterService { effect_id, .. }
             | Self::StartService { effect_id, .. }
             | Self::ProvisionStoreCredential { effect_id, .. }
@@ -255,6 +291,114 @@ impl InstallerEffectPlan {
                 }
                 Ok(())
             }
+            Self::ManagedEnvironmentChange {
+                accepted_plan_json,
+                request,
+                managed_tools_root,
+                recipe,
+                prior_resource,
+                prior_receipts,
+                ..
+            } => {
+                recipe.validate()?;
+                approved_path(managed_tools_root, "installer_effect.managed_tools_root")?;
+                recipe.require_supported().map_err(|requirement| {
+                    InstallationError::ProfileViolation(format!(
+                        "managed effect recipe requires unsupported capability {requirement:?}"
+                    ))
+                })?;
+                request.validate()?;
+                let accepted_plan_value: serde_json::Value =
+                    serde_json::from_str(accepted_plan_json).map_err(|error| {
+                        InstallationError::InvalidField {
+                            field: "installer_effect.accepted_plan_json".to_owned(),
+                            reason: format!("must be serialized accepted-plan JSON: {error}"),
+                        }
+                    })?;
+                let accepted_request = serde_json::to_value(request).map_err(|error| {
+                    InstallationError::InvalidField {
+                        field: "installer_effect.request".to_owned(),
+                        reason: error.to_string(),
+                    }
+                })?;
+                let accepted_recipe = serde_json::to_value(recipe.as_ref()).map_err(|error| {
+                    InstallationError::InvalidField {
+                        field: "installer_effect.recipe".to_owned(),
+                        reason: error.to_string(),
+                    }
+                })?;
+                if !accepted_plan_value.is_object()
+                    || accepted_plan_value.get("request") != Some(&accepted_request)
+                    || accepted_plan_value.get("effect_recipe") != Some(&accepted_recipe)
+                    || recipe.action != request.action
+                    || recipe.target_family != request.target_family
+                {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                let prior_required = matches!(
+                    recipe.operation,
+                    super::ManagedEffectOperation::UpdatePortableGeneration
+                        | super::ManagedEffectOperation::RepairPortableGeneration
+                        | super::ManagedEffectOperation::RemoveOwnedPortableGeneration
+                        | super::ManagedEffectOperation::ReconfigurePortableGeneration
+                );
+                match (prior_required, prior_resource.as_deref()) {
+                    (false, None) => {}
+                    (true, Some(prior))
+                        if prior.key.family_id == request.target_family
+                            && prior.key.exact_candidate == request.exact_candidate
+                            && prior.disposition
+                                != super::ManagedResourceDisposition::Removed =>
+                    {
+                        prior.validate()?;
+                    }
+                    _ => return Err(InstallationError::IdentityConflict),
+                }
+                let expected_receipts = prior_resource
+                    .as_deref()
+                    .map_or(&[][..], |prior| prior.owned_generations.as_slice())
+                    .iter()
+                    .filter_map(|owner| owner.staging_receipt_digest.as_ref())
+                    .collect::<Vec<_>>();
+                if expected_receipts.len() != prior_receipts.len()
+                    || expected_receipts
+                        .iter()
+                        .zip(prior_receipts)
+                        .any(|(expected, receipt)| receipt.digest() != expected.as_str())
+                {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                let matching_prior_generation = prior_receipts
+                    .iter()
+                    .filter(|receipt| {
+                        receipt.generation == recipe.package_manifest.generation
+                    })
+                    .count();
+                match recipe.operation {
+                    super::ManagedEffectOperation::RepairPortableGeneration
+                    | super::ManagedEffectOperation::RemoveOwnedPortableGeneration
+                        if matching_prior_generation != 1 =>
+                    {
+                        return Err(InstallationError::IdentityConflict);
+                    }
+                    super::ManagedEffectOperation::UpdatePortableGeneration
+                    | super::ManagedEffectOperation::ReconfigurePortableGeneration
+                        if matching_prior_generation != 0 =>
+                    {
+                        return Err(InstallationError::IdentityConflict);
+                    }
+                    _ => {}
+                }
+                for receipt in prior_receipts {
+                    if receipt.root_identity.volume_serial_number == 0
+                        || receipt.root_identity.file_index == 0
+                        || receipt.files.is_empty()
+                    {
+                        return Err(InstallationError::IdentityConflict);
+                    }
+                }
+                Ok(())
+            }
             Self::RegisterService {
                 service_name,
                 executable_path,
@@ -329,6 +473,16 @@ pub(super) fn validate_effect_profile(
 ) -> Result<(), InstallationError> {
     match plan {
         InstallerEffectPlan::CreateRoot { .. } | InstallerEffectPlan::StagePackage { .. } => Ok(()),
+        InstallerEffectPlan::ManagedEnvironmentChange { .. }
+            if profile == InstallationProfile::PortableDev =>
+        {
+            Ok(())
+        }
+        InstallerEffectPlan::ManagedEnvironmentChange { .. } => Err(
+            InstallationError::ProfileViolation(
+                "managed portable-tool effects require PortableDev".to_owned(),
+            ),
+        ),
         InstallerEffectPlan::ApplyAcl { principals, .. } => {
             let expected = match profile {
                 InstallationProfile::SystemService => [
@@ -482,10 +636,6 @@ pub(super) fn validate_user_mode_authority_effect_bindings(
     }
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "ordered fail-closed installer validation is kept in one auditable boundary"
-)]
 pub(super) fn validate_installer_effects(
     profile: InstallationProfile,
     roots: &RuntimeStateRoots,
@@ -493,6 +643,63 @@ pub(super) fn validate_installer_effects(
     planned_changes: &[PlannedChange],
     effects: &[InstallerEffectPlan],
 ) -> Result<(), InstallationError> {
+    validate_installer_effects_impl(
+        profile,
+        roots,
+        None,
+        store_credential_target,
+        planned_changes,
+        effects,
+    )
+}
+
+pub(super) fn validate_installer_effects_with_managed_root(
+    profile: InstallationProfile,
+    roots: &RuntimeStateRoots,
+    immutable_binaries: &PlatformHandle,
+    store_credential_target: &PlatformHandle,
+    planned_changes: &[PlannedChange],
+    effects: &[InstallerEffectPlan],
+) -> Result<(), InstallationError> {
+    validate_installer_effects_impl(
+        profile,
+        roots,
+        Some(immutable_binaries),
+        store_credential_target,
+        planned_changes,
+        effects,
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "ordered fail-closed installer validation is kept in one auditable boundary"
+)]
+fn validate_installer_effects_impl(
+    profile: InstallationProfile,
+    roots: &RuntimeStateRoots,
+    immutable_binaries: Option<&PlatformHandle>,
+    store_credential_target: &PlatformHandle,
+    planned_changes: &[PlannedChange],
+    effects: &[InstallerEffectPlan],
+) -> Result<(), InstallationError> {
+    if effects.iter().any(|effect| {
+        matches!(effect, InstallerEffectPlan::ManagedEnvironmentChange { .. })
+    }) {
+        let immutable_binaries = immutable_binaries.ok_or_else(|| {
+            InstallationError::ProfileViolation(
+                "managed portable effects require the retained immutable-binaries root"
+                    .to_owned(),
+            )
+        })?;
+        return validate_managed_installer_effects(
+            profile,
+            roots,
+            immutable_binaries,
+            planned_changes,
+            effects,
+        );
+    }
     if effects.is_empty() {
         return Err(InstallationError::InvalidField {
             field: "installer_effects".to_owned(),
@@ -763,6 +970,12 @@ pub(super) fn validate_installer_effects(
                     });
                 }
             }
+            InstallerEffectPlan::ManagedEnvironmentChange { .. } => {
+                return Err(InstallationError::ProfileViolation(
+                    "managed portable effects require the retained immutable-binaries root"
+                        .to_owned(),
+                ));
+            }
         }
         if package_index.is_some_and(|package| {
             index > package
@@ -924,6 +1137,167 @@ pub(super) fn validate_installer_effects(
         return Err(InstallationError::ProfileViolation(
             "non-service profiles must not register SCM services".to_owned(),
         ));
+    }
+    Ok(())
+}
+
+/// Closes the existing installation effect owner over the one narrow
+/// PortableDev managed-package recipe. These transactions may only add the
+/// two signed child roots needed by PackageStager; all other effects remain
+/// outside this adapter. The package generation itself is not a CreateRoot:
+/// PackageStager owns that exact final leaf and its durable receipt.
+fn validate_managed_installer_effects(
+    profile: InstallationProfile,
+    roots: &RuntimeStateRoots,
+    immutable_binaries: &PlatformHandle,
+    planned_changes: &[PlannedChange],
+    effects: &[InstallerEffectPlan],
+) -> Result<(), InstallationError> {
+    if profile != InstallationProfile::PortableDev
+        || roots.profile != InstallationProfile::PortableDev
+    {
+        return Err(InstallationError::ProfileViolation(
+            "managed portable-tool effects require the retained PortableDev contour".to_owned(),
+        ));
+    }
+    if effects.is_empty() || planned_changes.len() != effects.len() {
+        return Err(InstallationError::IdentityConflict);
+    }
+    let managed_indexes = effects
+        .iter()
+        .enumerate()
+        .filter_map(|(index, effect)| {
+            matches!(effect, InstallerEffectPlan::ManagedEnvironmentChange { .. })
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if managed_indexes.len() != 1 {
+        return Err(InstallationError::InvalidField {
+            field: "installer_effects".to_owned(),
+            reason: "a managed transaction must contain exactly one signed managed effect"
+                .to_owned(),
+        });
+    }
+    let managed_index = managed_indexes[0];
+    if managed_index + 1 != effects.len() {
+        return Err(InstallationError::IncompleteObservation(
+            "managed package effect must follow its exact root creation effects".to_owned(),
+        ));
+    }
+    let InstallerEffectPlan::ManagedEnvironmentChange {
+        recipe,
+        managed_tools_root,
+        prior_root_effects,
+        ..
+    } = &effects[managed_index]
+    else {
+        return Err(InstallationError::IdentityConflict);
+    };
+    let base = Path::new(immutable_binaries.as_str());
+    let expected_managed_tools_root = recipe.target_root(base);
+    if !eliot_platform_windows::windows_paths_equal(
+        Path::new(managed_tools_root.as_str()),
+        &expected_managed_tools_root,
+    ) {
+        return Err(InstallationError::IdentityConflict);
+    }
+    let stages_package = matches!(
+        recipe.operation,
+        super::ManagedEffectOperation::InstallPortableGeneration
+            | super::ManagedEffectOperation::UpdatePortableGeneration
+            | super::ManagedEffectOperation::RepairPortableGeneration
+            | super::ManagedEffectOperation::ReconfigurePortableGeneration
+    );
+    let expected_roots = if stages_package {
+        let managed_tools = recipe.target_root(base);
+        let family_root = managed_tools.join(recipe.target_family.as_str());
+        vec![managed_tools, family_root]
+    } else {
+        Vec::new()
+    };
+    let mut created_roots = Vec::new();
+    let mut effect_ids = BTreeSet::new();
+    for (index, effect) in effects.iter().enumerate() {
+        effect.validate()?;
+        validate_effect_profile(profile, effect)?;
+        if !effect_ids.insert(effect.effect_id().as_str()) {
+            return Err(InstallationError::Duplicate {
+                kind: "installer effect".to_owned(),
+                identity: effect.effect_id().as_str().to_owned(),
+            });
+        }
+        match effect {
+            InstallerEffectPlan::CreateRoot { root, .. } if index < managed_index => {
+                let actual = WindowsPathIdentity::parse_root(root.as_str(), "installer_effect.root")?;
+                created_roots.push(actual);
+            }
+            InstallerEffectPlan::ManagedEnvironmentChange { .. } if index == managed_index => {}
+            _ => {
+                return Err(InstallationError::ProfileViolation(
+                    "the managed portable adapter accepts only exact root creation and its signed managed effect"
+                        .to_owned(),
+                ));
+            }
+        }
+    }
+    let expected_roots = expected_roots
+        .iter()
+        .map(|root| WindowsPathIdentity::parse_root(&root.to_string_lossy(), "managed_effect.root"))
+        .collect::<Result<Vec<_>, _>>()?;
+    if created_roots != expected_roots {
+        return Err(InstallationError::IncompleteObservation(
+            "managed effects must create managed-tools and its exact signed family parent before staging"
+                .to_owned(),
+        ));
+    }
+    let required_prior_root_paths = if stages_package
+        || recipe.operation == super::ManagedEffectOperation::RemoveOwnedPortableGeneration
+    {
+        vec![
+            recipe.target_root(base),
+            recipe
+                .target_root(base)
+                .join(recipe.target_family.as_str()),
+        ]
+    } else {
+        Vec::new()
+    };
+    let mut previous_proof_index = None;
+    for proof in prior_root_effects {
+        let InstallerEffectPlan::CreateRoot { root, .. } = &proof.original_plan else {
+            return Err(InstallationError::IdentityConflict);
+        };
+        let root_identity = WindowsPathIdentity::parse_root(root.as_str(), "managed_root.root")?;
+        let mut proof_index = None;
+        for (index, required) in required_prior_root_paths.iter().enumerate() {
+            let required_identity = WindowsPathIdentity::parse_root(
+                &required.to_string_lossy(),
+                "managed_root.root",
+            )?;
+            if required_identity == root_identity {
+                if proof_index.replace(index).is_some() {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            }
+        }
+        let Some(proof_index) = proof_index else {
+            return Err(InstallationError::IdentityConflict);
+        };
+        if previous_proof_index.is_some_and(|previous| proof_index <= previous) {
+            return Err(InstallationError::IdentityConflict);
+        }
+        previous_proof_index = Some(proof_index);
+        proof.validate(root)?;
+    }
+    let planned_ids = planned_changes
+        .iter()
+        .map(|change| {
+            change.validate()?;
+            Ok(change.change_id.as_str())
+        })
+        .collect::<Result<BTreeSet<_>, InstallationError>>()?;
+    if planned_ids.len() != planned_changes.len() || planned_ids != effect_ids {
+        return Err(InstallationError::IdentityConflict);
     }
     Ok(())
 }

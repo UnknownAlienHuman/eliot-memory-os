@@ -93,6 +93,7 @@ thread_local! {
 
 mod directory_publication;
 mod event_log;
+mod file_version;
 mod installer_authority_key;
 mod installer_root;
 mod kernel_front_door_expectation;
@@ -111,8 +112,10 @@ mod protected_path;
 mod runtime_receipt_publication;
 pub mod scm_entry;
 mod secret_store;
+mod setup_signing_key;
 mod service_registration;
 mod supervision_authority_key;
+mod survey_stream_artifact;
 mod tcp_listener_owner;
 mod terminal_containment;
 mod user_owned_leases;
@@ -139,13 +142,22 @@ pub use event_log::{
     KernelEventLogReceipt, is_event_log_supported, report_kernel_event, report_local_event,
     validate_event_log_insertion,
 };
+pub use file_version::{
+    MAX_SURVEY_EXECUTABLE_BYTES, FileVersionObservation, FileVersionOutcome, observe_file_version,
+};
 pub use installer_authority_key::{
     INSTALLATION_AUTHORITY_KEY_FILE_BYTES, INSTALLATION_AUTHORITY_KEY_FILE_VERSION,
     INSTALLATION_AUTHORITY_KEY_ID_MAX_BYTES, INSTALLATION_AUTHORITY_KEY_MAGIC,
     INSTALLATION_AUTHORITY_KEY_ROOT_RELATIVE, INSTALLATION_AUTHORITY_SIGNER_ID,
     InstallationAuthorityKeyError, InstallationAuthorityKeyExpectation,
-    InstallationAuthorityKeyMetadata, InstallationAuthorityKeySigner,
+    InstallationAuthorityKeyMetadata, InstallationAuthorityKeyPreparationReceipt,
+    InstallationAuthorityKeySigner, PreparedInstallationAuthorityKey,
+    ReservedInstallationAuthorityKey,
     WindowsInstallationAuthorityKeyProvider, WindowsInstallationAuthorityKeyStore,
+};
+pub use setup_signing_key::{
+    ProtectedSetupOwnerInitialSnapshotSigner, SetupOwnerInitialSnapshotKeyError,
+    SetupOwnerInitialSnapshotKeyReference, WindowsSetupOwnerInitialSnapshotKeyProvider,
 };
 pub use installer_root::{
     ISOLATED_RESTORE_ROOT_DIR, InstallerProtectedFileReadback, InstallerRootAbsentSnapshot,
@@ -252,11 +264,20 @@ pub use process_job::{
     JobProcessHistory, PinnedRuntimeFile, ProcessObservation, RecoverableJobBinding,
     RecoverableJobObject, RunningExistingJobChild, RunningJobChild, RunningJobObservation,
     SUSPENDED_LAUNCH_STDIN_LIMIT, SuspendedExistingJobChild, SuspendedJobChild,
-    SuspendedLaunchSpec, SuspendedProcessEvidence, SuspendedValidationError,
+    SuspendedLaunchSpec, SuspendedProcessEvidence, SuspendedSpawnError, SuspendedValidationError,
+    SurveyProbeResumeError,
     TerminatedExistingJobChild, TerminatedJobChild, ValidatedSuspendedExistingJobChild,
     ValidatedSuspendedJobChild, cancel_capture_thread_io,
 };
-pub use process_path_lease::RetainedProcessPathLease;
+pub use process_path_lease::{
+    RetainedProcessPathLease, RetainedSurveyProbePathLease, SurveyProbeAppContainerIdentity,
+    SurveyProbePathAdmissionError,
+    SurveyProbeAppContainerProfile, retain_survey_probe_path_lease,
+};
+pub use survey_stream_artifact::{
+    SurveyStreamArtifact, SurveyStreamArtifactError, SurveyStreamArtifactReadback,
+    SurveyStreamArtifactRoot,
+};
 pub use profile_supervision::{
     ProfileRootLeaseSet, ProfileRootRequest, ProfileSelection, ProfileSelectionReceipt,
     open_profile_root_leases,

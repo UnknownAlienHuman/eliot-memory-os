@@ -148,6 +148,29 @@ struct SharedStore {
 }
 
 impl InstallationTransactionStore for SharedStore {
+    fn managed_root_effect_proof(
+        &self,
+        anchor_transaction_id: &PlatformHandle,
+        installation_root: &PlatformHandle,
+        profile: InstallationProfile,
+        root: &PlatformHandle,
+    ) -> Result<Option<InstallationManagedRootEffectProof>, InstallationError> {
+        let state = self.state.lock().unwrap_or_else(|_| unreachable!());
+        let transactions: Vec<_> = state.iter().cloned().collect();
+        managed_change_execution::derive_managed_root_effect_proof(
+            &transactions, anchor_transaction_id, installation_root, profile, root,
+        )
+    }
+
+    fn managed_resource_projection(
+        &self,
+        key: &ManagedResourceKey,
+    ) -> Result<Option<ManagedResourceProjection>, InstallationError> {
+        let state = self.state.lock().unwrap_or_else(|_| unreachable!());
+        let transactions: Vec<_> = state.iter().cloned().collect();
+        managed_change_execution::derive_managed_resource_projection(&transactions, key)
+    }
+
     fn create_planned(
         &mut self,
         transaction: &InstallationTransaction,
@@ -780,6 +803,25 @@ fn package_stage_win32_error_uses_a_stable_typed_provider_reference() {
     let json = serde_json::to_string(&error).unwrap_or_else(|_| unreachable!());
     assert!(json.contains("SET_SECURITY_INFO"));
     assert!(json.contains("\"code\":5"));
+}
+
+#[test]
+fn managed_stage_package_failures_keep_the_exact_semantic_and_sited_error() {
+    let refused = package_port_error(&PackageStagingError::RollbackRefused);
+    assert_eq!(
+        port_pending(PortOutcome::<()>::Error(refused)).as_str(),
+        "stage-package-error-v1:rollback-refused"
+    );
+
+    let sited = package_port_error(&PackageStagingError::Win32At {
+        stage: PackageStagingStage::CreateFileW,
+        site: "destination-file-create".to_owned(),
+        code: 32,
+    });
+    assert_eq!(
+        port_pending(PortOutcome::<()>::Error(sited)).as_str(),
+        "stage-package-win32-v1:create-file-w:destination-file-create:00000020"
+    );
 }
 
 #[test]
@@ -3997,6 +4039,7 @@ fn service_context_binds_same_host_root_for_host_and_watchdog_argv() {
                 )),
             }),
             registration_nonce: Some(test_handle("c".repeat(64))),
+            managed_root_effects: Vec::new(),
         };
         must(request.validate());
         let (_, registration, _) = must(WindowsInstallationEffectPort::service_context(&request));
@@ -4410,6 +4453,46 @@ fn cleanup_production_transaction(transaction: &InstallationTransaction) {
             .as_str(),
     );
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[test]
+fn survey_working_area_reads_original_root_marker_and_rejects_substitution() {
+    let _serial = PRODUCTION_INSTALLER_TEST_LOCK
+        .lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let transaction = planned_transaction();
+    let transaction_id = transaction.transaction_id.clone();
+    let expected_root = transaction.candidate_manifest.runtime_launch.runtime_state_roots
+        .kernel_work_root.clone();
+    let index = transaction.installer_effects.iter().position(|effect| matches!(
+        effect, InstallerEffectPlan::CreateRoot { root, .. } if *root == expected_root
+    )).unwrap_or_else(|| unreachable!());
+    let mut store = SharedStore::default();
+    must(store.create_planned(&transaction));
+    let mut coordinator = WindowsInstallationCoordinator::new(store.clone());
+    assert!(coordinator.retain_survey_probe_working_area(&transaction_id).is_err());
+    for _ in 0..=index {
+        let outcome = must(coordinator.drive_effect(&transaction_id));
+        assert!(matches!(outcome, InstallationStepOutcome::Applied { .. }));
+    }
+    let created = must(store.load(&transaction_id)).unwrap_or_else(|| unreachable!());
+    let area = must(coordinator.retain_survey_probe_working_area(&transaction_id));
+    assert_eq!(area.path(), Path::new(expected_root.as_str()));
+    must(area.verify());
+    let request = must(effect_request(&created, index, 1, InstallationEffectAction::Apply, None));
+    let marker = ownership_receipt_path(&request);
+    let original = must(std::fs::read(&marker));
+    must(std::fs::write(&marker, b"{}"));
+    assert!(area.verify().is_err());
+    must(std::fs::write(&marker, &original));
+    must(area.verify());
+    drop(area);
+    for progress in &created.effect_progress {
+        if let Some(ownership) = &progress.ownership_secret {
+            must(WindowsInstallerSecretProvider::new().delete(&ownership.reference.target));
+        }
+    }
+    cleanup_production_transaction(&created);
 }
 
 #[cfg(windows)]
@@ -9621,6 +9704,7 @@ fn package_precondition_snapshot_is_required_for_post_intent_stage_package() {
         expected_external_identity: None,
         service_bootstrap: None,
         registration_nonce: None,
+        managed_root_effects: Vec::new(),
     };
     assert!(
         request.validate().is_err(),
@@ -10013,4 +10097,826 @@ fn trusted_source_observe_is_bound_to_retained_handle_and_fails_on_mutation() {
     assert_eq!(second.files[0].sha256, sha256_hex(b"b"));
     drop(bundle);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(windows)]
+#[test]
+fn signed_managed_registration_runs_through_original_coordinator_to_completed() {
+    use integration_discovery::accepted_managed_change_tests::
+        managed_registration_transaction_for_terminal_test;
+
+    let mut fixture = managed_registration_transaction_for_terminal_test();
+    let (outcome, transaction, projection) = fixture.admit_and_drive();
+
+    assert!(matches!(
+        outcome,
+        InstallationStepOutcome::Applied {
+            stage: InstallationStage::Completed,
+            ..
+        }
+    ));
+    assert_eq!(transaction.stage, InstallationStage::Completed);
+    assert!(transaction.active_verified_receipt.is_none());
+    let InstallationEffectProgressState::Applied {
+        disposition,
+        external_identity,
+        evidence,
+        postcondition_digest,
+    } = &transaction.effect_progress[0].state
+    else {
+        panic!("the managed effect has its original durable readback receipt");
+    };
+    assert_eq!(
+        *disposition,
+        InstallationEffectDisposition::CreatedByTransaction
+    );
+    assert_eq!(external_identity.as_str().len(), 64);
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(
+        transaction.effect_progress[0].effect_id.as_str(),
+        transaction.installer_effects[0].effect_id().as_str()
+    );
+    let source_snapshot = transaction.effect_progress[0]
+        .admitted_precondition
+        .as_ref()
+        .and_then(|precondition| precondition.package_snapshot.as_ref())
+        .expect("ordinary readback retains the actual signed source snapshot");
+    assert_eq!(evidence[0], source_snapshot.digest);
+    assert!(transaction.observed_postconditions.contains(&evidence[0]));
+    assert!(transaction.completed_stage_refs.contains(&evidence[0]));
+    assert!(transaction
+        .completed_stage_refs
+        .contains(postcondition_digest));
+    let persisted_native_target = transaction
+        .completed_managed_target_executable_observation(
+            &transaction.effect_progress[0].effect_id,
+        )
+        .expect("the original Completed transaction validates its receipt chain")
+        .expect("the signed original survey retained one exact native target observation");
+    let admitted_native_target = fixture
+        .accepted
+        .plan()
+        .target_executable_observation()
+        .expect("the original accepted plan retains its native target observation");
+    assert_eq!(&persisted_native_target.0, admitted_native_target.0);
+    assert_eq!(&persisted_native_target.1, admitted_native_target.1);
+    assert_eq!(&persisted_native_target.2, admitted_native_target.2);
+    assert_eq!(persisted_native_target.1, fixture.target_executable_path);
+    assert_eq!(persisted_native_target.2, fixture.target_executable_sha256);
+    let projection = projection.expect("the original durable transaction owns registration");
+    assert_eq!(
+        projection.disposition,
+        ManagedResourceDisposition::Registered
+    );
+    assert_eq!(projection.origin.transaction_id, transaction.transaction_id);
+    assert_eq!(
+        projection.origin.effect_id,
+        transaction.effect_progress[0].effect_id
+    );
+    assert_eq!(projection.origin.external_identity, *external_identity);
+    assert!(projection.origin.staging_receipt_digest.is_none());
+    must(transaction.validate());
+}
+
+#[cfg(windows)]
+#[test]
+fn core_completed_transaction_without_activation_receipt_is_rejected() {
+    let mut transaction = fully_applied_system_registration_transaction();
+    transaction.stage = InstallationStage::Completed;
+    transaction.revision += 1;
+
+    let error = transaction
+        .validate()
+        .expect_err("a core generation cannot complete without its committed activation receipt");
+    assert!(matches!(
+        error,
+        InstallationError::IncompleteObservation(message)
+            if message == "active/completed transaction requires the exact committed activation receipt"
+    ));
+}
+
+#[test]
+fn managed_repair_restart_requires_candidate_and_prior_absence() {
+    let resumable = managed_change_execution::managed_repair_restart_readback(
+        eliot_platform_windows::PackageStagingObservation::Absent,
+        eliot_platform_windows::PackageStagingObservation::Absent,
+    );
+    assert!(matches!(
+        resumable,
+        eliot_platform_windows::PackageStagingObservation::Absent
+    ));
+
+    let foreign_prior = managed_change_execution::managed_repair_restart_readback(
+        eliot_platform_windows::PackageStagingObservation::Absent,
+        eliot_platform_windows::PackageStagingObservation::Mismatch(
+            PackageStagingError::IdentityMismatch,
+        ),
+    );
+    assert!(matches!(
+        foreign_prior,
+        eliot_platform_windows::PackageStagingObservation::Mismatch(
+            PackageStagingError::IdentityMismatch
+        )
+    ));
+
+    let substituted_candidate = managed_change_execution::managed_repair_restart_readback(
+        eliot_platform_windows::PackageStagingObservation::Mismatch(
+            PackageStagingError::IdentityMismatch,
+        ),
+        eliot_platform_windows::PackageStagingObservation::Absent,
+    );
+    assert!(matches!(
+        substituted_candidate,
+        eliot_platform_windows::PackageStagingObservation::Mismatch(
+            PackageStagingError::IdentityMismatch
+        )
+    ));
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct ManagedRepairLostAckTrace {
+    lost_intent_digest: Option<PlatformHandle>,
+    target_execute_count: usize,
+    target_rollback_execute_count: usize,
+    target_execute_error: bool,
+    target_reconcile_intents: Vec<PlatformHandle>,
+    target_secret_delete_count: usize,
+}
+
+#[cfg(windows)]
+struct ManagedRepairLostAckPort {
+    inner: WindowsInstallationEffectPort,
+    transaction_id: PlatformHandle,
+    effect_id: PlatformHandle,
+    lose_next_ack: bool,
+    trace: Arc<Mutex<ManagedRepairLostAckTrace>>,
+}
+
+#[cfg(windows)]
+impl ManagedRepairLostAckPort {
+    fn new(
+        transaction_id: PlatformHandle,
+        effect_id: PlatformHandle,
+        lose_next_ack: bool,
+        trace: Arc<Mutex<ManagedRepairLostAckTrace>>,
+        test_secret_store: InstallationTestSecretStore,
+    ) -> Self {
+        Self {
+            inner: WindowsInstallationEffectPort::new_with_test_secret_store(
+                Arc::clone(&test_secret_store),
+            ),
+            transaction_id,
+            effect_id,
+            lose_next_ack,
+            trace,
+        }
+    }
+
+    fn is_target(&self, request: &InstallationEffectRequest) -> bool {
+        request.transaction_id == self.transaction_id && request.effect_id == self.effect_id
+    }
+}
+
+#[cfg(windows)]
+impl InstallationEffectPort for ManagedRepairLostAckPort {
+    fn fresh_ownership_secret_reference(
+        &mut self,
+        request: &InstallationEffectRequest,
+    ) -> PortOutcome<InstallationSecretReference> {
+        self.inner.fresh_ownership_secret_reference(request)
+    }
+
+    fn prepare_ownership_secret(
+        &mut self,
+        request: &InstallationEffectRequest,
+        reference: &InstallationSecretReference,
+    ) -> PortOutcome<InstallationSecretCreationProof> {
+        self.inner.prepare_ownership_secret(request, reference)
+    }
+
+    fn provision_ownership_secret(
+        &mut self,
+        request: &InstallationEffectRequest,
+    ) -> PortOutcome<InstallationSecretProvisionDisposition> {
+        self.inner.provision_ownership_secret(request)
+    }
+
+    fn execute(
+        &mut self,
+        request: &InstallationEffectRequest,
+    ) -> PortOutcome<InstallationEffectExecution> {
+        let target = self.is_target(request);
+        let outcome = self.inner.execute(request);
+        if !target {
+            return outcome;
+        }
+        {
+            let mut trace = self.trace.lock().unwrap_or_else(|_| unreachable!());
+            trace.target_execute_count += 1;
+            if request.action == InstallationEffectAction::Rollback {
+                trace.target_rollback_execute_count += 1;
+            }
+            trace.target_execute_error |= matches!(&outcome, PortOutcome::Error(_));
+        }
+        if self.lose_next_ack {
+            match outcome {
+                PortOutcome::Known(execution) if execution.staging_receipt.is_some() => {
+                    let digest = must(request.intent_digest());
+                    self.trace
+                        .lock()
+                        .unwrap_or_else(|_| unreachable!())
+                        .lost_intent_digest = Some(digest);
+                    self.lose_next_ack = false;
+                    return PortOutcome::Unknown(eliot_platform::UnknownReason::Indeterminate);
+                }
+                other => return other,
+            }
+        }
+        outcome
+    }
+
+    fn inspect(
+        &mut self,
+        request: &InstallationEffectRequest,
+    ) -> PortOutcome<InstallationEffectObservation> {
+        self.inner.inspect(request)
+    }
+
+    fn reconcile(
+        &mut self,
+        request: &InstallationEffectRequest,
+    ) -> PortOutcome<InstallationEffectObservation> {
+        if self.is_target(request) {
+            self.trace
+                .lock()
+                .unwrap_or_else(|_| unreachable!())
+                .target_reconcile_intents
+                .push(must(request.intent_digest()));
+        }
+        self.inner.reconcile(request)
+    }
+
+    fn delete_ownership_secret(
+        &mut self,
+        request: &InstallationEffectRequest,
+    ) -> PortOutcome<()> {
+        if self.is_target(request) {
+            self.trace
+                .lock()
+                .unwrap_or_else(|_| unreachable!())
+                .target_secret_delete_count += 1;
+        }
+        self.inner.delete_ownership_secret(request)
+    }
+
+    fn ownership_secret_absent(
+        &mut self,
+        request: &InstallationEffectRequest,
+    ) -> PortOutcome<bool> {
+        self.inner.ownership_secret_absent(request)
+    }
+}
+
+#[cfg(windows)]
+fn drive_signed_managed_test_child<P: InstallationEffectPort>(
+    fixture: &integration_discovery::accepted_managed_change_tests::ManagedRepairCrashFixture,
+    accepted: &AcceptedManagedChange,
+    coordinator: &mut InstallationCoordinator<P, RedbInstallationTransactionStore>,
+    transaction_id: &PlatformHandle,
+) -> InstallationStepOutcome {
+    let initial = coordinator
+        .store()
+        .load(transaction_id)
+        .unwrap_or_else(|error| panic!("load the original managed test child: {error}"))
+        .expect("the original managed test child is durable");
+    let max_steps = initial.installer_effects.len() + 3;
+    for _ in 0..max_steps {
+        let current = coordinator
+            .store()
+            .load(transaction_id)
+            .unwrap_or_else(|error| panic!("reload the original managed test child: {error}"))
+            .expect("the original managed test child remains durable");
+        must(current.validate());
+        if current
+            .effect_progress()
+            .iter()
+            .all(|progress| {
+                matches!(
+                    &progress.state,
+                    InstallationEffectProgressState::Applied { .. }
+                )
+            })
+        {
+            must(current.require_all_effects_applied());
+            return must(coordinator.drive_effect(transaction_id));
+        }
+        fixture
+            .revalidate(coordinator.store(), accepted)
+            .unwrap_or_else(|error| panic!("revalidate the exact signed managed plan: {error}"));
+        let outcome = must(coordinator.drive_effect(transaction_id));
+        if !matches!(&outcome, InstallationStepOutcome::Applied { .. }) {
+            return outcome;
+        }
+    }
+    panic!("bounded original managed child drive did not settle or block");
+}
+
+#[cfg(windows)]
+fn install_managed_repair_fixture(
+    fixture: &mut integration_discovery::accepted_managed_change_tests::ManagedRepairCrashFixture,
+    test_secret_store: InstallationTestSecretStore,
+) -> RedbInstallationTransactionStore {
+    let mut store = fixture.take_store();
+    let transaction = must(fixture.install_transaction());
+    fixture
+        .revalidate(&store, &fixture.accepted_install)
+        .unwrap_or_else(|error| panic!("revalidate the signed Install approval: {error}"));
+    must(store.create_planned(&transaction));
+    let transaction_id = transaction.transaction_id.clone();
+    let mut coordinator = InstallationCoordinator::new(
+        WindowsInstallationEffectPort::new_with_test_secret_store(test_secret_store),
+        store,
+    );
+    let outcome = drive_signed_managed_test_child(
+        fixture,
+        &fixture.accepted_install,
+        &mut coordinator,
+        &transaction_id,
+    );
+    assert!(matches!(
+        outcome,
+        InstallationStepOutcome::Applied {
+            stage: InstallationStage::Completed,
+            ..
+        }
+    ));
+    let completed = coordinator
+        .store()
+        .load(&transaction_id)
+        .unwrap_or_else(|error| panic!("read the completed Install child: {error}"))
+        .expect("the original Install child remains in Redb");
+    assert_eq!(completed.stage(), InstallationStage::Completed);
+    drop(coordinator);
+    fixture.reopen_store()
+}
+
+#[cfg(windows)]
+#[test]
+fn signed_repair_lost_package_ack_reopens_and_reconciles_the_original_attempt() {
+    use integration_discovery::accepted_managed_change_tests::managed_repair_crash_fixture;
+
+    let mut fixture = managed_repair_crash_fixture();
+    let test_secret_store: InstallationTestSecretStore = Arc::new(Mutex::new(BTreeMap::new()));
+    let mut store =
+        install_managed_repair_fixture(&mut fixture, Arc::clone(&test_secret_store));
+    let repair = must(fixture.repair_transaction(&store));
+    fixture
+        .revalidate(&store, &fixture.accepted_repair)
+        .unwrap_or_else(|error| panic!("revalidate the signed Repair approval: {error}"));
+    must(store.create_planned(&repair));
+    let transaction_id = repair.transaction_id.clone();
+    let effect_id = repair
+        .installer_effects
+        .last()
+        .expect("the original Repair plan has its managed effect")
+        .effect_id()
+        .clone();
+    let trace = Arc::new(Mutex::new(ManagedRepairLostAckTrace::default()));
+    let first_port = ManagedRepairLostAckPort::new(
+        transaction_id.clone(),
+        effect_id.clone(),
+        true,
+        Arc::clone(&trace),
+        Arc::clone(&test_secret_store),
+    );
+    let mut first = InstallationCoordinator::new(first_port, store);
+    let first_outcome = drive_signed_managed_test_child(
+        &fixture,
+        &fixture.accepted_repair,
+        &mut first,
+        &transaction_id,
+    );
+    assert!(matches!(
+        first_outcome,
+        InstallationStepOutcome::RollbackRequired { .. }
+    ));
+    let interrupted = first
+        .store()
+        .load(&transaction_id)
+        .unwrap_or_else(|error| panic!("read the persisted lost-response transaction: {error}"))
+        .expect("the original intent remains durable after the lost response");
+    assert_eq!(interrupted.stage(), InstallationStage::RollbackRequired);
+    let effect_index = interrupted
+        .installer_effects
+        .iter()
+        .position(|effect| effect.effect_id() == &effect_id)
+        .expect("the exact Repair effect remains in the original plan");
+    let original_intent = match &interrupted.effect_progress()[effect_index].state {
+        InstallationEffectProgressState::IntentCommitted {
+            attempt,
+            intent_digest,
+        } => (*attempt, intent_digest.clone()),
+        state => panic!("lost stage response retains its exact committed intent: {state:?}"),
+    };
+    assert!(interrupted.effect_progress()[effect_index]
+        .staging_receipt
+        .is_none());
+    assert!(interrupted
+        .pending_external_changes
+        .iter()
+        .any(|reference| reference.as_str() == "unknown:Indeterminate"));
+    assert_eq!(
+        trace
+            .lock()
+            .unwrap_or_else(|_| unreachable!())
+            .lost_intent_digest,
+        Some(original_intent.1.clone())
+    );
+    drop(first);
+
+    let reopened = fixture.reopen_store();
+    let restarted_port = ManagedRepairLostAckPort::new(
+        transaction_id.clone(),
+        effect_id.clone(),
+        false,
+        Arc::clone(&trace),
+        Arc::clone(&test_secret_store),
+    );
+    let mut restarted = InstallationCoordinator::new(restarted_port, reopened);
+    let completed_outcome = drive_signed_managed_test_child(
+        &fixture,
+        &fixture.accepted_repair,
+        &mut restarted,
+        &transaction_id,
+    );
+    assert!(matches!(
+        completed_outcome,
+        InstallationStepOutcome::Applied {
+            stage: InstallationStage::Completed,
+            ..
+        }
+    ));
+    let completed = restarted
+        .store()
+        .load(&transaction_id)
+        .unwrap_or_else(|error| panic!("read the completed Repair receipt: {error}"))
+        .expect("the original Repair transaction reaches its durable terminal");
+    must(completed.validate());
+    assert_eq!(completed.stage(), InstallationStage::Completed);
+    assert!(completed
+        .completed_stage_refs
+        .iter()
+        .any(|reference| reference.as_str() == "unknown:Indeterminate"));
+    assert!(matches!(
+        &completed.effect_progress()[effect_index].state,
+        InstallationEffectProgressState::Applied {
+            disposition: InstallationEffectDisposition::CreatedByTransaction,
+            ..
+        }
+    ));
+    let receipt = completed.effect_progress()[effect_index]
+        .staging_receipt
+        .as_ref()
+        .expect("readback retains the exact package staging receipt");
+    let trace = trace.lock().unwrap_or_else(|_| unreachable!());
+    assert_eq!(trace.target_execute_count, 1);
+    assert_eq!(trace.target_rollback_execute_count, 0);
+    assert_eq!(trace.target_secret_delete_count, 0);
+    assert_eq!(trace.target_reconcile_intents, vec![original_intent.1.clone()]);
+    assert_eq!(trace.lost_intent_digest, Some(original_intent.1));
+    assert!(!trace.target_execute_error);
+    let projection = restarted
+        .store()
+        .managed_resource_projection(&ManagedResourceKey {
+            family_id: fixture.repair_request.target_family.clone(),
+            exact_candidate: fixture.repair_request.exact_candidate.clone(),
+        })
+        .unwrap_or_else(|error| panic!("derive the existing managed projection: {error}"))
+        .expect("the original transaction remains the managed resource owner");
+    assert_eq!(projection.origin.transaction_id, transaction_id);
+    assert_eq!(projection.origin.effect_id, effect_id);
+    assert_eq!(
+        projection.origin.staging_receipt_digest,
+        Some(test_handle(receipt.digest()))
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn signed_completed_repair_requalifies_its_current_stage_receipt_without_admitting_a_probe() {
+    use integration_discovery::accepted_managed_change_tests::
+        managed_repair_crash_fixture_with_prior_image;
+
+    let system_root = std::env::var_os("SystemRoot")
+        .expect("Windows exposes its system root to the signed-image fixture");
+    let prior_image_path = std::path::Path::new(&system_root)
+        .join("System32")
+        .join("cmd.exe");
+    let prior_image = std::fs::read(&prior_image_path)
+        .expect("read the existing System32 image without executing it");
+    let mut fixture = managed_repair_crash_fixture_with_prior_image(Some(&prior_image));
+    let test_secret_store: InstallationTestSecretStore = Arc::new(Mutex::new(BTreeMap::new()));
+    let mut store =
+        install_managed_repair_fixture(&mut fixture, Arc::clone(&test_secret_store));
+    let repair = must(fixture.repair_transaction(&store));
+    fixture
+        .revalidate(&store, &fixture.accepted_repair)
+        .unwrap_or_else(|error| panic!("revalidate the signed Repair approval: {error}"));
+    must(store.create_planned(&repair));
+    let transaction_id = repair.transaction_id.clone();
+    let effect_id = repair
+        .installer_effects
+        .last()
+        .expect("the original Repair plan has its managed effect")
+        .effect_id()
+        .clone();
+    let trace = Arc::new(Mutex::new(ManagedRepairLostAckTrace::default()));
+    let port = ManagedRepairLostAckPort::new(
+        transaction_id.clone(),
+        effect_id.clone(),
+        false,
+        Arc::clone(&trace),
+        Arc::clone(&test_secret_store),
+    );
+    let mut coordinator = InstallationCoordinator::new(port, store);
+    let outcome = drive_signed_managed_test_child(
+        &fixture,
+        &fixture.accepted_repair,
+        &mut coordinator,
+        &transaction_id,
+    );
+    assert!(matches!(
+        outcome,
+        InstallationStepOutcome::Applied {
+            stage: InstallationStage::Completed,
+            ..
+        }
+    ));
+    let completed = coordinator
+        .store()
+        .load(&transaction_id)
+        .unwrap_or_else(|error| panic!("read the completed Repair receipt: {error}"))
+        .expect("the original Repair transaction reaches its durable terminal");
+    must(completed.validate());
+    assert_eq!(completed.stage(), InstallationStage::Completed);
+    let progress = completed
+        .effect_progress()
+        .iter()
+        .find(|progress| progress.effect_id == effect_id)
+        .expect("the original managed effect retains its Applied progress");
+    assert!(matches!(
+        &progress.state,
+        InstallationEffectProgressState::Applied { .. }
+    ));
+    let receipt = progress
+        .staging_receipt
+        .as_ref()
+        .expect("the original Completed effect retains its native stage receipt");
+    let executable = fixture
+        .accepted_repair
+        .recipe()
+        .executable_relative_paths
+        .first()
+        .expect("the exact signed recipe declares its executable");
+    let staged_file = receipt
+        .files
+        .iter()
+        .find(|file| file.relative_path == executable.as_str())
+        .expect("the original Applied receipt names the staged executable");
+    let staged_path = receipt.root_path.join(&staged_file.relative_path);
+    let staged_bytes = std::fs::read(&staged_path)
+        .expect("the Completed receipt's exact stage-created executable remains readable");
+    let staged_sha256 = sha256_hex(&staged_bytes);
+    assert_eq!(staged_sha256, staged_file.sha256);
+    let staged_native = eliot_platform_windows::observe_file_version(&staged_path);
+    assert_eq!(
+        staged_native.file_identity.as_ref(),
+        Some(&staged_file.destination_identity)
+    );
+    assert_eq!(staged_native.sha256.as_deref(), Some(staged_file.sha256.as_str()));
+
+    let (original_identity, _, original_sha256) = fixture
+        .accepted_repair
+        .plan()
+        .target_executable_observation()
+        .expect("the frozen Repair plan retains its pre-change native candidate");
+    let original_candidate = fixture
+        .accepted_repair
+        .accepted_survey()
+        .survey()
+        .families
+        .iter()
+        .find(|family| family.family_id == fixture.repair_request.target_family)
+        .and_then(|family| {
+            family
+                .stages
+                .iter()
+                .find(|stage| stage.stage == SurveyStage::FileVersionSignatureIdentity)
+        })
+        .and_then(|stage| {
+            stage.observations.iter().find(|observation| {
+                observation.observed_identity.as_ref() == Some(original_identity)
+            })
+        })
+        .and_then(|observation| observation.file_version.as_ref())
+        .and_then(|observation| observation.file_identity.as_ref())
+        .expect("the signed native survey retains the pre-change file identity");
+    assert_ne!(original_candidate, &staged_file.destination_identity);
+
+    let context = fixture.context(coordinator.store());
+    let requalified = requalify_completed_managed_change(
+        &context,
+        &WindowsSurveyObservationSource,
+        &fixture.repair_request,
+        &transaction_id,
+    )
+    .expect("the exact completed owner can requalify its current stage receipt");
+    assert_eq!(requalified.result().runtime_hash.as_deref(), Some(staged_sha256.as_str()));
+    assert_eq!(
+        requalified.result().previous_runtime_hash.as_deref(),
+        Some(original_sha256.as_str())
+    );
+    assert_ne!(requalified.result().runtime_hash, requalified.result().previous_runtime_hash);
+    assert_eq!(requalified.result().advertisement.target_identity, None);
+    assert!(matches!(
+        &requalified.result().advertisement.state.status,
+        ManagedCapabilityStatus::Unsupported { missing }
+            if missing.contains(&MissingQualification::TargetNotObservedInTheLiveSurvey)
+    ));
+    assert!(requalified.probe().is_none());
+
+    let substituted_request = fixture.refusal_request.clone();
+    assert!(matches!(
+        requalify_completed_managed_change(
+            &context,
+            &WindowsSurveyObservationSource,
+            &substituted_request,
+            &transaction_id,
+        ),
+        Err(ManagedChangeAdmissionError::Installation(
+            InstallationError::IdentityConflict
+        ))
+    ));
+    let install_receipt_id = must(fixture.install_transaction()).transaction_id;
+    assert!(matches!(
+        requalify_completed_managed_change(
+            &context,
+            &WindowsSurveyObservationSource,
+            &fixture.repair_request,
+            &install_receipt_id,
+        ),
+        Err(ManagedChangeAdmissionError::Installation(
+            InstallationError::IdentityConflict
+        ))
+    ));
+
+    let mut foreign_bytes = staged_bytes;
+    foreign_bytes[0] ^= 0x01;
+    std::fs::write(&staged_path, &foreign_bytes)
+        .expect("substitute the current staged file after retaining the positive readback");
+    let foreign = requalify_completed_managed_change(
+        &context,
+        &WindowsSurveyObservationSource,
+        &fixture.repair_request,
+        &transaction_id,
+    )
+    .expect("foreign current bytes remain an explicit non-admission");
+    assert_eq!(foreign.result().runtime_hash, None);
+    assert!(foreign.probe().is_none());
+    assert!(matches!(
+        &foreign.result().advertisement.state.status,
+        ManagedCapabilityStatus::Unsupported { .. }
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+fn signed_repair_refuses_a_changed_prior_generation_and_keeps_its_typed_cause() {
+    use integration_discovery::accepted_managed_change_tests::managed_repair_crash_fixture;
+
+    let mut fixture = managed_repair_crash_fixture();
+    let test_secret_store: InstallationTestSecretStore = Arc::new(Mutex::new(BTreeMap::new()));
+    let mut store =
+        install_managed_repair_fixture(&mut fixture, Arc::clone(&test_secret_store));
+    let repair = must(fixture.refusal_transaction(&store));
+    fixture
+        .revalidate(&store, &fixture.accepted_refusal)
+        .unwrap_or_else(|error| panic!("revalidate the signed refusal Repair approval: {error}"));
+    must(store.create_planned(&repair));
+    let transaction_id = repair.transaction_id.clone();
+    let effect_id = repair
+        .installer_effects
+        .last()
+        .expect("the refusal Repair plan has its managed effect")
+        .effect_id()
+        .clone();
+    let changed_file = fixture.package_generation_path().join("codex.exe");
+    let mut changed_bytes = std::fs::read(&changed_file)
+        .expect("the completed Install generation contains the signed executable");
+    changed_bytes[0] ^= 0x01;
+    std::fs::write(&changed_file, &changed_bytes)
+        .expect("substitute the prior owned generation's exact executable bytes");
+
+    let trace = Arc::new(Mutex::new(ManagedRepairLostAckTrace::default()));
+    let port = ManagedRepairLostAckPort::new(
+        transaction_id.clone(),
+        effect_id.clone(),
+        false,
+        Arc::clone(&trace),
+        Arc::clone(&test_secret_store),
+    );
+    let mut first = InstallationCoordinator::new(port, store);
+    let outcome = drive_signed_managed_test_child(
+        &fixture,
+        &fixture.accepted_refusal,
+        &mut first,
+        &transaction_id,
+    );
+    assert!(matches!(
+        outcome,
+        InstallationStepOutcome::RollbackRequired { .. }
+    ));
+    let interrupted = first
+        .store()
+        .load(&transaction_id)
+        .unwrap_or_else(|error| panic!("read refusal state from original Redb: {error}"))
+        .expect("the exact refused Repair intent remains durable");
+    assert_eq!(interrupted.stage(), InstallationStage::RollbackRequired);
+    let effect_index = interrupted
+        .installer_effects
+        .iter()
+        .position(|effect| effect.effect_id() == &effect_id)
+        .expect("the original refusal effect remains in the plan");
+    let original_intent = match &interrupted.effect_progress()[effect_index].state {
+        InstallationEffectProgressState::IntentCommitted {
+            attempt,
+            intent_digest,
+        } => (*attempt, intent_digest.clone()),
+        state => panic!("a prior-resource mismatch preserves its original intent: {state:?}"),
+    };
+    assert!(interrupted
+        .pending_external_changes
+        .iter()
+        .any(|reference| reference.as_str() == "stage-package-error-v1:hash-mismatch"));
+    assert!(interrupted.effect_progress()[effect_index]
+        .staging_receipt
+        .is_none());
+    assert_eq!(
+        std::fs::read(&changed_file).expect("refused repair leaves the substituted file intact"),
+        changed_bytes
+    );
+    drop(first);
+
+    let reopened = fixture.reopen_store();
+    let port = ManagedRepairLostAckPort::new(
+        transaction_id.clone(),
+        effect_id.clone(),
+        false,
+        Arc::clone(&trace),
+        Arc::clone(&test_secret_store),
+    );
+    let mut restarted = InstallationCoordinator::new(port, reopened);
+    let restart_outcome = drive_signed_managed_test_child(
+        &fixture,
+        &fixture.accepted_refusal,
+        &mut restarted,
+        &transaction_id,
+    );
+    assert!(matches!(
+        restart_outcome,
+        InstallationStepOutcome::RollbackRequired { .. }
+    ));
+    let refused = restarted
+        .store()
+        .load(&transaction_id)
+        .unwrap_or_else(|error| panic!("read restart refusal from original Redb: {error}"))
+        .expect("unprovable prior ownership remains explicit after restart");
+    assert_eq!(refused.stage(), InstallationStage::RollbackRequired);
+    let retained = match &refused.effect_progress()[effect_index].state {
+        InstallationEffectProgressState::IntentCommitted {
+            attempt,
+            intent_digest,
+        } => (*attempt, intent_digest),
+        state => panic!("restart cannot mint or replace the Repair intent: {state:?}"),
+    };
+    assert_eq!(retained.0, original_intent.0);
+    assert_eq!(retained.1, &original_intent.1);
+    assert!(refused
+        .pending_external_changes
+        .iter()
+        .any(|reference| reference.as_str() == "stage-package-error-v1:hash-mismatch"));
+    assert!(refused.effect_progress()[effect_index]
+        .staging_receipt
+        .is_none());
+    let trace = trace.lock().unwrap_or_else(|_| unreachable!());
+    assert_eq!(trace.target_execute_count, 1);
+    assert_eq!(trace.target_rollback_execute_count, 0);
+    assert_eq!(trace.target_secret_delete_count, 0);
+    assert!(trace.target_execute_error);
+    assert_eq!(trace.target_reconcile_intents, vec![original_intent.1]);
+    assert_eq!(
+        std::fs::read(&changed_file).expect("restart refusal keeps foreign bytes untouched"),
+        changed_bytes
+    );
 }

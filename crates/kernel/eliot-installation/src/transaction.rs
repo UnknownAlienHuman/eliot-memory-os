@@ -18,15 +18,17 @@ use super::{
     InstallationError, InstallationProfile, InstallationRoots, InstallationServiceBootstrap,
     InstallationServiceStartProof, InstallationStepOutcome, InstallerEffectPlan,
     InstallerServiceControlGrantReceipt, InstallerServiceRegistrationApproval,
-    InstallerServiceRole, ManagedEnvironmentChangeRequest, PlannedChange, PlatformHandle,
+    InstallationManagedRootEffectProof, InstallerServiceRole, ManagedEnvironmentChangeRequest,
+    ManagedResourceProjection,
+    AcceptedManagedChange, PlannedChange, PlatformHandle,
     ProfileGovernedRoots, ProfileSelectionResolution, RetainedGuardRevert, RuntimeStateRoots,
     SERVICE_START_TIMEOUT_PENDING_REF, StagingReceipt, StoreCredentialLifecycle,
     StoreCredentialProgress, candidate_manifest_digest, handle, handles,
     ownership_secret_absence_evidence, phase_b_scm_digest,
     prove_no_service_profile_authority_dependency, sha256_handle, sha256_hex,
-    validate_installer_effects, validate_package_binding, validate_phase_b_effect_bindings,
-    validate_staging_receipt_for_observation, validate_staging_receipt_for_plan,
-    validate_user_mode_authority_effect_bindings,
+    validate_installer_effects_with_managed_root, validate_package_binding,
+    validate_phase_b_effect_bindings, validate_staging_receipt_for_observation,
+    validate_staging_receipt_for_plan, validate_user_mode_authority_effect_bindings,
 };
 /// Store-volume observation used to evaluate the immutable free-space policy.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -640,6 +642,140 @@ impl InstallationTransaction {
         )
     }
 
+    /// Creates one managed-tool transaction from the exact durable PortableDev
+    /// anchor and the private-constructed signed admission carrier. The core
+    /// candidate manifest is retained byte-for-byte as the transaction's
+    /// lifecycle anchor; only the closed managed effect and its two selected
+    /// child-root effects are added to the immutable effect list.
+    pub(crate) fn new_accepted_managed_change(
+        anchor: &Self,
+        accepted: &AcceptedManagedChange,
+        prior_resource: Option<ManagedResourceProjection>,
+        prior_receipts: Vec<StagingReceipt>,
+        prior_root_effects: Vec<InstallationManagedRootEffectProof>,
+    ) -> Result<Self, InstallationError> {
+        anchor.validate()?;
+        let plan = accepted.plan();
+        let request = plan.request().clone();
+        let recipe = accepted.recipe().clone();
+        recipe.validate()?;
+        recipe.require_supported().map_err(|requirement| {
+            InstallationError::ProfileViolation(format!(
+                "managed effect recipe requires unsupported capability {requirement:?}"
+            ))
+        })?;
+        if anchor.profile != InstallationProfile::PortableDev
+            || plan.profile() != anchor.profile
+            || anchor.transaction_id == request.request_id
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let roots = anchor
+            .profile_governed_roots
+            .as_ref()
+            .ok_or_else(|| InstallationError::MigrationRequired {
+                reason: "managed effect requires the retained PortableDev I3.1 root binding"
+                    .to_owned(),
+            })?;
+        roots.validate(InstallationProfile::PortableDev)?;
+        let expected_managed_tools = recipe.target_root(std::path::Path::new(
+            &roots.immutable_binaries,
+        ));
+        if !eliot_platform_windows::windows_paths_equal(
+            accepted.managed_tools_root(),
+            &expected_managed_tools,
+        ) {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let managed_tools_root = PlatformHandle::new(
+            expected_managed_tools.to_string_lossy().into_owned(),
+        )
+        .map_err(|error| InstallationError::InvalidField {
+            field: "managed_effect.managed_tools_root".to_owned(),
+            reason: error.to_string(),
+        })?;
+        let managed_effect_id = managed_effect_identity(&request.request_id, "effect")?;
+        let mut effects = Vec::new();
+        if super::managed_change_execution::managed_operation_stages(recipe.operation) {
+            let managed_root_id =
+                managed_effect_identity(&request.request_id, "managed-tools-root")?;
+            let family_root_id =
+                managed_effect_identity(&request.request_id, "managed-family-root")?;
+            let family_root = expected_managed_tools.join(request.target_family.as_str());
+            effects.push(InstallerEffectPlan::CreateRoot {
+                effect_id: managed_root_id,
+                root: managed_tools_root.clone(),
+            });
+            effects.push(InstallerEffectPlan::CreateRoot {
+                effect_id: family_root_id,
+                root: PlatformHandle::new(family_root.to_string_lossy().into_owned()).map_err(
+                    |error| InstallationError::InvalidField {
+                        field: "managed_effect.family_root".to_owned(),
+                        reason: error.to_string(),
+                    },
+                )?,
+            });
+        }
+        let accepted_plan_json = serde_json::to_string(plan).map_err(|error| {
+            InstallationError::InvalidField {
+                field: "managed_effect.accepted_plan_json".to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+        effects.push(InstallerEffectPlan::ManagedEnvironmentChange {
+            effect_id: managed_effect_id.clone(),
+            accepted_plan_json,
+            request: request.clone(),
+            managed_tools_root,
+            recipe: Box::new(recipe.clone()),
+            prior_resource: prior_resource.map(Box::new),
+            prior_receipts,
+            prior_root_effects,
+        });
+        let evidence_preconditions = if request.source_assurance_refs.is_empty() {
+            vec![request.expected_delta.clone()]
+        } else {
+            request.source_assurance_refs.clone()
+        };
+        let evidence_postconditions = vec![request.expected_delta.clone(), request.verifier.clone()];
+        let planned_changes = effects
+            .iter()
+            .map(|effect| {
+                let target = match effect {
+                    InstallerEffectPlan::CreateRoot { root, .. } => root.clone(),
+                    InstallerEffectPlan::ManagedEnvironmentChange { recipe, .. } => {
+                        recipe.registration_identity.clone()
+                    }
+                    _ => return Err(InstallationError::IdentityConflict),
+                };
+                Ok(PlannedChange {
+                    change_id: effect.effect_id().clone(),
+                    target,
+                    precondition_refs: evidence_preconditions.clone(),
+                    postcondition_refs: evidence_postconditions.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, InstallationError>>()?;
+        let mut transaction = Self::new_with_construction_proof(
+            request.request_id.clone(),
+            anchor.installation_epoch.clone(),
+            InstallationProfile::PortableDev,
+            request.clone(),
+            anchor.current_active_manifest.clone(),
+            anchor.candidate_manifest.clone(),
+            anchor.staging_root.clone(),
+            planned_changes,
+            effects,
+            anchor.minimum_store_available_bytes,
+            evidence_preconditions,
+            request.rollback_plan.clone(),
+            PlannerConstructionProof::Bound,
+        )?;
+        transaction.profile_governed_roots = Some(roots.clone());
+        transaction.validate()?;
+        Ok(transaction)
+    }
+
     /// Creates a validated, unbound transaction projection for read-only
     /// fixture and diagnostic consumers.
     ///
@@ -747,9 +883,13 @@ impl InstallationTransaction {
                 reason: "must be a non-zero explicit policy value".to_owned(),
             });
         }
-        validate_installer_effects(
+        validate_installer_effects_with_managed_root(
             profile,
             &candidate_manifest.runtime_launch.runtime_state_roots,
+            &candidate_manifest
+                .runtime_launch
+                .profile_governed_roots
+                .immutable_binaries,
             &candidate_manifest.store_credential_target,
             &planned_changes,
             &installer_effects,
@@ -842,6 +982,52 @@ impl InstallationTransaction {
     #[must_use]
     pub const fn stage(&self) -> InstallationStage {
         self.stage
+    }
+
+    /// Returns the original managed target's native identity, input path and
+    /// SHA-256 together from one exact Completed effect.
+    ///
+    /// Callers obtain `self` by loading the original transaction from the
+    /// existing transaction store using its same-table effect reference. This
+    /// method validates the complete durable row and refuses an uncompleted,
+    /// substituted or non-managed effect. A `None` result preserves the
+    /// original survey's unknown/ambiguous native observation.
+    pub fn completed_managed_target_executable_observation(
+        &self,
+        effect_id: &PlatformHandle,
+    ) -> Result<Option<(PlatformHandle, PlatformHandle, PlatformHandle)>, InstallationError> {
+        self.validate()?;
+        if self.stage != InstallationStage::Completed {
+            return Err(InstallationError::IncompleteObservation(
+                "native target observation requires the original Completed managed transaction"
+                    .to_owned(),
+            ));
+        }
+        let (index, effect) = self
+            .installer_effects
+            .iter()
+            .enumerate()
+            .find(|(_, effect)| effect.effect_id() == effect_id)
+            .ok_or(InstallationError::IdentityConflict)?;
+        let InstallerEffectPlan::ManagedEnvironmentChange {
+            accepted_plan_json,
+            request,
+            ..
+        } = effect
+        else {
+            return Err(InstallationError::IdentityConflict);
+        };
+        let progress = self
+            .effect_progress
+            .get(index)
+            .ok_or(InstallationError::IdentityConflict)?;
+        if !matches!(
+            &progress.state,
+            InstallationEffectProgressState::Applied { .. }
+        ) {
+            return Err(InstallationError::IdentityConflict);
+        }
+        retained_managed_target_executable_observation(accepted_plan_json, request)
     }
 
     /// Returns the ordered effect progress as a read-only projection.
@@ -1480,6 +1666,13 @@ impl InstallationTransaction {
         handle(&self.transaction_id, "transaction_id")?;
         self.installation_epoch.validate()?;
         self.request.validate()?;
+        for effect in &self.installer_effects {
+            if let InstallerEffectPlan::ManagedEnvironmentChange { request, .. } = effect
+                && (request != &self.request || request.request_id != self.transaction_id)
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+        }
         self.candidate_manifest.validate()?;
         if self.profile != self.candidate_manifest.runtime_launch.profile {
             return Err(InstallationError::ProfileViolation(
@@ -1513,13 +1706,31 @@ impl InstallationTransaction {
         for change in &self.planned_changes {
             change.validate()?;
         }
-        validate_installer_effects(
+        validate_installer_effects_with_managed_root(
             self.profile,
             &self.candidate_manifest.runtime_launch.runtime_state_roots,
+            &self
+                .candidate_manifest
+                .runtime_launch
+                .profile_governed_roots
+                .immutable_binaries,
             &self.candidate_manifest.store_credential_target,
             &self.planned_changes,
             &self.installer_effects,
         )?;
+        for effect in &self.installer_effects {
+            if let InstallerEffectPlan::ManagedEnvironmentChange {
+                accepted_plan_json,
+                request,
+                ..
+            } = effect
+            {
+                let _ = retained_managed_target_executable_observation(
+                    accepted_plan_json,
+                    request,
+                )?;
+            }
+        }
         validate_phase_b_effect_bindings(&self.candidate_manifest, &self.installer_effects)?;
         validate_user_mode_authority_effect_bindings(
             &self.transaction_id,
@@ -1570,13 +1781,30 @@ impl InstallationTransaction {
             "observed_postconditions",
             false,
         )?;
+        let managed_child = self.is_managed_child_transaction();
+        if managed_child
+            && (self.active_verified_receipt.is_some()
+                || self.activation_projection_intent.is_some()
+                || self.no_return_boundary.is_some()
+                || self.last_known_good.is_some())
+        {
+            return Err(InstallationError::IncompleteObservation(
+                "managed operation completion cannot carry core activation or generation-adoption state"
+                    .to_owned(),
+            ));
+        }
         match (&self.stage, &self.active_verified_receipt) {
             (
                 InstallationStage::ActiveVerified
-                | InstallationStage::Cleaning
-                | InstallationStage::Completed,
+                | InstallationStage::Cleaning,
                 Some(receipt),
             ) => receipt.validate_against_transaction(self)?,
+            (InstallationStage::Completed, Some(receipt)) => {
+                receipt.validate_against_transaction(self)?;
+            }
+            (InstallationStage::Completed, None) if managed_child => {
+                self.validate_managed_completion()?;
+            }
             (
                 InstallationStage::ActiveVerified
                 | InstallationStage::Cleaning
@@ -1681,6 +1909,11 @@ impl InstallationTransaction {
                             && precondition.credential_snapshot.is_none()
                             && precondition.package_snapshot.is_none()
                     }
+                    InstallerEffectPlan::ManagedEnvironmentChange { .. } => {
+                        precondition.package_snapshot.is_some()
+                            && precondition.os_snapshot.is_none()
+                            && precondition.credential_snapshot.is_none()
+                    }
                     InstallerEffectPlan::StagePackage { .. }
                     | InstallerEffectPlan::MaterializePhaseB { .. } => {
                         precondition.credential_snapshot.is_none()
@@ -1711,7 +1944,8 @@ impl InstallationTransaction {
                         if !matches!(
                             self.stage,
                             InstallationStage::Completed | InstallationStage::RolledBack
-                        ) => {}
+                        ) || (self.stage == InstallationStage::Completed
+                            && self.is_managed_child_transaction()) => {}
                     InstallationSecretLifecycle::DeleteIntentCommitted
                         if self.stage == InstallationStage::RollbackRequired => {}
                     InstallationSecretLifecycle::Deleted
@@ -2030,13 +2264,20 @@ impl InstallationTransaction {
                 });
             }
             if let Some(receipt) = &progress.staging_receipt {
-                let InstallerEffectPlan::StagePackage { .. } = effect else {
+                let managed_stage = matches!(
+                    effect,
+                    InstallerEffectPlan::ManagedEnvironmentChange { recipe, .. }
+                        if super::managed_change_execution::managed_operation_stages(
+                            recipe.operation,
+                        )
+                );
+                if !matches!(effect, InstallerEffectPlan::StagePackage { .. }) && !managed_stage {
                     return Err(InstallationError::InvalidField {
                         field: "effect_progress.staging_receipt".to_owned(),
-                        reason: "package receipts belong only to the StagePackage effect"
+                        reason: "package receipts belong only to package staging effects"
                             .to_owned(),
                     });
-                };
+                }
                 validate_staging_receipt_for_plan(effect, receipt)?;
                 let Some(precondition) = progress.admitted_precondition.as_ref() else {
                     return Err(InstallationError::IncompleteObservation(
@@ -2050,12 +2291,17 @@ impl InstallationTransaction {
                 };
                 validate_staging_receipt_for_observation(snapshot, receipt)?;
             } else if matches!(
-                (&progress.state, effect),
-                (
-                    InstallationEffectProgressState::Applied { .. },
-                    InstallerEffectPlan::StagePackage { .. }
-                )
-            ) {
+                &progress.state,
+                InstallationEffectProgressState::Applied { .. }
+            ) && (matches!(effect, InstallerEffectPlan::StagePackage { .. })
+                || matches!(
+                    effect,
+                    InstallerEffectPlan::ManagedEnvironmentChange { recipe, .. }
+                        if super::managed_change_execution::managed_operation_stages(
+                            recipe.operation,
+                        )
+                ))
+            {
                 return Err(InstallationError::InvalidField {
                     field: "effect_progress.staging_receipt".to_owned(),
                     reason: "applied package effect requires its typed staging receipt".to_owned(),
@@ -2112,6 +2358,29 @@ impl InstallationTransaction {
                     None,
                     None,
                 ) => {}
+                (
+                    InstallationEffectProgressState::IntentCommitted { .. }
+                    | InstallationEffectProgressState::Unknown { .. }
+                    | InstallationEffectProgressState::Applied {
+                        disposition: InstallationEffectDisposition::CreatedByTransaction,
+                        ..
+                    },
+                    InstallerEffectPlan::ManagedEnvironmentChange { recipe, .. },
+                    Some(precondition),
+                    ownership,
+                ) if precondition.package_snapshot.is_some()
+                    && precondition.os_snapshot.is_none()
+                    && precondition.credential_snapshot.is_none()
+                    && (super::managed_change_execution::managed_operation_stages(
+                        recipe.operation,
+                    ) == ownership.as_ref().is_some_and(|ownership| {
+                        ownership.lifecycle != InstallationSecretLifecycle::Deleted
+                            && matches!(
+                                ownership.secret_provision_disposition,
+                                InstallationSecretProvisionDisposition::NotAttempted
+                                    | InstallationSecretProvisionDisposition::Created
+                            )
+                    })) => {}
                 (
                     InstallationEffectProgressState::IntentCommitted { .. }
                     | InstallationEffectProgressState::Unknown { .. }
@@ -2218,6 +2487,7 @@ impl InstallationTransaction {
                             InstallerEffectPlan::RegisterService { .. }
                                 | InstallerEffectPlan::StartService { .. }
                                 | InstallerEffectPlan::StagePackage { .. }
+                                | InstallerEffectPlan::ManagedEnvironmentChange { .. }
                                 | InstallerEffectPlan::MaterializePhaseB { .. }
                                 | InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. }
                         )
@@ -2276,6 +2546,18 @@ impl InstallationTransaction {
                         return Err(InstallationError::InvalidField {
                             field: "effect_progress.staging_receipt".to_owned(),
                             reason: "applied package effect requires a durable receipt".to_owned(),
+                        });
+                    }
+                    if let InstallerEffectPlan::ManagedEnvironmentChange { recipe, .. } = effect
+                        && super::managed_change_execution::managed_operation_stages(
+                            recipe.operation,
+                        )
+                        && progress.staging_receipt.is_none()
+                    {
+                        return Err(InstallationError::InvalidField {
+                            field: "effect_progress.staging_receipt".to_owned(),
+                            reason: "applied managed package effect requires its typed staging receipt"
+                                .to_owned(),
                         });
                     }
                     if matches!(
@@ -2369,7 +2651,16 @@ impl InstallationTransaction {
         let Some(package_index) = self
             .installer_effects
             .iter()
-            .position(|effect| matches!(effect, InstallerEffectPlan::StagePackage { .. }))
+            .position(|effect| {
+                matches!(effect, InstallerEffectPlan::StagePackage { .. })
+                    || matches!(
+                        effect,
+                        InstallerEffectPlan::ManagedEnvironmentChange { recipe, .. }
+                            if super::managed_change_execution::managed_operation_stages(
+                                recipe.operation,
+                            )
+                    )
+            })
         else {
             return Ok(());
         };
@@ -2414,6 +2705,228 @@ impl InstallationTransaction {
             ));
         }
         Ok(())
+    }
+
+    /// Identifies the exact constructor-shaped managed child transaction.
+    /// The common installer-effect validator has already checked the precise
+    /// root paths and signed managed plan before this predicate is used.
+    fn managed_child_effect_index(&self) -> Option<usize> {
+        if self.profile != InstallationProfile::PortableDev
+            || self.request.request_id != self.transaction_id
+            || self.planned_changes.len() != self.installer_effects.len()
+        {
+            return None;
+        }
+        let mut managed = self
+            .installer_effects
+            .iter()
+            .enumerate()
+            .filter_map(|(index, effect)| {
+                matches!(effect, InstallerEffectPlan::ManagedEnvironmentChange { .. })
+                    .then_some(index)
+            });
+        let index = managed.next()?;
+        if managed.next().is_some() || index + 1 != self.installer_effects.len() {
+            return None;
+        }
+        let InstallerEffectPlan::ManagedEnvironmentChange { recipe, .. } =
+            &self.installer_effects[index]
+        else {
+            return None;
+        };
+        let stages_package = super::managed_change_execution::managed_operation_stages(
+            recipe.operation,
+        );
+        let expected_effects = if stages_package { 3 } else { 1 };
+        if self.installer_effects.len() != expected_effects
+            || (stages_package
+                && self.installer_effects[..index]
+                    .iter()
+                    .any(|effect| !matches!(effect, InstallerEffectPlan::CreateRoot { .. })))
+        {
+            return None;
+        }
+        Some(index)
+    }
+
+    /// Whether this transaction is the single managed operation shape emitted
+    /// by `new_accepted_managed_change`, rather than a core installation plan.
+    pub(super) fn is_managed_child_transaction(&self) -> bool {
+        self.managed_child_effect_index().is_some()
+    }
+
+    fn validate_managed_completion(&self) -> Result<(), InstallationError> {
+        let index = self
+            .managed_child_effect_index()
+            .ok_or(InstallationError::IdentityConflict)?;
+        if !self.pending_external_changes.is_empty()
+            || self.guard_revert.is_some()
+            || self.observed_postconditions.is_empty()
+        {
+            return Err(InstallationError::IncompleteObservation(
+                "managed completion requires settled effect readbacks and no pending recovery state"
+                    .to_owned(),
+            ));
+        }
+        if self.effect_progress.iter().any(|progress| {
+            !matches!(
+                &progress.state,
+                InstallationEffectProgressState::Applied { .. }
+            )
+        }) {
+            return Err(InstallationError::IncompleteObservation(
+                "managed completion requires every exact planned effect to be applied"
+                    .to_owned(),
+            ));
+        }
+        let InstallerEffectPlan::ManagedEnvironmentChange { recipe, .. } =
+            &self.installer_effects[index]
+        else {
+            return Err(InstallationError::IdentityConflict);
+        };
+        let progress = &self.effect_progress[index];
+        let InstallationEffectProgressState::Applied {
+            disposition,
+            evidence,
+            postcondition_digest,
+            ..
+        } = &progress.state
+        else {
+            return Err(InstallationError::IncompleteObservation(
+                "managed postcondition has not been read back as applied".to_owned(),
+            ));
+        };
+        if *disposition != super::InstallationEffectDisposition::CreatedByTransaction
+            || evidence.is_empty()
+            || evidence
+                .iter()
+                .any(|reference| !self.observed_postconditions.contains(reference))
+            || evidence
+                .iter()
+                .any(|reference| !self.completed_stage_refs.contains(reference))
+            || !self.completed_stage_refs.contains(postcondition_digest)
+        {
+            return Err(InstallationError::IncompleteObservation(
+                "managed completion requires its retained exact effect readback receipt"
+                    .to_owned(),
+            ));
+        }
+        let stages_package = super::managed_change_execution::managed_operation_stages(
+            recipe.operation,
+        );
+        if stages_package {
+            let receipt = progress
+                .staging_receipt
+                .as_ref()
+                .ok_or(InstallationError::IdentityConflict)?;
+            let receipt_digest = PlatformHandle::new(receipt.digest()).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "effect_progress.staging_receipt".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?;
+            if !self.completed_stage_refs.contains(&receipt_digest)
+                || progress
+                    .ownership_secret
+                    .as_ref()
+                    .is_none_or(|ownership| {
+                        ownership.lifecycle != super::InstallationSecretLifecycle::Active
+                    })
+            {
+                return Err(InstallationError::IncompleteObservation(
+                    "managed package completion requires its retained receipt and ownership key"
+                        .to_owned(),
+                ));
+            }
+        }
+        for (effect, progress) in self.installer_effects.iter().zip(&self.effect_progress) {
+            if matches!(effect, InstallerEffectPlan::CreateRoot { .. })
+                && matches!(
+                    &progress.state,
+                    InstallationEffectProgressState::Applied {
+                        disposition: super::InstallationEffectDisposition::CreatedByTransaction,
+                        ..
+                    }
+                )
+                && progress
+                    .ownership_secret
+                    .as_ref()
+                    .is_none_or(|ownership| {
+                        ownership.lifecycle != super::InstallationSecretLifecycle::Active
+                    })
+            {
+                return Err(InstallationError::IncompleteObservation(
+                    "managed completion requires each created parent root's retained owner key"
+                        .to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Completes the exact managed operation after the coordinator has
+    /// persisted readback for every planned root and the approved effect.
+    /// This terminal denotes that operation's postcondition, never Host/core
+    /// activation or adoption of the cloned candidate manifest.
+    pub(super) fn complete_managed_operation(&mut self) -> Result<(), InstallationError> {
+        let index = self
+            .managed_child_effect_index()
+            .ok_or(InstallationError::IdentityConflict)?;
+        if self.stage == InstallationStage::Completed {
+            return self.validate_managed_completion();
+        }
+        let InstallerEffectPlan::ManagedEnvironmentChange { recipe, .. } =
+            &self.installer_effects[index]
+        else {
+            return Err(InstallationError::IdentityConflict);
+        };
+        let required_stage = if super::managed_change_execution::managed_operation_stages(
+            recipe.operation,
+        ) {
+            InstallationStage::Staging
+        } else {
+            InstallationStage::Planned
+        };
+        if self.stage != required_stage {
+            return Err(InstallationError::IllegalTransition {
+                from: self.stage,
+                to: InstallationStage::Completed,
+            });
+        }
+        self.validate()?;
+        let InstallationEffectProgressState::Applied {
+            evidence,
+            postcondition_digest,
+            ..
+        } = &self.effect_progress[index].state
+        else {
+            return Err(InstallationError::IncompleteObservation(
+                "managed completion requires its exact applied effect receipt".to_owned(),
+            ));
+        };
+        let mut terminal_evidence = evidence.clone();
+        if let Some(receipt) = &self.effect_progress[index].staging_receipt {
+            terminal_evidence.push(PlatformHandle::new(receipt.digest()).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "effect_progress.staging_receipt".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?);
+        }
+        terminal_evidence.push(postcondition_digest.clone());
+        for reference in terminal_evidence {
+            if !self.completed_stage_refs.contains(&reference) {
+                self.completed_stage_refs.push(reference);
+            }
+        }
+        self.stage = InstallationStage::Completed;
+        self.revision = self.revision.checked_add(1).ok_or_else(|| {
+            InstallationError::InvalidField {
+                field: "revision".to_owned(),
+                reason: "overflow".to_owned(),
+            }
+        })?;
+        self.validate()
     }
 
     pub(super) fn is_constructor_planned(&self) -> bool {
@@ -2964,6 +3477,112 @@ impl InstallationTransaction {
         }
         Ok(readback)
     }
+}
+
+fn retained_managed_target_executable_observation(
+    accepted_plan_json: &str,
+    request: &ManagedEnvironmentChangeRequest,
+) -> Result<Option<(PlatformHandle, PlatformHandle, PlatformHandle)>, InstallationError> {
+    let accepted_plan: serde_json::Value =
+        serde_json::from_str(accepted_plan_json).map_err(|error| {
+            InstallationError::InvalidField {
+                field: "managed_effect.accepted_plan_json".to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+    let saved_target_identity = match accepted_plan.get("target_identity") {
+        Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(value)) => {
+            Some(retained_plan_handle(value, "managed_change_plan.target_identity")?)
+        }
+        _ => return Err(InstallationError::IdentityConflict),
+    };
+    match request.action {
+        super::ManagedEnvironmentAction::Install if saved_target_identity.is_none() => {}
+        super::ManagedEnvironmentAction::Install => {
+            return Err(InstallationError::IdentityConflict);
+        }
+        _ if saved_target_identity.as_ref() == Some(&request.exact_candidate) => {}
+        _ => return Err(InstallationError::IdentityConflict),
+    }
+    let Some(observation) = accepted_plan.get("target_executable_observation") else {
+        // Older same-wire managed rows did not retain this native observation;
+        // they remain explicitly unknown rather than borrowing the new recipe.
+        return Ok(None);
+    };
+    if observation.is_null() {
+        return Ok(None);
+    }
+    let Some(fields) = observation.as_object() else {
+        return Err(InstallationError::IdentityConflict);
+    };
+    if fields.len() != 3 {
+        return Err(InstallationError::IdentityConflict);
+    }
+    let target_identity = fields
+        .get("target_identity")
+        .and_then(serde_json::Value::as_str)
+        .map(|value| retained_plan_handle(value, "managed_change_plan.target_identity"))
+        .transpose()?
+        .ok_or(InstallationError::IdentityConflict)?;
+    let path = fields
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .map(|value| {
+            retained_plan_handle(
+                value,
+                "managed_change_plan.target_executable_observation.path",
+            )
+        })
+        .transpose()?
+        .ok_or(InstallationError::IdentityConflict)?;
+    let sha256 = fields
+        .get("sha256")
+        .and_then(serde_json::Value::as_str)
+        .map(|value| {
+            retained_plan_handle(
+                value,
+                "managed_change_plan.target_executable_observation.sha256",
+            )
+        })
+        .transpose()?
+        .ok_or(InstallationError::IdentityConflict)?;
+    if saved_target_identity.as_ref() != Some(&target_identity)
+        || target_identity != request.exact_candidate
+    {
+        return Err(InstallationError::IdentityConflict);
+    }
+    sha256_handle(
+        &sha256,
+        "managed_change_plan.target_executable_observation.sha256",
+    )?;
+    Ok(Some((target_identity, path, sha256)))
+}
+
+fn retained_plan_handle(value: &str, field: &str) -> Result<PlatformHandle, InstallationError> {
+    let platform_handle = PlatformHandle::new(value.to_owned()).map_err(|error| {
+        InstallationError::InvalidField {
+            field: field.to_owned(),
+            reason: error.to_string(),
+        }
+    })?;
+    handle(&platform_handle, field)?;
+    Ok(platform_handle)
+}
+
+fn managed_effect_identity(
+    request_id: &PlatformHandle,
+    role: &str,
+) -> Result<PlatformHandle, InstallationError> {
+    let bytes = serde_json::to_vec(&("managed-environment-effect-v1", request_id, role))
+        .map_err(|error| InstallationError::InvalidField {
+            field: "managed_effect.effect_id".to_owned(),
+            reason: error.to_string(),
+        })?;
+    PlatformHandle::new(sha256_hex(&bytes)).map_err(|error| InstallationError::InvalidField {
+        field: "managed_effect.effect_id".to_owned(),
+        reason: error.to_string(),
+    })
 }
 
 /// Private durable decoder shape for [`InstallationTransaction`].  The

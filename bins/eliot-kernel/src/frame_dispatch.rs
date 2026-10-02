@@ -1458,6 +1458,7 @@ fn is_daemon_operation(operation: &str) -> bool {
     matches!(
         operation,
         "snapshot"
+            | eliot_installation::INSTALLATION_SURVEY_PROBE_OPERATION
             | "daemon_ready"
             | "origin_challenge_issue"
             | "origin_control_decide"

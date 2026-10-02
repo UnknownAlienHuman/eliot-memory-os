@@ -1250,6 +1250,42 @@ impl ProcessRequest {
         )
     }
 
+    /// Projects the exact expected binding fields from this immutable request.
+    ///
+    /// This is passive comparison data for a component that must verify a
+    /// binding against the original sealed request. It does not authenticate
+    /// dispatch, consume a permit, or grant permission to execute. Requests
+    /// without an exact validation revision sealed into their permit cannot
+    /// produce this complete projection.
+    pub fn expected_execution_binding(&self) -> Result<ProcessExecutionBinding, ContractError> {
+        self.validate()?;
+        let validation_revision = self
+            .permit
+            .validation_revision
+            .ok_or(ContractError::InvalidValue {
+                field: "dispatch_permit.validation_revision",
+                reason: "an exact revision must be sealed to project the expected binding",
+            })?;
+        let binding = ProcessExecutionBinding {
+            operation_id: self.intent.operation_id.clone(),
+            process_tree_id: self.intent.process_tree_id.clone(),
+            job_id: self.intent.job_id.clone(),
+            image_id: self.intent.image_id.clone(),
+            session_id: self.intent.session_id.clone(),
+            generation: self.intent.generation,
+            action_lease_ref: self.permit.action_lease_ref.clone(),
+            authority_id: self.permit.authority_id.clone(),
+            authority_epoch: self.permit.state_fence.authority_epoch.clone(),
+            state_fence: self.permit.state_fence.clone(),
+            request_digest: self.invocation_digest.clone(),
+            permit_digest: self.permit.permit_digest.clone(),
+            effect_digest: self.intent.effect_digest.clone(),
+            validation_revision,
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
     fn compute_digest(&self) -> Result<String, ContractError> {
         #[derive(Serialize)]
         struct UnsignedRequest<'a> {
@@ -1904,6 +1940,13 @@ impl ExitStatus {
     /// Returns the physical disposition.
     pub const fn disposition(&self) -> ExitDisposition {
         self.disposition
+    }
+
+    /// Returns the observed exit code, when the physical disposition has one.
+    /// A completed disposition alone is not a successful exit observation.
+    #[must_use]
+    pub const fn code(&self) -> Option<i32> {
+        self.code
     }
 }
 
@@ -3190,6 +3233,49 @@ mod tests {
             Err(ContractError::DispatchPermitConsumed)
         ));
         assert_eq!(authority.consumed_permit_count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn expected_execution_binding_projects_only_exact_original_request_fields() -> TestResult {
+        let mut dispatch_authority = authority()?;
+        let intent = intent()?;
+        let permit = dispatch_authority.issue(
+            &intent,
+            PermitIssuance::new_with_validation_revision(
+                ActionLeaseRef::new("lease-1")?,
+                fence()?,
+                revisions(),
+                100,
+                200,
+                "expected-binding",
+                41,
+            )?,
+        )?;
+        let request = ProcessRequest::new(intent.clone(), permit)?;
+        let expected = request.expected_execution_binding()?;
+        let validated = dispatch_authority.validate_and_consume(
+            request,
+            observed(&intent)?,
+            &context(150)?,
+        )?;
+
+        assert_eq!(&expected, validated.binding());
+        assert_eq!(expected.validation_revision(), 41);
+
+        let mut unpinned_authority = authority()?;
+        let unpinned_intent = intent()?;
+        let unpinned = ProcessRequest::new(
+            unpinned_intent.clone(),
+            unpinned_authority.issue(&unpinned_intent, issuance("unpinned-binding")?)?,
+        )?;
+        assert!(matches!(
+            unpinned.expected_execution_binding(),
+            Err(ContractError::InvalidValue {
+                field: "dispatch_permit.validation_revision",
+                ..
+            })
+        ));
         Ok(())
     }
 

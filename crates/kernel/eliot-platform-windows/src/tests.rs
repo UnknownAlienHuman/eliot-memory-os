@@ -2967,7 +2967,7 @@ fn suspended_launch_does_not_start_before_consuming_validation() {
     let root = std::env::temp_dir().join(format!("eliot-p02-suspended-{}", unique_suffix()));
     std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
     let marker = root.join("started");
-    let child = spawn_suspended_child(&marker, &root, true);
+    let mut child = spawn_suspended_child(&marker, &root, true);
     let pid = child.id();
     assert!(!marker.exists(), "child must not run before ResumeThread");
     let terminal = child.terminate(0xE1_05).unwrap_or_else(|_| unreachable!());
@@ -3154,6 +3154,28 @@ fn resumed_tree_termination_is_consuming_and_reaps_every_member() {
     assert!(terminal.job_empty());
     assert!(terminal.root_reaped());
     assert!(pids.into_iter().all(wait_for_process_gone));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[test]
+fn running_survey_cleanup_transfer_keeps_original_child_until_reap() {
+    let _spawn_guard = process_job_spawn_test_guard();
+    let root = std::env::temp_dir().join(format!("eliot-p02-survey-cleanup-{}", unique_suffix()));
+    std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
+    let marker = root.join("started");
+    let child = spawn_suspended_child(&marker, &root, true);
+    let process_id = child.id();
+    let running = child
+        .validate::<(), &'static str, _>(|_| Ok(()))
+        .unwrap_or_else(|_| unreachable!())
+        .resume()
+        .unwrap_or_else(|_| unreachable!());
+
+    let mut cleanup_owner = running.into_survey_probe_cleanup_owner();
+    assert_eq!(cleanup_owner.id(), process_id);
+    assert_eq!(cleanup_owner.terminate_for_cleanup(), Ok(()));
+    assert!(wait_for_process_gone(process_id));
     let _ = std::fs::remove_dir_all(root);
 }
 

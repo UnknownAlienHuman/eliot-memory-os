@@ -21,7 +21,9 @@ use thiserror::Error;
 use eliot_contracts::{ContractVersion, StateFence, canonical_json_bytes, sha256_hex};
 
 use crate::first_run::FirstRunDecision;
-use crate::{ConfigPolicySnapshot, HumanOwner, PolicyFence, PolicyRevision, SourceCompleteness};
+use crate::{
+    ConfigPolicySnapshot, HumanOwner, PolicyFence, PolicyRevision, Setting, SourceCompleteness,
+};
 
 /// Stable schema marker for the signed initial configuration snapshot.
 pub const INITIAL_SNAPSHOT_SCHEMA: &str = "eliot.initial-config-snapshot.v1";
@@ -162,6 +164,31 @@ pub fn prepare_initial_snapshot_payload(
     privacy: PrivacyChoice,
     first_run: &FirstRunDecision,
 ) -> Result<InitialSnapshotPayload, InitialSnapshotError> {
+    prepare_initial_snapshot_payload_with_settings(identity, privacy, first_run, &[])
+}
+
+/// Builds the deterministic first signed configuration payload and appends
+/// settings accepted by the authenticated installation owner.
+///
+/// Additional settings stay in the same immutable genesis snapshot. Each must
+/// be owned by the same confirmed owner as the base first-run settings, and a
+/// key may appear only once across the complete snapshot. The payload digest
+/// is recalculated only after the final settings set has been validated.
+///
+/// This helper does not authenticate the owner or decide which settings are
+/// admissible. The installation publication owner must establish that
+/// authority before calling it and must pass the exact bytes to the protected
+/// signer and original durable snapshot store.
+///
+/// # Errors
+/// Returns [`InitialSnapshotError`] when the identity, choices, or appended
+/// settings are invalid or conflict with the first-run settings.
+pub fn prepare_initial_snapshot_payload_with_settings(
+    identity: &InitialSnapshotIdentity,
+    privacy: PrivacyChoice,
+    first_run: &FirstRunDecision,
+    additional_settings: &[Setting],
+) -> Result<InitialSnapshotPayload, InitialSnapshotError> {
     identity.validate()?;
     if matches!(privacy, PrivacyChoice::LocalOnly) && first_run.has_paid_route() {
         return Err(InitialSnapshotError::PrivacyChoiceConflict {
@@ -171,6 +198,21 @@ pub fn prepare_initial_snapshot_payload(
     let revision = PolicyRevision::genesis();
     let mut settings = crate::first_run::to_settings(first_run, &identity.owner_ref);
     settings.push(privacy.to_setting(&identity.owner_ref));
+    for setting in additional_settings {
+        non_empty_text(&setting.key, "snapshot.settings.key")?;
+        non_empty_text(&setting.value_ref, "snapshot.settings.value_ref")?;
+        non_empty_text(&setting.owner_ref, "snapshot.settings.owner_ref")?;
+        if setting.owner_ref != identity.owner_ref {
+            return Err(InitialSnapshotError::BindingMismatch);
+        }
+        if settings.iter().any(|existing| existing.key == setting.key) {
+            return Err(InitialSnapshotError::InvalidField {
+                field: "snapshot.settings".to_owned(),
+                reason: format!("setting key {} is already present", setting.key),
+            });
+        }
+        settings.push(setting.clone());
+    }
     let snapshot = ConfigPolicySnapshot {
         snapshot_id: identity.snapshot_id.clone(),
         machine_id: identity.machine_id.clone(),
@@ -439,6 +481,7 @@ impl SignedInitialConfigSnapshot {
         payload: &InitialSnapshotPayload,
         signer: &S,
     ) -> Result<SignedInitialConfigSnapshot, InitialSnapshotError> {
+        payload.validate()?;
         if signer.algorithm() != INITIAL_SNAPSHOT_SIGNATURE_ALGORITHM {
             return Err(InitialSnapshotError::UnsupportedAlgorithm(
                 signer.algorithm().to_owned(),
@@ -446,6 +489,9 @@ impl SignedInitialConfigSnapshot {
         }
         non_empty_text(signer.signer_id(), "signer_id")?;
         non_empty_text(signer.key_id(), "key_id")?;
+        if signer.signer_id() != payload.owner_ref {
+            return Err(InitialSnapshotError::BindingMismatch);
+        }
         let payload_bytes = payload.canonical_bytes()?;
         let payload_sha256 = sha256_hex(&payload_bytes);
         let preimage = SignedInitialSnapshotPreimage {

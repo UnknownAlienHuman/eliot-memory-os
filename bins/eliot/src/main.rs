@@ -56,6 +56,7 @@ mod controlboard_status;
 mod dashboard;
 mod dev_crate_check;
 mod first_run_flow;
+mod managed_installation;
 mod plugin_preview;
 mod release_surface;
 mod scope_observe;
@@ -208,6 +209,48 @@ enum BootstrapCommand {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum InstallationCommand {
+    /// Run the accepted ordered metadata survey without executing candidates.
+    Survey {
+        /// Original installation transaction journal.
+        #[arg(long, value_parser = absolute_path)]
+        store: PathBuf,
+        /// Original signed setup publication in that journal.
+        #[arg(long)]
+        publication_transaction_id: String,
+    },
+    /// Admit and execute one owner-approved external environment change.
+    ManagedChange {
+        /// Original installation transaction journal.
+        #[arg(long, value_parser = absolute_path)]
+        store: PathBuf,
+        /// Original signed setup publication in that journal.
+        #[arg(long)]
+        publication_transaction_id: String,
+        /// Exact request accepted in the signed approval set.
+        #[arg(long, value_parser = absolute_path)]
+        request: PathBuf,
+    },
+    /// Resume the original managed operation with fresh signed admission.
+    ManagedResume {
+        /// Original installation transaction journal.
+        #[arg(long, value_parser = absolute_path)]
+        store: PathBuf,
+        /// Original signed setup publication in that journal.
+        #[arg(long)]
+        publication_transaction_id: String,
+        /// Original managed transaction to resume.
+        #[arg(long)]
+        transaction_id: String,
+    },
+    /// Read the original managed effect outcome and qualification gaps.
+    ManagedStatus {
+        /// Original installation transaction journal.
+        #[arg(long, value_parser = absolute_path)]
+        store: PathBuf,
+        /// Original managed transaction to read.
+        #[arg(long)]
+        transaction_id: String,
+    },
     /// Retired compatibility command. It remains parseable but always fails
     /// closed before the planner, output, or durable store; use
     /// `installation materialize-source-bundle` for production generation.
@@ -893,55 +936,43 @@ enum SetupCommand {
         #[arg(long)]
         scope: String,
     },
-    /// Prepare the first signed configuration payload from the confirmed
-    /// privacy mode and first-run choices (I3.2 milestone 7).
-    ///
-    /// Preparation is deterministic and model-free: it reads no configuration
-    /// file, signs nothing, publishes nothing, and executes no model. The
-    /// installation owner signs, publishes, re-reads and verifies the payload
-    /// before it advances the setup binding.
+    /// Publish and read back the first System Owner signed configuration
+    /// through the original installation/setup transaction (I3.2 milestone 7).
     InitialConfig {
-        /// Identity of the immutable configuration snapshot being prepared.
+        /// Exact existing published installation transaction store.
         #[arg(long)]
-        snapshot_id: String,
-        /// Installation identity confirmed at setup milestone 1.
+        store: PathBuf,
+        /// Exact original setup transaction in that store.
         #[arg(long)]
-        installation_id: String,
-        /// Selected profile reference: `system_service`, `user_mode`, or
-        /// `portable_dev`.
+        transaction_id: String,
+        /// Explicit confirmation of the original installation identity.
         #[arg(long)]
-        profile_ref: String,
-        /// Confirmed System Owner reference and settings owner.
-        #[arg(long)]
-        owner_ref: String,
-        /// Active key identity bound to the established trust root.
-        #[arg(long)]
-        key_identity: String,
+        confirmed_installation_id: String,
         /// Machine identity the snapshot applies to.
         #[arg(long)]
         machine_id: String,
         /// Scope identity the snapshot applies to.
         #[arg(long)]
         scope_id: String,
-        /// Lowercase SHA-256 digest of the profile-bound runtime root topology.
-        #[arg(long)]
-        runtime_state_roots_digest: String,
-        /// Setup binding revision at milestone 7. Must be non-zero.
-        #[arg(long)]
-        setup_revision: u64,
-        /// Canonical lowercase hyphenated authority-epoch lineage UUID observed
-        /// by the installation owner.
+        /// Configuration observation of the canonical authority-epoch lineage;
+        /// this input grants no current Kernel authority.
         #[arg(long)]
         authority_lineage: String,
-        /// Non-zero authority-epoch sequence observed by the installation owner.
+        /// Non-zero authority-epoch sequence stored as configuration observation.
         #[arg(long)]
         authority_sequence: u64,
-        /// Non-zero resource generation observed by the installation owner.
+        /// Non-zero resource-generation configuration observation.
         #[arg(long)]
         resource_generation: u64,
         /// Confirmed privacy mode: `local_only` or `standard`.
         #[arg(long)]
         privacy: String,
+        /// Exact strict JSON catalogue the authenticated System Owner accepts.
+        #[arg(long)]
+        catalogue_json: String,
+        /// Exact strict JSON approved managed requests for that catalogue.
+        #[arg(long)]
+        approvals_json: String,
         /// Dreamer route kind: `unassigned`, `local`, `economy`, or `paid`.
         #[arg(long)]
         dreamer_route: Option<String>,
@@ -1073,19 +1104,17 @@ fn run_setup(command: SetupCommand) -> Result<i32> {
             scope,
         }),
         SetupCommand::InitialConfig {
-            snapshot_id,
-            installation_id,
-            profile_ref,
-            owner_ref,
-            key_identity,
+            store,
+            transaction_id,
+            confirmed_installation_id,
             machine_id,
             scope_id,
-            runtime_state_roots_digest,
-            setup_revision,
             authority_lineage,
             authority_sequence,
             resource_generation,
             privacy,
+            catalogue_json,
+            approvals_json,
             dreamer_route,
             watchdog_route,
             dreamer_displayed,
@@ -1093,20 +1122,21 @@ fn run_setup(command: SetupCommand) -> Result<i32> {
             dreamer_explicit,
             watchdog_explicit,
             automation,
-        } => first_run_flow::run_setup_initial_config(&first_run_flow::SetupInitialConfigArgs {
-            snapshot_id,
-            installation_id,
-            profile_ref,
-            owner_ref,
-            key_identity,
+        } => {
+            let transaction_id = parse_installation_transaction_id(transaction_id)
+                .context("parse the original setup transaction identity")?;
+            let mut store = RedbInstallationTransactionStore::open_existing_exact_path(&store)
+                .context("open the original published installation transaction store")?;
+            first_run_flow::run_setup_initial_config(&first_run_flow::SetupInitialConfigArgs {
+            confirmed_installation_id,
             machine_id,
             scope_id,
-            runtime_state_roots_digest,
-            setup_revision,
             authority_lineage,
             authority_sequence,
             resource_generation,
             privacy,
+            catalogue_json,
+            approvals_json,
             dreamer_route,
             watchdog_route,
             dreamer_displayed,
@@ -1114,7 +1144,8 @@ fn run_setup(command: SetupCommand) -> Result<i32> {
             dreamer_explicit,
             watchdog_explicit,
             automation,
-        }),
+            }, &mut store, &transaction_id)
+        },
     }
 }
 
@@ -2222,6 +2253,18 @@ fn write_manifest_canary_error(pulse: u8, code: &str, detail: &str) {
 #[allow(clippy::too_many_lines)]
 fn run_installation(command: InstallationCommand) -> Result<i32> {
     match command {
+        InstallationCommand::Survey { store, publication_transaction_id } => {
+            managed_installation::survey(&store, &publication_transaction_id)
+        }
+        InstallationCommand::ManagedChange { store, publication_transaction_id, request } => {
+            managed_installation::change(&store, &publication_transaction_id, &request)
+        }
+        InstallationCommand::ManagedResume { store, publication_transaction_id, transaction_id } => {
+            managed_installation::resume(&store, &publication_transaction_id, &transaction_id)
+        }
+        InstallationCommand::ManagedStatus { store, transaction_id } => {
+            managed_installation::status(&store, &transaction_id)
+        }
         InstallationCommand::Generate { .. } => {
             write_installation_error(
                 "INSTALLATION_GENERATE_RETIRED",

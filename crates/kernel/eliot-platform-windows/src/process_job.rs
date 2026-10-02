@@ -53,6 +53,9 @@ use crate::same_windows_path;
 use crate::validate_complete_environment;
 use crate::wait_for_job_empty;
 use crate::windows_adapter_from_io;
+use crate::process_path_lease::{
+    RetainedSurveyProbePathLease, SurveyProbeAppContainerProfile,
+};
 
 #[path = "process_job_observation_models.rs"]
 mod process_job_observation_models;
@@ -308,6 +311,13 @@ impl OuterKillDomain {
 
 #[cfg(windows)]
 static JOB_OBJECT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(all(test, windows))]
+std::thread_local! {
+    static FAIL_NEXT_JOB_CHILD_CLEANUP_READBACK: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
 
 /// RAII wrapper for a named Windows Job Object configured to terminate
 /// assigned processes when the sole owning handle closes.
@@ -1325,6 +1335,59 @@ pub struct SuspendedProcessEvidence {
     command_line_utf16: Vec<u16>,
     job_process_count: u32,
     enforced_limits: Option<JobObjectLimits>,
+    survey_probe_token: Option<SurveyProbeTokenEvidence>,
+}
+
+/// Fresh, handle-bound security-token facts for a suspended survey probe.
+/// This is observational mechanics only and carries no launch authority.
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SurveyProbeTokenEvidence {
+    app_container_sid: String,
+    app_container_membership: bool,
+    /// True only because this process was successfully created with the
+    /// documented `ALL_APPLICATION_PACKAGES_OPT_OUT` policy attribute. The
+    /// LPAC property is construction-bound; Windows does not document a
+    /// `GetTokenInformation` result layout for information class 46.
+    lpac_policy_applied: bool,
+    low_integrity: bool,
+    elevated: bool,
+    capability_count: u32,
+}
+
+#[cfg(windows)]
+impl SurveyProbeTokenEvidence {
+    #[must_use]
+    pub fn app_container_sid(&self) -> &str {
+        &self.app_container_sid
+    }
+
+    #[must_use]
+    pub const fn app_container_membership(&self) -> bool {
+        self.app_container_membership
+    }
+
+    /// Reports the accepted process-creation LPAC policy attribute. This is
+    /// construction evidence, not an independently queried token-class bit.
+    #[must_use]
+    pub const fn lpac_policy_applied(&self) -> bool {
+        self.lpac_policy_applied
+    }
+
+    #[must_use]
+    pub const fn low_integrity(&self) -> bool {
+        self.low_integrity
+    }
+
+    #[must_use]
+    pub const fn elevated(&self) -> bool {
+        self.elevated
+    }
+
+    #[must_use]
+    pub const fn capability_count(&self) -> u32 {
+        self.capability_count
+    }
 }
 
 #[cfg(windows)]
@@ -1398,16 +1461,93 @@ impl SuspendedProcessEvidence {
     pub const fn enforced_limits(&self) -> Option<JobObjectLimits> {
         self.enforced_limits
     }
+
+    /// Returns the strict AppContainer token readback when this child was
+    /// admitted through the survey-probe launch path.
+    #[must_use]
+    pub fn survey_probe_token(&self) -> Option<&SurveyProbeTokenEvidence> {
+        self.survey_probe_token.as_ref()
+    }
 }
 
 /// Failure of the consuming caller-owned validation transition.
 #[cfg(windows)]
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub enum SuspendedValidationError<E> {
     Mechanics(WindowsAdapterError),
     Rejected(E),
     /// Cleanup could not observe that the still-suspended child was reaped.
-    UnknownOutcome,
+    /// The exact process and Job handles remain available to the original
+    /// operation owner for another bounded cleanup/readback attempt.
+    UnknownOutcome {
+        child: SuspendedJobChild,
+        primary_failure: String,
+    },
+}
+
+/// Result of constructing and mechanically validating a new suspended child.
+/// Unknown post-create cleanup retains the exact still-suspended process and
+/// Job handles for the original ProcessExecutor operation.
+#[cfg(windows)]
+#[derive(Debug)]
+pub enum SuspendedSpawnError {
+    Mechanics(WindowsAdapterError),
+    UnknownOutcome {
+        child: SuspendedJobChild,
+        primary_failure: String,
+        cleanup_failure: WindowsAdapterError,
+    },
+}
+
+/// Resume failure for the strictly admitted installation-survey launch path.
+/// Unknown cleanup retains the exact process and Job owner; it never returns a
+/// running child or a successful observation.
+#[cfg(windows)]
+#[derive(Debug)]
+pub enum SurveyProbeResumeError {
+    Mechanics(WindowsAdapterError),
+    UnknownOutcome {
+        child: SuspendedJobChild,
+        primary_failure: WindowsAdapterError,
+        cleanup_failure: WindowsAdapterError,
+    },
+}
+
+#[cfg(windows)]
+fn survey_probe_resume_failure(
+    mut inner: JobChildHandles,
+    primary_failure: WindowsAdapterError,
+) -> SurveyProbeResumeError {
+    if inner.best_effort_cleanup() {
+        SurveyProbeResumeError::Mechanics(primary_failure)
+    } else {
+        SurveyProbeResumeError::UnknownOutcome {
+            child: SuspendedJobChild {
+                owner: SuspendedJobChildOwner::CleanupOnly(inner),
+            },
+            primary_failure,
+            cleanup_failure: WindowsAdapterError::Timeout,
+        }
+    }
+}
+
+#[cfg(windows)]
+impl From<WindowsAdapterError> for SuspendedSpawnError {
+    fn from(error: WindowsAdapterError) -> Self {
+        Self::Mechanics(error)
+    }
+}
+
+#[cfg(windows)]
+impl SuspendedSpawnError {
+    fn into_adapter_error(self) -> WindowsAdapterError {
+        match self {
+            Self::Mechanics(error) => error,
+            Self::UnknownOutcome {
+                cleanup_failure, ..
+            } => cleanup_failure,
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -1741,6 +1881,9 @@ fn job_process_observer_loop(
 struct ProcThreadAttributeList {
     _storage: Vec<usize>,
     list: windows_sys::Win32::System::Threading::LPPROC_THREAD_ATTRIBUTE_LIST,
+    _security_capabilities: Option<
+        Box<windows_sys::Win32::Security::SECURITY_CAPABILITIES>,
+    >,
 }
 
 #[cfg(windows)]
@@ -1792,6 +1935,95 @@ impl ProcThreadAttributeList {
         Ok(Self {
             _storage: storage,
             list,
+            _security_capabilities: None,
+        })
+    }
+
+    fn for_survey_probe(
+        handles: &[windows_sys::Win32::Foundation::HANDLE],
+        profile: &SurveyProbeAppContainerProfile,
+    ) -> Result<Self, WindowsAdapterError> {
+        use windows_sys::Win32::System::Threading::{
+            InitializeProcThreadAttributeList,
+            PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+            UpdateProcThreadAttribute,
+        };
+        use windows_sys::Win32::System::WindowsProgramming::
+            PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
+
+        let mut bytes = 0_usize;
+        // SAFETY: the documented sizing call writes only `bytes`.
+        unsafe {
+            InitializeProcThreadAttributeList(std::ptr::null_mut(), 3, 0, &raw mut bytes);
+        }
+        if bytes == 0 {
+            return Err(last_windows_adapter_error());
+        }
+        let mut storage = vec![0_usize; bytes.div_ceil(std::mem::size_of::<usize>())];
+        let list = storage.as_mut_ptr().cast::<std::ffi::c_void>();
+        // SAFETY: storage is aligned, sufficiently large, and retained.
+        if unsafe { InitializeProcThreadAttributeList(list, 3, 0, &raw mut bytes) } == 0 {
+            return Err(last_windows_adapter_error());
+        }
+        let mut security_capabilities = Box::new(
+            windows_sys::Win32::Security::SECURITY_CAPABILITIES {
+                AppContainerSid: profile.sid(),
+                Capabilities: std::ptr::null_mut(),
+                CapabilityCount: 0,
+                Reserved: 0,
+            },
+        );
+        let handle_attribute = usize::try_from(PROC_THREAD_ATTRIBUTE_HANDLE_LIST)
+            .map_err(|_| WindowsAdapterError::Failed)?;
+        let security_attribute = usize::try_from(PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES)
+            .map_err(|_| WindowsAdapterError::Failed)?;
+        let lpac_attribute = usize::try_from(PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY)
+            .map_err(|_| WindowsAdapterError::Failed)?;
+        // SAFETY: the initialized list and every input remain live through the
+        // eventual CreateProcessW call; the boxed SECURITY_CAPABILITIES stays
+        // at a stable address and names the retained created profile SID.
+        let updated = unsafe {
+            UpdateProcThreadAttribute(
+                list,
+                0,
+                handle_attribute,
+                handles.as_ptr().cast::<std::ffi::c_void>(),
+                std::mem::size_of_val(handles),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            ) != 0
+                && UpdateProcThreadAttribute(
+                    list,
+                    0,
+                    security_attribute,
+                    (&raw const *security_capabilities).cast(),
+                    std::mem::size_of::<windows_sys::Win32::Security::SECURITY_CAPABILITIES>(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                ) != 0
+                && UpdateProcThreadAttribute(
+                    list,
+                    0,
+                    lpac_attribute,
+                    (&raw const PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT).cast(),
+                    std::mem::size_of_val(
+                        &PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT,
+                    ),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                ) != 0
+        };
+        if !updated {
+            let error = last_windows_adapter_error();
+            // SAFETY: list was initialized above.
+            unsafe { windows_sys::Win32::System::Threading::DeleteProcThreadAttributeList(list) };
+            return Err(error);
+        }
+        Ok(Self {
+            _storage: storage,
+            list,
+            _security_capabilities: Some(security_capabilities),
         })
     }
 }
@@ -1928,6 +2160,7 @@ struct JobChildHandles {
     stdout: Option<std::fs::File>,
     stderr: Option<std::fs::File>,
     observer: JobProcessObserver,
+    survey_probe_profile_sid: Option<String>,
     terminal: bool,
 }
 
@@ -1960,6 +2193,11 @@ impl JobChildHandles {
         if count == 0 {
             return Err(WindowsAdapterError::IdentityMismatch);
         }
+        let survey_probe_token = self
+            .survey_probe_profile_sid
+            .as_deref()
+            .map(|expected_sid| survey_probe_token_evidence(self.process.0, expected_sid))
+            .transpose()?;
         Ok(SuspendedProcessEvidence {
             process,
             executable: observed_file,
@@ -1971,6 +2209,7 @@ impl JobChildHandles {
             command_line_utf16: self.command_line_utf16.clone(),
             job_process_count: count,
             enforced_limits: Some(self.resource_limits),
+            survey_probe_token,
         })
     }
 
@@ -2017,7 +2256,9 @@ impl JobChildHandles {
     ) -> Result<(i32, JobProcessHistory), WindowsAdapterError> {
         use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
         use windows_sys::Win32::System::Threading::WaitForSingleObject;
-        self.job.terminate(requested_exit_code)?;
+        if self.active_process_count()? > 0 {
+            self.job.terminate(requested_exit_code)?;
+        }
         wait_for_job_empty(self.job.handle, std::time::Duration::from_secs(5))?;
         if unsafe { WaitForSingleObject(self.process.0, 5_000) } != WAIT_OBJECT_0 {
             return Err(WindowsAdapterError::Timeout);
@@ -2036,25 +2277,209 @@ impl JobChildHandles {
         if self.terminal {
             return true;
         }
+        #[cfg(test)]
+        if FAIL_NEXT_JOB_CHILD_CLEANUP_READBACK.with(|fail| fail.replace(false)) {
+            return false;
+        }
         let _ = unsafe { TerminateProcess(self.process.0, 0xE1_04) };
         let _ = self.job.terminate(0xE1_04);
         let job_empty =
             wait_for_job_empty(self.job.handle, std::time::Duration::from_secs(5)).is_ok();
         let process_reaped = unsafe { WaitForSingleObject(self.process.0, 5_000) } == WAIT_OBJECT_0;
-        self.terminal = job_empty && process_reaped;
+        let history_empty = self
+            .observer
+            .wait_for_empty_history(self.job.handle, std::time::Duration::from_secs(5))
+            .is_ok();
+        self.terminal = job_empty && process_reaped && history_empty;
         self.terminal
     }
 
     fn cleanup_after_pre_resume_failure(
         mut self,
         original: WindowsAdapterError,
-    ) -> WindowsAdapterError {
+    ) -> SuspendedSpawnError {
         if self.best_effort_cleanup() {
-            original
+            SuspendedSpawnError::Mechanics(original)
         } else {
-            WindowsAdapterError::Timeout
+            SuspendedSpawnError::UnknownOutcome {
+                child: SuspendedJobChild {
+                    owner: SuspendedJobChildOwner::CleanupOnly(self),
+                },
+                primary_failure: original.to_string(),
+                cleanup_failure: WindowsAdapterError::Timeout,
+            }
         }
     }
+}
+
+/// Reads only documented token fields from the exact suspended process handle.
+/// LPAC itself is construction-bound by the successful process-creation call
+/// carrying `ALL_APPLICATION_PACKAGES_OPT_OUT`; information class 46 is not
+/// queried because its Win32 output layout is undocumented.
+#[cfg(windows)]
+fn survey_probe_token_evidence(
+    process: windows_sys::Win32::Foundation::HANDLE,
+    expected_app_container_sid: &str,
+) -> Result<SurveyProbeTokenEvidence, WindowsAdapterError> {
+    use windows_sys::Win32::Security::{
+        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation,
+        TOKEN_APPCONTAINER_INFORMATION, TOKEN_ELEVATION, TOKEN_GROUPS, TOKEN_MANDATORY_LABEL,
+        TOKEN_QUERY, TokenAppContainerSid, TokenCapabilities, TokenElevation, TokenIntegrityLevel,
+        TokenIsAppContainer, SECURITY_MAX_SID_SIZE,
+    };
+    use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, GetLastError};
+    use windows_sys::Win32::System::Threading::OpenProcessToken;
+    use windows_sys::Win32::System::SystemServices::SECURITY_MANDATORY_LOW_RID;
+
+    let mut token = std::ptr::null_mut();
+    // SAFETY: `process` is the live handle retained by the suspended child;
+    // the result slot is initialized and requests query-only access.
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &raw mut token) } == 0 {
+        return Err(last_windows_adapter_error());
+    }
+    let token = OwnedKernelHandle::new(token)?;
+
+    fn read_token_value<T: Default>(
+        token: windows_sys::Win32::Foundation::HANDLE,
+        information_class: windows_sys::Win32::Security::TOKEN_INFORMATION_CLASS,
+    ) -> Result<T, WindowsAdapterError> {
+        use windows_sys::Win32::Security::GetTokenInformation;
+
+        let mut value = T::default();
+        let mut returned = 0_u32;
+        let length = u32::try_from(std::mem::size_of::<T>())
+            .map_err(|_| WindowsAdapterError::Failed)?;
+        // SAFETY: `value` is a writable output buffer of exactly `length`;
+        // the token is live and queried for a fixed-size documented class.
+        if unsafe {
+            GetTokenInformation(
+                token,
+                information_class,
+                (&raw mut value).cast(),
+                length,
+                &raw mut returned,
+            )
+        } == 0
+            || returned != length
+        {
+            return Err(last_windows_adapter_error());
+        }
+        Ok(value)
+    }
+
+    fn read_token_buffer(
+        token: windows_sys::Win32::Foundation::HANDLE,
+        information_class: windows_sys::Win32::Security::TOKEN_INFORMATION_CLASS,
+        maximum_bytes: usize,
+        minimum_bytes: usize,
+    ) -> Result<Vec<usize>, WindowsAdapterError> {
+        use windows_sys::Win32::Security::GetTokenInformation;
+
+        let mut required = 0_u32;
+        // SAFETY: a null buffer with zero length is the documented sizing
+        // query; `required` is a valid result slot and the token is live.
+        if unsafe { GetTokenInformation(token, information_class, std::ptr::null_mut(), 0, &raw mut required) } != 0
+            || required == 0
+            || unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER
+            || usize::try_from(required).map_err(|_| WindowsAdapterError::Failed)? > maximum_bytes
+            || usize::try_from(required).map_err(|_| WindowsAdapterError::Failed)? < minimum_bytes
+        {
+            return Err(last_windows_adapter_error());
+        }
+        let required = usize::try_from(required).map_err(|_| WindowsAdapterError::Failed)?;
+        let mut buffer = vec![0_usize; required.div_ceil(std::mem::size_of::<usize>())];
+        let buffer_length = u32::try_from(required).map_err(|_| WindowsAdapterError::Failed)?;
+        let mut returned = 0_u32;
+        // SAFETY: the aligned vector is large enough for the exact size
+        // Windows reported, and all pointers stay live for this call.
+        if unsafe {
+            GetTokenInformation(
+                token,
+                information_class,
+                buffer.as_mut_ptr().cast(),
+                buffer_length,
+                &raw mut returned,
+            )
+        } == 0
+            || returned != buffer_length
+        {
+            return Err(last_windows_adapter_error());
+        }
+        Ok(buffer)
+    }
+
+    let app_container = read_token_value::<u32>(token.0, TokenIsAppContainer)? != 0;
+    let app_container_info_buffer = read_token_buffer(
+        token.0,
+        TokenAppContainerSid,
+        std::mem::size_of::<TOKEN_APPCONTAINER_INFORMATION>()
+            .saturating_add(SECURITY_MAX_SID_SIZE as usize),
+        std::mem::size_of::<TOKEN_APPCONTAINER_INFORMATION>(),
+    )?;
+    let app_container_info = unsafe {
+        &*app_container_info_buffer
+            .as_ptr()
+            .cast::<TOKEN_APPCONTAINER_INFORMATION>()
+    };
+    let app_container_sid = if app_container_info.TokenAppContainer.is_null() {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    } else {
+        crate::sid_to_string(app_container_info.TokenAppContainer)
+            .map_err(|_| WindowsAdapterError::Failed)?
+    };
+    let capabilities_buffer = read_token_buffer(
+        token.0,
+        TokenCapabilities,
+        std::mem::size_of::<TOKEN_GROUPS>(),
+        std::mem::size_of::<u32>(),
+    )?;
+    let capabilities = unsafe { &*capabilities_buffer.as_ptr().cast::<TOKEN_GROUPS>() };
+    let elevation = read_token_value::<TOKEN_ELEVATION>(token.0, TokenElevation)?;
+    let integrity_buffer = read_token_buffer(
+        token.0,
+        TokenIntegrityLevel,
+        std::mem::size_of::<TOKEN_MANDATORY_LABEL>()
+            .saturating_add(SECURITY_MAX_SID_SIZE as usize),
+        std::mem::size_of::<TOKEN_MANDATORY_LABEL>(),
+    )?;
+    let integrity = unsafe { &*integrity_buffer.as_ptr().cast::<TOKEN_MANDATORY_LABEL>() };
+    if integrity.Label.Sid.is_null() {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    // SAFETY: the token-provided SID remains owned by the live token result
+    // buffer until this function returns; both accessors validate SID layout.
+    let subauthority_count = unsafe { GetSidSubAuthorityCount(integrity.Label.Sid) };
+    if subauthority_count.is_null() || unsafe { *subauthority_count } == 0 {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    let integrity_rid = unsafe {
+        GetSidSubAuthority(
+            integrity.Label.Sid,
+            u32::from(*subauthority_count).saturating_sub(1),
+        )
+    };
+    if integrity_rid.is_null() {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    let low_integrity = unsafe { *integrity_rid } <= SECURITY_MANDATORY_LOW_RID as u32;
+    if !app_container
+        || !app_container_sid.eq_ignore_ascii_case(expected_app_container_sid)
+        || capabilities.GroupCount != 0
+        || !low_integrity
+        || elevation.TokenIsElevated != 0
+    {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    Ok(SurveyProbeTokenEvidence {
+        app_container_sid,
+        app_container_membership: app_container,
+        // The caller reaches this helper only after CreateProcessW accepted
+        // both SECURITY_CAPABILITIES and ALL_APPLICATION_PACKAGES_OPT_OUT.
+        lpac_policy_applied: true,
+        low_integrity,
+        elevated: elevation.TokenIsElevated != 0,
+        capability_count: capabilities.GroupCount,
+    })
 }
 
 #[cfg(windows)]
@@ -2127,6 +2552,7 @@ impl ExistingJobMemberHandles {
             // ceilings enforced by that Job are unknown to this launch and
             // stay explicit here instead of a containment claim.
             enforced_limits: None,
+            survey_probe_token: None,
         })
     }
 
@@ -2549,7 +2975,83 @@ impl<V> RunningExistingJobChild<'_, V> {
 /// typestate transitions, so neither transition can be repeated.
 #[cfg(windows)]
 pub struct SuspendedJobChild {
-    inner: JobChildHandles,
+    owner: SuspendedJobChildOwner,
+}
+
+#[cfg(windows)]
+enum SuspendedJobChildOwner {
+    Ready(JobChildHandles),
+    /// A pre-resume error path transferred the exact process/Job handles to
+    /// the original executor for cleanup. It is not eligible for validation,
+    /// resume, or successful process evidence.
+    CleanupOnly(JobChildHandles),
+    /// CreateProcessW reported success but returned an incomplete process
+    /// information pair. This owner can only terminate/read back the exact
+    /// returned process handle and Job; it can never validate or resume.
+    Partial(PartialProcessCreationCleanup),
+}
+
+#[cfg(windows)]
+struct PartialProcessCreationCleanup {
+    process: Option<OwnedProcessHandle>,
+    thread: Option<OwnedProcessHandle>,
+    job: JobObject,
+    observer: JobProcessObserver,
+    terminal: bool,
+}
+
+#[cfg(windows)]
+impl PartialProcessCreationCleanup {
+    fn best_effort_cleanup(&mut self) -> bool {
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+
+        if self.terminal {
+            return true;
+        }
+
+        let Some(process) = self.process.as_ref() else {
+            // A PID or thread handle alone is not a safe substitute for the
+            // original process handle. Keep the original Job/handles and
+            // report unknown until an owner can establish termination.
+            let _ = self.job.terminate(0xE1_04);
+            let _ = wait_for_job_empty(self.job.handle, std::time::Duration::from_secs(5));
+            let _ = self.observer.snapshot(self.job.handle);
+            return false;
+        };
+
+        let _ = unsafe { TerminateProcess(process.0, 0xE1_04) };
+        let process_reaped = unsafe { WaitForSingleObject(process.0, 5_000) } == WAIT_OBJECT_0;
+        let _ = self.job.terminate(0xE1_04);
+        let job_empty = wait_for_job_empty(self.job.handle, std::time::Duration::from_secs(5))
+            .is_ok();
+        let history_empty = self
+            .observer
+            .snapshot(self.job.handle)
+            .is_ok_and(|history| history.processes().is_empty());
+        self.terminal = process_reaped && job_empty && history_empty;
+        self.terminal
+    }
+}
+
+#[cfg(windows)]
+impl std::fmt::Debug for SuspendedJobChild {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.owner {
+            SuspendedJobChildOwner::Ready(inner)
+            | SuspendedJobChildOwner::CleanupOnly(inner) => formatter
+                .debug_struct("SuspendedJobChild")
+                .field("process_id", &inner.spawn_identity.process_id)
+                .field("terminal", &inner.terminal)
+                .finish_non_exhaustive(),
+            SuspendedJobChildOwner::Partial(inner) => formatter
+                .debug_struct("SuspendedJobChild")
+                .field("process_handle_retained", &inner.process.is_some())
+                .field("thread_handle_retained", &inner.thread.is_some())
+                .field("terminal", &inner.terminal)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 /// Suspended child carrying the opaque token returned by caller-owned policy.
@@ -2778,7 +3280,8 @@ impl SuspendedJobChild {
         job_identity: JobObjectIdentity,
         resource_limits: JobObjectLimits,
     ) -> Result<Self, WindowsAdapterError> {
-        Self::spawn_named_job_child(spec, job_identity, resource_limits, None, None)
+        Self::spawn_named_job_child(spec, job_identity, resource_limits, None, None, None)
+            .map_err(SuspendedSpawnError::into_adapter_error)
     }
 
     /// Creates a child suspended in one exact fresh Host-owned outer Job
@@ -2817,7 +3320,9 @@ impl SuspendedJobChild {
             resource_limits,
             Some(outer_kill_domain),
             None,
+            None,
         )
+        .map_err(SuspendedSpawnError::into_adapter_error)
     }
 
     /// Creates a child suspended in a fresh per-generation/per-attempt Job
@@ -2859,7 +3364,68 @@ impl SuspendedJobChild {
         {
             return Err(WindowsAdapterError::IdentityMismatch);
         }
-        Self::spawn_named_job_child(spec, job_identity, resource_limits, None, Some(&outer_job))
+        Self::spawn_named_job_child(
+            spec,
+            job_identity,
+            resource_limits,
+            None,
+            Some(&outer_job),
+            None,
+        )
+        .map_err(SuspendedSpawnError::into_adapter_error)
+    }
+
+    /// Creates one suspended survey probe inside the current Host Kernel Job,
+    /// with the exact newly-created operation AppContainer profile and LPAC
+    /// process attributes. The path scope is revalidated before the child is
+    /// created and is retained by the executor through terminal cleanup.
+    ///
+    /// # Errors
+    /// Returns a typed refusal when the profile, retained path scope, outer
+    /// Job, or suspended launch cannot be revalidated exactly.
+    pub fn spawn_nested_in_kernel_outer_kill_domain_for_survey_probe(
+        spec: SuspendedLaunchSpec,
+        job_identity: JobObjectIdentity,
+        resource_limits: JobObjectLimits,
+        outer_binding: RecoverableJobBinding,
+        profile: &SurveyProbeAppContainerProfile,
+        path_scope: &RetainedSurveyProbePathLease,
+    ) -> Result<Self, SuspendedSpawnError> {
+        if !profile.is_active()
+            || profile.identity() != path_scope.app_container_identity()
+            || spec.executable() != path_scope.executable_path()
+            || spec.working_directory() != path_scope.working_directory()
+            || path_scope
+                .validate_request_binding(
+                    spec.executable(),
+                    path_scope.executable_sha256(),
+                    spec.working_directory(),
+                    path_scope.operation_id(),
+                    path_scope.invocation_digest(),
+                )
+                .is_err()
+            || !OuterKillDomain::Kernel.owns_host_job_name(outer_binding.job_identity().name())
+        {
+            return Err(WindowsAdapterError::IdentityMismatch.into());
+        }
+        require_probed_outer_kill_domain(OuterKillDomain::Kernel)?;
+        let outer_job = RecoverableJobObject::open(outer_binding)?;
+        let current_process = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() };
+        let current_identity = inspect_process_handle(std::process::id(), current_process)
+            .map_err(|error| windows_adapter_from_io(&error))?;
+        if outer_job.binding().root().process() != &current_identity
+            || !is_process_in_job(current_process, outer_job.handle.0)?
+        {
+            return Err(WindowsAdapterError::IdentityMismatch.into());
+        }
+        Self::spawn_named_job_child(
+            spec,
+            job_identity,
+            resource_limits,
+            None,
+            Some(&outer_job),
+            Some(profile),
+        )
     }
 
     #[allow(
@@ -2872,7 +3438,8 @@ impl SuspendedJobChild {
         resource_limits: JobObjectLimits,
         outer_kill_domain: Option<OuterKillDomain>,
         required_outer_job: Option<&RecoverableJobObject>,
-    ) -> Result<Self, WindowsAdapterError> {
+        survey_profile: Option<&SurveyProbeAppContainerProfile>,
+    ) -> Result<Self, SuspendedSpawnError> {
         use windows_sys::Win32::System::Threading::{
             CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
             EXTENDED_STARTUPINFO_PRESENT, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
@@ -2895,7 +3462,12 @@ impl SuspendedJobChild {
         make_non_inheritable(stdout_read.0)?;
         make_non_inheritable(stderr_read.0)?;
         let inherited_handles = [stdin_read.0, stdout_write.0, stderr_write.0];
-        let attributes = ProcThreadAttributeList::for_inherited_handles(&inherited_handles)?;
+        let attributes = match survey_profile {
+            Some(profile) => {
+                ProcThreadAttributeList::for_survey_probe(&inherited_handles, profile)?
+            }
+            None => ProcThreadAttributeList::for_inherited_handles(&inherited_handles)?,
+        };
         let job = match outer_kill_domain {
             Some(domain) => JobObject::new_named_outer_kill_on_close_with_limits(
                 domain,
@@ -2938,39 +3510,21 @@ impl SuspendedJobChild {
             )
         } == 0
         {
-            return Err(last_windows_adapter_error());
+            return Err(last_windows_adapter_error().into());
         }
         if information.hProcess.is_null() || information.hThread.is_null() {
-            use windows_sys::Win32::Foundation::CloseHandle;
-            use windows_sys::Win32::System::Threading::{
-                OpenProcess, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+            let child = SuspendedJobChild {
+                owner: SuspendedJobChildOwner::Partial(PartialProcessCreationCleanup {
+                    process: (!information.hProcess.is_null())
+                        .then(|| OwnedProcessHandle(information.hProcess)),
+                    thread: (!information.hThread.is_null())
+                        .then(|| OwnedProcessHandle(information.hThread)),
+                    job,
+                    observer,
+                    terminal: false,
+                }),
             };
-            let cleanup_process = if information.hProcess.is_null() && information.dwProcessId != 0
-            {
-                unsafe { OpenProcess(PROCESS_TERMINATE | 0x0010_0000, 0, information.dwProcessId) }
-            } else {
-                information.hProcess
-            };
-            let mut cleanup_observed = false;
-            if !cleanup_process.is_null() {
-                let _ = unsafe { TerminateProcess(cleanup_process, 0xE1_04) };
-                cleanup_observed = unsafe { WaitForSingleObject(cleanup_process, 5_000) }
-                    == windows_sys::Win32::Foundation::WAIT_OBJECT_0;
-                if cleanup_process != information.hProcess {
-                    unsafe { CloseHandle(cleanup_process) };
-                }
-            }
-            if !information.hThread.is_null() {
-                unsafe { CloseHandle(information.hThread) };
-            }
-            if !information.hProcess.is_null() {
-                unsafe { CloseHandle(information.hProcess) };
-            }
-            return Err(if cleanup_observed {
-                WindowsAdapterError::Failed
-            } else {
-                WindowsAdapterError::Timeout
-            });
+            return Err(child.cleanup_after_pre_resume_failure(WindowsAdapterError::Failed));
         }
         // A one-shot request is delivered before resume and followed by EOF.
         // Live mode keeps the sole parent writer attached to this exact child
@@ -3001,20 +3555,22 @@ impl SuspendedJobChild {
         };
         let process = match OwnedProcessHandle::new(information.hProcess) {
             Ok(process) => process,
-            Err(error) => return Err(cleanup_error(&mut cleanup, error)),
+            Err(error) => return Err(cleanup_error(&mut cleanup, error).into()),
         };
         let thread = match OwnedProcessHandle::new(information.hThread) {
             Ok(thread) => thread,
-            Err(error) => return Err(cleanup_error(&mut cleanup, error)),
+            Err(error) => return Err(cleanup_error(&mut cleanup, error).into()),
         };
         if let Err(error) = stdin_delivery {
-            return Err(cleanup_error(&mut cleanup, error));
+            return Err(cleanup_error(&mut cleanup, error).into());
         }
         let spawn_identity =
             match inspect_process_handle(information.dwProcessId, information.hProcess) {
                 Ok(identity) => identity,
                 Err(error) => {
-                    return Err(cleanup_error(&mut cleanup, windows_adapter_from_io(&error)));
+                    return Err(
+                        cleanup_error(&mut cleanup, windows_adapter_from_io(&error)).into(),
+                    );
                 }
             };
         let inner = JobChildHandles {
@@ -3030,6 +3586,7 @@ impl SuspendedJobChild {
             stdout: Some(stdout_read.into_file()),
             stderr: Some(stderr_read.into_file()),
             observer,
+            survey_probe_profile_sid: survey_profile.map(|profile| profile.sid_text().to_owned()),
             terminal: false,
         };
         cleanup.disarm();
@@ -3065,12 +3622,21 @@ impl SuspendedJobChild {
         if let Err(error) = post_create {
             return Err(inner.cleanup_after_pre_resume_failure(error));
         }
-        Ok(Self { inner })
+        Ok(Self {
+            owner: SuspendedJobChildOwner::Ready(inner),
+        })
     }
 
     #[must_use]
     pub const fn id(&self) -> u32 {
-        self.inner.spawn_identity.process_id
+        match &self.owner {
+            SuspendedJobChildOwner::Ready(inner)
+            | SuspendedJobChildOwner::CleanupOnly(inner) => inner.spawn_identity.process_id,
+            // Zero is the Windows invalid-PID sentinel. No PID is inferred
+            // from PROCESS_INFORMATION when the original process handle was
+            // not returned.
+            SuspendedJobChildOwner::Partial(_) => 0,
+        }
     }
 
     /// Consumes the unvalidated state and requires caller-owned policy to
@@ -3086,41 +3652,138 @@ impl SuspendedJobChild {
         validator: F,
     ) -> Result<ValidatedSuspendedJobChild<V>, SuspendedValidationError<E>>
     where
+        E: std::fmt::Display,
         F: FnOnce(&SuspendedProcessEvidence) -> Result<V, E>,
     {
-        let evidence = match self.inner.fresh_evidence() {
+        let mut inner = match self.owner {
+            SuspendedJobChildOwner::Ready(inner) => inner,
+            SuspendedJobChildOwner::CleanupOnly(mut inner) => {
+                let error = WindowsAdapterError::Failed;
+                if inner.best_effort_cleanup() {
+                    return Err(SuspendedValidationError::Mechanics(error));
+                }
+                return Err(SuspendedValidationError::UnknownOutcome {
+                    child: Self {
+                        owner: SuspendedJobChildOwner::CleanupOnly(inner),
+                    },
+                    primary_failure: error.to_string(),
+                });
+            }
+            SuspendedJobChildOwner::Partial(mut partial) => {
+                let error = WindowsAdapterError::Failed;
+                if partial.best_effort_cleanup() {
+                    return Err(SuspendedValidationError::Mechanics(error));
+                }
+                return Err(SuspendedValidationError::UnknownOutcome {
+                    child: Self {
+                        owner: SuspendedJobChildOwner::Partial(partial),
+                    },
+                    primary_failure: error.to_string(),
+                });
+            }
+        };
+        let evidence = match inner.fresh_evidence() {
             Ok(evidence) => evidence,
             Err(error) => {
-                return Err(if self.inner.best_effort_cleanup() {
-                    SuspendedValidationError::Mechanics(error)
-                } else {
-                    SuspendedValidationError::UnknownOutcome
+                if inner.best_effort_cleanup() {
+                    return Err(SuspendedValidationError::Mechanics(error));
+                }
+                return Err(SuspendedValidationError::UnknownOutcome {
+                    primary_failure: error.to_string(),
+                    child: Self {
+                        owner: SuspendedJobChildOwner::Ready(inner),
+                    },
                 });
             }
         };
         let validation = match validator(&evidence) {
             Ok(validation) => validation,
             Err(error) => {
-                return Err(if self.inner.best_effort_cleanup() {
-                    SuspendedValidationError::Rejected(error)
-                } else {
-                    SuspendedValidationError::UnknownOutcome
+                if inner.best_effort_cleanup() {
+                    return Err(SuspendedValidationError::Rejected(error));
+                }
+                return Err(SuspendedValidationError::UnknownOutcome {
+                    primary_failure: error.to_string(),
+                    child: Self {
+                        owner: SuspendedJobChildOwner::Ready(inner),
+                    },
                 });
             }
         };
         Ok(ValidatedSuspendedJobChild {
-            inner: self.inner,
+            inner,
             evidence,
             validation,
         })
     }
 
-    /// Consumes and terminates an unvalidated child without resuming it.
+    /// Retries the same bounded terminate-and-reap transition without
+    /// consuming the retained handles. The caller keeps this value if native
+    /// readback remains unknown.
+    ///
+    /// # Errors
+    /// Returns a typed adapter error unless the exact process and Job tree are
+    /// both observed terminal.
+    pub fn terminate_for_cleanup(&mut self) -> Result<(), WindowsAdapterError> {
+        match &mut self.owner {
+            SuspendedJobChildOwner::Ready(inner)
+            | SuspendedJobChildOwner::CleanupOnly(inner) => {
+                if inner.terminal {
+                    Ok(())
+                } else {
+                    inner.terminate_and_reap(0xE1_04).map(|_| ())
+                }
+            }
+            SuspendedJobChildOwner::Partial(partial) => {
+                if partial.best_effort_cleanup() {
+                    Ok(())
+                } else {
+                    Err(WindowsAdapterError::Timeout)
+                }
+            }
+        }
+    }
+
+    fn cleanup_after_pre_resume_failure(
+        mut self,
+        original: WindowsAdapterError,
+    ) -> SuspendedSpawnError {
+        if self.terminate_for_cleanup().is_ok() {
+            SuspendedSpawnError::Mechanics(original)
+        } else {
+            SuspendedSpawnError::UnknownOutcome {
+                child: self,
+                primary_failure: original.to_string(),
+                cleanup_failure: WindowsAdapterError::Timeout,
+            }
+        }
+    }
+
+    /// Terminates an unvalidated child without resuming it.
     ///
     /// # Errors
     /// Returns a typed adapter error when termination or bounded reap fails.
-    pub fn terminate(mut self, exit_code: u32) -> Result<TerminatedJobChild, WindowsAdapterError> {
-        terminalize(&mut self.inner, exit_code)
+    pub fn terminate(&mut self, exit_code: u32) -> Result<TerminatedJobChild, WindowsAdapterError> {
+        match &mut self.owner {
+            SuspendedJobChildOwner::Ready(inner) if !inner.terminal => {
+                terminalize(inner, exit_code)
+            }
+            SuspendedJobChildOwner::Ready(_) => Err(WindowsAdapterError::InvalidInput),
+            SuspendedJobChildOwner::CleanupOnly(inner) => {
+                if inner.best_effort_cleanup() {
+                    Err(WindowsAdapterError::Failed)
+                } else {
+                    Err(WindowsAdapterError::Timeout)
+                }
+            }
+            SuspendedJobChildOwner::Partial(partial) => {
+                if partial.best_effort_cleanup() {
+                    Err(WindowsAdapterError::Failed)
+                } else {
+                    Err(WindowsAdapterError::Timeout)
+                }
+            }
+        }
     }
 }
 
@@ -3134,6 +3797,53 @@ impl<V> ValidatedSuspendedJobChild<V> {
     #[must_use]
     pub const fn validation(&self) -> &V {
         &self.validation
+    }
+
+    /// Resumes a strictly admitted survey probe while preserving its original
+    /// process/Job owner if resume cleanup cannot be observed. The returned
+    /// unknown owner is cleanup-only and cannot publish process evidence.
+    ///
+    /// # Errors
+    /// Returns `Mechanics` when the failure was followed by complete cleanup,
+    /// or `UnknownOutcome` with the exact owner when cleanup remains unknown.
+    pub fn resume_for_survey_probe(
+        self,
+    ) -> Result<RunningJobChild<V>, SurveyProbeResumeError> {
+        use windows_sys::Win32::System::Threading::ResumeThread;
+
+        let Self {
+            inner,
+            evidence,
+            validation,
+        } = self;
+        let token_matches_profile = evidence
+            .survey_probe_token()
+            .zip(inner.survey_probe_profile_sid.as_deref())
+            .is_some_and(|(token, sid)| {
+                token.app_container_sid() == sid
+                    && token.app_container_membership()
+                    && token.lpac_policy_applied()
+                    && token.low_integrity()
+                    && !token.elevated()
+                    && token.capability_count() == 0
+            });
+        if !token_matches_profile {
+            return Err(survey_probe_resume_failure(
+                inner,
+                WindowsAdapterError::IdentityMismatch,
+            ));
+        }
+        if unsafe { ResumeThread(inner.thread.0) } == u32::MAX {
+            return Err(survey_probe_resume_failure(
+                inner,
+                last_windows_adapter_error(),
+            ));
+        }
+        Ok(RunningJobChild {
+            inner,
+            evidence,
+            validation,
+        })
     }
 
     /// Consumes the validated suspended state and resumes exactly once.
@@ -3177,6 +3887,14 @@ impl<V> RunningJobChild<V> {
     #[must_use]
     pub const fn validation(&self) -> &V {
         &self.validation
+    }
+
+    /// Transfers this running survey process into the original executor's
+    /// cleanup-only owner without constructing evidence or a terminal result.
+    pub fn into_survey_probe_cleanup_owner(self) -> SuspendedJobChild {
+        SuspendedJobChild {
+            owner: SuspendedJobChildOwner::CleanupOnly(self.inner),
+        }
     }
 
     /// Returns the exact owner-scoped Job Object identity.
@@ -3340,4 +4058,127 @@ fn terminalize(
         job_empty: true,
         root_reaped: true,
     })
+}
+
+#[cfg(all(test, windows))]
+mod malformed_process_information_cleanup_tests {
+    use super::{
+        JobObject, JobProcessObserver, PartialProcessCreationCleanup, SuspendedJobChild,
+        SuspendedJobChildOwner, SuspendedSpawnError, WindowsAdapterError,
+    };
+
+    #[test]
+    fn malformed_creation_without_process_handle_keeps_job_owner_unknown() {
+        let job = JobObject::new_kill_on_close().unwrap_or_else(|_| unreachable!());
+        let expected_job = job.identity().clone();
+        let observer = JobProcessObserver::attach(job.handle).unwrap_or_else(|_| unreachable!());
+        let child = SuspendedJobChild {
+            owner: SuspendedJobChildOwner::Partial(PartialProcessCreationCleanup {
+                process: None,
+                thread: None,
+                job,
+                observer,
+                terminal: false,
+            }),
+        };
+
+        assert_eq!(child.id(), 0, "no process handle means no PID evidence");
+        let error = child.cleanup_after_pre_resume_failure(WindowsAdapterError::Failed);
+        let SuspendedSpawnError::UnknownOutcome {
+            child,
+            primary_failure,
+            cleanup_failure,
+        } = error
+        else {
+            unreachable!("the absent original process handle leaves cleanup unknown")
+        };
+        assert_eq!(primary_failure, WindowsAdapterError::Failed.to_string());
+        assert_eq!(cleanup_failure, WindowsAdapterError::Timeout);
+        assert_eq!(child.id(), 0, "no PID may be inferred during cleanup");
+        match &child.owner {
+            SuspendedJobChildOwner::Partial(partial) => {
+                assert!(partial.process.is_none());
+                assert!(partial.thread.is_none());
+                assert_eq!(partial.job.identity(), &expected_job);
+                assert!(!partial.terminal);
+            }
+            SuspendedJobChildOwner::Ready(_) | SuspendedJobChildOwner::CleanupOnly(_) => {
+                unreachable!()
+            }
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod survey_probe_resume_cleanup_tests {
+    use super::{
+        FAIL_NEXT_JOB_CHILD_CLEANUP_READBACK, SuspendedJobChild, SuspendedJobChildOwner,
+        SuspendedLaunchSpec, SurveyProbeResumeError, ValidatedSuspendedJobChild,
+        WindowsAdapterError, survey_probe_resume_failure,
+    };
+
+    const CHILD_MARKER: &str = "ELIOT_P04_SURVEY_CLEANUP_CHILD";
+
+    #[test]
+    fn held_survey_probe_process_child() {
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }
+    }
+
+    #[test]
+    fn unknown_resume_cleanup_keeps_same_process_and_job_owner() {
+        let mut environment = std::env::vars_os().collect::<Vec<_>>();
+        environment.retain(|(name, _)| {
+            !name.to_string_lossy().eq_ignore_ascii_case(CHILD_MARKER)
+        });
+        environment.push((CHILD_MARKER.into(), "1".into()));
+        let spec = SuspendedLaunchSpec::new(
+            std::env::current_exe().unwrap_or_else(|_| unreachable!()),
+            vec![
+                "--exact".into(),
+                "process_job::survey_probe_resume_cleanup_tests::held_survey_probe_process_child"
+                    .into(),
+                "--nocapture".into(),
+            ],
+            std::env::current_dir().unwrap_or_else(|_| unreachable!()),
+            environment,
+        )
+        .unwrap_or_else(|_| unreachable!());
+        let child = SuspendedJobChild::spawn(spec).unwrap_or_else(|_| unreachable!());
+        let validated = child
+            .validate::<(), &'static str, _>(|_| Ok(()))
+            .unwrap_or_else(|_| unreachable!());
+        let ValidatedSuspendedJobChild { inner, .. } = validated;
+        let original_process_id = inner.spawn_identity.process_id;
+        let original_job = inner.job.identity().clone();
+
+        // Simulate a failed native cleanup readback at the exact resume-error
+        // transition. The original suspended process and Job handles remain
+        // valid and are retried below through the returned owner.
+        FAIL_NEXT_JOB_CHILD_CLEANUP_READBACK.with(|fail| fail.set(true));
+        let error = survey_probe_resume_failure(inner, WindowsAdapterError::Failed);
+        let SurveyProbeResumeError::UnknownOutcome {
+            child: mut owner,
+            primary_failure,
+            cleanup_failure,
+        } = error
+        else {
+            unreachable!("failed cleanup readback must retain the original owner")
+        };
+        assert_eq!(primary_failure, WindowsAdapterError::Failed);
+        assert_eq!(cleanup_failure, WindowsAdapterError::Timeout);
+        assert_eq!(owner.id(), original_process_id);
+        match &owner.owner {
+            SuspendedJobChildOwner::CleanupOnly(retained) => {
+                assert_eq!(retained.spawn_identity.process_id, original_process_id);
+                assert_eq!(retained.job.identity(), &original_job);
+            }
+            SuspendedJobChildOwner::Ready(_) | SuspendedJobChildOwner::Partial(_) => {
+                unreachable!("resume failure returns a cleanup-only owner")
+            }
+        }
+
+        assert!(owner.terminate_for_cleanup().is_ok());
+    }
 }

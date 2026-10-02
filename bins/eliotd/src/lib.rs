@@ -95,6 +95,7 @@ pub mod governed_source_readback;
 mod governor_authority_feed;
 mod governor_local_read;
 mod governor_observe_serve;
+mod installation_capability_observation;
 /// Issue #1145: the live constructor and caller of the Governor improvement
 /// candidate route. `ImprovementRouteRequest` borrows seven Governor-owned
 /// records, so it had no constructor anywhere in the repository and
@@ -3147,6 +3148,52 @@ impl DaemonComposition {
             ));
         }
         Ok(KernelContextReadClient::new(Arc::clone(kernel)))
+    }
+
+    /// Captures an authenticated installation survey as raw observation and
+    /// restricts only capability evidence bound to its original prior runtime.
+    /// Neither a probe result nor this capture admits a runtime or adapter.
+    pub async fn capture_installation_survey_observation(
+        &mut self,
+        kernel: &Arc<DaemonKernelClient>,
+        envelope: &eliot_protocol::HostRequestEnvelope,
+        tool: &serde_json::Value,
+        attempt: &eliot_protocol::LocalReadAttempt,
+        result: &eliot_installation::InstallationSurveyProbeResult,
+    ) -> Result<eliot_protocol::HostRequestResultBody, DaemonError> {
+        let reads = self.context_read_client(kernel)?;
+        let request = crate::installation_capability_observation::decode_original_survey_request(
+            envelope, tool,
+        )
+        .map_err(DaemonError::Kernel)?;
+        let body = crate::installation_capability_observation::capture_installation_survey_observation(
+            &self.governor, &reads, envelope, attempt, result,
+        ).await.map_err(DaemonError::Kernel)?;
+        match crate::installation_capability_observation::decide_prior_runtime_scope_change(
+            &request, result,
+        )
+        .map_err(DaemonError::Kernel)?
+        {
+            crate::installation_capability_observation::PriorRuntimeScopeChange::NoExactChange => {}
+            crate::installation_capability_observation::PriorRuntimeScopeChange::Changed {
+                previous,
+                observed,
+            } => {
+                let scope = eliot_store_api::ScopeId::new(eliot_governor::GOVERNOR_SCOPE_ID)
+                    .map_err(|error| DaemonError::Composition(CompositionError::Owner(error.to_string())))?;
+                let fence = envelope.state_fence.clone();
+                crate::capability_evidence_wiring::commit_exact_prior_runtime_scope_change_restriction(
+                    &self.governor, kernel.as_ref(), &reads, &mut self.capability_admission,
+                    Some(&previous), &observed, &scope, &fence, attempt.expires_at_unix_ms,
+                ).await.map_err(|error| {
+                    DaemonError::Composition(CompositionError::Owner(error.to_string()))
+                })?;
+            }
+        }
+        if self.governor.refresh_from_kernel().is_err() {
+            self.view_stale = true;
+        }
+        Ok(body)
     }
 
     /// Borrows the Governor epistemic composition over the retained owners

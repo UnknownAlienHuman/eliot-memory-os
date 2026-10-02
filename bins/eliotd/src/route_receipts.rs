@@ -281,30 +281,28 @@ impl RouteAdmissionVisibility {
     }
 
     /// Behaviour-bearing execution-identity dimensions on which the
-    /// runtime-observed route differs from the requested route, narrowed to
-    /// the adapter and serializer identity I3.4 names.
+    /// runtime-observed route differs from the requested route, including
+    /// every known I3.4 runtime, adapter, provider, and serializer change.
     ///
     /// I3.4 keeps the requested route and the observed route separate
     /// precisely so a divergence between them is visible, and states that a
     /// "runtime/adapter/provider/serializer change makes dependent evidence
-    /// stale". This is that rule over the two dimensions whose evidence the
-    /// requested route cannot possibly cover: `adapter`, `adapter_hash` and
-    /// `serializer_hash` are the runtime-exposed execution identity, so a
-    /// route that executed under a different adapter or serializer did not
-    /// execute the route its evidence was taken against.
+    /// stale". A different runtime hash, adapter identity/hash, known
+    /// provider/model, or serializer hash means the current execution did not
+    /// use the exact route whose evidence is being considered.
     ///
-    /// `provider`, `model` and `auth_billing` are deliberately NOT selected.
-    /// A runtime that does not expose them yields the explicit
-    /// [`UNKNOWN_ROUTE_FACT`] marker, and I3.4 requires that an account-scoped
-    /// difference never generalize into another account's or route's evidence
-    /// ("capability may be route/account-specific and cannot be generalized
-    /// silently"). Those dimensions stay visible through
-    /// [`diverged_fields`](Self::diverged_fields) and decide nothing here.
+    /// `provider` and `model` are compared only when the runtime exposed them.
+    /// An unexposed field remains the explicit [`UNKNOWN_ROUTE_FACT`] marker;
+    /// it is neither inferred from the requested route nor treated as proof
+    /// that a different provider/model ran. `auth_billing` remains visible
+    /// through [`diverged_fields`](Self::diverged_fields) but is not selected
+    /// here: account-scoped evidence must not generalize to another route or
+    /// account.
     ///
-    /// Empty means the observed execution identity is the requested one on
-    /// every dimension this rule covers. The result is load-bearing, not
-    /// diagnostic: the admission consumer refuses an otherwise-admitted
-    /// disposition whenever it is non-empty — see
+    /// Empty means every compared observation matches; an unexposed
+    /// provider/model remains `unknown` and is not compared. The result is
+    /// load-bearing, not diagnostic: the admission consumer refuses an
+    /// otherwise-admitting disposition whenever it is non-empty — see
     /// [`eliotd::admit_production_route`](crate::capability_admission::admit_production_route).
     #[must_use]
     pub fn stale_dimensions(&self) -> Vec<&'static str> {
@@ -312,8 +310,21 @@ impl RouteAdmissionVisibility {
         if self.observed_route.adapter != self.requested_route.adapter {
             stale.push("adapter");
         }
+        if self.observed_route.runtime_hash != self.requested_route.runtime_hash {
+            stale.push("runtime_hash");
+        }
         if self.observed_route.adapter_hash != self.requested_route.adapter_hash {
             stale.push("adapter_hash");
+        }
+        if self.observed_route.provider != UNKNOWN_ROUTE_FACT
+            && self.observed_route.provider != self.requested_route.provider
+        {
+            stale.push("provider");
+        }
+        if self.observed_route.model != UNKNOWN_ROUTE_FACT
+            && self.observed_route.model != self.requested_route.model
+        {
+            stale.push("model");
         }
         if self.observed_route.serializer_hash != self.requested_route.serializer_hash {
             stale.push("serializer_hash");
@@ -440,6 +451,11 @@ impl GovernorRouteAttempt {
 mod tests {
     use super::*;
 
+    const TEST_NOW: u64 = 1_000_000;
+    const TEST_GENERATION: u64 = 7;
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
     fn digest(hex_char: char) -> Result<LowercaseSha256, serde_json::Error> {
         let hex: String = std::iter::repeat_n(hex_char, 64).collect();
         serde_json::from_value(serde_json::Value::String(hex))
@@ -480,6 +496,44 @@ mod tests {
             feature_flags_hash: digest('e')?,
             evidence_refs: vec!["handshake:session-1".to_owned()],
         })
+    }
+
+    fn fresh_observed_record(
+        route: &RouteFingerprint,
+    ) -> crate::capability_admission::CapabilityEvidenceRecord {
+        crate::capability_admission::CapabilityEvidenceRecord {
+            capability: "route.execute".to_owned(),
+            route: route.clone(),
+            generation: TEST_GENERATION,
+            status: crate::capability_admission::CapabilityEvidenceStatus::Observed,
+            observed_at_unix_ms: TEST_NOW - 60_000,
+            expires_at_unix_ms: TEST_NOW + 60_000,
+        }
+    }
+
+    fn production_decision<'a>(
+        requested: &RouteFingerprint,
+        facts: &RuntimeObservedFacts,
+        records: &'a [crate::capability_admission::CapabilityEvidenceRecord],
+    ) -> TestResult<crate::capability_admission::RouteAdmissionDecision<'a>> {
+        let request = crate::capability_admission::ProductionAdmissionRequest {
+            capability: "route.execute".to_owned(),
+            route: requested.clone(),
+            generation: TEST_GENERATION,
+            now_unix_ms: TEST_NOW,
+            critical: false,
+        };
+        let evidence = crate::capability_admission::ProductionEvidenceBundle {
+            records,
+            static_attestation: None,
+            pulse: None,
+        };
+        Ok(crate::capability_admission::admit_production_route(
+            &request,
+            &evidence,
+            AttemptId::new("attempt-1")?,
+            facts,
+        )?)
     }
 
     #[test]
@@ -528,6 +582,96 @@ mod tests {
         assert_eq!(receipt.observed_route.model, "observed-model");
         assert_eq!(receipt.observed_route.auth_billing, "observed-billing");
         assert!(!receipt.provider_unobserved());
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_only_change_defers_production_admission() -> TestResult {
+        let requested = requested_route()?;
+        let mut facts = unexposed_facts()?;
+        facts.runtime_hash = digest('f')?;
+        let record = fresh_observed_record(&requested);
+
+        let decision = production_decision(&requested, &facts, std::slice::from_ref(&record))?;
+
+        assert_eq!(decision.stale_dimensions, vec!["runtime_hash"]);
+        assert_eq!(
+            decision.outcome.disposition,
+            crate::capability_admission::AdmissionDisposition::Defer
+        );
+        assert_eq!(
+            decision.attempt.actual.observed_route.runtime_hash,
+            digest('f')?
+        );
+        assert_eq!(
+            decision.attempt.requested_route.runtime_hash,
+            requested.runtime_hash
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_model_only_change_defers_production_admission() -> TestResult {
+        let requested = requested_route()?;
+        let mut facts = unexposed_facts()?;
+        facts.provider = Some("observed-provider".to_owned());
+        facts.model = Some("observed-model".to_owned());
+        let record = fresh_observed_record(&requested);
+
+        let decision = production_decision(&requested, &facts, std::slice::from_ref(&record))?;
+
+        assert_eq!(decision.stale_dimensions, vec!["provider", "model"]);
+        assert_eq!(
+            decision.outcome.disposition,
+            crate::capability_admission::AdmissionDisposition::Defer
+        );
+        assert_eq!(
+            decision.attempt.actual.observed_route.provider,
+            "observed-provider"
+        );
+        assert_eq!(
+            decision.attempt.actual.observed_route.model,
+            "observed-model"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_provider_model_observation_stays_unknown() -> TestResult {
+        let requested = requested_route()?;
+        let facts = unexposed_facts()?;
+
+        let receipt = RouteAdmissionVisibility::observe(requested.clone(), &facts)?;
+
+        assert_eq!(receipt.observed_route.provider, UNKNOWN_ROUTE_FACT);
+        assert_eq!(receipt.observed_route.model, UNKNOWN_ROUTE_FACT);
+        assert!(receipt.provider_unobserved());
+        assert!(receipt.model_unobserved());
+        assert!(!receipt.stale_dimensions().contains(&"provider"));
+        assert!(!receipt.stale_dimensions().contains(&"model"));
+        assert!(receipt.stale_dimensions().is_empty());
+        assert_ne!(receipt.observed_route.provider, requested.provider);
+        assert_ne!(receipt.observed_route.model, requested.model);
+        Ok(())
+    }
+
+    #[test]
+    fn unchanged_route_with_fresh_exact_evidence_remains_admitted() -> TestResult {
+        let requested = requested_route()?;
+        let mut facts = unexposed_facts()?;
+        facts.provider = Some(requested.provider.clone());
+        facts.model = Some(requested.model.clone());
+        facts.auth_billing = Some(requested.auth_billing.clone());
+        let record = fresh_observed_record(&requested);
+
+        let decision = production_decision(&requested, &facts, std::slice::from_ref(&record))?;
+
+        assert!(decision.stale_dimensions.is_empty());
+        assert_eq!(decision.attempt.actual.observed_route, requested);
+        assert_eq!(
+            decision.outcome.disposition,
+            crate::capability_admission::AdmissionDisposition::Admit
+        );
         Ok(())
     }
 

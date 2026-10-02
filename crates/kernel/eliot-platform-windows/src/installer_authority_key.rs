@@ -148,6 +148,11 @@ pub struct InstallationAuthorityKeyExpectation {
 }
 
 impl InstallationAuthorityKeyMetadata {
+    /// Windows principal which owns protected installer-authority key slots.
+    /// This is the physical key-slot principal; callers must keep it distinct
+    /// from the user SID that confirmed an installation operation.
+    pub const OWNER_SID: &'static str = EXPECTED_OWNER_SID;
+
     /// Returns the exact public identity required for a later reopen.
     ///
     /// # Errors
@@ -322,6 +327,101 @@ pub struct WindowsInstallationAuthorityKeyStore {
     contour: Arc<ProtectedRootLease>,
 }
 
+/// Non-secret preparation facts for one exact protected key-slot creation.
+/// The optional slot identity is filled only after `CREATE_NEW` has returned a
+/// retained handle; it is durably recorded before the prepared seed is
+/// written. A receipt without a slot identity is never enough to adopt an
+/// existing object.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstallationAuthorityKeyPreparationReceipt {
+    /// Exact slot name selected by the original transaction.
+    pub key_id: String,
+    /// Public Ed25519 key derived from the single prepared seed.
+    pub public_key: Vec<u8>,
+    /// Lowercase SHA-256 digest of `public_key`.
+    pub public_key_fingerprint: String,
+    /// Exact protected authority-key root identity observed on open.
+    pub key_root_identity: FileIdentity,
+    /// Native identity captured from the original `CREATE_NEW` slot handle.
+    pub slot_file_identity: Option<FileIdentity>,
+}
+
+impl InstallationAuthorityKeyPreparationReceipt {
+    /// Checks the immutable prepared key and, when present, its exact slot
+    /// identity.
+    pub fn validate(&self) -> Result<(), InstallationAuthorityKeyError> {
+        validate_key_id(&self.key_id)?;
+        if self.public_key.len() != 32
+            || !is_sha256(&self.public_key_fingerprint)
+            || sha256_hex(&self.public_key) != self.public_key_fingerprint
+            || self.key_root_identity.volume_serial_number == 0
+            || self.key_root_identity.file_index == 0
+            || self.slot_file_identity.is_some_and(|identity| {
+                identity.volume_serial_number == 0 || identity.file_index == 0
+            })
+        {
+            return Err(InstallationAuthorityKeyError::IdentityMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Secret-bearing, in-memory preparation. It is never serializable or
+/// printable; only its public receipt may enter the original setup intent.
+pub struct PreparedInstallationAuthorityKey {
+    receipt: InstallationAuthorityKeyPreparationReceipt,
+    seed: SecretSeed,
+}
+
+impl fmt::Debug for PreparedInstallationAuthorityKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedInstallationAuthorityKey")
+            .field("receipt", &self.receipt)
+            .field("seed", &"<redacted>")
+            .finish()
+    }
+}
+
+impl PreparedInstallationAuthorityKey {
+    /// Returns the public preparation receipt that must be durably committed
+    /// before reserving or writing the key slot.
+    #[must_use]
+    pub fn receipt(&self) -> &InstallationAuthorityKeyPreparationReceipt {
+        &self.receipt
+    }
+}
+
+/// A prepared key plus its exact reserved native file identity. The file is
+/// held without delete sharing while the caller durably commits this receipt
+/// before writing the secret bytes.
+pub struct ReservedInstallationAuthorityKey {
+    receipt: InstallationAuthorityKeyPreparationReceipt,
+    seed: SecretSeed,
+    slot: std::fs::File,
+}
+
+impl fmt::Debug for ReservedInstallationAuthorityKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReservedInstallationAuthorityKey")
+            .field("receipt", &self.receipt)
+            .field("seed", &"<redacted>")
+            .field("slot", &"<retained>")
+            .finish()
+    }
+}
+
+impl ReservedInstallationAuthorityKey {
+    /// Returns the public receipt with the native identity of the slot just
+    /// created by this process.
+    #[must_use]
+    pub fn receipt(&self) -> &InstallationAuthorityKeyPreparationReceipt {
+        &self.receipt
+    }
+}
+
 impl WindowsInstallationAuthorityKeyStore {
     /// Constructs a store at an already-existing dedicated key root.
     ///
@@ -363,6 +463,37 @@ impl WindowsInstallationAuthorityKeyStore {
         &self.key_root
     }
 
+    /// Returns the exact native identity of this existing protected key root.
+    pub fn root_identity(&self) -> Result<FileIdentity, InstallationAuthorityKeyError> {
+        self.validate_root()?;
+        #[cfg(windows)]
+        {
+            Ok(self.root_identity)
+        }
+        #[cfg(not(windows))]
+        {
+            Err(InstallationAuthorityKeyError::UnsupportedPlatform)
+        }
+    }
+
+    /// Requires the transaction-selected exact slot name to be absent before
+    /// preparing a new setup-purpose key. This is only a collision check; it
+    /// never adopts an existing key without its original public and native
+    /// identity receipt.
+    pub fn require_absent_slot(
+        &self,
+        key_id: &str,
+    ) -> Result<(), InstallationAuthorityKeyError> {
+        validate_key_id(key_id)?;
+        self.validate_root()?;
+        let path = self.slot_path(key_id);
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(_) => Err(InstallationAuthorityKeyError::AlreadyExists),
+            Err(_) => Err(InstallationAuthorityKeyError::Io),
+        }
+    }
+
     /// Creates a fresh unpredictable key id and immutable slot.
     ///
     /// # Errors
@@ -390,39 +521,155 @@ impl WindowsInstallationAuthorityKeyStore {
         &self,
         key_id: &str,
     ) -> Result<InstallationAuthorityKeySigner, InstallationAuthorityKeyError> {
+        let prepared = self.prepare_with_key_id(key_id)?;
+        let reserved = self.reserve_prepared(prepared)?;
+        self.write_reserved(reserved)
+    }
+
+    /// Derives one public key receipt and holds its seed in memory without
+    /// touching the filesystem. The caller must persist `receipt()` in the
+    /// original durable effect intent before invoking `reserve_prepared`.
+    pub fn prepare_with_key_id(
+        &self,
+        key_id: &str,
+    ) -> Result<PreparedInstallationAuthorityKey, InstallationAuthorityKeyError> {
         validate_key_id(key_id)?;
         self.validate_root()?;
         #[cfg(windows)]
         {
-            let path = self.slot_path(key_id);
             let seed = SecretSeed({
                 let mut bytes = [0_u8; 32];
                 fill_system_random(&mut bytes).map_err(map_windows_error)?;
                 bytes
             });
-            let created = create_new_slot(&path)?;
-            (|| {
-                write_new_slot(&created, &seed.0)?;
-                flush_parent_directory(&self.key_root);
-                let reopened = reopen_slot(&path)?;
-                let signer = build_signer(
-                    &path,
-                    reopened,
-                    key_id,
-                    None,
-                    Arc::clone(&self.contour),
-                    self.root_identity,
-                )?;
-                self.validate_root()?;
-                validate_signer_slot(&signer)?;
-                Ok(signer)
-            })()
+            let signer = Ed25519InstallationActivationApprovalSigner::from_secret_key(
+                INSTALLATION_AUTHORITY_SIGNER_ID,
+                key_id,
+                seed.0,
+            )
+            .map_err(|_| InstallationAuthorityKeyError::CryptographicFailure)?;
+            let public_key = signer.public_key().to_vec();
+            let receipt = InstallationAuthorityKeyPreparationReceipt {
+                key_id: key_id.to_owned(),
+                public_key_fingerprint: sha256_hex(&public_key),
+                public_key,
+                key_root_identity: self.root_identity,
+                slot_file_identity: None,
+            };
+            receipt.validate()?;
+            Ok(PreparedInstallationAuthorityKey { receipt, seed })
         }
         #[cfg(not(windows))]
         {
             let _ = key_id;
             Err(InstallationAuthorityKeyError::UnsupportedPlatform)
         }
+    }
+
+    /// Creates the exact empty slot with `CREATE_NEW`, captures and validates
+    /// its native identity, and retains the handle. The caller must durably
+    /// update the original intent with `receipt()` before writing key bytes.
+    pub fn reserve_prepared(
+        &self,
+        prepared: PreparedInstallationAuthorityKey,
+    ) -> Result<ReservedInstallationAuthorityKey, InstallationAuthorityKeyError> {
+        prepared.receipt.validate()?;
+        self.validate_root()?;
+        #[cfg(windows)]
+        {
+            if prepared.receipt.key_root_identity != self.root_identity
+                || prepared.receipt.slot_file_identity.is_some()
+            {
+                return Err(InstallationAuthorityKeyError::IdentityMismatch);
+            }
+            let path = self.slot_path(&prepared.receipt.key_id);
+            let slot = create_new_slot(&path)?;
+            let identity = validate_empty_new_slot(&path, &slot, &prepared.receipt.key_id)?;
+            let mut receipt = prepared.receipt;
+            receipt.slot_file_identity = Some(identity);
+            receipt.validate()?;
+            Ok(ReservedInstallationAuthorityKey {
+                receipt,
+                seed: prepared.seed,
+                slot,
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = prepared;
+            Err(InstallationAuthorityKeyError::UnsupportedPlatform)
+        }
+    }
+
+    /// Writes the already-receipted seed through its retained exact slot
+    /// handle, then independently reopens the same native file identity and
+    /// returns the original protected signer.
+    pub fn write_reserved(
+        &self,
+        reserved: ReservedInstallationAuthorityKey,
+    ) -> Result<InstallationAuthorityKeySigner, InstallationAuthorityKeyError> {
+        reserved.receipt.validate()?;
+        self.validate_root()?;
+        #[cfg(windows)]
+        {
+            if reserved.receipt.key_root_identity != self.root_identity {
+                return Err(InstallationAuthorityKeyError::IdentityMismatch);
+            }
+            let slot_identity = reserved
+                .receipt
+                .slot_file_identity
+                .ok_or(InstallationAuthorityKeyError::IdentityMismatch)?;
+            let path = self.slot_path(&reserved.receipt.key_id);
+            if validate_empty_new_slot(&path, &reserved.slot, &reserved.receipt.key_id)?
+                != slot_identity
+            {
+                return Err(InstallationAuthorityKeyError::IdentityMismatch);
+            }
+            write_new_slot(&reserved.slot, &reserved.seed.0)?;
+            flush_parent_directory(&self.key_root);
+            let expectation = InstallationAuthorityKeyExpectation::new(
+                reserved.receipt.key_id.clone(),
+                reserved.receipt.public_key_fingerprint.clone(),
+                slot_identity,
+            )?;
+            let reopened = reopen_slot(&path)?;
+            let signer = build_signer(
+                &path,
+                reopened,
+                &reserved.receipt.key_id,
+                Some(&expectation),
+                Arc::clone(&self.contour),
+                self.root_identity,
+            )?;
+            self.validate_root()?;
+            validate_signer_slot(&signer)?;
+            Ok(signer)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = reserved;
+            Err(InstallationAuthorityKeyError::UnsupportedPlatform)
+        }
+    }
+
+    /// Reopens a completed key only when both the original public preparation
+    /// and the recorded native slot identity are present and exact.
+    pub fn open_prepared_receipt(
+        &self,
+        receipt: &InstallationAuthorityKeyPreparationReceipt,
+    ) -> Result<InstallationAuthorityKeySigner, InstallationAuthorityKeyError> {
+        receipt.validate()?;
+        if receipt.key_root_identity != self.root_identity {
+            return Err(InstallationAuthorityKeyError::IdentityMismatch);
+        }
+        let identity = receipt
+            .slot_file_identity
+            .ok_or(InstallationAuthorityKeyError::MissingOrMalformed)?;
+        self.open_existing(&InstallationAuthorityKeyExpectation::new(
+            receipt.key_id.clone(),
+            receipt.public_key_fingerprint.clone(),
+            identity,
+        )?)
     }
 
     /// Reopens one existing immutable slot only with its recorded public
@@ -768,6 +1015,49 @@ fn validate_live_slot(
         .map_err(|_| InstallationAuthorityKeyError::AclMismatch)?;
     verify_exact_file_security(file, &descriptor, EXPECTED_OWNER_SID).map_err(map_windows_error)?;
     Ok(identity)
+}
+
+#[cfg(windows)]
+fn validate_empty_new_slot(
+    path: &Path,
+    file: &std::fs::File,
+    key_id: &str,
+) -> Result<FileIdentity, InstallationAuthorityKeyError> {
+    validate_key_id(key_id)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| InstallationAuthorityKeyError::Io)?;
+    if !metadata.is_file() || is_reparse_point(&metadata) || metadata.len() != 0 {
+        return Err(InstallationAuthorityKeyError::MissingOrMalformed);
+    }
+    let expected_name = format!("{key_id}{KEY_FILE_EXTENSION}");
+    if path
+        .file_name()
+        .is_none_or(|name| name != std::ffi::OsStr::new(&expected_name))
+    {
+        return Err(InstallationAuthorityKeyError::IdentityMismatch);
+    }
+    let canonical = final_windows_path_from_handle(file)
+        .map_err(|_| InstallationAuthorityKeyError::IdentityMismatch)?;
+    if !equivalent_windows_paths(&canonical, path) {
+        return Err(InstallationAuthorityKeyError::IdentityMismatch);
+    }
+    let identity = file_identity_from_handle(file)
+        .map_err(|_| InstallationAuthorityKeyError::IdentityMismatch)?;
+    ensure_single_link(file)?;
+    let descriptor = OwnedSecurityDescriptor::for_installer_authority_key()
+        .map_err(|_| InstallationAuthorityKeyError::AclMismatch)?;
+    verify_exact_file_security(file, &descriptor, EXPECTED_OWNER_SID).map_err(map_windows_error)?;
+    Ok(identity)
+}
+
+#[cfg(not(windows))]
+fn validate_empty_new_slot(
+    _path: &Path,
+    _file: &std::fs::File,
+    _key_id: &str,
+) -> Result<FileIdentity, InstallationAuthorityKeyError> {
+    Err(InstallationAuthorityKeyError::UnsupportedPlatform)
 }
 
 #[cfg(windows)]

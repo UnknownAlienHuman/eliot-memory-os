@@ -80,6 +80,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+eliot-instrument-api.workspace = true
 eliot-ipc = { workspace = true, features = ["test-support"] }
 eliot-kernel-service = { workspace = true, features = ["test-support"] }
 eliot-ors = { workspace = true, features = ["test-support"] }

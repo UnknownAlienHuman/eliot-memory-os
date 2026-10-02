@@ -28,6 +28,9 @@ use eliot_process::{
     SessionId, StreamEvidenceGap, StreamPersistenceStatus, StreamTransportStatus,
     SuspendedLaunchEvidence, SuspendedProcessIdentity, ValidatedDispatch,
 };
+use eliot_platform_windows::{
+    RetainedSurveyProbePathLease, SurveyProbeAppContainerIdentity, SurveyProbeAppContainerProfile,
+};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -47,7 +50,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use eliot_platform_windows::{
     JobObjectIdentity, JobObjectLimits, RecoverableJobBinding, RunningJobChild,
     RunningJobObservation, SuspendedJobChild, SuspendedLaunchSpec, SuspendedProcessEvidence,
-    SuspendedValidationError, TerminatedJobChild, WindowsAdapterError, cancel_capture_thread_io,
+    SuspendedSpawnError, SuspendedValidationError, SurveyProbeResumeError, TerminatedJobChild,
+    WindowsAdapterError, cancel_capture_thread_io,
 };
 
 #[cfg(windows)]
@@ -108,6 +112,34 @@ fn sink_backpressure_limits() -> Result<ProcessStreamSinkLimits, ProcessExecutio
         250,
         2_000,
         2_000,
+    )
+    .map_err(|_| ProcessExecutionError::UnknownOutcome)
+}
+
+fn sink_backpressure_limits_for_stream(
+    stream_byte_bound: u64,
+) -> Result<ProcessStreamSinkLimits, ProcessExecutionError> {
+    let ceilings = sink_backpressure_limits()?;
+    let max_total_admitted_bytes = ceilings
+        .max_total_admitted_bytes()
+        .min(stream_byte_bound);
+    if max_total_admitted_bytes == 0 {
+        return Err(ProcessExecutionError::UnknownOutcome);
+    }
+    let max_chunk_bytes = ceilings.max_chunk_bytes().min(max_total_admitted_bytes);
+    let max_in_flight_bytes = ceilings
+        .max_in_flight_bytes()
+        .min(max_total_admitted_bytes);
+    ProcessStreamSinkLimits::new(
+        max_chunk_bytes,
+        max_total_admitted_bytes,
+        ceilings.max_chunks(),
+        ceilings.max_preview_bytes().min(max_total_admitted_bytes),
+        ceilings.max_in_flight_chunks(),
+        max_in_flight_bytes,
+        ceilings.max_append_wait_ms(),
+        ceilings.max_finalize_wait_ms(),
+        ceilings.max_abort_wait_ms(),
     )
     .map_err(|_| ProcessExecutionError::UnknownOutcome)
 }
@@ -445,6 +477,51 @@ impl StreamSinkPump {
         };
         block_on_sink(self.client.readback(session))
             .map_err(|_| ProcessExecutionError::UnknownOutcome)
+    }
+
+    /// Requires the exact original session to settle to a provider-read-back
+    /// terminal before a retained survey operation can be released. The
+    /// checked session returned by the original open stays on this pump, so
+    /// an uncertain provider result is reconciled through that same capability.
+    fn reconcile_terminal_readback(
+        &mut self,
+        disposition: CaptureDisposition,
+    ) -> Result<(), ProcessExecutionError> {
+        if self.terminal.is_none() {
+            if disposition != CaptureDisposition::Eof {
+                return Err(ProcessExecutionError::UnknownOutcome);
+            }
+            // EOF is already observed by the original capture owner. A
+            // failed terminal call remains retryable and is resolved below
+            // through the same session's provider readback/reconcile.
+            let _ = self.finalize_eof();
+        }
+        let session = self
+            .session
+            .clone()
+            .ok_or(ProcessExecutionError::UnknownOutcome)?;
+        let prior_terminal = self.terminal.clone();
+        let readback = block_on_sink(self.client.readback(session.clone()))
+            .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
+        let readback = match readback {
+            ProcessStreamSinkReadback::UnknownOutcome { outcome } => {
+                block_on_sink(self.client.reconcile(session.clone(), outcome))
+                    .map_err(|_| ProcessExecutionError::UnknownOutcome)?
+            }
+            readback => readback,
+        };
+        let ProcessStreamSinkReadback::Terminal { terminal } = readback else {
+            return Err(ProcessExecutionError::UnknownOutcome);
+        };
+        enforce_sink_terminal(Some(&session), &terminal)?;
+        if prior_terminal
+            .as_ref()
+            .is_some_and(|prior| prior.identity_sha256() != terminal.identity_sha256())
+        {
+            return Err(ProcessExecutionError::UnknownOutcome);
+        }
+        self.terminal = Some(terminal);
+        Ok(())
     }
 
     /// Returns the admitted-byte count covered by the terminal (or so far).
@@ -1212,6 +1289,12 @@ struct Operation {
     // Drop the child before joining its stdin writer so a blocked pipe write
     // is released only after the owned process lifecycle has been contained.
     child: Option<RunningJobChild<ValidatedDispatch>>,
+    survey_probe_profile: Option<SurveyProbeAppContainerProfile>,
+    survey_probe_path_scope: Option<RetainedSurveyProbePathLease>,
+    /// The per-survey provider remains owned across stream-open failures and
+    /// unknown cleanup. It can own a pending created-artifact lease even
+    /// when neither capture pump was opened.
+    survey_probe_stream_sink: Option<Arc<dyn ProcessStreamSinkClient>>,
     stdin_writer: Option<LiveStdinWriter>,
     stdout: Arc<Mutex<CaptureSession>>,
     stderr: Arc<Mutex<CaptureSession>>,
@@ -1252,6 +1335,33 @@ struct Operation {
     cleanup_required: bool,
     termination: Option<TerminatedJobChild>,
     capture_failures: Vec<CaptureFailure>,
+}
+
+/// The exact newly-created profile and operation-bound path scope consumed by
+/// the one strict installation-survey start path.
+struct SurveyProbeLaunch {
+    profile: SurveyProbeAppContainerProfile,
+    path_scope: RetainedSurveyProbePathLease,
+    stream_sink: Arc<dyn ProcessStreamSinkClient>,
+    stream_policy: ProcessStreamPolicyBinding,
+}
+
+#[cfg(windows)]
+struct PendingPreResumeCleanup {
+    profile: Option<SurveyProbeAppContainerProfile>,
+    path_scope: Option<RetainedSurveyProbePathLease>,
+    child: Option<SuspendedJobChild>,
+    /// A post-resume publication failure retains the exact original operation
+    /// Arc here so every native/process/stream owner stays in its original
+    /// cleanup contour while the same identity is fenced from restart.
+    operation: Option<Arc<Mutex<Operation>>>,
+    /// Before a full Operation exists, keep the survey provider alive with
+    /// the profile/path/child cleanup owners. Once transferred, it is owned by
+    /// `operation.survey_probe_stream_sink` instead.
+    stream_sink: Option<Arc<dyn ProcessStreamSinkClient>>,
+    survey_probe: bool,
+    primary_failure: String,
+    cleanup_failure: Option<String>,
 }
 
 /// Explicit start state machine for `WindowsProcessExecutor::start`
@@ -1491,6 +1601,8 @@ pub struct WindowsProcessExecutor {
     stream_sink: Option<Arc<dyn ProcessStreamSinkClient>>,
     operations: Mutex<BTreeMap<OperationId, Arc<Mutex<Operation>>>>,
     reservations: Mutex<std::collections::BTreeSet<OperationId>>,
+    #[cfg(windows)]
+    pending_pre_resume_cleanups: Mutex<BTreeMap<OperationId, Vec<PendingPreResumeCleanup>>>,
     capture_limit: usize,
 }
 
@@ -1520,7 +1632,69 @@ impl WindowsProcessExecutor {
         sink: Arc<dyn ProcessEvidenceSink>,
         outer_binding: RecoverableJobBinding,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
-        self.start_inner(request, sink, Some(outer_binding), None, false)
+        self.start_inner(request, sink, Some(outer_binding), None, false, None)
+    }
+
+    /// Starts one admitted installation survey probe in its exact newly
+    /// created zero-capability LPAC profile and temporary operation cwd ACL.
+    /// The profile and path lease transfer into the original executor
+    /// operation and are cleaned only after terminal Job/stream readback.
+    ///
+    /// # Errors
+    /// Refuses any mismatch between the original sealed request, profile and
+    /// retained path binding, or any strict suspended launch/token check.
+    #[cfg(windows)]
+    pub fn start_survey_probe_with_kernel_outer_job_binding(
+        &self,
+        request: ProcessRequest,
+        sink: Arc<dyn ProcessEvidenceSink>,
+        outer_binding: RecoverableJobBinding,
+        stream_sink: Arc<dyn ProcessStreamSinkClient>,
+        stream_policy: ProcessStreamPolicyBinding,
+        profile: SurveyProbeAppContainerProfile,
+        path_scope: RetainedSurveyProbePathLease,
+    ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
+        self.start_inner(
+            request,
+            sink,
+            Some(outer_binding),
+            None,
+            false,
+            Some(SurveyProbeLaunch {
+                profile,
+                path_scope,
+                stream_sink,
+                stream_policy,
+            }),
+        )
+    }
+
+    #[cfg(windows)]
+    fn retain_resumed_survey_probe_failure<V>(
+        &self,
+        operation_id: OperationId,
+        probe: SurveyProbeLaunch,
+        running: RunningJobChild<V>,
+        primary_failure: ProcessExecutionError,
+    ) -> ProcessExecutionError {
+        self.retain_pre_resume_cleanup(
+            operation_id.clone(),
+            PendingPreResumeCleanup {
+                profile: Some(probe.profile),
+                path_scope: Some(probe.path_scope),
+                child: Some(running.into_survey_probe_cleanup_owner()),
+                operation: None,
+                stream_sink: Some(probe.stream_sink),
+                survey_probe: true,
+                primary_failure: primary_failure.to_string(),
+                cleanup_failure: None,
+            },
+        );
+
+        match self.reconcile_pending_pre_resume_cleanup(&operation_id) {
+            Ok(Some(primary)) => unavailable(primary),
+            Ok(None) | Err(_) => ProcessExecutionError::UnknownOutcome,
+        }
     }
 
     /// Starts one Kernel child with the exact one-shot standard-input bytes the
@@ -1545,7 +1719,7 @@ impl WindowsProcessExecutor {
         sink: Arc<dyn ProcessEvidenceSink>,
         stdin_payload: Option<&[u8]>,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
-        self.start_inner(request, sink, None, stdin_payload, false)
+        self.start_inner(request, sink, None, stdin_payload, false, None)
     }
 
     /// Starts one admitted Kernel child with a retained live standard-input
@@ -1562,7 +1736,7 @@ impl WindowsProcessExecutor {
         sink: Arc<dyn ProcessEvidenceSink>,
         outer_binding: RecoverableJobBinding,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
-        self.start_inner(request, sink, Some(outer_binding), None, true)
+        self.start_inner(request, sink, Some(outer_binding), None, true, None)
     }
 
     /// Queues one complete, already-encoded EBP frame for the exact running
@@ -1621,6 +1795,8 @@ impl WindowsProcessExecutor {
             stream_sink: None,
             operations: Mutex::new(BTreeMap::new()),
             reservations: Mutex::new(std::collections::BTreeSet::new()),
+            #[cfg(windows)]
+            pending_pre_resume_cleanups: Mutex::new(BTreeMap::new()),
             capture_limit: DEFAULT_CAPTURE_LIMIT,
         }
     }
@@ -1645,6 +1821,8 @@ impl WindowsProcessExecutor {
             stream_sink: Some(stream_sink),
             operations: Mutex::new(BTreeMap::new()),
             reservations: Mutex::new(std::collections::BTreeSet::new()),
+            #[cfg(windows)]
+            pending_pre_resume_cleanups: Mutex::new(BTreeMap::new()),
             capture_limit: DEFAULT_CAPTURE_LIMIT,
         }
     }
@@ -1666,6 +1844,8 @@ impl WindowsProcessExecutor {
             stream_sink: None,
             operations: Mutex::new(BTreeMap::new()),
             reservations: Mutex::new(std::collections::BTreeSet::new()),
+            #[cfg(windows)]
+            pending_pre_resume_cleanups: Mutex::new(BTreeMap::new()),
             capture_limit: DEFAULT_CAPTURE_LIMIT,
         }
     }
@@ -1683,6 +1863,8 @@ impl WindowsProcessExecutor {
             stream_sink: None,
             operations: Mutex::new(BTreeMap::new()),
             reservations: Mutex::new(std::collections::BTreeSet::new()),
+            #[cfg(windows)]
+            pending_pre_resume_cleanups: Mutex::new(BTreeMap::new()),
             capture_limit: capture_limit.max(1),
         }
     }
@@ -1696,6 +1878,278 @@ impl WindowsProcessExecutor {
             .ok_or(ProcessExecutionError::NotFound)
     }
 
+    #[cfg(windows)]
+    fn retain_pre_resume_cleanup(
+        &self,
+        operation_id: OperationId,
+        cleanup: PendingPreResumeCleanup,
+    ) {
+        // A poisoned mutex still owns the original native handles. Recover
+        // its map and append this owner; never replace/drop a prior cleanup.
+        let mut pending = self
+            .pending_pre_resume_cleanups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.entry(operation_id).or_default().push(cleanup);
+    }
+
+    /// Transfers the same resumed survey operation Arc into the existing
+    /// cleanup fence when post-resume registry publication cannot complete.
+    /// It makes a bounded containment attempt when the operation lock permits
+    /// it, then retains this Arc with every native, stream, thread, watcher,
+    /// profile, and path owner for retry.
+    #[cfg(windows)]
+    fn retain_resumed_survey_operation_failure(
+        &self,
+        operation_id: OperationId,
+        operation: Arc<Mutex<Operation>>,
+        primary_failure: String,
+        mut cleanup_failure: Option<String>,
+    ) {
+        match operation.lock() {
+            Ok(mut guard) => {
+                if guard.child.is_some()
+                    && let Err(error) =
+                        finalize_operation(&mut guard, ExitDisposition::Unknown, false)
+                {
+                    let error = error.to_string();
+                    cleanup_failure = Some(cleanup_failure.map_or_else(
+                        || error.clone(),
+                        |previous| format!("{previous}; {error}"),
+                    ));
+                }
+                quarantine_operation(&mut guard);
+            }
+            Err(_) => {
+                cleanup_failure = Some(operation_unavailable(&operation_id, "lock").to_string());
+            }
+        }
+        self.retain_pre_resume_cleanup(
+            operation_id,
+            PendingPreResumeCleanup {
+                profile: None,
+                path_scope: None,
+                child: None,
+                operation: Some(operation),
+                stream_sink: None,
+                survey_probe: true,
+                primary_failure,
+                cleanup_failure,
+            },
+        );
+    }
+
+    /// Reconciles one full post-resume survey owner without moving it out of
+    /// its original Operation. A missing child field is insufficient: the
+    /// state must independently prove a terminal, complete, empty Job tree,
+    /// then the stream/thread and survey path owners must also cleanly settle.
+    #[cfg(windows)]
+    fn reconcile_retained_survey_operation(
+        operation: &Arc<Mutex<Operation>>,
+    ) -> Result<(), ProcessExecutionError> {
+        let watcher = {
+            let mut guard = operation
+                .lock()
+                .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
+            if guard.survey_probe_stream_sink.is_none() {
+                quarantine_operation(&mut guard);
+                return Err(ProcessExecutionError::UnknownOutcome);
+            }
+            if guard.child.is_some()
+                && finalize_operation(&mut guard, ExitDisposition::Unknown, false).is_err()
+            {
+                quarantine_operation(&mut guard);
+                return Err(ProcessExecutionError::UnknownOutcome);
+            }
+            let view = guard.state.view();
+            if guard.child.is_some()
+                || !view.lifecycle().is_terminal()
+                || !view
+                    .descendants()
+                    .is_some_and(|tree| tree.complete() && tree.tree_terminated())
+            {
+                quarantine_operation(&mut guard);
+                return Err(ProcessExecutionError::UnknownOutcome);
+            }
+            guard.deadline_watcher.take()
+        };
+
+        if let Some(watcher) = watcher {
+            if join_deadline_watcher(watcher).is_err() {
+                return Err(ProcessExecutionError::UnknownOutcome);
+            }
+        }
+
+        let (streams, pumps) = {
+            let mut guard = operation
+                .lock()
+                .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
+            let view = guard.state.view();
+            if guard.child.is_some()
+                || !view.lifecycle().is_terminal()
+                || !view
+                    .descendants()
+                    .is_some_and(|tree| tree.complete() && tree.tree_terminated())
+                || !join_streams(&mut guard)
+            {
+                quarantine_operation(&mut guard);
+                return Err(ProcessExecutionError::UnknownOutcome);
+            }
+            (
+                [Arc::clone(&guard.stdout), Arc::clone(&guard.stderr)],
+                [guard.stdout_pump.clone(), guard.stderr_pump.clone()],
+            )
+        };
+        for (stream, pump) in streams.into_iter().zip(pumps) {
+            if let Some(pump) = pump {
+                let disposition = session_status(&stream);
+                pump.lock()
+                    .map_err(|_| ProcessExecutionError::UnknownOutcome)?
+                    .reconcile_terminal_readback(disposition)?;
+            }
+        }
+
+        let mut guard = operation
+            .lock()
+            .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
+        let view = guard.state.view();
+        if guard.child.is_some()
+            || !view.lifecycle().is_terminal()
+            || !view
+                .descendants()
+                .is_some_and(|tree| tree.complete() && tree.tree_terminated())
+            || cleanup_survey_probe_resources(&mut guard).is_err()
+        {
+            quarantine_operation(&mut guard);
+            return Err(ProcessExecutionError::UnknownOutcome);
+        }
+        // Keep cleanup_required and the provider Arc intact. The operation is
+        // not released here; Kernel must complete its independent artifact
+        // cleanup/readback before finish_pre_resume_cleanup drops this owner.
+        Ok(())
+    }
+
+    /// Retains a profile and optional partially admitted native path owner
+    /// after setup failed. The caller must keep the same operation unknown
+    /// until [`Self::reconcile_pending_pre_resume_cleanup`] proves release.
+    #[cfg(windows)]
+    pub fn retain_survey_probe_setup_failure(
+        &self,
+        operation_id: OperationId,
+        profile: SurveyProbeAppContainerProfile,
+        path_scope: Option<RetainedSurveyProbePathLease>,
+        primary_failure: String,
+        cleanup_failure: Option<String>,
+    ) {
+        self.retain_pre_resume_cleanup(
+            operation_id,
+            PendingPreResumeCleanup {
+                profile: Some(profile),
+                path_scope,
+                child: None,
+                operation: None,
+                stream_sink: None,
+                survey_probe: true,
+                primary_failure,
+                cleanup_failure,
+            },
+        );
+    }
+
+    /// Retries exact pending cleanup in the original executor owner.
+    /// `Some(primary)` means any retained process/Job, stream terminal,
+    /// survey path, and profile cleanup proof completed; no process evidence
+    /// or start receipt is synthesized.
+    #[cfg(windows)]
+    pub fn reconcile_pending_pre_resume_cleanup(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<String>, ProcessExecutionError> {
+        let mut pending = self
+            .pending_pre_resume_cleanups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(cleanups) = pending.get_mut(operation_id) else {
+            return Ok(None);
+        };
+        for cleanup in cleanups.iter_mut() {
+            // This provider Arc is intentionally parked until Kernel finishes
+            // its independent raw-artifact cleanup/readback.
+            let _provider_owner_retained = cleanup.stream_sink.as_ref();
+            if let Some(operation) = cleanup.operation.as_ref()
+                && let Err(error) = Self::reconcile_retained_survey_operation(operation)
+            {
+                cleanup.cleanup_failure = Some(error.to_string());
+                return Err(ProcessExecutionError::UnknownOutcome);
+            }
+            if let Some(child) = cleanup.child.as_mut() {
+                if let Err(error) = child.terminate_for_cleanup() {
+                    cleanup.cleanup_failure = Some(error.to_string());
+                    return Err(ProcessExecutionError::UnknownOutcome);
+                }
+                cleanup.child.take();
+            }
+            if let Some(scope) = cleanup.path_scope.as_mut() {
+                if let Err(error) = scope.restore() {
+                    cleanup.cleanup_failure = Some(error.to_string());
+                    return Err(ProcessExecutionError::UnknownOutcome);
+                }
+                cleanup.path_scope.take();
+            }
+            if let Some(profile) = cleanup.profile.as_mut() {
+                if let Err(error) = profile.remove() {
+                    cleanup.cleanup_failure = Some(error.to_string());
+                    return Err(ProcessExecutionError::UnknownOutcome);
+                }
+                cleanup.profile.take();
+            }
+        }
+        let primary = cleanups
+            .first()
+            .map(|cleanup| match cleanup.cleanup_failure.as_deref() {
+                Some(cleanup_failure) => format!(
+                    "{}; prior cleanup attempt remained unknown: {cleanup_failure}",
+                    cleanup.primary_failure
+                ),
+                None => cleanup.primary_failure.clone(),
+            })
+            .unwrap_or_else(|| "pre-resume cleanup had no retained failure".to_owned());
+        Ok(Some(primary))
+    }
+
+    /// Releases the pending owner only after Kernel independently completes
+    /// its installation-root and retained-provider artifact readback.
+    #[cfg(windows)]
+    pub fn finish_pre_resume_cleanup(&self, operation_id: &OperationId) {
+        let mut pending = self
+            .pending_pre_resume_cleanups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.remove(operation_id);
+    }
+
+    #[cfg(windows)]
+    pub fn pending_pre_resume_cleanup_requires_survey_area(
+        &self,
+        operation_id: &OperationId,
+    ) -> bool {
+        self.pending_pre_resume_cleanups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(operation_id)
+            .is_some_and(|cleanups| cleanups.iter().any(|cleanup| cleanup.survey_probe))
+    }
+
+    #[cfg(windows)]
+    fn pending_pre_resume_cleanup_count(&self) -> usize {
+        self.pending_pre_resume_cleanups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .map(Vec::len)
+            .sum()
+    }
+
     fn reserve_operation(
         &self,
         id: OperationId,
@@ -1707,6 +2161,17 @@ impl WindowsProcessExecutor {
         // stranding a reservation: the `OperationReservation` guard drops at
         // function exit and releases the id, while registry inserts below
         // replace only the exact failed identity.
+        #[cfg(windows)]
+        let pending = self
+            .pending_pre_resume_cleanups
+            .lock()
+            .map_err(|_| unavailable("pre-resume cleanup registry lock poisoned"))?;
+        #[cfg(windows)]
+        if pending.contains_key(&id) {
+            return Err(unavailable(
+                "operation identity has unresolved pre-resume cleanup",
+            ));
+        }
         let operations = self
             .operations
             .lock()
@@ -1724,6 +2189,8 @@ impl WindowsProcessExecutor {
         if !reservations.insert(id.clone()) {
             return Err(unavailable("operation identity already exists"));
         }
+        #[cfg(windows)]
+        drop(pending);
         Ok(OperationReservation {
             executor: self,
             operation_id: id,
@@ -1777,14 +2244,26 @@ impl WindowsProcessExecutor {
             .iter()
             .filter(|record| !record.wall_time_enforcement_installed())
             .count();
+        let pending_pre_resume = {
+            #[cfg(windows)]
+            {
+                self.pending_pre_resume_cleanup_count()
+            }
+            #[cfg(not(windows))]
+            {
+                0
+            }
+        };
         let cleanup_pending_operations = quarantined_operations
             .iter()
             .filter(|record| record.cleanup_pending())
-            .count();
+            .count()
+            + pending_pre_resume;
         let unknown_outcome_operations = quarantined_operations
             .iter()
             .filter(|record| record.lifecycle() == ProcessLifecycle::UnknownOutcome)
-            .count();
+            .count()
+            + pending_pre_resume;
         ExecutorHealthSummary {
             new_start_ready,
             // The registry lock was usable above (we hold its snapshot), so
@@ -1835,7 +2314,7 @@ impl WindowsProcessExecutor {
         let Ok(registry) = self.operations.lock() else {
             return 0;
         };
-        registry
+        let registered_pending = registry
             .values()
             .filter(|operation| {
                 operation.lock().is_ok_and(|guard| {
@@ -1843,7 +2322,15 @@ impl WindowsProcessExecutor {
                         || guard.state.view().lifecycle() == ProcessLifecycle::UnknownOutcome
                 })
             })
-            .count()
+            .count();
+        #[cfg(windows)]
+        {
+            registered_pending + self.pending_pre_resume_cleanup_count()
+        }
+        #[cfg(not(windows))]
+        {
+            registered_pending
+        }
     }
 
     /// Returns the number of registered operations fenced as unknown
@@ -1853,14 +2340,22 @@ impl WindowsProcessExecutor {
         let Ok(registry) = self.operations.lock() else {
             return 0;
         };
-        registry
+        let registered_unknown = registry
             .values()
             .filter(|operation| {
                 operation.lock().is_ok_and(|guard| {
                     guard.state.view().lifecycle() == ProcessLifecycle::UnknownOutcome
                 })
             })
-            .count()
+            .count();
+        #[cfg(windows)]
+        {
+            registered_unknown + self.pending_pre_resume_cleanup_count()
+        }
+        #[cfg(not(windows))]
+        {
+            registered_unknown
+        }
     }
 
     /// Returns whether a new operation identity can currently be reserved.
@@ -2001,6 +2496,11 @@ impl WindowsProcessExecutor {
                     cleanup_unknown = true;
                     continue;
                 }
+                if cleanup_survey_probe_resources(&mut guard).is_err() {
+                    quarantine_operation(&mut guard);
+                    cleanup_unknown = true;
+                    continue;
+                }
                 // Cleanup/reopen reconciles the sink session identity without
                 // minting a second receipt: a best-effort readback surfaces an
                 // out-of-band terminal under the same session, and never
@@ -2069,6 +2569,10 @@ impl WindowsProcessExecutor {
                     retain_cleanup_owners = true;
                 }
                 if !join_streams(&mut guard) {
+                    quarantine_operation(&mut guard);
+                    retain_cleanup_owners = true;
+                }
+                if cleanup_survey_probe_resources(&mut guard).is_err() {
                     quarantine_operation(&mut guard);
                     retain_cleanup_owners = true;
                 }
@@ -2152,11 +2656,68 @@ impl WindowsProcessExecutor {
         outer_binding: Option<KernelOuterJobBinding>,
         stdin_payload: Option<&[u8]>,
         retain_stdin_writer: bool,
+        mut survey_probe: Option<SurveyProbeLaunch>,
+    ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
+        let operation_id = request.operation_id().clone();
+        let result = self.start_inner_with_probe_resources(
+            request,
+            sink,
+            outer_binding,
+            stdin_payload,
+            retain_stdin_writer,
+            &mut survey_probe,
+        );
+        let Some(probe) = survey_probe.take() else {
+            return result;
+        };
+
+        // An early return before the strict resources reach either the
+        // pending-cleanup owner or the live operation must not drop their
+        // native leases. Keep this original profile/path pair under the same
+        // operation identity; Kernel performs the final installer-root
+        // readback before releasing it.
+        let primary_failure = result.as_ref().err().map_or_else(
+            || "survey probe resources were not transferred to an operation owner".to_owned(),
+            ToString::to_string,
+        );
+        self.retain_pre_resume_cleanup(
+            operation_id,
+            PendingPreResumeCleanup {
+                profile: Some(probe.profile),
+                path_scope: Some(probe.path_scope),
+                child: None,
+                operation: None,
+                stream_sink: Some(probe.stream_sink),
+                survey_probe: true,
+                primary_failure,
+                cleanup_failure: None,
+            },
+        );
+        Err(ProcessExecutionError::UnknownOutcome)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the suspend, validate-and-consume, resume, capture, and registration order is security-critical"
+    )]
+    fn start_inner_with_probe_resources(
+        &self,
+        request: ProcessRequest,
+        sink: Arc<dyn ProcessEvidenceSink>,
+        outer_binding: Option<KernelOuterJobBinding>,
+        stdin_payload: Option<&[u8]>,
+        retain_stdin_writer: bool,
+        survey_probe: &mut Option<SurveyProbeLaunch>,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
         request.validate()?;
         if retain_stdin_writer && stdin_payload.is_some() {
             return Err(unavailable(
                 "live stdin cannot be combined with one-shot stdin payload bytes",
+            ));
+        }
+        if survey_probe.is_some() && (retain_stdin_writer || stdin_payload.is_some()) {
+            return Err(unavailable(
+                "installation survey probes do not accept stdin payloads or live stdin",
             ));
         }
         if self.kernel_outer_binding_required && outer_binding.is_none() {
@@ -2175,6 +2736,7 @@ impl WindowsProcessExecutor {
                 outer_binding,
                 stdin_payload,
                 retain_stdin_writer,
+                survey_probe,
             );
             return Err(unavailable(
                 "Windows ProcessExecutor is unavailable on this target",
@@ -2183,6 +2745,36 @@ impl WindowsProcessExecutor {
 
         #[cfg(windows)]
         {
+            if let Some(probe) = survey_probe.as_ref() {
+                let operation_id = request.operation_id().as_str();
+                if request.executable() != probe.path_scope.executable_path().to_string_lossy()
+                    || request.working_directory()
+                        != probe.path_scope.working_directory().to_string_lossy()
+                    || operation_id != probe.path_scope.operation_id()
+                    || request.invocation_digest() != probe.path_scope.invocation_digest()
+                    || probe.profile.identity() != probe.path_scope.app_container_identity()
+                    || !probe.profile.is_active()
+                    || probe
+                        .path_scope
+                        .validate_request_binding(
+                            Path::new(request.executable()),
+                            request.executable_sha256(),
+                            Path::new(request.working_directory()),
+                            operation_id,
+                            request.invocation_digest(),
+                        )
+                        .is_err()
+                {
+                    return Err(unavailable(
+                        "survey probe request does not match its retained operation scope",
+                    ));
+                }
+                if outer_binding.is_none() {
+                    return Err(unavailable(
+                        "installation survey probes require the current Host Kernel Job binding",
+                    ));
+                }
+            }
             if !request.environment().secret_refs().is_empty() {
                 return Err(unavailable(
                     "secret environment references require an admitted secret projection",
@@ -2256,21 +2848,93 @@ impl WindowsProcessExecutor {
             // observed assignment, permitted nesting, and outer kill-on-close
             // before launch. The limits above stay exactly the admitted
             // `ResourceLimits`; this call adds no default, cap, or fallback.
-            let child = if let Some(binding) = outer_binding {
-                SuspendedJobChild::spawn_nested_in_kernel_outer_kill_domain(
-                    spec, job_name, limits, binding,
-                )
-                .map_err(|error| match error {
-                    WindowsAdapterError::Timeout => ProcessExecutionError::UnknownOutcome,
-                    error => unavailable(error),
-                })?
-            } else {
-                SuspendedJobChild::spawn_named_with_limits(spec, job_name, limits).map_err(
-                    |error| match error {
-                        WindowsAdapterError::Timeout => ProcessExecutionError::UnknownOutcome,
-                        error => unavailable(error),
-                    },
-                )?
+            let spawn_result = match (outer_binding, survey_probe.as_ref()) {
+                (Some(binding), Some(probe)) => {
+                    SuspendedJobChild::spawn_nested_in_kernel_outer_kill_domain_for_survey_probe(
+                        spec,
+                        job_name,
+                        limits,
+                        binding,
+                        &probe.profile,
+                        &probe.path_scope,
+                    )
+                }
+                (Some(binding), None) => {
+                    SuspendedJobChild::spawn_nested_in_kernel_outer_kill_domain(
+                        spec, job_name, limits, binding,
+                    )
+                    .map_err(SuspendedSpawnError::from)
+                }
+                (None, None) => SuspendedJobChild::spawn_named_with_limits(spec, job_name, limits)
+                    .map_err(SuspendedSpawnError::from),
+                (None, Some(_)) => {
+                    return Err(unavailable(
+                        "installation survey probes require the current Host Kernel Job binding",
+                    ));
+                }
+            };
+            let child = match spawn_result {
+                Ok(child) => child,
+                Err(SuspendedSpawnError::Mechanics(error)) => {
+                    let Some(probe) = survey_probe.take() else {
+                        return Err(map_suspended_spawn_error(error));
+                    };
+                    self.retain_pre_resume_cleanup(
+                        operation_id.clone(),
+                        PendingPreResumeCleanup {
+                            profile: Some(probe.profile),
+                            path_scope: Some(probe.path_scope),
+                            child: None,
+                            operation: None,
+                            stream_sink: Some(probe.stream_sink),
+                            survey_probe: true,
+                            primary_failure: error.to_string(),
+                            cleanup_failure: None,
+                        },
+                    );
+                    return match self
+                        .reconcile_pending_pre_resume_cleanup(&operation_id)
+                    {
+                        Ok(Some(primary)) => Err(unavailable(primary)),
+                        Ok(None) | Err(_) => Err(ProcessExecutionError::UnknownOutcome),
+                    };
+                }
+                Err(SuspendedSpawnError::UnknownOutcome {
+                    child,
+                    primary_failure,
+                    cleanup_failure,
+                }) => {
+                    let is_survey_probe = survey_probe.is_some();
+                    let (profile, path_scope, stream_sink) = survey_probe
+                        .take()
+                        .map(|probe| {
+                            (
+                                Some(probe.profile),
+                                Some(probe.path_scope),
+                                Some(probe.stream_sink),
+                            )
+                        })
+                        .unwrap_or((None, None, None));
+                    self.retain_pre_resume_cleanup(
+                        operation_id.clone(),
+                        PendingPreResumeCleanup {
+                            profile,
+                            path_scope,
+                            child: Some(child),
+                            operation: None,
+                            stream_sink,
+                            survey_probe: is_survey_probe,
+                            primary_failure: primary_failure.clone(),
+                            cleanup_failure: Some(cleanup_failure.to_string()),
+                        },
+                    );
+                    return match self
+                        .reconcile_pending_pre_resume_cleanup(&operation_id)
+                    {
+                        Ok(Some(primary)) => Err(unavailable(primary)),
+                        Ok(None) | Err(_) => Err(ProcessExecutionError::UnknownOutcome),
+                    };
+                }
             };
 
             // Issue-84 start state machine: `SuspendedLaunch` (above) →
@@ -2292,8 +2956,23 @@ impl WindowsProcessExecutor {
             debug_assert_eq!(start_phase, StartPhase::SuspendedLaunch);
             let authority = Arc::clone(&self.authority);
             let launch_admission = self.launch_admission.as_ref().map(Arc::clone);
-            let validated = child
-                .validate(|evidence| {
+            let validated = match child.validate(|evidence| {
+                    if let Some(probe) = survey_probe.as_ref() {
+                        let token = evidence.survey_probe_token().ok_or_else(|| {
+                            unavailable("suspended survey-probe token readback is unavailable")
+                        })?;
+                        if token.app_container_sid() != probe.profile.sid_text()
+                            || !token.app_container_membership()
+                            || !token.lpac_policy_applied()
+                            || !token.low_integrity()
+                            || token.elevated()
+                            || token.capability_count() != 0
+                        {
+                            return Err(unavailable(
+                                "suspended survey-probe token did not match strict LPAC bounds",
+                            ));
+                        }
+                    }
                     let observed = suspended_identity(&request, evidence)?;
                     let executable = evidence.executable_file_identity();
                     let launch = SuspendedLaunchEvidence::new(
@@ -2305,8 +2984,51 @@ impl WindowsProcessExecutor {
                         admission.validate_launch(&request, &observed, &launch)?;
                     }
                     authority.validate_and_consume(request, observed)
-                })
-                .map_err(validation_error)?;
+                }) {
+                Ok(validated) => validated,
+                Err(error) => {
+                    let (child, primary_failure) = match error {
+                        SuspendedValidationError::Mechanics(error) =>
+                            (None, error.to_string()),
+                        SuspendedValidationError::Rejected(error) =>
+                            (None, error.to_string()),
+                        SuspendedValidationError::UnknownOutcome {
+                            child,
+                            primary_failure,
+                        } => (Some(child), primary_failure),
+                    };
+                    let is_survey_probe = survey_probe.is_some();
+                    let (profile, path_scope, stream_sink) = survey_probe
+                        .take()
+                        .map(|probe| {
+                            (
+                                Some(probe.profile),
+                                Some(probe.path_scope),
+                                Some(probe.stream_sink),
+                            )
+                        })
+                        .unwrap_or((None, None, None));
+                    self.retain_pre_resume_cleanup(
+                        operation_id.clone(),
+                        PendingPreResumeCleanup {
+                            profile,
+                            path_scope,
+                            child,
+                            operation: None,
+                            stream_sink,
+                            survey_probe: is_survey_probe,
+                            primary_failure: primary_failure.clone(),
+                            cleanup_failure: None,
+                        },
+                    );
+                    return match self
+                        .reconcile_pending_pre_resume_cleanup(&operation_id)
+                    {
+                        Ok(Some(primary)) => Err(unavailable(primary)),
+                        Ok(None) | Err(_) => Err(ProcessExecutionError::UnknownOutcome),
+                    };
+                }
+            };
             // `AuthorityValidation`: the one-shot permit was consumed against
             // fresh suspended evidence above.
             start_phase = StartPhase::AuthorityValidation;
@@ -2315,21 +3037,99 @@ impl WindowsProcessExecutor {
             // `Resumed`: resume must precede stream-capture ownership — the
             // stdout/stderr read handles live on `RunningJobChild` and can
             // only be taken after `resume()`.
-            let mut running = validated.resume().map_err(|error| match error {
-                WindowsAdapterError::Timeout => ProcessExecutionError::UnknownOutcome,
-                error => unavailable(error),
-            })?;
+            let mut running = if survey_probe.is_some() {
+                match validated.resume_for_survey_probe() {
+                    Ok(running) => running,
+                    Err(SurveyProbeResumeError::Mechanics(error)) => {
+                        if let Some(probe) = survey_probe.take() {
+                            self.retain_pre_resume_cleanup(
+                                operation_id.clone(),
+                                PendingPreResumeCleanup {
+                                    profile: Some(probe.profile),
+                                    path_scope: Some(probe.path_scope),
+                                    child: None,
+                                    operation: None,
+                                    stream_sink: Some(probe.stream_sink),
+                                    survey_probe: true,
+                                    primary_failure: error.to_string(),
+                                    cleanup_failure: None,
+                                },
+                            );
+                            return match self
+                                .reconcile_pending_pre_resume_cleanup(&operation_id)
+                            {
+                                Ok(Some(primary)) => Err(unavailable(primary)),
+                                Ok(None) | Err(_) => {
+                                    Err(ProcessExecutionError::UnknownOutcome)
+                                }
+                            };
+                        }
+                        return Err(unavailable(error));
+                    }
+                    Err(SurveyProbeResumeError::UnknownOutcome {
+                        child,
+                        primary_failure,
+                        cleanup_failure,
+                    }) => {
+                        let (profile, path_scope, stream_sink, is_survey_probe) = survey_probe
+                            .take()
+                            .map(|probe| {
+                                (
+                                    Some(probe.profile),
+                                    Some(probe.path_scope),
+                                    Some(probe.stream_sink),
+                                    true,
+                                )
+                            })
+                            .unwrap_or((None, None, None, false));
+                        self.retain_pre_resume_cleanup(
+                            operation_id.clone(),
+                            PendingPreResumeCleanup {
+                                profile,
+                                path_scope,
+                                child: Some(child),
+                                operation: None,
+                                stream_sink,
+                                survey_probe: is_survey_probe,
+                                primary_failure: primary_failure.to_string(),
+                                cleanup_failure: Some(cleanup_failure.to_string()),
+                            },
+                        );
+                        return match self
+                            .reconcile_pending_pre_resume_cleanup(&operation_id)
+                        {
+                            Ok(Some(primary)) => Err(unavailable(primary)),
+                            Ok(None) | Err(_) => Err(ProcessExecutionError::UnknownOutcome),
+                        };
+                    }
+                }
+            } else {
+                validated.resume().map_err(|error| match error {
+                    WindowsAdapterError::Timeout => ProcessExecutionError::UnknownOutcome,
+                    error => unavailable(error),
+                })?
+            };
             start_phase = StartPhase::Resumed;
             let now = now_ms();
-            state.mark_resumed(
-                now,
-                ProcessHealth::new(
+            let resumed_state = ProcessHealth::new(
                     ProcessHealthStatus::Healthy,
                     true,
                     now,
                     Some("P-02 suspended launch and resume observed".to_owned()),
-                )?,
-            )?;
+                )
+                .and_then(|health| state.mark_resumed(now, health));
+            if let Err(error) = resumed_state {
+                let primary_failure = ProcessExecutionError::from(error);
+                if let Some(probe) = survey_probe.take() {
+                    return Err(self.retain_resumed_survey_probe_failure(
+                        operation_id.clone(),
+                        probe,
+                        running,
+                        primary_failure,
+                    ));
+                }
+                return Err(primary_failure);
+            }
             let (stdin_writer, stdin_writer_setup_error) = if retain_stdin_writer {
                 match running.take_stdin_writer() {
                     Some(stdin) => match LiveStdinWriter::spawn(stdin) {
@@ -2361,9 +3161,20 @@ impl WindowsProcessExecutor {
                 retention(stderr_limit, self.capture_limit),
                 stderr_requested,
             )));
-            let deadline = Instant::now()
+            let Some(deadline) = Instant::now()
                 .checked_add(Duration::from_millis(wall_timeout_ms))
-                .ok_or_else(|| unavailable("wall timeout overflows monotonic clock"))?;
+            else {
+                let primary_failure = unavailable("wall timeout overflows monotonic clock");
+                if let Some(probe) = survey_probe.take() {
+                    return Err(self.retain_resumed_survey_probe_failure(
+                        operation_id.clone(),
+                        probe,
+                        running,
+                        primary_failure,
+                    ));
+                }
+                return Err(primary_failure);
+            };
             // Issue-84 start state machine: `Resumed` (just observed above) →
             // `CaptureSetup` (below). Capture threads must follow resume
             // because the read handles live on `RunningJobChild`. Every
@@ -2394,17 +3205,31 @@ impl WindowsProcessExecutor {
             // the legacy `SourceUnavailable` path applies (provider failure
             // never claims a complete source).
             let stream_binding = state.view().binding().clone();
+            let survey_probe_stream_sink = survey_probe
+                .as_ref()
+                .map(|probe| Arc::clone(&probe.stream_sink));
+            let stream_sink = survey_probe_stream_sink
+                .as_ref()
+                .map(Arc::clone)
+                .or_else(|| self.stream_sink.as_ref().map(Arc::clone));
+            let survey_stream_policy = survey_probe
+                .as_ref()
+                .map(|probe| probe.stream_policy.clone());
             let stdout_pump = open_stream_pump(
-                self.stream_sink.as_ref(),
+                stream_sink.as_ref(),
                 &stream_binding,
                 ProcessStreamKind::Stdout,
                 stdout_requested,
+                survey_stream_policy.as_ref(),
+                stdout_limit,
             );
             let stderr_pump = open_stream_pump(
-                self.stream_sink.as_ref(),
+                stream_sink.as_ref(),
                 &stream_binding,
                 ProcessStreamKind::Stderr,
                 stderr_requested,
+                survey_stream_policy.as_ref(),
+                stderr_limit,
             );
             let stdout_thread = match spawn_capture(
                 "stdout",
@@ -2463,10 +3288,18 @@ impl WindowsProcessExecutor {
             // (state fences the flow — a take consumes the handle, so the
             // second arm cannot re-take).
             debug_assert_eq!(start_phase, StartPhase::CaptureSetup);
+            let (survey_probe_profile, survey_probe_path_scope) = survey_probe
+                .take()
+                .map(|probe| (Some(probe.profile), Some(probe.path_scope)))
+                .unwrap_or((None, None));
+            let is_survey_probe_operation = survey_probe_stream_sink.is_some();
             let operation = Arc::new(Mutex::new(Operation {
                 state,
                 sink,
                 child: Some(running),
+                survey_probe_profile,
+                survey_probe_path_scope,
+                survey_probe_stream_sink,
                 stdin_writer,
                 stdout,
                 stderr,
@@ -2501,31 +3334,48 @@ impl WindowsProcessExecutor {
                 // queryable/cancellable/reconcilable until terminal cleanup is
                 // proven; no unrelated op is touched (#82 operation-local
                 // contour). Never a bare `Err` that orphans a live child.
-                let finalize_result = {
-                    let mut guard = operation
-                        .lock()
-                        .map_err(|_| unavailable("operation lock poisoned"))?;
-                    guard.start_phase = start_phase;
-                    let finalize_result =
-                        finalize_operation(&mut guard, ExitDisposition::Unknown, false);
-                    quarantine_operation(&mut guard);
-                    let _ = quarantine_snapshot(&operation_id, &guard, evidence_gap);
-                    finalize_result
+                let finalize_result = match operation.lock() {
+                    Ok(mut guard) => {
+                        guard.start_phase = start_phase;
+                        let finalize_result =
+                            finalize_operation(&mut guard, ExitDisposition::Unknown, false);
+                        quarantine_operation(&mut guard);
+                        let _ = quarantine_snapshot(&operation_id, &guard, evidence_gap);
+                        finalize_result
+                    }
+                    Err(_) if is_survey_probe_operation => {
+                        self.retain_resumed_survey_operation_failure(
+                            operation_id.clone(),
+                            Arc::clone(&operation),
+                            error.to_string(),
+                            Some(operation_unavailable(&operation_id, "lock").to_string()),
+                        );
+                        return Err(ProcessExecutionError::UnknownOutcome);
+                    }
+                    Err(_) => return Err(unavailable("operation lock poisoned")),
                 };
                 // `finalize_operation` joins every installed stream and stdin
                 // writer owner before returning. Any half-installed control
                 // path stays attached to this operation for reconciliation.
-                if self
+                let registry_published = self
                     .operations
                     .lock()
                     .map(|mut registry| {
                         registry.insert(operation_id.clone(), Arc::clone(&operation));
                     })
-                    .is_err()
-                {
+                    .is_ok();
+                if !registry_published {
                     // The Job tree is already contained through the admitted
                     // owner above; only registry publication failed. Fence
                     // stays local on the retained op, report typed unknown.
+                    if is_survey_probe_operation {
+                        self.retain_resumed_survey_operation_failure(
+                            operation_id.clone(),
+                            Arc::clone(&operation),
+                            error.to_string(),
+                            Some(registry_unavailable("lock").to_string()),
+                        );
+                    }
                     return Err(ProcessExecutionError::UnknownOutcome);
                 }
                 return match finalize_result {
@@ -2543,7 +3393,9 @@ impl WindowsProcessExecutor {
             start_phase = StartPhase::WatcherSetup;
             debug_assert_eq!(start_phase, StartPhase::WatcherSetup);
             let watcher_owner = deadline_watcher_owner_id(&operation_id);
-            let Ok(deadline_watcher) = spawn_deadline_watcher(&operation_id, &operation) else {
+            let deadline_watcher = match spawn_deadline_watcher(&operation_id, &operation) {
+                Ok(deadline_watcher) => deadline_watcher,
+                Err(watcher_error) => {
                 // Fail closed AFTER resume (issues #83 §2 / #84 §2): the child is
                 // already running, so terminate/contain the COMPLETE Job
                 // tree through the admitted process owner
@@ -2556,9 +3408,19 @@ impl WindowsProcessExecutor {
                 // stays queryable/cancellable/reconcilable until terminal
                 // cleanup is proven, and no unrelated op is touched (#82:
                 // no global poison; #84 keeps that contract).
-                let mut guard = operation
-                    .lock()
-                    .map_err(|_| unavailable("operation lock poisoned"))?;
+                let mut guard = match operation.lock() {
+                    Ok(guard) => guard,
+                    Err(_) if is_survey_probe_operation => {
+                        self.retain_resumed_survey_operation_failure(
+                            operation_id.clone(),
+                            Arc::clone(&operation),
+                            watcher_error.to_string(),
+                            Some(operation_unavailable(&operation_id, "lock").to_string()),
+                        );
+                        return Err(ProcessExecutionError::UnknownOutcome);
+                    }
+                    Err(_) => return Err(unavailable("operation lock poisoned")),
+                };
                 guard.start_phase = start_phase;
                 if finalize_operation(&mut guard, ExitDisposition::Unknown, false).is_err() {
                     // Finalize already stored partial termination/cleanup
@@ -2568,23 +3430,40 @@ impl WindowsProcessExecutor {
                 quarantine_operation(&mut guard);
                 let _ = quarantine_snapshot(&operation_id, &guard, WATCHER_EVIDENCE_GAP);
                 drop(guard);
-                if self
+                let registry_published = self
                     .operations
                     .lock()
                     .map(|mut registry| {
                         registry.insert(operation_id.clone(), Arc::clone(&operation));
                     })
-                    .is_err()
-                {
+                    .is_ok();
+                if !registry_published {
+                    if is_survey_probe_operation {
+                        self.retain_resumed_survey_operation_failure(
+                            operation_id.clone(),
+                            Arc::clone(&operation),
+                            watcher_error.to_string(),
+                            Some(registry_unavailable("lock").to_string()),
+                        );
+                    }
                     return Err(ProcessExecutionError::UnknownOutcome);
                 }
                 return Err(ProcessExecutionError::UnknownOutcome);
+                }
             };
             let Ok(mut guard) = operation.lock() else {
                 let _ = join_deadline_watcher(deadline_watcher);
-                // The operation was never registered; the reservation guard
-                // releases the identity so a retry with the same id can start
-                // cleanly and no reservation is stranded.
+                // This branch is reached only when the operation lock was
+                // poisoned; a survey transfers the exact Arc to the pending
+                // cleanup fence below before its reservation guard drops.
+                if is_survey_probe_operation {
+                    self.retain_resumed_survey_operation_failure(
+                        operation_id.clone(),
+                        Arc::clone(&operation),
+                        operation_unavailable(&operation_id, "lock").to_string(),
+                        None,
+                    );
+                }
                 return Err(ProcessExecutionError::UnknownOutcome);
             };
             guard.deadline_watcher = Some(deadline_watcher);
@@ -2618,9 +3497,19 @@ impl WindowsProcessExecutor {
                 // then fence locally and KEEP the (contained) op registered
                 // so it stays queryable/cancellable/reconcilable. Never a
                 // bare error that orphans a live child; never global poison.
-                let mut guard = operation
-                    .lock()
-                    .map_err(|_| unavailable("operation lock poisoned"))?;
+                let mut guard = match operation.lock() {
+                    Ok(guard) => guard,
+                    Err(_) if is_survey_probe_operation => {
+                        self.retain_resumed_survey_operation_failure(
+                            operation_id.clone(),
+                            Arc::clone(&operation),
+                            PUBLISH_EVIDENCE_GAP.to_owned(),
+                            Some(operation_unavailable(&operation_id, "lock").to_string()),
+                        );
+                        return Err(ProcessExecutionError::UnknownOutcome);
+                    }
+                    Err(_) => return Err(unavailable("operation lock poisoned")),
+                };
                 guard.start_phase = start_phase;
                 if finalize_operation(&mut guard, ExitDisposition::Unknown, false).is_err() {
                     // Finalize already stored partial termination/cleanup
@@ -2631,14 +3520,22 @@ impl WindowsProcessExecutor {
                 quarantine_operation(&mut guard);
                 let _ = quarantine_snapshot(&operation_id, &guard, PUBLISH_EVIDENCE_GAP);
                 drop(guard);
-                if self
+                let registry_published = self
                     .operations
                     .lock()
                     .map(|mut registry| {
                         registry.insert(operation_id.clone(), Arc::clone(&operation));
                     })
-                    .is_err()
-                {
+                    .is_ok();
+                if !registry_published {
+                    if is_survey_probe_operation {
+                        self.retain_resumed_survey_operation_failure(
+                            operation_id.clone(),
+                            Arc::clone(&operation),
+                            PUBLISH_EVIDENCE_GAP.to_owned(),
+                            Some(registry_unavailable("lock").to_string()),
+                        );
+                    }
                     return Err(ProcessExecutionError::UnknownOutcome);
                 }
                 return Err(ProcessExecutionError::UnknownOutcome);
@@ -2648,11 +3545,18 @@ impl WindowsProcessExecutor {
                 Ok(evidence) => sink.record(evidence).is_ok(),
                 Err(_) => false,
             };
-            let Ok(mut guard) = operation.lock() else {
-                // Never stranding: the operation was never registered, so the
-                // reservation guard releases the exact identity and a retry
-                // with the same id can start cleanly.
-                return Err(ProcessExecutionError::UnknownOutcome);
+            let mut guard = match operation.lock() {
+                Ok(guard) => guard,
+                Err(_) if is_survey_probe_operation => {
+                    self.retain_resumed_survey_operation_failure(
+                        operation_id.clone(),
+                        Arc::clone(&operation),
+                        operation_unavailable(&operation_id, "lock").to_string(),
+                        None,
+                    );
+                    return Err(ProcessExecutionError::UnknownOutcome);
+                }
+                Err(_) => return Err(ProcessExecutionError::UnknownOutcome),
             };
             if !published {
                 // Sink-publication failure is operation-local: fence this op,
@@ -2665,10 +3569,22 @@ impl WindowsProcessExecutor {
                 quarantine_operation(&mut guard);
                 let _ = quarantine_snapshot(&operation_id, &guard, SINK_EVIDENCE_GAP);
                 drop(guard);
-                if let Ok(mut registry) = self.operations.lock() {
-                    registry
-                        .entry(operation_id.clone())
-                        .or_insert_with(|| Arc::clone(&operation));
+                let registry_published = match self.operations.lock() {
+                    Ok(mut registry) => {
+                        registry
+                            .entry(operation_id.clone())
+                            .or_insert_with(|| Arc::clone(&operation));
+                        true
+                    }
+                    Err(_) => false,
+                };
+                if !registry_published && is_survey_probe_operation {
+                    self.retain_resumed_survey_operation_failure(
+                        operation_id.clone(),
+                        Arc::clone(&operation),
+                        SINK_EVIDENCE_GAP.to_owned(),
+                        Some(registry_unavailable("lock").to_string()),
+                    );
                 }
                 return Err(ProcessExecutionError::UnknownOutcome);
             }
@@ -2725,6 +3641,20 @@ impl WindowsProcessExecutor {
                 // success: fence the (unregistered) operation locally and
                 // report unknown while leaving every other operation alone.
                 guard.start_phase = start_phase;
+                if is_survey_probe_operation {
+                    guard.start_publish_gap = Some(PUBLISH_EVIDENCE_GAP);
+                    let _ = finalize_operation(&mut guard, ExitDisposition::Unknown, false);
+                    quarantine_operation(&mut guard);
+                    let _ = quarantine_snapshot(&operation_id, &guard, PUBLISH_EVIDENCE_GAP);
+                    drop(guard);
+                    self.retain_resumed_survey_operation_failure(
+                        operation_id.clone(),
+                        Arc::clone(&operation),
+                        registry_unavailable("lock").to_string(),
+                        None,
+                    );
+                    return Err(ProcessExecutionError::UnknownOutcome);
+                }
                 quarantine_operation(&mut guard);
                 return Err(ProcessExecutionError::UnknownOutcome);
             }
@@ -2928,6 +3858,10 @@ impl WindowsProcessExecutor {
                 quarantine_operation(&mut guard);
                 return Err(ProcessExecutionError::UnknownOutcome);
             };
+            if cleanup_survey_probe_resources(&mut guard).is_err() {
+                quarantine_operation(&mut guard);
+                return Err(ProcessExecutionError::UnknownOutcome);
+            }
             guard.sink.record(evidence.clone())?;
             Ok(evidence)
         }
@@ -2947,7 +3881,7 @@ impl ProcessExecutor for WindowsProcessExecutor {
         request: ProcessRequest,
         sink: Arc<dyn ProcessEvidenceSink>,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
-        self.start_inner(request, sink, None, None, false)
+        self.start_inner(request, sink, None, None, false, None)
     }
 
     async fn inspect(
@@ -3000,13 +3934,10 @@ fn suspended_identity(
 }
 
 #[cfg(windows)]
-fn validation_error<E: std::fmt::Display>(
-    error: SuspendedValidationError<E>,
-) -> ProcessExecutionError {
+fn map_suspended_spawn_error(error: WindowsAdapterError) -> ProcessExecutionError {
     match error {
-        SuspendedValidationError::Mechanics(error) => unavailable(error),
-        SuspendedValidationError::Rejected(error) => unavailable(error),
-        SuspendedValidationError::UnknownOutcome => ProcessExecutionError::UnknownOutcome,
+        WindowsAdapterError::Timeout => ProcessExecutionError::UnknownOutcome,
+        error => unavailable(error),
     }
 }
 
@@ -3198,6 +4129,45 @@ fn fence_unknown(operation: &mut Operation) -> Result<(), ProcessExecutionError>
     )?;
     let exit = ExitStatus::new(ExitDisposition::Unknown, None, None, now_ms())?;
     operation.state.exit(exit, descendants)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn cleanup_survey_probe_resources(
+    operation: &mut Operation,
+) -> Result<(), ProcessExecutionError> {
+    if operation.survey_probe_profile.is_none() && operation.survey_probe_path_scope.is_none() {
+        return Ok(());
+    }
+
+    let view = operation.state.view();
+    if !view.lifecycle().is_terminal()
+        || !view
+            .descendants()
+            .is_some_and(|tree| tree.complete() && tree.tree_terminated())
+    {
+        return Err(ProcessExecutionError::UnknownOutcome);
+    }
+
+    let (Some(scope), Some(profile)) = (
+        operation.survey_probe_path_scope.as_mut(),
+        operation.survey_probe_profile.as_mut(),
+    ) else {
+        return Err(ProcessExecutionError::UnknownOutcome);
+    };
+
+    // Restore the exact original ACL and remove the operation-owned cwd before
+    // deleting its profile. Each step is idempotent and remains retained when
+    // readback/cleanup fails, so a later original reconciliation can retry.
+    scope
+        .restore()
+        .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
+    profile
+        .remove()
+        .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
+
+    operation.survey_probe_path_scope.take();
+    operation.survey_probe_profile.take();
     Ok(())
 }
 
@@ -3769,13 +4739,21 @@ fn open_stream_pump(
     binding: &ProcessExecutionBinding,
     kind: ProcessStreamKind,
     requested: bool,
+    survey_policy: Option<&ProcessStreamPolicyBinding>,
+    stream_byte_bound: u64,
 ) -> Option<Arc<Mutex<StreamSinkPump>>> {
     if !requested {
         return None;
     }
     let client = client.map(Arc::clone)?;
-    let policy = p04_stream_policy().ok()?;
-    let limits = sink_backpressure_limits().ok()?;
+    let (policy, limits) = if let Some(policy) = survey_policy {
+        (
+            policy.clone(),
+            sink_backpressure_limits_for_stream(stream_byte_bound).ok()?,
+        )
+    } else {
+        (p04_stream_policy().ok()?, sink_backpressure_limits().ok()?)
+    };
     let mut pump = StreamSinkPump::new(client, binding.clone(), kind, policy, limits);
     pump.open().ok()?;
     Some(Arc::new(Mutex::new(pump)))
@@ -4731,7 +5709,9 @@ fn registry_unavailable(what: &'static str) -> ProcessExecutionError {
 
 #[cfg(test)]
 mod tests {
-    use super::{DispatchValidationPort, WindowsProcessExecutor};
+    use super::{
+        DispatchValidationPort, WindowsProcessExecutor, sink_backpressure_limits_for_stream,
+    };
     use eliot_process::{
         ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, EnvironmentInheritance,
         EnvironmentProjection, EvidenceSinkError, FencingToken, Generation, ImageId, JobId,
@@ -4743,6 +5723,16 @@ mod tests {
     use std::future::Future;
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll, Waker};
+
+    #[test]
+    fn survey_sink_limits_are_clamped_to_the_admitted_stream_bound() {
+        let limits = sink_backpressure_limits_for_stream(1).expect("bounded stream limits");
+        assert_eq!(limits.max_total_admitted_bytes(), 1);
+        assert_eq!(limits.max_chunk_bytes(), 1);
+        assert_eq!(limits.max_in_flight_bytes(), 1);
+        assert_eq!(limits.max_preview_bytes(), 1);
+        assert!(sink_backpressure_limits_for_stream(0).is_err());
+    }
 
     #[cfg(windows)]
     use eliot_instrument_api::EvidenceAxes;
@@ -4830,6 +5820,284 @@ mod tests {
             Err(ProcessExecutionError::Unavailable(
                 "dummy port must not be called pre-spawn".to_owned(),
             ))
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pre_resume_cleanup_keeps_primary_until_kernel_readback_finishes() {
+        use super::PendingPreResumeCleanup;
+
+        let executor = WindowsProcessExecutor::new(Arc::new(DummyPort));
+        let operation_id = OperationId::new("pre-resume-cleanup-readback")
+            .expect("test operation identity");
+        executor.retain_pre_resume_cleanup(
+            operation_id.clone(),
+            PendingPreResumeCleanup {
+                profile: None,
+                path_scope: None,
+                child: None,
+                operation: None,
+                stream_sink: None,
+                survey_probe: false,
+                primary_failure: "suspended validation failed".to_owned(),
+                cleanup_failure: None,
+            },
+        );
+        assert!(
+            executor.reserve_operation(operation_id.clone()).is_err(),
+            "an unresolved cleanup owner must block same-id restart"
+        );
+
+        assert_eq!(
+            executor
+                .reconcile_pending_pre_resume_cleanup(&operation_id)
+                .expect("native cleanup observation"),
+            Some("suspended validation failed".to_owned())
+        );
+        // A successful native stage does not release the original owner until
+        // Kernel has independently read back its installer-root marker.
+        assert_eq!(
+            executor
+                .reconcile_pending_pre_resume_cleanup(&operation_id)
+                .expect("retry before Kernel readback"),
+            Some("suspended validation failed".to_owned())
+        );
+        executor.finish_pre_resume_cleanup(&operation_id);
+        assert!(executor
+            .reconcile_pending_pre_resume_cleanup(&operation_id)
+            .expect("finished cleanup owner")
+            .is_none());
+        drop(
+            executor
+                .reserve_operation(operation_id)
+                .expect("operation id can be reused after cleanup release")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pending_survey_cleanup_keeps_original_child_until_kernel_readback() {
+        use super::PendingPreResumeCleanup;
+        use eliot_platform_windows::{SuspendedJobChild, SuspendedLaunchSpec};
+
+        const CHILD_MARKER: &str = "ELIOT_P04_EXECUTOR_PENDING_CLEANUP_CHILD";
+        let mut environment = std::env::vars_os().collect::<Vec<_>>();
+        environment.retain(|(name, _)| {
+            !name.to_string_lossy().eq_ignore_ascii_case(CHILD_MARKER)
+        });
+        environment.push((CHILD_MARKER.into(), "1".into()));
+        let spec = SuspendedLaunchSpec::new(
+            std::env::current_exe().expect("current test executable"),
+            vec![
+                "--exact".into(),
+                "tests::executor_pending_cleanup_process_child".into(),
+                "--nocapture".into(),
+            ],
+            std::env::current_dir().expect("current working directory"),
+            environment,
+        )
+        .expect("test child launch spec");
+        let child = SuspendedJobChild::spawn(spec).expect("suspended test child");
+        let child = child
+            .validate::<(), &'static str, _>(|_| Ok(()))
+            .expect("validated test child")
+            .resume()
+            .expect("resumed test child")
+            .into_survey_probe_cleanup_owner();
+
+        let executor = WindowsProcessExecutor::new(Arc::new(DummyPort));
+        let operation_id = OperationId::new("survey-pending-child-readback")
+            .expect("test operation identity");
+        executor.retain_pre_resume_cleanup(
+            operation_id.clone(),
+            PendingPreResumeCleanup {
+                profile: None,
+                path_scope: None,
+                child: Some(child),
+                operation: None,
+                stream_sink: None,
+                survey_probe: true,
+                primary_failure: "resume cleanup readback remained unknown".to_owned(),
+                cleanup_failure: Some("native cleanup was not observed".to_owned()),
+            },
+        );
+
+        assert_eq!(executor.pending_pre_resume_cleanup_count(), 1);
+        assert_eq!(
+            executor
+                .reconcile_pending_pre_resume_cleanup(&operation_id)
+                .expect("original child cleanup"),
+            Some(
+                "resume cleanup readback remained unknown; prior cleanup attempt remained unknown: native cleanup was not observed"
+                    .to_owned()
+            )
+        );
+        assert!(executor.pending_pre_resume_cleanup_requires_survey_area(&operation_id));
+        // Native child cleanup alone does not release the original pending
+        // owner before Kernel performs its installer-root readback.
+        assert_eq!(executor.pending_pre_resume_cleanup_count(), 1);
+        executor.finish_pre_resume_cleanup(&operation_id);
+        assert_eq!(executor.pending_pre_resume_cleanup_count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn survey_registry_publication_failure_retains_original_operation_arc(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use super::{CaptureSession, Operation, StartPhase};
+        use eliot_process::ProcessState;
+        use std::time::{Duration, Instant};
+
+        let operation_id = OperationId::new("survey-registry-publication-owner")?;
+        let generation = Generation::new(1)?;
+        let fence = FencingToken::new(
+            test_epoch(1),
+            generation,
+            "fence-survey-registry-publication-owner",
+        )?;
+        let tree = ProcessTreeId::new("tree-survey-registry-publication-owner")?;
+        let job = JobId::new("job-survey-registry-publication-owner")?;
+        let image = ImageId::new("image-survey-registry-publication-owner")?;
+        let session_id = SessionId::new("session-survey-registry-publication-owner")?;
+        let executable_digest = "e".repeat(64);
+        let intent = ProcessIntent::new(
+            operation_id.clone(),
+            tree.clone(),
+            job.clone(),
+            image.clone(),
+            session_id.clone(),
+            generation,
+            "survey-registry-publication-image",
+            executable_digest.clone(),
+            vec!["probe".to_owned()],
+            std::env::temp_dir().to_string_lossy().into_owned(),
+            EnvironmentProjection::default(),
+            ResourceLimits::new(30_000, Some(10_000), Some(512_000_000), 4_096, 4_096, 4)?,
+        )?;
+        let mut authority = DispatchPermitAuthority::activate(
+            DispatchAuthorityId::new("auth-survey-registry-publication-owner")?,
+            KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
+        );
+        let permit = authority.issue(
+            &intent,
+            PermitIssuance::new(
+                ActionLeaseRef::new("lease-survey-registry-publication-owner")?,
+                fence.clone(),
+                revisions(),
+                100,
+                10_000,
+                "nonce-survey-registry-publication-owner",
+            )?,
+        )?;
+        let request = ProcessRequest::new(intent, permit)?;
+        let observed = SuspendedProcessIdentity::new(
+            eliot_process::ProcessId::new("windows-process-survey-registry-publication-owner")?,
+            tree,
+            job,
+            image,
+            session_id,
+            generation,
+            eliot_process::PhysicalProcessBinding::new(
+                4_242,
+                818_934_281,
+                "survey-registry-publication-image",
+                "Local\\Eliot-survey-registry-publication-owner",
+            )?,
+            super::now_ms(),
+            executable_digest,
+        )?;
+        let context = DispatchValidationContext::new(
+            ClockObservation {
+                valid_time_ms: Some(150),
+                known_time_ms: Some(150),
+                transaction_sequence: None,
+                monotonic_ns: Some(1),
+            },
+            fence,
+            test_epoch(1),
+            revisions(),
+            41,
+        )?;
+        let validated = authority.validate_and_consume(request, observed, &context)?;
+        let state = ProcessState::from_validated(&validated);
+
+        let process_sink: Arc<dyn ProcessEvidenceSink> = Arc::new(RecordingSink::default());
+        let stream_sink = Arc::new(FakeStreamSink::new());
+        let stream_sink_owner: Arc<dyn super::ProcessStreamSinkClient> = stream_sink.clone();
+        let operation = Arc::new(Mutex::new(Operation {
+            state,
+            sink: process_sink,
+            child: None,
+            survey_probe_profile: None,
+            survey_probe_path_scope: None,
+            survey_probe_stream_sink: Some(Arc::clone(&stream_sink_owner)),
+            stdin_writer: None,
+            stdout: Arc::new(Mutex::new(CaptureSession::new("stdout", 1, false))),
+            stderr: Arc::new(Mutex::new(CaptureSession::new("stderr", 1, false))),
+            stdout_thread: None,
+            stderr_thread: None,
+            stdout_pump: None,
+            stderr_pump: None,
+            deadline: Instant::now() + Duration::from_secs(30),
+            deadline_watcher: None,
+            deadline_watcher_owner: None,
+            watcher_fail_closed_contained: false,
+            start_publish_gap: Some(super::PUBLISH_EVIDENCE_GAP),
+            start_phase: StartPhase::RegistryPublication,
+            timed_out: false,
+            cleanup_required: true,
+            termination: None,
+            capture_failures: Vec::new(),
+        }));
+
+        let executor = WindowsProcessExecutor::new(Arc::new(DummyPort));
+        executor.retain_resumed_survey_operation_failure(
+            operation_id.clone(),
+            Arc::clone(&operation),
+            super::registry_unavailable("lock").to_string(),
+            None,
+        );
+
+        {
+            let pending = executor
+                .pending_pre_resume_cleanups
+                .lock()
+                .expect("pending cleanup registry");
+            let cleanup = pending
+                .get(&operation_id)
+                .and_then(|owners| owners.first())
+                .expect("publication failure owner");
+            let retained = cleanup
+                .operation
+                .as_ref()
+                .expect("same original operation Arc retained");
+            assert!(Arc::ptr_eq(retained, &operation));
+            assert_eq!(cleanup.primary_failure, "operation registry lock unavailable");
+            let retained_guard = retained.lock().expect("retained original operation");
+            assert!(Arc::ptr_eq(
+                retained_guard
+                    .survey_probe_stream_sink
+                    .as_ref()
+                    .expect("survey sink owner retained on Operation"),
+                &stream_sink_owner,
+            ));
+        }
+
+        assert!(executor.reserve_operation(operation_id.clone()).is_err());
+        assert!(matches!(
+            executor.reconcile_pending_pre_resume_cleanup(&operation_id),
+            Err(ProcessExecutionError::UnknownOutcome)
+        ));
+        assert!(executor.reserve_operation(operation_id).is_err());
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn executor_pending_cleanup_process_child() {
+        if std::env::var_os("ELIOT_P04_EXECUTOR_PENDING_CLEANUP_CHILD").is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(30));
         }
     }
 
