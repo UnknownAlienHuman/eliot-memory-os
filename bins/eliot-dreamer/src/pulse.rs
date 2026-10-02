@@ -828,4 +828,30 @@ mod pulse_denominator_coverage_tests {
             "a ledger missing a mandatory member must refuse"
         );
     }
+
+    /// The refusal case that only property 2 can catch, and the reason it
+    /// exists.
+    ///
+    /// A duplicated record standing in for a missing one keeps the ledger at
+    /// the published count, so property 1 - the independent expected count -
+    /// passes it. Dropping the last member and appending a second copy of the
+    /// first leaves `len == PULSE_EXPECTED_MEMBER_COUNT` while the denominator
+    /// is no longer covered: one member is missing and another is claimed
+    /// twice. The exactly-once property is what refuses it.
+    #[test]
+    fn ledger_duplicate_standing_in_for_a_missing_member_is_refused() {
+        let mut ledger = complete_ledger();
+        ledger.retain(|record| record.stage != PulseStageId::Packet.as_str());
+        ledger.push(complete_ledger()[0].clone());
+        assert_eq!(
+            ledger.len(),
+            PULSE_EXPECTED_MEMBER_COUNT,
+            "the substituted ledger still satisfies the published count, so the count alone cannot refuse it"
+        );
+        assert_eq!(
+            verify_denominator_coverage(&ledger),
+            Err(PULSE_DENOMINATOR_INCOMPLETE),
+            "a duplicate standing in for a missing member must refuse"
+        );
+    }
 }
