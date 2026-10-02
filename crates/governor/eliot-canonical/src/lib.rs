@@ -1469,7 +1469,7 @@ mod tests {
             {
                 let mut edited = minimal.clone();
                 edited.idempotency_key.push_str("-edited");
-                minimal.canonical_request_hash_for_edited(&edited)
+                canonical_request_hash_for_edited(&edited)
             },
             "{SHARED} digest must not survive an envelope-field edit"
         );
