@@ -239,8 +239,7 @@ fn real_process_gateway(
     )));
     let platform = Arc::new(
         WindowsPlatform::new(
-            std::fs::canonicalize(containment_root)
-                .expect("canonical real gateway platform root"),
+            std::fs::canonicalize(containment_root).expect("canonical real gateway platform root"),
         )
         .expect("real gateway platform root"),
     );
@@ -5611,8 +5610,8 @@ async fn c183_probe_ready_shares_store_rebind_gate_and_requires_committed_public
             panic!("the test lease requires its authenticated Kernel peer")
         }
     };
-    let kernel_generation = ResourceGeneration::new(incarnation.kernel_generation.sequence)
-        .unwrap();
+    let kernel_generation =
+        ResourceGeneration::new(incarnation.kernel_generation.sequence).unwrap();
     let expected_generation_binding = SupervisionGenerationBinding {
         target_id: incarnation.observation_scope.targets[0].clone(),
         target_generation: kernel_generation,
@@ -5627,24 +5626,27 @@ async fn c183_probe_ready_shares_store_rebind_gate_and_requires_committed_public
     };
     let lease_binding = eliot_ors::SupervisionLeaseBinding {
         scope_ref: OperationIdentity::new(
-            incarnation.derived_scope_ref().expect("derived lease scope ref"),
+            incarnation
+                .derived_scope_ref()
+                .expect("derived lease scope ref"),
         )
         .expect("supervision scope identity"),
         observation_scope: incarnation.observation_scope.clone(),
         installation_id: OperationIdentity::new(candidate.installation_id.as_str()).unwrap(),
         host_epoch: candidate.host_epoch.clone(),
         activation_id: OperationIdentity::new(candidate.activation_id.as_str()).unwrap(),
-        activation_generation: ResourceGeneration::new(
-            incarnation.activation_generation.sequence,
-        )
-        .unwrap(),
+        activation_generation: ResourceGeneration::new(incarnation.activation_generation.sequence)
+            .unwrap(),
         kernel_epoch: candidate.kernel_epoch.clone(),
         kernel_front_door_server_sid: kernel_front_door_server_sid.clone(),
         kernel_front_door_session_id,
         kernel_front_door_artifact_sha256: candidate.artifact_hash.as_str().to_owned(),
         watchdog_epoch: AuthorityEpoch::new(incarnation.watchdog_epoch.sequence).unwrap(),
         generation_binding: expected_generation_binding.clone(),
-        state_fence: StateFence::new(candidate.kernel_epoch.clone(), ResourceGeneration::genesis()),
+        state_fence: StateFence::new(
+            candidate.kernel_epoch.clone(),
+            ResourceGeneration::genesis(),
+        ),
         issued_at_ms: now_ms,
         expires_at_ms: now_ms.saturating_add(60_000),
         renew_before_ms: now_ms.saturating_add(30_000),
@@ -5721,9 +5723,15 @@ async fn c183_probe_ready_shares_store_rebind_gate_and_requires_committed_public
         active_payload.observation_scope,
         candidate.supervision_incarnation.observation_scope
     );
-    assert_eq!(active_payload.installation_id, candidate.installation_id.as_str());
+    assert_eq!(
+        active_payload.installation_id,
+        candidate.installation_id.as_str()
+    );
     assert_eq!(active_payload.host_epoch, candidate.host_epoch);
-    assert_eq!(active_payload.activation_id, candidate.activation_id.as_str());
+    assert_eq!(
+        active_payload.activation_id,
+        candidate.activation_id.as_str()
+    );
     assert_eq!(
         active_payload.activation_generation,
         ResourceGeneration::new(incarnation.activation_generation.sequence).unwrap()
@@ -5745,11 +5753,20 @@ async fn c183_probe_ready_shares_store_rebind_gate_and_requires_committed_public
         active_payload.watchdog_epoch,
         AuthorityEpoch::new(incarnation.watchdog_epoch.sequence).unwrap()
     );
-    assert_eq!(active_payload.generation_binding, expected_generation_binding);
-    assert_eq!(active_payload.state_fence.authority_epoch, candidate.kernel_epoch);
+    assert_eq!(
+        active_payload.generation_binding,
+        expected_generation_binding
+    );
+    assert_eq!(
+        active_payload.state_fence.authority_epoch,
+        candidate.kernel_epoch
+    );
     assert_eq!(
         active_payload.state_fence,
-        StateFence::new(candidate.kernel_epoch.clone(), ResourceGeneration::genesis())
+        StateFence::new(
+            candidate.kernel_epoch.clone(),
+            ResourceGeneration::genesis()
+        )
     );
     assert_eq!(
         kernel.service.lock().unwrap().state(),
@@ -5761,7 +5778,9 @@ async fn c183_probe_ready_shares_store_rebind_gate_and_requires_committed_public
     let (release_gate_tx, release_gate_rx) = tokio::sync::oneshot::channel();
     let holder = tokio::spawn(async move {
         let _guard = gate_kernel.store_rebind_gate.lock().await;
-        gate_held_tx.send(()).expect("signal held store rebind gate");
+        gate_held_tx
+            .send(())
+            .expect("signal held store rebind gate");
         release_gate_rx
             .await
             .expect("release held store rebind gate");
