@@ -16,9 +16,8 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use eliot_protocol::{
-    SELECTED_SOURCE_CAPTURE_INVOCATION_WIRE_ID,
-    SELECTED_SOURCE_CAPTURE_INVOCATION_WIRE_VERSION, SelectedSourceCaptureInvocation,
-    SelectedSourceCaptureOperation,
+    SELECTED_SOURCE_CAPTURE_INVOCATION_WIRE_ID, SELECTED_SOURCE_CAPTURE_INVOCATION_WIRE_VERSION,
+    SelectedSourceCaptureInvocation, SelectedSourceCaptureOperation,
 };
 use serde_json::json;
 
@@ -48,7 +47,10 @@ fn legacy_diagnostics_and_probe_version_keep_the_v1_unit_wire() {
             json!("PROBE_VERSION"),
         ),
     ] {
-        assert_eq!(serde_json::to_value(&operation).expect("encode v1 operation"), wire);
+        assert_eq!(
+            serde_json::to_value(&operation).expect("encode v1 operation"),
+            wire
+        );
         assert_eq!(
             serde_json::from_value::<SelectedSourceCaptureOperation>(wire)
                 .expect("decode v1 operation"),
@@ -88,10 +90,7 @@ fn semantic_operation_arguments_round_trip_without_loss() {
                 }
             }),
         ),
-        (
-            SelectedSourceCaptureOperation::Symbols,
-            json!("SYMBOLS"),
-        ),
+        (SelectedSourceCaptureOperation::Symbols, json!("SYMBOLS")),
         (
             SelectedSourceCaptureOperation::RenameCandidate {
                 symbol: "rust-analyzer cargo probe 0.1.0 crate::rename_me().".to_owned(),
@@ -166,12 +165,12 @@ fn executable_configuration_and_unknown_operation_fields_are_closed_out() {
         }
     });
     assert!(
-        serde_json::from_value::<SelectedSourceCaptureOperation>(rename_with_applied_claim).is_err()
+        serde_json::from_value::<SelectedSourceCaptureOperation>(rename_with_applied_claim)
+            .is_err()
     );
 
     let unknown_operation = json!("APPLY_RENAME");
     assert!(serde_json::from_value::<SelectedSourceCaptureOperation>(unknown_operation).is_err());
-
 }
 
 #[test]
@@ -186,7 +185,10 @@ fn selected_path_rejects_traversal_and_foreign_root_forms() {
         "\\\\server\\share\\workspace\\src\\lib.rs",
     ] {
         let request = invocation(SelectedSourceCaptureOperation::Diagnostics, path, None);
-        assert!(request.validate().is_err(), "path should be refused: {path}");
+        assert!(
+            request.validate().is_err(),
+            "path should be refused: {path}"
+        );
     }
 
     let normalized = invocation(
@@ -207,11 +209,15 @@ fn invocation_identity_and_selector_bounds_are_enforced() {
     request.wire_version = SELECTED_SOURCE_CAPTURE_INVOCATION_WIRE_VERSION + 1;
     assert!(request.validate().is_err());
 
-    let mut request = invocation(SelectedSourceCaptureOperation::Symbols, "src/lib.rs", Some(" "));
+    let request = invocation(
+        SelectedSourceCaptureOperation::Symbols,
+        "src/lib.rs",
+        Some(" "),
+    );
     assert!(request.validate().is_err());
 
     let too_long = "s".repeat(513);
-    let mut request = invocation(
+    let request = invocation(
         SelectedSourceCaptureOperation::Symbols,
         "src/lib.rs",
         Some(&too_long),
