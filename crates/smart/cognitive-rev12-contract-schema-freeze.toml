@@ -29,7 +29,7 @@ rejects = ["generic JSON treated as a projection contract", "prose-invented requ
 # that recorded the disagreement rather than absorbing them silently. Every
 # verdict bound to the r12 digest is invalidated by this revision rather than
 # edited, per the [readback] rule below.
-[revision_note]
+[revision_note_r13]
 revision = 13
 supersedes = "cognitive-rev12-contract-schema-freeze-2026-09-22-r12"
 changed = "four [[frozen_type]].fields lists (eliot_memory_projection_contracts::ExclusionReason gains INFLUENCE_INELIGIBLE, eleven to twelve; eliot_memory_projection_provider::ProjectionRequest gains continuity, workflow_view and workflow_continuity, four to seven, plus its denominator_note restated as the two-count single-read rule the owner code already enforces; eliot_context_contracts::ActiveUnderstandingView gains execution and policy_sha256, nine to eleven; eliot_learning_contracts::HarnessActivationReceiptCandidate goes fifteen to thirty-three), the DIS-LEA-ACTIVATION-SURFACE prose counts thirty-two and seventeen to thirty-three and eighteen, and the SemanticRole count thirteen to fourteen in the two rows that measured it"
