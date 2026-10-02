@@ -201,16 +201,25 @@ pub struct OperatorIdentityLedger {
 }
 
 impl OperatorIdentityLedger {
+    /// Hands out the next issuance ordinal, or the one typed refusal.
+    ///
+    /// The counter is seeded at zero and `fetch_add` returns the value it
+    /// replaced, so the ordinal an issuance actually uses is the successor of
+    /// the seeded value: ordinals are 1-based, the reserved zero is never
+    /// minted into a request id, and the first issuance of a process is
+    /// ordinal 1. Reading the raw counter instead made the very first
+    /// issuance of every process mint ordinal 0 and fence, so this owner could
+    /// never issue an identity at all. A counter that has already handed out
+    /// the whole range is the one case that refuses rather than wrapping,
+    /// because a wrapped ordinal would reuse a request id.
     fn next_ordinal(&self) -> Result<u64, TransportError> {
-        let ordinal = self
+        let previous = self
             .next_ordinal
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // Zero is never a valid ordinal for a minted request id, and a wrapped
-        // counter would reuse request ids, so both refuse instead of minting.
-        if ordinal == 0 || ordinal == u64::MAX {
+        if previous == u64::MAX {
             return Err(TransportError::SessionFenced);
         }
-        Ok(ordinal)
+        Ok(previous + 1)
     }
 }
 
@@ -511,23 +520,47 @@ fn mint_operator_request_identity(
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-    use eliot_contracts::{AuthorityEpoch, EpochId, EpochLineageId, ResourceGeneration};
-    use eliot_ipc::{PeerIdentity, ProcessBinding, SessionState};
+    use eliot_contracts::{
+        AuthorityEpoch, ContractVersion, EpochId, EpochLineageId, ResourceGeneration,
+    };
+    use eliot_ipc::{PeerIdentity, ProcessBinding, ServerHandshakePolicy};
     use eliot_kernel_service::{
         HostKernelCandidateBinding, KernelActivationPermit, KernelControlCommand,
         KernelReadyReceipt, KernelService, KernelServiceState,
     };
     use eliot_platform::PlatformHandle;
-    use eliot_protocol::{EncodingProfile, ProtocolVersion};
+    use eliot_protocol::{ClientHello, EncodingProfile, ProtocolVersion};
     use eliot_runtime_contracts::{
-        HealthVector, RegisteredActivityWakePolicy, ServiceProcessState, SupervisionJournalEpoch,
-        SupervisionLeaseIncarnationBinding, SupervisionObservationScope,
+        HealthVector, ModuleContract, RegisteredActivityWakePolicy, ServiceProcessState,
+        SupervisionJournalEpoch, SupervisionLeaseIncarnationBinding, SupervisionObservationScope,
     };
 
     use super::*;
-    use crate::{KernelComposition, KernelConfig};
+    use crate::{KernelComposition, KernelConfig, PROTOCOL_VERSION, SERVICE_NAME};
 
     const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    /// Module identity the public operator surface is admitted under on this
+    /// front door.
+    ///
+    /// The composition publishes exactly one `ServerHandshakePolicy`
+    /// (`composition_bootstrap.rs`), and its `module_id` is `eliotd`, which is
+    /// `ACTIVE_DAEMON_CALLER`. A session bound on that shared policy is not a
+    /// neutral client: `bind_session` runs `validate_eliotd_peer` for that
+    /// identity, which requires a live daemon launch and then proves the peer's
+    /// process binding against the launch receipt and its Job, so a session
+    /// carrying it is provably the daemon process itself. The issuance arm
+    /// refuses that identity, and refusing it is correct: handing an
+    /// `OPERATOR_ROLE` identity to the daemon would be exactly the reserved
+    /// role crossing the closed matrix that this arm exists to keep shut.
+    ///
+    /// The public `eliot ui` / `eliot controlboard status` front door is a
+    /// different peer with its own admitted identity, and it is neither a
+    /// reserved service role nor the daemon. A fixture that cloned the daemon
+    /// policy into a session was building a daemon session and then asserting
+    /// that the owner mints operator identities for the daemon; the refusal it
+    /// hit was the gate working.
+    const OPERATOR_FRONT_DOOR_MODULE_ID: &str = "eliot-operator";
 
     fn test_epoch(sequence: u64) -> EpochId {
         EpochId::new(
@@ -685,33 +718,102 @@ mod tests {
         (kernel, root)
     }
 
-    /// One admitted front-door session carrying a proven OS peer and the live
-    /// policy generation, exactly as `bind_session` establishes it.
-    fn admitted_session(kernel: &KernelComposition, connection_id: &str) -> Session {
-        let policy = kernel
+    /// Republishes this composition's own front-door policy for the public
+    /// operator surface and returns it.
+    ///
+    /// Only the admitted module identity is changed. The generation, Authority
+    /// Epoch, State Fence, artifact, launch nonce, capability set, privacy
+    /// classes, effects, session principal binding and configuration snapshot
+    /// are the composition's live published values, and the session below is
+    /// established from this exact policy by the real server-authoritative
+    /// handshake, so the fixture holds nothing this Kernel could not admit.
+    fn operator_front_door_policy(kernel: &KernelComposition) -> ServerHandshakePolicy {
+        let mut policy = kernel
             .front_door_policy
             .lock()
             .expect("front-door policy")
             .clone();
-        Session {
-            connection_id: connection_id.to_owned(),
-            protocol_version: ProtocolVersion::CURRENT,
-            peer: PeerIdentity::authenticated_for_test(
-                ProcessBinding::from_observation(4242, 55, r"C:\eliot\eliot.exe")
-                    .expect("process binding"),
-                "S-1-5-18".to_owned(),
-                "0".to_owned(),
-            )
-            .expect("authenticated peer"),
-            authority_epoch: policy.module_generation.state_fence.authority_epoch.clone(),
+        policy.module_id = OPERATOR_FRONT_DOOR_MODULE_ID.to_owned();
+        policy.module_generation.module_id =
+            crate::ContractId::new(OPERATOR_FRONT_DOOR_MODULE_ID).expect("operator module id");
+        *kernel.front_door_policy.lock().expect("front-door policy") = policy.clone();
+        policy
+    }
+
+    /// The `ClientHello` this operator surface presents, built from the
+    /// published policy exactly as the real protected client declaration is.
+    fn operator_client_hello(policy: &ServerHandshakePolicy) -> ClientHello {
+        ClientHello {
+            protocol_range: policy.protocol_range,
+            module_bridge_identity: policy.module_id.clone(),
+            artifact_hash: policy.module_generation.artifact_id.clone(),
+            module_contract: ModuleContract {
+                module_id: policy.module_generation.module_id.clone(),
+                version: ContractVersion::new(1, 0, 0),
+                artifact_id: policy.module_generation.artifact_id.clone(),
+                protocols: vec![PROTOCOL_VERSION.to_owned()],
+                capabilities: Vec::new(),
+                required_capabilities: Vec::new(),
+                optional_capabilities: Vec::new(),
+                advisory_capabilities: Vec::new(),
+                state_owner: SERVICE_NAME.to_owned(),
+                failure_domain: SERVICE_NAME.to_owned(),
+                owner: SERVICE_NAME.to_owned(),
+                hot_replace: false,
+                startup_after: Vec::new(),
+                drain_before: Vec::new(),
+                invalidation_triggers: Vec::new(),
+                supervision_plan: "one_for_one".to_owned(),
+                child_restart: "transient".to_owned(),
+                restart_intensity: "3/10m".to_owned(),
+                resource_profile: "background-medium".to_owned(),
+                privacy_classes: vec!["PUBLIC".to_owned()],
+                permissions: Vec::new(),
+                health_contract: "health/test-v1".to_owned(),
+                checkpoint_contract: "checkpoint/test-v1".to_owned(),
+                compatibility_state: "rebuildable".to_owned(),
+                independent_test_profile: "module/test".to_owned(),
+                contract_fixture_set: "eliot.kernel.v1/test".to_owned(),
+                affected_test_tags: vec!["test".to_owned()],
+                architecture: Vec::new(),
+                telemetry: "telemetry/test-v1".to_owned(),
+                removal_boundary: SERVICE_NAME.to_owned(),
+            },
             module_generation: policy.module_generation.clone(),
             launch_nonce: policy.launch_nonce.clone(),
             capabilities: policy.allowed_capabilities.clone(),
             privacy_classes: policy.allowed_privacy_classes.clone(),
-            effects: policy.allowed_effects.clone(),
-            session_epoch: 1,
-            state: SessionState::Open,
+            max_frame: policy.max_frame,
+            authority_epoch: policy.module_generation.state_fence.authority_epoch.clone(),
         }
+    }
+
+    /// One admitted public-operator front-door session carrying a proven OS
+    /// peer, established by the real server-authoritative handshake from the
+    /// published operator policy.
+    fn admitted_session(kernel: &KernelComposition, connection_id: &str) -> Session {
+        let policy = operator_front_door_policy(kernel);
+        let peer = PeerIdentity::authenticated_for_test(
+            ProcessBinding::from_observation(4242, 55, r"C:\eliot\eliot.exe")
+                .expect("process binding"),
+            "S-1-5-18".to_owned(),
+            "0".to_owned(),
+        )
+        .expect("authenticated peer");
+        let session = Session::establish_with_server(
+            connection_id.to_owned(),
+            peer,
+            &operator_client_hello(&policy),
+            &policy,
+        )
+        .expect("public operator session is admitted by the real handshake")
+        .session;
+        assert_eq!(
+            session.module_generation.module_id.as_str(),
+            OPERATOR_FRONT_DOOR_MODULE_ID,
+            "the admitted session is the public operator peer, not a reserved service role"
+        );
+        session
     }
 
     fn request_for(operation: &str) -> OperatorRequestIdentityRequest {
@@ -844,6 +946,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// The reserved service roles keep this lane closed.
+    ///
+    /// Each of them owns a different matrix, and the `eliotd` entry is the
+    /// daemon itself: `bind_session` proves that peer's process against the
+    /// live daemon launch receipt, so a session carrying that identity is the
+    /// daemon and must never receive an `OPERATOR_ROLE` identity from this
+    /// owner. The dispatch gate reads exactly this one server-owned field, so
+    /// each reserved identity is pinned here on a session that differs from the
+    /// admitted operator session in nothing else. A refusal surfaces as the
+    /// closed matrix's own terminal action rather than as an error, so the
+    /// assertion is that no grant is ever produced, and the retained ledger
+    /// proves no issuance survived either.
+    #[test]
+    fn reserved_service_module_ids_keep_the_issuance_lane_closed() {
+        let (kernel, root) = ready_composition("reserved-roles");
+        let admitted = admitted_session(&kernel, "cli-reserved-roles");
+        for reserved in [
+            eliot_protocol::AGENT_BRIDGE_MODULE_ID,
+            crate::user_broker_registration_route::USER_BROKER_MODULE_ID,
+            crate::ACTIVE_DAEMON_CALLER,
+            crate::front_door_session::DOCTOR_MODULE_ID,
+            crate::front_door_session::TESTD_MODULE_ID,
+            crate::front_door_session::NATIVE_MODULE_ID,
+            crate::front_door_session::WATCHDOG_MODULE_ID,
+        ] {
+            let mut reserved_session = admitted.clone();
+            reserved_session.module_generation.module_id =
+                crate::ContractId::new(reserved).expect("reserved module id");
+            let action = kernel.dispatch_frame(
+                &reserved_session,
+                &issuance_request_frame(&reserved_session.connection_id, "operator.launch"),
+            );
+            assert!(
+                !matches!(action, Ok(KernelFrameAction::Reply(_))),
+                "{reserved}: a reserved service role is never answered with an operator grant"
+            );
+        }
+        assert!(
+            kernel
+                .operator_request_identities
+                .retained
+                .lock()
+                .expect("retained ledger")
+                .is_empty(),
+            "a refused reserved role retains no issuance"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// Wrong session and wrong generation: a session that is not this
     /// composition's, or one bound to a replaced generation, never receives an
     /// identity.
@@ -867,11 +1018,15 @@ mod tests {
             Err(TransportError::SessionFenced)
         ));
 
-        let mut foreign = session.clone();
-        foreign.connection_id = "some-other-connection".to_owned();
-        let frame = issuance_request_frame("some-other-connection", "operator.launch");
+        // A frame that belongs to another connection is not this session's to
+        // serve. Renaming the session and its frame together is not a foreign
+        // session at all — the connection identity is never an authority input
+        // here, it is echoed back from the session this owner is handed — so
+        // the genuinely foreign case is a frame whose own connection is not the
+        // admitted session's, and that is refused.
+        let foreign_frame = issuance_request_frame("some-other-connection", "operator.launch");
         assert!(matches!(
-            kernel.dispatch_operator_request_identity(&foreign, &frame),
+            kernel.dispatch_operator_request_identity(&session, &foreign_frame),
             Err(TransportError::SessionFenced)
         ));
         assert!(
